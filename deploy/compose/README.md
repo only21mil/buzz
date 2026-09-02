@@ -56,7 +56,17 @@ non-secret Compose settings file separately from the mode-`0600` secret file:
 export BUZZ_COMPOSE_ENV_FILE=/path/to/compose.env
 export BUZZ_SECRET_ENV_FILE="$HOME/.config/sats/secrets.env"
 export BUZZ_PRE_FREEZE_RECEIPT=/path/to/pre-freeze-receipt.json
-export BUZZ_PROTECTED_CI_RECEIPT=/path/to/protected-ci-receipt.json
+evidence_dir=/absolute/private/evidence-directory # caller-owned mode 0700
+../../scripts/protected-ci-receipt.py acquire-main \
+  --repository only21mil/buzz \
+  --head 0123456789abcdef0123456789abcdef01234567 \
+  --branch main --output "$evidence_dir/protected-ci-main.json"
+../../scripts/protected-ci-receipt.py validate \
+  --receipt "$evidence_dir/protected-ci-main.json" \
+  --repository only21mil/buzz \
+  --head 0123456789abcdef0123456789abcdef01234567 \
+  --scope main --max-age-seconds 86400
+export BUZZ_PROTECTED_CI_RECEIPT="$evidence_dir/protected-ci-main.json"
 ./deploy-local.sh 0123456789abcdef0123456789abcdef01234567
 ```
 
@@ -73,8 +83,12 @@ all name the requested full commit. Both receipts must be mode-safe JSON from
 `only21mil/buzz`, record `overall: "PASS"`, contain at least one passing check,
 and be no older than `BUZZ_DEPLOY_RECEIPT_MAX_AGE_SECONDS` (default 86400).
 The pre-freeze receipt comes from `scripts/pre-freeze.sh`. The protected-CI
-receipt also requires `source: "protected-ci"`, `protected: true`, and
-`full_exact_head: true`.
+receipt must be the canonical provider-bound `main`-scope receipt acquired for
+the landed commit. `BUZZ_PROTECTED_CI_RECEIPT` is mandatory and absolute; its
+immediate parent must be caller-owned mode `0700`, and the receipt must be mode
+`0600`. Pull-request-scoped receipts and legacy JSON that merely asserts
+`protected: true` or `full_exact_head: true` are refused. Reacquire after any
+rerun or ruleset change because validation is point-in-time.
 
 `run-local.sh` carries an expected deployment image through `sudo` with an
 explicit non-secret environment assignment, asks Compose for its resolved image

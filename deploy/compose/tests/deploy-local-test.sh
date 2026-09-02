@@ -12,6 +12,10 @@ trap 'rm -rf "${scratch}"' EXIT
 
 fail() {
   printf 'FAIL: %s\n' "$*" >&2
+  if [[ ${TEST_KEEP_FAILED:-0} == 1 ]]; then
+    trap - EXIT
+    printf 'Retained failed fixtures at %s\n' "${scratch}" >&2
+  fi
   exit 1
 }
 
@@ -585,19 +589,70 @@ PY
   "checks": [{"name": "targeted", "status": "PASS"}]
 }
 JSON
-  cat >"${case_dir}/protected-ci-receipt.json" <<JSON
-{
-  "schema_version": 1,
-  "source": "protected-ci",
-  "repository": "only21mil/buzz",
-  "head_sha": "${protected_ci_head}",
-  "timestamp": "${receipt_timestamp}",
-  "overall": "PASS",
-  "protected": true,
-  "full_exact_head": true,
-  "checks": [{"name": "full-exact-head", "status": "PASS"}]
+  python3 - "${compose_dir}/../../scripts/test-protected-ci-receipt.py" \
+    "${case_dir}/protected-ci-receipt.json" "${protected_ci_head}" \
+    "${receipt_timestamp}" "${scenario}" <<'PY'
+import datetime as dt
+import importlib.util
+from pathlib import Path
+import sys
+
+fixture_path, output_path, head, timestamp, scenario = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("protected_ci_deploy_fixture", fixture_path)
+assert spec is not None and spec.loader is not None
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+client = fixture.FakeClient()
+if scenario == "pull_request_protected_receipt":
+    value = fixture.receipt.build_receipt(client, 17, fixture.HEAD, "main")
+else:
+    client.base_ref_sha = fixture.HEAD
+    value = fixture.receipt.build_main_receipt(client, fixture.HEAD, "main")
+
+def replace(item):
+    if isinstance(item, dict):
+        return {key: replace(child) for key, child in item.items()}
+    if isinstance(item, list):
+        return [replace(child) for child in item]
+    if isinstance(item, str):
+        return item.replace(fixture.HEAD, head)
+    return item
+
+value = replace(value)
+parsed = dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+provider_date = parsed.astimezone(dt.timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+value["timestamp"] = timestamp
+for request in value["provider"]["requests"]:
+    request["date"] = provider_date
+Path(output_path).write_bytes(fixture.receipt.canonical_json(value))
+Path(output_path).chmod(0o600)
+PY
+  if [[ ${scenario} == legacy_protected_receipt ]]; then
+    python3 - "${case_dir}/protected-ci-receipt.json" "${protected_ci_head}" \
+      "${receipt_timestamp}" <<'PY'
+import json
+from pathlib import Path
+import sys
+path, head, timestamp = sys.argv[1:]
+value = {
+    "schema_version": 1, "source": "protected-ci", "repository": "only21mil/buzz",
+    "head_sha": head, "timestamp": timestamp, "overall": "PASS", "protected": True,
+    "full_exact_head": True, "checks": [{"name": "full-exact-head", "status": "PASS"}],
 }
-JSON
+Path(path).write_text(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+Path(path).chmod(0o600)
+PY
+  elif [[ ${scenario} == noncanonical_protected_receipt ]]; then
+    python3 - "${case_dir}/protected-ci-receipt.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+value = json.loads(path.read_text())
+path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+path.chmod(0o600)
+PY
+  fi
   if [[ ${scenario} == dirty_receipt ]]; then
     chmod 666 "${case_dir}/protected-ci-receipt.json"
   fi
@@ -661,6 +716,8 @@ ENV
       TEST_SOURCE_HEAD="${source_head}" \
       TEST_DIRTY_CHECKOUT="${dirty_checkout}" \
       BUZZ_RUN_LOCAL="${run_local_override}" \
+      PYTHONHOME="${case_dir}/poison-python-home" \
+      PYTHONPATH="${case_dir}/poison-python-path" \
       BUZZ_DEPLOY_SOURCE_REF="${deploy_source_ref}" \
       BUZZ_SECRET_ENV_FILE="${case_dir}/secrets.env" \
       BUZZ_DOCKER_SOCKET="${case_dir}/docker.sock" \
@@ -776,17 +833,21 @@ ENV
 }
 
 for early_failure in stale_checkout stale_source dirty_checkout dirty_receipt \
-  short_receipt mismatched_receipt stale_receipt; do
+  short_receipt mismatched_receipt stale_receipt legacy_protected_receipt \
+  noncanonical_protected_receipt pull_request_protected_receipt; do
   run_case "${early_failure}" failure
   assert_not_contains "${scratch}/${early_failure}/commands.log" '^docker '
 done
 assert_contains "${scratch}/stale_checkout/output" 'source checkout is at'
 assert_contains "${scratch}/stale_source/output" 'source ref .* expected'
 assert_contains "${scratch}/dirty_checkout/output" 'source checkout is dirty'
-assert_contains "${scratch}/dirty_receipt/output" 'group- or world-writable'
+assert_contains "${scratch}/dirty_receipt/output" 'caller-owned, mode 0600'
 assert_contains "${scratch}/short_receipt/output" 'head_sha must be a full 40-character'
-assert_contains "${scratch}/mismatched_receipt/output" 'does not match the requested commit'
-assert_contains "${scratch}/stale_receipt/output" 'receipt is stale'
+assert_contains "${scratch}/mismatched_receipt/output" 'head mismatch'
+assert_contains "${scratch}/stale_receipt/output" 'future-dated or stale'
+assert_contains "${scratch}/legacy_protected_receipt/output" 'receipt missing fields'
+assert_contains "${scratch}/noncanonical_protected_receipt/output" 'canonical JSON'
+assert_contains "${scratch}/pull_request_protected_receipt/output" 'receipt scope mismatch'
 
 set +e
 "${deploy_script}" --check abc >"${scratch}/check-invalid-sha.output" 2>&1
@@ -795,6 +856,16 @@ set -e
 [[ ${invalid_sha_rc} -ne 0 ]] || fail 'check mode accepted a short commit'
 assert_contains "${scratch}/check-invalid-sha.output" \
   'commit must be exactly 40 lowercase hexadecimal characters'
+
+set +e
+env -u BUZZ_PROTECTED_CI_RECEIPT BUZZ_COMPOSE_ENV_FILE=/nonexistent/compose.env \
+  "${deploy_script}" --check "${test_commit}" \
+  >"${scratch}/check-missing-protected-receipt.output" 2>&1
+missing_receipt_rc=$?
+set -e
+[[ ${missing_receipt_rc} -ne 0 ]] || fail 'check mode accepted a missing protected receipt path'
+assert_contains "${scratch}/check-missing-protected-receipt.output" \
+  'BUZZ_PROTECTED_CI_RECEIPT must name an explicit absolute receipt path'
 
 run_case check_success success check
 assert_contains "${scratch}/check_success/output" '^PREFLIGHT PASSED:'

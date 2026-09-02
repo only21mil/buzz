@@ -23,7 +23,7 @@
     "landing"
   ],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"const": 2},
     "repository": {"const": "only21mil/buzz"},
     "candidate_sha": {"$ref": "#/$defs/sha40"},
     "base_sha": {"$ref": "#/$defs/sha40"},
@@ -276,7 +276,7 @@
           "items": {"$ref": "#/$defs/signed_ci_request"}
         },
         "events": {
-          "type": "array", "minItems": 10,
+          "type": "array", "minItems": 8,
           "items": {"$ref": "#/$defs/signed_ci_event"}
         },
         "decoded_logs": {
@@ -289,7 +289,9 @@
     "signed_ci_request": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "pubkey", "created_at", "kind", "tags", "content", "sig", "stored"],
+      "required": [
+        "id", "pubkey", "created_at", "kind", "tags", "content", "sig", "stored", "watch_cursor"
+      ],
       "properties": {
         "kind": {"const": 46100},
         "id": {"$ref": "#/$defs/sha256"},
@@ -298,6 +300,7 @@
         "tags": {"$ref": "#/$defs/nostr_tags"},
         "sig": {"$ref": "#/$defs/sig128"},
         "stored": {"const": true},
+        "watch_cursor": {"type": "integer", "minimum": 1},
         "content": {"type": "string", "minLength": 1}
       }
     },

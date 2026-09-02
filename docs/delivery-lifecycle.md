@@ -25,14 +25,30 @@ disagree, stop delivery, fix the disagreement, and re-run the affected gate.
    ancestor of the candidate and the candidate worktree is clean.
 2. Run `scripts/pre-freeze.sh` with the intended base. Use `--full` and
    `--test` when the change or verification tier requires workspace-wide
-   coverage. Retain the generated `pre-freeze-receipt.json`.
-3. The parent or operator independently reads the authenticated live repository
-   ruleset and exact-head workflow/check evidence, and confirms that every
-   protected requirement passed for the candidate. Retain a mode-safe
-   `protected-ci-receipt.json` with `source: "protected-ci"`, `protected: true`,
-   `full_exact_head: true`, the full candidate commit, and only passing checks.
-   The repository currently has no maintained authenticated acquisition tool
-   that creates this receipt from the live provider.
+   coverage. The script writes `pre-freeze-receipt.json` into the repository
+   root. Move that file into the private mode-`0700` evidence directory at mode
+   `0600` before exporting `BUZZ_PRE_FREEZE_RECEIPT`.
+3. Acquire the provider-bound pull-request receipt for the exact candidate with
+   `scripts/protected-ci-receipt.py acquire`. The output parent must be an
+   absolute, canonical, caller-owned mode-`0700` directory; the tool publishes
+   a new mode-`0600` file and refuses replacement. Validate it with literal
+   scope `pull-request` before supplying it to the promotion gate:
+
+   ```bash
+   evidence_dir=/absolute/private/evidence-directory
+   scripts/protected-ci-receipt.py acquire \
+     --repository only21mil/buzz --pull-request PR_NUMBER \
+     --head FULL_40_CHARACTER_CANDIDATE --base main \
+     --output "$evidence_dir/protected-ci-pr.json"
+   scripts/protected-ci-receipt.py validate \
+     --receipt "$evidence_dir/protected-ci-pr.json" \
+     --repository only21mil/buzz --head FULL_40_CHARACTER_CANDIDATE \
+     --scope pull-request --max-age-seconds 86400
+   ```
+
+   Supply GitHub authentication through the environment. Never place a token
+   in the command line or receipt. Legacy JSON that merely asserts
+   `protected: true` or `full_exact_head: true` is not evidence and is refused.
 4. Apply the current risk classifier. When Tier 2 is required, close review on
    the exact candidate before promotion. A review of an ancestor, tree-equivalent
    reconstruction, or later amended commit does not close the gate.
@@ -40,8 +56,9 @@ disagree, stop delivery, fix the disagreement, and re-run the affected gate.
    external publication, or other approval-gated action.
 
 `scripts/ci-promotion-readiness.py` validates a supplied promotion evidence
-bundle when that broader gate applies. It does not authenticate or acquire live
-provider evidence, and it does not create approval.
+bundle when that broader gate applies. It accepts only the canonical,
+provider-bound `pull-request` receipt; it does not acquire evidence or create
+approval.
 
 ## Landing
 
@@ -58,6 +75,12 @@ Record the merge commit and any failed, skipped, superseded, or duplicate CI
 runs in the Buzz repository record. Do not describe a history containing a
 failure as uniformly green. State which exact-head run is the promotion gate.
 
+When initially adding the relay canary as a protected requirement, merge the
+foundation first without that new required context. Dispatch the workflow for
+the exact landed ref, record the expected first-attempt failure, rerun it once,
+and require the second attempt to pass on the same landed commit. Add the
+ruleset requirement only after that bootstrap evidence is complete.
+
 ## Deployment preflight
 
 Production deployment is approval-gated. Run it only from a clean checkout of
@@ -68,10 +91,18 @@ The operator supplies a non-secret Compose settings file, the existing
 mode-`0600` secret file under a mode-`0700` directory, and fresh receipts:
 
 ```bash
+evidence_dir=/absolute/private/evidence-directory
+scripts/protected-ci-receipt.py acquire-main \
+  --repository only21mil/buzz --head FULL_40_CHARACTER_LANDED_COMMIT \
+  --branch main --output "$evidence_dir/protected-ci-main.json"
+scripts/protected-ci-receipt.py validate \
+  --receipt "$evidence_dir/protected-ci-main.json" \
+  --repository only21mil/buzz --head FULL_40_CHARACTER_LANDED_COMMIT \
+  --scope main --max-age-seconds 86400
 export BUZZ_COMPOSE_ENV_FILE=/absolute/path/to/compose.env
 export BUZZ_SECRET_ENV_FILE="$HOME/.config/sats/secrets.env"
 export BUZZ_PRE_FREEZE_RECEIPT=/absolute/path/to/pre-freeze-receipt.json
-export BUZZ_PROTECTED_CI_RECEIPT=/absolute/path/to/protected-ci-receipt.json
+export BUZZ_PROTECTED_CI_RECEIPT="$evidence_dir/protected-ci-main.json"
 export BUZZ_DEPLOY_SOURCE_REF=refs/remotes/buzz/main
 deploy/compose/deploy-local.sh --check FULL_40_CHARACTER_LANDED_COMMIT
 deploy/compose/deploy-local.sh FULL_40_CHARACTER_LANDED_COMMIT
@@ -88,8 +119,10 @@ set it to a raw commit merely to bypass the branch readback.
 - the checkout is clean, apart from the two generated receipt files;
 - both receipts are regular, mode-safe, fresh, exact-commit PASS receipts from
   `only21mil/buzz`, and the pre-freeze base is an ancestor;
-- the operator-supplied protected-CI receipt is schema-valid, fresh, and states
-  that protected full exact-head CI passed;
+- the explicitly supplied protected-CI receipt is canonical provider-bound
+  `main`-scope evidence for the landed commit, fresh, and a full exact-head
+  protected-CI pass; a pull-request-scoped or legacy self-asserted receipt is
+  refused;
 - the Compose runner, both Compose files, the non-secret settings file, the
   secret file, and their relevant parent directories have the required regular
   file or directory type, ownership, mode, and no-symlink state. The non-secret
@@ -150,12 +183,12 @@ The real deploy completes this same preflight before its first filesystem write
 and repeats it after the candidate build before rollback capture or backup, so
 live-state drift during the build fails closed.
 
-Receipt validation is not provider authentication. `deploy-local.sh` checks the
-supplied JSON's mode, schema, freshness, commit binding, and asserted result; it
-does not contact GitHub or the Buzz relay and cannot prove that the assertions
-came from either system. Until a maintained authenticated acquisition tool is
-present, the parent or operator must independently verify the current live
-ruleset and exact-head run/check evidence before invoking the deploy script.
+`protected-ci-receipt.py` records the exact GitHub REST responses, pinned client
+identity, active rulesets, app-bound required checks, and exact-head check runs.
+Validation is point-in-time: reacquire after a rerun, ruleset change, or landing.
+`deploy-local.sh` does not contact GitHub and requires an explicit absolute
+`BUZZ_PROTECTED_CI_RECEIPT`; a repository-root default is intentionally absent
+because a normal checkout is not a private mode-`0700` evidence directory.
 
 Never use `run-local.sh up` as an upgrade path. The deploy script is the only
 path that binds the build, backup, migration gate, swap, health checks, and

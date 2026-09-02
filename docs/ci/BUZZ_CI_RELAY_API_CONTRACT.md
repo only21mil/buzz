@@ -145,9 +145,20 @@ Each job's selected attempt is the greatest accepted attempt in its contiguous l
 
 The next rerun attempt for a selected failed job is `selected_job_attempt + 1`; `parent_attempt` is exactly the selected failed attempt. Global maximum attempts are checked against the new attempt. Hidden whole-run restarts are forbidden; signed `also_reruns` enumerates every dependency fan-out job and each receives the same new attempt with its own contiguous parent.
 
+The relay accepts that rerun request only after the selected parent job's
+terminal failure. Promotion evidence proves the same ordering with durable
+`watch_cursor` values; request content alone is not proof of that causal edge.
+
 ## 7. Watch ordering and replay
 
 Per-envelope `sequence` remains stream-local and is never presented as a global order. On accepted CI event insertion, the relay transactionally assigns a durable, strictly increasing `watch_cursor` within the run's unique request index. The cursor orders storage acceptance, not event `created_at`.
+
+`GET /ci/runs/<run_id>/events` includes every accepted kind-46100 request in
+that same cursor stream, beginning with the immutable initial request at cursor
+one. `GET /ci/runs/<run_id>/request` returns that initial event and the same
+cursor. Promotion evidence may separate kind 46100 records from later event
+kinds for schema clarity, but it preserves every assigned cursor and validates
+the combined request-and-event sequence as one gap-free `1..N` history.
 
 `buzz ci watch --run <run_id> --timeout-seconds <bound>` first resolves the request, then
 requests events after an optional cursor. The required timeout is one fixed deadline for the
