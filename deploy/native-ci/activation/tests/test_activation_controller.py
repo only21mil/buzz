@@ -1575,7 +1575,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "2d09d2dd6f5854b23916bbe536e110374b577925bc970fd1511e7029c66bfb3f",
+            "04b09c1439e625aa6719466bf15ed24efab4351698475bf504e44931893e773b",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -4109,6 +4109,61 @@ class ActivationControllerTests(unittest.TestCase):
                 CONTROLLER._validate_phase_configs(manifest, payloads)
         manifest, payloads, _driver = self.fixture.load()
         CONTROLLER._validate_phase_configs(manifest, payloads)
+
+    def test_runner_time_reference_must_be_the_frozen_acceptance_template_reference(self) -> None:
+        """H7 clean host, canary stage 5: the fixture hard-coded issued_at
+        1800000000 (2027-01-15T08:00:00Z) with a 300 s window while the runner
+        judged the window by wall clock, so it refused controld's dispatch as
+        "does not match static activation coordinates". The template now
+        records its bound time reference, the runner copies it as the static
+        coordinate acceptance_time_reference, and the freezer binds the two."""
+        manifest, payloads, _driver = self.fixture.load()
+        template = manifest["acceptance_template"]
+        reference = template["time_reference"]
+        run = json.loads(template["run_event"][5])
+        self.assertEqual(template["run_event"][2], reference)
+        self.assertEqual(run["issued_at"], reference)
+        self.assertEqual(run["expires_at"], reference + 300)
+        entries = {entry["role"]: entry for entry in manifest["entries"]}
+        runner_active = json.loads(payloads[entries["runner_config"]["active_source"]])
+        self.assertEqual(runner_active["acceptance_time_reference"], reference)
+        for value in (reference + 1, reference - 1, 1_800_000_300):
+            manifest, payloads, _driver = self.fixture.load()
+            entries = {entry["role"]: entry for entry in manifest["entries"]}
+            runner_active = json.loads(payloads[entries["runner_config"]["active_source"]])
+            runner_active["acceptance_time_reference"] = value
+            payloads[entries["runner_config"]["active_source"]] = activation_package.canonical_json(runner_active)
+            with self.assertRaisesRegex(ValueError, "time reference differs from the frozen acceptance template"):
+                CONTROLLER._validate_phase_configs(manifest, payloads)
+        manifest, payloads, _driver = self.fixture.load()
+        entries = {entry["role"]: entry for entry in manifest["entries"]}
+        runner_active = json.loads(payloads[entries["runner_config"]["active_source"]])
+        del runner_active["acceptance_time_reference"]
+        payloads[entries["runner_config"]["active_source"]] = activation_package.canonical_json(runner_active)
+        with self.assertRaisesRegex(ValueError, "complete v2 proxy contract"):
+            CONTROLLER._validate_phase_configs(manifest, payloads)
+        drifted = copy.deepcopy(template)
+        drifted["time_reference"] = reference + 1
+        with self.assertRaisesRegex(ValueError, "not issued at the time reference"):
+            activation_package.validate_acceptance_template(drifted)
+        drifted = copy.deepcopy(template)
+        del drifted["time_reference"]
+        with self.assertRaisesRegex(ValueError, "template shape differs"):
+            activation_package.validate_acceptance_template(drifted)
+        rebuilt = activation_package.production_acceptance_template(
+            actor_public_key=template["actor"]["public_key"],
+            actor_generation=template["actor"]["generation"],
+            ci_signer_public_key=json.loads(template["grant_event"][5])["signer_pubkey"],
+            candidate_sha=manifest["source_commit"],
+            workflow_id=run["workflow_id"],
+            workflow_digest=run["workflow_digest"],
+            job_id=run["job_ids"][0],
+            time_reference=reference + 7,
+        )
+        self.assertEqual(rebuilt["time_reference"], reference + 7)
+        self.assertEqual(json.loads(rebuilt["run_event"][5])["issued_at"], reference + 7)
+        self.assertEqual(json.loads(rebuilt["rerun_event"][5])["issued_at"], reference + 17)
+        self.assertNotEqual(rebuilt["run_event"], template["run_event"])
 
     def test_every_execution_declaration_field_drift_is_rejected(self) -> None:
         mutations = {

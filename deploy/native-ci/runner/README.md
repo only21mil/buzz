@@ -36,6 +36,18 @@ membership. Broker authorization still checks the exact root `SO_PEERCRED` UID.
 
 The runner writes only its bounded request-ID replay map under
 `/var/lib/buzzci/runner`. Execd owns active v2 evidence retention.
+
+In `v2_proxy` mode the runner serves one static activation lane. Its static
+activation coordinates copy the execd lane manifest (`lane_manifest_digest`,
+`lane_epoch`, `admission_key_generation`, `isolation_profile_digest`,
+`audience_digest`) and the activation package's bound time reference
+(`acceptance_time_reference`). The package freezes the public
+Run/Grant/Rerun/Tombstone fixture at that reference, so the runner judges
+every admission and cancel window (`issued_at <= reference < expires_at`)
+against the reference and never against the wall clock. A frozen package
+therefore admits on any host date. The runner names the two window failures
+("issued after the package time reference", "expired at the package time
+reference") separately from a static coordinate mismatch.
 The controld handoff root remains `/var/lib/buzzci/runner-output`; this package
 does not create it and the runner service cannot write it.
 

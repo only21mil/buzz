@@ -97,6 +97,7 @@ class ActivationFixture:
             workflow_id="capacity-one",
             workflow_digest="80" * 32,
             job_id="capacity-one-fixture",
+            time_reference=1_800_000_000,
         )
         self.manifest = self._manifest()
         self.scenario = self._scenario()
@@ -184,6 +185,7 @@ class ActivationFixture:
             "admission_key_generation": lane_manifest["admission_key_generation"],
             "isolation_profile_digest": lane_manifest["isolation_profile_digest"],
             "audience_digest": "70" * 32,
+            "acceptance_time_reference": 1_800_000_000,
         })
         self._asset_entry(
             "runner_config", activation_package.CONFIG_TARGETS["runner_config"], "runner-staged.json", runner_staged,

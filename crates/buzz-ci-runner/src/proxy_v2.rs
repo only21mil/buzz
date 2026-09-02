@@ -13,7 +13,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use buzz_ci_broker_protocol::v2::{self, BrokerResponse, FrameHeader, Request};
 use buzz_ci_broker_protocol::{BrokerState, Conclusion, GitOid, ResponseCode, HEADER_SIZE};
@@ -46,6 +46,10 @@ pub struct ProxySettings {
     admission_key_generation: u64,
     isolation_profile_digest: [u8; 32],
     audience_digest: [u8; 32],
+    /// The package's bound time reference. The lane's Run/Grant/Rerun/
+    /// Tombstone fixture is frozen with this value, so request windows are
+    /// judged against it rather than the wall clock.
+    time_reference: u64,
 }
 
 impl ProxySettings {
@@ -64,6 +68,7 @@ impl ProxySettings {
             admission_key_generation,
             isolation_profile_digest,
             audience_digest,
+            acceptance_time_reference,
         } = &config.mode
         else {
             return None;
@@ -84,6 +89,7 @@ impl ProxySettings {
             admission_key_generation: *admission_key_generation,
             isolation_profile_digest: decode_digest(isolation_profile_digest)?,
             audience_digest: decode_digest(audience_digest)?,
+            time_reference: *acceptance_time_reference,
         })
     }
 }
@@ -96,6 +102,14 @@ pub enum ProxyError {
     InvalidControlFrame,
     #[error("runner v2 request does not match static activation coordinates")]
     InvalidActivationCoordinates,
+    #[error(
+        "runner v2 request was issued after the package time reference: issued_at {issued_at} > time_reference {reference}"
+    )]
+    IssuedAfterTimeReference { issued_at: u64, reference: u64 },
+    #[error(
+        "runner v2 request expired at the package time reference: expires_at {expires_at} <= time_reference {reference}"
+    )]
+    ExpiredAtTimeReference { expires_at: u64, reference: u64 },
     #[error("runner replay identifier was reused for different bytes")]
     ReplayConflict,
     #[error("runner durable replay map is unavailable")]
@@ -558,7 +572,7 @@ impl<C: ExecdConnector> RunnerV2Proxy<C> {
         if header.request_id == [0; 16] {
             return Err(ProxyError::InvalidControlFrame);
         }
-        validate_request(&self.settings, header, request, unix_now()?)?;
+        validate_request(&self.settings, header, request)?;
         let admitted_binding = match request {
             Request::CancelAttempt(request) => {
                 Some(self.replay.admitted_binding_for_cancel(request)?)
@@ -733,7 +747,6 @@ fn validate_request(
     settings: &ProxySettings,
     header: FrameHeader,
     request: Request,
-    now: u64,
 ) -> Result<(), ProxyError> {
     match request {
         Request::AdmitAttempt(request) => {
@@ -747,8 +760,6 @@ fn validate_request(
                 || request.admission_signature == [0; 64]
                 || request.run_id == [0; 16]
                 || request.issued_at == 0
-                || request.issued_at > now
-                || now >= request.expires_at
                 || request.wall_timeout_seconds == 0
                 || request.attempt == 0
                 || (request.attempt == 1 && request.parent_attempt != 0)
@@ -757,9 +768,14 @@ fn validate_request(
             {
                 return Err(ProxyError::InvalidActivationCoordinates);
             }
+            validate_window(
+                request.issued_at,
+                request.expires_at,
+                settings.time_reference,
+            )?;
         }
         Request::RegisterJobIntent(request) => {
-            validate_admission(settings, request.admission, now)?;
+            validate_admission(settings, request.admission)?;
             if header.request_id != intent_registration_request_id(request)
                 || v2::intent_registration_request_frame_digest(header, &request)
                     != Some(request.request_frame_digest)
@@ -778,12 +794,15 @@ fn validate_request(
                 || request.actor_pubkey == [0; 32]
                 || request.cancel_digest == [0; 32]
                 || request.issued_at == 0
-                || request.issued_at > now
-                || now >= request.expires_at
                 || request.expected_generation == 0
             {
                 return Err(ProxyError::InvalidActivationCoordinates);
             }
+            validate_window(
+                request.issued_at,
+                request.expires_at,
+                settings.time_reference,
+            )?;
         }
         Request::DescribeAttemptEvidence(request) => {
             if v2::evidence_request_frame_digest(header, &Request::DescribeAttemptEvidence(request))
@@ -819,10 +838,31 @@ fn intent_registration_request_id(request: v2::RegisterJobIntentRequest) -> [u8;
     request_id
 }
 
+/// The v2 proxy serves one static activation lane whose Run/Grant/Rerun/
+/// Tombstone fixture is frozen into the package. Request windows are judged
+/// against the package's bound time reference, recorded at freeze and carried
+/// in the manifest and in these static coordinates, never against the wall
+/// clock: the fixture stays reproducible and replayable on any host date. The
+/// two window failures are named separately from a coordinate mismatch.
+fn validate_window(issued_at: u64, expires_at: u64, reference: u64) -> Result<(), ProxyError> {
+    if issued_at > reference {
+        return Err(ProxyError::IssuedAfterTimeReference {
+            issued_at,
+            reference,
+        });
+    }
+    if reference >= expires_at {
+        return Err(ProxyError::ExpiredAtTimeReference {
+            expires_at,
+            reference,
+        });
+    }
+    Ok(())
+}
+
 fn validate_admission(
     settings: &ProxySettings,
     request: v2::AdmitAttemptRequest,
-    now: u64,
 ) -> Result<(), ProxyError> {
     let valid = request.audience_digest == settings.audience_digest
         && request.isolation_profile_digest == settings.isolation_profile_digest
@@ -834,8 +874,6 @@ fn validate_admission(
         && request.admission_signature != [0; 64]
         && request.run_id != [0; 16]
         && request.issued_at != 0
-        && request.issued_at <= now
-        && now < request.expires_at
         && request.wall_timeout_seconds != 0
         && request.attempt != 0
         && ((request.attempt == 1 && request.parent_attempt == 0)
@@ -843,7 +881,12 @@ fn validate_admission(
                 && request.parent_attempt.checked_add(1) == Some(request.attempt)));
     valid
         .then_some(())
-        .ok_or(ProxyError::InvalidActivationCoordinates)
+        .ok_or(ProxyError::InvalidActivationCoordinates)?;
+    validate_window(
+        request.issued_at,
+        request.expires_at,
+        settings.time_reference,
+    )
 }
 
 fn validate_response(request: Request, response: BrokerResponse) -> Result<(), ProxyError> {
@@ -1111,13 +1154,6 @@ fn connect_with_timeout(_path: &Path, _timeout: Duration) -> io::Result<UnixStre
     Err(io::Error::new(io::ErrorKind::Unsupported, "Linux only"))
 }
 
-fn unix_now() -> Result<u64, ProxyError> {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .map_err(|_| ProxyError::InvalidActivationCoordinates)
-}
-
 fn decode_digest(value: &str) -> Option<[u8; 32]> {
     decode_exact(value)
 }
@@ -1210,6 +1246,7 @@ mod tests {
             admission_key_generation: 9,
             isolation_profile_digest: [8; 32],
             audience_digest: [3; 32],
+            time_reference: 1_800_000_000,
         }
     }
 
@@ -1438,7 +1475,7 @@ mod tests {
     fn restart_replays_cached_exact_response_without_second_execd_call() {
         let directory = private_directory();
         let settings = settings(directory.path());
-        let now = unix_now().expect("clock");
+        let now = settings.time_reference;
         let request = admission(now);
         let header = FrameHeader {
             operation: Operation::AdmitAttempt,
@@ -1488,7 +1525,7 @@ mod tests {
     fn cancel_is_bound_to_cached_admission_and_replays_only_exact_terminal_response() {
         let directory = private_directory();
         let settings = settings(directory.path());
-        let now = unix_now().expect("clock");
+        let now = settings.time_reference;
         let admitted_request = admission(now);
         let admitted_header = FrameHeader {
             operation: Operation::AdmitAttempt,
@@ -1574,7 +1611,7 @@ mod tests {
             .to_vec();
         assert!(matches!(
             exchange(&mut proxy, &expired_frame),
-            Err(ProxyError::InvalidActivationCoordinates)
+            Err(ProxyError::ExpiredAtTimeReference { .. })
         ));
 
         let admitted_binding = proxy
@@ -1695,7 +1732,7 @@ mod tests {
             Err(ProxyError::UnauthorizedControlPeer)
         ));
 
-        let now = unix_now().expect("clock");
+        let now = settings.time_reference;
         let request = admission(now);
         let header = FrameHeader {
             operation: Operation::AdmitAttempt,
@@ -1745,13 +1782,85 @@ mod tests {
             },
         )
         .expect("proxy");
-        let now = unix_now().expect("clock");
+        let now = proxy.settings.time_reference;
         let frame = request_frame([23; 16], admission(now));
         assert!(matches!(
             exchange(&mut proxy, &frame),
             Err(ProxyError::ExecdUnavailable)
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// H7 clean host: the frozen fixture's run request carried
+    /// `issued_at 1800000000, expires_at 1800000300` while the guest clock read
+    /// 2026, and the runner refused controld's dispatch with the coordinate
+    /// mismatch text. Windows are judged against the package time reference
+    /// (the same frozen value), the two window failures are named, and a
+    /// coordinate mismatch still reports as such.
+    #[test]
+    fn admission_window_is_judged_against_the_package_time_reference_not_the_wall_clock() {
+        let directory = private_directory();
+        let settings = settings(directory.path());
+        let header = FrameHeader {
+            operation: Operation::AdmitAttempt,
+            request_id: [60; 16],
+        };
+        let mut frozen = admission(settings.time_reference);
+        frozen.issued_at = 1_800_000_000;
+        frozen.expires_at = 1_800_000_300;
+        assert_eq!(settings.time_reference, 1_800_000_000);
+        validate_request(&settings, header, Request::AdmitAttempt(frozen))
+            .expect("frozen fixture window contains the package time reference");
+
+        let mut future = frozen;
+        future.issued_at = settings.time_reference + 1;
+        let error = validate_request(&settings, header, Request::AdmitAttempt(future))
+            .expect_err("issued after the reference");
+        assert!(matches!(
+            error,
+            ProxyError::IssuedAfterTimeReference {
+                issued_at: 1_800_000_001,
+                reference: 1_800_000_000
+            }
+        ));
+        let message = error.to_string();
+        assert!(
+            message.contains("issued after the package time reference"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("static activation coordinates"),
+            "{message}"
+        );
+
+        let mut expired = frozen;
+        expired.expires_at = settings.time_reference;
+        let error = validate_request(&settings, header, Request::AdmitAttempt(expired))
+            .expect_err("expired at the reference");
+        assert!(matches!(
+            error,
+            ProxyError::ExpiredAtTimeReference {
+                expires_at: 1_800_000_000,
+                reference: 1_800_000_000
+            }
+        ));
+        assert!(error
+            .to_string()
+            .contains("expired at the package time reference"));
+
+        let mut mismatch = future;
+        mismatch.lane_epoch += 1;
+        assert!(matches!(
+            validate_request(&settings, header, Request::AdmitAttempt(mismatch)),
+            Err(ProxyError::InvalidActivationCoordinates)
+        ));
+
+        let (intent_header, mut intent) = registration_request(settings.time_reference);
+        intent.admission.issued_at = settings.time_reference + 1;
+        assert!(matches!(
+            validate_request(&settings, intent_header, Request::RegisterJobIntent(intent)),
+            Err(ProxyError::IssuedAfterTimeReference { .. })
+        ));
     }
 
     #[test]
@@ -1769,7 +1878,6 @@ mod tests {
                 &settings,
                 describe_header,
                 Request::DescribeAttemptEvidence(describe),
-                unix_now().expect("clock")
             ),
             Err(ProxyError::InvalidActivationCoordinates)
         ));
@@ -1781,12 +1889,7 @@ mod tests {
         let mut read = read_request(read_header);
         read.coordinates.attempt = read.coordinates.attempt.saturating_add(1);
         assert!(matches!(
-            validate_request(
-                &settings,
-                read_header,
-                Request::ReadAttemptEvidence(read),
-                unix_now().expect("clock")
-            ),
+            validate_request(&settings, read_header, Request::ReadAttemptEvidence(read),),
             Err(ProxyError::InvalidActivationCoordinates)
         ));
     }
@@ -1931,7 +2034,7 @@ mod tests {
     fn intent_registration_forwards_exact_frame_and_rejects_drift_or_unbound_response() {
         let directory = private_directory();
         let settings = settings(directory.path());
-        let now = unix_now().expect("clock");
+        let now = settings.time_reference;
         let (header, request) = registration_request(now);
         let frame = v2::encode_request(header.request_id, Request::RegisterJobIntent(request))
             .as_bytes()

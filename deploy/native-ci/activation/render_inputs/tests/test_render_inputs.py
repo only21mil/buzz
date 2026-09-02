@@ -113,6 +113,7 @@ def acceptance_template() -> dict[str, object]:
         workflow_id="0123456789abcdef0123456789abcdef",
         workflow_digest="1" * 64,
         job_id="capacity-one-fixture",
+        time_reference=1_800_000_000,
     )
 
 
@@ -465,7 +466,7 @@ class RendererTests(unittest.TestCase):
                 "    }:\n"
                 "        raise ValueError('default state differs')\n"
                 "def validate_acceptance_template(value):\n"
-                "    if set(value) != {'actor', 'run_event', 'grant_event', 'rerun_event', 'tombstone_event'}:\n"
+                "    if set(value) != {'actor', 'time_reference', 'run_event', 'grant_event', 'rerun_event', 'tombstone_event'}:\n"
                 "        raise ValueError('template shape differs')\n"
                 "    return value\n"
             )

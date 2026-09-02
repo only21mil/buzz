@@ -65,7 +65,11 @@ selector is the one source of the admission key: controld derives
 `admission_key_generation` from `keyholder_selectors.manifest.generation`, the
 activation freezer requires the execd lane manifest's `admission_verifying_key`
 and `admission_key_generation` to equal that selector, and the runner's static
-activation coordinates copy the lane manifest.
+activation coordinates copy the lane manifest. The public event templates are
+issued at the package's bound time reference (`acceptance_template.time_reference`,
+recorded at freeze); the freezer requires the runner's static
+`acceptance_time_reference` to equal it, and the runner judges the admission
+window against that reference rather than the wall clock.
 The active daemon polls the authenticated accepted-request source one at a
 time, signs through keyholder, admits only the exact runner-control v2 frame,
 and fetches terminal logs, the declared artifact, and teardown through the

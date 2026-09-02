@@ -253,6 +253,7 @@ class BootstrapCompositionTests(unittest.TestCase):
             workflow_id=controld_active["workflow_id"],
             workflow_digest=controld_active["workflow_digest"],
             job_id=controld_active["jobs"][0]["job_id"],
+            time_reference=draft["acceptance_template"]["time_reference"],
         )
 
         entries = {item["role"]: item for item in draft["entries"]}
@@ -489,6 +490,7 @@ class BootstrapCompositionTests(unittest.TestCase):
                 workflow_id=controld_active["workflow_id"],
                 workflow_digest=controld_active["workflow_digest"],
                 job_id=controld_active["jobs"][0]["job_id"],
+                time_reference=draft["acceptance_template"]["time_reference"],
             )
             self.assertEqual(
                 (ceremony / "packages/keyholder/public-binding.json").read_bytes(),

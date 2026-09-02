@@ -21,6 +21,7 @@ PROXY_FIELDS = frozenset({
     "connect_timeout_millis", "io_timeout_millis", "transport_attempts",
     "retry_delay_millis", "lane_manifest_digest", "lane_epoch",
     "admission_key_generation", "isolation_profile_digest", "audience_digest",
+    "acceptance_time_reference",
 })
 
 
@@ -50,6 +51,8 @@ def config_bytes(controld_uid: int, controld_gid: int, proxy: dict[str, object] 
             raise ValueError("invalid retry delay")
         if int(proxy["lane_epoch"]) <= 0 or int(proxy["admission_key_generation"]) <= 0:
             raise ValueError("lane epoch and key generation must be positive")
+        if int(proxy["acceptance_time_reference"]) <= 0:
+            raise ValueError("acceptance time reference must be positive")
         value.update({
             "execd_socket": BROKER_SOCKET,
             "execd_uid": BROKER_UID,

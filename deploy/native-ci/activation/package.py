@@ -815,8 +815,18 @@ def _positive_integer(value: object, maximum: int, where: str) -> int:
 def production_acceptance_template(
     *, actor_public_key: str, actor_generation: int, ci_signer_public_key: str,
     candidate_sha: str, workflow_id: str, workflow_digest: str, job_id: str,
+    time_reference: int,
 ) -> dict[str, Any]:
-    """Build the one canonical public Run/Grant/Rerun/Tombstone authority set."""
+    """Build the one canonical public Run/Grant/Rerun/Tombstone authority set.
+
+    The set is static: its event ids are bound by digest into the keyholder
+    signing policy, the controld acceptance authority, the scenario fixture,
+    and the acceptance binding receipt. Its request windows therefore hang off
+    ``time_reference``, the package's bound time reference recorded at freeze
+    and carried in the manifest, and the runner judges every admission and
+    cancel window against that same value as a static activation coordinate
+    (``acceptance_time_reference``), never against the wall clock.
+    """
     actor = _nonzero_sha256(actor_public_key, "public acceptance actor")
     signer = _nonzero_sha256(ci_signer_public_key, "public CI signer")
     _positive_integer(actor_generation, 0xFFFFFFFFFFFFFFFF, "public acceptance actor generation")
@@ -832,7 +842,9 @@ def production_acceptance_template(
     run_id = "13131313-1313-4313-8313-131313131313"
     target_repo = f"30617:{'22' * 32}:buzz"
     pr_event = "33" * 32
-    issued_at = 1_800_000_000
+    issued_at = _positive_integer(
+        time_reference, 0xFFFFFFFFFFFFFFFF - 601, "public acceptance time reference",
+    )
 
     def request(*, request_type: str, attempt: int, idempotency_key: str) -> dict[str, Any]:
         value: dict[str, Any] = {
@@ -902,6 +914,7 @@ def production_acceptance_template(
     ).encode())
     return validate_acceptance_template({
         "actor": {"public_key": actor, "generation": actor_generation},
+        "time_reference": issued_at,
         "run_event": run_event,
         "grant_event": grant_event,
         "rerun_event": rerun_event,
@@ -914,9 +927,13 @@ def production_activation_draft(
     components: list[dict[str, Any]], entries: list[dict[str, Any]],
     effective_systemd: list[dict[str, Any]], actor_public_key: str,
     actor_generation: int, ci_signer_public_key: str, workflow_id: str,
-    workflow_digest: str, job_id: str,
+    workflow_digest: str, job_id: str, time_reference: int,
 ) -> dict[str, Any]:
-    """Materialize a new closed activation draft from explicit ready inputs."""
+    """Materialize a new closed activation draft from explicit ready inputs.
+
+    ``time_reference`` is the freeze-time value the acceptance template is
+    issued at; the materializer records it once and the manifest carries it.
+    """
     def detached(value: object) -> Any:
         return json.loads(canonical_json(value), object_pairs_hook=reject_duplicates)
 
@@ -937,6 +954,7 @@ def production_activation_draft(
             workflow_id=workflow_id,
             workflow_digest=workflow_digest,
             job_id=job_id,
+            time_reference=time_reference,
         ),
         "entries": detached(entries),
         "effective_systemd": detached(effective_systemd),
@@ -963,7 +981,7 @@ def production_activation_draft(
 
 
 def validate_acceptance_template(value: object) -> dict[str, Any]:
-    fields = {"actor", "run_event", "grant_event", "rerun_event", "tombstone_event"}
+    fields = {"actor", "time_reference", "run_event", "grant_event", "rerun_event", "tombstone_event"}
     if not isinstance(value, dict) or set(value) != fields:
         raise ValueError("public acceptance template shape differs")
     actor = value["actor"]
@@ -971,6 +989,9 @@ def validate_acceptance_template(value: object) -> dict[str, Any]:
         raise ValueError("public acceptance actor shape differs")
     public_key = _nonzero_sha256(actor["public_key"], "public acceptance actor")
     _positive_integer(actor["generation"], 0xFFFFFFFFFFFFFFFF, "public acceptance actor generation")
+    time_reference = _positive_integer(
+        value["time_reference"], 0xFFFFFFFFFFFFFFFF, "public acceptance time reference",
+    )
     expected_kinds = {
         "run_event": 46_100,
         "grant_event": 46_107,
@@ -993,6 +1014,20 @@ def validate_acceptance_template(value: object) -> dict[str, Any]:
         if len(raw) > 64 * 1024 or raw in encoded:
             raise ValueError("public acceptance event templates are oversized or duplicate")
         encoded.add(raw)
+    run_event = value["run_event"]
+    try:
+        run = json.loads(run_event[5], object_pairs_hook=reject_duplicates)
+    except (TypeError, ValueError) as error:
+        raise ValueError("public acceptance run template envelope is invalid") from error
+    if (
+        run_event[2] != time_reference
+        or not isinstance(run, dict)
+        or run.get("issued_at") != time_reference
+        or isinstance(run.get("expires_at"), bool)
+        or not isinstance(run.get("expires_at"), int)
+        or run["expires_at"] <= time_reference
+    ):
+        raise ValueError("public acceptance run template is not issued at the time reference")
     return value
 
 
@@ -1194,6 +1229,7 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
         "execd_socket", "execd_uid", "execd_gid", "replay_journal", "connect_timeout_millis",
         "io_timeout_millis", "transport_attempts", "retry_delay_millis", "lane_manifest_digest",
         "lane_epoch", "admission_key_generation", "isolation_profile_digest", "audience_digest",
+        "acceptance_time_reference",
     }
     if set(runner_staged) != staged_runner_fields or set(runner_active) != active_runner_fields:
         raise ValueError("runner capacity flip must select the complete v2 proxy contract")
@@ -1238,6 +1274,11 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
         _nonzero_sha256(runner_active[field], f"runner {field}")
     for field in ("lane_epoch", "admission_key_generation"):
         _positive_integer(runner_active[field], 9_007_199_254_740_991, f"runner {field}")
+    _positive_integer(
+        runner_active["acceptance_time_reference"], 0xFFFFFFFFFFFFFFFF, "runner acceptance_time_reference",
+    )
+    if runner_active["acceptance_time_reference"] != manifest["acceptance_template"]["time_reference"]:
+        raise ValueError("runner v2 proxy time reference differs from the frozen acceptance template")
 
     execd = entries["execd_config"]
     if "active_source" not in execd:
