@@ -1941,23 +1941,80 @@ class TimingAndProgressTests(unittest.TestCase):
         for literal in ("62002", "961", "1201"):
             self.assertIsNone(re.search(rf"\b{literal}\b", source), literal)
 
-    def test_live_acceptance_roles_accepts_explicit_empty_groups_record(self) -> None:
+    def test_live_acceptance_roles_accepts_a_groups_record_without_extra_groups(self) -> None:
+        for prepared, groups_record in (
+            ((62002, 62002), "Groups:\t\n"),
+            ((62002, 62002), "Groups:\t62002 \n"),
+            ((1201, 1201), "Groups:\t\n"),
+            ((1201, 1201), "Groups:\t1201 \n"),
+        ):
+            with self.subTest(prepared=prepared, groups=groups_record):
+                self.assertEqual(
+                    self.assert_live_acceptance_roles_for_status(
+                        f"Uid:\t{prepared[0]}\t{prepared[0]}\t{prepared[0]}\t{prepared[0]}\n"
+                        f"Gid:\t{prepared[1]}\t{prepared[1]}\t{prepared[1]}\t{prepared[1]}\n"
+                        + groups_record,
+                        prepared=prepared,
+                    ),
+                    (961, 961, [62005]),
+                )
+
+    def test_live_acceptance_roles_accepts_the_systemd_259_primary_gid_groups_record(self) -> None:
+        """systemd 259 starts a User= service with `Groups: <primary gid>` (initgroups semantics)."""
         self.assertEqual(
             self.assert_live_acceptance_roles_for_status(
-                "Uid:\t62002\t62002\t62002\t62002\n"
-                "Gid:\t62002\t62002\t62002\t62002\n"
-                "Groups:\t\n",
+                "Uid:\t1201\t1201\t1201\t1201\n"
+                "Gid:\t1201\t1201\t1201\t1201\n"
+                "Groups:\t1201 \n",
+                prepared=(1201, 1201),
             ),
             (961, 961, [62005]),
         )
 
-    def test_live_acceptance_roles_rejects_nonempty_groups_record(self) -> None:
-        with self.assertRaisesRegex(guest.GuestError, "live controld credentials differ"):
-            self.assert_live_acceptance_roles_for_status(
-                "Uid:\t62002\t62002\t62002\t62002\n"
-                "Gid:\t62002\t62002\t62002\t62002\n"
-                "Groups:\t62005\n",
-            )
+    def test_live_acceptance_roles_rejects_a_groups_record_with_an_extra_group(self) -> None:
+        for prepared, groups_record in (
+            ((62002, 62002), "Groups:\t62005\n"),
+            ((62002, 62002), "Groups:\t62002 62005 \n"),
+            ((1201, 1201), "Groups:\t1201 1204 \n"),
+            ((1201, 1201), "Groups:\t1204 \n"),
+            ((1201, 1201), "Groups:\t0 \n"),
+            ((1201, 1201), "Groups:\t62002 \n"),
+            ((1201, 1201), "Groups:\tbuzzci-controld\n"),
+        ):
+            with self.subTest(prepared=prepared, groups=groups_record), self.assertRaisesRegex(
+                guest.GuestError, "live controld credentials differ",
+            ):
+                self.assert_live_acceptance_roles_for_status(
+                    f"Uid:\t{prepared[0]}\t{prepared[0]}\t{prepared[0]}\t{prepared[0]}\n"
+                    f"Gid:\t{prepared[1]}\t{prepared[1]}\t{prepared[1]}\t{prepared[1]}\n"
+                    + groups_record,
+                    prepared=prepared,
+                )
+
+    def test_live_supplementary_gids_drop_only_the_primary_gid(self) -> None:
+        self.assertEqual(guest.live_supplementary_gids("\t\n", 1201), set())
+        self.assertEqual(guest.live_supplementary_gids("\t1201 \n", 1201), set())
+        self.assertEqual(guest.live_supplementary_gids("\t1201 1204 \n", 1201), {1204})
+        self.assertEqual(guest.live_supplementary_gids("\t1204 \n", 1201), {1204})
+        with self.assertRaises(ValueError):
+            guest.live_supplementary_gids("\tbuzzci-execd\n", 1201)
+
+    def test_manifest_supplementary_gids_resolve_the_role_groups(self) -> None:
+        activation = {
+            "identities": {
+                "controld": {"supplementary_groups": []},
+                "qualification": {"supplementary_groups": ["buzzci-execd"]},
+            },
+        }
+        self.assertEqual(guest.manifest_supplementary_gids(activation, "controld"), set())
+        with mock.patch.object(guest.grp, "getgrnam", return_value=mock.Mock(gr_gid=1204)) as getgrnam:
+            self.assertEqual(guest.manifest_supplementary_gids(activation, "qualification"), {1204})
+        getgrnam.assert_called_once_with("buzzci-execd")
+        for broken in ({}, {"identities": {}}, {"identities": {"controld": {}}}, {"identities": {"controld": {"supplementary_groups": [1204]}}}):
+            with self.subTest(activation=broken), self.assertRaisesRegex(
+                guest.GuestError, "installed acceptance identities differ",
+            ):
+                guest.manifest_supplementary_gids(broken, "controld")
 
     def test_live_acceptance_roles_rejects_missing_groups_record(self) -> None:
         with self.assertRaisesRegex(guest.GuestError, "live controld credentials differ"):

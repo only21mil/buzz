@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import fcntl
+import grp
 import hashlib
 import importlib.util
 import io
@@ -1138,6 +1139,7 @@ def assert_live_acceptance_roles(
     ):
         raise GuestError("acceptance role binding differs")
 
+    expected_supplementary = manifest_supplementary_gids(activation, "controld")
     controld_processes = []
     for process_root in Path("/proc").iterdir():
         if not process_root.name.isdigit():
@@ -1150,15 +1152,37 @@ def assert_live_acceptance_roles(
             continue
         status = dict(line.split(":", 1) for line in status_lines if ":" in line)
         try:
-            process_credentials = tuple(
-                status[field].split() for field in ("Uid", "Gid", "Groups")
-            )
-        except KeyError as error:
+            uid_fields = status["Uid"].split()
+            gid_fields = status["Gid"].split()
+            supplementary = live_supplementary_gids(status["Groups"], controld_gid)
+        except (KeyError, ValueError) as error:
             raise GuestError("live controld credentials differ") from error
-        controld_processes.append(process_credentials)
-    if controld_processes != [([str(controld_uid)] * 4, [str(controld_gid)] * 4, [])]:
+        controld_processes.append((uid_fields, gid_fields, supplementary))
+    if controld_processes != [([str(controld_uid)] * 4, [str(controld_gid)] * 4, expected_supplementary)]:
         raise GuestError("live controld credentials differ")
     return credentials
+
+
+def manifest_supplementary_gids(activation: dict[str, object], role: str) -> set[int]:
+    """Resolve the activation manifest's supplementary group names for one role to gids."""
+    identities = activation.get("identities")
+    identity = identities.get(role) if isinstance(identities, dict) else None
+    names = identity.get("supplementary_groups") if isinstance(identity, dict) else None
+    if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+        raise GuestError("installed acceptance identities differ")
+    return {grp.getgrnam(name).gr_gid for name in names}
+
+
+def live_supplementary_gids(groups_record: str, primary_gid: int) -> set[int]:
+    """Return a /proc status `Groups` record as a gid set without the primary gid.
+
+    systemd starts a `User=` service with initgroups semantics, so the kernel
+    supplementary list carries the primary gid even when the unit sets no
+    SupplementaryGroups=. The primary gid grants nothing beyond `Gid`, so the
+    comparison against the manifest's `supplementary_groups` drops it and keeps
+    every other entry. Raises ValueError for a record that is not decimal gids.
+    """
+    return {int(field) for field in groups_record.split()} - {primary_gid}
 
 
 def run_capacity_one_canary(
