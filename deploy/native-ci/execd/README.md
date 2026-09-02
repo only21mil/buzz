@@ -108,7 +108,14 @@ remain below root-owned mode-`0700` parents. Attempt children are job-owned mode
 `0500` with a mode-`0700` artifact output directory and are removed after sealed
 teardown. The immutable profile alone is root-owned mode `0444`.
 
-The root execd service retains no Linux capabilities. OCI process execution
+The root execd service retains exactly three Linux capabilities, the set its
+attempt materialization needs: `CAP_CHOWN` to hand the attempt tree to
+`buzzci-job`, `CAP_FOWNER` to set the mode of inodes it no longer owns, and
+`CAP_DAC_OVERRIDE` to create, read, and remove inside those job-owned `0500` and
+`0700` trees. `ProtectSystem=strict` and `ReadWritePaths` still bound every write
+to the execd state roots; no other capability is in the bounding or ambient set,
+and `deploy/native-ci/execd/verify.py` and the package tests pin the exact lines.
+OCI process execution
 runs only in the separate unprivileged `buzzci-job` executor service. The
 executor service retains no capabilities, devices, namespaces, SUID/SGID,
 realtime, resource-control, or kernel mutation syscalls; systemd also pins its

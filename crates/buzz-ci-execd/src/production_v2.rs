@@ -4485,6 +4485,163 @@ mod tests {
         ));
     }
 
+    /// H8 clean host, canary stage 5 (diagnostic boot 5): the executor
+    /// accepted `executor_handoff` and `runtime_descriptor`, then execd sent
+    /// `crash_recovery` 5 ms later without any `materialization` request,
+    /// because `buzz-ci-execd.service` ran root with an empty capability
+    /// bounding set and the attempt directory could not be chowned to
+    /// buzzci-job. This process cannot chown to another account either, so
+    /// the same refusal reproduces here: closed, before any executor request,
+    /// with the attempt root left empty.
+    #[test]
+    fn materialization_refuses_closed_before_any_executor_request_when_the_host_cannot_chown() {
+        if Uid::effective().is_root() {
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let package = temporary.path().join("package");
+        fs::create_dir(&package).unwrap();
+        let attempts = temporary.path().join("attempts");
+        fs::create_dir(&attempts).unwrap();
+        fs::set_permissions(&attempts, fs::Permissions::from_mode(0o711)).unwrap();
+        let evidence = temporary.path().join("evidence");
+        let teardown_root = temporary.path().join("teardown");
+        for path in [&evidence, &teardown_root] {
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let sources = [
+            (
+                FIXTURE_MANIFEST_NAME,
+                include_bytes!(
+                    "../../../deploy/native-ci/acceptance/fixtures/fixture-manifest.json"
+                )
+                .as_slice(),
+                0o444,
+                FIXTURE_MANIFEST_SHA256,
+            ),
+            (
+                FIXTURE_INPUT_NAME,
+                include_bytes!("../../../deploy/native-ci/acceptance/fixtures/input.txt")
+                    .as_slice(),
+                0o444,
+                FIXTURE_INPUT_SHA256,
+            ),
+            (
+                FIXTURE_SCRIPT_NAME,
+                include_bytes!("../../../deploy/native-ci/acceptance/fixtures/run-fixture.sh")
+                    .as_slice(),
+                0o555,
+                FIXTURE_SCRIPT_SHA256,
+            ),
+        ];
+        for (name, bytes, mode, _) in sources {
+            let path = package.join(name);
+            fs::write(&path, bytes).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let owner = Uid::effective().as_raw();
+        let group = Gid::effective().as_raw();
+        let artifact_declaration = no_artifact_fixture();
+        let mut static_job = static_job_fixture(artifact_declaration);
+        for (program, name, mode, digest) in [
+            (
+                &mut static_job.fixture_manifest,
+                FIXTURE_MANIFEST_NAME,
+                0o444,
+                FIXTURE_MANIFEST_SHA256,
+            ),
+            (
+                &mut static_job.fixture_input,
+                FIXTURE_INPUT_NAME,
+                0o444,
+                FIXTURE_INPUT_SHA256,
+            ),
+            (
+                &mut static_job.fixture_script,
+                FIXTURE_SCRIPT_NAME,
+                0o555,
+                FIXTURE_SCRIPT_SHA256,
+            ),
+        ] {
+            *program = ProgramProvenance {
+                path: package.join(name).to_string_lossy().into_owned(),
+                sha256: digest.into(),
+                source_commit: "1".repeat(40),
+                uid: owner,
+                gid: group,
+                mode,
+            };
+        }
+        static_job.declaration_digest = static_execution_digest(&static_job);
+        let mut intent = valid_intent();
+        intent.tip_oid = static_job.candidate;
+        intent.base_oid = static_job.candidate;
+        intent.lane_manifest_digest = static_job.lane_manifest_digest;
+        intent.isolation_profile_digest = static_job.isolation_profile_digest;
+        intent.workflow_digest = static_job.workflow_digest;
+        intent.workflow_id = static_job.workflow_id;
+        intent.job_id = static_job.job_id;
+        intent.artifact_count = 1;
+        intent.artifacts = [Some(artifact_declaration)];
+        let mut binding_record = valid_record();
+        binding_record.binding.job_intent_digest = intent.digest();
+        binding_record.binding.tip_oid = static_job.candidate;
+        binding_record.binding.base_oid = static_job.candidate;
+        binding_record.binding.lane_manifest_digest = static_job.lane_manifest_digest;
+        binding_record.binding.workflow_digest = static_job.workflow_digest;
+        binding_record.binding.workflow_id = static_job.workflow_id;
+        binding_record.binding.job_id = static_job.job_id;
+        binding_record.binding.artifact_count = 1;
+        binding_record.binding.artifacts = [Some(artifact_declaration)];
+        binding_record.binding.execution_binding_digest = binding_record.binding.computed_digest();
+        let binding = binding_record.binding;
+
+        let socket = temporary.path().join("executor.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        // The job account is one this process cannot chown to, as root without
+        // CAP_CHOWN could not chown to buzzci-job on the clean host.
+        let foreign_job = owner.wrapping_add(1);
+        let mut system = LocalHostSystem {
+            identity: HostIdentity {
+                broker_build_identity: [1; 32],
+                host_profile_digest: [2; 32],
+                suite_identity: [3; 32],
+            },
+            socket: socket.clone(),
+            executor_uid: owner,
+            executor_gid: group,
+            executor: static_job.fixture_script.clone(),
+            seccomp: SeccompRuntimeBinding::fixture(),
+            evidence: SafeDirectory::open(evidence, owner, 0o700).unwrap(),
+            teardown: SafeDirectory::open(teardown_root, owner, 0o700).unwrap(),
+            evidence_by_binding: BTreeMap::new(),
+            attempts: SafeDirectory::open(attempts.clone(), owner, 0o711).unwrap(),
+            job_uid: foreign_job,
+            job_gid: group,
+            static_job,
+        };
+        // `create_child` fails at `fchown`; `binding_error` reports the closed
+        // host as `StorageUnavailable`, and `admit` recovers on any error.
+        assert!(matches!(
+            system.materialization_input_provider(binding, intent),
+            Err(BindingError::StorageUnavailable)
+        ));
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "no executor request may precede a refused materialization"
+        );
+        assert_eq!(fs::read_dir(&attempts).unwrap().count(), 0);
+
+        // The same host with a job account it can own materializes.
+        system.job_uid = owner;
+        assert_ne!(system.materialize(binding, intent).unwrap(), [0; 32]);
+        assert_eq!(fs::read_dir(&attempts).unwrap().count(), 1);
+    }
+
     #[test]
     fn declared_artifact_capture_is_exact_scrubbed_restartable_and_hostile_closed() {
         let temporary = tempfile::tempdir().unwrap();

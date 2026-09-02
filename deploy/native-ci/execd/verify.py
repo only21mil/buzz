@@ -24,8 +24,8 @@ EXPECTED = {
         "PrivateDevices=yes",
         "DevicePolicy=closed",
         "RestrictNamespaces=yes",
-        "CapabilityBoundingSet=",
-        "AmbientCapabilities=",
+        "CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER",
+        "AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER",
         "SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @raw-io @reboot @swap",
     ),
     "templates/buzz-ci-executor.service": (
