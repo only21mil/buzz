@@ -9,6 +9,10 @@ The checked-in package does not create accounts, run `systemd-tmpfiles`, reload
 systemd, enable or start a unit, provision keys, contact a relay, connect to a
 runner or broker, or grant execution capacity. The installed service sandbox
 permits only the network and local sockets needed after a separate activation.
+The unit lists `/run/buzzci` as a read-only directory rather than the keyholder
+and runner socket inodes: SELinux denies `init_t` `mounton` on a `sock_file`, so
+a per-socket `ReadOnlyPaths=` entry fails the service at NAMESPACE as soon as
+the socket exists. Connecting through a read-only bind mount still works.
 
 ## Closed contract
 

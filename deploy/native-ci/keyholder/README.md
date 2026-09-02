@@ -122,9 +122,14 @@ sources fail closed. The existing three credential mappings remain in the base
 service and never appear in the acceptance drop-in.
 
 The binary opens the systemd credential directory once with `O_NOFOLLOW`, then
-opens these fixed names relative to that descriptor. It rejects links,
-non-regular files, multiple links, wrong lengths, and group- or world-writable
-objects. Error messages identify only the failed class, never the credential,
+opens these fixed names relative to that descriptor. It accepts the two shapes
+systemd delivers: a directory and files owned by the service account (`0500`,
+`0400`), or, as systemd 259 installs them on the clean host, `root:root` with no
+world bits and read access granted to the service through an ACL (directory
+`0550`, files `0440`). It rejects links, non-regular files, multiple links,
+wrong lengths, world-readable objects, group- or world-writable objects,
+setuid, setgid, or sticky bits, and any owner other than root or the service
+account. Error messages identify only the failed class, never the credential,
 path, parser detail, key bytes, request, URL, digest, public key, or signature.
 
 The checked-in unit is not enabled. Freezing or installing a package does not

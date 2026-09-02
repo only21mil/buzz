@@ -1575,7 +1575,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "c4a6b0f32b08215a0226cd853641bc5eb51108286dbc9ee1d1db1855005fbdb8",
+            "c7f957dfcf610246d83c3fec639912e944365230aa6676a65df7525105fa9bcd",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -3512,11 +3512,17 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertNotIn("buzz-ci-keyholder.socket", requires)
         self.assertNotIn("buzz-ci-runner.socket", requires)
         read_only = next(line for line in drop_in.splitlines() if line.startswith("ReadOnlyPaths="))
-        self.assertIn("-/run/buzzci/keyholder.sock", read_only)
-        self.assertIn("-/run/buzzci/runner-control.sock", read_only)
         base = (REPO_ROOT / "deploy/native-ci/controld/templates/buzz-ci-controld.service").read_text()
-        self.assertIn("-/run/buzzci/keyholder.sock", base)
-        self.assertIn("-/run/buzzci/runner-control.sock", base)
+        base_read_only = next(line for line in base.splitlines() if line.startswith("ReadOnlyPaths="))
+        # The sockets are reached through the read-only /run/buzzci directory.
+        # A socket inode must never be a ReadOnlyPaths entry: SELinux denies
+        # init_t mounton on a sock_file, which failed controld at NAMESPACE at
+        # capacity one on the clean host (systemd 259.5, Fedora 44).
+        for line in (read_only, base_read_only):
+            entries = line.split("=", 1)[1].split()
+            self.assertIn("/run/buzzci", entries)
+            self.assertFalse([entry for entry in entries if entry.endswith(".sock")], entries)
+        self.assertIn("/var/lib/buzzci/activation-controller/controld-acceptance-v2.json", read_only)
 
         manifest, payloads, driver = self.fixture.load()
         staged = CONTROLLER.stage(

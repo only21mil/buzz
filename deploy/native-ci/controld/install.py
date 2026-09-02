@@ -304,7 +304,7 @@ def validate_assets(package: Path, entries: list[Entry]) -> None:
         "Group=buzzci-controld",
         "PrivateNetwork=no",
         "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
-        "ReadOnlyPaths=/etc/buzzci/controld-v2.json -/var/lib/buzzci/activation-controller/controld-acceptance-v2.json -/run/buzzci/runner-control.sock -/run/buzzci/keyholder.sock",
+        "ReadOnlyPaths=/etc/buzzci/controld-v2.json /run/buzzci -/var/lib/buzzci/activation-controller/controld-acceptance-v2.json",
         "ReadWritePaths=/var/lib/buzzci/controld",
         "Restart=on-failure",
     }
