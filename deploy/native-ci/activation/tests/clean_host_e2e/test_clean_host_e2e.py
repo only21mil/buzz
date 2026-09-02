@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -15,6 +17,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import unittest
@@ -35,6 +38,8 @@ def load(name: str):
 harness = load("harness")
 relay = load("local_tls_relay")
 guest = load("guest_entry")
+sys.path.insert(0, str(HERE.parents[1]))
+import controller as stage_controller
 HOST_TOOLS = harness.TOOLS.copy()
 TEST_TOOL_DIRECTORY: tempfile.TemporaryDirectory[str] | None = None
 
@@ -156,6 +161,7 @@ def make_run_contract(parent: Path, state: Path) -> tuple[Path, dict[str, object
         "timing_asset_sha256": harness.timing_asset_sha256(),
         "timing": harness.TIMING_CONTRACT,
         "timing_sha256": harness.timing_sha256(),
+        "platform_systemd": copy.deepcopy(harness.PLATFORM_SYSTEMD),
         "scenario": {"path": str(scenario), "sha256": harness.file_sha256(scenario)},
         "seccomp_source": {"path": str(seccomp), "sha256": seccomp_sha},
         "packages": packages,
@@ -167,6 +173,27 @@ def make_run_contract(parent: Path, state: Path) -> tuple[Path, dict[str, object
 
 def rewrite_contract(path: Path, value: dict[str, object]) -> None:
     path.write_bytes(harness.canonical(value))
+
+
+def write_guest_package(
+    inputs: Path, name: str, entries: list[tuple[str, str, bytes]],
+) -> Path:
+    package = inputs / name
+    package.mkdir(parents=True)
+    manifest_entries = []
+    for index, (source, target, payload) in enumerate(entries):
+        member = package / source
+        member.parent.mkdir(parents=True, exist_ok=True)
+        member.write_bytes(payload)
+        manifest_entries.append({
+            "role": f"test_{index}",
+            "source": source,
+            "target": target,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        })
+    manifest_name = "activation-manifest.json" if name == "activation" else "package-manifest.json"
+    (package / manifest_name).write_bytes(harness.canonical({"entries": manifest_entries}))
+    return package
 
 
 def passing_frame(contract: dict[str, object]) -> dict[str, object]:
@@ -214,6 +241,52 @@ def progress_frame(
     }
     payload = harness.canonical(value)
     return struct.pack(">I", len(payload)) + payload + hashlib.sha256(payload).digest()
+
+
+def systemd_process(
+    lines: list[str], *, returncode: int = 0, stderr: bytes = b"",
+) -> subprocess.CompletedProcess[bytes]:
+    stdout = ("\n".join(lines) + "\n").encode()
+    return subprocess.CompletedProcess(["systemctl", "show"], returncode, stdout, stderr)
+
+
+def rock_ridge_metadata(image: Path, root: str) -> dict[str, tuple[str, int, int]]:
+    process = subprocess.run(
+        [
+            HOST_TOOLS["xorriso"], "-indev", str(image),
+            "-find", root, "-exec", "lsdl", "--",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    result: dict[str, tuple[str, int, int]] = {}
+    pattern = re.compile(
+        r"^([d-][rwx-]{9})\s+\d+\s+(\d+)\s+(\d+)\s+\d+\s+"
+        r"\S+\s+\S+\s+\S+\s+'([^']+)'$",
+    )
+    for line in (process.stdout + process.stderr).splitlines():
+        match = pattern.fullmatch(line)
+        if match is not None:
+            result[match.group(4)] = (
+                match.group(1), int(match.group(2)), int(match.group(3)),
+            )
+    if not result:
+        raise AssertionError("Rock Ridge metadata listing is empty")
+    return result
+
+
+def require_root_owned_iso_paths(
+    metadata: dict[str, tuple[str, int, int]], expected: dict[str, str],
+) -> None:
+    if set(metadata) != set(expected):
+        raise AssertionError("Rock Ridge path inventory differs")
+    for path, expected_mode in expected.items():
+        mode, uid, gid = metadata[path]
+        if (uid, gid) != (0, 0):
+            raise AssertionError(f"Rock Ridge owner differs: {path}")
+        if mode != expected_mode:
+            raise AssertionError(f"Rock Ridge mode differs: {path}")
 
 
 def mount_pairs(command: list[str], option: str) -> list[tuple[str, str]]:
@@ -264,6 +337,134 @@ def nip98(secret: int, method: str, url: str, body: bytes, now: int) -> str:
 
 
 class BoundaryTests(unittest.TestCase):
+    def test_qemu_boots_only_the_os_disk_before_the_transfer_disk(self) -> None:
+        for overlay, transfer in (
+            ("ceremony.qcow2", None),
+            ("candidate.qcow2", "read-write"),
+            ("verifier.qcow2", "read-only"),
+        ):
+            with self.subTest(overlay=overlay, transfer=transfer):
+                command = harness.qemu_command(
+                    Path("/private-state"), overlay=overlay,
+                    evidence=overlay != "candidate.qcow2", transfer=transfer,
+                )
+                qemu = command[command.index("--") + 1:]
+                os_drive = f"file=/work/{overlay},if=none,format=qcow2,cache=none,id=os"
+                os_index = qemu.index(os_drive)
+                self.assertEqual(qemu[os_index - 1:os_index + 3], [
+                    "-drive", os_drive,
+                    "-device", "virtio-blk-pci,drive=os,bootindex=1",
+                ])
+                self.assertEqual(
+                    [value for value in qemu if "bootindex=" in value],
+                    ["virtio-blk-pci,drive=os,bootindex=1"],
+                )
+                if transfer is not None:
+                    transfer_drive = (
+                        "file=/work/transfer.raw,if=none,format=raw,cache=none,id=transfer"
+                        + (",readonly=on" if transfer == "read-only" else "")
+                    )
+                    transfer_index = qemu.index(transfer_drive)
+                    self.assertEqual(qemu[transfer_index - 1:transfer_index + 3], [
+                        "-drive", transfer_drive,
+                        "-device", "virtio-blk-pci,drive=transfer,serial=buzzci-transfer",
+                    ])
+
+    def test_stage_iso_normalizes_root_ownership_and_preserves_package_tree(self) -> None:
+        if not Path(HOST_TOOLS["xorriso"]).is_file():
+            self.skipTest("clean-host xorriso is unavailable")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage = root / "stage"
+            package = stage / "inputs/runner"
+            assets = package / "assets"
+            assets.mkdir(mode=0o700, parents=True)
+            stage.chmod(0o700)
+            (stage / "inputs").chmod(0o700)
+            package.chmod(0o700)
+            manifest = package / "package-manifest.json"
+            manifest.write_bytes(harness.canonical({"schema": "test"}))
+            manifest.chmod(0o600)
+            payload = assets / "payload"
+            payload.write_bytes(b"exact package payload\n")
+            payload.chmod(0o400)
+
+            source_uid, source_gid = os.geteuid(), os.getegid()
+            if source_uid == 0 or source_gid == 0:
+                source_uid = source_gid = 1
+                for path in (stage, stage / "inputs", package, assets, manifest, payload):
+                    os.chown(path, source_uid, source_gid)
+            self.assertNotEqual(source_uid, 0)
+            self.assertNotEqual(source_gid, 0)
+            self.assertEqual(
+                (package.stat().st_uid, package.stat().st_gid),
+                (source_uid, source_gid),
+            )
+
+            original_digest = harness.tree_digest(harness.tree_records(package))
+            image = root / "stage.iso"
+            observed_commands: list[list[str]] = []
+            real_bounded = harness.bounded
+
+            def bounded(argv, **keywords):
+                observed_commands.append(list(argv))
+                return real_bounded(argv, **keywords)
+
+            with mock.patch.dict(
+                harness.TOOLS, {"xorriso": HOST_TOOLS["xorriso"]}, clear=False,
+            ), mock.patch.object(harness, "bounded", side_effect=bounded):
+                harness.make_iso(stage, image, "BUZZCI_STAGE_TEST")
+
+            self.assertEqual(observed_commands, [[
+                HOST_TOOLS["xorriso"], "-as", "mkisofs", "-quiet", "-J", "-R",
+                "-uid", "0", "-gid", "0", "-V", "BUZZCI_STAGE_TEST",
+                "-o", str(image), str(stage),
+            ]])
+            self.assertEqual(stat.S_IMODE(image.stat().st_mode), 0o400)
+            expected = {
+                "/inputs/runner": "drwx------",
+                "/inputs/runner/assets": "drwx------",
+                "/inputs/runner/assets/payload": "-r--------",
+                "/inputs/runner/package-manifest.json": "-rw-------",
+            }
+            require_root_owned_iso_paths(
+                rock_ridge_metadata(image, "/inputs/runner"), expected,
+            )
+
+            extracted = root / "extracted-runner"
+            subprocess.run(
+                [
+                    HOST_TOOLS["xorriso"], "-osirrox", "on", "-indev", str(image),
+                    "-extract", "/inputs/runner", str(extracted),
+                ],
+                check=True,
+                capture_output=True,
+            )
+            self.assertEqual(
+                harness.tree_digest(harness.tree_records(extracted)), original_digest,
+            )
+
+            for name, owner_flags in (
+                ("omitted", []),
+                ("mutated", ["-uid", "1", "-gid", "1"]),
+            ):
+                hostile = root / f"{name}.iso"
+                subprocess.run(
+                    [
+                        HOST_TOOLS["xorriso"], "-as", "mkisofs", "-quiet", "-J", "-R",
+                        *owner_flags, "-V", "BUZZCI_STAGE_TEST",
+                        "-o", str(hostile), str(stage),
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                with self.subTest(owner_flags=owner_flags), self.assertRaisesRegex(
+                    AssertionError, "Rock Ridge owner differs",
+                ):
+                    require_root_owned_iso_paths(
+                        rock_ridge_metadata(hostile, "/inputs/runner"), expected,
+                    )
+
     def test_qemu_boundary_has_no_container_network_or_host_share(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             command = harness.qemu_command(
@@ -374,6 +575,11 @@ class BoundaryTests(unittest.TestCase):
                 evidence = state / "evidence.bin"
                 self.assertTrue(evidence.is_file())
                 self.assertEqual(evidence.stat().st_mode & 0o777, 0o600)
+                (state / "progress.bin").write_bytes(b"".join((
+                    progress_frame("verifier", 0, "guest_started", "start", 1),
+                    progress_frame("verifier", 1, "verifier", "start", 2),
+                    progress_frame("verifier", 2, "complete", "complete", 3),
+                )))
                 return ["/usr/bin/true"]
 
             with mock.patch.object(harness, "qemu_command", side_effect=command):
@@ -628,6 +834,173 @@ class BoundaryTests(unittest.TestCase):
             with self.assertRaisesRegex(guest.GuestError, "readback failed"):
                 guest.unit_state()
 
+    def test_systemd259_absent_unit_shapes_normalize_only_nonservice_main_pid(self) -> None:
+        common = [
+            "LoadState=not-found", "ActiveState=inactive", "SubState=dead",
+            "FragmentPath=", "UnitFileState=", "InvocationID=",
+        ]
+
+        def show(argv, **_keywords):
+            unit = argv[2]
+            lines = list(common)
+            if unit.endswith(".service"):
+                lines.append("MainPID=0")
+            return systemd_process(lines)
+
+        with mock.patch.object(guest, "command", side_effect=show) as command:
+            observed = guest.unit_state()
+        self.assertEqual(set(observed), set(guest.UNITS))
+        self.assertTrue(all(value["MainPID"] == "0" for value in observed.values()))
+        self.assertEqual(command.call_count, len(guest.UNITS))
+        for call in command.call_args_list:
+            self.assertEqual(
+                call.args[0][3], "--property=" + ",".join(guest.SYSTEMD_UNIT_PROPERTIES),
+            )
+
+    def test_systemd_unit_readback_accepts_loaded_service_and_active_socket(self) -> None:
+        loaded_service = systemd_process([
+            "LoadState=loaded", "ActiveState=active", "SubState=running",
+            "UnitFileState=enabled", "MainPID=123", "InvocationID=" + "a" * 32,
+            "FragmentPath=/usr/lib/systemd/system/buzz-ci-runner.service",
+        ])
+        service = guest.systemd_unit_values("buzz-ci-runner.service", loaded_service)
+        self.assertEqual(service["MainPID"], "123")
+        self.assertEqual(service["LoadState"], "loaded")
+
+        active_socket = systemd_process([
+            "LoadState=loaded", "ActiveState=active", "SubState=listening",
+            "UnitFileState=enabled", "InvocationID=" + "b" * 32,
+            "FragmentPath=/usr/lib/systemd/system/buzz-ci-runner.socket",
+        ])
+        socket = guest.systemd_unit_values("buzz-ci-runner.socket", active_socket)
+        self.assertEqual(socket["MainPID"], "0")
+        self.assertEqual(socket["SubState"], "listening")
+        active_socket_with_pid = systemd_process([
+            *active_socket.stdout.decode().splitlines(), "MainPID=456",
+        ])
+        self.assertEqual(
+            guest.systemd_unit_values(
+                "buzz-ci-runner.socket", active_socket_with_pid,
+            )["MainPID"],
+            "456",
+        )
+
+    def test_systemd_unit_readback_rejects_missing_service_pid_and_hostile_output(self) -> None:
+        valid = [
+            "LoadState=not-found", "ActiveState=inactive", "SubState=dead",
+            "UnitFileState=", "MainPID=0", "InvocationID=", "FragmentPath=",
+        ]
+        for missing in set(guest.SYSTEMD_UNIT_PROPERTIES) - {"MainPID"}:
+            lines = [line for line in valid if not line.startswith(missing + "=")]
+            with self.subTest(missing=missing), self.assertRaisesRegex(
+                guest.GuestError, "readback failed",
+            ):
+                guest.systemd_unit_values("buzz-ci-runner.service", systemd_process(lines))
+
+        omitted_pid = [line for line in valid if not line.startswith("MainPID=")]
+        hostile = (
+            (omitted_pid, 0, b""),
+            ([*valid, "LoadState=not-found"], 0, b""),
+            ([*valid, "Description=hostile"], 0, b""),
+            ([*valid, "malformed"], 0, b""),
+            ([line.replace("MainPID=0", "MainPID=7") for line in valid], 0, b""),
+            ([line.replace("MainPID=0", "MainPID=invalid") for line in valid], 0, b""),
+            ([line.replace("LoadState=not-found", "LoadState=loaded") for line in valid], 1, b""),
+            (valid, 0, b"unexpected stderr"),
+        )
+        for lines, returncode, stderr in hostile:
+            with self.subTest(lines=lines, returncode=returncode, stderr=stderr), self.assertRaisesRegex(
+                guest.GuestError, "readback failed",
+            ):
+                guest.systemd_unit_values(
+                    "buzz-ci-runner.service",
+                    systemd_process(lines, returncode=returncode, stderr=stderr),
+                )
+
+        absent_nonzero = systemd_process(valid, returncode=1)
+        self.assertEqual(
+            guest.systemd_unit_values("buzz-ci-runner.service", absent_nonzero)["LoadState"],
+            "not-found",
+        )
+        with self.assertRaisesRegex(guest.GuestError, "readback failed"):
+            guest.systemd_unit_values(
+                "buzz-ci-runner.service",
+                subprocess.CompletedProcess(["systemctl"], 0, b"\xff", b""),
+            )
+
+    def test_dormant_relay_accepts_exact_absence_for_zero_or_nonzero_return(self) -> None:
+        exact = ["LoadState=not-found", "ActiveState=inactive", "MainPID=0"]
+        units = {
+            unit: {
+                "LoadState": "not-found", "ActiveState": "inactive",
+                "UnitFileState": "", "MainPID": "0",
+            }
+            for unit in guest.UNITS
+        }
+        baseline = {
+            unit: {"LoadState": "not-found", "UnitFileState": ""}
+            for unit in guest.UNITS
+        }
+        for returncode in (0, 1):
+            with self.subTest(returncode=returncode), mock.patch.object(
+                guest, "tree_state", return_value={},
+            ), mock.patch.object(
+                guest, "unit_state", return_value=units,
+            ), mock.patch.object(
+                Path, "exists", return_value=False,
+            ), mock.patch.object(
+                guest, "command", side_effect=(
+                    systemd_process(exact, returncode=returncode),
+                    subprocess.CompletedProcess(["pgrep"], 1, b"", b""),
+                ),
+            ):
+                proof = guest.dormant_proof({}, baseline)
+            self.assertTrue(proof["relay_residue_absent"])
+
+    def test_dormant_relay_rejects_residue_and_malformed_absence(self) -> None:
+        exact = ["LoadState=not-found", "ActiveState=inactive", "MainPID=0"]
+        units = {
+            unit: {
+                "LoadState": "not-found", "ActiveState": "inactive",
+                "UnitFileState": "", "MainPID": "0",
+            }
+            for unit in guest.UNITS
+        }
+        baseline = {
+            unit: {"LoadState": "not-found", "UnitFileState": ""}
+            for unit in guest.UNITS
+        }
+        hostile = (
+            ["LoadState=loaded", "ActiveState=inactive", "MainPID=0"],
+            ["LoadState=not-found", "ActiveState=active", "MainPID=0"],
+            ["LoadState=not-found", "ActiveState=inactive", "MainPID=7"],
+            exact[:-1],
+            [*exact, "LoadState=not-found"],
+            [*exact, "Description=hostile"],
+            [*exact, "malformed"],
+        )
+        for lines in hostile:
+            with self.subTest(lines=lines), mock.patch.object(
+                guest, "tree_state", return_value={},
+            ), mock.patch.object(
+                guest, "unit_state", return_value=units,
+            ), mock.patch.object(
+                Path, "exists", return_value=False,
+            ), mock.patch.object(
+                guest, "command", return_value=systemd_process(lines),
+            ), self.assertRaisesRegex(guest.GuestError, "relay unit residue remains"):
+                guest.dormant_proof({}, baseline)
+        with mock.patch.object(
+            guest, "tree_state", return_value={},
+        ), mock.patch.object(
+            guest, "unit_state", return_value=units,
+        ), mock.patch.object(
+            Path, "exists", return_value=False,
+        ), mock.patch.object(
+            guest, "command", return_value=systemd_process(exact, stderr=b"unexpected stderr"),
+        ), self.assertRaisesRegex(guest.GuestError, "relay unit residue remains"):
+            guest.dormant_proof({}, baseline)
+
     def test_strict_verifier_verdict_rejects_status_and_outcome_mutation(self) -> None:
         valid = guest.canonical({"outcome": "pass", "status": "verified"})
         self.assertEqual(guest.parse_verdict(valid), {"outcome": "pass", "status": "verified"})
@@ -641,6 +1014,681 @@ class BoundaryTests(unittest.TestCase):
 
 
 class TimingAndProgressTests(unittest.TestCase):
+    INSTALL_CHECKPOINTS = (
+        "relay_ready", "preinstall_units_clean", "package_units_validated",
+        "principals_created", "seccomp_ready", "runner_installed",
+        "controld_installed", "keyholder_installed", "execd_installed",
+        "installed_units_verified",
+    )
+
+    def run_mocked_acceptance(
+        self, *, fail_at: str | None = None, cleanup_errors: tuple[str, ...] = (),
+        stage_failure: bool = False, stage_subphase: str | None = None,
+    ) -> tuple[list[tuple[str, str]], BaseException | None]:
+        events: list[tuple[str, str]] = []
+        descriptor = {
+            "schema_version": guest.STAGE_SCHEMA,
+            "candidate_sha": "a" * 40,
+            "harness_sha256": "b" * 64,
+            "timing_asset_sha256": "c" * 64,
+            "timing_sha256": "d" * 64,
+            "candidate_tar_sha256": "e" * 64,
+            "scenario_sha256": "f" * 64,
+            "seccomp_source_sha256": guest.SECCOMP_SHA256,
+            "public_binding_sha256": "1" * 64,
+            "package_tree_sha256": {name: "2" * 64 for name in guest.PACKAGE_NAMES},
+            "platform_systemd": copy.deepcopy(guest.PLATFORM_SYSTEMD),
+        }
+        phase = {
+            "challenge": "3" * 64,
+            "descriptor_sha256": hashlib.sha256(guest.canonical(descriptor)).hexdigest(),
+            "timing_sha256": descriptor["timing_sha256"],
+        }
+        expected_units = {
+            unit: {"fragment_path": f"/usr/lib/systemd/system/{unit}", "sha256": "4" * 64}
+            for unit in guest.UNITS
+        }
+
+        def completed(name: str, value=None):
+            if fail_at == name:
+                raise guest.GuestError("injected boundary failure")
+            return value
+
+        def command(argv, **_keywords):
+            for component in ("runner", "controld", "keyholder", "execd"):
+                if f"/{component}/install.py" in str(argv[1]) and fail_at == f"{component}_installed":
+                    raise guest.GuestError("injected boundary failure")
+            return subprocess.CompletedProcess(argv, 0, b"verifier", b"")
+
+        unit_inventory_calls = 0
+
+        def expected_unit_fragments(_inputs, _names):
+            nonlocal unit_inventory_calls
+            unit_inventory_calls += 1
+            if fail_at == "package_units_validated":
+                raise guest.GuestError("injected boundary failure")
+            return expected_units if unit_inventory_calls == 1 else {}
+
+        def cleanup(_candidate, _activation, attempted_stage, _hosts_added):
+            if attempted_stage:
+                guest.emit_progress("rollback")
+            guest.emit_progress("cleanup")
+            return list(cleanup_errors)
+
+        def staged(argv, **_keywords):
+            self.assertEqual(argv[2:4], ["stage", "--package"])
+            self.assertEqual(Path(argv[4]), stage / "inputs/activation")
+            self.assertEqual(argv[5], "--scenario")
+            self.assertEqual(Path(argv[6]), stage / "inputs/scenario.json")
+            if stage_failure:
+                if stage_subphase:
+                    guest.emit_progress(f"controller_stage:{stage_subphase}")
+                raise guest.StageCommandFailure(
+                    "guest command failed: controller_stage", stage_subphase,
+                )
+            return completed(
+                "controller_stage", subprocess.CompletedProcess(argv, 0, b"", b""),
+            )
+
+        error: BaseException | None = None
+        with tempfile.TemporaryDirectory() as temporary, contextlib.ExitStack() as stack:
+            root = Path(temporary)
+            state = root / "state"
+            stage = root / "stage"
+            state.mkdir()
+            stage.mkdir()
+            candidate = root / "candidate"
+            stack.enter_context(mock.patch.object(guest, "STATE_ROOT", state))
+            stack.enter_context(mock.patch.object(guest, "load_json", return_value=descriptor))
+            stack.enter_context(mock.patch.object(
+                guest, "cross_bind", return_value=(candidate, {}, {}),
+            ))
+            stack.enter_context(mock.patch.object(guest, "relay_mapping_present", return_value=False))
+            stack.enter_context(mock.patch.object(
+                guest, "start_relay", side_effect=lambda _public: completed("relay_ready"),
+            ))
+            stack.enter_context(mock.patch.object(
+                guest, "unit_state", side_effect=lambda: completed(
+                    "preinstall_units_clean",
+                    {unit: {"LoadState": "not-found"} for unit in guest.UNITS},
+                ),
+            ))
+            stack.enter_context(mock.patch.object(
+                guest, "expected_unit_fragments", side_effect=expected_unit_fragments,
+            ))
+            stack.enter_context(mock.patch.object(
+                guest, "create_principals",
+                side_effect=lambda _package: completed("principals_created"),
+            ))
+            stack.enter_context(mock.patch.object(
+                guest, "provision_seccomp",
+                side_effect=lambda _source: completed("seccomp_ready"),
+            ))
+            stack.enter_context(mock.patch.object(guest, "command", side_effect=command))
+            stack.enter_context(mock.patch.object(
+                guest, "stage_command",
+                side_effect=staged,
+            ))
+            stack.enter_context(mock.patch.object(guest, "tree_state", return_value={}))
+            stack.enter_context(mock.patch.object(
+                guest, "prove_installed_units",
+                side_effect=lambda _expected: completed("installed_units_verified", expected_units),
+            ))
+            stack.enter_context(mock.patch.object(guest, "run_capacity_one_canary", return_value=b"receipt"))
+            stack.enter_context(mock.patch.object(guest, "read_file", return_value=b"scenario"))
+            stack.enter_context(mock.patch.object(guest, "parse_verdict"))
+            stack.enter_context(mock.patch.object(guest, "cleanup", side_effect=cleanup))
+            stack.enter_context(mock.patch.object(guest, "dormant_proof", return_value={"proof": True}))
+            stack.enter_context(mock.patch.object(guest, "write_transfer"))
+            stack.enter_context(mock.patch.object(
+                guest, "emit_progress", side_effect=lambda name, event="start": events.append((name, event)),
+            ))
+            stack.enter_context(mock.patch.object(
+                guest, "begin_phase", side_effect=lambda name, **_keywords: guest.emit_progress(name),
+            ))
+            stack.enter_context(mock.patch.object(
+                guest, "complete_progress", side_effect=lambda: guest.emit_progress("complete", "complete"),
+            ))
+            stack.enter_context(mock.patch.object(guest, "abandon_command_inventory"))
+            try:
+                guest.run_acceptance(phase, stage)
+            except BaseException as caught:
+                error = caught
+        return events, error
+
+    def test_candidate_checkpoint_contract_is_shared_role_scoped_and_ordered(self) -> None:
+        self.assertEqual(guest.PROGRESS_PHASES, harness.PROGRESS_PHASES)
+        self.assertEqual(
+            guest.STAGE_PROGRESS_SUBPHASES,
+            harness.STAGE_PROGRESS_SUBPHASES,
+        )
+        self.assertEqual(
+            guest.STAGE_PROGRESS_SUBPHASES,
+            stage_controller.STAGE_PROGRESS_NAMES,
+        )
+        phases = (
+            "guest_started", "install", *self.INSTALL_CHECKPOINTS,
+            "controller_check", "controller_stage", "controller_activate", "canary",
+            "receipt_verifier", "rollback", "cleanup", "cleanup_return",
+        )
+        raw = b"".join(
+            progress_frame("candidate", sequence, phase, "start", sequence + 1)
+            for sequence, phase in enumerate(phases)
+        ) + progress_frame("candidate", len(phases), "complete", "complete", len(phases) + 1)
+        parsed = harness.parse_progress(raw, "candidate")
+        self.assertEqual(parsed["status"], "valid")
+        self.assertTrue(harness.progress_completed(parsed))
+
+        for role in ("ceremony", "verifier"):
+            hostile = progress_frame(role, 0, "relay_ready", "start", 1)
+            self.assertEqual(harness.parse_progress(hostile, role)["reason"], "boot-phase")
+        backward = progress_frame("candidate", 0, "seccomp_ready", "start", 1) + progress_frame(
+            "candidate", 1, "principals_created", "start", 2,
+        )
+        self.assertEqual(harness.parse_progress(backward, "candidate")["reason"], "order")
+        stale_timeout = progress_frame("candidate", 0, "seccomp_ready", "start", 1) + progress_frame(
+            "candidate", 1, "principals_created", "timeout", 2,
+        )
+        self.assertEqual(harness.parse_progress(stale_timeout, "candidate")["reason"], "order")
+        no_terminal = harness.parse_progress(raw.rsplit(progress_frame(
+            "candidate", len(phases), "complete", "complete", len(phases) + 1,
+        ), 1)[0], "candidate")
+        self.assertFalse(harness.progress_completed(no_terminal))
+
+    def test_stage_progress_protocol_rejects_hostile_streams_and_maps_only_prefixes(self) -> None:
+        magic = guest.STAGE_PROGRESS_MAGIC
+        record = lambda ordinal: bytes((ordinal, ordinal ^ 0xFF))
+        full_prefix = magic + b"".join(record(value) for value in range(1, 47))
+        complete = full_prefix + record(0x80)
+        unchanged_prefix = magic + b"".join(record(value) for value in range(1, 7))
+        unchanged = unchanged_prefix + record(0x81)
+        self.assertEqual((len(complete), len(unchanged)), (98, 18))
+        self.assertEqual(
+            guest.parse_stage_progress(complete, require_complete=True),
+            "stage_complete",
+        )
+        self.assertEqual(
+            guest.parse_stage_progress(unchanged, require_complete=True),
+            "stage_unchanged",
+        )
+        prefix = magic + b"".join(record(value) for value in range(1, 16))
+        self.assertEqual(
+            guest.parse_stage_progress(prefix, require_complete=False), "tmpfiles",
+        )
+        self.assertIsNone(guest.parse_stage_progress(prefix, require_complete=True))
+        self.assertEqual(guest.parse_stage_progress(magic, require_complete=False), "")
+        hostile = (
+            b"",
+            b"BSP\x01" + b"".join(record(value) for value in range(1, 47)),
+            magic + b"\x01",
+            magic + record(2),
+            magic + record(1) + record(1),
+            magic + record(1) + record(3),
+            magic + bytes((1, 1)),
+            full_prefix,
+            unchanged_prefix,
+            full_prefix + record(0x81),
+            full_prefix + record(0x82),
+            unchanged_prefix + record(0x80),
+            magic + record(0x81),
+            full_prefix + bytes((0x80, 0x80)),
+            complete + record(0x80),
+            unchanged + record(7),
+            complete + b"x",
+            b"x" * 129,
+        )
+        for raw in hostile:
+            with self.subTest(raw=raw[:12]):
+                self.assertIsNone(guest.parse_stage_progress(raw, require_complete=True))
+        self.assertIsNone(guest.parse_stage_progress(complete, require_complete=False))
+        self.assertIsNone(guest.parse_stage_progress(unchanged, require_complete=False))
+
+        diagnostic = "controller_stage:tmpfiles"
+        raw = b"".join((
+            progress_frame("candidate", 0, "controller_stage", "start", 1),
+            progress_frame("candidate", 1, diagnostic, "start", 2),
+            progress_frame("candidate", 2, "rollback", "start", 3),
+            progress_frame("candidate", 3, "cleanup", "start", 4),
+            progress_frame("candidate", 4, "cleanup_return", "start", 5),
+        ))
+        parsed = harness.parse_progress(raw, "candidate")
+        self.assertEqual(parsed["status"], "valid")
+        failure = harness.progress_failure("candidate", parsed, timed_out=False)
+        self.assertIn(f"candidate {diagnostic} guest failure", str(failure))
+        self.assertNotIn("sentinel-private", str(failure))
+
+        timeout_raw = b"".join((
+            progress_frame("candidate", 0, "controller_stage", "start", 1),
+            progress_frame("candidate", 1, diagnostic, "timeout", 2),
+            progress_frame("candidate", 2, "rollback", "start", 3),
+            progress_frame("candidate", 3, "cleanup", "start", 4),
+        ))
+        timeout_progress = harness.parse_progress(timeout_raw, "candidate")
+        self.assertEqual(timeout_progress["status"], "valid")
+        timeout_failure = harness.progress_failure(
+            "candidate", timeout_progress, timed_out=True,
+        )
+        self.assertIn(f"candidate {diagnostic} watchdog timeout", str(timeout_failure))
+        self.assertFalse(harness.progress_completed(timeout_progress))
+
+    def test_stage_command_emits_only_authenticated_mapped_failure(self) -> None:
+        record = lambda ordinal: bytes((ordinal, ordinal ^ 0xFF))
+        complete = guest.STAGE_PROGRESS_MAGIC + b"".join(
+            record(value) for value in range(1, 47)
+        ) + record(0x80)
+        unchanged = guest.STAGE_PROGRESS_MAGIC + b"".join(
+            record(value) for value in range(1, 7)
+        ) + record(0x81)
+        prefix = guest.STAGE_PROGRESS_MAGIC + b"".join(
+            record(value) for value in range(1, 16)
+        )
+        scenario_prefix = guest.STAGE_PROGRESS_MAGIC + b"".join(
+            record(value) for value in range(1, 4)
+        )
+        staged_stdout = guest.canonical({
+            "status": "staged", "state": "staged_zero", "capacity": 0,
+        })
+        unchanged_stdout = guest.canonical({
+            "status": "unchanged", "state": "staged_zero", "capacity": 0,
+        })
+
+        class Process:
+            def __init__(self, returncode: int | None) -> None:
+                self.returncode = returncode
+
+            def poll(self):
+                return self.returncode
+
+        def invoke(
+            raw: bytes, returncode: int | None, timeout: int,
+            *, stdout_payload: bytes = b"", stderr_payload: bytes = b"",
+        ):
+            process = Process(returncode)
+            descriptors: list[int] = []
+            reap_calls = 0
+            real_pipe2 = os.pipe2
+
+            def pipe2(flags: int):
+                pair = real_pipe2(flags)
+                descriptors.extend(pair)
+                return pair
+
+            def spawn(_argv, **kwargs):
+                os.write(kwargs["pass_fds"][0], raw)
+                kwargs["stdout"].write(stdout_payload)
+                kwargs["stderr"].write(stderr_payload)
+                return process
+
+            def reap(value, **_kwargs):
+                nonlocal reap_calls
+                reap_calls += 1
+                value.returncode = -9 if value.returncode is None else value.returncode
+
+            with tempfile.TemporaryDirectory() as scratch, mock.patch.object(
+                guest, "SCRATCH_ROOT", Path(scratch),
+            ), mock.patch.object(
+                guest.os, "pipe2", side_effect=pipe2,
+            ), mock.patch.object(
+                guest, "record_command_timing",
+            ), mock.patch.object(
+                guest.subprocess, "Popen", side_effect=spawn,
+            ), mock.patch.object(
+                guest, "reap_process_group", side_effect=reap,
+            ), mock.patch.object(guest, "emit_progress") as emitted:
+                error = None
+                result = None
+                try:
+                    result = guest.stage_command(["controller", "stage"], timeout=timeout)
+                except guest.GuestError as caught:
+                    error = caught
+            self.assertFalse(Path(scratch).exists())
+            self.assertEqual(reap_calls, 1)
+            self.assertEqual(len(descriptors), 2)
+            for descriptor in descriptors:
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+            return result, error, emitted.call_args_list
+
+        result, error, emitted = invoke(complete, 0, 1, stdout_payload=staged_stdout)
+        self.assertIsNotNone(result)
+        self.assertIsNone(error)
+        self.assertEqual(emitted, [])
+
+        result, error, emitted = invoke(unchanged, 0, 1, stdout_payload=unchanged_stdout)
+        self.assertIsNotNone(result)
+        self.assertIsNone(error)
+        self.assertEqual(emitted, [])
+
+        rejected_successes = (
+            (prefix, staged_stdout),
+            (complete, unchanged_stdout),
+            (unchanged, staged_stdout),
+            (complete + record(0x80), staged_stdout),
+            (complete, b'{"status":"staged","status":"staged","state":"staged_zero","capacity":0}\n'),
+            (complete, b'{"status": "staged", "state":"staged_zero","capacity":0}\n'),
+            (complete, b'{"status":"staged","state":"staged_zero","capacity":NaN}\n'),
+            (complete, b'{"status":"staged","state":"staged_zero"}\n'),
+            (complete, b'{"status":"staged","state":"staged_zero","capacity":true}\n'),
+        )
+        for raw, stdout_payload in rejected_successes:
+            with self.subTest(raw=raw[-8:], stdout=stdout_payload[:24]):
+                _result, error, emitted = invoke(
+                    raw, 0, 1, stdout_payload=stdout_payload,
+                )
+                self.assertIsInstance(error, guest.GuestError)
+                self.assertEqual(emitted, [])
+
+        _result, error, emitted = invoke(complete, 1, 1)
+        self.assertIsInstance(error, guest.GuestError)
+        self.assertEqual(emitted, [])
+
+        _result, error, emitted = invoke(prefix, 1, 1)
+        self.assertIsInstance(error, guest.StageCommandFailure)
+        self.assertEqual(error.subphase, "tmpfiles")
+        self.assertTrue(error.rollback_required)
+        self.assertNotIn("tmpfiles", str(error))
+        self.assertEqual(
+            emitted,
+            [mock.call("controller_stage:tmpfiles", "start")],
+        )
+
+        _result, error, emitted = invoke(scenario_prefix, 1, 1)
+        self.assertIsInstance(error, guest.StageCommandFailure)
+        self.assertEqual(error.subphase, "scenario_binding")
+        self.assertFalse(error.rollback_required)
+        self.assertEqual(
+            emitted,
+            [mock.call("controller_stage:scenario_binding", "start")],
+        )
+
+        _result, error, emitted = invoke(b"sentinel-private-stderr", 1, 1)
+        self.assertIsInstance(error, guest.GuestError)
+        self.assertNotIn("sentinel-private", str(error))
+        self.assertEqual(emitted, [])
+
+        _result, error, emitted = invoke(
+            prefix, 1, 1,
+            stdout_payload=b"sentinel-private-stdout",
+            stderr_payload=b"sentinel-private-stderr",
+        )
+        self.assertIsInstance(error, guest.GuestError)
+        self.assertNotIn("sentinel-private", str(error))
+        self.assertEqual(
+            emitted,
+            [mock.call("controller_stage:tmpfiles", "start")],
+        )
+
+        _result, error, emitted = invoke(prefix, None, 0)
+        self.assertIsInstance(error, guest.GuestError)
+        self.assertEqual(
+            emitted,
+            [mock.call("controller_stage:tmpfiles", "timeout")],
+        )
+
+    def test_guest_checkpoint_emitter_rejects_unknown_and_backward_phases(self) -> None:
+        original = (
+            guest._PROGRESS_BOOT, guest._PROGRESS_LAST_PHASE, guest._ACTIVE_PHASE,
+        )
+        try:
+            guest._PROGRESS_BOOT = "candidate"
+            guest._PROGRESS_LAST_PHASE = "seccomp_ready"
+            guest._ACTIVE_PHASE = "install"
+            with self.assertRaisesRegex(guest.GuestError, "progress order differs"):
+                guest.emit_progress("caller-controlled")
+            with self.assertRaisesRegex(guest.GuestError, "progress order differs"):
+                guest.emit_progress("principals_created")
+            with mock.patch.object(guest, "emit_progress") as emitted:
+                guest.emit_timeout_progress()
+            emitted.assert_called_once_with("seccomp_ready", "timeout")
+        finally:
+            guest._PROGRESS_BOOT, guest._PROGRESS_LAST_PHASE, guest._ACTIVE_PHASE = original
+
+    def test_run_acceptance_checkpoints_follow_completed_boundaries(self) -> None:
+        events, error = self.run_mocked_acceptance()
+        self.assertIsNone(error)
+        self.assertEqual(
+            [name for name, _event in events],
+            [
+                "install", *self.INSTALL_CHECKPOINTS, "controller_check", "controller_stage",
+                "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup",
+                "cleanup_return", "complete",
+            ],
+        )
+
+        previous = "install"
+        for checkpoint in self.INSTALL_CHECKPOINTS:
+            with self.subTest(checkpoint=checkpoint):
+                events, error = self.run_mocked_acceptance(fail_at=checkpoint)
+                names = [name for name, _event in events]
+                self.assertIsInstance(error, guest.GuestError)
+                self.assertNotIn(checkpoint, names)
+                self.assertIn(previous, names)
+                self.assertEqual(names[-2:], ["cleanup", "cleanup_return"])
+                raw = b"".join(
+                    progress_frame("candidate", sequence, name, event, sequence + 1)
+                    for sequence, (name, event) in enumerate(events)
+                )
+                parsed = harness.parse_progress(raw, "candidate")
+                self.assertEqual(parsed["status"], "valid")
+                failure = harness.progress_failure("candidate", parsed, timed_out=False)
+                self.assertIn(f"candidate {previous} guest failure", str(failure))
+                self.assertIn('"cleanup_returned":true', str(failure))
+                self.assertNotIn("injected boundary failure", str(failure))
+            previous = checkpoint
+
+        events, error = self.run_mocked_acceptance(fail_at="controller_stage")
+        names = [name for name, _event in events]
+        self.assertIsInstance(error, guest.GuestError)
+        self.assertEqual(
+            names[-4:], ["controller_stage", "rollback", "cleanup", "cleanup_return"],
+        )
+        self.assertNotIn("complete", names)
+
+        events, error = self.run_mocked_acceptance(
+            stage_failure=True, stage_subphase="scenario_binding",
+        )
+        names = [name for name, _event in events]
+        self.assertIsInstance(error, guest.GuestError)
+        self.assertEqual(
+            names[-4:], [
+                "controller_stage", "controller_stage:scenario_binding",
+                "cleanup", "cleanup_return",
+            ],
+        )
+        self.assertNotIn("rollback", names)
+
+        for subphase in ("preflight", "fixed_package_install", None):
+            with self.subTest(stage_subphase=subphase):
+                events, error = self.run_mocked_acceptance(
+                    stage_failure=True, stage_subphase=subphase,
+                )
+                names = [name for name, _event in events]
+                self.assertIsInstance(error, guest.GuestError)
+                self.assertIn("rollback", names)
+                self.assertEqual(names[-2:], ["cleanup", "cleanup_return"])
+
+    def test_cleanup_return_requires_successful_cleanup(self) -> None:
+        events, error = self.run_mocked_acceptance(cleanup_errors=("cleanup failed",))
+        self.assertIsInstance(error, guest.GuestError)
+        names = [name for name, _event in events]
+        self.assertEqual(names[-1], "cleanup")
+        self.assertNotIn("cleanup_return", names)
+        self.assertNotIn("complete", names)
+
+    def test_cleanup_tail_reports_last_authenticated_operational_phase(self) -> None:
+        raw = b"".join((
+            progress_frame("candidate", 0, "controller_stage", "start", 1),
+            progress_frame("candidate", 1, "rollback", "start", 2),
+            progress_frame("candidate", 2, "cleanup", "start", 3),
+        ))
+        failure = harness.progress_failure(
+            "candidate", harness.parse_progress(raw, "candidate"), timed_out=False,
+        )
+        self.assertIn("candidate controller_stage guest failure", str(failure))
+        self.assertIn('"cleanup_returned":false', str(failure))
+
+        events, error = self.run_mocked_acceptance(
+            cleanup_errors=("cleanup transport failed", "dormant proof failed"),
+        )
+        self.assertIsInstance(error, guest.GuestError)
+        self.assertEqual([name for name, _event in events][-2:], ["rollback", "cleanup"])
+        self.assertNotIn("cleanup_return", [name for name, _event in events])
+        progress = b"".join(
+            progress_frame("candidate", sequence, name, event, sequence + 1)
+            for sequence, (name, event) in enumerate(events)
+        )
+        cleanup_failure = harness.progress_failure(
+            "candidate", harness.parse_progress(progress, "candidate"), timed_out=False,
+        )
+        self.assertIn("candidate receipt_verifier guest failure", str(cleanup_failure))
+        self.assertIn('"cleanup_returned":false', str(cleanup_failure))
+        self.assertNotIn("transport", str(cleanup_failure))
+        self.assertNotIn("dormant proof", str(cleanup_failure))
+
+    def test_cleanup_enters_rollback_then_cleanup_without_filesystem_access(self) -> None:
+        events: list[str] = []
+        completed = subprocess.CompletedProcess(["mocked"], 0, b"", b"")
+        with mock.patch.object(
+            guest, "begin_phase", side_effect=events.append,
+        ), mock.patch.object(
+            guest, "command", return_value=completed,
+        ), mock.patch.object(
+            guest.shutil, "rmtree",
+        ), mock.patch.object(
+            Path, "is_file", return_value=False,
+        ), mock.patch.object(
+            Path, "exists", return_value=False,
+        ), mock.patch.object(
+            Path, "unlink", side_effect=FileNotFoundError,
+        ):
+            errors = guest.cleanup(
+                Path("/not-accessed/candidate"), Path("/not-accessed/activation"), True, False,
+            )
+        self.assertEqual(errors, [])
+        self.assertEqual(events, ["rollback", "cleanup"])
+
+    def test_rc_zero_requires_one_timeout_free_terminal_progress_record(self) -> None:
+        evidence_value = {"schema_version": harness.FRAME_SCHEMA, "outcome": "pass"}
+        evidence_payload = harness.canonical(evidence_value)
+        evidence_frame = (
+            struct.pack(">I", len(evidence_payload))
+            + evidence_payload
+            + hashlib.sha256(evidence_payload).digest()
+        )
+        cases = {
+            "candidate": (
+                "candidate.qcow2", False, "read-write",
+                (
+                    ("missing", b"", "boot_cloud_init guest failure"),
+                    ("truncated", progress_frame("candidate", 0, "install", "start", 1)[:-1], "boot_cloud_init guest failure"),
+                    ("install-only", progress_frame("candidate", 0, "install", "start", 1), "install guest failure"),
+                    ("no-complete", b"".join((
+                        progress_frame("candidate", 0, "guest_started", "start", 1),
+                        progress_frame("candidate", 1, "install", "start", 2),
+                        progress_frame("candidate", 2, "cleanup", "start", 3),
+                    )), "install guest failure"),
+                    ("timeout-then-complete", b"".join((
+                        progress_frame("candidate", 0, "canary", "start", 1),
+                        progress_frame("candidate", 1, "canary", "timeout", 2),
+                        progress_frame("candidate", 2, "cleanup", "start", 3),
+                        progress_frame("candidate", 3, "complete", "complete", 4),
+                    )), "canary inner timeout"),
+                    ("duplicate-complete", b"".join((
+                        progress_frame("candidate", 0, "complete", "complete", 1),
+                        progress_frame("candidate", 1, "complete", "complete", 2),
+                    )), "complete guest failure"),
+                ),
+            ),
+            "verifier": (
+                "verifier.qcow2", True, "read-only",
+                (
+                    ("missing", b"", "boot_cloud_init guest failure"),
+                    ("truncated", progress_frame("verifier", 0, "verifier", "start", 1)[:-1], "boot_cloud_init guest failure"),
+                    ("install-only", progress_frame("verifier", 0, "install", "start", 1), "install guest failure"),
+                    ("no-complete", b"".join((
+                        progress_frame("verifier", 0, "guest_started", "start", 1),
+                        progress_frame("verifier", 1, "verifier", "start", 2),
+                    )), "verifier guest failure"),
+                    ("timeout-then-complete", b"".join((
+                        progress_frame("verifier", 0, "verifier", "start", 1),
+                        progress_frame("verifier", 1, "verifier", "timeout", 2),
+                        progress_frame("verifier", 2, "complete", "complete", 3),
+                    )), "verifier inner timeout"),
+                    ("duplicate-complete", b"".join((
+                        progress_frame("verifier", 0, "complete", "complete", 1),
+                        progress_frame("verifier", 1, "complete", "complete", 2),
+                    )), "complete guest failure"),
+                ),
+            ),
+        }
+        for role, (overlay, evidence_expected, transfer, mutations) in cases.items():
+            for name, raw_progress, expected in mutations:
+                with self.subTest(role=role, mutation=name), tempfile.TemporaryDirectory() as temporary:
+                    state = Path(temporary)
+                    process = mock.Mock()
+                    process.poll.return_value = 0
+
+                    def spawn(*_args, **_kwargs):
+                        (state / "progress.bin").write_bytes(raw_progress)
+                        if evidence_expected:
+                            (state / "evidence.bin").write_bytes(evidence_frame)
+                        return process
+
+                    with mock.patch.object(harness.subprocess, "Popen", side_effect=spawn), mock.patch.object(
+                        harness, "reap_process_group",
+                    ), mock.patch.object(harness, "parse_frame", wraps=harness.parse_frame) as parse_frame:
+                        with self.assertRaisesRegex(harness.HarnessError, expected):
+                            harness.boot(
+                                state, harness.watchdog_seconds(role), overlay=overlay,
+                                evidence_expected=evidence_expected, transfer=transfer,
+                            )
+                    parse_frame.assert_not_called()
+
+    def test_rc_zero_with_exact_terminal_progress_preserves_each_boot_role(self) -> None:
+        evidence_value = {"schema_version": harness.FRAME_SCHEMA, "outcome": "pass"}
+        evidence_payload = harness.canonical(evidence_value)
+        evidence_frame = (
+            struct.pack(">I", len(evidence_payload))
+            + evidence_payload
+            + hashlib.sha256(evidence_payload).digest()
+        )
+        cases = (
+            ("ceremony", "ceremony.qcow2", True, None, ("guest_started", "ceremony")),
+            (
+                "candidate", "candidate.qcow2", False, "read-write",
+                (
+                    "guest_started", "install", *self.INSTALL_CHECKPOINTS,
+                    "controller_check", "controller_stage", "controller_activate", "canary",
+                    "receipt_verifier", "rollback", "cleanup", "cleanup_return",
+                ),
+            ),
+            ("verifier", "verifier.qcow2", True, "read-only", ("guest_started", "verifier")),
+        )
+        for role, overlay, evidence_expected, transfer, phases in cases:
+            raw_progress = b"".join(
+                progress_frame(role, sequence, phase, "start", sequence + 1)
+                for sequence, phase in enumerate(phases)
+            ) + progress_frame(role, len(phases), "complete", "complete", len(phases) + 1)
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as temporary:
+                state = Path(temporary)
+                process = mock.Mock()
+                process.poll.return_value = 0
+
+                def spawn(*_args, **_kwargs):
+                    (state / "progress.bin").write_bytes(raw_progress)
+                    if evidence_expected:
+                        (state / "evidence.bin").write_bytes(evidence_frame)
+                    return process
+
+                with mock.patch.object(harness.subprocess, "Popen", side_effect=spawn), mock.patch.object(
+                    harness, "reap_process_group",
+                ):
+                    result = harness.boot(
+                        state, harness.watchdog_seconds(role), overlay=overlay,
+                        evidence_expected=evidence_expected, transfer=transfer,
+                    )
+                self.assertEqual(result, evidence_value if evidence_expected else None)
+
     def test_timing_source_recursively_matches_actual_leaf_counts(self) -> None:
         harness.validate_timing_contract()
         timing = harness.TIMING_CONTRACT
@@ -685,6 +1733,7 @@ class TimingAndProgressTests(unittest.TestCase):
 
     def test_canary_command_forwards_exact_qualification_credentials(self) -> None:
         activation = {"manifest": "exact"}
+        public = {"binding": "exact"}
         scenario = b'{"scenario":"exact"}'
         completed = subprocess.CompletedProcess(
             ["/usr/libexec/buzz-ci-capacity-one-canary"], 0, b"receipt", b"",
@@ -695,10 +1744,10 @@ class TimingAndProgressTests(unittest.TestCase):
             guest, "command", return_value=completed,
         ) as command:
             self.assertEqual(
-                guest.run_capacity_one_canary(activation, scenario),
+                guest.run_capacity_one_canary(activation, scenario, public),
                 b"receipt",
             )
-        credentials.assert_called_once_with(activation)
+        credentials.assert_called_once_with(activation, public)
         command.assert_called_once_with(
             ["/usr/libexec/buzz-ci-capacity-one-canary"],
             stdin=scenario,
@@ -752,13 +1801,45 @@ class TimingAndProgressTests(unittest.TestCase):
                 guest.qualification_credentials(changed)
 
     def assert_live_acceptance_roles_for_status(
-        self, status: str,
+        self,
+        status: str | None = None,
+        *,
+        prepared: tuple[int, int] = (62002, 62002),
+        activation_controld: tuple[int, int] | None = None,
+        controld_account: tuple[int, int] | None = None,
+        actor_account: tuple[int, int] | None = None,
+        binding_peer: tuple[int, int] | None = None,
+        keyholder_peer: tuple[int, int] | None = None,
+        process: tuple[int, int] | None = None,
     ) -> tuple[int, int, list[int]]:
+        """Drive the live role assertion against one prepared controld identity.
+
+        `prepared` is the identity the key ceremony recorded in the public
+        binding. Every live value defaults to that identity; a keyword override
+        models one live value that differs from the prepared one.
+        """
+        activation_controld = activation_controld or prepared
+        controld_account = controld_account or prepared
+        actor_account = actor_account or (961, 961)
+        binding_peer = binding_peer or prepared
+        keyholder_peer = keyholder_peer or prepared
+        process = process or prepared
+        if status is None:
+            status = (
+                f"Uid:\t{process[0]}\t{process[0]}\t{process[0]}\t{process[0]}\n"
+                f"Gid:\t{process[1]}\t{process[1]}\t{process[1]}\t{process[1]}\n"
+                "Groups:\t\n"
+            )
+        public = {
+            "keyholder_public_spec": {
+                "peer": {"uid": prepared[0], "gid": prepared[1], "allowed_operations": ["describe"]},
+            },
+        }
         activation = {
             "identities": {
                 "controld": {
-                    "uid": 62002,
-                    "gid": 62002,
+                    "uid": activation_controld[0],
+                    "gid": activation_controld[1],
                     "supplementary_groups": [],
                 },
                 "qualification": {
@@ -774,17 +1855,17 @@ class TimingAndProgressTests(unittest.TestCase):
             },
         }
         accounts = {
-            "buzzci-controld": mock.Mock(pw_uid=62002, pw_gid=62002),
-            "buzzci-ctl": mock.Mock(pw_uid=961, pw_gid=961),
+            "buzzci-controld": mock.Mock(pw_uid=controld_account[0], pw_gid=controld_account[1]),
+            "buzzci-ctl": mock.Mock(pw_uid=actor_account[0], pw_gid=actor_account[1]),
         }
         binding = {
             "schema_version": "buzz-ci-activation-acceptance-binding/v2",
-            "keyholder_peer_uid": 62002,
-            "keyholder_peer_gid": 62002,
+            "keyholder_peer_uid": binding_peer[0],
+            "keyholder_peer_gid": binding_peer[1],
             "acceptance_peer_uid": 961,
             "acceptance_peer_gid": 961,
         }
-        keyholder = {"peer": {"uid": 62002, "gid": 62002}}
+        keyholder = {"peer": {"uid": keyholder_peer[0], "gid": keyholder_peer[1]}}
         socket_metadata = mock.Mock(
             st_mode=stat.S_IFSOCK | 0o620,
             st_uid=0,
@@ -810,25 +1891,130 @@ class TimingAndProgressTests(unittest.TestCase):
             with mock.patch.object(guest, "Path", side_effect=mapped_path), mock.patch.object(
                 guest.pwd, "getpwnam", side_effect=accounts.__getitem__,
             ), mock.patch.object(guest, "load_json", side_effect=(binding, keyholder)):
-                return guest.assert_live_acceptance_roles(activation)
+                return guest.assert_live_acceptance_roles(activation, public)
 
-    def test_live_acceptance_roles_accepts_explicit_empty_groups_record(self) -> None:
+    def test_live_acceptance_roles_derive_controld_identity_from_the_prepared_binding(self) -> None:
+        for prepared in ((1201, 1201), (62002, 62002)):
+            with self.subTest(prepared=prepared):
+                self.assertEqual(
+                    self.assert_live_acceptance_roles_for_status(prepared=prepared),
+                    (961, 961, [62005]),
+                )
+
+    def test_live_acceptance_roles_reject_any_role_that_differs_from_the_prepared_binding(self) -> None:
+        for prepared, other in (((1201, 1201), (62002, 62002)), ((62002, 62002), (1201, 1201))):
+            for field, message in (
+                ("activation_controld", "installed acceptance identities differ"),
+                ("controld_account", "installed acceptance identities differ"),
+                ("binding_peer", "acceptance role binding differs"),
+                ("keyholder_peer", "acceptance role binding differs"),
+                ("process", "live controld credentials differ"),
+            ):
+                with self.subTest(prepared=prepared, field=field), self.assertRaisesRegex(
+                    guest.GuestError, message,
+                ):
+                    self.assert_live_acceptance_roles_for_status(prepared=prepared, **{field: other})
+            with self.subTest(prepared=prepared, field="actor_account"), self.assertRaisesRegex(
+                guest.GuestError, "installed acceptance identities differ",
+            ):
+                self.assert_live_acceptance_roles_for_status(prepared=prepared, actor_account=(962, 961))
+
+    def test_prepared_controld_identity_rejects_an_unusable_binding_peer(self) -> None:
+        activation = {"identities": {"controld": {"uid": 1201, "gid": 1201, "supplementary_groups": []}}}
+        for peer in ({}, {"uid": 0, "gid": 1201}, {"uid": True, "gid": 1201}, {"uid": 1201, "gid": "1201"}, None):
+            public = {"keyholder_public_spec": {"peer": peer}}
+            with self.subTest(peer=peer), self.assertRaisesRegex(guest.GuestError, "prepared controld identity differs"):
+                guest.prepared_controld_identity(public, activation)
+        with self.assertRaisesRegex(guest.GuestError, "prepared controld identity differs"):
+            guest.prepared_controld_identity({}, activation)
+        self.assertEqual(
+            guest.prepared_controld_identity({"keyholder_public_spec": {"peer": {"uid": 1201, "gid": 1201}}}, activation),
+            (1201, 1201),
+        )
+        grouped = copy.deepcopy(activation)
+        grouped["identities"]["controld"]["supplementary_groups"] = ["buzzci-execd"]
+        with self.assertRaisesRegex(guest.GuestError, "installed acceptance identities differ"):
+            guest.prepared_controld_identity({"keyholder_public_spec": {"peer": {"uid": 1201, "gid": 1201}}}, grouped)
+
+    def test_guest_entry_carries_no_literal_acceptance_role_identity(self) -> None:
+        source = Path(guest.__file__).read_text()
+        for literal in ("62002", "961", "1201"):
+            self.assertIsNone(re.search(rf"\b{literal}\b", source), literal)
+
+    def test_live_acceptance_roles_accepts_a_groups_record_without_extra_groups(self) -> None:
+        for prepared, groups_record in (
+            ((62002, 62002), "Groups:\t\n"),
+            ((62002, 62002), "Groups:\t62002 \n"),
+            ((1201, 1201), "Groups:\t\n"),
+            ((1201, 1201), "Groups:\t1201 \n"),
+        ):
+            with self.subTest(prepared=prepared, groups=groups_record):
+                self.assertEqual(
+                    self.assert_live_acceptance_roles_for_status(
+                        f"Uid:\t{prepared[0]}\t{prepared[0]}\t{prepared[0]}\t{prepared[0]}\n"
+                        f"Gid:\t{prepared[1]}\t{prepared[1]}\t{prepared[1]}\t{prepared[1]}\n"
+                        + groups_record,
+                        prepared=prepared,
+                    ),
+                    (961, 961, [62005]),
+                )
+
+    def test_live_acceptance_roles_accepts_the_systemd_259_primary_gid_groups_record(self) -> None:
+        """systemd 259 starts a User= service with `Groups: <primary gid>` (initgroups semantics)."""
         self.assertEqual(
             self.assert_live_acceptance_roles_for_status(
-                "Uid:\t62002\t62002\t62002\t62002\n"
-                "Gid:\t62002\t62002\t62002\t62002\n"
-                "Groups:\t\n",
+                "Uid:\t1201\t1201\t1201\t1201\n"
+                "Gid:\t1201\t1201\t1201\t1201\n"
+                "Groups:\t1201 \n",
+                prepared=(1201, 1201),
             ),
             (961, 961, [62005]),
         )
 
-    def test_live_acceptance_roles_rejects_nonempty_groups_record(self) -> None:
-        with self.assertRaisesRegex(guest.GuestError, "live controld credentials differ"):
-            self.assert_live_acceptance_roles_for_status(
-                "Uid:\t62002\t62002\t62002\t62002\n"
-                "Gid:\t62002\t62002\t62002\t62002\n"
-                "Groups:\t62005\n",
-            )
+    def test_live_acceptance_roles_rejects_a_groups_record_with_an_extra_group(self) -> None:
+        for prepared, groups_record in (
+            ((62002, 62002), "Groups:\t62005\n"),
+            ((62002, 62002), "Groups:\t62002 62005 \n"),
+            ((1201, 1201), "Groups:\t1201 1204 \n"),
+            ((1201, 1201), "Groups:\t1204 \n"),
+            ((1201, 1201), "Groups:\t0 \n"),
+            ((1201, 1201), "Groups:\t62002 \n"),
+            ((1201, 1201), "Groups:\tbuzzci-controld\n"),
+        ):
+            with self.subTest(prepared=prepared, groups=groups_record), self.assertRaisesRegex(
+                guest.GuestError, "live controld credentials differ",
+            ):
+                self.assert_live_acceptance_roles_for_status(
+                    f"Uid:\t{prepared[0]}\t{prepared[0]}\t{prepared[0]}\t{prepared[0]}\n"
+                    f"Gid:\t{prepared[1]}\t{prepared[1]}\t{prepared[1]}\t{prepared[1]}\n"
+                    + groups_record,
+                    prepared=prepared,
+                )
+
+    def test_live_supplementary_gids_drop_only_the_primary_gid(self) -> None:
+        self.assertEqual(guest.live_supplementary_gids("\t\n", 1201), set())
+        self.assertEqual(guest.live_supplementary_gids("\t1201 \n", 1201), set())
+        self.assertEqual(guest.live_supplementary_gids("\t1201 1204 \n", 1201), {1204})
+        self.assertEqual(guest.live_supplementary_gids("\t1204 \n", 1201), {1204})
+        with self.assertRaises(ValueError):
+            guest.live_supplementary_gids("\tbuzzci-execd\n", 1201)
+
+    def test_manifest_supplementary_gids_resolve_the_role_groups(self) -> None:
+        activation = {
+            "identities": {
+                "controld": {"supplementary_groups": []},
+                "qualification": {"supplementary_groups": ["buzzci-execd"]},
+            },
+        }
+        self.assertEqual(guest.manifest_supplementary_gids(activation, "controld"), set())
+        with mock.patch.object(guest.grp, "getgrnam", return_value=mock.Mock(gr_gid=1204)) as getgrnam:
+            self.assertEqual(guest.manifest_supplementary_gids(activation, "qualification"), {1204})
+        getgrnam.assert_called_once_with("buzzci-execd")
+        for broken in ({}, {"identities": {}}, {"identities": {"controld": {}}}, {"identities": {"controld": {"supplementary_groups": [1204]}}}):
+            with self.subTest(activation=broken), self.assertRaisesRegex(
+                guest.GuestError, "installed acceptance identities differ",
+            ):
+                guest.manifest_supplementary_gids(broken, "controld")
 
     def test_live_acceptance_roles_rejects_missing_groups_record(self) -> None:
         with self.assertRaisesRegex(guest.GuestError, "live controld credentials differ"):
@@ -929,7 +2115,8 @@ class TimingAndProgressTests(unittest.TestCase):
         )
         self.assertIn("verifier boot_cloud_init watchdog timeout", str(missing))
         for phase in (
-            "install", "controller_stage", "canary", "receipt_verifier", "rollback", "cleanup",
+            "install", *self.INSTALL_CHECKPOINTS, "controller_stage", "canary",
+            "receipt_verifier", "rollback", "cleanup", "cleanup_return",
         ):
             raw = progress_frame("candidate", 0, phase, "start", 1) + progress_frame(
                 "candidate", 1, phase, "timeout", 2,
@@ -999,6 +2186,7 @@ class TimingAndProgressTests(unittest.TestCase):
         )
         for _metadata, user_data in observed:
             self.assertIn("LABEL=BUZZCI_STAGE, /mnt/buzzci-stage, iso9660", user_data)
+            self.assertIn("ro,nosuid,nodev,noexec", user_data)
             self.assertIn("python3, /mnt/buzzci-stage/guest_entry.py", user_data)
             self.assertIn("mode: poweroff", user_data)
             self.assertIn("timeout: 30", user_data)
@@ -1030,6 +2218,131 @@ class TimingAndProgressTests(unittest.TestCase):
 
 
 class InputTests(unittest.TestCase):
+    def test_guest_unit_inventory_accepts_direct_unit_and_valid_drop_in(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            inputs = Path(temporary) / "inputs"
+            write_guest_package(inputs, "runner", [
+                (
+                    "buzz-ci-runner.service", "/usr/lib/systemd/system/buzz-ci-runner.service",
+                    b"[Service]\nExecStart=/usr/libexec/buzz-ci-runner\n",
+                ),
+                (
+                    "20-capacity-one.conf",
+                    "/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.conf",
+                    b"[Service]\nEnvironment=BUZZ_CI_CAPACITY=1\n",
+                ),
+            ])
+
+            expected = guest.expected_unit_fragments(inputs, ("runner",))
+
+            self.assertEqual(set(expected), {"buzz-ci-runner.service"})
+            self.assertEqual(
+                expected["buzz-ci-runner.service"]["fragment_path"],
+                "/usr/lib/systemd/system/buzz-ci-runner.service",
+            )
+
+    def test_guest_unit_inventory_rejects_malformed_or_nested_paths(self) -> None:
+        invalid = (
+            "/usr/lib/systemd/system/buzz-ci-runner.timer",
+            "/etc/systemd/system/buzz-ci-runner.service.d/nested/20-capacity-one.conf",
+            "/etc/systemd/system/buzz-ci-runner.service.d/../20-capacity-one.conf",
+            "/etc/systemd/system//buzz-ci-runner.service",
+        )
+        for target in invalid:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
+                inputs = Path(temporary) / "inputs"
+                write_guest_package(inputs, "runner", [("payload", target, b"payload")])
+                with self.assertRaisesRegex(guest.GuestError, "unit inventory differs"):
+                    guest.expected_unit_fragments(inputs, ("runner",))
+
+    def test_guest_unit_inventory_rejects_invalid_drop_in_parent_suffix(self) -> None:
+        invalid = (
+            "/etc/systemd/system/buzz-ci-runner.timer.d/20-capacity-one.conf",
+            "/etc/systemd/system/buzz-ci-runner.service/20-capacity-one.conf",
+            "/etc/systemd/system/.service.d/20-capacity-one.conf",
+        )
+        for target in invalid:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
+                inputs = Path(temporary) / "inputs"
+                write_guest_package(inputs, "runner", [("payload", target, b"payload")])
+                with self.assertRaisesRegex(guest.GuestError, "unit inventory differs"):
+                    guest.expected_unit_fragments(inputs, ("runner",))
+
+    def test_guest_unit_inventory_rejects_invalid_drop_in_name(self) -> None:
+        invalid = (
+            "/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.txt",
+            "/etc/systemd/system/buzz-ci-runner.service.d/.conf",
+            "/etc/systemd/system/buzz-ci-runner.service.d/-hostile.conf",
+        )
+        for target in invalid:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
+                inputs = Path(temporary) / "inputs"
+                write_guest_package(inputs, "runner", [("payload", target, b"payload")])
+                with self.assertRaisesRegex(guest.GuestError, "unit inventory differs"):
+                    guest.expected_unit_fragments(inputs, ("runner",))
+
+    def test_guest_unit_inventory_retains_digest_and_conflict_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            inputs = Path(temporary) / "inputs"
+            package = write_guest_package(inputs, "runner", [(
+                "drop-in", "/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.conf",
+                b"trusted",
+            )])
+            (package / "drop-in").write_bytes(b"changed")
+            with self.assertRaisesRegex(guest.GuestError, "unit digest differs"):
+                guest.expected_unit_fragments(inputs, ("runner",))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            inputs = Path(temporary) / "inputs"
+            write_guest_package(inputs, "runner", [(
+                "runner-unit", "/usr/lib/systemd/system/buzz-ci-runner.service", b"first",
+            )])
+            write_guest_package(inputs, "controld", [(
+                "runner-unit", "/etc/systemd/system/buzz-ci-runner.service", b"second",
+            )])
+            with self.assertRaisesRegex(guest.GuestError, "unit binding conflicts"):
+                guest.expected_unit_fragments(inputs, ("runner", "controld"))
+
+    def test_guest_requires_exact_fedora_global_service_drop_in(self) -> None:
+        self.assertEqual(guest.PLATFORM_SYSTEMD, harness.PLATFORM_SYSTEMD)
+        schema = json.loads((HERE / "contract.schema.json").read_bytes())
+        self.assertEqual(schema["properties"]["platform_systemd"]["const"], guest.PLATFORM_SYSTEMD)
+        expected = (
+            HERE.parents[1]
+            / "platform/fedora-44-systemd-259/10-timeout-abort.conf"
+        ).read_bytes()
+        with mock.patch.object(guest, "read_file", return_value=expected) as opened:
+            guest.verify_platform_systemd(copy.deepcopy(guest.PLATFORM_SYSTEMD))
+        opened.assert_called_once_with(
+            Path("/usr/lib/systemd/system/service.d/10-timeout-abort.conf"),
+            guest.MAX_JSON,
+        )
+
+        mutations = []
+        for field, value in (
+            ("path", "/etc/systemd/system/service.d/10-timeout-abort.conf"),
+            ("sha256", "0" * 64),
+        ):
+            changed = copy.deepcopy(guest.PLATFORM_SYSTEMD)
+            changed["service_drop_ins"][0][field] = value
+            mutations.append(changed)
+        extra = copy.deepcopy(guest.PLATFORM_SYSTEMD)
+        extra["service_drop_ins"].append({
+            "owner": "platform",
+            "path": "/usr/lib/systemd/system/service.d/99-hostile.conf",
+            "sha256": "1" * 64,
+        })
+        mutations.append(extra)
+        mutations.append({**copy.deepcopy(guest.PLATFORM_SYSTEMD), "service_drop_ins": []})
+        for changed in mutations:
+            with self.subTest(changed=changed), self.assertRaisesRegex(
+                guest.GuestError, "platform binding differs",
+            ):
+                guest.verify_platform_systemd(changed)
+        with mock.patch.object(guest, "read_file", return_value=b"[Service]\nHostile=yes\n"):
+            with self.assertRaisesRegex(guest.GuestError, "platform file digest differs"):
+                guest.verify_platform_systemd(copy.deepcopy(guest.PLATFORM_SYSTEMD))
+
     def test_guest_cross_binds_keyholder_client_and_service_identities(self) -> None:
         public_spec = {"peer": {"uid": 1201, "gid": 1201}}
         activation = {"identities": {
@@ -1082,6 +2395,85 @@ class InputTests(unittest.TestCase):
             for name in harness.GUEST_ASSETS:
                 self.assertEqual((stage / name).read_bytes(), ("frozen-" + name).encode())
             self.assertFalse((stage / "harness.py").exists())
+
+    def test_run_stage_archive_matches_guest_scope_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            candidate = root / "candidate"
+            candidate.mkdir()
+            subprocess.run(["/usr/bin/git", "init", "--quiet", str(candidate)], check=True)
+            source = candidate / "deploy/native-ci/probe.txt"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"candidate-bound\n")
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(candidate), "add", "deploy/native-ci/probe.txt"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "/usr/bin/git", "-C", str(candidate),
+                    "-c", "user.name=Clean Host Test",
+                    "-c", "user.email=clean-host@example.invalid",
+                    "commit", "--quiet", "-m", "candidate",
+                ],
+                check=True,
+            )
+            candidate_sha = subprocess.run(
+                ["/usr/bin/git", "-C", str(candidate), "rev-parse", "HEAD^{commit}"],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+            source.write_bytes(b"uncommitted\n")
+
+            state = root / "state"
+            state.mkdir()
+            (state / "state.json").write_bytes(harness.canonical({"challenge": "1" * 64}))
+            (state / "public-binding.json").write_bytes(b"{}\n")
+            frozen = state / "frozen-assets"
+            frozen.mkdir()
+            for name in harness.GUEST_ASSETS:
+                (frozen / name).write_bytes(("frozen-" + name).encode())
+            records = {}
+            for name in harness.PACKAGE_NAMES:
+                package = root / f"package-{name}"
+                package.mkdir()
+                (package / "payload").write_bytes(name.encode())
+                records[name] = harness.tree_records(package)
+            contract = {
+                "candidate_root": str(candidate),
+                "candidate_sha": candidate_sha,
+                "harness_sha256": "2" * 64,
+                "timing_asset_sha256": "3" * 64,
+                "timing_sha256": harness.timing_sha256(),
+                "scenario": {"sha256": hashlib.sha256(b"{}\n").hexdigest()},
+                "platform_systemd": copy.deepcopy(harness.PLATFORM_SYSTEMD),
+            }
+            archive = b""
+
+            def capture_archive(stage: Path, _output: Path, _label: str) -> None:
+                nonlocal archive
+                archive = (stage / "candidate.tar").read_bytes()
+
+            with mock.patch.object(harness, "make_iso", side_effect=capture_archive), mock.patch.object(
+                harness, "make_seed",
+            ):
+                harness.create_run_stage(contract, state, records, b"{}\n", b"seccomp\n")
+
+            extracted = root / "extracted"
+            guest.extract_candidate(archive, extracted)
+            self.assertEqual(
+                (extracted / "deploy/native-ci/probe.txt").read_bytes(),
+                b"candidate-bound\n",
+            )
+            with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as handle:
+                self.assertEqual(handle.getmembers()[0].name, "deploy/native-ci")
+
+            hostile = io.BytesIO()
+            with tarfile.open(fileobj=hostile, mode="w:") as handle:
+                member = tarfile.TarInfo("outside.txt")
+                member.size = len(b"hostile\n")
+                handle.addfile(member, io.BytesIO(b"hostile\n"))
+            with self.assertRaisesRegex(guest.GuestError, "archive scope differs"):
+                guest.extract_candidate(hostile.getvalue(), root / "hostile")
 
     def test_tree_digest_rejects_links_and_binds_mode_name_and_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1283,6 +2675,7 @@ class InputTests(unittest.TestCase):
             lambda value: value.update(schema_version="wrong"),
             lambda value: value.update(candidate_sha="not-a-commit"),
             lambda value: value.update(state=["not", "a", "path"]),
+            lambda value: value["platform_systemd"]["service_drop_ins"][0].update(sha256="0" * 64),
             lambda value: value.update(extra="rejected"),
         )
         for mutate in mutations:

@@ -573,6 +573,8 @@ pub const fn response_code_name(code: ResponseCode) -> &'static str {
         ResponseCode::Reconciling => "reconciling",
         ResponseCode::StorageUnavailable => "storage_unavailable",
         ResponseCode::InternalFailure => "internal_failure",
+        ResponseCode::IssuedAfterTimeReference => "issued_after_time_reference",
+        ResponseCode::ExpiredAtTimeReference => "expired_at_time_reference",
     }
 }
 

@@ -518,7 +518,7 @@ impl<T: AdapterTransport> ProductionDriver<T> {
                 .exchange(AdapterEndpoint::Control, &bytes, timeout)
             {
                 Ok(response) => {
-                    let response: ControlResponse = parse_bounded(&response)?;
+                    let response = parse_control_response(&response)?;
                     validate_control_response(request, &response)?;
                     return Ok((response, attempt));
                 }
@@ -547,7 +547,7 @@ where
             .transport
             .exchange(AdapterEndpoint::Control, &control_bytes, timeout)
             .map_err(|_| DriverError::Transport)?;
-        let control_response: ControlResponse = parse_bounded(&response)?;
+        let control_response = parse_control_response(&response)?;
         validate_control_response(&control, &control_response)?;
 
         let adapter = AdapterRequest {
@@ -1015,6 +1015,48 @@ impl AdapterTransport for UnixAdapterTransport {
     }
 }
 
+/// Inode facts of an endpoint socket path, read without following links.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SocketInode {
+    pub is_socket: bool,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+}
+
+/// Accept only the inode the socket unit installs: a socket owned by root with
+/// the driver's group and mode `0620`. `/run/buzzci` is root-owned mode `0711`,
+/// so only root can place that inode, and `RemoveOnStop=yes` unlinks it when
+/// the socket unit stops.
+pub const fn socket_inode_accepted(inode: SocketInode, expected_gid: u32) -> bool {
+    inode.is_socket && inode.uid == 0 && inode.gid == expected_gid && inode.mode == 0o620
+}
+
+/// Credentials the kernel reports to the connecting side. `SO_PEERCRED` names
+/// the process that called `listen()`, so a connection through a systemd
+/// socket unit reports pid 1 root even though the service that accepts it runs
+/// as its own account.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ListenerPeer {
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// Accept exactly two listeners: the endpoint service itself, when it bound
+/// the socket, or pid 1 as root, when the socket unit bound it. Every other
+/// root process, an unmappable pid, and every other identity are rejected.
+/// Combined with [`socket_inode_accepted`] on the fixed path this excludes
+/// every unprivileged impersonator; root can already replace the service.
+pub const fn listener_peer_accepted(
+    peer: ListenerPeer,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> bool {
+    (peer.uid == expected_uid && peer.gid == expected_gid)
+        || (peer.pid == 1 && peer.uid == 0 && peer.gid == 0)
+}
+
 #[cfg(target_os = "linux")]
 fn exchange_unix(
     path: &Path,
@@ -1024,20 +1066,37 @@ fn exchange_unix(
     request: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>, DriverError> {
-    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-    use std::os::unix::fs::FileTypeExt;
-
     let metadata = fs::symlink_metadata(path).map_err(|_| DriverError::Transport)?;
-    if !metadata.file_type().is_socket()
-        || metadata.uid() != 0
-        || metadata.gid() != expected_socket_gid
-        || metadata.permissions().mode() & 0o7777 != 0o620
-    {
+    let inode = SocketInode {
+        is_socket: metadata.file_type().is_socket(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode: metadata.permissions().mode() & 0o7777,
+    };
+    if !socket_inode_accepted(inode, expected_socket_gid) {
         return Err(DriverError::WrongPeer);
     }
-    let mut stream = UnixStream::connect(path).map_err(|_| DriverError::Transport)?;
+    let stream = UnixStream::connect(path).map_err(|_| DriverError::Transport)?;
+    exchange_connected(stream, expected_uid, expected_gid, request, timeout)
+}
+
+#[cfg(target_os = "linux")]
+fn exchange_connected(
+    mut stream: UnixStream,
+    expected_uid: u32,
+    expected_gid: u32,
+    request: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, DriverError> {
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+
     let peer = getsockopt(&stream, PeerCredentials).map_err(|_| DriverError::WrongPeer)?;
-    if peer.uid() != expected_uid || peer.gid() != expected_gid {
+    let peer = ListenerPeer {
+        pid: peer.pid(),
+        uid: peer.uid(),
+        gid: peer.gid(),
+    };
+    if !listener_peer_accepted(peer, expected_uid, expected_gid) {
         return Err(DriverError::WrongPeer);
     }
     stream
@@ -1386,7 +1445,9 @@ trait CapacityOneRuntime {
     ) -> Result<(), ControlError>;
 }
 
-struct LiveCapacityOneRuntime;
+struct LiveCapacityOneRuntime {
+    systemctl: Systemctl,
+}
 
 impl CapacityOneRuntime for LiveCapacityOneRuntime {
     fn activate(&mut self, input: &[u8], timeout: Duration) -> Result<Vec<u8>, ControlError> {
@@ -1398,7 +1459,7 @@ impl CapacityOneRuntime for LiveCapacityOneRuntime {
         unit: &'static str,
         timeout: Duration,
     ) -> Result<UnitState, ControlError> {
-        unit_state(unit, timeout)
+        self.systemctl.unit_state(unit, timeout)
     }
 
     fn invocation(
@@ -1406,7 +1467,7 @@ impl CapacityOneRuntime for LiveCapacityOneRuntime {
         unit: &'static str,
         timeout: Duration,
     ) -> Result<String, ControlError> {
-        unit_invocation(unit, timeout)
+        self.systemctl.unit_invocation(unit, timeout)
     }
 
     fn optional_invocation(
@@ -1414,7 +1475,7 @@ impl CapacityOneRuntime for LiveCapacityOneRuntime {
         unit: &'static str,
         timeout: Duration,
     ) -> Result<String, ControlError> {
-        unit_invocation_optional(unit, timeout)
+        self.systemctl.unit_invocation_optional(unit, timeout)
     }
 
     fn fragment_path(
@@ -1422,7 +1483,7 @@ impl CapacityOneRuntime for LiveCapacityOneRuntime {
         unit: &'static str,
         timeout: Duration,
     ) -> Result<String, ControlError> {
-        unit_fragment_path(unit, timeout)
+        self.systemctl.unit_fragment_path(unit, timeout)
     }
 
     fn load_state(
@@ -1430,15 +1491,15 @@ impl CapacityOneRuntime for LiveCapacityOneRuntime {
         unit: &'static str,
         timeout: Duration,
     ) -> Result<String, ControlError> {
-        unit_property(unit, "LoadState", timeout)
+        self.systemctl.unit_property(unit, "LoadState", timeout)
     }
 
     fn sub_state(&mut self, unit: &'static str, timeout: Duration) -> Result<String, ControlError> {
-        unit_property(unit, "SubState", timeout)
+        self.systemctl.unit_property(unit, "SubState", timeout)
     }
 
     fn main_pid(&mut self, unit: &'static str, timeout: Duration) -> Result<u32, ControlError> {
-        unit_main_pid(unit, timeout)
+        self.systemctl.unit_main_pid(unit, timeout)
     }
 
     fn process_identity(
@@ -1455,9 +1516,10 @@ impl CapacityOneRuntime for LiveCapacityOneRuntime {
         timeout: Duration,
     ) -> Result<(String, String, String), ControlError> {
         Ok((
-            unit_property(unit, "User", timeout)?,
-            unit_property(unit, "Group", timeout)?,
-            unit_property(unit, "SupplementaryGroups", timeout)?,
+            self.systemctl.unit_property(unit, "User", timeout)?,
+            self.systemctl.unit_property(unit, "Group", timeout)?,
+            self.systemctl
+                .unit_property(unit, "SupplementaryGroups", timeout)?,
         ))
     }
 
@@ -1489,6 +1551,51 @@ struct CapacityOneTransition {
     runner_invocation: String,
 }
 
+/// InvocationIDs the staged services carry before capacity one starts them.
+///
+/// systemd 259 keeps the InvocationID of a stopped service until its next stop
+/// job, so after the closed qualification `buzz-ci-execd.service` is
+/// `inactive`/`dead` with `MainPID=0` and a non-empty id. A retained id is not a
+/// live process. Staleness is proven twice: now, by `SubState=dead` and
+/// `MainPID=0`; and after the controller ran, by every service reporting an id
+/// that differs from the retained one.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RetainedInvocations {
+    runner: String,
+    execd: String,
+    executor: String,
+    keyholder: String,
+}
+
+fn retained_staged_invocations<R: CapacityOneRuntime>(
+    runtime: &mut R,
+    timeout: Duration,
+) -> Result<RetainedInvocations, ControlError> {
+    let mut retained = RetainedInvocations::default();
+    for (unit, slot) in [
+        ("buzz-ci-runner.service", &mut retained.runner),
+        (EXECD_SERVICE, &mut retained.execd),
+        (EXECUTOR_SERVICE, &mut retained.executor),
+        ("buzz-ci-keyholder.service", &mut retained.keyholder),
+    ] {
+        if runtime.sub_state(unit, timeout)? != "dead" || runtime.main_pid(unit, timeout)? != 0 {
+            return Err(ControlError::StaleGeneration);
+        }
+        *slot = runtime.optional_invocation(unit, timeout)?;
+    }
+    Ok(retained)
+}
+
+/// Healthy sub-states of an `Accept=no` socket unit at capacity one.
+///
+/// systemd reports `listening` while only the socket is up and `running` once
+/// the service it triggers is active (the H6 clean host: `buzz-ci-execd.socket
+/// ... ActiveState=active SubState=running`). Both mean the listener is bound
+/// and serviceable. `failed`, `dead`, and every other value stay rejected.
+fn accept_no_socket_is_healthy(sub_state: &str) -> bool {
+    matches!(sub_state, "listening" | "running")
+}
+
 fn activate_capacity_one<R: CapacityOneRuntime>(
     config: &AcceptanceControlConfig,
     request: &ControlRequest,
@@ -1502,7 +1609,7 @@ fn activate_capacity_one<R: CapacityOneRuntime>(
         || request.expected_controller_generation != Some(config.controller_generation)
         || request.expected_runner_generation != Some(config.runner_generation)
         || !lower_hex(staged_controller_invocation, &[32])
-        || !staged_runner_invocation.is_empty()
+        || !(staged_runner_invocation.is_empty() || lower_hex(staged_runner_invocation, &[32]))
     {
         return Err(ControlError::BindingMismatch);
     }
@@ -1532,21 +1639,10 @@ fn activate_capacity_one<R: CapacityOneRuntime>(
             return Err(ControlError::ReadbackMismatch);
         }
     }
-    if runtime.invocation("buzz-ci-controld.service", timeout)? != staged_controller_invocation
-        || !runtime
-            .optional_invocation("buzz-ci-runner.service", timeout)?
-            .is_empty()
-        || !runtime
-            .optional_invocation(EXECD_SERVICE, timeout)?
-            .is_empty()
-        || !runtime
-            .optional_invocation(EXECUTOR_SERVICE, timeout)?
-            .is_empty()
-        || runtime.main_pid(EXECD_SERVICE, timeout)? != 0
-        || runtime.main_pid(EXECUTOR_SERVICE, timeout)? != 0
-    {
+    if runtime.invocation("buzz-ci-controld.service", timeout)? != staged_controller_invocation {
         return Err(ControlError::StaleGeneration);
     }
+    let retained = retained_staged_invocations(runtime, timeout)?;
 
     let body = CapacityOneRequest {
         schema_version: CAPACITY_ONE_REQUEST_SCHEMA,
@@ -1646,7 +1742,7 @@ fn activate_capacity_one<R: CapacityOneRuntime>(
         }
     }
     for unit in [EXECD_SOCKET, EXECUTOR_SOCKET] {
-        if runtime.sub_state(unit, timeout)? != "listening" {
+        if !accept_no_socket_is_healthy(&runtime.sub_state(unit, timeout)?) {
             return Err(ControlError::ReadbackMismatch);
         }
     }
@@ -1658,9 +1754,10 @@ fn activate_capacity_one<R: CapacityOneRuntime>(
     let executor_pid = runtime.main_pid(EXECUTOR_SERVICE, timeout)?;
     if controller_invocation == staged_controller_invocation
         || runner_invocation == staged_runner_invocation
-        || execd_invocation.is_empty()
-        || executor_invocation.is_empty()
-        || keyholder_invocation.is_empty()
+        || runner_invocation == retained.runner
+        || execd_invocation == retained.execd
+        || executor_invocation == retained.executor
+        || keyholder_invocation == retained.keyholder
         || execd_pid == 0
         || executor_pid == 0
     {
@@ -1716,14 +1813,18 @@ pub struct SystemdHostControl {
     controller_generation: u64,
     runner_generation: u64,
     timeout: Duration,
+    systemctl: Systemctl,
 }
 
 impl SystemdHostControl {
     pub fn open(config: AcceptanceControlConfig) -> Result<Self, ControlError> {
         validate_activation_receipt(&config)?;
         let timeout = Duration::from_secs(30);
-        let controller_invocation = unit_invocation_optional("buzz-ci-controld.service", timeout)?;
-        let runner_invocation = unit_invocation_optional("buzz-ci-runner.service", timeout)?;
+        let systemctl = Systemctl::live();
+        let controller_invocation =
+            systemctl.unit_invocation_optional("buzz-ci-controld.service", timeout)?;
+        let runner_invocation =
+            systemctl.unit_invocation_optional("buzz-ci-runner.service", timeout)?;
         Ok(Self {
             controller_generation: config.controller_generation,
             runner_generation: config.runner_generation,
@@ -1731,16 +1832,18 @@ impl SystemdHostControl {
             controller_invocation,
             runner_invocation,
             timeout,
+            systemctl,
         })
     }
 
     fn readback(&self) -> Result<ControlReadback, ControlError> {
         validate_activation_receipt(&self.config)?;
-        let target = unit_active("buzz-ci-capacity-one.target", self.timeout)?;
-        let controller = unit_active("buzz-ci-controld.service", self.timeout)?;
-        let runner = unit_active("buzz-ci-runner.socket", self.timeout)?;
-        let execd = unit_active("buzz-ci-execd.socket", self.timeout)?;
-        let keyholder = unit_active("buzz-ci-keyholder.socket", self.timeout)?;
+        let systemctl = &self.systemctl;
+        let target = systemctl.unit_active("buzz-ci-capacity-one.target", self.timeout)?;
+        let controller = systemctl.unit_active("buzz-ci-controld.service", self.timeout)?;
+        let runner = systemctl.unit_active("buzz-ci-runner.socket", self.timeout)?;
+        let execd = systemctl.unit_active("buzz-ci-execd.socket", self.timeout)?;
+        let keyholder = systemctl.unit_active("buzz-ci-keyholder.socket", self.timeout)?;
         let capacity = u32::from(target);
         let admission = if target && controller && runner && execd && keyholder {
             AdmissionState::Open
@@ -1761,30 +1864,30 @@ impl SystemdHostControl {
         })
     }
 
-    fn systemctl(&self, action: &'static str, unit: &'static str) -> Result<(), ControlError> {
-        let output = run_bounded_command("/usr/bin/systemctl", &[action, unit], self.timeout)?;
-        if output.is_empty() {
-            Ok(())
-        } else {
-            Err(ControlError::HostAction)
-        }
+    fn close_capacity(&self) -> Result<(), ControlError> {
+        close_capacity(&self.systemctl, self.timeout)
     }
 
-    fn close_capacity(&self) -> Result<(), ControlError> {
-        for unit in [
-            "buzz-ci-capacity-one.target",
-            "buzz-ci-runner.service",
-            "buzz-ci-runner.socket",
-            EXECD_SERVICE,
-            EXECD_SOCKET,
-            EXECUTOR_SERVICE,
-            EXECUTOR_SOCKET,
-            "buzz-ci-keyholder.service",
-            "buzz-ci-keyholder.socket",
-        ] {
-            self.systemctl("stop", unit)?;
+    /// A restart that reads back the same InvocationID is a stale generation:
+    /// capacity is closed before the error returns. The close is judged like
+    /// every other stop (exit status plus readback), and a close failure is
+    /// the error surfaced, because capacity-one units may still be running
+    /// and the caller must not treat the host as closed. `StaleGeneration`
+    /// is returned only once all nine units read back stopped.
+    fn stale_generation_closed(&self, unit: &str) -> ControlError {
+        match self.close_capacity() {
+            Ok(()) => ControlError::StaleGeneration,
+            Err(error) => {
+                let line = serde_json::json!({
+                    "schema_version": "buzz-ci-acceptance-control-note/v1",
+                    "event": "stale_generation_close_failed",
+                    "unit": unit,
+                    "error": error.code(),
+                });
+                eprintln!("{line}");
+                error
+            }
         }
-        Ok(())
     }
 
     fn zero_proof(&self) -> Result<ZeroProof, ControlError> {
@@ -1800,12 +1903,16 @@ impl SystemdHostControl {
             "buzz-ci-keyholder.service",
             "buzz-ci-keyholder.socket",
         ] {
-            if unit_state(unit, self.timeout)? != UnitState::Inactive {
+            if self.systemctl.unit_state(unit, self.timeout)? != UnitState::Inactive {
                 return Err(ControlError::ReadbackMismatch);
             }
         }
-        let socket_active = unit_active("buzz-ci-controld-acceptance.socket", self.timeout)?;
-        let service_active = unit_active("buzz-ci-controld.service", self.timeout)?;
+        let socket_active = self
+            .systemctl
+            .unit_active("buzz-ci-controld-acceptance.socket", self.timeout)?;
+        let service_active = self
+            .systemctl
+            .unit_active("buzz-ci-controld.service", self.timeout)?;
         let socket_present = match fs::symlink_metadata(CONTROLD_SOCKET_PATH) {
             Ok(_) => true,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -1876,7 +1983,9 @@ impl HostControl for SystemdHostControl {
         &mut self,
         request: &ControlRequest,
     ) -> Result<HostCapacityOneResult, Self::Error> {
-        let mut runtime = LiveCapacityOneRuntime;
+        let mut runtime = LiveCapacityOneRuntime {
+            systemctl: self.systemctl.clone(),
+        };
         let transition = activate_capacity_one(
             &self.config,
             request,
@@ -1891,14 +2000,18 @@ impl HostControl for SystemdHostControl {
     }
 
     fn restart_controller(&mut self) -> Result<ControlReadback, Self::Error> {
-        let before = unit_invocation("buzz-ci-controld.service", self.timeout)?;
-        self.systemctl("restart", "buzz-ci-controld.service")?;
-        let invocation = unit_invocation("buzz-ci-controld.service", self.timeout)?;
+        let before = self
+            .systemctl
+            .unit_invocation("buzz-ci-controld.service", self.timeout)?;
+        self.systemctl
+            .restart("buzz-ci-controld.service", self.timeout)?;
+        let invocation = self
+            .systemctl
+            .unit_invocation("buzz-ci-controld.service", self.timeout)?;
         if invocation == before
             || (!self.controller_invocation.is_empty() && invocation == self.controller_invocation)
         {
-            let _ = self.close_capacity();
-            return Err(ControlError::StaleGeneration);
+            return Err(self.stale_generation_closed("buzz-ci-controld.service"));
         }
         self.controller_invocation = invocation;
         self.controller_generation = self
@@ -1909,14 +2022,18 @@ impl HostControl for SystemdHostControl {
     }
 
     fn restart_runner(&mut self) -> Result<ControlReadback, Self::Error> {
-        let before = unit_invocation("buzz-ci-runner.service", self.timeout)?;
-        self.systemctl("restart", "buzz-ci-runner.service")?;
-        let invocation = unit_invocation("buzz-ci-runner.service", self.timeout)?;
+        let before = self
+            .systemctl
+            .unit_invocation("buzz-ci-runner.service", self.timeout)?;
+        self.systemctl
+            .restart("buzz-ci-runner.service", self.timeout)?;
+        let invocation = self
+            .systemctl
+            .unit_invocation("buzz-ci-runner.service", self.timeout)?;
         if invocation == before
             || (!self.runner_invocation.is_empty() && invocation == self.runner_invocation)
         {
-            let _ = self.close_capacity();
-            return Err(ControlError::StaleGeneration);
+            return Err(self.stale_generation_closed("buzz-ci-runner.service"));
         }
         self.runner_invocation = invocation;
         self.runner_generation = self
@@ -1932,8 +2049,10 @@ impl HostControl for SystemdHostControl {
     ) -> Result<ControlReadback, Self::Error> {
         let _ = self.controller_zero_action(QualificationZeroAction::Prepare, request)?;
         self.close_capacity()?;
-        self.systemctl("start", "buzz-ci-controld-acceptance.socket")?;
-        self.systemctl("start", "buzz-ci-controld.service")?;
+        reopen_controld_at_staged_zero(&self.systemctl, self.timeout)?;
+        self.controller_invocation = self
+            .systemctl
+            .unit_invocation("buzz-ci-controld.service", self.timeout)?;
         let readback = self.readback()?;
         if readback.capacity != 0 || readback.admission != AdmissionState::Closed {
             return Err(ControlError::ReadbackMismatch);
@@ -1946,8 +2065,10 @@ impl HostControl for SystemdHostControl {
         request: &ControlRequest,
     ) -> Result<HostZeroResult, Self::Error> {
         self.close_capacity()?;
-        self.systemctl("stop", "buzz-ci-controld-acceptance.socket")?;
-        self.systemctl("stop", "buzz-ci-controld.service")?;
+        self.systemctl
+            .stop("buzz-ci-controld-acceptance.socket", self.timeout)?;
+        self.systemctl
+            .stop("buzz-ci-controld.service", self.timeout)?;
         let controller_receipt_sha256 =
             self.controller_zero_action(QualificationZeroAction::Finalize, request)?;
         Ok(HostZeroResult {
@@ -1970,8 +2091,10 @@ impl HostControl for SystemdHostControl {
 
     fn emergency_capacity_zero(&mut self) -> Result<ZeroProof, Self::Error> {
         self.close_capacity()?;
-        self.systemctl("stop", "buzz-ci-controld-acceptance.socket")?;
-        self.systemctl("stop", "buzz-ci-controld.service")?;
+        self.systemctl
+            .stop("buzz-ci-controld-acceptance.socket", self.timeout)?;
+        self.systemctl
+            .stop("buzz-ci-controld.service", self.timeout)?;
         self.zero_proof()
     }
 }
@@ -1989,6 +2112,19 @@ fn activation_receipt(
     .map_err(|_| ControlError::InvalidConfig)?;
     let value: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| ControlError::InvalidConfig)?;
+    validate_live_activation_receipt(&value, config)?;
+    Ok((bytes, value))
+}
+
+/// The activation receipt must bind this activation and sit in a live phase:
+/// staged zero, the closed qualification, activation, capacity one, or the
+/// qualification-zero prepare the acceptance host itself drives (the
+/// controller records `preparing_zero` between prepare and finalize, and the
+/// prepare readback happens inside that window).
+fn validate_live_activation_receipt(
+    value: &serde_json::Value,
+    config: &AcceptanceControlConfig,
+) -> Result<(), ControlError> {
     if value.get("activation_id").and_then(|item| item.as_str()) != Some(&config.activation_id)
         || value.get("package_digest").and_then(|item| item.as_str())
             != Some(&config.activation_package_digest)
@@ -1996,12 +2132,14 @@ fn activation_receipt(
             != Some(&config.integrated_candidate_sha)
         || !matches!(
             value.get("state").and_then(|item| item.as_str()),
-            Some("staged_zero" | "qualified_closed" | "activating" | "active_one")
+            Some(
+                "staged_zero" | "qualified_closed" | "activating" | "active_one" | "preparing_zero"
+            )
         )
     {
         return Err(ControlError::BindingMismatch);
     }
-    Ok((bytes, value))
+    Ok(())
 }
 
 fn validate_activation_receipt(config: &AcceptanceControlConfig) -> Result<(), ControlError> {
@@ -2032,107 +2170,253 @@ fn active_activation_receipt_sha256(
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
-fn unit_state(unit: &'static str, timeout: Duration) -> Result<UnitState, ControlError> {
-    let output = run_bounded_command(
-        "/usr/bin/systemctl",
-        &["show", "--property=ActiveState", "--value", unit],
-        timeout,
-    )?;
-    match output.as_slice() {
-        b"active\n" => Ok(UnitState::Active),
-        b"inactive\n" => Ok(UnitState::Inactive),
-        b"failed\n" => Ok(UnitState::Failed),
-        _ => Err(ControlError::ReadbackMismatch),
+/// Output of one bounded host command that exited successfully.
+///
+/// stderr is informational. systemd 259 prints advisory text on a successful
+/// `systemctl stop <service>` while the service's socket unit is still active
+/// ("Stopping 'buzz-ci-runner.service', but its triggering units are still
+/// active:\nbuzz-ci-runner.socket"). Success is the exit status plus the
+/// caller's readback, never the absence of stderr.
+struct HostCommandOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// The fixed systemctl executable; tests substitute a fixture program.
+#[derive(Clone, Debug)]
+struct Systemctl {
+    program: PathBuf,
+}
+
+/// Capacity-one units in the fixed stop order shared with the activation
+/// controller (`STOP_ORDER`): target first, then each service before its
+/// socket.
+const CAPACITY_ONE_STOP_ORDER: [&str; 9] = [
+    "buzz-ci-capacity-one.target",
+    "buzz-ci-runner.service",
+    "buzz-ci-runner.socket",
+    EXECD_SERVICE,
+    EXECD_SOCKET,
+    EXECUTOR_SERVICE,
+    EXECUTOR_SOCKET,
+    "buzz-ci-keyholder.service",
+    "buzz-ci-keyholder.socket",
+];
+
+/// Stops every capacity-one unit. Each stop is judged by exit status plus
+/// readback, so systemd's advisory stderr never ends the sequence early (the
+/// H6 clean host stopped after `buzz-ci-runner.service` and left the runner
+/// socket, execd, executor, and keyholder running on every zero path).
+fn close_capacity(systemctl: &Systemctl, timeout: Duration) -> Result<(), ControlError> {
+    for unit in CAPACITY_ONE_STOP_ORDER {
+        systemctl.stop(unit, timeout)?;
     }
+    Ok(())
 }
 
-fn unit_active(unit: &'static str, timeout: Duration) -> Result<bool, ControlError> {
-    Ok(unit_state(unit, timeout)? == UnitState::Active)
-}
-
-fn unit_invocation(unit: &'static str, timeout: Duration) -> Result<String, ControlError> {
-    let output = run_bounded_command(
-        "/usr/bin/systemctl",
-        &["show", "--property=InvocationID", "--value", unit],
-        timeout,
-    )?;
-    let value = std::str::from_utf8(&output)
-        .map_err(|_| ControlError::ReadbackMismatch)?
-        .trim();
-    if lower_hex(value, &[32]) {
-        Ok(value.to_owned())
-    } else {
-        Err(ControlError::ReadbackMismatch)
-    }
-}
-
-fn unit_invocation_optional(unit: &'static str, timeout: Duration) -> Result<String, ControlError> {
-    let output = run_bounded_command(
-        "/usr/bin/systemctl",
-        &["show", "--property=InvocationID", "--value", unit],
-        timeout,
-    )?;
-    let value = std::str::from_utf8(&output)
-        .map_err(|_| ControlError::ReadbackMismatch)?
-        .trim();
-    if value.is_empty() || lower_hex(value, &[32]) {
-        Ok(value.to_owned())
-    } else {
-        Err(ControlError::ReadbackMismatch)
-    }
-}
-
-fn unit_fragment_path(unit: &'static str, timeout: Duration) -> Result<String, ControlError> {
-    let output = run_bounded_command(
-        "/usr/bin/systemctl",
-        &["show", "--property=FragmentPath", "--value", unit],
-        timeout,
-    )?;
-    let value = std::str::from_utf8(&output)
-        .map_err(|_| ControlError::ReadbackMismatch)?
-        .strip_suffix('\n')
-        .ok_or(ControlError::ReadbackMismatch)?;
-    if valid_absolute(Path::new(value)) {
-        Ok(value.to_owned())
-    } else {
-        Err(ControlError::ReadbackMismatch)
-    }
-}
-
-fn unit_property(
-    unit: &'static str,
-    property: &'static str,
+/// Reopens controld at staged zero after the controller's prepare wrote the
+/// staged configs: controld reads its capacity once at start, so the
+/// capacity-one process is stopped (socket first, then service, the finalize
+/// order) and started again into the zero configuration, where it serves the
+/// stage-13 durable snapshot as the capacity-zero service. The controller
+/// generation does not move: this is the activation's own transition, not
+/// an observed restart.
+fn reopen_controld_at_staged_zero(
+    systemctl: &Systemctl,
     timeout: Duration,
-) -> Result<String, ControlError> {
-    let property_argument = match property {
-        "LoadState" => "--property=LoadState",
-        "SubState" => "--property=SubState",
-        "MainPID" => "--property=MainPID",
-        "User" => "--property=User",
-        "Group" => "--property=Group",
-        "SupplementaryGroups" => "--property=SupplementaryGroups",
-        _ => return Err(ControlError::ReadbackMismatch),
-    };
-    let output = run_bounded_command(
-        "/usr/bin/systemctl",
-        &["show", property_argument, "--value", unit],
-        timeout,
-    )?;
-    let value = std::str::from_utf8(&output)
-        .map_err(|_| ControlError::ReadbackMismatch)?
-        .strip_suffix('\n')
-        .ok_or(ControlError::ReadbackMismatch)?;
-    if value.contains(['\n', '\r']) {
-        Err(ControlError::ReadbackMismatch)
-    } else {
-        Ok(value.to_owned())
-    }
+) -> Result<(), ControlError> {
+    systemctl.stop("buzz-ci-controld-acceptance.socket", timeout)?;
+    systemctl.stop("buzz-ci-controld.service", timeout)?;
+    systemctl.start("buzz-ci-controld-acceptance.socket", timeout)?;
+    systemctl.start("buzz-ci-controld.service", timeout)
 }
 
-fn unit_main_pid(unit: &'static str, timeout: Duration) -> Result<u32, ControlError> {
-    unit_property(unit, "MainPID", timeout)?
-        .parse()
-        .map_err(|_| ControlError::ReadbackMismatch)
+/// Journal line for advisory stderr from a host command that exited zero.
+fn host_command_note(program: &str, arguments: &[&str], stderr: &[u8]) {
+    const MAX_NOTE_BYTES: usize = 1024;
+    let shown = &stderr[..stderr.len().min(MAX_NOTE_BYTES)];
+    let line = serde_json::json!({
+        "schema_version": "buzz-ci-acceptance-control-note/v1",
+        "event": "host_command_stderr",
+        "program": program,
+        "arguments": arguments,
+        "stderr": String::from_utf8_lossy(shown),
+        "truncated": stderr.len() > MAX_NOTE_BYTES,
+    });
+    eprintln!("{line}");
+}
+
+impl Systemctl {
+    fn live() -> Self {
+        Self {
+            program: PathBuf::from("/usr/bin/systemctl"),
+        }
+    }
+
+    fn run(
+        &self,
+        arguments: &[&str],
+        timeout: Duration,
+    ) -> Result<HostCommandOutput, ControlError> {
+        let output = run_bounded_command(&self.program, arguments, timeout)?;
+        if !output.stderr.is_empty() {
+            host_command_note("systemctl", arguments, &output.stderr);
+        }
+        Ok(output)
+    }
+
+    /// `systemctl stop`, judged by exit status and the post-stop readback: the
+    /// unit must be `inactive`/`dead`, or `failed`/`failed` for a unit whose
+    /// last run failed (nothing runs; the zero proof still demands inactive).
+    /// Exit status nonzero, or a unit that still reads back active, fails.
+    fn stop(&self, unit: &'static str, timeout: Duration) -> Result<(), ControlError> {
+        self.run(&["stop", unit], timeout)?;
+        let state = self.unit_state(unit, timeout)?;
+        let sub_state = self.unit_property(unit, "SubState", timeout)?;
+        match (state, sub_state.as_str()) {
+            (UnitState::Inactive, "dead") | (UnitState::Failed, "failed") => Ok(()),
+            _ => Err(ControlError::HostAction),
+        }
+    }
+
+    /// `systemctl start`, judged by exit status and an `active` readback.
+    fn start(&self, unit: &'static str, timeout: Duration) -> Result<(), ControlError> {
+        self.run(&["start", unit], timeout)?;
+        self.require_active(unit, timeout)
+    }
+
+    /// `systemctl restart`, judged by exit status and an `active` readback;
+    /// callers compare the InvocationID around it.
+    fn restart(&self, unit: &'static str, timeout: Duration) -> Result<(), ControlError> {
+        self.run(&["restart", unit], timeout)?;
+        self.require_active(unit, timeout)
+    }
+
+    fn require_active(&self, unit: &'static str, timeout: Duration) -> Result<(), ControlError> {
+        if self.unit_state(unit, timeout)? == UnitState::Active {
+            Ok(())
+        } else {
+            Err(ControlError::HostAction)
+        }
+    }
+
+    fn unit_state(&self, unit: &'static str, timeout: Duration) -> Result<UnitState, ControlError> {
+        let output = self
+            .run(
+                &["show", "--property=ActiveState", "--value", unit],
+                timeout,
+            )?
+            .stdout;
+        match output.as_slice() {
+            b"active\n" => Ok(UnitState::Active),
+            b"inactive\n" => Ok(UnitState::Inactive),
+            b"failed\n" => Ok(UnitState::Failed),
+            _ => Err(ControlError::ReadbackMismatch),
+        }
+    }
+
+    fn unit_active(&self, unit: &'static str, timeout: Duration) -> Result<bool, ControlError> {
+        Ok(self.unit_state(unit, timeout)? == UnitState::Active)
+    }
+
+    fn unit_invocation(
+        &self,
+        unit: &'static str,
+        timeout: Duration,
+    ) -> Result<String, ControlError> {
+        let output = self
+            .run(
+                &["show", "--property=InvocationID", "--value", unit],
+                timeout,
+            )?
+            .stdout;
+        let value = std::str::from_utf8(&output)
+            .map_err(|_| ControlError::ReadbackMismatch)?
+            .trim();
+        if lower_hex(value, &[32]) {
+            Ok(value.to_owned())
+        } else {
+            Err(ControlError::ReadbackMismatch)
+        }
+    }
+
+    fn unit_invocation_optional(
+        &self,
+        unit: &'static str,
+        timeout: Duration,
+    ) -> Result<String, ControlError> {
+        let output = self
+            .run(
+                &["show", "--property=InvocationID", "--value", unit],
+                timeout,
+            )?
+            .stdout;
+        let value = std::str::from_utf8(&output)
+            .map_err(|_| ControlError::ReadbackMismatch)?
+            .trim();
+        if value.is_empty() || lower_hex(value, &[32]) {
+            Ok(value.to_owned())
+        } else {
+            Err(ControlError::ReadbackMismatch)
+        }
+    }
+
+    fn unit_fragment_path(
+        &self,
+        unit: &'static str,
+        timeout: Duration,
+    ) -> Result<String, ControlError> {
+        let output = self
+            .run(
+                &["show", "--property=FragmentPath", "--value", unit],
+                timeout,
+            )?
+            .stdout;
+        let value = std::str::from_utf8(&output)
+            .map_err(|_| ControlError::ReadbackMismatch)?
+            .strip_suffix('\n')
+            .ok_or(ControlError::ReadbackMismatch)?;
+        if valid_absolute(Path::new(value)) {
+            Ok(value.to_owned())
+        } else {
+            Err(ControlError::ReadbackMismatch)
+        }
+    }
+
+    fn unit_property(
+        &self,
+        unit: &'static str,
+        property: &'static str,
+        timeout: Duration,
+    ) -> Result<String, ControlError> {
+        let property_argument = match property {
+            "LoadState" => "--property=LoadState",
+            "SubState" => "--property=SubState",
+            "MainPID" => "--property=MainPID",
+            "User" => "--property=User",
+            "Group" => "--property=Group",
+            "SupplementaryGroups" => "--property=SupplementaryGroups",
+            _ => return Err(ControlError::ReadbackMismatch),
+        };
+        let output = self
+            .run(&["show", property_argument, "--value", unit], timeout)?
+            .stdout;
+        let value = std::str::from_utf8(&output)
+            .map_err(|_| ControlError::ReadbackMismatch)?
+            .strip_suffix('\n')
+            .ok_or(ControlError::ReadbackMismatch)?;
+        if value.contains(['\n', '\r']) {
+            Err(ControlError::ReadbackMismatch)
+        } else {
+            Ok(value.to_owned())
+        }
+    }
+
+    fn unit_main_pid(&self, unit: &'static str, timeout: Duration) -> Result<u32, ControlError> {
+        self.unit_property(unit, "MainPID", timeout)?
+            .parse()
+            .map_err(|_| ControlError::ReadbackMismatch)
+    }
 }
 
 fn live_process_identity(pid: u32) -> Result<ProcessIdentity, ControlError> {
@@ -2185,10 +2469,10 @@ fn live_socket_identity(path: &Path) -> Result<SocketIdentity, ControlError> {
 }
 
 fn run_bounded_command(
-    program: &'static str,
-    args: &[&'static str],
+    program: &Path,
+    args: &[&str],
     timeout: Duration,
-) -> Result<Vec<u8>, ControlError> {
+) -> Result<HostCommandOutput, ControlError> {
     const MAX_OUTPUT: usize = 64 * 1024;
     let mut child = Command::new(program)
         .args(args)
@@ -2219,10 +2503,10 @@ fn run_bounded_command(
     let stderr = stderr_reader
         .join()
         .map_err(|_| ControlError::HostAction)??;
-    if !status.success() || !stderr.is_empty() {
+    if !status.success() {
         return Err(ControlError::HostAction);
     }
-    Ok(stdout)
+    Ok(HostCommandOutput { stdout, stderr })
 }
 
 fn run_bounded_controller(
@@ -2715,7 +2999,68 @@ pub enum ControlError {
     Ledger,
 }
 
+/// Schema of the rejection frame the root helper writes before it closes a
+/// rejected connection, so the driver reads a reason instead of an empty frame.
+pub const CONTROL_ERROR_SCHEMA: &str = "buzz-ci-acceptance-control-error/v1";
+
+/// Structured rejection returned by the root helper. It names only the error
+/// class; the helper's own journal line carries the same code.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlErrorFrame {
+    pub schema_version: String,
+    pub code: String,
+    pub message: String,
+}
+
+impl ControlErrorFrame {
+    pub fn new(error: ControlError) -> Self {
+        Self {
+            schema_version: CONTROL_ERROR_SCHEMA.to_owned(),
+            code: error.code().to_owned(),
+            message: error.message().to_owned(),
+        }
+    }
+
+    /// Driver-side classification of a helper rejection.
+    pub fn driver_error(&self) -> DriverError {
+        match self.code.as_str() {
+            "stale_generation" => DriverError::StaleGeneration,
+            "binding_mismatch" | "replay_mismatch" | "invalid_config" => {
+                DriverError::BindingMismatch
+            }
+            _ => DriverError::Protocol,
+        }
+    }
+}
+
+/// Parse a helper response: either the bound [`ControlResponse`] or a
+/// [`ControlErrorFrame`], which fails closed with its classified error.
+fn parse_control_response(bytes: &[u8]) -> Result<ControlResponse, DriverError> {
+    if bytes.is_empty() || bytes.len() > MAX_ADAPTER_FRAME_BYTES {
+        return Err(DriverError::FrameTooLarge);
+    }
+    if let Ok(frame) = serde_json::from_slice::<ControlErrorFrame>(bytes) {
+        if frame.schema_version == CONTROL_ERROR_SCHEMA {
+            return Err(frame.driver_error());
+        }
+    }
+    parse_bounded(bytes)
+}
+
 impl ControlError {
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::InvalidConfig => "control configuration rejected",
+            Self::BindingMismatch => "control binding rejected",
+            Self::HostAction => "host action failed",
+            Self::ReadbackMismatch => "host readback rejected",
+            Self::StaleGeneration => "host generation rejected",
+            Self::ReplayMismatch => "operation replay rejected",
+            Self::Ledger => "operation ledger unavailable",
+        }
+    }
+
     pub const fn code(self) -> &'static str {
         match self {
             Self::InvalidConfig => "invalid_config",
@@ -3671,6 +4016,9 @@ mod tests {
             let output = run_bounded_controller_command(command, input, timeout)?;
             let mut state: serde_json::Value =
                 serde_json::from_slice(&fs::read(&self.state).unwrap()).unwrap();
+            // The fake controller models the live transition for the units it
+            // knows; the executor pair is layered here with the same shape: an
+            // `Accept=no` socket reports `running` once its service is up.
             for unit in [
                 EXECD_SERVICE,
                 EXECD_SOCKET,
@@ -3679,9 +4027,8 @@ mod tests {
             ] {
                 state["units"][unit]["state"] = "active".into();
                 state["units"][unit]["load_state"] = "loaded".into();
+                state["units"][unit]["sub_state"] = "running".into();
             }
-            state["units"][EXECD_SOCKET]["sub_state"] = "listening".into();
-            state["units"][EXECUTOR_SOCKET]["sub_state"] = "listening".into();
             state["units"][EXECD_SERVICE]["invocation_id"] = hex('4', 32).into();
             state["units"][EXECD_SERVICE]["main_pid"] = 404.into();
             state["units"][EXECUTOR_SERVICE]["invocation_id"] = hex('6', 32).into();
@@ -3730,6 +4077,15 @@ mod tests {
                 }
                 "unloaded_execd_socket" => {
                     state["units"][EXECD_SOCKET]["load_state"] = "not-found".into();
+                }
+                "listening_execd_socket" => {
+                    state["units"][EXECD_SOCKET]["sub_state"] = "listening".into();
+                }
+                "dead_execd_socket" => {
+                    state["units"][EXECD_SOCKET]["sub_state"] = "dead".into();
+                }
+                "failed_executor_socket" => {
+                    state["units"][EXECUTOR_SOCKET]["sub_state"] = "failed".into();
                 }
                 _ => {}
             }
@@ -4044,14 +4400,14 @@ mod tests {
         assert_eq!(runtime.controller_calls, 1);
         let state = runtime.state();
         assert_eq!(state["units"][EXECD_SERVICE]["load_state"], "loaded");
-        assert_eq!(state["units"][EXECD_SOCKET]["sub_state"], "listening");
+        assert_eq!(state["units"][EXECD_SOCKET]["sub_state"], "running");
         assert_eq!(state["units"][EXECUTOR_SERVICE]["load_state"], "loaded");
         assert_eq!(state["units"][EXECUTOR_SERVICE]["main_pid"], 606);
         assert_eq!(
             state["units"][EXECUTOR_SERVICE]["fragment_path"],
             "/usr/lib/systemd/system/buzz-ci-executor.service"
         );
-        assert_eq!(state["units"][EXECUTOR_SOCKET]["sub_state"], "listening");
+        assert_eq!(state["units"][EXECUTOR_SOCKET]["sub_state"], "running");
         assert_eq!(state["executor_socket"]["uid"], 0);
         assert_eq!(state["executor_socket"]["gid"], 0);
         assert_eq!(state["executor_socket"]["mode"], 0o600);
@@ -4081,6 +4437,119 @@ mod tests {
             Err(ControlError::ReadbackMismatch)
         );
         assert_eq!(runtime.controller_calls, 0);
+    }
+
+    #[test]
+    fn retained_invocation_ids_on_dead_units_do_not_block_capacity_one() {
+        // systemd 259 keeps a stopped unit's InvocationID until its next stop
+        // job. After the closed qualification execd is inactive/dead with
+        // MainPID=0 and a retained id; that is not a live process.
+        let (_directory, mut runtime, config, request) = capacity_one_fixture("success");
+        let mut state = runtime.state();
+        for unit in [
+            EXECD_SERVICE,
+            EXECD_SOCKET,
+            EXECUTOR_SOCKET,
+            "buzz-ci-runner.service",
+        ] {
+            state["units"][unit]["invocation_id"] = hex('f', 32).into();
+        }
+        fs::write(&runtime.state, serde_json::to_vec(&state).unwrap()).unwrap();
+        let transition = activate_capacity_one(
+            &config,
+            &request,
+            &hex('1', 32),
+            &hex('f', 32),
+            Duration::from_millis(500),
+            &mut runtime,
+        )
+        .unwrap();
+        assert_eq!(transition.result.readback.capacity, 1);
+        assert_eq!(transition.result.readback.admission, AdmissionState::Open);
+        assert_eq!(transition.runner_invocation, hex('3', 32));
+        assert_eq!(runtime.controller_calls, 1);
+    }
+
+    #[test]
+    fn dead_unit_with_a_live_substate_or_main_pid_is_stale_before_the_controller_runs() {
+        for (field, value) in [
+            ("sub_state", serde_json::json!("auto-restart")),
+            ("main_pid", serde_json::json!(404)),
+        ] {
+            let (_directory, mut runtime, config, request) = capacity_one_fixture("success");
+            let mut state = runtime.state();
+            state["units"][EXECD_SERVICE]["invocation_id"] = hex('f', 32).into();
+            state["units"][EXECD_SERVICE][field] = value;
+            fs::write(&runtime.state, serde_json::to_vec(&state).unwrap()).unwrap();
+            assert_eq!(
+                activate_capacity_one(
+                    &config,
+                    &request,
+                    &hex('1', 32),
+                    "",
+                    Duration::from_millis(500),
+                    &mut runtime,
+                )
+                .map(|_| ()),
+                Err(ControlError::StaleGeneration),
+                "{field}"
+            );
+            assert_eq!(runtime.controller_calls, 0, "{field}");
+        }
+    }
+
+    #[test]
+    fn unchanged_invocation_id_after_the_controller_ran_is_stale() {
+        // The fixture controller reports hex('4') for execd afterwards; a
+        // retained id equal to it means the unit was never restarted.
+        let (_directory, mut runtime, config, request) = capacity_one_fixture("success");
+        let mut state = runtime.state();
+        state["units"][EXECD_SERVICE]["invocation_id"] = hex('4', 32).into();
+        fs::write(&runtime.state, serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(
+            activate_capacity_one(
+                &config,
+                &request,
+                &hex('1', 32),
+                "",
+                Duration::from_millis(500),
+                &mut runtime,
+            )
+            .map(|_| ()),
+            Err(ControlError::StaleGeneration)
+        );
+        assert_eq!(runtime.controller_calls, 1);
+    }
+
+    #[test]
+    fn control_error_frames_are_classified_and_never_parsed_as_responses() {
+        let frame = ControlErrorFrame::new(ControlError::StaleGeneration);
+        assert_eq!(frame.schema_version, CONTROL_ERROR_SCHEMA);
+        assert_eq!(frame.code, "stale_generation");
+        assert_eq!(frame.message, "host generation rejected");
+        for (error, expected) in [
+            (ControlError::StaleGeneration, DriverError::StaleGeneration),
+            (ControlError::BindingMismatch, DriverError::BindingMismatch),
+            (ControlError::ReplayMismatch, DriverError::BindingMismatch),
+            (ControlError::InvalidConfig, DriverError::BindingMismatch),
+            (ControlError::HostAction, DriverError::Protocol),
+            (ControlError::ReadbackMismatch, DriverError::Protocol),
+            (ControlError::Ledger, DriverError::Protocol),
+        ] {
+            let bytes = serde_json::to_vec(&ControlErrorFrame::new(error)).unwrap();
+            assert_eq!(parse_control_response(&bytes).err(), Some(expected));
+        }
+        assert_eq!(
+            parse_control_response(b"").err(),
+            Some(DriverError::FrameTooLarge)
+        );
+        assert_eq!(
+            parse_control_response(
+                b"{\"schema_version\":\"other\",\"code\":\"x\",\"message\":\"y\"}"
+            )
+            .err(),
+            Some(DriverError::Protocol)
+        );
     }
 
     #[test]
@@ -4115,6 +4584,57 @@ mod tests {
                 run_capacity_one_fixture(mode).err().unwrap(),
                 expected,
                 "mode {mode} must fail closed"
+            );
+        }
+    }
+
+    /// H6 clean host, canary stage 2: the controller returned `active_one`
+    /// and `buzz-ci-execd.socket` read back `ActiveState=active
+    /// SubState=running` (an `Accept=no` socket whose service is up), which
+    /// the helper rejected as a readback mismatch. Both fakes now model that
+    /// transition, so the default success path exercises `running`;
+    /// `listening` (socket up before its service) stays accepted and
+    /// `dead` or `failed` stay rejected.
+    #[test]
+    fn accept_no_socket_running_with_its_service_is_a_healthy_capacity_one_readback() {
+        let (transition, runtime) = run_capacity_one_fixture("success").unwrap();
+        let state = runtime.state();
+        assert_eq!(state["units"][EXECD_SOCKET]["sub_state"], "running");
+        assert_eq!(state["units"][EXECD_SERVICE]["sub_state"], "running");
+        assert_eq!(state["units"][EXECUTOR_SOCKET]["sub_state"], "running");
+        assert_eq!(
+            state["units"]["buzz-ci-runner.socket"]["sub_state"],
+            "running"
+        );
+        assert_eq!(transition.result.readback.capacity, 1);
+
+        let (transition, runtime) = run_capacity_one_fixture("listening_execd_socket").unwrap();
+        assert_eq!(
+            runtime.state()["units"][EXECD_SOCKET]["sub_state"],
+            "listening"
+        );
+        assert_eq!(transition.result.readback.capacity, 1);
+
+        for mode in ["dead_execd_socket", "failed_executor_socket"] {
+            assert_eq!(
+                run_capacity_one_fixture(mode).err().unwrap(),
+                ControlError::ReadbackMismatch,
+                "mode {mode} must fail closed"
+            );
+        }
+        for (sub_state, healthy) in [
+            ("listening", true),
+            ("running", true),
+            ("dead", false),
+            ("failed", false),
+            ("inactive", false),
+            ("", false),
+            ("Listening", false),
+        ] {
+            assert_eq!(
+                accept_no_socket_is_healthy(sub_state),
+                healthy,
+                "{sub_state:?}"
             );
         }
     }
@@ -4207,5 +4727,514 @@ mod tests {
         );
         assert_eq!(result, Err(ControlError::HostAction));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// The exact advisory systemd 259 prints on a successful
+    /// `systemctl stop <service>` while the service's socket still listens
+    /// (H6 clean host, diagnostic boot 4, rc 0).
+    const STOP_ADVISORY: &str =
+        "Stopping 'buzz-ci-runner.service', but its triggering units are still active:\nbuzz-ci-runner.socket\n";
+
+    /// A systemd-259-shaped fake systemctl: `stop` records the unit and prints
+    /// the advisory for a service whose socket is still up; `show` answers
+    /// ActiveState and SubState from the recorded set and a fixed InvocationID
+    /// (`restart` never changes it, so every restart reads back stale). Marker
+    /// files switch the failure shapes on: `fail-stop` (rc 1) and
+    /// `ignore-stop` (rc 0, unit stays active).
+    fn fake_systemctl(directory: &Path) -> Systemctl {
+        let dir = directory.display();
+        let script = format!(
+            r#"#!/bin/sh
+dir='{dir}'
+printf '%s\n' "$*" >> "$dir/calls"
+case "$1" in
+  stop)
+    unit=$2
+    if [ -e "$dir/fail-stop" ]; then
+      echo "Failed to stop $unit: refused by fixture" >&2
+      exit 1
+    fi
+    if [ ! -e "$dir/ignore-stop" ]; then
+      printf '%s\n' "$unit" >> "$dir/stopped"
+    fi
+    case "$unit" in
+      *.service)
+        socket="${{unit%.service}}.socket"
+        if ! grep -qxF "$socket" "$dir/stopped" 2>/dev/null; then
+          printf "Stopping '%s', but its triggering units are still active:\n%s\n" "$unit" "$socket" >&2
+        fi
+        ;;
+    esac
+    exit 0
+    ;;
+  start|restart)
+    unit=$2
+    if [ -e "$dir/stopped" ]; then
+      grep -vxF "$unit" "$dir/stopped" > "$dir/stopped.new"
+      mv "$dir/stopped.new" "$dir/stopped"
+    fi
+    exit 0
+    ;;
+  show)
+    unit=$4
+    stopped=0
+    if [ -e "$dir/stopped" ] && grep -qxF "$unit" "$dir/stopped"; then stopped=1; fi
+    case "$2" in
+      --property=ActiveState) if [ "$stopped" = 1 ]; then echo inactive; else echo active; fi ;;
+      --property=SubState) if [ "$stopped" = 1 ]; then echo dead; else echo running; fi ;;
+      --property=InvocationID) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
+      *) exit 1 ;;
+    esac
+    exit 0
+    ;;
+esac
+exit 1
+"#
+        );
+        let program = directory.join("systemctl");
+        fs::write(&program, script).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        Systemctl { program }
+    }
+
+    /// H6 clean host: every zero path aborted after the first service stop
+    /// because `run_bounded_command` treated systemd's advisory stderr as a
+    /// failed host action. Stop is now judged by exit status plus the
+    /// post-stop readback; the advisory is informational.
+    #[test]
+    fn systemctl_stop_advisory_stderr_is_informational_and_close_capacity_completes() {
+        let directory = tempfile::tempdir().unwrap();
+        let systemctl = fake_systemctl(directory.path());
+        let timeout = Duration::from_secs(5);
+
+        let output = run_bounded_command(
+            &systemctl.program,
+            &["stop", "buzz-ci-runner.service"],
+            timeout,
+        )
+        .unwrap();
+        assert_eq!(output.stdout, b"");
+        assert_eq!(std::str::from_utf8(&output.stderr).unwrap(), STOP_ADVISORY);
+        fs::remove_file(directory.path().join("stopped")).unwrap();
+        fs::remove_file(directory.path().join("calls")).unwrap();
+
+        systemctl.stop("buzz-ci-runner.service", timeout).unwrap();
+        assert_eq!(
+            fs::read_to_string(directory.path().join("calls")).unwrap(),
+            "stop buzz-ci-runner.service\n\
+             show --property=ActiveState --value buzz-ci-runner.service\n\
+             show --property=SubState --value buzz-ci-runner.service\n"
+        );
+        fs::remove_file(directory.path().join("stopped")).unwrap();
+
+        close_capacity(&systemctl, timeout).unwrap();
+        let stopped = fs::read_to_string(directory.path().join("stopped")).unwrap();
+        assert_eq!(
+            stopped.lines().collect::<Vec<_>>(),
+            CAPACITY_ONE_STOP_ORDER.to_vec()
+        );
+        for unit in CAPACITY_ONE_STOP_ORDER {
+            assert_eq!(
+                systemctl.unit_state(unit, timeout).unwrap(),
+                UnitState::Inactive
+            );
+        }
+
+        systemctl.start("buzz-ci-runner.socket", timeout).unwrap();
+        assert_eq!(
+            systemctl
+                .unit_state("buzz-ci-runner.socket", timeout)
+                .unwrap(),
+            UnitState::Active
+        );
+        systemctl.restart("buzz-ci-runner.socket", timeout).unwrap();
+
+        fs::write(directory.path().join("ignore-stop"), b"").unwrap();
+        assert_eq!(
+            systemctl.stop("buzz-ci-runner.socket", timeout),
+            Err(ControlError::HostAction)
+        );
+        fs::remove_file(directory.path().join("ignore-stop")).unwrap();
+        fs::write(directory.path().join("fail-stop"), b"").unwrap();
+        assert_eq!(
+            systemctl.stop("buzz-ci-runner.socket", timeout),
+            Err(ControlError::HostAction)
+        );
+        assert_eq!(
+            close_capacity(&systemctl, timeout),
+            Err(ControlError::HostAction)
+        );
+    }
+
+    /// H10 clean host, boot 8: stage 13's prepare wrote the staged zero
+    /// configs and closed capacity, but controld kept running as the
+    /// capacity-one service (it reads its capacity once at start), refused
+    /// sequence 13 and exited closed. Prepare now reopens controld at staged
+    /// zero: socket and service stopped in the finalize order, then started.
+    #[test]
+    fn prepare_reopens_controld_at_staged_zero_in_the_finalize_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let systemctl = fake_systemctl(directory.path());
+        let timeout = Duration::from_secs(5);
+        reopen_controld_at_staged_zero(&systemctl, timeout).unwrap();
+        let calls = fs::read_to_string(directory.path().join("calls")).unwrap();
+        let transitions: Vec<&str> = calls
+            .lines()
+            .filter(|line| line.starts_with("stop ") || line.starts_with("start "))
+            .collect();
+        assert_eq!(
+            transitions,
+            [
+                "stop buzz-ci-controld-acceptance.socket",
+                "stop buzz-ci-controld.service",
+                "start buzz-ci-controld-acceptance.socket",
+                "start buzz-ci-controld.service",
+            ]
+        );
+        for unit in [
+            "buzz-ci-controld-acceptance.socket",
+            "buzz-ci-controld.service",
+        ] {
+            assert_eq!(
+                systemctl.unit_state(unit, timeout).unwrap(),
+                UnitState::Active
+            );
+        }
+        fs::write(directory.path().join("fail-stop"), b"").unwrap();
+        assert_eq!(
+            reopen_controld_at_staged_zero(&systemctl, timeout),
+            Err(ControlError::HostAction)
+        );
+    }
+
+    /// Sol focus read of head Q, finding 11: a restart that read back a stale
+    /// InvocationID discarded the result of `close_capacity` and returned
+    /// `StaleGeneration`, so capacity-one units could stay running while the
+    /// driver treated the host as closed. The close failure is now the error
+    /// surfaced; `StaleGeneration` is returned only after the nine-unit stop
+    /// order completed and every unit read back stopped.
+    #[test]
+    fn stale_restart_generation_surfaces_a_failed_capacity_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let systemctl = fake_systemctl(directory.path());
+        let timeout = Duration::from_secs(5);
+        let mut host = SystemdHostControl {
+            config: control_config(),
+            controller_invocation: String::new(),
+            runner_invocation: String::new(),
+            controller_generation: 1,
+            runner_generation: 1,
+            timeout,
+            systemctl,
+        };
+
+        fs::write(directory.path().join("fail-stop"), b"").unwrap();
+        assert_eq!(
+            host.restart_controller().err(),
+            Some(ControlError::HostAction)
+        );
+        assert_eq!(host.restart_runner().err(), Some(ControlError::HostAction));
+        assert!(!directory.path().join("stopped").exists());
+        assert_eq!(host.controller_generation, 1);
+        assert_eq!(host.runner_generation, 1);
+        assert!(host.controller_invocation.is_empty());
+        assert!(host.runner_invocation.is_empty());
+
+        fs::remove_file(directory.path().join("fail-stop")).unwrap();
+        fs::remove_file(directory.path().join("calls")).unwrap();
+        assert_eq!(
+            host.restart_controller().err(),
+            Some(ControlError::StaleGeneration)
+        );
+        let stopped = fs::read_to_string(directory.path().join("stopped")).unwrap();
+        assert_eq!(
+            stopped.lines().collect::<Vec<_>>(),
+            CAPACITY_ONE_STOP_ORDER.to_vec()
+        );
+        let calls = fs::read_to_string(directory.path().join("calls")).unwrap();
+        assert_eq!(
+            calls.lines().next(),
+            Some("show --property=InvocationID --value buzz-ci-controld.service")
+        );
+        assert!(calls.contains("restart buzz-ci-controld.service"));
+        for unit in CAPACITY_ONE_STOP_ORDER {
+            assert_eq!(
+                host.systemctl.unit_state(unit, timeout).unwrap(),
+                UnitState::Inactive,
+                "{unit}"
+            );
+        }
+        assert_eq!(host.controller_generation, 1);
+    }
+
+    /// H10 clean host, boot 7: stage 13's prepare succeeded in the controller
+    /// (receipt state preparing_zero), capacity closed, controld restarted,
+    /// and the readback refused the receipt because preparing_zero was not
+    /// a live state, failing the host action closed. The prepare window is
+    /// live; the failure states stay refused.
+    #[test]
+    fn live_activation_receipt_accepts_the_zero_prepare_window() {
+        let config = control_config();
+        let receipt = |state: &str| {
+            serde_json::json!({
+                "activation_id": config.activation_id,
+                "package_digest": config.activation_package_digest,
+                "source_commit": config.integrated_candidate_sha,
+                "scenario_sha256": config.scenario_sha256,
+                "state": state,
+            })
+        };
+        for state in [
+            "staged_zero",
+            "qualified_closed",
+            "activating",
+            "active_one",
+            "preparing_zero",
+        ] {
+            assert_eq!(
+                validate_live_activation_receipt(&receipt(state), &config),
+                Ok(()),
+                "{state}"
+            );
+        }
+        for state in [
+            "absent",
+            "dormant",
+            "preparing",
+            "qualification_uncertain",
+            "rollback_cleanup",
+            "rollback_failed",
+            "rolled_back",
+        ] {
+            assert_eq!(
+                validate_live_activation_receipt(&receipt(state), &config),
+                Err(ControlError::BindingMismatch),
+                "{state}"
+            );
+        }
+        let mut foreign = receipt("preparing_zero");
+        foreign["activation_id"] = serde_json::json!("buzz-ci-capacity-one-other");
+        assert_eq!(
+            validate_live_activation_receipt(&foreign, &config),
+            Err(ControlError::BindingMismatch)
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod endpoint_identity_tests {
+    use std::{
+        io::{ErrorKind, Read, Write},
+        os::unix::{fs::PermissionsExt, net::UnixListener},
+        thread,
+    };
+
+    use super::*;
+
+    const SERVICE_UID: u32 = 1002;
+    const SERVICE_GID: u32 = 1002;
+    const SYSTEMD: ListenerPeer = ListenerPeer {
+        pid: 1,
+        uid: 0,
+        gid: 0,
+    };
+
+    fn own_ids() -> (u32, u32) {
+        (
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+        )
+    }
+
+    #[test]
+    fn listener_peer_accepts_the_endpoint_service_or_the_systemd_socket_unit() {
+        let service = ListenerPeer {
+            pid: 4242,
+            uid: SERVICE_UID,
+            gid: SERVICE_GID,
+        };
+        assert!(listener_peer_accepted(service, SERVICE_UID, SERVICE_GID));
+        assert!(listener_peer_accepted(SYSTEMD, SERVICE_UID, SERVICE_GID));
+        assert!(listener_peer_accepted(SYSTEMD, 0, 0));
+    }
+
+    #[test]
+    fn listener_peer_rejects_every_other_shape() {
+        let rejected = [
+            ListenerPeer {
+                pid: 4242,
+                uid: 0,
+                gid: 0,
+            },
+            ListenerPeer {
+                pid: 0,
+                uid: 0,
+                gid: 0,
+            },
+            ListenerPeer {
+                pid: -1,
+                uid: 0,
+                gid: 0,
+            },
+            ListenerPeer {
+                pid: 1,
+                uid: 0,
+                gid: SERVICE_GID,
+            },
+            ListenerPeer {
+                pid: 1,
+                uid: SERVICE_UID,
+                gid: 0,
+            },
+            ListenerPeer {
+                pid: 4242,
+                uid: SERVICE_UID,
+                gid: 0,
+            },
+            ListenerPeer {
+                pid: 4242,
+                uid: 0,
+                gid: SERVICE_GID,
+            },
+            ListenerPeer {
+                pid: 4242,
+                uid: SERVICE_UID + 1,
+                gid: SERVICE_GID,
+            },
+            ListenerPeer {
+                pid: 4242,
+                uid: SERVICE_UID,
+                gid: SERVICE_GID + 1,
+            },
+        ];
+        for peer in rejected {
+            assert!(
+                !listener_peer_accepted(peer, SERVICE_UID, SERVICE_GID),
+                "{peer:?}"
+            );
+        }
+        let root_not_init = ListenerPeer {
+            pid: 4242,
+            uid: 0,
+            gid: 0,
+        };
+        assert!(listener_peer_accepted(root_not_init, 0, 0));
+        assert!(!listener_peer_accepted(
+            ListenerPeer {
+                pid: 1,
+                uid: 0,
+                gid: 1
+            },
+            0,
+            0
+        ));
+    }
+
+    #[test]
+    fn socket_inode_requires_a_root_owned_group_0620_socket() {
+        let installed = SocketInode {
+            is_socket: true,
+            uid: 0,
+            gid: SERVICE_GID,
+            mode: 0o620,
+        };
+        assert!(socket_inode_accepted(installed, SERVICE_GID));
+        let rejected = [
+            SocketInode {
+                is_socket: false,
+                ..installed
+            },
+            SocketInode {
+                uid: SERVICE_UID,
+                ..installed
+            },
+            SocketInode {
+                gid: 0,
+                ..installed
+            },
+            SocketInode {
+                gid: SERVICE_GID + 1,
+                ..installed
+            },
+            SocketInode {
+                mode: 0o660,
+                ..installed
+            },
+            SocketInode {
+                mode: 0o600,
+                ..installed
+            },
+            SocketInode {
+                mode: 0o1620,
+                ..installed
+            },
+        ];
+        for inode in rejected {
+            assert!(!socket_inode_accepted(inode, SERVICE_GID), "{inode:?}");
+        }
+    }
+
+    #[test]
+    fn exchange_connected_accepts_the_listener_credentials_and_rejects_foreign_ones() {
+        let (uid, gid) = own_ids();
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let echo = thread::spawn(move || {
+            let mut request = Vec::new();
+            server.read_to_end(&mut request).unwrap();
+            server.write_all(b"reply:").unwrap();
+            server.write_all(&request).unwrap();
+        });
+        let response = exchange_connected(client, uid, gid, b"ping", Duration::from_secs(2));
+        echo.join().unwrap();
+        assert_eq!(response, Ok(b"reply:ping".to_vec()));
+
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let observed = thread::spawn(move || {
+            let mut request = Vec::new();
+            server.read_to_end(&mut request).unwrap();
+            request
+        });
+        let response = exchange_connected(
+            client,
+            uid.checked_add(1).unwrap(),
+            gid,
+            b"ping",
+            Duration::from_secs(2),
+        );
+        assert_eq!(response, Err(DriverError::WrongPeer));
+        assert!(
+            observed.join().unwrap().is_empty(),
+            "no bytes before peer check"
+        );
+    }
+
+    #[test]
+    fn exchange_unix_rejects_an_unprivileged_socket_before_connecting() {
+        let (uid, gid) = own_ids();
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let path = root.path().join("endpoint.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o620)).unwrap();
+        let response = exchange_unix(&path, gid, uid, gid, b"ping", Duration::from_secs(2));
+        assert_eq!(response, Err(DriverError::WrongPeer));
+        assert_eq!(
+            listener.accept().map(|_| ()).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            exchange_unix(
+                &root.path().join("absent.sock"),
+                gid,
+                uid,
+                gid,
+                b"ping",
+                Duration::from_secs(2)
+            ),
+            Err(DriverError::Transport)
+        );
     }
 }

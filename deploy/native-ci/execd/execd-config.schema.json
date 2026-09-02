@@ -2,6 +2,7 @@
   "$schema":"https://json-schema.org/draft/2020-12/schema",
   "additionalProperties":false,
   "properties":{
+    "acceptance_time_reference":{"type":"integer","minimum":1,"maximum":18446744073709551615},
     "capacity":{"enum":[0,1]},
     "enabled_protocol":{"const":2},
     "execution":{"$ref":"#/$defs/execution"},
@@ -13,7 +14,7 @@
     "qualification":{"$ref":"#/$defs/qualification"},
     "schema_version":{"const":2}
   },
-  "required":["schema_version","enabled_protocol","capacity","identities","paths","lane_manifest","lane_manifest_digest","executor","execution","qualification"],
+  "required":["schema_version","enabled_protocol","capacity","identities","paths","lane_manifest","lane_manifest_digest","executor","execution","qualification","acceptance_time_reference"],
   "type":"object",
   "$defs":{
     "execution":{
@@ -34,7 +35,7 @@
         "declaration_digest":{"$ref":"#/$defs/sha256"},
         "fixture_input_sha256":{"const":"967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6"},
         "fixture_manifest_sha256":{"const":"f204b8fba64e972408f5a0ea1c0bb3140cfa696289903d96a8cb07d602af6b23"},
-        "fixture_script_sha256":{"const":"3bb81cfd157e50b1d0834de48a9ecf1c27b0438a4f2bc374e091fb4f11ec213d"},
+        "fixture_script_sha256":{"const":"d081e43ebfde3ee67c3cd8d852d58410a79ad799bbfa2cf98d5e2ef7b8bed3b1"},
         "job_id":{"const":"capacity-one-fixture"},
         "max_memory_bytes":{"const":134217728},
         "max_processes":{"const":16},

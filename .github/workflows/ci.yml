@@ -169,6 +169,20 @@ jobs:
           tool: cargo-nextest@0.9.136
       - name: Install native-CI schema validator
         run: python3 -m pip install --disable-pip-version-check --no-input check-jsonschema==0.38.0
+      - name: Install clean-host ISO tools
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30
+          sudo apt-get install -y --no-install-recommends \
+            -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=30 \
+            -o Acquire::https::Timeout=30 \
+            -o DPkg::Lock::Timeout=120 \
+            xorriso
       - name: Unit tests
         run: just test-unit
 

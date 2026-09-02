@@ -102,7 +102,31 @@ grep -Fq 'git/refs' "$auto_tag"
 grep -Fq 'TAG_PREFIX="desktop-v"' "$auto_tag"
 grep -Fq 'target_sha=${{ github.event.pull_request.head.sha }}' "$auto_tag"
 grep -Fq 'scripts/verify-desktop-release-merge.sh' "$auto_tag"
-candidate_workflow="$repo_root/.github/workflows/desktop-release-candidate.yml"
+candidate_workflow="${DRC_CANDIDATE_WORKFLOW:-$repo_root/.github/workflows/desktop-release-candidate.yml}"
+grep -Fq '  push:' "$candidate_workflow" || {
+  echo "desktop candidate workflow does not run for main pushes" >&2
+  exit 1
+}
+[[ "$(grep -Fc '    branches: [main]' "$candidate_workflow")" -eq 2 ]] || {
+  echo "desktop candidate workflow must bind both pull requests and pushes to main" >&2
+  exit 1
+}
+[[ "$(grep -Fc '          ref:' "$candidate_workflow")" -eq 1 ]] || {
+  echo "desktop candidate workflow has an ambiguous checkout ref" >&2
+  exit 1
+}
+grep -Fq "          ref: \${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}" "$candidate_workflow" || {
+  echo "desktop candidate checkout is not bound to the PR head or exact push SHA" >&2
+  exit 1
+}
+if grep -Eq 'ref:.*github\.(head_ref|ref)([^_a-zA-Z]|$)' "$candidate_workflow"; then
+  echo "desktop candidate checkout accepts an untrusted or mutable branch ref" >&2
+  exit 1
+fi
+grep -Fq '          persist-credentials: false' "$candidate_workflow" || {
+  echo "desktop candidate checkout persists repository credentials" >&2
+  exit 1
+}
 grep -Eq '^  pull-requests: read$' "$candidate_workflow" || {
   echo "desktop candidate token cannot read pull requests for prior-release lookup" >&2
   exit 1
@@ -111,6 +135,79 @@ grep -Fq 'GH_TOKEN: ${{ github.token }}' "$candidate_workflow" || {
   echo "desktop candidate validation has no GitHub token for prior-release lookup" >&2
   exit 1
 }
+# Push to main must always execute a real validation of the exact pushed
+# commit. The pull-request step keeps its version-bump/ condition; the push
+# step must be gated only on the push event and must call verify-main.
+candidate_step() {
+  awk -v name="$1" '
+    /^      - / { keep = ($0 ~ "- name: " name) }
+    keep { print }
+  ' "$candidate_workflow"
+}
+pr_step=$(candidate_step 'Validate immutable desktop candidate')
+push_step=$(candidate_step 'Verify desktop candidate on main')
+grep -Fxq "        if: startsWith(github.event.pull_request.head.ref, 'version-bump/')" <<<"$pr_step" || {
+  echo "desktop candidate pull-request validation lost its version-bump/ condition" >&2
+  exit 1
+}
+grep -Fq 'desktop_release.py validate --candidate HEAD --version "$VERSION"' <<<"$pr_step" || {
+  echo "desktop candidate pull-request validation no longer validates the checked-out head" >&2
+  exit 1
+}
+[[ -n "$push_step" ]] || {
+  echo "desktop candidate workflow has no push-to-main verification step" >&2
+  exit 1
+}
+[[ "$(grep -c '^        if:' <<<"$push_step")" -eq 1 ]] || {
+  echo "desktop candidate push verification must carry exactly one condition" >&2
+  exit 1
+}
+grep -Fxq "        if: github.event_name == 'push'" <<<"$push_step" || {
+  echo "desktop candidate push verification is not gated on the push event alone" >&2
+  exit 1
+}
+if grep -Fq 'pull_request' <<<"$push_step"; then
+  echo "desktop candidate push verification depends on pull-request context, which is absent on push" >&2
+  exit 1
+fi
+grep -Fq 'run: scripts/desktop_release.py verify-main --commit "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"' <<<"$push_step" || {
+  echo "desktop candidate push verification does not run verify-main on the exact pushed commit" >&2
+  exit 1
+}
+grep -Fq 'GH_TOKEN: ${{ github.token }}' <<<"$push_step" || {
+  echo "desktop candidate push verification has no GitHub token for release-mode lookup" >&2
+  exit 1
+}
+grep -Fq 'sub.add_parser("verify-main")' "$repo_root/scripts/desktop_release.py"
+grep -Fq 'desktop candidate unchanged on main:' "$repo_root/scripts/desktop_release.py"
+grep -Fq 'desktop candidate released on main:' "$repo_root/scripts/desktop_release.py"
+
+if [[ ${DRC_SKIP_MUTATION_PROBES:-0} != 1 ]]; then
+  probe_dir=$(mktemp -d)
+  trap 'rm -rf "$tmp" "$probe_dir"' EXIT
+  mutated="$probe_dir/pr-only-condition.yml"
+  removed="$probe_dir/no-push-step.yml"
+  sed "s/^        if: github.event_name == 'push'\$/        if: startsWith(github.event.pull_request.head.ref, 'version-bump\/')/" \
+    "$candidate_workflow" >"$mutated"
+  awk '
+    /^      - / { drop = ($0 ~ "- name: Verify desktop candidate on main") }
+    !drop { print }
+  ' "$candidate_workflow" >"$removed"
+  if cmp -s "$candidate_workflow" "$mutated" || cmp -s "$candidate_workflow" "$removed"; then
+    echo "mutation probes did not change the desktop candidate workflow" >&2
+    exit 1
+  fi
+  if DRC_CANDIDATE_WORKFLOW="$mutated" DRC_SKIP_MUTATION_PROBES=1 \
+    bash "${BASH_SOURCE[0]}" >"$probe_dir/mutated.log" 2>&1; then
+    echo "contract accepted a push step that skips on every push" >&2
+    exit 1
+  fi
+  if DRC_CANDIDATE_WORKFLOW="$removed" DRC_SKIP_MUTATION_PROBES=1 \
+    bash "${BASH_SOURCE[0]}" >"$probe_dir/removed.log" 2>&1; then
+    echo "contract accepted a workflow with no push-to-main verification" >&2
+    exit 1
+  fi
+fi
 grep -Fq 'reviewed candidate' "$repo_root/scripts/prepare-desktop-release.sh"
 if grep -Fq 'current `main`' "$repo_root/scripts/prepare-desktop-release.sh"; then
   echo "desktop release PR body contains executable command substitution" >&2

@@ -24,6 +24,17 @@ opens it beneath the root-owned `attempts` anchor without following links,
 scrubs it, and persists the receipt once before teardown; undeclared, linked,
 oversized, or metadata-drifting outputs fail closed.
 
+The config carries the activation package's bound time reference
+(`acceptance_time_reference`, the frozen acceptance template's `issued_at`, the
+same value the runner holds as a static coordinate). Execd judges the lane
+manifest window and every admission, intent-registration, and cancel window
+against that reference (`issued_at <= reference < expires_at`, no tolerance)
+and never against the wall clock, so a frozen package admits on any host date;
+the two failures answer `issued_after_time_reference` (114) and
+`expired_at_time_reference` (115), apart from `policy_denied`. The attempt
+deadline is `admitted_at + min(wall_timeout, expires_at - issued_at)`: the
+window bounds a run by its length, not by an absolute expiry.
+
 Capacity one admits only the single config-declared fixture job. Its static
 declaration digest binds the candidate, activation package, lane and isolation
 manifests, workflow and job identities, exact artifact declaration, all three
@@ -67,6 +78,15 @@ The activation access group is `buzzci-execd`, with exactly `buzzci-runner` and
 `0620`. Execd still authorizes the peer by exact `SO_PEERCRED` UID and primary
 GID. Supplementary group membership grants filesystem access only.
 
+Execd reaches its executor through `/run/buzzci/executor.sock`, which
+`buzz-ci-executor.socket` binds as root:root mode `0600`. Because `SO_PEERCRED`
+names the `listen()` caller, that connection reports pid 1 root while
+`buzz-ci-executor.service` accepts as `buzzci-job`. Execd authenticates the
+listener the way controld authenticates keyholder and runner: the inode must be
+a socket of mode `0600` owned by root or by the job account, and the peer must
+be either the job account or pid 1 root. Any other root process, an unmappable
+pid, or another account is refused before a request is sent.
+
 The config freezes the control account and primary group as `buzzci-ctl` at
 `961:961`, with home `/var/lib/buzzci/principals/ctl`, a nologin shell, and sole
 supplementary group `buzzci-execd`.
@@ -99,7 +119,14 @@ remain below root-owned mode-`0700` parents. Attempt children are job-owned mode
 `0500` with a mode-`0700` artifact output directory and are removed after sealed
 teardown. The immutable profile alone is root-owned mode `0444`.
 
-The root execd service retains no Linux capabilities. OCI process execution
+The root execd service retains exactly three Linux capabilities, the set its
+attempt materialization needs: `CAP_CHOWN` to hand the attempt tree to
+`buzzci-job`, `CAP_FOWNER` to set the mode of inodes it no longer owns, and
+`CAP_DAC_OVERRIDE` to create, read, and remove inside those job-owned `0500` and
+`0700` trees. `ProtectSystem=strict` and `ReadWritePaths` still bound every write
+to the execd state roots; no other capability is in the bounding or ambient set,
+and `deploy/native-ci/execd/verify.py` and the package tests pin the exact lines.
+OCI process execution
 runs only in the separate unprivileged `buzzci-job` executor service. The
 executor service retains no capabilities, devices, namespaces, SUID/SGID,
 realtime, resource-control, or kernel mutation syscalls; systemd also pins its
@@ -160,6 +187,7 @@ deploy/native-ci/execd/freeze_package.py freeze-package \
   --preactivation-input "$EXECD_PREACTIVATION_INPUT" \
   --activation-package "$ACTIVATION_PACKAGE" --output "$EXECD_PACKAGE"
 deploy/native-ci/execd/install.py verify-package --package "$EXECD_PACKAGE"
+deploy/native-ci/execd/install.py install --dry-run --package "$EXECD_PACKAGE"
 deploy/native-ci/execd/install.py install --package "$EXECD_PACKAGE"
 ```
 

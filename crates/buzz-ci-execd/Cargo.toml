@@ -20,6 +20,7 @@ name = "buzz-ci-executor"
 path = "src/executor_main.rs"
 
 [dependencies]
+buzz-ci-acceptance-ctl = { path = "../buzz-ci-acceptance-ctl" }
 buzz-ci-broker-protocol = { workspace = true }
 buzz-ci-isolation-contract = { path = "../buzz-ci-isolation-contract" }
 buzz-ci-materializer = { path = "../buzz-ci-materializer" }

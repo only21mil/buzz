@@ -1,8 +1,9 @@
 #![deny(unsafe_code)]
 
+use std::io::{self, Read, Write};
+
 #[cfg(target_os = "linux")]
 use std::{
-    io::{Read, Write},
     os::{
         fd::{AsFd, FromRawFd},
         unix::net::{UnixListener, UnixStream},
@@ -10,10 +11,13 @@ use std::{
     path::Path,
 };
 
+use buzz_ci_acceptance_ctl::acceptance_binding::{
+    AcceptanceBindingReceipt, MAX_ACCEPTANCE_BINDING_BYTES,
+};
 #[cfg(target_os = "linux")]
 use buzz_ci_acceptance_ctl::production::{
-    handle_control_durable, AcceptanceControlConfig, ControlError, HostControl, SystemdHostControl,
-    CONTROL_CONFIG_PATH, MAX_ADAPTER_FRAME_BYTES,
+    handle_control_durable, AcceptanceControlConfig, ControlError, ControlErrorFrame, HostControl,
+    SystemdHostControl, CONTROL_CONFIG_PATH, MAX_ADAPTER_FRAME_BYTES,
 };
 use serde::Serialize;
 
@@ -25,6 +29,12 @@ struct ErrorLine {
 }
 
 fn main() {
+    if std::env::args_os().len() == 2
+        && std::env::args_os().nth(1).as_deref()
+            == Some(std::ffi::OsStr::new("--validate-binding-stdin"))
+    {
+        std::process::exit(if validate_binding_stdin() { 0 } else { 4 });
+    }
     #[cfg(target_os = "linux")]
     if let Err(error) = run() {
         emit_error(error);
@@ -35,6 +45,31 @@ fn main() {
         emit_error(ControlError::InvalidConfig);
         std::process::exit(4);
     }
+}
+
+fn validate_binding_stdin() -> bool {
+    let mut bytes = Vec::new();
+    if io::stdin()
+        .lock()
+        .take(MAX_ACCEPTANCE_BINDING_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.is_empty()
+        || bytes.len() as u64 > MAX_ACCEPTANCE_BINDING_BYTES
+    {
+        return false;
+    }
+    let Some(granted_ci_signer) = validate_binding_bytes(&bytes) else {
+        return false;
+    };
+    let mut output = hex::encode(granted_ci_signer).into_bytes();
+    output.push(b'\n');
+    io::stdout().lock().write_all(&output).is_ok()
+}
+
+fn validate_binding_bytes(bytes: &[u8]) -> Option<[u8; 32]> {
+    let receipt = AcceptanceBindingReceipt::from_canonical_bytes(bytes).ok()?;
+    Some(receipt.validate().ok()?.granted_ci_signer())
 }
 
 #[cfg(target_os = "linux")]
@@ -127,7 +162,19 @@ fn serve_connection(
     if request.len() > MAX_ADAPTER_FRAME_BYTES {
         return Err(ControlError::BindingMismatch);
     }
-    let response = handle_control_durable(config, &request, host)?;
+    let response = match handle_control_durable(config, &request, host) {
+        Ok(response) => response,
+        Err(error) => {
+            // Name the error class in the journal and hand the driver a
+            // structured frame instead of an empty one; the caller still
+            // fails closed to capacity zero.
+            emit_error(error);
+            if let Ok(frame) = serde_json::to_vec(&ControlErrorFrame::new(error)) {
+                let _ = stream.write_all(&frame).and_then(|()| stream.flush());
+            }
+            return Err(error);
+        }
+    };
     let bytes = serde_json::to_vec(&response).map_err(|_| ControlError::HostAction)?;
     if bytes.len() > MAX_ADAPTER_FRAME_BYTES {
         return Err(ControlError::HostAction);
@@ -142,15 +189,7 @@ fn emit_error(error: ControlError) {
     let line = ErrorLine {
         schema_version: "buzz-ci-acceptance-control-error/v1",
         code: error.code(),
-        message: match error {
-            ControlError::InvalidConfig => "control configuration rejected",
-            ControlError::BindingMismatch => "control binding rejected",
-            ControlError::HostAction => "host action failed",
-            ControlError::ReadbackMismatch => "host readback rejected",
-            ControlError::StaleGeneration => "host generation rejected",
-            ControlError::ReplayMismatch => "operation replay rejected",
-            ControlError::Ledger => "operation ledger unavailable",
-        },
+        message: error.message(),
     };
     if serde_json::to_writer(std::io::stderr().lock(), &line).is_ok() {
         eprintln!();
@@ -173,5 +212,10 @@ mod tests {
 
         let flags = fcntl(&listener, FcntlArg::F_GETFD).expect("read descriptor flags");
         assert!(FdFlag::from_bits_truncate(flags).contains(FdFlag::FD_CLOEXEC));
+    }
+
+    #[test]
+    fn offline_binding_mode_rejects_non_receipt_input() {
+        assert_eq!(validate_binding_bytes(b"{}"), None);
     }
 }

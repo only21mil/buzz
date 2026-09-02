@@ -71,11 +71,12 @@ def checked_activation_template(draft: dict[str, Any]) -> dict[str, Any]:
         component = components[name]
         for field in ("binary_sha256", "provenance_sha256", "source_commit"):
             component[field] = {"$copy": f"package_components.{name}.{field}"}
-    controld = components["controld"]
-    controld["package_manifest_sha256"] = {
-        "$copy": "package_manifest_sha256.controld",
-    }
-    controld["package_digest"] = {"$copy": "packages.controld.package_digest"}
+    for name in ("runner", "controld"):
+        component = components[name]
+        component["package_manifest_sha256"] = {
+            "$copy": f"package_manifest_sha256.{name}",
+        }
+        component["package_digest"] = {"$copy": f"packages.{name}.package_digest"}
     execd = components["execd"]
     for field in ("binary_sha256", "provenance_sha256", "source_commit"):
         execd[field] = {"$copy": f"execd_preactivation.{field}"}
@@ -110,6 +111,10 @@ def checked_scenario_template(scenario: dict[str, Any]) -> dict[str, Any]:
         ("source_oid", "candidate_sha"),
         ("activation_id", "packages.activation.activation_id"),
         ("activation_package_digest", "packages.activation.package_digest"),
+        ("request_digest", "activation_request_digest"),
+        ("manifest_digest", "activation_fixture_manifest_sha256"),
+        ("grant_event_id", "activation_grant_event_id"),
+        ("approved_by", "activation_approved_by"),
     ):
         fixture[field] = {"$copy": binding}
     return {

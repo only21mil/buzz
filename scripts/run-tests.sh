@@ -106,6 +106,7 @@ run_unit_tests() {
       deploy/native-ci/controld/tests \
       deploy/native-ci/execd/tests \
       deploy/native-ci/keyholder/tests \
+      deploy/native-ci/legacy_state_migration/tests \
       deploy/native-ci/runner/tests \
       deploy/native-ci/tests; do \
         python3 -m unittest discover "$suite" -p "test_*.py"; \

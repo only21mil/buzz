@@ -9,7 +9,7 @@ use std::{
     io::{Read, Write},
     os::fd::AsFd,
     os::unix::{
-        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         io::AsRawFd,
         net::{UnixListener, UnixStream},
         process::CommandExt,
@@ -90,7 +90,7 @@ const FIXTURE_MANIFEST_SHA256: &str =
 const FIXTURE_INPUT_SHA256: &str =
     "967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6";
 const FIXTURE_SCRIPT_SHA256: &str =
-    "3bb81cfd157e50b1d0834de48a9ecf1c27b0438a4f2bc374e091fb4f11ec213d";
+    "d081e43ebfde3ee67c3cd8d852d58410a79ad799bbfa2cf98d5e2ef7b8bed3b1";
 const CONFIG_SCHEMA: u16 = 2;
 const RPC_SCHEMA: u16 = 1;
 const MAX_CONFIG: u64 = 64 * 1024;
@@ -170,6 +170,10 @@ struct ProductionConfig {
     executor: ProgramProvenance,
     execution: StaticExecutionConfig,
     qualification: QualificationConfig,
+    /// The activation package's bound time reference (the frozen acceptance
+    /// template's issued_at); every admission, lane, and cancel window is
+    /// judged against it, never against the wall clock.
+    acceptance_time_reference: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1098,6 +1102,47 @@ impl LocalHostSystem {
         Ok(digest.finalize().into())
     }
 
+    /// Connect to the executor handoff socket and authenticate its listener.
+    ///
+    /// `/run/buzzci/executor.sock` is bound by `buzz-ci-executor.socket`, so
+    /// `SO_PEERCRED` names pid 1 root, the `listen()` caller, while
+    /// `buzz-ci-executor.service` accepts as the job account. The inode is
+    /// checked first: only root (the socket unit) or the job account itself
+    /// may own it, and the mode must be the unit's `0600`. The peer then
+    /// follows the shared listener rule: the job account or pid 1 root.
+    fn connect_executor(&self) -> Result<UnixStream, BindingError> {
+        let metadata = fs::symlink_metadata(&self.socket).map_err(|_| BindingError::HostRefused)?;
+        if !executor_socket_inode_accepted(
+            metadata.file_type().is_socket(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.permissions().mode() & 0o7777,
+            self.executor_uid,
+            self.executor_gid,
+        ) {
+            return Err(BindingError::HostRefused);
+        }
+        let stream = UnixStream::connect(&self.socket).map_err(|_| BindingError::HostRefused)?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|_| BindingError::HostRefused)?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .map_err(|_| BindingError::HostRefused)?;
+        let credentials =
+            getsockopt(&stream, PeerCredentials).map_err(|_| BindingError::HostRefused)?;
+        if !executor_listener_accepted(
+            credentials.pid(),
+            credentials.uid(),
+            credentials.gid(),
+            self.executor_uid,
+            self.executor_gid,
+        ) {
+            return Err(BindingError::HostRefused);
+        }
+        Ok(stream)
+    }
+
     fn request(
         &mut self,
         operation: &str,
@@ -1109,19 +1154,7 @@ impl LocalHostSystem {
     ) -> Result<ExecutorResponse, BindingError> {
         verify_program(&self.executor).map_err(binding_error)?;
         self.seccomp.validate().map_err(binding_error)?;
-        let mut stream =
-            UnixStream::connect(&self.socket).map_err(|_| BindingError::HostRefused)?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .map_err(|_| BindingError::HostRefused)?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .map_err(|_| BindingError::HostRefused)?;
-        let credentials =
-            getsockopt(&stream, PeerCredentials).map_err(|_| BindingError::HostRefused)?;
-        if credentials.uid() != self.executor_uid || credentials.gid() != self.executor_gid {
-            return Err(BindingError::HostRefused);
-        }
+        let mut stream = self.connect_executor()?;
         let request = ExecutorRequest {
             schema_version: RPC_SCHEMA,
             operation: operation.to_owned(),
@@ -1797,7 +1830,19 @@ impl PrivilegedHostSystem for LocalHostSystem {
             .map_err(binding_error)?;
         let teardown: TeardownDocument = canonical_parse(&teardown_bytes).map_err(binding_error)?;
         let teardown_digest: [u8; 32] = Sha256::digest(&teardown_bytes).into();
-        let (artifact_items, artifact_receipt_set_digest) = self.sealed_artifacts(binding)?;
+        // A stopped attempt (cancelled, expired, recovery) sealed no artifacts:
+        // the executor killed the job, the attempt tree is gone, and the
+        // teardown recorded the empty receipt set. Only that exact record
+        // skips the capture; a completed attempt still seals every declared
+        // artifact or is refused.
+        let empty_receipt_set = empty_artifact_receipt_set_digest(binding);
+        let (artifact_items, artifact_receipt_set_digest) = if teardown.stop_reason != "completed"
+            && teardown.artifact_receipt_set_digest == hex::encode(empty_receipt_set)
+        {
+            (Vec::new(), empty_receipt_set)
+        } else {
+            self.sealed_artifacts(binding)?
+        };
         if teardown.schema_version != 1
             || decode_hex::<32>(&teardown.execution_binding_digest).map_err(binding_error)?
                 != binding.execution_binding_digest
@@ -2219,6 +2264,7 @@ where
             intents,
             journal,
             host,
+            config.acceptance_time_reference,
         );
         controller
             .recover_open(now)
@@ -2279,6 +2325,7 @@ fn validate_config(
     if config.schema_version != CONFIG_SCHEMA
         || config.enabled_protocol != 2
         || !matches!(config.capacity, 0 | 1)
+        || config.acceptance_time_reference == 0
         || identities.execd_uid != owner
         || identities.execd_uid == identities.runner_uid
         || identities.execd_uid == identities.control_uid
@@ -3006,7 +3053,29 @@ fn read_document<T: for<'de> Deserialize<'de> + Serialize>(
         .ok_or(ProductionV2Error::Closed)?;
     let directory = SafeDirectory::open(parent.to_owned(), owner, 0o755)?;
     let bytes = directory.read(name, mode, maximum)?;
-    canonical_parse(&bytes)
+    canonical_sorted_parse(&bytes)
+}
+
+/// Byte contract for the activation-controller rendered config at
+/// [`CONFIG_PATH`]: compact JSON with every object key sorted bytewise and one
+/// trailing LF, which is `deploy/native-ci/activation/package.py`
+/// `canonical_json`. Documents execd writes for itself keep the struct-order
+/// form of [`canonical_bytes`].
+fn canonical_sorted_parse<T: for<'de> Deserialize<'de> + Serialize>(
+    bytes: &[u8],
+) -> Result<T, ProductionV2Error> {
+    let value: T = serde_json::from_slice(bytes).map_err(|_| ProductionV2Error::Closed)?;
+    if canonical_sorted_bytes(&value)? != bytes {
+        return Err(ProductionV2Error::Closed);
+    }
+    Ok(value)
+}
+
+fn canonical_sorted_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, ProductionV2Error> {
+    let sorted = serde_json::to_value(value).map_err(|_| ProductionV2Error::Closed)?;
+    let mut bytes = serde_json::to_vec(&sorted).map_err(|_| ProductionV2Error::Closed)?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 fn canonical_parse<T: for<'de> Deserialize<'de> + Serialize>(
@@ -3303,6 +3372,41 @@ fn verify_executor_dac_contract() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Accept only the inode the executor socket unit installs (root:root mode
+/// `0600` under root-owned `0711` `/run/buzzci`) or a socket the executor
+/// account bound itself with the same mode. Anything else is a foreign
+/// endpoint and is refused before `connect()`.
+const fn executor_socket_inode_accepted(
+    is_socket: bool,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    executor_uid: u32,
+    executor_gid: u32,
+) -> bool {
+    is_socket
+        && mode == 0o600
+        && ((uid == 0 && gid == 0) || (uid == executor_uid && gid == executor_gid))
+}
+
+/// `SO_PEERCRED` names the process that called `listen()`. Production binds
+/// `/run/buzzci/executor.sock` through `buzz-ci-executor.socket`, so the
+/// kernel reports pid 1 root while `buzz-ci-executor.service` accepts as the
+/// job account. The shared acceptance-driver rule accepts exactly that
+/// listener or the executor account; every other root process, an unmappable
+/// pid, and every other account fail closed.
+fn executor_listener_accepted(
+    pid: i32,
+    uid: u32,
+    gid: u32,
+    executor_uid: u32,
+    executor_gid: u32,
+) -> bool {
+    use buzz_ci_acceptance_ctl::production::{listener_peer_accepted, ListenerPeer};
+
+    listener_peer_accepted(ListenerPeer { pid, uid, gid }, executor_uid, executor_gid)
+}
+
 fn serve_executor_stream(
     stream: &mut UnixStream,
     executable_sha256: &str,
@@ -3443,7 +3547,7 @@ fn executor_transition(
         }
         "terminal_evidence" => {
             verify_executor_binding(active, &binding, &request)?;
-            let now = unix_seconds()?;
+            let now = live_bound_now()?;
             let lease = active.get_mut(&binding).ok_or(ProductionV2Error::Closed)?;
             if lease.stage == ExecutorStage::Running {
                 match poll_running_job(lease, now)? {
@@ -3804,7 +3908,14 @@ fn evidence_document_digest(
     Ok(Sha256::digest(canonical_bytes(&document)?).into())
 }
 
-fn unix_seconds() -> Result<u64, ProductionV2Error> {
+/// The host clock, used only to bound a live operation: the executor lease
+/// polls it against `contract.deadline_at`, which execd anchored at admission
+/// on this same clock (`admitted_at + min(wall_timeout, window length)`). It
+/// never judges a package-bound window; `production_binding::validate_window`
+/// judges those against `acceptance_time_reference`. See
+/// deploy/native-ci/README.md, "Clock model". This is the only wall-clock
+/// read in this file (pinned by a test).
+fn live_bound_now() -> Result<u64, ProductionV2Error> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -4167,7 +4278,7 @@ mod tests {
             "executor_handoff",
             [41; 32],
             [7; 16],
-            unix_seconds().unwrap() + 10,
+            live_bound_now().unwrap() + 10,
         );
         for field in ["argv", "env", "program", "cwd", "path"] {
             let mut value = serde_json::to_value(&request).unwrap();
@@ -4263,6 +4374,399 @@ mod tests {
             b"before\n[REDACTED]\n"
         );
         assert!(scrub(&vec![b'x'; MAX_RAW_OUTPUT + 1]).is_err());
+    }
+
+    /// H7 clean host, boot 6: `/run/buzzci/executor.sock` is bound by
+    /// `buzz-ci-executor.socket`, so `SO_PEERCRED` measured pid 1 uid 0 gid 0
+    /// while execd demanded the job account 1205:1205 and refused its own
+    /// executor before sending anything. The shared listener rule accepts the
+    /// socket unit or the job account and nothing else.
+    #[test]
+    fn executor_listener_rule_accepts_the_socket_unit_or_the_job_account_and_rejects_the_rest() {
+        assert!(executor_listener_accepted(1, 0, 0, 1205, 1205));
+        assert!(executor_listener_accepted(4242, 1205, 1205, 1205, 1205));
+        for (pid, uid, gid) in [
+            (4242, 0, 0),
+            (0, 0, 0),
+            (-1, 0, 0),
+            (1, 1205, 0),
+            (1, 0, 1205),
+            (4242, 1205, 1204),
+            (4242, 1204, 1205),
+            (4242, 1200, 1200),
+        ] {
+            assert!(
+                !executor_listener_accepted(pid, uid, gid, 1205, 1205),
+                "{pid} {uid}:{gid}"
+            );
+        }
+    }
+
+    #[test]
+    fn executor_socket_inode_rule_accepts_only_root_or_job_owned_0600_sockets() {
+        assert!(executor_socket_inode_accepted(
+            true, 0, 0, 0o600, 1205, 1205
+        ));
+        assert!(executor_socket_inode_accepted(
+            true, 1205, 1205, 0o600, 1205, 1205
+        ));
+        for (is_socket, uid, gid, mode) in [
+            (false, 0, 0, 0o600),
+            (true, 0, 0, 0o620),
+            (true, 0, 0, 0o660),
+            (true, 0, 0, 0o700),
+            (true, 0, 1205, 0o600),
+            (true, 1205, 0, 0o600),
+            (true, 1200, 1200, 0o600),
+        ] {
+            assert!(
+                !executor_socket_inode_accepted(is_socket, uid, gid, mode, 1205, 1205),
+                "{is_socket} {uid}:{gid} {mode:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_executor_accepts_the_listener_the_executor_account_bound_and_rejects_foreign_inodes()
+    {
+        let temporary = tempfile::tempdir().unwrap();
+        let evidence_path = temporary.path().join("evidence");
+        let teardown_path = temporary.path().join("teardown");
+        let attempts_path = temporary.path().join("attempts");
+        for (path, mode) in [
+            (&evidence_path, 0o700),
+            (&teardown_path, 0o700),
+            (&attempts_path, 0o711),
+        ] {
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let owner = fs::metadata(&evidence_path).unwrap().uid();
+        let group = fs::metadata(&evidence_path).unwrap().gid();
+        let socket = temporary.path().join("executor.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        let make_system = |executor_uid: u32, executor_gid: u32| LocalHostSystem {
+            identity: HostIdentity {
+                broker_build_identity: [1; 32],
+                host_profile_digest: [2; 32],
+                suite_identity: [3; 32],
+            },
+            socket: socket.clone(),
+            executor_uid,
+            executor_gid,
+            executor: ProgramProvenance {
+                path: "/nonexistent".into(),
+                sha256: hex::encode([4; 32]),
+                source_commit: "1".repeat(40),
+                uid: owner,
+                gid: 0,
+                mode: 0o755,
+            },
+            seccomp: SeccompRuntimeBinding::fixture(),
+            evidence: SafeDirectory::open(evidence_path.clone(), owner, 0o700).unwrap(),
+            teardown: SafeDirectory::open(teardown_path.clone(), owner, 0o700).unwrap(),
+            evidence_by_binding: BTreeMap::new(),
+            attempts: SafeDirectory::open(attempts_path.clone(), owner, 0o711).unwrap(),
+            job_uid: owner,
+            job_gid: group,
+            static_job: static_job_fixture(no_artifact_fixture()),
+        };
+
+        // The test process bound the socket, so the inode and the listener
+        // are the executor account's own; the socket unit shape (root:root
+        // inode, pid 1 root listener) is covered by the pure rules above.
+        let stream = make_system(owner, group)
+            .connect_executor()
+            .expect("own listener is accepted");
+        drop(stream);
+        let (accepted, _) = listener.accept().unwrap();
+        drop(accepted);
+
+        assert!(matches!(
+            make_system(owner.wrapping_add(1), group).connect_executor(),
+            Err(BindingError::HostRefused)
+        ));
+        assert!(matches!(
+            make_system(owner, group.wrapping_add(1)).connect_executor(),
+            Err(BindingError::HostRefused)
+        ));
+
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o660)).unwrap();
+        assert!(matches!(
+            make_system(owner, group).connect_executor(),
+            Err(BindingError::HostRefused)
+        ));
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let regular = temporary.path().join("regular.sock");
+        fs::write(&regular, b"").unwrap();
+        fs::set_permissions(&regular, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut not_a_socket = make_system(owner, group);
+        not_a_socket.socket = regular;
+        assert!(matches!(
+            not_a_socket.connect_executor(),
+            Err(BindingError::HostRefused)
+        ));
+    }
+
+    /// H8 clean host, canary stage 5 (diagnostic boot 5): the executor
+    /// accepted `executor_handoff` and `runtime_descriptor`, then execd sent
+    /// `crash_recovery` 5 ms later without any `materialization` request,
+    /// because `buzz-ci-execd.service` ran root with an empty capability
+    /// bounding set and the attempt directory could not be chowned to
+    /// buzzci-job. This process cannot chown to another account either, so
+    /// the same refusal reproduces here: closed, before any executor request,
+    /// with the attempt root left empty.
+    #[test]
+    fn materialization_refuses_closed_before_any_executor_request_when_the_host_cannot_chown() {
+        if Uid::effective().is_root() {
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let package = temporary.path().join("package");
+        fs::create_dir(&package).unwrap();
+        let attempts = temporary.path().join("attempts");
+        fs::create_dir(&attempts).unwrap();
+        fs::set_permissions(&attempts, fs::Permissions::from_mode(0o711)).unwrap();
+        let evidence = temporary.path().join("evidence");
+        let teardown_root = temporary.path().join("teardown");
+        for path in [&evidence, &teardown_root] {
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let sources = [
+            (
+                FIXTURE_MANIFEST_NAME,
+                include_bytes!(
+                    "../../../deploy/native-ci/acceptance/fixtures/fixture-manifest.json"
+                )
+                .as_slice(),
+                0o444,
+                FIXTURE_MANIFEST_SHA256,
+            ),
+            (
+                FIXTURE_INPUT_NAME,
+                include_bytes!("../../../deploy/native-ci/acceptance/fixtures/input.txt")
+                    .as_slice(),
+                0o444,
+                FIXTURE_INPUT_SHA256,
+            ),
+            (
+                FIXTURE_SCRIPT_NAME,
+                include_bytes!("../../../deploy/native-ci/acceptance/fixtures/run-fixture.sh")
+                    .as_slice(),
+                0o555,
+                FIXTURE_SCRIPT_SHA256,
+            ),
+        ];
+        for (name, bytes, mode, _) in sources {
+            let path = package.join(name);
+            fs::write(&path, bytes).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let owner = Uid::effective().as_raw();
+        let group = Gid::effective().as_raw();
+        let artifact_declaration = no_artifact_fixture();
+        let mut static_job = static_job_fixture(artifact_declaration);
+        for (program, name, mode, digest) in [
+            (
+                &mut static_job.fixture_manifest,
+                FIXTURE_MANIFEST_NAME,
+                0o444,
+                FIXTURE_MANIFEST_SHA256,
+            ),
+            (
+                &mut static_job.fixture_input,
+                FIXTURE_INPUT_NAME,
+                0o444,
+                FIXTURE_INPUT_SHA256,
+            ),
+            (
+                &mut static_job.fixture_script,
+                FIXTURE_SCRIPT_NAME,
+                0o555,
+                FIXTURE_SCRIPT_SHA256,
+            ),
+        ] {
+            *program = ProgramProvenance {
+                path: package.join(name).to_string_lossy().into_owned(),
+                sha256: digest.into(),
+                source_commit: "1".repeat(40),
+                uid: owner,
+                gid: group,
+                mode,
+            };
+        }
+        static_job.declaration_digest = static_execution_digest(&static_job);
+        let mut intent = valid_intent();
+        intent.tip_oid = static_job.candidate;
+        intent.base_oid = static_job.candidate;
+        intent.lane_manifest_digest = static_job.lane_manifest_digest;
+        intent.isolation_profile_digest = static_job.isolation_profile_digest;
+        intent.workflow_digest = static_job.workflow_digest;
+        intent.workflow_id = static_job.workflow_id;
+        intent.job_id = static_job.job_id;
+        intent.artifact_count = 1;
+        intent.artifacts = [Some(artifact_declaration)];
+        let mut binding_record = valid_record();
+        binding_record.binding.job_intent_digest = intent.digest();
+        binding_record.binding.tip_oid = static_job.candidate;
+        binding_record.binding.base_oid = static_job.candidate;
+        binding_record.binding.lane_manifest_digest = static_job.lane_manifest_digest;
+        binding_record.binding.workflow_digest = static_job.workflow_digest;
+        binding_record.binding.workflow_id = static_job.workflow_id;
+        binding_record.binding.job_id = static_job.job_id;
+        binding_record.binding.artifact_count = 1;
+        binding_record.binding.artifacts = [Some(artifact_declaration)];
+        binding_record.binding.execution_binding_digest = binding_record.binding.computed_digest();
+        let binding = binding_record.binding;
+
+        let socket = temporary.path().join("executor.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        // The job account is one this process cannot chown to, as root without
+        // CAP_CHOWN could not chown to buzzci-job on the clean host.
+        let foreign_job = owner.wrapping_add(1);
+        let mut system = LocalHostSystem {
+            identity: HostIdentity {
+                broker_build_identity: [1; 32],
+                host_profile_digest: [2; 32],
+                suite_identity: [3; 32],
+            },
+            socket: socket.clone(),
+            executor_uid: owner,
+            executor_gid: group,
+            executor: static_job.fixture_script.clone(),
+            seccomp: SeccompRuntimeBinding::fixture(),
+            evidence: SafeDirectory::open(evidence, owner, 0o700).unwrap(),
+            teardown: SafeDirectory::open(teardown_root, owner, 0o700).unwrap(),
+            evidence_by_binding: BTreeMap::new(),
+            attempts: SafeDirectory::open(attempts.clone(), owner, 0o711).unwrap(),
+            job_uid: foreign_job,
+            job_gid: group,
+            static_job,
+        };
+        // `create_child` fails at `fchown`; `binding_error` reports the closed
+        // host as `StorageUnavailable`, and `admit` recovers on any error.
+        assert!(matches!(
+            system.materialization_input_provider(binding, intent),
+            Err(BindingError::StorageUnavailable)
+        ));
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "no executor request may precede a refused materialization"
+        );
+        assert_eq!(fs::read_dir(&attempts).unwrap().count(), 0);
+
+        // The same host with a job account it can own materializes.
+        system.job_uid = owner;
+        assert_ne!(system.materialize(binding, intent).unwrap(), [0; 32]);
+        assert_eq!(fs::read_dir(&attempts).unwrap().count(), 1);
+    }
+
+    /// H10 clean host, boot 3: a cancelled attempt is torn down without
+    /// artifacts (the executor killed the job, the tree is removed, the
+    /// teardown records the empty receipt set), so describing its evidence
+    /// refused at the declared artifact and controld failed stage 9 closed.
+    /// A stopped attempt now seals stdout and teardown only; a completed
+    /// attempt without its declared artifact stays refused.
+    #[test]
+    fn stopped_attempt_seals_stdout_and_teardown_without_artifacts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let evidence_path = temporary.path().join("evidence");
+        let teardown_path = temporary.path().join("teardown");
+        let attempts_path = temporary.path().join("attempts");
+        for (path, mode) in [
+            (&evidence_path, 0o700),
+            (&teardown_path, 0o700),
+            (&attempts_path, 0o711),
+        ] {
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let owner = fs::metadata(&evidence_path).unwrap().uid();
+        let group = fs::metadata(&evidence_path).unwrap().gid();
+        let mut system = LocalHostSystem {
+            identity: HostIdentity {
+                broker_build_identity: [1; 32],
+                host_profile_digest: [2; 32],
+                suite_identity: [3; 32],
+            },
+            socket: "/nonexistent".into(),
+            executor_uid: owner,
+            executor_gid: group,
+            executor: ProgramProvenance {
+                path: "/nonexistent".into(),
+                sha256: hex::encode([4; 32]),
+                source_commit: "1".repeat(40),
+                uid: owner,
+                gid: 0,
+                mode: 0o755,
+            },
+            seccomp: SeccompRuntimeBinding::fixture(),
+            evidence: SafeDirectory::open(evidence_path.clone(), owner, 0o700).unwrap(),
+            teardown: SafeDirectory::open(teardown_path.clone(), owner, 0o700).unwrap(),
+            evidence_by_binding: BTreeMap::new(),
+            attempts: SafeDirectory::open(attempts_path.clone(), owner, 0o711).unwrap(),
+            job_uid: owner,
+            job_gid: group,
+            static_job: static_job_fixture(no_artifact_fixture()),
+        };
+        let mut binding = valid_record().binding;
+        binding.artifact_count = 1;
+        binding.artifacts = [Some(no_artifact_fixture())];
+        binding.execution_binding_digest = binding.computed_digest();
+        let response = |conclusion: &str| ExecutorResponse {
+            schema_version: 1,
+            operation: "teardown".into(),
+            execution_binding_digest: hex::encode(binding.execution_binding_digest),
+            receipt_digest: hex::encode([7; 32]),
+            conclusion: Some(conclusion.into()),
+            evidence_set_digest: None,
+            teardown_digest: None,
+            raw_stdout: Some(String::new()),
+            raw_stderr: Some(String::new()),
+            exit_code: Some(-1),
+            running: Some(false),
+            capacity_returned: None,
+            quarantine: None,
+        };
+
+        let cancelled = system
+            .persist_teardown(
+                binding,
+                HostStopReason::Cancelled,
+                response("cancelled"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(cancelled.conclusion, Conclusion::Cancelled);
+        assert!(!attempts_path.join(hex::encode(binding.attempt_id)).exists());
+        let items = system.sealed_attempt_evidence(binding).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].descriptor.kind, EvidenceKind::Stdout);
+        assert_eq!(items[0].descriptor.digest, cancelled.evidence_set_digest);
+        assert_eq!(items[1].descriptor.kind, EvidenceKind::Teardown);
+        assert_eq!(items[1].descriptor.digest, cancelled.teardown_digest);
+        assert_eq!(items[1].descriptor.teardown_lease_id, binding.lease_id);
+
+        // A completed attempt that never produced its declared artifact is
+        // still refused: the empty receipt set does not excuse it.
+        let mut completed = binding;
+        completed.attempt_id = [58; 16];
+        completed.execution_binding_digest = completed.computed_digest();
+        system
+            .persist_teardown(
+                completed,
+                HostStopReason::Completed,
+                response("success"),
+                None,
+            )
+            .unwrap();
+        assert!(system.sealed_attempt_evidence(completed).is_err());
     }
 
     #[test]
@@ -4748,7 +5252,9 @@ mod tests {
         };
         let materialization_receipt = system.materialize(binding, intent).unwrap();
         assert_ne!(materialization_receipt, [0; 32]);
-        let deadline = unix_seconds().unwrap() + 10;
+        // The frozen fixture holds ten seconds before it writes evidence so a
+        // cancellation can reach it; the deadline leaves that hold room.
+        let deadline = live_bound_now().unwrap() + 30;
         let request = |operation: &str| {
             let mut request = executor_request_fixture(
                 operation,
@@ -4886,7 +5392,7 @@ mod tests {
                 stderr: capture_pipe(stderr, FIXED_MAX_STDERR_BYTES as usize),
             }
         }
-        let deadline = unix_seconds().unwrap() + 60;
+        let deadline = live_bound_now().unwrap() + 60;
         for (binding, operation, reason, expected) in [
             ([51; 32], "teardown", "cancelled", "cancelled"),
             (
@@ -5186,7 +5692,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(static_execution_digest(&execution)),
-            "e941bf7b2a6152a5633f14f8c632fb8ce048c1d6eee008f2dc0d6f8dda90efe4"
+            "a699a308fae53c2109af532c06ed6a345e1ad76323c0817a1ef8e8d015b0be55"
         );
     }
 
@@ -5320,8 +5826,15 @@ mod tests {
         assert!(tampered.sealed_attempt_evidence(binding).is_err());
     }
 
-    #[test]
-    fn exact_fake_root_capacity_one_config_selects_v2() {
+    struct FakeRoot {
+        temporary: tempfile::TempDir,
+        owner: u32,
+        group: u32,
+        config: ProductionConfig,
+    }
+
+    /// Exact capacity-one fake root with a config that `load_from` accepts.
+    fn capacity_one_fake_root() -> FakeRoot {
         let temporary = tempfile::tempdir().unwrap();
         let prefix = temporary.path();
         for relative in [
@@ -5408,6 +5921,7 @@ mod tests {
             schema_version: CONFIG_SCHEMA,
             enabled_protocol: 2,
             capacity: 1,
+            acceptance_time_reference: 1_800_000_000,
             identities: IdentityConfig {
                 execd_uid: owner,
                 execd_gid: group,
@@ -5527,8 +6041,376 @@ mod tests {
         .unwrap();
         config.execution.declaration_digest =
             hex::encode(static_execution_digest(&static_contract));
+        FakeRoot {
+            temporary,
+            owner,
+            group,
+            config,
+        }
+    }
+
+    fn write_fake_root_principals(prefix: &Path, owner: u32, group: u32) {
+        fs::write(
+            prefix.join("etc/passwd"),
+            format!(
+                "buzzci-runner:x:{}:{}::/var/lib/buzzci/runner:/usr/sbin/nologin\nbuzzci-ctl:x:{}:{}::{CONTROL_HOME}:/usr/sbin/nologin\nbuzzci-job:x:{}:{}::/var/empty:/usr/sbin/nologin\n",
+                owner + 1,
+                group + 1,
+                CONTROL_UID,
+                CONTROL_GID,
+                owner + 3,
+                group + 3,
+            ),
+        )
+        .unwrap();
+        fs::write(
+            prefix.join("etc/group"),
+            format!(
+                "buzzci-execd:x:{}:buzzci-ctl,buzzci-runner\nbuzzci-ctl:x:{}:\n",
+                group + 4,
+                CONTROL_GID
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Render an execd config through the exact Python activation controller
+    /// (`deploy/native-ci/activation/controller.py` `_render_execd_config`).
+    fn render_with_activation_controller(request: &serde_json::Value) -> Vec<u8> {
+        let activation_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/native-ci/activation");
+        let script = r#"
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root))
+spec = importlib.util.spec_from_file_location("activation_controller", root / "controller.py")
+controller = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(controller)
+request = json.load(sys.stdin)
+source = "assets/execd-template.json"
+rendered = controller._render_execd_config(
+    request["manifest"],
+    {source: request["template"].encode()},
+    {"source": source, "active_source": source},
+    request["binding"],
+    capacity=request["capacity"],
+)
+sys.stdout.buffer.write(rendered)
+"#;
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(script)
+            .arg(&activation_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("python3 is required to exercise the activation controller renderer");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&serde_json::to_vec(request).unwrap())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "controller render failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    #[test]
+    fn controller_rendered_execd_config_bytes_load_exactly() {
+        let fake = capacity_one_fake_root();
+        let prefix = fake.temporary.path();
+        let expected = fake.config;
+        let mut template = expected.clone();
+        template.execution.declaration_digest = "0".repeat(64);
+        template.qualification.activation_package_digest = "0".repeat(64);
+        template.qualification.fixture_digest = "0".repeat(64);
+        let request = serde_json::json!({
+            "template": String::from_utf8(canonical_sorted_bytes(&template).unwrap()).unwrap(),
+            "manifest": {
+                "source_commit": expected.qualification.integrated_candidate_sha,
+                "package_digest": expected.qualification.activation_package_digest,
+            },
+            "binding": {
+                "scenario_sha256": expected.qualification.fixture_digest,
+                "fixture": {
+                    "controller_generation": expected.qualification.controller_generation,
+                    "runner_generation": expected.qualification.runner_generation,
+                    "manifest_digest": FIXTURE_MANIFEST_SHA256,
+                },
+            },
+            "capacity": expected.capacity,
+        });
+        let rendered = render_with_activation_controller(&request);
+
+        // The controller's bytes are the sorted-key compact form plus LF, and
+        // the Python execution digest equals the Rust static digest.
+        assert_eq!(rendered, canonical_sorted_bytes(&expected).unwrap());
+        assert_eq!(
+            canonical_sorted_parse::<ProductionConfig>(&rendered).unwrap(),
+            expected
+        );
+        assert!(
+            canonical_sorted_parse::<ProductionConfig>(&canonical_bytes(&expected).unwrap())
+                .is_err()
+        );
+
+        // Any drift from the exact bytes closes the config.
+        let struct_order = canonical_bytes(&expected).unwrap();
+        assert_ne!(struct_order, rendered);
+        assert!(canonical_sorted_parse::<ProductionConfig>(&struct_order).is_err());
+        let without_newline = &rendered[..rendered.len() - 1];
+        assert!(canonical_sorted_parse::<ProductionConfig>(without_newline).is_err());
+        let mut padded = rendered.clone();
+        padded.push(b'\n');
+        assert!(canonical_sorted_parse::<ProductionConfig>(&padded).is_err());
+        let text = String::from_utf8(rendered.clone()).unwrap();
+        let head = format!(
+            "{{\"acceptance_time_reference\":{},\"capacity\":1,\"enabled_protocol\":2,",
+            expected.acceptance_time_reference
+        );
+        assert!(text.starts_with(&head));
+        let reordered = text.replacen(
+            &head,
+            &format!(
+                "{{\"acceptance_time_reference\":{},\"enabled_protocol\":2,\"capacity\":1,",
+                expected.acceptance_time_reference
+            ),
+            1,
+        );
+        assert!(canonical_sorted_parse::<ProductionConfig>(reordered.as_bytes()).is_err());
+        let spaced = text.replacen(",\"capacity\":1,", ",\"capacity\": 1,", 1);
+        assert!(canonical_sorted_parse::<ProductionConfig>(spaced.as_bytes()).is_err());
+
+        // The exact controller bytes on disk let load_from open capacity one.
         let config_path = prefix.join("etc/buzzci/execd-v2.json");
-        fs::write(&config_path, canonical_bytes(&config).unwrap()).unwrap();
+        fs::write(&config_path, &rendered).unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+        write_fake_root_principals(prefix, fake.owner, fake.group);
+        let activated = Cell::new(false);
+        assert!(load_from(
+            RuntimePaths {
+                prefix: prefix.to_owned(),
+            },
+            fake.owner,
+            2,
+            true,
+            || {
+                activated.set(true);
+                Ok(SeccompRuntimeBinding::fixture())
+            },
+        )
+        .is_ok());
+        assert!(activated.get());
+
+        fs::write(&config_path, &struct_order).unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let refused = Cell::new(false);
+        assert!(load_from(
+            RuntimePaths {
+                prefix: prefix.to_owned(),
+            },
+            fake.owner,
+            2,
+            true,
+            || {
+                refused.set(true);
+                Ok(SeccompRuntimeBinding::fixture())
+            },
+        )
+        .is_err());
+        assert!(!refused.get());
+    }
+
+    /// Exact bytes recorded from a clean-host guest at candidate cbca8b13:
+    /// the installed `/etc/buzzci/execd-v2.json` (without its trailing LF)
+    /// and the production qualification request the activation controller
+    /// persisted. execd answered `policy_denied` to this request.
+    const RECORDED_EXECD_CONFIG: &str = r#"{"acceptance_time_reference":1788322400,"capacity":0,"enabled_protocol":2,"execution":{"artifact":{"artifact_id":"result","max_bytes":32768,"media_type":"application/json","name":"result.json","relative_name":"result.json"},"declaration_digest":"880ecdbe623808f5356c008b6d35e9e0a016b9ecdc6cac1e1d0e3fc5f27837a3","fixture_input_sha256":"967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6","fixture_manifest_sha256":"f204b8fba64e972408f5a0ea1c0bb3140cfa696289903d96a8cb07d602af6b23","fixture_script_sha256":"d081e43ebfde3ee67c3cd8d852d58410a79ad799bbfa2cf98d5e2ef7b8bed3b1","job_id":"capacity-one-fixture","max_memory_bytes":134217728,"max_processes":16,"max_stderr_bytes":32768,"max_stdout_bytes":32768,"max_wall_seconds":120,"schema_version":1,"workflow_digest":"8080808080808080808080808080808080808080808080808080808080808080","workflow_id":"capacity-one"},"executor":{"gid":0,"mode":493,"path":"/usr/libexec/buzz-ci-executor","sha256":"ac9ef9987b627eded1d40e30726ec02b24fa6591b394513007218ef91a22ba7b","source_commit":"cbca8b1371206688fde40d6f370ee65b97bb145a","uid":0},"identities":{"access_group":"buzzci-execd","access_group_gid":1204,"access_group_members":["buzzci-ctl","buzzci-runner"],"control_gid":961,"control_group":"buzzci-ctl","control_home":"/var/lib/buzzci/principals/ctl","control_shell":"/usr/sbin/nologin","control_supplementary_groups":["buzzci-execd"],"control_uid":961,"control_user":"buzzci-ctl","execd_gid":0,"execd_uid":0,"job_gid":1205,"job_uid":1205,"runner_gid":1200,"runner_uid":1200},"lane_manifest":{"admission_key_generation":9,"admission_verifying_key":"2020202020202020202020202020202020202020202020202020202020202020","broker_build_identity":"3030303030303030303030303030303030303030303030303030303030303030","expires_at":4102444800,"host_profile_digest":"4040404040404040404040404040404040404040404040404040404040404040","isolation_profile_digest":"6060606060606060606060606060606060606060606060606060606060606060","lane_epoch":4,"lane_id":"1010101010101010101010101010101010101010101010101010101010101010","max_wall_timeout_seconds":300,"not_before":1,"schema_version":1,"suite_identity":"5050505050505050505050505050505050505050505050505050505050505050"},"lane_manifest_digest":"12ede37672233a144707bc49efa5d8f86ec5803e6b9d623347472702b2c98f04","paths":{"attempt_root":"/var/lib/buzzci/execd-v2/attempts","binding_root":"/var/lib/buzzci/execd-v2/bindings","evidence_root":"/var/lib/buzzci/execd-v2/evidence","executor_socket":"/run/buzzci/executor.sock","intent_root":"/var/lib/buzzci/execd-v2/intents","qualification_root":"/var/lib/buzzci/execd-v2/qualification","teardown_root":"/var/lib/buzzci/execd-v2/teardown"},"qualification":{"activation_package_digest":"1c390e3a93e17d5b7d874b4a3f749cfbf5b5273448e62c72bce8d33a3bb91a0d","controller_generation":1,"fixture_digest":"10a308a084aef26b2c15f35464aee2bead575ed46f38713af9683d07d75f9667","integrated_candidate_sha":"cbca8b1371206688fde40d6f370ee65b97bb145a","runner_generation":1},"schema_version":2}"#;
+    const RECORDED_QUALIFICATION_REQUEST: &str = r#"{"schema_version":"buzz-ci-production-qualification-request/v2","request_id":"113099804cb3fde2a6681257809ae38e","integrated_candidate_sha":"cbca8b1371206688fde40d6f370ee65b97bb145a","activation_package_digest":"1c390e3a93e17d5b7d874b4a3f749cfbf5b5273448e62c72bce8d33a3bb91a0d","fixture_digest":"10a308a084aef26b2c15f35464aee2bead575ed46f38713af9683d07d75f9667","principal_digest":"ee22ba0c8e462a5cba4cf2fc6fde6f1a65c663199a9021b01f9108ad56aa5a2e","lane_manifest_digest":"12ede37672233a144707bc49efa5d8f86ec5803e6b9d623347472702b2c98f04","broker_build_identity_digest":"3030303030303030303030303030303030303030303030303030303030303030","host_profile_digest":"4040404040404040404040404040404040404040404040404040404040404040","suite_digest":"5050505050505050505050505050505050505050505050505050505050505050","isolation_profile_digest":"6060606060606060606060606060606060606060606060606060606060606060","seccomp_profile_digest":"2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4","executor_program_digest":"ac9ef9987b627eded1d40e30726ec02b24fa6591b394513007218ef91a22ba7b","executor_provenance_digest":"112e3fda1d0f1c4409fd8bacd198d9a96d41db885ac544d9f1353a7c2753f0c0","nonce":"fe13709b692cd3a459ad05baee42fefed49384c4437e213a1d2913e7712b0927","controller_generation":1,"runner_generation":1,"lane_epoch":4,"admission_key_generation":9,"issued_at":1788322456,"expires_at":1788322516}"#;
+
+    fn recorded_qualification_request(value: &serde_json::Value) -> ProductionQualificationRequest {
+        let hex32 = |name: &str| decode_hex::<32>(value[name].as_str().unwrap()).unwrap();
+        let number = |name: &str| value[name].as_u64().unwrap();
+        ProductionQualificationRequest {
+            integrated_candidate_sha: GitOid::Sha1(
+                decode_hex::<20>(value["integrated_candidate_sha"].as_str().unwrap()).unwrap(),
+            ),
+            activation_package_digest: hex32("activation_package_digest"),
+            fixture_digest: hex32("fixture_digest"),
+            principal_digest: hex32("principal_digest"),
+            lane_manifest_digest: hex32("lane_manifest_digest"),
+            broker_build_identity: hex32("broker_build_identity_digest"),
+            host_profile_digest: hex32("host_profile_digest"),
+            suite_identity: hex32("suite_digest"),
+            isolation_profile_digest: hex32("isolation_profile_digest"),
+            seccomp_profile_digest: hex32("seccomp_profile_digest"),
+            executor_program_digest: hex32("executor_program_digest"),
+            executor_provenance_digest: hex32("executor_provenance_digest"),
+            nonce: hex32("nonce"),
+            controller_generation: number("controller_generation"),
+            runner_generation: number("runner_generation"),
+            lane_epoch: number("lane_epoch"),
+            admission_key_generation: number("admission_key_generation"),
+            issued_at: number("issued_at"),
+            expires_at: number("expires_at"),
+            request_frame_digest: [0; 32],
+        }
+    }
+
+    /// Compute the executor provenance digest through the exact Python
+    /// activation controller (`_executor_provenance_digest`).
+    fn controller_executor_provenance_digest(executor: &serde_json::Value) -> [u8; 32] {
+        let activation_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/native-ci/activation");
+        let script = r#"
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root))
+spec = importlib.util.spec_from_file_location("activation_controller", root / "controller.py")
+controller = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(controller)
+sys.stdout.write(controller._executor_provenance_digest(json.load(sys.stdin)))
+"#;
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(script)
+            .arg(&activation_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("python3 is required to exercise the activation controller digest");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&serde_json::to_vec(executor).unwrap())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "controller digest failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        decode_hex(&String::from_utf8(output.stdout).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn controller_executor_provenance_digest_matches_execd_contract() {
+        let config: ProductionConfig =
+            canonical_sorted_parse(format!("{RECORDED_EXECD_CONFIG}\n").as_bytes()).unwrap();
+        let manifest = config.lane_manifest.clone().into_manifest().unwrap();
+        let contract =
+            qualification_contract(&config, &manifest, &SeccompRuntimeBinding::fixture()).unwrap();
+        let recorded_value: serde_json::Value =
+            serde_json::from_str(RECORDED_QUALIFICATION_REQUEST).unwrap();
+        let header = FrameHeader {
+            operation: buzz_ci_broker_protocol::Operation::AdmitQualification,
+            request_id: decode_hex::<16>(recorded_value["request_id"].as_str().unwrap()).unwrap(),
+        };
+        let mut recorded = recorded_qualification_request(&recorded_value);
+        recorded.request_frame_digest =
+            production_qualification_request_frame_digest(header, &recorded).unwrap();
+
+        // The recorded request fails the contract in exactly one field: the
+        // controller hashed the source commit as a length byte (20) plus the
+        // raw SHA-1 instead of the 33-byte protocol GitOid wire form.
+        assert!(!contract.matches(recorded));
+        let mut only_provenance_differs = recorded;
+        only_provenance_differs.executor_provenance_digest = contract.executor_provenance_digest;
+        assert!(contract.matches(only_provenance_differs));
+        let mut legacy = Sha256::new();
+        legacy.update(b"buzz-ci-execd:production-qualification-executor-provenance:v1\0");
+        legacy.update((config.executor.path.len() as u16).to_be_bytes());
+        legacy.update(config.executor.path.as_bytes());
+        legacy.update(decode_hex::<32>(&config.executor.sha256).unwrap());
+        legacy.update([20]);
+        legacy.update(decode_hex::<20>(&config.executor.source_commit).unwrap());
+        legacy.update(config.executor.uid.to_be_bytes());
+        legacy.update(config.executor.gid.to_be_bytes());
+        legacy.update(config.executor.mode.to_be_bytes());
+        let legacy: [u8; 32] = legacy.finalize().into();
+        assert_eq!(legacy, recorded.executor_provenance_digest);
+        assert_ne!(legacy, contract.executor_provenance_digest);
+
+        // The controller now renders the digest execd enforces, for SHA-1 and
+        // SHA-256 source commits.
+        let executor_value = serde_json::to_value(&config.executor).unwrap();
+        let rendered = controller_executor_provenance_digest(&executor_value);
+        assert_eq!(rendered, contract.executor_provenance_digest);
+        let mut sha256_executor = executor_value.clone();
+        sha256_executor["source_commit"] = serde_json::Value::String("ab".repeat(32));
+        assert_eq!(
+            controller_executor_provenance_digest(&sha256_executor),
+            production_qualification_executor_provenance_digest(
+                &config.executor.path,
+                decode_hex(&config.executor.sha256).unwrap(),
+                GitOid::Sha256([0xab; 32]),
+                config.executor.uid,
+                config.executor.gid,
+                config.executor.mode,
+            )
+            .unwrap()
+        );
+
+        // Through the real dispatch: the recorded request is still denied and
+        // the corrected request qualifies inside its validity window.
+        let temporary = tempfile::tempdir().unwrap();
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = fs::metadata(temporary.path()).unwrap().uid();
+        let mut dispatch = ProductionV2Dispatch {
+            ordinary: None,
+            qualification: DurableQualificationFiles::open(
+                SafeDirectory::open(temporary.path().to_owned(), owner, 0o700).unwrap(),
+                contract,
+            )
+            .unwrap(),
+            contract,
+        };
+        let now = recorded.issued_at + 1;
+        let denied =
+            dispatch.dispatch_v2_encoded(header, Request::AdmitQualification(recorded), now);
+        assert_eq!(
+            decode_production_qualification_response(header, denied.as_bytes())
+                .unwrap()
+                .code,
+            ResponseCode::PolicyDenied
+        );
+        let mut corrected = recorded;
+        corrected.executor_provenance_digest = rendered;
+        corrected.request_frame_digest = [0; 32];
+        corrected.request_frame_digest =
+            production_qualification_request_frame_digest(header, &corrected).unwrap();
+        let accepted =
+            dispatch.dispatch_v2_encoded(header, Request::AdmitQualification(corrected), now);
+        let response =
+            decode_production_qualification_response(header, accepted.as_bytes()).unwrap();
+        assert_eq!(response.code, ResponseCode::Ok);
+        assert_eq!(response.executor_provenance_digest, rendered);
+        assert_eq!(response.qualified_at, now);
+    }
+
+    #[test]
+    fn exact_fake_root_capacity_one_config_selects_v2() {
+        let fake = capacity_one_fake_root();
+        let prefix = fake.temporary.path();
+        let (owner, group, config) = (fake.owner, fake.group, fake.config);
+        let config_path = prefix.join("etc/buzzci/execd-v2.json");
+        fs::write(&config_path, canonical_sorted_bytes(&config).unwrap()).unwrap();
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
         let passwd_path = prefix.join("etc/passwd");
         let passwd = format!(
@@ -5591,7 +6473,11 @@ mod tests {
 
         let mut capacity_zero = config.clone();
         capacity_zero.capacity = 0;
-        fs::write(&config_path, canonical_bytes(&capacity_zero).unwrap()).unwrap();
+        fs::write(
+            &config_path,
+            canonical_sorted_bytes(&capacity_zero).unwrap(),
+        )
+        .unwrap();
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
         let mut runtime = load_from(
             RuntimePaths {
@@ -5798,7 +6684,7 @@ mod tests {
 
         let mut drifted = config;
         drifted.capacity = 2;
-        fs::write(&config_path, canonical_bytes(&drifted).unwrap()).unwrap();
+        fs::write(&config_path, canonical_sorted_bytes(&drifted).unwrap()).unwrap();
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
         let invalid_called = Cell::new(false);
         assert!(load_from(
@@ -5815,5 +6701,19 @@ mod tests {
         )
         .is_err());
         assert!(!invalid_called.get());
+    }
+
+    /// Sol focus read of head Q, finding 2: the executor lease reads the host
+    /// clock. It bounds a live job against a deadline execd anchored at
+    /// admission on the same clock; package-bound windows are judged in
+    /// production_binding against the time reference. Pinned so a reviewer
+    /// verifies the rule by grep: one wall-clock read, named `live_bound_now`.
+    #[test]
+    fn live_bound_now_is_the_only_wall_clock_in_production_v2() {
+        let needle = concat!("SystemTime", "::now()");
+        let source = include_str!("production_v2.rs");
+        assert_eq!(source.matches(needle).count(), 1);
+        assert!(source.contains("fn live_bound_now()"));
+        assert!(!include_str!("production_binding.rs").contains(needle));
     }
 }

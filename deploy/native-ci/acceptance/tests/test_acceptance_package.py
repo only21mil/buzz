@@ -67,6 +67,57 @@ class AcceptancePackageTests(unittest.TestCase):
             )
         )
 
+    def test_fixture_holds_before_evidence_so_a_cancellation_reaches_a_running_job(self) -> None:
+        """H10 clean host, boot 3: the fixture finished about 150 ms after
+        admission, so the stage 9 cancellation met a completed attempt and
+        controld failed closed. The fixture now holds (bounded, inside the 120 s
+        wall timeout) before it writes any evidence: a cancel during the hold
+        kills a job that has produced nothing."""
+        script = ACCEPTANCE / "fixtures/run-fixture.sh"
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            fixture_dir = root_path / "fixtures"
+            shutil.copytree(ACCEPTANCE / "fixtures", fixture_dir)
+            artifact_dir = root_path / "artifacts"
+            stub_bin = root_path / "bin"
+            stub_bin.mkdir()
+            record = root_path / "sleep.record"
+            stub = stub_bin / "sleep"
+            stub.write_text(
+                "#!/bin/sh\n"
+                f"printf '%s %s\\n' \"$1\" \"$(test -e '{artifact_dir}' && echo present || echo absent)\" >> '{record}'\n"
+            )
+            stub.chmod(0o755)
+            env = dict(os.environ, PATH=f"{stub_bin}:{os.environ.get('PATH', '/usr/bin:/bin')}")
+            completed = subprocess.run(
+                [str(fixture_dir / "run-fixture.sh"), str(artifact_dir)],
+                capture_output=True, check=True, env=env, timeout=30,
+            )
+            self.assertEqual(
+                completed.stdout.decode(),
+                "fixture=buzz-ci-capacity-one-v1 input_sha256="
+                "967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6 artifact=result.json\n",
+            )
+            self.assertEqual(completed.stderr, b"")
+            holds = record.read_text().splitlines()
+            self.assertEqual(len(holds), 1, holds)
+            seconds, artifacts_before = holds[0].split()
+            self.assertTrue(seconds.isdigit(), seconds)
+            self.assertGreaterEqual(int(seconds), 5)
+            self.assertLessEqual(int(seconds), 60)
+            self.assertEqual(artifacts_before, "absent")
+            self.assertEqual(
+                json.loads((artifact_dir / "result.json").read_text()),
+                {"fixture_version": "v1", "input_sha256": "967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6"},
+            )
+        # The digest every consumer pins follows the script bytes.
+        import hashlib
+        digest = hashlib.sha256(script.read_bytes()).hexdigest()
+        package_source = (ROOT / "deploy/native-ci/activation/package.py").read_text()
+        self.assertIn(f'FIXTURE_SCRIPT_SHA256 = "{digest}"', package_source)
+        for relative in ("deploy/native-ci/execd/execd-config.schema.json", "deploy/native-ci/execd/verify.py", "crates/buzz-ci-execd/src/production_v2.rs"):
+            self.assertIn(digest, (ROOT / relative).read_text(), relative)
+
     def test_systemd_assets_freeze_socket_principals_and_paths(self) -> None:
         templates = ACCEPTANCE / "templates"
         control_socket = (templates / "buzz-ci-acceptance-control.socket").read_text()

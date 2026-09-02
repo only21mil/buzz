@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{mpsc::Receiver, mpsc::Sender, Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use buzz_ci_broker_protocol::v2::{
     self, AttemptEvidenceCoordinates, DescribeAttemptEvidenceRequest, EvidenceDescriptor,
@@ -21,8 +21,8 @@ use crate::production::{
     JobCompletion, JobMetadata, OutputDescriptor,
 };
 use crate::runner_v2::{
-    prepare_signed_admission, AdmissionSigner, BoundAttempt, RunnerV2Client, RunnerV2Error,
-    RunnerV2Transport, StaticAdmissionBindings, TerminalAttempt,
+    live_bound_now, prepare_signed_admission, AdmissionSigner, BoundAttempt, RunnerV2Client,
+    RunnerV2Error, RunnerV2Transport, StaticAdmissionBindings, TerminalAttempt,
 };
 
 const MAX_EVIDENCE_ITEM_BYTES: u32 = 16 * 1024 * 1024;
@@ -165,7 +165,8 @@ where
             .map_err(|_| ProductionV2Error::Runner)?;
         if bound.response.broker_state != buzz_ci_broker_protocol::BrokerState::Terminal {
             self.observe(AttemptObservation::Active(bound))?;
-            self.await_command(admission.expires_at)?;
+            let deadline_at = bound.deadline_at().map_err(|_| ProductionV2Error::Runner)?;
+            self.await_command(deadline_at)?;
         }
         let terminal = session
             .client
@@ -357,15 +358,16 @@ impl<T, S> RunnerV2AttemptExecutor<T, S> {
         Ok(())
     }
 
-    fn await_command(&self, expires_at: u64) -> Result<(), ProductionV2Error> {
+    /// Hold the admitted attempt until the acceptance gate releases it or
+    /// its deadline (admission time plus the bounded window) passes. The
+    /// deadline is a live bound on the host clock (`live_bound_now`), never
+    /// the package-bound window.
+    fn await_command(&self, deadline_at: u64) -> Result<(), ProductionV2Error> {
         let Some(receiver) = &self.control.command else {
             return Ok(());
         };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| ProductionV2Error::Runner)?
-            .as_secs();
-        let timeout = expires_at
+        let now = live_bound_now().map_err(|_| ProductionV2Error::Runner)?;
+        let timeout = deadline_at
             .checked_sub(now)
             .filter(|value| *value > 0)
             .map(Duration::from_secs)
@@ -381,8 +383,17 @@ fn validate_description(
     terminal: TerminalAttempt,
     description: v2::EvidenceDescriptionResponse,
 ) -> Result<Vec<EvidenceDescriptor>, ProductionV2Error> {
+    // A successful attempt seals stdout, its one declared artifact, and the
+    // teardown. A stopped attempt (cancelled, timed out) was killed before it
+    // produced the artifact and seals stdout and teardown only; execd records
+    // the empty artifact receipt set in that teardown.
+    let expected_items: u8 = if terminal.response.conclusion == Conclusion::Success {
+        3
+    } else {
+        2
+    };
     if description.code != ResponseCode::Ok
-        || description.item_count != 3
+        || description.item_count != expected_items
         || description.descriptor_set_digest == [0; 32]
     {
         return Err(ProductionV2Error::Evidence);
@@ -393,29 +404,39 @@ fn validate_description(
         .take(usize::from(description.item_count))
         .collect::<Option<Vec<_>>>()
         .ok_or(ProductionV2Error::Evidence)?;
+    if descriptors.len() != usize::from(expected_items) {
+        return Err(ProductionV2Error::Evidence);
+    }
+    let stdout = descriptors[0];
+    let teardown = descriptors[descriptors.len() - 1];
     if descriptors.iter().any(|item| {
         item.length == 0 || item.length > MAX_EVIDENCE_ITEM_BYTES || item.digest == [0; 32]
-    }) || descriptors.first().map(|item| item.kind) != Some(EvidenceKind::Stdout)
-        || descriptors.get(1).map(|item| item.kind) != Some(EvidenceKind::Artifact)
-        || descriptors.first().map(|item| item.digest)
-            != Some(terminal.response.evidence_set_digest)
-        || descriptors.last().map(|item| item.kind) != Some(EvidenceKind::Teardown)
-        || descriptors.last().map(|item| item.digest) != Some(terminal.response.teardown_digest)
-        || !empty_artifact_metadata(descriptors[0])
-        || !empty_teardown_metadata(descriptors[0])
-        || descriptors[1].artifact_id == WireText64::EMPTY
-        || descriptors[1].artifact_name == WireText64::EMPTY
-        || descriptors[1].artifact_media_type == WireText64::EMPTY
-        || descriptors[1].artifact_name_digest == [0; 32]
-        || descriptors[1].artifact_media_type_digest == [0; 32]
-        || !empty_teardown_metadata(descriptors[1])
-        || !empty_artifact_metadata(descriptors[2])
-        || descriptors[2].teardown_lease_id == [0; 16]
-        || descriptors[2].teardown_lease_generation != terminal.response.lease_generation
-        || descriptors[2].teardown_attestation_digest != descriptors[2].digest
+    }) || stdout.kind != EvidenceKind::Stdout
+        || stdout.digest != terminal.response.evidence_set_digest
+        || !empty_artifact_metadata(stdout)
+        || !empty_teardown_metadata(stdout)
+        || teardown.kind != EvidenceKind::Teardown
+        || teardown.digest != terminal.response.teardown_digest
+        || !empty_artifact_metadata(teardown)
+        || teardown.teardown_lease_id == [0; 16]
+        || teardown.teardown_lease_generation != terminal.response.lease_generation
+        || teardown.teardown_attestation_digest != teardown.digest
         || descriptor_set_digest(terminal, &descriptors) != description.descriptor_set_digest
     {
         return Err(ProductionV2Error::Evidence);
+    }
+    if expected_items == 3 {
+        let artifact = descriptors[1];
+        if artifact.kind != EvidenceKind::Artifact
+            || artifact.artifact_id == WireText64::EMPTY
+            || artifact.artifact_name == WireText64::EMPTY
+            || artifact.artifact_media_type == WireText64::EMPTY
+            || artifact.artifact_name_digest == [0; 32]
+            || artifact.artifact_media_type_digest == [0; 32]
+            || !empty_teardown_metadata(artifact)
+        {
+            return Err(ProductionV2Error::Evidence);
+        }
     }
     Ok(descriptors)
 }
@@ -706,5 +727,175 @@ fn nonzero_lower_hex(value: &str, length: usize) -> bool {
 impl From<RunnerV2Error> for ProductionV2Error {
     fn from(_value: RunnerV2Error) -> Self {
         Self::Runner
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use buzz_ci_broker_protocol::v2::{
+        AdmissionSignatureAlgorithm, AdmitAttemptRequest, BrokerResponse,
+    };
+    use buzz_ci_broker_protocol::{BrokerState, GitOid, TrustClass};
+
+    use super::*;
+
+    fn terminal(conclusion: Conclusion) -> TerminalAttempt {
+        TerminalAttempt {
+            admission: AdmitAttemptRequest {
+                signed_request_digest: [1; 32],
+                actor_pubkey: [2; 32],
+                audience_digest: [3; 32],
+                idempotency_digest: [4; 32],
+                source_pin_event_id: [5; 32],
+                workflow_digest: [6; 32],
+                job_intent_digest: [7; 32],
+                isolation_profile_digest: [8; 32],
+                lane_manifest_digest: [9; 32],
+                admission_signature: [10; 64],
+                run_id: [11; 16],
+                tip_oid: GitOid::Sha1([12; 20]),
+                base_oid: GitOid::Sha1([13; 20]),
+                issued_at: 100,
+                expires_at: 200,
+                lane_epoch: 1,
+                admission_key_generation: 2,
+                wall_timeout_seconds: 30,
+                attempt: 2,
+                parent_attempt: 1,
+                trust_class: TrustClass::AcceptedReviewed,
+                admission_signature_algorithm: AdmissionSignatureAlgorithm::Bip340Secp256k1Sha256,
+            },
+            response: BrokerResponse {
+                code: ResponseCode::Existing,
+                retry_after_millis: 0,
+                attempt_id: [14; 16],
+                run_id: [11; 16],
+                accepted_request_digest: [1; 32],
+                job_intent_digest: [7; 32],
+                execution_binding_digest: [15; 32],
+                tip_oid: Some(GitOid::Sha1([12; 20])),
+                broker_state: BrokerState::Terminal,
+                conclusion,
+                terminal_reason: 0,
+                generation: 6,
+                accepted_at: 101,
+                updated_at: 102,
+                lease_generation: 1,
+                evidence_set_digest: [16; 32],
+                teardown_digest: [17; 32],
+                attempt: 2,
+            },
+        }
+    }
+
+    fn stdout_item() -> EvidenceDescriptor {
+        EvidenceDescriptor {
+            kind: EvidenceKind::Stdout,
+            digest: [16; 32],
+            length: 120,
+            artifact_name_digest: [0; 32],
+            artifact_media_type_digest: [0; 32],
+            artifact_id: WireText64::EMPTY,
+            artifact_name: WireText64::EMPTY,
+            artifact_media_type: WireText64::EMPTY,
+            teardown_lease_id: [0; 16],
+            teardown_lease_generation: 0,
+            teardown_attestation_digest: [0; 32],
+        }
+    }
+
+    fn artifact_item() -> EvidenceDescriptor {
+        EvidenceDescriptor {
+            kind: EvidenceKind::Artifact,
+            digest: [18; 32],
+            length: 107,
+            artifact_name_digest: [19; 32],
+            artifact_media_type_digest: [20; 32],
+            artifact_id: WireText64::from_ascii("result").unwrap(),
+            artifact_name: WireText64::from_ascii("result.json").unwrap(),
+            artifact_media_type: WireText64::from_ascii("application/json").unwrap(),
+            teardown_lease_id: [0; 16],
+            teardown_lease_generation: 0,
+            teardown_attestation_digest: [0; 32],
+        }
+    }
+
+    fn teardown_item() -> EvidenceDescriptor {
+        EvidenceDescriptor {
+            kind: EvidenceKind::Teardown,
+            digest: [17; 32],
+            length: 700,
+            artifact_name_digest: [0; 32],
+            artifact_media_type_digest: [0; 32],
+            artifact_id: WireText64::EMPTY,
+            artifact_name: WireText64::EMPTY,
+            artifact_media_type: WireText64::EMPTY,
+            teardown_lease_id: [21; 16],
+            teardown_lease_generation: 1,
+            teardown_attestation_digest: [17; 32],
+        }
+    }
+
+    fn description(
+        terminal: TerminalAttempt,
+        items: &[EvidenceDescriptor],
+    ) -> v2::EvidenceDescriptionResponse {
+        let mut slots = [None; v2::MAX_EVIDENCE_ITEMS];
+        for (slot, item) in slots.iter_mut().zip(items) {
+            *slot = Some(*item);
+        }
+        v2::EvidenceDescriptionResponse {
+            code: ResponseCode::Ok,
+            execution_binding_digest: terminal.response.execution_binding_digest,
+            generation: terminal.response.generation,
+            request_frame_digest: [22; 32],
+            descriptor_set_digest: descriptor_set_digest(terminal, items),
+            item_count: items.len() as u8,
+            items: slots,
+            request_event_id: [1; 32],
+            run_id: terminal.response.run_id,
+            workflow_id: WireText64::from_ascii("capacity-one").unwrap(),
+            workflow_digest: [6; 32],
+            job_id: WireText64::from_ascii("capacity-one-fixture").unwrap(),
+            attempt: 2,
+        }
+    }
+
+    /// H10 clean host, boot 3: the cancelled second attempt seals stdout and
+    /// teardown only, and the description was refused for lacking the
+    /// artifact a killed job never produced. A stopped attempt now describes
+    /// two items; a successful attempt still needs its artifact.
+    #[test]
+    fn stopped_attempt_evidence_describes_stdout_and_teardown_only() {
+        let cancelled = terminal(Conclusion::Cancelled);
+        let two = [stdout_item(), teardown_item()];
+        let descriptors = validate_description(cancelled, description(cancelled, &two))
+            .expect("cancelled attempt describes two items");
+        assert_eq!(descriptors, two.to_vec());
+        let timed_out = terminal(Conclusion::TimedOut);
+        assert!(validate_description(timed_out, description(timed_out, &two)).is_ok());
+
+        let three = [stdout_item(), artifact_item(), teardown_item()];
+        assert_eq!(
+            validate_description(cancelled, description(cancelled, &three)).map(|_| ()),
+            Err(ProductionV2Error::Evidence)
+        );
+        let success = terminal(Conclusion::Success);
+        assert!(validate_description(success, description(success, &three)).is_ok());
+        assert_eq!(
+            validate_description(success, description(success, &two)).map(|_| ()),
+            Err(ProductionV2Error::Evidence)
+        );
+        let swapped = [teardown_item(), stdout_item()];
+        assert_eq!(
+            validate_description(cancelled, description(cancelled, &swapped)).map(|_| ()),
+            Err(ProductionV2Error::Evidence)
+        );
+        let mut foreign = description(cancelled, &two);
+        foreign.descriptor_set_digest[0] ^= 1;
+        assert_eq!(
+            validate_description(cancelled, foreign).map(|_| ()),
+            Err(ProductionV2Error::Evidence)
+        );
     }
 }
