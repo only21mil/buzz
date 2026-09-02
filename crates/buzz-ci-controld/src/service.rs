@@ -512,7 +512,7 @@ impl AcceptanceOperationHandler for CapacityOneService {
                 let cancelled = self.cancel_active_attempt(request, active)?;
                 self.release_async_attempt()?;
                 let (reconciled, _) = self.finish_async_attempt()?;
-                if reconciled != cancelled {
+                if !same_terminal_binding(cancelled, reconciled) {
                     return Err(AcceptanceSocketError::Operation);
                 }
                 Ok(cancelled_response(request, prior, cancelled)?)
@@ -633,6 +633,24 @@ impl CapacityOneService {
         validate_cancelled_terminal(active, terminal, true)?;
         Ok(terminal)
     }
+}
+
+/// The cancellation answer (execd answers a stop with `Ok`) and the worker's
+/// reconciled read of the same closed binding (a state read answers
+/// `Existing`) describe one terminal binding; every bound field must agree,
+/// the wire code and retry hint are the transport's, not the binding's.
+fn same_terminal_binding(cancelled: TerminalAttempt, reconciled: TerminalAttempt) -> bool {
+    let mut normalized = reconciled.response;
+    normalized.code = cancelled.response.code;
+    normalized.retry_after_millis = cancelled.response.retry_after_millis;
+    matches!(
+        cancelled.response.code,
+        ResponseCode::Ok | ResponseCode::Existing
+    ) && matches!(
+        reconciled.response.code,
+        ResponseCode::Ok | ResponseCode::Existing
+    ) && cancelled.admission == reconciled.admission
+        && cancelled.response == normalized
 }
 
 fn validate_cancelled_terminal(
@@ -1366,6 +1384,47 @@ mod tests {
             running_response(&resume, None, first, false).map(|_| ()),
             Err(AcceptanceSocketError::Operation)
         );
+    }
+
+    /// H10 clean host, boot 6: the cancel answered `Ok` with the closed
+    /// binding, the worker's GetAttempt read of the same binding answered
+    /// `Existing`, and stage 9 compared the two whole responses and failed
+    /// closed. The reconciliation binds every field but the wire code.
+    #[test]
+    fn cancel_reconciliation_binds_the_closed_binding_not_the_wire_code() {
+        let active = active_binding();
+        let mut response = active.response;
+        response.broker_state = BrokerState::Terminal;
+        response.conclusion = BrokerConclusion::Cancelled;
+        response.generation += 3;
+        response.updated_at += 1;
+        response.evidence_set_digest = [16; 32];
+        response.teardown_digest = [17; 32];
+        let cancelled = TerminalAttempt {
+            admission: active.admission,
+            response,
+        };
+        assert_eq!(validate_cancelled_terminal(active, cancelled, true), Ok(()));
+        let mut read = cancelled;
+        read.response.code = ResponseCode::Existing;
+        assert_ne!(read, cancelled);
+        assert!(same_terminal_binding(cancelled, read));
+        assert!(same_terminal_binding(cancelled, cancelled));
+        let mut later = read;
+        later.response.generation += 1;
+        assert!(!same_terminal_binding(cancelled, later));
+        let mut other_evidence = read;
+        other_evidence.response.evidence_set_digest[0] ^= 1;
+        assert!(!same_terminal_binding(cancelled, other_evidence));
+        let mut other_conclusion = read;
+        other_conclusion.response.conclusion = BrokerConclusion::Success;
+        assert!(!same_terminal_binding(cancelled, other_conclusion));
+        let mut refused = read;
+        refused.response.code = ResponseCode::PolicyDenied;
+        assert!(!same_terminal_binding(cancelled, refused));
+        let mut other_admission = read;
+        other_admission.admission.attempt = 1;
+        assert!(!same_terminal_binding(cancelled, other_admission));
     }
 
     #[test]
