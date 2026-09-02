@@ -585,7 +585,14 @@ impl<C: ExecdConnector> RunnerV2Proxy<C> {
             (Request::CancelAttempt(request), Some(binding))
                 if request.expected_generation != binding.generation
         );
-        let decision = if stale_cancel {
+        // A bound state read is not a mutation: it is forwarded every time so
+        // a poll observes the broker's current state. Journaling it would
+        // replay the first observation (leased) for the attempt's whole life
+        // and let the poll run out its deadline (H10 clean host, stage 6).
+        let state_read = matches!(request, Request::GetAttempt(_));
+        let decision = if state_read {
+            ReplayDecision::Forward
+        } else if stale_cancel {
             ReplayDecision::Cached(
                 self.replay
                     .cached_exact(header.request_id, request_digest)?
@@ -598,8 +605,10 @@ impl<C: ExecdConnector> RunnerV2Proxy<C> {
             ReplayDecision::Cached(response) => response,
             ReplayDecision::Forward => {
                 let response = self.forward(header, request, &frame)?;
-                self.replay
-                    .complete(header.request_id, request_digest, &response)?;
+                if !state_read {
+                    self.replay
+                        .complete(header.request_id, request_digest, &response)?;
+                }
                 response
             }
         };
@@ -1519,6 +1528,80 @@ mod tests {
             response
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// H10 clean host, boot 5: controld polls GetAttempt under one
+    /// deterministic request id, the journal cached the first (leased)
+    /// observation of a ten-second job and replayed it for the attempt's
+    /// whole deadline. A bound state read is forwarded every time and never
+    /// journaled; mutations keep their exactly-once cache.
+    #[test]
+    fn state_reads_are_forwarded_every_time_and_never_journaled() {
+        let directory = private_directory();
+        let settings = settings(directory.path());
+        let now = settings.time_reference;
+        let leased = response(admission(now));
+        let mut terminal = leased;
+        terminal.code = ResponseCode::Existing;
+        terminal.broker_state = BrokerState::Terminal;
+        terminal.conclusion = Conclusion::Success;
+        terminal.generation = 5;
+        terminal.updated_at = leased.accepted_at + 10;
+        terminal.evidence_set_digest = [16; 32];
+        terminal.teardown_digest = [17; 32];
+        let header = FrameHeader {
+            operation: Operation::GetAttempt,
+            request_id: [61; 16],
+        };
+        let frame = v2::encode_request(
+            header.request_id,
+            Request::GetAttempt(v2::GetAttemptRequest {
+                attempt_id: leased.attempt_id,
+                execution_binding_digest: leased.execution_binding_digest,
+            }),
+        )
+        .as_bytes()
+        .to_vec();
+        let leased_frame = v2::encode_response(header, leased).as_bytes().to_vec();
+        let terminal_frame = v2::encode_response(header, terminal).as_bytes().to_vec();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut proxy = RunnerV2Proxy::with_connector(
+            settings.clone(),
+            FakeConnector {
+                connections: VecDeque::from([
+                    Ok(fake_execd(
+                        frame.clone(),
+                        leased_frame.clone(),
+                        settings.execd_uid,
+                        settings.execd_gid,
+                    )),
+                    Ok(fake_execd(
+                        frame.clone(),
+                        terminal_frame.clone(),
+                        settings.execd_uid,
+                        settings.execd_gid,
+                    )),
+                ]),
+                calls: Arc::clone(&calls),
+            },
+        )
+        .expect("proxy");
+        assert_eq!(
+            exchange(&mut proxy, &frame).expect("first poll"),
+            leased_frame
+        );
+        assert_eq!(
+            exchange(&mut proxy, &frame).expect("second poll"),
+            terminal_frame
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(proxy.replay.document.entries.is_empty());
+        // The third poll has no execd and fails transport-closed instead of
+        // answering from a cache.
+        assert!(matches!(
+            exchange(&mut proxy, &frame),
+            Err(ProxyError::ExecdUnavailable)
+        ));
     }
 
     #[test]
