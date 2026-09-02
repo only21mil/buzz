@@ -1445,7 +1445,9 @@ trait CapacityOneRuntime {
     ) -> Result<(), ControlError>;
 }
 
-struct LiveCapacityOneRuntime;
+struct LiveCapacityOneRuntime {
+    systemctl: Systemctl,
+}
 
 impl CapacityOneRuntime for LiveCapacityOneRuntime {
     fn activate(&mut self, input: &[u8], timeout: Duration) -> Result<Vec<u8>, ControlError> {
@@ -1457,7 +1459,7 @@ impl CapacityOneRuntime for LiveCapacityOneRuntime {
         unit: &'static str,
         timeout: Duration,
     ) -> Result<UnitState, ControlError> {
-        unit_state(unit, timeout)
+        self.systemctl.unit_state(unit, timeout)
     }
 
     fn invocation(
@@ -1465,7 +1467,7 @@ impl CapacityOneRuntime for LiveCapacityOneRuntime {
         unit: &'static str,
         timeout: Duration,
     ) -> Result<String, ControlError> {
-        unit_invocation(unit, timeout)
+        self.systemctl.unit_invocation(unit, timeout)
     }
 
     fn optional_invocation(
@@ -1473,7 +1475,7 @@ impl CapacityOneRuntime for LiveCapacityOneRuntime {
         unit: &'static str,
         timeout: Duration,
     ) -> Result<String, ControlError> {
-        unit_invocation_optional(unit, timeout)
+        self.systemctl.unit_invocation_optional(unit, timeout)
     }
 
     fn fragment_path(
@@ -1481,7 +1483,7 @@ impl CapacityOneRuntime for LiveCapacityOneRuntime {
         unit: &'static str,
         timeout: Duration,
     ) -> Result<String, ControlError> {
-        unit_fragment_path(unit, timeout)
+        self.systemctl.unit_fragment_path(unit, timeout)
     }
 
     fn load_state(
@@ -1489,15 +1491,15 @@ impl CapacityOneRuntime for LiveCapacityOneRuntime {
         unit: &'static str,
         timeout: Duration,
     ) -> Result<String, ControlError> {
-        unit_property(unit, "LoadState", timeout)
+        self.systemctl.unit_property(unit, "LoadState", timeout)
     }
 
     fn sub_state(&mut self, unit: &'static str, timeout: Duration) -> Result<String, ControlError> {
-        unit_property(unit, "SubState", timeout)
+        self.systemctl.unit_property(unit, "SubState", timeout)
     }
 
     fn main_pid(&mut self, unit: &'static str, timeout: Duration) -> Result<u32, ControlError> {
-        unit_main_pid(unit, timeout)
+        self.systemctl.unit_main_pid(unit, timeout)
     }
 
     fn process_identity(
@@ -1514,9 +1516,10 @@ impl CapacityOneRuntime for LiveCapacityOneRuntime {
         timeout: Duration,
     ) -> Result<(String, String, String), ControlError> {
         Ok((
-            unit_property(unit, "User", timeout)?,
-            unit_property(unit, "Group", timeout)?,
-            unit_property(unit, "SupplementaryGroups", timeout)?,
+            self.systemctl.unit_property(unit, "User", timeout)?,
+            self.systemctl.unit_property(unit, "Group", timeout)?,
+            self.systemctl
+                .unit_property(unit, "SupplementaryGroups", timeout)?,
         ))
     }
 
@@ -1810,14 +1813,18 @@ pub struct SystemdHostControl {
     controller_generation: u64,
     runner_generation: u64,
     timeout: Duration,
+    systemctl: Systemctl,
 }
 
 impl SystemdHostControl {
     pub fn open(config: AcceptanceControlConfig) -> Result<Self, ControlError> {
         validate_activation_receipt(&config)?;
         let timeout = Duration::from_secs(30);
-        let controller_invocation = unit_invocation_optional("buzz-ci-controld.service", timeout)?;
-        let runner_invocation = unit_invocation_optional("buzz-ci-runner.service", timeout)?;
+        let systemctl = Systemctl::live();
+        let controller_invocation =
+            systemctl.unit_invocation_optional("buzz-ci-controld.service", timeout)?;
+        let runner_invocation =
+            systemctl.unit_invocation_optional("buzz-ci-runner.service", timeout)?;
         Ok(Self {
             controller_generation: config.controller_generation,
             runner_generation: config.runner_generation,
@@ -1825,16 +1832,18 @@ impl SystemdHostControl {
             controller_invocation,
             runner_invocation,
             timeout,
+            systemctl,
         })
     }
 
     fn readback(&self) -> Result<ControlReadback, ControlError> {
         validate_activation_receipt(&self.config)?;
-        let target = unit_active("buzz-ci-capacity-one.target", self.timeout)?;
-        let controller = unit_active("buzz-ci-controld.service", self.timeout)?;
-        let runner = unit_active("buzz-ci-runner.socket", self.timeout)?;
-        let execd = unit_active("buzz-ci-execd.socket", self.timeout)?;
-        let keyholder = unit_active("buzz-ci-keyholder.socket", self.timeout)?;
+        let systemctl = &self.systemctl;
+        let target = systemctl.unit_active("buzz-ci-capacity-one.target", self.timeout)?;
+        let controller = systemctl.unit_active("buzz-ci-controld.service", self.timeout)?;
+        let runner = systemctl.unit_active("buzz-ci-runner.socket", self.timeout)?;
+        let execd = systemctl.unit_active("buzz-ci-execd.socket", self.timeout)?;
+        let keyholder = systemctl.unit_active("buzz-ci-keyholder.socket", self.timeout)?;
         let capacity = u32::from(target);
         let admission = if target && controller && runner && execd && keyholder {
             AdmissionState::Open
@@ -1855,30 +1864,8 @@ impl SystemdHostControl {
         })
     }
 
-    fn systemctl(&self, action: &'static str, unit: &'static str) -> Result<(), ControlError> {
-        let output = run_bounded_command("/usr/bin/systemctl", &[action, unit], self.timeout)?;
-        if output.is_empty() {
-            Ok(())
-        } else {
-            Err(ControlError::HostAction)
-        }
-    }
-
     fn close_capacity(&self) -> Result<(), ControlError> {
-        for unit in [
-            "buzz-ci-capacity-one.target",
-            "buzz-ci-runner.service",
-            "buzz-ci-runner.socket",
-            EXECD_SERVICE,
-            EXECD_SOCKET,
-            EXECUTOR_SERVICE,
-            EXECUTOR_SOCKET,
-            "buzz-ci-keyholder.service",
-            "buzz-ci-keyholder.socket",
-        ] {
-            self.systemctl("stop", unit)?;
-        }
-        Ok(())
+        close_capacity(&self.systemctl, self.timeout)
     }
 
     fn zero_proof(&self) -> Result<ZeroProof, ControlError> {
@@ -1894,12 +1881,16 @@ impl SystemdHostControl {
             "buzz-ci-keyholder.service",
             "buzz-ci-keyholder.socket",
         ] {
-            if unit_state(unit, self.timeout)? != UnitState::Inactive {
+            if self.systemctl.unit_state(unit, self.timeout)? != UnitState::Inactive {
                 return Err(ControlError::ReadbackMismatch);
             }
         }
-        let socket_active = unit_active("buzz-ci-controld-acceptance.socket", self.timeout)?;
-        let service_active = unit_active("buzz-ci-controld.service", self.timeout)?;
+        let socket_active = self
+            .systemctl
+            .unit_active("buzz-ci-controld-acceptance.socket", self.timeout)?;
+        let service_active = self
+            .systemctl
+            .unit_active("buzz-ci-controld.service", self.timeout)?;
         let socket_present = match fs::symlink_metadata(CONTROLD_SOCKET_PATH) {
             Ok(_) => true,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
@@ -1970,7 +1961,9 @@ impl HostControl for SystemdHostControl {
         &mut self,
         request: &ControlRequest,
     ) -> Result<HostCapacityOneResult, Self::Error> {
-        let mut runtime = LiveCapacityOneRuntime;
+        let mut runtime = LiveCapacityOneRuntime {
+            systemctl: self.systemctl.clone(),
+        };
         let transition = activate_capacity_one(
             &self.config,
             request,
@@ -1985,9 +1978,14 @@ impl HostControl for SystemdHostControl {
     }
 
     fn restart_controller(&mut self) -> Result<ControlReadback, Self::Error> {
-        let before = unit_invocation("buzz-ci-controld.service", self.timeout)?;
-        self.systemctl("restart", "buzz-ci-controld.service")?;
-        let invocation = unit_invocation("buzz-ci-controld.service", self.timeout)?;
+        let before = self
+            .systemctl
+            .unit_invocation("buzz-ci-controld.service", self.timeout)?;
+        self.systemctl
+            .restart("buzz-ci-controld.service", self.timeout)?;
+        let invocation = self
+            .systemctl
+            .unit_invocation("buzz-ci-controld.service", self.timeout)?;
         if invocation == before
             || (!self.controller_invocation.is_empty() && invocation == self.controller_invocation)
         {
@@ -2003,9 +2001,14 @@ impl HostControl for SystemdHostControl {
     }
 
     fn restart_runner(&mut self) -> Result<ControlReadback, Self::Error> {
-        let before = unit_invocation("buzz-ci-runner.service", self.timeout)?;
-        self.systemctl("restart", "buzz-ci-runner.service")?;
-        let invocation = unit_invocation("buzz-ci-runner.service", self.timeout)?;
+        let before = self
+            .systemctl
+            .unit_invocation("buzz-ci-runner.service", self.timeout)?;
+        self.systemctl
+            .restart("buzz-ci-runner.service", self.timeout)?;
+        let invocation = self
+            .systemctl
+            .unit_invocation("buzz-ci-runner.service", self.timeout)?;
         if invocation == before
             || (!self.runner_invocation.is_empty() && invocation == self.runner_invocation)
         {
@@ -2026,8 +2029,10 @@ impl HostControl for SystemdHostControl {
     ) -> Result<ControlReadback, Self::Error> {
         let _ = self.controller_zero_action(QualificationZeroAction::Prepare, request)?;
         self.close_capacity()?;
-        self.systemctl("start", "buzz-ci-controld-acceptance.socket")?;
-        self.systemctl("start", "buzz-ci-controld.service")?;
+        self.systemctl
+            .start("buzz-ci-controld-acceptance.socket", self.timeout)?;
+        self.systemctl
+            .start("buzz-ci-controld.service", self.timeout)?;
         let readback = self.readback()?;
         if readback.capacity != 0 || readback.admission != AdmissionState::Closed {
             return Err(ControlError::ReadbackMismatch);
@@ -2040,8 +2045,10 @@ impl HostControl for SystemdHostControl {
         request: &ControlRequest,
     ) -> Result<HostZeroResult, Self::Error> {
         self.close_capacity()?;
-        self.systemctl("stop", "buzz-ci-controld-acceptance.socket")?;
-        self.systemctl("stop", "buzz-ci-controld.service")?;
+        self.systemctl
+            .stop("buzz-ci-controld-acceptance.socket", self.timeout)?;
+        self.systemctl
+            .stop("buzz-ci-controld.service", self.timeout)?;
         let controller_receipt_sha256 =
             self.controller_zero_action(QualificationZeroAction::Finalize, request)?;
         Ok(HostZeroResult {
@@ -2064,8 +2071,10 @@ impl HostControl for SystemdHostControl {
 
     fn emergency_capacity_zero(&mut self) -> Result<ZeroProof, Self::Error> {
         self.close_capacity()?;
-        self.systemctl("stop", "buzz-ci-controld-acceptance.socket")?;
-        self.systemctl("stop", "buzz-ci-controld.service")?;
+        self.systemctl
+            .stop("buzz-ci-controld-acceptance.socket", self.timeout)?;
+        self.systemctl
+            .stop("buzz-ci-controld.service", self.timeout)?;
         self.zero_proof()
     }
 }
@@ -2126,107 +2135,236 @@ fn active_activation_receipt_sha256(
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
-fn unit_state(unit: &'static str, timeout: Duration) -> Result<UnitState, ControlError> {
-    let output = run_bounded_command(
-        "/usr/bin/systemctl",
-        &["show", "--property=ActiveState", "--value", unit],
-        timeout,
-    )?;
-    match output.as_slice() {
-        b"active\n" => Ok(UnitState::Active),
-        b"inactive\n" => Ok(UnitState::Inactive),
-        b"failed\n" => Ok(UnitState::Failed),
-        _ => Err(ControlError::ReadbackMismatch),
+/// Output of one bounded host command that exited successfully.
+///
+/// stderr is informational. systemd 259 prints advisory text on a successful
+/// `systemctl stop <service>` while the service's socket unit is still active
+/// ("Stopping 'buzz-ci-runner.service', but its triggering units are still
+/// active:\nbuzz-ci-runner.socket"). Success is the exit status plus the
+/// caller's readback, never the absence of stderr.
+struct HostCommandOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// The fixed systemctl executable; tests substitute a fixture program.
+#[derive(Clone, Debug)]
+struct Systemctl {
+    program: PathBuf,
+}
+
+/// Capacity-one units in the fixed stop order shared with the activation
+/// controller (`STOP_ORDER`): target first, then each service before its
+/// socket.
+const CAPACITY_ONE_STOP_ORDER: [&str; 9] = [
+    "buzz-ci-capacity-one.target",
+    "buzz-ci-runner.service",
+    "buzz-ci-runner.socket",
+    EXECD_SERVICE,
+    EXECD_SOCKET,
+    EXECUTOR_SERVICE,
+    EXECUTOR_SOCKET,
+    "buzz-ci-keyholder.service",
+    "buzz-ci-keyholder.socket",
+];
+
+/// Stops every capacity-one unit. Each stop is judged by exit status plus
+/// readback, so systemd's advisory stderr never ends the sequence early (the
+/// H6 clean host stopped after `buzz-ci-runner.service` and left the runner
+/// socket, execd, executor, and keyholder running on every zero path).
+fn close_capacity(systemctl: &Systemctl, timeout: Duration) -> Result<(), ControlError> {
+    for unit in CAPACITY_ONE_STOP_ORDER {
+        systemctl.stop(unit, timeout)?;
     }
+    Ok(())
 }
 
-fn unit_active(unit: &'static str, timeout: Duration) -> Result<bool, ControlError> {
-    Ok(unit_state(unit, timeout)? == UnitState::Active)
+/// Journal line for advisory stderr from a host command that exited zero.
+fn host_command_note(program: &str, arguments: &[&str], stderr: &[u8]) {
+    const MAX_NOTE_BYTES: usize = 1024;
+    let shown = &stderr[..stderr.len().min(MAX_NOTE_BYTES)];
+    let line = serde_json::json!({
+        "schema_version": "buzz-ci-acceptance-control-note/v1",
+        "event": "host_command_stderr",
+        "program": program,
+        "arguments": arguments,
+        "stderr": String::from_utf8_lossy(shown),
+        "truncated": stderr.len() > MAX_NOTE_BYTES,
+    });
+    eprintln!("{line}");
 }
 
-fn unit_invocation(unit: &'static str, timeout: Duration) -> Result<String, ControlError> {
-    let output = run_bounded_command(
-        "/usr/bin/systemctl",
-        &["show", "--property=InvocationID", "--value", unit],
-        timeout,
-    )?;
-    let value = std::str::from_utf8(&output)
-        .map_err(|_| ControlError::ReadbackMismatch)?
-        .trim();
-    if lower_hex(value, &[32]) {
-        Ok(value.to_owned())
-    } else {
-        Err(ControlError::ReadbackMismatch)
+impl Systemctl {
+    fn live() -> Self {
+        Self {
+            program: PathBuf::from("/usr/bin/systemctl"),
+        }
     }
-}
 
-fn unit_invocation_optional(unit: &'static str, timeout: Duration) -> Result<String, ControlError> {
-    let output = run_bounded_command(
-        "/usr/bin/systemctl",
-        &["show", "--property=InvocationID", "--value", unit],
-        timeout,
-    )?;
-    let value = std::str::from_utf8(&output)
-        .map_err(|_| ControlError::ReadbackMismatch)?
-        .trim();
-    if value.is_empty() || lower_hex(value, &[32]) {
-        Ok(value.to_owned())
-    } else {
-        Err(ControlError::ReadbackMismatch)
+    fn run(
+        &self,
+        arguments: &[&str],
+        timeout: Duration,
+    ) -> Result<HostCommandOutput, ControlError> {
+        let output = run_bounded_command(&self.program, arguments, timeout)?;
+        if !output.stderr.is_empty() {
+            host_command_note("systemctl", arguments, &output.stderr);
+        }
+        Ok(output)
     }
-}
 
-fn unit_fragment_path(unit: &'static str, timeout: Duration) -> Result<String, ControlError> {
-    let output = run_bounded_command(
-        "/usr/bin/systemctl",
-        &["show", "--property=FragmentPath", "--value", unit],
-        timeout,
-    )?;
-    let value = std::str::from_utf8(&output)
-        .map_err(|_| ControlError::ReadbackMismatch)?
-        .strip_suffix('\n')
-        .ok_or(ControlError::ReadbackMismatch)?;
-    if valid_absolute(Path::new(value)) {
-        Ok(value.to_owned())
-    } else {
-        Err(ControlError::ReadbackMismatch)
+    /// `systemctl stop`, judged by exit status and the post-stop readback: the
+    /// unit must be `inactive`/`dead`, or `failed`/`failed` for a unit whose
+    /// last run failed (nothing runs; the zero proof still demands inactive).
+    /// Exit status nonzero, or a unit that still reads back active, fails.
+    fn stop(&self, unit: &'static str, timeout: Duration) -> Result<(), ControlError> {
+        self.run(&["stop", unit], timeout)?;
+        let state = self.unit_state(unit, timeout)?;
+        let sub_state = self.unit_property(unit, "SubState", timeout)?;
+        match (state, sub_state.as_str()) {
+            (UnitState::Inactive, "dead") | (UnitState::Failed, "failed") => Ok(()),
+            _ => Err(ControlError::HostAction),
+        }
     }
-}
 
-fn unit_property(
-    unit: &'static str,
-    property: &'static str,
-    timeout: Duration,
-) -> Result<String, ControlError> {
-    let property_argument = match property {
-        "LoadState" => "--property=LoadState",
-        "SubState" => "--property=SubState",
-        "MainPID" => "--property=MainPID",
-        "User" => "--property=User",
-        "Group" => "--property=Group",
-        "SupplementaryGroups" => "--property=SupplementaryGroups",
-        _ => return Err(ControlError::ReadbackMismatch),
-    };
-    let output = run_bounded_command(
-        "/usr/bin/systemctl",
-        &["show", property_argument, "--value", unit],
-        timeout,
-    )?;
-    let value = std::str::from_utf8(&output)
-        .map_err(|_| ControlError::ReadbackMismatch)?
-        .strip_suffix('\n')
-        .ok_or(ControlError::ReadbackMismatch)?;
-    if value.contains(['\n', '\r']) {
-        Err(ControlError::ReadbackMismatch)
-    } else {
-        Ok(value.to_owned())
+    /// `systemctl start`, judged by exit status and an `active` readback.
+    fn start(&self, unit: &'static str, timeout: Duration) -> Result<(), ControlError> {
+        self.run(&["start", unit], timeout)?;
+        self.require_active(unit, timeout)
     }
-}
 
-fn unit_main_pid(unit: &'static str, timeout: Duration) -> Result<u32, ControlError> {
-    unit_property(unit, "MainPID", timeout)?
-        .parse()
-        .map_err(|_| ControlError::ReadbackMismatch)
+    /// `systemctl restart`, judged by exit status and an `active` readback;
+    /// callers compare the InvocationID around it.
+    fn restart(&self, unit: &'static str, timeout: Duration) -> Result<(), ControlError> {
+        self.run(&["restart", unit], timeout)?;
+        self.require_active(unit, timeout)
+    }
+
+    fn require_active(&self, unit: &'static str, timeout: Duration) -> Result<(), ControlError> {
+        if self.unit_state(unit, timeout)? == UnitState::Active {
+            Ok(())
+        } else {
+            Err(ControlError::HostAction)
+        }
+    }
+
+    fn unit_state(&self, unit: &'static str, timeout: Duration) -> Result<UnitState, ControlError> {
+        let output = self
+            .run(
+                &["show", "--property=ActiveState", "--value", unit],
+                timeout,
+            )?
+            .stdout;
+        match output.as_slice() {
+            b"active\n" => Ok(UnitState::Active),
+            b"inactive\n" => Ok(UnitState::Inactive),
+            b"failed\n" => Ok(UnitState::Failed),
+            _ => Err(ControlError::ReadbackMismatch),
+        }
+    }
+
+    fn unit_active(&self, unit: &'static str, timeout: Duration) -> Result<bool, ControlError> {
+        Ok(self.unit_state(unit, timeout)? == UnitState::Active)
+    }
+
+    fn unit_invocation(
+        &self,
+        unit: &'static str,
+        timeout: Duration,
+    ) -> Result<String, ControlError> {
+        let output = self
+            .run(
+                &["show", "--property=InvocationID", "--value", unit],
+                timeout,
+            )?
+            .stdout;
+        let value = std::str::from_utf8(&output)
+            .map_err(|_| ControlError::ReadbackMismatch)?
+            .trim();
+        if lower_hex(value, &[32]) {
+            Ok(value.to_owned())
+        } else {
+            Err(ControlError::ReadbackMismatch)
+        }
+    }
+
+    fn unit_invocation_optional(
+        &self,
+        unit: &'static str,
+        timeout: Duration,
+    ) -> Result<String, ControlError> {
+        let output = self
+            .run(
+                &["show", "--property=InvocationID", "--value", unit],
+                timeout,
+            )?
+            .stdout;
+        let value = std::str::from_utf8(&output)
+            .map_err(|_| ControlError::ReadbackMismatch)?
+            .trim();
+        if value.is_empty() || lower_hex(value, &[32]) {
+            Ok(value.to_owned())
+        } else {
+            Err(ControlError::ReadbackMismatch)
+        }
+    }
+
+    fn unit_fragment_path(
+        &self,
+        unit: &'static str,
+        timeout: Duration,
+    ) -> Result<String, ControlError> {
+        let output = self
+            .run(
+                &["show", "--property=FragmentPath", "--value", unit],
+                timeout,
+            )?
+            .stdout;
+        let value = std::str::from_utf8(&output)
+            .map_err(|_| ControlError::ReadbackMismatch)?
+            .strip_suffix('\n')
+            .ok_or(ControlError::ReadbackMismatch)?;
+        if valid_absolute(Path::new(value)) {
+            Ok(value.to_owned())
+        } else {
+            Err(ControlError::ReadbackMismatch)
+        }
+    }
+
+    fn unit_property(
+        &self,
+        unit: &'static str,
+        property: &'static str,
+        timeout: Duration,
+    ) -> Result<String, ControlError> {
+        let property_argument = match property {
+            "LoadState" => "--property=LoadState",
+            "SubState" => "--property=SubState",
+            "MainPID" => "--property=MainPID",
+            "User" => "--property=User",
+            "Group" => "--property=Group",
+            "SupplementaryGroups" => "--property=SupplementaryGroups",
+            _ => return Err(ControlError::ReadbackMismatch),
+        };
+        let output = self
+            .run(&["show", property_argument, "--value", unit], timeout)?
+            .stdout;
+        let value = std::str::from_utf8(&output)
+            .map_err(|_| ControlError::ReadbackMismatch)?
+            .strip_suffix('\n')
+            .ok_or(ControlError::ReadbackMismatch)?;
+        if value.contains(['\n', '\r']) {
+            Err(ControlError::ReadbackMismatch)
+        } else {
+            Ok(value.to_owned())
+        }
+    }
+
+    fn unit_main_pid(&self, unit: &'static str, timeout: Duration) -> Result<u32, ControlError> {
+        self.unit_property(unit, "MainPID", timeout)?
+            .parse()
+            .map_err(|_| ControlError::ReadbackMismatch)
+    }
 }
 
 fn live_process_identity(pid: u32) -> Result<ProcessIdentity, ControlError> {
@@ -2279,10 +2417,10 @@ fn live_socket_identity(path: &Path) -> Result<SocketIdentity, ControlError> {
 }
 
 fn run_bounded_command(
-    program: &'static str,
-    args: &[&'static str],
+    program: &Path,
+    args: &[&str],
     timeout: Duration,
-) -> Result<Vec<u8>, ControlError> {
+) -> Result<HostCommandOutput, ControlError> {
     const MAX_OUTPUT: usize = 64 * 1024;
     let mut child = Command::new(program)
         .args(args)
@@ -2313,10 +2451,10 @@ fn run_bounded_command(
     let stderr = stderr_reader
         .join()
         .map_err(|_| ControlError::HostAction)??;
-    if !status.success() || !stderr.is_empty() {
+    if !status.success() {
         return Err(ControlError::HostAction);
     }
-    Ok(stdout)
+    Ok(HostCommandOutput { stdout, stderr })
 }
 
 fn run_bounded_controller(
@@ -4537,6 +4675,141 @@ mod tests {
         );
         assert_eq!(result, Err(ControlError::HostAction));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// The exact advisory systemd 259 prints on a successful
+    /// `systemctl stop <service>` while the service's socket still listens
+    /// (H6 clean host, diagnostic boot 4, rc 0).
+    const STOP_ADVISORY: &str =
+        "Stopping 'buzz-ci-runner.service', but its triggering units are still active:\nbuzz-ci-runner.socket\n";
+
+    /// A systemd-259-shaped fake systemctl: `stop` records the unit and prints
+    /// the advisory for a service whose socket is still up; `show` answers
+    /// ActiveState and SubState from the recorded set. Marker files switch the
+    /// failure shapes on: `fail-stop` (rc 1) and `ignore-stop` (rc 0, unit
+    /// stays active).
+    fn fake_systemctl(directory: &Path) -> Systemctl {
+        let dir = directory.display();
+        let script = format!(
+            r#"#!/bin/sh
+dir='{dir}'
+printf '%s\n' "$*" >> "$dir/calls"
+case "$1" in
+  stop)
+    unit=$2
+    if [ -e "$dir/fail-stop" ]; then
+      echo "Failed to stop $unit: refused by fixture" >&2
+      exit 1
+    fi
+    if [ ! -e "$dir/ignore-stop" ]; then
+      printf '%s\n' "$unit" >> "$dir/stopped"
+    fi
+    case "$unit" in
+      *.service)
+        socket="${{unit%.service}}.socket"
+        if ! grep -qxF "$socket" "$dir/stopped" 2>/dev/null; then
+          printf "Stopping '%s', but its triggering units are still active:\n%s\n" "$unit" "$socket" >&2
+        fi
+        ;;
+    esac
+    exit 0
+    ;;
+  start|restart)
+    unit=$2
+    if [ -e "$dir/stopped" ]; then
+      grep -vxF "$unit" "$dir/stopped" > "$dir/stopped.new"
+      mv "$dir/stopped.new" "$dir/stopped"
+    fi
+    exit 0
+    ;;
+  show)
+    unit=$4
+    stopped=0
+    if [ -e "$dir/stopped" ] && grep -qxF "$unit" "$dir/stopped"; then stopped=1; fi
+    case "$2" in
+      --property=ActiveState) if [ "$stopped" = 1 ]; then echo inactive; else echo active; fi ;;
+      --property=SubState) if [ "$stopped" = 1 ]; then echo dead; else echo running; fi ;;
+      *) exit 1 ;;
+    esac
+    exit 0
+    ;;
+esac
+exit 1
+"#
+        );
+        let program = directory.join("systemctl");
+        fs::write(&program, script).unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        Systemctl { program }
+    }
+
+    /// H6 clean host: every zero path aborted after the first service stop
+    /// because `run_bounded_command` treated systemd's advisory stderr as a
+    /// failed host action. Stop is now judged by exit status plus the
+    /// post-stop readback; the advisory is informational.
+    #[test]
+    fn systemctl_stop_advisory_stderr_is_informational_and_close_capacity_completes() {
+        let directory = tempfile::tempdir().unwrap();
+        let systemctl = fake_systemctl(directory.path());
+        let timeout = Duration::from_secs(5);
+
+        let output = run_bounded_command(
+            &systemctl.program,
+            &["stop", "buzz-ci-runner.service"],
+            timeout,
+        )
+        .unwrap();
+        assert_eq!(output.stdout, b"");
+        assert_eq!(std::str::from_utf8(&output.stderr).unwrap(), STOP_ADVISORY);
+        fs::remove_file(directory.path().join("stopped")).unwrap();
+        fs::remove_file(directory.path().join("calls")).unwrap();
+
+        systemctl.stop("buzz-ci-runner.service", timeout).unwrap();
+        assert_eq!(
+            fs::read_to_string(directory.path().join("calls")).unwrap(),
+            "stop buzz-ci-runner.service\n\
+             show --property=ActiveState --value buzz-ci-runner.service\n\
+             show --property=SubState --value buzz-ci-runner.service\n"
+        );
+        fs::remove_file(directory.path().join("stopped")).unwrap();
+
+        close_capacity(&systemctl, timeout).unwrap();
+        let stopped = fs::read_to_string(directory.path().join("stopped")).unwrap();
+        assert_eq!(
+            stopped.lines().collect::<Vec<_>>(),
+            CAPACITY_ONE_STOP_ORDER.to_vec()
+        );
+        for unit in CAPACITY_ONE_STOP_ORDER {
+            assert_eq!(
+                systemctl.unit_state(unit, timeout).unwrap(),
+                UnitState::Inactive
+            );
+        }
+
+        systemctl.start("buzz-ci-runner.socket", timeout).unwrap();
+        assert_eq!(
+            systemctl
+                .unit_state("buzz-ci-runner.socket", timeout)
+                .unwrap(),
+            UnitState::Active
+        );
+        systemctl.restart("buzz-ci-runner.socket", timeout).unwrap();
+
+        fs::write(directory.path().join("ignore-stop"), b"").unwrap();
+        assert_eq!(
+            systemctl.stop("buzz-ci-runner.socket", timeout),
+            Err(ControlError::HostAction)
+        );
+        fs::remove_file(directory.path().join("ignore-stop")).unwrap();
+        fs::write(directory.path().join("fail-stop"), b"").unwrap();
+        assert_eq!(
+            systemctl.stop("buzz-ci-runner.socket", timeout),
+            Err(ControlError::HostAction)
+        );
+        assert_eq!(
+            close_capacity(&systemctl, timeout),
+            Err(ControlError::HostAction)
+        );
     }
 }
 
