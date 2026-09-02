@@ -3006,7 +3006,29 @@ fn read_document<T: for<'de> Deserialize<'de> + Serialize>(
         .ok_or(ProductionV2Error::Closed)?;
     let directory = SafeDirectory::open(parent.to_owned(), owner, 0o755)?;
     let bytes = directory.read(name, mode, maximum)?;
-    canonical_parse(&bytes)
+    canonical_sorted_parse(&bytes)
+}
+
+/// Byte contract for the activation-controller rendered config at
+/// [`CONFIG_PATH`]: compact JSON with every object key sorted bytewise and one
+/// trailing LF, which is `deploy/native-ci/activation/package.py`
+/// `canonical_json`. Documents execd writes for itself keep the struct-order
+/// form of [`canonical_bytes`].
+fn canonical_sorted_parse<T: for<'de> Deserialize<'de> + Serialize>(
+    bytes: &[u8],
+) -> Result<T, ProductionV2Error> {
+    let value: T = serde_json::from_slice(bytes).map_err(|_| ProductionV2Error::Closed)?;
+    if canonical_sorted_bytes(&value)? != bytes {
+        return Err(ProductionV2Error::Closed);
+    }
+    Ok(value)
+}
+
+fn canonical_sorted_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, ProductionV2Error> {
+    let sorted = serde_json::to_value(value).map_err(|_| ProductionV2Error::Closed)?;
+    let mut bytes = serde_json::to_vec(&sorted).map_err(|_| ProductionV2Error::Closed)?;
+    bytes.push(b'\n');
+    Ok(bytes)
 }
 
 fn canonical_parse<T: for<'de> Deserialize<'de> + Serialize>(
@@ -5320,8 +5342,15 @@ mod tests {
         assert!(tampered.sealed_attempt_evidence(binding).is_err());
     }
 
-    #[test]
-    fn exact_fake_root_capacity_one_config_selects_v2() {
+    struct FakeRoot {
+        temporary: tempfile::TempDir,
+        owner: u32,
+        group: u32,
+        config: ProductionConfig,
+    }
+
+    /// Exact capacity-one fake root with a config that `load_from` accepts.
+    fn capacity_one_fake_root() -> FakeRoot {
         let temporary = tempfile::tempdir().unwrap();
         let prefix = temporary.path();
         for relative in [
@@ -5527,8 +5556,193 @@ mod tests {
         .unwrap();
         config.execution.declaration_digest =
             hex::encode(static_execution_digest(&static_contract));
+        FakeRoot {
+            temporary,
+            owner,
+            group,
+            config,
+        }
+    }
+
+    fn write_fake_root_principals(prefix: &Path, owner: u32, group: u32) {
+        fs::write(
+            prefix.join("etc/passwd"),
+            format!(
+                "buzzci-runner:x:{}:{}::/var/lib/buzzci/runner:/usr/sbin/nologin\nbuzzci-ctl:x:{}:{}::{CONTROL_HOME}:/usr/sbin/nologin\nbuzzci-job:x:{}:{}::/var/empty:/usr/sbin/nologin\n",
+                owner + 1,
+                group + 1,
+                CONTROL_UID,
+                CONTROL_GID,
+                owner + 3,
+                group + 3,
+            ),
+        )
+        .unwrap();
+        fs::write(
+            prefix.join("etc/group"),
+            format!(
+                "buzzci-execd:x:{}:buzzci-ctl,buzzci-runner\nbuzzci-ctl:x:{}:\n",
+                group + 4,
+                CONTROL_GID
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Render an execd config through the exact Python activation controller
+    /// (`deploy/native-ci/activation/controller.py` `_render_execd_config`).
+    fn render_with_activation_controller(request: &serde_json::Value) -> Vec<u8> {
+        let activation_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/native-ci/activation");
+        let script = r#"
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root))
+spec = importlib.util.spec_from_file_location("activation_controller", root / "controller.py")
+controller = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(controller)
+request = json.load(sys.stdin)
+source = "assets/execd-template.json"
+rendered = controller._render_execd_config(
+    request["manifest"],
+    {source: request["template"].encode()},
+    {"source": source, "active_source": source},
+    request["binding"],
+    capacity=request["capacity"],
+)
+sys.stdout.buffer.write(rendered)
+"#;
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(script)
+            .arg(&activation_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("python3 is required to exercise the activation controller renderer");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&serde_json::to_vec(request).unwrap())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "controller render failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    #[test]
+    fn controller_rendered_execd_config_bytes_load_exactly() {
+        let fake = capacity_one_fake_root();
+        let prefix = fake.temporary.path();
+        let expected = fake.config;
+        let mut template = expected.clone();
+        template.execution.declaration_digest = "0".repeat(64);
+        template.qualification.activation_package_digest = "0".repeat(64);
+        template.qualification.fixture_digest = "0".repeat(64);
+        let request = serde_json::json!({
+            "template": String::from_utf8(canonical_sorted_bytes(&template).unwrap()).unwrap(),
+            "manifest": {
+                "source_commit": expected.qualification.integrated_candidate_sha,
+                "package_digest": expected.qualification.activation_package_digest,
+            },
+            "binding": {
+                "scenario_sha256": expected.qualification.fixture_digest,
+                "fixture": {
+                    "controller_generation": expected.qualification.controller_generation,
+                    "runner_generation": expected.qualification.runner_generation,
+                    "manifest_digest": FIXTURE_MANIFEST_SHA256,
+                },
+            },
+            "capacity": expected.capacity,
+        });
+        let rendered = render_with_activation_controller(&request);
+
+        // The controller's bytes are the sorted-key compact form plus LF, and
+        // the Python execution digest equals the Rust static digest.
+        assert_eq!(rendered, canonical_sorted_bytes(&expected).unwrap());
+        assert_eq!(
+            canonical_sorted_parse::<ProductionConfig>(&rendered).unwrap(),
+            expected
+        );
+        assert!(
+            canonical_sorted_parse::<ProductionConfig>(&canonical_bytes(&expected).unwrap())
+                .is_err()
+        );
+
+        // Any drift from the exact bytes closes the config.
+        let struct_order = canonical_bytes(&expected).unwrap();
+        assert_ne!(struct_order, rendered);
+        assert!(canonical_sorted_parse::<ProductionConfig>(&struct_order).is_err());
+        let without_newline = &rendered[..rendered.len() - 1];
+        assert!(canonical_sorted_parse::<ProductionConfig>(without_newline).is_err());
+        let mut padded = rendered.clone();
+        padded.push(b'\n');
+        assert!(canonical_sorted_parse::<ProductionConfig>(&padded).is_err());
+        let text = String::from_utf8(rendered.clone()).unwrap();
+        let head = "{\"capacity\":1,\"enabled_protocol\":2,";
+        assert!(text.starts_with(head));
+        let reordered = text.replacen(head, "{\"enabled_protocol\":2,\"capacity\":1,", 1);
+        assert!(canonical_sorted_parse::<ProductionConfig>(reordered.as_bytes()).is_err());
+        let spaced = text.replacen("{\"capacity\":1,", "{\"capacity\": 1,", 1);
+        assert!(canonical_sorted_parse::<ProductionConfig>(spaced.as_bytes()).is_err());
+
+        // The exact controller bytes on disk let load_from open capacity one.
         let config_path = prefix.join("etc/buzzci/execd-v2.json");
-        fs::write(&config_path, canonical_bytes(&config).unwrap()).unwrap();
+        fs::write(&config_path, &rendered).unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+        write_fake_root_principals(prefix, fake.owner, fake.group);
+        let activated = Cell::new(false);
+        assert!(load_from(
+            RuntimePaths {
+                prefix: prefix.to_owned(),
+            },
+            fake.owner,
+            2,
+            true,
+            || {
+                activated.set(true);
+                Ok(SeccompRuntimeBinding::fixture())
+            },
+        )
+        .is_ok());
+        assert!(activated.get());
+
+        fs::write(&config_path, &struct_order).unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let refused = Cell::new(false);
+        assert!(load_from(
+            RuntimePaths {
+                prefix: prefix.to_owned(),
+            },
+            fake.owner,
+            2,
+            true,
+            || {
+                refused.set(true);
+                Ok(SeccompRuntimeBinding::fixture())
+            },
+        )
+        .is_err());
+        assert!(!refused.get());
+    }
+
+    #[test]
+    fn exact_fake_root_capacity_one_config_selects_v2() {
+        let fake = capacity_one_fake_root();
+        let prefix = fake.temporary.path();
+        let (owner, group, config) = (fake.owner, fake.group, fake.config);
+        let config_path = prefix.join("etc/buzzci/execd-v2.json");
+        fs::write(&config_path, canonical_sorted_bytes(&config).unwrap()).unwrap();
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
         let passwd_path = prefix.join("etc/passwd");
         let passwd = format!(
@@ -5591,7 +5805,11 @@ mod tests {
 
         let mut capacity_zero = config.clone();
         capacity_zero.capacity = 0;
-        fs::write(&config_path, canonical_bytes(&capacity_zero).unwrap()).unwrap();
+        fs::write(
+            &config_path,
+            canonical_sorted_bytes(&capacity_zero).unwrap(),
+        )
+        .unwrap();
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
         let mut runtime = load_from(
             RuntimePaths {
@@ -5798,7 +6016,7 @@ mod tests {
 
         let mut drifted = config;
         drifted.capacity = 2;
-        fs::write(&config_path, canonical_bytes(&drifted).unwrap()).unwrap();
+        fs::write(&config_path, canonical_sorted_bytes(&drifted).unwrap()).unwrap();
         fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
         let invalid_called = Cell::new(false);
         assert!(load_from(

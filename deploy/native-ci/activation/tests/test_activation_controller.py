@@ -3767,6 +3767,45 @@ class ActivationControllerTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     activation_package.validate_execution_declaration(mutated, allow_placeholder=True)
 
+    def test_execd_config_bytes_follow_the_sorted_canonical_contract(self) -> None:
+        # execd `canonical_sorted_parse` accepts exactly these bytes: compact JSON,
+        # every object key sorted bytewise, one trailing LF, nothing else.
+        manifest, payloads, driver = self.fixture.load()
+        entry = next(item for item in manifest["entries"] if item["role"] == "execd_config")
+
+        def assert_sorted(value: object) -> None:
+            if isinstance(value, dict):
+                self.assertEqual(list(value), sorted(value))
+                for child in value.values():
+                    assert_sorted(child)
+            elif isinstance(value, list):
+                for child in value:
+                    assert_sorted(child)
+
+        for capacity in (0, 1):
+            with self.subTest(capacity=capacity):
+                rendered = CONTROLLER._render_execd_config(
+                    manifest, payloads, entry, self.fixture.binding, capacity=capacity,
+                )
+                self.assertTrue(rendered.endswith(b"\n"))
+                self.assertNotIn(b"\n", rendered[:-1])
+                self.assertEqual(rendered.decode("ascii").encode("ascii"), rendered)
+                value = json.loads(rendered, object_pairs_hook=activation_package.reject_duplicates)
+                self.assertEqual(value["capacity"], capacity)
+                assert_sorted(value)
+                self.assertEqual(activation_package.canonical_json(value), rendered)
+                self.assertEqual(
+                    json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n", rendered,
+                )
+                self.assertNotEqual(json.dumps(value, sort_keys=True).encode() + b"\n", rendered)
+                self.assertNotEqual(rendered[:-1], activation_package.canonical_json(value))
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        staged = (self.fixture.root / entry["target"].lstrip("/")).read_bytes()
+        self.assertEqual(
+            staged,
+            CONTROLLER._render_execd_config(manifest, payloads, entry, self.fixture.binding, capacity=0),
+        )
+
     def test_execution_digest_matches_frozen_rust_vector(self) -> None:
         manifest, payloads, _driver = self.fixture.load()
         entry = next(item for item in manifest["entries"] if item["role"] == "execd_config")
