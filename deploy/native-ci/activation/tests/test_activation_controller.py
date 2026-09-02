@@ -1575,7 +1575,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "04b09c1439e625aa6719466bf15ed24efab4351698475bf504e44931893e773b",
+            "b2a919489f5d6e6f35876f6eea7b5934f2547a269056d992b040e7c57ace7cdb",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -4164,6 +4164,25 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertEqual(json.loads(rebuilt["run_event"][5])["issued_at"], reference + 7)
         self.assertEqual(json.loads(rebuilt["rerun_event"][5])["issued_at"], reference + 17)
         self.assertNotEqual(rebuilt["run_event"], template["run_event"])
+        # H8 clean host, diagnostic boots 3 and 4: execd judged the same window
+        # by wall clock. Its config now carries the reference as well, bound to
+        # the template in both phases.
+        for source_field, value in (("source", reference + 1), ("active_source", reference - 1)):
+            manifest, payloads, _driver = self.fixture.load()
+            entries = {entry["role"]: entry for entry in manifest["entries"]}
+            execd = json.loads(payloads[entries["execd_config"][source_field]])
+            self.assertEqual(execd["acceptance_time_reference"], reference)
+            execd["acceptance_time_reference"] = value
+            payloads[entries["execd_config"][source_field]] = activation_package.canonical_json(execd)
+            with self.assertRaisesRegex(ValueError, "execd v2 time reference differs"):
+                CONTROLLER._validate_phase_configs(manifest, payloads)
+        manifest, payloads, _driver = self.fixture.load()
+        entries = {entry["role"]: entry for entry in manifest["entries"]}
+        execd = json.loads(payloads[entries["execd_config"]["source"]])
+        del execd["acceptance_time_reference"]
+        payloads[entries["execd_config"]["source"]] = activation_package.canonical_json(execd)
+        with self.assertRaisesRegex(ValueError, "shape differs from production"):
+            CONTROLLER._validate_phase_configs(manifest, payloads)
 
     def test_every_execution_declaration_field_drift_is_rejected(self) -> None:
         mutations = {

@@ -170,6 +170,10 @@ struct ProductionConfig {
     executor: ProgramProvenance,
     execution: StaticExecutionConfig,
     qualification: QualificationConfig,
+    /// The activation package's bound time reference (the frozen acceptance
+    /// template's issued_at); every admission, lane, and cancel window is
+    /// judged against it, never against the wall clock.
+    acceptance_time_reference: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2248,6 +2252,7 @@ where
             intents,
             journal,
             host,
+            config.acceptance_time_reference,
         );
         controller
             .recover_open(now)
@@ -2308,6 +2313,7 @@ fn validate_config(
     if config.schema_version != CONFIG_SCHEMA
         || config.enabled_protocol != 2
         || !matches!(config.capacity, 0 | 1)
+        || config.acceptance_time_reference == 0
         || identities.execd_uid != owner
         || identities.execd_uid == identities.runner_uid
         || identities.execd_uid == identities.control_uid
@@ -5792,6 +5798,7 @@ mod tests {
             schema_version: CONFIG_SCHEMA,
             enabled_protocol: 2,
             capacity: 1,
+            acceptance_time_reference: 1_800_000_000,
             identities: IdentityConfig {
                 execd_uid: owner,
                 execd_gid: group,
@@ -6044,11 +6051,21 @@ sys.stdout.buffer.write(rendered)
         padded.push(b'\n');
         assert!(canonical_sorted_parse::<ProductionConfig>(&padded).is_err());
         let text = String::from_utf8(rendered.clone()).unwrap();
-        let head = "{\"capacity\":1,\"enabled_protocol\":2,";
-        assert!(text.starts_with(head));
-        let reordered = text.replacen(head, "{\"enabled_protocol\":2,\"capacity\":1,", 1);
+        let head = format!(
+            "{{\"acceptance_time_reference\":{},\"capacity\":1,\"enabled_protocol\":2,",
+            expected.acceptance_time_reference
+        );
+        assert!(text.starts_with(&head));
+        let reordered = text.replacen(
+            &head,
+            &format!(
+                "{{\"acceptance_time_reference\":{},\"enabled_protocol\":2,\"capacity\":1,",
+                expected.acceptance_time_reference
+            ),
+            1,
+        );
         assert!(canonical_sorted_parse::<ProductionConfig>(reordered.as_bytes()).is_err());
-        let spaced = text.replacen("{\"capacity\":1,", "{\"capacity\": 1,", 1);
+        let spaced = text.replacen(",\"capacity\":1,", ",\"capacity\": 1,", 1);
         assert!(canonical_sorted_parse::<ProductionConfig>(spaced.as_bytes()).is_err());
 
         // The exact controller bytes on disk let load_from open capacity one.
@@ -6095,7 +6112,7 @@ sys.stdout.buffer.write(rendered)
     /// the installed `/etc/buzzci/execd-v2.json` (without its trailing LF)
     /// and the production qualification request the activation controller
     /// persisted. execd answered `policy_denied` to this request.
-    const RECORDED_EXECD_CONFIG: &str = r#"{"capacity":0,"enabled_protocol":2,"execution":{"artifact":{"artifact_id":"result","max_bytes":32768,"media_type":"application/json","name":"result.json","relative_name":"result.json"},"declaration_digest":"880ecdbe623808f5356c008b6d35e9e0a016b9ecdc6cac1e1d0e3fc5f27837a3","fixture_input_sha256":"967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6","fixture_manifest_sha256":"f204b8fba64e972408f5a0ea1c0bb3140cfa696289903d96a8cb07d602af6b23","fixture_script_sha256":"3bb81cfd157e50b1d0834de48a9ecf1c27b0438a4f2bc374e091fb4f11ec213d","job_id":"capacity-one-fixture","max_memory_bytes":134217728,"max_processes":16,"max_stderr_bytes":32768,"max_stdout_bytes":32768,"max_wall_seconds":120,"schema_version":1,"workflow_digest":"8080808080808080808080808080808080808080808080808080808080808080","workflow_id":"capacity-one"},"executor":{"gid":0,"mode":493,"path":"/usr/libexec/buzz-ci-executor","sha256":"ac9ef9987b627eded1d40e30726ec02b24fa6591b394513007218ef91a22ba7b","source_commit":"cbca8b1371206688fde40d6f370ee65b97bb145a","uid":0},"identities":{"access_group":"buzzci-execd","access_group_gid":1204,"access_group_members":["buzzci-ctl","buzzci-runner"],"control_gid":961,"control_group":"buzzci-ctl","control_home":"/var/lib/buzzci/principals/ctl","control_shell":"/usr/sbin/nologin","control_supplementary_groups":["buzzci-execd"],"control_uid":961,"control_user":"buzzci-ctl","execd_gid":0,"execd_uid":0,"job_gid":1205,"job_uid":1205,"runner_gid":1200,"runner_uid":1200},"lane_manifest":{"admission_key_generation":9,"admission_verifying_key":"2020202020202020202020202020202020202020202020202020202020202020","broker_build_identity":"3030303030303030303030303030303030303030303030303030303030303030","expires_at":4102444800,"host_profile_digest":"4040404040404040404040404040404040404040404040404040404040404040","isolation_profile_digest":"6060606060606060606060606060606060606060606060606060606060606060","lane_epoch":4,"lane_id":"1010101010101010101010101010101010101010101010101010101010101010","max_wall_timeout_seconds":300,"not_before":1,"schema_version":1,"suite_identity":"5050505050505050505050505050505050505050505050505050505050505050"},"lane_manifest_digest":"12ede37672233a144707bc49efa5d8f86ec5803e6b9d623347472702b2c98f04","paths":{"attempt_root":"/var/lib/buzzci/execd-v2/attempts","binding_root":"/var/lib/buzzci/execd-v2/bindings","evidence_root":"/var/lib/buzzci/execd-v2/evidence","executor_socket":"/run/buzzci/executor.sock","intent_root":"/var/lib/buzzci/execd-v2/intents","qualification_root":"/var/lib/buzzci/execd-v2/qualification","teardown_root":"/var/lib/buzzci/execd-v2/teardown"},"qualification":{"activation_package_digest":"1c390e3a93e17d5b7d874b4a3f749cfbf5b5273448e62c72bce8d33a3bb91a0d","controller_generation":1,"fixture_digest":"10a308a084aef26b2c15f35464aee2bead575ed46f38713af9683d07d75f9667","integrated_candidate_sha":"cbca8b1371206688fde40d6f370ee65b97bb145a","runner_generation":1},"schema_version":2}"#;
+    const RECORDED_EXECD_CONFIG: &str = r#"{"acceptance_time_reference":1788322400,"capacity":0,"enabled_protocol":2,"execution":{"artifact":{"artifact_id":"result","max_bytes":32768,"media_type":"application/json","name":"result.json","relative_name":"result.json"},"declaration_digest":"880ecdbe623808f5356c008b6d35e9e0a016b9ecdc6cac1e1d0e3fc5f27837a3","fixture_input_sha256":"967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6","fixture_manifest_sha256":"f204b8fba64e972408f5a0ea1c0bb3140cfa696289903d96a8cb07d602af6b23","fixture_script_sha256":"3bb81cfd157e50b1d0834de48a9ecf1c27b0438a4f2bc374e091fb4f11ec213d","job_id":"capacity-one-fixture","max_memory_bytes":134217728,"max_processes":16,"max_stderr_bytes":32768,"max_stdout_bytes":32768,"max_wall_seconds":120,"schema_version":1,"workflow_digest":"8080808080808080808080808080808080808080808080808080808080808080","workflow_id":"capacity-one"},"executor":{"gid":0,"mode":493,"path":"/usr/libexec/buzz-ci-executor","sha256":"ac9ef9987b627eded1d40e30726ec02b24fa6591b394513007218ef91a22ba7b","source_commit":"cbca8b1371206688fde40d6f370ee65b97bb145a","uid":0},"identities":{"access_group":"buzzci-execd","access_group_gid":1204,"access_group_members":["buzzci-ctl","buzzci-runner"],"control_gid":961,"control_group":"buzzci-ctl","control_home":"/var/lib/buzzci/principals/ctl","control_shell":"/usr/sbin/nologin","control_supplementary_groups":["buzzci-execd"],"control_uid":961,"control_user":"buzzci-ctl","execd_gid":0,"execd_uid":0,"job_gid":1205,"job_uid":1205,"runner_gid":1200,"runner_uid":1200},"lane_manifest":{"admission_key_generation":9,"admission_verifying_key":"2020202020202020202020202020202020202020202020202020202020202020","broker_build_identity":"3030303030303030303030303030303030303030303030303030303030303030","expires_at":4102444800,"host_profile_digest":"4040404040404040404040404040404040404040404040404040404040404040","isolation_profile_digest":"6060606060606060606060606060606060606060606060606060606060606060","lane_epoch":4,"lane_id":"1010101010101010101010101010101010101010101010101010101010101010","max_wall_timeout_seconds":300,"not_before":1,"schema_version":1,"suite_identity":"5050505050505050505050505050505050505050505050505050505050505050"},"lane_manifest_digest":"12ede37672233a144707bc49efa5d8f86ec5803e6b9d623347472702b2c98f04","paths":{"attempt_root":"/var/lib/buzzci/execd-v2/attempts","binding_root":"/var/lib/buzzci/execd-v2/bindings","evidence_root":"/var/lib/buzzci/execd-v2/evidence","executor_socket":"/run/buzzci/executor.sock","intent_root":"/var/lib/buzzci/execd-v2/intents","qualification_root":"/var/lib/buzzci/execd-v2/qualification","teardown_root":"/var/lib/buzzci/execd-v2/teardown"},"qualification":{"activation_package_digest":"1c390e3a93e17d5b7d874b4a3f749cfbf5b5273448e62c72bce8d33a3bb91a0d","controller_generation":1,"fixture_digest":"10a308a084aef26b2c15f35464aee2bead575ed46f38713af9683d07d75f9667","integrated_candidate_sha":"cbca8b1371206688fde40d6f370ee65b97bb145a","runner_generation":1},"schema_version":2}"#;
     const RECORDED_QUALIFICATION_REQUEST: &str = r#"{"schema_version":"buzz-ci-production-qualification-request/v2","request_id":"113099804cb3fde2a6681257809ae38e","integrated_candidate_sha":"cbca8b1371206688fde40d6f370ee65b97bb145a","activation_package_digest":"1c390e3a93e17d5b7d874b4a3f749cfbf5b5273448e62c72bce8d33a3bb91a0d","fixture_digest":"10a308a084aef26b2c15f35464aee2bead575ed46f38713af9683d07d75f9667","principal_digest":"ee22ba0c8e462a5cba4cf2fc6fde6f1a65c663199a9021b01f9108ad56aa5a2e","lane_manifest_digest":"12ede37672233a144707bc49efa5d8f86ec5803e6b9d623347472702b2c98f04","broker_build_identity_digest":"3030303030303030303030303030303030303030303030303030303030303030","host_profile_digest":"4040404040404040404040404040404040404040404040404040404040404040","suite_digest":"5050505050505050505050505050505050505050505050505050505050505050","isolation_profile_digest":"6060606060606060606060606060606060606060606060606060606060606060","seccomp_profile_digest":"2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4","executor_program_digest":"ac9ef9987b627eded1d40e30726ec02b24fa6591b394513007218ef91a22ba7b","executor_provenance_digest":"112e3fda1d0f1c4409fd8bacd198d9a96d41db885ac544d9f1353a7c2753f0c0","nonce":"fe13709b692cd3a459ad05baee42fefed49384c4437e213a1d2913e7712b0927","controller_generation":1,"runner_generation":1,"lane_epoch":4,"admission_key_generation":9,"issued_at":1788322456,"expires_at":1788322516}"#;
 
     fn recorded_qualification_request(value: &serde_json::Value) -> ProductionQualificationRequest {

@@ -2,6 +2,7 @@
   "$schema":"https://json-schema.org/draft/2020-12/schema",
   "additionalProperties":false,
   "properties":{
+    "acceptance_time_reference":{"type":"integer","minimum":1,"maximum":18446744073709551615},
     "capacity":{"enum":[0,1]},
     "enabled_protocol":{"const":2},
     "execution":{"$ref":"#/$defs/execution"},
@@ -13,7 +14,7 @@
     "qualification":{"$ref":"#/$defs/qualification"},
     "schema_version":{"const":2}
   },
-  "required":["schema_version","enabled_protocol","capacity","identities","paths","lane_manifest","lane_manifest_digest","executor","execution","qualification"],
+  "required":["schema_version","enabled_protocol","capacity","identities","paths","lane_manifest","lane_manifest_digest","executor","execution","qualification","acceptance_time_reference"],
   "type":"object",
   "$defs":{
     "execution":{

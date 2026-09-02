@@ -348,6 +348,10 @@ pub enum ResponseCode {
     Reconciling = 111,
     StorageUnavailable = 112,
     InternalFailure = 113,
+    /// The request window opens after the package time reference.
+    IssuedAfterTimeReference = 114,
+    /// The request window closed at or before the package time reference.
+    ExpiredAtTimeReference = 115,
 }
 
 impl TryFrom<u16> for ResponseCode {
@@ -371,6 +375,8 @@ impl TryFrom<u16> for ResponseCode {
             111 => Ok(Self::Reconciling),
             112 => Ok(Self::StorageUnavailable),
             113 => Ok(Self::InternalFailure),
+            114 => Ok(Self::IssuedAfterTimeReference),
+            115 => Ok(Self::ExpiredAtTimeReference),
             _ => Err(DecodeError::UnknownEnum),
         }
     }

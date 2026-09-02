@@ -24,6 +24,17 @@ opens it beneath the root-owned `attempts` anchor without following links,
 scrubs it, and persists the receipt once before teardown; undeclared, linked,
 oversized, or metadata-drifting outputs fail closed.
 
+The config carries the activation package's bound time reference
+(`acceptance_time_reference`, the frozen acceptance template's `issued_at`, the
+same value the runner holds as a static coordinate). Execd judges the lane
+manifest window and every admission, intent-registration, and cancel window
+against that reference (`issued_at <= reference < expires_at`, no tolerance)
+and never against the wall clock, so a frozen package admits on any host date;
+the two failures answer `issued_after_time_reference` (114) and
+`expired_at_time_reference` (115), apart from `policy_denied`. The attempt
+deadline is `admitted_at + min(wall_timeout, expires_at - issued_at)`: the
+window bounds a run by its length, not by an absolute expiry.
+
 Capacity one admits only the single config-declared fixture job. Its static
 declaration digest binds the candidate, activation package, lane and isolation
 manifests, workflow and job identities, exact artifact declaration, all three

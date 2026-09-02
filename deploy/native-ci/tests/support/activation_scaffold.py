@@ -195,6 +195,7 @@ class ActivationFixture:
         execd_template = {
             "schema_version": 2,
             "enabled_protocol": 2,
+            "acceptance_time_reference": 1_800_000_000,
             "capacity": 0,
             "identities": {
                 "execd_uid": 0, "execd_gid": 0,

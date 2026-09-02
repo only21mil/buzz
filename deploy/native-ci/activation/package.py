@@ -1288,9 +1288,16 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
     execd_fields = {
         "schema_version", "enabled_protocol", "capacity", "identities", "paths",
         "lane_manifest", "lane_manifest_digest", "executor", "qualification", "execution",
+        "acceptance_time_reference",
     }
     if set(execd_staged) != execd_fields or set(execd_active) != execd_fields:
         raise ValueError("execd v2 configuration shape differs from production")
+    for phase, value in (("staged", execd_staged), ("active", execd_active)):
+        _positive_integer(
+            value["acceptance_time_reference"], 0xFFFFFFFFFFFFFFFF, f"execd {phase} acceptance_time_reference",
+        )
+        if value["acceptance_time_reference"] != manifest["acceptance_template"]["time_reference"]:
+            raise ValueError("execd v2 time reference differs from the frozen acceptance template")
     if (
         any(isinstance(value[field], bool) for value in (execd_staged, execd_active) for field in ("schema_version", "enabled_protocol", "capacity"))
         or execd_staged["schema_version"] != 2
