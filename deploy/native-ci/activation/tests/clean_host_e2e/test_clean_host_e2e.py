@@ -371,6 +371,8 @@ class BoundaryTests(unittest.TestCase):
                     ])
 
     def test_stage_iso_normalizes_root_ownership_and_preserves_package_tree(self) -> None:
+        if not Path(HOST_TOOLS["xorriso"]).is_file():
+            self.skipTest("clean-host xorriso is unavailable")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             stage = root / "stage"
