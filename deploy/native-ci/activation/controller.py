@@ -4215,9 +4215,23 @@ def _qualification_principal_digest(manifest: dict[str, Any]) -> str:
     return hasher.hexdigest()
 
 
+def _protocol_git_oid(source_commit: str) -> bytes:
+    """Fixed 33-byte GitOid wire form shared with buzz-ci-broker-protocol.
+
+    Tag 1 plus 20 bytes plus 12 zero bytes for SHA-1; tag 2 plus 32 bytes for
+    SHA-256. execd hashes exactly these bytes into the executor provenance
+    digest it enforces against every production qualification request.
+    """
+    raw = bytes.fromhex(source_commit)
+    if len(raw) == 20:
+        return b"\x01" + raw + bytes(12)
+    if len(raw) == 32:
+        return b"\x02" + raw
+    raise ValueError("executor source commit is neither SHA-1 nor SHA-256")
+
+
 def _executor_provenance_digest(executor: dict[str, Any]) -> str:
-    source_commit = executor["source_commit"]
-    encoded_source = bytes([20 if len(source_commit) == 40 else 32]) + bytes.fromhex(source_commit)
+    encoded_source = _protocol_git_oid(executor["source_commit"])
     hasher = hashlib.sha256(QUALIFICATION_EXECUTOR_DOMAIN)
     hasher.update(_length_prefixed(executor["path"]))
     hasher.update(bytes.fromhex(executor["sha256"]))

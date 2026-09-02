@@ -1575,7 +1575,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "8b7731f6f2d70ebc93d1ca7150894e8d9d06fdcf500c075ab8c75020b5d22182",
+            "fcb3ce8aff3a018d304a4ebf21eca41a8bb404a4e3062ba188516da6912ecaac",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -3547,12 +3547,47 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertEqual((request["activation_package_digest"], request["fixture_digest"]), (manifest["package_digest"], self.fixture.binding["scenario_sha256"]))
         self.assertEqual(request["expires_at"] - request["issued_at"], 60)
         self.assertEqual(request["principal_digest"], CONTROLLER._qualification_principal_digest(manifest))
+        execd_record = next(item for item in receipt["acceptance_generated"] if item["role"] == "execd_config")
+        execd_config = json.loads(base64.b64decode(execd_record["payload_base64"], validate=True))
+        self.assertEqual(request["executor_provenance_digest"], CONTROLLER._executor_provenance_digest(execd_config["executor"]))
         self.assertTrue(set(request).isdisjoint({"action", "program", "path", "argv", "environment"}))
         self.assertEqual((state["status"], result["status"]), ("passed", "qualified_closed"))
         before = request_raw
         CONTROLLER.qualify(manifest, payloads, self.fixture.root, driver)
         after = base64.b64decode(CONTROLLER._read_receipt(self.fixture.root)["qualification"]["request_base64"], validate=True)
         self.assertEqual(after, before)
+
+    def test_executor_provenance_digest_uses_protocol_git_oid_wire_form(self) -> None:
+        # Executor record recorded from /etc/buzzci/execd-v2.json on a clean
+        # host at candidate cbca8b13. execd (buzz-ci-broker-protocol
+        # production_qualification_executor_provenance_digest) hashes the
+        # source commit as the 33-byte GitOid wire form; the expected value is
+        # the digest execd computed for this record.
+        executor = {
+            "gid": 0,
+            "mode": 493,
+            "path": "/usr/libexec/buzz-ci-executor",
+            "sha256": "ac9ef9987b627eded1d40e30726ec02b24fa6591b394513007218ef91a22ba7b",
+            "source_commit": "cbca8b1371206688fde40d6f370ee65b97bb145a",
+            "uid": 0,
+        }
+        self.assertEqual(
+            CONTROLLER._executor_provenance_digest(executor),
+            "fe38da0b58ca8073b45ab76a716bf98577016d9d6cbed67227f405a79705a9bc",
+        )
+        # The previous encoding (length byte 20 plus the raw SHA-1) produced
+        # the digest execd refused with policy_denied.
+        self.assertNotEqual(
+            CONTROLLER._executor_provenance_digest(executor),
+            "112e3fda1d0f1c4409fd8bacd198d9a96d41db885ac544d9f1353a7c2753f0c0",
+        )
+        self.assertEqual(
+            CONTROLLER._protocol_git_oid(executor["source_commit"]),
+            b"\x01" + bytes.fromhex(executor["source_commit"]) + bytes(12),
+        )
+        self.assertEqual(CONTROLLER._protocol_git_oid("ab" * 32), b"\x02" + bytes([0xAB] * 32))
+        with self.assertRaisesRegex(ValueError, "neither SHA-1 nor SHA-256"):
+            CONTROLLER._protocol_git_oid("ab" * 24)
 
     def test_production_v2_nonzero_exit_keeps_exact_pending_request(self) -> None:
         manifest, payloads, driver = self.fixture.load()

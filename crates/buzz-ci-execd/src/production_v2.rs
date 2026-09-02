@@ -5736,6 +5736,179 @@ sys.stdout.buffer.write(rendered)
         assert!(!refused.get());
     }
 
+    /// Exact bytes recorded from a clean-host guest at candidate cbca8b13:
+    /// the installed `/etc/buzzci/execd-v2.json` (without its trailing LF)
+    /// and the production qualification request the activation controller
+    /// persisted. execd answered `policy_denied` to this request.
+    const RECORDED_EXECD_CONFIG: &str = r#"{"capacity":0,"enabled_protocol":2,"execution":{"artifact":{"artifact_id":"result","max_bytes":32768,"media_type":"application/json","name":"result.json","relative_name":"result.json"},"declaration_digest":"880ecdbe623808f5356c008b6d35e9e0a016b9ecdc6cac1e1d0e3fc5f27837a3","fixture_input_sha256":"967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6","fixture_manifest_sha256":"f204b8fba64e972408f5a0ea1c0bb3140cfa696289903d96a8cb07d602af6b23","fixture_script_sha256":"3bb81cfd157e50b1d0834de48a9ecf1c27b0438a4f2bc374e091fb4f11ec213d","job_id":"capacity-one-fixture","max_memory_bytes":134217728,"max_processes":16,"max_stderr_bytes":32768,"max_stdout_bytes":32768,"max_wall_seconds":120,"schema_version":1,"workflow_digest":"8080808080808080808080808080808080808080808080808080808080808080","workflow_id":"capacity-one"},"executor":{"gid":0,"mode":493,"path":"/usr/libexec/buzz-ci-executor","sha256":"ac9ef9987b627eded1d40e30726ec02b24fa6591b394513007218ef91a22ba7b","source_commit":"cbca8b1371206688fde40d6f370ee65b97bb145a","uid":0},"identities":{"access_group":"buzzci-execd","access_group_gid":1204,"access_group_members":["buzzci-ctl","buzzci-runner"],"control_gid":961,"control_group":"buzzci-ctl","control_home":"/var/lib/buzzci/principals/ctl","control_shell":"/usr/sbin/nologin","control_supplementary_groups":["buzzci-execd"],"control_uid":961,"control_user":"buzzci-ctl","execd_gid":0,"execd_uid":0,"job_gid":1205,"job_uid":1205,"runner_gid":1200,"runner_uid":1200},"lane_manifest":{"admission_key_generation":9,"admission_verifying_key":"2020202020202020202020202020202020202020202020202020202020202020","broker_build_identity":"3030303030303030303030303030303030303030303030303030303030303030","expires_at":4102444800,"host_profile_digest":"4040404040404040404040404040404040404040404040404040404040404040","isolation_profile_digest":"6060606060606060606060606060606060606060606060606060606060606060","lane_epoch":4,"lane_id":"1010101010101010101010101010101010101010101010101010101010101010","max_wall_timeout_seconds":300,"not_before":1,"schema_version":1,"suite_identity":"5050505050505050505050505050505050505050505050505050505050505050"},"lane_manifest_digest":"12ede37672233a144707bc49efa5d8f86ec5803e6b9d623347472702b2c98f04","paths":{"attempt_root":"/var/lib/buzzci/execd-v2/attempts","binding_root":"/var/lib/buzzci/execd-v2/bindings","evidence_root":"/var/lib/buzzci/execd-v2/evidence","executor_socket":"/run/buzzci/executor.sock","intent_root":"/var/lib/buzzci/execd-v2/intents","qualification_root":"/var/lib/buzzci/execd-v2/qualification","teardown_root":"/var/lib/buzzci/execd-v2/teardown"},"qualification":{"activation_package_digest":"1c390e3a93e17d5b7d874b4a3f749cfbf5b5273448e62c72bce8d33a3bb91a0d","controller_generation":1,"fixture_digest":"10a308a084aef26b2c15f35464aee2bead575ed46f38713af9683d07d75f9667","integrated_candidate_sha":"cbca8b1371206688fde40d6f370ee65b97bb145a","runner_generation":1},"schema_version":2}"#;
+    const RECORDED_QUALIFICATION_REQUEST: &str = r#"{"schema_version":"buzz-ci-production-qualification-request/v2","request_id":"113099804cb3fde2a6681257809ae38e","integrated_candidate_sha":"cbca8b1371206688fde40d6f370ee65b97bb145a","activation_package_digest":"1c390e3a93e17d5b7d874b4a3f749cfbf5b5273448e62c72bce8d33a3bb91a0d","fixture_digest":"10a308a084aef26b2c15f35464aee2bead575ed46f38713af9683d07d75f9667","principal_digest":"ee22ba0c8e462a5cba4cf2fc6fde6f1a65c663199a9021b01f9108ad56aa5a2e","lane_manifest_digest":"12ede37672233a144707bc49efa5d8f86ec5803e6b9d623347472702b2c98f04","broker_build_identity_digest":"3030303030303030303030303030303030303030303030303030303030303030","host_profile_digest":"4040404040404040404040404040404040404040404040404040404040404040","suite_digest":"5050505050505050505050505050505050505050505050505050505050505050","isolation_profile_digest":"6060606060606060606060606060606060606060606060606060606060606060","seccomp_profile_digest":"2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4","executor_program_digest":"ac9ef9987b627eded1d40e30726ec02b24fa6591b394513007218ef91a22ba7b","executor_provenance_digest":"112e3fda1d0f1c4409fd8bacd198d9a96d41db885ac544d9f1353a7c2753f0c0","nonce":"fe13709b692cd3a459ad05baee42fefed49384c4437e213a1d2913e7712b0927","controller_generation":1,"runner_generation":1,"lane_epoch":4,"admission_key_generation":9,"issued_at":1788322456,"expires_at":1788322516}"#;
+
+    fn recorded_qualification_request(value: &serde_json::Value) -> ProductionQualificationRequest {
+        let hex32 = |name: &str| decode_hex::<32>(value[name].as_str().unwrap()).unwrap();
+        let number = |name: &str| value[name].as_u64().unwrap();
+        ProductionQualificationRequest {
+            integrated_candidate_sha: GitOid::Sha1(
+                decode_hex::<20>(value["integrated_candidate_sha"].as_str().unwrap()).unwrap(),
+            ),
+            activation_package_digest: hex32("activation_package_digest"),
+            fixture_digest: hex32("fixture_digest"),
+            principal_digest: hex32("principal_digest"),
+            lane_manifest_digest: hex32("lane_manifest_digest"),
+            broker_build_identity: hex32("broker_build_identity_digest"),
+            host_profile_digest: hex32("host_profile_digest"),
+            suite_identity: hex32("suite_digest"),
+            isolation_profile_digest: hex32("isolation_profile_digest"),
+            seccomp_profile_digest: hex32("seccomp_profile_digest"),
+            executor_program_digest: hex32("executor_program_digest"),
+            executor_provenance_digest: hex32("executor_provenance_digest"),
+            nonce: hex32("nonce"),
+            controller_generation: number("controller_generation"),
+            runner_generation: number("runner_generation"),
+            lane_epoch: number("lane_epoch"),
+            admission_key_generation: number("admission_key_generation"),
+            issued_at: number("issued_at"),
+            expires_at: number("expires_at"),
+            request_frame_digest: [0; 32],
+        }
+    }
+
+    /// Compute the executor provenance digest through the exact Python
+    /// activation controller (`_executor_provenance_digest`).
+    fn controller_executor_provenance_digest(executor: &serde_json::Value) -> [u8; 32] {
+        let activation_root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/native-ci/activation");
+        let script = r#"
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root))
+spec = importlib.util.spec_from_file_location("activation_controller", root / "controller.py")
+controller = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(controller)
+sys.stdout.write(controller._executor_provenance_digest(json.load(sys.stdin)))
+"#;
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(script)
+            .arg(&activation_root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("python3 is required to exercise the activation controller digest");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&serde_json::to_vec(executor).unwrap())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "controller digest failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        decode_hex(&String::from_utf8(output.stdout).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn controller_executor_provenance_digest_matches_execd_contract() {
+        let config: ProductionConfig =
+            canonical_sorted_parse(format!("{RECORDED_EXECD_CONFIG}\n").as_bytes()).unwrap();
+        let manifest = config.lane_manifest.clone().into_manifest().unwrap();
+        let contract =
+            qualification_contract(&config, &manifest, &SeccompRuntimeBinding::fixture()).unwrap();
+        let recorded_value: serde_json::Value =
+            serde_json::from_str(RECORDED_QUALIFICATION_REQUEST).unwrap();
+        let header = FrameHeader {
+            operation: buzz_ci_broker_protocol::Operation::AdmitQualification,
+            request_id: decode_hex::<16>(recorded_value["request_id"].as_str().unwrap()).unwrap(),
+        };
+        let mut recorded = recorded_qualification_request(&recorded_value);
+        recorded.request_frame_digest =
+            production_qualification_request_frame_digest(header, &recorded).unwrap();
+
+        // The recorded request fails the contract in exactly one field: the
+        // controller hashed the source commit as a length byte (20) plus the
+        // raw SHA-1 instead of the 33-byte protocol GitOid wire form.
+        assert!(!contract.matches(recorded));
+        let mut only_provenance_differs = recorded;
+        only_provenance_differs.executor_provenance_digest = contract.executor_provenance_digest;
+        assert!(contract.matches(only_provenance_differs));
+        let mut legacy = Sha256::new();
+        legacy.update(b"buzz-ci-execd:production-qualification-executor-provenance:v1\0");
+        legacy.update((config.executor.path.len() as u16).to_be_bytes());
+        legacy.update(config.executor.path.as_bytes());
+        legacy.update(decode_hex::<32>(&config.executor.sha256).unwrap());
+        legacy.update([20]);
+        legacy.update(decode_hex::<20>(&config.executor.source_commit).unwrap());
+        legacy.update(config.executor.uid.to_be_bytes());
+        legacy.update(config.executor.gid.to_be_bytes());
+        legacy.update(config.executor.mode.to_be_bytes());
+        let legacy: [u8; 32] = legacy.finalize().into();
+        assert_eq!(legacy, recorded.executor_provenance_digest);
+        assert_ne!(legacy, contract.executor_provenance_digest);
+
+        // The controller now renders the digest execd enforces, for SHA-1 and
+        // SHA-256 source commits.
+        let executor_value = serde_json::to_value(&config.executor).unwrap();
+        let rendered = controller_executor_provenance_digest(&executor_value);
+        assert_eq!(rendered, contract.executor_provenance_digest);
+        let mut sha256_executor = executor_value.clone();
+        sha256_executor["source_commit"] = serde_json::Value::String("ab".repeat(32));
+        assert_eq!(
+            controller_executor_provenance_digest(&sha256_executor),
+            production_qualification_executor_provenance_digest(
+                &config.executor.path,
+                decode_hex(&config.executor.sha256).unwrap(),
+                GitOid::Sha256([0xab; 32]),
+                config.executor.uid,
+                config.executor.gid,
+                config.executor.mode,
+            )
+            .unwrap()
+        );
+
+        // Through the real dispatch: the recorded request is still denied and
+        // the corrected request qualifies inside its validity window.
+        let temporary = tempfile::tempdir().unwrap();
+        fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = fs::metadata(temporary.path()).unwrap().uid();
+        let mut dispatch = ProductionV2Dispatch {
+            ordinary: None,
+            qualification: DurableQualificationFiles::open(
+                SafeDirectory::open(temporary.path().to_owned(), owner, 0o700).unwrap(),
+                contract,
+            )
+            .unwrap(),
+            contract,
+        };
+        let now = recorded.issued_at + 1;
+        let denied =
+            dispatch.dispatch_v2_encoded(header, Request::AdmitQualification(recorded), now);
+        assert_eq!(
+            decode_production_qualification_response(header, denied.as_bytes())
+                .unwrap()
+                .code,
+            ResponseCode::PolicyDenied
+        );
+        let mut corrected = recorded;
+        corrected.executor_provenance_digest = rendered;
+        corrected.request_frame_digest = [0; 32];
+        corrected.request_frame_digest =
+            production_qualification_request_frame_digest(header, &corrected).unwrap();
+        let accepted =
+            dispatch.dispatch_v2_encoded(header, Request::AdmitQualification(corrected), now);
+        let response =
+            decode_production_qualification_response(header, accepted.as_bytes()).unwrap();
+        assert_eq!(response.code, ResponseCode::Ok);
+        assert_eq!(response.executor_provenance_digest, rendered);
+        assert_eq!(response.qualified_at, now);
+    }
+
     #[test]
     fn exact_fake_root_capacity_one_config_selects_v2() {
         let fake = capacity_one_fake_root();
