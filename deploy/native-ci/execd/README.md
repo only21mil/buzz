@@ -67,6 +67,15 @@ The activation access group is `buzzci-execd`, with exactly `buzzci-runner` and
 `0620`. Execd still authorizes the peer by exact `SO_PEERCRED` UID and primary
 GID. Supplementary group membership grants filesystem access only.
 
+Execd reaches its executor through `/run/buzzci/executor.sock`, which
+`buzz-ci-executor.socket` binds as root:root mode `0600`. Because `SO_PEERCRED`
+names the `listen()` caller, that connection reports pid 1 root while
+`buzz-ci-executor.service` accepts as `buzzci-job`. Execd authenticates the
+listener the way controld authenticates keyholder and runner: the inode must be
+a socket of mode `0600` owned by root or by the job account, and the peer must
+be either the job account or pid 1 root. Any other root process, an unmappable
+pid, or another account is refused before a request is sent.
+
 The config freezes the control account and primary group as `buzzci-ctl` at
 `961:961`, with home `/var/lib/buzzci/principals/ctl`, a nologin shell, and sole
 supplementary group `buzzci-execd`.

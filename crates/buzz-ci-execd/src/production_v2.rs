@@ -9,7 +9,7 @@ use std::{
     io::{Read, Write},
     os::fd::AsFd,
     os::unix::{
-        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         io::AsRawFd,
         net::{UnixListener, UnixStream},
         process::CommandExt,
@@ -1098,6 +1098,47 @@ impl LocalHostSystem {
         Ok(digest.finalize().into())
     }
 
+    /// Connect to the executor handoff socket and authenticate its listener.
+    ///
+    /// `/run/buzzci/executor.sock` is bound by `buzz-ci-executor.socket`, so
+    /// `SO_PEERCRED` names pid 1 root, the `listen()` caller, while
+    /// `buzz-ci-executor.service` accepts as the job account. The inode is
+    /// checked first: only root (the socket unit) or the job account itself
+    /// may own it, and the mode must be the unit's `0600`. The peer then
+    /// follows the shared listener rule: the job account or pid 1 root.
+    fn connect_executor(&self) -> Result<UnixStream, BindingError> {
+        let metadata = fs::symlink_metadata(&self.socket).map_err(|_| BindingError::HostRefused)?;
+        if !executor_socket_inode_accepted(
+            metadata.file_type().is_socket(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.permissions().mode() & 0o7777,
+            self.executor_uid,
+            self.executor_gid,
+        ) {
+            return Err(BindingError::HostRefused);
+        }
+        let stream = UnixStream::connect(&self.socket).map_err(|_| BindingError::HostRefused)?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|_| BindingError::HostRefused)?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .map_err(|_| BindingError::HostRefused)?;
+        let credentials =
+            getsockopt(&stream, PeerCredentials).map_err(|_| BindingError::HostRefused)?;
+        if !executor_listener_accepted(
+            credentials.pid(),
+            credentials.uid(),
+            credentials.gid(),
+            self.executor_uid,
+            self.executor_gid,
+        ) {
+            return Err(BindingError::HostRefused);
+        }
+        Ok(stream)
+    }
+
     fn request(
         &mut self,
         operation: &str,
@@ -1109,19 +1150,7 @@ impl LocalHostSystem {
     ) -> Result<ExecutorResponse, BindingError> {
         verify_program(&self.executor).map_err(binding_error)?;
         self.seccomp.validate().map_err(binding_error)?;
-        let mut stream =
-            UnixStream::connect(&self.socket).map_err(|_| BindingError::HostRefused)?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .map_err(|_| BindingError::HostRefused)?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .map_err(|_| BindingError::HostRefused)?;
-        let credentials =
-            getsockopt(&stream, PeerCredentials).map_err(|_| BindingError::HostRefused)?;
-        if credentials.uid() != self.executor_uid || credentials.gid() != self.executor_gid {
-            return Err(BindingError::HostRefused);
-        }
+        let mut stream = self.connect_executor()?;
         let request = ExecutorRequest {
             schema_version: RPC_SCHEMA,
             operation: operation.to_owned(),
@@ -3325,6 +3354,41 @@ fn verify_executor_dac_contract() -> std::io::Result<()> {
     Ok(())
 }
 
+/// Accept only the inode the executor socket unit installs (root:root mode
+/// `0600` under root-owned `0711` `/run/buzzci`) or a socket the executor
+/// account bound itself with the same mode. Anything else is a foreign
+/// endpoint and is refused before `connect()`.
+const fn executor_socket_inode_accepted(
+    is_socket: bool,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    executor_uid: u32,
+    executor_gid: u32,
+) -> bool {
+    is_socket
+        && mode == 0o600
+        && ((uid == 0 && gid == 0) || (uid == executor_uid && gid == executor_gid))
+}
+
+/// `SO_PEERCRED` names the process that called `listen()`. Production binds
+/// `/run/buzzci/executor.sock` through `buzz-ci-executor.socket`, so the
+/// kernel reports pid 1 root while `buzz-ci-executor.service` accepts as the
+/// job account. The shared acceptance-driver rule accepts exactly that
+/// listener or the executor account; every other root process, an unmappable
+/// pid, and every other account fail closed.
+fn executor_listener_accepted(
+    pid: i32,
+    uid: u32,
+    gid: u32,
+    executor_uid: u32,
+    executor_gid: u32,
+) -> bool {
+    use buzz_ci_acceptance_ctl::production::{listener_peer_accepted, ListenerPeer};
+
+    listener_peer_accepted(ListenerPeer { pid, uid, gid }, executor_uid, executor_gid)
+}
+
 fn serve_executor_stream(
     stream: &mut UnixStream,
     executable_sha256: &str,
@@ -4285,6 +4349,140 @@ mod tests {
             b"before\n[REDACTED]\n"
         );
         assert!(scrub(&vec![b'x'; MAX_RAW_OUTPUT + 1]).is_err());
+    }
+
+    /// H7 clean host, boot 6: `/run/buzzci/executor.sock` is bound by
+    /// `buzz-ci-executor.socket`, so `SO_PEERCRED` measured pid 1 uid 0 gid 0
+    /// while execd demanded the job account 1205:1205 and refused its own
+    /// executor before sending anything. The shared listener rule accepts the
+    /// socket unit or the job account and nothing else.
+    #[test]
+    fn executor_listener_rule_accepts_the_socket_unit_or_the_job_account_and_rejects_the_rest() {
+        assert!(executor_listener_accepted(1, 0, 0, 1205, 1205));
+        assert!(executor_listener_accepted(4242, 1205, 1205, 1205, 1205));
+        for (pid, uid, gid) in [
+            (4242, 0, 0),
+            (0, 0, 0),
+            (-1, 0, 0),
+            (1, 1205, 0),
+            (1, 0, 1205),
+            (4242, 1205, 1204),
+            (4242, 1204, 1205),
+            (4242, 1200, 1200),
+        ] {
+            assert!(
+                !executor_listener_accepted(pid, uid, gid, 1205, 1205),
+                "{pid} {uid}:{gid}"
+            );
+        }
+    }
+
+    #[test]
+    fn executor_socket_inode_rule_accepts_only_root_or_job_owned_0600_sockets() {
+        assert!(executor_socket_inode_accepted(
+            true, 0, 0, 0o600, 1205, 1205
+        ));
+        assert!(executor_socket_inode_accepted(
+            true, 1205, 1205, 0o600, 1205, 1205
+        ));
+        for (is_socket, uid, gid, mode) in [
+            (false, 0, 0, 0o600),
+            (true, 0, 0, 0o620),
+            (true, 0, 0, 0o660),
+            (true, 0, 0, 0o700),
+            (true, 0, 1205, 0o600),
+            (true, 1205, 0, 0o600),
+            (true, 1200, 1200, 0o600),
+        ] {
+            assert!(
+                !executor_socket_inode_accepted(is_socket, uid, gid, mode, 1205, 1205),
+                "{is_socket} {uid}:{gid} {mode:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn connect_executor_accepts_the_listener_the_executor_account_bound_and_rejects_foreign_inodes()
+    {
+        let temporary = tempfile::tempdir().unwrap();
+        let evidence_path = temporary.path().join("evidence");
+        let teardown_path = temporary.path().join("teardown");
+        let attempts_path = temporary.path().join("attempts");
+        for (path, mode) in [
+            (&evidence_path, 0o700),
+            (&teardown_path, 0o700),
+            (&attempts_path, 0o711),
+        ] {
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let owner = fs::metadata(&evidence_path).unwrap().uid();
+        let group = fs::metadata(&evidence_path).unwrap().gid();
+        let socket = temporary.path().join("executor.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+        let make_system = |executor_uid: u32, executor_gid: u32| LocalHostSystem {
+            identity: HostIdentity {
+                broker_build_identity: [1; 32],
+                host_profile_digest: [2; 32],
+                suite_identity: [3; 32],
+            },
+            socket: socket.clone(),
+            executor_uid,
+            executor_gid,
+            executor: ProgramProvenance {
+                path: "/nonexistent".into(),
+                sha256: hex::encode([4; 32]),
+                source_commit: "1".repeat(40),
+                uid: owner,
+                gid: 0,
+                mode: 0o755,
+            },
+            seccomp: SeccompRuntimeBinding::fixture(),
+            evidence: SafeDirectory::open(evidence_path.clone(), owner, 0o700).unwrap(),
+            teardown: SafeDirectory::open(teardown_path.clone(), owner, 0o700).unwrap(),
+            evidence_by_binding: BTreeMap::new(),
+            attempts: SafeDirectory::open(attempts_path.clone(), owner, 0o711).unwrap(),
+            job_uid: owner,
+            job_gid: group,
+            static_job: static_job_fixture(no_artifact_fixture()),
+        };
+
+        // The test process bound the socket, so the inode and the listener
+        // are the executor account's own; the socket unit shape (root:root
+        // inode, pid 1 root listener) is covered by the pure rules above.
+        let stream = make_system(owner, group)
+            .connect_executor()
+            .expect("own listener is accepted");
+        drop(stream);
+        let (accepted, _) = listener.accept().unwrap();
+        drop(accepted);
+
+        assert!(matches!(
+            make_system(owner.wrapping_add(1), group).connect_executor(),
+            Err(BindingError::HostRefused)
+        ));
+        assert!(matches!(
+            make_system(owner, group.wrapping_add(1)).connect_executor(),
+            Err(BindingError::HostRefused)
+        ));
+
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o660)).unwrap();
+        assert!(matches!(
+            make_system(owner, group).connect_executor(),
+            Err(BindingError::HostRefused)
+        ));
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let regular = temporary.path().join("regular.sock");
+        fs::write(&regular, b"").unwrap();
+        fs::set_permissions(&regular, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut not_a_socket = make_system(owner, group);
+        not_a_socket.socket = regular;
+        assert!(matches!(
+            not_a_socket.connect_executor(),
+            Err(BindingError::HostRefused)
+        ));
     }
 
     #[test]
