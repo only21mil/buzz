@@ -58,6 +58,9 @@ pub enum RunnerMode {
         admission_key_generation: u64,
         isolation_profile_digest: String,
         audience_digest: String,
+        /// Package-bound time reference the frozen acceptance fixture was
+        /// issued at; request windows are judged against it, not the clock.
+        acceptance_time_reference: u64,
     },
 }
 
@@ -170,6 +173,7 @@ impl RunnerConfig {
             admission_key_generation,
             isolation_profile_digest,
             audience_digest,
+            acceptance_time_reference,
         } = &config.mode
         {
             if execd_socket != Path::new(EXECD_SOCKET_PATH)
@@ -185,6 +189,7 @@ impl RunnerConfig {
                 || *admission_key_generation == 0
                 || !digest(isolation_profile_digest)
                 || !digest(audience_digest)
+                || *acceptance_time_reference == 0
             {
                 return Err(ConfigError::InvalidV2Proxy);
             }
@@ -217,6 +222,7 @@ fn validate_config_fields(bytes: &[u8]) -> Result<(), ConfigError> {
             "admission_key_generation",
             "isolation_profile_digest",
             "audience_digest",
+            "acceptance_time_reference",
         ],
         _ => return Ok(()),
     };
@@ -304,6 +310,7 @@ mod tests {
             "admission_key_generation": 9,
             "isolation_profile_digest": "22".repeat(32),
             "audience_digest": "33".repeat(32),
+            "acceptance_time_reference": 1_800_000_000_u64,
         });
         write_config(&path, &serde_json::to_vec(&value).unwrap(), 0o600);
         assert!(matches!(
@@ -322,6 +329,30 @@ mod tests {
             RunnerConfig::load(&directory.path().join("drifted.json")),
             Err(ConfigError::InvalidV2Proxy)
         ));
+
+        let mut unreferenced = drifted.clone();
+        unreferenced["execd_socket"] = serde_json::json!(EXECD_SOCKET_PATH);
+        unreferenced["acceptance_time_reference"] = serde_json::json!(0);
+        write_config(
+            &directory.path().join("unreferenced.json"),
+            &serde_json::to_vec(&unreferenced).unwrap(),
+            0o600,
+        );
+        assert!(matches!(
+            RunnerConfig::load(&directory.path().join("unreferenced.json")),
+            Err(ConfigError::InvalidV2Proxy)
+        ));
+        let mut missing = unreferenced;
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("acceptance_time_reference");
+        write_config(
+            &directory.path().join("missing.json"),
+            &serde_json::to_vec(&missing).unwrap(),
+            0o600,
+        );
+        assert!(RunnerConfig::load(&directory.path().join("missing.json")).is_err());
     }
 
     #[test]

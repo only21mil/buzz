@@ -83,7 +83,13 @@ following before calling the landing complete:
 - authoritative relay default branch at the merge commit;
 - GitHub mirror default branch at the same commit;
 - intended feature-branch retention or deletion; and
-- terminal post-merge CI for the merge commit.
+- terminal post-merge CI for the merge commit, including the mandatory
+  `Desktop Release Candidate` check on that exact commit. On `main` that check
+  runs `scripts/desktop_release.py verify-main` for the pushed commit and never
+  passes without validating: either the desktop candidate identity is
+  byte-equal to the first parent and the manifests agree, or the commit is the
+  merge of one internal `version-bump/` pull request and carries that pull
+  request's validated immutable candidate byte-for-byte.
 
 Record the merge commit and any failed, skipped, superseded, or duplicate CI
 runs in the Buzz repository record. Do not describe a history containing a

@@ -113,15 +113,13 @@ impl LaneActivationManifestV1 {
         self,
         request: AdmitAttemptRequest,
         measured: HostIdentity,
-        now: u64,
+        time_reference: u64,
     ) -> Result<(), BindingError> {
         if self.schema_version != LANE_ACTIVATION_MANIFEST_SCHEMA_V1
             || manifest_fields(self).contains(&[0; 32])
             || self.lane_epoch == 0
             || self.admission_key_generation == 0
             || self.not_before == 0
-            || self.not_before > now
-            || now >= self.expires_at
             || request.lane_epoch != self.lane_epoch
             || request.admission_signature_algorithm != self.admission_signature_algorithm
             || request.admission_key_generation != self.admission_key_generation
@@ -135,6 +133,7 @@ impl LaneActivationManifestV1 {
         {
             return Err(BindingError::ManifestRefused);
         }
+        validate_window(self.not_before, self.expires_at, time_reference)?;
         Ok(())
     }
 }
@@ -268,7 +267,11 @@ impl JobIntentV2 {
         sha256(&bytes)
     }
 
-    fn validate(self, request: AdmitAttemptRequest, now: u64) -> Result<(), BindingError> {
+    fn validate(
+        self,
+        request: AdmitAttemptRequest,
+        time_reference: u64,
+    ) -> Result<(), BindingError> {
         if self.schema_version != JOB_INTENT_SCHEMA_V2
             || self.digest() != request.job_intent_digest
             || self.signed_request_digest != request.signed_request_digest
@@ -299,8 +302,6 @@ impl JobIntentV2 {
                 != self.artifacts.iter().filter(|item| item.is_some()).count()
             || self.artifacts.iter().flatten().any(|item| !item.validate())
             || request.issued_at == 0
-            || request.issued_at > now
-            || now >= request.expires_at
             || request.attempt == 0
             || (request.attempt == 1 && request.parent_attempt != 0)
             || (request.attempt > 1
@@ -308,7 +309,7 @@ impl JobIntentV2 {
         {
             return Err(BindingError::IntentRefused);
         }
-        Ok(())
+        validate_window(request.issued_at, request.expires_at, time_reference)
     }
 }
 
@@ -523,9 +524,16 @@ impl ExecutionBindingV1 {
         intent: JobIntentV2,
         admitted_at: u64,
     ) -> Result<Self, BindingError> {
+        // The admission window is a package constant judged against the
+        // package time reference, so it bounds the run by its length rather
+        // than by its absolute expiry: a run may not outlive its window.
+        let window = request
+            .expires_at
+            .checked_sub(request.issued_at)
+            .filter(|window| *window > 0)
+            .ok_or(BindingError::IntentRefused)?;
         let deadline_at = admitted_at
-            .checked_add(u64::from(request.wall_timeout_seconds))
-            .map(|deadline| deadline.min(request.expires_at))
+            .checked_add(u64::from(request.wall_timeout_seconds).min(window))
             .filter(|deadline| *deadline > admitted_at)
             .ok_or(BindingError::IntentRefused)?;
         let admission_message_digest = sha256(&admission_signature_message(&request));
@@ -985,10 +993,34 @@ impl<S: PrivilegedHostSystem> ConcreteHostAdapters<S> {
 }
 
 /// Fail-closed refusal from manifest, state, or host binding.
+/// Judge a request window against the package's bound time reference.
+///
+/// The lane manifest window and the frozen acceptance fixture's admission
+/// and cancel windows are package constants, so they are compared with the
+/// reference the freezer recorded (`acceptance_time_reference`), never with
+/// the wall clock; the two failures are named apart from a refused intent.
+pub fn validate_window(
+    issued_at: u64,
+    expires_at: u64,
+    time_reference: u64,
+) -> Result<(), BindingError> {
+    if issued_at > time_reference {
+        return Err(BindingError::IssuedAfterTimeReference);
+    }
+    if time_reference >= expires_at {
+        return Err(BindingError::ExpiredAtTimeReference);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BindingError {
     ManifestRefused,
     IntentRefused,
+    /// The request window opens after the package time reference.
+    IssuedAfterTimeReference,
+    /// The request window closed at or before the package time reference.
+    ExpiredAtTimeReference,
     SignatureRefused,
     StorageUnavailable,
     NotFound,
@@ -1005,16 +1037,20 @@ pub struct ProductionBindingController<M, I, J, S> {
     journal: J,
     host: ConcreteHostAdapters<S>,
     recovery_complete: bool,
+    /// Package time reference every admission, lane, and cancel window is
+    /// judged against; `now` only stamps records and deadlines.
+    time_reference: u64,
 }
 
 impl<M, I, J, S> ProductionBindingController<M, I, J, S> {
-    pub const fn new(manifests: M, intents: I, journal: J, system: S) -> Self {
+    pub const fn new(manifests: M, intents: I, journal: J, system: S, time_reference: u64) -> Self {
         Self {
             manifests,
             intents,
             journal,
             host: ConcreteHostAdapters::new(system),
             recovery_complete: false,
+            time_reference,
         }
     }
 }
@@ -1228,17 +1264,17 @@ where
         &mut self,
         header: FrameHeader,
         request: RegisterJobIntentRequest,
-        now: u64,
+        _now: u64,
     ) -> Result<ResponseCode, BindingError> {
         let admission = request.admission;
         let manifest = self
             .manifests
             .load(admission.lane_manifest_digest, admission.lane_epoch)?;
         let measured = self.host.identity()?;
-        manifest.validate(admission, measured, now)?;
+        manifest.validate(admission, measured, self.time_reference)?;
         verify_admission_signature(manifest, admission)?;
         let intent = JobIntentV2::from_registration(request);
-        intent.validate(admission, now)?;
+        intent.validate(admission, self.time_reference)?;
 
         let attempt_id = attempt_id_for_admission(admission);
         let admitted = match self.journal.load(attempt_id)? {
@@ -1276,7 +1312,7 @@ where
             Ok(identity) => identity,
             Err(error) => return error_response(error, now),
         };
-        if let Err(error) = manifest.validate(request, measured, now) {
+        if let Err(error) = manifest.validate(request, measured, self.time_reference) {
             return error_response(error, now);
         }
         if verify_admission_signature(manifest, request).is_err() {
@@ -1293,7 +1329,7 @@ where
             return empty_response(ResponseCode::ReplayConflict, now);
         }
         let intent = registered.intent;
-        if let Err(error) = intent.validate(request, now) {
+        if let Err(error) = intent.validate(request, self.time_reference) {
             return error_response(error, now);
         }
         let occupied = match self.journal.list() {
@@ -1348,12 +1384,13 @@ where
             Ok(record) => record,
             Err(error) => return error_response(error, now),
         };
-        if request.actor_pubkey != record.binding.actor_pubkey
-            || request.issued_at == 0
-            || request.issued_at > now
-            || now >= request.expires_at
-        {
+        if request.actor_pubkey != record.binding.actor_pubkey || request.issued_at == 0 {
             return empty_response(ResponseCode::PolicyDenied, now);
+        }
+        if let Err(error) =
+            validate_window(request.issued_at, request.expires_at, self.time_reference)
+        {
+            return error_response(error, now);
         }
         if request.expected_generation != record.generation {
             return record_response(ResponseCode::StateConflict, record, now);
@@ -1837,6 +1874,8 @@ fn error_code(error: BindingError) -> ResponseCode {
         BindingError::ManifestRefused
         | BindingError::IntentRefused
         | BindingError::SignatureRefused => ResponseCode::PolicyDenied,
+        BindingError::IssuedAfterTimeReference => ResponseCode::IssuedAfterTimeReference,
+        BindingError::ExpiredAtTimeReference => ResponseCode::ExpiredAtTimeReference,
         BindingError::StorageUnavailable => ResponseCode::StorageUnavailable,
         BindingError::NotFound => ResponseCode::NotFound,
         BindingError::ReplayConflict => ResponseCode::ReplayConflict,
@@ -1908,6 +1947,11 @@ mod tests {
     use nostr::secp256k1::{Keypair, SecretKey};
 
     use super::*;
+
+    /// Package time reference the test controllers judge windows against; the
+    /// fixture admission is issued at 10 and expires at 200, the lane opens at
+    /// 1 and closes at 1000.
+    const TIME_REFERENCE: u64 = 20;
 
     #[derive(Default)]
     struct HostState {
@@ -2234,8 +2278,13 @@ mod tests {
             teardown_digest,
         };
         assert_eq!(journal.insert(record).unwrap(), JournalWrite::Written);
-        let mut controller =
-            ProductionBindingController::new(StaticLaneManifest::new(lane), intents, journal, host);
+        let mut controller = ProductionBindingController::new(
+            StaticLaneManifest::new(lane),
+            intents,
+            journal,
+            host,
+            TIME_REFERENCE,
+        );
         controller.recovery_complete = true;
         let coordinates = AttemptEvidenceCoordinates {
             signed_request_digest: binding.signed_request_digest,
@@ -2418,6 +2467,7 @@ mod tests {
             intents,
             MemoryExecutionBindingJournal::default(),
             host,
+            TIME_REFERENCE,
         );
         controller.recover_open(10).unwrap();
         (controller, key, state)
@@ -2428,6 +2478,70 @@ mod tests {
             operation,
             request_id: [99; 16],
         }
+    }
+
+    /// H8 clean host, diagnostic boots 3 and 4: execd compared the frozen
+    /// fixture's window with its wall clock, so RegisterJobIntent was refused
+    /// eight minutes after materialization (expired) and, with the reference
+    /// stamped ahead of the clock, before it (issued in the future). Windows
+    /// are judged against the package time reference alone; the wall clock only
+    /// stamps the record, and the two failures answer their own codes.
+    #[test]
+    fn windows_are_judged_against_the_package_time_reference_not_the_clock() {
+        let (mut admitted, key, state) = controller();
+        let lane = manifest(&key);
+        let job = intent_for(lane);
+        let request = request(&key, lane, job);
+        let admit = header(buzz_ci_broker_protocol::Operation::AdmitAttempt);
+        // The wall clock sits far beyond expires_at 200; the reference (20) is
+        // inside the window, so the admission proceeds and the deadline is
+        // bounded by the window length, not by the absolute expiry.
+        let response = admitted.dispatch(admit, Request::AdmitAttempt(request), 5_000);
+        assert_eq!(response.code, ResponseCode::Ok);
+        assert_eq!(response.broker_state, BrokerState::Leased);
+        assert_eq!(
+            state.borrow().calls,
+            ["identity", "executor", "runtime", "materialize", "proxy"]
+        );
+        let (mut early_clock, key, _) = controller();
+        let response = early_clock.dispatch(admit, Request::AdmitAttempt(request_for(&key)), 1);
+        assert_eq!(response.code, ResponseCode::Ok);
+
+        let (mut expired, key, state) = controller();
+        expired.time_reference = 200;
+        let response = expired.dispatch(admit, Request::AdmitAttempt(request_for(&key)), 20);
+        assert_eq!(response.code, ResponseCode::ExpiredAtTimeReference);
+        assert_eq!(state.borrow().calls, ["identity"]);
+
+        let (mut future, key, state) = controller();
+        future.time_reference = 9;
+        let response = future.dispatch(admit, Request::AdmitAttempt(request_for(&key)), 20);
+        assert_eq!(response.code, ResponseCode::IssuedAfterTimeReference);
+        assert_eq!(state.borrow().calls, ["identity"]);
+
+        let (mut lane_closed, key, _) = controller();
+        lane_closed.time_reference = 1_000;
+        let response = lane_closed.dispatch(admit, Request::AdmitAttempt(request_for(&key)), 20);
+        assert_eq!(response.code, ResponseCode::ExpiredAtTimeReference);
+
+        assert_eq!(validate_window(10, 200, 10), Ok(()));
+        assert_eq!(validate_window(10, 200, 199), Ok(()));
+        assert_eq!(
+            validate_window(10, 200, 200),
+            Err(BindingError::ExpiredAtTimeReference)
+        );
+        assert_eq!(
+            validate_window(10, 200, 9),
+            Err(BindingError::IssuedAfterTimeReference)
+        );
+        assert_eq!(
+            error_code(BindingError::IssuedAfterTimeReference),
+            ResponseCode::IssuedAfterTimeReference
+        );
+        assert_eq!(
+            error_code(BindingError::ExpiredAtTimeReference),
+            ResponseCode::ExpiredAtTimeReference
+        );
     }
 
     #[test]
@@ -2578,6 +2692,7 @@ mod tests {
             intents,
             MemoryExecutionBindingJournal::default(),
             host,
+            TIME_REFERENCE,
         );
 
         let response = controller.dispatch(
@@ -2808,6 +2923,7 @@ mod tests {
             journal,
             host,
             recovery_complete: _,
+            time_reference,
         } = first_process;
         let mut restarted = ProductionBindingController {
             manifests,
@@ -2815,6 +2931,7 @@ mod tests {
             journal,
             host,
             recovery_complete: false,
+            time_reference,
         };
         restarted.recover_open(30).unwrap();
         let record = restarted.journal.list().unwrap()[0];
@@ -2850,6 +2967,7 @@ mod tests {
             journal,
             host,
             recovery_complete: _,
+            time_reference,
         } = first_process;
         let mut restarted = ProductionBindingController {
             manifests,
@@ -2857,6 +2975,7 @@ mod tests {
             journal,
             host,
             recovery_complete: false,
+            time_reference,
         };
 
         restarted.recover_open(30).unwrap();

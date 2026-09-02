@@ -15,6 +15,7 @@
     "components",
     "entries",
     "systemd",
+    "platform_systemd",
     "effective_systemd",
     "socket_policy",
     "qualification",
@@ -103,6 +104,19 @@
         "active_capacity": 1
       }
     },
+    "platform_systemd": {
+      "const": {
+        "schema_version": "buzz-ci-systemd-platform-binding/v1",
+        "platform_id": "fedora-44-systemd-259",
+        "service_drop_ins": [
+          {
+            "owner": "platform",
+            "path": "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+            "sha256": "ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37"
+          }
+        ]
+      }
+    },
     "effective_systemd": {
       "type": "array",
       "minItems": 13,
@@ -187,7 +201,7 @@
     "acceptanceTemplate": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["actor", "run_event", "grant_event", "rerun_event", "tombstone_event"],
+      "required": ["actor", "time_reference", "run_event", "grant_event", "rerun_event", "tombstone_event"],
       "properties": {
         "actor": {
           "type": "object",
@@ -198,6 +212,7 @@
             "generation": { "type": "integer", "minimum": 1, "maximum": 18446744073709551615 }
           }
         },
+        "time_reference": { "type": "integer", "minimum": 1, "maximum": 18446744073709551615 },
         "run_event": { "$ref": "#/$defs/runEvent" },
         "grant_event": { "$ref": "#/$defs/grantEvent" },
         "rerun_event": { "$ref": "#/$defs/runEvent" },
@@ -378,7 +393,7 @@
       },
       "allOf": [
         {
-          "if": { "properties": { "name": { "const": "controld" } }, "required": ["name"] },
+          "if": { "properties": { "name": { "enum": ["runner", "controld"] } }, "required": ["name"] },
           "then": { "required": ["package_manifest_source", "package_manifest_sha256", "package_digest"] },
           "else": {
             "not": {
@@ -397,7 +412,7 @@
       "additionalProperties": false,
       "required": ["owner", "path", "sha256"],
       "properties": {
-        "owner": { "enum": ["activation", "runner", "controld", "keyholder"] },
+        "owner": { "enum": ["activation", "runner", "controld", "keyholder", "platform"] },
         "path": { "type": "string", "pattern": "^/(etc|usr)/[A-Za-z0-9._/@+-]+(?:/[A-Za-z0-9._@+-]+)*$" },
         "sha256": { "$ref": "#/$defs/sha256" }
       }

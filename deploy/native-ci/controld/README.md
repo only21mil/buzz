@@ -9,6 +9,18 @@ The checked-in package does not create accounts, run `systemd-tmpfiles`, reload
 systemd, enable or start a unit, provision keys, contact a relay, connect to a
 runner or broker, or grant execution capacity. The installed service sandbox
 permits only the network and local sockets needed after a separate activation.
+The unit lists `/run/buzzci` as a read-only directory rather than the keyholder
+and runner socket inodes: SELinux denies `init_t` `mounton` on a `sock_file`, so
+a per-socket `ReadOnlyPaths=` entry fails the service at NAMESPACE as soon as
+the socket exists. Connecting through a read-only bind mount still works.
+
+Controld authenticates the keyholder and runner listeners the way the
+acceptance driver authenticates controld: the socket inode must be owned by the
+service account with controld's group and mode `0620`, and `SO_PEERCRED` must
+name either that account or pid 1 root, which the kernel reports for a socket
+bound by a systemd socket unit because `SO_PEERCRED` names the `listen()`
+caller. Any other root process, an unmappable pid, or another account fails
+closed.
 
 ## Closed contract
 
@@ -48,7 +60,16 @@ bytes that contribute to the package digest.
 Capacity one is accepted only with the complete relay authority, channel,
 authenticated runner identity and bounds, exact static lane, JobIntentV2 job
 and artifact declaration, keyholder selector generations, and a receipt whose
-authority description exactly matches keyholder.
+authority description exactly matches keyholder. The `manifest` keyholder
+selector is the one source of the admission key: controld derives
+`admission_key_generation` from `keyholder_selectors.manifest.generation`, the
+activation freezer requires the execd lane manifest's `admission_verifying_key`
+and `admission_key_generation` to equal that selector, and the runner's static
+activation coordinates copy the lane manifest. The public event templates are
+issued at the package's bound time reference (`acceptance_template.time_reference`,
+recorded at freeze); the freezer requires the runner's static
+`acceptance_time_reference` to equal it, and the runner judges the admission
+window against that reference rather than the wall clock.
 The active daemon polls the authenticated accepted-request source one at a
 time, signs through keyholder, admits only the exact runner-control v2 frame,
 and fetches terminal logs, the declared artifact, and teardown through the
@@ -106,6 +127,13 @@ does not repair source modes.
 Before any install against `/`, the package root and assets directory must be
 root-owned mode `0700`. Manifest and provenance files must be root-owned mode
 `0600`; every asset must retain the manifest mode.
+
+The default transaction path uses the cross-installer shared parent
+`/var/lib/buzzci`, which must be root-owned mode `0711`. The installer creates
+an absent shared parent with that exact mode even under umask `077`; it refuses
+an existing symlink or any ownership or mode drift instead of widening it.
+`/var/lib/buzzci/install-backups` and the controld transaction tree remain
+root-owned mode `0700`.
 
 ## Source-only operator modes
 

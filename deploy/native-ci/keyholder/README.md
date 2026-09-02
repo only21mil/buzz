@@ -108,6 +108,13 @@ The active package adds a separate systemd drop-in with exactly:
 LoadCredentialEncrypted=acceptance-actor.key:/etc/credstore.encrypted/buzzci-keyholder/acceptance-actor.key
 ```
 
+A production activation therefore needs four separately provisioned,
+cryptographically distinct credentials: the three selector credentials above
+and `acceptance-actor.key`. The acceptance credential also contains exactly 32
+raw secret bytes. Hex, `nsec`, PEM, a trailing LF, or a copied clean-host guest
+credential is invalid. Provisioning all four credentials is one approval-gated
+operation; generating a public binding does not provision or inspect them.
+
 The encrypted source is an external prerequisite owned by root with mode
 `0400`; it is not a package asset. The installer checks only its file metadata
 and size and never opens it. Missing, linked, loose-mode, or wrongly owned
@@ -115,9 +122,14 @@ sources fail closed. The existing three credential mappings remain in the base
 service and never appear in the acceptance drop-in.
 
 The binary opens the systemd credential directory once with `O_NOFOLLOW`, then
-opens these fixed names relative to that descriptor. It rejects links,
-non-regular files, multiple links, wrong lengths, and group- or world-writable
-objects. Error messages identify only the failed class, never the credential,
+opens these fixed names relative to that descriptor. It accepts the two shapes
+systemd delivers: a directory and files owned by the service account (`0500`,
+`0400`), or, as systemd 259 installs them on the clean host, `root:root` with no
+world bits and read access granted to the service through an ACL (directory
+`0550`, files `0440`). It rejects links, non-regular files, multiple links,
+wrong lengths, world-readable objects, group- or world-writable objects,
+setuid, setgid, or sticky bits, and any owner other than root or the service
+account. Error messages identify only the failed class, never the credential,
 path, parser detail, key bytes, request, URL, digest, public key, or signature.
 
 The checked-in unit is not enabled. Freezing or installing a package does not
@@ -125,10 +137,57 @@ change that state. Creating the dedicated principals, creating the encrypted
 credential, reloading systemd, and enabling the socket remain separate
 approval-gated activation work.
 
+## Generate a production public binding
+
+The clean-host `prepare` binding contains disposable guest keys and is valid
+only for that isolated qualification run. Do not use those public keys for a
+live host. After the separately approved production provisioner has written
+all four encrypted credentials directly to their fixed paths, capture its four
+public readback streams in an owner-held mode-`0700` directory. Each stream
+must contain only the corresponding 64-character lowercase BIP-340 x-only
+public key plus one LF. Redirect only that documented public-readback stream.
+Reject a provisioner that puts secret bytes in stdout, argv, logs, or a public
+readback file; never decrypt a credential to obtain this input.
+
+The generator accepts only those four public files, public relay origins,
+numeric identities, and explicit generation `1`. It never reads a credential,
+accepts stdin, or prints a key. The four public files must be regular,
+singly-linked, owned by the caller, and mode `0400`, `0444`, `0600`, or `0644`.
+The output parent must be an owner-held real mode-`0700` directory, and the
+output must not exist.
+
+```bash
+PUBLIC_INPUTS=/protected/buzzci-production-public
+PUBLIC_BINDING=/protected/buzzci-production-binding/public-binding.json
+
+deploy/native-ci/keyholder/generate_public_binding.py \
+  --relay-url wss://relay.example.invalid \
+  --relay-http-origin https://relay.example.invalid \
+  --controld-uid 1201 --controld-gid 1201 \
+  --ci-event-public-key "$PUBLIC_INPUTS/ci-event.pub" \
+  --ci-event-generation 1 \
+  --nip98-public-key "$PUBLIC_INPUTS/nip98.pub" \
+  --nip98-generation 1 \
+  --manifest-public-key "$PUBLIC_INPUTS/manifest.pub" \
+  --manifest-generation 1 \
+  --acceptance-actor-public-key "$PUBLIC_INPUTS/acceptance-actor.pub" \
+  --acceptance-actor-generation 1 \
+  --output "$PUBLIC_BINDING"
+```
+
+The result is mode `0600`, canonical compact declaration-order JSON plus LF
+with schema `buzz-ci-clean-host-e2e-public-binding/v3`. The schema name remains
+unchanged because the keyholder freezer and activation renderers consume those
+exact bytes. The generator validates that all four public keys lift to
+secp256k1 points, are nonzero and distinct, that both origins name one exact
+lowercase authority, and that every downstream v3 consumer accepts the result.
+It does not copy any guest key or credential bytes.
+
 ## Freeze and inspect an acceptance package
 
-Use the canonical `public-binding.json` emitted by the clean-host `prepare`
-step. The freezer requires schema
+For isolated qualification, use the canonical `public-binding.json` emitted by
+the clean-host `prepare` step. For a live host, use only the production binding
+generated from the approved production public readbacks above. The freezer requires schema
 `buzz-ci-clean-host-e2e-public-binding/v3`, validates the complete closed
 document in the producer's exact declaration-order compact JSON plus LF,
 checks the controld UID and GID, rejects raw or private key fields, and verifies

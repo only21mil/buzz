@@ -19,7 +19,10 @@ ProtectHome=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes
 ProtectSystem=strict
-ReadOnlyPaths=/etc/buzzci/controld-v2.json -/var/lib/buzzci/activation-controller/controld-acceptance-v2.json -/run/buzzci/runner-control.sock -/run/buzzci/keyholder.sock
+# /run/buzzci is listed as a directory, never as its socket inodes: SELinux
+# denies init_t mounton on a sock_file, so a per-socket ReadOnlyPaths entry
+# fails the unit at NAMESPACE once the keyholder or runner socket exists.
+ReadOnlyPaths=/etc/buzzci/controld-v2.json /run/buzzci -/var/lib/buzzci/activation-controller/controld-acceptance-v2.json
 ReadWritePaths=/var/lib/buzzci/controld
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictSUIDSGID=yes

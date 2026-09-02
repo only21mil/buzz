@@ -36,6 +36,18 @@ membership. Broker authorization still checks the exact root `SO_PEERCRED` UID.
 
 The runner writes only its bounded request-ID replay map under
 `/var/lib/buzzci/runner`. Execd owns active v2 evidence retention.
+
+In `v2_proxy` mode the runner serves one static activation lane. Its static
+activation coordinates copy the execd lane manifest (`lane_manifest_digest`,
+`lane_epoch`, `admission_key_generation`, `isolation_profile_digest`,
+`audience_digest`) and the activation package's bound time reference
+(`acceptance_time_reference`). The package freezes the public
+Run/Grant/Rerun/Tombstone fixture at that reference, so the runner judges
+every admission and cancel window (`issued_at <= reference < expires_at`)
+against the reference and never against the wall clock. A frozen package
+therefore admits on any host date. The runner names the two window failures
+("issued after the package time reference", "expired at the package time
+reference") separately from a static coordinate mismatch.
 The controld handoff root remains `/var/lib/buzzci/runner-output`; this package
 does not create it and the runner service cannot write it.
 
@@ -95,6 +107,13 @@ provenance, and every asset to `root:root`. The two directories must be mode
 `0700`; the manifest and provenance must be mode `0600`; package payload modes
 must match the manifest. `install.py` checks all of this with no-follow file
 descriptors.
+
+The default transaction path uses the cross-installer shared parent
+`/var/lib/buzzci`, which must be root-owned mode `0711`. The installer creates
+an absent shared parent with that exact mode even under umask `077`; it refuses
+an existing symlink or any ownership or mode drift instead of widening it.
+`/var/lib/buzzci/install-backups` and the runner transaction tree remain
+root-owned mode `0700`.
 
 ## Source-only operator modes
 

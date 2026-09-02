@@ -16,6 +16,18 @@ The acceptance tree does not own or retain a deployable copy of
 `buzz-ci-controld-acceptance.socket`. The controld package is its sole source
 and package owner.
 
+Both driver endpoints are systemd socket units, so the kernel reports pid 1
+root as the `SO_PEERCRED` of every connection the driver opens: it names the
+process that called `listen()`, not the service that accepts. Before it
+connects, the driver requires the socket inode at the fixed path to be a
+root-owned socket with the `buzzci-ctl` group and mode `0620`, the shape only
+the installed socket unit produces under the root-owned `0711` runtime
+directory. After it connects, it accepts exactly two listeners: the endpoint
+service's own uid and gid, or pid 1 root. Any other root process, an
+unmappable pid, and any other identity fail closed as `wrong_peer`. Controld
+still authenticates the driver itself through `SO_PEERCRED`, because the
+driver connects directly and the kernel reports the connecting process.
+
 ## What the gate proves
 
 The 13 checks run in this order:

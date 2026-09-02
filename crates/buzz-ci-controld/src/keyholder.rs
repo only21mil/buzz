@@ -215,7 +215,7 @@ impl UnixKeyholderClient {
         let mut stream =
             connect_with_timeout(&self.config.keyholder_socket, self.config.timeout())?;
         let peer = getsockopt(&stream, PeerCredentials).map_err(|_| KeyholderError::WrongServer)?;
-        if peer.uid() != self.config.keyholder_uid || peer.gid() != self.config.keyholder_gid {
+        if !keyholder_listener_accepted(peer.pid(), peer.uid(), peer.gid(), &self.config) {
             return Err(KeyholderError::WrongServer);
         }
         stream
@@ -637,6 +637,30 @@ fn classify_transport_error(error: io::Error) -> KeyholderError {
     }
 }
 
+/// `SO_PEERCRED` names the process that called `listen()`. Production binds
+/// `/run/buzzci/keyholder.sock` through `buzz-ci-keyholder.socket`, so the
+/// kernel reports pid 1 root even though `buzz-ci-keyholder.service` accepts
+/// the connection as its own account. The shared rule from the acceptance
+/// driver accepts exactly that listener or the keyholder account itself;
+/// [`validate_socket_file`] has already proven the inode is the keyholder's
+/// (owner uid, controld's group, mode `0620` under root-owned `0711`
+/// `/run/buzzci`).
+#[cfg(target_os = "linux")]
+fn keyholder_listener_accepted(
+    pid: i32,
+    uid: u32,
+    gid: u32,
+    config: &KeyholderClientConfig,
+) -> bool {
+    use buzz_ci_acceptance_ctl::production::{listener_peer_accepted, ListenerPeer};
+
+    listener_peer_accepted(
+        ListenerPeer { pid, uid, gid },
+        config.keyholder_uid,
+        config.keyholder_gid,
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn validate_socket_file(path: &Path, expected_owner_uid: u32) -> Result<(), KeyholderError> {
     use nix::unistd::getegid;
@@ -1041,6 +1065,34 @@ mod tests {
         ));
         assert!(started.elapsed() < Duration::from_secs(1));
         server.join().expect("server");
+    }
+
+    #[test]
+    fn listener_rule_accepts_the_socket_unit_or_the_keyholder_and_rejects_the_rest() {
+        let config = KeyholderClientConfig {
+            keyholder_uid: 1202,
+            keyholder_gid: 1202,
+            ..config(PathBuf::from("/run/buzzci/keyholder.sock"), 100, 1)
+        };
+        // pid 1 root: the shape a systemd socket unit reports (H4 probe, H5 rule).
+        assert!(keyholder_listener_accepted(1, 0, 0, &config));
+        // The keyholder service bound the socket itself.
+        assert!(keyholder_listener_accepted(4242, 1202, 1202, &config));
+        for (pid, uid, gid) in [
+            (4242, 0, 0),
+            (0, 0, 0),
+            (-1, 0, 0),
+            (1, 1202, 0),
+            (1, 0, 1202),
+            (4242, 1202, 1203),
+            (4242, 1203, 1202),
+            (4242, 1201, 1201),
+        ] {
+            assert!(
+                !keyholder_listener_accepted(pid, uid, gid, &config),
+                "{pid} {uid}:{gid}"
+            );
+        }
     }
 
     #[test]

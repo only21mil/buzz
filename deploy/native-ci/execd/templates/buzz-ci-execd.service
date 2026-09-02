@@ -29,8 +29,12 @@ RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 RemoveIPC=yes
-CapabilityBoundingSet=
-AmbientCapabilities=
+# Materialization creates the job-owned attempt tree as root: CAP_CHOWN for the
+# fchown to buzzci-job, CAP_FOWNER for the fchmod of inodes it no longer owns,
+# CAP_DAC_OVERRIDE to create, read, and remove inside those job-owned 0500/0700
+# trees. Nothing else; ProtectSystem=strict and ReadWritePaths bound the writes.
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
+AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER
 SystemCallArchitectures=native
 SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @raw-io @reboot @swap
 LockPersonality=yes

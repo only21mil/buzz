@@ -140,7 +140,7 @@ EXECUTION_SCHEMA_VERSION = 1
 EXECUTION_DIGEST_DOMAIN = b"buzz-ci-execd:static-execution:v1\0"
 FIXTURE_MANIFEST_SHA256 = "f204b8fba64e972408f5a0ea1c0bb3140cfa696289903d96a8cb07d602af6b23"
 FIXTURE_INPUT_SHA256 = "967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6"
-FIXTURE_SCRIPT_SHA256 = "3bb81cfd157e50b1d0834de48a9ecf1c27b0438a4f2bc374e091fb4f11ec213d"
+FIXTURE_SCRIPT_SHA256 = "d081e43ebfde3ee67c3cd8d852d58410a79ad799bbfa2cf98d5e2ef7b8bed3b1"
 FIXTURE_MANIFEST_PATH = "/usr/share/buzzci/execd-v2/fixture/fixture-manifest.json"
 FIXTURE_INPUT_PATH = "/usr/share/buzzci/execd-v2/fixture/input.txt"
 FIXTURE_SCRIPT_PATH = "/usr/libexec/buzz-ci-capacity-one-fixture"
@@ -231,6 +231,11 @@ STATIC_TARGETS = {
     "controld_service_dropin": "/etc/systemd/system/buzz-ci-controld.service.d/20-capacity-one.conf",
     "keyholder_socket_dropin": "/etc/systemd/system/buzz-ci-keyholder.socket.d/20-capacity-one.conf",
 }
+COMPONENT_PACKAGE_NAMES = ("runner", "controld")
+COMPONENT_TMPFILES_TARGETS = {
+    "runner": "/usr/lib/tmpfiles.d/buzzci-runner.conf",
+    "controld": "/usr/lib/tmpfiles.d/buzzci-controld.conf",
+}
 
 PACKAGE_UNIT_ROLES = {
     PERSISTENT_UNIT: "capacity_target",
@@ -244,6 +249,44 @@ PACKAGE_UNIT_ROLES = {
 DEPENDENCY_UNITS = sorted(
     set(START_ORDER + STOP_ORDER) - set(PACKAGE_UNIT_ROLES)
 )
+
+PLATFORM_SYSTEMD = {
+    "schema_version": "buzz-ci-systemd-platform-binding/v1",
+    "platform_id": "fedora-44-systemd-259",
+    "service_drop_ins": [{
+        "owner": "platform",
+        "path": "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+        "sha256": "ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37",
+    }],
+}
+
+
+def systemd_drop_in_order(paths: list[str]) -> list[str]:
+    """Return systemd's bytewise basename order, rejecting ambiguous overrides."""
+    basenames: dict[bytes, str] = {}
+    for path in paths:
+        if not isinstance(path, str):
+            raise ValueError("systemd drop-in path must be text")
+        basename = PurePosixPath(path).name.encode("utf-8")
+        if not basename or basename in basenames:
+            raise ValueError("systemd drop-in basename collision is ambiguous")
+        basenames[basename] = path
+    return [basenames[basename] for basename in sorted(basenames)]
+
+
+def _service_drop_ins(*records: dict[str, str]) -> list[dict[str, str]]:
+    combined = [
+        *records,
+        *[
+            {"owner": item["owner"], "path": item["path"]}
+            for item in PLATFORM_SYSTEMD["service_drop_ins"]
+        ],
+    ]
+    by_path = {item["path"]: item for item in combined}
+    return [
+        by_path[path]
+        for path in systemd_drop_in_order([item["path"] for item in combined])
+    ]
 
 SYSTEMD_UNIT_LAYOUT = {
     "buzz-ci-capacity-one.target": {
@@ -260,13 +303,13 @@ SYSTEMD_UNIT_LAYOUT = {
     },
     "buzz-ci-acceptance-control.service": {
         "fragment": {"owner": "activation", "path": "/etc/systemd/system/buzz-ci-acceptance-control.service"},
-        "drop_ins": [],
+        "drop_ins": _service_drop_ins(),
     },
     "buzz-ci-runner.service": {
         "fragment": {"owner": "runner", "path": "/etc/systemd/system/buzz-ci-runner.service"},
-        "drop_ins": [
+        "drop_ins": _service_drop_ins(
             {"owner": "activation", "path": "/etc/systemd/system/buzz-ci-runner.service.d/20-capacity-one.conf"},
-        ],
+        ),
     },
     "buzz-ci-runner.socket": {
         "fragment": {"owner": "runner", "path": "/etc/systemd/system/buzz-ci-runner.socket"},
@@ -274,15 +317,15 @@ SYSTEMD_UNIT_LAYOUT = {
     },
     "buzz-ci-controld.service": {
         "fragment": {"owner": "controld", "path": "/etc/systemd/system/buzz-ci-controld.service"},
-        "drop_ins": [
+        "drop_ins": _service_drop_ins(
             {"owner": "activation", "path": "/etc/systemd/system/buzz-ci-controld.service.d/20-capacity-one.conf"},
-        ],
+        ),
     },
     "buzz-ci-keyholder.service": {
         "fragment": {"owner": "keyholder", "path": "/etc/systemd/system/buzz-ci-keyholder.service"},
-        "drop_ins": [
+        "drop_ins": _service_drop_ins(
             {"owner": "keyholder", "path": "/etc/systemd/system/buzz-ci-keyholder.service.d/20-acceptance-actor.conf"},
-        ],
+        ),
     },
     "buzz-ci-keyholder.socket": {
         "fragment": {"owner": "keyholder", "path": "/etc/systemd/system/buzz-ci-keyholder.socket"},
@@ -292,7 +335,7 @@ SYSTEMD_UNIT_LAYOUT = {
     },
     "buzz-ci-execd.service": {
         "fragment": {"owner": "activation", "path": "/usr/lib/systemd/system/buzz-ci-execd.service"},
-        "drop_ins": [],
+        "drop_ins": _service_drop_ins(),
     },
     "buzz-ci-execd.socket": {
         "fragment": {"owner": "activation", "path": "/usr/lib/systemd/system/buzz-ci-execd.socket"},
@@ -302,7 +345,7 @@ SYSTEMD_UNIT_LAYOUT = {
     },
     "buzz-ci-executor.service": {
         "fragment": {"owner": "activation", "path": "/usr/lib/systemd/system/buzz-ci-executor.service"},
-        "drop_ins": [],
+        "drop_ins": _service_drop_ins(),
     },
     "buzz-ci-executor.socket": {
         "fragment": {"owner": "activation", "path": "/usr/lib/systemd/system/buzz-ci-executor.socket"},
@@ -439,13 +482,13 @@ def _validate_component(value: object) -> dict[str, Any]:
         "name", "binary_path", "binary_sha256", "source_commit", "provenance_source",
         "provenance_sha256", "uid", "gid", "mode", "unit",
     }
-    controld_manifest_fields = {
+    package_manifest_fields = {
         "package_manifest_source", "package_manifest_sha256", "package_digest",
     }
     name = value.get("name")
     require_keys(
         value,
-        base_fields | (controld_manifest_fields if name == "controld" else set()),
+        base_fields | (package_manifest_fields if name in COMPONENT_PACKAGE_NAMES else set()),
         "component",
     )
     if name not in COMPONENTS:
@@ -466,11 +509,11 @@ def _validate_component(value: object) -> dict[str, Any]:
         raise ValueError(f"component {name} binary must be root owned")
     if parse_mode(value["mode"]) != 0o755:
         raise ValueError(f"component {name} binary mode must be 0755")
-    if name == "controld":
-        require_asset(value["package_manifest_source"], "controld package manifest")
+    if name in COMPONENT_PACKAGE_NAMES:
+        require_asset(value["package_manifest_source"], f"{name} package manifest")
         for field in ("package_manifest_sha256", "package_digest"):
             if not isinstance(value[field], str) or not SHA256.fullmatch(value[field]):
-                raise ValueError(f"controld {field} is invalid")
+                raise ValueError(f"{name} {field} is invalid")
     return value
 
 
@@ -513,9 +556,10 @@ def _validate_effective_systemd(value: object) -> list[dict[str, Any]]:
             if not isinstance(drop_in["sha256"], str) or not SHA256.fullmatch(drop_in["sha256"]):
                 raise ValueError(f"effective systemd drop-in digest is invalid: {unit}")
             require_absolute(drop_in["path"], f"effective systemd drop-in path {unit}")
-            if drop_in["path"] in observed_paths:
+            if drop_in["path"] in observed_paths and drop_in["owner"] != "platform":
                 raise ValueError("effective systemd path is duplicated")
-            observed_paths.add(drop_in["path"])
+            if drop_in["owner"] != "platform":
+                observed_paths.add(drop_in["path"])
         result.append(item)
     if observed_units != set(SYSTEMD_UNIT_LAYOUT):
         raise ValueError("effective systemd units are incomplete")
@@ -564,7 +608,7 @@ def _validate_entry(value: object) -> dict[str, Any]:
 def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) -> dict[str, Any]:
     expected = {
         "schema", "activation_id", "source_commit", "default_state", "identities", "components", "entries",
-        "access_group", "acceptance_template", "systemd", "effective_systemd", "socket_policy", "qualification", "package_uid",
+        "access_group", "acceptance_template", "systemd", "platform_systemd", "effective_systemd", "socket_policy", "qualification", "package_uid",
         "package_gid", "package_digest",
     }
     if not require_digest:
@@ -580,6 +624,8 @@ def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) 
         raise ValueError("activation package must remain dormant by default")
     if manifest["package_uid"] != 0 or manifest["package_gid"] != 0:
         raise ValueError("activation package must be root owned")
+    if manifest["platform_systemd"] != PLATFORM_SYSTEMD:
+        raise ValueError("systemd platform binding differs from the fixed plan")
 
     identities = manifest["identities"]
     if not isinstance(identities, dict) or set(identities) != set(IDENTITIES):
@@ -662,12 +708,18 @@ def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) 
             raise ValueError(f"tracked activation program entry mode differs: {role}")
 
     effective_systemd = _validate_effective_systemd(manifest["effective_systemd"])
+    platform_records = {
+        item["path"]: item for item in manifest["platform_systemd"]["service_drop_ins"]
+    }
     for unit in effective_systemd:
         for record in (unit["fragment"], *unit["drop_ins"]):
             role = SYSTEMD_ENTRY_ROLES.get(record["path"])
             if record["owner"] == "activation":
                 if role is None or entries_by_role[role]["sha256"] != record["sha256"]:
                     raise ValueError(f"activation effective systemd bytes differ: {record['path']}")
+            elif record["owner"] == "platform":
+                if role is not None or platform_records.get(record["path"]) != record:
+                    raise ValueError(f"platform effective systemd binding differs: {record['path']}")
             elif role is not None:
                 raise ValueError(f"non-activation systemd path is activation-owned: {record['path']}")
 
@@ -702,7 +754,10 @@ def validate_manifest(manifest: dict[str, Any], *, require_digest: bool = True) 
     if qualification["terminate_grace_seconds"] != 2:
         raise ValueError("qualification termination grace must be two seconds")
     all_sources = sources + [item["provenance_source"] for item in validated_components]
-    all_sources.append(components_by_name["controld"]["package_manifest_source"])
+    all_sources.extend(
+        components_by_name[name]["package_manifest_source"]
+        for name in COMPONENT_PACKAGE_NAMES
+    )
     if len(all_sources) != len(set(all_sources)):
         raise ValueError("activation assets must not share source names")
 
@@ -757,8 +812,180 @@ def _positive_integer(value: object, maximum: int, where: str) -> int:
     return value
 
 
+def production_acceptance_template(
+    *, actor_public_key: str, actor_generation: int, ci_signer_public_key: str,
+    candidate_sha: str, workflow_id: str, workflow_digest: str, job_id: str,
+    time_reference: int,
+) -> dict[str, Any]:
+    """Build the one canonical public Run/Grant/Rerun/Tombstone authority set.
+
+    The set is static: its event ids are bound by digest into the keyholder
+    signing policy, the controld acceptance authority, the scenario fixture,
+    and the acceptance binding receipt. Its request windows therefore hang off
+    ``time_reference``, the package's bound time reference recorded at freeze
+    and carried in the manifest, and the runner judges every admission and
+    cancel window against that same value as a static activation coordinate
+    (``acceptance_time_reference``), never against the wall clock.
+    """
+    actor = _nonzero_sha256(actor_public_key, "public acceptance actor")
+    signer = _nonzero_sha256(ci_signer_public_key, "public CI signer")
+    _positive_integer(actor_generation, 0xFFFFFFFFFFFFFFFF, "public acceptance actor generation")
+    if not GIT_OID.fullmatch(candidate_sha):
+        raise ValueError("production acceptance candidate must be a full SHA-1 object id")
+    if not isinstance(workflow_id, str) or not workflow_id or len(workflow_id.encode("utf-8")) > 64:
+        raise ValueError("production acceptance workflow id is invalid")
+    _nonzero_sha256(workflow_digest, "production acceptance workflow digest")
+    if not isinstance(job_id, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", job_id) is None:
+        raise ValueError("production acceptance job id is invalid")
+
+    channel = "12345678-1234-4abc-8def-123456789abc"
+    run_id = "13131313-1313-4313-8313-131313131313"
+    target_repo = f"30617:{'22' * 32}:buzz"
+    pr_event = "33" * 32
+    issued_at = _positive_integer(
+        time_reference, 0xFFFFFFFFFFFFFFFF - 601, "public acceptance time reference",
+    )
+
+    def request(*, request_type: str, attempt: int, idempotency_key: str) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "schema_version": 1,
+            "request_type": request_type,
+            "target_repo_a": target_repo,
+            "pr_root_event_id": pr_event,
+            "source_clone_url": "https://relay.example.invalid/git/buzz",
+            "immutable_source_ref": "refs/nostr/source",
+            "tip_oid": candidate_sha,
+            "source_branch": "acceptance/capacity-one",
+            "base_ref": "refs/heads/main",
+            "base_oid": candidate_sha,
+            "workflow_id": workflow_id,
+            "workflow_digest": workflow_digest,
+            "job_ids": [job_id],
+            "run_id": run_id,
+            "attempt": attempt,
+        }
+        if request_type == "rerun":
+            value.update({"parent_attempt": 1, "parent_run_id": run_id})
+        value.update({
+            "trigger_event_id": pr_event,
+            "actor": actor,
+            "timeout_seconds": 120,
+            "idempotency_key": idempotency_key,
+            # Every request is issued at the reference: the runner and execd
+            # judge issued_at <= reference < expires_at for the run and the
+            # rerun alike (H9 clean host: a rerun issued at reference + 10 was
+            # refused as issued after the package time reference).
+            "issued_at": issued_at,
+            "expires_at": issued_at + (300 if attempt == 1 else 310),
+        })
+        return value
+
+    run = request(
+        request_type="run", attempt=1,
+        idempotency_key="12121212-1212-4212-8212-121212121212",
+    )
+    rerun = request(
+        request_type="rerun", attempt=2,
+        idempotency_key="14141414-1414-4414-8414-141414141414",
+    )
+
+    def request_event(envelope: dict[str, Any]) -> list[object]:
+        attempt = str(envelope["attempt"])
+        tags = [
+            ["h", channel], ["a", target_repo], ["run", run_id],
+            ["workflow", workflow_id], ["c", candidate_sha], ["attempt", attempt],
+        ]
+        return [
+            0, actor, envelope["issued_at"], 46_100, tags,
+            json.dumps(envelope, ensure_ascii=False, separators=(",", ":")),
+        ]
+
+    run_event = request_event(run)
+    rerun_event = request_event(rerun)
+    grant = {
+        "schema_version": 1,
+        "target_repo_a": target_repo,
+        "signer_pubkey": signer,
+        "valid_from": issued_at + 1,
+        "valid_until": issued_at + 601,
+    }
+    grant_event = [
+        0, actor, issued_at + 1, 46_107, [["h", channel]],
+        json.dumps(grant, ensure_ascii=False, separators=(",", ":")),
+    ]
+    rerun_event_id = digest(json.dumps(
+        rerun_event, ensure_ascii=False, separators=(",", ":"),
+    ).encode())
+    return validate_acceptance_template({
+        "actor": {"public_key": actor, "generation": actor_generation},
+        "time_reference": issued_at,
+        "run_event": run_event,
+        "grant_event": grant_event,
+        "rerun_event": rerun_event,
+        "tombstone_event": [0, actor, issued_at + 20, 5, [["e", rerun_event_id]], ""],
+    })
+
+
+def production_activation_draft(
+    *, source_commit: str, identities: dict[str, Any], access_group: dict[str, Any],
+    components: list[dict[str, Any]], entries: list[dict[str, Any]],
+    effective_systemd: list[dict[str, Any]], actor_public_key: str,
+    actor_generation: int, ci_signer_public_key: str, workflow_id: str,
+    workflow_digest: str, job_id: str, time_reference: int,
+) -> dict[str, Any]:
+    """Materialize a new closed activation draft from explicit ready inputs.
+
+    ``time_reference`` is the freeze-time value the acceptance template is
+    issued at; the materializer records it once and the manifest carries it.
+    """
+    def detached(value: object) -> Any:
+        return json.loads(canonical_json(value), object_pairs_hook=reject_duplicates)
+
+    draft = {
+        "schema": DRAFT_SCHEMA,
+        "source_commit": source_commit,
+        "default_state": {
+            "capacity": 0, "enabled": False, "active": False, "provisioned": False,
+        },
+        "identities": detached(identities),
+        "access_group": detached(access_group),
+        "components": detached(components),
+        "acceptance_template": production_acceptance_template(
+            actor_public_key=actor_public_key,
+            actor_generation=actor_generation,
+            ci_signer_public_key=ci_signer_public_key,
+            candidate_sha=source_commit,
+            workflow_id=workflow_id,
+            workflow_digest=workflow_digest,
+            job_id=job_id,
+            time_reference=time_reference,
+        ),
+        "entries": detached(entries),
+        "effective_systemd": detached(effective_systemd),
+        "platform_systemd": detached(PLATFORM_SYSTEMD),
+        "socket_policy": detached(SOCKET_POLICY),
+        "systemd": {
+            "start_order": list(START_ORDER),
+            "stop_order": list(STOP_ORDER),
+            "persistent_unit": PERSISTENT_UNIT,
+            "stage_capacity": 0,
+            "active_capacity": 1,
+        },
+        "qualification": {
+            "program": "/usr/libexec/buzz-ci-production-qualification",
+            "request_validity_seconds": 60,
+            "timeout_seconds": 5,
+            "terminate_grace_seconds": 2,
+            "principal": "qualification",
+        },
+        "package_uid": 0,
+        "package_gid": 0,
+    }
+    return validate_manifest(draft, require_digest=False)
+
+
 def validate_acceptance_template(value: object) -> dict[str, Any]:
-    fields = {"actor", "run_event", "grant_event", "rerun_event", "tombstone_event"}
+    fields = {"actor", "time_reference", "run_event", "grant_event", "rerun_event", "tombstone_event"}
     if not isinstance(value, dict) or set(value) != fields:
         raise ValueError("public acceptance template shape differs")
     actor = value["actor"]
@@ -766,6 +993,9 @@ def validate_acceptance_template(value: object) -> dict[str, Any]:
         raise ValueError("public acceptance actor shape differs")
     public_key = _nonzero_sha256(actor["public_key"], "public acceptance actor")
     _positive_integer(actor["generation"], 0xFFFFFFFFFFFFFFFF, "public acceptance actor generation")
+    time_reference = _positive_integer(
+        value["time_reference"], 0xFFFFFFFFFFFFFFFF, "public acceptance time reference",
+    )
     expected_kinds = {
         "run_event": 46_100,
         "grant_event": 46_107,
@@ -788,6 +1018,34 @@ def validate_acceptance_template(value: object) -> dict[str, Any]:
         if len(raw) > 64 * 1024 or raw in encoded:
             raise ValueError("public acceptance event templates are oversized or duplicate")
         encoded.add(raw)
+    run_event = value["run_event"]
+    try:
+        run = json.loads(run_event[5], object_pairs_hook=reject_duplicates)
+    except (TypeError, ValueError) as error:
+        raise ValueError("public acceptance run template envelope is invalid") from error
+    if (
+        run_event[2] != time_reference
+        or not isinstance(run, dict)
+        or run.get("issued_at") != time_reference
+        or isinstance(run.get("expires_at"), bool)
+        or not isinstance(run.get("expires_at"), int)
+        or run["expires_at"] <= time_reference
+    ):
+        raise ValueError("public acceptance run template is not issued at the time reference")
+    rerun_event = value["rerun_event"]
+    try:
+        rerun = json.loads(rerun_event[5], object_pairs_hook=reject_duplicates)
+    except (TypeError, ValueError) as error:
+        raise ValueError("public acceptance rerun template envelope is invalid") from error
+    if (
+        rerun_event[2] != time_reference
+        or not isinstance(rerun, dict)
+        or rerun.get("issued_at") != time_reference
+        or isinstance(rerun.get("expires_at"), bool)
+        or not isinstance(rerun.get("expires_at"), int)
+        or rerun["expires_at"] <= time_reference
+    ):
+        raise ValueError("public acceptance rerun template is not issued at the time reference")
     return value
 
 
@@ -989,6 +1247,7 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
         "execd_socket", "execd_uid", "execd_gid", "replay_journal", "connect_timeout_millis",
         "io_timeout_millis", "transport_attempts", "retry_delay_millis", "lane_manifest_digest",
         "lane_epoch", "admission_key_generation", "isolation_profile_digest", "audience_digest",
+        "acceptance_time_reference",
     }
     if set(runner_staged) != staged_runner_fields or set(runner_active) != active_runner_fields:
         raise ValueError("runner capacity flip must select the complete v2 proxy contract")
@@ -1033,6 +1292,11 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
         _nonzero_sha256(runner_active[field], f"runner {field}")
     for field in ("lane_epoch", "admission_key_generation"):
         _positive_integer(runner_active[field], 9_007_199_254_740_991, f"runner {field}")
+    _positive_integer(
+        runner_active["acceptance_time_reference"], 0xFFFFFFFFFFFFFFFF, "runner acceptance_time_reference",
+    )
+    if runner_active["acceptance_time_reference"] != manifest["acceptance_template"]["time_reference"]:
+        raise ValueError("runner v2 proxy time reference differs from the frozen acceptance template")
 
     execd = entries["execd_config"]
     if "active_source" not in execd:
@@ -1042,9 +1306,16 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
     execd_fields = {
         "schema_version", "enabled_protocol", "capacity", "identities", "paths",
         "lane_manifest", "lane_manifest_digest", "executor", "qualification", "execution",
+        "acceptance_time_reference",
     }
     if set(execd_staged) != execd_fields or set(execd_active) != execd_fields:
         raise ValueError("execd v2 configuration shape differs from production")
+    for phase, value in (("staged", execd_staged), ("active", execd_active)):
+        _positive_integer(
+            value["acceptance_time_reference"], 0xFFFFFFFFFFFFFFFF, f"execd {phase} acceptance_time_reference",
+        )
+        if value["acceptance_time_reference"] != manifest["acceptance_template"]["time_reference"]:
+            raise ValueError("execd v2 time reference differs from the frozen acceptance template")
     if (
         any(isinstance(value[field], bool) for value in (execd_staged, execd_active) for field in ("schema_version", "enabled_protocol", "capacity"))
         or execd_staged["schema_version"] != 2
@@ -1263,6 +1534,17 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
             raise ValueError(f"controld keyholder selector is invalid: {name}")
         _nonzero_sha256(selector["public_key"], f"controld keyholder selector {name}")
         _positive_integer(selector["generation"], 9_007_199_254_740_991, f"controld keyholder generation {name}")
+    # The keyholder's manifest selector is the one source of the admission key
+    # and its generation: keyholder signs admissions with that key at that
+    # generation, controld derives admission_key_generation from this selector,
+    # execd verifies against the lane manifest, and the runner's static
+    # coordinates copy the lane manifest (checked above). All must agree.
+    manifest_selector = selectors["manifest"]
+    if (
+        lane_manifest["admission_verifying_key"] != manifest_selector["public_key"]
+        or lane_manifest["admission_key_generation"] != manifest_selector["generation"]
+    ):
+        raise ValueError("execd lane manifest admission key differs from the keyholder manifest selector")
     controld_encoded = canonical_json(controld_active)
     if SOCKET_POLICY["execd"]["path"].encode() in controld_encoded or COMPONENTS["execd"][0].encode() in controld_encoded:
         raise ValueError("controld configuration must not bypass the runner to reach execd")
@@ -1271,16 +1553,32 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
         raise ValueError("activation packages cannot contain secrets or credentials")
 
 
-def _validate_controld_package_manifest(manifest: dict[str, Any], payload: bytes) -> None:
-    component = next(item for item in manifest["components"] if item["name"] == "controld")
+def _validate_component_package_manifest(
+    manifest: dict[str, Any], payload: bytes, name: str,
+) -> dict[str, Any]:
+    if name not in COMPONENT_PACKAGE_NAMES:
+        raise ValueError("component package manifest name is unsupported")
+    component = next(item for item in manifest["components"] if item["name"] == name)
     if digest(payload) != component["package_manifest_sha256"]:
-        raise ValueError("controld package manifest bytes differ")
-    package = _json_payload(payload, "controld package manifest")
+        raise ValueError(f"{name} package manifest bytes differ")
+    package = _json_payload(payload, f"{name} package manifest")
     if canonical_json(package) != payload:
-        raise ValueError("controld package manifest is not canonical")
-    required = {"schema", "source_commit", "entries", "package_digest"}
-    if not required <= set(package) or package["schema"] != "buzz-ci-controld-install-package-v2":
-        raise ValueError("controld package manifest identity differs")
+        raise ValueError(f"{name} package manifest is not canonical")
+    special_field = "peer_policy" if name == "runner" else "daemon_contract"
+    identity_field = "identities" if name == "runner" else "identity"
+    required = {
+        "schema", "package_id", "source_commit", "binary_provenance_sha256",
+        "default_state", special_field, "package_uid", "package_gid",
+        identity_field, "directories", "entries", "package_digest",
+    }
+    if set(package) != required:
+        raise ValueError(f"{name} package manifest fields differ")
+    if type(package["package_uid"]) is not int or type(package["package_gid"]) is not int:
+        raise ValueError(f"{name} package ownership types differ")
+    expected_schema = f"buzz-ci-{name}-install-package-v2"
+    expected_id = f"buzz-ci-{name}-{component['source_commit'][:12]}-{component['binary_sha256'][:12]}"
+    if package["schema"] != expected_schema or package["package_id"] != expected_id:
+        raise ValueError(f"{name} package manifest identity differs")
     package_digest = package["package_digest"]
     unsigned = dict(package)
     unsigned.pop("package_digest", None)
@@ -1291,31 +1589,178 @@ def _validate_controld_package_manifest(manifest: dict[str, Any], payload: bytes
         or not SHA256.fullmatch(package_digest)
         or digest(canonical_json(unsigned)) != package_digest
     ):
-        raise ValueError("controld package manifest digest or source differs")
-    daemon_contract = package.get("daemon_contract")
+        raise ValueError(f"{name} package manifest digest or source differs")
     if (
-        not isinstance(daemon_contract, dict)
-        or daemon_contract.get("acceptance_binding") != ACCEPTANCE_BINDING_PATH
+        package["binary_provenance_sha256"] != component["provenance_sha256"]
+        or package["package_uid"] != 0
+        or package["package_gid"] != 0
     ):
-        raise ValueError("controld package acceptance binding contract differs")
+        raise ValueError(f"{name} package provenance or ownership differs")
+    identities = manifest["identities"]
+    if name == "runner":
+        if (
+            type(package["default_state"].get("capacity")) is not int
+            or type(package["default_state"].get("host_block")) is not bool
+            or any(type(package["default_state"].get(field)) is not bool for field in ("enabled", "active", "provisioned"))
+            or type(package["peer_policy"].get("broker_socket", {}).get("expected_uid")) is not int
+            or type(package["peer_policy"].get("broker_socket", {}).get("managed_by_package")) is not bool
+        ):
+            raise ValueError("runner package numeric or boolean types differ")
+        if package["default_state"] != {
+            "enabled": False, "active": False, "provisioned": False,
+            "capacity": 0, "host_block": False,
+        }:
+            raise ValueError("runner package default state differs")
+        expected_identity = {
+            role: {
+                "user": identities[role]["user"], "group": identities[role]["group"],
+                "uid": identities[role]["uid"], "gid": identities[role]["gid"],
+            }
+            for role in ("runner", "controld")
+        }
+        if package["identities"] != expected_identity:
+            raise ValueError("runner package identities differ")
+        if any(
+            type(package["identities"][role][field]) is not int
+            for role in ("runner", "controld") for field in ("uid", "gid")
+        ):
+            raise ValueError("runner package identity types differ")
+        peer = package["peer_policy"]
+        if (
+            not isinstance(peer, dict)
+            or set(peer) != {"runner_control_socket", "broker_socket"}
+            or peer["runner_control_socket"] != {
+                "path": SOCKET_POLICY["runner"]["path"],
+                "descriptor_name": "buzz-ci-runner-control",
+                "user": "buzzci-runner", "group": "buzzci-controld",
+                "mode": "0620", "directory_mode": "0711",
+            }
+            or peer["broker_socket"] != {
+                "path": SOCKET_POLICY["execd"]["path"], "expected_uid": 0,
+                "owner": "root", "group": ACCESS_GROUP_NAME, "mode": "0620",
+                "supplementary_members": ["buzzci-runner", "buzzci-ctl"],
+                "managed_by_package": False,
+            }
+        ):
+            raise ValueError("runner package peer policy differs")
+    else:
+        if (
+            type(package["default_state"].get("capacity")) is not int
+            or type(package["default_state"].get("providers_wired")) is not bool
+            or any(type(package["default_state"].get(field)) is not bool for field in ("enabled", "active", "provisioned"))
+            or any(
+                type(package["daemon_contract"].get(field)) is not int
+                for field in ("default_capacity", "maximum_capacity", "runner_protocol")
+            )
+            or type(package["daemon_contract"].get("providers_fail_closed")) is not bool
+        ):
+            raise ValueError("controld package numeric or boolean types differ")
+        if package["default_state"] != {
+            "enabled": False, "active": False, "provisioned": False,
+            "capacity": 0, "providers_wired": False,
+        }:
+            raise ValueError("controld package default state differs")
+        expected_identity = {
+            "user": identities["controld"]["user"],
+            "group": identities["controld"]["group"],
+            "uid": identities["controld"]["uid"],
+            "gid": identities["controld"]["gid"],
+        }
+        if package["identity"] != expected_identity:
+            raise ValueError("controld package identity differs")
+        if any(type(package["identity"][field]) is not int for field in ("uid", "gid")):
+            raise ValueError("controld package identity types differ")
+        if package["daemon_contract"] != {
+            "service_user": "buzzci-controld",
+            "config_path": CONFIG_TARGETS["controld_config"],
+            "acceptance_binding": ACCEPTANCE_BINDING_PATH,
+            "store_root": "/var/lib/buzzci/controld",
+            "default_capacity": 0,
+            "maximum_capacity": 1,
+            "providers_fail_closed": True,
+            "runner_protocol": 2,
+            "acceptance_socket": "/run/buzzci/controld-acceptance.sock",
+        }:
+            raise ValueError("controld package daemon contract differs")
+    expected_directories = [
+        {"target": "/etc/buzzci", "mode": "0755", "uid": 0, "gid": 0},
+        {"target": f"/usr/share/doc/buzz-ci-{name}", "mode": "0755", "uid": 0, "gid": 0},
+    ]
+    if package["directories"] != expected_directories:
+        raise ValueError(f"{name} package directories differ")
+    if any(
+        not isinstance(item, dict)
+        or type(item.get("uid")) is not int
+        or type(item.get("gid")) is not int
+        for item in package["directories"]
+    ):
+        raise ValueError(f"{name} package directory ownership types differ")
     entries = package["entries"]
-    if not isinstance(entries, list):
-        raise ValueError("controld package entry inventory differs")
+    if not isinstance(entries, list) or len(entries) != 6:
+        raise ValueError(f"{name} package entry inventory differs")
     by_target: dict[str, dict[str, Any]] = {}
     for entry in entries:
-        if not isinstance(entry, dict) or not isinstance(entry.get("target"), str):
-            raise ValueError("controld package entry is invalid")
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"role", "source", "target", "source_mode", "install_mode", "uid", "gid", "sha256"}
+            or not isinstance(entry.get("target"), str)
+            or not isinstance(entry.get("source"), str)
+            or not isinstance(entry.get("sha256"), str)
+            or not SHA256.fullmatch(entry["sha256"])
+            or type(entry.get("uid")) is not int
+            or type(entry.get("gid")) is not int
+        ):
+            raise ValueError(f"{name} package entry is invalid")
         if entry["target"] in by_target:
-            raise ValueError("controld package target is duplicated")
+            raise ValueError(f"{name} package target is duplicated")
         by_target[entry["target"]] = entry
-    activation_config = next(
-        item for item in manifest["entries"] if item["role"] == "controld_config"
-    )
-    packaged_config = by_target.get(CONFIG_TARGETS["controld_config"])
+    if entries != sorted(entries, key=lambda item: item["target"].encode()):
+        raise ValueError(f"{name} package entries are not bytewise target ordered")
+    socket_role = "socket" if name == "runner" else "acceptance_socket"
+    expected_targets = {
+        "binary": COMPONENTS[name][0],
+        "config": CONFIG_TARGETS[f"{name}_config"],
+        "service": f"/etc/systemd/system/buzz-ci-{name}.service",
+        socket_role: (
+            "/etc/systemd/system/buzz-ci-runner.socket"
+            if name == "runner"
+            else "/etc/systemd/system/buzz-ci-controld-acceptance.socket"
+        ),
+        "tmpfiles": COMPONENT_TMPFILES_TARGETS[name],
+        "documentation": f"/usr/share/doc/buzz-ci-{name}/README.md",
+    }
+    by_role = {entry["role"]: entry for entry in entries}
+    if set(by_role) != set(expected_targets) or any(
+        by_role[role]["target"] != target for role, target in expected_targets.items()
+    ):
+        raise ValueError(f"{name} package role or target inventory differs")
+    expected_sources = {
+        "binary": f"assets/buzz-ci-{name}",
+        "config": f"assets/{name}-v2.json",
+        "service": f"assets/buzz-ci-{name}.service",
+        socket_role: f"assets/buzz-ci-{name}{'-acceptance' if name == 'controld' else ''}.socket",
+        "tmpfiles": f"assets/buzzci-{name}.conf",
+        "documentation": "assets/README.md",
+    }
+    if any(by_role[role]["source"] != source for role, source in expected_sources.items()):
+        raise ValueError(f"{name} package source inventory differs")
+    for role, entry in by_role.items():
+        expected_source_mode = "0500" if role == "binary" else "0400"
+        expected_install_mode = "0755" if role == "binary" else ("0600" if role == "config" else "0644")
+        expected_owner = identities[name] if role == "config" else {"uid": 0, "gid": 0}
+        if (
+            entry["source_mode"] != expected_source_mode
+            or entry["install_mode"] != expected_install_mode
+            or entry["uid"] != expected_owner["uid"]
+            or entry["gid"] != expected_owner["gid"]
+        ):
+            raise ValueError(f"{name} package entry metadata differs: {role}")
+    if by_role["binary"]["sha256"] != component["binary_sha256"]:
+        raise ValueError(f"{name} package binary binding differs")
+    activation_config = next(item for item in manifest["entries"] if item["role"] == f"{name}_config")
+    packaged_config = by_role["config"]
     if (
-        not isinstance(packaged_config, dict)
-        or packaged_config.get("role") != "config"
-        or any(
+        any(
             packaged_config.get(package_field) != activation_config[activation_field]
             for package_field, activation_field in (
                 ("sha256", "sha256"),
@@ -1325,9 +1770,12 @@ def _validate_controld_package_manifest(manifest: dict[str, Any], payload: bytes
             )
         )
     ):
-        raise ValueError("controld package staged config binding differs")
+        raise ValueError(f"{name} package staged config binding differs")
     effective = {item["unit"]: item for item in manifest["effective_systemd"]}
-    for unit in ("buzz-ci-controld.service", "buzz-ci-controld-acceptance.socket"):
+    for unit, role in (
+        (f"buzz-ci-{name}.service", "service"),
+        (("buzz-ci-runner.socket" if name == "runner" else "buzz-ci-controld-acceptance.socket"), socket_role),
+    ):
         fragment = effective[unit]["fragment"]
         entry = by_target.get(fragment["path"])
         if (
@@ -1337,13 +1785,51 @@ def _validate_controld_package_manifest(manifest: dict[str, Any], payload: bytes
             or entry.get("uid") != 0
             or entry.get("gid") != 0
         ):
-            raise ValueError(f"controld package effective unit binding differs: {unit}")
+            raise ValueError(f"{name} package effective unit binding differs: {unit}")
+    return package
+
+
+def _validate_controld_package_manifest(manifest: dict[str, Any], payload: bytes) -> None:
+    _validate_component_package_manifest(manifest, payload, "controld")
+
+
+def component_tmpfiles_plan(
+    manifest: dict[str, Any], payloads: dict[str, bytes],
+) -> tuple[dict[str, object], ...]:
+    components = {item["name"]: item for item in manifest["components"]}
+    result: list[dict[str, object]] = []
+    for name in COMPONENT_PACKAGE_NAMES:
+        component = components[name]
+        package = _validate_component_package_manifest(
+            manifest, payloads[component["package_manifest_source"]], name,
+        )
+        entry = next(item for item in package["entries"] if item["role"] == "tmpfiles")
+        result.append({
+            "component": name, "target": entry["target"], "sha256": entry["sha256"],
+            "mode": entry["install_mode"], "uid": entry["uid"], "gid": entry["gid"],
+        })
+    return tuple(result)
+
+
+def tmpfiles_plan(
+    manifest: dict[str, Any], payloads: dict[str, bytes],
+) -> tuple[dict[str, object], ...]:
+    entries = {item["role"]: item for item in manifest["entries"]}
+    result = [
+        {
+            "component": "activation", "target": entries[role]["target"],
+            "sha256": entries[role]["sha256"], "mode": entries[role]["install_mode"],
+            "uid": entries[role]["uid"], "gid": entries[role]["gid"],
+        }
+        for role in ("tmpfiles", "acceptance_tmpfiles")
+    ]
+    result.extend(component_tmpfiles_plan(manifest, payloads))
+    return tuple(result)
 
 
 def validate_payloads(manifest: dict[str, Any], payloads: dict[str, bytes]) -> None:
     validate_phase_configs(manifest, payloads)
-    component = next(item for item in manifest["components"] if item["name"] == "controld")
-    _validate_controld_package_manifest(manifest, payloads[component["package_manifest_source"]])
+    component_tmpfiles_plan(manifest, payloads)
 
 
 def rooted(root: Path, target: str) -> Path:

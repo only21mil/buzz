@@ -89,8 +89,15 @@ def main() -> None:
     ):
         fail("receipt binding rejected")
 
+    # Model the live transition (systemd 259, H6 clean host): every started
+    # service reports SubState=running, the target reports active, and an
+    # Accept=no socket reports `running` once its service is up rather than the
+    # `listening` it shows while only the socket is bound.
     for unit in ACTIVE_UNITS:
         state["units"][unit]["state"] = "active"
+        state["units"][unit]["sub_state"] = (
+            "active" if unit.endswith(".target") else "running"
+        )
     state["units"]["buzz-ci-controld.service"]["invocation_id"] = "2" * 32
     state["units"]["buzz-ci-runner.service"]["invocation_id"] = "3" * 32
     state["units"]["buzz-ci-execd.service"]["invocation_id"] = "4" * 32

@@ -7,8 +7,10 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(os.environ.get("DESKTOP_RELEASE_ROOT", Path(__file__).resolve().parent.parent))
@@ -44,6 +46,36 @@ REQUIRED_CANDIDATE_FILES = {
 
 def git(*args: str) -> str:
     return subprocess.check_output(["git", *args], cwd=ROOT, text=True).strip()
+
+
+def tree_text(commit: str, path: str) -> str:
+    try:
+        return subprocess.check_output(["git", "show", f"{commit}:{path}"], cwd=ROOT, text=True)
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(f"{commit} has no {path}") from error
+
+
+def manifest_versions(commit: str) -> dict[str, str]:
+    versions = {
+        "desktop/package.json": json.loads(tree_text(commit, "desktop/package.json"))["version"],
+        "desktop/src-tauri/tauri.conf.json": json.loads(tree_text(commit, "desktop/src-tauri/tauri.conf.json"))["version"],
+    }
+    cargo = re.search(r'(?m)^version = "([^"]+)"', tree_text(commit, "desktop/src-tauri/Cargo.toml"))
+    versions["desktop/src-tauri/Cargo.toml"] = cargo.group(1) if cargo else ""
+    return versions
+
+
+def candidate_identity(commit: str) -> dict[str, str] | None:
+    # The identity is the exact metadata blob plus the three manifest version
+    # fields. Manifest bytes outside the version field change in ordinary
+    # dependency work and do not make a commit a release candidate. A commit
+    # without candidate metadata has no identity.
+    entry = git("ls-tree", commit, "--", ".release/desktop-candidate.json")
+    if not entry:
+        return None
+    identity = {"metadata_blob": entry.split()[2]}
+    identity.update(manifest_versions(commit))
+    return identity
 
 
 def commit_list(range_spec: str, paths: tuple[str, ...] | None = None) -> list[dict[str, str]]:
@@ -268,6 +300,89 @@ def validate(args: argparse.Namespace) -> None:
     print(f"validated immutable desktop candidate {candidate} for desktop-v{version}")
 
 
+def verify_main(args: argparse.Namespace) -> None:
+    """Verify the desktop candidate carried by an exact commit on main.
+
+    Unchanged mode: the candidate identity is byte-equal to the first parent
+    and the tree is self-consistent. Release mode: the identity changed, so the
+    commit must be the merge of one internal version-bump/<version> pull
+    request, carry that pull request's candidate files byte-for-byte, and the
+    pull request head must pass the immutable candidate validation.
+    """
+    commit = git("rev-parse", f"{args.commit}^{{commit}}")
+    parents = git("show", "-s", "--format=%P", commit).split()
+    if not parents:
+        raise SystemExit(f"{commit} has no parent to compare the desktop candidate against")
+    parent = parents[0]
+    metadata = json.loads(tree_text(commit, ".release/desktop-candidate.json"))
+    version = metadata.get("version")
+    if not isinstance(version, str) or not SEMVER.fullmatch(version):
+        raise SystemExit(f"{commit} records an invalid desktop candidate version: {version!r}")
+    if metadata.get("tag") != f"desktop-v{version}":
+        raise SystemExit(f"{commit} records a candidate tag that does not match desktop-v{version}")
+    current = candidate_identity(commit)
+    assert current is not None
+    bad = [path for path, value in current.items() if path != "metadata_blob" and value != version]
+    if bad:
+        raise SystemExit(f"{commit} version mismatch in: {', '.join(bad)}")
+    blocks = re.findall(rf"(?ms)^## v{re.escape(version)}\n.*?(?=^## v|\Z)", tree_text(commit, "CHANGELOG.md"))
+    if len(blocks) != 1:
+        raise SystemExit(f"{commit} must carry exactly one changelog block for v{version}")
+    previous = candidate_identity(parent)
+    if current == previous:
+        print(
+            f"desktop candidate unchanged on main: {commit} matches parent {parent} "
+            f"for desktop-v{version} (metadata blob {current['metadata_blob']})"
+        )
+        return
+
+    repo = args.repo or "block/buzz"
+    pulls = gh_json(f"repos/{repo}/commits/{commit}/pulls")
+    matches = [pr for pr in pulls if pr.get("merged_at") and pr.get("merge_commit_sha") == commit]
+    if len(matches) != 1:
+        raise SystemExit(f"desktop candidate changed at {commit}, which is not the merge of exactly one pull request")
+    pr = matches[0]
+    head_sha = pr.get("head", {}).get("sha", "")
+    head_ref = pr.get("head", {}).get("ref", "")
+    head_repo = pr.get("head", {}).get("repo", {}).get("full_name", "")
+    number = pr.get("number")
+    if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+        raise SystemExit(f"pull request #{number} has no resolvable head commit")
+    if head_ref != f"version-bump/{version}":
+        raise SystemExit(
+            f"desktop candidate changed at {commit} outside a version-bump/{version} release "
+            f"(pull request #{number} from {head_ref or '?'})"
+        )
+    if head_repo != repo:
+        raise SystemExit(f"desktop release pull request #{number} must be internal, not from {head_repo or '?'}")
+    if subprocess.run(["git", "cat-file", "-e", f"{head_sha}^{{commit}}"], cwd=ROOT).returncode != 0:
+        git("fetch", "origin", head_sha, "--no-tags")
+    differs = git("diff", "--name-only", head_sha, commit, "--", *sorted(CANDIDATE_FILES))
+    if differs:
+        raise SystemExit(
+            f"{commit} does not carry reviewed candidate {head_sha} byte-for-byte: "
+            + ", ".join(differs.splitlines())
+        )
+    worktree = tempfile.mkdtemp(prefix="desktop-candidate.")
+    try:
+        git("worktree", "add", "--detach", worktree, head_sha)
+        result = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "validate",
+             "--candidate", head_sha, "--version", version, "--repo", repo],
+            cwd=worktree, env={**os.environ, "DESKTOP_RELEASE_ROOT": worktree},
+        )
+    finally:
+        subprocess.run(["git", "worktree", "remove", "--force", worktree], cwd=ROOT,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        shutil.rmtree(worktree, ignore_errors=True)
+    if result.returncode != 0:
+        raise SystemExit(f"immutable candidate {head_sha} carried by {commit} failed validation")
+    print(
+        f"desktop candidate released on main: {commit} carries validated immutable candidate "
+        f"{head_sha} for desktop-v{version} (pull request #{number})"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -279,8 +394,11 @@ def main() -> None:
     val.add_argument("--candidate", default="HEAD")
     val.add_argument("--version")
     val.add_argument("--repo")
+    main_check = sub.add_parser("verify-main")
+    main_check.add_argument("--commit", default="HEAD")
+    main_check.add_argument("--repo")
     args = parser.parse_args()
-    generate(args) if args.command == "generate" else validate(args)
+    {"generate": generate, "validate": validate, "verify-main": verify_main}[args.command](args)
 
 
 if __name__ == "__main__":

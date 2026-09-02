@@ -39,16 +39,54 @@ MAX_TREE_FILES = 1024
 TRANSFER_SIZE = 8 * 1024 * 1024
 TIMING_PATH = Path(__file__).with_name("timing-contract.json")
 TIMING_CONTRACT = json.loads(TIMING_PATH.read_bytes())
+STAGE_STOP_ORDER = (
+    "buzz-ci-controld-acceptance.socket", "buzz-ci-controld.service",
+    "buzz-ci-acceptance-control.socket", "buzz-ci-acceptance-control.service",
+    "buzz-ci-runner.service", "buzz-ci-runner.socket", "buzz-ci-execd.service",
+    "buzz-ci-execd.socket", "buzz-ci-executor.service", "buzz-ci-executor.socket",
+    "buzz-ci-keyholder.service", "buzz-ci-keyholder.socket",
+)
+STAGE_ZERO_UNITS = STAGE_STOP_ORDER[:4]
+STAGE_PROGRESS_SUBPHASES = (
+    "package_load", "live_driver", "scenario_binding", "generated_plan", "tmpfiles_plan",
+    "receipt_read", "preflight", "fixed_package_install", "fixed_package_verify",
+    "new_receipt_capture", "recovery_targets_install", "preparing_receipt_write",
+    "staged_apply", "sysusers", "tmpfiles", "generated_apply", "daemon_reload",
+    "installed_unit_readback", "persistent_target_disable",
+    *(f"stop:{unit}" for unit in STAGE_STOP_ORDER),
+    "persistent_target_stop", "zero_readback", "captured_ledger_removal",
+    "identity_readback", "access_group_readback", "managed_target_readback",
+    "generated_readback", "staged_receipt_write",
+    *(f"start:{unit}" for unit in STAGE_ZERO_UNITS),
+    "staged_zero_readback", "rollback_retirement_completion", "stage_complete",
+)
+if len(STAGE_PROGRESS_SUBPHASES) != 46:
+    raise RuntimeError("stage progress operation inventory differs")
 PROGRESS_PHASES = (
-    "boot_cloud_init", "guest_started", "ceremony", "install", "controller_check",
-    "controller_stage", "controller_activate", "canary", "receipt_verifier",
-    "rollback", "cleanup", "verifier", "complete",
+    "boot_cloud_init", "guest_started", "ceremony", "install", "relay_ready",
+    "preinstall_units_clean", "package_units_validated", "principals_created",
+    "seccomp_ready", "runner_installed", "controld_installed", "keyholder_installed",
+    "execd_installed", "installed_units_verified", "controller_check", "controller_stage",
+    *(f"controller_stage:{name}" for name in STAGE_PROGRESS_SUBPHASES),
+    "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup",
+    "cleanup_return", "verifier", "complete",
 )
 PROGRESS_EVENTS = ("start", "timeout", "complete")
 PROGRESS_ORDER = {name: index for index, name in enumerate(PROGRESS_PHASES)}
+for _stage_subphase in STAGE_PROGRESS_SUBPHASES:
+    PROGRESS_ORDER[f"controller_stage:{_stage_subphase}"] = PROGRESS_ORDER["controller_stage"]
 MAX_PROGRESS_RECORDS = 32
 MAX_PROGRESS = 16 * 1024
 SECCOMP_SHA256 = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
+PLATFORM_SYSTEMD = {
+    "schema_version": "buzz-ci-systemd-platform-binding/v1",
+    "platform_id": "fedora-44-systemd-259",
+    "service_drop_ins": [{
+        "owner": "platform",
+        "path": "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+        "sha256": "ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37",
+    }],
+}
 TOOLS = {
     "qemu": "/usr/bin/qemu-system-x86_64",
     "qemu_img": "/usr/bin/qemu-img",
@@ -740,7 +778,8 @@ def qemu_command(
         "-machine", "q35,accel=kvm", "-cpu", "host", "-smp", "2", "-m", "2048",
         "-display", "none", "-serial", "none", "-monitor", "none", "-nic", "none",
         "-no-reboot", "-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
-        "-drive", f"file=/work/{overlay},if=virtio,format=qcow2,cache=none",
+        "-drive", f"file=/work/{overlay},if=none,format=qcow2,cache=none,id=os",
+        "-device", "virtio-blk-pci,drive=os,bootindex=1",
         "-drive", "file=/work/stage.iso,media=cdrom,readonly=on",
         "-drive", "file=/work/seed.iso,media=cdrom,readonly=on",
         "-device", "virtio-serial-pci",
@@ -851,6 +890,7 @@ def validate_transfer(state: Path) -> None:
 def make_iso(source: Path, output: Path, label: str) -> None:
     bounded([
         TOOLS["xorriso"], "-as", "mkisofs", "-quiet", "-J", "-R",
+        "-uid", "0", "-gid", "0",
         "-V", label, "-o", str(output), str(source),
     ], timeout=60)
     output.chmod(0o400)
@@ -949,9 +989,13 @@ def parse_progress(raw: bytes, boot_role: str) -> dict[str, object]:
     allowed = {
         "ceremony": {"boot_cloud_init", "guest_started", "ceremony", "complete"},
         "candidate": {
-            "boot_cloud_init", "guest_started", "install", "controller_check", "controller_stage",
-            "controller_activate", "canary", "receipt_verifier", "rollback",
-            "cleanup", "complete",
+            "boot_cloud_init", "guest_started", "install", "relay_ready",
+            "preinstall_units_clean", "package_units_validated", "principals_created",
+            "seccomp_ready", "runner_installed", "controld_installed", "keyholder_installed",
+            "execd_installed", "installed_units_verified", "controller_check", "controller_stage",
+            *(f"controller_stage:{name}" for name in STAGE_PROGRESS_SUBPHASES),
+            "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup",
+            "cleanup_return", "complete",
         },
         "verifier": {"boot_cloud_init", "guest_started", "verifier", "complete"},
     }
@@ -980,7 +1024,16 @@ def progress_failure(boot_role: str, progress: dict[str, object], *, timed_out: 
         None,
     )
     latest = safe_records[-1] if safe_records and isinstance(safe_records[-1], dict) else None
-    phase = str((timeout_record or latest or {}).get("phase", "boot_cloud_init"))
+    cleanup_returned = latest is not None and latest.get("phase") == "cleanup_return"
+    operational = next((
+        record for record in reversed(safe_records)
+        if isinstance(record, dict)
+        and record.get("phase") not in {"rollback", "cleanup", "cleanup_return"}
+    ), None)
+    reported = operational if latest is not None and latest.get("phase") in {
+        "rollback", "cleanup", "cleanup_return",
+    } else latest
+    phase = str((timeout_record or reported or latest or {}).get("phase", "boot_cloud_init"))
     if phase == "guest_started":
         phase = "boot_cloud_init"
     detail = {
@@ -989,11 +1042,31 @@ def progress_failure(boot_role: str, progress: dict[str, object], *, timed_out: 
         "records": len(safe_records),
         "last_sequence": latest.get("sequence") if latest else None,
         "last_elapsed_ms": latest.get("elapsed_ms") if latest else None,
+        "cleanup_returned": cleanup_returned,
     }
     if progress.get("status") == "invalid":
         detail["reason"] = progress.get("reason", "invalid")
     failure = "watchdog timeout" if timed_out else "inner timeout" if timeout_record is not None else "guest failure"
     return HarnessError(f"{boot_role} {phase} {failure}; progress={canonical(detail).decode().strip()}")
+
+
+def progress_completed(progress: dict[str, object]) -> bool:
+    records = progress.get("records")
+    if progress.get("status") != "valid" or not isinstance(records, list) or not records:
+        return False
+    terminal = [
+        index for index, record in enumerate(records)
+        if isinstance(record, dict)
+        and record.get("phase") == "complete"
+        and record.get("event") == "complete"
+    ]
+    return (
+        terminal == [len(records) - 1]
+        and not any(
+            isinstance(record, dict) and record.get("event") == "timeout"
+            for record in records
+        )
+    )
 
 
 def boot(
@@ -1047,6 +1120,8 @@ def boot(
     if timed_out:
         raise progress_failure(boot_role, progress, timed_out=True)
     if code != 0:
+        raise progress_failure(boot_role, progress, timed_out=False)
+    if not progress_completed(progress):
         raise progress_failure(boot_role, progress, timed_out=False)
     if not evidence_expected:
         if evidence.exists():
@@ -1445,6 +1520,7 @@ def validate_contract_envelope(value: object) -> dict[str, object]:
     required = {
         "schema_version", "state", "candidate_root", "candidate_sha", "harness_sha256",
         "timing_asset_sha256", "timing", "timing_sha256", "scenario", "seccomp_source", "packages",
+        "platform_systemd",
     }
     if not isinstance(value, dict) or set(value) != required or value.get("schema_version") != SCHEMA:
         raise HarnessError("run contract shape differs")
@@ -1459,6 +1535,8 @@ def validate_contract_envelope(value: object) -> dict[str, object]:
         or value.get("timing_sha256") != timing_sha256()
     ):
         raise HarnessError("run contract harness or timing binding differs")
+    if value.get("platform_systemd") != PLATFORM_SYSTEMD:
+        raise HarnessError("run contract systemd platform binding differs")
     return value
 
 
@@ -2360,7 +2438,8 @@ def create_run_stage(
     candidate_tar = stage / "candidate.tar"
     bounded([
         "/usr/bin/git", "-C", str(contract["candidate_root"]), "archive", "--format=tar",
-        f"--output={candidate_tar}", contract["candidate_sha"], "--", "deploy/native-ci",
+        "--prefix=deploy/native-ci/", f"--output={candidate_tar}",
+        f"{contract['candidate_sha']}:deploy/native-ci",
     ], timeout=60)
     candidate_tar.chmod(0o400)
     inputs = stage / "inputs"
@@ -2385,6 +2464,7 @@ def create_run_stage(
         "seccomp_source_sha256": SECCOMP_SHA256,
         "public_binding_sha256": hashlib.sha256(public_raw).hexdigest(),
         "package_tree_sha256": {name: tree_digest(records[name]) for name in PACKAGE_NAMES},
+        "platform_systemd": contract["platform_systemd"],
     }
     (stage / "descriptor.json").write_bytes(canonical(descriptor))
     (stage / "descriptor.json").chmod(0o444)

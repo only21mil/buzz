@@ -194,6 +194,43 @@ class ExecdPackageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "misses"):
                 VERIFY.verify(fake)
 
+    def test_execd_unit_grants_exactly_the_materialization_capabilities(self) -> None:
+        """H8 clean host, canary stage 5: buzz-ci-execd.service ran root with an
+        empty bounding set, so materialize's fchown of the attempt directory to
+        buzzci-job failed with EPERM and every admission ended in crash
+        recovery. The unit now grants exactly CAP_CHOWN, CAP_DAC_OVERRIDE and
+        CAP_FOWNER; the executor keeps none."""
+        def capability_lines(relative: str) -> dict[str, list[str]]:
+            lines: dict[str, list[str]] = {"CapabilityBoundingSet": [], "AmbientCapabilities": []}
+            for line in (EXECD_DIR / relative).read_text().splitlines():
+                key, _, value = line.partition("=")
+                if key in lines:
+                    lines[key].append(value)
+            return lines
+
+        expected = "CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER"
+        self.assertEqual(
+            capability_lines("templates/buzz-ci-execd.service"),
+            {"CapabilityBoundingSet": [expected], "AmbientCapabilities": [expected]},
+        )
+        self.assertEqual(
+            capability_lines("templates/buzz-ci-executor.service"),
+            {"CapabilityBoundingSet": [""], "AmbientCapabilities": [""]},
+        )
+        for original, replacement in (
+            (f"CapabilityBoundingSet={expected}", "CapabilityBoundingSet="),
+            (f"CapabilityBoundingSet={expected}", f"CapabilityBoundingSet={expected} CAP_SYS_ADMIN"),
+            (f"AmbientCapabilities={expected}", "AmbientCapabilities=CAP_CHOWN CAP_DAC_OVERRIDE"),
+        ):
+            with self.subTest(replacement=replacement):
+                with tempfile.TemporaryDirectory() as directory:
+                    fake = Path(directory)
+                    target = _copy_execd_package(fake)
+                    service = target / "templates/buzz-ci-execd.service"
+                    service.write_text(service.read_text().replace(original, replacement))
+                    with self.assertRaisesRegex(ValueError, "misses"):
+                        VERIFY.verify(fake)
+
     def test_static_execution_and_sandbox_drift_are_rejected(self) -> None:
         mutations = (
             (

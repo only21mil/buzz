@@ -84,6 +84,17 @@ ordered `DropInPaths`. It independently hashes every returned fragment and
 drop-in. Dormant checks allow only manifest-bound dependencies and exact
 activation files captured as prior state. Every later phase rejects missing,
 extra, duplicated, reordered, relocated, stale, or byte-drifted drop-ins.
+The manifest's closed `platform_systemd` binding permits exactly Fedora 44
+systemd 259's global
+`/usr/lib/systemd/system/service.d/10-timeout-abort.conf`, with SHA-256
+`ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37`.
+Systemd orders applicable drop-ins bytewise by basename across global and
+unit-specific directories. The manifest and fake driver share that rule, so
+global `10-timeout-abort.conf` precedes unit-specific `20-*.conf`. A duplicate
+basename across applicable directories is rejected as ambiguous rather than
+silently deduplicated. Sockets and the capacity target do not receive the
+global service drop-in. An extra host, administrator, or distribution drop-in
+remains a hard failure.
 
 1. `stage --scenario` validates the exact scenario and atomically installs and
    reopens the complete package at the fixed root-owned mode-`0700`
@@ -132,10 +143,12 @@ extra, duplicated, reordered, relocated, stale, or byte-drifted drop-ins.
    last transport error, returns to proven capacity zero, and permits only
    rollback. Restaging must change the package, fixture, controller generation,
    or runner generation before the controller creates a new request identity.
-4. A passing qualification stops the temporary execd service and records
-   `qualified_closed` only after the staged configs, capacity-zero units, and
-   closed admission are read back. Capacity remains zero until the root helper
-   invokes the separate fixed `set-capacity-one` action.
+4. A passing qualification stops every capacity-one unit in stop order,
+   services before sockets. That covers the temporary execd service and socket
+   and the executor socket systemd started for them through `Requires=`. It
+   records `qualified_closed` only after the staged configs, capacity-zero
+   units, and closed admission are read back. Capacity remains zero until the
+   root helper invokes the separate fixed `set-capacity-one` action.
 5. `set-capacity-one` verifies the immutable package, private receipt, shared
    acceptance binding, passed qualification, exact principal, candidate,
    scenario, and initial generation bindings. It stops the staged controld
@@ -214,7 +227,10 @@ package or root path from the caller.
 
 - `prepare-qualification-zero` verifies the immutable fixed package, restores
   and reads back the staged runner, rendered execd, and controld configs, and keeps controld plus
-  both acceptance services available for the stage-13 durable snapshot.
+  both acceptance services available. The acceptance host then closes the
+  capacity-one units and reopens controld at staged zero (socket and service
+  stopped in the finalize order, then started), so the capacity-zero service
+  serves the stage-13 durable snapshot from the shared acceptance ledger.
 - `finalize-qualification-zero` stops the controld acceptance socket first and
   controld second, closes the remaining capacity-one units, keeps the root
   acceptance-control service available, restores the prior controld binding,
@@ -271,7 +287,10 @@ level and in the nested acceptance object, where the two values must match.
 The scenario digest matches `serde_json::to_vec` field order used by the Rust
 canary. `render-scenario` emits that declaration order as compact JSON with no
 trailing LF, so its literal file bytes hash to the same digest used by the
-controller and installed verifier.
+controller and installed verifier. Its grant-event ID is not a caller input:
+the checked renderer derives it from the exact compact bytes of the frozen
+public `grant_event`, both scenario and clean-host rendering recompute it, and
+the controller performs the final independent comparison.
 
 ## Freeze
 
@@ -281,7 +300,13 @@ Create a private mode-`0600` draft that follows
 `package_digest`. Asset names are flat `assets/...` names. Put config and
 provenance inputs in a private asset directory with the exact source modes
 declared by the draft. Qualification requests are never frozen assets because
-they bind the final package digest and runtime validity interval.
+they bind the final package digest and runtime validity interval. Production
+callers materialize the draft with `package.production_activation_draft` from
+the exact candidate, public actor and CI selector, ready component manifests,
+provenance/config entries, and effective-systemd inventory. The materializer
+owns the canonical Run, Grant, Rerun, and Tombstone seed, supplies the fixed
+closed contracts, and validates the complete draft; production bootstrap does
+not inherit a prior artifact or test fixture.
 
 The runner staged config is the exact runner-v2 `dormant` shape at
 `/etc/buzzci/runner-v2.json`. Its active config selects `mode=v2_proxy`, binds
@@ -358,6 +383,10 @@ directories never receive this exception.
 It renders exact numeric sysusers entries, copies the reviewed systemd files,
 checks all config and provenance digests, writes a canonical manifest, and
 binds the activation ID to its package digest.
+The freezer also compares the platform binding with the tracked Fedora package
+bytes at
+`deploy/native-ci/activation/platform/fedora-44-systemd-259/10-timeout-abort.conf`.
+It does not install or replace that distribution-owned file.
 The draft's controld component names a mode-`0400` copy of the frozen controld
 `package-manifest.json` in `--asset-root`. The freezer checks its canonical
 package digest, source commit, and both controld unit entries.
@@ -404,8 +433,9 @@ Clean-host preflight permits `not-found` only for the seven fragments installed
 by this package. Every external dependency unit, including the controld
 acceptance socket, must already be loaded from its sole package owner. After
 installation and `daemon-reload`, staging requires all 13 lifecycle units
-loaded and re-reads 18 exact fragment/drop-in paths and digests before starting
-any staged service.
+loaded and re-reads 24 exact fragment/drop-in bindings and digests before
+starting any staged service. Six service-unit bindings refer to the same
+distribution-owned global file by exact path and digest.
 
 A clean-host terminal run takes an exclusive advisory lock through a no-follow
 descriptor for the prepared state's parent directory. Contention waits at most
@@ -446,8 +476,9 @@ deploy/native-ci/activation/controller.py activate --package /private/package
 deploy/native-ci/activation/controller.py rollback --package /private/package
 ```
 
-`activate` runs the closed production qualification and stops at
-`qualified_closed`. The acceptance canary then uses the fixed controller calls
+`activate` itself runs the closed production qualification and returns only
+after the host reaches `qualified_closed`. Do not run a separate `qualify`
+command before the acceptance sequence. The acceptance canary then uses the fixed controller calls
 above, exercises capacity one, and returns the host to proven capacity zero.
 Validate its pass receipt as described in
 [`../acceptance/README.md`](../acceptance/README.md). The approved keyholder then
@@ -482,6 +513,13 @@ not retry activation. Recover deterministically with the fixed package path:
 `qualify --package ...` remains a post-activation health probe. It is not the
 persistent cutover and requires `active_one`.
 
+After `persist-capacity-one` reports `persistent_active`, run the separately
+approved relay E2E canary exactly once. A failure does not authorize another
+relay E2E attempt or an edited acceptance receipt. Use the fixed installed
+controller rollback command above to close capacity and restore the prior
+state, then prove the host is at capacity zero through an independent readback.
+This is the approved return-to-zero path after a persistent active-one failure.
+
 The installed canary calls these fixed commands. Operators do not pass a
 package path to them:
 
@@ -492,6 +530,12 @@ package path to them:
 ```
 
 Tests use a non-root filesystem and an explicit fake driver state file:
+
+Before staging, an activation-owned unit with no fragment must match the
+Fedora 44/systemd 259 absence tuple exactly: `LoadState=not-found`,
+`ActiveState=inactive`, `SubState=dead`, and an empty `UnitFileState`. Empty
+unit-file state is not accepted for loaded units. The fake driver uses this
+same absence shape so source-only checks exercise the live platform contract.
 
 ```bash
 deploy/native-ci/activation/controller.py check \

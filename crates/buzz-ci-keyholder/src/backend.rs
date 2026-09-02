@@ -110,8 +110,8 @@ impl Secp256k1Backend {
     #[cfg(target_os = "linux")]
     pub fn from_systemd_credentials(directory: &Path) -> Result<Self, BackendError> {
         use nix::fcntl::{open, openat, OFlag};
-        use nix::sys::stat::{fstat, Mode, SFlag};
-        use nix::unistd::geteuid;
+        use nix::sys::stat::{fstat, Mode};
+        use nix::unistd::{getegid, geteuid};
         use std::fs::File;
         use std::io::Read;
 
@@ -126,12 +126,14 @@ impl Secp256k1Backend {
         .map_err(|_| BackendError::CredentialDirectory)?;
         let stat = fstat(&descriptor).map_err(|_| BackendError::CredentialDirectory)?;
         let owner_uid = geteuid().as_raw();
-        if SFlag::from_bits_truncate(stat.st_mode) != SFlag::S_IFDIR
-            || stat.st_uid != owner_uid
-            || stat.st_mode & 0o7000 != 0
-            || stat.st_mode & 0o077 != 0
-            || stat.st_mode & 0o500 != 0o500
-        {
+        let owner_gid = getegid().as_raw();
+        if !credential_directory_is_secure(
+            stat.st_mode,
+            stat.st_uid,
+            stat.st_gid,
+            owner_uid,
+            owner_gid,
+        ) {
             return Err(BackendError::CredentialDirectory);
         }
 
@@ -147,9 +149,11 @@ impl Secp256k1Backend {
             if !credential_metadata_is_secure(
                 stat.st_mode,
                 stat.st_uid,
+                stat.st_gid,
                 stat.st_nlink,
                 stat.st_size,
                 owner_uid,
+                owner_gid,
             ) {
                 return Err(BackendError::Credential);
             }
@@ -187,8 +191,8 @@ impl Secp256k1Backend {
         directory: &Path,
     ) -> Result<Self, BackendError> {
         use nix::fcntl::{open, openat, OFlag};
-        use nix::sys::stat::{fstat, Mode, SFlag};
-        use nix::unistd::geteuid;
+        use nix::sys::stat::{fstat, Mode};
+        use nix::unistd::{getegid, geteuid};
         use std::fs::File;
         use std::io::Read;
 
@@ -201,12 +205,14 @@ impl Secp256k1Backend {
         .map_err(|_| BackendError::CredentialDirectory)?;
         let stat = fstat(&descriptor).map_err(|_| BackendError::CredentialDirectory)?;
         let owner_uid = geteuid().as_raw();
-        if SFlag::from_bits_truncate(stat.st_mode) != SFlag::S_IFDIR
-            || stat.st_uid != owner_uid
-            || stat.st_mode & 0o7000 != 0
-            || stat.st_mode & 0o077 != 0
-            || stat.st_mode & 0o500 != 0o500
-        {
+        let owner_gid = getegid().as_raw();
+        if !credential_directory_is_secure(
+            stat.st_mode,
+            stat.st_uid,
+            stat.st_gid,
+            owner_uid,
+            owner_gid,
+        ) {
             return Err(BackendError::CredentialDirectory);
         }
         let key_fd = openat(
@@ -220,9 +226,11 @@ impl Secp256k1Backend {
         if !credential_metadata_is_secure(
             stat.st_mode,
             stat.st_uid,
+            stat.st_gid,
             stat.st_nlink,
             stat.st_size,
             owner_uid,
+            owner_gid,
         ) {
             return Err(BackendError::Credential);
         }
@@ -258,21 +266,55 @@ impl Secp256k1Backend {
     }
 }
 
+/// systemd delivers `$CREDENTIALS_DIRECTORY` in one of two shapes. Older
+/// managers chown the directory and every file to the service account
+/// (`0500`, `0400`). systemd 259 (259.5 on the clean host) keeps them root
+/// owned with no world bits and grants the service read access through an ACL:
+/// directory `0550`, files `0440`, both `root:root`. Both shapes are accepted.
+/// Any group or world write bit, any world bit, any setuid, setgid, or sticky
+/// bit, and any owner other than root or the service account fail closed.
+#[cfg(target_os = "linux")]
+fn credential_directory_is_secure(
+    mode: u32,
+    owner_uid: u32,
+    owner_gid: u32,
+    service_uid: u32,
+    service_gid: u32,
+) -> bool {
+    use nix::sys::stat::SFlag;
+
+    if SFlag::from_bits_truncate(mode) != SFlag::S_IFDIR {
+        return false;
+    }
+    let permissions = mode & 0o7777;
+    (owner_uid == service_uid && matches!(permissions, 0o500 | 0o700))
+        || (owner_uid == 0
+            && (owner_gid == 0 || owner_gid == service_gid)
+            && matches!(permissions, 0o500 | 0o550))
+}
+
+/// One credential file: a single-link regular file of exactly 32 bytes in
+/// either delivery shape (see [`credential_directory_is_secure`]).
 #[cfg(target_os = "linux")]
 fn credential_metadata_is_secure(
     mode: u32,
     owner_uid: u32,
+    owner_gid: u32,
     link_count: u64,
     size: i64,
-    expected_owner_uid: u32,
+    service_uid: u32,
+    service_gid: u32,
 ) -> bool {
     use nix::sys::stat::SFlag;
 
-    SFlag::from_bits_truncate(mode) == SFlag::S_IFREG
-        && mode & 0o7777 == 0o400
-        && owner_uid == expected_owner_uid
-        && link_count == 1
-        && size == 32
+    if SFlag::from_bits_truncate(mode) != SFlag::S_IFREG || link_count != 1 || size != 32 {
+        return false;
+    }
+    let permissions = mode & 0o7777;
+    (owner_uid == service_uid && permissions == 0o400)
+        || (owner_uid == 0
+            && (owner_gid == 0 || owner_gid == service_gid)
+            && matches!(permissions, 0o400 | 0o440))
 }
 
 impl SigningBackend for Secp256k1Backend {
@@ -416,23 +458,28 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         use nix::sys::stat::SFlag;
-        use nix::unistd::geteuid;
+        use nix::unistd::{getegid, geteuid};
 
         let regular = SFlag::S_IFREG.bits();
         let owner = geteuid().as_raw();
+        let group = getegid().as_raw();
         assert!(!credential_metadata_is_secure(
             regular | 0o444,
             owner,
+            group,
             1,
             32,
             owner,
+            group,
         ));
         assert!(!credential_metadata_is_secure(
             regular | 0o400,
             owner,
+            group,
             1,
             32,
             owner.wrapping_add(1),
+            group,
         ));
         assert_eq!(
             BackendError::Credential.to_string(),
@@ -459,5 +506,114 @@ mod tests {
             Secp256k1Backend::from_systemd_credentials(directory.path()).unwrap_err(),
             BackendError::Credential
         );
+    }
+    /// Shape recorded on the clean host (systemd 259.5, boot 5): the
+    /// credentials directory is `dr-xr-x---+ root root` and each file is
+    /// `-r--r-----+ root root`, 32 bytes, one link, with an ACL granting the
+    /// service account read access. The service-owned `0500`/`0400` shape stays
+    /// accepted; every writable, world-readable, special-bit, or third-party
+    /// variant is rejected.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn systemd_root_owned_acl_credentials_are_accepted_and_loose_variants_rejected() {
+        use nix::sys::stat::SFlag;
+
+        let directory = SFlag::S_IFDIR.bits();
+        let regular = SFlag::S_IFREG.bits();
+        let (service_uid, service_gid) = (1202, 1202);
+        let other = 1203;
+
+        for (mode, uid, gid, expected) in [
+            (0o550, 0, 0, true),
+            (0o500, 0, 0, true),
+            (0o550, 0, service_gid, true),
+            (0o500, service_uid, service_gid, true),
+            (0o700, service_uid, service_gid, true),
+            (0o555, 0, 0, false),
+            (0o570, 0, 0, false),
+            (0o750, 0, 0, false),
+            (0o770, 0, 0, false),
+            (0o1550, 0, 0, false),
+            (0o2550, 0, 0, false),
+            (0o550, 0, other, false),
+            (0o550, other, other, false),
+            (0o550, service_uid, service_gid, false),
+            (0o400, 0, 0, false),
+        ] {
+            assert_eq!(
+                credential_directory_is_secure(
+                    directory | mode,
+                    uid,
+                    gid,
+                    service_uid,
+                    service_gid
+                ),
+                expected,
+                "directory {mode:o} {uid}:{gid}"
+            );
+        }
+        assert!(!credential_directory_is_secure(
+            regular | 0o550,
+            0,
+            0,
+            service_uid,
+            service_gid
+        ));
+
+        for (mode, uid, gid, expected) in [
+            (0o440, 0, 0, true),
+            (0o400, 0, 0, true),
+            (0o440, 0, service_gid, true),
+            (0o400, service_uid, service_gid, true),
+            (0o444, 0, 0, false),
+            (0o460, 0, 0, false),
+            (0o640, 0, 0, false),
+            (0o4440, 0, 0, false),
+            (0o440, 0, other, false),
+            (0o440, other, other, false),
+            (0o440, service_uid, service_gid, false),
+            (0o600, service_uid, service_gid, false),
+        ] {
+            assert_eq!(
+                credential_metadata_is_secure(
+                    regular | mode,
+                    uid,
+                    gid,
+                    1,
+                    32,
+                    service_uid,
+                    service_gid
+                ),
+                expected,
+                "file {mode:o} {uid}:{gid}"
+            );
+        }
+        assert!(!credential_metadata_is_secure(
+            regular | 0o440,
+            0,
+            0,
+            2,
+            32,
+            service_uid,
+            service_gid
+        ));
+        assert!(!credential_metadata_is_secure(
+            regular | 0o440,
+            0,
+            0,
+            1,
+            33,
+            service_uid,
+            service_gid
+        ));
+        assert!(!credential_metadata_is_secure(
+            directory | 0o440,
+            0,
+            0,
+            1,
+            32,
+            service_uid,
+            service_gid
+        ));
     }
 }
