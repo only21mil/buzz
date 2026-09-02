@@ -1868,6 +1868,28 @@ impl SystemdHostControl {
         close_capacity(&self.systemctl, self.timeout)
     }
 
+    /// A restart that reads back the same InvocationID is a stale generation:
+    /// capacity is closed before the error returns. The close is judged like
+    /// every other stop (exit status plus readback), and a close failure is
+    /// the error surfaced, because capacity-one units may still be running
+    /// and the caller must not treat the host as closed. `StaleGeneration`
+    /// is returned only once all nine units read back stopped.
+    fn stale_generation_closed(&self, unit: &str) -> ControlError {
+        match self.close_capacity() {
+            Ok(()) => ControlError::StaleGeneration,
+            Err(error) => {
+                let line = serde_json::json!({
+                    "schema_version": "buzz-ci-acceptance-control-note/v1",
+                    "event": "stale_generation_close_failed",
+                    "unit": unit,
+                    "error": error.code(),
+                });
+                eprintln!("{line}");
+                error
+            }
+        }
+    }
+
     fn zero_proof(&self) -> Result<ZeroProof, ControlError> {
         let readback = self.readback()?;
         for unit in [
@@ -1989,8 +2011,7 @@ impl HostControl for SystemdHostControl {
         if invocation == before
             || (!self.controller_invocation.is_empty() && invocation == self.controller_invocation)
         {
-            let _ = self.close_capacity();
-            return Err(ControlError::StaleGeneration);
+            return Err(self.stale_generation_closed("buzz-ci-controld.service"));
         }
         self.controller_invocation = invocation;
         self.controller_generation = self
@@ -2012,8 +2033,7 @@ impl HostControl for SystemdHostControl {
         if invocation == before
             || (!self.runner_invocation.is_empty() && invocation == self.runner_invocation)
         {
-            let _ = self.close_capacity();
-            return Err(ControlError::StaleGeneration);
+            return Err(self.stale_generation_closed("buzz-ci-runner.service"));
         }
         self.runner_invocation = invocation;
         self.runner_generation = self
@@ -4717,9 +4737,10 @@ mod tests {
 
     /// A systemd-259-shaped fake systemctl: `stop` records the unit and prints
     /// the advisory for a service whose socket is still up; `show` answers
-    /// ActiveState and SubState from the recorded set. Marker files switch the
-    /// failure shapes on: `fail-stop` (rc 1) and `ignore-stop` (rc 0, unit
-    /// stays active).
+    /// ActiveState and SubState from the recorded set and a fixed InvocationID
+    /// (`restart` never changes it, so every restart reads back stale). Marker
+    /// files switch the failure shapes on: `fail-stop` (rc 1) and
+    /// `ignore-stop` (rc 0, unit stays active).
     fn fake_systemctl(directory: &Path) -> Systemctl {
         let dir = directory.display();
         let script = format!(
@@ -4761,6 +4782,7 @@ case "$1" in
     case "$2" in
       --property=ActiveState) if [ "$stopped" = 1 ]; then echo inactive; else echo active; fi ;;
       --property=SubState) if [ "$stopped" = 1 ]; then echo dead; else echo running; fi ;;
+      --property=InvocationID) echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
       *) exit 1 ;;
     esac
     exit 0
@@ -4883,6 +4905,66 @@ exit 1
             reopen_controld_at_staged_zero(&systemctl, timeout),
             Err(ControlError::HostAction)
         );
+    }
+
+    /// Sol focus read of head Q, finding 11: a restart that read back a stale
+    /// InvocationID discarded the result of `close_capacity` and returned
+    /// `StaleGeneration`, so capacity-one units could stay running while the
+    /// driver treated the host as closed. The close failure is now the error
+    /// surfaced; `StaleGeneration` is returned only after the nine-unit stop
+    /// order completed and every unit read back stopped.
+    #[test]
+    fn stale_restart_generation_surfaces_a_failed_capacity_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let systemctl = fake_systemctl(directory.path());
+        let timeout = Duration::from_secs(5);
+        let mut host = SystemdHostControl {
+            config: control_config(),
+            controller_invocation: String::new(),
+            runner_invocation: String::new(),
+            controller_generation: 1,
+            runner_generation: 1,
+            timeout,
+            systemctl,
+        };
+
+        fs::write(directory.path().join("fail-stop"), b"").unwrap();
+        assert_eq!(
+            host.restart_controller().err(),
+            Some(ControlError::HostAction)
+        );
+        assert_eq!(host.restart_runner().err(), Some(ControlError::HostAction));
+        assert!(!directory.path().join("stopped").exists());
+        assert_eq!(host.controller_generation, 1);
+        assert_eq!(host.runner_generation, 1);
+        assert!(host.controller_invocation.is_empty());
+        assert!(host.runner_invocation.is_empty());
+
+        fs::remove_file(directory.path().join("fail-stop")).unwrap();
+        fs::remove_file(directory.path().join("calls")).unwrap();
+        assert_eq!(
+            host.restart_controller().err(),
+            Some(ControlError::StaleGeneration)
+        );
+        let stopped = fs::read_to_string(directory.path().join("stopped")).unwrap();
+        assert_eq!(
+            stopped.lines().collect::<Vec<_>>(),
+            CAPACITY_ONE_STOP_ORDER.to_vec()
+        );
+        let calls = fs::read_to_string(directory.path().join("calls")).unwrap();
+        assert_eq!(
+            calls.lines().next(),
+            Some("show --property=InvocationID --value buzz-ci-controld.service")
+        );
+        assert!(calls.contains("restart buzz-ci-controld.service"));
+        for unit in CAPACITY_ONE_STOP_ORDER {
+            assert_eq!(
+                host.systemctl.unit_state(unit, timeout).unwrap(),
+                UnitState::Inactive,
+                "{unit}"
+            );
+        }
+        assert_eq!(host.controller_generation, 1);
     }
 
     /// H10 clean host, boot 7: stage 13's prepare succeeded in the controller
