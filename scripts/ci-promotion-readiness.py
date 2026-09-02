@@ -7,6 +7,7 @@ import argparse
 import base64
 import datetime as dt
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -48,6 +49,15 @@ SECP256K1_G = (
     0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
     0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8,
 )
+
+PROTECTED_CI_SCRIPT = Path(__file__).with_name("protected-ci-receipt.py")
+PROTECTED_CI_SPEC = importlib.util.spec_from_file_location(
+    "buzz_protected_ci_receipt", PROTECTED_CI_SCRIPT
+)
+if PROTECTED_CI_SPEC is None or PROTECTED_CI_SPEC.loader is None:
+    raise RuntimeError(f"cannot load protected-CI validator: {PROTECTED_CI_SCRIPT}")
+PROTECTED_CI = importlib.util.module_from_spec(PROTECTED_CI_SPEC)
+PROTECTED_CI_SPEC.loader.exec_module(PROTECTED_CI)
 
 
 class GateError(Exception):
@@ -463,10 +473,9 @@ def validate_source(bundle: dict[str, Any], candidate_dir: Path) -> tuple[str, s
     return candidate, base, tree
 
 
-def validate_named_receipt(
+def validate_pre_freeze_receipt(
     descriptor: dict[str, Any],
     label: str,
-    expected_source: str,
     candidate: str,
     base: str,
     now: int,
@@ -480,7 +489,7 @@ def validate_named_receipt(
     expect(actual_digest == expected_digest, f"{label} digest does not match retained file")
     receipt = load_json(path, label)
     expect(field(receipt, "schema_version", label) == 1, f"{label} schema_version must be 1")
-    expect(field(receipt, "source", label) == expected_source, f"{label} source mismatch")
+    expect(field(receipt, "source", label) == "pre-freeze", f"{label} source mismatch")
     expect(field(receipt, "repository", label) == REPOSITORY, f"{label} repository mismatch")
     expect(sha40(field(receipt, "head_sha", label), f"{label}.head_sha") == candidate,
            f"{label} head_sha does not match candidate")
@@ -492,14 +501,52 @@ def validate_named_receipt(
     expect(bool(checks), f"{label}.checks must not be empty")
     expect(all(obj(check, f"{label}.checks[]").get("status") == "PASS" for check in checks),
            f"{label} contains a non-PASS check")
-    if expected_source == "pre-freeze":
-        expect(sha40(field(receipt, "base_sha", label), f"{label}.base_sha") == base,
-               "pre-freeze receipt base_sha mismatch")
-    else:
-        expect(receipt.get("protected") is True, "protected-CI receipt must attest protected=true")
-        expect(receipt.get("full_exact_head") is True,
-               "protected-CI receipt must attest full_exact_head=true")
+    expect(sha40(field(receipt, "base_sha", label), f"{label}.base_sha") == base,
+           "pre-freeze receipt base_sha mismatch")
     return actual_digest, receipt
+
+
+def validate_protected_ci_receipt(
+    descriptor: dict[str, Any], label: str, candidate: str, now: int, max_age: int
+) -> tuple[str, dict[str, Any]]:
+    exact_fields(descriptor, {"path", "sha256"}, set(), label)
+    path = Path(text(field(descriptor, "path", label), f"{label}.path"))
+    expected_digest = sha256(field(descriptor, "sha256", label), f"{label}.sha256")
+    try:
+        raw = PROTECTED_CI.safe_read_receipt(path)
+        actual_digest = hashlib.sha256(raw).hexdigest()
+        expect(actual_digest == expected_digest, f"{label} digest does not match retained file")
+        receipt = obj(json.loads(raw), label)
+        PROTECTED_CI.require_bounded_json_depth(receipt)
+        expect(raw == PROTECTED_CI.canonical_json(receipt),
+               f"{label} must be canonical JSON")
+        PROTECTED_CI.validate_receipt(
+            receipt,
+            REPOSITORY,
+            candidate,
+            "pull-request",
+            dt.datetime.fromtimestamp(now, tz=dt.timezone.utc),
+            max_age,
+        )
+    except GateError:
+        raise
+    except (PROTECTED_CI.ReceiptError, OSError, UnicodeDecodeError, json.JSONDecodeError,
+            RecursionError) as error:
+        refuse(f"{label} is invalid: {error}")
+    return actual_digest, receipt
+
+
+def reverify_protected_ci_receipt(receipt: dict[str, Any], label: str) -> None:
+    """Require live GitHub to still back the receipt; this is the verifier's only network call.
+
+    GitHub does not sign REST responses, so an offline receipt can be internally
+    consistent without ever having contacted GitHub. Needs GH_TOKEN and the pinned gh.
+    """
+    try:
+        gh, identity = PROTECTED_CI.resolve_gh()
+        PROTECTED_CI.reverify_receipt(receipt, PROTECTED_CI.GhClient(gh, identity))
+    except (PROTECTED_CI.ReceiptError, OSError) as error:
+        refuse(f"{label} re-verification against GitHub failed: {error}")
 
 
 def validate_acceptance_verdict(
@@ -582,7 +629,9 @@ def validate_acceptance_records(
     return actual_digest
 
 
-def validate_protected_ci(section: dict[str, Any], candidate: str) -> list[str]:
+def validate_protected_ci(
+    section: dict[str, Any], candidate: str, receipt: dict[str, Any]
+) -> list[str]:
     path = "protected_ci"
     expect(sha40(field(section, "head_sha", path), f"{path}.head_sha") == candidate,
            "protected CI head does not match candidate")
@@ -591,6 +640,11 @@ def validate_protected_ci(section: dict[str, Any], candidate: str) -> list[str]:
     expect(field(section, "conclusion", path) == "success", "protected CI conclusion must be success")
     contexts = array(field(section, "contexts", path), f"{path}.contexts")
     expect(bool(contexts), "protected CI contexts must not be empty")
+    receipt_checks = {
+        text(check.get("name"), "protected-CI receipt check name"): check
+        for check in array(receipt.get("checks"), "protected-CI receipt checks")
+        if isinstance(check, dict)
+    }
     names: list[str] = []
     for index, raw_context in enumerate(contexts):
         context_path = f"{path}.contexts[{index}]"
@@ -601,8 +655,14 @@ def validate_protected_ci(section: dict[str, Any], candidate: str) -> list[str]:
         expect(sha40(field(context, "head_sha", context_path), f"{context_path}.head_sha") == candidate,
                f"{context_path} head_sha mismatch")
         run_url = text(field(context, "run_url", context_path), f"{context_path}.run_url")
-        expect(run_url.startswith("https://"), f"{context_path}.run_url must use https")
+        expected_check = receipt_checks.get(names[-1])
+        expect(expected_check is not None,
+               f"{context_path}.name is not present in the protected-CI receipt")
+        expect(run_url == (expected_check.get("details_url") or expected_check.get("html_url")),
+               f"{context_path}.run_url does not match the protected-CI receipt")
     expect(len(names) == len(set(names)), "protected CI context names must be unique")
+    expect(set(names) == set(receipt_checks),
+           "protected CI contexts do not match the protected-CI receipt")
     return sorted(names)
 
 
@@ -710,15 +770,18 @@ def validate_ci_event_evidence(
     }
     requests: dict[str, dict[str, Any]] = {}
     request_order: list[str] = []
+    request_cursors: list[int] = []
+    request_cursor_by_id: dict[str, int] = {}
     initial_request_id = ""
     initial_content: dict[str, Any] | None = None
     raw_requests = array(field(section, "requests", path), f"{path}.requests")
     expect(bool(raw_requests), f"{path}.requests must not be empty")
     for index, raw_request in enumerate(raw_requests):
         request_path = f"{path}.requests[{index}]"
-        request_content, kind, request_id, request_pubkey, _, tags = validate_wire_event(
-            raw_request, request_path, require_cursor=False
+        request_content, kind, request_id, request_pubkey, request_cursor, tags = validate_wire_event(
+            raw_request, request_path, require_cursor=True
         )
+        assert request_cursor is not None
         expect(kind == 46100, f"{request_path}.kind must be 46100")
         exact_fields(
             request_content,
@@ -774,10 +837,17 @@ def validate_ci_event_evidence(
         expect(request_id not in requests, f"{request_path}.id is duplicated")
         requests[request_id] = request_content
         request_order.append(request_id)
+        request_cursors.append(request_cursor)
+        request_cursor_by_id[request_id] = request_cursor
 
     expect(initial_content is not None, f"{path} has no initial run request")
     expect(requests[request_order[0]]["request_type"] == "run",
            f"{path} initial run request must be first")
+    expect(request_cursors[0] == 1, f"{path} initial request watch cursor must be one")
+    expect(
+        all(previous < current for previous, current in zip(request_cursors, request_cursors[1:])),
+        f"{path}.requests are not in strict watch cursor order",
+    )
     immutable_request_fields = (
         "target_repo_a", "pr_root_event_id", "pr_update_event_id", "source_clone_url",
         "immutable_source_ref", "tip_oid", "source_branch", "base_ref", "base_oid",
@@ -866,6 +936,8 @@ def validate_ci_event_evidence(
         request_event_id = event_id(field(content, "request_event_id", content_path),
                                     f"{content_path}.request_event_id")
         expect(request_event_id in requests, f"{content_path} request_event_id is not a signed request")
+        expect(cursor > request_cursor_by_id[request_event_id],
+               f"{event_path} was stored before its signed request")
         bound_request = requests[request_event_id]
         expect(run_uuid(field(content, "run_id", content_path), f"{content_path}.run_id") == run_id,
                f"{content_path} run_id mismatch")
@@ -970,7 +1042,15 @@ def validate_ci_event_evidence(
 
     expect(set(obj(field(section, "decoded_logs", path), f"{path}.decoded_logs")) == set(log_events),
            f"{path}.decoded_logs does not exactly match signed log events")
-    expect(cursors == list(range(1, len(cursors) + 1)), f"{path}.events watch cursors are not gap-free")
+    expect(
+        all(previous < current for previous, current in zip(cursors, cursors[1:])),
+        f"{path}.events are not in strict watch cursor order",
+    )
+    all_cursors = request_cursors + cursors
+    expect(
+        sorted(all_cursors) == list(range(1, len(all_cursors) + 1)),
+        f"{path} request and event watch cursors are not globally gap-free",
+    )
     expect(len(observed_signers) == 1, f"{path}.events must bind one relay signer")
     relay_signer = next(iter(observed_signers))
     if expected_run_state == "success":
@@ -988,6 +1068,7 @@ def validate_ci_event_evidence(
     job_attempt_ranges: dict[str, list[int]] = {}
     job_request_ids: dict[tuple[str, int], str] = {}
     job_terminals: dict[tuple[str, int], dict[str, Any]] = {}
+    job_terminal_cursors: dict[tuple[str, int], int] = {}
     immutable_manifests: dict[str, tuple[Any, ...]] = {}
     for job_id_value in selected_jobs:
         job_attempts = sorted(attempt for job, attempt in job_histories if job == job_id_value)
@@ -1030,6 +1111,7 @@ def validate_ci_event_evidence(
                    f"{history_path} is not bound to one signed request")
             job_request_ids[(job_id_value, attempt)] = next(iter(request_ids))
             job_terminals[(job_id_value, attempt)] = terminal_content
+            job_terminal_cursors[(job_id_value, attempt)] = ordered_history[-1][0]
             if attempt < job_attempts[-1]:
                 expect(terminal == "failure", f"{history_path} must fail before a rerun")
 
@@ -1059,6 +1141,11 @@ def validate_ci_event_evidence(
             prior = job_terminals[(selected_job, parent_attempt)]
             expect(prior["state"] == "failure",
                    f"{path} rerun parent job is not a terminal failure")
+            expect(
+                request_cursor_by_id[request_id_value]
+                > job_terminal_cursors[(selected_job, parent_attempt)],
+                f"{path} rerun request was stored before its selected parent job terminal failure",
+            )
             for job in observed_jobs:
                 expect(evolving_attempts[job] == attempt - 1,
                        f"{path} rerun fanout does not advance each job contiguously")
@@ -1453,7 +1540,7 @@ def validate_bundle(bundle: dict[str, Any], candidate_dir: Path, now: int, max_a
         "evidence_files", "protected_ci", "tier2", "artifacts", "staging", "production_canary",
         "deliberate_red", "deployment", "rollback", "landing",
     }, set(), "evidence")
-    expect(field(bundle, "schema_version", "evidence") == 1, "evidence schema_version must be 1")
+    expect(field(bundle, "schema_version", "evidence") == 2, "evidence schema_version must be 2")
     expect(field(bundle, "repository", "evidence") == REPOSITORY, "evidence repository mismatch")
     candidate, base, tree = validate_source(bundle, candidate_dir)
 
@@ -1464,13 +1551,13 @@ def validate_bundle(bundle: dict[str, Any], candidate_dir: Path, now: int, max_a
         {"collection_manifest"},
         "evidence.evidence_files",
     )
-    pre_digest, _ = validate_named_receipt(
+    pre_digest, _ = validate_pre_freeze_receipt(
         obj(field(evidence_files, "pre_freeze", "evidence.evidence_files"), "evidence_files.pre_freeze"),
-        "evidence_files.pre_freeze", "pre-freeze", candidate, base, now, max_age,
+        "evidence_files.pre_freeze", candidate, base, now, max_age,
     )
-    ci_digest, _ = validate_named_receipt(
+    ci_digest, protected_receipt = validate_protected_ci_receipt(
         obj(field(evidence_files, "protected_ci", "evidence.evidence_files"), "evidence_files.protected_ci"),
-        "evidence_files.protected_ci", "protected-ci", candidate, base, now, max_age,
+        "evidence_files.protected_ci", candidate, now, max_age,
     )
     acceptance_digest, _ = validate_acceptance_verdict(
         obj(field(evidence_files, "acceptance_verdict", "evidence.evidence_files"),
@@ -1501,7 +1588,11 @@ def validate_bundle(bundle: dict[str, Any], candidate_dir: Path, now: int, max_a
             == sha256(descriptor["sha256"], "evidence_files.collection_manifest.sha256"),
             "collection manifest digest does not match retained sidecar",
         )
-    contexts = validate_protected_ci(obj(field(bundle, "protected_ci", "evidence"), "protected_ci"), candidate)
+    contexts = validate_protected_ci(
+        obj(field(bundle, "protected_ci", "evidence"), "protected_ci"),
+        candidate,
+        protected_receipt,
+    )
     tier2 = validate_tier2(obj(field(bundle, "tier2", "evidence"), "tier2"), candidate, now)
     artifacts = validate_artifacts(obj(field(bundle, "artifacts", "evidence"), "artifacts"), candidate)
     staging = validate_staging(obj(field(bundle, "staging", "evidence"), "staging"), candidate, base)
@@ -1516,6 +1607,7 @@ def validate_bundle(bundle: dict[str, Any], candidate_dir: Path, now: int, max_a
         obj(field(bundle, "rollback", "evidence"), "rollback"), candidate, artifacts,
     )
     landing = validate_landing(obj(field(bundle, "landing", "evidence"), "landing"), candidate)
+    reverify_protected_ci_receipt(protected_receipt, "evidence_files.protected_ci")
 
     return {
         "schema_version": 1,

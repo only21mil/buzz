@@ -1,0 +1,31 @@
+name: relay_e2e_canary
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  relay_e2e_canary:
+    name: relay_e2e_canary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Exercise protected rerun semantics
+        env:
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          case "$RUN_ATTEMPT" in
+            1)
+              echo "expected attempt 1 failure" >&2
+              exit 1
+              ;;
+            2)
+              echo "expected attempt 2 success"
+              ;;
+            *)
+              echo "unexpected run attempt: $RUN_ATTEMPT" >&2
+              exit 1
+              ;;
+          esac

@@ -25,14 +25,42 @@ disagree, stop delivery, fix the disagreement, and re-run the affected gate.
    ancestor of the candidate and the candidate worktree is clean.
 2. Run `scripts/pre-freeze.sh` with the intended base. Use `--full` and
    `--test` when the change or verification tier requires workspace-wide
-   coverage. Retain the generated `pre-freeze-receipt.json`.
-3. The parent or operator independently reads the authenticated live repository
-   ruleset and exact-head workflow/check evidence, and confirms that every
-   protected requirement passed for the candidate. Retain a mode-safe
-   `protected-ci-receipt.json` with `source: "protected-ci"`, `protected: true`,
-   `full_exact_head: true`, the full candidate commit, and only passing checks.
-   The repository currently has no maintained authenticated acquisition tool
-   that creates this receipt from the live provider.
+   coverage. The script writes `pre-freeze-receipt.json` into the repository
+   root. Move that file into the private mode-`0700` evidence directory at mode
+   `0600` before exporting `BUZZ_PRE_FREEZE_RECEIPT`.
+3. Acquire the pull-request receipt for the exact candidate with
+   `scripts/protected-ci-receipt.py acquire`. The receipt is operator-acquired
+   evidence: it retains the exact GitHub REST bodies for the repository, the
+   `main` ref, the pull request, the branch rules, the rulesets, and the check
+   runs, hash-bound and replayed on every validation. GitHub does not sign
+   those responses, so the receipt is trusted only after `validate --reverify`
+   finds the live authority unchanged, including the pull request itself: it
+   must still be open, non-draft, at the receipt head, based on `main`, with
+   its base SHA and the live `main` head equal to the recorded base. The output parent
+   must be an absolute, canonical, caller-owned mode-`0700` directory; the tool
+   publishes a new mode-`0600` file and refuses replacement. Validate it with
+   literal scope `pull-request` and `--reverify` before supplying it to the
+   promotion gate:
+
+   ```bash
+   evidence_dir=/absolute/private/evidence-directory
+   scripts/protected-ci-receipt.py acquire \
+     --repository only21mil/buzz --pull-request PR_NUMBER \
+     --head FULL_40_CHARACTER_CANDIDATE --base main \
+     --output "$evidence_dir/protected-ci-pr.json"
+   scripts/protected-ci-receipt.py validate \
+     --receipt "$evidence_dir/protected-ci-pr.json" \
+     --repository only21mil/buzz --head FULL_40_CHARACTER_CANDIDATE \
+     --scope pull-request --max-age-seconds 86400 --reverify
+   ```
+
+   Supply GitHub authentication through `GH_TOKEN` in the environment. Never
+   place a token in the command line or receipt. Legacy JSON that merely
+   asserts `protected: true` or `full_exact_head: true` is not evidence and is
+   refused, and so is a receipt whose retained bodies no longer reproduce its
+   recorded hashes, whose binding live GitHub no longer backs, or whose
+   commit is no longer the head of an open pull request against the current
+   `main`.
 4. Apply the current risk classifier. When Tier 2 is required, close review on
    the exact candidate before promotion. A review of an ancestor, tree-equivalent
    reconstruction, or later amended commit does not close the gate.
@@ -40,8 +68,11 @@ disagree, stop delivery, fix the disagreement, and re-run the affected gate.
    external publication, or other approval-gated action.
 
 `scripts/ci-promotion-readiness.py` validates a supplied promotion evidence
-bundle when that broader gate applies. It does not authenticate or acquire live
-provider evidence, and it does not create approval.
+bundle when that broader gate applies. It accepts only the canonical
+`pull-request` receipt, and after every offline invariant passes it re-verifies
+that receipt against live GitHub through the pinned `gh` and `GH_TOKEN`,
+including the live pull request and `main` head. That is its only network
+call; it does not acquire evidence or create approval.
 
 ## Landing
 
@@ -58,6 +89,12 @@ Record the merge commit and any failed, skipped, superseded, or duplicate CI
 runs in the Buzz repository record. Do not describe a history containing a
 failure as uniformly green. State which exact-head run is the promotion gate.
 
+When initially adding the relay canary as a protected requirement, merge the
+foundation first without that new required context. Dispatch the workflow for
+the exact landed ref, record the expected first-attempt failure, rerun it once,
+and require the second attempt to pass on the same landed commit. Add the
+ruleset requirement only after that bootstrap evidence is complete.
+
 ## Deployment preflight
 
 Production deployment is approval-gated. Run it only from a clean checkout of
@@ -68,10 +105,18 @@ The operator supplies a non-secret Compose settings file, the existing
 mode-`0600` secret file under a mode-`0700` directory, and fresh receipts:
 
 ```bash
+evidence_dir=/absolute/private/evidence-directory
+scripts/protected-ci-receipt.py acquire-main \
+  --repository only21mil/buzz --head FULL_40_CHARACTER_LANDED_COMMIT \
+  --branch main --output "$evidence_dir/protected-ci-main.json"
+scripts/protected-ci-receipt.py validate \
+  --receipt "$evidence_dir/protected-ci-main.json" \
+  --repository only21mil/buzz --head FULL_40_CHARACTER_LANDED_COMMIT \
+  --scope main --max-age-seconds 86400 --reverify
 export BUZZ_COMPOSE_ENV_FILE=/absolute/path/to/compose.env
 export BUZZ_SECRET_ENV_FILE="$HOME/.config/sats/secrets.env"
 export BUZZ_PRE_FREEZE_RECEIPT=/absolute/path/to/pre-freeze-receipt.json
-export BUZZ_PROTECTED_CI_RECEIPT=/absolute/path/to/protected-ci-receipt.json
+export BUZZ_PROTECTED_CI_RECEIPT="$evidence_dir/protected-ci-main.json"
 export BUZZ_DEPLOY_SOURCE_REF=refs/remotes/buzz/main
 deploy/compose/deploy-local.sh --check FULL_40_CHARACTER_LANDED_COMMIT
 deploy/compose/deploy-local.sh FULL_40_CHARACTER_LANDED_COMMIT
@@ -79,7 +124,9 @@ deploy/compose/deploy-local.sh FULL_40_CHARACTER_LANDED_COMMIT
 
 `BUZZ_DEPLOY_SOURCE_REF` may be omitted only when its default,
 `refs/remotes/origin/main`, is the freshly fetched authoritative branch. Do not
-set it to a raw commit merely to bypass the branch readback.
+set it to a raw commit merely to bypass the branch readback. `GH_TOKEN` must be
+present in the environment, loaded from the secret file without output, because
+the deploy re-verifies the protected-CI receipt against GitHub.
 
 `deploy/compose/deploy-local.sh` refuses unless:
 
@@ -88,8 +135,14 @@ set it to a raw commit merely to bypass the branch readback.
 - the checkout is clean, apart from the two generated receipt files;
 - both receipts are regular, mode-safe, fresh, exact-commit PASS receipts from
   `only21mil/buzz`, and the pre-freeze base is an ancestor;
-- the operator-supplied protected-CI receipt is schema-valid, fresh, and states
-  that protected full exact-head CI passed;
+- the explicitly supplied protected-CI receipt is canonical `main`-scope
+  evidence for the landed commit, fresh, and a full exact-head protected-CI
+  pass whose retained GitHub bodies reproduce every recorded hash and whose
+  binding live GitHub still backs (`validate --reverify` through the pinned
+  `gh` with `GH_TOKEN`), with the live `refs/heads/main` head equal to the
+  landed commit; the local remote-tracking ref alone does not establish that
+  the commit landed. A pull-request-scoped, legacy self-asserted,
+  hand-edited, no-longer-backed, or not-yet-landed receipt is refused;
 - the Compose runner, both Compose files, the non-secret settings file, the
   secret file, and their relevant parent directories have the required regular
   file or directory type, ownership, mode, and no-symlink state. The non-secret
@@ -142,7 +195,7 @@ network endpoint, or the strictly parseable connection inputs are unavailable,
 preflight refuses. A Docker Engine archive stream carries the running relay
 binary directly to trusted host Python for exact tar-shape validation and
 SHA-256; neither container code nor `docker cp` is a hash trust anchor. The
-runner is always the clean commit-bound `deploy/compose/run-local.sh`—an
+runner is always the clean commit-bound `deploy/compose/run-local.sh`; an
 operator path override is refused. Independent static blockers are reported
 together; identity-dependent live checks stop at the first broken prerequisite
 instead of guessing through missing or ambiguous state.
@@ -150,12 +203,26 @@ The real deploy completes this same preflight before its first filesystem write
 and repeats it after the candidate build before rollback capture or backup, so
 live-state drift during the build fails closed.
 
-Receipt validation is not provider authentication. `deploy-local.sh` checks the
-supplied JSON's mode, schema, freshness, commit binding, and asserted result; it
-does not contact GitHub or the Buzz relay and cannot prove that the assertions
-came from either system. Until a maintained authenticated acquisition tool is
-present, the parent or operator must independently verify the current live
-ruleset and exact-head run/check evidence before invoking the deploy script.
+`protected-ci-receipt.py` records the pinned client identity, every request's
+metadata and body hash, and the exact response bodies for the repository, the
+`main` ref, the pull request (pull-request scope), the branch rules, the
+rulesets, and the check runs. Those retained bodies count toward the 4 MiB
+receipt cap; acquisition refuses to publish anything larger. Every `validate`
+recomputes the body hashes and replays the bodies through the scope's
+acquisition sequence, so a hand-edited receipt fails offline. GitHub does not
+sign REST responses, so a receipt fabricated without contacting GitHub can
+still be internally consistent; `validate --reverify` closes that gap by
+requiring the live rulesets, required contexts, and exact-head check runs to
+match the receipt binding, and by re-reading the scope authority: a `main`
+receipt needs the live `refs/heads/main` head at the receipt head; a
+`pull-request` receipt needs the live pull request open, non-draft, at the
+receipt head, based on `main`, with its base SHA and the live `main` head
+equal to the recorded base. Passing checks on a commit are not enough on
+their own. `deploy-local.sh` always validates with `--reverify`, which is its
+only GitHub contact, and requires an explicit absolute
+`BUZZ_PROTECTED_CI_RECEIPT`; a repository-root default is intentionally absent
+because a normal checkout is not a private mode-`0700` evidence directory.
+Reacquire after a rerun, ruleset change, or landing.
 
 Never use `run-local.sh up` as an upgrade path. The deploy script is the only
 path that binds the build, backup, migration gate, swap, health checks, and

@@ -1,18 +1,34 @@
 # Promotion acceptance runbook
 
 This runbook closes a Buzz promotion only when every receipt names the same
-immutable commit and the same artifacts. The verifier is intentionally
-source-only: it validates retained evidence and emits a machine-readable
-receipt, but it does not contact GitHub, Docker, the relay, a database, or a
-deployment host. Passing the hermetic tests is not live acceptance.
+immutable commit and the same artifacts. The verifier validates retained
+evidence and emits a machine-readable receipt. It does not contact Docker, the
+relay, a database, or a deployment host. Its one network call is to GitHub,
+after every offline invariant passes: it re-verifies the protected-CI receipt
+against the live rulesets, required contexts, and exact-head check runs through
+the pinned `gh` and `GH_TOKEN`, and re-reads the receipt's scope authority: the
+recorded pull request must still be open, non-draft, at the receipt head, based
+on `main`, and its base SHA and the live `refs/heads/main` head must still equal
+the recorded base. A receipt for a commit with passing checks that is no longer
+the pull request head, or whose base has moved, is refused. The protected-CI
+receipt is operator-acquired evidence with the exact GitHub REST bodies retained
+and hash-bound (repository, main ref, pull request, branch rules, rulesets, and
+check runs); GitHub does not sign those bodies, so a receipt is accepted only
+when live GitHub still matches it. Passing the hermetic tests is not live
+acceptance.
 
 ## Inputs and invariants
 
-Use [`promotion-evidence.schema.json`](promotion-evidence.schema.json) for the
+Use version 2 of [`promotion-evidence.schema.json`](promotion-evidence.schema.json) for the
 collected input and [`promotion-readiness-receipt.schema.json`](promotion-readiness-receipt.schema.json)
 for the emitted receipt. Keep evidence outside the candidate checkout in a
-mode-0700 directory; every retained file and generated receipt must be a
-regular, non-symlinked mode-0600 file.
+mode-0700 directory. The verifier requires every `evidence_files` descriptor
+path to be absolute and to name a regular, non-symlinked mode-0600 file, and it
+additionally requires the immediate parent of the protected-CI receipt to be a
+canonical, caller-owned mode-0700 directory. A mode-0700 parent for the
+remaining descriptors is an operator obligation the verifier does not currently
+check. The emitted receipt is written as a mode-0600 file outside the candidate
+checkout.
 
 The bundle must bind all of these identities exactly:
 
@@ -37,6 +53,14 @@ from the same trusted `BUZZ_RELAY_URL` or `--relay-url` configuration used to
 collect that run. Collection refuses missing configuration and never supplies a
 fallback relay.
 
+Every retained request and status event also carries the relay-assigned
+`watch_cursor`. The authenticated event export includes kind 46100 requests in
+the same durable acceptance sequence as kinds 46101 through 46106. A collector
+splits those records into `requests` and `events` without changing their
+cursors. Each array remains in strict cursor order, and the union of both arrays
+must be exactly `1..N` with no duplicates or gaps. Every status or evidence
+event must have been stored after the signed request it names.
+
 Kind coverage is deduplicated. It must equal 46101 through 46106, but the
 event list must contain every transition. A successful initial run therefore
 has ordered `queued`, `running` and terminal `success` kind-46101 facts and the
@@ -48,6 +72,8 @@ through the lifecycle. Terminal state and conclusion must agree.
 
 Every rerun has its own signed kind-46100 request. Its stable run UUID, selected
 job, parent run, parent attempt and next attempt must form a contiguous lineage.
+Its durable cursor must be greater than the selected parent job's terminal
+failure cursor; a request accepted before that failure is not a valid rerun.
 Signed kind-46102 histories must match that request exactly, including the
 selected job instance and dependency fanout. The verifier decodes every retained
 log body, then checks its signed byte length, cap and SHA-256.
@@ -68,7 +94,11 @@ receipt is written.
 ## Evidence order
 
 1. Freeze a clean full candidate SHA. Retain its pre-freeze receipt and the
-   protected exact-head CI receipt, including their SHA-256 digests.
+   protected exact-head CI receipt, including their SHA-256 digests. Acquire
+   the CI receipt with `scripts/protected-ci-receipt.py acquire` and confirm it
+   with `validate --scope pull-request --reverify`; the verifier repeats that
+   live re-verification, including the pull request and base re-read, when it
+   runs. Reacquire after any push to the branch or any movement of `main`.
 2. Run the final Tier 2 review after exact-head CI. Its checked commit and
    fingerprint must still match the frozen candidate, and its review window
    may not exceed 5,400 seconds or be expired at verification time.
@@ -140,6 +170,10 @@ python3 scripts/ci-promotion-readiness.py \
 Exit status 0 means the receipt was written and printed. Exit status 2 prints
 one `REFUSED:` reason and writes no receipt. Validate the input and output
 against their schemas before retaining or signing them.
+
+Re-running with the same `--receipt` path replaces an existing receipt in place,
+whereas `scripts/protected-ci-receipt.py acquire` refuses to replace an existing
+`--output`.
 
 The hermetic contract test is safe on a development host:
 

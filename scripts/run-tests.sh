@@ -111,6 +111,9 @@ run_unit_tests() {
         python3 -m unittest discover "$suite" -p "test_*.py"; \
       done; \
       python3 scripts/test-ci-promotion-readiness.py; \
+      python3 scripts/test-protected-ci-receipt.py; \
+      bash scripts/test-ci-path-filter-contract.sh; \
+      bash scripts/test-relay-e2e-canary-contract.sh; \
       python3 scripts/test-populate-ci-promotion-relay-origin.py'
 
   # buzz-db migrator/lint unit tests (no infra): guard the embedded-migrator

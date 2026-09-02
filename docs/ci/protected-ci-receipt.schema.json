@@ -1,0 +1,273 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/only21mil/buzz/blob/main/docs/ci/protected-ci-receipt.schema.json",
+  "title": "Buzz protected-CI receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "source",
+    "scope",
+    "repository",
+    "head_sha",
+    "timestamp",
+    "overall",
+    "protected",
+    "full_exact_head",
+    "provider",
+    "pull_request",
+    "protection",
+    "checks"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "source": { "const": "protected-ci" },
+    "scope": { "enum": ["pull-request", "main"] },
+    "repository": { "const": "only21mil/buzz" },
+    "head_sha": { "$ref": "#/$defs/sha40" },
+    "timestamp": { "$ref": "#/$defs/timestamp" },
+    "overall": { "const": "PASS" },
+    "protected": { "const": true },
+    "full_exact_head": { "const": true },
+    "provider": { "$ref": "#/$defs/provider" },
+    "pull_request": {
+      "oneOf": [
+        { "$ref": "#/$defs/pull_request" },
+        { "type": "null" }
+      ]
+    },
+    "protection": { "$ref": "#/$defs/protection" },
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/check" }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "scope": { "const": "pull-request" } },
+        "required": ["scope"]
+      },
+      "then": { "properties": { "pull_request": { "$ref": "#/$defs/pull_request" } } },
+      "else": { "properties": { "pull_request": { "type": "null" } } }
+    }
+  ],
+  "$defs": {
+    "sha40": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "positive_integer": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "viewer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["login", "id"],
+      "properties": {
+        "login": { "type": "string", "minLength": 1 },
+        "id": { "$ref": "#/$defs/positive_integer" }
+      }
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["endpoint", "page", "status", "request_id", "date", "etag", "body_sha256", "body"],
+      "properties": {
+        "endpoint": { "type": "string", "minLength": 1 },
+        "page": { "$ref": "#/$defs/positive_integer" },
+        "status": { "const": 200 },
+        "request_id": { "type": "string", "minLength": 1 },
+        "date": { "type": "string", "minLength": 1 },
+        "etag": {
+          "oneOf": [
+            { "type": "string", "minLength": 1 },
+            { "type": "null" }
+          ]
+        },
+        "body_sha256": { "$ref": "#/$defs/sha256" },
+        "body": {
+          "description": "Exact response body for the repository, the refs/heads/main ref, the pull request (pull-request scope), branch-rule, ruleset, and check-run requests; null for every other request. Each body is capped at 4 MiB and the whole receipt at 4 MiB. Validation recomputes body_sha256 from this text and replays the bodies through the scope's acquisition sequence, so the retained scope authority (default branch, main head, pull request state, head, and base) must reproduce the receipt.",
+          "oneOf": [
+            { "type": "string", "minLength": 1 },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "host", "api_origin", "api_version", "client", "viewer", "repository_id", "requests"],
+      "properties": {
+        "kind": { "const": "github-rest" },
+        "host": { "const": "github.com" },
+        "api_origin": { "const": "https://api.github.com" },
+        "api_version": { "const": "2022-11-28" },
+        "client": { "$ref": "#/$defs/client" },
+        "viewer": { "$ref": "#/$defs/viewer" },
+        "repository_id": { "$ref": "#/$defs/positive_integer" },
+        "requests": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/request" }
+        }
+      }
+    },
+    "client": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "uid", "gid", "mode", "sha256"],
+      "properties": {
+        "path": { "const": "/usr/bin/gh" },
+        "uid": { "const": 0 },
+        "gid": { "const": 0 },
+        "mode": { "const": "0755" },
+        "sha256": { "const": "16fdbf30d6f97bc5b0fb94745e00fa06ae68beb6c6653d7f584b32602800397d" }
+      }
+    },
+    "pull_request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "number", "url", "state", "draft", "head_repo", "head_ref", "head_sha",
+        "base_repo", "base_ref", "base_sha", "merge_base_sha", "behind_by"
+      ],
+      "properties": {
+        "number": { "$ref": "#/$defs/positive_integer" },
+        "url": { "type": "string", "format": "uri", "pattern": "^https://github\\.com/only21mil/buzz/pull/[1-9][0-9]*$" },
+        "state": { "const": "open" },
+        "draft": { "const": false },
+        "head_repo": { "const": "only21mil/buzz" },
+        "head_ref": { "type": "string", "minLength": 1 },
+        "head_sha": { "$ref": "#/$defs/sha40" },
+        "base_repo": { "const": "only21mil/buzz" },
+        "base_ref": { "const": "main" },
+        "base_sha": { "$ref": "#/$defs/sha40" },
+        "merge_base_sha": { "$ref": "#/$defs/sha40" },
+        "behind_by": { "const": 0 }
+      }
+    },
+    "ruleset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id", "name", "target", "source_type", "source", "enforcement",
+        "metadata_sha256", "bypass_actors_sha256", "conditions_sha256", "rules_sha256"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/positive_integer" },
+        "name": { "type": "string", "minLength": 1 },
+        "target": { "type": "string", "minLength": 1 },
+        "source_type": { "type": "string", "minLength": 1 },
+        "source": { "type": "string", "minLength": 1 },
+        "enforcement": { "const": "active" },
+        "metadata_sha256": { "$ref": "#/$defs/sha256" },
+        "bypass_actors_sha256": { "$ref": "#/$defs/sha256" },
+        "conditions_sha256": { "$ref": "#/$defs/sha256" },
+        "rules_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "required_check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "integration_id"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "integration_id": { "$ref": "#/$defs/positive_integer" }
+      }
+    },
+    "protection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["base_ref", "base_sha", "strict", "branch_rules_sha256", "rulesets", "required_checks"],
+      "properties": {
+        "base_ref": { "const": "refs/heads/main" },
+        "base_sha": { "$ref": "#/$defs/sha40" },
+        "strict": { "const": true },
+        "branch_rules_sha256": { "$ref": "#/$defs/sha256" },
+        "rulesets": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/ruleset" }
+        },
+        "required_checks": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/required_check" }
+        }
+      }
+    },
+    "superseded_check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["check_run_id", "check_suite_id", "provider_status", "conclusion", "started_at", "completed_at"],
+      "properties": {
+        "check_run_id": { "$ref": "#/$defs/positive_integer" },
+        "check_suite_id": { "$ref": "#/$defs/positive_integer" },
+        "provider_status": { "type": "string", "minLength": 1 },
+        "conclusion": { "type": ["string", "null"] },
+        "started_at": {
+          "oneOf": [
+            { "$ref": "#/$defs/timestamp" },
+            { "type": "null" }
+          ]
+        },
+        "completed_at": {
+          "oneOf": [
+            { "$ref": "#/$defs/timestamp" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name", "status", "integration_id", "app_slug", "head_sha", "check_run_id",
+        "check_suite_id", "provider_status", "conclusion", "started_at", "completed_at",
+        "html_url", "details_url", "superseded"
+      ],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "status": { "const": "PASS" },
+        "integration_id": { "$ref": "#/$defs/positive_integer" },
+        "app_slug": { "type": "string", "minLength": 1 },
+        "head_sha": { "$ref": "#/$defs/sha40" },
+        "check_run_id": { "$ref": "#/$defs/positive_integer" },
+        "check_suite_id": { "$ref": "#/$defs/positive_integer" },
+        "provider_status": { "const": "completed" },
+        "conclusion": { "const": "success" },
+        "started_at": { "$ref": "#/$defs/timestamp" },
+        "completed_at": { "$ref": "#/$defs/timestamp" },
+        "html_url": { "type": "string", "format": "uri", "pattern": "^https://github\\.com/only21mil/buzz/" },
+        "details_url": {
+          "oneOf": [
+            { "type": "string", "format": "uri", "pattern": "^https://github\\.com/only21mil/buzz/" },
+            { "type": "null" }
+          ]
+        },
+        "superseded": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/superseded_check" }
+        }
+      }
+    }
+  }
+}

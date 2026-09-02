@@ -46,22 +46,42 @@ jobs:
               - 'rust-toolchain.toml'
               - 'deny.toml'
               - 'deploy/native-ci/**'
+              - 'deploy/compose/**'
               - '.github/workflows/ci.yml'
+              - '.github/workflows/relay_e2e_canary.yml'
+              - 'docs/ci/**'
+              - 'docs/delivery-lifecycle.md'
+              - 'scripts/ci-promotion-readiness.py'
+              - 'scripts/protected-ci-receipt.py'
               - 'scripts/run-tests.sh'
+              - 'scripts/test-ci-promotion-readiness.py'
+              - 'scripts/test-ci-path-filter-contract.sh'
+              - 'scripts/test-protected-ci-receipt.py'
+              - 'scripts/test-relay-e2e-canary-contract.sh'
               - 'Justfile'
             desktop:
               - 'scripts/check-file-sizes-core.mjs'
               - 'scripts/check-file-sizes-core.test.mjs'
               - 'desktop/**'
               - '!desktop/src-tauri/**'
+              - 'admin-web/package.json'
+              - 'package.json'
               - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+              - 'patches/**'
             desktop-rust:
               - 'desktop/src-tauri/**'
             web:
               - 'scripts/check-file-sizes-core.mjs'
               - 'scripts/check-file-sizes-core.test.mjs'
               - 'web/**'
+              - 'admin-web/package.json'
+              - 'package.json'
               - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+              - 'patches/**'
+              - '.github/workflows/ci.yml'
+              - 'Justfile'
             mobile:
               - 'scripts/check-file-sizes-core.mjs'
               - 'scripts/check-file-sizes-core.test.mjs'
@@ -104,6 +124,8 @@ jobs:
         run: node --test scripts/check-file-sizes-core.test.mjs
       - name: Android Google SDK-free guard unit tests
         run: scripts/test-check-android-google-free.sh
+      - name: CI path filter contract
+        run: scripts/test-ci-path-filter-contract.sh
 
   rust-lint:
     name: Rust Lint
