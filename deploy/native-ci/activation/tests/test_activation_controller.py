@@ -1575,7 +1575,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "c7f957dfcf610246d83c3fec639912e944365230aa6676a65df7525105fa9bcd",
+            "21e78aa83b2ff7715864af3b788586ecbe613f3ace25478fa32e1107b9d1ecbc",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -1984,6 +1984,81 @@ class ActivationControllerTests(unittest.TestCase):
             )
         CONTROLLER._verify_phase(manifest, self.fixture.root, "staged")
         CONTROLLER._staged_zero_readback(manifest, self.fixture.root, driver)
+
+    def compensation_paths(self, manifest: dict[str, object]) -> tuple[set[Path], set[str]]:
+        """Static entry parents (never written by return-to-zero) and the targets it does write."""
+        static_parents: set[Path] = set()
+        written: set[str] = set()
+        for entry in manifest["entries"]:
+            if entry["role"] == "execd_config":
+                continue
+            if "active_source" in entry:
+                written.add(entry["target"])
+            else:
+                static_parents.add(self.fixture.root / Path(entry["target"]).parent.relative_to("/"))
+        for record in CONTROLLER._read_receipt(self.fixture.root)["acceptance_generated"]:
+            written.add(record["target"])
+        return static_parents, written
+
+    def test_return_to_zero_writes_only_inside_the_helper_sandbox_paths(self) -> None:
+        # buzz-ci-acceptance-control.service runs the compensation under
+        # ProtectSystem=strict with only /etc/buzzci, /var/lib/buzzci/acceptance-control,
+        # and /var/lib/buzzci/activation-controller writable. On the clean host the
+        # full-package restage hit EROFS on every binary and unit (H5 boot 3).
+        service = (ACTIVATION_ROOT / "templates/buzz-ci-acceptance-control.service").read_text()
+        writable = next(line for line in service.splitlines() if line.startswith("ReadWritePaths=")).split("=", 1)[1].split()
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        self.activate_one(manifest, payloads, driver)
+        static_parents, written = self.compensation_paths(manifest)
+        self.assertTrue(written)
+        for target in written:
+            self.assertTrue(any(target.startswith(prefix + "/") for prefix in writable), target)
+        for parent in static_parents:
+            self.assertFalse(any(str("/" / parent.relative_to(self.fixture.root)).startswith(prefix + "/") for prefix in writable), parent)
+        self.assertNotEqual(self.fixture.root, Path("/"))
+        self.assertNotEqual(os.geteuid(), 0)
+        writes: list[str] = []
+        original_write = CONTROLLER._atomic_write
+
+        def record_write(root: Path, target: str, payload: bytes, mode: int, uid: int, gid: int, **kwargs: object) -> None:
+            writes.append(target)
+            original_write(root, target, payload, mode, uid, gid, **kwargs)
+
+        saved_modes = {parent: parent.stat().st_mode for parent in static_parents}
+        try:
+            for parent in static_parents:
+                parent.chmod(0o555)
+            with mock.patch.object(CONTROLLER, "_atomic_write", record_write):
+                result = CONTROLLER._return_to_staged_zero(
+                    manifest, payloads, self.fixture.root, driver,
+                    CONTROLLER._read_receipt(self.fixture.root)["acceptance_generated"],
+                    keep_acceptance_control=True,
+                )
+        finally:
+            for parent, mode in saved_modes.items():
+                parent.chmod(stat.S_IMODE(mode))
+        self.assertEqual(set(writes) - {CONTROLLER.RECEIPT_PATH}, written)
+        self.assertEqual(result["managed_targets"]["controld_config"], "staged")
+        CONTROLLER._verify_phase(manifest, self.fixture.root, "staged")
+        CONTROLLER._staged_zero_readback(manifest, self.fixture.root, driver)
+        self.assertEqual(driver.unit("buzz-ci-acceptance-control.service")["ActiveState"], "active")
+
+    def test_return_to_zero_reports_a_drifted_static_target_instead_of_rewriting_it(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        self.activate_one(manifest, payloads, driver)
+        entry = next(item for item in manifest["entries"] if item["role"] == "qualification_binary")
+        target = self.fixture.root / entry["target"].lstrip("/")
+        original = target.read_bytes()
+        write_file(target, original + b"drift", stat.S_IMODE(target.stat().st_mode))
+        with self.assertRaisesRegex(ValueError, "staged readback: .*" + re.escape(entry["target"])):
+            CONTROLLER._return_to_staged_zero(
+                manifest, payloads, self.fixture.root, driver,
+                CONTROLLER._read_receipt(self.fixture.root)["acceptance_generated"],
+                keep_acceptance_control=True,
+            )
+        self.assertEqual(target.read_bytes(), original + b"drift")
 
     def test_capacity_one_rejects_stale_controld_process_and_compensates(self) -> None:
         manifest, payloads, driver = self.fixture.load()

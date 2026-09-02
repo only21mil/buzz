@@ -4578,20 +4578,18 @@ def _return_to_staged_zero(
     generated: list[dict[str, object]], *, keep_acceptance_control: bool = False,
 ) -> dict[str, object]:
     errors = _capacity_one_stop_errors(driver) if keep_acceptance_control else _stop_zero_errors(driver)
-    for entry in manifest["entries"]:
-        if entry["role"] == "execd_config":
-            continue
-        try:
-            _atomic_write(
-                root,
-                entry["target"],
-                payloads[entry["source"]],
-                activation_package.parse_mode(entry["install_mode"]),
-                entry["uid"],
-                entry["gid"],
-            )
-        except BaseException as error:
-            errors.append(f"restage {entry['role']}: {error}")
+    # Return-to-zero reverts the phase swap; it does not reinstall the package.
+    # Only the runner and controld configs and the generated acceptance files
+    # change between the staged and active phases, and only /etc/buzzci and
+    # /var/lib/buzzci/activation-controller are writable inside the
+    # buzz-ci-acceptance-control.service sandbox that runs this compensation.
+    # Every other entry is verified below; a drifted static target fails the
+    # return instead of being rewritten from a sandbox that must not write
+    # binaries or units.
+    try:
+        _apply_staged_configs(manifest, payloads, root)
+    except BaseException as error:
+        errors.append(f"restage phase configs: {error}")
     try:
         _apply_generated(root, generated, phase="staged")
     except BaseException as error:
