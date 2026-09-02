@@ -1830,7 +1830,19 @@ impl PrivilegedHostSystem for LocalHostSystem {
             .map_err(binding_error)?;
         let teardown: TeardownDocument = canonical_parse(&teardown_bytes).map_err(binding_error)?;
         let teardown_digest: [u8; 32] = Sha256::digest(&teardown_bytes).into();
-        let (artifact_items, artifact_receipt_set_digest) = self.sealed_artifacts(binding)?;
+        // A stopped attempt (cancelled, expired, recovery) sealed no artifacts:
+        // the executor killed the job, the attempt tree is gone, and the
+        // teardown recorded the empty receipt set. Only that exact record
+        // skips the capture; a completed attempt still seals every declared
+        // artifact or is refused.
+        let empty_receipt_set = empty_artifact_receipt_set_digest(binding);
+        let (artifact_items, artifact_receipt_set_digest) = if teardown.stop_reason != "completed"
+            && teardown.artifact_receipt_set_digest == hex::encode(empty_receipt_set)
+        {
+            (Vec::new(), empty_receipt_set)
+        } else {
+            self.sealed_artifacts(binding)?
+        };
         if teardown.schema_version != 1
             || decode_hex::<32>(&teardown.execution_binding_digest).map_err(binding_error)?
                 != binding.execution_binding_digest
@@ -4646,6 +4658,108 @@ mod tests {
         system.job_uid = owner;
         assert_ne!(system.materialize(binding, intent).unwrap(), [0; 32]);
         assert_eq!(fs::read_dir(&attempts).unwrap().count(), 1);
+    }
+
+    /// H10 clean host, boot 3: a cancelled attempt is torn down without
+    /// artifacts (the executor killed the job, the tree is removed, the
+    /// teardown records the empty receipt set), so describing its evidence
+    /// refused at the declared artifact and controld failed stage 9 closed.
+    /// A stopped attempt now seals stdout and teardown only; a completed
+    /// attempt without its declared artifact stays refused.
+    #[test]
+    fn stopped_attempt_seals_stdout_and_teardown_without_artifacts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let evidence_path = temporary.path().join("evidence");
+        let teardown_path = temporary.path().join("teardown");
+        let attempts_path = temporary.path().join("attempts");
+        for (path, mode) in [
+            (&evidence_path, 0o700),
+            (&teardown_path, 0o700),
+            (&attempts_path, 0o711),
+        ] {
+            fs::create_dir(path).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let owner = fs::metadata(&evidence_path).unwrap().uid();
+        let group = fs::metadata(&evidence_path).unwrap().gid();
+        let mut system = LocalHostSystem {
+            identity: HostIdentity {
+                broker_build_identity: [1; 32],
+                host_profile_digest: [2; 32],
+                suite_identity: [3; 32],
+            },
+            socket: "/nonexistent".into(),
+            executor_uid: owner,
+            executor_gid: group,
+            executor: ProgramProvenance {
+                path: "/nonexistent".into(),
+                sha256: hex::encode([4; 32]),
+                source_commit: "1".repeat(40),
+                uid: owner,
+                gid: 0,
+                mode: 0o755,
+            },
+            seccomp: SeccompRuntimeBinding::fixture(),
+            evidence: SafeDirectory::open(evidence_path.clone(), owner, 0o700).unwrap(),
+            teardown: SafeDirectory::open(teardown_path.clone(), owner, 0o700).unwrap(),
+            evidence_by_binding: BTreeMap::new(),
+            attempts: SafeDirectory::open(attempts_path.clone(), owner, 0o711).unwrap(),
+            job_uid: owner,
+            job_gid: group,
+            static_job: static_job_fixture(no_artifact_fixture()),
+        };
+        let mut binding = valid_record().binding;
+        binding.artifact_count = 1;
+        binding.artifacts = [Some(no_artifact_fixture())];
+        binding.execution_binding_digest = binding.computed_digest();
+        let response = |conclusion: &str| ExecutorResponse {
+            schema_version: 1,
+            operation: "teardown".into(),
+            execution_binding_digest: hex::encode(binding.execution_binding_digest),
+            receipt_digest: hex::encode([7; 32]),
+            conclusion: Some(conclusion.into()),
+            evidence_set_digest: None,
+            teardown_digest: None,
+            raw_stdout: Some(String::new()),
+            raw_stderr: Some(String::new()),
+            exit_code: Some(-1),
+            running: Some(false),
+            capacity_returned: None,
+            quarantine: None,
+        };
+
+        let cancelled = system
+            .persist_teardown(
+                binding,
+                HostStopReason::Cancelled,
+                response("cancelled"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(cancelled.conclusion, Conclusion::Cancelled);
+        assert!(!attempts_path.join(hex::encode(binding.attempt_id)).exists());
+        let items = system.sealed_attempt_evidence(binding).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].descriptor.kind, EvidenceKind::Stdout);
+        assert_eq!(items[0].descriptor.digest, cancelled.evidence_set_digest);
+        assert_eq!(items[1].descriptor.kind, EvidenceKind::Teardown);
+        assert_eq!(items[1].descriptor.digest, cancelled.teardown_digest);
+        assert_eq!(items[1].descriptor.teardown_lease_id, binding.lease_id);
+
+        // A completed attempt that never produced its declared artifact is
+        // still refused: the empty receipt set does not excuse it.
+        let mut completed = binding;
+        completed.attempt_id = [58; 16];
+        completed.execution_binding_digest = completed.computed_digest();
+        system
+            .persist_teardown(
+                completed,
+                HostStopReason::Completed,
+                response("success"),
+                None,
+            )
+            .unwrap();
+        assert!(system.sealed_attempt_evidence(completed).is_err());
     }
 
     #[test]
