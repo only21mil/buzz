@@ -1015,6 +1015,48 @@ impl AdapterTransport for UnixAdapterTransport {
     }
 }
 
+/// Inode facts of an endpoint socket path, read without following links.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SocketInode {
+    pub is_socket: bool,
+    pub uid: u32,
+    pub gid: u32,
+    pub mode: u32,
+}
+
+/// Accept only the inode the socket unit installs: a socket owned by root with
+/// the driver's group and mode `0620`. `/run/buzzci` is root-owned mode `0711`,
+/// so only root can place that inode, and `RemoveOnStop=yes` unlinks it when
+/// the socket unit stops.
+pub const fn socket_inode_accepted(inode: SocketInode, expected_gid: u32) -> bool {
+    inode.is_socket && inode.uid == 0 && inode.gid == expected_gid && inode.mode == 0o620
+}
+
+/// Credentials the kernel reports to the connecting side. `SO_PEERCRED` names
+/// the process that called `listen()`, so a connection through a systemd
+/// socket unit reports pid 1 root even though the service that accepts it runs
+/// as its own account.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ListenerPeer {
+    pub pid: i32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+/// Accept exactly two listeners: the endpoint service itself, when it bound
+/// the socket, or pid 1 as root, when the socket unit bound it. Every other
+/// root process, an unmappable pid, and every other identity are rejected.
+/// Combined with [`socket_inode_accepted`] on the fixed path this excludes
+/// every unprivileged impersonator; root can already replace the service.
+pub const fn listener_peer_accepted(
+    peer: ListenerPeer,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> bool {
+    (peer.uid == expected_uid && peer.gid == expected_gid)
+        || (peer.pid == 1 && peer.uid == 0 && peer.gid == 0)
+}
+
 #[cfg(target_os = "linux")]
 fn exchange_unix(
     path: &Path,
@@ -1024,20 +1066,37 @@ fn exchange_unix(
     request: &[u8],
     timeout: Duration,
 ) -> Result<Vec<u8>, DriverError> {
-    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
-    use std::os::unix::fs::FileTypeExt;
-
     let metadata = fs::symlink_metadata(path).map_err(|_| DriverError::Transport)?;
-    if !metadata.file_type().is_socket()
-        || metadata.uid() != 0
-        || metadata.gid() != expected_socket_gid
-        || metadata.permissions().mode() & 0o7777 != 0o620
-    {
+    let inode = SocketInode {
+        is_socket: metadata.file_type().is_socket(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode: metadata.permissions().mode() & 0o7777,
+    };
+    if !socket_inode_accepted(inode, expected_socket_gid) {
         return Err(DriverError::WrongPeer);
     }
-    let mut stream = UnixStream::connect(path).map_err(|_| DriverError::Transport)?;
+    let stream = UnixStream::connect(path).map_err(|_| DriverError::Transport)?;
+    exchange_connected(stream, expected_uid, expected_gid, request, timeout)
+}
+
+#[cfg(target_os = "linux")]
+fn exchange_connected(
+    mut stream: UnixStream,
+    expected_uid: u32,
+    expected_gid: u32,
+    request: &[u8],
+    timeout: Duration,
+) -> Result<Vec<u8>, DriverError> {
+    use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+
     let peer = getsockopt(&stream, PeerCredentials).map_err(|_| DriverError::WrongPeer)?;
-    if peer.uid() != expected_uid || peer.gid() != expected_gid {
+    let peer = ListenerPeer {
+        pid: peer.pid(),
+        uid: peer.uid(),
+        gid: peer.gid(),
+    };
+    if !listener_peer_accepted(peer, expected_uid, expected_gid) {
         return Err(DriverError::WrongPeer);
     }
     stream
@@ -4207,5 +4266,223 @@ mod tests {
         );
         assert_eq!(result, Err(ControlError::HostAction));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod endpoint_identity_tests {
+    use std::{
+        io::{ErrorKind, Read, Write},
+        os::unix::{fs::PermissionsExt, net::UnixListener},
+        thread,
+    };
+
+    use super::*;
+
+    const SERVICE_UID: u32 = 1002;
+    const SERVICE_GID: u32 = 1002;
+    const SYSTEMD: ListenerPeer = ListenerPeer {
+        pid: 1,
+        uid: 0,
+        gid: 0,
+    };
+
+    fn own_ids() -> (u32, u32) {
+        (
+            nix::unistd::geteuid().as_raw(),
+            nix::unistd::getegid().as_raw(),
+        )
+    }
+
+    #[test]
+    fn listener_peer_accepts_the_endpoint_service_or_the_systemd_socket_unit() {
+        let service = ListenerPeer {
+            pid: 4242,
+            uid: SERVICE_UID,
+            gid: SERVICE_GID,
+        };
+        assert!(listener_peer_accepted(service, SERVICE_UID, SERVICE_GID));
+        assert!(listener_peer_accepted(SYSTEMD, SERVICE_UID, SERVICE_GID));
+        assert!(listener_peer_accepted(SYSTEMD, 0, 0));
+    }
+
+    #[test]
+    fn listener_peer_rejects_every_other_shape() {
+        let rejected = [
+            ListenerPeer {
+                pid: 4242,
+                uid: 0,
+                gid: 0,
+            },
+            ListenerPeer {
+                pid: 0,
+                uid: 0,
+                gid: 0,
+            },
+            ListenerPeer {
+                pid: -1,
+                uid: 0,
+                gid: 0,
+            },
+            ListenerPeer {
+                pid: 1,
+                uid: 0,
+                gid: SERVICE_GID,
+            },
+            ListenerPeer {
+                pid: 1,
+                uid: SERVICE_UID,
+                gid: 0,
+            },
+            ListenerPeer {
+                pid: 4242,
+                uid: SERVICE_UID,
+                gid: 0,
+            },
+            ListenerPeer {
+                pid: 4242,
+                uid: 0,
+                gid: SERVICE_GID,
+            },
+            ListenerPeer {
+                pid: 4242,
+                uid: SERVICE_UID + 1,
+                gid: SERVICE_GID,
+            },
+            ListenerPeer {
+                pid: 4242,
+                uid: SERVICE_UID,
+                gid: SERVICE_GID + 1,
+            },
+        ];
+        for peer in rejected {
+            assert!(
+                !listener_peer_accepted(peer, SERVICE_UID, SERVICE_GID),
+                "{peer:?}"
+            );
+        }
+        let root_not_init = ListenerPeer {
+            pid: 4242,
+            uid: 0,
+            gid: 0,
+        };
+        assert!(listener_peer_accepted(root_not_init, 0, 0));
+        assert!(!listener_peer_accepted(
+            ListenerPeer {
+                pid: 1,
+                uid: 0,
+                gid: 1
+            },
+            0,
+            0
+        ));
+    }
+
+    #[test]
+    fn socket_inode_requires_a_root_owned_group_0620_socket() {
+        let installed = SocketInode {
+            is_socket: true,
+            uid: 0,
+            gid: SERVICE_GID,
+            mode: 0o620,
+        };
+        assert!(socket_inode_accepted(installed, SERVICE_GID));
+        let rejected = [
+            SocketInode {
+                is_socket: false,
+                ..installed
+            },
+            SocketInode {
+                uid: SERVICE_UID,
+                ..installed
+            },
+            SocketInode {
+                gid: 0,
+                ..installed
+            },
+            SocketInode {
+                gid: SERVICE_GID + 1,
+                ..installed
+            },
+            SocketInode {
+                mode: 0o660,
+                ..installed
+            },
+            SocketInode {
+                mode: 0o600,
+                ..installed
+            },
+            SocketInode {
+                mode: 0o1620,
+                ..installed
+            },
+        ];
+        for inode in rejected {
+            assert!(!socket_inode_accepted(inode, SERVICE_GID), "{inode:?}");
+        }
+    }
+
+    #[test]
+    fn exchange_connected_accepts_the_listener_credentials_and_rejects_foreign_ones() {
+        let (uid, gid) = own_ids();
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let echo = thread::spawn(move || {
+            let mut request = Vec::new();
+            server.read_to_end(&mut request).unwrap();
+            server.write_all(b"reply:").unwrap();
+            server.write_all(&request).unwrap();
+        });
+        let response = exchange_connected(client, uid, gid, b"ping", Duration::from_secs(2));
+        echo.join().unwrap();
+        assert_eq!(response, Ok(b"reply:ping".to_vec()));
+
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let observed = thread::spawn(move || {
+            let mut request = Vec::new();
+            server.read_to_end(&mut request).unwrap();
+            request
+        });
+        let response = exchange_connected(
+            client,
+            uid.checked_add(1).unwrap(),
+            gid,
+            b"ping",
+            Duration::from_secs(2),
+        );
+        assert_eq!(response, Err(DriverError::WrongPeer));
+        assert!(
+            observed.join().unwrap().is_empty(),
+            "no bytes before peer check"
+        );
+    }
+
+    #[test]
+    fn exchange_unix_rejects_an_unprivileged_socket_before_connecting() {
+        let (uid, gid) = own_ids();
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let path = root.path().join("endpoint.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o620)).unwrap();
+        let response = exchange_unix(&path, gid, uid, gid, b"ping", Duration::from_secs(2));
+        assert_eq!(response, Err(DriverError::WrongPeer));
+        assert_eq!(
+            listener.accept().map(|_| ()).unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            exchange_unix(
+                &root.path().join("absent.sock"),
+                gid,
+                uid,
+                gid,
+                b"ping",
+                Duration::from_secs(2)
+            ),
+            Err(DriverError::Transport)
+        );
     }
 }
