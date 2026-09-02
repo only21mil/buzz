@@ -1583,6 +1583,16 @@ fn retained_staged_invocations<R: CapacityOneRuntime>(
     Ok(retained)
 }
 
+/// Healthy sub-states of an `Accept=no` socket unit at capacity one.
+///
+/// systemd reports `listening` while only the socket is up and `running` once
+/// the service it triggers is active (the H6 clean host: `buzz-ci-execd.socket
+/// ... ActiveState=active SubState=running`). Both mean the listener is bound
+/// and serviceable. `failed`, `dead`, and every other value stay rejected.
+fn accept_no_socket_is_healthy(sub_state: &str) -> bool {
+    matches!(sub_state, "listening" | "running")
+}
+
 fn activate_capacity_one<R: CapacityOneRuntime>(
     config: &AcceptanceControlConfig,
     request: &ControlRequest,
@@ -1729,7 +1739,7 @@ fn activate_capacity_one<R: CapacityOneRuntime>(
         }
     }
     for unit in [EXECD_SOCKET, EXECUTOR_SOCKET] {
-        if runtime.sub_state(unit, timeout)? != "listening" {
+        if !accept_no_socket_is_healthy(&runtime.sub_state(unit, timeout)?) {
             return Err(ControlError::ReadbackMismatch);
         }
     }
@@ -3816,6 +3826,9 @@ mod tests {
             let output = run_bounded_controller_command(command, input, timeout)?;
             let mut state: serde_json::Value =
                 serde_json::from_slice(&fs::read(&self.state).unwrap()).unwrap();
+            // The fake controller models the live transition for the units it
+            // knows; the executor pair is layered here with the same shape: an
+            // `Accept=no` socket reports `running` once its service is up.
             for unit in [
                 EXECD_SERVICE,
                 EXECD_SOCKET,
@@ -3824,9 +3837,8 @@ mod tests {
             ] {
                 state["units"][unit]["state"] = "active".into();
                 state["units"][unit]["load_state"] = "loaded".into();
+                state["units"][unit]["sub_state"] = "running".into();
             }
-            state["units"][EXECD_SOCKET]["sub_state"] = "listening".into();
-            state["units"][EXECUTOR_SOCKET]["sub_state"] = "listening".into();
             state["units"][EXECD_SERVICE]["invocation_id"] = hex('4', 32).into();
             state["units"][EXECD_SERVICE]["main_pid"] = 404.into();
             state["units"][EXECUTOR_SERVICE]["invocation_id"] = hex('6', 32).into();
@@ -3875,6 +3887,15 @@ mod tests {
                 }
                 "unloaded_execd_socket" => {
                     state["units"][EXECD_SOCKET]["load_state"] = "not-found".into();
+                }
+                "listening_execd_socket" => {
+                    state["units"][EXECD_SOCKET]["sub_state"] = "listening".into();
+                }
+                "dead_execd_socket" => {
+                    state["units"][EXECD_SOCKET]["sub_state"] = "dead".into();
+                }
+                "failed_executor_socket" => {
+                    state["units"][EXECUTOR_SOCKET]["sub_state"] = "failed".into();
                 }
                 _ => {}
             }
@@ -4189,14 +4210,14 @@ mod tests {
         assert_eq!(runtime.controller_calls, 1);
         let state = runtime.state();
         assert_eq!(state["units"][EXECD_SERVICE]["load_state"], "loaded");
-        assert_eq!(state["units"][EXECD_SOCKET]["sub_state"], "listening");
+        assert_eq!(state["units"][EXECD_SOCKET]["sub_state"], "running");
         assert_eq!(state["units"][EXECUTOR_SERVICE]["load_state"], "loaded");
         assert_eq!(state["units"][EXECUTOR_SERVICE]["main_pid"], 606);
         assert_eq!(
             state["units"][EXECUTOR_SERVICE]["fragment_path"],
             "/usr/lib/systemd/system/buzz-ci-executor.service"
         );
-        assert_eq!(state["units"][EXECUTOR_SOCKET]["sub_state"], "listening");
+        assert_eq!(state["units"][EXECUTOR_SOCKET]["sub_state"], "running");
         assert_eq!(state["executor_socket"]["uid"], 0);
         assert_eq!(state["executor_socket"]["gid"], 0);
         assert_eq!(state["executor_socket"]["mode"], 0o600);
@@ -4373,6 +4394,57 @@ mod tests {
                 run_capacity_one_fixture(mode).err().unwrap(),
                 expected,
                 "mode {mode} must fail closed"
+            );
+        }
+    }
+
+    /// H6 clean host, canary stage 2: the controller returned `active_one`
+    /// and `buzz-ci-execd.socket` read back `ActiveState=active
+    /// SubState=running` (an `Accept=no` socket whose service is up), which
+    /// the helper rejected as a readback mismatch. Both fakes now model that
+    /// transition, so the default success path exercises `running`;
+    /// `listening` (socket up before its service) stays accepted and
+    /// `dead` or `failed` stay rejected.
+    #[test]
+    fn accept_no_socket_running_with_its_service_is_a_healthy_capacity_one_readback() {
+        let (transition, runtime) = run_capacity_one_fixture("success").unwrap();
+        let state = runtime.state();
+        assert_eq!(state["units"][EXECD_SOCKET]["sub_state"], "running");
+        assert_eq!(state["units"][EXECD_SERVICE]["sub_state"], "running");
+        assert_eq!(state["units"][EXECUTOR_SOCKET]["sub_state"], "running");
+        assert_eq!(
+            state["units"]["buzz-ci-runner.socket"]["sub_state"],
+            "running"
+        );
+        assert_eq!(transition.result.readback.capacity, 1);
+
+        let (transition, runtime) = run_capacity_one_fixture("listening_execd_socket").unwrap();
+        assert_eq!(
+            runtime.state()["units"][EXECD_SOCKET]["sub_state"],
+            "listening"
+        );
+        assert_eq!(transition.result.readback.capacity, 1);
+
+        for mode in ["dead_execd_socket", "failed_executor_socket"] {
+            assert_eq!(
+                run_capacity_one_fixture(mode).err().unwrap(),
+                ControlError::ReadbackMismatch,
+                "mode {mode} must fail closed"
+            );
+        }
+        for (sub_state, healthy) in [
+            ("listening", true),
+            ("running", true),
+            ("dead", false),
+            ("failed", false),
+            ("inactive", false),
+            ("", false),
+            ("Listening", false),
+        ] {
+            assert_eq!(
+                accept_no_socket_is_healthy(sub_state),
+                healthy,
+                "{sub_state:?}"
             );
         }
     }
