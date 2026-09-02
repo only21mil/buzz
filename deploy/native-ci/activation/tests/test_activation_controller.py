@@ -1575,7 +1575,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "dd1e4cebdc7f48c9bc91f324ae3901487d55b7750f96164e5409e264d5d93ad9",
+            "9fe3ed9a6b243560611c494aa40db11df15936d5786c6aba37d4fcec17f1f553",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -4072,7 +4072,7 @@ class ActivationControllerTests(unittest.TestCase):
             activation_package.execution_declaration_digest(
                 "aa" * 20, "70" * 32, frozen_lane_manifest, config["execution"],
             ),
-            "e941bf7b2a6152a5633f14f8c632fb8ce048c1d6eee008f2dc0d6f8dda90efe4",
+            "a699a308fae53c2109af532c06ed6a345e1ad76323c0817a1ef8e8d015b0be55",
         )
 
     def test_lane_manifest_admission_key_must_be_the_keyholder_manifest_selector(self) -> None:
