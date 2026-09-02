@@ -191,4 +191,61 @@ root_sha=$(git -C "$initial" rev-parse HEAD)
 grep -Fq "$root_sha" "$initial/CHANGELOG.md"
 rm -rf "$initial"
 
+# Push-to-main verification. The reviewed candidate lives on a side branch;
+# main receives its squash. Unchanged commits must compare byte-equal to
+# their parent, and a changed identity must resolve to one validated release
+# pull request.
+candidate=$(git -C "$tmp" rev-parse HEAD)
+git -C "$tmp" reset -q --hard "$base"
+git -C "$tmp" merge -q --squash "$candidate" >/dev/null
+git -C "$tmp" commit -qm 'chore(release): release Buzz Desktop version 1.0.1 (#7)'
+squash=$(git -C "$tmp" rev-parse HEAD)
+echo unrelated >> "$tmp/ROOT.md"
+git -C "$tmp" commit -qam 'docs: unrelated change after release'
+after=$(git -C "$tmp" rev-parse HEAD)
+cat > "$mock_bin/gh" <<GH
+#!/usr/bin/env bash
+[[ "\$1" == api ]] || exit 90
+case "\$2" in
+  "repos/block/buzz/commits/$prior_candidate/pulls")
+    printf '%s\n' '[{"merged_at":"2026-01-01T00:00:00Z","merge_commit_sha":"$prior_merge","head":{"sha":"$prior_candidate"}}]' ;;
+  "repos/block/buzz/commits/$squash/pulls")
+    printf '%s\n' '[{"number":7,"merged_at":"2026-02-01T00:00:00Z","merge_commit_sha":"$squash","head":{"sha":"$candidate","ref":"version-bump/1.0.1","repo":{"full_name":"block/buzz"}}}]' ;;
+  *) exit 90 ;;
+esac
+GH
+chmod +x "$mock_bin/gh"
+(cd "$tmp" && PATH="$mock_bin:$PATH" scripts/desktop_release.py verify-main --commit "$squash" --repo block/buzz) \
+  | grep -Fq "desktop candidate released on main: $squash carries validated immutable candidate $candidate for desktop-v1.0.1 (pull request #7)"
+(cd "$tmp" && PATH="$mock_bin:$PATH" scripts/desktop_release.py verify-main --commit "$after" --repo block/buzz) \
+  | grep -Fq "desktop candidate unchanged on main: $after matches parent $squash for desktop-v1.0.1"
+missing=$( (cd "$tmp" && PATH="$mock_bin:$PATH" scripts/desktop_release.py verify-main --commit "$base" --repo block/buzz) 2>&1 || true)
+grep -Fq "$base has no .release/desktop-candidate.json" <<<"$missing" || {
+  echo "verify-main accepted a main commit without candidate metadata" >&2; exit 1
+}
+[[ "$(git -C "$tmp" worktree list | wc -l)" -eq 1 ]] || {
+  echo "verify-main left a temporary worktree behind" >&2; exit 1
+}
+
+# A squash whose candidate files drift from the reviewed head is refused.
+git -C "$tmp" reset -q --hard "$base"
+git -C "$tmp" merge -q --squash "$candidate" >/dev/null
+echo tampered >> "$tmp/CHANGELOG.md"
+git -C "$tmp" commit -qam 'chore(release): release Buzz Desktop version 1.0.1 (#7)'
+drift=$(git -C "$tmp" rev-parse HEAD)
+sed -i "s/$squash/$drift/g" "$mock_bin/gh"
+if (cd "$tmp" && PATH="$mock_bin:$PATH" scripts/desktop_release.py verify-main --commit "$drift" --repo block/buzz) >/dev/null 2>&1; then
+  echo "verify-main accepted a main commit that drifted from the reviewed candidate" >&2; exit 1
+fi
+
+# A candidate identity change merged from a non-release branch is refused.
+sed -i 's#"ref":"version-bump/1.0.1"#"ref":"feature/hand-edited-release"#' "$mock_bin/gh"
+git -C "$tmp" reset -q --hard "$base"
+git -C "$tmp" merge -q --squash "$candidate" >/dev/null
+git -C "$tmp" commit -qm 'chore(release): release Buzz Desktop version 1.0.1 (#7)'
+sed -i "s/$drift/$(git -C "$tmp" rev-parse HEAD)/g" "$mock_bin/gh"
+if (cd "$tmp" && PATH="$mock_bin:$PATH" scripts/desktop_release.py verify-main --commit HEAD --repo block/buzz) >/dev/null 2>&1; then
+  echo "verify-main accepted a candidate identity change outside a version-bump/ pull request" >&2; exit 1
+fi
+
 echo "desktop release candidate contract passed"
