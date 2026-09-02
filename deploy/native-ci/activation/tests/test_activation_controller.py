@@ -1575,7 +1575,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "b2a919489f5d6e6f35876f6eea7b5934f2547a269056d992b040e7c57ace7cdb",
+            "dd1e4cebdc7f48c9bc91f324ae3901487d55b7750f96164e5409e264d5d93ad9",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -4110,6 +4110,37 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, _driver = self.fixture.load()
         CONTROLLER._validate_phase_configs(manifest, payloads)
 
+    def test_every_frozen_request_is_admissible_at_the_package_time_reference(self) -> None:
+        """H9 clean host, canary stage 8 (rerun_separation): the runner refused the
+        frozen rerun with "issued after the package time reference: issued_at
+        reference + 10 > time_reference". The runner and execd judge every request
+        window as issued_at <= reference < expires_at, so the template issues the
+        run and the rerun at the reference and the validator holds both there."""
+        manifest, _payloads, _driver = self.fixture.load()
+        template = manifest["acceptance_template"]
+        reference = template["time_reference"]
+        for name in ("run_event", "rerun_event"):
+            event = template[name]
+            envelope = json.loads(event[5])
+            self.assertEqual(event[2], reference, name)
+            self.assertLessEqual(envelope["issued_at"], reference, name)
+            self.assertLess(reference, envelope["expires_at"], name)
+        rerun = json.loads(template["rerun_event"][5])
+        self.assertEqual((rerun["request_type"], rerun["attempt"], rerun["parent_attempt"]), ("rerun", 2, 1))
+        self.assertEqual(rerun["expires_at"], reference + 310)
+        for shift in (1, 10):
+            drifted = copy.deepcopy(template)
+            envelope = json.loads(drifted["rerun_event"][5])
+            envelope["issued_at"] = reference + shift
+            drifted["rerun_event"][2] = reference + shift
+            drifted["rerun_event"][5] = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+            with self.assertRaisesRegex(ValueError, "rerun template is not issued at the time reference"):
+                activation_package.validate_acceptance_template(drifted)
+        drifted = copy.deepcopy(template)
+        drifted["rerun_event"][5] = "{"
+        with self.assertRaisesRegex(ValueError, "rerun template envelope is invalid"):
+            activation_package.validate_acceptance_template(drifted)
+
     def test_runner_time_reference_must_be_the_frozen_acceptance_template_reference(self) -> None:
         """H7 clean host, canary stage 5: the fixture hard-coded issued_at
         1800000000 (2027-01-15T08:00:00Z) with a 300 s window while the runner
@@ -4162,7 +4193,8 @@ class ActivationControllerTests(unittest.TestCase):
         )
         self.assertEqual(rebuilt["time_reference"], reference + 7)
         self.assertEqual(json.loads(rebuilt["run_event"][5])["issued_at"], reference + 7)
-        self.assertEqual(json.loads(rebuilt["rerun_event"][5])["issued_at"], reference + 17)
+        self.assertEqual(json.loads(rebuilt["rerun_event"][5])["issued_at"], reference + 7)
+        self.assertEqual(rebuilt["rerun_event"][2], reference + 7)
         self.assertNotEqual(rebuilt["run_event"], template["run_event"])
         # H8 clean host, diagnostic boots 3 and 4: execd judged the same window
         # by wall clock. Its config now carries the reference as well, bound to

@@ -871,7 +871,11 @@ def production_acceptance_template(
             "actor": actor,
             "timeout_seconds": 120,
             "idempotency_key": idempotency_key,
-            "issued_at": issued_at if attempt == 1 else issued_at + 10,
+            # Every request is issued at the reference: the runner and execd
+            # judge issued_at <= reference < expires_at for the run and the
+            # rerun alike (H9 clean host: a rerun issued at reference + 10 was
+            # refused as issued after the package time reference).
+            "issued_at": issued_at,
             "expires_at": issued_at + (300 if attempt == 1 else 310),
         })
         return value
@@ -1028,6 +1032,20 @@ def validate_acceptance_template(value: object) -> dict[str, Any]:
         or run["expires_at"] <= time_reference
     ):
         raise ValueError("public acceptance run template is not issued at the time reference")
+    rerun_event = value["rerun_event"]
+    try:
+        rerun = json.loads(rerun_event[5], object_pairs_hook=reject_duplicates)
+    except (TypeError, ValueError) as error:
+        raise ValueError("public acceptance rerun template envelope is invalid") from error
+    if (
+        rerun_event[2] != time_reference
+        or not isinstance(rerun, dict)
+        or rerun.get("issued_at") != time_reference
+        or isinstance(rerun.get("expires_at"), bool)
+        or not isinstance(rerun.get("expires_at"), int)
+        or rerun["expires_at"] <= time_reference
+    ):
+        raise ValueError("public acceptance rerun template is not issued at the time reference")
     return value
 
 
