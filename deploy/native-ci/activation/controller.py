@@ -2201,7 +2201,50 @@ class FakeSystemd:
                 }
         self._write(state)
 
+    def _pulled_in(self, name: str) -> list[str]:
+        """Managed units systemd starts with this one: Requires=, BindsTo=, Wants=.
+
+        Read from the installed fragment and drop-ins under the fake root, so the
+        fake follows the packaged unit files rather than a second dependency list.
+        """
+        unit = self._read()["units"].get(name)
+        if not isinstance(unit, dict) or unit.get("LoadState") != "loaded":
+            return []
+        managed = set(
+            activation_package.START_ORDER + activation_package.STOP_ORDER + [activation_package.PERSISTENT_UNIT],
+        )
+        dependencies: list[str] = []
+        for path in (unit.get("FragmentPath", ""), *unit.get("DropInPaths", [])):
+            if not isinstance(path, str) or not path:
+                continue
+            unit_file = activation_package.rooted(self.root, path)
+            if not unit_file.is_file():
+                continue
+            section = ""
+            for raw in unit_file.read_text("utf-8").splitlines():
+                line = raw.strip()
+                if line.startswith("[") and line.endswith("]"):
+                    section = line[1:-1]
+                    continue
+                key, separator, value = line.partition("=")
+                if section != "Unit" or not separator or key.strip() not in {"Requires", "BindsTo", "Wants"}:
+                    continue
+                for dependency in value.split():
+                    if dependency in managed and dependency not in dependencies:
+                        dependencies.append(dependency)
+        return dependencies
+
     def start(self, name: str) -> None:
+        self._start_with_dependencies(name, set())
+
+    def _start_with_dependencies(self, name: str, seen: set[str]) -> None:
+        seen.add(name)
+        for dependency in self._pulled_in(name):
+            if dependency not in seen and self.unit(dependency)["ActiveState"] != "active":
+                self._start_with_dependencies(dependency, seen)
+        self._start_unit(name)
+
+    def _start_unit(self, name: str) -> None:
         state = self._read()
         unit = state["units"].setdefault(name, {})
         was_active = unit.get("ActiveState") == "active"
@@ -2954,6 +2997,24 @@ def _stop_to_zero(driver: LiveSystemd | FakeSystemd) -> None:
     errors = _stop_zero_errors(driver)
     if errors:
         raise ValueError("capacity-zero stop failures: " + "; ".join(errors))
+
+
+def _qualification_stop_order() -> list[str]:
+    """Every capacity-one unit that staged zero keeps inactive, in STOP_ORDER.
+
+    The closed qualification starts buzz-ci-execd.socket and buzz-ci-execd.service.
+    systemd also starts every unit those two Require, today buzz-ci-executor.socket.
+    Stopping the whole non-staged part of STOP_ORDER, services before their sockets,
+    covers each pulled-in unit without naming unit dependencies here, and it is the
+    exact set _staged_zero_readback requires inactive.
+    """
+    staged = set(activation_package.STAGED_ZERO_UNITS)
+    return [unit for unit in activation_package.STOP_ORDER if unit not in staged]
+
+
+def _stop_qualification_units(driver: LiveSystemd | FakeSystemd) -> None:
+    for unit in _qualification_stop_order():
+        driver.stop(unit)
 
 
 def _restore_systemd_prior_errors(
@@ -4837,8 +4898,7 @@ def _activate_unlocked(
         driver.start("buzz-ci-execd.socket")
         driver.start("buzz-ci-execd.service")
         qualification = _run_qualification(manifest, root, receipt)
-        driver.stop("buzz-ci-execd.service")
-        driver.stop("buzz-ci-execd.socket")
+        _stop_qualification_units(driver)
         staged_zero = _staged_zero_readback(manifest, root, driver)
         _verify_phase(manifest, root, "staged")
         _verify_generated(root, receipt["acceptance_generated"], phase="staged")

@@ -1575,7 +1575,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "fcb3ce8aff3a018d304a4ebf21eca41a8bb404a4e3062ba188516da6912ecaac",
+            "6d79e3a77303c59fc4e5e1fda73bcc662ecb8aab218ebc2c8ffd77fbb7adc96f",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -2925,6 +2925,82 @@ class ActivationControllerTests(unittest.TestCase):
             "inactive",
         )
         CONTROLLER._verify_phase(manifest, self.fixture.root, "staged")
+
+    def test_fake_systemd_starts_units_required_by_packaged_unit_files(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        explicit: list[str] = []
+        original_start = driver.start
+
+        def record_start(name: str) -> None:
+            explicit.append(name)
+            original_start(name)
+
+        driver.start = record_start
+        for unit in ("buzz-ci-execd.socket", "buzz-ci-executor.socket"):
+            self.assertEqual(driver.unit(unit)["ActiveState"], "inactive")
+        driver.start("buzz-ci-execd.service")
+        self.assertEqual(explicit, ["buzz-ci-execd.service"])
+        for unit in ("buzz-ci-execd.service", "buzz-ci-execd.socket", "buzz-ci-executor.socket"):
+            self.assertEqual(driver.unit(unit)["ActiveState"], "active", unit)
+        self.assertEqual(driver.unit("buzz-ci-executor.service")["ActiveState"], "inactive")
+        self.assertEqual(
+            driver.socket(manifest["socket_policy"]["executor"]),
+            {"path": "/run/buzzci/executor.sock", "mode": "0600", "uid": 0, "gid": 0},
+        )
+        self.assertEqual(
+            driver._pulled_in("buzz-ci-execd.service"),
+            ["buzz-ci-execd.socket", "buzz-ci-executor.socket"],
+        )
+        self.assertEqual(driver._pulled_in("buzz-ci-executor.socket"), [])
+
+    def test_stopping_only_the_execd_units_after_qualification_leaves_the_required_executor_socket_active(self) -> None:
+        # The stop sequence the controller used before this fix, replayed against the
+        # fake that models Requires=, reproduces the recorded clean-host failure.
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        driver.start("buzz-ci-execd.socket")
+        driver.start("buzz-ci-execd.service")
+        driver.stop("buzz-ci-execd.service")
+        driver.stop("buzz-ci-execd.socket")
+        with self.assertRaisesRegex(
+            ValueError,
+            r"^staged-zero readback found unit buzz-ci-executor\.socket active, expected inactive$",
+        ):
+            CONTROLLER._staged_zero_readback(manifest, self.fixture.root, driver)
+        CONTROLLER._stop_qualification_units(driver)
+        CONTROLLER._staged_zero_readback(manifest, self.fixture.root, driver)
+
+    def test_activate_stops_every_unit_the_closed_qualification_started(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        stops: list[str] = []
+        original_stop = driver.stop
+
+        def record_stop(name: str) -> None:
+            stops.append(name)
+            original_stop(name)
+
+        driver.stop = record_stop
+        qualified = CONTROLLER.activate(manifest, payloads, self.fixture.root, driver)
+        driver.stop = original_stop
+        self.assertEqual((qualified["state"], qualified["capacity"]), ("qualified_closed", 0))
+        expected = [
+            unit for unit in activation_package.STOP_ORDER
+            if unit not in activation_package.STAGED_ZERO_UNITS
+        ]
+        self.assertEqual(stops, expected)
+        self.assertIn("buzz-ci-executor.socket", stops)
+        for unit in expected:
+            if unit.endswith(".service"):
+                socket = unit[: -len(".service")] + ".socket"
+                self.assertLess(stops.index(unit), stops.index(socket), unit)
+        readback = qualified["staged_zero"]["units"]
+        for unit in expected:
+            self.assertEqual(readback[unit]["ActiveState"], "inactive", unit)
+        for unit in activation_package.STAGED_ZERO_UNITS:
+            self.assertEqual(readback[unit]["ActiveState"], "active", unit)
+        self.assertEqual(CONTROLLER._read_receipt(self.fixture.root)["state"], "qualified_closed")
 
     def test_rollback_refuses_drift_before_systemd_mutation(self) -> None:
         manifest, payloads, driver = self.fixture.load()

@@ -143,10 +143,12 @@ remains a hard failure.
    last transport error, returns to proven capacity zero, and permits only
    rollback. Restaging must change the package, fixture, controller generation,
    or runner generation before the controller creates a new request identity.
-4. A passing qualification stops the temporary execd service and records
-   `qualified_closed` only after the staged configs, capacity-zero units, and
-   closed admission are read back. Capacity remains zero until the root helper
-   invokes the separate fixed `set-capacity-one` action.
+4. A passing qualification stops every capacity-one unit in stop order,
+   services before sockets. That covers the temporary execd service and socket
+   and the executor socket systemd started for them through `Requires=`. It
+   records `qualified_closed` only after the staged configs, capacity-zero
+   units, and closed admission are read back. Capacity remains zero until the
+   root helper invokes the separate fixed `set-capacity-one` action.
 5. `set-capacity-one` verifies the immutable package, private receipt, shared
    acceptance binding, passed qualification, exact principal, candidate,
    scenario, and initial generation bindings. It stops the staged controld
