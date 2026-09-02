@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{mpsc::Receiver, mpsc::Sender, Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use buzz_ci_broker_protocol::v2::{
     self, AttemptEvidenceCoordinates, DescribeAttemptEvidenceRequest, EvidenceDescriptor,
@@ -21,8 +21,8 @@ use crate::production::{
     JobCompletion, JobMetadata, OutputDescriptor,
 };
 use crate::runner_v2::{
-    prepare_signed_admission, AdmissionSigner, BoundAttempt, RunnerV2Client, RunnerV2Error,
-    RunnerV2Transport, StaticAdmissionBindings, TerminalAttempt,
+    live_bound_now, prepare_signed_admission, AdmissionSigner, BoundAttempt, RunnerV2Client,
+    RunnerV2Error, RunnerV2Transport, StaticAdmissionBindings, TerminalAttempt,
 };
 
 const MAX_EVIDENCE_ITEM_BYTES: u32 = 16 * 1024 * 1024;
@@ -359,15 +359,14 @@ impl<T, S> RunnerV2AttemptExecutor<T, S> {
     }
 
     /// Hold the admitted attempt until the acceptance gate releases it or
-    /// its deadline (admission time plus the bounded window) passes.
+    /// its deadline (admission time plus the bounded window) passes. The
+    /// deadline is a live bound on the host clock (`live_bound_now`), never
+    /// the package-bound window.
     fn await_command(&self, deadline_at: u64) -> Result<(), ProductionV2Error> {
         let Some(receiver) = &self.control.command else {
             return Ok(());
         };
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| ProductionV2Error::Runner)?
-            .as_secs();
+        let now = live_bound_now().map_err(|_| ProductionV2Error::Runner)?;
         let timeout = deadline_at
             .checked_sub(now)
             .filter(|value| *value > 0)

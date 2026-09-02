@@ -459,7 +459,7 @@ where
                     response,
                 });
             }
-            let now = unix_time()?;
+            let now = live_bound_now()?;
             if now >= deadline_at {
                 return Err(RunnerV2Error::Deadline);
             }
@@ -678,7 +678,14 @@ fn decode_array<const N: usize>(value: &str) -> Result<[u8; N], RunnerV2Error> {
         .map_err(|_| RunnerV2Error::InvalidRequest)
 }
 
-fn unix_time() -> Result<u64, RunnerV2Error> {
+/// The host clock, used only to bound a live operation: the attempt wait,
+/// the acceptance command hold, and cancel eligibility all compare it with
+/// [`BoundAttempt::deadline_at`], which execd anchored at admission on this
+/// same host clock. It never judges a package-bound window; those are judged
+/// by the runner and execd against `acceptance_time_reference`. See
+/// deploy/native-ci/README.md, "Clock model". This is the only wall-clock
+/// read in controld's attempt path (pinned by a test).
+pub fn live_bound_now() -> Result<u64, RunnerV2Error> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -1024,7 +1031,7 @@ mod tests {
         admission.issued_at = 1_700_000_000;
         admission.expires_at = 1_700_000_300;
         admission.wall_timeout_seconds = 120;
-        let now = unix_time().unwrap();
+        let now = live_bound_now().unwrap();
         let leased = |accepted_at: u64| BoundAttempt {
             admission,
             response: v2::BrokerResponse {
@@ -1165,5 +1172,25 @@ mod tests {
             })],
         };
         assert_eq!(admission.job_intent_digest, intent.digest());
+    }
+
+    /// Sol focus read of head Q, findings 3 to 5: the attempt wait, the
+    /// acceptance command hold, and cancel eligibility read the host clock.
+    /// They bound live operations against a deadline anchored at admission
+    /// on the same host; the package-bound windows are judged elsewhere
+    /// against the time reference. This pins the rule so a reviewer can
+    /// verify it by grep: `live_bound_now` is the only wall-clock read in
+    /// controld's attempt path, and the two callers name it.
+    #[test]
+    fn live_bound_now_is_the_only_wall_clock_in_the_attempt_path() {
+        let needle = concat!("SystemTime", "::now()");
+        assert_eq!(include_str!("runner_v2.rs").matches(needle).count(), 1);
+        for (name, source) in [
+            ("production_v2.rs", include_str!("production_v2.rs")),
+            ("service.rs", include_str!("service.rs")),
+        ] {
+            assert_eq!(source.matches(needle).count(), 0, "{name}");
+            assert!(source.contains("live_bound_now()"), "{name}");
+        }
     }
 }

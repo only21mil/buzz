@@ -211,6 +211,21 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def live_unix_now() -> int:
+    """The host clock for live bounds only.
+
+    The qualification request is minted here at activation with a fresh
+    request ID and nonce and a 60-second delivery validity; execd judges that
+    same request with its own host clock. It is not package material. The
+    package-bound windows (the frozen Run/Grant/Rerun/Tombstone templates) are
+    never judged here; the runner and execd judge them against
+    ``acceptance_time_reference``. See deploy/native-ci/README.md, "Clock
+    model". This is the controller's only wall-clock read (pinned by a
+    test).
+    """
+    return int(time.time())
+
+
 def _metadata_dict(metadata: os.stat_result) -> dict[str, int]:
     return {
         "mode": stat.S_IMODE(metadata.st_mode),
@@ -4323,7 +4338,7 @@ def _new_qualification_request(manifest: dict[str, Any], receipt: dict[str, Any]
     lane = config["lane_manifest"]
     executor = config["executor"]
     qualification = config["qualification"]
-    issued_at = int(time.time())
+    issued_at = live_unix_now()
     if issued_at <= 0:
         raise ValueError("qualification clock is invalid")
     request_id = os.urandom(16)
@@ -4382,7 +4397,7 @@ def _qualification_request(manifest: dict[str, Any], receipt: dict[str, Any], ro
         raise ValueError("qualification delivery outcome is unresolved after request expiry; rollback and restage with a new replay binding")
     if state["status"] == "pending":
         parsed = json.loads(request, object_pairs_hook=activation_package.reject_duplicates)
-        if int(time.time()) >= parsed["expires_at"]:
+        if live_unix_now() >= parsed["expires_at"]:
             message = "qualification delivery outcome remained unresolved when the exact request expired"
             state.update({"status": "expired_uncertain", "expired_at": utc_now()})
             if state["last_error"] is None:
@@ -4403,7 +4418,7 @@ def _record_qualification_failure(
         object_pairs_hook=activation_package.reject_duplicates,
     )
     state["last_error"] = str(error)
-    if int(time.time()) >= request["expires_at"]:
+    if live_unix_now() >= request["expires_at"]:
         state.update({"status": "expired_uncertain", "expired_at": utc_now()})
     _write_receipt(root, receipt, manifest["identities"]["controld"]["gid"])
 

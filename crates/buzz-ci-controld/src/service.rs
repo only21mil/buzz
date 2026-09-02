@@ -2,7 +2,7 @@
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use buzz_ci_acceptance_ctl::acceptance::{
     AdmissionState, ApprovalSnapshot, AttemptSnapshot, AttemptState,
@@ -31,7 +31,8 @@ use buzz_ci_controld::production_v2::{
 };
 use buzz_ci_controld::runner_client::{UnixRunnerConnector, UnixRunnerConnectorError};
 use buzz_ci_controld::runner_v2::{
-    BoundAttempt, RunnerV2Client, StaticAdmissionBindings, StaticArtifactBinding, TerminalAttempt,
+    live_bound_now, BoundAttempt, RunnerV2Client, StaticAdmissionBindings, StaticArtifactBinding,
+    TerminalAttempt,
 };
 use buzz_ci_controld::source::{AuthenticatedRelay, ReqwestTransport, SourceError, TransportError};
 use buzz_ci_controld::store::{DurableControlStore, StoreError};
@@ -591,12 +592,10 @@ impl CapacityOneService {
         request: &AdapterRequest,
         active: BoundAttempt,
     ) -> Result<TerminalAttempt, AcceptanceSocketError> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| AcceptanceSocketError::Operation)?
-            .as_secs();
         // The frozen window is judged against the package time reference by
-        // the runner and execd; the live bound is the attempt's deadline.
+        // the runner and execd; the live bound is the attempt's deadline on
+        // the host clock (`live_bound_now`).
+        let now = live_bound_now().map_err(|_| AcceptanceSocketError::Operation)?;
         let deadline_at = active
             .deadline_at()
             .map_err(|_| AcceptanceSocketError::Operation)?;

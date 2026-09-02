@@ -3547,7 +3547,7 @@ fn executor_transition(
         }
         "terminal_evidence" => {
             verify_executor_binding(active, &binding, &request)?;
-            let now = unix_seconds()?;
+            let now = live_bound_now()?;
             let lease = active.get_mut(&binding).ok_or(ProductionV2Error::Closed)?;
             if lease.stage == ExecutorStage::Running {
                 match poll_running_job(lease, now)? {
@@ -3908,7 +3908,14 @@ fn evidence_document_digest(
     Ok(Sha256::digest(canonical_bytes(&document)?).into())
 }
 
-fn unix_seconds() -> Result<u64, ProductionV2Error> {
+/// The host clock, used only to bound a live operation: the executor lease
+/// polls it against `contract.deadline_at`, which execd anchored at admission
+/// on this same clock (`admitted_at + min(wall_timeout, window length)`). It
+/// never judges a package-bound window; `production_binding::validate_window`
+/// judges those against `acceptance_time_reference`. See
+/// deploy/native-ci/README.md, "Clock model". This is the only wall-clock
+/// read in this file (pinned by a test).
+fn live_bound_now() -> Result<u64, ProductionV2Error> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -4271,7 +4278,7 @@ mod tests {
             "executor_handoff",
             [41; 32],
             [7; 16],
-            unix_seconds().unwrap() + 10,
+            live_bound_now().unwrap() + 10,
         );
         for field in ["argv", "env", "program", "cwd", "path"] {
             let mut value = serde_json::to_value(&request).unwrap();
@@ -5247,7 +5254,7 @@ mod tests {
         assert_ne!(materialization_receipt, [0; 32]);
         // The frozen fixture holds ten seconds before it writes evidence so a
         // cancellation can reach it; the deadline leaves that hold room.
-        let deadline = unix_seconds().unwrap() + 30;
+        let deadline = live_bound_now().unwrap() + 30;
         let request = |operation: &str| {
             let mut request = executor_request_fixture(
                 operation,
@@ -5385,7 +5392,7 @@ mod tests {
                 stderr: capture_pipe(stderr, FIXED_MAX_STDERR_BYTES as usize),
             }
         }
-        let deadline = unix_seconds().unwrap() + 60;
+        let deadline = live_bound_now().unwrap() + 60;
         for (binding, operation, reason, expected) in [
             ([51; 32], "teardown", "cancelled", "cancelled"),
             (
@@ -6694,5 +6701,19 @@ sys.stdout.write(controller._executor_provenance_digest(json.load(sys.stdin)))
         )
         .is_err());
         assert!(!invalid_called.get());
+    }
+
+    /// Sol focus read of head Q, finding 2: the executor lease reads the host
+    /// clock. It bounds a live job against a deadline execd anchored at
+    /// admission on the same clock; package-bound windows are judged in
+    /// production_binding against the time reference. Pinned so a reviewer
+    /// verifies the rule by grep: one wall-clock read, named `live_bound_now`.
+    #[test]
+    fn live_bound_now_is_the_only_wall_clock_in_production_v2() {
+        let needle = concat!("SystemTime", "::now()");
+        let source = include_str!("production_v2.rs");
+        assert_eq!(source.matches(needle).count(), 1);
+        assert!(source.contains("fn live_bound_now()"));
+        assert!(!include_str!("production_binding.rs").contains(needle));
     }
 }

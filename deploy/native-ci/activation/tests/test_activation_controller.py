@@ -1575,7 +1575,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "9fe3ed9a6b243560611c494aa40db11df15936d5786c6aba37d4fcec17f1f553",
+            "2ff53001a48fd22d4c0bdb3b547de4eda857463797c5300e60b6a678bde78a2d",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -3819,6 +3819,22 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertEqual(activation_package.digest(request), persisted["request_sha256"])
         self.assertEqual(persisted["attempt_count"], 1)
         self.assertIn("failed with status 3", persisted["last_error"])
+
+    def test_qualification_clock_is_the_named_live_bound_only(self) -> None:
+        # Sol focus read of head Q, finding 1: the qualification request's
+        # issue and expiry read the host clock. That request is minted live
+        # (fresh ID and nonce, 60 s delivery validity) and execd judges it on
+        # the same host clock; it is not package material. The rule is named
+        # once so a reviewer verifies it by grep.
+        source = (ACTIVATION_ROOT / "controller.py").read_text()
+        needle = "time." + "time()"
+        self.assertEqual(source.count(needle), 1)
+        helper_start = source.index("def live_unix_now()")
+        helper_end = source.index("\n\n\n", helper_start)
+        self.assertIn(needle, source[helper_start:helper_end])
+        self.assertEqual(source.count("live_unix_now()"), 4)
+        with mock.patch.object(CONTROLLER.time, "time", return_value=1_234.9):
+            self.assertEqual(CONTROLLER.live_unix_now(), 1_234)
 
     def test_production_v2_retries_only_the_exact_valid_request_with_a_fixed_budget(self) -> None:
         manifest, payloads, driver = self.fixture.load()
