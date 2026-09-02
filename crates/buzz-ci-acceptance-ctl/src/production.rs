@@ -2092,6 +2092,19 @@ fn activation_receipt(
     .map_err(|_| ControlError::InvalidConfig)?;
     let value: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|_| ControlError::InvalidConfig)?;
+    validate_live_activation_receipt(&value, config)?;
+    Ok((bytes, value))
+}
+
+/// The activation receipt must bind this activation and sit in a live phase:
+/// staged zero, the closed qualification, activation, capacity one, or the
+/// qualification-zero prepare the acceptance host itself drives (the
+/// controller records `preparing_zero` between prepare and finalize, and the
+/// prepare readback happens inside that window).
+fn validate_live_activation_receipt(
+    value: &serde_json::Value,
+    config: &AcceptanceControlConfig,
+) -> Result<(), ControlError> {
     if value.get("activation_id").and_then(|item| item.as_str()) != Some(&config.activation_id)
         || value.get("package_digest").and_then(|item| item.as_str())
             != Some(&config.activation_package_digest)
@@ -2099,12 +2112,14 @@ fn activation_receipt(
             != Some(&config.integrated_candidate_sha)
         || !matches!(
             value.get("state").and_then(|item| item.as_str()),
-            Some("staged_zero" | "qualified_closed" | "activating" | "active_one")
+            Some(
+                "staged_zero" | "qualified_closed" | "activating" | "active_one" | "preparing_zero"
+            )
         )
     {
         return Err(ControlError::BindingMismatch);
     }
-    Ok((bytes, value))
+    Ok(())
 }
 
 fn validate_activation_receipt(config: &AcceptanceControlConfig) -> Result<(), ControlError> {
@@ -4809,6 +4824,59 @@ exit 1
         assert_eq!(
             close_capacity(&systemctl, timeout),
             Err(ControlError::HostAction)
+        );
+    }
+
+    /// H10 clean host, boot 7: stage 13's prepare succeeded in the controller
+    /// (receipt state preparing_zero), capacity closed, controld restarted,
+    /// and the readback refused the receipt because preparing_zero was not
+    /// a live state, failing the host action closed. The prepare window is
+    /// live; the failure states stay refused.
+    #[test]
+    fn live_activation_receipt_accepts_the_zero_prepare_window() {
+        let config = control_config();
+        let receipt = |state: &str| {
+            serde_json::json!({
+                "activation_id": config.activation_id,
+                "package_digest": config.activation_package_digest,
+                "source_commit": config.integrated_candidate_sha,
+                "scenario_sha256": config.scenario_sha256,
+                "state": state,
+            })
+        };
+        for state in [
+            "staged_zero",
+            "qualified_closed",
+            "activating",
+            "active_one",
+            "preparing_zero",
+        ] {
+            assert_eq!(
+                validate_live_activation_receipt(&receipt(state), &config),
+                Ok(()),
+                "{state}"
+            );
+        }
+        for state in [
+            "absent",
+            "dormant",
+            "preparing",
+            "qualification_uncertain",
+            "rollback_cleanup",
+            "rollback_failed",
+            "rolled_back",
+        ] {
+            assert_eq!(
+                validate_live_activation_receipt(&receipt(state), &config),
+                Err(ControlError::BindingMismatch),
+                "{state}"
+            );
+        }
+        let mut foreign = receipt("preparing_zero");
+        foreign["activation_id"] = serde_json::json!("buzz-ci-capacity-one-other");
+        assert_eq!(
+            validate_live_activation_receipt(&foreign, &config),
+            Err(ControlError::BindingMismatch)
         );
     }
 }
