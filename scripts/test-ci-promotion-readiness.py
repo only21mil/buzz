@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,7 @@ import unittest
 
 SCRIPT = Path(__file__).with_name("ci-promotion-readiness.py")
 PRODUCER_SCRIPT = Path(__file__).with_name("populate-ci-promotion-relay-origin.py")
+PROTECTED_TEST_SCRIPT = Path(__file__).with_name("test-protected-ci-receipt.py")
 REPO_ROOT = SCRIPT.parent.parent
 SPEC = importlib.util.spec_from_file_location("ci_promotion_readiness", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
@@ -28,6 +30,12 @@ PRODUCER_SPEC = importlib.util.spec_from_file_location("ci_promotion_relay_origi
 assert PRODUCER_SPEC is not None and PRODUCER_SPEC.loader is not None
 PRODUCER = importlib.util.module_from_spec(PRODUCER_SPEC)
 PRODUCER_SPEC.loader.exec_module(PRODUCER)
+PROTECTED_TEST_SPEC = importlib.util.spec_from_file_location(
+    "protected_ci_receipt_test_fixture", PROTECTED_TEST_SCRIPT
+)
+assert PROTECTED_TEST_SPEC is not None and PROTECTED_TEST_SPEC.loader is not None
+PROTECTED_TEST = importlib.util.module_from_spec(PROTECTED_TEST_SPEC)
+PROTECTED_TEST_SPEC.loader.exec_module(PROTECTED_TEST)
 NOW = 1_787_832_000
 DIGEST_A = "a" * 64
 DIGEST_B = "b" * 64
@@ -84,10 +92,57 @@ def write_json(path: Path, value: dict) -> None:
     path.chmod(0o600)
 
 
+def write_protected_receipt(path: Path, value: dict) -> None:
+    path.write_bytes(READINESS.PROTECTED_CI.canonical_json(value))
+    path.chmod(0o600)
+
+
 def write_jsonl(path: Path, values: list[dict]) -> None:
     path.write_text("".join(json.dumps(value, sort_keys=True) + "\n" for value in values),
                     encoding="utf-8")
     path.chmod(0o600)
+
+
+FAKE_GITHUB_WRAPPER = """#!/usr/bin/env python3
+# Test-only entry point: runs ci-promotion-readiness.py with the pinned GitHub
+# client replaced by the hermetic FakeClient so re-verification never touches
+# the network. The verifier itself carries no such seam.
+import importlib.util
+import json
+import os
+import sys
+
+sys.dont_write_bytecode = True
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+readiness = load("ci_promotion_readiness", sys.argv[1])
+fixture = load("protected_ci_receipt_test_fixture", sys.argv[2])
+config = json.loads(os.environ["TEST_FAKE_GITHUB"])
+calls = []
+
+
+def fake_client(gh, identity=None, runner=None):
+    client = fixture.FakeClient(**config["client"])
+    fixture.apply_drift(client, config["drift"])
+    calls.append(client)
+    return client
+
+
+readiness.PROTECTED_CI.resolve_gh = lambda: (fixture.receipt.GH_PATH,
+                                             fixture.FakeClient().identity)
+readiness.PROTECTED_CI.GhClient = fake_client
+del sys.argv[1:3]
+status = readiness.main()
+print(f"fake-github-clients={len(calls)}", file=sys.stderr)
+sys.exit(status)
+"""
 
 
 def digest(path: Path) -> str:
@@ -128,18 +183,25 @@ class PromotionReadinessTest(unittest.TestCase):
             "overall": "PASS",
             "checks": [{"name": "source", "status": "PASS"}],
         })
+        self.wrapper = self.root / "readiness-with-fake-github.py"
+        self.wrapper.write_text(FAKE_GITHUB_WRAPPER, encoding="utf-8")
+        self.fake_github_client = {
+            "head": self.candidate,
+            "base": self.base,
+            "started": dt.datetime.fromtimestamp(
+                NOW - 180, tz=dt.timezone.utc
+            ).isoformat().replace("+00:00", "Z"),
+            "completed": dt.datetime.fromtimestamp(
+                NOW - 120, tz=dt.timezone.utc
+            ).isoformat().replace("+00:00", "Z"),
+            "http_date": dt.datetime.fromtimestamp(
+                NOW - 60, tz=dt.timezone.utc
+            ).strftime("%a, %d %b %Y %H:%M:%S GMT"),
+        }
+        self.github_drift = "none"
         self.protected_ci_path = self.evidence_dir / "protected-ci.json"
-        write_json(self.protected_ci_path, {
-            "schema_version": 1,
-            "source": "protected-ci",
-            "repository": "only21mil/buzz",
-            "head_sha": self.candidate,
-            "timestamp": timestamp,
-            "overall": "PASS",
-            "protected": True,
-            "full_exact_head": True,
-            "checks": [{"name": "required", "status": "PASS"}],
-        })
+        self.protected_receipt = self.make_protected_receipt("pull-request")
+        write_protected_receipt(self.protected_ci_path, self.protected_receipt)
         self.acceptance_path = self.evidence_dir / "acceptance-verdict.json"
         write_json(self.acceptance_path, {
             "candidate_sha": self.candidate,
@@ -162,6 +224,13 @@ class PromotionReadinessTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def make_protected_receipt(self, scope: str) -> dict:
+        client = PROTECTED_TEST.FakeClient(**self.fake_github_client)
+        if scope == "main":
+            client.base_ref_sha = self.candidate
+            return PROTECTED_TEST.receipt.build_main_receipt(client, self.candidate, "main")
+        return PROTECTED_TEST.receipt.build_receipt(client, 17, self.candidate, "main")
 
     def acceptance_record(self, suite: str, test_id: str, *, run: int | None = None) -> dict:
         record = {
@@ -291,29 +360,34 @@ class PromotionReadinessTest(unittest.TestCase):
                 content["parent_run_id"] = run_id
             return content
 
-        requests = []
-        for request_index, (attempt, active_jobs, parent_attempt, secret) in enumerate(request_specs):
-            request_actor = xonly_pubkey(secret)
-            requests.append(wire_event(
-                46100,
-                request_content(request_index, attempt, active_jobs, parent_attempt, request_actor),
-                secret,
-            ))
+        requests: list[dict] = []
         events: list[dict] = []
         decoded_logs: dict[str, str] = {}
         final_refs: dict[str, tuple[int, str, str]] = {}
         cursor = 0
 
-        def append(kind: int, content: dict) -> dict:
+        def append_event(kind: int, content: dict, secret: int) -> dict:
             nonlocal cursor
             cursor += 1
-            event = wire_event(kind, content, SIGNER_SECRET, cursor=cursor)
+            event = wire_event(kind, content, secret, cursor=cursor)
+            return event
+
+        def append_request(content: dict, secret: int) -> dict:
+            event = append_event(46100, content, secret)
+            requests.append(event)
+            return event
+
+        def append(kind: int, content: dict) -> dict:
+            event = append_event(kind, content, SIGNER_SECRET)
             events.append(event)
             return event
 
-        for request_index, ((attempt, active_jobs, parent_attempt, _), request) in enumerate(
-            zip(request_specs, requests)
-        ):
+        for request_index, (attempt, active_jobs, parent_attempt, secret) in enumerate(request_specs):
+            request_actor = xonly_pubkey(secret)
+            request = append_request(
+                request_content(request_index, attempt, active_jobs, parent_attempt, request_actor),
+                secret,
+            )
             request_event_id = request["id"]
             base_content = {
                 "schema_version": 1, "request_event_id": request_event_id, "run_id": run_id,
@@ -441,7 +515,7 @@ class PromotionReadinessTest(unittest.TestCase):
             "byte_cap": 1024,
         }
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "repository": "only21mil/buzz",
             "candidate_sha": self.candidate,
             "base_sha": self.base,
@@ -458,14 +532,12 @@ class PromotionReadinessTest(unittest.TestCase):
                 "head_sha": self.candidate,
                 "protected": True,
                 "conclusion": "success",
-                "contexts": [
-                    {"name": "buzz-native-ci", "head_sha": self.candidate, "conclusion": "success",
-                     "run_url": "https://ci.example.invalid/run/0"},
-                    {"name": "build", "head_sha": self.candidate, "conclusion": "success",
-                     "run_url": "https://ci.example.invalid/run/1"},
-                    {"name": "test", "head_sha": self.candidate, "conclusion": "success",
-                     "run_url": "https://ci.example.invalid/run/2"},
-                ],
+                "contexts": [{
+                    "name": check["name"],
+                    "head_sha": self.candidate,
+                    "conclusion": "success",
+                    "run_url": check["details_url"] or check["html_url"],
+                } for check in self.protected_receipt["checks"]],
             },
             "tier2": {
                 "eligible_commit": self.candidate,
@@ -527,7 +599,7 @@ class PromotionReadinessTest(unittest.TestCase):
                 "system_sha": self.candidate,
                 "red_sha": self.red_sha,
                 "accepted_commit": True,
-                "required_check": "buzz-native-ci",
+                "required_check": "build",
                 "conclusion": "failure",
                 "merge_allowed": False,
                 "protected_rule": True,
@@ -608,7 +680,7 @@ class PromotionReadinessTest(unittest.TestCase):
         receipt_path = self.evidence_dir / "receipt.json"
         write_json(bundle_path, bundle)
         return subprocess.run(
-            [sys.executable, str(SCRIPT),
+            [sys.executable, str(self.wrapper), str(SCRIPT), str(PROTECTED_TEST_SCRIPT),
              "--candidate-dir", str(self.repo),
              "--evidence", str(bundle_path),
              "--receipt", str(receipt_path),
@@ -616,6 +688,8 @@ class PromotionReadinessTest(unittest.TestCase):
             check=False,
             capture_output=True,
             text=True,
+            env={**os.environ, "TEST_FAKE_GITHUB": json.dumps(
+                {"client": self.fake_github_client, "drift": self.github_drift})},
         )
 
     def assert_refused(self, bundle: dict, message: str, *, now: int = NOW) -> None:
@@ -623,10 +697,28 @@ class PromotionReadinessTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
         self.assertIn(message, result.stderr)
 
+    def assert_schema_valid(self, schema_name: str, instance: Path) -> None:
+        checker = shutil.which("check-jsonschema")
+        self.assertIsNotNone(checker, "check-jsonschema is required by the test gate")
+        result = subprocess.run(
+            [checker, "--schemafile", str(REPO_ROOT / "docs" / "ci" / schema_name),
+             str(instance)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_valid_bundle_is_deterministic_and_complete(self) -> None:
         first = self.invoke(self.bundle)
         self.assertEqual(first.returncode, 0, first.stderr)
+        self.assert_schema_valid(
+            "promotion-evidence.schema.json", self.evidence_dir / "bundle.json"
+        )
         first_bytes = (self.evidence_dir / "receipt.json").read_bytes()
+        self.assert_schema_valid(
+            "promotion-readiness-receipt.schema.json", self.evidence_dir / "receipt.json"
+        )
         second = self.invoke(self.bundle)
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(first_bytes, (self.evidence_dir / "receipt.json").read_bytes())
@@ -641,6 +733,11 @@ class PromotionReadinessTest(unittest.TestCase):
         self.assertEqual(kinds.count(46101), 3)
         self.assertEqual(kinds.count(46102), 3)
         self.assertEqual(set(kinds), {46101, 46102, 46103, 46104, 46105, 46106})
+
+    def test_schema_version_one_is_refused(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        bundle["schema_version"] = 1
+        self.assert_refused(bundle, "evidence schema_version must be 2")
 
     def test_private_collection_sidecar_is_digest_bound(self) -> None:
         bundle = copy.deepcopy(self.bundle)
@@ -673,7 +770,19 @@ class PromotionReadinessTest(unittest.TestCase):
         evidence_schema = json.loads(
             (REPO_ROOT / "docs" / "ci" / "promotion-evidence.schema.json").read_text(encoding="utf-8")
         )
+        self.assertEqual(evidence_schema["properties"]["schema_version"]["const"], 2)
         self.assertIn("signed_ci_event_evidence", evidence_schema["$defs"])
+        request_schema = evidence_schema["$defs"]["signed_ci_request"]
+        self.assertEqual(
+            evidence_schema["$defs"]["signed_ci_event_evidence"]["properties"]["events"][
+                "minItems"
+            ],
+            8,
+        )
+        self.assertIn("watch_cursor", request_schema["required"])
+        self.assertEqual(request_schema["properties"]["watch_cursor"], {
+            "type": "integer", "minimum": 1,
+        })
         self.assertEqual(
             evidence_schema["$defs"]["signed_ci_event"]["properties"]["kind"]["enum"],
             [46101, 46102, 46103, 46104, 46105, 46106],
@@ -811,6 +920,58 @@ class PromotionReadinessTest(unittest.TestCase):
         self.resign_event(event, content)
         self.assert_refused(bundle, "sequence is not gap-free")
 
+    def test_signed_request_watch_cursor_is_required(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        del bundle["staging"]["event_evidence"]["requests"][0]["watch_cursor"]
+        self.assert_refused(bundle, "missing fields: ['watch_cursor']")
+
+    def test_request_and_event_watch_cursors_are_globally_gap_free(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        for event in bundle["staging"]["event_evidence"]["events"]:
+            event["watch_cursor"] += 1
+        self.assert_refused(bundle, "request and event watch cursors are not globally gap-free")
+
+    def test_request_watch_cursors_are_strictly_ordered(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        requests = bundle["production_canary"]["event_evidence"]["requests"]
+        requests[1]["watch_cursor"] = requests[0]["watch_cursor"]
+        self.assert_refused(bundle, "requests are not in strict watch cursor order")
+
+    def test_event_watch_cursors_are_strictly_ordered(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        events = bundle["staging"]["event_evidence"]["events"]
+        events[0], events[1] = events[1], events[0]
+        self.assert_refused(bundle, "events are not in strict watch cursor order")
+
+    def test_event_must_be_stored_after_its_bound_request(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        evidence = bundle["production_canary"]["event_evidence"]
+        rerun_request = evidence["requests"][1]
+        rerun_event = next(
+            event for event in evidence["events"]
+            if self.event_content(event)["request_event_id"] == rerun_request["id"]
+        )
+        rerun_request["watch_cursor"] = rerun_event["watch_cursor"] + 1
+        self.assert_refused(bundle, "was stored before its signed request")
+
+    def test_rerun_request_must_follow_selected_parent_job_failure(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        evidence = bundle["production_canary"]["event_evidence"]
+        rerun_request = evidence["requests"][1]
+        parent_terminal = next(
+            event for event in evidence["events"]
+            if event["kind"] == 46102
+            and self.event_content(event)["attempt"] == 1
+            and self.event_content(event)["state"] == "failure"
+        )
+        rerun_cursor = rerun_request["watch_cursor"]
+        rerun_request["watch_cursor"] = parent_terminal["watch_cursor"]
+        parent_terminal["watch_cursor"] = rerun_cursor
+        evidence["events"].sort(key=lambda event: event["watch_cursor"])
+        self.assert_refused(
+            bundle, "rerun request was stored before its selected parent job terminal failure"
+        )
+
     def test_attempt_binding_is_required(self) -> None:
         bundle = copy.deepcopy(self.bundle)
         event = next(item for item in bundle["staging"]["event_evidence"]["events"]
@@ -854,7 +1015,7 @@ class PromotionReadinessTest(unittest.TestCase):
                         if item["kind"] == 46101 and self.event_content(item)["state"] == "success")
         finalized = next(item for item in events if item["kind"] == 46105)
         teardown = next(item for item in events if item["kind"] == 46106)
-        terminal["watch_cursor"], finalized["watch_cursor"], teardown["watch_cursor"] = 8, 9, 10
+        terminal["watch_cursor"], finalized["watch_cursor"], teardown["watch_cursor"] = 9, 10, 11
         events.sort(key=lambda item: item["watch_cursor"])
         self.assert_refused(bundle, "terminal run was stored before")
 
@@ -1121,10 +1282,124 @@ class PromotionReadinessTest(unittest.TestCase):
     def test_mismatched_protected_ci_receipt_is_refused(self) -> None:
         receipt = json.loads(self.protected_ci_path.read_text(encoding="utf-8"))
         receipt["head_sha"] = self.red_sha
-        write_json(self.protected_ci_path, receipt)
+        write_protected_receipt(self.protected_ci_path, receipt)
         bundle = copy.deepcopy(self.bundle)
         bundle["evidence_files"]["protected_ci"]["sha256"] = digest(self.protected_ci_path)
-        self.assert_refused(bundle, "head_sha does not match")
+        self.assert_refused(bundle, "head mismatch")
+
+    def test_main_scoped_protected_ci_receipt_is_refused(self) -> None:
+        self.protected_receipt = self.make_protected_receipt("main")
+        write_protected_receipt(self.protected_ci_path, self.protected_receipt)
+        bundle = self.valid_bundle()
+        self.assert_refused(bundle, "receipt scope mismatch")
+
+    def test_legacy_self_asserted_protected_ci_receipt_is_refused(self) -> None:
+        legacy = {
+            "schema_version": 1,
+            "source": "protected-ci",
+            "repository": "only21mil/buzz",
+            "head_sha": self.candidate,
+            "timestamp": dt.datetime.fromtimestamp(
+                NOW - 60, tz=dt.timezone.utc
+            ).isoformat().replace("+00:00", "Z"),
+            "overall": "PASS",
+            "protected": True,
+            "full_exact_head": True,
+            "checks": [{"name": "required", "status": "PASS"}],
+        }
+        write_protected_receipt(self.protected_ci_path, legacy)
+        bundle = copy.deepcopy(self.bundle)
+        bundle["evidence_files"]["protected_ci"]["sha256"] = digest(self.protected_ci_path)
+        self.assert_refused(bundle, "receipt missing fields")
+
+    def test_valid_bundle_re_verifies_the_receipt_against_github(self) -> None:
+        result = self.invoke(self.bundle)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("fake-github-clients=1", result.stderr)
+
+    def test_live_authority_drift_is_refused(self) -> None:
+        for drift, message in (
+            ("check_failure", "did not succeed"),
+            ("ruleset_changed", "rulesets differs from the receipt binding"),
+            ("ruleset_inactive", "is not active"),
+        ):
+            with self.subTest(drift=drift):
+                self.github_drift = drift
+                self.assert_refused(self.bundle, "re-verification against GitHub failed")
+                self.assertIn(message, self.invoke(self.bundle).stderr)
+                self.assertFalse((self.evidence_dir / "receipt.json").exists())
+
+    def test_forged_receipt_without_live_backing_is_refused(self) -> None:
+        self.github_drift = "no_runs"
+        self.assert_refused(self.bundle, "re-verification against GitHub failed")
+        self.assertIn("has no run from app", self.invoke(self.bundle).stderr)
+
+    def test_pull_request_scope_authority_drift_is_refused(self) -> None:
+        for drift, message in (
+            ("pr_closed", "live pull request #17 is not open"),
+            ("pr_draft", "live pull request #17 is a draft"),
+            ("pr_head_mismatch", "not the receipt head"),
+            ("pr_base_moved", "live pull request #17 base moved from"),
+            ("main_head_moved", "live refs/heads/main moved from"),
+        ):
+            with self.subTest(drift=drift):
+                self.github_drift = drift
+                self.assert_refused(self.bundle, "re-verification against GitHub failed")
+                self.assertIn(message, self.invoke(self.bundle).stderr)
+                self.assertFalse((self.evidence_dir / "receipt.json").exists())
+
+    def test_re_verification_runs_only_after_offline_checks(self) -> None:
+        self.github_drift = "no_runs"
+        bundle = copy.deepcopy(self.bundle)
+        bundle["landing"]["merge_sha"] = self.red_sha
+        result = self.invoke(bundle)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("landing merge_sha does not match candidate", result.stderr)
+        self.assertIn("fake-github-clients=0", result.stderr)
+
+    def test_re_verification_without_pinned_client_is_refused(self) -> None:
+        bundle_path = self.evidence_dir / "bundle.json"
+        write_json(bundle_path, self.bundle)
+        environment = {key: value for key, value in os.environ.items() if key != "GH_TOKEN"}
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "--candidate-dir", str(self.repo),
+             "--evidence", str(bundle_path),
+             "--receipt", str(self.evidence_dir / "receipt.json"),
+             "--now", str(NOW)],
+            check=False, capture_output=True, text=True, env=environment,
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("re-verification against GitHub failed: GH_TOKEN is required", result.stderr)
+        self.assertFalse((self.evidence_dir / "receipt.json").exists())
+
+    def test_noncanonical_protected_ci_receipt_is_refused(self) -> None:
+        write_json(self.protected_ci_path, self.protected_receipt)
+        bundle = copy.deepcopy(self.bundle)
+        bundle["evidence_files"]["protected_ci"]["sha256"] = digest(self.protected_ci_path)
+        self.assert_refused(bundle, "must be canonical JSON")
+
+    def test_deeply_nested_protected_ci_receipt_is_refused_cleanly(self) -> None:
+        receipt = copy.deepcopy(self.protected_receipt)
+        nested: dict = {}
+        receipt["unexpected"] = nested
+        for _ in range(160):
+            child: dict = {}
+            nested["nested"] = child
+            nested = child
+        write_protected_receipt(self.protected_ci_path, receipt)
+        bundle = copy.deepcopy(self.bundle)
+        bundle["evidence_files"]["protected_ci"]["sha256"] = digest(self.protected_ci_path)
+        result = self.invoke(bundle)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("JSON nesting limit exceeded", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_protected_ci_context_must_match_receipt(self) -> None:
+        bundle = copy.deepcopy(self.bundle)
+        bundle["protected_ci"]["contexts"][0]["run_url"] = \
+            "https://github.com/only21mil/buzz/actions/runs/999"
+        self.assert_refused(bundle, "run_url does not match")
 
     def test_world_readable_evidence_is_refused(self) -> None:
         self.pre_freeze_path.chmod(0o644)

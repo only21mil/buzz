@@ -4,6 +4,8 @@ umask 077
 export GIT_OPTIONAL_LOCKS=0
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+python3_bin=$(/usr/bin/readlink -f /usr/bin/python3)
+unset PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONINSPECT
 usage() {
   printf 'Usage: %s [--check] <full-40-character-commit>\n' "${0##*/}" >&2
 }
@@ -39,18 +41,29 @@ health_interval=${BUZZ_DEPLOY_HEALTH_INTERVAL:-2}
 probe_timeout=${BUZZ_DEPLOY_PROBE_TIMEOUT:-5}
 source_ref=${BUZZ_DEPLOY_SOURCE_REF:-refs/remotes/origin/main}
 pre_freeze_receipt=${BUZZ_PRE_FREEZE_RECEIPT:-${repo_root}/pre-freeze-receipt.json}
-protected_ci_receipt=${BUZZ_PROTECTED_CI_RECEIPT:-${repo_root}/protected-ci-receipt.json}
+protected_ci_receipt=${BUZZ_PROTECTED_CI_RECEIPT-}
+protected_ci_tool=${repo_root}/scripts/protected-ci-receipt.py
 receipt_max_age=${BUZZ_DEPLOY_RECEIPT_MAX_AGE_SECONDS:-86400}
 prior_migration_override=${BUZZ_PRIOR_MIGRATION_OVERRIDE-}
+if [[ -z ${protected_ci_receipt} || ${protected_ci_receipt} != /* ]]; then
+  printf 'REFUSED: BUZZ_PROTECTED_CI_RECEIPT must name an explicit absolute receipt path\n' >&2
+  exit 64
+fi
+# The receipt is re-verified against live GitHub through the pinned gh; GitHub
+# does not sign REST responses, so an offline-consistent receipt is not enough.
+if [[ -z ${GH_TOKEN-} ]]; then
+  printf 'REFUSED: GH_TOKEN must be set so the protected-CI receipt can be re-verified against GitHub\n' >&2
+  exit 64
+fi
 
-validate_receipt() {
-  local receipt_path=$1 receipt_source=$2
+validate_pre_freeze_receipt() {
+  local receipt_path=$1 receipt_source=pre-freeze
   [[ -f ${receipt_path} && ! -L ${receipt_path} ]] || {
     printf 'REFUSED: %s receipt is missing or is not a regular file: %s\n' \
       "${receipt_source}" "${receipt_path}" >&2
     return 1
   }
-  python3 - "${receipt_path}" "${receipt_source}" "${commit}" "${receipt_max_age}" <<'PY'
+  "${python3_bin}" -I - "${receipt_path}" "${commit}" "${receipt_max_age}" <<'PY'
 import datetime
 import json
 import os
@@ -58,7 +71,8 @@ import re
 import stat
 import sys
 
-path, expected_source, expected_commit, max_age_text = sys.argv[1:]
+path, expected_commit, max_age_text = sys.argv[1:]
+expected_source = "pre-freeze"
 
 def refuse(message):
     print(f"REFUSED: {expected_source} receipt {message}: {path}", file=sys.stderr)
@@ -112,17 +126,21 @@ if not isinstance(checks, list) or not checks:
 if any(not isinstance(check, dict) or check.get("status") != "PASS" for check in checks):
     refuse("contains a check without PASS status")
 
-if expected_source == "pre-freeze":
-    base_sha = receipt.get("base_sha")
-    if not isinstance(base_sha, str) or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None:
-        refuse("base_sha must be a full 40-character lowercase commit")
-    print(base_sha)
-elif expected_source == "protected-ci":
-    if receipt.get("protected") is not True:
-        refuse("does not attest protected CI")
-    if receipt.get("full_exact_head") is not True:
-        refuse("does not attest the full exact-head matrix")
+base_sha = receipt.get("base_sha")
+if not isinstance(base_sha, str) or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None:
+    refuse("base_sha must be a full 40-character lowercase commit")
+print(base_sha)
 PY
+}
+
+validate_protected_ci_receipt() {
+  "${python3_bin}" -I "${protected_ci_tool}" validate \
+    --receipt "${protected_ci_receipt}" \
+    --repository only21mil/buzz \
+    --head "${commit}" \
+    --scope main \
+    --max-age-seconds "${receipt_max_age}" \
+    --reverify
 }
 
 build_worktree=
@@ -251,6 +269,52 @@ validate_owned_file() {
   }
 }
 
+validate_checkout_file() {
+  local path=$1 executable=$2 description=$3 actual_uid actual_gid actual_mode mode_value
+  [[ -f ${path} && ! -L ${path} ]] || {
+    printf 'REFUSED: %s is missing, is not a regular file, or is a symlink: %s\n' \
+      "${description}" "${path}" >&2
+    return 1
+  }
+  actual_uid=$(/usr/bin/stat -c %u "${path}") || return 1
+  actual_gid=$(/usr/bin/stat -c %g "${path}") || return 1
+  actual_mode=$(/usr/bin/stat -c %a "${path}") || return 1
+  mode_value=$((8#${actual_mode}))
+  [[ ${actual_uid} == "${EUID}" && ${actual_gid} == "$(id -g)" && \
+    $((mode_value & 8#022)) == 0 && $((mode_value & 8#400)) != 0 ]] || {
+    printf 'REFUSED: %s must be caller-owned, readable, and not group/world writable: %s\n' \
+      "${description}" "${path}" >&2
+    return 1
+  }
+  if [[ ${executable} == yes ]]; then
+    ((mode_value & 8#100)) || {
+      printf 'REFUSED: %s must be owner-executable: %s\n' "${description}" "${path}" >&2
+      return 1
+    }
+  else
+    ((!(mode_value & 8#111))) || {
+      printf 'REFUSED: %s must not be executable: %s\n' "${description}" "${path}" >&2
+      return 1
+    }
+  fi
+}
+
+validate_root_owned_file() {
+  local path=$1 expected_mode=$2 description=$3
+  [[ ${path} == /usr/bin/python3.* && -f ${path} && ! -L ${path} ]] || {
+    printf 'REFUSED: %s is not a resolved /usr/bin regular file: %s\n' \
+      "${description}" "${path}" >&2
+    return 1
+  }
+  [[ $(/usr/bin/stat -c %u "${path}") == 0 && \
+    $(/usr/bin/stat -c %g "${path}") == 0 && \
+    $(/usr/bin/stat -c %a "${path}") == "${expected_mode}" ]] || {
+    printf 'REFUSED: %s must be root:root mode %s: %s\n' \
+      "${description}" "${expected_mode}" "${path}" >&2
+    return 1
+  }
+}
+
 validate_safe_parent() {
   local path=$1 exact_mode=${2-} description=$3 parent actual_uid actual_mode
   parent=$(dirname "${path}")
@@ -280,7 +344,7 @@ validate_safe_parent() {
 }
 
 validate_storage_roots() {
-  python3 - "${repo_root}" "${build_root}" "${log_root}" "${EUID}" "$(id -g)" <<'PY'
+  "${python3_bin}" -I - "${repo_root}" "${build_root}" "${log_root}" "${EUID}" "$(id -g)" <<'PY'
 import os
 import stat
 import sys
@@ -351,7 +415,7 @@ PY
 }
 
 validate_required_secret_names() {
-  python3 - "${secret_env_file}" <<'PY'
+  "${python3_bin}" -I - "${secret_env_file}" <<'PY'
 import re
 import sys
 
@@ -403,7 +467,7 @@ candidate_required_migration() {
 
 container_network_ip() {
   local container=$1
-  docker_state inspect --format '{{json .NetworkSettings.Networks}}' "${container}" | python3 -c '
+  docker_state inspect --format '{{json .NetworkSettings.Networks}}' "${container}" | "${python3_bin}" -I -c '
 import ipaddress
 import json
 import sys
@@ -433,7 +497,7 @@ print(address)
 db_query_readonly() {
   local sql=$1
   timeout --foreground "${probe_timeout}" \
-    python3 - "${compose_env_file}" "${secret_env_file}" "${postgres_network_ip}" "${sql}" <<'PY'
+    "${python3_bin}" -I - "${compose_env_file}" "${secret_env_file}" "${postgres_network_ip}" "${sql}" <<'PY'
 import os
 import re
 import shlex
@@ -520,7 +584,7 @@ container_binary_sha_readonly() {
   }
   curl_readonly --fail --silent --show-error --unix-socket "${docker_socket}" \
     --get --data-urlencode 'path=/usr/local/bin/buzz-relay' \
-    "http://localhost/containers/${container}/archive" | python3 -c '
+    "http://localhost/containers/${container}/archive" | "${python3_bin}" -I -c '
 import hashlib
 import sys
 import tarfile
@@ -823,7 +887,7 @@ resolve_relay_platform() {
     printf 'REFUSED: DOCKER_DEFAULT_PLATFORM is set; use an explicit relay service platform or unset it\n' >&2
     return 1
   }
-  resolved=$(compose_readonly "${prior_image_ref}" config --format json | python3 -c '
+  resolved=$(compose_readonly "${prior_image_ref}" config --format json | "${python3_bin}" -I -c '
 import json
 import sys
 
@@ -859,7 +923,7 @@ descriptor_evidence() {
       ;;
     *) return 1 ;;
   esac
-  python3 - "${kind}" "${object}" "${descriptor}" <<'PY'
+  "${python3_bin}" -I - "${kind}" "${object}" "${descriptor}" <<'PY'
 import json
 import re
 import sys
@@ -900,7 +964,7 @@ PY
 }
 
 validate_compose_services() {
-  compose_readonly "${prior_image_ref}" ps --all --format json | python3 -c '
+  compose_readonly "${prior_image_ref}" ps --all --format json | "${python3_bin}" -I -c '
 import json
 import sys
 
@@ -1070,7 +1134,7 @@ probe_relay() {
       "http://${relay_network_ip}:8080/_readiness" >/dev/null
     curl_readonly --fail --silent --show-error --max-time "${probe_timeout}" \
       --header 'Accept: application/nostr+json' "http://${relay_network_ip}:3000/" | \
-      python3 -c '
+      "${python3_bin}" -I -c '
 import json
 import sys
 try:
@@ -1189,6 +1253,21 @@ collect_static_preflight_blockers() {
     fi
   }
 
+  if ! output=$(validate_root_owned_file "${python3_bin}" 755 'Python interpreter' 2>&1); then
+    printf '%s\n' "${output}" >&2
+    printf 'REFUSED: preflight will not execute an untrusted Python interpreter\n' >&2
+    unset -f capture
+    return 1
+  fi
+  if ! output=$(validate_checkout_file "${protected_ci_tool}" yes 'protected-CI validator' 2>&1) || \
+    ! validate_safe_parent "${protected_ci_tool}" '' 'protected-CI validator' >/dev/null 2>&1 || \
+    ! git -C "${repo_root}" diff --quiet "${commit}" -- scripts/protected-ci-receipt.py; then
+    printf '%s\n' "${output:-REFUSED: protected-CI validator is unsafe or differs from the requested commit}" >&2
+    printf 'REFUSED: preflight will not execute an untrusted protected-CI validator\n' >&2
+    unset -f capture
+    return 1
+  fi
+
   if [[ ! ${health_attempts} =~ ^[1-9][0-9]*$ ]] || \
     [[ ! ${health_interval} =~ ^[0-9]+([.][0-9]+)?$ ]] || \
     [[ ! ${probe_timeout} =~ ^([1-9][0-9]*|0[.][0-9]*[1-9][0-9]*)$ ]] || \
@@ -1231,16 +1310,17 @@ collect_static_preflight_blockers() {
   capture 'deployment scripts or Compose inputs differ from the requested commit' \
     git -C "${repo_root}" diff --quiet "${commit}" -- \
     deploy/compose/run-local.sh deploy/compose/compose.yml \
-    deploy/compose/compose.localhost.yml deploy/compose/deploy-local.sh
+    deploy/compose/compose.localhost.yml deploy/compose/deploy-local.sh \
+    scripts/protected-ci-receipt.py
 
   capture 'Compose runner validation failed' \
-    validate_owned_file "${run_local}" 755 'Compose runner'
+    validate_checkout_file "${run_local}" yes 'Compose runner'
   capture 'Compose runner parent validation failed' \
     validate_safe_parent "${run_local}" '' 'Compose runner'
   capture 'base Compose file validation failed' \
-    validate_owned_file "${compose_file}" 644 'base Compose file'
+    validate_checkout_file "${compose_file}" no 'base Compose file'
   capture 'localhost Compose file validation failed' \
-    validate_owned_file "${compose_local_file}" 644 'localhost Compose file'
+    validate_checkout_file "${compose_local_file}" no 'localhost Compose file'
   capture 'Compose environment file validation failed' \
     validate_owned_file "${compose_env_file}" 640 'Compose environment file'
   capture 'Compose environment parent validation failed' \
@@ -1255,17 +1335,17 @@ collect_static_preflight_blockers() {
   capture 'pre-freeze receipt parent validation failed' \
     validate_safe_parent "${pre_freeze_receipt}" '' 'pre-freeze receipt'
   capture 'protected-CI receipt parent validation failed' \
-    validate_safe_parent "${protected_ci_receipt}" '' 'protected-CI receipt'
+    validate_safe_parent "${protected_ci_receipt}" 700 'protected-CI receipt'
   if [[ ${receipt_max_age} =~ ^[1-9][0-9]*$ ]]; then
     capture 'pre-freeze receipt validation failed' \
-      validate_receipt "${pre_freeze_receipt}" pre-freeze
+      validate_pre_freeze_receipt "${pre_freeze_receipt}"
     capture 'protected-CI receipt validation failed' \
-      validate_receipt "${protected_ci_receipt}" protected-ci
+      validate_protected_ci_receipt
   fi
   capture 'candidate migration could not be read from the Git object' candidate_required_migration
   capture 'deployment storage-root validation failed' validate_storage_roots
 
-  for tool in git python3 docker curl psql timeout env sha256sum awk sed sort tail df stat dirname id; do
+  for tool in git docker curl psql timeout env sha256sum awk sed sort tail df stat dirname id; do
     command -v "${tool}" >/dev/null || \
       blockers+=("REFUSED: required deployment tool is unavailable: ${tool}")
   done
@@ -1360,26 +1440,29 @@ deployment_preflight() {
   }
   git -C "${repo_root}" diff --quiet "${commit}" -- \
     deploy/compose/run-local.sh deploy/compose/compose.yml \
-    deploy/compose/compose.localhost.yml deploy/compose/deploy-local.sh || {
+    deploy/compose/compose.localhost.yml deploy/compose/deploy-local.sh \
+    scripts/protected-ci-receipt.py || {
     printf 'REFUSED: deployment scripts or Compose inputs differ from the requested commit\n' >&2
     return 1
   }
   validate_safe_parent "${pre_freeze_receipt}" '' 'pre-freeze receipt'
-  validate_safe_parent "${protected_ci_receipt}" '' 'protected-CI receipt'
-  pre_freeze_base=$(validate_receipt "${pre_freeze_receipt}" pre-freeze)
+  validate_safe_parent "${protected_ci_receipt}" 700 'protected-CI receipt'
+  pre_freeze_base=$(validate_pre_freeze_receipt "${pre_freeze_receipt}")
   git -C "${repo_root}" cat-file -e "${pre_freeze_base}^{commit}"
   git -C "${repo_root}" merge-base --is-ancestor "${pre_freeze_base}" "${commit}" || {
     printf 'REFUSED: pre-freeze receipt base %s is not an ancestor of %s\n' \
       "${pre_freeze_base}" "${commit}" >&2
     return 1
   }
-  validate_receipt "${protected_ci_receipt}" protected-ci
+  validate_protected_ci_receipt
   required_migration=$(candidate_required_migration)
 
-  validate_owned_file "${run_local}" 755 'Compose runner'
+  validate_checkout_file "${run_local}" yes 'Compose runner'
   validate_safe_parent "${run_local}" '' 'Compose runner'
-  validate_owned_file "${compose_file}" 644 'base Compose file'
-  validate_owned_file "${compose_local_file}" 644 'localhost Compose file'
+  validate_checkout_file "${protected_ci_tool}" yes 'protected-CI validator'
+  validate_safe_parent "${protected_ci_tool}" '' 'protected-CI validator'
+  validate_checkout_file "${compose_file}" no 'base Compose file'
+  validate_checkout_file "${compose_local_file}" no 'localhost Compose file'
   validate_owned_file "${compose_env_file}" 640 'Compose environment file'
   validate_safe_parent "${compose_env_file}" '' 'Compose environment file'
   validate_owned_file "${secret_env_file}" 600 'secret environment file'
@@ -1387,7 +1470,7 @@ deployment_preflight() {
   validate_required_secret_names
   validate_storage_roots
 
-  for tool in git python3 docker curl psql timeout env sha256sum awk sed sort tail df stat dirname id; do
+  for tool in git docker curl psql timeout env sha256sum awk sed sort tail df stat dirname id; do
     command -v "${tool}" >/dev/null || {
       printf 'REFUSED: required deployment tool is unavailable: %s\n' "${tool}" >&2
       return 1
@@ -1442,7 +1525,7 @@ deployment_preflight() {
   prior_image_ref=$(container_image_ref "${prior_container}")
   prior_revision=$(object_revision "${prior_container}")
   resolve_relay_platform
-  resolved_image=$(compose_readonly "${prior_image_ref}" config --format json | python3 -c '
+  resolved_image=$(compose_readonly "${prior_image_ref}" config --format json | "${python3_bin}" -I -c '
 import json
 import sys
 image = json.load(sys.stdin).get("services", {}).get("relay", {}).get("image")

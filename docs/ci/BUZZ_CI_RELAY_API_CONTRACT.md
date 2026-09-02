@@ -55,7 +55,7 @@ Response:
 
 The relay resolves exactly one authorized effective PR snapshot whose full `tip_oid` equals `requested_tip_oid`; `trigger_event_id` equals `pr_update_event_id` when present and otherwise `pr_root_event_id`. The workflow is resolved only from canonical bytes at the trusted full `base_oid`. Jobs are static IDs using `^[A-Za-z_][A-Za-z0-9_-]{0,63}$`, non-empty and unique. This follows the GitHub Actions job identifier contract while preserving Buzz's 64-byte bound; IDs that begin with a digit or contain whitespace, dots, slashes, colons, or non-ASCII bytes fail closed.
 
-This source contract does not activate Buzz-native CI. Native CI remains unavailable until the separate production adapter seams, maintained control service, owner-configured status signers and policy, and required service credentials are completed, reviewed, and deployed. GitHub's protected checks remain the delivery authority until that activation work is complete.
+This source contract does not activate Buzz-native CI. Native CI remains unavailable until the separate production adapter seams, maintained control service, owner-configured status signers and policy, and required service credentials are completed, reviewed, and deployed. GitHub's protected checks remain the delivery authority until that activation work is complete. Unlike the signed relay events in this contract, that authority carries no provider signature: `scripts/protected-ci-receipt.py` produces an operator-acquired receipt that retains the exact GitHub REST bodies for the repository, the `main` ref, the pull request, the branch rules, the rulesets, and the check runs, hash-bound, and every consumer re-verifies the receipt against live GitHub before trusting it, including the scope authority: the live `main` head for a landed receipt, and the live open, non-draft pull request at the receipt head with an unmoved base for a pull-request receipt.
 
 Before signing kind 46100, the CLI independently requires: exact repository/tip equality; exact effective-trigger equality; a safe credential-free clone URL; a non-empty advertised immutable ref; SHA-256 of decoded `canonical_workflow_base64` equals `workflow_digest`; and selected jobs are a non-empty unique subset of the returned static set. Preflight fields never supply or extend the authorized signer set.
 
@@ -145,9 +145,20 @@ Each job's selected attempt is the greatest accepted attempt in its contiguous l
 
 The next rerun attempt for a selected failed job is `selected_job_attempt + 1`; `parent_attempt` is exactly the selected failed attempt. Global maximum attempts are checked against the new attempt. Hidden whole-run restarts are forbidden; signed `also_reruns` enumerates every dependency fan-out job and each receives the same new attempt with its own contiguous parent.
 
+The relay accepts that rerun request only after the selected parent job's
+terminal failure. Promotion evidence proves the same ordering with durable
+`watch_cursor` values; request content alone is not proof of that causal edge.
+
 ## 7. Watch ordering and replay
 
 Per-envelope `sequence` remains stream-local and is never presented as a global order. On accepted CI event insertion, the relay transactionally assigns a durable, strictly increasing `watch_cursor` within the run's unique request index. The cursor orders storage acceptance, not event `created_at`.
+
+`GET /ci/runs/<run_id>/events` includes every accepted kind-46100 request in
+that same cursor stream, beginning with the immutable initial request at cursor
+one. `GET /ci/runs/<run_id>/request` returns that initial event and the same
+cursor. Promotion evidence may separate kind 46100 records from later event
+kinds for schema clarity, but it preserves every assigned cursor and validates
+the combined request-and-event sequence as one gap-free `1..N` history.
 
 `buzz ci watch --run <run_id> --timeout-seconds <bound>` first resolves the request, then
 requests events after an optional cursor. The required timeout is one fixed deadline for the
