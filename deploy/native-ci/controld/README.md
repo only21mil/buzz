@@ -14,6 +14,14 @@ and runner socket inodes: SELinux denies `init_t` `mounton` on a `sock_file`, so
 a per-socket `ReadOnlyPaths=` entry fails the service at NAMESPACE as soon as
 the socket exists. Connecting through a read-only bind mount still works.
 
+Controld authenticates the keyholder and runner listeners the way the
+acceptance driver authenticates controld: the socket inode must be owned by the
+service account with controld's group and mode `0620`, and `SO_PEERCRED` must
+name either that account or pid 1 root, which the kernel reports for a socket
+bound by a systemd socket unit because `SO_PEERCRED` names the `listen()`
+caller. Any other root process, an unmappable pid, or another account fails
+closed.
+
 ## Closed contract
 
 The installed default remains:
