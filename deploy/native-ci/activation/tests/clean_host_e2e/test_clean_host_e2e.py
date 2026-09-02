@@ -1733,6 +1733,7 @@ class TimingAndProgressTests(unittest.TestCase):
 
     def test_canary_command_forwards_exact_qualification_credentials(self) -> None:
         activation = {"manifest": "exact"}
+        public = {"binding": "exact"}
         scenario = b'{"scenario":"exact"}'
         completed = subprocess.CompletedProcess(
             ["/usr/libexec/buzz-ci-capacity-one-canary"], 0, b"receipt", b"",
@@ -1743,10 +1744,10 @@ class TimingAndProgressTests(unittest.TestCase):
             guest, "command", return_value=completed,
         ) as command:
             self.assertEqual(
-                guest.run_capacity_one_canary(activation, scenario),
+                guest.run_capacity_one_canary(activation, scenario, public),
                 b"receipt",
             )
-        credentials.assert_called_once_with(activation)
+        credentials.assert_called_once_with(activation, public)
         command.assert_called_once_with(
             ["/usr/libexec/buzz-ci-capacity-one-canary"],
             stdin=scenario,
@@ -1800,13 +1801,45 @@ class TimingAndProgressTests(unittest.TestCase):
                 guest.qualification_credentials(changed)
 
     def assert_live_acceptance_roles_for_status(
-        self, status: str,
+        self,
+        status: str | None = None,
+        *,
+        prepared: tuple[int, int] = (62002, 62002),
+        activation_controld: tuple[int, int] | None = None,
+        controld_account: tuple[int, int] | None = None,
+        actor_account: tuple[int, int] | None = None,
+        binding_peer: tuple[int, int] | None = None,
+        keyholder_peer: tuple[int, int] | None = None,
+        process: tuple[int, int] | None = None,
     ) -> tuple[int, int, list[int]]:
+        """Drive the live role assertion against one prepared controld identity.
+
+        `prepared` is the identity the key ceremony recorded in the public
+        binding. Every live value defaults to that identity; a keyword override
+        models one live value that differs from the prepared one.
+        """
+        activation_controld = activation_controld or prepared
+        controld_account = controld_account or prepared
+        actor_account = actor_account or (961, 961)
+        binding_peer = binding_peer or prepared
+        keyholder_peer = keyholder_peer or prepared
+        process = process or prepared
+        if status is None:
+            status = (
+                f"Uid:\t{process[0]}\t{process[0]}\t{process[0]}\t{process[0]}\n"
+                f"Gid:\t{process[1]}\t{process[1]}\t{process[1]}\t{process[1]}\n"
+                "Groups:\t\n"
+            )
+        public = {
+            "keyholder_public_spec": {
+                "peer": {"uid": prepared[0], "gid": prepared[1], "allowed_operations": ["describe"]},
+            },
+        }
         activation = {
             "identities": {
                 "controld": {
-                    "uid": 62002,
-                    "gid": 62002,
+                    "uid": activation_controld[0],
+                    "gid": activation_controld[1],
                     "supplementary_groups": [],
                 },
                 "qualification": {
@@ -1822,17 +1855,17 @@ class TimingAndProgressTests(unittest.TestCase):
             },
         }
         accounts = {
-            "buzzci-controld": mock.Mock(pw_uid=62002, pw_gid=62002),
-            "buzzci-ctl": mock.Mock(pw_uid=961, pw_gid=961),
+            "buzzci-controld": mock.Mock(pw_uid=controld_account[0], pw_gid=controld_account[1]),
+            "buzzci-ctl": mock.Mock(pw_uid=actor_account[0], pw_gid=actor_account[1]),
         }
         binding = {
             "schema_version": "buzz-ci-activation-acceptance-binding/v2",
-            "keyholder_peer_uid": 62002,
-            "keyholder_peer_gid": 62002,
+            "keyholder_peer_uid": binding_peer[0],
+            "keyholder_peer_gid": binding_peer[1],
             "acceptance_peer_uid": 961,
             "acceptance_peer_gid": 961,
         }
-        keyholder = {"peer": {"uid": 62002, "gid": 62002}}
+        keyholder = {"peer": {"uid": keyholder_peer[0], "gid": keyholder_peer[1]}}
         socket_metadata = mock.Mock(
             st_mode=stat.S_IFSOCK | 0o620,
             st_uid=0,
@@ -1858,7 +1891,55 @@ class TimingAndProgressTests(unittest.TestCase):
             with mock.patch.object(guest, "Path", side_effect=mapped_path), mock.patch.object(
                 guest.pwd, "getpwnam", side_effect=accounts.__getitem__,
             ), mock.patch.object(guest, "load_json", side_effect=(binding, keyholder)):
-                return guest.assert_live_acceptance_roles(activation)
+                return guest.assert_live_acceptance_roles(activation, public)
+
+    def test_live_acceptance_roles_derive_controld_identity_from_the_prepared_binding(self) -> None:
+        for prepared in ((1201, 1201), (62002, 62002)):
+            with self.subTest(prepared=prepared):
+                self.assertEqual(
+                    self.assert_live_acceptance_roles_for_status(prepared=prepared),
+                    (961, 961, [62005]),
+                )
+
+    def test_live_acceptance_roles_reject_any_role_that_differs_from_the_prepared_binding(self) -> None:
+        for prepared, other in (((1201, 1201), (62002, 62002)), ((62002, 62002), (1201, 1201))):
+            for field, message in (
+                ("activation_controld", "installed acceptance identities differ"),
+                ("controld_account", "installed acceptance identities differ"),
+                ("binding_peer", "acceptance role binding differs"),
+                ("keyholder_peer", "acceptance role binding differs"),
+                ("process", "live controld credentials differ"),
+            ):
+                with self.subTest(prepared=prepared, field=field), self.assertRaisesRegex(
+                    guest.GuestError, message,
+                ):
+                    self.assert_live_acceptance_roles_for_status(prepared=prepared, **{field: other})
+            with self.subTest(prepared=prepared, field="actor_account"), self.assertRaisesRegex(
+                guest.GuestError, "installed acceptance identities differ",
+            ):
+                self.assert_live_acceptance_roles_for_status(prepared=prepared, actor_account=(962, 961))
+
+    def test_prepared_controld_identity_rejects_an_unusable_binding_peer(self) -> None:
+        activation = {"identities": {"controld": {"uid": 1201, "gid": 1201, "supplementary_groups": []}}}
+        for peer in ({}, {"uid": 0, "gid": 1201}, {"uid": True, "gid": 1201}, {"uid": 1201, "gid": "1201"}, None):
+            public = {"keyholder_public_spec": {"peer": peer}}
+            with self.subTest(peer=peer), self.assertRaisesRegex(guest.GuestError, "prepared controld identity differs"):
+                guest.prepared_controld_identity(public, activation)
+        with self.assertRaisesRegex(guest.GuestError, "prepared controld identity differs"):
+            guest.prepared_controld_identity({}, activation)
+        self.assertEqual(
+            guest.prepared_controld_identity({"keyholder_public_spec": {"peer": {"uid": 1201, "gid": 1201}}}, activation),
+            (1201, 1201),
+        )
+        grouped = copy.deepcopy(activation)
+        grouped["identities"]["controld"]["supplementary_groups"] = ["buzzci-execd"]
+        with self.assertRaisesRegex(guest.GuestError, "installed acceptance identities differ"):
+            guest.prepared_controld_identity({"keyholder_public_spec": {"peer": {"uid": 1201, "gid": 1201}}}, grouped)
+
+    def test_guest_entry_carries_no_literal_acceptance_role_identity(self) -> None:
+        source = Path(guest.__file__).read_text()
+        for literal in ("62002", "961", "1201"):
+            self.assertIsNone(re.search(rf"\b{literal}\b", source), literal)
 
     def test_live_acceptance_roles_accepts_explicit_empty_groups_record(self) -> None:
         self.assertEqual(

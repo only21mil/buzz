@@ -1056,6 +1056,33 @@ def validate_ceremony_identities(
         raise GuestError("activation controld provider differs from ceremony binding")
 
 
+def valid_identity(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 0xFFFFFFFF
+
+
+def prepared_controld_identity(public: dict[str, object], activation: dict[str, object]) -> tuple[int, int]:
+    """Return the controld uid and gid that `prepare` recorded, never a literal.
+
+    The key ceremony writes the exact `--controld-uid` and `--controld-gid` given
+    to `prepare` into the public binding as the keyholder peer, and the host
+    binds that file into the stage descriptor. The activation manifest must
+    carry the same identity with no supplementary groups.
+    """
+    public_spec = public.get("keyholder_public_spec") if isinstance(public, dict) else None
+    peer = public_spec.get("peer") if isinstance(public_spec, dict) else None
+    if not isinstance(peer, dict) or not valid_identity(peer.get("uid")) or not valid_identity(peer.get("gid")):
+        raise GuestError("prepared controld identity differs")
+    identities = activation.get("identities")
+    controld = identities.get("controld") if isinstance(identities, dict) else None
+    if (
+        not isinstance(controld, dict)
+        or (controld.get("uid"), controld.get("gid")) != (peer["uid"], peer["gid"])
+        or controld.get("supplementary_groups")
+    ):
+        raise GuestError("installed acceptance identities differ")
+    return peer["uid"], peer["gid"]
+
+
 def qualification_credentials(activation: dict[str, object]) -> tuple[int, int, list[int]]:
     identities = activation.get("identities", {})
     qualification = identities.get("qualification", {}) if isinstance(identities, dict) else {}
@@ -1063,7 +1090,8 @@ def qualification_credentials(activation: dict[str, object]) -> tuple[int, int, 
     if (
         not isinstance(qualification, dict)
         or not isinstance(access_group, dict)
-        or (qualification.get("uid"), qualification.get("gid")) != (961, 961)
+        or not valid_identity(qualification.get("uid"))
+        or not valid_identity(qualification.get("gid"))
         or qualification.get("supplementary_groups") != ["buzzci-execd"]
         or access_group.get("group") != "buzzci-execd"
         or access_group.get("members") != ["buzzci-ctl", "buzzci-runner"]
@@ -1072,27 +1100,27 @@ def qualification_credentials(activation: dict[str, object]) -> tuple[int, int, 
         or not 1 <= access_group["gid"] <= 0xFFFF_FFFF
     ):
         raise GuestError("qualification credentials differ from the frozen manifest")
-    return 961, 961, [access_group["gid"]]
+    return qualification["uid"], qualification["gid"], [access_group["gid"]]
 
 
-def assert_live_acceptance_roles(activation: dict[str, object]) -> tuple[int, int, list[int]]:
-    identities = activation["identities"]
-    controld = identities["controld"]
+def assert_live_acceptance_roles(
+    activation: dict[str, object], public: dict[str, object],
+) -> tuple[int, int, list[int]]:
+    controld_uid, controld_gid = prepared_controld_identity(public, activation)
     credentials = qualification_credentials(activation)
+    actor_uid, actor_gid, _supplementary_gids = credentials
+    controld_account = pwd.getpwnam("buzzci-controld")
+    actor_account = pwd.getpwnam("buzzci-ctl")
     if (
-        (controld["uid"], controld["gid"]) != (62002, 62002)
-        or pwd.getpwnam("buzzci-controld").pw_uid != 62002
-        or pwd.getpwnam("buzzci-controld").pw_gid != 62002
-        or pwd.getpwnam("buzzci-ctl").pw_uid != 961
-        or pwd.getpwnam("buzzci-ctl").pw_gid != 961
-        or controld["supplementary_groups"]
+        (controld_account.pw_uid, controld_account.pw_gid) != (controld_uid, controld_gid)
+        or (actor_account.pw_uid, actor_account.pw_gid) != (actor_uid, actor_gid)
     ):
         raise GuestError("installed acceptance identities differ")
 
     socket_metadata = Path("/run/buzzci/controld-acceptance.sock").lstat()
     if (
         not stat.S_ISSOCK(socket_metadata.st_mode)
-        or (socket_metadata.st_uid, socket_metadata.st_gid) != (0, 961)
+        or (socket_metadata.st_uid, socket_metadata.st_gid) != (0, actor_gid)
         or stat.S_IMODE(socket_metadata.st_mode) != 0o620
     ):
         raise GuestError("controld acceptance socket credentials differ")
@@ -1102,10 +1130,11 @@ def assert_live_acceptance_roles(activation: dict[str, object]) -> tuple[int, in
     if (
         binding.get("schema_version") != "buzz-ci-activation-acceptance-binding/v2"
         or (binding.get("keyholder_peer_uid"), binding.get("keyholder_peer_gid"))
-        != (62002, 62002)
-        or (binding.get("acceptance_peer_uid"), binding.get("acceptance_peer_gid")) != (961, 961)
+        != (controld_uid, controld_gid)
+        or (binding.get("acceptance_peer_uid"), binding.get("acceptance_peer_gid"))
+        != (actor_uid, actor_gid)
         or (keyholder.get("peer", {}).get("uid"), keyholder.get("peer", {}).get("gid"))
-        != (62002, 62002)
+        != (controld_uid, controld_gid)
     ):
         raise GuestError("acceptance role binding differs")
 
@@ -1127,15 +1156,15 @@ def assert_live_acceptance_roles(activation: dict[str, object]) -> tuple[int, in
         except KeyError as error:
             raise GuestError("live controld credentials differ") from error
         controld_processes.append(process_credentials)
-    if controld_processes != [(["62002"] * 4, ["62002"] * 4, [])]:
+    if controld_processes != [([str(controld_uid)] * 4, [str(controld_gid)] * 4, [])]:
         raise GuestError("live controld credentials differ")
     return credentials
 
 
 def run_capacity_one_canary(
-    activation: dict[str, object], scenario: bytes,
+    activation: dict[str, object], scenario: bytes, public: dict[str, object],
 ) -> bytes:
-    uid, gid, supplementary_gids = assert_live_acceptance_roles(activation)
+    uid, gid, supplementary_gids = assert_live_acceptance_roles(activation, public)
     return command(
         ["/usr/libexec/buzz-ci-capacity-one-canary"],
         stdin=scenario,
@@ -1696,6 +1725,7 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
         receipt_raw = run_capacity_one_canary(
             package_manifest(activation_package, "activation"),
             read_file(inputs / "scenario.json"),
+            public,
         )
         receipt_path = STATE_ROOT / "acceptance-receipt.json"
         receipt_path.write_bytes(receipt_raw)
