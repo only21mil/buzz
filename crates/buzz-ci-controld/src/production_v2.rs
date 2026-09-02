@@ -165,7 +165,8 @@ where
             .map_err(|_| ProductionV2Error::Runner)?;
         if bound.response.broker_state != buzz_ci_broker_protocol::BrokerState::Terminal {
             self.observe(AttemptObservation::Active(bound))?;
-            self.await_command(admission.expires_at)?;
+            let deadline_at = bound.deadline_at().map_err(|_| ProductionV2Error::Runner)?;
+            self.await_command(deadline_at)?;
         }
         let terminal = session
             .client
@@ -357,7 +358,9 @@ impl<T, S> RunnerV2AttemptExecutor<T, S> {
         Ok(())
     }
 
-    fn await_command(&self, expires_at: u64) -> Result<(), ProductionV2Error> {
+    /// Hold the admitted attempt until the acceptance gate releases it or
+    /// its deadline (admission time plus the bounded window) passes.
+    fn await_command(&self, deadline_at: u64) -> Result<(), ProductionV2Error> {
         let Some(receiver) = &self.control.command else {
             return Ok(());
         };
@@ -365,7 +368,7 @@ impl<T, S> RunnerV2AttemptExecutor<T, S> {
             .duration_since(UNIX_EPOCH)
             .map_err(|_| ProductionV2Error::Runner)?
             .as_secs();
-        let timeout = expires_at
+        let timeout = deadline_at
             .checked_sub(now)
             .filter(|value| *value > 0)
             .map(Duration::from_secs)

@@ -159,6 +159,27 @@ pub struct BoundAttempt {
     pub response: v2::BrokerResponse,
 }
 
+impl BoundAttempt {
+    /// The attempt's deadline as execd judges it: the admission time the
+    /// broker recorded plus the lesser of the wall timeout and the frozen
+    /// request window's length. The window itself is a package constant
+    /// judged against the package time reference, never against the wall
+    /// clock, so a retained package admits and completes on any host date.
+    pub fn deadline_at(self) -> Result<u64, RunnerV2Error> {
+        let window = self
+            .admission
+            .expires_at
+            .checked_sub(self.admission.issued_at)
+            .filter(|window| *window > 0)
+            .ok_or(RunnerV2Error::InvalidRequest)?;
+        self.response
+            .accepted_at
+            .checked_add(u64::from(self.admission.wall_timeout_seconds).min(window))
+            .filter(|deadline| *deadline > self.response.accepted_at)
+            .ok_or(RunnerV2Error::InvalidRequest)
+    }
+}
+
 impl TerminalAttempt {
     pub fn evidence_coordinates(
         self,
@@ -429,6 +450,7 @@ where
             return Err(RunnerV2Error::InvalidConfig);
         }
         let admission = bound.admission;
+        let deadline_at = bound.deadline_at()?;
         let mut response = bound.response;
         loop {
             if response.broker_state == BrokerState::Terminal {
@@ -438,10 +460,10 @@ where
                 });
             }
             let now = unix_time()?;
-            if now >= admission.expires_at {
+            if now >= deadline_at {
                 return Err(RunnerV2Error::Deadline);
             }
-            let remaining = Duration::from_secs(admission.expires_at - now);
+            let remaining = Duration::from_secs(deadline_at - now);
             thread::sleep(poll_interval.min(remaining));
             response = self.exchange(Request::GetAttempt(GetAttemptRequest {
                 attempt_id: response.attempt_id,
@@ -982,6 +1004,117 @@ mod tests {
                 }
             )),
             Err(RunnerV2Error::InvalidRequest)
+        );
+    }
+
+    /// H10 clean host, boot 4: a package materialized eleven minutes earlier
+    /// admitted (the runner and execd judge the frozen window against the
+    /// package time reference) but controld's wait_terminal compared the
+    /// window with its own clock and failed the attempt at once. The deadline
+    /// is now the broker's admission time plus the lesser of the wall timeout
+    /// and the window length, as execd judges it.
+    fn admission_fixture() -> AdmitAttemptRequest {
+        prepare_signed_admission(&accepted(), &bindings(), &mut Signer).unwrap()
+    }
+
+    #[test]
+    fn attempt_deadline_follows_admission_time_and_window_length_not_the_wall_clock() {
+        let mut admission = admission_fixture();
+        // A package frozen in 2023: its window closed by wall clock long ago.
+        admission.issued_at = 1_700_000_000;
+        admission.expires_at = 1_700_000_300;
+        admission.wall_timeout_seconds = 120;
+        let now = unix_time().unwrap();
+        let leased = |accepted_at: u64| BoundAttempt {
+            admission,
+            response: v2::BrokerResponse {
+                code: ResponseCode::Ok,
+                retry_after_millis: 0,
+                attempt_id: [14; 16],
+                run_id: admission.run_id,
+                accepted_request_digest: admission.signed_request_digest,
+                job_intent_digest: admission.job_intent_digest,
+                execution_binding_digest: [15; 32],
+                tip_oid: Some(admission.tip_oid),
+                broker_state: BrokerState::Leased,
+                conclusion: Conclusion::None,
+                terminal_reason: 0,
+                generation: 2,
+                accepted_at,
+                updated_at: accepted_at,
+                lease_generation: 1,
+                evidence_set_digest: [0; 32],
+                teardown_digest: [0; 32],
+                attempt: admission.attempt,
+            },
+        };
+        assert_eq!(leased(now).deadline_at(), Ok(now + 120));
+        let mut short = leased(now);
+        short.admission.wall_timeout_seconds = 30;
+        assert_eq!(short.deadline_at(), Ok(now + 30));
+        let mut narrow = leased(now);
+        narrow.admission.expires_at = narrow.admission.issued_at + 45;
+        assert_eq!(narrow.deadline_at(), Ok(now + 45));
+        let mut empty = leased(now);
+        empty.admission.expires_at = empty.admission.issued_at;
+        assert_eq!(empty.deadline_at(), Err(RunnerV2Error::InvalidRequest));
+
+        struct TerminalTransport;
+        impl RunnerV2Transport for TerminalTransport {
+            type Error = ();
+
+            fn exchange_frame(
+                &mut self,
+                request: &[u8],
+                _response_length: usize,
+                _transport_attempts: u32,
+            ) -> Result<Vec<u8>, Self::Error> {
+                let (header, decoded) = v2::decode_request(request).unwrap();
+                let Request::GetAttempt(value) = decoded else {
+                    unreachable!();
+                };
+                let admission = admission_fixture();
+                Ok(v2::encode_response(
+                    header,
+                    v2::BrokerResponse {
+                        code: ResponseCode::Existing,
+                        retry_after_millis: 0,
+                        attempt_id: value.attempt_id,
+                        run_id: admission.run_id,
+                        accepted_request_digest: admission.signed_request_digest,
+                        job_intent_digest: admission.job_intent_digest,
+                        execution_binding_digest: value.execution_binding_digest,
+                        tip_oid: Some(admission.tip_oid),
+                        broker_state: BrokerState::Terminal,
+                        conclusion: Conclusion::Success,
+                        terminal_reason: 0,
+                        generation: 5,
+                        accepted_at: 1_800_000_000,
+                        updated_at: 1_800_000_011,
+                        lease_generation: 1,
+                        evidence_set_digest: [16; 32],
+                        teardown_digest: [17; 32],
+                        attempt: admission.attempt,
+                    },
+                )
+                .as_bytes()
+                .to_vec())
+            }
+        }
+        // The frozen window closed by wall clock long ago; the deadline is live.
+        assert!(now >= admission.expires_at);
+        let mut client = RunnerV2Client::new(TerminalTransport, 1).unwrap();
+        let terminal = client
+            .wait_terminal(leased(now), Duration::from_millis(1))
+            .expect("a live deadline reconciles the attempt");
+        assert_eq!(terminal.response.conclusion, Conclusion::Success);
+        // A deadline already behind the clock is refused before any poll.
+        let mut client = RunnerV2Client::new(TerminalTransport, 1).unwrap();
+        assert_eq!(
+            client
+                .wait_terminal(leased(now - 200), Duration::from_millis(1))
+                .map(|_| ()),
+            Err(RunnerV2Error::Deadline)
         );
     }
 

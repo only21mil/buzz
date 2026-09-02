@@ -595,7 +595,12 @@ impl CapacityOneService {
             .duration_since(UNIX_EPOCH)
             .map_err(|_| AcceptanceSocketError::Operation)?
             .as_secs();
-        if now == 0 || now >= active.admission.expires_at {
+        // The frozen window is judged against the package time reference by
+        // the runner and execd; the live bound is the attempt's deadline.
+        let deadline_at = active
+            .deadline_at()
+            .map_err(|_| AcceptanceSocketError::Operation)?;
+        if now == 0 || now >= deadline_at {
             return Err(AcceptanceSocketError::Operation);
         }
         if active.response.broker_state == BrokerState::Terminal {
