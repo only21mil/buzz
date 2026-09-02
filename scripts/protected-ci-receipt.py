@@ -315,6 +315,58 @@ def next_link(value: str | None) -> str | None:
     return None
 
 
+def enclosing_worktree(path: Path) -> Path | None:
+    """Return the git worktree root that contains path, or None outside any worktree."""
+    for candidate in (path, *path.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def make_private_dir(path: Path) -> None:
+    """Create path as a mode-0700 directory owned by the caller, or refuse."""
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    else:
+        os.chmod(path, 0o700)
+    info = os.lstat(path)
+    refuse(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+           and stat.S_IMODE(info.st_mode) == 0o700,
+           f"gh state directory {path} must be a mode-0700 directory owned by the caller",
+           ProviderError)
+
+
+def private_gh_home() -> Path:
+    """Create and return the private directory gh uses for state, config, and cache.
+
+    gh resolves its state directory relative to the working directory when the
+    environment carries neither HOME nor XDG_STATE_HOME, and the deploy checker
+    runs this tool from the repository root, so a gh subprocess with a minimal
+    environment left `.local/state/gh/device-id` inside the checkout. The
+    directory lives under the caller's own state root, is mode 0700, and must
+    resolve outside the git worktree that contains the working directory.
+    """
+    base = os.environ.get("XDG_STATE_HOME") or ""
+    if not os.path.isabs(base):
+        home = os.environ.get("HOME") or ""
+        refuse(os.path.isabs(home), "HOME or XDG_STATE_HOME must be an absolute path",
+               ProviderError)
+        base = os.path.join(home, ".local", "state")
+    gh_home = Path(base, "buzz-protected-ci", "gh")
+    worktree = enclosing_worktree(Path.cwd().resolve())
+    if worktree is not None:
+        resolved = gh_home.resolve()
+        refuse(resolved != worktree and not resolved.is_relative_to(worktree),
+               f"gh state directory {gh_home} resolves inside the git worktree {worktree}",
+               ProviderError)
+    os.makedirs(base, exist_ok=True)
+    make_private_dir(gh_home.parent)
+    make_private_dir(gh_home)
+    return gh_home
+
+
 class GhClient:
     def __init__(self, gh: str, identity: dict[str, Any] | None = None,
                  runner: Callable[..., subprocess.CompletedProcess[Any]] = subprocess.run):
@@ -324,6 +376,7 @@ class GhClient:
             "mode": "0755", "sha256": GH_SHA256,
         }
         self.runner = runner
+        self.home = private_gh_home()
         self.requests: list[dict[str, Any]] = []
 
     def request(self, endpoint: str, page: int) -> tuple[Any, str | None, str]:
@@ -335,12 +388,17 @@ class GhClient:
         ]
         token = os.environ.get("GH_TOKEN")
         refuse(bool(token), "GH_TOKEN is required", ProviderError)
+        home = str(self.home)
         env = {
             "GH_TOKEN": token,
             "GH_PROMPT_DISABLED": "1",
             "GH_HOST": HOST,
             "LC_ALL": "C.UTF-8",
             "NO_COLOR": "1",
+            "HOME": home,
+            "XDG_STATE_HOME": home,
+            "XDG_CONFIG_HOME": home,
+            "XDG_CACHE_HOME": home,
         }
         try:
             completed = self.runner(command, text=False, capture_output=True, env=env, check=False,

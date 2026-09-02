@@ -251,6 +251,15 @@ def apply_drift(client: FakeClient, name: str) -> None:
 
 
 class ReceiptTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Keep GhClient's private gh home out of the developer's real state root.
+        state = tempfile.TemporaryDirectory()
+        self.addCleanup(state.cleanup)
+        os.chmod(state.name, 0o700)
+        patcher = mock.patch.dict(os.environ, {"XDG_STATE_HOME": state.name})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def build(self, client: FakeClient | None = None) -> dict:
         return receipt.build_receipt(client or FakeClient(), 17, HEAD, "main")
 
@@ -547,11 +556,112 @@ class ReceiptTests(unittest.TestCase):
             output = f"HTTP/2 200 OK\nX-GitHub-Request-Id: id\nDate: {HTTP_DATE}\n\n{body}"
             return subprocess.CompletedProcess(command, 0, output, "")
 
-        with mock.patch.dict(os.environ, {"GH_TOKEN": "secret", "LEAK_ME": "no"}, clear=True):
-            receipt.GhClient("/usr/bin/gh", runner=runner).one("/user")
-        self.assertEqual(set(captured), {"GH_TOKEN", "GH_PROMPT_DISABLED", "GH_HOST", "LC_ALL",
-                                         "NO_COLOR"})
-        self.assertNotIn("LEAK_ME", captured)
+        with tempfile.TemporaryDirectory() as raw:
+            state = Path(raw) / "state"
+            state.mkdir(mode=0o700)
+            environment = {"GH_TOKEN": "secret", "LEAK_ME": "no", "XDG_STATE_HOME": str(state)}
+            with mock.patch.dict(os.environ, environment, clear=True):
+                receipt.GhClient("/usr/bin/gh", runner=runner).one("/user")
+            self.assertEqual(set(captured), {"GH_TOKEN", "GH_PROMPT_DISABLED", "GH_HOST", "LC_ALL",
+                                             "NO_COLOR", "HOME", "XDG_STATE_HOME",
+                                             "XDG_CONFIG_HOME", "XDG_CACHE_HOME"})
+            self.assertNotIn("LEAK_ME", captured)
+            gh_home = state / "buzz-protected-ci" / "gh"
+            for name in ("HOME", "XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME"):
+                self.assertEqual(captured[name], str(gh_home))
+            for path in (gh_home, gh_home.parent):
+                info = os.lstat(path)
+                self.assertTrue(stat.S_ISDIR(info.st_mode))
+                self.assertEqual(stat.S_IMODE(info.st_mode), 0o700)
+
+    def fake_gh(self, path: Path) -> None:
+        """A gh stand-in that resolves its state directory the way gh 2.97 does."""
+        body = json.dumps({"login": "sats", "id": 42})
+        path.write_text(
+            "#!/bin/sh\n"
+            "if [ -n \"${XDG_STATE_HOME:-}\" ]; then dir=\"${XDG_STATE_HOME}/gh\"\n"
+            "elif [ -n \"${HOME:-}\" ]; then dir=\"${HOME}/.local/state/gh\"\n"
+            "else dir=.local/state/gh; fi\n"
+            "mkdir -p \"${dir}\" && printf device > \"${dir}/device-id\" || exit 9\n"
+            "printf 'HTTP/2 200 OK\\r\\nX-GitHub-Request-Id: id\\r\\n"
+            f"Date: {HTTP_DATE}\\r\\n\\r\\n%s' '{body}'\n"
+        )
+        path.chmod(0o700)
+
+    def test_gh_state_never_lands_in_the_checkout(self) -> None:
+        def porcelain(repo: Path) -> str:
+            return subprocess.run(["git", "-C", str(repo), "status", "--porcelain",
+                                   "--untracked-files=all"], text=True, capture_output=True,
+                                  check=True).stdout
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            repo = root / "repo"
+            repo.mkdir(mode=0o700)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            fake = root / "gh"
+            self.fake_gh(fake)
+            # The stand-in reproduces the defect under the old minimal environment.
+            subprocess.run([str(fake)], cwd=repo, env={"GH_TOKEN": "test"}, check=True,
+                           capture_output=True)
+            self.assertEqual(porcelain(repo), "?? .local/state/gh/device-id\n")
+            subprocess.run(["rm", "-r", str(repo / ".local")], check=True)
+            self.assertEqual(porcelain(repo), "")
+
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            environment = {"GH_TOKEN": "test", "XDG_STATE_HOME": str(state)}
+            with contextlib.chdir(repo), mock.patch.dict(os.environ, environment, clear=True):
+                self.assertEqual(receipt.GhClient(str(fake)).one("/user"), {"login": "sats", "id": 42})
+            self.assertEqual(porcelain(repo), "")
+            self.assertEqual([p for p in repo.rglob("*") if ".git" not in p.relative_to(repo).parts], [])
+            self.assertEqual((state / "buzz-protected-ci/gh/gh/device-id").read_text(), "device")
+
+            home = root / "home"
+            home.mkdir(mode=0o700)
+            environment = {"GH_TOKEN": "test", "HOME": str(home)}
+            with contextlib.chdir(repo), mock.patch.dict(os.environ, environment, clear=True):
+                receipt.GhClient(str(fake)).one("/user")
+            self.assertEqual(porcelain(repo), "")
+            self.assertTrue((home / ".local/state/buzz-protected-ci/gh/gh/device-id").is_file())
+
+            for environment in ({"GH_TOKEN": "test", "XDG_STATE_HOME": str(repo / "var")},
+                                {"GH_TOKEN": "test", "HOME": str(repo)},
+                                {"GH_TOKEN": "test", "XDG_STATE_HOME": "relative", "HOME": str(repo)}):
+                with contextlib.chdir(repo), mock.patch.dict(os.environ, environment, clear=True):
+                    with self.assertRaisesRegex(receipt.ProviderError, "inside the git worktree"):
+                        receipt.GhClient(str(fake))
+            with contextlib.chdir(repo), mock.patch.dict(os.environ, {"GH_TOKEN": "test"}, clear=True):
+                with self.assertRaisesRegex(receipt.ProviderError, "HOME or XDG_STATE_HOME"):
+                    receipt.GhClient(str(fake))
+            self.assertEqual(porcelain(repo), "")
+
+    def test_gh_env_carries_private_xdg_paths_and_never_the_repository_home(self) -> None:
+        captured = {}
+
+        def runner(command, **kwargs):
+            captured.update(kwargs["env"])
+            body = json.dumps({"login": "sats", "id": 42})
+            output = f"HTTP/2 200 OK\nX-GitHub-Request-Id: id\nDate: {HTTP_DATE}\n\n{body}"
+            return subprocess.CompletedProcess(command, 0, output, "")
+
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            repo = root / "repo"
+            repo.mkdir(mode=0o700)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            state = root / "state"
+            state.mkdir(mode=0o700)
+            environment = {"GH_TOKEN": "test", "HOME": str(repo), "XDG_STATE_HOME": str(state)}
+            with contextlib.chdir(repo), mock.patch.dict(os.environ, environment, clear=True):
+                receipt.GhClient("/usr/bin/gh", runner=runner).one("/user")
+            gh_home = (state / "buzz-protected-ci" / "gh").resolve()
+            for name in ("XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "HOME"):
+                self.assertEqual(Path(captured[name]).resolve(), gh_home)
+            self.assertNotEqual(Path(captured["HOME"]).resolve(), repo.resolve())
+            self.assertFalse(Path(captured["HOME"]).resolve().is_relative_to(repo.resolve()))
+            self.assertEqual(stat.S_IMODE(os.lstat(captured["HOME"]).st_mode), 0o700)
+            self.assertNotIn("GH_CONFIG_DIR", captured)
 
     def test_token_is_required_without_exposure(self) -> None:
         with mock.patch.dict(os.environ, {}, clear=True), \
