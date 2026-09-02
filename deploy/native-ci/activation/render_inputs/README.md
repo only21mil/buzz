@@ -57,7 +57,10 @@ The checked-template generator validates a complete canonical activation draft
 before it replaces the candidate, public actor, ready-package component, execd
 pre-activation, and controld package fields with renderer bindings. Its scenario
 mode validates the maintained capacity-one scenario before it binds the four
-candidate and activation fields. Both outputs use the checked envelope below;
+candidate and activation fields plus the frozen grant-event ID. That ID is
+derived only from compact declaration-order JSON bytes for the exact activation
+manifest's `acceptance_template.grant_event`; the maintained placeholder is
+never trusted. Both outputs use the checked envelope below;
 the generator creates new private files and never replaces an output.
 
 The generator rebinds `source_commit` for every candidate-owned component. It
@@ -80,12 +83,21 @@ pre-activation input, the ceremony's public binding, and the generated checked
 template. `render-scenario` also requires the frozen execd and activation
 manifests. It rejects an activation manifest unless its default state is closed
 capacity zero, then binds the rendered scenario to the exact candidate,
-activation ID, activation package digest, and source object. A checked template
+activation ID, activation package digest, source object, and derived grant-event
+ID. `render-scenario` and `render-clean-host` independently recompute that ID
+from the frozen manifest and reject a missing, literal, stale, or extra binding.
+A checked template
 has this exact envelope:
 
 ```json
 {"definitions":{},"document":{"source_commit":{"$copy":"candidate_sha"}},"kind":"activation-draft","schema_version":"buzz-ci-checked-render-template/v1"}
 ```
+
+`render-clean-host` copies the validated activation manifest's closed
+`platform_systemd` object into the VM contract. The guest compares that object
+with the activation package and the distribution-owned file in the pinned
+image before installation. The renderer accepts no caller override for this
+binding.
 
 `$copy` reads only the immutable binding graph: `candidate_sha`,
 `public_binding`, `packages`, normalized ready-package component evidence,

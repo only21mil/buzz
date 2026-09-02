@@ -17,6 +17,14 @@ if [ "$input_sha256" != "$expected_input_sha256" ]; then
   exit 1
 fi
 
+# Hold before producing any evidence so a cancellation issued right after
+# admission (acceptance stage 9, cancellation_terminal) reaches a running job:
+# the executor kills the process group and the attempt ends cancelled with no
+# artifact. The first attempt (stage 6) waits the hold out. Bounded well inside
+# the 120 s wall timeout and the driver operation budget.
+hold_seconds=10
+sleep "$hold_seconds"
+
 mkdir -p "$artifact_dir"
 printf '%s\n' '{"fixture_version":"v1","input_sha256":"967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6"}' > "$artifact_dir/result.json"
 printf '%s\n' 'fixture=buzz-ci-capacity-one-v1 input_sha256=967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6 artifact=result.json'

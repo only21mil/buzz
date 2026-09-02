@@ -35,6 +35,9 @@ def load_module(name: str, path: Path):
 
 ACTIVATION_PACKAGE = load_module("bootstrap_activation_package", ACTIVATION_ROOT / "package.py")
 ACTIVATION_FREEZER = load_module("bootstrap_activation_freezer", ACTIVATION_ROOT / "freeze_package.py")
+ACTIVATION_CONTROLLER = load_module(
+    "bootstrap_activation_controller", ACTIVATION_ROOT / "controller.py",
+)
 INVENTORY = load_module("bootstrap_inventory", ACTIVATION_ROOT / "check_package_inventory.py")
 RENDER = load_module("bootstrap_renderer", ACTIVATION_ROOT / "render_inputs/render_inputs.py")
 TEMPLATE_GENERATOR = load_module(
@@ -42,8 +45,9 @@ TEMPLATE_GENERATOR = load_module(
     ACTIVATION_ROOT / "render_inputs/generate_checked_templates.py",
 )
 EXECD_FREEZER = load_module("bootstrap_execd_freezer", EXECD_ROOT / "freeze_package.py")
-ACTIVATION_TESTS = load_module(
-    "bootstrap_activation_test_fixture", ACTIVATION_ROOT / "tests/test_activation_controller.py",
+ACTIVATION_SCAFFOLD = load_module(
+    "bootstrap_activation_scaffold",
+    REPO_ROOT / "deploy/native-ci/tests/support/activation_scaffold.py",
 )
 load_module("render_runner_config", RUNNER_ROOT / "render_runner_config.py")
 RUNNER_FREEZER = load_module("bootstrap_runner_freezer", RUNNER_ROOT / "freeze_package.py")
@@ -86,12 +90,48 @@ def file_ref(base: Path, path: Path) -> dict[str, object]:
 
 
 class BootstrapCompositionTests(unittest.TestCase):
+    def test_production_bootstrap_has_one_event_owner_and_no_test_or_prior_seed(self) -> None:
+        tracked = subprocess.run(
+            ["git", "ls-files", "-z", "--", "."],
+            cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+        ).stdout.split(b"\0")
+        serialized_placeholders = (
+            b'{"type":"' + b'run"}',
+            b'{"type":"' + b'grant"}',
+            b'{"type":"' + b'rerun"}',
+        )
+        banned = (
+            b"tests/test_activation_" + b"controller.py",
+            b"bootstrap_activation_" + b"test_fixture",
+            b"validated-activation-" + b"draft",
+            *serialized_placeholders,
+            *(value.replace(b'"', b'\\"') for value in serialized_placeholders),
+        )
+        event_owners = 0
+        for raw_relative in tracked:
+            if not raw_relative:
+                continue
+            relative = raw_relative.decode()
+            if "/archive/" in relative or "/evidence/" in relative:
+                continue
+            path = REPO_ROOT / relative
+            try:
+                payload = path.read_bytes()
+            except OSError:
+                continue
+            for marker in banned:
+                self.assertNotIn(marker, payload, relative)
+            event_owners += payload.count(
+                b"def production_acceptance_" + b"template(",
+            )
+        self.assertEqual(event_owners, 1)
+
     def test_activation_template_generator_rejects_unsafe_input_and_never_clobbers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             fixture_root = root / "fixture"
             fixture_root.mkdir(mode=0o700)
-            fixture = ACTIVATION_TESTS.ActivationFixture(fixture_root)
+            fixture = ACTIVATION_SCAFFOLD.ActivationFixture(fixture_root)
             draft = self._retarget_draft(fixture, "c" * 40)
             source = root / "draft.json"
             output = root / "template.json"
@@ -177,9 +217,9 @@ class BootstrapCompositionTests(unittest.TestCase):
                     ],
                 },
                 "selectors": {
-                    "ci_event": {"public_key": "44" * 32, "generation": 1},
-                    "nip98": {"public_key": "55" * 32, "generation": 1},
-                    "manifest": {"public_key": "66" * 32, "generation": 1},
+                    "ci_event": {"public_key": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5", "generation": 1},
+                    "nip98": {"public_key": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9", "generation": 1},
+                    "manifest": {"public_key": "e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13", "generation": 1},
                 },
                 "nip98_origin": "https://relay.example.invalid",
                 "acceptance": {
@@ -200,6 +240,21 @@ class BootstrapCompositionTests(unittest.TestCase):
         draft["schema"] = ACTIVATION_PACKAGE.DRAFT_SCHEMA
         draft["source_commit"] = candidate
         draft["acceptance_template"]["actor"]["generation"] = 1
+
+        controld_entry = next(
+            item for item in draft["entries"] if item["role"] == "controld_config"
+        )
+        controld_active = json.loads(fixture.assets[controld_entry["active_source"]][0])
+        draft["acceptance_template"] = ACTIVATION_PACKAGE.production_acceptance_template(
+            actor_public_key=draft["acceptance_template"]["actor"]["public_key"],
+            actor_generation=1,
+            ci_signer_public_key=controld_active["keyholder_selectors"]["ci_event"]["public_key"],
+            candidate_sha=candidate,
+            workflow_id=controld_active["workflow_id"],
+            workflow_digest=controld_active["workflow_digest"],
+            job_id=controld_active["jobs"][0]["job_id"],
+            time_reference=draft["acceptance_template"]["time_reference"],
+        )
 
         entries = {item["role"]: item for item in draft["entries"]}
         components = {item["name"]: item for item in draft["components"]}
@@ -236,6 +291,51 @@ class BootstrapCompositionTests(unittest.TestCase):
             execd_entry[digest_key] = hashlib.sha256(payload).hexdigest()
 
         return draft
+
+    def _bind_admission_key(
+        self,
+        draft: dict[str, object],
+        fixture: object,
+        public: dict[str, object],
+    ) -> dict[str, object]:
+        """Retarget the draft to the ceremony's keyholder selectors.
+
+        The manifest selector is the one source of the admission key: the execd
+        lane manifest copies its public key and generation, the runner's static
+        coordinates and every lane_manifest_digest follow, and controld carries
+        the selectors themselves (package.validate_phase_configs binds them).
+        """
+        selectors = copy.deepcopy(public["keyholder_public_spec"]["selectors"])
+        entries = {item["role"]: item for item in draft["entries"]}
+        execd_entry = entries["execd_config"]
+        lane_digest = ""
+        for source_key, digest_key in (
+            ("source", "sha256"), ("active_source", "active_sha256"),
+        ):
+            source = execd_entry[source_key]
+            value = json.loads(fixture.assets[source][0])
+            value["lane_manifest"]["admission_verifying_key"] = selectors["manifest"]["public_key"]
+            value["lane_manifest"]["admission_key_generation"] = selectors["manifest"]["generation"]
+            lane_digest = ACTIVATION_PACKAGE.lane_manifest_digest(value["lane_manifest"])
+            value["lane_manifest_digest"] = lane_digest
+            payload = canonical(value)
+            fixture.assets[source] = (payload, 0o400)
+            execd_entry[digest_key] = hashlib.sha256(payload).hexdigest()
+        runner_entry = entries["runner_config"]
+        runner_active = json.loads(fixture.assets[runner_entry["active_source"]][0])
+        runner_active["lane_manifest_digest"] = lane_digest
+        runner_active["admission_key_generation"] = selectors["manifest"]["generation"]
+        payload = canonical(runner_active)
+        fixture.assets[runner_entry["active_source"]] = (payload, 0o400)
+        runner_entry["active_sha256"] = hashlib.sha256(payload).hexdigest()
+        controld_entry = entries["controld_config"]
+        controld_active = json.loads(fixture.assets[controld_entry["active_source"]][0])
+        controld_active["keyholder_selectors"] = selectors
+        controld_active["lane_manifest_digest"] = lane_digest
+        payload = canonical(controld_active)
+        fixture.assets[controld_entry["active_source"]] = (payload, 0o400)
+        controld_entry["active_sha256"] = hashlib.sha256(payload).hexdigest()
+        return controld_active
 
     def _ready_packages(
         self,
@@ -298,10 +398,10 @@ class BootstrapCompositionTests(unittest.TestCase):
                     identities["controld"]["uid"],
                     identities["controld"]["gid"],
                 )
-                raw = (output / "package-manifest.json").read_bytes()
-                component["package_manifest_sha256"] = hashlib.sha256(raw).hexdigest()
-                component["package_digest"] = manifest["package_digest"]
-                fixture.assets[component["package_manifest_source"]] = (raw, 0o400)
+            raw = (output / "package-manifest.json").read_bytes()
+            component["package_manifest_sha256"] = hashlib.sha256(raw).hexdigest()
+            component["package_digest"] = manifest["package_digest"]
+            fixture.assets[component["package_manifest_source"]] = (raw, 0o400)
             results[name] = manifest
 
         keyholder_component = next(
@@ -361,22 +461,10 @@ class BootstrapCompositionTests(unittest.TestCase):
             source, candidate = self._source_checkout(ceremony)
             fixture_root = ceremony / "fixture"
             fixture_root.mkdir(mode=0o700)
-            fixture = ACTIVATION_TESTS.ActivationFixture(fixture_root)
+            fixture = ACTIVATION_SCAFFOLD.ActivationFixture(fixture_root)
             draft = self._retarget_draft(fixture, candidate)
             public = self._public_binding(draft["acceptance_template"]["actor"])
-            controld_entry = next(
-                item for item in draft["entries"] if item["role"] == "controld_config"
-            )
-            controld_active_source = controld_entry["active_source"]
-            controld_active = json.loads(fixture.assets[controld_active_source][0])
-            controld_active["keyholder_selectors"] = copy.deepcopy(
-                public["keyholder_public_spec"]["selectors"]
-            )
-            controld_active_raw = canonical(controld_active)
-            fixture.assets[controld_active_source] = (controld_active_raw, 0o400)
-            controld_entry["active_sha256"] = hashlib.sha256(
-                controld_active_raw
-            ).hexdigest()
+            controld_active = self._bind_admission_key(draft, fixture, public)
             state = ceremony / "state"
             state.mkdir(mode=0o700)
             public_path = state / "public-binding.json"
@@ -388,6 +476,21 @@ class BootstrapCompositionTests(unittest.TestCase):
             self.assertNotEqual(public_path.read_bytes(), canonical(public))
             ready = self._ready_packages(
                 ceremony, source, draft, fixture, candidate, public_path,
+            )
+            draft = ACTIVATION_PACKAGE.production_activation_draft(
+                source_commit=candidate,
+                identities=draft["identities"],
+                access_group=draft["access_group"],
+                components=draft["components"],
+                entries=draft["entries"],
+                effective_systemd=draft["effective_systemd"],
+                actor_public_key=public["acceptance_actor"]["public_key"],
+                actor_generation=public["acceptance_actor"]["generation"],
+                ci_signer_public_key=public["keyholder_public_spec"]["selectors"]["ci_event"]["public_key"],
+                workflow_id=controld_active["workflow_id"],
+                workflow_digest=controld_active["workflow_digest"],
+                job_id=controld_active["jobs"][0]["job_id"],
+                time_reference=draft["acceptance_template"]["time_reference"],
             )
             self.assertEqual(
                 (ceremony / "packages/keyholder/public-binding.json").read_bytes(),
@@ -510,10 +613,37 @@ class BootstrapCompositionTests(unittest.TestCase):
             activation_manifest = ACTIVATION_FREEZER.freeze_package(
                 source, candidate, ceremony / "activation-draft.json", asset_root, activation_path,
             )
-            loaded_manifest, _loaded_payloads = ACTIVATION_TESTS.CONTROLLER.load_package(
+            loaded_manifest, _loaded_payloads = ACTIVATION_CONTROLLER.load_package(
                 activation_path, live=False,
             )
             self.assertEqual(loaded_manifest, activation_manifest)
+            hostile_draft = copy.deepcopy(rendered_draft)
+            hostile_runner = next(
+                item for item in hostile_draft["components"] if item["name"] == "runner"
+            )
+            runner_asset = asset_root / Path(hostile_runner["package_manifest_source"]).name
+            original_runner_raw = runner_asset.read_bytes()
+            hostile_package = json.loads(original_runner_raw)
+            hostile_tmpfiles = next(
+                item for item in hostile_package["entries"] if item["role"] == "tmpfiles"
+            )
+            hostile_tmpfiles["sha256"] = "f" * 64
+            hostile_unsigned = {
+                key: value for key, value in hostile_package.items() if key != "package_digest"
+            }
+            hostile_package["package_digest"] = hashlib.sha256(canonical(hostile_unsigned)).hexdigest()
+            hostile_raw = canonical(hostile_package)
+            hostile_runner["package_manifest_sha256"] = hashlib.sha256(hostile_raw).hexdigest()
+            hostile_runner["package_digest"] = hostile_package["package_digest"]
+            hostile_draft_path = ceremony / "hostile-activation-draft.json"
+            write_file(hostile_draft_path, canonical(hostile_draft), 0o600)
+            write_file(runner_asset, hostile_raw, 0o400)
+            with self.assertRaisesRegex(ValueError, "runner package tmpfiles source binding differs"):
+                ACTIVATION_FREEZER.freeze_package(
+                    source, candidate, hostile_draft_path, asset_root,
+                    ceremony / "packages/hostile-activation",
+                )
+            write_file(runner_asset, original_runner_raw, 0o400)
             execd_path = ceremony / "packages/execd"
             execd_manifest = EXECD_FREEZER.freeze_package(
                 source, candidate, execd_binary, execd_provenance, preactivation_path,
@@ -538,13 +668,6 @@ class BootstrapCompositionTests(unittest.TestCase):
                 "source_oid": candidate,
                 "activation_id": activation_manifest["activation_id"],
                 "activation_package_digest": activation_manifest["package_digest"],
-                "grant_event_id": ACTIVATION_PACKAGE.digest(
-                    json.dumps(
-                        activation_manifest["acceptance_template"]["grant_event"],
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ).encode()
-                ),
             })
             scenario_template_path = ceremony / "scenario-template.json"
             scenario_source_path = ceremony / "scenario-source.json"
@@ -561,6 +684,28 @@ class BootstrapCompositionTests(unittest.TestCase):
             self.assertEqual(
                 json.loads(scenario_template_path.read_bytes()),
                 TEMPLATE_GENERATOR.checked_scenario_template(scenario),
+            )
+            checked_scenario = json.loads(scenario_template_path.read_bytes())
+            self.assertEqual(
+                checked_scenario["document"]["fixture"]["grant_event_id"],
+                {"$copy": "activation_grant_event_id"},
+            )
+            scenario["fixture"]["request_digest"] = ACTIVATION_PACKAGE.digest(
+                json.dumps(
+                    activation_manifest["acceptance_template"]["run_event"],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode()
+            )
+            scenario["fixture"]["grant_event_id"] = ACTIVATION_PACKAGE.digest(
+                json.dumps(
+                    activation_manifest["acceptance_template"]["grant_event"],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode()
+            )
+            scenario["fixture"]["approved_by"] = (
+                activation_manifest["acceptance_template"]["actor"]["public_key"]
             )
             scenario_descriptor = self._write_descriptor(ceremony, "scenario-descriptor.json", {
                 "schema_version": "buzz-ci-capacity-one-scenario-render-input/v1",
@@ -587,7 +732,7 @@ class BootstrapCompositionTests(unittest.TestCase):
             self.assertFalse(scenario_raw.endswith(b"\n"))
             self.assertEqual(verifier._digest(verifier._ordered_scenario(scenario)), scenario_sha256)
             self.assertEqual(
-                ACTIVATION_TESTS.CONTROLLER._acceptance_binding(
+                ACTIVATION_CONTROLLER._acceptance_binding(
                     activation_manifest, json.loads(scenario_raw),
                 )["scenario_sha256"],
                 scenario_sha256,
@@ -632,6 +777,25 @@ class BootstrapCompositionTests(unittest.TestCase):
             self.assertEqual(set(clean_contract["packages"]), set(RENDER.PACKAGE_NAMES))
             self.assertEqual(clean_contract["seccomp_source"]["sha256"], seccomp_sha256)
             self.assertEqual(clean_contract["scenario"]["sha256"], scenario_sha256)
+            self.assertEqual(clean_contract["platform_systemd"], RENDER.PLATFORM_SYSTEMD)
+
+            stale_scenario = copy.deepcopy(scenario)
+            stale_scenario["fixture"]["grant_event_id"] = "8" * 64
+            write_file(scenario_path, RENDER.canonical_scenario(stale_scenario), 0o600)
+            stale_clean_descriptor = json.loads(clean_descriptor.read_bytes())
+            stale_clean_descriptor["scenario"] = file_ref(ceremony, scenario_path)
+            stale_clean_descriptor_path = self._write_descriptor(
+                ceremony, "stale-grant-clean-descriptor.json", stale_clean_descriptor,
+            )
+            with mock.patch.object(
+                RENDER, "SECCOMP_SHA256", seccomp_sha256,
+            ), self.assertRaisesRegex(RENDER.RenderError, "cross-binding differs"):
+                self._render(
+                    "render-clean-host",
+                    stale_clean_descriptor_path,
+                    "stale-grant-clean-host-contract.json",
+                )
+            write_file(scenario_path, scenario_raw, 0o600)
             previous_directory = Path.cwd()
             try:
                 os.chdir(ceremony)
@@ -675,6 +839,7 @@ class BootstrapCompositionTests(unittest.TestCase):
                     "tar", "-cf", str(guest_stage / "candidate.tar"), "-C", str(source),
                     "deploy/native-ci/activation/tests/clean_host_e2e/harness.py",
                     "deploy/native-ci/activation/tests/clean_host_e2e/timing-contract.json",
+                    "deploy/native-ci/activation/platform/fedora-44-systemd-259/10-timeout-abort.conf",
                 ],
                 check=True,
             )
@@ -694,6 +859,7 @@ class BootstrapCompositionTests(unittest.TestCase):
                 "scenario_sha256": scenario_sha256,
                 "seccomp_source_sha256": seccomp_sha256,
                 "timing_asset_sha256": clean_contract["timing_asset_sha256"],
+                "platform_systemd": clean_contract["platform_systemd"],
             }
             with (
                 mock.patch.object(CLEAN_HOST_GUEST, "STATE_ROOT", guest_state),
@@ -703,10 +869,12 @@ class BootstrapCompositionTests(unittest.TestCase):
                     source / "deploy/native-ci/activation/tests/clean_host_e2e/timing-contract.json",
                 ),
                 mock.patch.object(CLEAN_HOST_GUEST, "SECCOMP_SHA256", seccomp_sha256),
+                mock.patch.object(CLEAN_HOST_GUEST, "verify_platform_systemd") as platform_check,
             ):
                 _candidate_path, guest_scenario, _guest_public = CLEAN_HOST_GUEST.cross_bind(
                     guest_stage, guest_descriptor,
                 )
+            platform_check.assert_called_once_with(clean_contract["platform_systemd"])
             self.assertEqual(RENDER.canonical_scenario(guest_scenario), scenario_raw)
 
             drifted_seccomp = b'{"defaultAction":"SCMP_ACT_ALLOW"}\n'

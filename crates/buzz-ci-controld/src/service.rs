@@ -2,7 +2,7 @@
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use buzz_ci_acceptance_ctl::acceptance::{
     AdmissionState, ApprovalSnapshot, AttemptSnapshot, AttemptState,
@@ -31,7 +31,8 @@ use buzz_ci_controld::production_v2::{
 };
 use buzz_ci_controld::runner_client::{UnixRunnerConnector, UnixRunnerConnectorError};
 use buzz_ci_controld::runner_v2::{
-    BoundAttempt, RunnerV2Client, StaticAdmissionBindings, StaticArtifactBinding, TerminalAttempt,
+    live_bound_now, BoundAttempt, RunnerV2Client, StaticAdmissionBindings, StaticArtifactBinding,
+    TerminalAttempt,
 };
 use buzz_ci_controld::source::{AuthenticatedRelay, ReqwestTransport, SourceError, TransportError};
 use buzz_ci_controld::store::{DurableControlStore, StoreError};
@@ -512,7 +513,7 @@ impl AcceptanceOperationHandler for CapacityOneService {
                 let cancelled = self.cancel_active_attempt(request, active)?;
                 self.release_async_attempt()?;
                 let (reconciled, _) = self.finish_async_attempt()?;
-                if reconciled != cancelled {
+                if !same_terminal_binding(cancelled, reconciled) {
                     return Err(AcceptanceSocketError::Operation);
                 }
                 Ok(cancelled_response(request, prior, cancelled)?)
@@ -591,11 +592,14 @@ impl CapacityOneService {
         request: &AdapterRequest,
         active: BoundAttempt,
     ) -> Result<TerminalAttempt, AcceptanceSocketError> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| AcceptanceSocketError::Operation)?
-            .as_secs();
-        if now == 0 || now >= active.admission.expires_at {
+        // The frozen window is judged against the package time reference by
+        // the runner and execd; the live bound is the attempt's deadline on
+        // the host clock (`live_bound_now`).
+        let now = live_bound_now().map_err(|_| AcceptanceSocketError::Operation)?;
+        let deadline_at = active
+            .deadline_at()
+            .map_err(|_| AcceptanceSocketError::Operation)?;
+        if now == 0 || now >= deadline_at {
             return Err(AcceptanceSocketError::Operation);
         }
         if active.response.broker_state == BrokerState::Terminal {
@@ -628,6 +632,24 @@ impl CapacityOneService {
         validate_cancelled_terminal(active, terminal, true)?;
         Ok(terminal)
     }
+}
+
+/// The cancellation answer (execd answers a stop with `Ok`) and the worker's
+/// reconciled read of the same closed binding (a state read answers
+/// `Existing`) describe one terminal binding; every bound field must agree,
+/// the wire code and retry hint are the transport's, not the binding's.
+fn same_terminal_binding(cancelled: TerminalAttempt, reconciled: TerminalAttempt) -> bool {
+    let mut normalized = reconciled.response;
+    normalized.code = cancelled.response.code;
+    normalized.retry_after_millis = cancelled.response.retry_after_millis;
+    matches!(
+        cancelled.response.code,
+        ResponseCode::Ok | ResponseCode::Existing
+    ) && matches!(
+        reconciled.response.code,
+        ResponseCode::Ok | ResponseCode::Existing
+    ) && cancelled.admission == reconciled.admission
+        && cancelled.response == normalized
 }
 
 fn validate_cancelled_terminal(
@@ -758,24 +780,31 @@ fn running_response(
     rerun: bool,
 ) -> Result<AdapterResponse, AcceptanceSocketError> {
     let attempt_id = hex::encode(active.response.attempt_id);
-    if request
-        .attempt_id
-        .as_deref()
-        .is_some_and(|value| value != attempt_id)
-        || active.admission.attempt != if rerun { 2 } else { 1 }
+    if active.admission.attempt != if rerun { 2 } else { 1 }
         || active.response.broker_state == BrokerState::Terminal
     {
         return Err(AcceptanceSocketError::Operation);
     }
-    let mut attempts = if rerun {
-        prior_run(prior)?.attempts.clone()
+    // The driver names the attempt it reruns at sequence 8 (the first
+    // attempt, the only id it holds); the new attempt's id exists only in
+    // this response. Sequence 5 carries no attempt id, so the first attempt
+    // accepts none or its own.
+    let (mut attempts, parent_attempt_id) = if rerun {
+        let parent = first_attempt_id(prior)?;
+        if parent.is_none() || request.attempt_id != parent {
+            return Err(AcceptanceSocketError::Operation);
+        }
+        (prior_run(prior)?.attempts.clone(), parent)
     } else {
-        Vec::new()
+        if request
+            .attempt_id
+            .as_deref()
+            .is_some_and(|value| value != attempt_id)
+        {
+            return Err(AcceptanceSocketError::Operation);
+        }
+        (Vec::new(), None)
     };
-    let parent_attempt_id = rerun
-        .then(|| first_attempt_id(prior))
-        .transpose()?
-        .flatten();
     attempts.push(attempt_snapshot(
         request,
         attempt_id,
@@ -1136,6 +1165,7 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     use buzz_ci_acceptance_ctl::acceptance_binding_test_support::canonical_acceptance_binding;
+    use buzz_ci_acceptance_ctl::production::{ControlReadback, ADAPTER_REQUEST_SCHEMA};
     use buzz_ci_broker_protocol::v2::{AdmissionSignatureAlgorithm, AdmitAttemptRequest};
     use buzz_ci_broker_protocol::{GitOid, TrustClass};
     use tempfile::TempDir;
@@ -1240,6 +1270,160 @@ mod tests {
                 attempt: 2,
             },
         }
+    }
+
+    fn rerun_request(attempt_id: Option<&str>) -> AdapterRequest {
+        let binding = canonical_acceptance_binding();
+        AdapterRequest {
+            schema_version: ADAPTER_REQUEST_SCHEMA.to_owned(),
+            sequence: 8,
+            operation: Operation::Rerun,
+            scenario_sha256: binding.scenario_sha256.clone(),
+            operation_id: "operation".to_owned(),
+            fixture: binding.fixture.clone(),
+            attempt_id: attempt_id.map(str::to_owned),
+            expected_controller_generation: Some(1),
+            expected_runner_generation: Some(1),
+            host: ControlReadback {
+                activation_id: binding.activation_id.clone(),
+                activation_package_digest: binding.activation_package_digest.clone(),
+                integrated_candidate_sha: binding.fixture.integrated_candidate_sha.clone(),
+                capacity: 1,
+                admission: AdmissionState::Open,
+                controller_generation: 1,
+                runner_generation: 1,
+            },
+        }
+    }
+
+    /// H9 clean host, canary stage 8 (rerun_separation): the driver sent the
+    /// first attempt's id (the attempt it reruns, the only id it holds) and
+    /// controld compared it with the new attempt's id, failed the operation,
+    /// and exited closed. The rerun response binds the request to the first
+    /// attempt and reports the second as running under it.
+    #[test]
+    fn rerun_running_response_binds_the_request_to_the_first_attempt_it_reruns() {
+        let active = active_binding();
+        let second_id = hex::encode(active.response.attempt_id);
+        let first_id = "0123456789abcdef0123456789abcdef".to_owned();
+        let mut exported = rerun_request(Some(&first_id));
+        exported.sequence = 7;
+        exported.operation = Operation::ExportFirstEvidence;
+        let prior = acceptance_response(
+            &exported,
+            run_snapshot(
+                &exported,
+                RunState::Terminal,
+                AcceptanceConclusion::Success,
+                Some(approval_snapshot(&exported, true)),
+                Some(first_id.clone()),
+                vec![attempt_snapshot(
+                    &exported,
+                    first_id.clone(),
+                    1,
+                    None,
+                    AttemptState::Terminal,
+                    AcceptanceConclusion::Success,
+                    Some("11".repeat(32)),
+                )],
+            ),
+            0,
+            None,
+        );
+
+        let response =
+            running_response(&rerun_request(Some(&first_id)), Some(&prior), active, true)
+                .expect("rerun bound to the first attempt");
+        let run = response.response.snapshot.run.expect("run snapshot");
+        assert_eq!(run.state, RunState::Running);
+        assert_eq!(run.aggregate_conclusion, AcceptanceConclusion::None);
+        assert_eq!(run.attempts.len(), 2);
+        assert_eq!(run.attempts[0].attempt_id, first_id);
+        assert_eq!(run.attempts[0].state, AttemptState::Terminal);
+        assert_eq!(run.attempts[1].attempt_id, second_id);
+        assert_eq!(run.attempts[1].attempt, 2);
+        assert_eq!(
+            run.attempts[1].parent_attempt_id.as_deref(),
+            Some(first_id.as_str())
+        );
+        assert_eq!(run.attempts[1].state, AttemptState::Running);
+        assert_eq!(run.attempts[1].conclusion, AcceptanceConclusion::None);
+
+        for foreign in [
+            None,
+            Some(second_id.as_str()),
+            Some("ffffffffffffffffffffffffffffffff"),
+        ] {
+            assert_eq!(
+                running_response(&rerun_request(foreign), Some(&prior), active, true).map(|_| ()),
+                Err(AcceptanceSocketError::Operation),
+                "request attempt id {foreign:?}"
+            );
+        }
+        assert_eq!(
+            running_response(&rerun_request(Some(&first_id)), None, active, true).map(|_| ()),
+            Err(AcceptanceSocketError::Operation)
+        );
+        // The first attempt (sequence 5) still carries no id or its own.
+        let mut first = active;
+        first.admission.attempt = 1;
+        first.admission.parent_attempt = 0;
+        first.response.attempt = 1;
+        let mut resume = rerun_request(None);
+        resume.sequence = 5;
+        resume.operation = Operation::ResumeGrant;
+        let response =
+            running_response(&resume, None, first, false).expect("first attempt running");
+        assert_eq!(
+            response.response.snapshot.run.expect("run").attempts.len(),
+            1
+        );
+        resume.attempt_id = Some(first_id.clone());
+        assert_eq!(
+            running_response(&resume, None, first, false).map(|_| ()),
+            Err(AcceptanceSocketError::Operation)
+        );
+    }
+
+    /// H10 clean host, boot 6: the cancel answered `Ok` with the closed
+    /// binding, the worker's GetAttempt read of the same binding answered
+    /// `Existing`, and stage 9 compared the two whole responses and failed
+    /// closed. The reconciliation binds every field but the wire code.
+    #[test]
+    fn cancel_reconciliation_binds_the_closed_binding_not_the_wire_code() {
+        let active = active_binding();
+        let mut response = active.response;
+        response.broker_state = BrokerState::Terminal;
+        response.conclusion = BrokerConclusion::Cancelled;
+        response.generation += 3;
+        response.updated_at += 1;
+        response.evidence_set_digest = [16; 32];
+        response.teardown_digest = [17; 32];
+        let cancelled = TerminalAttempt {
+            admission: active.admission,
+            response,
+        };
+        assert_eq!(validate_cancelled_terminal(active, cancelled, true), Ok(()));
+        let mut read = cancelled;
+        read.response.code = ResponseCode::Existing;
+        assert_ne!(read, cancelled);
+        assert!(same_terminal_binding(cancelled, read));
+        assert!(same_terminal_binding(cancelled, cancelled));
+        let mut later = read;
+        later.response.generation += 1;
+        assert!(!same_terminal_binding(cancelled, later));
+        let mut other_evidence = read;
+        other_evidence.response.evidence_set_digest[0] ^= 1;
+        assert!(!same_terminal_binding(cancelled, other_evidence));
+        let mut other_conclusion = read;
+        other_conclusion.response.conclusion = BrokerConclusion::Success;
+        assert!(!same_terminal_binding(cancelled, other_conclusion));
+        let mut refused = read;
+        refused.response.code = ResponseCode::PolicyDenied;
+        assert!(!same_terminal_binding(cancelled, refused));
+        let mut other_admission = read;
+        other_admission.admission.attempt = 1;
+        assert!(!same_terminal_binding(cancelled, other_admission));
     }
 
     #[test]

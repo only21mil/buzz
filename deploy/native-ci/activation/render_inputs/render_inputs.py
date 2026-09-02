@@ -39,6 +39,15 @@ HARNESS_PATH = "deploy/native-ci/activation/tests/clean_host_e2e/harness.py"
 GUEST_ENTRY_PATH = "deploy/native-ci/activation/tests/clean_host_e2e/guest_entry.py"
 TIMING_PATH = "deploy/native-ci/activation/tests/clean_host_e2e/timing-contract.json"
 SECCOMP_SHA256 = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
+PLATFORM_SYSTEMD = {
+    "schema_version": "buzz-ci-systemd-platform-binding/v1",
+    "platform_id": "fedora-44-systemd-259",
+    "service_drop_ins": [{
+        "owner": "platform",
+        "path": "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+        "sha256": "ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37",
+    }],
+}
 PACKAGE_SCHEMAS = {
     "runner": "buzz-ci-runner-install-package-v2",
     "controld": "buzz-ci-controld-install-package-v2",
@@ -389,6 +398,28 @@ def validate_manifest(manifest: dict[str, Any], candidate: str, name: str) -> No
             require_sha(item["active_sha256"], f"{name} active source")
 
 
+def _validate_activation_component_package_bindings(
+    manifests: dict[str, Any], manifest_sha256: dict[str, str],
+) -> None:
+    if "activation" not in manifests:
+        return
+    components = {
+        item.get("name"): item
+        for item in manifests["activation"].get("components", [])
+        if isinstance(item, dict)
+    }
+    for name in ("runner", "controld"):
+        if name not in manifests:
+            continue
+        component = components.get(name)
+        if (
+            not isinstance(component, dict)
+            or component.get("package_manifest_sha256") != manifest_sha256[name]
+            or component.get("package_digest") != manifests[name].get("package_digest")
+        ):
+            raise RenderError(f"activation {name} package cross-binding differs")
+
+
 def load_manifests(root: DescriptorRoot, value: object, candidate: str, names: tuple[str, ...]) -> tuple[dict[str, Any], dict[str, str]]:
     descriptors = require_keys(value, set(names), "package manifests")
     manifests: dict[str, Any] = {}
@@ -398,6 +429,7 @@ def load_manifests(root: DescriptorRoot, value: object, candidate: str, names: t
         validate_manifest(manifest, candidate, name)
         manifests[name] = manifest
         digests[name] = hashlib.sha256(raw).hexdigest()
+    _validate_activation_component_package_bindings(manifests, digests)
     if "activation" in manifests:
         activation = manifests["activation"]
         try:
@@ -634,6 +666,19 @@ def load_template_bindings(root: DescriptorRoot, descriptor: dict[str, Any], nam
         "package_manifest_sha256": manifest_file_sha,
         "public_binding_sha256": hashlib.sha256(public_raw).hexdigest(),
     }
+    if "activation" in manifests:
+        bindings["activation_request_digest"] = activation_request_digest(
+            manifests["activation"],
+        )
+        bindings["activation_grant_event_id"] = activation_grant_event_id(
+            manifests["activation"],
+        )
+        bindings["activation_approved_by"] = activation_approved_by(
+            manifests["activation"],
+        )
+        bindings["activation_fixture_manifest_sha256"] = (
+            activation_fixture_manifest_sha256(manifests["activation"])
+        )
     template, _raw, _ = root.json_ref(descriptor["template"], "checked template")
     return template, bindings
 
@@ -690,6 +735,49 @@ def ordered_scenario(value: object) -> dict[str, Any]:
 def canonical_scenario(value: object) -> bytes:
     """Return the exact no-LF bytes hashed by controller and receipt verifier."""
     return compact_declared(ordered_scenario(value))
+
+
+def _activation_acceptance_template(activation: object) -> dict[str, Any]:
+    if not isinstance(activation, dict):
+        raise RenderError("activation package manifest is absent")
+    try:
+        return activation_package_module().validate_acceptance_template(
+            activation["acceptance_template"],
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as error:
+        raise RenderError("activation acceptance template binding is invalid") from error
+
+
+def activation_request_digest(activation: object) -> str:
+    """Bind a scenario to the exact frozen public run-event bytes."""
+    return hashlib.sha256(compact_declared(
+        _activation_acceptance_template(activation)["run_event"],
+    )).hexdigest()
+
+
+def activation_grant_event_id(activation: object) -> str:
+    """Bind a scenario to the exact frozen public grant-event bytes."""
+    return hashlib.sha256(compact_declared(
+        _activation_acceptance_template(activation)["grant_event"],
+    )).hexdigest()
+
+
+def activation_approved_by(activation: object) -> str:
+    """Bind a scenario to the exact frozen public acceptance actor."""
+    return _activation_acceptance_template(activation)["actor"]["public_key"]
+
+
+def activation_fixture_manifest_sha256(activation: object) -> str:
+    """Return the sole fixture-manifest digest frozen by the activation package."""
+    if not isinstance(activation, dict) or not isinstance(activation.get("entries"), list):
+        raise RenderError("activation fixture manifest binding is absent")
+    entries = [
+        entry for entry in activation["entries"]
+        if isinstance(entry, dict) and entry.get("role") == "fixture_manifest"
+    ]
+    if len(entries) != 1:
+        raise RenderError("activation fixture manifest binding is not unique")
+    return require_sha(entries[0].get("sha256"), "activation fixture manifest")
 
 
 def parse_scenario_json(raw: bytes, where: str) -> dict[str, Any]:
@@ -811,22 +899,6 @@ def validate_scenario(value: object, bindings: dict[str, Any]) -> dict[str, Any]
     fixture = scenario["fixture"]
     if not isinstance(fixture, dict):
         raise RenderError("capacity-one scenario fixture differs")
-    activation = bindings["packages"]["activation"]
-    if activation.get("default_state") != {
-        "capacity": 0,
-        "enabled": False,
-        "active": False,
-        "provisioned": False,
-    }:
-        raise RenderError("activation package does not stage at closed capacity zero")
-    expected = {
-        "integrated_candidate_sha": bindings["candidate_sha"],
-        "source_oid": bindings["candidate_sha"],
-        "activation_id": activation["activation_id"],
-        "activation_package_digest": activation["package_digest"],
-    }
-    if any(fixture.get(key) != wanted for key, wanted in expected.items()):
-        raise RenderError("capacity-one scenario cross-binding differs")
     required = {
         "integrated_candidate_sha", "activation_id", "activation_package_digest", "run_id",
         "job_id", "request_digest", "manifest_digest", "source_oid", "approval_id",
@@ -835,6 +907,35 @@ def validate_scenario(value: object, bindings: dict[str, Any]) -> dict[str, Any]
         "expected_log", "expected_artifacts",
     }
     require_keys(fixture, required, "capacity-one fixture")
+    activation = bindings["packages"]["activation"]
+    if activation.get("default_state") != {
+        "capacity": 0,
+        "enabled": False,
+        "active": False,
+        "provisioned": False,
+    }:
+        raise RenderError("activation package does not stage at closed capacity zero")
+    request_digest = activation_request_digest(activation)
+    grant_event_id = activation_grant_event_id(activation)
+    approved_by = activation_approved_by(activation)
+    if bindings.get("activation_request_digest") != request_digest:
+        raise RenderError("activation run event renderer binding differs")
+    if bindings.get("activation_grant_event_id") != grant_event_id:
+        raise RenderError("activation grant event renderer binding differs")
+    if bindings.get("activation_approved_by") != approved_by:
+        raise RenderError("activation actor renderer binding differs")
+    expected = {
+        "integrated_candidate_sha": bindings["candidate_sha"],
+        "source_oid": bindings["candidate_sha"],
+        "activation_id": activation["activation_id"],
+        "activation_package_digest": activation["package_digest"],
+        "request_digest": request_digest,
+        "manifest_digest": activation_fixture_manifest_sha256(activation),
+        "grant_event_id": grant_event_id,
+        "approved_by": approved_by,
+    }
+    if any(fixture.get(key) != wanted for key, wanted in expected.items()):
+        raise RenderError("capacity-one scenario cross-binding differs")
     return ordered_scenario(scenario)
 
 
@@ -972,18 +1073,32 @@ def clean_host_contract(root: DescriptorRoot, descriptor: dict[str, Any]) -> dic
         raise RenderError("seccomp source differs from the frozen contract")
     package_descriptors = require_keys(descriptor["packages"], set(PACKAGE_NAMES), "package trees")
     manifests: dict[str, Any] = {}
+    manifest_sha256: dict[str, str] = {}
     tree_digests: dict[str, str] = {}
     paths: dict[str, str] = {}
     for name in PACKAGE_NAMES:
         package_value = package_descriptors[name]
         if not isinstance(package_value, dict):
             raise RenderError(f"{name} package descriptor differs")
-        manifests[name], _manifest_sha, tree_digests[name] = validate_package_tree(root, name, package_value, candidate)
+        manifests[name], manifest_sha256[name], tree_digests[name] = validate_package_tree(root, name, package_value, candidate)
         paths[name] = normalized(package_value["path"], f"{name} package path")
+    _validate_activation_component_package_bindings(manifests, manifest_sha256)
     validate_keyholder_public_binding(public_raw, manifests)
-    bindings = {"candidate_sha": candidate, "packages": manifests}
+    bindings = {
+        "candidate_sha": candidate,
+        "packages": manifests,
+        "activation_request_digest": activation_request_digest(manifests["activation"]),
+        "activation_grant_event_id": activation_grant_event_id(manifests["activation"]),
+        "activation_approved_by": activation_approved_by(manifests["activation"]),
+        "activation_fixture_manifest_sha256": activation_fixture_manifest_sha256(
+            manifests["activation"],
+        ),
+    }
     validate_scenario(scenario, bindings)
     activation = manifests["activation"]
+    platform_systemd = activation.get("platform_systemd")
+    if platform_systemd != PLATFORM_SYSTEMD:
+        raise RenderError("activation systemd platform binding differs")
     binding = manifests["execd"].get("activation_binding")
     if not isinstance(binding, dict) or any(binding.get(key) != value for key, value in (
         ("source_commit", candidate), ("activation_id", activation["activation_id"]), ("package_digest", activation["package_digest"]),
@@ -994,6 +1109,7 @@ def clean_host_contract(root: DescriptorRoot, descriptor: dict[str, Any]) -> dic
         "candidate_sha": candidate,
         "harness_sha256": harness_sha256,
         "packages": {name: {"path": paths[name], "tree_sha256": tree_digests[name]} for name in PACKAGE_NAMES},
+        "platform_systemd": platform_systemd,
         "scenario": {"path": scenario_path, "sha256": hashlib.sha256(scenario_raw).hexdigest()},
         "schema_version": "buzz-ci-clean-host-e2e-vm-contract/v3",
         "seccomp_source": {"path": seccomp_path, "sha256": SECCOMP_SHA256},
@@ -1021,7 +1137,7 @@ def lifecycle_evidence(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict
     evidence = values["evidence_manifest"]
     receipt = values["acceptance_receipt"]
     verifier = values["verifier"]
-    require_keys(contract, {"schema_version", "state", "candidate_root", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing", "timing_sha256", "scenario", "seccomp_source", "packages"}, "lifecycle contract")
+    require_keys(contract, {"schema_version", "state", "candidate_root", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing", "timing_sha256", "scenario", "seccomp_source", "packages", "platform_systemd"}, "lifecycle contract")
     require_keys(evidence, {"schema_version", "candidate_sha", "image_sha256", "tool_sha256", "harness_sha256", "harness_asset_sha256", "timing_asset_sha256", "timing", "timing_sha256", "package_tree_sha256", "scenario_sha256", "seccomp_source_sha256", "transfer_bytes", "transfer_sha256", "receipt_sha256", "verifier_sha256", "dormant_proof"}, "lifecycle evidence manifest")
     require_keys(result, {"status", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing_sha256", "receipt_sha256", "verifier_sha256", "evidence_manifest_sha256", "dormant_proof", "vm_state_absent"}, "lifecycle result")
     require_keys(verifier, {"outcome", "status"}, "installed verifier output")
@@ -1052,6 +1168,8 @@ def lifecycle_evidence(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict
     normalized(contract_seccomp["path"], "lifecycle seccomp source")
     if contract_seccomp["sha256"] != SECCOMP_SHA256:
         raise RenderError("lifecycle seccomp source differs")
+    if contract["platform_systemd"] != PLATFORM_SYSTEMD:
+        raise RenderError("lifecycle systemd platform binding differs")
     if evidence.get("schema_version") != "buzz-ci-clean-host-e2e-evidence/v3" or evidence.get("candidate_sha") != candidate:
         raise RenderError("lifecycle evidence candidate differs")
     require_sha(evidence["image_sha256"], "lifecycle image")

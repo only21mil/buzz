@@ -97,6 +97,7 @@ TRACKED_EXECUTABLES = (
 )
 
 SYSTEMD_SOURCE_PATHS = {
+    "/usr/lib/systemd/system/service.d/10-timeout-abort.conf": Path("deploy/native-ci/activation/platform/fedora-44-systemd-259/10-timeout-abort.conf"),
     "/etc/systemd/system/buzz-ci-capacity-one.target": Path("deploy/native-ci/activation/templates/buzz-ci-capacity-one.target"),
     "/etc/systemd/system/buzz-ci-controld-acceptance.socket": Path("deploy/native-ci/controld/templates/buzz-ci-controld-acceptance.socket"),
     "/etc/systemd/system/buzz-ci-acceptance-control.socket": Path("deploy/native-ci/activation/templates/buzz-ci-acceptance-control.socket"),
@@ -420,11 +421,11 @@ def freeze_package(
         if activation_package.digest(raw) != component["provenance_sha256"]:
             raise ValueError(f"component provenance digest differs: {component['name']}")
         payloads[source] = (raw, 0o400)
-        if component["name"] == "controld":
+        if "package_manifest_source" in component:
             package_source = component["package_manifest_source"]
             package_raw = _external_payload(asset_root, package_source, 0o400)
             if activation_package.digest(package_raw) != component["package_manifest_sha256"]:
-                raise ValueError("controld package manifest digest differs")
+                raise ValueError(f"{component['name']} package manifest digest differs")
             payloads[package_source] = (package_raw, 0o400)
 
     component_commits = {item["name"]: item["source_commit"] for item in draft["components"]}
@@ -433,7 +434,11 @@ def freeze_package(
             source_path = SYSTEMD_SOURCE_PATHS.get(record["path"])
             if source_path is None:
                 raise ValueError(f"effective systemd source is unknown: {record['path']}")
-            revision = source_commit if record["owner"] == "activation" else component_commits[record["owner"]]
+            revision = (
+                source_commit
+                if record["owner"] in {"activation", "platform"}
+                else component_commits[record["owner"]]
+            )
             if activation_package.digest(_git_blob(source_root, revision, source_path)) != record["sha256"]:
                 raise ValueError(f"effective systemd source digest differs: {record['path']}")
 
@@ -441,6 +446,31 @@ def freeze_package(
         draft,
         {source: payload for source, (payload, _mode) in payloads.items()},
     )
+    tmpfiles_sources = {
+        "runner": Path("deploy/native-ci/runner/templates/buzzci-runner.tmpfiles"),
+        "controld": Path("deploy/native-ci/controld/templates/buzzci-controld.tmpfiles"),
+    }
+    tmpfiles_plan = {
+        item["component"]: item
+        for item in activation_package.component_tmpfiles_plan(
+            draft, {source: payload for source, (payload, _mode) in payloads.items()},
+        )
+    }
+    component_commits = {item["name"]: item["source_commit"] for item in draft["components"]}
+    for name, relative in tmpfiles_sources.items():
+        if activation_package.digest(
+            _git_blob(source_root, component_commits[name], relative)
+        ) != tmpfiles_plan[name]["sha256"]:
+            raise ValueError(f"{name} package tmpfiles source binding differs")
+    components_by_name = {item["name"]: item for item in draft["components"]}
+    for name in activation_package.COMPONENT_PACKAGE_NAMES:
+        component = components_by_name[name]
+        package = json.loads(payloads[component["package_manifest_source"]][0])
+        documentation = next(item for item in package["entries"] if item["role"] == "documentation")
+        if activation_package.digest(
+            _git_blob(source_root, component_commits[name], Path(f"deploy/native-ci/{name}/README.md"))
+        ) != documentation["sha256"]:
+            raise ValueError(f"{name} package documentation source binding differs")
 
     referenced_sources = {
         entry["source"] for entry in draft["entries"]
@@ -449,11 +479,11 @@ def freeze_package(
     } | {
         component["provenance_source"] for component in draft["components"]
     }
-    referenced_sources.add(next(
+    referenced_sources.update(
         component["package_manifest_source"]
         for component in draft["components"]
-        if component["name"] == "controld"
-    ))
+        if "package_manifest_source" in component
+    )
     if set(payloads) != referenced_sources:
         raise ValueError("package assets collide")
 

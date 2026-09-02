@@ -1,6 +1,8 @@
 name: Desktop Release Candidate
 
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
 
@@ -15,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Validate immutable desktop candidate
@@ -26,3 +28,13 @@ jobs:
         run: |
           VERSION="${VERSION#version-bump/}"
           scripts/desktop_release.py validate --candidate HEAD --version "$VERSION" --repo "$GITHUB_REPOSITORY"
+      # Every push to main validates the exact pushed commit. Unchanged mode
+      # proves the candidate identity is byte-equal to the first parent and the
+      # manifests agree; release mode proves the commit carries the validated
+      # immutable candidate of one version-bump/ pull request. The step never
+      # succeeds without running one of the two modes.
+      - name: Verify desktop candidate on main
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/desktop_release.py verify-main --commit "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"

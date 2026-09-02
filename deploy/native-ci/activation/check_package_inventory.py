@@ -36,6 +36,18 @@ CONTROLD_ACCEPTANCE_SOURCE = Path(
     "deploy/native-ci/controld/templates/buzz-ci-controld-acceptance.socket"
 )
 CONTROLD_ACCEPTANCE_NAME = CONTROLD_ACCEPTANCE_SOURCE.name
+PLATFORM_SYSTEMD_SOURCE = Path(
+    "deploy/native-ci/activation/platform/fedora-44-systemd-259/10-timeout-abort.conf"
+)
+PLATFORM_SYSTEMD = {
+    "schema_version": "buzz-ci-systemd-platform-binding/v1",
+    "platform_id": "fedora-44-systemd-259",
+    "service_drop_ins": [{
+        "owner": "platform",
+        "path": "/usr/lib/systemd/system/service.d/10-timeout-abort.conf",
+        "sha256": "ae6b234f92bc22f1201a7572b59b454c9809f33c80d13f361b9674e1801acc37",
+    }],
+}
 
 
 def _canonical(value: object) -> bytes:
@@ -91,9 +103,14 @@ def check_source_inventory(source_root: Path) -> dict[str, object]:
     canonical = source_root / CONTROLD_ACCEPTANCE_SOURCE
     if not canonical.is_file() or canonical.is_symlink():
         raise ValueError("controld acceptance socket canonical source is not a regular file")
+    platform_source = source_root / PLATFORM_SYSTEMD_SOURCE
+    if not platform_source.is_file() or platform_source.is_symlink():
+        raise ValueError("systemd platform binding source is not a regular file")
     return {
         "controld_acceptance_source": str(CONTROLD_ACCEPTANCE_SOURCE),
         "sha256": hashlib.sha256(canonical.read_bytes()).hexdigest(),
+        "systemd_platform_source": str(PLATFORM_SYSTEMD_SOURCE),
+        "systemd_platform_sha256": hashlib.sha256(platform_source.read_bytes()).hexdigest(),
     }
 
 
@@ -172,6 +189,16 @@ def check_inventory(
         raise ValueError("controld must solely own its acceptance socket package target")
 
     activation = manifests["activation"]
+    platform = activation.get("platform_systemd")
+    if platform != PLATFORM_SYSTEMD:
+        raise ValueError("activation systemd platform binding differs")
+    platform_records = {
+        record.get("path"): record
+        for record in platform["service_drop_ins"]
+        if isinstance(record, dict) and isinstance(record.get("path"), str)
+    }
+    if len(platform_records) != len(platform["service_drop_ins"]):
+        raise ValueError("activation systemd platform binding is invalid")
     effective = activation.get("effective_systemd")
     if not isinstance(effective, list):
         raise ValueError("activation effective systemd inventory is absent")
@@ -184,6 +211,11 @@ def check_inventory(
                 raise ValueError("activation effective systemd path is invalid")
             owner = record.get("owner")
             target = record.get("path")
+            if owner == "platform":
+                if platform_records.get(target) != record:
+                    raise ValueError(f"effective systemd platform binding differs: {target}")
+                effective_count += 1
+                continue
             entry = entries_by_package.get(str(owner), {}).get(str(target))
             if not isinstance(entry, dict) or entry.get("sha256") != record.get("sha256"):
                 raise ValueError(f"effective systemd owner or bytes differ: {target}")
@@ -207,6 +239,9 @@ def check_inventory(
     }
     if source_root is not None:
         report["source_inventory"] = check_source_inventory(source_root)
+        platform_digests = {record.get("sha256") for record in platform_records.values()}
+        if report["source_inventory"]["systemd_platform_sha256"] not in platform_digests:
+            raise ValueError("systemd platform source bytes differ from the activation binding")
     return report
 
 

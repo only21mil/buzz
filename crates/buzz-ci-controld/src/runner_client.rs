@@ -707,7 +707,7 @@ impl RunnerConnector for UnixRunnerConnector {
         )?;
         let peer = getsockopt(&stream, PeerCredentials)
             .map_err(|_| UnixRunnerConnectorError::WrongPeer)?;
-        if peer.uid() != self.config.runner_uid || peer.gid() != self.config.runner_gid {
+        if !runner_listener_accepted(peer.pid(), peer.uid(), peer.gid(), &self.config) {
             return Err(UnixRunnerConnectorError::WrongPeer);
         }
         let timeout = Duration::from_millis(self.config.io_timeout_millis);
@@ -727,6 +727,28 @@ impl RunnerConnector for UnixRunnerConnector {
     fn connect(&mut self) -> Result<Self::Connection, Self::Error> {
         Err(UnixRunnerConnectorError::Unavailable)
     }
+}
+
+/// `SO_PEERCRED` names the process that called `listen()`. Production binds
+/// `/run/buzzci/runner-control.sock` through `buzz-ci-runner.socket`, so the
+/// kernel reports pid 1 root while `buzz-ci-runner.service` accepts as its own
+/// account. The shared acceptance-driver rule accepts exactly that listener or
+/// the runner account; the inode check in `connect` has already proven the
+/// socket is the runner's (owner uid, controld's group, mode `0620`).
+#[cfg(target_os = "linux")]
+fn runner_listener_accepted(
+    pid: i32,
+    uid: u32,
+    gid: u32,
+    config: &UnixRunnerConnectorConfig,
+) -> bool {
+    use buzz_ci_acceptance_ctl::production::{listener_peer_accepted, ListenerPeer};
+
+    listener_peer_accepted(
+        ListenerPeer { pid, uid, gid },
+        config.runner_uid,
+        config.runner_gid,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -1523,6 +1545,71 @@ mod tests {
         fn connect(&mut self) -> Result<Self::Connection, Self::Error> {
             Err(())
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn listener_rule_accepts_the_socket_unit_or_the_runner_and_rejects_the_rest() {
+        let config = UnixRunnerConnectorConfig {
+            socket_path: PathBuf::from("/run/buzzci/runner-control.sock"),
+            runner_uid: 1200,
+            runner_gid: 1200,
+            connect_timeout_millis: 100,
+            io_timeout_millis: 100,
+        };
+        assert!(runner_listener_accepted(1, 0, 0, &config));
+        assert!(runner_listener_accepted(4242, 1200, 1200, &config));
+        for (pid, uid, gid) in [
+            (4242, 0, 0),
+            (0, 0, 0),
+            (-1, 0, 0),
+            (1, 1200, 0),
+            (1, 0, 1200),
+            (4242, 1200, 1201),
+            (4242, 1201, 1200),
+            (4242, 1204, 1204),
+        ] {
+            assert!(
+                !runner_listener_accepted(pid, uid, gid, &config),
+                "{pid} {uid}:{gid}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn connect_authenticates_a_listener_the_runner_account_bound_and_rejects_a_foreign_inode() {
+        use std::os::unix::net::UnixListener;
+
+        use nix::unistd::{getegid, geteuid};
+
+        let directory = tempfile::tempdir().expect("socket directory");
+        let path = directory.path().join("runner-control.sock");
+        let listener = UnixListener::bind(&path).expect("bind runner test socket");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o620))
+            .expect("socket mode");
+        let config = UnixRunnerConnectorConfig {
+            socket_path: path.clone(),
+            runner_uid: geteuid().as_raw(),
+            runner_gid: getegid().as_raw(),
+            connect_timeout_millis: 500,
+            io_timeout_millis: 500,
+        };
+        let mut connector = UnixRunnerConnector::new(config.clone()).expect("connector");
+        let stream = connector.connect().expect("own listener is accepted");
+        drop(stream);
+        let (accepted, _) = listener.accept().expect("connection reached the listener");
+        drop(accepted);
+
+        // An inode owned by another account is rejected before connecting.
+        let foreign = UnixRunnerConnector::new(UnixRunnerConnectorConfig {
+            runner_uid: geteuid().as_raw().wrapping_add(1),
+            ..config
+        })
+        .expect("connector")
+        .connect()
+        .err();
+        assert_eq!(foreign, Some(UnixRunnerConnectorError::WrongSocket));
     }
 
     #[test]

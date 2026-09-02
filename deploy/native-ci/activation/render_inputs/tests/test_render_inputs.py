@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -102,6 +103,20 @@ def public_binding() -> dict[str, object]:
     }
 
 
+def acceptance_template() -> dict[str, object]:
+    package = RENDER.activation_package_module()
+    return package.production_acceptance_template(
+        actor_public_key="79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        actor_generation=1,
+        ci_signer_public_key="c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+        candidate_sha=CANDIDATE,
+        workflow_id="0123456789abcdef0123456789abcdef",
+        workflow_digest="1" * 64,
+        job_id="capacity-one-fixture",
+        time_reference=1_800_000_000,
+    )
+
+
 def minimal_manifest(name: str, source: str, raw: bytes, mode: int = 0o400) -> dict[str, object]:
     unsigned: dict[str, object] = {
         "schema": f"test-{name}-package-v1",
@@ -115,6 +130,9 @@ def minimal_manifest(name: str, source: str, raw: bytes, mode: int = 0o400) -> d
 
 
 class RendererTests(unittest.TestCase):
+    def test_systemd_platform_binding_matches_activation_validator(self) -> None:
+        self.assertEqual(RENDER.PLATFORM_SYSTEMD, RENDER.activation_package_module().PLATFORM_SYSTEMD)
+
     def test_production_scenario_template_generator_is_deterministic_and_no_clobber(self) -> None:
         scenario_path = ROOT.parents[1] / "acceptance/scenario.template.json"
         with tempfile.TemporaryDirectory() as temporary:
@@ -134,6 +152,14 @@ class RendererTests(unittest.TestCase):
             self.assertEqual(
                 template["document"]["fixture"]["integrated_candidate_sha"],
                 {"$copy": "candidate_sha"},
+            )
+            self.assertEqual(
+                template["document"]["fixture"]["grant_event_id"],
+                {"$copy": "activation_grant_event_id"},
+            )
+            self.assertEqual(
+                template["document"]["fixture"]["manifest_digest"],
+                {"$copy": "activation_fixture_manifest_sha256"},
             )
             expected = output.read_bytes()
             second = subprocess.run(
@@ -279,6 +305,11 @@ class RendererTests(unittest.TestCase):
         activation = {
             "activation_id": fixture["activation_id"],
             "package_digest": fixture["activation_package_digest"],
+            "acceptance_template": acceptance_template(),
+            "entries": [{
+                "role": "fixture_manifest",
+                "sha256": fixture["manifest_digest"],
+            }],
             "default_state": {
                 "capacity": 0,
                 "enabled": False,
@@ -290,11 +321,35 @@ class RendererTests(unittest.TestCase):
             "candidate_sha": fixture["integrated_candidate_sha"],
             "packages": {"activation": activation},
         }
+        grant_event_id = RENDER.activation_grant_event_id(activation)
+        request_digest = RENDER.activation_request_digest(activation)
+        approved_by = RENDER.activation_approved_by(activation)
+        self.assertEqual(
+            grant_event_id,
+            "249147dcef17979a5cca7aa705a28664827324f9a866348df47e460df1ce1493",
+        )
+        bindings["activation_grant_event_id"] = grant_event_id
+        bindings["activation_request_digest"] = request_digest
+        bindings["activation_approved_by"] = approved_by
+        bindings["activation_fixture_manifest_sha256"] = (
+            fixture["manifest_digest"]
+        )
         template = {
             "schema_version": "buzz-ci-checked-render-template/v1",
             "kind": "capacity-one-scenario",
             "definitions": {},
-            "document": scenario,
+            "document": {
+                **scenario,
+                "fixture": {
+                    **scenario["fixture"],
+                    "manifest_digest": {
+                        "$copy": "activation_fixture_manifest_sha256",
+                    },
+                    "grant_event_id": {"$copy": "activation_grant_event_id"},
+                    "request_digest": {"$copy": "activation_request_digest"},
+                    "approved_by": {"$copy": "activation_approved_by"},
+                },
+            },
         }
         descriptor = {
             "schema_version": "buzz-ci-capacity-one-scenario-render-input/v1",
@@ -323,7 +378,19 @@ class RendererTests(unittest.TestCase):
         }
         with mock.patch.object(RENDER, "load_template_bindings", return_value=(template, bindings)):
             rendered = RENDER.render_scenario(mock.Mock(), descriptor)
+        scenario["fixture"]["grant_event_id"] = grant_event_id
+        scenario["fixture"]["request_digest"] = request_digest
+        scenario["fixture"]["approved_by"] = approved_by
         self.assertEqual(rendered, scenario)
+        wrong_bindings = {
+            **bindings,
+            "activation_fixture_manifest_sha256": "9" * 64,
+        }
+        wrong_rendered = RENDER.resolve_template(
+            template, "capacity-one-scenario", wrong_bindings,
+        )
+        with self.assertRaisesRegex(RENDER.RenderError, "cross-binding differs"):
+            RENDER.validate_scenario(wrong_rendered, wrong_bindings)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             descriptor_path = root / "descriptor.json"
@@ -351,6 +418,36 @@ class RendererTests(unittest.TestCase):
         with self.assertRaisesRegex(RENDER.RenderError, "closed capacity zero"):
             RENDER.validate_scenario(scenario, bindings)
 
+        bindings["packages"] = {"activation": activation}
+        stale = json.loads(json.dumps(scenario))
+        stale["fixture"]["grant_event_id"] = "8" * 64
+        with self.assertRaisesRegex(RENDER.RenderError, "cross-binding differs"):
+            RENDER.validate_scenario(stale, bindings)
+        stale_request = json.loads(json.dumps(scenario))
+        stale_request["fixture"]["request_digest"] = "8" * 64
+        with self.assertRaisesRegex(RENDER.RenderError, "cross-binding differs"):
+            RENDER.validate_scenario(stale_request, bindings)
+        stale_approver = json.loads(json.dumps(scenario))
+        stale_approver["fixture"]["approved_by"] = "8" * 64
+        with self.assertRaisesRegex(RENDER.RenderError, "cross-binding differs"):
+            RENDER.validate_scenario(stale_approver, bindings)
+        bindings["activation_grant_event_id"] = "9" * 64
+        with self.assertRaisesRegex(RENDER.RenderError, "renderer binding differs"):
+            RENDER.validate_scenario(scenario, bindings)
+        bindings["activation_grant_event_id"] = grant_event_id
+        wrong_fixture = json.loads(json.dumps(scenario))
+        wrong_fixture["fixture"]["manifest_digest"] = "9" * 64
+        with self.assertRaisesRegex(RENDER.RenderError, "cross-binding differs"):
+            RENDER.validate_scenario(wrong_fixture, bindings)
+        missing = json.loads(json.dumps(scenario))
+        del missing["fixture"]["grant_event_id"]
+        with self.assertRaisesRegex(RENDER.RenderError, "shape differs"):
+            RENDER.validate_scenario(missing, bindings)
+        extra = json.loads(json.dumps(scenario))
+        extra["fixture"]["caller_grant_event_id"] = grant_event_id
+        with self.assertRaisesRegex(RENDER.RenderError, "shape differs"):
+            RENDER.validate_scenario(extra, bindings)
+
     def test_scenario_cli_renders_descriptor_bound_final_candidate(self) -> None:
         acceptance = ROOT.parents[1] / "acceptance"
         with tempfile.TemporaryDirectory() as temporary:
@@ -368,6 +465,10 @@ class RendererTests(unittest.TestCase):
                 "        'capacity': 0, 'enabled': False, 'active': False, 'provisioned': False\n"
                 "    }:\n"
                 "        raise ValueError('default state differs')\n"
+                "def validate_acceptance_template(value):\n"
+                "    if set(value) != {'actor', 'time_reference', 'run_event', 'grant_event', 'rerun_event', 'tombstone_event'}:\n"
+                "        raise ValueError('template shape differs')\n"
+                "    return value\n"
             )
 
             entry = {
@@ -380,6 +481,15 @@ class RendererTests(unittest.TestCase):
                 "gid": 0,
                 "sha256": "8" * 64,
             }
+            fixture_entry = {
+                **entry,
+                "role": "fixture_manifest",
+                "source": "assets/fixture-manifest.json",
+                "target": "/usr/share/buzzci/execd-v2/fixture/fixture-manifest.json",
+                "sha256": hashlib.sha256(
+                    (acceptance / "fixtures/fixture-manifest.json").read_bytes(),
+                ).hexdigest(),
+            }
             zero = {
                 "capacity": 0,
                 "enabled": False,
@@ -390,8 +500,9 @@ class RendererTests(unittest.TestCase):
                 "schema": "buzz-ci-capacity-one-activation-draft-v2",
                 "source_commit": CANDIDATE,
                 "default_state": zero,
+                "acceptance_template": acceptance_template(),
                 "identities": {"controld": {"uid": 1201, "gid": 1201}},
-                "entries": [entry],
+                "entries": [entry, fixture_entry],
             }
             activation_digest = hashlib.sha256(canonical(activation_draft)).hexdigest()
             activation = {
@@ -435,6 +546,34 @@ class RendererTests(unittest.TestCase):
                 unsigned = {key: value for key, value in manifest.items() if key != "package_digest"}
                 manifest["package_digest"] = hashlib.sha256(canonical(unsigned)).hexdigest()
                 manifests[name] = manifest
+            activation_draft["components"] = [
+                {
+                    "name": name,
+                    "package_manifest_sha256": hashlib.sha256(canonical(manifests[name])).hexdigest(),
+                    "package_digest": manifests[name]["package_digest"],
+                }
+                for name in ("runner", "controld")
+            ]
+            activation_digest = hashlib.sha256(canonical(activation_draft)).hexdigest()
+            activation = {
+                **activation_draft,
+                "schema": "buzz-ci-capacity-one-activation-package-v2",
+                "activation_id": f"buzz-ci-capacity-one-{CANDIDATE[:12]}-{activation_digest[:12]}",
+                "package_digest": activation_digest,
+            }
+            execd_unsigned = {
+                key: value for key, value in manifests["execd"].items()
+                if key != "package_digest"
+            }
+            execd_unsigned["activation_binding"] = {
+                "source_commit": CANDIDATE,
+                "package_digest": activation_digest,
+                "activation_id": activation["activation_id"],
+            }
+            manifests["execd"] = {
+                **execd_unsigned,
+                "package_digest": hashlib.sha256(canonical(execd_unsigned)).hexdigest(),
+            }
             manifests["activation"] = activation
 
             references = {
@@ -445,26 +584,42 @@ class RendererTests(unittest.TestCase):
             public_path.write_bytes(public_raw)
             public_path.chmod(0o400)
             public_ref = file_ref(root, "inputs/public.json")
-            scenario = json.loads((acceptance / "scenario.template.json").read_bytes())
+            source_scenario = json.loads((acceptance / "scenario.template.json").read_bytes())
+            scenario = json.loads(json.dumps(source_scenario))
+            grant_event_id = hashlib.sha256(
+                RENDER.compact_declared(activation["acceptance_template"]["grant_event"]),
+            ).hexdigest()
+            request_digest = hashlib.sha256(
+                RENDER.compact_declared(activation["acceptance_template"]["run_event"]),
+            ).hexdigest()
+            approved_by = activation["acceptance_template"]["actor"]["public_key"]
+            self.assertEqual(
+                grant_event_id,
+                "249147dcef17979a5cca7aa705a28664827324f9a866348df47e460df1ce1493",
+            )
             scenario["fixture"].update(
                 {
                     "integrated_candidate_sha": CANDIDATE,
                     "source_oid": CANDIDATE,
                     "activation_id": activation["activation_id"],
                     "activation_package_digest": activation_digest,
+                    "grant_event_id": grant_event_id,
+                    "request_digest": request_digest,
+                    "approved_by": approved_by,
                 }
             )
-            template_ref = write_json(
-                root,
-                "inputs/scenario-template.json",
-                {
-                    "schema_version": "buzz-ci-checked-render-template/v1",
-                    "kind": "capacity-one-scenario",
-                    "definitions": {},
-                    "document": scenario,
-                },
-                0o400,
+            template_path = root / "inputs/scenario-template.json"
+            template_process = subprocess.run(
+                [
+                    "python3", str(TEMPLATE_GENERATOR), "capacity-one-scenario",
+                    "--input", str(acceptance / "scenario.template.json"),
+                    "--output", str(template_path),
+                ],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
             )
+            self.assertEqual(template_process.returncode, 0, template_process.stderr)
+            template_path.chmod(0o400)
+            template_ref = file_ref(root, "inputs/scenario-template.json")
             descriptor = {
                 "schema_version": "buzz-ci-capacity-one-scenario-render-input/v1",
                 "candidate_sha": CANDIDATE,
@@ -493,6 +648,7 @@ class RendererTests(unittest.TestCase):
             rendered = json.loads(rendered_raw)
             self.assertEqual(rendered, scenario)
             self.assertEqual(rendered["fixture"]["integrated_candidate_sha"], CANDIDATE)
+            self.assertEqual(rendered["fixture"]["grant_event_id"], grant_event_id)
             self.assertEqual(rendered_raw, RENDER.canonical_scenario(scenario))
             self.assertFalse(rendered_raw.endswith(b"\n"))
 
@@ -515,6 +671,7 @@ class RendererTests(unittest.TestCase):
             "state": "state", "candidate_root": "candidate",
             "harness_sha256": harness_sha, "timing_asset_sha256": timing_asset_sha,
             "timing": TIMING, "timing_sha256": timing_sha,
+            "platform_systemd": RENDER.PLATFORM_SYSTEMD,
             "scenario": {"path": "scenario.json", "sha256": HEX["scenario"]},
             "seccomp_source": {"path": "seccomp.json", "sha256": RENDER.SECCOMP_SHA256},
             "packages": {name: {"path": name, "tree_sha256": trees[name]} for name in RENDER.PACKAGE_NAMES},
@@ -773,6 +930,31 @@ class RendererTests(unittest.TestCase):
                 manifest_name = "activation-manifest.json" if name == "activation" else "package-manifest.json"
                 refs[name] = write_json(root_path, f"{name}/{manifest_name}", manifest, 0o400)
                 manifests[name] = manifest
+            activation = manifests["activation"]
+            unsigned_activation = {
+                key: value for key, value in activation.items() if key not in {"activation_id", "package_digest"}
+            }
+            unsigned_activation["schema"] = "buzz-ci-capacity-one-activation-draft-v2"
+            unsigned_activation["components"] = [
+                {
+                    "name": name,
+                    "package_manifest_sha256": refs[name]["sha256"],
+                    "package_digest": manifests[name]["package_digest"],
+                }
+                for name in ("runner", "controld")
+            ]
+            activation_digest = hashlib.sha256(canonical(unsigned_activation)).hexdigest()
+            activation = {
+                **unsigned_activation,
+                "schema": "buzz-ci-capacity-one-activation-package-v2",
+                "activation_id": f"buzz-ci-capacity-one-{CANDIDATE[:12]}-{activation_digest[:12]}",
+                "package_digest": activation_digest,
+            }
+            (root_path / "activation/activation-manifest.json").chmod(0o600)
+            refs["activation"] = write_json(
+                root_path, "activation/activation-manifest.json", activation, 0o400,
+            )
+            manifests["activation"] = activation
             execd = json.loads((root_path / "execd/package-manifest.json").read_bytes())
             unsigned_execd = dict(execd)
             unsigned_execd.pop("package_digest")
@@ -808,6 +990,112 @@ class RendererTests(unittest.TestCase):
                 self.assertEqual(set(output["package_manifest_sha256"]), set(RENDER.PACKAGE_NAMES))
             finally:
                 root.close()
+
+    def test_clean_host_rejects_recanonicalized_lane_digest_scenario(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root_path = Path(temporary)
+            (root_path / "state").mkdir()
+            (root_path / "candidate").mkdir()
+            public_raw = RENDER.canonical_public_binding(public_binding())
+            public_path = root_path / "state/public-binding.json"
+            public_path.write_bytes(public_raw)
+            public_path.chmod(0o444)
+            activation = {
+                "activation_id": f"buzz-ci-capacity-one-{CANDIDATE[:12]}-{'a' * 12}",
+                "package_digest": "a" * 64,
+                "default_state": {"capacity": 0, "enabled": False, "active": False, "provisioned": False},
+                "acceptance_template": acceptance_template(),
+                "entries": [{"role": "fixture_manifest", "sha256": "b" * 64}],
+                "platform_systemd": RENDER.PLATFORM_SYSTEMD,
+            }
+            grant_event_id = RENDER.activation_grant_event_id(activation)
+            scenario = json.loads(
+                (ROOT.parents[1] / "acceptance/scenario.template.json").read_bytes()
+            )
+            scenario["fixture"].update({
+                "integrated_candidate_sha": CANDIDATE,
+                "source_oid": CANDIDATE,
+                "activation_id": activation["activation_id"],
+                "activation_package_digest": activation["package_digest"],
+                "grant_event_id": grant_event_id,
+                "manifest_digest": "c" * 64,
+            })
+            scenario_path = root_path / "state/scenario.json"
+            scenario_path.write_bytes(RENDER.canonical_scenario(scenario))
+            scenario_path.chmod(0o400)
+            seccomp_path = root_path / "state/seccomp.json"
+            seccomp_path.write_bytes(b"seccomp\n")
+            seccomp_path.chmod(0o400)
+            manifests = {
+                name: ({
+                    "activation_binding": {
+                        "source_commit": CANDIDATE,
+                        "activation_id": activation["activation_id"],
+                        "package_digest": activation["package_digest"],
+                    }
+                } if name == "execd" else {})
+                for name in RENDER.PACKAGE_NAMES
+            }
+            manifests["activation"] = activation
+            descriptor = {
+                "schema_version": "buzz-ci-clean-host-e2e-render-input/v3",
+                "candidate_sha": CANDIDATE,
+                "state": "state",
+                "candidate_root": "candidate",
+                "public_binding": file_ref(root_path, "state/public-binding.json"),
+                "scenario": file_ref(root_path, "state/scenario.json"),
+                "seccomp_source": file_ref(root_path, "state/seccomp.json"),
+                "packages": {name: {"path": name} for name in RENDER.PACKAGE_NAMES},
+            }
+            descriptor_path = root_path / "descriptor.json"
+            descriptor_path.write_bytes(canonical(descriptor))
+            descriptor_path.chmod(0o600)
+            descriptor_root = RENDER.DescriptorRoot(descriptor_path)
+            try:
+                with (
+                    mock.patch.object(
+                        RENDER.subprocess, "run",
+                        return_value=subprocess.CompletedProcess([], 0, CANDIDATE + "\n", ""),
+                    ),
+                    mock.patch.object(
+                        RENDER, "candidate_blob",
+                        side_effect=lambda _root, _candidate, relative: RENDER.checked_renderer_asset(relative),
+                    ),
+                    mock.patch.object(RENDER, "SECCOMP_SHA256", hashlib.sha256(b"seccomp\n").hexdigest()),
+                    mock.patch.object(RENDER, "validate_package_tree", side_effect=lambda _root, name, _value, _candidate: (manifests[name], name[0] * 64, name[-1] * 64)),
+                    mock.patch.object(RENDER, "_validate_activation_component_package_bindings"),
+                    mock.patch.object(RENDER, "validate_keyholder_public_binding"),
+                ):
+                    with self.assertRaisesRegex(RENDER.RenderError, "cross-binding differs"):
+                        RENDER.clean_host_contract(descriptor_root, descriptor)
+            finally:
+                descriptor_root.close()
+
+    def test_activation_component_manifests_cross_bind_both_packages(self) -> None:
+        manifests = {
+            "runner": {"package_digest": "1" * 64},
+            "controld": {"package_digest": "2" * 64},
+            "activation": {
+                "components": [
+                    {"name": "runner", "package_manifest_sha256": "3" * 64, "package_digest": "1" * 64},
+                    {"name": "controld", "package_manifest_sha256": "4" * 64, "package_digest": "2" * 64},
+                ],
+            },
+        }
+        digests = {"runner": "3" * 64, "controld": "4" * 64, "activation": "5" * 64}
+        RENDER._validate_activation_component_package_bindings(manifests, digests)
+        stale = copy.deepcopy(manifests)
+        stale["activation"]["components"][0]["package_manifest_sha256"] = "6" * 64
+        with self.assertRaisesRegex(RENDER.RenderError, "runner package cross-binding differs"):
+            RENDER._validate_activation_component_package_bindings(stale, digests)
+        swapped = dict(digests)
+        swapped["runner"], swapped["controld"] = swapped["controld"], swapped["runner"]
+        with self.assertRaisesRegex(RENDER.RenderError, "runner package cross-binding differs"):
+            RENDER._validate_activation_component_package_bindings(manifests, swapped)
+        wrong_digest = copy.deepcopy(manifests)
+        wrong_digest["activation"]["components"][1]["package_digest"] = "7" * 64
+        with self.assertRaisesRegex(RENDER.RenderError, "controld package cross-binding differs"):
+            RENDER._validate_activation_component_package_bindings(wrong_digest, digests)
 
 
 if __name__ == "__main__":
