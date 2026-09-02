@@ -227,7 +227,10 @@ package or root path from the caller.
 
 - `prepare-qualification-zero` verifies the immutable fixed package, restores
   and reads back the staged runner, rendered execd, and controld configs, and keeps controld plus
-  both acceptance services available for the stage-13 durable snapshot.
+  both acceptance services available. The acceptance host then closes the
+  capacity-one units and reopens controld at staged zero (socket and service
+  stopped in the finalize order, then started), so the capacity-zero service
+  serves the stage-13 durable snapshot from the shared acceptance ledger.
 - `finalize-qualification-zero` stops the controld acceptance socket first and
   controld second, closes the remaining capacity-one units, keeps the root
   acceptance-control service available, restores the prior controld binding,

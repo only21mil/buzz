@@ -2029,10 +2029,10 @@ impl HostControl for SystemdHostControl {
     ) -> Result<ControlReadback, Self::Error> {
         let _ = self.controller_zero_action(QualificationZeroAction::Prepare, request)?;
         self.close_capacity()?;
-        self.systemctl
-            .start("buzz-ci-controld-acceptance.socket", self.timeout)?;
-        self.systemctl
-            .start("buzz-ci-controld.service", self.timeout)?;
+        reopen_controld_at_staged_zero(&self.systemctl, self.timeout)?;
+        self.controller_invocation = self
+            .systemctl
+            .unit_invocation("buzz-ci-controld.service", self.timeout)?;
         let readback = self.readback()?;
         if readback.capacity != 0 || readback.admission != AdmissionState::Closed {
             return Err(ControlError::ReadbackMismatch);
@@ -2192,6 +2192,23 @@ fn close_capacity(systemctl: &Systemctl, timeout: Duration) -> Result<(), Contro
         systemctl.stop(unit, timeout)?;
     }
     Ok(())
+}
+
+/// Reopens controld at staged zero after the controller's prepare wrote the
+/// staged configs: controld reads its capacity once at start, so the
+/// capacity-one process is stopped (socket first, then service, the finalize
+/// order) and started again into the zero configuration, where it serves the
+/// stage-13 durable snapshot as the capacity-zero service. The controller
+/// generation does not move: this is the activation's own transition, not
+/// an observed restart.
+fn reopen_controld_at_staged_zero(
+    systemctl: &Systemctl,
+    timeout: Duration,
+) -> Result<(), ControlError> {
+    systemctl.stop("buzz-ci-controld-acceptance.socket", timeout)?;
+    systemctl.stop("buzz-ci-controld.service", timeout)?;
+    systemctl.start("buzz-ci-controld-acceptance.socket", timeout)?;
+    systemctl.start("buzz-ci-controld.service", timeout)
 }
 
 /// Journal line for advisory stderr from a host command that exited zero.
@@ -4823,6 +4840,47 @@ exit 1
         );
         assert_eq!(
             close_capacity(&systemctl, timeout),
+            Err(ControlError::HostAction)
+        );
+    }
+
+    /// H10 clean host, boot 8: stage 13's prepare wrote the staged zero
+    /// configs and closed capacity, but controld kept running as the
+    /// capacity-one service (it reads its capacity once at start), refused
+    /// sequence 13 and exited closed. Prepare now reopens controld at staged
+    /// zero: socket and service stopped in the finalize order, then started.
+    #[test]
+    fn prepare_reopens_controld_at_staged_zero_in_the_finalize_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let systemctl = fake_systemctl(directory.path());
+        let timeout = Duration::from_secs(5);
+        reopen_controld_at_staged_zero(&systemctl, timeout).unwrap();
+        let calls = fs::read_to_string(directory.path().join("calls")).unwrap();
+        let transitions: Vec<&str> = calls
+            .lines()
+            .filter(|line| line.starts_with("stop ") || line.starts_with("start "))
+            .collect();
+        assert_eq!(
+            transitions,
+            [
+                "stop buzz-ci-controld-acceptance.socket",
+                "stop buzz-ci-controld.service",
+                "start buzz-ci-controld-acceptance.socket",
+                "start buzz-ci-controld.service",
+            ]
+        );
+        for unit in [
+            "buzz-ci-controld-acceptance.socket",
+            "buzz-ci-controld.service",
+        ] {
+            assert_eq!(
+                systemctl.unit_state(unit, timeout).unwrap(),
+                UnitState::Active
+            );
+        }
+        fs::write(directory.path().join("fail-stop"), b"").unwrap();
+        assert_eq!(
+            reopen_controld_at_staged_zero(&systemctl, timeout),
             Err(ControlError::HostAction)
         );
     }
