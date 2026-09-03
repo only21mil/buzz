@@ -1382,6 +1382,38 @@ class ActivationControllerTests(unittest.TestCase):
     def test_abrupt_restart_boundaries_are_safe_for_second_activation(self) -> None:
         self.assert_restart_safe_stage_boundaries(second_activation=True)
 
+    def test_successor_check_accepts_only_retained_prior_or_next_recovery_targets(self) -> None:
+        first_manifest, first_payloads, driver = self.fixture.load()
+        CONTROLLER.stage(
+            first_manifest, first_payloads, self.fixture.root, driver,
+            self.fixture.binding,
+        )
+        CONTROLLER.rollback(first_manifest, self.fixture.root, driver)
+        self.advance_recovery_candidate(self.fixture)
+        manifest, payloads, driver = self.fixture.load()
+
+        prior = CONTROLLER.check_current(manifest, self.fixture.root, driver)
+        self.assertEqual(prior["status"], "ready_to_stage")
+        self.assertEqual(
+            prior["retained_recovery_targets"],
+            {role: "prior" for role in CONTROLLER.ROLLBACK_RECOVERY_ROLES},
+        )
+
+        role = "activation_package_module"
+        entry = next(item for item in manifest["entries"] if item["role"] == role)
+        target = self.fixture.root / entry["target"].lstrip("/")
+        write_file(
+            target, payloads[entry["source"]], int(entry["install_mode"], 8),
+        )
+        mixed = CONTROLLER.check_current(manifest, self.fixture.root, driver)
+        self.assertEqual(mixed["retained_recovery_targets"][role], "next")
+
+        write_file(
+            target, payloads[entry["source"]] + b"hostile", int(entry["install_mode"], 8),
+        )
+        with self.assertRaisesRegex(ValueError, "target content drift"):
+            CONTROLLER.check_current(manifest, self.fixture.root, driver)
+
     def test_every_legacy_pre_fixed_boundary_has_restart_safe_first_activation_rollback(self) -> None:
         manifest, _payloads, _driver = self.fixture.load()
         boundaries = self.legacy_pre_fixed_boundaries(manifest)
@@ -1575,7 +1607,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "2649c14e6493962530ade09471af8a11a78b2d55d6d27cf22ecb5f702c94e768",
+            "13869bb62ec3ba0cdadc43be53ade252a9320e61650eb5b6fabbc68169eb0c21",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")

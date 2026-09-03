@@ -5403,8 +5403,21 @@ def check_current(
     manifest: dict[str, Any], root: Path, driver: LiveSystemd | FakeSystemd,
 ) -> dict[str, object]:
     receipt = _read_receipt(root)
-    if receipt is None or receipt.get("state") == "rolled_back":
+    if receipt is None:
         return {"status": "ready_to_stage", "state": "dormant", **preflight(manifest, root, driver, require_dormant=True)}
+    if receipt.get("state") == "rolled_back":
+        retained_recovery_targets = _retained_recovery_targets_readback(
+            receipt, manifest, root,
+        )
+        return {
+            "status": "ready_to_stage",
+            "state": "dormant",
+            "retained_recovery_targets": retained_recovery_targets,
+            **preflight(
+                manifest, root, driver, require_dormant=True,
+                allow_recovery_upgrade=True,
+            ),
+        }
     _bind_receipt(receipt, manifest)
     if receipt["state"] == "staged_zero":
         qualification_zero = receipt["qualification_zero"]
