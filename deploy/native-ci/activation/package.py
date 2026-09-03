@@ -882,10 +882,32 @@ def production_acceptance_template(
     channel = _canonical_channel_id(channel_id, "production acceptance channel")
     target_repo = repository_coordinate(repository_owner_public_key, repository_id)
     clone_url = _source_clone_url(source_clone_url)
-    # The run id, PR root id, and idempotency keys are fixed fixture
-    # identities: the relay requires their shape (UUID, 64 hex, non-empty)
-    # and uniqueness per channel, not an existing PR event.
-    run_id = "13131313-1313-4313-8313-131313131313"
+    # The relay permanently reserves a run id per channel and an idempotency
+    # key per actor/repository after accepting a request. Derive both request
+    # identities from the complete frozen authority set so a retry with a new
+    # package time reference cannot reuse an accepted-but-failed run, while a
+    # repeated build of the same package remains byte-identical.
+    identity_digest = digest(canonical_json({
+        "actor": actor,
+        "actor_generation": actor_generation,
+        "candidate_sha": candidate_sha,
+        "channel": channel,
+        "ci_signer": signer,
+        "job_id": job_id,
+        "source_clone_url": clone_url,
+        "target_repo": target_repo,
+        "time_reference": time_reference,
+        "workflow_digest": workflow_digest,
+        "workflow_id": workflow_id,
+    }))
+
+    def request_identity(purpose: str) -> str:
+        return str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"buzz-native-ci-production-acceptance:{identity_digest}:{purpose}",
+        ))
+
+    run_id = request_identity("run")
     pr_event = "33" * 32
     issued_at = _positive_integer(
         time_reference, 0xFFFFFFFFFFFFFFFF - 601, "public acceptance time reference",
@@ -927,11 +949,11 @@ def production_acceptance_template(
 
     run = request(
         request_type="run", attempt=1,
-        idempotency_key="12121212-1212-4212-8212-121212121212",
+        idempotency_key=request_identity("request-attempt-1"),
     )
     rerun = request(
         request_type="rerun", attempt=2,
-        idempotency_key="14141414-1414-4414-8414-141414141414",
+        idempotency_key=request_identity("request-attempt-2"),
     )
 
     def request_event(envelope: dict[str, Any]) -> list[object]:
