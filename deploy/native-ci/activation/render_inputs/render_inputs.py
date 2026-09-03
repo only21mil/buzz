@@ -25,6 +25,9 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 MODE = re.compile(r"^[0-7]{4}$")
 PACKAGE_NAMES = ("runner", "controld", "keyholder", "execd", "activation")
 PRE_ACTIVATION_PACKAGE_NAMES = PACKAGE_NAMES[:3]
+PRIOR_PACKAGE_NAMES = ("execd", "activation")
+CLEAN_HOST_CONTRACT_SCHEMA = "buzz-ci-clean-host-e2e-vm-contract/v4"
+CLEAN_HOST_EVIDENCE_SCHEMA = "buzz-ci-clean-host-e2e-evidence/v4"
 HARNESS_ASSETS = (
     "harness.py",
     "guest_entry.py",
@@ -1027,7 +1030,7 @@ def validate_package_tree(root: DescriptorRoot, name: str, package: dict[str, An
 
 
 def clean_host_contract(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict[str, Any]:
-    require_keys(descriptor, {"schema_version", "candidate_sha", "state", "candidate_root", "public_binding", "scenario", "seccomp_source", "packages"}, "clean-host descriptor")
+    require_keys(descriptor, {"schema_version", "candidate_sha", "state", "candidate_root", "public_binding", "scenario", "seccomp_source", "packages", "prior_packages", "prior_scenario"}, "clean-host descriptor")
     candidate = require_sha(descriptor["candidate_sha"], "candidate", git=True)
     state = normalized(descriptor["state"], "state")
     candidate_root = normalized(descriptor["candidate_root"], "candidate root")
@@ -1068,6 +1071,9 @@ def clean_host_contract(root: DescriptorRoot, descriptor: dict[str, Any]) -> dic
     scenario, scenario_raw, scenario_path = root.scenario_ref(
         descriptor["scenario"], "scenario",
     )
+    prior_scenario, prior_scenario_raw, prior_scenario_path = root.scenario_ref(
+        descriptor["prior_scenario"], "prior scenario",
+    )
     seccomp_raw, seccomp_path = root.read_ref(descriptor["seccomp_source"], "seccomp source", 16 * 1024 * 1024)
     if hashlib.sha256(seccomp_raw).hexdigest() != SECCOMP_SHA256:
         raise RenderError("seccomp source differs from the frozen contract")
@@ -1082,36 +1088,66 @@ def clean_host_contract(root: DescriptorRoot, descriptor: dict[str, Any]) -> dic
             raise RenderError(f"{name} package descriptor differs")
         manifests[name], manifest_sha256[name], tree_digests[name] = validate_package_tree(root, name, package_value, candidate)
         paths[name] = normalized(package_value["path"], f"{name} package path")
-    _validate_activation_component_package_bindings(manifests, manifest_sha256)
-    validate_keyholder_public_binding(public_raw, manifests)
-    bindings = {
-        "candidate_sha": candidate,
-        "packages": manifests,
-        "activation_request_digest": activation_request_digest(manifests["activation"]),
-        "activation_grant_event_id": activation_grant_event_id(manifests["activation"]),
-        "activation_approved_by": activation_approved_by(manifests["activation"]),
-        "activation_fixture_manifest_sha256": activation_fixture_manifest_sha256(
-            manifests["activation"],
-        ),
-    }
-    validate_scenario(scenario, bindings)
+    prior_descriptors = require_keys(descriptor["prior_packages"], set(PRIOR_PACKAGE_NAMES), "prior package trees")
+    prior_manifests: dict[str, Any] = dict(manifests)
+    prior_manifest_sha256: dict[str, str] = dict(manifest_sha256)
+    prior_tree_digests: dict[str, str] = {}
+    prior_paths: dict[str, str] = {}
+    for name in PRIOR_PACKAGE_NAMES:
+        package_value = prior_descriptors[name]
+        if not isinstance(package_value, dict):
+            raise RenderError(f"prior {name} package descriptor differs")
+        prior_manifests[name], prior_manifest_sha256[name], prior_tree_digests[name] = validate_package_tree(root, name, package_value, candidate)
+        prior_paths[name] = normalized(package_value["path"], f"prior {name} package path")
+    for label, package_set, package_sha256, scenario_value in (
+        ("activation", manifests, manifest_sha256, scenario),
+        ("prior activation", prior_manifests, prior_manifest_sha256, prior_scenario),
+    ):
+        _validate_activation_component_package_bindings(package_set, package_sha256)
+        validate_keyholder_public_binding(public_raw, package_set)
+        bindings = {
+            "candidate_sha": candidate,
+            "packages": package_set,
+            "activation_request_digest": activation_request_digest(package_set["activation"]),
+            "activation_grant_event_id": activation_grant_event_id(package_set["activation"]),
+            "activation_approved_by": activation_approved_by(package_set["activation"]),
+            "activation_fixture_manifest_sha256": activation_fixture_manifest_sha256(
+                package_set["activation"],
+            ),
+        }
+        validate_scenario(scenario_value, bindings)
+        if package_set["activation"].get("platform_systemd") != PLATFORM_SYSTEMD:
+            raise RenderError(f"{label} systemd platform binding differs")
+        binding = package_set["execd"].get("activation_binding")
+        if not isinstance(binding, dict) or any(binding.get(key) != value for key, value in (
+            ("source_commit", candidate),
+            ("activation_id", package_set["activation"]["activation_id"]),
+            ("package_digest", package_set["activation"]["package_digest"]),
+        )):
+            raise RenderError(f"execd package {label} binding differs")
     activation = manifests["activation"]
-    platform_systemd = activation.get("platform_systemd")
-    if platform_systemd != PLATFORM_SYSTEMD:
-        raise RenderError("activation systemd platform binding differs")
-    binding = manifests["execd"].get("activation_binding")
-    if not isinstance(binding, dict) or any(binding.get(key) != value for key, value in (
-        ("source_commit", candidate), ("activation_id", activation["activation_id"]), ("package_digest", activation["package_digest"]),
-    )):
-        raise RenderError("execd package activation binding differs")
+    prior_activation = prior_manifests["activation"]
+    if (
+        prior_activation["activation_id"] == activation["activation_id"]
+        or prior_activation["package_digest"] == activation["package_digest"]
+        or prior_tree_digests["activation"] == tree_digests["activation"]
+    ):
+        raise RenderError("prior activation does not differ from the candidate activation")
+    if (
+        prior_activation.get("identities") != activation.get("identities")
+        or prior_activation.get("access_group") != activation.get("access_group")
+    ):
+        raise RenderError("prior activation principals differ from the candidate activation")
     return {
         "candidate_root": candidate_root,
         "candidate_sha": candidate,
         "harness_sha256": harness_sha256,
         "packages": {name: {"path": paths[name], "tree_sha256": tree_digests[name]} for name in PACKAGE_NAMES},
-        "platform_systemd": platform_systemd,
+        "platform_systemd": activation.get("platform_systemd"),
+        "prior_packages": {name: {"path": prior_paths[name], "tree_sha256": prior_tree_digests[name]} for name in PRIOR_PACKAGE_NAMES},
+        "prior_scenario": {"path": prior_scenario_path, "sha256": hashlib.sha256(prior_scenario_raw).hexdigest()},
         "scenario": {"path": scenario_path, "sha256": hashlib.sha256(scenario_raw).hexdigest()},
-        "schema_version": "buzz-ci-clean-host-e2e-vm-contract/v3",
+        "schema_version": CLEAN_HOST_CONTRACT_SCHEMA,
         "seccomp_source": {"path": seccomp_path, "sha256": SECCOMP_SHA256},
         "state": state,
         "timing": timing,
@@ -1137,11 +1173,11 @@ def lifecycle_evidence(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict
     evidence = values["evidence_manifest"]
     receipt = values["acceptance_receipt"]
     verifier = values["verifier"]
-    require_keys(contract, {"schema_version", "state", "candidate_root", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing", "timing_sha256", "scenario", "seccomp_source", "packages", "platform_systemd"}, "lifecycle contract")
-    require_keys(evidence, {"schema_version", "candidate_sha", "image_sha256", "tool_sha256", "harness_sha256", "harness_asset_sha256", "timing_asset_sha256", "timing", "timing_sha256", "package_tree_sha256", "scenario_sha256", "seccomp_source_sha256", "transfer_bytes", "transfer_sha256", "receipt_sha256", "verifier_sha256", "dormant_proof"}, "lifecycle evidence manifest")
+    require_keys(contract, {"schema_version", "state", "candidate_root", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing", "timing_sha256", "scenario", "seccomp_source", "packages", "platform_systemd", "prior_packages", "prior_scenario"}, "lifecycle contract")
+    require_keys(evidence, {"schema_version", "candidate_sha", "image_sha256", "tool_sha256", "harness_sha256", "harness_asset_sha256", "timing_asset_sha256", "timing", "timing_sha256", "package_tree_sha256", "scenario_sha256", "prior_package_tree_sha256", "prior_scenario_sha256", "prior_activation", "seccomp_source_sha256", "transfer_bytes", "transfer_sha256", "receipt_sha256", "verifier_sha256", "dormant_proof"}, "lifecycle evidence manifest")
     require_keys(result, {"status", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing_sha256", "receipt_sha256", "verifier_sha256", "evidence_manifest_sha256", "dormant_proof", "vm_state_absent"}, "lifecycle result")
     require_keys(verifier, {"outcome", "status"}, "installed verifier output")
-    if contract.get("schema_version") != "buzz-ci-clean-host-e2e-vm-contract/v3" or contract.get("candidate_sha") != candidate:
+    if contract.get("schema_version") != CLEAN_HOST_CONTRACT_SCHEMA or contract.get("candidate_sha") != candidate:
         raise RenderError("lifecycle contract candidate differs")
     harness_sha256 = require_sha(contract["harness_sha256"], "lifecycle harness")
     timing_asset_sha256 = require_sha(contract["timing_asset_sha256"], "lifecycle timing asset")
@@ -1164,13 +1200,18 @@ def lifecycle_evidence(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict
     contract_scenario = require_keys(contract["scenario"], {"path", "sha256"}, "lifecycle scenario")
     normalized(contract_scenario["path"], "lifecycle scenario")
     require_sha(contract_scenario["sha256"], "lifecycle scenario")
+    contract_prior_scenario = require_keys(contract["prior_scenario"], {"path", "sha256"}, "lifecycle prior scenario")
+    normalized(contract_prior_scenario["path"], "lifecycle prior scenario")
+    require_sha(contract_prior_scenario["sha256"], "lifecycle prior scenario")
+    if evidence.get("prior_scenario_sha256") != contract_prior_scenario["sha256"]:
+        raise RenderError("lifecycle prior scenario binding differs")
     contract_seccomp = require_keys(contract["seccomp_source"], {"path", "sha256"}, "lifecycle seccomp source")
     normalized(contract_seccomp["path"], "lifecycle seccomp source")
     if contract_seccomp["sha256"] != SECCOMP_SHA256:
         raise RenderError("lifecycle seccomp source differs")
     if contract["platform_systemd"] != PLATFORM_SYSTEMD:
         raise RenderError("lifecycle systemd platform binding differs")
-    if evidence.get("schema_version") != "buzz-ci-clean-host-e2e-evidence/v3" or evidence.get("candidate_sha") != candidate:
+    if evidence.get("schema_version") != CLEAN_HOST_EVIDENCE_SCHEMA or evidence.get("candidate_sha") != candidate:
         raise RenderError("lifecycle evidence candidate differs")
     require_sha(evidence["image_sha256"], "lifecycle image")
     for field, expected_names in (
@@ -1234,6 +1275,30 @@ def lifecycle_evidence(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict
         require_keys(contract_trees[name], {"path", "tree_sha256"}, f"lifecycle {name} package")
         normalized(contract_trees[name]["path"], f"lifecycle {name} package")
         require_sha(evidence_trees[name], f"lifecycle {name} package tree")
+    prior_contract_trees = contract.get("prior_packages")
+    prior_evidence_trees = evidence.get("prior_package_tree_sha256")
+    if (
+        not isinstance(prior_contract_trees, dict) or not isinstance(prior_evidence_trees, dict)
+        or set(prior_contract_trees) != set(PRIOR_PACKAGE_NAMES) or set(prior_evidence_trees) != set(PRIOR_PACKAGE_NAMES)
+    ):
+        raise RenderError("lifecycle prior package tree set differs")
+    for name in PRIOR_PACKAGE_NAMES:
+        require_keys(prior_contract_trees[name], {"path", "tree_sha256"}, f"lifecycle prior {name} package")
+        normalized(prior_contract_trees[name]["path"], f"lifecycle prior {name} package")
+        require_sha(prior_evidence_trees[name], f"lifecycle prior {name} package tree")
+        if prior_contract_trees[name].get("tree_sha256") != prior_evidence_trees[name]:
+            raise RenderError("lifecycle prior package tree binding differs")
+    prior_activation = evidence.get("prior_activation")
+    if (
+        not isinstance(prior_activation, dict)
+        or set(prior_activation) != {"activation_id", "package_digest", "receipt_state", "rollback_cleanup_sha256", "execd_reinstall"}
+        or prior_activation.get("receipt_state") != "rolled_back"
+        or prior_activation.get("execd_reinstall") != "installed"
+        or not isinstance(prior_activation.get("activation_id"), str) or not prior_activation["activation_id"]
+    ):
+        raise RenderError("lifecycle prior activation proof differs")
+    require_sha(prior_activation["package_digest"], "lifecycle prior activation package")
+    require_sha(prior_activation["rollback_cleanup_sha256"], "lifecycle prior rollback cleanup marker")
     proof = evidence.get("dormant_proof")
     required_proof = {"configs_sha256", "units_sha256", "sockets_absent", "processes_absent", "encrypted_credentials_absent", "relay_residue_absent"}
     if not isinstance(proof, dict) or set(proof) != required_proof or proof != result.get("dormant_proof"):

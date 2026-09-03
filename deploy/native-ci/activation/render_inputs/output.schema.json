@@ -10,7 +10,7 @@
       "required": ["schema_version"],
       "properties": {"schema_version": {"enum": [
         "buzz-ci-capacity-one-scenario/v2",
-        "buzz-ci-clean-host-e2e-vm-contract/v3",
+        "buzz-ci-clean-host-e2e-vm-contract/v4",
         "buzz-ci-clean-host-residue-receipt-input/v1",
         "buzz-ci-sealed-freeze-receipt-input/v1"
       ]}}
@@ -26,7 +26,7 @@
       "then": {"$ref": "../../acceptance/scenario.schema.json"}
     },
     {
-      "if": {"required": ["schema_version"], "properties": {"schema_version": {"const": "buzz-ci-clean-host-e2e-vm-contract/v3"}}},
+      "if": {"required": ["schema_version"], "properties": {"schema_version": {"const": "buzz-ci-clean-host-e2e-vm-contract/v4"}}},
       "then": {"$ref": "../tests/clean_host_e2e/contract.schema.json"}
     },
     {

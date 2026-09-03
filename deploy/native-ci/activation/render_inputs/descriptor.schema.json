@@ -66,6 +66,13 @@
         "activation": {"$ref": "#/$defs/packageTree"}
       }
     },
+    "priorPackageTrees": {
+      "type": "object", "additionalProperties": false,
+      "required": ["execd", "activation"],
+      "properties": {
+        "execd": {"$ref": "#/$defs/packageTree"}, "activation": {"$ref": "#/$defs/packageTree"}
+      }
+    },
     "lifecycle": {
       "type": "object", "additionalProperties": false,
       "required": ["result", "contract", "evidence_manifest", "acceptance_receipt", "verifier"],
@@ -96,13 +103,14 @@
     },
     "cleanHost": {
       "type": "object", "additionalProperties": false,
-      "required": ["schema_version", "candidate_sha", "state", "candidate_root", "public_binding", "scenario", "seccomp_source", "packages"],
+      "required": ["schema_version", "candidate_sha", "state", "candidate_root", "public_binding", "scenario", "seccomp_source", "packages", "prior_packages", "prior_scenario"],
       "properties": {
         "schema_version": {"const": "buzz-ci-clean-host-contract-render-input/v1"},
         "candidate_sha": {"$ref": "#/$defs/candidate"}, "state": {"$ref": "#/$defs/relative"},
         "candidate_root": {"$ref": "#/$defs/relative"}, "public_binding": {"$ref": "#/$defs/file"},
         "scenario": {"$ref": "#/$defs/file"}, "seccomp_source": {"$ref": "#/$defs/file"},
-        "packages": {"$ref": "#/$defs/packageTrees"}
+        "packages": {"$ref": "#/$defs/packageTrees"},
+        "prior_packages": {"$ref": "#/$defs/priorPackageTrees"}, "prior_scenario": {"$ref": "#/$defs/file"}
       }
     },
     "residue": {

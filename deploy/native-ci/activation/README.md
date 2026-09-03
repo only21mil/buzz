@@ -109,6 +109,11 @@ remains a hard failure.
    A later activation accepts each retained recovery target only when it matches
    the prior rolled-back manifest or the exact successor manifest. It then
    completes the remaining recovery target before advancing durable state.
+   On such a host the successor execd package installs before `check`:
+   `execd/install.py` accepts the `rolled_back` central receipt only while the
+   controller's current `rollback-cleanup-v1.json` marker binds it, reports
+   `activation_receipt` as `rolled_back`, and leaves both files for `stage` to
+   retire. It refuses every live state of another activation.
    Only after this restart anchor is exact does it apply the remaining
    generated sysusers, tmpfiles, acceptance
    binaries and units, target, drop-ins, and capacity-zero configs. After the
@@ -427,7 +432,11 @@ between the execd and activation packages:
    package. Any changed or replayed tuple fails.
 7. Generate the checked scenario template from the maintained production
    scenario, then run `render-scenario` and `render-clean-host` with all five
-   final package manifests and trees. The final renderer derives the closed v3
+   final package manifests and trees. The clean-host descriptor also names a
+   prior activation package and execd package frozen from the same candidate
+   (for example with an earlier time reference) and that activation's rendered
+   scenario; the guest activates and rolls that package back before the
+   candidate activation. The final renderer derives the closed v4
    harness and timing bindings from the exact candidate Git object and rejects
    a renderer checkout whose harness, guest entry, or timing asset differs.
 8. Run `check_package_inventory.py` against those same five manifests before
@@ -484,6 +493,13 @@ deploy/native-ci/activation/controller.py stage \
 deploy/native-ci/activation/controller.py activate --package /private/package
 deploy/native-ci/activation/controller.py rollback --package /private/package
 ```
+
+On a host that carries a rolled-back prior activation, run the component
+installers first. The execd installer takes the host while the rolled-back
+central receipt and its rollback-cleanup marker agree; `check`, `stage`, and
+`activate` then read every component at the successor digests, and `stage`
+retires the marker. The clean-host harness proves this order on every run by
+activating and rolling back a prior package before the candidate activation.
 
 `activate` itself runs the closed production qualification and returns only
 after the host reaches `qualified_closed`. Do not run a separate `qualify`

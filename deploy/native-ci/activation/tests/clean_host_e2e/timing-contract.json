@@ -23,6 +23,11 @@
     "boot_cloud_init": {"cloud_init_margin": 1},
     "ceremony": {"phase_margin": 1},
     "install": {"relay_ready_window": 1, "relay_probe": 1, "phase_margin": 1},
+    "prior_controller_check": {"phase_margin": 1},
+    "prior_controller_stage": {"phase_margin": 1},
+    "prior_controller_activate": {"phase_margin": 1},
+    "prior_rollback": {"phase_margin": 1},
+    "reinstall": {"phase_margin": 1},
     "controller_check": {"phase_margin": 1},
     "controller_stage": {"phase_margin": 1},
     "controller_activate": {"phase_margin": 1},
@@ -37,6 +42,11 @@
     "boot_cloud_init": {"command_default": 1, "guest_command_reap": 1},
     "ceremony": {"command_default": 21, "guest_command_reap": 21},
     "install": {"command_default": 35, "guest_command_reap": 36},
+    "prior_controller_check": {"controller_check": 1, "guest_command_reap": 1},
+    "prior_controller_stage": {"controller_stage": 1, "command_default": 13, "guest_command_reap": 14},
+    "prior_controller_activate": {"controller_activate": 1, "guest_command_reap": 1},
+    "prior_rollback": {"rollback": 1, "guest_command_reap": 1},
+    "reinstall": {"command_default": 17, "guest_command_reap": 17},
     "controller_check": {"controller_check": 1, "guest_command_reap": 1},
     "controller_stage": {"controller_stage": 1, "command_default": 13, "guest_command_reap": 14},
     "controller_activate": {"controller_activate": 1, "guest_command_reap": 1},
@@ -49,7 +59,7 @@
   },
   "role_phases": {
     "ceremony": ["boot_cloud_init", "ceremony", "poweroff"],
-    "candidate": ["boot_cloud_init", "install", "controller_check", "controller_stage", "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup", "poweroff"],
+    "candidate": ["boot_cloud_init", "install", "prior_controller_check", "prior_controller_stage", "prior_controller_activate", "prior_rollback", "reinstall", "controller_check", "controller_stage", "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup", "poweroff"],
     "verifier": ["boot_cloud_init", "verifier", "poweroff"]
   }
 }

@@ -359,7 +359,85 @@ def _receipt_parent(
     return True
 
 
+ROLLBACK_CLEANUP_PATH = "/var/lib/buzzci/activation-controller/rollback-cleanup-v1.json"
+ROLLBACK_CLEANUP_SCHEMA = "buzz-ci-activation-rollback-cleanup-v1"
+ACTIVATION_RECEIPT_KEYS = frozenset({
+    "schema",
+    "activation_id",
+    "package_digest",
+    "source_commit",
+    "state",
+    "created_at",
+    "updated_at",
+    "principals_retained_on_rollback",
+    "targets",
+    "acceptance_generated",
+    "acceptance_ledger_prior",
+    "fixed_package",
+    "systemd_before",
+    "qualification",
+    "capacity_one",
+    "persistent_authorization",
+    "persistent_activation",
+    "qualification_zero",
+    "last_error",
+})
+ROLLBACK_CLEANUP_KEYS = frozenset({
+    "schema",
+    "activation_id",
+    "package_digest",
+    "source_commit",
+    "manifest_sha256",
+    "package_assets",
+    "manifest",
+})
+
+
+def _activation_binding_of(value: dict[str, object]) -> tuple[object, object, object]:
+    return value.get("activation_id"), value.get("package_digest"), value.get("source_commit")
+
+
+def _rollback_cleanup_marker(root: Path) -> dict[str, object] | None:
+    """Read the controller's terminal rollback-cleanup marker, or None when absent."""
+    path = rooted(root, ROLLBACK_CLEANUP_PATH)
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return None
+    value, raw, metadata = parse_json(path)
+    if (
+        metadata.st_uid != mapped_id(0, root)
+        or metadata.st_gid != mapped_id(0, root, group=True)
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or canonical_json(value) != raw
+        or set(value) != ROLLBACK_CLEANUP_KEYS
+        or value.get("schema") != ROLLBACK_CLEANUP_SCHEMA
+    ):
+        raise ValueError("activation rollback cleanup marker differs")
+    manifest = value.get("manifest")
+    assets = value.get("package_assets")
+    if (
+        not isinstance(manifest, dict)
+        or not isinstance(value.get("manifest_sha256"), str)
+        or value["manifest_sha256"] != sha256(canonical_json(manifest))
+        or _activation_binding_of(manifest) != _activation_binding_of(value)
+        or not isinstance(assets, list)
+        or any(not isinstance(item, str) for item in assets)
+        or assets != sorted(assets)
+    ):
+        raise ValueError("activation rollback cleanup marker binding differs")
+    return value
+
+
 def _activation_receipt_state(root: Path, manifest: dict[str, object]) -> str:
+    """Classify the central activation receipt relative to this execd package.
+
+    Returns ``pending`` when no central receipt exists, ``verified`` when the
+    receipt is bound to this package's activation, and ``rolled_back`` when the
+    receipt belongs to another activation whose rollback reached its terminal
+    state and the controller's rollback-cleanup marker proves that rollback.
+    Any receipt bound to another activation in a live state fails closed.
+    """
     binding = manifest["activation_binding"]
     receipt_path = rooted(root, str(binding["receipt_path"]))
     parent_ready = _receipt_parent(
@@ -377,42 +455,32 @@ def _activation_receipt_state(root: Path, manifest: dict[str, object]) -> str:
             raise ValueError("activation-owned targets exist without a central receipt")
         return "pending"
     receipt, receipt_raw, metadata = parse_json(receipt_path)
-    expected_keys = {
-        "schema",
-        "activation_id",
-        "package_digest",
-        "source_commit",
-        "state",
-        "created_at",
-        "updated_at",
-        "principals_retained_on_rollback",
-        "targets",
-        "acceptance_generated",
-        "acceptance_ledger_prior",
-        "fixed_package",
-        "systemd_before",
-        "qualification",
-        "capacity_one",
-        "persistent_authorization",
-        "persistent_activation",
-        "qualification_zero",
-        "last_error",
-    }
     if (
-        set(receipt) != expected_keys
+        set(receipt) != ACTIVATION_RECEIPT_KEYS
         or canonical_json(receipt) != receipt_raw
         or metadata.st_uid != mapped_id(0, root)
         or metadata.st_gid != mapped_id(0, root, group=True)
         or stat.S_IMODE(metadata.st_mode) != 0o600
         or receipt.get("schema") != binding["receipt_schema"]
-        or receipt.get("activation_id") != binding["activation_id"]
-        or receipt.get("package_digest") != binding["package_digest"]
-        or receipt.get("source_commit") != binding["source_commit"]
         or receipt.get("principals_retained_on_rollback") is not True
     ):
         raise ValueError("central activation receipt binding differs")
-    targets = receipt.get("targets")
+    expected_binding = (binding["activation_id"], binding["package_digest"], binding["source_commit"])
     fixed_package = receipt.get("fixed_package")
+    if _activation_binding_of(receipt) != expected_binding:
+        if receipt.get("state") != "rolled_back":
+            raise ValueError("central activation receipt binding differs")
+        marker = _rollback_cleanup_marker(root)
+        if marker is None:
+            raise ValueError("rolled-back central activation receipt lacks its rollback cleanup marker")
+        if (
+            _activation_binding_of(marker) != _activation_binding_of(receipt)
+            or not isinstance(fixed_package, dict)
+            or fixed_package.get("manifest_sha256") != marker["manifest_sha256"]
+        ):
+            raise ValueError("rolled-back central activation receipt differs from its rollback cleanup marker")
+        return "rolled_back"
+    targets = receipt.get("targets")
     if not isinstance(targets, list) or not isinstance(fixed_package, dict):
         raise ValueError("central activation receipt targets are absent")
     expected = {item["target"]: item["sha256"] for item in binding["owned_target_sha256"]}

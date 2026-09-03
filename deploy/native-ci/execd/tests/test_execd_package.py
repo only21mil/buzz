@@ -542,6 +542,133 @@ class ExecdPackageTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "managed bindings"):
                     INSTALL.inspect(package, root)
 
+    def test_installer_takes_a_rolled_back_foreign_receipt_only_with_its_cleanup_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            seccomp = b"test immutable seccomp\n"
+            with mock.patch.dict(
+                FREEZER.SECCOMP_CONTRACT,
+                {"source_sha256": hashlib.sha256(seccomp).hexdigest()},
+            ):
+                package, root = _manual_install_fixture(base, b"fixed execd binary\n", seccomp)
+                manifest = json.loads((package / "package-manifest.json").read_bytes())
+                binding = manifest["activation_binding"]
+                controller = root / "var/lib/buzzci/activation-controller"
+                controller.mkdir(parents=True)
+                for parent in (root / "var", root / "var/lib"):
+                    parent.chmod(0o755)
+                (root / "var/lib/buzzci").chmod(0o711)
+                controller.chmod(0o711)
+                receipt_path = controller / "receipt-v1.json"
+                marker_path = controller / "rollback-cleanup-v1.json"
+                prior_manifest = {
+                    "schema": "buzz-ci-capacity-one-activation-v2",
+                    "activation_id": "buzz-ci-capacity-one-ffffffffffff-" + "9" * 12,
+                    "package_digest": "9" * 64,
+                    "source_commit": "f" * 40,
+                    "entries": [],
+                }
+                prior_manifest_sha256 = hashlib.sha256(FREEZER.canonical_json(prior_manifest)).hexdigest()
+
+                def write_receipt(state: str, manifest_sha256: str = prior_manifest_sha256) -> None:
+                    receipt = {
+                        "schema": binding["receipt_schema"],
+                        "activation_id": prior_manifest["activation_id"],
+                        "package_digest": prior_manifest["package_digest"],
+                        "source_commit": prior_manifest["source_commit"],
+                        "targets": [],
+                        "state": state,
+                        "created_at": "2026-09-02T00:00:00Z",
+                        "updated_at": "2026-09-03T01:13:08Z",
+                        "principals_retained_on_rollback": True,
+                        "acceptance_generated": [],
+                        "acceptance_ledger_prior": None,
+                        "fixed_package": {
+                            "path": "/var/lib/buzzci/activation-controller/package",
+                            "manifest_sha256": manifest_sha256,
+                        },
+                        "systemd_before": {},
+                        "qualification": None,
+                        "capacity_one": None,
+                        "persistent_authorization": None,
+                        "persistent_activation": None,
+                        "qualification_zero": None,
+                        "last_error": None,
+                    }
+                    receipt_path.write_bytes(FREEZER.canonical_json(receipt))
+                    receipt_path.chmod(0o600)
+
+                def write_marker(manifest: dict[str, object], mode: int = 0o600) -> None:
+                    marker = {
+                        "schema": INSTALL.ROLLBACK_CLEANUP_SCHEMA,
+                        "activation_id": manifest["activation_id"],
+                        "package_digest": manifest["package_digest"],
+                        "source_commit": manifest["source_commit"],
+                        "manifest_sha256": hashlib.sha256(FREEZER.canonical_json(manifest)).hexdigest(),
+                        "package_assets": ["activation-manifest.json"],
+                        "manifest": manifest,
+                    }
+                    marker_path.write_bytes(FREEZER.canonical_json(marker))
+                    marker_path.chmod(mode)
+
+                # A live receipt of another activation refuses with or without a marker.
+                for state in (
+                    "preparing", "staged_zero", "qualified_closed", "activating", "active_one",
+                    "preparing_zero", "qualification_uncertain", "rollback_failed", "rollback_cleanup",
+                ):
+                    with self.subTest(state=state):
+                        write_receipt(state)
+                        if marker_path.exists():
+                            marker_path.unlink()
+                        with self.assertRaisesRegex(ValueError, "central activation receipt binding differs"):
+                            INSTALL.install(package, root, dry_run=True)
+                        write_marker(prior_manifest)
+                        with self.assertRaisesRegex(ValueError, "central activation receipt binding differs"):
+                            INSTALL.inspect(package, root)
+                        marker_path.unlink()
+
+                # A rolled-back receipt without the controller's cleanup marker refuses.
+                write_receipt("rolled_back")
+                with self.assertRaisesRegex(ValueError, "lacks its rollback cleanup marker"):
+                    INSTALL.install(package, root, dry_run=True)
+
+                # A marker bound to a third activation, or to a different manifest digest, refuses.
+                other_manifest = dict(prior_manifest, package_digest="8" * 64)
+                write_marker(other_manifest)
+                with self.assertRaisesRegex(ValueError, "differs from its rollback cleanup marker"):
+                    INSTALL.install(package, root, dry_run=True)
+                write_receipt("rolled_back", manifest_sha256="7" * 64)
+                write_marker(prior_manifest)
+                with self.assertRaisesRegex(ValueError, "differs from its rollback cleanup marker"):
+                    INSTALL.install(package, root, dry_run=True)
+
+                # A tampered or unsafe marker refuses before any binding decision.
+                write_receipt("rolled_back")
+                write_marker(prior_manifest, mode=0o644)
+                with self.assertRaisesRegex(ValueError, "rollback cleanup marker differs"):
+                    INSTALL.install(package, root, dry_run=True)
+                write_marker(prior_manifest)
+                tampered = json.loads(marker_path.read_bytes())
+                tampered["manifest"]["entries"] = [{"role": "drift"}]
+                marker_path.write_bytes(FREEZER.canonical_json(tampered))
+                with self.assertRaisesRegex(ValueError, "rollback cleanup marker binding differs"):
+                    INSTALL.install(package, root, dry_run=True)
+
+                # The proven rolled-back receipt lets the next execd package install dormant.
+                write_marker(prior_manifest)
+                self.assertEqual(marker_path.stat().st_mode & 0o777, 0o600)
+                dry_run = INSTALL.install(package, root, dry_run=True)
+                self.assertEqual((dry_run["status"], dry_run["activation_receipt"]), ("dry_run", "rolled_back"))
+                self.assertFalse((root / "usr/libexec/buzz-ci-execd").exists())
+                installed = INSTALL.install(package, root)
+                self.assertEqual((installed["status"], installed["activation_receipt"]), ("installed", "rolled_back"))
+                self.assertEqual((root / "usr/libexec/buzz-ci-execd").read_bytes(), b"fixed execd binary\n")
+                self.assertEqual(INSTALL.inspect(package, root)["activation_receipt"], "rolled_back")
+                self.assertEqual(INSTALL.install(package, root)["status"], "unchanged")
+                # The rolled-back receipt and its marker are left for the controller to retire.
+                self.assertEqual(json.loads(receipt_path.read_bytes())["state"], "rolled_back")
+                self.assertTrue(marker_path.exists())
+
     def test_installer_never_reopens_the_validated_binary_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)

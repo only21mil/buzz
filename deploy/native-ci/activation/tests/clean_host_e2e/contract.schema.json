@@ -1,11 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://buzz.dev/schemas/native-ci/clean-host-e2e-vm-contract-v3.json",
+  "$id": "https://buzz.dev/schemas/native-ci/clean-host-e2e-vm-contract-v4.json",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "state", "candidate_root", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing", "timing_sha256", "scenario", "seccomp_source", "packages", "platform_systemd"],
+  "required": ["schema_version", "state", "candidate_root", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing", "timing_sha256", "scenario", "seccomp_source", "packages", "platform_systemd", "prior_packages", "prior_scenario"],
   "properties": {
-    "schema_version": {"const": "buzz-ci-clean-host-e2e-vm-contract/v3"},
+    "schema_version": {"const": "buzz-ci-clean-host-e2e-vm-contract/v4"},
     "state": {"type": "string", "minLength": 1},
     "candidate_root": {"type": "string", "minLength": 1},
     "candidate_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$", "not": {"pattern": "^0+$"}},
@@ -41,6 +41,11 @@
           "boot_cloud_init": {"cloud_init_margin": 1},
           "ceremony": {"phase_margin": 1},
           "install": {"relay_ready_window": 1, "relay_probe": 1, "phase_margin": 1},
+          "prior_controller_check": {"phase_margin": 1},
+          "prior_controller_stage": {"phase_margin": 1},
+          "prior_controller_activate": {"phase_margin": 1},
+          "prior_rollback": {"phase_margin": 1},
+          "reinstall": {"phase_margin": 1},
           "controller_check": {"phase_margin": 1},
           "controller_stage": {"phase_margin": 1},
           "controller_activate": {"phase_margin": 1},
@@ -55,6 +60,11 @@
           "boot_cloud_init": {"command_default": 1, "guest_command_reap": 1},
           "ceremony": {"command_default": 21, "guest_command_reap": 21},
           "install": {"command_default": 35, "guest_command_reap": 36},
+          "prior_controller_check": {"controller_check": 1, "guest_command_reap": 1},
+          "prior_controller_stage": {"controller_stage": 1, "command_default": 13, "guest_command_reap": 14},
+          "prior_controller_activate": {"controller_activate": 1, "guest_command_reap": 1},
+          "prior_rollback": {"rollback": 1, "guest_command_reap": 1},
+          "reinstall": {"command_default": 17, "guest_command_reap": 17},
           "controller_check": {"controller_check": 1, "guest_command_reap": 1},
           "controller_stage": {"controller_stage": 1, "command_default": 13, "guest_command_reap": 14},
           "controller_activate": {"controller_activate": 1, "guest_command_reap": 1},
@@ -67,12 +77,13 @@
         },
         "role_phases": {
           "ceremony": ["boot_cloud_init", "ceremony", "poweroff"],
-          "candidate": ["boot_cloud_init", "install", "controller_check", "controller_stage", "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup", "poweroff"],
+          "candidate": ["boot_cloud_init", "install", "prior_controller_check", "prior_controller_stage", "prior_controller_activate", "prior_rollback", "reinstall", "controller_check", "controller_stage", "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup", "poweroff"],
           "verifier": ["boot_cloud_init", "verifier", "poweroff"]
         }
       }
     },
     "scenario": {"$ref": "#/$defs/file"},
+    "prior_scenario": {"$ref": "#/$defs/file"},
     "seccomp_source": {
       "type": "object", "additionalProperties": false,
       "required": ["path", "sha256"],
@@ -89,6 +100,15 @@
         "runner": {"$ref": "#/$defs/tree"},
         "controld": {"$ref": "#/$defs/tree"},
         "keyholder": {"$ref": "#/$defs/tree"},
+        "execd": {"$ref": "#/$defs/tree"},
+        "activation": {"$ref": "#/$defs/tree"}
+      }
+    },
+    "prior_packages": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["execd", "activation"],
+      "properties": {
         "execd": {"$ref": "#/$defs/tree"},
         "activation": {"$ref": "#/$defs/tree"}
       }

@@ -663,6 +663,11 @@ class RendererTests(unittest.TestCase):
             "encrypted_credentials_absent": True, "relay_residue_absent": True,
         }
         trees = {name: digit * 64 for name, digit in zip(RENDER.PACKAGE_NAMES, "89abc", strict=True)}
+        prior_trees = {name: digit * 64 for name, digit in zip(RENDER.PRIOR_PACKAGE_NAMES, "de", strict=True)}
+        prior_activation = {
+            "activation_id": f"buzz-ci-capacity-one-{CANDIDATE[:12]}-{'d' * 12}", "package_digest": "d" * 64,
+            "receipt_state": "rolled_back", "rollback_cleanup_sha256": "e" * 64, "execd_reinstall": "installed",
+        }
         harness_sha = hashlib.sha256(
             (ROOT.parents[0] / "tests/clean_host_e2e/harness.py").read_bytes()
         ).hexdigest()
@@ -671,7 +676,7 @@ class RendererTests(unittest.TestCase):
         ).hexdigest()
         timing_sha = hashlib.sha256(RENDER.canonical_declared(TIMING)).hexdigest()
         contract = {
-            "schema_version": "buzz-ci-clean-host-e2e-vm-contract/v3", "candidate_sha": CANDIDATE,
+            "schema_version": RENDER.CLEAN_HOST_CONTRACT_SCHEMA, "candidate_sha": CANDIDATE,
             "state": "state", "candidate_root": "candidate",
             "harness_sha256": harness_sha, "timing_asset_sha256": timing_asset_sha,
             "timing": TIMING, "timing_sha256": timing_sha,
@@ -679,13 +684,15 @@ class RendererTests(unittest.TestCase):
             "scenario": {"path": "scenario.json", "sha256": HEX["scenario"]},
             "seccomp_source": {"path": "seccomp.json", "sha256": RENDER.SECCOMP_SHA256},
             "packages": {name: {"path": name, "tree_sha256": trees[name]} for name in RENDER.PACKAGE_NAMES},
+            "prior_packages": {name: {"path": f"prior/{name}", "tree_sha256": prior_trees[name]} for name in RENDER.PRIOR_PACKAGE_NAMES},
+            "prior_scenario": {"path": "prior/scenario.json", "sha256": "f" * 64},
         }
         receipt = {"outcome": "pass", "integrated_candidate_sha": CANDIDATE, "scenario_sha256": HEX["scenario"]}
         verifier = {"outcome": "pass", "status": "verified"}
         receipt_ref = write_declared_json(root, "evidence/acceptance-receipt.json", receipt, 0o400)
         verifier_ref = write_declared_json(root, "evidence/verifier.json", verifier, 0o400)
         evidence = {
-            "schema_version": "buzz-ci-clean-host-e2e-evidence/v3", "candidate_sha": CANDIDATE,
+            "schema_version": RENDER.CLEAN_HOST_EVIDENCE_SCHEMA, "candidate_sha": CANDIDATE,
             "harness_sha256": harness_sha,
             "timing_asset_sha256": timing_asset_sha,
             "image_sha256": "f" * 64,
@@ -697,6 +704,8 @@ class RendererTests(unittest.TestCase):
             },
             "timing": TIMING, "timing_sha256": timing_sha,
             "package_tree_sha256": trees, "scenario_sha256": HEX["scenario"],
+            "prior_package_tree_sha256": prior_trees, "prior_scenario_sha256": "f" * 64,
+            "prior_activation": prior_activation,
             "seccomp_source_sha256": RENDER.SECCOMP_SHA256,
             "transfer_bytes": RENDER.TRANSFER_BYTES, "transfer_sha256": "3" * 64,
             "receipt_sha256": receipt_ref["sha256"], "verifier_sha256": verifier_ref["sha256"],
@@ -1050,6 +1059,8 @@ class RendererTests(unittest.TestCase):
                 "scenario": file_ref(root_path, "state/scenario.json"),
                 "seccomp_source": file_ref(root_path, "state/seccomp.json"),
                 "packages": {name: {"path": name} for name in RENDER.PACKAGE_NAMES},
+                "prior_packages": {name: {"path": f"prior/{name}"} for name in RENDER.PRIOR_PACKAGE_NAMES},
+                "prior_scenario": file_ref(root_path, "state/scenario.json"),
             }
             descriptor_path = root_path / "descriptor.json"
             descriptor_path.write_bytes(canonical(descriptor))

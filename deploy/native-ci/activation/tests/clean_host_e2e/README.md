@@ -28,10 +28,19 @@ The flow has two user-visible phases and three isolated boots:
    snapshots the exact Git commit with `git archive`, copies and rehashes the
    five frozen packages and scenario into a private ISO. The guest rehashes
    every input, validates candidate/package/
-   scenario/public-key cross-bindings, installs the packages, and runs real
+   scenario/public-key cross-bindings and installs the packages with the prior
+   activation's execd. It takes that prior activation through `check`,
+   `stage`, and `activate`, rolls it back with the installed controller, reads
+   back the `rolled_back` receipt and its rollback-cleanup marker, retires the
+   prior execd package through its rollback verb and the runbook's
+   receipt-directory rename, and installs the candidate execd on the
+   rolled-back host (dry run, then install; both must report the central
+   receipt as `rolled_back`). Only then does it run real
    systemd principals through staged-zero, closed qualification, fixed
    capacity-one, the frozen fixture, all 13 acceptance stages, finalize/prove
-   zero, strict installed verification, and rollback. It can write only a
+   zero, strict installed verification, and rollback. Every run therefore
+   proves that a host carrying a rolled-back activation takes the next
+   activation through the documented verbs. It can write only a
    digest-framed pending record to the fixed-capacity raw transfer device.
    A second virtio-serial port carries only digest-framed progress records with
    a fixed boot, phase, event, sequence, and elapsed-millisecond schema. The
@@ -44,7 +53,11 @@ The flow has two user-visible phases and three isolated boots:
    `relay_ready`, `preinstall_units_clean`, `package_units_validated`,
    `principals_created`, `seccomp_ready`, `runner_installed`,
    `controld_installed`, `keyholder_installed`, `execd_installed`, and
-   `installed_units_verified`. Controller phases follow in execution order.
+   `installed_units_verified`. The prior cycle follows as
+   `prior_controller_check`, `prior_controller_stage`,
+   `prior_controller_activate`, `prior_rollback`, and `reinstall`, which ends
+   with `execd_reinstalled`. The candidate's controller phases follow in
+   execution order.
    A failure may jump forward to `rollback` or `cleanup`. `cleanup_return`
    appears only after cleanup and its dormant-state check return without an
    error. On failure, the host reports the last completed operational phase
@@ -72,7 +85,11 @@ The flow has two user-visible phases and three isolated boots:
    candidate execution validates the receipt's closed schema and all strict
    acceptance checks. Guest code
    reconstructs canonical receipt and verdict objects from allowlisted fields
-   and emits only those objects in a bounded digest-framed receipt. The host
+   and emits only those objects in a bounded digest-framed receipt, together
+   with the prior-activation proof (activation ID, package digest,
+   `rolled_back` receipt state, rollback-cleanup marker digest, and the execd
+   reinstall status), which it binds to the prior activation named in its
+   phase file. The host
    revalidates the frame and writes the receipt, verifier
    output, and exact input/evidence manifest. The VM overlay, encrypted test
    credentials, staging media, and QEMU process are then destroyed and their
@@ -125,9 +142,13 @@ python3 "$HARNESS" run \
   --results /protected/e2e-results
 ```
 
-The closed v3 contract includes `harness_sha256`, `timing_asset_sha256`,
-`timing`, `timing_sha256`, and the exact `platform_systemd` binding copied from
-the validated activation package. The maintained final renderer derives the
+The closed v4 contract includes `harness_sha256`, `timing_asset_sha256`,
+`timing`, `timing_sha256`, the exact `platform_systemd` binding copied from
+the validated activation package, and the `prior_packages` (`execd` and
+`activation` trees of a distinct activation frozen from the same candidate)
+with their `prior_scenario`. The prior activation must bind the same runner,
+controld, and keyholder packages and the same principals as the candidate
+activation. The maintained final renderer derives the
 harness and timing values from the exact candidate Git object. For a manually
 assembled contract, copy the harness and timing values from `capabilities` and
 the platform value from the validated activation manifest. `prepare` records
@@ -153,12 +174,15 @@ candidate archive and its staged frozen timing asset.
 
 The frozen `timing-contract.json` is the single timing source. It records leaf
 command limits and an exact per-phase command inventory; the guest derives phase deadlines
-and the host derives each QEMU watchdog from those terms. The 5,712-second
+and the host derives each QEMU watchdog from those terms. The 7,222-second
 candidate watchdog covers a 220-second boot/cloud-init envelope, 1,452 seconds
-for install, 100 for controller check, 680 for controller stage and its 13-unit
-readback, 160 for activation, 1,870 for the canary's maximum 15 sequential
-120-second driver operations, 100 for receipt verification, 100 for rollback,
-990 for cleanup and dormant proof, 30 for guest poweroff, and 10 for host reap.
+for install, 100 for the prior controller check, 680 for the prior stage and
+its 13-unit readback, 160 for the prior activation, 100 for the prior rollback,
+710 for the execd retirement and reinstall with its 13-unit readback, 100 for
+controller check, 680 for controller stage and its 13-unit readback, 160 for
+activation, 1,630 for the canary's 13 sequential 120-second driver operations
+and margins, 100 for receipt verification, 100 for rollback, 990 for cleanup
+and dormant proof, 30 for guest poweroff, and 10 for host reap.
 Ceremony is 1,130 seconds (including all 21 bounded ceremony commands) and the
 verifier is 320 seconds. Every command count includes its 10-second process-
 group reap allowance, and command-heavy phases add a 30-second local

@@ -50,8 +50,13 @@ python3 "$RENDER" record-sealed-freeze \
 ```
 
 `--output` and every descriptor path are relative to the descriptor directory.
-The clean-host contract preserves those relative paths. Run the v3 harness from
-that same directory when consuming the contract.
+The clean-host contract preserves those relative paths. Run the harness from
+that same directory when consuming the contract. The clean-host descriptor also
+names `prior_packages` (`execd` and `activation` trees of a distinct activation
+frozen from the same candidate, for example with an earlier package time
+reference) and that activation's `prior_scenario`; the guest activates and
+rolls back the prior package, then installs the candidate execd on the
+rolled-back host before the candidate activation.
 
 The checked-template generator validates a complete canonical activation draft
 before it replaces the candidate, public actor, ready-package component, execd
@@ -106,10 +111,12 @@ file hash. `$ref` may point only below `#/definitions/`. Missing references,
 unknown directives, and reference cycles fail.
 
 `render-clean-host` computes the same path, mode, and content tree hash as the
-v3 clean-host harness. It reads the harness and timing assets from the exact
-candidate Git object and places their digests and timing value in the v3
+clean-host harness. It reads the harness and timing assets from the exact
+candidate Git object and places their digests and timing value in the v4
 contract. It checks every package member against the package
-manifest and rejects missing or extra files. For keyholder packages it also
+manifest and rejects missing or extra files, for the candidate and the prior
+package set alike, and requires the prior activation to differ from the
+candidate activation while binding the same component packages and principals. For keyholder packages it also
 checks every declared asset size and the retained mode-`0600`
 `public-binding.json`, then cross-binds those bytes to the prepared state. It
 also checks the candidate HEAD, scenario, seccomp source, and
