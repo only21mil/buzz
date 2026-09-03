@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from unittest import mock
 
 ACTIVATION_ROOT = Path(__file__).resolve().parents[1]
@@ -1607,7 +1608,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "13869bb62ec3ba0cdadc43be53ade252a9320e61650eb5b6fabbc68169eb0c21",
+            "4cb7d0321a01ff5d3c5fbf6282a0223a7ad98e9000b711d2ec88a173f4db7ec1",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -4324,13 +4325,13 @@ class ActivationControllerTests(unittest.TestCase):
             self.assertNotIn(placeholder, rendered)
         # The fixture's other invariants hold: event ids are digests of the
         # exact bytes, the tombstone names the rerun, both requests issue at
-        # the reference, and the run identity is unchanged.
+        # the reference, and the run identity rotates with the bound authority.
         rerun_id = activation_package.digest(json.dumps(
             bound["rerun_event"], ensure_ascii=False, separators=(",", ":"),
         ).encode())
         self.assertEqual(bound["tombstone_event"][4], [["e", rerun_id]])
         self.assertEqual(bound["time_reference"], template["time_reference"])
-        self.assertEqual(
+        self.assertNotEqual(
             json.loads(bound["run_event"][5])["run_id"], json.loads(template["run_event"][5])["run_id"],
         )
         self.assertIs(activation_package.validate_acceptance_template(bound), bound)
@@ -4357,6 +4358,32 @@ class ActivationControllerTests(unittest.TestCase):
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
             )
         self.assertEqual(output.returncode, 0, output.stdout + output.stderr)
+
+    def test_acceptance_template_request_identities_rotate_per_frozen_package(self) -> None:
+        manifest, _payloads, _driver = self.fixture.load()
+        inputs = self._bound_template_inputs(manifest)
+        first = activation_package.production_acceptance_template(**inputs)
+        repeated = activation_package.production_acceptance_template(**inputs)
+        later = activation_package.production_acceptance_template(
+            **{**inputs, "time_reference": inputs["time_reference"] + 1},
+        )
+
+        self.assertEqual(first, repeated)
+        first_run = json.loads(first["run_event"][5])
+        first_rerun = json.loads(first["rerun_event"][5])
+        later_run = json.loads(later["run_event"][5])
+        later_rerun = json.loads(later["rerun_event"][5])
+        self.assertEqual(first_run["run_id"], first_rerun["run_id"])
+        self.assertEqual(first_rerun["parent_run_id"], first_run["run_id"])
+        self.assertNotEqual(first_run["run_id"], later_run["run_id"])
+        self.assertNotEqual(first_run["idempotency_key"], later_run["idempotency_key"])
+        self.assertNotEqual(first_rerun["idempotency_key"], later_rerun["idempotency_key"])
+        for value in (
+            first_run["run_id"], first_run["idempotency_key"],
+            first_rerun["idempotency_key"], later_run["run_id"],
+            later_run["idempotency_key"], later_rerun["idempotency_key"],
+        ):
+            self.assertEqual(str(uuid.UUID(value)), value)
 
     def test_clean_host_scaffold_binds_its_own_test_channel_and_repository(self) -> None:
         manifest, payloads, _driver = self.fixture.load()
