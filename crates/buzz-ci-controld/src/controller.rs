@@ -409,6 +409,10 @@ mod tests {
             Err(())
         }
 
+        fn publication_exists(&mut self, _event: &SignedCiEvent) -> Result<bool, Self::Error> {
+            Err(())
+        }
+
         fn put_log(
             &mut self,
             _accepted: &AcceptedRequest,
@@ -504,6 +508,15 @@ mod tests {
             &mut self,
             _key: &str,
             _event: &SignedCiEvent,
+        ) -> Result<bool, Self::Error> {
+            Err(())
+        }
+
+        fn refresh_pending_publication(
+            &mut self,
+            _key: &str,
+            _expected_event_id: &str,
+            _replacement: &SignedCiEvent,
         ) -> Result<bool, Self::Error> {
             Err(())
         }

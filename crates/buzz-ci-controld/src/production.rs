@@ -127,6 +127,13 @@ pub trait RelayControl {
 
     fn publish(&mut self, event: &SignedCiEvent) -> Result<String, Self::Error>;
 
+    /// Confirm whether the relay already accepted this exact signed event.
+    ///
+    /// A durable pending publication may outlive the relay's timestamp window
+    /// after an acknowledgement is lost. Callers must reconcile the exact
+    /// event before replacing its signature with a fresh one.
+    fn publication_exists(&mut self, event: &SignedCiEvent) -> Result<bool, Self::Error>;
+
     fn put_log(
         &mut self,
         accepted: &AcceptedRequest,
@@ -370,6 +377,12 @@ pub trait ControlStore {
         &mut self,
         key: &str,
         event: &SignedCiEvent,
+    ) -> Result<bool, Self::Error>;
+    fn refresh_pending_publication(
+        &mut self,
+        key: &str,
+        expected_event_id: &str,
+        replacement: &SignedCiEvent,
     ) -> Result<bool, Self::Error>;
     fn accept_publication(&mut self, key: &str, event_id: &str) -> Result<(), Self::Error>;
 }
@@ -860,20 +873,81 @@ where
     ) -> Result<String, ProductionError> {
         match stored {
             StoredPublication::Accepted { relay_event_id, .. } => Ok(relay_event_id),
-            StoredPublication::Pending(signed) => {
-                let accepted_id = self
-                    .relay
-                    .publish(&signed)
-                    .map_err(|_| ProductionError::Relay)?;
-                if accepted_id != signed.event_id {
-                    return Err(ProductionError::PublicationConflict);
-                }
-                self.store
-                    .accept_publication(key, &accepted_id)
-                    .map_err(|_| ProductionError::Store)?;
-                Ok(accepted_id)
-            }
+            StoredPublication::Pending(signed) => self.publish_pending(key, signed),
         }
+    }
+
+    fn publish_pending(
+        &mut self,
+        key: &str,
+        signed: SignedCiEvent,
+    ) -> Result<String, ProductionError> {
+        let accepted_id = match self.relay.publish(&signed) {
+            Ok(accepted_id) => accepted_id,
+            Err(_) => return self.reconcile_failed_publication(key, signed),
+        };
+        self.accept_published(key, signed, accepted_id)
+    }
+
+    fn reconcile_failed_publication(
+        &mut self,
+        key: &str,
+        signed: SignedCiEvent,
+    ) -> Result<String, ProductionError> {
+        if self
+            .relay
+            .publication_exists(&signed)
+            .map_err(|_| ProductionError::Relay)?
+        {
+            self.store
+                .accept_publication(key, &signed.event_id)
+                .map_err(|_| ProductionError::Store)?;
+            return Ok(signed.event_id);
+        }
+
+        let replacement = self
+            .signer
+            .sign(signed.kind, &signed.content, signed.tags.clone())
+            .map_err(|_| ProductionError::Signer)?;
+        if replacement.kind != signed.kind
+            || replacement.content != signed.content
+            || replacement.tags != signed.tags
+            || replacement.event_id.len() != 64
+        {
+            return Err(ProductionError::Invalid);
+        }
+        if !self
+            .store
+            .refresh_pending_publication(key, &signed.event_id, &replacement)
+            .map_err(|_| ProductionError::Store)?
+        {
+            let reconciled = self
+                .store
+                .load_publication(key)
+                .map_err(|_| ProductionError::Store)?
+                .ok_or(ProductionError::PublicationConflict)?;
+            return self.republish(key, reconciled);
+        }
+        let accepted_id = self
+            .relay
+            .publish(&replacement)
+            .map_err(|_| ProductionError::Relay)?;
+        self.accept_published(key, replacement, accepted_id)
+    }
+
+    fn accept_published(
+        &mut self,
+        key: &str,
+        signed: SignedCiEvent,
+        accepted_id: String,
+    ) -> Result<String, ProductionError> {
+        if accepted_id != signed.event_id {
+            return Err(ProductionError::PublicationConflict);
+        }
+        self.store
+            .accept_publication(key, &accepted_id)
+            .map_err(|_| ProductionError::Store)?;
+        Ok(accepted_id)
     }
 }
 
@@ -1197,6 +1271,29 @@ mod tests {
             Ok(true)
         }
 
+        fn refresh_pending_publication(
+            &mut self,
+            key: &str,
+            expected_event_id: &str,
+            replacement: &SignedCiEvent,
+        ) -> Result<bool, Self::Error> {
+            let Some(StoredPublication::Pending(stored)) = self.publications.get(key) else {
+                return Err(());
+            };
+            if stored.event_id != expected_event_id
+                || stored.kind != replacement.kind
+                || stored.content != replacement.content
+                || stored.tags != replacement.tags
+            {
+                return Err(());
+            }
+            self.publications.insert(
+                key.to_owned(),
+                StoredPublication::Pending(replacement.clone()),
+            );
+            Ok(true)
+        }
+
         fn accept_publication(&mut self, key: &str, event_id: &str) -> Result<(), Self::Error> {
             let Some(StoredPublication::Pending(signed)) = self.publications.get(key).cloned()
             else {
@@ -1333,6 +1430,10 @@ mod tests {
             }
             self.published.push(event.kind);
             Ok(event.event_id.clone())
+        }
+
+        fn publication_exists(&mut self, _event: &SignedCiEvent) -> Result<bool, Self::Error> {
+            Ok(false)
         }
 
         fn put_log(
@@ -1696,6 +1797,168 @@ mod tests {
     }
 
     #[test]
+    fn failed_pending_publication_is_reconciled_before_its_signature_is_refreshed() {
+        struct ReconcileRelay {
+            exists: bool,
+            fail_first: bool,
+            published: Vec<String>,
+        }
+
+        impl RelayControl for ReconcileRelay {
+            type Error = ();
+
+            fn next_accepted(
+                &mut self,
+                _channel_id: &str,
+                _after_cursor: u64,
+            ) -> Result<Option<AcceptedRequest>, Self::Error> {
+                Ok(None)
+            }
+
+            fn publish(&mut self, event: &SignedCiEvent) -> Result<String, Self::Error> {
+                if self.fail_first {
+                    self.fail_first = false;
+                    return Err(());
+                }
+                self.published.push(event.event_id.clone());
+                Ok(event.event_id.clone())
+            }
+
+            fn publication_exists(&mut self, _event: &SignedCiEvent) -> Result<bool, Self::Error> {
+                Ok(self.exists)
+            }
+
+            fn put_log(
+                &mut self,
+                _accepted: &AcceptedRequest,
+                _job: &JobCompletion,
+                _bytes: &[u8],
+            ) -> Result<StoredObject, Self::Error> {
+                Err(())
+            }
+
+            fn put_artifact(
+                &mut self,
+                _accepted: &AcceptedRequest,
+                _job: &JobCompletion,
+                _artifact: &ArtifactCompletion,
+                _bytes: &[u8],
+            ) -> Result<StoredObject, Self::Error> {
+                Err(())
+            }
+        }
+
+        struct RefreshingSigner;
+
+        impl CiSigner for RefreshingSigner {
+            type Error = ();
+
+            fn pubkey(&self) -> &str {
+                SIGNER
+            }
+
+            fn sign(
+                &mut self,
+                kind: u32,
+                content: &str,
+                tags: serde_json::Value,
+            ) -> Result<SignedCiEvent, Self::Error> {
+                Ok(SignedCiEvent {
+                    event_id: "bb".repeat(32),
+                    kind,
+                    content: content.to_owned(),
+                    tags: tags.clone(),
+                    signed_event: serde_json::json!({
+                        "id": "bb".repeat(32),
+                        "kind": kind,
+                        "content": content,
+                        "tags": tags,
+                        "created_at": SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .expect("clock")
+                            .as_secs()
+                    }),
+                })
+            }
+        }
+
+        let key = format!("{}:run:terminal", "11".repeat(32));
+        let stale = SignedCiEvent {
+            event_id: "aa".repeat(32),
+            kind: KIND_CI_RUN_STATUS,
+            content: "{}".to_owned(),
+            tags: serde_json::json!([]),
+            signed_event: serde_json::json!({
+                "id": "aa".repeat(32),
+                "kind": KIND_CI_RUN_STATUS,
+                "content": "{}",
+                "tags": [],
+                "created_at": 1
+            }),
+        };
+        let mut handler = ProductionHandler::new(
+            ReconcileRelay {
+                exists: false,
+                fail_first: true,
+                published: Vec::new(),
+            },
+            RefreshingSigner,
+            FailingExecutor,
+            MemoryStore {
+                publications: HashMap::from([(
+                    key.clone(),
+                    StoredPublication::Pending(stale.clone()),
+                )]),
+                ..MemoryStore::default()
+            },
+            MemoryOutput(Vec::new()),
+        );
+
+        assert_eq!(
+            handler
+                .republish(&key, StoredPublication::Pending(stale.clone()))
+                .expect("refresh absent publication"),
+            "bb".repeat(32)
+        );
+        assert_eq!(handler.relay.published, vec!["bb".repeat(32)]);
+        assert!(matches!(
+            handler.store.publications.get(&key),
+            Some(StoredPublication::Accepted { signed, relay_event_id })
+                if signed.event_id == "bb".repeat(32) && relay_event_id == &"bb".repeat(32)
+        ));
+
+        let mut reconciled = ProductionHandler::new(
+            ReconcileRelay {
+                exists: true,
+                fail_first: true,
+                published: Vec::new(),
+            },
+            RefreshingSigner,
+            FailingExecutor,
+            MemoryStore {
+                publications: HashMap::from([(
+                    key.clone(),
+                    StoredPublication::Pending(stale.clone()),
+                )]),
+                ..MemoryStore::default()
+            },
+            MemoryOutput(Vec::new()),
+        );
+        assert_eq!(
+            reconciled
+                .republish(&key, StoredPublication::Pending(stale))
+                .expect("reconcile accepted publication"),
+            "aa".repeat(32)
+        );
+        assert!(reconciled.relay.published.is_empty());
+        assert!(matches!(
+            reconciled.store.publications.get(&key),
+            Some(StoredPublication::Accepted { signed, relay_event_id })
+                if signed.event_id == "aa".repeat(32) && relay_event_id == &"aa".repeat(32)
+        ));
+    }
+
+    #[test]
     fn refused_publication_leaves_durable_intent_for_restart_replay() {
         struct SignallingStore {
             durable: DurableControlStore,
@@ -1750,6 +2013,16 @@ mod tests {
                 let written = self.durable.record_publication_intent(key, event)?;
                 self.intent_signal.set(true);
                 Ok(written)
+            }
+
+            fn refresh_pending_publication(
+                &mut self,
+                key: &str,
+                expected_event_id: &str,
+                replacement: &SignedCiEvent,
+            ) -> Result<bool, Self::Error> {
+                self.durable
+                    .refresh_pending_publication(key, expected_event_id, replacement)
             }
 
             fn accept_publication(&mut self, key: &str, event_id: &str) -> Result<(), Self::Error> {

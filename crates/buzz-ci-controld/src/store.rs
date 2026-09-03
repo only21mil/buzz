@@ -265,6 +265,42 @@ impl ControlStore for DurableControlStore {
         })
     }
 
+    fn refresh_pending_publication(
+        &mut self,
+        key: &str,
+        expected_event_id: &str,
+        replacement: &SignedCiEvent,
+    ) -> Result<bool, Self::Error> {
+        validate_key(key)?;
+        if !is_lower_hex(expected_event_id, 64)
+            || !is_lower_hex(&replacement.event_id, 64)
+            || !(46101..=46106).contains(&replacement.kind)
+        {
+            return Err(StoreError::Conflict);
+        }
+        self.mutate(|snapshot| {
+            let Some(publication) = snapshot.publications.get(key).cloned() else {
+                return Err(StoreError::Conflict);
+            };
+            match publication {
+                StoredPublication::Pending(stored)
+                    if stored.event_id == expected_event_id
+                        && stored.kind == replacement.kind
+                        && stored.content == replacement.content
+                        && stored.tags == replacement.tags =>
+                {
+                    snapshot.publications.insert(
+                        key.to_owned(),
+                        StoredPublication::Pending(replacement.clone()),
+                    );
+                    Ok((true, stored != *replacement))
+                }
+                StoredPublication::Accepted { .. } => Ok((false, false)),
+                _ => Err(StoreError::Conflict),
+            }
+        })
+    }
+
     fn accept_publication(&mut self, key: &str, event_id: &str) -> Result<(), Self::Error> {
         validate_key(key)?;
         if !is_lower_hex(event_id, 64) {
@@ -746,14 +782,21 @@ mod tests {
             store.record_publication_intent("key", &event("b")),
             Err(StoreError::Conflict)
         );
+        assert!(store
+            .refresh_pending_publication("key", &"a".repeat(64), &event("b"))
+            .expect("refresh matching pending intent"));
+        assert_eq!(
+            store.refresh_pending_publication("key", &"a".repeat(64), &event("c")),
+            Err(StoreError::Conflict)
+        );
         store
-            .accept_publication("key", &"a".repeat(64))
+            .accept_publication("key", &"b".repeat(64))
             .expect("accept");
         store
-            .accept_publication("key", &"a".repeat(64))
+            .accept_publication("key", &"b".repeat(64))
             .expect("idempotent accept");
         assert_eq!(
-            store.accept_publication("key", &"b".repeat(64)),
+            store.accept_publication("key", &"a".repeat(64)),
             Err(StoreError::Conflict)
         );
     }
