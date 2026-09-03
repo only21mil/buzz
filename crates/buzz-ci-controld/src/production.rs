@@ -26,7 +26,8 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::runner_client::{
-    AttemptOutcome, PreparedRunnerRequest, RunnerClient, RunnerConnector, ValidatedRunnerResult,
+    AttemptOutcome, PreparedRunnerRequest, RefusalReason, RunnerClient, RunnerConnector,
+    ValidatedRunnerResult,
 };
 use crate::{RunIdentity, RunRecord, RunState, StateError, StoreWrite};
 
@@ -160,6 +161,13 @@ pub trait AttemptExecutor {
     type Error;
 
     fn execute(&mut self, request: &AcceptedRequest) -> Result<AttemptCompletion, Self::Error>;
+
+    /// Whether a validated runner refusal proves this request expired before admission.
+    /// Only this request-local terminal condition may advance the relay cursor without
+    /// closing controller capacity; transport and every other refusal remain fail-closed.
+    fn is_expired_refusal(&self, _error: &Self::Error) -> bool {
+        false
+    }
 }
 
 /// Host-owned preparation step for one accepted controller request.
@@ -216,8 +224,16 @@ pub enum RunnerBridgeError {
     Client,
     #[error("runner refused the accepted request")]
     Refused,
+    #[error("runner proved the accepted request expired before admission")]
+    ExpiredRefusal,
     #[error("runner terminal result lacks complete teardown-backed evidence")]
     Incomplete,
+}
+
+impl RunnerBridgeError {
+    const fn is_expired_refusal(&self) -> bool {
+        matches!(self, Self::ExpiredRefusal)
+    }
 }
 
 /// Production controller executor backed by the frozen runner protocol client.
@@ -260,8 +276,12 @@ where
             .client
             .execute(&prepared.request)
             .map_err(|_| RunnerBridgeError::Client)?;
-        let ValidatedRunnerResult::Finished(receipt) = result else {
-            return Err(RunnerBridgeError::Refused);
+        let receipt = match result {
+            ValidatedRunnerResult::Finished(receipt) => receipt,
+            ValidatedRunnerResult::Refused {
+                reason: RefusalReason::Expired,
+            } => return Err(RunnerBridgeError::ExpiredRefusal),
+            ValidatedRunnerResult::Refused { .. } => return Err(RunnerBridgeError::Refused),
         };
         if receipt.outcome != AttemptOutcome::Completed {
             return Err(RunnerBridgeError::Incomplete);
@@ -313,6 +333,10 @@ where
             teardown,
             finished_at: receipt.finished_at,
         })
+    }
+
+    fn is_expired_refusal(&self, error: &Self::Error) -> bool {
+        error.is_expired_refusal()
     }
 }
 
@@ -472,15 +496,33 @@ where
         }
         let completion = match self.executor.execute(accepted) {
             Ok(completion) => completion,
-            Err(_) => {
+            Err(error) => {
+                let expired = self.executor.is_expired_refusal(&error);
                 self.publish_terminal_infrastructure_failure(
-                    accepted, &identity, revision, &record,
+                    accepted,
+                    &identity,
+                    revision,
+                    &record,
+                    if expired {
+                        "request_expired_before_admission"
+                    } else {
+                        "runner_or_evidence_provider_failure"
+                    },
                 )?;
+                if expired {
+                    return Ok(());
+                }
                 return Err(ProductionError::Runner);
             }
         };
         if let Err(error) = validate_completion(accepted, &completion, self.signer.pubkey()) {
-            self.publish_terminal_infrastructure_failure(accepted, &identity, revision, &record)?;
+            self.publish_terminal_infrastructure_failure(
+                accepted,
+                &identity,
+                revision,
+                &record,
+                "runner_or_evidence_provider_failure",
+            )?;
             return Err(error);
         }
 
@@ -495,7 +537,11 @@ where
                 Ok(finalized) => finalized,
                 Err(error @ (ProductionError::Evidence | ProductionError::Invalid)) => {
                     self.publish_terminal_infrastructure_failure(
-                        accepted, &identity, revision, &record,
+                        accepted,
+                        &identity,
+                        revision,
+                        &record,
+                        "runner_or_evidence_provider_failure",
                     )?;
                     return Err(error);
                 }
@@ -551,6 +597,7 @@ where
         identity: &RunIdentity,
         revision: u64,
         record: &RunRecord,
+        reason: &str,
     ) -> Result<(), ProductionError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -561,7 +608,7 @@ where
         let terminal = record.transition(
             RunState::InfrastructureFailure,
             now,
-            Some("runner_or_evidence_provider_failure".to_owned()),
+            Some(reason.to_owned()),
         )?;
         let terminal_revision = persist_run(&mut self.store, identity, revision, &terminal)?;
         let terminal_event_id = self.publish_run(accepted, &terminal, "run:terminal")?;
@@ -1233,6 +1280,23 @@ mod tests {
         }
     }
 
+    struct ExpiredRefusalExecutor;
+
+    impl AttemptExecutor for ExpiredRefusalExecutor {
+        type Error = RunnerBridgeError;
+
+        fn execute(
+            &mut self,
+            _request: &AcceptedRequest,
+        ) -> Result<AttemptCompletion, Self::Error> {
+            Err(RunnerBridgeError::ExpiredRefusal)
+        }
+
+        fn is_expired_refusal(&self, error: &Self::Error) -> bool {
+            error.is_expired_refusal()
+        }
+    }
+
     struct Relay {
         accepted: Option<AcceptedRequest>,
         published: Vec<u32>,
@@ -1510,6 +1574,33 @@ mod tests {
         assert_eq!(record.reason(), Some("runner_or_evidence_provider_failure"));
         assert!(record.terminal_event_id().is_some());
         assert_eq!(handler.store.cursor, 0);
+    }
+
+    #[test]
+    fn expired_runner_refusal_is_terminal_for_only_that_request() {
+        assert!(RunnerBridgeError::ExpiredRefusal.is_expired_refusal());
+        assert!(!RunnerBridgeError::Refused.is_expired_refusal());
+        let mut handler = ProductionHandler::new(
+            Relay {
+                accepted: Some(accepted()),
+                published: Vec::new(),
+                job_statuses: Vec::new(),
+                intent_signal: None,
+                refuse_publication: false,
+            },
+            DeterministicSigner,
+            ExpiredRefusalExecutor,
+            MemoryStore::default(),
+            MemoryOutput(Vec::new()),
+        );
+
+        assert!(matches!(handler.poll_once(CHANNEL), Ok(true)));
+        assert_eq!(handler.relay.published, vec![46101, 46101]);
+        let record = &handler.store.run.as_ref().expect("durable run").1;
+        assert_eq!(record.state(), RunState::InfrastructureFailure);
+        assert_eq!(record.reason(), Some("request_expired_before_admission"));
+        assert!(record.terminal_event_id().is_some());
+        assert_eq!(handler.store.cursor, 7);
     }
 
     #[test]
