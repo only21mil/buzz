@@ -2,8 +2,8 @@ use buzz_ci_keyholder::{
     decode_request, decode_response, encode_request, encode_response, AcceptanceMutation,
     CanonicalPayload, DecodeError, DescribeAcceptanceRequest, DescribeAcceptanceResponse,
     DescribeRequest, DescribeResponse, EncodeError, ErrorCode, ErrorResponse, FrameHeader,
-    HttpMethod, KeyholderClient, KeyholderServer, ManifestKind, Nip98AuthorizeRequest, Operation,
-    OperationSet, PeerIdentity, PeerPolicy, PublicIdentity, Request, Response,
+    HttpMethod, KeyholderClient, KeyholderServer, ManifestKind, Nip98AuthorizeRequest, Nip98Signer,
+    Operation, OperationSet, PeerIdentity, PeerPolicy, PublicIdentity, Request, Response,
     SignAcceptanceMutationRequest, SignCiEventRequest, SignManifestRequest, SignatureResponse, Url,
     HEADER_SIZE, MAX_BODY_SIZE, MAX_CANONICAL_PAYLOAD_SIZE, MAX_FRAME_SIZE, PROTOCOL_VERSION,
 };
@@ -48,6 +48,7 @@ fn requests() -> Vec<Request> {
             payload_digest: Some([2; 32]),
             created_at: 1_800_000_000,
             nonce: [3; 16],
+            signer: Nip98Signer::CiEvent,
         }),
         Request::SignManifest(SignManifestRequest {
             expected_generation: 9,

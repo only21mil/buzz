@@ -45,7 +45,8 @@ pub use traits::{KeyholderClient, KeyholderServer};
 pub use types::{
     AcceptanceMutation, CanonicalPayload, DescribeAcceptanceRequest, DescribeAcceptanceResponse,
     DescribeRequest, DescribeResponse, ErrorCode, ErrorResponse, HttpMethod, ManifestKind,
-    Nip98AuthorizeRequest, Operation, OperationSet, PeerIdentity, PeerPolicy, PublicIdentity,
-    Request, Response, SignAcceptanceMutationRequest, SignCiEventRequest, SignManifestRequest,
-    SignatureResponse, Url, ValueError, MAX_CANONICAL_PAYLOAD_SIZE, MAX_URL_SIZE,
+    Nip98AuthorizeRequest, Nip98Signer, Operation, OperationSet, PeerIdentity, PeerPolicy,
+    PublicIdentity, Request, Response, SignAcceptanceMutationRequest, SignCiEventRequest,
+    SignManifestRequest, SignatureResponse, Url, ValueError, MAX_CANONICAL_PAYLOAD_SIZE,
+    MAX_URL_SIZE,
 };

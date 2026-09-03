@@ -119,11 +119,18 @@ impl HttpMethod {
 }
 
 /// The exact values covered by one fresh NIP-98 authorization event.
+///
+/// A `POST /events` binding names the published event's own `pubkey` as
+/// `publisher`: the relay stores an event only when that pubkey equals the
+/// NIP-98 token pubkey, so the authorizer signs the token with that key or
+/// refuses. Reads and evidence writes carry no publisher and keep the
+/// dedicated NIP-98 identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Nip98Binding {
     pub method: HttpMethod,
     pub url: Url,
     pub payload_sha256: Option<String>,
+    pub publisher: Option<String>,
 }
 
 impl Nip98Binding {
@@ -136,9 +143,16 @@ impl Nip98Binding {
         {
             return Err(SourceError::InvalidBinding);
         }
-        match (self.method, self.payload_sha256.as_deref()) {
-            (HttpMethod::Get, None) => Ok(()),
-            (HttpMethod::Post | HttpMethod::Put, Some(digest)) if is_lower_hex(digest, 64) => {
+        match (
+            self.method,
+            self.payload_sha256.as_deref(),
+            self.publisher.as_deref(),
+        ) {
+            (HttpMethod::Get, None, None) => Ok(()),
+            (HttpMethod::Put, Some(digest), None) if is_lower_hex(digest, 64) => Ok(()),
+            (HttpMethod::Post, Some(digest), Some(publisher))
+                if is_lower_hex(digest, 64) && is_lower_hex(publisher, 64) =>
+            {
                 Ok(())
             }
             _ => Err(SourceError::InvalidBinding),
@@ -322,6 +336,7 @@ where
         method: HttpMethod,
         url: Url,
         body: Vec<u8>,
+        publisher: Option<String>,
     ) -> Result<HttpResponse, SourceError> {
         let payload_sha256 =
             (method != HttpMethod::Get).then(|| hex::encode(Sha256::digest(&body)));
@@ -329,6 +344,7 @@ where
             method,
             url: url.clone(),
             payload_sha256,
+            publisher,
         };
         binding.validate()?;
         let authorization = self
@@ -374,7 +390,7 @@ where
 
     fn put_object(&mut self, path: &str, bytes: &[u8]) -> Result<StoredObject, SourceError> {
         let url = self.endpoint(path)?;
-        let response = self.request(HttpMethod::Put, url.clone(), bytes.to_vec())?;
+        let response = self.request(HttpMethod::Put, url.clone(), bytes.to_vec(), None)?;
         let stored: StoredObjectWire =
             serde_json::from_slice(&response.body).map_err(|_| SourceError::InvalidResponse)?;
         stored.validate()?;
@@ -409,7 +425,7 @@ where
             .append_pair("channel_id", channel_id)
             .append_pair("after_cursor", &after_cursor.to_string())
             .append_pair("limit", "1");
-        let response = self.request(HttpMethod::Get, url, Vec::new())?;
+        let response = self.request(HttpMethod::Get, url, Vec::new(), None)?;
         let wire: AcceptedResponse =
             serde_json::from_slice(&response.body).map_err(|_| SourceError::InvalidResponse)?;
         let Some(item) = wire.accepted else {
@@ -453,7 +469,10 @@ where
         let body =
             serde_json::to_vec(&event.signed_event).map_err(|_| SourceError::InvalidRequest)?;
         let url = self.endpoint("events")?;
-        let response = self.request(HttpMethod::Post, url, body)?;
+        // The token must be signed by the event's own author (relay rule:
+        // `event.pubkey` equals the authenticated pubkey), so bind it here.
+        let publisher = event_value.pubkey.to_hex();
+        let response = self.request(HttpMethod::Post, url, body, Some(publisher))?;
         let reply: PublishResponse =
             serde_json::from_slice(&response.body).map_err(|_| SourceError::InvalidResponse)?;
         let exact_duplicate = !reply.accepted && reply.message.starts_with("duplicate:");
@@ -660,6 +679,7 @@ mod tests {
         assert_eq!(binding.method, HttpMethod::Put);
         assert_eq!(binding.url, request.url);
         assert_eq!(binding.payload_sha256.as_deref(), Some(digest.as_str()));
+        assert_eq!(binding.publisher, None);
         assert_eq!(request.body, bytes);
         assert_eq!(
             request.headers.get("authorization").map(String::as_str),
@@ -768,6 +788,14 @@ mod tests {
         )
         .expect("relay");
         assert_eq!(relay.publish(&signed).expect("idempotent replay"), event_id);
+        let (_transport, authorizer) = relay.into_parts();
+        assert_eq!(authorizer.bindings.len(), 1);
+        let binding = &authorizer.bindings[0];
+        assert_eq!(binding.method, HttpMethod::Post);
+        assert_eq!(
+            binding.publisher.as_deref(),
+            Some(keys.public_key().to_hex().as_str())
+        );
     }
 
     #[test]
@@ -846,16 +874,44 @@ mod tests {
                 method: HttpMethod::Get,
                 url: Url::parse("https://relay.example/a").expect("url"),
                 payload_sha256: Some("11".repeat(32)),
+                publisher: None,
             },
             Nip98Binding {
                 method: HttpMethod::Post,
                 url: Url::parse("https://user@relay.example/a").expect("url"),
                 payload_sha256: Some("11".repeat(32)),
+                publisher: Some("22".repeat(32)),
             },
             Nip98Binding {
                 method: HttpMethod::Put,
                 url: Url::parse("https://relay.example/a").expect("url"),
                 payload_sha256: None,
+                publisher: None,
+            },
+            // A publish without its author, and a read or write with one.
+            Nip98Binding {
+                method: HttpMethod::Post,
+                url: Url::parse("https://relay.example/events").expect("url"),
+                payload_sha256: Some("11".repeat(32)),
+                publisher: None,
+            },
+            Nip98Binding {
+                method: HttpMethod::Post,
+                url: Url::parse("https://relay.example/events").expect("url"),
+                payload_sha256: Some("11".repeat(32)),
+                publisher: Some("not-a-pubkey".to_owned()),
+            },
+            Nip98Binding {
+                method: HttpMethod::Put,
+                url: Url::parse("https://relay.example/a").expect("url"),
+                payload_sha256: Some("11".repeat(32)),
+                publisher: Some("22".repeat(32)),
+            },
+            Nip98Binding {
+                method: HttpMethod::Get,
+                url: Url::parse("https://relay.example/a").expect("url"),
+                payload_sha256: None,
+                publisher: Some("22".repeat(32)),
             },
         ];
         for binding in cases {

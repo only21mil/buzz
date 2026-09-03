@@ -879,11 +879,12 @@ class BootstrapCompositionTests(unittest.TestCase):
                 mock.patch.object(CLEAN_HOST_GUEST, "SECCOMP_SHA256", seccomp_sha256),
                 mock.patch.object(CLEAN_HOST_GUEST, "verify_platform_systemd") as platform_check,
             ):
-                _candidate_path, guest_scenario, _guest_public = CLEAN_HOST_GUEST.cross_bind(
+                _candidate_path, guest_scenario, _guest_public, guest_channel = CLEAN_HOST_GUEST.cross_bind(
                     guest_stage, guest_descriptor,
                 )
             platform_check.assert_called_once_with(clean_contract["platform_systemd"])
             self.assertEqual(RENDER.canonical_scenario(guest_scenario), scenario_raw)
+            self.assertEqual(guest_channel, "12345678-1234-4abc-8def-123456789abc")
 
             drifted_seccomp = b'{"defaultAction":"SCMP_ACT_ALLOW"}\n'
             write_file(seccomp_path, drifted_seccomp, 0o644)

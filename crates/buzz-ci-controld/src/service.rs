@@ -190,7 +190,7 @@ impl CapacityOneService {
         let relay_signer = UnixKeyholderClient::connect(active.keyholder.clone())?;
         let admission_signer = UnixKeyholderClient::connect(active.keyholder.clone())?;
         let acceptance_signer = UnixKeyholderClient::connect(active.keyholder.clone())?;
-        let acceptance_authorizer = UnixKeyholderClient::connect(active.keyholder.clone())?;
+        let mut acceptance_authorizer = UnixKeyholderClient::connect(active.keyholder.clone())?;
         let relay_transport = ReqwestTransport::new(
             Duration::from_secs(5),
             Duration::from_secs(30),
@@ -201,6 +201,20 @@ impl CapacityOneService {
             relay_transport,
             relay_authorizer,
         )?;
+        let acceptance_authority = AcceptanceAuthority::new(binding)?;
+        let described = acceptance_signer.describe_acceptance()?;
+        if described.actor != acceptance_authority.actor
+            || described.scenario_sha256 != acceptance_authority.scenario_sha256
+            || described.event_ids != acceptance_authority.event_ids
+        {
+            return Err(ServiceError::InvalidConfig);
+        }
+        // The acceptance publisher signs its NIP-98 tokens with the actor that
+        // signed the frozen events (relay rule: token pubkey equals event
+        // pubkey); bind that actor only after the keyholder described it.
+        acceptance_authorizer
+            .bind_acceptance_actor(acceptance_authority.actor)
+            .map_err(|_| ServiceError::InvalidConfig)?;
         let acceptance_transport = ReqwestTransport::new(
             Duration::from_secs(5),
             Duration::from_secs(30),
@@ -211,14 +225,6 @@ impl CapacityOneService {
             acceptance_transport,
             acceptance_authorizer,
         )?;
-        let acceptance_authority = AcceptanceAuthority::new(binding)?;
-        let described = acceptance_signer.describe_acceptance()?;
-        if described.actor != acceptance_authority.actor
-            || described.scenario_sha256 != acceptance_authority.scenario_sha256
-            || described.event_ids != acceptance_authority.event_ids
-        {
-            return Err(ServiceError::InvalidConfig);
-        }
         let bindings = StaticAdmissionBindings {
             audience_digest: decode_digest(&active.audience_digest)?,
             isolation_profile_digest: decode_digest(&active.isolation_profile_digest)?,

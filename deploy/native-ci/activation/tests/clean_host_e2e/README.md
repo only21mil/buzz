@@ -79,8 +79,18 @@ The flow has two user-visible phases and three isolated boots:
    absence is checked.
 
 The relay is guest-loopback only. It verifies the complete NIP-98 event ID,
-BIP-340 signature, public key, method, exact URL, payload digest, and timestamp.
-Published Nostr events receive the same event-ID and signature verification.
+BIP-340 signature, method, exact URL, payload digest, timestamp, and replay,
+then applies the production relay's admission rules from `crates/buzz-relay`:
+a published event's `pubkey` must equal the token pubkey and its `created_at`
+must be within 900 seconds; an `h`-tagged event needs channel membership (the
+channel is private); a kind-46107 grant needs the owner or admin role and adds
+its signer for its repository and window; kinds 46101 to 46106 need a static or
+granted CI signer equal to `relay_signer`; a kind-5 tombstone must target the
+author's own stored event; the accepted read and evidence writes need a static
+or granted CI signer for the request's repository. The guest rosters the
+acceptance actor as channel admin, the ci-event key as member, and the nip98
+key as the static signer (`guest_entry.relay_public_config`), the same three
+facts production must hold for its channel.
 The host records every staged ISO path with Rock Ridge owner and group `0:0`
 while retaining each frozen file and directory mode. Package manifests,
 payload bytes, and tree digests are unchanged, so the guest's strict root-owned

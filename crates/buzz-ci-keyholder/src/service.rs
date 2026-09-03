@@ -14,9 +14,9 @@ use buzz_ci_broker_protocol::v2::{
 use crate::{
     AcceptanceMutation, BackendError, CanonicalPayload, DescribeAcceptanceResponse,
     DescribeRequest, DescribeResponse, ErrorCode, ErrorResponse, HttpMethod, KeySelector,
-    KeyholderServer, Nip98AuthorizeRequest, Operation, PeerIdentity, PeerPolicy, PublicIdentity,
-    Request, Response, SelectorSet, SignAcceptanceMutationRequest, SignCiEventRequest,
-    SignManifestRequest, SignatureResponse, SigningBackend,
+    KeyholderServer, Nip98AuthorizeRequest, Nip98Signer, Operation, PeerIdentity, PeerPolicy,
+    PublicIdentity, Request, Response, SelectorSet, SignAcceptanceMutationRequest,
+    SignCiEventRequest, SignManifestRequest, SignatureResponse, SigningBackend,
 };
 
 const CI_EVENT_KIND_MIN: u32 = 46_101;
@@ -206,6 +206,9 @@ impl SigningPolicy {
             return Err(ServiceError::PolicyDenied);
         }
         if request.method == HttpMethod::Get {
+            if request.signer != Nip98Signer::Nip98 {
+                return Err(ServiceError::PolicyDenied);
+            }
             return authorize_accepted_read(&parsed, request);
         }
         if parsed.query().is_some()
@@ -218,10 +221,18 @@ impl SigningPolicy {
             .ok_or(ServiceError::PolicyDenied)?
             .split('/')
             .collect::<Vec<_>>();
+        // A publish token is signed by the event's own signer: the relay stores
+        // an event only when `event.pubkey` equals the token pubkey, so a
+        // `nip98.key` token can never carry a publish. Every other route is
+        // authorized as a CI signer, which stays the `nip98.key` identity.
         let allowed = match (request.method, segments.as_slice()) {
-            (HttpMethod::Post, ["events"]) => true,
-            (HttpMethod::Put, ["ci", "logs", fields @ ..]) => fields.len() == 5,
-            (HttpMethod::Put, ["ci", "artifacts", fields @ ..]) => fields.len() == 6,
+            (HttpMethod::Post, ["events"]) => request.signer != Nip98Signer::Nip98,
+            (HttpMethod::Put, ["ci", "logs", fields @ ..]) => {
+                fields.len() == 5 && request.signer == Nip98Signer::Nip98
+            }
+            (HttpMethod::Put, ["ci", "artifacts", fields @ ..]) => {
+                fields.len() == 6 && request.signer == Nip98Signer::Nip98
+            }
             _ => false,
         };
         if !allowed
@@ -379,6 +390,24 @@ impl<B: SigningBackend> ProductionKeyholder<B> {
         Ok(identity)
     }
 
+    fn acceptance_actor_for_generation(
+        &self,
+        expected_generation: u64,
+    ) -> Result<PublicIdentity, ServiceError> {
+        let actor = self
+            .policy
+            .acceptance
+            .as_ref()
+            .ok_or(ServiceError::PolicyDenied)?
+            .actor;
+        if actor.generation != expected_generation {
+            return Err(ServiceError::StaleGeneration {
+                current: actor.generation,
+            });
+        }
+        Ok(actor)
+    }
+
     fn signature(
         &self,
         selector: KeySelector,
@@ -486,8 +515,17 @@ impl<B: SigningBackend> KeyholderServer for ProductionKeyholder<B> {
         request: Nip98AuthorizeRequest,
     ) -> Result<SignatureResponse, Self::Error> {
         self.authorize(peer, Operation::Nip98Authorize)?;
-        let identity =
-            self.identity_for_generation(KeySelector::Nip98, request.expected_generation)?;
+        let identity = match request.signer {
+            Nip98Signer::Nip98 => {
+                self.identity_for_generation(KeySelector::Nip98, request.expected_generation)?
+            }
+            Nip98Signer::CiEvent => {
+                self.identity_for_generation(KeySelector::CiEvent, request.expected_generation)?
+            }
+            Nip98Signer::AcceptanceActor => {
+                self.acceptance_actor_for_generation(request.expected_generation)?
+            }
+        };
         self.policy.authorize_nip98(&request)?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -497,7 +535,20 @@ impl<B: SigningBackend> KeyholderServer for ProductionKeyholder<B> {
             return Err(ServiceError::PolicyDenied);
         }
         let digest = nip98_event_digest(identity.public_key, &request)?;
-        self.signature(KeySelector::Nip98, identity, digest)
+        match request.signer {
+            Nip98Signer::Nip98 => self.signature(KeySelector::Nip98, identity, digest),
+            Nip98Signer::CiEvent => self.signature(KeySelector::CiEvent, identity, digest),
+            Nip98Signer::AcceptanceActor => {
+                if digest == [0; 32] {
+                    return Err(ServiceError::InvalidRequest);
+                }
+                Ok(SignatureResponse {
+                    identity,
+                    signed_digest: digest,
+                    signature: self.backend.sign_acceptance_digest(digest)?,
+                })
+            }
+        }
     }
 
     fn sign_manifest(
@@ -881,6 +932,7 @@ pub(crate) mod tests {
                 uid: 1000,
                 gid: 1001,
                 allowed_operations: OperationSet::only(Operation::Describe)
+                    .union(OperationSet::only(Operation::Nip98Authorize))
                     .union(OperationSet::only(Operation::DescribeAcceptance))
                     .union(OperationSet::only(Operation::SignAcceptanceMutation)),
             },
@@ -1159,23 +1211,30 @@ pub(crate) mod tests {
             .expect("system time")
             .as_secs();
         let request = Nip98AuthorizeRequest {
-            expected_generation: 8,
+            expected_generation: 7,
+            signer: Nip98Signer::CiEvent,
             method: HttpMethod::Post,
             url: Url::new("https://relay.example.test/events".to_owned()).expect("url"),
             payload_digest: Some([4_u8; 32]),
             created_at: now,
             nonce: [5_u8; 16],
         };
-        let expected = nip98_event_digest([2_u8; 32], &request).expect("digest");
+        let expected = nip98_event_digest([1_u8; 32], &request).expect("digest");
         let response = service.handle(peer(), Request::Nip98Authorize(request));
         let Response::Nip98Authorize(signature) = response else {
             panic!("authorization should sign");
         };
         assert_eq!(signature.signed_digest, expected);
+        assert_eq!(signature.identity.public_key, [1_u8; 32]);
+        assert_eq!(
+            service.backend.calls.borrow().last(),
+            Some(&(KeySelector::CiEvent, expected))
+        );
 
         let accepted_read_url = "https://relay.example.test/ci/control/accepted?channel_id=123e4567-e89b-12d3-a456-426614174000&after_cursor=42&limit=1";
         let accepted_read = Nip98AuthorizeRequest {
             expected_generation: 8,
+            signer: Nip98Signer::Nip98,
             method: HttpMethod::Get,
             url: Url::new(accepted_read_url.to_owned()).expect("url"),
             payload_digest: None,
@@ -1211,6 +1270,7 @@ pub(crate) mod tests {
         {
             let denied = Nip98AuthorizeRequest {
                 expected_generation: 8,
+                signer: Nip98Signer::Nip98,
                 method: HttpMethod::Get,
                 url: Url::new(url.to_owned()).expect("url"),
                 payload_digest: None,
@@ -1231,6 +1291,7 @@ pub(crate) mod tests {
 
         let payload_on_get = Nip98AuthorizeRequest {
             expected_generation: 8,
+            signer: Nip98Signer::Nip98,
             method: HttpMethod::Get,
             url: Url::new(accepted_read_url.to_owned()).expect("url"),
             payload_digest: Some([9; 32]),
@@ -1251,6 +1312,7 @@ pub(crate) mod tests {
         for denied in [
             Nip98AuthorizeRequest {
                 expected_generation: 8,
+                signer: Nip98Signer::Nip98,
                 method: HttpMethod::Get,
                 url: Url::new("https://relay.example.test/events".to_owned()).expect("url"),
                 payload_digest: Some([4; 32]),
@@ -1259,6 +1321,7 @@ pub(crate) mod tests {
             },
             Nip98AuthorizeRequest {
                 expected_generation: 8,
+                signer: Nip98Signer::Nip98,
                 method: HttpMethod::Post,
                 url: Url::new("https://relay.example.test/events?drift=1".to_owned()).expect("url"),
                 payload_digest: Some([4; 32]),
@@ -1267,6 +1330,7 @@ pub(crate) mod tests {
             },
             Nip98AuthorizeRequest {
                 expected_generation: 8,
+                signer: Nip98Signer::Nip98,
                 method: HttpMethod::Put,
                 url: Url::new("https://relay.example.test/ci/logs/a/b/c/d/e".to_owned())
                     .expect("url"),
@@ -1276,6 +1340,7 @@ pub(crate) mod tests {
             },
             Nip98AuthorizeRequest {
                 expected_generation: 8,
+                signer: Nip98Signer::Nip98,
                 method: HttpMethod::Put,
                 url: Url::new("https://relay.example.test/ci/artifacts/a/b/c/d/e/f".to_owned())
                     .expect("url"),
@@ -1298,6 +1363,7 @@ pub(crate) mod tests {
 
         let denied = Nip98AuthorizeRequest {
             expected_generation: 8,
+            signer: Nip98Signer::Nip98,
             method: HttpMethod::Get,
             url: Url::new("https://other.example.test/".to_owned()).expect("url"),
             payload_digest: None,
@@ -1317,6 +1383,7 @@ pub(crate) mod tests {
 
         let stale = Nip98AuthorizeRequest {
             expected_generation: 8,
+            signer: Nip98Signer::Nip98,
             method: HttpMethod::Get,
             url: Url::new(accepted_read_url.to_owned()).expect("url"),
             payload_digest: None,
@@ -1332,6 +1399,125 @@ pub(crate) mod tests {
                 },
                 ..
             }
+        ));
+    }
+
+    fn publish_request(
+        signer: Nip98Signer,
+        generation: u64,
+        nonce: u8,
+        now: u64,
+    ) -> Nip98AuthorizeRequest {
+        Nip98AuthorizeRequest {
+            expected_generation: generation,
+            signer,
+            method: HttpMethod::Post,
+            url: Url::new("https://relay.example.test/events".to_owned()).expect("url"),
+            payload_digest: Some([4_u8; 32]),
+            created_at: now,
+            nonce: [nonce; 16],
+        }
+    }
+
+    fn denied_with(response: Response, code: ErrorCode) -> bool {
+        matches!(response, Response::Error { error, .. } if error.code == code)
+    }
+
+    #[test]
+    fn publish_tokens_follow_the_event_signer_and_other_routes_keep_the_nip98_key() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_secs();
+        let service = service(OperationSet::only(Operation::Nip98Authorize));
+
+        // The relay refuses a publish whose token pubkey differs from the
+        // event pubkey, and nip98.key signs no event: deny it up front.
+        assert!(denied_with(
+            service.handle(
+                peer(),
+                Request::Nip98Authorize(publish_request(Nip98Signer::Nip98, 8, 50, now))
+            ),
+            ErrorCode::PolicyDenied
+        ));
+        // The event signers never authorize reads or evidence writes.
+        let accepted_read_url = "https://relay.example.test/ci/control/accepted?channel_id=123e4567-e89b-12d3-a456-426614174000&after_cursor=42&limit=1";
+        for (signer, generation) in [
+            (Nip98Signer::CiEvent, 7),
+            (Nip98Signer::AcceptanceActor, 10),
+        ] {
+            let read = Nip98AuthorizeRequest {
+                expected_generation: generation,
+                signer,
+                method: HttpMethod::Get,
+                url: Url::new(accepted_read_url.to_owned()).expect("url"),
+                payload_digest: None,
+                created_at: now,
+                nonce: [51; 16],
+            };
+            let put = Nip98AuthorizeRequest {
+                expected_generation: generation,
+                signer,
+                method: HttpMethod::Put,
+                url: Url::new("https://relay.example.test/ci/logs/a/b/c/d/e".to_owned())
+                    .expect("url"),
+                payload_digest: Some([4; 32]),
+                created_at: now,
+                nonce: [52; 16],
+            };
+            for request in [read, put] {
+                let response = service.handle(peer(), Request::Nip98Authorize(request));
+                assert!(matches!(response, Response::Error { .. }), "{signer:?}");
+            }
+        }
+        // Without an activation binding there is no actor to sign with.
+        assert!(denied_with(
+            service.handle(
+                peer(),
+                Request::Nip98Authorize(publish_request(Nip98Signer::AcceptanceActor, 10, 53, now))
+            ),
+            ErrorCode::PolicyDenied
+        ));
+        assert!(service.backend.calls.borrow().is_empty());
+        assert!(service.backend.acceptance_calls.borrow().is_empty());
+
+        // With the binding, the actor signs a publish token under its own
+        // identity and generation, through the acceptance credential.
+        let service = acceptance_service();
+        let request = publish_request(Nip98Signer::AcceptanceActor, 10, 54, now);
+        let expected = nip98_event_digest([4_u8; 32], &request).expect("digest");
+        let Response::Nip98Authorize(signature) =
+            service.handle(peer(), Request::Nip98Authorize(request))
+        else {
+            panic!("actor publish token should sign");
+        };
+        assert_eq!(signature.identity.public_key, [4_u8; 32]);
+        assert_eq!(signature.identity.generation, 10);
+        assert_eq!(signature.signed_digest, expected);
+        assert_eq!(
+            service.backend.acceptance_calls.borrow().as_slice(),
+            &[expected]
+        );
+        assert!(service.backend.calls.borrow().is_empty());
+        assert!(matches!(
+            service.handle(
+                peer(),
+                Request::Nip98Authorize(publish_request(Nip98Signer::AcceptanceActor, 9, 55, now))
+            ),
+            Response::Error {
+                error: ErrorResponse {
+                    code: ErrorCode::StaleGeneration,
+                    current_generation: 10,
+                },
+                ..
+            }
+        ));
+        assert!(denied_with(
+            service.handle(
+                peer(),
+                Request::Nip98Authorize(publish_request(Nip98Signer::Nip98, 8, 56, now))
+            ),
+            ErrorCode::PolicyDenied
         ));
     }
 
