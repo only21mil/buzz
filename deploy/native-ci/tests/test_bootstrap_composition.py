@@ -746,11 +746,92 @@ class BootstrapCompositionTests(unittest.TestCase):
                 scenario_sha256,
             )
 
+            # The prior activation the guest activates and rolls back before the candidate
+            # activation: a distinct package frozen from the same candidate, here with another
+            # repository binding, sharing every component package and principal.
+            prior_draft = ACTIVATION_PACKAGE.production_activation_draft(
+                source_commit=candidate,
+                identities=draft["identities"],
+                access_group=draft["access_group"],
+                components=draft["components"],
+                entries=draft["entries"],
+                effective_systemd=draft["effective_systemd"],
+                actor_public_key=public["acceptance_actor"]["public_key"],
+                actor_generation=public["acceptance_actor"]["generation"],
+                ci_signer_public_key=public["keyholder_public_spec"]["selectors"]["ci_event"]["public_key"],
+                workflow_id=controld_active["workflow_id"],
+                workflow_digest=controld_active["workflow_digest"],
+                job_id=controld_active["jobs"][0]["job_id"],
+                channel_id=controld_active["channel_id"],
+                repository_owner_public_key=ACTIVATION_SCAFFOLD.TEST_REPOSITORY_OWNER,
+                repository_id=ACTIVATION_SCAFFOLD.TEST_REPOSITORY_ID + "-prior",
+                source_clone_url=ACTIVATION_SCAFFOLD.TEST_SOURCE_CLONE_URL,
+                time_reference=draft["acceptance_template"]["time_reference"],
+            )
+            prior_root = ceremony / "prior"
+            (prior_root / "packages").mkdir(parents=True, mode=0o700)
+            prior_draft_path = prior_root / "activation-draft.json"
+            write_file(prior_draft_path, ACTIVATION_PACKAGE.canonical_json(prior_draft), 0o600)
+            prior_activation_path = prior_root / "packages/activation"
+            prior_activation_manifest = ACTIVATION_FREEZER.freeze_package(
+                source, candidate, prior_draft_path, asset_root, prior_activation_path,
+            )
+            self.assertNotEqual(prior_activation_manifest["activation_id"], activation_manifest["activation_id"])
+            self.assertNotEqual(prior_activation_manifest["package_digest"], activation_manifest["package_digest"])
+            self.assertEqual(prior_activation_manifest["components"], activation_manifest["components"])
+            prior_execd_path = prior_root / "packages/execd"
+            prior_execd_manifest = EXECD_FREEZER.freeze_package(
+                source, candidate, execd_binary, execd_provenance, preactivation_path,
+                prior_activation_path, prior_execd_path,
+            )
+            self.assertEqual(
+                prior_execd_manifest["activation_binding"]["activation_id"],
+                prior_activation_manifest["activation_id"],
+            )
+            self.assertNotEqual(prior_execd_manifest["package_digest"], execd_manifest["package_digest"])
+            self.assertEqual(
+                prior_execd_manifest["activation_binding"]["execd_binary_sha256"],
+                execd_manifest["activation_binding"]["execd_binary_sha256"],
+            )
+            prior_scenario = copy.deepcopy(scenario)
+            prior_scenario["fixture"].update({
+                "activation_id": prior_activation_manifest["activation_id"],
+                "activation_package_digest": prior_activation_manifest["package_digest"],
+                "request_digest": ACTIVATION_PACKAGE.digest(
+                    json.dumps(
+                        prior_activation_manifest["acceptance_template"]["run_event"],
+                        ensure_ascii=False, separators=(",", ":"),
+                    ).encode()
+                ),
+                "grant_event_id": ACTIVATION_PACKAGE.digest(
+                    json.dumps(
+                        prior_activation_manifest["acceptance_template"]["grant_event"],
+                        ensure_ascii=False, separators=(",", ":"),
+                    ).encode()
+                ),
+            })
+            prior_scenario_path = prior_root / "capacity-one-scenario.json"
+            write_file(prior_scenario_path, RENDER.canonical_scenario(prior_scenario), 0o600)
+            prior_scenario_raw = prior_scenario_path.read_bytes()
+            prior_scenario_sha256 = hashlib.sha256(prior_scenario_raw).hexdigest()
+            self.assertNotEqual(prior_scenario_sha256, scenario_sha256)
+
             seccomp_path = ceremony / "seccomp.json"
             seccomp = b'{"defaultAction":"SCMP_ACT_ERRNO"}\n'
             write_file(seccomp_path, seccomp, 0o644)
             seccomp_sha256 = hashlib.sha256(seccomp).hexdigest()
             self.assertEqual(file_ref(ceremony, seccomp_path)["sha256"], seccomp_sha256)
+
+            def package_tree(prefix: str, name: str) -> dict[str, object]:
+                manifest_name = "activation-manifest.json" if name == "activation" else "package-manifest.json"
+                reference = file_ref(ceremony, ceremony / f"{prefix}packages/{name}/{manifest_name}")
+                return {
+                    "path": f"{prefix}packages/{name}",
+                    "manifest_sha256": reference["sha256"],
+                    "manifest_bytes": reference["bytes"],
+                    "manifest_mode": reference["mode"],
+                }
+
             clean_descriptor = self._write_descriptor(ceremony, "clean-descriptor.json", {
                 "schema_version": "buzz-ci-clean-host-contract-render-input/v1",
                 "candidate_sha": candidate,
@@ -759,33 +840,39 @@ class BootstrapCompositionTests(unittest.TestCase):
                 "public_binding": file_ref(ceremony, public_path),
                 "scenario": file_ref(ceremony, ceremony / "capacity-one-scenario.json"),
                 "seccomp_source": file_ref(ceremony, seccomp_path),
-                "packages": {
-                    name: {
-                        "path": f"packages/{name}",
-                        "manifest_sha256": file_ref(
-                            ceremony,
-                            ceremony / f"packages/{name}/{'activation-manifest.json' if name == 'activation' else 'package-manifest.json'}",
-                        )["sha256"],
-                        "manifest_bytes": file_ref(
-                            ceremony,
-                            ceremony / f"packages/{name}/{'activation-manifest.json' if name == 'activation' else 'package-manifest.json'}",
-                        )["bytes"],
-                        "manifest_mode": file_ref(
-                            ceremony,
-                            ceremony / f"packages/{name}/{'activation-manifest.json' if name == 'activation' else 'package-manifest.json'}",
-                        )["mode"],
-                    }
-                    for name in RENDER.PACKAGE_NAMES
-                },
+                "packages": {name: package_tree("", name) for name in RENDER.PACKAGE_NAMES},
+                "prior_packages": {name: package_tree("prior/", name) for name in RENDER.PRIOR_PACKAGE_NAMES},
+                "prior_scenario": file_ref(ceremony, prior_scenario_path),
             })
             with mock.patch.object(RENDER, "SECCOMP_SHA256", seccomp_sha256):
                 clean_contract = self._render(
                     "render-clean-host", clean_descriptor, "clean-host-contract.json",
                 )
             self.assertEqual(set(clean_contract["packages"]), set(RENDER.PACKAGE_NAMES))
+            self.assertEqual(set(clean_contract["prior_packages"]), set(RENDER.PRIOR_PACKAGE_NAMES))
             self.assertEqual(clean_contract["seccomp_source"]["sha256"], seccomp_sha256)
             self.assertEqual(clean_contract["scenario"]["sha256"], scenario_sha256)
+            self.assertEqual(clean_contract["prior_scenario"]["sha256"], prior_scenario_sha256)
             self.assertEqual(clean_contract["platform_systemd"], RENDER.PLATFORM_SYSTEMD)
+            for name in RENDER.PRIOR_PACKAGE_NAMES:
+                self.assertNotEqual(
+                    clean_contract["prior_packages"][name]["tree_sha256"],
+                    clean_contract["packages"][name]["tree_sha256"],
+                )
+            same_prior_descriptor = json.loads(clean_descriptor.read_bytes())
+            same_prior_descriptor["prior_packages"] = {
+                name: package_tree("", name) for name in RENDER.PRIOR_PACKAGE_NAMES
+            }
+            same_prior_descriptor["prior_scenario"] = file_ref(ceremony, scenario_path)
+            same_prior_descriptor_path = self._write_descriptor(
+                ceremony, "same-prior-clean-descriptor.json", same_prior_descriptor,
+            )
+            with mock.patch.object(
+                RENDER, "SECCOMP_SHA256", seccomp_sha256,
+            ), self.assertRaisesRegex(RENDER.RenderError, "prior activation does not differ"):
+                self._render(
+                    "render-clean-host", same_prior_descriptor_path, "same-prior-clean-host-contract.json",
+                )
 
             stale_scenario = copy.deepcopy(scenario)
             stale_scenario["fixture"]["grant_event_id"] = "8" * 64
@@ -823,9 +910,10 @@ class BootstrapCompositionTests(unittest.TestCase):
                     (
                         harness_contract,
                         _harness_state,
-                        _harness_records,
+                        harness_records,
                         harness_scenario_raw,
                         _harness_seccomp_raw,
+                        harness_prior_scenario_raw,
                     ) = CLEAN_HOST_HARNESS.validate_contract(
                         ceremony / "clean-host-contract.json",
                     )
@@ -833,12 +921,24 @@ class BootstrapCompositionTests(unittest.TestCase):
                 os.chdir(previous_directory)
             self.assertEqual(harness_contract["scenario"]["sha256"], scenario_sha256)
             self.assertEqual(harness_scenario_raw, scenario_raw)
+            self.assertEqual(harness_prior_scenario_raw, prior_scenario_raw)
+            self.assertEqual(
+                CLEAN_HOST_HARNESS.prior_activation_binding(harness_records),
+                {
+                    "activation_id": prior_activation_manifest["activation_id"],
+                    "package_digest": prior_activation_manifest["package_digest"],
+                },
+            )
 
             guest_stage = ceremony / "guest-stage"
             guest_inputs = guest_stage / "inputs"
             guest_inputs.mkdir(parents=True)
             for name in RENDER.PACKAGE_NAMES:
                 shutil.copytree(ceremony / f"packages/{name}", guest_inputs / name)
+            (guest_inputs / "prior").mkdir()
+            for name in RENDER.PRIOR_PACKAGE_NAMES:
+                shutil.copytree(ceremony / f"prior/packages/{name}", guest_inputs / "prior" / name)
+            shutil.copyfile(prior_scenario_path, guest_inputs / "prior/scenario.json")
             shutil.copyfile(scenario_path, guest_inputs / "scenario.json")
             shutil.copyfile(seccomp_path, guest_inputs / "seccomp.json")
             shutil.copyfile(public_path, guest_inputs / "public-binding.json")
@@ -868,6 +968,11 @@ class BootstrapCompositionTests(unittest.TestCase):
                 "seccomp_source_sha256": seccomp_sha256,
                 "timing_asset_sha256": clean_contract["timing_asset_sha256"],
                 "platform_systemd": clean_contract["platform_systemd"],
+                "prior_package_tree_sha256": {
+                    name: clean_contract["prior_packages"][name]["tree_sha256"]
+                    for name in RENDER.PRIOR_PACKAGE_NAMES
+                },
+                "prior_scenario_sha256": prior_scenario_sha256,
             }
             with (
                 mock.patch.object(CLEAN_HOST_GUEST, "STATE_ROOT", guest_state),

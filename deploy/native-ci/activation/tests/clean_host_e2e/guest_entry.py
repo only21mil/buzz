@@ -29,13 +29,21 @@ PHASE_SCHEMA = "buzz-ci-clean-host-e2e-guest-phase/v3"
 FRAME_SCHEMA = "buzz-ci-clean-host-e2e-frame/v2"
 PROGRESS_SCHEMA = "buzz-ci-clean-host-e2e-progress/v1"
 BINDING_SCHEMA = "buzz-ci-clean-host-e2e-public-binding/v3"
-STAGE_SCHEMA = "buzz-ci-clean-host-e2e-stage/v2"
+STAGE_SCHEMA = "buzz-ci-clean-host-e2e-stage/v3"
+PENDING_SCHEMA = "buzz-ci-clean-host-e2e-pending-evidence/v3"
 STATE_ROOT = Path("/var/lib/buzzci-e2e")
 EVIDENCE_DEVICE = Path("/dev/virtio-ports/buzzci.evidence")
 PROGRESS_DEVICE = Path("/dev/virtio-ports/buzzci.progress")
 TRANSFER_DEVICE = Path("/dev/vdb")
 KEY_NAMES = ("ci-event", "nip98", "manifest", "acceptance-actor")
 PACKAGE_NAMES = ("runner", "controld", "keyholder", "execd", "activation")
+PRIOR_PACKAGE_NAMES = ("execd", "activation")
+PRIOR_ACTIVATION_PROOF_KEYS = frozenset({
+    "activation_id", "package_digest", "receipt_state", "rollback_cleanup_sha256", "execd_reinstall",
+})
+ACTIVATION_RECEIPT_PATH = Path("/var/lib/buzzci/activation-controller/receipt-v1.json")
+ROLLBACK_CLEANUP_PATH = Path("/var/lib/buzzci/activation-controller/rollback-cleanup-v1.json")
+EXECD_PACKAGE_STATE = Path("/var/lib/buzzci/execd-v2/package")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 VIRTIO_PORT_TARGET = re.compile(r"^\.\./(vport[0-9]+p[0-9]+)$")
@@ -126,7 +134,10 @@ PROGRESS_PHASES = (
     "boot_cloud_init", "guest_started", "ceremony", "install", "relay_ready",
     "preinstall_units_clean", "package_units_validated", "principals_created",
     "seccomp_ready", "runner_installed", "controld_installed", "keyholder_installed",
-    "execd_installed", "installed_units_verified", "controller_check", "controller_stage",
+    "execd_installed", "installed_units_verified",
+    "prior_controller_check", "prior_controller_stage", "prior_controller_activate",
+    "prior_rollback", "reinstall", "execd_reinstalled",
+    "controller_check", "controller_stage",
     *(f"controller_stage:{name}" for name in STAGE_PROGRESS_SUBPHASES),
     "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup",
     "cleanup_return", "verifier", "complete",
@@ -389,6 +400,16 @@ def load_json(path: Path) -> object:
         return json.loads(read_file(path), object_pairs_hook=reject_duplicates)
     except json.JSONDecodeError as error:
         raise GuestError(f"invalid staged JSON: {path.name}") from error
+
+
+def parse_status(raw: bytes, label: str) -> dict[str, object]:
+    try:
+        value = json.loads(raw, object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GuestError(f"{label} status differs") from error
+    if not isinstance(value, dict):
+        raise GuestError(f"{label} status differs")
+    return value
 
 
 def parse_verdict(raw: bytes) -> dict[str, object]:
@@ -1221,9 +1242,15 @@ def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[s
     for name in PACKAGE_NAMES:
         if tree_digest(inputs / name) != descriptor["package_tree_sha256"].get(name):
             raise GuestError(f"package digest differs inside guest: {name}")
+    for name in PRIOR_PACKAGE_NAMES:
+        if tree_digest(inputs / "prior" / name) != descriptor["prior_package_tree_sha256"].get(name):
+            raise GuestError(f"prior package digest differs inside guest: {name}")
     scenario_raw = read_file(inputs / "scenario.json")
     if hashlib.sha256(scenario_raw).hexdigest() != descriptor.get("scenario_sha256"):
         raise GuestError("scenario digest differs inside guest")
+    prior_scenario_raw = read_file(inputs / "prior" / "scenario.json")
+    if hashlib.sha256(prior_scenario_raw).hexdigest() != descriptor.get("prior_scenario_sha256"):
+        raise GuestError("prior scenario digest differs inside guest")
     seccomp_raw = read_file(inputs / "seccomp.json", 16 * 1024 * 1024)
     if hashlib.sha256(seccomp_raw).hexdigest() != descriptor.get("seccomp_source_sha256") or descriptor.get("seccomp_source_sha256") != SECCOMP_SHA256:
         raise GuestError("seccomp source digest differs inside guest")
@@ -1261,35 +1288,34 @@ def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[s
     if not isinstance(candidate_sha, str) or HEX40.fullmatch(candidate_sha) is None:
         raise GuestError("candidate binding differs")
     manifests = {name: package_manifest(inputs / name, name) for name in PACKAGE_NAMES}
+    prior_manifests = {name: package_manifest(inputs / "prior" / name, name) for name in PRIOR_PACKAGE_NAMES}
     for name, manifest in manifests.items():
         if manifest.get("source_commit") != candidate_sha:
             raise GuestError(f"package source commit differs: {name}")
+    for name, manifest in prior_manifests.items():
+        if manifest.get("source_commit") != candidate_sha:
+            raise GuestError(f"prior package source commit differs: {name}")
     activation = manifests["activation"]
-    if activation.get("platform_systemd") != platform_systemd:
-        raise GuestError("activation package systemd platform binding differs")
-    execd = manifests["execd"]
+    prior_activation = prior_manifests["activation"]
+    for label, activation_value, execd_value in (
+        ("activation", activation, manifests["execd"]),
+        ("prior activation", prior_activation, prior_manifests["execd"]),
+    ):
+        if activation_value.get("platform_systemd") != platform_systemd:
+            raise GuestError(f"{label} package systemd platform binding differs")
+        binding = execd_value.get("activation_binding")
+        if (
+            not isinstance(binding, dict)
+            or binding.get("source_commit") != candidate_sha
+            or binding.get("package_digest") != activation_value.get("package_digest")
+            or binding.get("activation_id") != activation_value.get("activation_id")
+        ):
+            raise GuestError(f"execd package differs from {label} package")
+    validate_prior_activation(prior_activation, activation)
     activation_digest = activation.get("package_digest")
     activation_id = activation.get("activation_id")
-    binding = execd.get("activation_binding")
-    if (
-        not isinstance(binding, dict)
-        or binding.get("source_commit") != candidate_sha
-        or binding.get("package_digest") != activation_digest
-        or binding.get("activation_id") != activation_id
-    ):
-        raise GuestError("execd package differs from activation package")
-    scenario = json.loads(scenario_raw, object_pairs_hook=reject_duplicates)
-    fixture = scenario.get("fixture") if isinstance(scenario, dict) else None
-    driver = scenario.get("driver") if isinstance(scenario, dict) else None
-    if (
-        not isinstance(fixture, dict)
-        or not isinstance(driver, dict)
-        or driver.get("timeout_seconds") != timing_leaf("driver_operation")
-        or fixture.get("integrated_candidate_sha") != candidate_sha
-        or fixture.get("activation_package_digest") != activation_digest
-        or fixture.get("activation_id") != activation_id
-    ):
-        raise GuestError("scenario differs from candidate or activation package")
+    scenario = validate_scenario_binding(scenario_raw, candidate_sha, activation, "scenario")
+    validate_scenario_binding(prior_scenario_raw, candidate_sha, prior_activation, "prior scenario")
     public = json.loads(binding_raw, object_pairs_hook=reject_duplicates)
     keyholder_entry = next((item for item in manifests["keyholder"].get("entries", []) if item.get("role") == "config"), None)
     if not isinstance(keyholder_entry, dict):
@@ -1300,30 +1326,86 @@ def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[s
     )
     if keyholder_config != public.get("keyholder_public_spec"):
         raise GuestError("keyholder package differs from ceremony public keys")
-    if activation.get("acceptance_template", {}).get("actor") != public.get("acceptance_actor"):
-        raise GuestError("activation actor differs from ceremony public key")
-    controld_entry = next((item for item in activation.get("entries", []) if item.get("role") == "controld_config"), None)
-    if not isinstance(controld_entry, dict):
-        raise GuestError("activation controld config entry is absent")
-    controld_active = json.loads(
-        read_package_member(inputs / "activation", controld_entry.get("active_source")),
-        object_pairs_hook=reject_duplicates,
-    )
     public_spec = public.get("keyholder_public_spec")
-    validate_ceremony_identities(
-        public_spec, activation, manifests["keyholder"], controld_active,
-    )
-    if (
-        not isinstance(public_spec, dict)
-        or controld_active.get("relay_url") != public.get("relay_url")
-        or controld_active.get("relay_http_origin") != public.get("relay_http_origin")
-        or controld_active.get("keyholder_selectors") != public_spec.get("selectors")
+    channel_ids: list[object] = []
+    for label, package, activation_value in (
+        ("activation", inputs / "activation", activation),
+        ("prior activation", inputs / "prior" / "activation", prior_activation),
     ):
-        raise GuestError("activation controld provider differs from ceremony binding")
-    channel_id = controld_active.get("channel_id")
+        if activation_value.get("acceptance_template", {}).get("actor") != public.get("acceptance_actor"):
+            raise GuestError(f"{label} actor differs from ceremony public key")
+        controld_entry = next((item for item in activation_value.get("entries", []) if item.get("role") == "controld_config"), None)
+        if not isinstance(controld_entry, dict):
+            raise GuestError(f"{label} controld config entry is absent")
+        controld_active = json.loads(
+            read_package_member(package, controld_entry.get("active_source")),
+            object_pairs_hook=reject_duplicates,
+        )
+        validate_ceremony_identities(
+            public_spec, activation_value, manifests["keyholder"], controld_active,
+        )
+        if (
+            not isinstance(public_spec, dict)
+            or controld_active.get("relay_url") != public.get("relay_url")
+            or controld_active.get("relay_http_origin") != public.get("relay_http_origin")
+            or controld_active.get("keyholder_selectors") != public_spec.get("selectors")
+        ):
+            raise GuestError(f"{label} controld provider differs from ceremony binding")
+        channel_ids.append(controld_active.get("channel_id"))
+    channel_id = channel_ids[0]
     if not isinstance(channel_id, str) or not channel_id:
         raise GuestError("activation controld channel id is absent")
+    if channel_ids[1] != channel_id:
+        raise GuestError("prior activation controld channel differs")
     return candidate, scenario, public, channel_id
+
+
+def validate_scenario_binding(
+    scenario_raw: bytes, candidate_sha: str, activation: dict[str, object], label: str,
+) -> dict[str, object]:
+    scenario = json.loads(scenario_raw, object_pairs_hook=reject_duplicates)
+    fixture = scenario.get("fixture") if isinstance(scenario, dict) else None
+    driver = scenario.get("driver") if isinstance(scenario, dict) else None
+    if (
+        not isinstance(fixture, dict)
+        or not isinstance(driver, dict)
+        or driver.get("timeout_seconds") != timing_leaf("driver_operation")
+        or fixture.get("integrated_candidate_sha") != candidate_sha
+        or fixture.get("activation_package_digest") != activation.get("package_digest")
+        or fixture.get("activation_id") != activation.get("activation_id")
+    ):
+        raise GuestError(f"{label} differs from candidate or activation package")
+    return scenario
+
+
+def validate_prior_activation(prior: dict[str, object], current: dict[str, object]) -> None:
+    """The prior activation must be a distinct package that shares every installed component."""
+    if (
+        not isinstance(prior.get("activation_id"), str)
+        or not isinstance(prior.get("package_digest"), str)
+        or HEX64.fullmatch(prior["package_digest"]) is None
+        or prior["activation_id"] == current.get("activation_id")
+        or prior["package_digest"] == current.get("package_digest")
+    ):
+        raise GuestError("prior activation does not differ from the candidate activation")
+
+    def component_packages(manifest: dict[str, object]) -> dict[object, tuple[object, object]]:
+        components = manifest.get("components")
+        if not isinstance(components, list):
+            raise GuestError("activation components differ")
+        return {
+            item.get("name"): (item.get("package_manifest_sha256"), item.get("package_digest"))
+            for item in components
+            if isinstance(item, dict) and "package_digest" in item
+        }
+
+    if (
+        not component_packages(prior)
+        or component_packages(prior) != component_packages(current)
+        or prior.get("identities") != current.get("identities")
+        or prior.get("access_group") != current.get("access_group")
+    ):
+        raise GuestError("prior activation binds different component packages or principals")
 
 
 def provision_seccomp(source: Path) -> None:
@@ -1354,15 +1436,85 @@ def create_principals(activation: Path) -> None:
     command(["systemd-sysusers", str(source)])
 
 
-def install_components(candidate: Path, inputs: Path) -> None:
+def install_components(candidate: Path, inputs: Path, execd_package: Path) -> None:
     for name in ("runner", "controld"):
         command(["python3", str(candidate / f"deploy/native-ci/{name}/install.py"), "install", "--package", str(inputs / name)])
         emit_progress(f"{name}_installed")
     command(["python3", str(candidate / "deploy/native-ci/keyholder/install.py"), "install", "--package", str(inputs / "keyholder")])
     emit_progress("keyholder_installed")
-    command(["python3", str(candidate / "deploy/native-ci/execd/install.py"), "install", "--package", str(inputs / "execd")])
+    command(["python3", str(candidate / "deploy/native-ci/execd/install.py"), "install", "--package", str(execd_package)])
     emit_progress("execd_installed")
     command(["systemctl", "daemon-reload"])
+
+
+def prior_rollback_proof(manifest: dict[str, object], rollback_stdout: bytes) -> dict[str, object]:
+    """Read back the controller's terminal rollback of the prior activation."""
+    status = parse_status(rollback_stdout, "controller rollback")
+    receipt = load_json(ACTIVATION_RECEIPT_PATH)
+    marker_raw = read_file(ROLLBACK_CLEANUP_PATH)
+    marker = json.loads(marker_raw, object_pairs_hook=reject_duplicates)
+    activation_id = manifest.get("activation_id")
+    package_digest = manifest.get("package_digest")
+    if (
+        status.get("state") != "rolled_back"
+        or status.get("activation_id") != activation_id
+        or not isinstance(receipt, dict)
+        or receipt.get("state") != "rolled_back"
+        or receipt.get("activation_id") != activation_id
+        or receipt.get("package_digest") != package_digest
+        or not isinstance(marker, dict)
+        or marker.get("activation_id") != activation_id
+        or marker.get("package_digest") != package_digest
+    ):
+        raise GuestError("prior activation rollback proof differs")
+    return {
+        "activation_id": activation_id,
+        "package_digest": package_digest,
+        "receipt_state": "rolled_back",
+        "rollback_cleanup_sha256": hashlib.sha256(marker_raw).hexdigest(),
+        "execd_reinstall": "pending",
+    }
+
+
+def retire_execd_package_state() -> None:
+    """After the execd rollback verb, move the terminal package state aside as the runbook does."""
+    try:
+        if not stat.S_ISREG(os.lstat(EXECD_PACKAGE_STATE / "rollback-v1.json").st_mode):
+            raise GuestError("prior execd rollback receipt differs")
+    except FileNotFoundError as error:
+        raise GuestError("prior execd rollback receipt is absent") from error
+    retired = EXECD_PACKAGE_STATE.with_name(
+        EXECD_PACKAGE_STATE.name + ".retired-" + time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
+    )
+    os.rename(EXECD_PACKAGE_STATE, retired)
+    if os.path.lexists(EXECD_PACKAGE_STATE) or not retired.is_dir():
+        raise GuestError("prior execd package state retirement differs")
+
+
+def reinstall_execd(candidate: Path, prior_package: Path, package: Path) -> str:
+    """Take the next execd package on a host whose central receipt is rolled back."""
+    installer = str(candidate / "deploy/native-ci/execd/install.py")
+    rolled_back = parse_status(
+        command(["python3", installer, "rollback", "--package", str(prior_package)]).stdout,
+        "execd rollback",
+    )
+    if rolled_back.get("state") != "rolled_back":
+        raise GuestError("prior execd package rollback differs")
+    retire_execd_package_state()
+    dry_run = parse_status(
+        command(["python3", installer, "install", "--dry-run", "--package", str(package)]).stdout,
+        "execd dry run",
+    )
+    if dry_run.get("status") != "dry_run" or dry_run.get("activation_receipt") != "rolled_back":
+        raise GuestError("execd dry run on the rolled-back host differs")
+    installed = parse_status(
+        command(["python3", installer, "install", "--package", str(package)]).stdout,
+        "execd install",
+    )
+    if installed.get("status") != "installed" or installed.get("activation_receipt") != "rolled_back":
+        raise GuestError("execd reinstall on the rolled-back host differs")
+    command(["systemctl", "daemon-reload"])
+    return "installed"
 
 
 def expected_unit_fragments(inputs: Path, package_names: tuple[str, ...]) -> dict[str, dict[str, str]]:
@@ -1704,6 +1856,7 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
             "schema_version", "candidate_sha", "harness_sha256", "timing_asset_sha256", "timing_sha256",
             "candidate_tar_sha256", "scenario_sha256", "seccomp_source_sha256",
             "public_binding_sha256", "package_tree_sha256", "platform_systemd",
+            "prior_package_tree_sha256", "prior_scenario_sha256",
         }
         or descriptor.get("schema_version") != STAGE_SCHEMA
         or descriptor.get("timing_sha256") != phase.get("timing_sha256")
@@ -1718,6 +1871,10 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
     candidate, _scenario, public, channel_id = cross_bind(stage, descriptor)
     inputs = stage / "inputs"
     activation_package = inputs / "activation"
+    prior_inputs = inputs / "prior"
+    prior_activation = prior_inputs / "activation"
+    rollback_package = prior_activation
+    prior_proof: dict[str, object] | None = None
     attempted_stage = False
     configs: dict[str, dict[str, object]] | None = None
     units: dict[str, dict[str, str]] | None = None
@@ -1747,11 +1904,32 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
         emit_progress("principals_created")
         provision_seccomp(inputs / "seccomp.json")
         emit_progress("seccomp_ready")
-        install_components(candidate, inputs)
+        install_components(candidate, inputs, prior_inputs / "execd")
         configs = tree_state(Path("/etc/buzzci"))
         units = prove_installed_units(component_units)
         emit_progress("installed_units_verified")
         controller = candidate / "deploy/native-ci/activation/controller.py"
+        installed_controller = "/usr/libexec/buzz-ci-activation-controller"
+        begin_phase("prior_controller_check")
+        command(["python3", str(controller), "check", "--package", str(prior_activation)], timeout=timing_leaf("controller_check"), timing_terms={"controller_check": 1})
+        begin_phase("prior_controller_stage")
+        attempted_stage = True
+        command(
+            ["python3", str(controller), "stage", "--package", str(prior_activation), "--scenario", str(prior_inputs / "scenario.json")],
+            timeout=timing_leaf("controller_stage"), timing_terms={"controller_stage": 1},
+        )
+        prove_installed_units(expected_units)
+        begin_phase("prior_controller_activate")
+        command([installed_controller, "activate", "--package", str(prior_activation)], timeout=timing_leaf("controller_activate"), timing_terms={"controller_activate": 1})
+        begin_phase("prior_rollback")
+        rolled_back = command([installed_controller, "rollback", "--package", str(prior_activation)], timeout=timing_leaf("rollback"), timing_terms={"rollback": 1})
+        prior_proof = prior_rollback_proof(package_manifest(prior_activation, "activation"), rolled_back.stdout)
+        attempted_stage = False
+        rollback_package = activation_package
+        begin_phase("reinstall")
+        prior_proof["execd_reinstall"] = reinstall_execd(candidate, prior_inputs / "execd", inputs / "execd")
+        prove_installed_units(component_units)
+        emit_progress("execd_reinstalled")
         begin_phase("controller_check")
         command(["python3", str(controller), "check", "--package", str(activation_package)], timeout=timing_leaf("controller_check"), timing_terms={"controller_check": 1})
         begin_phase("controller_stage")
@@ -1786,7 +1964,7 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
     except BaseException as error:
         primary = error
         abandon_command_inventory()
-    cleanup_errors = cleanup(candidate, activation_package, attempted_stage, hosts_added)
+    cleanup_errors = cleanup(candidate, rollback_package, attempted_stage, hosts_added)
     proof: dict[str, object] | None = None
     if configs is not None and units is not None:
         try:
@@ -1801,18 +1979,22 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
             pass
     if not cleanup_errors:
         emit_progress("cleanup_return")
-    if primary is not None or cleanup_errors or receipt_raw is None or verifier_raw is None or proof is None:
+    if (
+        primary is not None or cleanup_errors or receipt_raw is None or verifier_raw is None
+        or proof is None or prior_proof is None or prior_proof.get("execd_reinstall") != "installed"
+    ):
         message = str(primary) if primary is not None else "acceptance evidence incomplete"
         if cleanup_errors:
             message += "; " + "; ".join(cleanup_errors)
         raise GuestError(message)
     pending = {
-        "schema_version": "buzz-ci-clean-host-e2e-pending-evidence/v2",
+        "schema_version": PENDING_SCHEMA,
         "challenge": phase["challenge"],
         "candidate_sha": descriptor["candidate_sha"],
         "scenario_sha256": descriptor["scenario_sha256"],
         "receipt_base64": base64.b64encode(receipt_raw).decode(),
         "dormant_proof": proof,
+        "prior_activation": prior_proof,
     }
     write_transfer(pending)
     complete_progress()
@@ -1826,9 +2008,9 @@ def verify_pending(phase: dict[str, object], stage: Path) -> dict[str, object]:
         not isinstance(pending, dict)
         or set(pending) != {
             "schema_version", "challenge", "candidate_sha", "scenario_sha256",
-            "receipt_base64", "dormant_proof",
+            "receipt_base64", "dormant_proof", "prior_activation",
         }
-        or pending.get("schema_version") != "buzz-ci-clean-host-e2e-pending-evidence/v2"
+        or pending.get("schema_version") != PENDING_SCHEMA
         or pending.get("challenge") != phase["challenge"]
         or pending.get("candidate_sha") != phase.get("candidate_sha")
         or pending.get("scenario_sha256") != phase.get("scenario_sha256")
@@ -1895,6 +2077,18 @@ def verify_pending(phase: dict[str, object], stage: Path) -> dict[str, object]:
         ))
     ):
         raise GuestError("independent receipt identity differs")
+    prior_activation = pending.get("prior_activation")
+    if (
+        not isinstance(prior_activation, dict)
+        or set(prior_activation) != PRIOR_ACTIVATION_PROOF_KEYS
+        or prior_activation.get("activation_id") != phase.get("prior_activation_id")
+        or prior_activation.get("package_digest") != phase.get("prior_package_digest")
+        or prior_activation.get("receipt_state") != "rolled_back"
+        or prior_activation.get("execd_reinstall") != "installed"
+        or not isinstance(prior_activation.get("rollback_cleanup_sha256"), str)
+        or HEX64.fullmatch(prior_activation["rollback_cleanup_sha256"]) is None
+    ):
+        raise GuestError("prior activation proof differs")
     receipt_path.unlink()
     trusted_binary.unlink()
     stages_path.unlink()
@@ -1903,6 +2097,7 @@ def verify_pending(phase: dict[str, object], stage: Path) -> dict[str, object]:
         "receipt_base64": base64.b64encode(canonical(receipt)).decode(),
         "verifier_base64": base64.b64encode(canonical({"outcome": "pass", "status": "verified"})).decode(),
         "dormant_proof": pending["dormant_proof"],
+        "prior_activation": prior_activation,
     }
     complete_progress()
     return result
@@ -1960,6 +2155,7 @@ def main(argv: list[str]) -> int:
             if set(phase) != {
                 "schema_version", "phase", "challenge", "candidate_sha",
                 "scenario_sha256", "trusted_verifier_sha256", "expected_stages_sha256",
+                "prior_activation_id", "prior_package_digest",
                 "timing", "timing_sha256",
             }:
                 raise GuestError("verification phase fields differ")

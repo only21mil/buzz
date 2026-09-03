@@ -39,7 +39,7 @@ use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use nix::{
     sys::signal::{killpg, Signal},
     sys::stat::{mkdirat, Mode},
-    unistd::{fchown, Gid, Pid, Uid},
+    unistd::{fchown, unlinkat, Gid, Pid, Uid, UnlinkatFlags},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -631,6 +631,36 @@ impl SafeDirectory {
             let _ = fs::remove_file(path);
             return Err(ProductionV2Error::Closed);
         }
+        self.directory
+            .sync_all()
+            .map_err(|_| ProductionV2Error::Closed)
+    }
+
+    fn remove_file_if_unchanged(
+        &self,
+        name: &str,
+        expected_bytes: &[u8],
+        mode: u32,
+        maximum: u64,
+    ) -> Result<(), ProductionV2Error> {
+        let file = self.open_file(name, self.owner, mode, maximum, false)?;
+        let expected = file.metadata().map_err(|_| ProductionV2Error::Closed)?;
+        let mut observed_bytes = Vec::new();
+        file.take(maximum + 1)
+            .read_to_end(&mut observed_bytes)
+            .map_err(|_| ProductionV2Error::Closed)?;
+        let observed = fs::symlink_metadata(self.descriptor_path().join(name))
+            .map_err(|_| ProductionV2Error::Closed)?;
+        if observed_bytes != expected_bytes
+            || !observed.file_type().is_file()
+            || observed.dev() != expected.dev()
+            || observed.ino() != expected.ino()
+            || observed.nlink() != expected.nlink()
+        {
+            return Err(ProductionV2Error::Closed);
+        }
+        unlinkat(&self.directory, name, UnlinkatFlags::NoRemoveDir)
+            .map_err(|_| ProductionV2Error::Closed)?;
         self.directory
             .sync_all()
             .map_err(|_| ProductionV2Error::Closed)
@@ -1999,6 +2029,7 @@ impl DurableQualificationFiles {
         contract: ProductionQualificationContract,
     ) -> Result<Self, ProductionV2Error> {
         let mut count = 0;
+        let mut superseded = Vec::new();
         for entry in fs::read_dir(root.descriptor_path()).map_err(|_| ProductionV2Error::Closed)? {
             let entry = entry.map_err(|_| ProductionV2Error::Closed)?;
             let name = entry
@@ -2017,9 +2048,6 @@ impl DurableQualificationFiles {
             let (header, request, response) = document.decode()?;
             if hex::encode(production_qualification_key_digest(&request)) != name[..64]
                 || response.code != ResponseCode::Ok
-                || !contract.matches(request)
-                || response.seccomp_install_receipt_digest
-                    != contract.seccomp_install_receipt_digest
                 || response.request_frame_digest != request.request_frame_digest
                 || production_qualification_request_frame_digest(header, &request)
                     != Some(request.request_frame_digest)
@@ -2028,6 +2056,21 @@ impl DurableQualificationFiles {
             {
                 return Err(ProductionV2Error::Closed);
             }
+            if !contract.matches(request) {
+                // The activation controller owns durable lifecycle and rollback
+                // history. Execd receipts only make requests under the active
+                // contract idempotent. Validate superseded receipts before retiring
+                // them so malformed history cannot turn into accepted state.
+                superseded.push((name, bytes));
+                continue;
+            }
+            if response.seccomp_install_receipt_digest != contract.seccomp_install_receipt_digest {
+                return Err(ProductionV2Error::Closed);
+            }
+        }
+        superseded.sort_unstable();
+        for (name, bytes) in superseded {
+            root.remove_file_if_unchanged(&name, &bytes, 0o600, MAX_RECORD)?;
         }
         Ok(Self { root })
     }
@@ -6642,6 +6685,15 @@ sys.stdout.write(controller._executor_provenance_digest(json.load(sys.stdin)))
             ResponseCode::Existing
         );
         drop(restarted);
+
+        // A superseded receipt must remain fail-closed until startup has fully
+        // validated it. Once validated, startup retires it because the activation
+        // controller owns rollback history and this store only serves exact retries
+        // for the configured contract.
+        let mut successor = capacity_zero.clone();
+        successor.qualification.activation_package_digest = hex::encode([0x44; 32]);
+        fs::write(&config_path, canonical_sorted_bytes(&successor).unwrap()).unwrap();
+        fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
         let receipt_path = fs::read_dir(prefix.join("var/lib/buzzci/execd-v2/qualification"))
             .unwrap()
             .next()
@@ -6651,7 +6703,7 @@ sys.stdout.write(controller._executor_provenance_digest(json.load(sys.stdin)))
         let receipt_bytes = fs::read(&receipt_path).unwrap();
         let mut tampered = receipt_bytes.clone();
         tampered[0] ^= 1;
-        fs::write(&receipt_path, tampered).unwrap();
+        fs::write(&receipt_path, &tampered).unwrap();
         fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(load_from(
             RuntimePaths {
@@ -6663,8 +6715,100 @@ sys.stdout.write(controller._executor_provenance_digest(json.load(sys.stdin)))
             || Ok(SeccompRuntimeBinding::fixture()),
         )
         .is_err());
-        fs::write(&receipt_path, receipt_bytes).unwrap();
+        assert_eq!(fs::read(&receipt_path).unwrap(), tampered);
+        fs::write(&receipt_path, &receipt_bytes).unwrap();
         fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        fs::remove_file(&receipt_path).unwrap();
+        std::os::unix::fs::symlink(&config_path, &receipt_path).unwrap();
+        assert!(load_from(
+            RuntimePaths {
+                prefix: prefix.to_owned(),
+            },
+            owner,
+            2,
+            false,
+            || Ok(SeccompRuntimeBinding::fixture()),
+        )
+        .is_err());
+        fs::remove_file(&receipt_path).unwrap();
+        fs::write(&receipt_path, &receipt_bytes).unwrap();
+        fs::set_permissions(&receipt_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let forged_path = receipt_path.with_file_name(format!("{}.json", "00".repeat(32)));
+        fs::rename(&receipt_path, &forged_path).unwrap();
+        assert!(load_from(
+            RuntimePaths {
+                prefix: prefix.to_owned(),
+            },
+            owner,
+            2,
+            false,
+            || Ok(SeccompRuntimeBinding::fixture()),
+        )
+        .is_err());
+        fs::rename(&forged_path, &receipt_path).unwrap();
+
+        // Each startup validates and retires the preceding contract before it can
+        // write the current receipt. Seventeen distinct sequential activations
+        // therefore remain at one durable receipt instead of exhausting the bound.
+        for activation in 1u8..=17 {
+            let mut activation_config = capacity_zero.clone();
+            activation_config.qualification.activation_package_digest =
+                hex::encode([activation; 32]);
+            fs::write(
+                &config_path,
+                canonical_sorted_bytes(&activation_config).unwrap(),
+            )
+            .unwrap();
+            fs::set_permissions(&config_path, fs::Permissions::from_mode(0o600)).unwrap();
+            let mut activation_runtime = load_from(
+                RuntimePaths {
+                    prefix: prefix.to_owned(),
+                },
+                owner,
+                2,
+                false,
+                || Ok(SeccompRuntimeBinding::fixture()),
+            )
+            .unwrap();
+            if activation == 1 {
+                let stale = activation_runtime.dispatch.dispatch_v2_encoded(
+                    header,
+                    Request::AdmitQualification(qualification),
+                    3,
+                );
+                assert_eq!(
+                    decode_production_qualification_response(header, stale.as_bytes())
+                        .unwrap()
+                        .code,
+                    ResponseCode::PolicyDenied
+                );
+            }
+            let mut activation_request = qualification;
+            activation_request.activation_package_digest = [activation; 32];
+            activation_request.request_frame_digest = [0; 32];
+            activation_request.request_frame_digest =
+                production_qualification_request_frame_digest(header, &activation_request).unwrap();
+            let qualified = activation_runtime.dispatch.dispatch_v2_encoded(
+                header,
+                Request::AdmitQualification(activation_request),
+                3,
+            );
+            assert_eq!(
+                decode_production_qualification_response(header, qualified.as_bytes())
+                    .unwrap()
+                    .code,
+                ResponseCode::Ok
+            );
+            drop(activation_runtime);
+            assert_eq!(
+                fs::read_dir(prefix.join("var/lib/buzzci/execd-v2/qualification"))
+                    .unwrap()
+                    .count(),
+                1
+            );
+        }
 
         let refused = Cell::new(false);
         assert!(load_from(

@@ -127,6 +127,29 @@ def make_prepared_state(parent: Path) -> Path:
     return state
 
 
+PRIOR_ACTIVATION = {"activation_id": "buzz-ci-capacity-one-" + "a" * 12 + "-" + "b" * 12, "package_digest": "b" * 64}
+CURRENT_ACTIVATION = {"activation_id": "buzz-ci-capacity-one-" + "a" * 12 + "-" + "c" * 12, "package_digest": "c" * 64}
+
+
+def activation_manifest_record(binding: dict[str, str]) -> tuple[str, int, bytes]:
+    return ("activation-manifest.json", 0o400, harness.canonical(binding))
+
+
+def package_records() -> dict[str, list[tuple[str, int, bytes]]]:
+    records = {name: [("payload", 0o400, name.encode())] for name in harness.PACKAGE_NAMES}
+    records["activation"].append(activation_manifest_record(CURRENT_ACTIVATION))
+    records["prior/execd"] = [("payload", 0o400, b"prior-execd")]
+    records["prior/activation"] = [("payload", 0o400, b"prior-activation"), activation_manifest_record(PRIOR_ACTIVATION)]
+    return {name: sorted(items) for name, items in records.items()}
+
+
+def prior_activation_proof() -> dict[str, object]:
+    return {
+        **PRIOR_ACTIVATION, "receipt_state": "rolled_back",
+        "rollback_cleanup_sha256": "7" * 64, "execd_reinstall": "installed",
+    }
+
+
 def make_run_contract(parent: Path, state: Path) -> tuple[Path, dict[str, object], str]:
     candidate = HERE.parents[4]
     candidate_sha = harness.bounded([
@@ -137,17 +160,23 @@ def make_run_contract(parent: Path, state: Path) -> tuple[Path, dict[str, object
             "/usr/bin/git", "-C", str(candidate), "rev-parse", "HEAD^{commit}",
         ]).decode().strip()
     packages = {}
-    for name in harness.PACKAGE_NAMES:
-        package = parent / f"package-{name}"
-        package.mkdir(mode=0o700)
-        (package / "payload").write_bytes(name.encode())
-        packages[name] = {
-            "path": str(package),
-            "tree_sha256": harness.tree_digest(harness.tree_records(package)),
-        }
+    prior_packages = {}
+    for key, records in package_records().items():
+        package = parent / ("package-" + key.replace("/", "-"))
+        harness.materialize_tree(records, package)
+        descriptor = {"path": str(package), "tree_sha256": harness.tree_digest(records)}
+        if key.startswith("prior/"):
+            prior_packages[key.removeprefix("prior/")] = descriptor
+        else:
+            packages[key] = descriptor
     scenario = parent / "scenario.json"
     scenario.write_bytes(harness.canonical({
         "driver": {"timeout_seconds": harness.TIMING_CONTRACT["leaf_seconds"]["driver_operation"]},
+    }))
+    prior_scenario = parent / "prior-scenario.json"
+    prior_scenario.write_bytes(harness.canonical({
+        "driver": {"timeout_seconds": harness.TIMING_CONTRACT["leaf_seconds"]["driver_operation"]},
+        "fixture": {"activation_id": PRIOR_ACTIVATION["activation_id"]},
     }))
     seccomp = parent / "seccomp.json"
     seccomp.write_bytes(b'{"defaultAction":"SCMP_ACT_ERRNO"}\n')
@@ -165,6 +194,8 @@ def make_run_contract(parent: Path, state: Path) -> tuple[Path, dict[str, object
         "scenario": {"path": str(scenario), "sha256": harness.file_sha256(scenario)},
         "seccomp_source": {"path": str(seccomp), "sha256": seccomp_sha},
         "packages": packages,
+        "prior_packages": prior_packages,
+        "prior_scenario": {"path": str(prior_scenario), "sha256": harness.file_sha256(prior_scenario)},
     }
     contract = parent / "contract.json"
     contract.write_bytes(harness.canonical(value))
@@ -223,6 +254,7 @@ def passing_frame(contract: dict[str, object]) -> dict[str, object]:
         "receipt_base64": base64.b64encode(harness.canonical(receipt)).decode(),
         "verifier_base64": base64.b64encode(harness.canonical(verifier)).decode(),
         "dormant_proof": proof,
+        "prior_activation": prior_activation_proof(),
     }
 
 
@@ -1020,6 +1052,15 @@ class TimingAndProgressTests(unittest.TestCase):
         "controld_installed", "keyholder_installed", "execd_installed",
         "installed_units_verified",
     )
+    PRIOR_CHECKPOINTS = (
+        "prior_controller_check", "prior_controller_stage", "prior_controller_activate",
+        "prior_rollback", "reinstall", "execd_reinstalled",
+    )
+    CANDIDATE_PHASES = (
+        "install", *INSTALL_CHECKPOINTS, *PRIOR_CHECKPOINTS, "controller_check", "controller_stage",
+        "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup",
+        "cleanup_return",
+    )
 
     def run_mocked_acceptance(
         self, *, fail_at: str | None = None, cleanup_errors: tuple[str, ...] = (),
@@ -1038,6 +1079,8 @@ class TimingAndProgressTests(unittest.TestCase):
             "public_binding_sha256": "1" * 64,
             "package_tree_sha256": {name: "2" * 64 for name in guest.PACKAGE_NAMES},
             "platform_systemd": copy.deepcopy(guest.PLATFORM_SYSTEMD),
+            "prior_package_tree_sha256": {name: "7" * 64 for name in guest.PRIOR_PACKAGE_NAMES},
+            "prior_scenario_sha256": "8" * 64,
         }
         phase = {
             "challenge": "3" * 64,
@@ -1058,7 +1101,25 @@ class TimingAndProgressTests(unittest.TestCase):
             for component in ("runner", "controld", "keyholder", "execd"):
                 if f"/{component}/install.py" in str(argv[1]) and fail_at == f"{component}_installed":
                     raise guest.GuestError("injected boundary failure")
+            prior_actions = {
+                "check": "prior_controller_check", "stage": "prior_controller_stage",
+                "activate": "prior_controller_activate", "rollback": "prior_rollback",
+            }
+            action = next((item for item in argv if item in prior_actions), None)
+            if action is not None and "inputs/prior/activation" in " ".join(str(item) for item in argv):
+                if fail_at == prior_actions[action]:
+                    raise guest.GuestError("injected boundary failure")
             return subprocess.CompletedProcess(argv, 0, b"verifier", b"")
+
+        def prior_proof(_manifest, _stdout):
+            return dict(prior_activation_proof(), execd_reinstall="pending")
+
+        def reinstall(_candidate, prior_package, package):
+            self.assertEqual(Path(prior_package), stage / "inputs/prior/execd")
+            self.assertEqual(Path(package), stage / "inputs/execd")
+            if fail_at == "execd_reinstalled":
+                raise guest.GuestError("injected boundary failure")
+            return "installed"
 
         unit_inventory_calls = 0
 
@@ -1134,6 +1195,8 @@ class TimingAndProgressTests(unittest.TestCase):
                 guest, "prove_installed_units",
                 side_effect=lambda _expected: completed("installed_units_verified", expected_units),
             ))
+            stack.enter_context(mock.patch.object(guest, "prior_rollback_proof", side_effect=prior_proof))
+            stack.enter_context(mock.patch.object(guest, "reinstall_execd", side_effect=reinstall))
             stack.enter_context(mock.patch.object(guest, "run_capacity_one_canary", return_value=b"receipt"))
             stack.enter_context(mock.patch.object(guest, "read_file", return_value=b"scenario"))
             stack.enter_context(mock.patch.object(guest, "parse_verdict"))
@@ -1156,6 +1219,38 @@ class TimingAndProgressTests(unittest.TestCase):
                 error = caught
         return events, error
 
+    def test_prior_activation_must_differ_and_share_components(self) -> None:
+        components = [
+            {"name": "runner", "package_manifest_sha256": "1" * 64, "package_digest": "2" * 64},
+            {"name": "controld", "package_manifest_sha256": "3" * 64, "package_digest": "4" * 64},
+            {"name": "execd", "binary_sha256": "5" * 64},
+        ]
+        identities = {"controld": {"uid": 1201}}
+        current = {
+            "activation_id": "buzz-ci-capacity-one-" + "a" * 12 + "-" + "c" * 12, "package_digest": "c" * 64,
+            "components": components, "identities": identities, "access_group": {"gid": 1204},
+        }
+        prior = {**current, "activation_id": "buzz-ci-capacity-one-" + "a" * 12 + "-" + "b" * 12, "package_digest": "b" * 64}
+        guest.validate_prior_activation(prior, current)
+        for label, mutated in (
+            ("same id", {**prior, "activation_id": current["activation_id"]}),
+            ("same digest", {**prior, "package_digest": current["package_digest"]}),
+            ("bad digest", {**prior, "package_digest": "short"}),
+        ):
+            with self.subTest(label=label), self.assertRaisesRegex(guest.GuestError, "does not differ"):
+                guest.validate_prior_activation(mutated, current)
+        other_runner = [dict(components[0], package_digest="9" * 64), *components[1:]]
+        for label, mutated in (
+            ("other runner package", {**prior, "components": other_runner}),
+            ("no component packages", {**prior, "components": [components[2]]}),
+            ("other principals", {**prior, "identities": {"controld": {"uid": 1}}}),
+            ("other access group", {**prior, "access_group": {"gid": 1}}),
+        ):
+            with self.subTest(label=label), self.assertRaisesRegex(guest.GuestError, "different component packages or principals"):
+                guest.validate_prior_activation(mutated, current)
+        with self.assertRaisesRegex(guest.GuestError, "components differ"):
+            guest.validate_prior_activation({**prior, "components": None}, current)
+
     def test_candidate_checkpoint_contract_is_shared_role_scoped_and_ordered(self) -> None:
         self.assertEqual(guest.PROGRESS_PHASES, harness.PROGRESS_PHASES)
         self.assertEqual(
@@ -1166,11 +1261,7 @@ class TimingAndProgressTests(unittest.TestCase):
             guest.STAGE_PROGRESS_SUBPHASES,
             stage_controller.STAGE_PROGRESS_NAMES,
         )
-        phases = (
-            "guest_started", "install", *self.INSTALL_CHECKPOINTS,
-            "controller_check", "controller_stage", "controller_activate", "canary",
-            "receipt_verifier", "rollback", "cleanup", "cleanup_return",
-        )
+        phases = ("guest_started", *self.CANDIDATE_PHASES)
         raw = b"".join(
             progress_frame("candidate", sequence, phase, "start", sequence + 1)
             for sequence, phase in enumerate(phases)
@@ -1446,14 +1537,7 @@ class TimingAndProgressTests(unittest.TestCase):
     def test_run_acceptance_checkpoints_follow_completed_boundaries(self) -> None:
         events, error = self.run_mocked_acceptance()
         self.assertIsNone(error)
-        self.assertEqual(
-            [name for name, _event in events],
-            [
-                "install", *self.INSTALL_CHECKPOINTS, "controller_check", "controller_stage",
-                "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup",
-                "cleanup_return", "complete",
-            ],
-        )
+        self.assertEqual([name for name, _event in events], [*self.CANDIDATE_PHASES, "complete"])
 
         previous = "install"
         for checkpoint in self.INSTALL_CHECKPOINTS:
@@ -1475,6 +1559,33 @@ class TimingAndProgressTests(unittest.TestCase):
                 self.assertIn('"cleanup_returned":true', str(failure))
                 self.assertNotIn("injected boundary failure", str(failure))
             previous = checkpoint
+
+        # The prior cycle: a failure inside a staged prior phase rolls the prior activation back;
+        # a failure before its stage or after its terminal rollback cleans up without one.
+        for checkpoint, rolls_back in (
+            ("prior_controller_check", False), ("prior_controller_stage", True),
+            ("prior_controller_activate", True), ("prior_rollback", True),
+            ("execd_reinstalled", False),
+        ):
+            with self.subTest(checkpoint=checkpoint):
+                events, error = self.run_mocked_acceptance(fail_at=checkpoint)
+                names = [name for name, _event in events]
+                self.assertIsInstance(error, guest.GuestError)
+                self.assertNotIn("complete", names)
+                self.assertNotIn("controller_check", names)
+                reported = "reinstall" if checkpoint == "execd_reinstalled" else checkpoint
+                self.assertIn(reported, names)
+                self.assertNotIn(checkpoint if checkpoint == "execd_reinstalled" else "execd_reinstalled", names)
+                expected_tail = ["rollback", "cleanup", "cleanup_return"] if rolls_back else ["cleanup", "cleanup_return"]
+                self.assertEqual(names[-len(expected_tail) - 1:], [reported, *expected_tail])
+                raw = b"".join(
+                    progress_frame("candidate", sequence, name, event, sequence + 1)
+                    for sequence, (name, event) in enumerate(events)
+                )
+                parsed = harness.parse_progress(raw, "candidate")
+                self.assertEqual(parsed["status"], "valid")
+                failure = harness.progress_failure("candidate", parsed, timed_out=False)
+                self.assertIn(f"candidate {reported} guest failure", str(failure))
 
         events, error = self.run_mocked_acceptance(fail_at="controller_stage")
         names = [name for name, _event in events]
@@ -1656,11 +1767,7 @@ class TimingAndProgressTests(unittest.TestCase):
             ("ceremony", "ceremony.qcow2", True, None, ("guest_started", "ceremony")),
             (
                 "candidate", "candidate.qcow2", False, "read-write",
-                (
-                    "guest_started", "install", *self.INSTALL_CHECKPOINTS,
-                    "controller_check", "controller_stage", "controller_activate", "canary",
-                    "receipt_verifier", "rollback", "cleanup", "cleanup_return",
-                ),
+                ("guest_started", *self.CANDIDATE_PHASES),
             ),
             ("verifier", "verifier.qcow2", True, "read-only", ("guest_started", "verifier")),
         )
@@ -1701,6 +1808,12 @@ class TimingAndProgressTests(unittest.TestCase):
         self.assertEqual(inventory["ceremony"]["command_default"], len(guest.KEY_NAMES) * 4 + 5)
         self.assertEqual(inventory["install"]["command_default"], 3 + len(guest.UNITS) * 2 + 1 + 5)
         self.assertEqual(inventory["controller_stage"]["command_default"], len(guest.UNITS))
+        self.assertEqual(inventory["prior_controller_stage"], inventory["controller_stage"])
+        self.assertEqual(inventory["prior_controller_check"], inventory["controller_check"])
+        self.assertEqual(inventory["prior_controller_activate"], inventory["controller_activate"])
+        self.assertEqual(inventory["prior_rollback"], inventory["rollback"])
+        self.assertEqual(inventory["reinstall"]["command_default"], 4 + len(guest.UNITS))
+        self.assertEqual(inventory["reinstall"]["guest_command_reap"], 4 + len(guest.UNITS))
         self.assertEqual(inventory["cleanup"]["unit_stop"], len(guest.UNITS) + 1)
         self.assertEqual(inventory["cleanup"]["command_default"], len(guest.UNITS) + 4)
         self.assertEqual(inventory["cleanup"]["guest_command_reap"], len(guest.UNITS) * 2 + 5)
@@ -2035,7 +2148,7 @@ class TimingAndProgressTests(unittest.TestCase):
         self.assertNotEqual(operations(stages[:-1]), declared)
 
     def test_watchdog_boundaries_cover_legal_sequences_cleanup_poweroff_and_reap(self) -> None:
-        expected = {"ceremony": 1130, "candidate": 5472, "verifier": 320}
+        expected = {"ceremony": 1130, "candidate": 7222, "verifier": 320}
         for role, phases in harness.TIMING_CONTRACT["role_phases"].items():
             legal_boundary = sum(harness.phase_seconds(phase) for phase in phases)
             complete_boundary = legal_boundary + harness.REAP_TIMEOUT
@@ -2048,6 +2161,8 @@ class TimingAndProgressTests(unittest.TestCase):
         self.assertGreater(harness.phase_seconds("ceremony"), 21 * 30 + 21 * 10)
         self.assertGreater(harness.phase_seconds("install"), 35 * 30 + 36 * 10 + 12)
         self.assertGreater(harness.phase_seconds("controller_stage"), 120 + 13 * 30 + 14 * 10)
+        self.assertEqual(harness.phase_seconds("prior_controller_stage"), harness.phase_seconds("controller_stage"))
+        self.assertGreater(harness.phase_seconds("reinstall"), 17 * 30 + 17 * 10)
         self.assertGreater(harness.phase_seconds("cleanup"), 17 * 30 + 14 * 10 + 31 * 10)
 
     def test_inner_timeout_is_recorded_before_rollback_and_cleanup(self) -> None:
@@ -2115,7 +2230,7 @@ class TimingAndProgressTests(unittest.TestCase):
         )
         self.assertIn("verifier boot_cloud_init watchdog timeout", str(missing))
         for phase in (
-            "install", *self.INSTALL_CHECKPOINTS, "controller_stage", "canary",
+            "install", *self.INSTALL_CHECKPOINTS, *self.PRIOR_CHECKPOINTS, "controller_stage", "canary",
             "receipt_verifier", "rollback", "cleanup", "cleanup_return",
         ):
             raw = progress_frame("candidate", 0, phase, "start", 1) + progress_frame(
@@ -2432,12 +2547,7 @@ class InputTests(unittest.TestCase):
             frozen.mkdir()
             for name in harness.GUEST_ASSETS:
                 (frozen / name).write_bytes(("frozen-" + name).encode())
-            records = {}
-            for name in harness.PACKAGE_NAMES:
-                package = root / f"package-{name}"
-                package.mkdir()
-                (package / "payload").write_bytes(name.encode())
-                records[name] = harness.tree_records(package)
+            records = package_records()
             contract = {
                 "candidate_root": str(candidate),
                 "candidate_sha": candidate_sha,
@@ -2445,18 +2555,34 @@ class InputTests(unittest.TestCase):
                 "timing_asset_sha256": "3" * 64,
                 "timing_sha256": harness.timing_sha256(),
                 "scenario": {"sha256": hashlib.sha256(b"{}\n").hexdigest()},
+                "prior_scenario": {"sha256": hashlib.sha256(b"{\"prior\":true}\n").hexdigest()},
                 "platform_systemd": copy.deepcopy(harness.PLATFORM_SYSTEMD),
             }
             archive = b""
+            staged: dict[str, object] = {}
 
             def capture_archive(stage: Path, _output: Path, _label: str) -> None:
                 nonlocal archive
                 archive = (stage / "candidate.tar").read_bytes()
+                staged["descriptor"] = json.loads((stage / "descriptor.json").read_bytes())
+                staged["prior_scenario"] = (stage / "inputs/prior/scenario.json").read_bytes()
+                staged["prior_trees"] = {
+                    name: harness.tree_digest(harness.tree_records(stage / "inputs/prior" / name))
+                    for name in harness.PRIOR_PACKAGE_NAMES
+                }
 
             with mock.patch.object(harness, "make_iso", side_effect=capture_archive), mock.patch.object(
                 harness, "make_seed",
             ):
-                harness.create_run_stage(contract, state, records, b"{}\n", b"seccomp\n")
+                harness.create_run_stage(contract, state, records, b"{}\n", b"seccomp\n", b"{\"prior\":true}\n")
+            self.assertEqual(staged["descriptor"]["schema_version"], guest.STAGE_SCHEMA)
+            self.assertEqual(staged["prior_scenario"], b"{\"prior\":true}\n")
+            self.assertEqual(staged["descriptor"]["prior_scenario_sha256"], contract["prior_scenario"]["sha256"])
+            self.assertEqual(
+                staged["descriptor"]["prior_package_tree_sha256"],
+                {name: harness.tree_digest(records[f"prior/{name}"]) for name in harness.PRIOR_PACKAGE_NAMES},
+            )
+            self.assertEqual(staged["prior_trees"], staged["descriptor"]["prior_package_tree_sha256"])
 
             extracted = root / "extracted"
             guest.extract_candidate(archive, extracted)
@@ -2595,12 +2721,14 @@ class InputTests(unittest.TestCase):
                 for name in harness.FROZEN_ASSETS
             }
             evidence = {
-                "schema_version": "buzz-ci-clean-host-e2e-evidence/v3",
+                "schema_version": harness.EVIDENCE_SCHEMA,
                 "candidate_sha": candidate, "image_sha256": "5" * 64,
                 "tool_sha256": {name: "6" * 64 for name in harness.TOOLS},
                 "harness_sha256": assets["harness.py"],
                 "timing_asset_sha256": assets["timing-contract.json"],
                 "harness_asset_sha256": assets, "package_tree_sha256": {},
+                "prior_package_tree_sha256": {}, "prior_scenario_sha256": "8" * 64,
+                "prior_activation": prior_activation_proof(),
                 "timing": harness.TIMING_CONTRACT,
                 "timing_sha256": harness.timing_sha256(),
                 "scenario_sha256": scenario_sha,
@@ -4005,10 +4133,12 @@ class InputTests(unittest.TestCase):
                 "timing": harness.TIMING_CONTRACT,
                 "timing_sha256": harness.timing_sha256(),
             }
-            records = {
-                name: [("payload", 0o400, name.encode())]
-                for name in harness.PACKAGE_NAMES
+            records = package_records()
+            contract["prior_packages"] = {
+                name: {"path": "unused", "tree_sha256": harness.tree_digest(records[f"prior/{name}"])}
+                for name in harness.PRIOR_PACKAGE_NAMES
             }
+            contract["prior_scenario"] = {"path": "unused", "sha256": "8" * 64}
             receipt = {
                 "schema_version": "buzz-ci-capacity-one-acceptance-receipt/v2",
                 "outcome": "pass", "scenario_sha256": scenario_sha,
@@ -4027,6 +4157,7 @@ class InputTests(unittest.TestCase):
                 "receipt_base64": base64.b64encode(harness.canonical(receipt)).decode(),
                 "verifier_base64": base64.b64encode(harness.canonical(verifier)).decode(),
                 "dormant_proof": proof,
+                "prior_activation": prior_activation_proof(),
             }
 
             def create_image(image_state, name, _backing):
@@ -4035,14 +4166,18 @@ class InputTests(unittest.TestCase):
             def boot(_state, _timeout, *, overlay, **_kwargs):
                 return frame if overlay == "verifier.qcow2" else None
 
+            verify_stages = []
             with mock.patch.object(harness, "qemu_img_create", side_effect=create_image), mock.patch.object(
                 harness, "create_run_stage",
-            ), mock.patch.object(harness, "create_verify_stage"), mock.patch.object(
+            ), mock.patch.object(
+                harness, "create_verify_stage", side_effect=lambda *arguments: verify_stages.append(arguments),
+            ), mock.patch.object(
                 harness, "validate_prepared_state", return_value=state_record(),
             ), mock.patch.object(harness, "boot", side_effect=boot), mock.patch.object(
                 harness, "replay_frozen_verifier",
             ):
                 outcome = harness.run_vm(contract, state, records, b"{}\n", b"{}\n", results)
+            self.assertEqual([arguments[3] for arguments in verify_stages], [PRIOR_ACTIVATION])
             self.assertEqual(outcome["status"], "pass")
             self.assertTrue(outcome["vm_state_absent"])
             self.assertFalse(state.exists())
@@ -4058,6 +4193,16 @@ class InputTests(unittest.TestCase):
             self.assertEqual(manifest["harness_asset_sha256"]["timing-contract.json"], manifest["timing_asset_sha256"])
             self.assertEqual(manifest["timing"], harness.TIMING_CONTRACT)
             self.assertEqual(manifest["timing_sha256"], harness.timing_sha256())
+            self.assertEqual(manifest["schema_version"], harness.EVIDENCE_SCHEMA)
+            self.assertEqual(manifest["prior_activation"], prior_activation_proof())
+            self.assertEqual(manifest["prior_scenario_sha256"], "8" * 64)
+            self.assertEqual(
+                manifest["prior_package_tree_sha256"],
+                {name: harness.tree_digest(records[f"prior/{name}"]) for name in harness.PRIOR_PACKAGE_NAMES},
+            )
+            drifted = dict(frame, prior_activation={**prior_activation_proof(), "activation_id": "other"})
+            with self.assertRaisesRegex(harness.HarnessError, "prior activation proof differs"):
+                harness.validate_final_frame(drifted, contract, "1" * 64, PRIOR_ACTIVATION)
 
     def test_backed_or_external_data_qcow2_is_rejected(self) -> None:
         base = {"format": "qcow2", "virtual-size": 1024 * 1024, "backing-filename": "parent.qcow2"}
@@ -4136,9 +4281,20 @@ class InputTests(unittest.TestCase):
             "outcome": "pass", "receipt_base64": base64.b64encode(harness.canonical(receipt)).decode(),
             "verifier_base64": base64.b64encode(harness.canonical(verifier)).decode(),
             "dormant_proof": {"processes_absent": True},
+            "prior_activation": prior_activation_proof(),
         }
         with self.assertRaisesRegex(harness.HarnessError, "identity"):
             harness.validate_final_frame(frame, contract, "4" * 64)
+        for mutation in (
+            {"receipt_state": "staged_zero"}, {"execd_reinstall": "pending"},
+            {"rollback_cleanup_sha256": "short"}, {"extra": True},
+        ):
+            with self.subTest(mutation=mutation):
+                mutated = dict(frame, prior_activation={**prior_activation_proof(), **mutation})
+                with self.assertRaisesRegex(harness.HarnessError, "prior activation proof differs"):
+                    harness.validate_final_frame(mutated, contract, "4" * 64)
+        with self.assertRaisesRegex(harness.HarnessError, "final evidence frame differs"):
+            harness.validate_final_frame({key: value for key, value in frame.items() if key != "prior_activation"}, contract, "4" * 64)
 
     def test_final_frame_rejects_extra_receipt_and_verdict_fields(self) -> None:
         contract = {"candidate_sha": "1" * 40, "scenario": {"sha256": "2" * 64}}
@@ -4159,6 +4315,7 @@ class InputTests(unittest.TestCase):
             "outcome": "pass", "receipt_base64": base64.b64encode(harness.canonical(receipt)).decode(),
             "verifier_base64": base64.b64encode(harness.canonical(verifier)).decode(),
             "dormant_proof": proof,
+            "prior_activation": prior_activation_proof(),
         }
         with self.assertRaisesRegex(harness.HarnessError, "identity"):
             harness.validate_final_frame(frame, contract, "6" * 64)

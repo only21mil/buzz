@@ -76,6 +76,11 @@ pub const ADAPTER_RESPONSE_SCHEMA: &str = "buzz-ci-capacity-one-adapter-response
 pub const CONTROL_REQUEST_SCHEMA: &str = "buzz-ci-acceptance-control-request/v2";
 pub const CONTROL_RESPONSE_SCHEMA: &str = "buzz-ci-acceptance-control-response/v2";
 const MAX_CONFIG_BYTES: u64 = 128 * 1024;
+/// The activation receipt is not a config: on a host that rolled back an
+/// earlier activation it embeds the retained controller and package-module
+/// payloads as `prior` records, so it is read under the controller's own
+/// 1 MiB receipt bound (`activation_package.MAX_JSON_BYTES`).
+const MAX_ACTIVATION_RECEIPT_BYTES: u64 = 1024 * 1024;
 /// Maximum request or response frame.
 pub const MAX_ADAPTER_FRAME_BYTES: usize = 1024 * 1024;
 
@@ -2107,7 +2112,7 @@ fn activation_receipt(
         0,
         0,
         0o600,
-        MAX_CONFIG_BYTES,
+        MAX_ACTIVATION_RECEIPT_BYTES,
     )
     .map_err(|_| ControlError::InvalidConfig)?;
     let value: serde_json::Value =
@@ -4972,6 +4977,33 @@ exit 1
     /// and the readback refused the receipt because preparing_zero was not
     /// a live state, failing the host action closed. The prepare window is
     /// live; the failure states stay refused.
+    /// PR6 clean host: the candidate's receipt on a rolled-back host embeds the
+    /// retained controller and package module as `prior` payloads (about 524 KB
+    /// at e60431ac), so the 128 KiB config bound closed the acceptance host at
+    /// startup. The receipt reads under the controller's 1 MiB receipt bound.
+    #[test]
+    fn activation_receipt_reads_under_the_controller_receipt_bound_not_the_config_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("receipt-v1.json");
+        let mut receipt =
+            b"{\"state\":\"staged_zero\",\"targets\":[{\"prior\":{\"payload_base64\":\"".to_vec();
+        receipt.extend(std::iter::repeat_n(b'A', 600 * 1024));
+        receipt.extend_from_slice(b"\"}}]}\n");
+        fs::write(&path, &receipt).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let (uid, gid) = (metadata.uid(), metadata.gid());
+        assert!(receipt.len() as u64 > MAX_CONFIG_BYTES);
+        assert!(matches!(
+            read_secure_file(&path, uid, gid, 0o600, MAX_CONFIG_BYTES),
+            Err(DriverError::InvalidConfig)
+        ));
+        assert_eq!(
+            read_secure_file(&path, uid, gid, 0o600, MAX_ACTIVATION_RECEIPT_BYTES).unwrap(),
+            receipt
+        );
+    }
+
     #[test]
     fn live_activation_receipt_accepts_the_zero_prepare_window() {
         let config = control_config();

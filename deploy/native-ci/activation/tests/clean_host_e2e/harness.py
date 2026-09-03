@@ -25,11 +25,17 @@ import tempfile
 import time
 from collections.abc import Callable
 
-SCHEMA = "buzz-ci-clean-host-e2e-vm-contract/v3"
+SCHEMA = "buzz-ci-clean-host-e2e-vm-contract/v4"
+EVIDENCE_SCHEMA = "buzz-ci-clean-host-e2e-evidence/v4"
+STAGE_SCHEMA = "buzz-ci-clean-host-e2e-stage/v3"
 STATE_SCHEMA = "buzz-ci-clean-host-e2e-vm-state/v3"
 FRAME_SCHEMA = "buzz-ci-clean-host-e2e-frame/v2"
 PROGRESS_SCHEMA = "buzz-ci-clean-host-e2e-progress/v1"
 PACKAGE_NAMES = ("runner", "controld", "keyholder", "execd", "activation")
+PRIOR_PACKAGE_NAMES = ("execd", "activation")
+PRIOR_ACTIVATION_PROOF_KEYS = frozenset({
+    "activation_id", "package_digest", "receipt_state", "rollback_cleanup_sha256", "execd_reinstall",
+})
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 MAX_JSON = 1024 * 1024
@@ -66,7 +72,10 @@ PROGRESS_PHASES = (
     "boot_cloud_init", "guest_started", "ceremony", "install", "relay_ready",
     "preinstall_units_clean", "package_units_validated", "principals_created",
     "seccomp_ready", "runner_installed", "controld_installed", "keyholder_installed",
-    "execd_installed", "installed_units_verified", "controller_check", "controller_stage",
+    "execd_installed", "installed_units_verified",
+    "prior_controller_check", "prior_controller_stage", "prior_controller_activate",
+    "prior_rollback", "reinstall", "execd_reinstalled",
+    "controller_check", "controller_stage",
     *(f"controller_stage:{name}" for name in STAGE_PROGRESS_SUBPHASES),
     "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup",
     "cleanup_return", "verifier", "complete",
@@ -318,14 +327,17 @@ def validate_timing_contract() -> None:
     inventory = TIMING_CONTRACT.get("command_inventory")
     roles = TIMING_CONTRACT.get("role_phases")
     expected_phases = {
-        "boot_cloud_init", "ceremony", "install", "controller_check",
-        "controller_stage", "controller_activate", "canary", "receipt_verifier",
-        "rollback", "cleanup", "verifier", "poweroff",
+        "boot_cloud_init", "ceremony", "install", "prior_controller_check",
+        "prior_controller_stage", "prior_controller_activate", "prior_rollback",
+        "reinstall", "controller_check", "controller_stage", "controller_activate",
+        "canary", "receipt_verifier", "rollback", "cleanup", "verifier", "poweroff",
     }
     expected_roles = {
         "ceremony": ["boot_cloud_init", "ceremony", "poweroff"],
         "candidate": [
-            "boot_cloud_init", "install", "controller_check", "controller_stage",
+            "boot_cloud_init", "install", "prior_controller_check", "prior_controller_stage",
+            "prior_controller_activate", "prior_rollback", "reinstall",
+            "controller_check", "controller_stage",
             "controller_activate", "canary", "receipt_verifier", "rollback",
             "cleanup", "poweroff",
         ],
@@ -992,7 +1004,10 @@ def parse_progress(raw: bytes, boot_role: str) -> dict[str, object]:
             "boot_cloud_init", "guest_started", "install", "relay_ready",
             "preinstall_units_clean", "package_units_validated", "principals_created",
             "seccomp_ready", "runner_installed", "controld_installed", "keyholder_installed",
-            "execd_installed", "installed_units_verified", "controller_check", "controller_stage",
+            "execd_installed", "installed_units_verified",
+            "prior_controller_check", "prior_controller_stage", "prior_controller_activate",
+            "prior_rollback", "reinstall", "execd_reinstalled",
+            "controller_check", "controller_stage",
             *(f"controller_stage:{name}" for name in STAGE_PROGRESS_SUBPHASES),
             "controller_activate", "canary", "receipt_verifier", "rollback", "cleanup",
             "cleanup_return", "complete",
@@ -1520,7 +1535,7 @@ def validate_contract_envelope(value: object) -> dict[str, object]:
     required = {
         "schema_version", "state", "candidate_root", "candidate_sha", "harness_sha256",
         "timing_asset_sha256", "timing", "timing_sha256", "scenario", "seccomp_source", "packages",
-        "platform_systemd",
+        "platform_systemd", "prior_packages", "prior_scenario",
     }
     if not isinstance(value, dict) or set(value) != required or value.get("schema_version") != SCHEMA:
         raise HarnessError("run contract shape differs")
@@ -1540,10 +1555,73 @@ def validate_contract_envelope(value: object) -> dict[str, object]:
     return value
 
 
+def scenario_bytes(value: object, label: str) -> bytes:
+    if not isinstance(value, dict) or set(value) != {"path", "sha256"} or HEX64.fullmatch(str(value["sha256"])) is None:
+        raise HarnessError(f"{label} descriptor differs")
+    raw = read_regular(safe_input_file(Path(str(value["path"]))), MAX_JSON)
+    if hashlib.sha256(raw).hexdigest() != value["sha256"]:
+        raise HarnessError(f"{label} digest differs")
+    scenario_value = decode_result_json(raw, "scenario.json")
+    driver = scenario_value.get("driver") if isinstance(scenario_value, dict) else None
+    if (
+        not isinstance(driver, dict)
+        or driver.get("timeout_seconds") != TIMING_CONTRACT["leaf_seconds"]["driver_operation"]
+    ):
+        raise HarnessError(f"{label} driver timeout differs from frozen timing contract")
+    return raw
+
+
+def package_tree_records(packages: object, names: tuple[str, ...], label: str) -> dict[str, list[tuple[str, int, bytes]]]:
+    if not isinstance(packages, dict) or set(packages) != set(names):
+        raise HarnessError(f"{label} set differs")
+    records: dict[str, list[tuple[str, int, bytes]]] = {}
+    for name in names:
+        descriptor = packages[name]
+        if not isinstance(descriptor, dict) or set(descriptor) != {"path", "tree_sha256"} or HEX64.fullmatch(str(descriptor["tree_sha256"])) is None:
+            raise HarnessError(f"{label} descriptor differs: {name}")
+        item_records = tree_records(safe_input_directory(Path(str(descriptor["path"]))))
+        if tree_digest(item_records) != descriptor["tree_sha256"]:
+            raise HarnessError(f"{label} tree digest differs: {name}")
+        records[name] = item_records
+    return records
+
+
+def prior_activation_binding(records: dict[str, list[tuple[str, int, bytes]]]) -> dict[str, str]:
+    """The prior activation identity the verifier boot must find in the pending evidence."""
+    manifest_raw = next(
+        (raw for relative, _mode, raw in records.get("prior/activation", []) if relative == "activation-manifest.json"),
+        None,
+    )
+    if manifest_raw is None:
+        raise HarnessError("prior activation manifest is absent")
+    manifest = decode_result_json(manifest_raw, "activation-manifest.json")
+    if not isinstance(manifest, dict):
+        raise HarnessError("prior activation manifest differs")
+    activation_id = manifest.get("activation_id")
+    package_digest = manifest.get("package_digest")
+    if (
+        not isinstance(activation_id, str) or not activation_id
+        or not isinstance(package_digest, str) or HEX64.fullmatch(package_digest) is None
+    ):
+        raise HarnessError("prior activation identity differs")
+    current_raw = next(
+        (raw for relative, _mode, raw in records.get("activation", []) if relative == "activation-manifest.json"),
+        None,
+    )
+    current = decode_result_json(current_raw, "activation-manifest.json") if current_raw is not None else None
+    if (
+        not isinstance(current, dict)
+        or current.get("activation_id") == activation_id
+        or current.get("package_digest") == package_digest
+    ):
+        raise HarnessError("prior activation does not differ from the candidate activation")
+    return {"activation_id": activation_id, "package_digest": package_digest}
+
+
 def validate_contract_value(
     value: dict[str, object], *, selected_state: Path | None = None,
 ) -> tuple[
-    dict[str, object], Path, dict[str, list[tuple[str, int, bytes]]], bytes, bytes,
+    dict[str, object], Path, dict[str, list[tuple[str, int, bytes]]], bytes, bytes, bytes,
 ]:
     validate_contract_envelope(value)
     state = selected_state if selected_state is not None else safe_directory(Path(value["state"]))
@@ -1587,38 +1665,19 @@ def validate_contract_value(
     for relative in REQUIRED_CANDIDATE:
         if not bounded(["/usr/bin/git", "-C", str(candidate), "cat-file", "-e", f"{value['candidate_sha']}:{relative}"], maximum=1024) == b"":
             raise HarnessError("candidate prerequisite probe returned output")
-    packages = value["packages"]
-    if not isinstance(packages, dict) or set(packages) != set(PACKAGE_NAMES):
-        raise HarnessError("package set differs")
-    records: dict[str, list[tuple[str, int, bytes]]] = {}
-    for name in PACKAGE_NAMES:
-        descriptor = packages[name]
-        if not isinstance(descriptor, dict) or set(descriptor) != {"path", "tree_sha256"} or HEX64.fullmatch(str(descriptor["tree_sha256"])) is None:
-            raise HarnessError(f"package descriptor differs: {name}")
-        item_records = tree_records(safe_input_directory(Path(str(descriptor["path"]))))
-        if tree_digest(item_records) != descriptor["tree_sha256"]:
-            raise HarnessError(f"package tree digest differs: {name}")
-        records[name] = item_records
-    scenario = value["scenario"]
-    if not isinstance(scenario, dict) or set(scenario) != {"path", "sha256"} or HEX64.fullmatch(str(scenario["sha256"])) is None:
-        raise HarnessError("scenario descriptor differs")
-    scenario_raw = read_regular(safe_input_file(Path(str(scenario["path"]))), MAX_JSON)
-    if hashlib.sha256(scenario_raw).hexdigest() != scenario["sha256"]:
-        raise HarnessError("scenario digest differs")
-    scenario_value = decode_result_json(scenario_raw, "scenario.json")
-    driver = scenario_value.get("driver") if isinstance(scenario_value, dict) else None
-    if (
-        not isinstance(driver, dict)
-        or driver.get("timeout_seconds") != TIMING_CONTRACT["leaf_seconds"]["driver_operation"]
-    ):
-        raise HarnessError("scenario driver timeout differs from frozen timing contract")
+    records = package_tree_records(value["packages"], PACKAGE_NAMES, "package")
+    for name, item_records in package_tree_records(value["prior_packages"], PRIOR_PACKAGE_NAMES, "prior package").items():
+        records[f"prior/{name}"] = item_records
+    prior_activation_binding(records)
+    scenario_raw = scenario_bytes(value["scenario"], "scenario")
+    prior_scenario_raw = scenario_bytes(value["prior_scenario"], "prior scenario")
     seccomp = value["seccomp_source"]
     if not isinstance(seccomp, dict) or set(seccomp) != {"path", "sha256"} or seccomp.get("sha256") != SECCOMP_SHA256:
         raise HarnessError("seccomp source descriptor differs")
     seccomp_raw = read_regular(safe_input_file(Path(str(seccomp["path"]))), 16 * 1024 * 1024)
     if hashlib.sha256(seccomp_raw).hexdigest() != SECCOMP_SHA256:
         raise HarnessError("seccomp source digest differs")
-    return value, state, records, scenario_raw, seccomp_raw
+    return value, state, records, scenario_raw, seccomp_raw, prior_scenario_raw
 
 
 def validate_contract(
@@ -2098,12 +2157,13 @@ def _terminal_run_locked(
         raise HarnessError("interrupted terminal result staging was cleaned")
     handed_to_run = False
     try:
-        contract, state, records, scenario_raw, seccomp_raw = validate_contract_value(
+        contract, state, records, scenario_raw, seccomp_raw, prior_scenario_raw = validate_contract_value(
             value, selected_state=claimed,
         )
         handed_to_run = True
         return run_vm(
             contract, state, records, scenario_raw, seccomp_raw, results,
+            prior_scenario_raw=prior_scenario_raw,
             expected_state=expected, binding=binding, resumed=resumed,
         )
     except BaseException as run_error:
@@ -2277,6 +2337,7 @@ def validate_result_set_fd(
         "harness_sha256", "harness_asset_sha256", "timing_asset_sha256",
         "timing", "timing_sha256",
         "package_tree_sha256", "scenario_sha256",
+        "prior_package_tree_sha256", "prior_scenario_sha256", "prior_activation",
         "seccomp_source_sha256", "transfer_bytes", "transfer_sha256",
         "receipt_sha256", "verifier_sha256", "dormant_proof",
     }
@@ -2286,10 +2347,21 @@ def validate_result_set_fd(
         if isinstance(packages, dict) and set(packages) == set(PACKAGE_NAMES)
         else evidence.get("package_tree_sha256") if isinstance(evidence, dict) else None
     )
+    prior_packages = contract.get("prior_packages")
+    expected_prior_packages = (
+        {name: prior_packages[name]["tree_sha256"] for name in PRIOR_PACKAGE_NAMES}
+        if isinstance(prior_packages, dict) and set(prior_packages) == set(PRIOR_PACKAGE_NAMES)
+        else evidence.get("prior_package_tree_sha256") if isinstance(evidence, dict) else None
+    )
+    prior_scenario = contract.get("prior_scenario")
+    expected_prior_scenario = (
+        prior_scenario.get("sha256") if isinstance(prior_scenario, dict)
+        else evidence.get("prior_scenario_sha256") if isinstance(evidence, dict) else None
+    )
     if (
         not isinstance(evidence, dict)
         or set(evidence) != expected_manifest
-        or evidence.get("schema_version") != "buzz-ci-clean-host-e2e-evidence/v3"
+        or evidence.get("schema_version") != EVIDENCE_SCHEMA
         or evidence.get("candidate_sha") != contract["candidate_sha"]
         or evidence.get("harness_sha256") != contract["harness_sha256"]
         or evidence.get("timing_asset_sha256") != contract["timing_asset_sha256"]
@@ -2311,6 +2383,10 @@ def validate_result_set_fd(
         or evidence["harness_asset_sha256"].get("harness.py") != evidence.get("harness_sha256")
         or evidence["harness_asset_sha256"].get("timing-contract.json") != evidence.get("timing_asset_sha256")
         or evidence.get("package_tree_sha256") != expected_packages
+        or evidence.get("prior_package_tree_sha256") != expected_prior_packages
+        or evidence.get("prior_scenario_sha256") != expected_prior_scenario
+        or not isinstance(expected_prior_scenario, str)
+        or HEX64.fullmatch(expected_prior_scenario) is None
         or evidence.get("receipt_sha256") != hashlib.sha256(receipt_raw).hexdigest()
         or evidence.get("verifier_sha256") != hashlib.sha256(verifier_raw).hexdigest()
     ):
@@ -2323,6 +2399,7 @@ def validate_result_set_fd(
         "receipt_base64": base64.b64encode(receipt_raw).decode(),
         "verifier_base64": base64.b64encode(verifier_raw).decode(),
         "dormant_proof": evidence["dormant_proof"],
+        "prior_activation": evidence["prior_activation"],
     }
     validate_final_frame(frame, contract, "0" * 64)
     replay_frozen_verifier(contract, receipt_raw, evidence)
@@ -2432,6 +2509,7 @@ def finish_publication(
 def create_run_stage(
     contract: dict[str, object], state: Path,
     records: dict[str, list[tuple[str, int, bytes]]], scenario_raw: bytes, seccomp_raw: bytes,
+    prior_scenario_raw: bytes,
 ) -> None:
     stage = state / "stage"
     stage.mkdir(mode=0o700)
@@ -2446,6 +2524,12 @@ def create_run_stage(
     inputs.mkdir(mode=0o700)
     for name in PACKAGE_NAMES:
         materialize_tree(records[name], inputs / name)
+    prior = inputs / "prior"
+    prior.mkdir(mode=0o700)
+    for name in PRIOR_PACKAGE_NAMES:
+        materialize_tree(records[f"prior/{name}"], prior / name)
+    (prior / "scenario.json").write_bytes(prior_scenario_raw)
+    (prior / "scenario.json").chmod(0o400)
     (inputs / "scenario.json").write_bytes(scenario_raw)
     (inputs / "scenario.json").chmod(0o400)
     (inputs / "seccomp.json").write_bytes(seccomp_raw)
@@ -2454,7 +2538,7 @@ def create_run_stage(
     (inputs / "public-binding.json").write_bytes(public_raw)
     (inputs / "public-binding.json").chmod(0o400)
     descriptor = {
-        "schema_version": "buzz-ci-clean-host-e2e-stage/v2",
+        "schema_version": STAGE_SCHEMA,
         "candidate_sha": contract["candidate_sha"],
         "harness_sha256": contract["harness_sha256"],
         "timing_asset_sha256": contract["timing_asset_sha256"],
@@ -2465,6 +2549,8 @@ def create_run_stage(
         "public_binding_sha256": hashlib.sha256(public_raw).hexdigest(),
         "package_tree_sha256": {name: tree_digest(records[name]) for name in PACKAGE_NAMES},
         "platform_systemd": contract["platform_systemd"],
+        "prior_package_tree_sha256": {name: tree_digest(records[f"prior/{name}"]) for name in PRIOR_PACKAGE_NAMES},
+        "prior_scenario_sha256": contract["prior_scenario"]["sha256"],
     }
     (stage / "descriptor.json").write_bytes(canonical(descriptor))
     (stage / "descriptor.json").chmod(0o444)
@@ -2482,6 +2568,7 @@ def create_run_stage(
 
 def create_verify_stage(
     contract: dict[str, object], state: Path, scenario_raw: bytes,
+    prior_binding: dict[str, str],
 ) -> None:
     validate_prepared_state(state)
     clean_transient(state)
@@ -2499,6 +2586,8 @@ def create_verify_stage(
         "scenario_sha256": contract["scenario"]["sha256"],
         "trusted_verifier_sha256": assets["receipt_verifier.py"],
         "expected_stages_sha256": assets["expected-stages.json"],
+        "prior_activation_id": prior_binding["activation_id"],
+        "prior_package_digest": prior_binding["package_digest"],
         "timing": TIMING_CONTRACT, "timing_sha256": timing_sha256(),
     })
     make_iso(stage, state / "stage.iso", "BUZZCI_STAGE")
@@ -2506,10 +2595,33 @@ def create_verify_stage(
     make_seed(state, "buzzci-verify-" + str(state_record["challenge"])[:16])
 
 
-def validate_final_frame(frame: dict[str, object], contract: dict[str, object], challenge: str) -> tuple[bytes, bytes, dict[str, object]]:
-    expected = {"schema_version", "phase", "challenge", "outcome", "receipt_base64", "verifier_base64", "dormant_proof"}
+def validate_final_frame(
+    frame: dict[str, object], contract: dict[str, object], challenge: str,
+    prior_binding: dict[str, str] | None = None,
+) -> tuple[bytes, bytes, dict[str, object]]:
+    expected = {
+        "schema_version", "phase", "challenge", "outcome", "receipt_base64", "verifier_base64",
+        "dormant_proof", "prior_activation",
+    }
     if set(frame) != expected or frame["phase"] != "run" or frame["challenge"] != challenge or frame["outcome"] != "pass":
         raise HarnessError("final evidence frame differs")
+    prior_activation = frame["prior_activation"]
+    if (
+        not isinstance(prior_activation, dict)
+        or set(prior_activation) != PRIOR_ACTIVATION_PROOF_KEYS
+        or prior_activation.get("receipt_state") != "rolled_back"
+        or prior_activation.get("execd_reinstall") != "installed"
+        or not isinstance(prior_activation.get("activation_id"), str)
+        or not prior_activation["activation_id"]
+        or any(
+            not isinstance(prior_activation.get(name), str) or HEX64.fullmatch(prior_activation[name]) is None
+            for name in ("package_digest", "rollback_cleanup_sha256")
+        )
+        or prior_binding is not None and any(
+            prior_activation.get(name) != prior_binding[name] for name in ("activation_id", "package_digest")
+        )
+    ):
+        raise HarnessError("final prior activation proof differs")
     try:
         receipt_raw = base64.b64decode(frame["receipt_base64"], validate=True)
         verifier_raw = base64.b64decode(frame["verifier_base64"], validate=True)
@@ -2553,7 +2665,7 @@ def validate_final_frame(frame: dict[str, object], contract: dict[str, object], 
 def run_vm(
     contract: dict[str, object], state: Path, records: dict[str, list[tuple[str, int, bytes]]],
     scenario_raw: bytes, seccomp_raw: bytes, results_arg: Path,
-    *, expected_state: StateIdentity | None = None,
+    *, prior_scenario_raw: bytes = b"", expected_state: StateIdentity | None = None,
     binding: dict[str, str] | None = None, resumed: bool = False,
 ) -> dict[str, object]:
     if expected_state is None:
@@ -2574,7 +2686,7 @@ def run_vm(
                 raise HarnessError("prior VM run residue exists")
             qemu_img_create(state, "candidate.qcow2", "trusted.qcow2")
             create_transfer(state)
-            create_run_stage(contract, state, records, scenario_raw, seccomp_raw)
+            create_run_stage(contract, state, records, scenario_raw, seccomp_raw, prior_scenario_raw)
             boot(
                 state, watchdog_seconds("candidate"), overlay="candidate.qcow2",
                 evidence_expected=False, transfer="read-write",
@@ -2586,8 +2698,9 @@ def run_vm(
                 raise HarnessError("candidate VM reached verifier evidence storage")
             validate_transfer(state)
             validate_prepared_state(state)
+            prior_binding = prior_activation_binding(records)
             qemu_img_create(state, "verifier.qcow2", "trusted.qcow2")
-            create_verify_stage(contract, state, scenario_raw)
+            create_verify_stage(contract, state, scenario_raw, prior_binding)
             validate_prepared_state(state)
             frame = boot(
                 state, watchdog_seconds("verifier"), overlay="verifier.qcow2",
@@ -2596,14 +2709,14 @@ def run_vm(
             if frame is None:
                 raise HarnessError("verification guest returned no evidence")
             validate_transfer(state)
-            receipt_raw, verifier_raw, proof = validate_final_frame(frame, contract, challenge)
+            receipt_raw, verifier_raw, proof = validate_final_frame(frame, contract, challenge, prior_binding)
             receipt_path = results / "acceptance-receipt.json"
             verifier_path = results / "verifier.json"
             state_record = load_json(state / "state.json")
             receipt_digest = hashlib.sha256(receipt_raw).hexdigest()
             verifier_digest = hashlib.sha256(verifier_raw).hexdigest()
             evidence_manifest = {
-                "schema_version": "buzz-ci-clean-host-e2e-evidence/v3",
+                "schema_version": EVIDENCE_SCHEMA,
                 "candidate_sha": contract["candidate_sha"],
                 "harness_sha256": state_record["harness_sha256"],
                 "timing_asset_sha256": state_record["timing_asset_sha256"],
@@ -2614,6 +2727,9 @@ def run_vm(
                 "timing_sha256": state_record["timing_sha256"],
                 "package_tree_sha256": {name: tree_digest(records[name]) for name in PACKAGE_NAMES},
                 "scenario_sha256": contract["scenario"]["sha256"],
+                "prior_package_tree_sha256": {name: tree_digest(records[f"prior/{name}"]) for name in PRIOR_PACKAGE_NAMES},
+                "prior_scenario_sha256": contract["prior_scenario"]["sha256"],
+                "prior_activation": frame["prior_activation"],
                 "seccomp_source_sha256": SECCOMP_SHA256,
                 "transfer_bytes": TRANSFER_SIZE,
                 "transfer_sha256": file_sha256(state / "transfer.raw"),
@@ -2697,7 +2813,7 @@ def main() -> int:
             if arguments.action == "run":
                 result = terminal_run(arguments.contract, arguments.results)
             else:
-                contract, _state, _records, _scenario_raw, _seccomp_raw = validate_contract(arguments.contract)
+                contract, _state, _records, _scenario_raw, _seccomp_raw, _prior_scenario_raw = validate_contract(arguments.contract)
                 result = {
                     "status": "ready", "candidate_sha": contract["candidate_sha"],
                     "boundary": "bubblewrap+qemu-kvm",

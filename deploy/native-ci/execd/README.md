@@ -91,10 +91,18 @@ The config freezes the control account and primary group as `buzzci-ctl` at
 `961:961`, with home `/var/lib/buzzci/principals/ctl`, a nologin shell, and sole
 supplementary group `buzzci-execd`.
 Execd validates `/etc/passwd` and `/etc/group` before serving. It stores at most
-16 create-once qualification receipts under
+16 create-once receipts for the configured qualification contract under
 `/var/lib/buzzci/execd-v2/qualification`, root-owned mode `0600` inside a
 root-owned mode-`0700` directory. Exact retries return `Existing`; frame drift
 under the same package, fixture, and generation key returns `ReplayConflict`.
+At startup execd validates every receipt before changing the directory. A
+receipt under the configured contract must be canonical, self-consistent, and
+carry this host's seccomp install receipt digest. Execd then durably retires
+validated receipts from superseded contracts in sorted filename order. The
+activation controller retains the lifecycle and rollback history; this private
+store retains only replay state for the active contract. Malformed, renamed,
+symlinked, or otherwise invalid historical material keeps execd closed and is
+not retired.
 
 Package generation must replace the sysusers UID/GID placeholders, install the
 two release binaries, and write canonical compact JSON. The execd config binds
@@ -164,7 +172,21 @@ binds the exact pre-activation-input digest, final activation ID, package and
 manifest digests, execd provenance, and eight activation-owned targets.
 The installer never writes those targets. On a clean host their receipt state
 is `pending`; after activation has written its central receipt, `check` requires
-the exact package, source, fixed-manifest, and managed-target binding.
+the exact package, source, fixed-manifest, and managed-target binding. When the
+central receipt belongs to a different activation, the installer accepts it only
+in state `rolled_back` and only while the controller's root-owned mode-`0600`
+`/var/lib/buzzci/activation-controller/rollback-cleanup-v1.json` marker binds
+that receipt's activation ID, package digest, source commit, and manifest
+digest. It then reports `activation_receipt` as `rolled_back` and leaves both
+files for the next `stage` to retire. A foreign receipt in any live state, a
+missing marker, or a marker bound elsewhere fails closed.
+
+A rolled-back execd package keeps its terminal `rollback-v1.json`, which blocks
+an install replay in that state directory. To take the next execd package after
+the rollback verb reports `rolled_back`, rename
+`/var/lib/buzzci/execd-v2/package` to `package.retired-<UTC>`; the installer
+creates the directory again. The clean-host harness runs this exact sequence
+against a rolled-back activation before every candidate activation.
 
 The standalone package does not bundle the distribution seccomp profile. It
 checks `/usr/share/containers/seccomp.json` against the compiled digest and
