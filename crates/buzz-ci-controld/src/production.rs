@@ -577,11 +577,28 @@ where
     ) -> Result<Vec<CiFinalizedJobAttempt>, ProductionError> {
         let mut finalized_jobs = Vec::with_capacity(completion.jobs.len());
         for job in &completion.jobs {
-            let running = job_envelope(
+            let queued = job_envelope(
                 accepted,
                 job,
                 self.signer.pubkey(),
                 1,
+                CiJobState::Queued,
+                None,
+                Vec::new(),
+            );
+            self.publish_envelope(
+                accepted,
+                KIND_CI_JOB_STATUS,
+                &queued,
+                job_status_tags(&accepted.channel_id, &queued)
+                    .map_err(|_| ProductionError::Invalid)?,
+                &format!("job:{}:{}:status:1", job.metadata.job_id, job.attempt),
+            )?;
+            let running = job_envelope(
+                accepted,
+                job,
+                self.signer.pubkey(),
+                2,
                 CiJobState::Running,
                 None,
                 Vec::new(),
@@ -592,14 +609,14 @@ where
                 &running,
                 job_status_tags(&accepted.channel_id, &running)
                     .map_err(|_| ProductionError::Invalid)?,
-                &format!("job:{}:{}:running", job.metadata.job_id, job.attempt),
+                &format!("job:{}:{}:status:2", job.metadata.job_id, job.attempt),
             )?;
             let finalized = self.finalized_job(accepted, job)?;
             let terminal = job_envelope(
                 accepted,
                 job,
                 self.signer.pubkey(),
-                2,
+                3,
                 job.state,
                 Some(finalized.log_ref.clone()),
                 finalized.artifact_refs.clone(),
@@ -610,7 +627,7 @@ where
                 &terminal,
                 job_status_tags(&accepted.channel_id, &terminal)
                     .map_err(|_| ProductionError::Invalid)?,
-                &format!("job:{}:{}:terminal", job.metadata.job_id, job.attempt),
+                &format!("job:{}:{}:status:3", job.metadata.job_id, job.attempt),
             )?;
             finalized_jobs.push(finalized);
         }
@@ -952,7 +969,7 @@ fn job_envelope(
         skip_policy: job.metadata.skip_policy,
         selected_job_instance: job.metadata.selected_job_instance.clone(),
         also_reruns: job.metadata.also_reruns.clone(),
-        started_at: Some(job.started_at),
+        started_at: (state != CiJobState::Queued).then_some(job.started_at),
         finished_at: state.is_terminal().then_some(job.finished_at),
         log_ref,
         artifact_refs,
@@ -1219,6 +1236,7 @@ mod tests {
     struct Relay {
         accepted: Option<AcceptedRequest>,
         published: Vec<u32>,
+        job_statuses: Vec<CiJobStatusEnvelope>,
         intent_signal: Option<Rc<Cell<bool>>>,
         refuse_publication: bool,
     }
@@ -1244,6 +1262,10 @@ mod tests {
             }
             if self.refuse_publication {
                 return Err(());
+            }
+            if event.kind == KIND_CI_JOB_STATUS {
+                self.job_statuses
+                    .push(serde_json::from_str(&event.content).expect("job status envelope"));
             }
             self.published.push(event.kind);
             Ok(event.event_id.clone())
@@ -1362,20 +1384,58 @@ mod tests {
         }
     }
 
+    fn signed_job_status(
+        accepted: &AcceptedRequest,
+        job: &JobCompletion,
+        sequence: u64,
+        state: CiJobState,
+    ) -> SignedCiEvent {
+        let envelope = job_envelope(accepted, job, SIGNER, sequence, state, None, Vec::new());
+        let content = serde_json::to_string(&envelope).expect("job status content");
+        let tags = serde_json::to_value(
+            job_status_tags(&accepted.channel_id, &envelope).expect("job status tags"),
+        )
+        .expect("serialized job status tags");
+        DeterministicSigner
+            .sign(KIND_CI_JOB_STATUS, &content, tags)
+            .expect("signed job status")
+    }
+
     #[test]
-    fn accepted_request_persists_and_publishes_full_signed_lifecycle() {
+    fn accepted_request_bypasses_legacy_job_keys_and_publishes_full_signed_lifecycle() {
         let log = b"ok\n".to_vec();
+        let accepted = accepted();
+        let completion = completion(&log);
+        let legacy_running =
+            signed_job_status(&accepted, &completion.jobs[0], 1, CiJobState::Running);
+        let legacy_terminal =
+            signed_job_status(&accepted, &completion.jobs[0], 2, CiJobState::Success);
+        let legacy_running_key = format!("{}:job:test:1:running", accepted.event_id);
+        let legacy_terminal_key = format!("{}:job:test:1:terminal", accepted.event_id);
         let relay = Relay {
-            accepted: Some(accepted()),
+            accepted: Some(accepted.clone()),
             published: Vec::new(),
+            job_statuses: Vec::new(),
             intent_signal: None,
             refuse_publication: false,
         };
         let mut handler = ProductionHandler::new(
             relay,
             DeterministicSigner,
-            Executor(completion(&log)),
-            MemoryStore::default(),
+            Executor(completion),
+            MemoryStore {
+                publications: HashMap::from([
+                    (
+                        legacy_running_key.clone(),
+                        StoredPublication::Pending(legacy_running),
+                    ),
+                    (
+                        legacy_terminal_key.clone(),
+                        StoredPublication::Pending(legacy_terminal),
+                    ),
+                ]),
+                ..MemoryStore::default()
+            },
             MemoryOutput(log),
         );
 
@@ -1383,8 +1443,40 @@ mod tests {
         assert!(!handler.poll_once(CHANNEL).unwrap());
         assert_eq!(
             handler.relay.published,
-            vec![46101, 46101, 46102, 46103, 46102, 46105, 46106, 46101]
+            vec![46101, 46101, 46102, 46102, 46103, 46102, 46105, 46106, 46101]
         );
+        assert_eq!(
+            handler
+                .relay
+                .job_statuses
+                .iter()
+                .map(|status| (status.sequence, status.state))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, CiJobState::Queued),
+                (2, CiJobState::Running),
+                (3, CiJobState::Success),
+            ]
+        );
+        assert_eq!(handler.relay.job_statuses[0].started_at, None);
+        assert_eq!(handler.relay.job_statuses[1].started_at, Some(11));
+        assert!(matches!(
+            handler.store.publications.get(&legacy_running_key),
+            Some(StoredPublication::Pending(_))
+        ));
+        assert!(matches!(
+            handler.store.publications.get(&legacy_terminal_key),
+            Some(StoredPublication::Pending(_))
+        ));
+        for sequence in 1..=3 {
+            assert!(matches!(
+                handler.store.publications.get(&format!(
+                    "{}:job:test:1:status:{sequence}",
+                    accepted.event_id
+                )),
+                Some(StoredPublication::Accepted { .. })
+            ));
+        }
         assert_eq!(handler.store.cursor, 7);
         assert_eq!(
             handler.store.run.as_ref().unwrap().1.state(),
@@ -1398,6 +1490,7 @@ mod tests {
             Relay {
                 accepted: Some(accepted()),
                 published: Vec::new(),
+                job_statuses: Vec::new(),
                 intent_signal: None,
                 refuse_publication: false,
             },
@@ -1440,6 +1533,7 @@ mod tests {
             Relay {
                 accepted: Some(accepted),
                 published: Vec::new(),
+                job_statuses: Vec::new(),
                 intent_signal: None,
                 refuse_publication: false,
             },
@@ -1483,6 +1577,7 @@ mod tests {
             Relay {
                 accepted: Some(accepted),
                 published: Vec::new(),
+                job_statuses: Vec::new(),
                 intent_signal: None,
                 refuse_publication: false,
             },
@@ -1585,6 +1680,7 @@ mod tests {
             Relay {
                 accepted: Some(accepted()),
                 published: Vec::new(),
+                job_statuses: Vec::new(),
                 intent_signal: Some(Rc::clone(&signal)),
                 refuse_publication: true,
             },
