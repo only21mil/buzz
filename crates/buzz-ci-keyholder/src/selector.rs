@@ -12,7 +12,9 @@ pub enum KeySelector {
 }
 
 impl KeySelector {
-    /// Return the only selector valid for a signing operation.
+    /// Return the default selector for a signing operation. `Nip98Authorize`
+    /// may also select `CiEvent` or the acceptance actor through
+    /// [`crate::Nip98Signer`] for a `POST /events` token.
     pub const fn for_operation(operation: Operation) -> Option<Self> {
         match operation {
             Operation::Describe => None,

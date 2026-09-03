@@ -69,12 +69,30 @@ activation coordinates copy the lane manifest. The public event templates are
 issued at the package's bound time reference (`acceptance_template.time_reference`,
 recorded at freeze); the freezer requires the runner's static
 `acceptance_time_reference` to equal it, and the runner judges the admission
-window against that reference rather than the wall clock.
+window against that reference rather than the wall clock. The freezer also
+requires the active `channel_id` to equal the `h` tag channel frozen into
+those templates: the acceptance path publishes the signed Run event on the
+event's own channel while the daemon polls the configured one.
 The active daemon polls the authenticated accepted-request source one at a
 time, signs through keyholder, admits only the exact runner-control v2 frame,
 and fetches terminal logs, the declared artifact, and teardown through the
 runner-forwarded bounded evidence operations. It never connects to execd or
 reads an evidence filesystem.
+
+Relay identities. The relay stores a `POST /events` only when the event's
+`pubkey` equals the NIP-98 token pubkey and that pubkey is a member of the
+event's private channel, so controld asks keyholder for a publish token signed
+by the key that signed the event: `ci-event.key` for kinds 46101 to 46106 and
+the acceptance actor for the four frozen acceptance events. The client refuses
+to send when the event pubkey equals no identity it holds or when the returned
+token identity differs from the event pubkey. `nip98.key` signs only the
+accepted read and the evidence `PUT`s, where the relay authorizes the caller as
+a CI signer (`BUZZ_CI_STATUS_SIGNER_PUBKEYS` or an active kind-46107 grant for
+the request's repository). A production channel therefore needs the acceptance
+actor as an owner or admin (it issues the grant), `ci-event.key` as a member,
+and `nip98.key` listed as a static CI signer; the relay also refuses any event
+whose `created_at` is more than 900 seconds from its clock, so the frozen
+acceptance events must be published within that window of the time reference.
 
 The disabled `buzz-ci-controld-acceptance.socket` binds
 `/run/buzzci/controld-acceptance.sock` as root:`buzzci-ctl` mode `0620` beneath

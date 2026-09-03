@@ -209,6 +209,37 @@ impl TryFrom<u8> for HttpMethod {
     }
 }
 
+/// Closed set of keys that may sign one NIP-98 authorization event.
+///
+/// The relay's `POST /events` stores an event only when its `pubkey` equals
+/// the NIP-98 token pubkey, so the token for a publish is signed by the key
+/// that signed the event. Every other route keeps the dedicated NIP-98 key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum Nip98Signer {
+    /// The `nip98.key` selector: accepted reads and evidence object writes.
+    Nip98 = 1,
+    /// The `ci-event.key` selector: `POST /events` carrying a kind 46101 to
+    /// 46106 event it signed.
+    CiEvent = 2,
+    /// The activation-bound acceptance actor: `POST /events` carrying one of
+    /// the four frozen acceptance events.
+    AcceptanceActor = 3,
+}
+
+impl TryFrom<u8> for Nip98Signer {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Nip98),
+            2 => Ok(Self::CiEvent),
+            3 => Ok(Self::AcceptanceActor),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Closed manifest domains accepted by the manifest signing operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -294,6 +325,8 @@ pub struct Nip98AuthorizeRequest {
     pub created_at: u64,
     /// Caller nonce included by the future NIP-98 event builder.
     pub nonce: [u8; 16],
+    /// Key that signs the token; a `POST /events` token names the event's own signer.
+    pub signer: Nip98Signer,
 }
 
 /// Request to sign one canonical CI manifest.

@@ -1101,11 +1101,11 @@ class TimingAndProgressTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(guest, "STATE_ROOT", state))
             stack.enter_context(mock.patch.object(guest, "load_json", return_value=descriptor))
             stack.enter_context(mock.patch.object(
-                guest, "cross_bind", return_value=(candidate, {}, {}),
+                guest, "cross_bind", return_value=(candidate, {}, {}, "12345678-1234-4abc-8def-123456789abc"),
             ))
             stack.enter_context(mock.patch.object(guest, "relay_mapping_present", return_value=False))
             stack.enter_context(mock.patch.object(
-                guest, "start_relay", side_effect=lambda _public: completed("relay_ready"),
+                guest, "start_relay", side_effect=lambda _public, _channel: completed("relay_ready"),
             ))
             stack.enter_context(mock.patch.object(
                 guest, "unit_state", side_effect=lambda: completed(
@@ -4172,23 +4172,23 @@ class RelayCryptoTests(unittest.TestCase):
         mutated = signature[:-2] + ("00" if signature[-2:] != "00" else "01")
         self.assertFalse(relay.schnorr_verify(message, public, mutated))
 
-    def test_nip98_binds_signature_key_url_method_payload_and_time(self) -> None:
+    def test_nip98_binds_signature_url_method_payload_time_and_returns_the_signer(self) -> None:
         now = 1_800_000_000
         body = b"fixture"
         url = "https://relay.test.invalid:3443/events"
         header = nip98(7, "POST", url, body, now)
         public = signed_event(7, 1, [], "", now)["pubkey"]
-        relay.verify_nip98(header, "POST", url, body, public, now=now)
+        token = relay.verify_nip98(header, "POST", url, body, now=now)
+        self.assertEqual(token["pubkey"], public)
         cases = (
-            ("GET", url, body, public, now),
-            ("POST", url + "?x=1", body, public, now),
-            ("POST", url, b"other", public, now),
-            ("POST", url, body, "f" * 64, now),
-            ("POST", url, body, public, now + 61),
+            ("GET", url, body, now),
+            ("POST", url + "?x=1", body, now),
+            ("POST", url, b"other", now),
+            ("POST", url, body, now + 61),
         )
-        for method, candidate_url, candidate_body, candidate_public, candidate_now in cases:
+        for method, candidate_url, candidate_body, candidate_now in cases:
             with self.assertRaises(relay.RelayError):
-                relay.verify_nip98(header, method, candidate_url, candidate_body, candidate_public, now=candidate_now)
+                relay.verify_nip98(header, method, candidate_url, candidate_body, now=candidate_now)
 
     def test_published_event_requires_real_id_and_signature(self) -> None:
         event = signed_event(11, 46100, [["h", "channel"]], "{}", 1_800_000_000)
@@ -4196,6 +4196,199 @@ class RelayCryptoTests(unittest.TestCase):
         event["content"] = "drift"
         with self.assertRaisesRegex(relay.RelayError, "signature"):
             relay.verify_event(event)
+
+
+ACTOR = 4
+CI_EVENT = 1
+NIP98 = 2
+STRANGER = 5
+CHANNEL = "123e4567-e89b-12d3-a456-426614174099"
+REPOSITORY = "30617:" + "22" * 32 + ":buzz"
+RUN_ID = "123e4567-e89b-12d3-a456-426614174011"
+
+
+def public_hex(secret: int) -> str:
+    point = relay.point_mul(secret)
+    assert point is not None
+    return point[0].to_bytes(32, "big").hex()
+
+
+def request_event(secret: int, created_at: int, *, attempt: int = 1, channel: str = CHANNEL) -> dict[str, object]:
+    content = {"actor": public_hex(secret), "run_id": RUN_ID, "target_repo_a": REPOSITORY, "attempt": attempt}
+    tags = [["h", channel], ["a", REPOSITORY], ["run", RUN_ID], ["attempt", str(attempt)]]
+    return signed_event(secret, 46100, tags, json.dumps(content, separators=(",", ":")), created_at)
+
+
+def grant_event(secret: int, created_at: int, signer: int, *, valid_until: int | None) -> dict[str, object]:
+    content = {
+        "schema_version": 1, "target_repo_a": REPOSITORY, "signer_pubkey": public_hex(signer),
+        "valid_from": created_at, "valid_until": valid_until,
+    }
+    return signed_event(secret, 46107, [["h", CHANNEL]], json.dumps(content, separators=(",", ":")), created_at)
+
+
+def status_event(secret: int, created_at: int, *, relay_signer: int | None = None) -> dict[str, object]:
+    content = {"relay_signer": public_hex(relay_signer or secret), "target_repo_a": REPOSITORY, "run_id": RUN_ID}
+    return signed_event(secret, 46101, [["h", CHANNEL], ["run", RUN_ID]], json.dumps(content, separators=(",", ":")), created_at)
+
+
+class RelayAdmissionTests(unittest.TestCase):
+    """The loopback relay refuses what crates/buzz-relay refuses on POST /events."""
+
+    def setUp(self) -> None:
+        self.now = 1_800_000_000
+        self.state = relay.RelayState(
+            Path("/nonexistent"), "https://relay.test.invalid:3443", CHANNEL, "private",
+            {public_hex(ACTOR): "admin", public_hex(CI_EVENT): "member"}, {public_hex(NIP98)},
+        )
+
+    def admit(self, token: int, event: dict[str, object], *, now: int | None = None) -> tuple[str | None, bool]:
+        return relay.admit_event(self.state, public_hex(token), event, self.now if now is None else now)
+
+    def refused(self, token: int, event: dict[str, object], status: int, message: str, *, now: int | None = None) -> None:
+        with self.assertRaises(relay.Refusal) as caught:
+            self.admit(token, event, now=now)
+        self.assertEqual((caught.exception.status, caught.exception.message), (status, message))
+
+    def test_old_pairing_nip98_token_with_actor_event_is_refused(self) -> None:
+        # Before this change controld sent the actor's Run event under a
+        # nip98.key token; the production relay refuses that pairing.
+        self.refused(
+            NIP98, request_event(ACTOR, self.now), 403,
+            "invalid: event pubkey does not match authenticated identity",
+        )
+        self.assertEqual(self.state.accepted, [])
+
+    def test_new_pairing_actor_token_with_actor_event_is_accepted_and_indexed(self) -> None:
+        run = request_event(ACTOR, self.now)
+        self.assertEqual(self.admit(ACTOR, run), (CHANNEL, True))
+        self.assertEqual(self.state.accepted, [(1, CHANNEL, run)])
+        self.assertEqual(self.admit(ACTOR, run), (CHANNEL, False))
+        rerun = request_event(ACTOR, self.now + 10, attempt=2)
+        self.assertEqual(self.admit(ACTOR, rerun), (CHANNEL, True))
+        self.assertEqual([cursor for cursor, _channel, _event in self.state.accepted], [1, 2])
+
+    def test_membership_drift_and_channel_rules(self) -> None:
+        self.refused(STRANGER, request_event(STRANGER, self.now), 400, "restricted: not a channel member")
+        self.refused(
+            ACTOR, request_event(ACTOR, self.now, channel="123e4567-e89b-12d3-a456-426614174000"),
+            400, "restricted: not a channel member",
+        )
+        self.refused(
+            ACTOR, request_event(ACTOR, self.now - 901), 400,
+            "invalid: event timestamp too far from server time",
+        )
+        self.assertEqual(self.admit(ACTOR, request_event(ACTOR, self.now - 900)), (CHANNEL, True))
+        self.refused(
+            ACTOR, signed_event(ACTOR, 46100, [], "{}", self.now), 400,
+            "invalid: CI events require a channel h tag",
+        )
+        actor_signed_for_ci = signed_event(
+            ACTOR, 46100, [["h", CHANNEL], ["a", REPOSITORY], ["run", RUN_ID]],
+            json.dumps({"actor": public_hex(CI_EVENT), "run_id": RUN_ID, "target_repo_a": REPOSITORY}),
+            self.now,
+        )
+        self.refused(ACTOR, actor_signed_for_ci, 400, "invalid: request actor does not match event signer")
+
+    def test_grant_needs_owner_or_admin_and_authorizes_status_signers_for_its_window(self) -> None:
+        self.refused(CI_EVENT, status_event(CI_EVENT, self.now), 400, "invalid: unauthorized CI status signer")
+        self.refused(
+            CI_EVENT, grant_event(CI_EVENT, self.now, CI_EVENT, valid_until=self.now + 600), 403,
+            "restricted: only a channel owner or admin may issue a CI signer grant",
+        )
+        self.refused(
+            NIP98, grant_event(NIP98, self.now, CI_EVENT, valid_until=self.now + 600), 400,
+            "restricted: not a channel member",
+        )
+        grant = grant_event(ACTOR, self.now + 1, CI_EVENT, valid_until=self.now + 601)
+        self.assertEqual(self.admit(ACTOR, grant, now=self.now + 1), (CHANNEL, True))
+        self.refused(CI_EVENT, status_event(CI_EVENT, self.now), 400, "invalid: unauthorized CI status signer", now=self.now)
+        self.assertEqual(self.admit(CI_EVENT, status_event(CI_EVENT, self.now + 2), now=self.now + 2), (CHANNEL, True))
+        self.refused(
+            CI_EVENT, status_event(CI_EVENT, self.now + 601), 400,
+            "invalid: unauthorized CI status signer", now=self.now + 601,
+        )
+        self.refused(
+            CI_EVENT, status_event(CI_EVENT, self.now + 3, relay_signer=NIP98), 400,
+            "invalid: status signer does not match event signer", now=self.now + 3,
+        )
+        self.refused(
+            NIP98, status_event(CI_EVENT, self.now + 3), 403,
+            "invalid: event pubkey does not match authenticated identity", now=self.now + 3,
+        )
+        self.assertEqual(
+            self.state.active_signers(REPOSITORY, self.now + 2), {public_hex(NIP98), public_hex(CI_EVENT)},
+        )
+        self.refused(
+            ACTOR, grant_event(ACTOR, self.now + 4, CI_EVENT, valid_until=self.now + 3), 400,
+            "invalid: CI grant content rejected", now=self.now + 4,
+        )
+
+    def test_tombstone_must_target_the_authors_own_stored_event(self) -> None:
+        rerun = request_event(ACTOR, self.now + 10, attempt=2)
+        missing = signed_event(ACTOR, 5, [["e", rerun["id"]]], "", self.now + 20)
+        self.refused(ACTOR, missing, 400, "invalid: target event not found", now=self.now + 20)
+        # A rerun extends an existing run; without the initial request it is refused.
+        self.refused(ACTOR, rerun, 400, "invalid: CI rerun names an unknown run", now=self.now + 10)
+        self.assertEqual(self.admit(ACTOR, request_event(ACTOR, self.now)), (CHANNEL, True))
+        self.refused(
+            ACTOR, request_event(ACTOR, self.now + 1), 400,
+            "invalid: CI run ID or initial request event ID already exists", now=self.now + 1,
+        )
+        self.assertEqual(self.admit(ACTOR, rerun, now=self.now + 10), (CHANNEL, True))
+        foreign = signed_event(CI_EVENT, 5, [["e", rerun["id"]]], "", self.now + 20)
+        self.refused(CI_EVENT, foreign, 400, "invalid: must be event author", now=self.now + 20)
+        tombstone = signed_event(ACTOR, 5, [["e", rerun["id"]]], "", self.now + 20)
+        self.assertEqual(self.admit(ACTOR, tombstone, now=self.now + 20), (CHANNEL, True))
+        two_targets = signed_event(ACTOR, 5, [["e", rerun["id"]], ["e", tombstone["id"]]], "", self.now + 21)
+        self.refused(
+            ACTOR, two_targets, 400,
+            "invalid: deletion events must reference exactly one target via e or a tag", now=self.now + 21,
+        )
+
+    def test_accepted_read_and_evidence_writes_need_a_static_or_granted_signer(self) -> None:
+        run = request_event(ACTOR, self.now)
+        self.assertEqual(self.admit(ACTOR, run), (CHANNEL, True))
+        self.state.require_signer(REPOSITORY, public_hex(NIP98), self.now)
+        with self.assertRaises(relay.Refusal) as caught:
+            self.state.require_signer(REPOSITORY, public_hex(ACTOR), self.now)
+        self.assertEqual((caught.exception.status, caught.exception.message), (403, "CI signer is not authorized"))
+        self.assertEqual(self.state.request_repository(run["id"]), REPOSITORY)
+        with self.assertRaises(relay.Refusal) as caught:
+            self.state.request_repository("ab" * 32)
+        self.assertEqual(caught.exception.status, 404)
+
+    def test_guest_roster_names_the_three_production_facts(self) -> None:
+        public = {
+            "relay_http_origin": "https://relay.test.invalid:3443",
+            "acceptance_actor": {"public_key": public_hex(ACTOR), "generation": 1},
+            "keyholder_public_spec": {"selectors": {
+                "ci_event": {"public_key": public_hex(CI_EVENT), "generation": 1},
+                "nip98": {"public_key": public_hex(NIP98), "generation": 1},
+                "manifest": {"public_key": public_hex(3), "generation": 1},
+            }},
+        }
+        config = guest.relay_public_config(public, CHANNEL)
+        self.assertEqual(config, {
+            "origin": "https://relay.test.invalid:3443",
+            "channel": {
+                "id": CHANNEL, "visibility": "private",
+                "members": {public_hex(ACTOR): "admin", public_hex(CI_EVENT): "member"},
+            },
+            "ci_status_signer_pubkeys": [public_hex(NIP98)],
+        })
+        state = relay.state_from_config(config, Path("/nonexistent"))
+        self.assertEqual(state.members, config["channel"]["members"])
+        self.assertEqual(state.static_signers, {public_hex(NIP98)})
+        for broken in (
+            {**config, "extra": 1},
+            {**config, "channel": {**config["channel"], "visibility": "hidden"}},
+            {**config, "channel": {**config["channel"], "members": {"zz": "admin"}}},
+            {**config, "channel": {**config["channel"], "members": {public_hex(ACTOR): "guest"}}},
+            {**config, "ci_status_signer_pubkeys": ["nope"]},
+        ):
+            with self.assertRaises(ValueError):
+                relay.state_from_config(broken, Path("/nonexistent"))
 
 
 if __name__ == "__main__":

@@ -1575,7 +1575,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "2ff53001a48fd22d4c0bdb3b547de4eda857463797c5300e60b6a678bde78a2d",
+            "2649c14e6493962530ade09471af8a11a78b2d55d6d27cf22ecb5f702c94e768",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -4205,6 +4205,10 @@ class ActivationControllerTests(unittest.TestCase):
             workflow_id=run["workflow_id"],
             workflow_digest=run["workflow_digest"],
             job_id=run["job_ids"][0],
+            channel_id=activation_package.acceptance_template_channel(template),
+            repository_owner_public_key=run["target_repo_a"].split(":")[1],
+            repository_id=run["target_repo_a"].split(":")[2],
+            source_clone_url=run["source_clone_url"],
             time_reference=reference + 7,
         )
         self.assertEqual(rebuilt["time_reference"], reference + 7)
@@ -4231,6 +4235,182 @@ class ActivationControllerTests(unittest.TestCase):
         payloads[entries["execd_config"]["source"]] = activation_package.canonical_json(execd)
         with self.assertRaisesRegex(ValueError, "shape differs from production"):
             CONTROLLER._validate_phase_configs(manifest, payloads)
+
+    def _bound_template_inputs(self, manifest: dict[str, object]) -> dict[str, object]:
+        template = manifest["acceptance_template"]
+        run = json.loads(template["run_event"][5])
+        return {
+            "actor_public_key": template["actor"]["public_key"],
+            "actor_generation": template["actor"]["generation"],
+            "ci_signer_public_key": json.loads(template["grant_event"][5])["signer_pubkey"],
+            "candidate_sha": manifest["source_commit"],
+            "workflow_id": run["workflow_id"],
+            "workflow_digest": run["workflow_digest"],
+            "job_id": run["job_ids"][0],
+            "channel_id": activation_package.acceptance_template_channel(template),
+            "repository_owner_public_key": run["target_repo_a"].split(":")[1],
+            "repository_id": run["target_repo_a"].split(":")[2],
+            "source_clone_url": run["source_clone_url"],
+            "time_reference": template["time_reference"],
+        }
+
+    def test_acceptance_template_renders_the_bound_channel_and_repository(self) -> None:
+        """M4 canary, stage 3 (manifest_identity): controld signed the frozen Run
+        event and published it to the production relay, which refused it because
+        the fixture hard-coded a channel, repository coordinate, and clone URL
+        that exist on no relay. The relay indexes a kind-46100 request by its h
+        tag channel and a tag repository and requires both to be well formed, so
+        the builder takes them as inputs and the freezer binds the controld
+        channel to the frozen events."""
+        manifest, payloads, _driver = self.fixture.load()
+        template = manifest["acceptance_template"]
+        channel = "1ad360e2-da4d-42c4-9702-2e4ad7cd90df"
+        owner = "73c705675d848ad38a919a5fa07687f55b4f0863c21969941c216b44f9e7a812"
+        clone_url = f"https://framework-desktop.tail69757d.ts.net:38443/git/{owner}/buzz"
+        coordinate = f"30617:{owner}:buzz"
+        inputs = self._bound_template_inputs(manifest)
+        inputs.update({
+            "channel_id": channel, "repository_owner_public_key": owner,
+            "repository_id": "buzz", "source_clone_url": clone_url,
+        })
+        bound = activation_package.production_acceptance_template(**inputs)
+        self.assertEqual(activation_package.acceptance_template_channel(bound), channel)
+        self.assertEqual(activation_package.acceptance_template_repository(bound), coordinate)
+        for name in ("run_event", "grant_event", "rerun_event"):
+            self.assertEqual([tag for tag in bound[name][4] if tag[0] == "h"], [["h", channel]], name)
+        for name in ("run_event", "rerun_event"):
+            envelope = json.loads(bound[name][5])
+            self.assertEqual(envelope["target_repo_a"], coordinate, name)
+            self.assertEqual(envelope["source_clone_url"], clone_url, name)
+            self.assertEqual([tag for tag in bound[name][4] if tag[0] == "a"], [["a", coordinate]], name)
+        self.assertEqual(json.loads(bound["grant_event"][5])["target_repo_a"], coordinate)
+        rendered = activation_package.canonical_json(bound).decode()
+        for placeholder in (
+            ACTIVATION_SCAFFOLD.TEST_CHANNEL_ID, ACTIVATION_SCAFFOLD.TEST_REPOSITORY_OWNER,
+            "relay.example.invalid",
+        ):
+            self.assertNotIn(placeholder, rendered)
+        # The fixture's other invariants hold: event ids are digests of the
+        # exact bytes, the tombstone names the rerun, both requests issue at
+        # the reference, and the run identity is unchanged.
+        rerun_id = activation_package.digest(json.dumps(
+            bound["rerun_event"], ensure_ascii=False, separators=(",", ":"),
+        ).encode())
+        self.assertEqual(bound["tombstone_event"][4], [["e", rerun_id]])
+        self.assertEqual(bound["time_reference"], template["time_reference"])
+        self.assertEqual(
+            json.loads(bound["run_event"][5])["run_id"], json.loads(template["run_event"][5])["run_id"],
+        )
+        self.assertIs(activation_package.validate_acceptance_template(bound), bound)
+        # Frozen into a manifest, the template must agree with the controld
+        # channel: the acceptance path publishes on the event's own h tag while
+        # controld polls the configured channel.
+        bound_manifest = copy.deepcopy(manifest)
+        bound_manifest["acceptance_template"] = bound
+        with self.assertRaisesRegex(ValueError, "controld channel differs from the frozen acceptance template channel"):
+            CONTROLLER._validate_phase_configs(bound_manifest, payloads)
+        entries = {entry["role"]: entry for entry in manifest["entries"]}
+        controld_active = json.loads(payloads[entries["controld_config"]["active_source"]])
+        controld_active["channel_id"] = channel
+        payloads[entries["controld_config"]["active_source"]] = activation_package.canonical_json(controld_active)
+        CONTROLLER._validate_phase_configs(bound_manifest, payloads)
+        with tempfile.NamedTemporaryFile("wb", suffix=".json", dir=os.environ.get("TMPDIR")) as handle:
+            handle.write(activation_package.canonical_json(bound_manifest))
+            handle.flush()
+            output = subprocess.run(
+                [
+                    "check-jsonschema", "--schemafile",
+                    str(ACTIVATION_ROOT / "activation-manifest.schema.json"), handle.name,
+                ],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+            )
+        self.assertEqual(output.returncode, 0, output.stdout + output.stderr)
+
+    def test_clean_host_scaffold_binds_its_own_test_channel_and_repository(self) -> None:
+        manifest, payloads, _driver = self.fixture.load()
+        template = manifest["acceptance_template"]
+        self.assertEqual(
+            activation_package.acceptance_template_channel(template), ACTIVATION_SCAFFOLD.TEST_CHANNEL_ID,
+        )
+        self.assertEqual(
+            activation_package.acceptance_template_repository(template),
+            f"30617:{ACTIVATION_SCAFFOLD.TEST_REPOSITORY_OWNER}:{ACTIVATION_SCAFFOLD.TEST_REPOSITORY_ID}",
+        )
+        for name in ("run_event", "rerun_event"):
+            self.assertEqual(
+                json.loads(template[name][5])["source_clone_url"], ACTIVATION_SCAFFOLD.TEST_SOURCE_CLONE_URL,
+            )
+        entries = {entry["role"]: entry for entry in manifest["entries"]}
+        controld_active = json.loads(payloads[entries["controld_config"]["active_source"]])
+        self.assertEqual(controld_active["channel_id"], ACTIVATION_SCAFFOLD.TEST_CHANNEL_ID)
+        CONTROLLER._validate_phase_configs(manifest, payloads)
+        controld_active["channel_id"] = "1ad360e2-da4d-42c4-9702-2e4ad7cd90df"
+        payloads[entries["controld_config"]["active_source"]] = activation_package.canonical_json(controld_active)
+        with self.assertRaisesRegex(ValueError, "controld channel differs from the frozen acceptance template channel"):
+            CONTROLLER._validate_phase_configs(manifest, payloads)
+
+    def test_acceptance_template_rejects_malformed_channel_repository_and_clone_url(self) -> None:
+        manifest, _payloads, _driver = self.fixture.load()
+        inputs = self._bound_template_inputs(manifest)
+        activation_package.production_acceptance_template(**inputs)
+        cases = [
+            ({"channel_id": "12345678-1234-4ABC-8DEF-123456789ABC"}, "not a canonical UUID"),
+            ({"channel_id": "123456781234 4abc8def123456789abc"}, "not a canonical UUID"),
+            ({"channel_id": "not-a-uuid"}, "not a canonical UUID"),
+            ({"channel_id": 5}, "not a canonical UUID"),
+            ({"repository_owner_public_key": "0" * 64}, "repository owner public key"),
+            ({"repository_owner_public_key": "22" * 31}, "repository owner public key"),
+            ({"repository_owner_public_key": "2G" * 32}, "repository owner public key"),
+            ({"repository_id": ""}, "plain NIP-34 d tag"),
+            ({"repository_id": "buzz:main"}, "plain NIP-34 d tag"),
+            ({"repository_id": "/buzz"}, "plain NIP-34 d tag"),
+            ({"repository_id": "a" * 65}, "plain NIP-34 d tag"),
+            ({"repository_id": None}, "plain NIP-34 d tag"),
+            ({"source_clone_url": "http://relay.example.invalid/git/buzz"}, "credential-free https"),
+            ({"source_clone_url": "https://user@relay.example.invalid/git/buzz"}, "credential-free https"),
+            ({"source_clone_url": "https://:pw@relay.example.invalid/git/buzz"}, "credential-free https"),
+            ({"source_clone_url": "https://relay.example.invalid/git/buzz?token=1"}, "credential-free https"),
+            ({"source_clone_url": "https://relay.example.invalid/git/buzz#main"}, "credential-free https"),
+            ({"source_clone_url": "https://relay.example.invalid/"}, "credential-free https"),
+            ({"source_clone_url": "https://relay.example.invalid"}, "credential-free https"),
+            ({"source_clone_url": "https:///git/buzz"}, "credential-free https"),
+            ({"source_clone_url": None}, "credential-free https"),
+        ]
+        for overrides, message in cases:
+            with self.subTest(**{key: str(value) for key, value in overrides.items()}):
+                with self.assertRaisesRegex(ValueError, message):
+                    activation_package.production_acceptance_template(**{**inputs, **overrides})
+        template = manifest["acceptance_template"]
+        drifted = copy.deepcopy(template)
+        drifted["grant_event"][4] = [["h", "1ad360e2-da4d-42c4-9702-2e4ad7cd90df"]]
+        with self.assertRaisesRegex(ValueError, "more than one channel"):
+            activation_package.validate_acceptance_template(drifted)
+        drifted = copy.deepcopy(template)
+        drifted["rerun_event"][4][0] = ["h", "1ad360e2-da4d-42c4-9702-2e4ad7cd90df"]
+        with self.assertRaisesRegex(ValueError, "more than one channel"):
+            activation_package.validate_acceptance_template(drifted)
+        drifted = copy.deepcopy(template)
+        drifted["run_event"][4].append(["h", "1ad360e2-da4d-42c4-9702-2e4ad7cd90df"])
+        with self.assertRaisesRegex(ValueError, "exactly one h tag"):
+            activation_package.validate_acceptance_template(drifted)
+        drifted = copy.deepcopy(template)
+        drifted["run_event"][4] = [tag for tag in drifted["run_event"][4] if tag[0] != "h"]
+        with self.assertRaisesRegex(ValueError, "exactly one h tag"):
+            activation_package.validate_acceptance_template(drifted)
+        drifted = copy.deepcopy(template)
+        drifted["run_event"][4][0] = ["h", "12345678-1234-4ABC-8DEF-123456789ABC"]
+        with self.assertRaisesRegex(ValueError, "not a canonical UUID"):
+            activation_package.validate_acceptance_template(drifted)
+        drifted = copy.deepcopy(template)
+        drifted["run_event"][4][1] = ["a", f"30617:{'24' * 32}:buzz"]
+        with self.assertRaisesRegex(ValueError, "more than one repository"):
+            activation_package.validate_acceptance_template(drifted)
+        drifted = copy.deepcopy(template)
+        envelope = json.loads(drifted["rerun_event"][5])
+        envelope["target_repo_a"] = f"30617:{'24' * 32}:buzz"
+        drifted["rerun_event"][5] = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+        with self.assertRaisesRegex(ValueError, "more than one repository"):
+            activation_package.validate_acceptance_template(drifted)
 
     def test_every_execution_declaration_field_drift_is_rejected(self) -> None:
         mutations = {

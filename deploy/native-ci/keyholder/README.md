@@ -54,6 +54,17 @@ timestamp within 60 seconds of the keyholder clock. The three selector public
 keys must be distinct, so a configuration error cannot collapse the signing
 domains onto one credential.
 
+A NIP-98 request names its `signer`. The relay stores a `POST /events` only
+when the event `pubkey` equals the token pubkey, so a publish token is signed
+by the key that signed the event: signer `ci_event` for kinds 46101 to 46106
+(the `ci-event.key` selector) and signer `acceptance_actor` for the four frozen
+acceptance events (the `acceptance-actor.key` credential, only when the
+activation binding is loaded and at the actor's generation). Both are accepted
+only for `POST {origin}/events` with a payload digest. Signer `nip98` (the
+`nip98.key` selector) is accepted only for the accepted read and the evidence
+`PUT` routes, where the relay authorizes the caller as a CI signer rather than
+as the event author. A `POST /events` request with signer `nip98` is denied.
+
 The config never contains an activation package digest, scenario digest,
 acceptance actor identity, or event template. After the activation package and
 scenario are frozen, the root activation controller creates one public compact

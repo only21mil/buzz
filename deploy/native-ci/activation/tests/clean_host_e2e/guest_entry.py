@@ -1210,7 +1210,7 @@ def verify_platform_systemd(platform_systemd: object) -> None:
             raise GuestError(f"systemd platform file digest differs inside guest: {record['path']}")
 
 
-def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[str, object], dict[str, object]]:
+def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[str, object], dict[str, object], str]:
     platform_systemd = descriptor.get("platform_systemd")
     verify_platform_systemd(platform_systemd)
     candidate_tar = stage / "candidate.tar"
@@ -1320,7 +1320,10 @@ def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[s
         or controld_active.get("keyholder_selectors") != public_spec.get("selectors")
     ):
         raise GuestError("activation controld provider differs from ceremony binding")
-    return candidate, scenario, public
+    channel_id = controld_active.get("channel_id")
+    if not isinstance(channel_id, str) or not channel_id:
+        raise GuestError("activation controld channel id is absent")
+    return candidate, scenario, public, channel_id
 
 
 def provision_seccomp(source: Path) -> None:
@@ -1533,7 +1536,33 @@ def relay_mapping_present() -> bool:
     return any(fields and fields[0] == "127.0.0.1" and "relay.test.invalid" in fields[1:] for fields in mappings)
 
 
-def start_relay(public: dict[str, object]) -> None:
+def relay_public_config(public: dict[str, object], channel_id: str) -> dict[str, object]:
+    """Roster the loopback relay enforces, shaped like the production prerequisites.
+
+    The relay stores a ``POST /events`` only when the event pubkey equals the
+    NIP-98 token pubkey and is a member of the private channel; a kind-46107
+    grant needs the owner or admin role; the accepted read and evidence writes
+    need a static or granted CI signer. So the acceptance actor is a channel
+    admin, the ci-event key a channel member, and the nip98 key a static signer
+    with no channel membership. Production must provide the same three facts
+    for its channel before the canary.
+    """
+    selectors = public["keyholder_public_spec"]["selectors"]
+    return {
+        "origin": public["relay_http_origin"],
+        "channel": {
+            "id": channel_id,
+            "visibility": "private",
+            "members": {
+                public["acceptance_actor"]["public_key"]: "admin",
+                selectors["ci_event"]["public_key"]: "member",
+            },
+        },
+        "ci_status_signer_pubkeys": [selectors["nip98"]["public_key"]],
+    }
+
+
+def start_relay(public: dict[str, object], channel_id: str) -> None:
     ca_target, ca_install, _ca_remove = ca_backend()
     hosts = Path("/etc/hosts")
     if not relay_mapping_present():
@@ -1543,10 +1572,7 @@ def start_relay(public: dict[str, object]) -> None:
     ca_target.chmod(0o644)
     command(list(ca_install))
     config = STATE_ROOT / "relay-public.json"
-    config.write_bytes(canonical({
-        "origin": public["relay_http_origin"],
-        "nip98_public_key": public["keyholder_public_spec"]["selectors"]["nip98"]["public_key"],
-    }))
+    config.write_bytes(canonical(relay_public_config(public, channel_id)))
     config.chmod(0o444)
     relay_root = Path("/var/lib/buzzci-e2e-relay")
     relay_root.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -1689,7 +1715,7 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
         raise GuestError("stage descriptor schema differs")
     if hashlib.sha256(canonical(descriptor)).hexdigest() != phase.get("descriptor_sha256"):
         raise GuestError("stage descriptor digest differs")
-    candidate, _scenario, public = cross_bind(stage, descriptor)
+    candidate, _scenario, public, channel_id = cross_bind(stage, descriptor)
     inputs = stage / "inputs"
     activation_package = inputs / "activation"
     attempted_stage = False
@@ -1701,7 +1727,7 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
     hosts_added = False
     try:
         hosts_added = not relay_mapping_present()
-        start_relay(public)
+        start_relay(public, channel_id)
         emit_progress("relay_ready")
         preinstall_units = unit_state()
         if any(state["LoadState"] != "not-found" for state in preinstall_units.values()):

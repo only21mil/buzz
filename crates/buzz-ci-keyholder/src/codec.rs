@@ -3,9 +3,9 @@ use std::fmt;
 use crate::types::{
     AcceptanceMutation, CanonicalPayload, DescribeAcceptanceRequest, DescribeAcceptanceResponse,
     DescribeRequest, DescribeResponse, ErrorCode, ErrorResponse, HttpMethod, ManifestKind,
-    Nip98AuthorizeRequest, Operation, OperationSet, PeerPolicy, PublicIdentity, Request, Response,
-    SignAcceptanceMutationRequest, SignCiEventRequest, SignManifestRequest, SignatureResponse, Url,
-    ValueError,
+    Nip98AuthorizeRequest, Nip98Signer, Operation, OperationSet, PeerPolicy, PublicIdentity,
+    Request, Response, SignAcceptanceMutationRequest, SignCiEventRequest, SignManifestRequest,
+    SignatureResponse, Url, ValueError,
 };
 
 /// Keyholder frame magic.
@@ -332,13 +332,16 @@ fn encode_nip98(body: &mut BodyEncoder, value: &Nip98AuthorizeRequest) -> Result
     body.field(3, value.url.as_str().as_bytes())?;
     body.field(4, value.payload_digest.as_ref().map_or(&[], |value| value))?;
     body.field(5, &value.created_at.to_be_bytes())?;
-    body.field(6, &value.nonce)
+    body.field(6, &value.nonce)?;
+    body.field(7, &[value.signer as u8])
 }
 
 fn decode_nip98(fields: &[Field<'_>]) -> Result<Nip98AuthorizeRequest, DecodeError> {
-    expect_tags(fields, &[1, 2, 3, 4, 5, 6])?;
+    expect_tags(fields, &[1, 2, 3, 4, 5, 6, 7])?;
     let method =
         HttpMethod::try_from(read_u8(fields[1].value)?).map_err(|_| DecodeError::UnknownEnum)?;
+    let signer =
+        Nip98Signer::try_from(read_u8(fields[6].value)?).map_err(|_| DecodeError::UnknownEnum)?;
     let url_text = std::str::from_utf8(fields[2].value).map_err(|_| DecodeError::InvalidText)?;
     let url = Url::new(url_text.to_owned()).map_err(map_value_error)?;
     let payload_digest = match fields[3].value.len() {
@@ -353,6 +356,7 @@ fn decode_nip98(fields: &[Field<'_>]) -> Result<Nip98AuthorizeRequest, DecodeErr
         payload_digest,
         created_at: nonzero_u64(fields[4].value)?,
         nonce: nonzero_array(fields[5].value)?,
+        signer,
     })
 }
 

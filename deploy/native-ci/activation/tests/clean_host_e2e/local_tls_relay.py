@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Loopback TLS relay with full NIP-98 and Nostr signature verification."""
+"""Loopback TLS relay that enforces the production relay's CI admission rules.
+
+The rules mirror ``crates/buzz-relay`` for the routes the native-CI daemons use:
+``POST /events`` (api/bridge.rs ``submit_event`` and handlers/ingest.rs),
+``GET /ci/control/accepted`` (api/ci.rs ``next_accepted_control``), and
+``PUT /ci/logs|artifacts/...`` (api/ci.rs ``put_ci_evidence``). Every request
+carries a NIP-98 token; the token pubkey is the only identity the relay knows.
+"""
 
 from __future__ import annotations
 
@@ -23,13 +30,38 @@ GY = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
 G = (GX, GY)
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX128 = re.compile(r"^[0-9a-f]{128}$")
-OBJECT_PATH = re.compile(r"^/ci/(?:logs|artifacts)/[A-Za-z0-9._/-]{1,512}$")
+UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+REPO_COORDINATE = re.compile(r"^30617:[0-9a-f]{64}:[^:]+$")
+OBJECT_PATH = re.compile(r"^/ci/(logs|artifacts)/([A-Za-z0-9._-]{1,128})(?:/[A-Za-z0-9._-]{1,128}){3,4}/([0-9a-f]{64})$")
 MAX_BODY = 64 * 1024
 MAX_AUTH = 16 * 1024
+# handlers/ingest.rs MAX_TIMESTAMP_DRIFT_SECS and MAX_EVENT_CONTENT_BYTES.
+MAX_EVENT_DRIFT = 900
+MAX_CONTENT_BYTES = 256 * 1024
+# buzz-auth nip98.rs TIMESTAMP_TOLERANCE_SECS.
+MAX_TOKEN_DRIFT = 60
+KIND_DELETION = 5
+KIND_CI_REQUEST = 46_100
+KIND_CI_STATUS_MIN = 46_101
+KIND_CI_STATUS_MAX = 46_106
+KIND_CI_GRANT = 46_107
+# handlers/ingest.rs: kinds that bypass the generic member-or-open gate.
+MEMBERSHIP_EXEMPT_KINDS = frozenset({9021, 9007, 40003, 9002, 9005, 9008})
+GRANT_ROLES = frozenset({"owner", "admin"})
+MEMBER_ROLES = GRANT_ROLES | {"member"}
 
 
 class RelayError(ValueError):
     pass
+
+
+class Refusal(Exception):
+    """One production-shaped refusal: HTTP status and the relay's message."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
 
 
 def tagged_hash(tag: str, payload: bytes) -> bytes:
@@ -99,13 +131,12 @@ def event_id(event: dict[str, object]) -> str:
     return hashlib.sha256(serialized).hexdigest()
 
 
-def verify_event(value: object, *, expected_public_key: str | None = None) -> dict[str, object]:
+def verify_event(value: object) -> dict[str, object]:
     fields = {"id", "pubkey", "created_at", "kind", "tags", "content", "sig"}
     if not isinstance(value, dict) or set(value) != fields:
         raise RelayError("event shape rejected")
     if (
         not isinstance(value["pubkey"], str) or HEX64.fullmatch(value["pubkey"]) is None
-        or expected_public_key is not None and value["pubkey"] != expected_public_key
         or not isinstance(value["created_at"], int) or isinstance(value["created_at"], bool) or value["created_at"] < 1
         or not isinstance(value["kind"], int) or isinstance(value["kind"], bool) or not 0 <= value["kind"] <= 65535
         or not isinstance(value["tags"], list) or not isinstance(value["content"], str)
@@ -129,7 +160,8 @@ def tag_value(tags: list[list[str]], name: str, *, required: bool = True) -> str
     return values[0] if values else None
 
 
-def verify_nip98(header: str, method: str, url: str, body: bytes, expected_public_key: str, now: int | None = None) -> None:
+def verify_nip98(header: str, method: str, url: str, body: bytes, now: int | None = None) -> dict[str, object]:
+    """Verify one NIP-98 token and return its event; the caller reads `pubkey` and `id`."""
     if not header.startswith("Nostr ") or len(header) > MAX_AUTH:
         raise RelayError("NIP-98 authorization rejected")
     try:
@@ -137,9 +169,9 @@ def verify_nip98(header: str, method: str, url: str, body: bytes, expected_publi
         value = json.loads(raw)
     except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise RelayError("NIP-98 encoding rejected") from error
-    event = verify_event(value, expected_public_key=expected_public_key)
+    event = verify_event(value)
     current = int(time.time()) if now is None else now
-    if event["kind"] != 27235 or event["content"] != "" or abs(current - event["created_at"]) > 60:
+    if event["kind"] != 27235 or event["content"] != "" or abs(current - event["created_at"]) > MAX_TOKEN_DRIFT:
         raise RelayError("NIP-98 kind, content, or time rejected")
     tags = event["tags"]
     if tag_value(tags, "u") != url or tag_value(tags, "method") != method:
@@ -150,17 +182,174 @@ def verify_nip98(header: str, method: str, url: str, body: bytes, expected_publi
             raise RelayError("NIP-98 payload binding rejected")
     elif payload_values:
         raise RelayError("NIP-98 empty payload binding rejected")
+    return event
+
+
+def first_tag(tags: list[list[str]], name: str) -> str | None:
+    return next((tag[1] for tag in tags if len(tag) >= 2 and tag[0] == name), None)
+
+
+def parse_content(event: dict[str, object], what: str) -> dict[str, object]:
+    try:
+        content = json.loads(str(event["content"]))
+    except json.JSONDecodeError as error:
+        raise Refusal(400, f"invalid: {what} content is not valid JSON") from error
+    if not isinstance(content, dict):
+        raise Refusal(400, f"invalid: {what} content is not an object")
+    return content
 
 
 class RelayState:
-    def __init__(self, object_root: Path, origin: str, nip98_public_key: str) -> None:
+    """One community, one channel roster, one static CI signer set.
+
+    ``members`` maps pubkey to role (owner, admin, member), the relay's
+    ``channel_members`` row. ``static_signers`` is the relay operator's
+    ``BUZZ_CI_STATUS_SIGNER_PUBKEYS``; grants accepted through kind 46107 add
+    to it per repository and window.
+    """
+
+    def __init__(
+        self, object_root: Path, origin: str, channel_id: str, visibility: str,
+        members: dict[str, str], static_signers: set[str],
+    ) -> None:
+        if UUID.fullmatch(channel_id) is None or visibility not in {"open", "private"}:
+            raise ValueError("relay channel rejected")
+        if any(HEX64.fullmatch(key) is None or role not in MEMBER_ROLES for key, role in members.items()):
+            raise ValueError("relay roster rejected")
+        if any(HEX64.fullmatch(key) is None for key in static_signers):
+            raise ValueError("relay signer set rejected")
         self.object_root = object_root
         self.origin = origin.rstrip("/")
-        self.nip98_public_key = nip98_public_key
+        self.channel_id = channel_id
+        self.visibility = visibility
+        self.members = dict(members)
+        self.static_signers = set(static_signers)
         self.events: dict[str, dict[str, object]] = {}
+        self.event_channels: dict[str, str | None] = {}
         self.accepted: list[tuple[int, str, dict[str, object]]] = []
+        self.grants: list[tuple[str, str, int, int | None]] = []
+        self.run_ids: set[tuple[str, str]] = set()
+        self.seen_tokens: set[str] = set()
         self.cursor = 0
         self.lock = threading.Lock()
+
+    def active_signers(self, target_repo_a: str, now: int) -> set[str]:
+        signers = set(self.static_signers)
+        for repo, signer, valid_from, valid_until in self.grants:
+            if repo == target_repo_a and valid_from <= now and (valid_until is None or valid_until > now):
+                signers.add(signer)
+        return signers
+
+    def require_membership(self, channel: str, pubkey: str) -> None:
+        # handlers/ingest.rs check_channel_membership: member, or open channel.
+        if channel != self.channel_id:
+            raise Refusal(400, "restricted: not a channel member")
+        if pubkey not in self.members and self.visibility != "open":
+            raise Refusal(400, "restricted: not a channel member")
+
+    def require_signer(self, target_repo_a: str, pubkey: str, now: int) -> None:
+        # api/ci.rs authorize_ci_signer.
+        if pubkey not in self.active_signers(target_repo_a, now):
+            raise Refusal(403, "CI signer is not authorized")
+
+    def request_repository(self, request_id: str) -> str:
+        event = self.events.get(request_id)
+        if event is None or event["kind"] != KIND_CI_REQUEST:
+            raise Refusal(404, "CI request not found")
+        return str(parse_content(event, "CI request")["target_repo_a"])
+
+
+def admit_event(state: RelayState, token_pubkey: str, event: dict[str, object], now: int) -> tuple[str | None, bool]:
+    """Apply the production POST /events rules; return (channel, accepted).
+
+    Raises :class:`Refusal` with the relay's status and message. The caller
+    holds ``state.lock``.
+    """
+    kind = int(event["kind"])
+    tags = event["tags"]
+    assert isinstance(tags, list)
+    if abs(int(event["created_at"]) - now) > MAX_EVENT_DRIFT:
+        raise Refusal(400, "invalid: event timestamp too far from server time")
+    if len(str(event["content"]).encode()) > MAX_CONTENT_BYTES:
+        raise Refusal(400, "invalid: content exceeds maximum size")
+    if event["pubkey"] != token_pubkey:
+        raise Refusal(403, "invalid: event pubkey does not match authenticated identity")
+    pubkey = str(event["pubkey"])
+    channel = first_tag(tags, "h")
+    if kind == KIND_DELETION:
+        targets = [tag[1] for tag in tags if len(tag) >= 2 and tag[0] == "e"]
+        if len(targets) != 1:
+            raise Refusal(400, "invalid: deletion events must reference exactly one target via e or a tag")
+        target = state.events.get(targets[0])
+        if target is None:
+            raise Refusal(400, "invalid: target event not found")
+        if target["pubkey"] != pubkey:
+            raise Refusal(400, "invalid: must be event author")
+        channel = state.event_channels.get(targets[0])
+    if KIND_CI_REQUEST <= kind <= KIND_CI_GRANT and channel is None:
+        raise Refusal(400, "invalid: CI events require a channel h tag")
+    if channel is not None and kind not in MEMBERSHIP_EXEMPT_KINDS:
+        state.require_membership(channel, pubkey)
+    if kind == KIND_CI_GRANT:
+        if state.members.get(pubkey) not in GRANT_ROLES:
+            raise Refusal(403, "restricted: only a channel owner or admin may issue a CI signer grant")
+        content = parse_content(event, "CI grant")
+        valid_from = content.get("valid_from")
+        valid_until = content.get("valid_until")
+        if (
+            set(content) - {"schema_version", "target_repo_a", "signer_pubkey", "valid_from", "valid_until"}
+            or content.get("schema_version") != 1
+            or not isinstance(content.get("target_repo_a"), str)
+            or REPO_COORDINATE.fullmatch(content["target_repo_a"]) is None
+            or not isinstance(content.get("signer_pubkey"), str)
+            or HEX64.fullmatch(content["signer_pubkey"]) is None
+            or not isinstance(valid_from, int) or isinstance(valid_from, bool)
+            or valid_until is not None and (not isinstance(valid_until, int) or isinstance(valid_until, bool))
+            or valid_until is not None and valid_until <= valid_from
+        ):
+            raise Refusal(400, "invalid: CI grant content rejected")
+    elif kind == KIND_CI_REQUEST:
+        content = parse_content(event, "CI request")
+        run_id = content.get("run_id")
+        if content.get("actor") != pubkey:
+            raise Refusal(400, "invalid: request actor does not match event signer")
+        if not isinstance(run_id, str) or UUID.fullmatch(run_id) is None or first_tag(tags, "run") != run_id:
+            raise Refusal(400, "invalid: CI request run tag rejected")
+        if not isinstance(content.get("target_repo_a"), str) or first_tag(tags, "a") != content["target_repo_a"]:
+            raise Refusal(400, "invalid: CI request repository tag rejected")
+        # buzz-db ci.rs prepare_request: an initial request must create its
+        # run; a rerun (attempt 2 or later) must find the run it extends.
+        attempt = content.get("attempt")
+        if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+            raise Refusal(400, "invalid: CI request attempt rejected")
+        exists = (channel, run_id) in state.run_ids
+        if event["id"] not in state.events and exists == (attempt == 1):
+            raise Refusal(400, "invalid: CI run ID or initial request event ID already exists" if exists else "invalid: CI rerun names an unknown run")
+    elif KIND_CI_STATUS_MIN <= kind <= KIND_CI_STATUS_MAX:
+        content = parse_content(event, "CI event")
+        if content.get("relay_signer") != pubkey:
+            raise Refusal(400, "invalid: status signer does not match event signer")
+        if not isinstance(content.get("target_repo_a"), str):
+            raise Refusal(400, "invalid: CI event missing target_repo_a")
+        if pubkey not in state.active_signers(content["target_repo_a"], now):
+            raise Refusal(400, "invalid: unauthorized CI status signer")
+    identifier = str(event["id"])
+    if identifier in state.events:
+        return channel, False
+    state.events[identifier] = event
+    state.event_channels[identifier] = channel
+    if kind == KIND_CI_GRANT:
+        content = parse_content(event, "CI grant")
+        state.grants.append((
+            str(content["target_repo_a"]), str(content["signer_pubkey"]),
+            int(content["valid_from"]), None if content.get("valid_until") is None else int(content["valid_until"]),
+        ))
+    if kind == KIND_CI_REQUEST:
+        assert channel is not None
+        state.run_ids.add((channel, str(parse_content(event, "CI request")["run_id"])))
+        state.cursor += 1
+        state.accepted.append((state.cursor, channel, event))
+    return channel, True
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -187,91 +376,127 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         return raw if len(raw) == length else None
 
-    def _authorize(self, method: str, body: bytes) -> bool:
+    def _authenticate(self, method: str, body: bytes) -> str:
+        """Return the token pubkey; raise Refusal(401) like verify_bridge_auth."""
         try:
-            verify_nip98(
-                self.headers.get("Authorization", ""), method,
-                self.server.state.origin + self.path, body, self.server.state.nip98_public_key,
+            token = verify_nip98(
+                self.headers.get("Authorization", ""), method, self.server.state.origin + self.path, body,
             )
-            return True
-        except RelayError:
-            return False
+        except RelayError as error:
+            raise Refusal(401, f"NIP-98: {error}") from error
+        with self.server.state.lock:
+            if token["id"] in self.server.state.seen_tokens:
+                raise Refusal(401, "NIP-98: replayed authorization")
+            self.server.state.seen_tokens.add(str(token["id"]))
+        return str(token["pubkey"])
+
+    def _refuse(self, refusal: Refusal) -> None:
+        self._json(refusal.status, {"error": refusal.message})
 
     def do_GET(self) -> None:
         parsed = urlsplit(self.path)
-        if parsed.path != "/ci/control/accepted" or not self._authorize("GET", b""):
-            self._json(403, {"error": "rejected"})
-            return
         try:
-            query = parse_qs(parsed.query, strict_parsing=True)
-            if set(query) != {"channel_id", "after_cursor", "limit"} or any(len(values) != 1 for values in query.values()):
-                raise ValueError("query shape")
-            channel = query["channel_id"][0]
-            after = int(query["after_cursor"][0])
-            limit = int(query["limit"][0])
-        except (KeyError, ValueError, IndexError):
-            self._json(400, {"error": "invalid query"})
+            if parsed.path != "/ci/control/accepted":
+                raise Refusal(404, "not found")
+            caller = self._authenticate("GET", b"")
+            try:
+                query = parse_qs(parsed.query, strict_parsing=True)
+                if set(query) != {"channel_id", "after_cursor", "limit"} or any(len(values) != 1 for values in query.values()):
+                    raise ValueError("query shape")
+                channel = query["channel_id"][0]
+                after = int(query["after_cursor"][0])
+                limit = int(query["limit"][0])
+            except (KeyError, ValueError, IndexError) as error:
+                raise Refusal(400, "invalid query") from error
+            if UUID.fullmatch(channel) is None or after < 0 or limit != 1:
+                raise Refusal(400, "invalid query")
+            accepted = None
+            with self.server.state.lock:
+                for cursor, event_channel, event in self.server.state.accepted:
+                    if cursor > after and event_channel == channel:
+                        # api/ci.rs next_accepted_control: a non-empty result
+                        # is gated on the caller's signer authority for the
+                        # request's repository; an empty result is not.
+                        repository = str(parse_content(event, "CI request")["target_repo_a"])
+                        self.server.state.require_signer(repository, caller, int(time.time()))
+                        accepted = {"channel_id": channel, "watch_cursor": cursor, "event": event}
+                        break
+        except Refusal as refusal:
+            self._refuse(refusal)
             return
-        if not channel or after < 0 or limit != 1:
-            self._json(400, {"error": "invalid query"})
-            return
-        accepted = None
-        with self.server.state.lock:
-            for cursor, event_channel, event in self.server.state.accepted:
-                if cursor > after and event_channel == channel:
-                    accepted = {"channel_id": channel, "watch_cursor": cursor, "event": event}
-                    break
         self._json(200, {"accepted": accepted})
 
     def do_POST(self) -> None:
         raw = self._body()
-        if self.path != "/events" or raw is None or not self._authorize("POST", raw):
-            self._json(403, {"error": "rejected"})
-            return
         try:
-            event = verify_event(json.loads(raw))
-        except (json.JSONDecodeError, RelayError):
-            self._json(400, {"error": "invalid event"})
+            if self.path != "/events" or raw is None:
+                raise Refusal(404, "not found")
+            caller = self._authenticate("POST", raw)
+            try:
+                event = verify_event(json.loads(raw))
+            except (json.JSONDecodeError, RelayError) as error:
+                raise Refusal(400, f"invalid event: {error}") from error
+            with self.server.state.lock:
+                _channel, accepted = admit_event(self.server.state, caller, event, int(time.time()))
+        except Refusal as refusal:
+            self._refuse(refusal)
             return
-        event_id_value = event["id"]
-        channel = next((tag[1] for tag in event["tags"] if len(tag) >= 2 and tag[0] == "h"), None) if event["kind"] == 46100 else None
-        if event["kind"] == 46100 and (not isinstance(channel, str) or not channel):
-            self._json(400, {"error": "run event lacks channel"})
-            return
-        with self.server.state.lock:
-            duplicate = event_id_value in self.server.state.events
-            if not duplicate:
-                self.server.state.events[event_id_value] = event
-                if isinstance(channel, str):
-                    self.server.state.cursor += 1
-                    self.server.state.accepted.append((self.server.state.cursor, channel, event))
-        self._json(200, {"event_id": event_id_value, "accepted": not duplicate, "message": "stored" if not duplicate else "duplicate:stored"})
+        self._json(200, {
+            "event_id": event["id"], "accepted": accepted,
+            "message": "stored" if accepted else "duplicate:stored",
+        })
 
     def do_PUT(self) -> None:
         parsed = urlsplit(self.path)
         raw = self._body()
-        if raw is None or parsed.query or parsed.fragment or OBJECT_PATH.fullmatch(parsed.path) is None or not self._authorize("PUT", raw):
-            self._json(403, {"error": "rejected"})
+        try:
+            match = OBJECT_PATH.fullmatch(parsed.path)
+            if raw is None or parsed.query or parsed.fragment or match is None:
+                raise Refusal(404, "not found")
+            caller = self._authenticate("PUT", raw)
+            digest = hashlib.sha256(raw).hexdigest()
+            if match.group(3) != digest:
+                raise Refusal(400, "digest mismatch")
+            with self.server.state.lock:
+                # api/ci.rs put_ci_evidence: the request event must exist and
+                # the caller must be an authorized signer for its repository.
+                repository = self.server.state.request_repository(match.group(2))
+                self.server.state.require_signer(repository, caller, int(time.time()))
+                target = self.server.state.object_root / digest
+                if target.exists() and target.read_bytes() != raw:
+                    raise Refusal(409, "object collision")
+                if not target.exists():
+                    target.write_bytes(raw)
+                    target.chmod(0o400)
+        except Refusal as refusal:
+            self._refuse(refusal)
             return
-        digest = hashlib.sha256(raw).hexdigest()
-        if parsed.path.rsplit("/", 1)[-1] != digest:
-            self._json(400, {"error": "digest mismatch"})
-            return
-        target = self.server.state.object_root / digest
-        with self.server.state.lock:
-            if target.exists() and target.read_bytes() != raw:
-                self._json(409, {"error": "object collision"})
-                return
-            if not target.exists():
-                target.write_bytes(raw)
-                target.chmod(0o400)
         self._json(200, {"url": self.server.state.origin + parsed.path, "sha256": digest, "byte_length": len(raw)})
 
 
 class RelayServer(ThreadingHTTPServer):
-    def __init__(self, address: tuple[str, int], state: RelayState) -> None:
+    def __init__(self, address: tuple[int, int] | tuple[str, int], state: RelayState) -> None:
         super().__init__(address, Handler)
         self.state = state
+
+
+def state_from_config(config: object, object_root: Path) -> RelayState:
+    if (
+        not isinstance(config, dict)
+        or set(config) != {"origin", "channel", "ci_status_signer_pubkeys"}
+        or not isinstance(config["origin"], str)
+        or not isinstance(config["channel"], dict)
+        or set(config["channel"]) != {"id", "visibility", "members"}
+        or not isinstance(config["channel"]["members"], dict)
+        or not isinstance(config["ci_status_signer_pubkeys"], list)
+    ):
+        raise ValueError("relay public config rejected")
+    channel = config["channel"]
+    return RelayState(
+        object_root, config["origin"], str(channel["id"]), str(channel["visibility"]),
+        {str(key): str(role) for key, role in channel["members"].items()},
+        {str(key) for key in config["ci_status_signer_pubkeys"]},
+    )
 
 
 def main() -> int:
@@ -281,11 +506,12 @@ def main() -> int:
     parser.add_argument("--public-config", type=Path, required=True)
     parser.add_argument("--object-root", type=Path, required=True)
     arguments = parser.parse_args()
-    config = json.loads(arguments.public_config.read_bytes())
-    if not isinstance(config, dict) or set(config) != {"origin", "nip98_public_key"} or HEX64.fullmatch(str(config["nip98_public_key"])) is None:
+    try:
+        config = json.loads(arguments.public_config.read_bytes())
+        arguments.object_root.mkdir(mode=0o700, parents=True, exist_ok=False)
+        state = state_from_config(config, arguments.object_root)
+    except (OSError, ValueError):
         return 1
-    arguments.object_root.mkdir(mode=0o700, parents=True, exist_ok=False)
-    state = RelayState(arguments.object_root, str(config["origin"]), str(config["nip98_public_key"]))
     server = RelayServer(("127.0.0.1", 3443), state)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2

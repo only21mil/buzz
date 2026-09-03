@@ -12,9 +12,10 @@ use buzz_ci_keyholder::{
     decode_response, encode_request, AcceptanceMutation, CanonicalPayload,
     DescribeAcceptanceRequest, DescribeAcceptanceResponse, DescribeRequest, DescribeResponse,
     ErrorCode, FrameHeader, HttpMethod as KeyholderHttpMethod, KeySelector, KeyholderClient,
-    ManifestKind, Nip98AuthorizeRequest, OperationSet, PeerPolicy, PublicIdentity, Request,
-    Response, SelectorSet, SignAcceptanceMutationRequest, SignCiEventRequest, SignManifestRequest,
-    SignatureResponse, Url as KeyholderUrl, HEADER_SIZE, KEYHOLDER_SOCKET_PATH, MAX_BODY_SIZE,
+    ManifestKind, Nip98AuthorizeRequest, Nip98Signer, OperationSet, PeerPolicy, PublicIdentity,
+    Request, Response, SelectorSet, SignAcceptanceMutationRequest, SignCiEventRequest,
+    SignManifestRequest, SignatureResponse, Url as KeyholderUrl, HEADER_SIZE,
+    KEYHOLDER_SOCKET_PATH, MAX_BODY_SIZE,
 };
 use nostr::secp256k1::{schnorr::Signature, Message, XOnlyPublicKey, SECP256K1};
 use nostr::{Event, Tag};
@@ -152,6 +153,10 @@ pub enum KeyholderError {
 pub struct UnixKeyholderClient {
     config: KeyholderClientConfig,
     ci_pubkey: String,
+    /// Activation-bound acceptance actor, bound after the keyholder's
+    /// `describe_acceptance` matched the receipt. Only a client that publishes
+    /// the four frozen acceptance events binds one.
+    acceptance_actor: Option<PublicIdentity>,
 }
 
 impl std::fmt::Debug for UnixKeyholderClient {
@@ -172,7 +177,11 @@ impl UnixKeyholderClient {
 
     fn connect_validated(config: KeyholderClientConfig) -> Result<Self, KeyholderError> {
         let ci_pubkey = config.keyholder_selectors.ci_event.public_key.clone();
-        let mut client = Self { config, ci_pubkey };
+        let mut client = Self {
+            config,
+            ci_pubkey,
+            acceptance_actor: None,
+        };
         let description = KeyholderClient::describe(&mut client, DescribeRequest)?;
         client.validate_description(description)?;
         Ok(client)
@@ -182,6 +191,63 @@ impl UnixKeyholderClient {
     fn connect_for_test(config: KeyholderClientConfig) -> Result<Self, KeyholderError> {
         config.validate_common()?;
         Self::connect_validated(config)
+    }
+
+    /// Bind the acceptance actor this client may name as a `POST /events`
+    /// publisher. The actor must be distinct from every keyholder selector.
+    pub fn bind_acceptance_actor(&mut self, actor: PublicIdentity) -> Result<(), KeyholderError> {
+        let selectors = self.config.keyholder_selectors.selector_set()?;
+        if actor.public_key == [0; 32]
+            || actor.generation == 0
+            || [
+                KeySelector::CiEvent,
+                KeySelector::Nip98,
+                KeySelector::Manifest,
+            ]
+            .iter()
+            .any(|selector| selectors.identity(*selector).public_key == actor.public_key)
+        {
+            return Err(KeyholderError::InvalidConfig);
+        }
+        XOnlyPublicKey::from_slice(&actor.public_key).map_err(|_| KeyholderError::InvalidConfig)?;
+        self.acceptance_actor = Some(actor);
+        Ok(())
+    }
+
+    /// Identity that signs a NIP-98 token for the given signer.
+    fn nip98_identity(&self, signer: Nip98Signer) -> Result<PublicIdentity, KeyholderError> {
+        match signer {
+            Nip98Signer::Nip98 => self.config.expected_identity(KeySelector::Nip98),
+            Nip98Signer::CiEvent => self.config.expected_identity(KeySelector::CiEvent),
+            Nip98Signer::AcceptanceActor => {
+                self.acceptance_actor.ok_or(KeyholderError::WrongIdentity)
+            }
+        }
+    }
+
+    /// Select the token signer for one binding: a publish names its event
+    /// author and that author must be an identity this client holds; any
+    /// other route is the dedicated NIP-98 identity. Fails closed otherwise.
+    fn nip98_signer(&self, binding: &Nip98Binding) -> Result<Nip98Signer, KeyholderError> {
+        let Some(publisher) = binding.publisher.as_deref() else {
+            return Ok(Nip98Signer::Nip98);
+        };
+        let publisher = decode_digest(publisher)?;
+        if publisher
+            == self
+                .config
+                .expected_identity(KeySelector::CiEvent)?
+                .public_key
+        {
+            return Ok(Nip98Signer::CiEvent);
+        }
+        if self
+            .acceptance_actor
+            .is_some_and(|actor| actor.public_key == publisher)
+        {
+            return Ok(Nip98Signer::AcceptanceActor);
+        }
+        Err(KeyholderError::WrongIdentity)
     }
 
     fn validate_description(&self, value: DescribeResponse) -> Result<(), KeyholderError> {
@@ -249,7 +315,7 @@ impl UnixKeyholderClient {
     fn signature_response(
         &self,
         request: Request,
-        selector: KeySelector,
+        expected_identity: PublicIdentity,
         expected_digest: [u8; 32],
     ) -> Result<SignatureResponse, KeyholderError> {
         let response = self.exchange(&request)?;
@@ -262,7 +328,6 @@ impl UnixKeyholderClient {
             | Response::DescribeAcceptance(_)
             | Response::SignAcceptanceMutation(_) => return Err(KeyholderError::Protocol),
         };
-        let expected_identity = self.config.expected_identity(selector)?;
         if signature.identity != expected_identity {
             return Err(KeyholderError::WrongIdentity);
         }
@@ -300,7 +365,7 @@ impl UnixKeyholderClient {
                 canonical_manifest: CanonicalPayload::new(message)
                     .map_err(|_| KeyholderError::InvalidInput)?,
             }),
-            KeySelector::Manifest,
+            identity,
             digest,
         )?;
         request.admission_signature = response.signature;
@@ -408,20 +473,17 @@ impl KeyholderClient for UnixKeyholderClient {
         request: SignCiEventRequest,
     ) -> Result<SignatureResponse, Self::Error> {
         let digest = Sha256::digest(request.canonical_event.as_bytes()).into();
-        self.signature_response(Request::SignCiEvent(request), KeySelector::CiEvent, digest)
+        let identity = self.config.expected_identity(KeySelector::CiEvent)?;
+        self.signature_response(Request::SignCiEvent(request), identity, digest)
     }
 
     fn nip98_authorize(
         &mut self,
         request: Nip98AuthorizeRequest,
     ) -> Result<SignatureResponse, Self::Error> {
-        let digest = nip98_digest(
-            self.config
-                .expected_identity(KeySelector::Nip98)?
-                .public_key,
-            &request,
-        )?;
-        self.signature_response(Request::Nip98Authorize(request), KeySelector::Nip98, digest)
+        let identity = self.nip98_identity(request.signer)?;
+        let digest = nip98_digest(identity.public_key, &request)?;
+        self.signature_response(Request::Nip98Authorize(request), identity, digest)
     }
 
     fn sign_manifest(
@@ -437,9 +499,10 @@ impl KeyholderClient for UnixKeyholderClient {
                 .to_be_bytes(),
         );
         digest.update(request.canonical_manifest.as_bytes());
+        let identity = self.config.expected_identity(KeySelector::Manifest)?;
         self.signature_response(
             Request::SignManifest(request),
-            KeySelector::Manifest,
+            identity,
             digest.finalize().into(),
         )
     }
@@ -501,21 +564,28 @@ impl Nip98Authorizer for UnixKeyholderClient {
             .as_deref()
             .map(decode_digest)
             .transpose()?;
+        let signer = self.nip98_signer(binding)?;
+        let identity = self.nip98_identity(signer)?;
         let created_at = unix_time()?;
         let nonce = *Uuid::new_v4().as_bytes();
         let request = Nip98AuthorizeRequest {
-            expected_generation: self
-                .config
-                .expected_identity(KeySelector::Nip98)?
-                .generation,
+            expected_generation: identity.generation,
             method,
             url: KeyholderUrl::new(binding.url.as_str().to_owned())
                 .map_err(|_| KeyholderError::InvalidInput)?,
             payload_digest,
             created_at,
             nonce,
+            signer,
         };
         let response = KeyholderClient::nip98_authorize(self, request)?;
+        // The keyholder answered with the identity chosen above; a publish
+        // token must carry the event author or the relay refuses the event.
+        if let Some(publisher) = binding.publisher.as_deref() {
+            if hex::encode(response.identity.public_key) != publisher {
+                return Err(KeyholderError::WrongIdentity);
+            }
+        }
         let mut tags = vec![
             serde_json::json!(["u", binding.url.as_str()]),
             serde_json::json!(["method", binding.method.as_str()]),
@@ -769,6 +839,10 @@ mod tests {
         SignCiEvent,
         DescribeAcceptance,
         SignAcceptance,
+        /// Sign a NIP-98 request with the key its `signer` names.
+        Nip98,
+        /// Answer a NIP-98 request with the nip98 identity whatever it named.
+        Nip98WrongKey,
         Stale,
         WrongOperation,
         WrongRequestId,
@@ -801,6 +875,40 @@ mod tests {
             keyholder_timeout_millis: timeout_millis,
             keyholder_transport_attempts: attempts,
         }
+    }
+
+    fn scalar_key(scalar: u8) -> (nostr::secp256k1::Keypair, [u8; 32]) {
+        use nostr::secp256k1::{Keypair, SecretKey};
+
+        let mut bytes = [0_u8; 32];
+        bytes[31] = scalar;
+        let secret = SecretKey::from_slice(&bytes).expect("secret");
+        let keypair = Keypair::from_secret_key(SECP256K1, &secret);
+        (keypair, keypair.x_only_public_key().0.serialize())
+    }
+
+    fn actor_identity() -> PublicIdentity {
+        PublicIdentity {
+            public_key: scalar_key(4).1,
+            generation: 10,
+        }
+    }
+
+    fn publish_binding(publisher: &str) -> Nip98Binding {
+        Nip98Binding {
+            method: HttpMethod::Post,
+            url: url::Url::parse("https://relay.example.test/events").expect("url"),
+            payload_sha256: Some("11".repeat(32)),
+            publisher: Some(publisher.to_owned()),
+        }
+    }
+
+    fn token_event(header: &str) -> Event {
+        let encoded = header.strip_prefix("Nostr ").expect("nostr scheme");
+        let json = BASE64.decode(encoded).expect("base64 token");
+        let event: Event = serde_json::from_slice(&json).expect("token event");
+        event.verify().expect("token signature");
+        event
     }
 
     fn spawn_server(replies: Vec<Reply>) -> (TempDir, PathBuf, thread::JoinHandle<()>) {
@@ -909,6 +1017,34 @@ mod tests {
                                         .identity(KeySelector::CiEvent)
                                         .public_key,
                                     generation: 10,
+                                },
+                                signed_digest: digest,
+                                signature: SECP256K1
+                                    .sign_schnorr_no_aux_rand(
+                                        &Message::from_digest(digest),
+                                        &keypair,
+                                    )
+                                    .serialize(),
+                            }),
+                        )
+                    }
+                    Reply::Nip98 | Reply::Nip98WrongKey => {
+                        let Request::Nip98Authorize(request) = request else {
+                            panic!("nip98 request")
+                        };
+                        let (scalar, generation) = match (reply, request.signer) {
+                            (Reply::Nip98WrongKey, _) | (_, Nip98Signer::Nip98) => (2, 8),
+                            (_, Nip98Signer::CiEvent) => (1, 7),
+                            (_, Nip98Signer::AcceptanceActor) => (4, 10),
+                        };
+                        let (keypair, public_key) = scalar_key(scalar);
+                        let digest = nip98_digest(public_key, &request).expect("digest");
+                        (
+                            request_header,
+                            Response::Nip98Authorize(SignatureResponse {
+                                identity: PublicIdentity {
+                                    public_key,
+                                    generation,
                                 },
                                 signed_digest: digest,
                                 signature: SECP256K1
@@ -1040,6 +1176,91 @@ mod tests {
             )
             .expect("acceptance signature");
         assert_eq!(signature.signed_digest, description.event_ids[0]);
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn publish_tokens_carry_the_event_author_and_reads_keep_the_nip98_identity() {
+        let (_directory, path, server) = spawn_server(vec![
+            Reply::Describe,
+            Reply::Nip98,
+            Reply::Nip98,
+            Reply::Nip98,
+        ]);
+        let mut client = UnixKeyholderClient::connect_for_test(config(path, 500, 1))
+            .expect("authenticated client");
+        client
+            .bind_acceptance_actor(actor_identity())
+            .expect("bind actor");
+        let actor_hex = hex::encode(actor_identity().public_key);
+
+        let read = Nip98Binding {
+            method: HttpMethod::Get,
+            url: url::Url::parse(
+                "https://relay.example.test/ci/control/accepted?channel_id=123e4567-e89b-12d3-a456-426614174000&after_cursor=0&limit=1",
+            )
+            .expect("url"),
+            payload_sha256: None,
+            publisher: None,
+        };
+        let token = token_event(&client.authorization(&read).expect("read token"));
+        assert_eq!(token.pubkey.to_hex(), NIP98_KEY);
+        assert_eq!(token.kind.as_u16() as u32, NIP98_EVENT_KIND);
+
+        let token = token_event(
+            &client
+                .authorization(&publish_binding(CI_KEY))
+                .expect("status publish token"),
+        );
+        assert_eq!(token.pubkey.to_hex(), CI_KEY);
+
+        let token = token_event(
+            &client
+                .authorization(&publish_binding(&actor_hex))
+                .expect("acceptance publish token"),
+        );
+        assert_eq!(token.pubkey.to_hex(), actor_hex);
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn publish_with_an_unknown_author_is_refused_before_any_keyholder_request() {
+        let (_directory, path, server) = spawn_server(vec![Reply::Describe]);
+        let mut client = UnixKeyholderClient::connect_for_test(config(path, 500, 1))
+            .expect("authenticated client");
+        // nip98.key signs no event, the manifest key signs no event, and the
+        // actor is not bound on this client.
+        for publisher in [
+            NIP98_KEY,
+            MANIFEST_KEY,
+            &hex::encode(actor_identity().public_key),
+        ] {
+            assert_eq!(
+                client.authorization(&publish_binding(publisher)),
+                Err(KeyholderError::WrongIdentity),
+                "{publisher}"
+            );
+        }
+        // The actor may not collide with a selector.
+        assert_eq!(
+            client.bind_acceptance_actor(PublicIdentity {
+                public_key: scalar_key(2).1,
+                generation: 10,
+            }),
+            Err(KeyholderError::InvalidConfig)
+        );
+        server.join().expect("server");
+    }
+
+    #[test]
+    fn a_token_identity_that_differs_from_the_publisher_is_refused() {
+        let (_directory, path, server) = spawn_server(vec![Reply::Describe, Reply::Nip98WrongKey]);
+        let mut client = UnixKeyholderClient::connect_for_test(config(path, 500, 1))
+            .expect("authenticated client");
+        assert_eq!(
+            client.authorization(&publish_binding(CI_KEY)),
+            Err(KeyholderError::WrongIdentity)
+        );
         server.join().expect("server");
     }
 
