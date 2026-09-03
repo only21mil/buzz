@@ -69,7 +69,10 @@ activation coordinates copy the lane manifest. The public event templates are
 issued at the package's bound time reference (`acceptance_template.time_reference`,
 recorded at freeze); the freezer requires the runner's static
 `acceptance_time_reference` to equal it, and the runner judges the admission
-window against that reference rather than the wall clock.
+window against that reference rather than the wall clock. The freezer also
+requires the active `channel_id` to equal the `h` tag channel frozen into
+those templates: the acceptance path publishes the signed Run event on the
+event's own channel while the daemon polls the configured one.
 The active daemon polls the authenticated accepted-request source one at a
 time, signs through keyholder, admits only the exact runner-control v2 frame,
 and fetches terminal logs, the declared artifact, and teardown through the

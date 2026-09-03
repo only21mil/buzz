@@ -23,6 +23,13 @@ def load_module(name: str, path: Path):
 
 
 CONTROLLER = load_module("activation_scaffold_controller", ACTIVATION_ROOT / "controller.py")
+# Test-only relay identities: the disposable clean-host relay accepts any
+# channel and repository, so the scaffold binds these explicitly instead of
+# inheriting production values.
+TEST_CHANNEL_ID = "12345678-1234-4abc-8def-123456789abc"
+TEST_REPOSITORY_OWNER = "22" * 32
+TEST_REPOSITORY_ID = "buzz"
+TEST_SOURCE_CLONE_URL = "https://relay.example.invalid/git/buzz"
 FREEZER = load_module("activation_scaffold_freezer", ACTIVATION_ROOT / "freeze_package.py")
 
 QUALIFICATION_SCRIPT = b'''#!/usr/bin/python3
@@ -97,6 +104,10 @@ class ActivationFixture:
             workflow_id="capacity-one",
             workflow_digest="80" * 32,
             job_id="capacity-one-fixture",
+            channel_id=TEST_CHANNEL_ID,
+            repository_owner_public_key=TEST_REPOSITORY_OWNER,
+            repository_id=TEST_REPOSITORY_ID,
+            source_clone_url=TEST_SOURCE_CLONE_URL,
             time_reference=1_800_000_000,
         )
         self.manifest = self._manifest()
@@ -269,7 +280,7 @@ class ActivationFixture:
             "schema_version": 2, "capacity": 1, "store_root": "/var/lib/buzzci/controld",
             "acceptance_binding": activation_package.ACCEPTANCE_BINDING_PATH,
             "relay_url": "wss://relay.example.invalid", "relay_http_origin": "https://relay.example.invalid",
-            "channel_id": "12345678-1234-4abc-8def-123456789abc", "poll_interval_millis": 1000,
+            "channel_id": TEST_CHANNEL_ID, "poll_interval_millis": 1000,
             "runner_socket": "/run/buzzci/runner-control.sock", "runner_uid": 62001, "runner_gid": 62001,
             "runner_connect_timeout_millis": 1000, "runner_io_timeout_millis": 5000,
             "runner_transport_attempts": 3, "lane_manifest_digest": lane_manifest_digest,

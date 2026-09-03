@@ -812,10 +812,43 @@ def _positive_integer(value: object, maximum: int, where: str) -> int:
     return value
 
 
+def _canonical_channel_id(value: object, where: str) -> str:
+    try:
+        parsed = uuid.UUID(value)  # type: ignore[arg-type]
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError(f"{where} is not a canonical UUID") from error
+    if not isinstance(value, str) or str(parsed) != value:
+        raise ValueError(f"{where} is not a canonical UUID")
+    return value
+
+
+def repository_coordinate(owner_public_key: object, repository_id: object) -> str:
+    """Return the NIP-34 ``30617:<owner>:<repo id>`` coordinate the relay indexes."""
+    owner = _nonzero_sha256(owner_public_key, "repository owner public key")
+    if (
+        not isinstance(repository_id, str)
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", repository_id) is None
+    ):
+        raise ValueError("repository id is not a plain NIP-34 d tag")
+    return f"30617:{owner}:{repository_id}"
+
+
+def _source_clone_url(value: object) -> str:
+    parts = urlsplit(value if isinstance(value, str) else "")
+    if (
+        parts.scheme != "https" or not parts.hostname or parts.username is not None
+        or parts.password is not None or parts.query or parts.fragment
+        or parts.path in {"", "/"}
+    ):
+        raise ValueError("source clone URL must be a credential-free https repository URL")
+    return value  # type: ignore[return-value]
+
+
 def production_acceptance_template(
     *, actor_public_key: str, actor_generation: int, ci_signer_public_key: str,
     candidate_sha: str, workflow_id: str, workflow_digest: str, job_id: str,
-    time_reference: int,
+    channel_id: str, repository_owner_public_key: str, repository_id: str,
+    source_clone_url: str, time_reference: int,
 ) -> dict[str, Any]:
     """Build the one canonical public Run/Grant/Rerun/Tombstone authority set.
 
@@ -826,6 +859,14 @@ def production_acceptance_template(
     and carried in the manifest, and the runner judges every admission and
     cancel window against that same value as a static activation coordinate
     (``acceptance_time_reference``), never against the wall clock.
+
+    The relay that receives the signed Run event indexes it by the ``h`` tag
+    channel and the ``a`` tag repository coordinate and stores the clone URL
+    from the envelope, so the caller binds the channel controld polls
+    (``channel_id``), the announced repository (``repository_owner_public_key``
+    and ``repository_id``), and that repository's clone URL. Nothing here is a
+    placeholder: ``validate_phase_configs`` requires the active controld
+    ``channel_id`` to equal the channel frozen into these events.
     """
     actor = _nonzero_sha256(actor_public_key, "public acceptance actor")
     signer = _nonzero_sha256(ci_signer_public_key, "public CI signer")
@@ -838,9 +879,13 @@ def production_acceptance_template(
     if not isinstance(job_id, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", job_id) is None:
         raise ValueError("production acceptance job id is invalid")
 
-    channel = "12345678-1234-4abc-8def-123456789abc"
+    channel = _canonical_channel_id(channel_id, "production acceptance channel")
+    target_repo = repository_coordinate(repository_owner_public_key, repository_id)
+    clone_url = _source_clone_url(source_clone_url)
+    # The run id, PR root id, and idempotency keys are fixed fixture
+    # identities: the relay requires their shape (UUID, 64 hex, non-empty)
+    # and uniqueness per channel, not an existing PR event.
     run_id = "13131313-1313-4313-8313-131313131313"
-    target_repo = f"30617:{'22' * 32}:buzz"
     pr_event = "33" * 32
     issued_at = _positive_integer(
         time_reference, 0xFFFFFFFFFFFFFFFF - 601, "public acceptance time reference",
@@ -852,7 +897,7 @@ def production_acceptance_template(
             "request_type": request_type,
             "target_repo_a": target_repo,
             "pr_root_event_id": pr_event,
-            "source_clone_url": "https://relay.example.invalid/git/buzz",
+            "source_clone_url": clone_url,
             "immutable_source_ref": "refs/nostr/source",
             "tip_oid": candidate_sha,
             "source_branch": "acceptance/capacity-one",
@@ -931,12 +976,17 @@ def production_activation_draft(
     components: list[dict[str, Any]], entries: list[dict[str, Any]],
     effective_systemd: list[dict[str, Any]], actor_public_key: str,
     actor_generation: int, ci_signer_public_key: str, workflow_id: str,
-    workflow_digest: str, job_id: str, time_reference: int,
+    workflow_digest: str, job_id: str, channel_id: str,
+    repository_owner_public_key: str, repository_id: str, source_clone_url: str,
+    time_reference: int,
 ) -> dict[str, Any]:
     """Materialize a new closed activation draft from explicit ready inputs.
 
     ``time_reference`` is the freeze-time value the acceptance template is
     issued at; the materializer records it once and the manifest carries it.
+    ``channel_id``, ``repository_owner_public_key``, ``repository_id``, and
+    ``source_clone_url`` are the relay-side identities the acceptance events
+    name; the caller reads them from the relay it activates against.
     """
     def detached(value: object) -> Any:
         return json.loads(canonical_json(value), object_pairs_hook=reject_duplicates)
@@ -958,6 +1008,10 @@ def production_activation_draft(
             workflow_id=workflow_id,
             workflow_digest=workflow_digest,
             job_id=job_id,
+            channel_id=channel_id,
+            repository_owner_public_key=repository_owner_public_key,
+            repository_id=repository_id,
+            source_clone_url=source_clone_url,
             time_reference=time_reference,
         ),
         "entries": detached(entries),
@@ -1046,7 +1100,42 @@ def validate_acceptance_template(value: object) -> dict[str, Any]:
         or rerun["expires_at"] <= time_reference
     ):
         raise ValueError("public acceptance rerun template is not issued at the time reference")
+    channel = _event_tag_value(run_event[4], "h", "public acceptance run template")
+    _canonical_channel_id(channel, "public acceptance run template channel")
+    if (
+        _event_tag_value(value["grant_event"][4], "h", "public acceptance grant template") != channel
+        or _event_tag_value(rerun_event[4], "h", "public acceptance rerun template") != channel
+    ):
+        raise ValueError("public acceptance templates name more than one channel")
+    repository = run.get("target_repo_a")
+    if (
+        not isinstance(repository, str)
+        or _event_tag_value(run_event[4], "a", "public acceptance run template") != repository
+        or _event_tag_value(rerun_event[4], "a", "public acceptance rerun template") != repository
+        or rerun.get("target_repo_a") != repository
+    ):
+        raise ValueError("public acceptance templates name more than one repository")
     return value
+
+
+def _event_tag_value(tags: object, name: str, where: str) -> str:
+    matching = [
+        tag[1] for tag in (tags if isinstance(tags, list) else [])
+        if isinstance(tag, list) and len(tag) == 2 and tag[0] == name and isinstance(tag[1], str)
+    ]
+    if len(matching) != 1:
+        raise ValueError(f"{where} must carry exactly one {name} tag")
+    return matching[0]
+
+
+def acceptance_template_channel(template: dict[str, Any]) -> str:
+    """Return the one channel the validated acceptance template publishes into."""
+    return _event_tag_value(template["run_event"][4], "h", "public acceptance run template")
+
+
+def acceptance_template_repository(template: dict[str, Any]) -> str:
+    """Return the one repository coordinate the validated acceptance template names."""
+    return _event_tag_value(template["run_event"][4], "a", "public acceptance run template")
 
 
 def validate_external_keyholder_config(
@@ -1446,12 +1535,9 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
         or origin.query or origin.fragment
     ):
         raise ValueError("controld relay URL and HTTP origin differ from one secure authority")
-    try:
-        channel = uuid.UUID(controld_active["channel_id"])
-    except (AttributeError, TypeError, ValueError) as error:
-        raise ValueError("controld channel id is not a canonical UUID") from error
-    if str(channel) != controld_active["channel_id"]:
-        raise ValueError("controld channel id is not a canonical UUID")
+    channel = _canonical_channel_id(controld_active["channel_id"], "controld channel id")
+    if channel != acceptance_template_channel(manifest["acceptance_template"]):
+        raise ValueError("controld channel differs from the frozen acceptance template channel")
     if controld_active.get("runner_socket") != SOCKET_POLICY["runner"]["path"]:
         raise ValueError("controld active configuration does not bind the runner socket")
     runner_identity = manifest["identities"]["runner"]

@@ -113,6 +113,10 @@ def acceptance_template() -> dict[str, object]:
         workflow_id="0123456789abcdef0123456789abcdef",
         workflow_digest="1" * 64,
         job_id="capacity-one-fixture",
+        channel_id="12345678-1234-4abc-8def-123456789abc",
+        repository_owner_public_key="22" * 32,
+        repository_id="buzz",
+        source_clone_url="https://relay.example.invalid/git/buzz",
         time_reference=1_800_000_000,
     )
 

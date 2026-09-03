@@ -303,10 +303,19 @@ declared by the draft. Qualification requests are never frozen assets because
 they bind the final package digest and runtime validity interval. Production
 callers materialize the draft with `package.production_activation_draft` from
 the exact candidate, public actor and CI selector, ready component manifests,
-provenance/config entries, and effective-systemd inventory. The materializer
+provenance/config entries, effective-systemd inventory, and the relay-side
+identities the acceptance events name: `channel_id` (the channel controld
+polls), `repository_owner_public_key` and `repository_id` (the announced
+kind-30617 repository, rendered as the `30617:<owner>:<id>` coordinate), and
+`source_clone_url` (that repository's credential-free https clone URL). Read
+those four values from the relay you activate against; the relay refuses a Run
+event whose channel it does not know. The materializer
 owns the canonical Run, Grant, Rerun, and Tombstone seed, supplies the fixed
 closed contracts, and validates the complete draft; production bootstrap does
-not inherit a prior artifact or test fixture.
+not inherit a prior artifact or test fixture. `validate_phase_configs` requires
+the active controld `channel_id` to equal the channel frozen into the events,
+and `validate_acceptance_template` requires the run, grant, and rerun events to
+name one channel and one repository.
 
 The runner staged config is the exact runner-v2 `dormant` shape at
 `/etc/buzzci/runner-v2.json`. Its active config selects `mode=v2_proxy`, binds

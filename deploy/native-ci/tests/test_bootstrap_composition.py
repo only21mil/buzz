@@ -253,6 +253,10 @@ class BootstrapCompositionTests(unittest.TestCase):
             workflow_id=controld_active["workflow_id"],
             workflow_digest=controld_active["workflow_digest"],
             job_id=controld_active["jobs"][0]["job_id"],
+            channel_id=controld_active["channel_id"],
+            repository_owner_public_key=ACTIVATION_SCAFFOLD.TEST_REPOSITORY_OWNER,
+            repository_id=ACTIVATION_SCAFFOLD.TEST_REPOSITORY_ID,
+            source_clone_url=ACTIVATION_SCAFFOLD.TEST_SOURCE_CLONE_URL,
             time_reference=draft["acceptance_template"]["time_reference"],
         )
 
@@ -490,6 +494,10 @@ class BootstrapCompositionTests(unittest.TestCase):
                 workflow_id=controld_active["workflow_id"],
                 workflow_digest=controld_active["workflow_digest"],
                 job_id=controld_active["jobs"][0]["job_id"],
+                channel_id=controld_active["channel_id"],
+                repository_owner_public_key=ACTIVATION_SCAFFOLD.TEST_REPOSITORY_OWNER,
+                repository_id=ACTIVATION_SCAFFOLD.TEST_REPOSITORY_ID,
+                source_clone_url=ACTIVATION_SCAFFOLD.TEST_SOURCE_CLONE_URL,
                 time_reference=draft["acceptance_template"]["time_reference"],
             )
             self.assertEqual(
