@@ -1,18 +1,50 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
+import pathlib
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 HERE = Path(__file__).resolve().parents[1]
 TOOL = HERE / "migrate.py"
+
+
+def load_tool():
+    spec = importlib.util.spec_from_file_location("legacy_state_migrate", TOOL)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@contextlib.contextmanager
+def emulated_owners(owners: dict[Path, tuple[int, int]]):
+    """Make lstat report the mapped uid/gid for the given paths without chown."""
+    real_lstat = pathlib.Path.lstat
+
+    def fake_lstat(self):
+        result = real_lstat(self)
+        ids = owners.get(Path(self))
+        if ids is None:
+            return result
+        return os.stat_result(
+            (result.st_mode, result.st_ino, result.st_dev, result.st_nlink, ids[0], ids[1], result.st_size, result.st_atime, result.st_mtime, result.st_ctime),
+            {"st_atime_ns": result.st_atime_ns, "st_mtime_ns": result.st_mtime_ns, "st_ctime_ns": result.st_ctime_ns},
+        )
+
+    with mock.patch.object(pathlib.Path, "lstat", fake_lstat):
+        yield
 
 
 def canonical(value: object) -> bytes:
@@ -287,6 +319,40 @@ class MigrationTests(unittest.TestCase):
                     backing.parent.mkdir(parents=True)
                     backing.write_text("/var/lib/buzzci/lease01.img\n", encoding="utf-8")
                 self.fixture.run("plan", success=False)
+
+    def run_in_process(self, tool, action: str) -> tuple[int, bytes, str]:
+        stdout = io.TextIOWrapper(io.BytesIO())
+        stderr = io.StringIO()
+        argv = self.fixture.command(action)[1:]
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = tool.main()
+        stdout.flush()
+        return code, stdout.buffer.getvalue(), stderr.getvalue()
+
+    def test_principal_owned_home_is_accepted_when_planning(self) -> None:
+        ctl = self.fixture.path("/var/lib/buzzci/principals/ctl")
+        tool = load_tool()
+        with emulated_owners({ctl: (961, 961)}), mock.patch.object(tool, "principal_owner", lambda root, logical: (961, 961)):
+            for action in ("check", "plan"):
+                with self.subTest(action=action):
+                    code, out, err = self.run_in_process(tool, action)
+                    self.assertEqual((code, err), (0, ""))
+                    payload = json.loads(out)
+                    plan = payload["plan"] if action == "check" else payload
+                    principals = next(item for item in plan["retained_items"] if item["path"].endswith("/principals"))
+                    entry = next(item for item in principals["entries"] if item["relative_path"] == "ctl")
+                    self.assertEqual((entry["uid"], entry["gid"]), (961, 961))
+                    self.assertEqual([item["before_mode"] for item in plan["normalized_directories"]], ["0700"] * 4)
+
+    def test_foreign_owned_directory_outside_principals_still_refuses(self) -> None:
+        tool = load_tool()
+        for logical in ("/var/lib/buzzci/seccomp/v1", "/var/lib/buzzci/leases", "/var/lib/buzzci"):
+            with self.subTest(path=logical):
+                with emulated_owners({self.fixture.path(logical): (961, 961)}):
+                    for action in ("check", "plan"):
+                        code, out, err = self.run_in_process(tool, action)
+                        self.assertEqual((code, out), (1, b""))
+                        self.assertIn("root-owned", err)
 
     def test_plan_refuses_non_private_approval_file(self) -> None:
         plan, raw = self.fixture.plan_file()
