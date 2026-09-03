@@ -41,6 +41,9 @@ ALLOWED_SYMLINKS = {
     "/etc/systemd/system/sockets.target.wants/buzz-ci-execd.socket": "/etc/systemd/system/buzz-ci-execd.socket",
 }
 RETAINED_DIRECT = {"principals", "seccomp"}
+# Principal home directories are owned by their principal on the live host.
+# Only the shared root and its normalized directories must be root-owned.
+PRINCIPAL_OWNERS = {"/var/lib/buzzci/principals/ctl": (961, 961)}
 NORMALIZED_DIRS = (
     "/var/lib/buzzci",
     "/var/lib/buzzci/seccomp",
@@ -94,6 +97,12 @@ def root_ids(root: Path) -> tuple[int, int]:
         return (0, 0)
     metadata = root.lstat()
     return (metadata.st_uid, metadata.st_gid)
+
+
+def principal_owner(root: Path, logical: str) -> tuple[int, int]:
+    if root == Path("/"):
+        return PRINCIPAL_OWNERS[logical]
+    return root_ids(root)
 
 
 def safe_root(value: str) -> Path:
@@ -248,7 +257,7 @@ def scan_retained(root: Path) -> list[dict[str, object]]:
     if principals_entries["."]["mode"] != "0711" or principals_entries["ctl"]["mode"] != "0700":
         raise Refusal("legacy principals directory modes differ")
     expected_root = root_ids(root)
-    expected_ctl = (961, 961) if root == Path("/") else expected_root
+    expected_ctl = principal_owner(root, SHARED + "/principals/ctl")
     if (principals_entries["."]["uid"], principals_entries["."]["gid"]) != expected_root or (
         principals_entries["ctl"]["uid"], principals_entries["ctl"]["gid"]
     ) != expected_ctl:
@@ -472,6 +481,19 @@ def validate_archive_location(root: Path, archive: str) -> None:
         raise Refusal("archive root is not on the shared-state filesystem")
 
 
+def normalized_directory_mode(root: Path, logical: str) -> str:
+    # Only the directory itself must be root-owned. Its children were already
+    # scanned as archive items or retained trees, where principal homes keep
+    # their principal's ownership.
+    path = mapped(root, logical)
+    if not path.exists() and not path.is_symlink():
+        raise Refusal(f"required legacy path is absent: {path}")
+    record = metadata_record(path, root=root, base=path)
+    if record["type"] != "directory":
+        raise Refusal(f"normalized path is not a directory: {logical}")
+    return str(record["mode"])
+
+
 def build_plan(root: Path, proc_root: Path, sys_root: Path, archive: str, systemctl_path: Path) -> dict[str, object]:
     validate_archive_location(root, archive)
     validate_tool_path(root, systemctl_path)
@@ -523,7 +545,7 @@ def build_plan(root: Path, proc_root: Path, sys_root: Path, archive: str, system
         ],
         "retained_items": retained,
         "normalized_directories": [
-            {"path": path, "before_mode": scan_tree(mapped(root, path), root=root)["entries"][0]["mode"], "after_mode": "0711"}
+            {"path": path, "before_mode": normalized_directory_mode(root, path), "after_mode": "0711"}
             for path in NORMALIZED_DIRS
         ],
         "unused_proof": proof,
