@@ -183,8 +183,15 @@ async fn cmd_rerun(
         max_attempts: 5,
     };
 
-    let plan = ev::derive_rerun_plan(&request_event_id, &request, &statuses, job, parameters)
-        .map_err(|e| CliError::Other(format!("failed to derive rerun plan: {e}")))?;
+    let plan = ev::derive_rerun_plan(
+        &request_event_id,
+        &request,
+        &accepted,
+        &statuses,
+        job,
+        parameters,
+    )
+    .map_err(|e| CliError::Other(format!("failed to derive rerun plan: {e}")))?;
 
     // Build and sign the rerun request event (kind 46100).
     let content = serde_json::to_string(&plan.request)
