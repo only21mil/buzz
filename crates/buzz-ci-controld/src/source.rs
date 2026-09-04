@@ -22,6 +22,12 @@ use crate::production::{
 };
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// The exact `POST /events` refusal the relay returns when a kind-46101 to
+/// 46106 signer is neither a static status signer nor covered by an active
+/// kind-46107 grant at ingest time (`buzz_core::ci::validate_signed_ci_event`
+/// through `crates/buzz-relay/src/handlers/ingest.rs`, surfaced by
+/// `api/bridge.rs submit_event` as HTTP 400 `{"error": <message>}`).
+const UNAUTHORIZED_STATUS_SIGNER_ERROR: &str = "invalid CI envelope: unauthorized CI status signer";
 const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 const CONFIG_MODE: u32 = 0o600;
 
@@ -293,6 +299,8 @@ pub enum SourceError {
     Transport,
     #[error("relay refused the operation")]
     RelayRefused,
+    #[error("relay refused the CI status signer")]
+    UnauthorizedStatusSigner,
     #[error("relay response is invalid")]
     InvalidResponse,
     #[error("relay returned an invalid CI request")]
@@ -347,7 +355,7 @@ where
             .map_err(|_| SourceError::InvalidConfig)
     }
 
-    fn request(
+    fn request_raw(
         &mut self,
         method: HttpMethod,
         url: Url,
@@ -400,6 +408,18 @@ where
         if response.body.len() > MAX_RESPONSE_BYTES {
             return Err(SourceError::InvalidResponse);
         }
+        Ok(response)
+    }
+
+    fn request(
+        &mut self,
+        method: HttpMethod,
+        url: Url,
+        body: Vec<u8>,
+        publisher: Option<String>,
+        query_filter: Option<Vec<u8>>,
+    ) -> Result<HttpResponse, SourceError> {
+        let response = self.request_raw(method, url, body, publisher, query_filter)?;
         if !(200..300).contains(&response.status) {
             return Err(SourceError::RelayRefused);
         }
@@ -490,7 +510,10 @@ where
         // The token must be signed by the event's own author (relay rule:
         // `event.pubkey` equals the authenticated pubkey), so bind it here.
         let publisher = event_value.pubkey.to_hex();
-        let response = self.request(HttpMethod::Post, url, body, Some(publisher), None)?;
+        let response = self.request_raw(HttpMethod::Post, url, body, Some(publisher), None)?;
+        if !(200..300).contains(&response.status) {
+            return Err(publish_refusal(&response));
+        }
         let reply: PublishResponse =
             serde_json::from_slice(&response.body).map_err(|_| SourceError::InvalidResponse)?;
         let exact_duplicate = !reply.accepted && reply.message.starts_with("duplicate:");
@@ -498,6 +521,10 @@ where
             return Err(SourceError::RelayRefused);
         }
         Ok(reply.event_id)
+    }
+
+    fn is_unauthorized_status_signer(&self, error: &Self::Error) -> bool {
+        matches!(error, SourceError::UnauthorizedStatusSigner)
     }
 
     fn publication_exists(&mut self, event: &SignedCiEvent) -> Result<bool, Self::Error> {
@@ -597,6 +624,26 @@ struct AcceptedWire {
     channel_id: String,
     watch_cursor: u64,
     event: serde_json::Value,
+}
+
+/// Classify one non-2xx `POST /events` reply. Only the relay's exact
+/// unauthorized-signer envelope error (HTTP 400, body `{"error": ...}` equal to
+/// [`UNAUTHORIZED_STATUS_SIGNER_ERROR`]) is distinguished; every other status
+/// or body stays the opaque [`SourceError::RelayRefused`].
+fn publish_refusal(response: &HttpResponse) -> SourceError {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RefusalBody {
+        error: String,
+    }
+
+    if response.status == 400
+        && serde_json::from_slice::<RefusalBody>(&response.body)
+            .is_ok_and(|body| body.error == UNAUTHORIZED_STATUS_SIGNER_ERROR)
+    {
+        return SourceError::UnauthorizedStatusSigner;
+    }
+    SourceError::RelayRefused
 }
 
 #[derive(Debug, Deserialize)]
@@ -858,6 +905,66 @@ mod tests {
             binding.publisher.as_deref(),
             Some(keys.public_key().to_hex().as_str())
         );
+    }
+
+    #[test]
+    fn only_the_exact_unauthorized_signer_refusal_is_distinguished_on_publish() {
+        let keys = Keys::parse(&"02".repeat(32)).expect("synthetic key");
+        let event = EventBuilder::new(Kind::Custom(46101), "{}")
+            .sign_with_keys(&keys)
+            .expect("signed event");
+        let signed = SignedCiEvent {
+            event_id: event.id.to_hex(),
+            kind: 46101,
+            content: "{}".to_owned(),
+            tags: serde_json::to_value(&event.tags).expect("tags"),
+            signed_event: serde_json::to_value(event).expect("event"),
+        };
+        let publish = |status: u16, body: serde_json::Value| {
+            let transport = RecordingTransport {
+                response: HttpResponse {
+                    status,
+                    body: serde_json::to_vec(&body).expect("response"),
+                },
+                requests: Vec::new(),
+            };
+            let mut relay = AuthenticatedRelay::new(
+                Url::parse("https://relay.example/").expect("url"),
+                transport,
+                RecordingAuth::default(),
+            )
+            .expect("relay");
+            let error = relay.publish(&signed).unwrap_err();
+            let distinguished = relay.is_unauthorized_status_signer(&error);
+            (error, distinguished)
+        };
+        let exact = serde_json::json!({"error": UNAUTHORIZED_STATUS_SIGNER_ERROR});
+        assert_eq!(
+            publish(400, exact.clone()),
+            (SourceError::UnauthorizedStatusSigner, true)
+        );
+        for (status, body) in [
+            (
+                400,
+                serde_json::json!({"error": "invalid: event timestamp too far from server time"}),
+            ),
+            (
+                400,
+                serde_json::json!({"error": "invalid: unauthorized CI status signer"}),
+            ),
+            (
+                400,
+                serde_json::json!({"error": UNAUTHORIZED_STATUS_SIGNER_ERROR, "detail": 1}),
+            ),
+            (403, exact.clone()),
+            (500, exact),
+            (
+                400,
+                serde_json::json!("invalid CI envelope: unauthorized CI status signer"),
+            ),
+        ] {
+            assert_eq!(publish(status, body), (SourceError::RelayRefused, false));
+        }
     }
 
     #[test]

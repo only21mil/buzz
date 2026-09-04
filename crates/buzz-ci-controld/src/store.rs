@@ -1,6 +1,6 @@
 //! Crash-safe file-backed control state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -301,6 +301,21 @@ impl ControlStore for DurableControlStore {
         })
     }
 
+    fn defer_publication(&mut self, key: &str) -> Result<(), Self::Error> {
+        validate_key(key)?;
+        self.mutate(|snapshot| match snapshot.publications.get(key) {
+            Some(StoredPublication::Pending(_)) => {
+                let inserted = snapshot.deferred_publications.insert(key.to_owned());
+                Ok(((), inserted))
+            }
+            _ => Err(StoreError::Conflict),
+        })
+    }
+
+    fn deferred_publications(&self) -> Result<Vec<String>, Self::Error> {
+        self.with_locked(|snapshot| Ok(snapshot.deferred_publications.iter().cloned().collect()))
+    }
+
     fn accept_publication(&mut self, key: &str, event_id: &str) -> Result<(), Self::Error> {
         validate_key(key)?;
         if !is_lower_hex(event_id, 64) {
@@ -319,12 +334,16 @@ impl ControlStore for DurableControlStore {
                             relay_event_id: event_id.to_owned(),
                         },
                     );
+                    snapshot.deferred_publications.remove(key);
                     Ok(((), true))
                 }
                 StoredPublication::Accepted {
                     signed,
                     relay_event_id,
-                } if signed.event_id == event_id && relay_event_id == event_id => Ok(((), false)),
+                } if signed.event_id == event_id && relay_event_id == event_id => {
+                    let cleared = snapshot.deferred_publications.remove(key);
+                    Ok(((), cleared))
+                }
                 _ => Err(StoreError::Conflict),
             }
         })
@@ -340,6 +359,12 @@ struct Snapshot {
     #[serde(default)]
     finalizations: BTreeMap<String, StoredFinalization>,
     publications: BTreeMap<String, StoredPublication>,
+    /// Pending publication keys whose replay the relay refused as an
+    /// unauthorized status signer before the activation grant was approved.
+    /// Present in the snapshot only while non-empty, so a snapshot at rest keeps
+    /// the shape earlier binaries read.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    deferred_publications: BTreeSet<String>,
 }
 
 impl Default for Snapshot {
@@ -350,6 +375,7 @@ impl Default for Snapshot {
             runs: BTreeMap::new(),
             finalizations: BTreeMap::new(),
             publications: BTreeMap::new(),
+            deferred_publications: BTreeSet::new(),
         }
     }
 }
@@ -396,6 +422,14 @@ impl Snapshot {
                 || !(46101..=46106).contains(&signed.kind)
                 || relay_id.is_some_and(|id| id != &signed.event_id)
             {
+                return Err(StoreError::InvalidSnapshot);
+            }
+        }
+        for key in &self.deferred_publications {
+            if !matches!(
+                self.publications.get(key),
+                Some(StoredPublication::Pending(_))
+            ) {
                 return Err(StoreError::InvalidSnapshot);
             }
         }
@@ -757,6 +791,72 @@ mod tests {
         bad_finalization["finalizations"]["123e4567-e89b-12d3-a456-426614174011"]["finalization"]
             ["jobs"]["test"]["lease"]["attempt"] = serde_json::json!(2);
         assert_main_v1_snapshot_rejected(&bad_finalization);
+    }
+
+    #[test]
+    fn deferred_publications_survive_restart_and_clear_only_on_acceptance() {
+        let (directory, mut store) = store();
+        let root = fs::canonicalize(directory.path()).expect("canonical root");
+        let uid = fs::metadata(&root).expect("metadata").uid();
+        assert_eq!(
+            store.defer_publication("absent"),
+            Err(StoreError::Conflict),
+            "only a pending publication can be deferred"
+        );
+        assert!(store
+            .record_publication_intent("run:terminal", &event("a"))
+            .expect("intent"));
+        let at_rest = fs::read(root.join(SNAPSHOT_NAME)).expect("snapshot");
+        assert!(
+            !String::from_utf8_lossy(&at_rest).contains("deferred_publications"),
+            "an empty deferral set is absent from the snapshot"
+        );
+        store.defer_publication("run:terminal").expect("defer");
+        store
+            .defer_publication("run:terminal")
+            .expect("deferral is idempotent");
+        assert_eq!(
+            store.deferred_publications().expect("deferred"),
+            vec!["run:terminal".to_owned()]
+        );
+        drop(store);
+
+        let mut reopened = DurableControlStore::open(root.clone(), uid).expect("reopen");
+        assert_eq!(
+            reopened.deferred_publications().expect("deferred"),
+            vec!["run:terminal".to_owned()],
+            "a deferral survives restart"
+        );
+        assert!(reopened
+            .refresh_pending_publication("run:terminal", &"a".repeat(64), &event("b"))
+            .expect("re-sign keeps the deferral"));
+        assert_eq!(
+            reopened.deferred_publications().expect("deferred"),
+            vec!["run:terminal".to_owned()]
+        );
+        assert_eq!(
+            reopened.accept_publication("run:terminal", &"a".repeat(64)),
+            Err(StoreError::Conflict),
+            "a stale id cannot clear the deferral"
+        );
+        reopened
+            .accept_publication("run:terminal", &"b".repeat(64))
+            .expect("accept");
+        assert!(reopened
+            .deferred_publications()
+            .expect("deferred")
+            .is_empty());
+        assert_eq!(
+            reopened.defer_publication("run:terminal"),
+            Err(StoreError::Conflict),
+            "an accepted publication cannot be deferred"
+        );
+        drop(reopened);
+        let at_rest = fs::read(root.join(SNAPSHOT_NAME)).expect("snapshot");
+        assert!(!String::from_utf8_lossy(&at_rest).contains("deferred_publications"));
+        let mut orphan = main_v1_snapshot();
+        orphan["deferred_publications"] = serde_json::json!(["run:terminal"]);
+        assert_main_v1_snapshot_rejected(&orphan);
     }
 
     #[test]

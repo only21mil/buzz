@@ -9,13 +9,24 @@ controld issues before it re-signs a refused publication),
 ``PUT /ci/logs|artifacts/...`` (api/ci.rs ``put_ci_evidence``). Every request
 carries a NIP-98 token; the token pubkey is the only identity the relay knows.
 
-One opt-in fault mode, ``stale-terminal-publication-recovery``, is armed by a
-flag file the guest writes before the relay starts. It answers the first publish
+Two opt-in fault modes are armed by a flag file the guest writes before the
+relay starts. ``stale-terminal-publication-recovery`` answers the first publish
 of the terminal kind-46101 run status with the production drift refusal and
 stores nothing, so controld must read the event back through ``POST /query``
 before it re-signs and publishes again. The relay records the refused id and
 whether that read-back happened next to the flag, so the guest can prove the
 fault fired and the recovery path ran (M11 failed exactly there: no query).
+``stale-terminal-replay-before-grant`` expires every active kind-46107 grant the
+moment the first terminal kind-46101 run status arrives, so that publish and
+every later status from the ci-event key is refused with the production
+``invalid CI envelope: unauthorized CI status signer`` until a new grant is
+accepted. The guest runs the prior activation's canary under it (its terminal
+publish is refused after its grant expired, the run stays pending, as the
+2026-09-03 run did in production) and then the candidate activation, whose
+controld replays that pending terminal at startup, before its own grant is
+approved (the M12 failure). The relay records the expiry, every unauthorized
+refusal, every read-back of a refused id, and the first terminal status it
+accepts after the expiry (the replay under the new grant).
 """
 
 from __future__ import annotations
@@ -59,7 +70,12 @@ KIND_CI_GRANT = 46_107
 # buzz-core ci.rs CiRunState: every other state is terminal.
 OPEN_RUN_STATES = frozenset({"queued", "running"})
 FAULT_STALE_TERMINAL = "stale-terminal-publication-recovery"
-RELAY_FAULTS = frozenset({FAULT_STALE_TERMINAL})
+FAULT_REPLAY_BEFORE_GRANT = "stale-terminal-replay-before-grant"
+RELAY_FAULTS = frozenset({FAULT_STALE_TERMINAL, FAULT_REPLAY_BEFORE_GRANT})
+# buzz-core ci.rs CiValidationError("unauthorized CI status signer") displayed
+# through its "invalid CI envelope: {0}" prefix; api/bridge.rs returns it as
+# HTTP 400 {"error": ...}. controld matches this exact string.
+UNAUTHORIZED_STATUS_SIGNER = "invalid CI envelope: unauthorized CI status signer"
 FAULT_RECORD_NAME = "fault-fired.json"
 MAX_QUERY_FILTERS = 16
 # handlers/ingest.rs: kinds that bypass the generic member-or-open gate.
@@ -253,6 +269,10 @@ class RelayState:
         self.fault_root: Path | None = None
         self.stale_event_id: str | None = None
         self.stale_queried = False
+        self.grants_expired_at: int | None = None
+        self.refused_event_ids: list[str] = []
+        self.queried_event_ids: list[str] = []
+        self.replayed_event_id: str | None = None
 
     def arm_fault(self, flag: Path) -> None:
         """Read the guest's flag file; an unknown mode is a configuration error."""
@@ -278,17 +298,71 @@ class RelayState:
         return True
 
     def note_query(self, ids: set[str] | None, kinds: list[object]) -> None:
-        """Record the exact-event read-back of the refused publication."""
-        if self.stale_event_id is None or self.stale_queried or ids is None or self.stale_event_id not in ids or KIND_CI_RUN_STATUS not in kinds:
+        """Record the exact-event read-back of a refused publication."""
+        if ids is None or KIND_CI_RUN_STATUS not in kinds:
             return
-        self.stale_queried = True
+        if self.fault == FAULT_STALE_TERMINAL:
+            if self.stale_event_id is None or self.stale_queried or self.stale_event_id not in ids:
+                return
+            self.stale_queried = True
+            self.write_fault_record()
+        elif self.fault == FAULT_REPLAY_BEFORE_GRANT:
+            read_back = [event_id for event_id in self.refused_event_ids if event_id in ids and event_id not in self.queried_event_ids]
+            if not read_back:
+                return
+            self.queried_event_ids.extend(read_back)
+            self.write_fault_record()
+
+    def expires_grants_before(self, event: dict[str, object], now: int) -> None:
+        """Replay-before-grant fault, one shot: the first terminal run status
+        finds every active grant expired at ``now`` (production: the 2026-09-03
+        run's terminal arrived after its 600 s grant window). The caller holds
+        ``lock``; the ordinary signer check then refuses the event."""
+        if self.fault != FAULT_REPLAY_BEFORE_GRANT or self.grants_expired_at is not None or event["kind"] != KIND_CI_RUN_STATUS:
+            return
+        try:
+            state = parse_content(event, "CI event").get("state")
+        except Refusal:
+            return
+        if not isinstance(state, str) or state in OPEN_RUN_STATES:
+            return
+        self.grants = [
+            (repo, signer, valid_from, now if valid_until is None or valid_until > now else valid_until)
+            for repo, signer, valid_from, valid_until in self.grants
+        ]
+        self.grants_expired_at = now
         self.write_fault_record()
+
+    def note_unauthorized(self, event: dict[str, object]) -> None:
+        """Record one unauthorized-signer refusal after the grant expiry."""
+        if self.fault != FAULT_REPLAY_BEFORE_GRANT or self.grants_expired_at is None:
+            return
+        self.refused_event_ids.append(str(event["id"]))
+        self.write_fault_record()
+
+    def note_terminal_accepted(self, event: dict[str, object]) -> None:
+        """Record the first terminal run status accepted after the expiry: the
+        replay of the pending terminal under the next activation's grant."""
+        if self.fault != FAULT_REPLAY_BEFORE_GRANT or self.grants_expired_at is None or self.replayed_event_id is not None or event["kind"] != KIND_CI_RUN_STATUS:
+            return
+        state = parse_content(event, "CI event").get("state")
+        if not isinstance(state, str) or state in OPEN_RUN_STATES:
+            return
+        self.replayed_event_id = str(event["id"])
+        self.write_fault_record()
+
+    def fault_record(self) -> dict[str, object]:
+        if self.fault == FAULT_REPLAY_BEFORE_GRANT:
+            return {
+                "mode": self.fault, "grants_expired_at": self.grants_expired_at,
+                "refused_event_ids": list(self.refused_event_ids), "queried_event_ids": list(self.queried_event_ids),
+                "replayed_event_id": self.replayed_event_id,
+            }
+        return {"mode": self.fault, "refused_event_id": self.stale_event_id, "queried": self.stale_queried}
 
     def write_fault_record(self) -> None:
         assert self.fault_root is not None
-        record = json.dumps({
-            "mode": self.fault, "refused_event_id": self.stale_event_id, "queried": self.stale_queried,
-        }, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        record = json.dumps(self.fault_record(), sort_keys=True, separators=(",", ":")).encode() + b"\n"
         pending = self.fault_root / (FAULT_RECORD_NAME + ".next")
         pending.write_bytes(record)
         pending.chmod(0o400)
@@ -400,13 +474,20 @@ def admit_event(state: RelayState, token_pubkey: str, event: dict[str, object], 
             raise Refusal(400, "invalid: status signer does not match event signer")
         if not isinstance(content.get("target_repo_a"), str):
             raise Refusal(400, "invalid: CI event missing target_repo_a")
+        # handlers/ingest.rs: the signer set is the static set plus the grants
+        # active for (channel, target_repo_a) at ingest time; buzz-core
+        # validate_signed_ci_event refuses any other signer with this message.
+        state.expires_grants_before(event, now)
         if pubkey not in state.active_signers(content["target_repo_a"], now):
-            raise Refusal(400, "invalid: unauthorized CI status signer")
+            state.note_unauthorized(event)
+            raise Refusal(400, UNAUTHORIZED_STATUS_SIGNER)
     identifier = str(event["id"])
     if identifier in state.events:
         return channel, False
     state.events[identifier] = event
     state.event_channels[identifier] = channel
+    if KIND_CI_STATUS_MIN <= kind <= KIND_CI_STATUS_MAX:
+        state.note_terminal_accepted(event)
     if kind == KIND_CI_GRANT:
         content = parse_content(event, "CI grant")
         state.grants.append((

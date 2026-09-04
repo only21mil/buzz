@@ -134,6 +134,16 @@ pub trait RelayControl {
     /// event before replacing its signature with a fresh one.
     fn publication_exists(&mut self, event: &SignedCiEvent) -> Result<bool, Self::Error>;
 
+    /// Whether `error` is the relay's exact unauthorized-CI-status-signer
+    /// refusal of a publish (HTTP 400 `invalid CI envelope: unauthorized CI
+    /// status signer`). Only that refusal may be deferred until the
+    /// activation's own kind-46107 grant is approved; every other error keeps
+    /// its terminal meaning. Implementations without a distinguishable wire
+    /// error keep the default.
+    fn is_unauthorized_status_signer(&self, _error: &Self::Error) -> bool {
+        false
+    }
+
     fn put_log(
         &mut self,
         accepted: &AcceptedRequest,
@@ -384,7 +394,29 @@ pub trait ControlStore {
         expected_event_id: &str,
         replacement: &SignedCiEvent,
     ) -> Result<bool, Self::Error>;
+    /// Mark `key` (a pending publication) as deferred: the relay refused its
+    /// replay as an unauthorized status signer before this activation's grant
+    /// was approved. Idempotent. The marker survives restarts.
+    fn defer_publication(&mut self, key: &str) -> Result<(), Self::Error>;
+    /// Every deferred publication key, in a stable order. A key leaves the set
+    /// only through `accept_publication`.
+    fn deferred_publications(&self) -> Result<Vec<String>, Self::Error>;
+    /// Record the relay's acceptance of the exact pending event and clear any
+    /// deferral marker for `key` in the same durable write.
     fn accept_publication(&mut self, key: &str, event_id: &str) -> Result<(), Self::Error>;
+}
+
+/// One handler poll step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PollStep {
+    /// No accepted request after the cursor.
+    Idle,
+    /// One accepted request settled and the cursor advanced.
+    Completed,
+    /// The head request's publication was refused as an unauthorized status
+    /// signer before the activation grant; it is recorded as deferred and the
+    /// cursor did not move.
+    Deferred,
 }
 
 #[derive(Debug, Error)]
@@ -405,6 +437,8 @@ pub enum ProductionError {
     State(#[from] StateError),
     #[error("publication intent conflicts with a different signed event")]
     PublicationConflict,
+    #[error("publication replay deferred until the activation grant is approved")]
+    DeferredPublication,
 }
 
 /// Broker-backed C3/C4 control handler. It has no default production composition.
@@ -414,6 +448,11 @@ pub struct ProductionHandler<R, S, X, P, O> {
     executor: X,
     store: P,
     output: O,
+    /// While set, a replayed pending publication that the relay refuses as an
+    /// unauthorized status signer is recorded as deferred instead of failing
+    /// the poll. The service enables it at startup until the activation's
+    /// first kind-46107 grant is approved, then clears it before the replay.
+    defer_unauthorized_refusals: bool,
 }
 
 impl<R, S, X, P, O> ProductionHandler<R, S, X, P, O> {
@@ -424,7 +463,16 @@ impl<R, S, X, P, O> ProductionHandler<R, S, X, P, O> {
             executor,
             store,
             output,
+            defer_unauthorized_refusals: false,
         }
+    }
+
+    pub fn set_replay_deferral(&mut self, enabled: bool) {
+        self.defer_unauthorized_refusals = enabled;
+    }
+
+    pub const fn replay_deferral(&self) -> bool {
+        self.defer_unauthorized_refusals
     }
 }
 
@@ -437,7 +485,43 @@ where
     O: EvidenceReader,
 {
     /// Consume at most one accepted request after the durable channel cursor.
-    pub fn poll_once(&mut self, channel_id: &str) -> Result<bool, ProductionError> {
+    pub fn poll_once(&mut self, channel_id: &str) -> Result<PollStep, ProductionError> {
+        self.poll_head(channel_id, false)
+    }
+
+    /// Replay every deferred publication through the ordinary pending path
+    /// (exact retry, exact-event read-back, re-sign), then settle the channel
+    /// head when its run is already terminal so the cursor moves past the
+    /// replayed request without executing anything. Callers clear replay
+    /// deferral first: a refusal here is terminal, as it is after the grant.
+    /// Returns the number of deferred keys that were replayed.
+    pub fn replay_deferred_publications(
+        &mut self,
+        channel_id: &str,
+    ) -> Result<usize, ProductionError> {
+        let deferred = self
+            .store
+            .deferred_publications()
+            .map_err(|_| ProductionError::Store)?;
+        for key in &deferred {
+            let stored = self
+                .store
+                .load_publication(key)
+                .map_err(|_| ProductionError::Store)?
+                .ok_or(ProductionError::PublicationConflict)?;
+            self.republish(key, stored)?;
+        }
+        if !deferred.is_empty() {
+            while self.poll_head(channel_id, true)? == PollStep::Completed {}
+        }
+        Ok(deferred.len())
+    }
+
+    fn poll_head(
+        &mut self,
+        channel_id: &str,
+        terminal_only: bool,
+    ) -> Result<PollStep, ProductionError> {
         let cursor = self
             .store
             .cursor(channel_id)
@@ -447,12 +531,27 @@ where
             .next_accepted(channel_id, cursor)
             .map_err(|_| ProductionError::Relay)?
         else {
-            return Ok(false);
+            return Ok(PollStep::Idle);
         };
         if accepted.channel_id != channel_id || accepted.watch_cursor <= cursor {
             return Err(ProductionError::Invalid);
         }
-        self.handle_accepted(&accepted)?;
+        if terminal_only {
+            let identity = run_identity(&accepted)?;
+            let terminal = self
+                .store
+                .load_run(&identity)
+                .map_err(|_| ProductionError::Store)?
+                .is_some_and(|(_, record)| record.state().is_terminal());
+            if !terminal {
+                return Ok(PollStep::Idle);
+            }
+        }
+        match self.handle_accepted(&accepted) {
+            Ok(()) => {}
+            Err(ProductionError::DeferredPublication) => return Ok(PollStep::Deferred),
+            Err(error) => return Err(error),
+        }
         if !self
             .store
             .advance_cursor(channel_id, cursor, accepted.watch_cursor)
@@ -460,25 +559,11 @@ where
         {
             return Err(ProductionError::PublicationConflict);
         }
-        Ok(true)
+        Ok(PollStep::Completed)
     }
 
     fn handle_accepted(&mut self, accepted: &AcceptedRequest) -> Result<(), ProductionError> {
-        accepted
-            .envelope
-            .validate()
-            .map_err(|_| ProductionError::Invalid)?;
-        if accepted.event_id.len() != 64 || accepted.event_id != accepted.event_id.to_lowercase() {
-            return Err(ProductionError::Invalid);
-        }
-        let identity = RunIdentity::new(
-            accepted.event_id.clone(),
-            Uuid::parse_str(&accepted.envelope.run_id).map_err(|_| ProductionError::Invalid)?,
-            accepted.envelope.attempt,
-            accepted.envelope.target_repo_a.clone(),
-            accepted.envelope.tip_oid.clone(),
-            accepted.envelope.workflow_id.clone(),
-        )?;
+        let identity = run_identity(accepted)?;
         let queued = RunRecord::queued(identity.clone(), accepted.envelope.issued_at)?;
         let (mut revision, mut record) = match self
             .store
@@ -873,8 +958,37 @@ where
     ) -> Result<String, ProductionError> {
         match stored {
             StoredPublication::Accepted { relay_event_id, .. } => Ok(relay_event_id),
-            StoredPublication::Pending(signed) => self.publish_pending(key, signed),
+            StoredPublication::Pending(signed) => {
+                if self.defer_unauthorized_refusals && self.is_deferred(key)? {
+                    // Already refused before the grant: do not re-sign or
+                    // re-publish on every poll; the grant approval replays it.
+                    return Err(ProductionError::DeferredPublication);
+                }
+                self.publish_pending(key, signed)
+            }
         }
+    }
+
+    fn is_deferred(&self, key: &str) -> Result<bool, ProductionError> {
+        Ok(self
+            .store
+            .deferred_publications()
+            .map_err(|_| ProductionError::Store)?
+            .iter()
+            .any(|deferred| deferred == key))
+    }
+
+    /// Map a refused publish. Only the relay's exact unauthorized-signer
+    /// refusal, and only while replay deferral is enabled, becomes a durable
+    /// deferral; everything else is the terminal relay failure it always was.
+    fn refuse_or_defer(&mut self, key: &str, error: &R::Error) -> ProductionError {
+        if self.defer_unauthorized_refusals && self.relay.is_unauthorized_status_signer(error) {
+            return match self.store.defer_publication(key) {
+                Ok(()) => ProductionError::DeferredPublication,
+                Err(_) => ProductionError::Store,
+            };
+        }
+        ProductionError::Relay
     }
 
     fn publish_pending(
@@ -928,10 +1042,10 @@ where
                 .ok_or(ProductionError::PublicationConflict)?;
             return self.republish(key, reconciled);
         }
-        let accepted_id = self
-            .relay
-            .publish(&replacement)
-            .map_err(|_| ProductionError::Relay)?;
+        let accepted_id = match self.relay.publish(&replacement) {
+            Ok(accepted_id) => accepted_id,
+            Err(error) => return Err(self.refuse_or_defer(key, &error)),
+        };
         self.accept_published(key, replacement, accepted_id)
     }
 
@@ -949,6 +1063,24 @@ where
             .map_err(|_| ProductionError::Store)?;
         Ok(accepted_id)
     }
+}
+
+fn run_identity(accepted: &AcceptedRequest) -> Result<RunIdentity, ProductionError> {
+    accepted
+        .envelope
+        .validate()
+        .map_err(|_| ProductionError::Invalid)?;
+    if accepted.event_id.len() != 64 || accepted.event_id != accepted.event_id.to_lowercase() {
+        return Err(ProductionError::Invalid);
+    }
+    Ok(RunIdentity::new(
+        accepted.event_id.clone(),
+        Uuid::parse_str(&accepted.envelope.run_id).map_err(|_| ProductionError::Invalid)?,
+        accepted.envelope.attempt,
+        accepted.envelope.target_repo_a.clone(),
+        accepted.envelope.tip_oid.clone(),
+        accepted.envelope.workflow_id.clone(),
+    )?)
 }
 
 fn persist_run<P: ControlStore>(
@@ -1190,7 +1322,7 @@ impl EvidenceReader for DescriptorOutputReader {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap, VecDeque};
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::rc::Rc;
@@ -1208,6 +1340,7 @@ mod tests {
         cursor: u64,
         run: Option<(u64, RunRecord)>,
         publications: HashMap<String, StoredPublication>,
+        deferred: BTreeSet<String>,
     }
 
     impl ControlStore for MemoryStore {
@@ -1294,6 +1427,21 @@ mod tests {
             Ok(true)
         }
 
+        fn defer_publication(&mut self, key: &str) -> Result<(), Self::Error> {
+            if !matches!(
+                self.publications.get(key),
+                Some(StoredPublication::Pending(_))
+            ) {
+                return Err(());
+            }
+            self.deferred.insert(key.to_owned());
+            Ok(())
+        }
+
+        fn deferred_publications(&self) -> Result<Vec<String>, Self::Error> {
+            Ok(self.deferred.iter().cloned().collect())
+        }
+
         fn accept_publication(&mut self, key: &str, event_id: &str) -> Result<(), Self::Error> {
             let Some(StoredPublication::Pending(signed)) = self.publications.get(key).cloned()
             else {
@@ -1306,6 +1454,7 @@ mod tests {
                     relay_event_id: event_id.to_owned(),
                 },
             );
+            self.deferred.remove(key);
             Ok(())
         }
     }
@@ -1604,8 +1753,8 @@ mod tests {
             MemoryOutput(log),
         );
 
-        assert!(handler.poll_once(CHANNEL).unwrap());
-        assert!(!handler.poll_once(CHANNEL).unwrap());
+        assert_eq!(handler.poll_once(CHANNEL).unwrap(), PollStep::Completed);
+        assert_eq!(handler.poll_once(CHANNEL).unwrap(), PollStep::Idle);
         assert_eq!(
             handler.relay.published,
             vec![46101, 46101, 46102, 46102, 46103, 46102, 46105, 46106, 46101]
@@ -1695,7 +1844,10 @@ mod tests {
             MemoryOutput(Vec::new()),
         );
 
-        assert!(matches!(handler.poll_once(CHANNEL), Ok(true)));
+        assert!(matches!(
+            handler.poll_once(CHANNEL),
+            Ok(PollStep::Completed)
+        ));
         assert_eq!(handler.relay.published, vec![46101, 46101]);
         let record = &handler.store.run.as_ref().expect("durable run").1;
         assert_eq!(record.state(), RunState::InfrastructureFailure);
@@ -1735,11 +1887,15 @@ mod tests {
                 cursor: 0,
                 run: Some((2, running)),
                 publications: HashMap::new(),
+                deferred: BTreeSet::new(),
             },
             MemoryOutput(log),
         );
 
-        assert!(handler.poll_once(CHANNEL).expect("reconcile running"));
+        assert_eq!(
+            handler.poll_once(CHANNEL).expect("reconcile running"),
+            PollStep::Completed
+        );
         assert_eq!(handler.relay.published.first(), Some(&KIND_CI_RUN_STATUS));
         assert!(handler
             .store
@@ -1779,11 +1935,15 @@ mod tests {
                 cursor: 0,
                 run: Some((3, terminal)),
                 publications: HashMap::new(),
+                deferred: BTreeSet::new(),
             },
             MemoryOutput(Vec::new()),
         );
 
-        assert!(handler.poll_once(CHANNEL).expect("reconcile terminal"));
+        assert_eq!(
+            handler.poll_once(CHANNEL).expect("reconcile terminal"),
+            PollStep::Completed
+        );
         assert_eq!(handler.relay.published, vec![KIND_CI_RUN_STATUS]);
         assert_eq!(handler.store.cursor, 7);
         assert!(handler
@@ -2025,6 +2185,14 @@ mod tests {
                     .refresh_pending_publication(key, expected_event_id, replacement)
             }
 
+            fn defer_publication(&mut self, key: &str) -> Result<(), Self::Error> {
+                self.durable.defer_publication(key)
+            }
+
+            fn deferred_publications(&self) -> Result<Vec<String>, Self::Error> {
+                self.durable.deferred_publications()
+            }
+
             fn accept_publication(&mut self, key: &str, event_id: &str) -> Result<(), Self::Error> {
                 self.durable.accept_publication(key, event_id)
             }
@@ -2068,6 +2236,498 @@ mod tests {
             Some(StoredPublication::Pending(_))
         ));
         assert_eq!(reopened.cursor(CHANNEL).expect("cursor"), 0);
+    }
+
+    /// Relay double for the grant-order scenario: every publish consumes one
+    /// scripted answer (an empty script accepts), and only `Unauthorized` is
+    /// the relay's exact unauthorized-status-signer refusal.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Refusal {
+        Unauthorized,
+        Other,
+    }
+
+    struct ScriptedRelay {
+        accepted: Option<AcceptedRequest>,
+        answers: VecDeque<Result<(), Refusal>>,
+        published: Vec<String>,
+        exists: bool,
+    }
+
+    impl ScriptedRelay {
+        fn new(accepted: Option<AcceptedRequest>, answers: &[Result<(), Refusal>]) -> Self {
+            Self {
+                accepted,
+                answers: answers.iter().copied().collect(),
+                published: Vec::new(),
+                exists: false,
+            }
+        }
+    }
+
+    impl RelayControl for ScriptedRelay {
+        type Error = Refusal;
+
+        fn next_accepted(
+            &mut self,
+            _channel_id: &str,
+            after_cursor: u64,
+        ) -> Result<Option<AcceptedRequest>, Self::Error> {
+            Ok(self
+                .accepted
+                .as_ref()
+                .filter(|accepted| accepted.watch_cursor > after_cursor)
+                .cloned())
+        }
+
+        fn publish(&mut self, event: &SignedCiEvent) -> Result<String, Self::Error> {
+            self.published.push(event.event_id.clone());
+            match self.answers.pop_front() {
+                Some(Err(refusal)) => Err(refusal),
+                _ => Ok(event.event_id.clone()),
+            }
+        }
+
+        fn publication_exists(&mut self, _event: &SignedCiEvent) -> Result<bool, Self::Error> {
+            Ok(self.exists)
+        }
+
+        fn is_unauthorized_status_signer(&self, error: &Self::Error) -> bool {
+            *error == Refusal::Unauthorized
+        }
+
+        fn put_log(
+            &mut self,
+            _accepted: &AcceptedRequest,
+            _job: &JobCompletion,
+            _bytes: &[u8],
+        ) -> Result<StoredObject, Self::Error> {
+            Err(Refusal::Other)
+        }
+
+        fn put_artifact(
+            &mut self,
+            _accepted: &AcceptedRequest,
+            _job: &JobCompletion,
+            _artifact: &ArtifactCompletion,
+            _bytes: &[u8],
+        ) -> Result<StoredObject, Self::Error> {
+            Err(Refusal::Other)
+        }
+    }
+
+    /// Every signature gets a fresh id, as a keyholder re-sign does.
+    struct CountingSigner(u64);
+
+    impl CiSigner for CountingSigner {
+        type Error = ();
+
+        fn pubkey(&self) -> &str {
+            SIGNER
+        }
+
+        fn sign(
+            &mut self,
+            kind: u32,
+            content: &str,
+            tags: serde_json::Value,
+        ) -> Result<SignedCiEvent, Self::Error> {
+            self.0 += 1;
+            let event_id = hex::encode(Sha256::digest(self.0.to_be_bytes()));
+            Ok(SignedCiEvent {
+                event_id: event_id.clone(),
+                kind,
+                content: content.to_owned(),
+                tags: tags.clone(),
+                signed_event: serde_json::json!({"id": event_id, "kind": kind, "content": content, "tags": tags}),
+            })
+        }
+    }
+
+    fn counted_id(count: u64) -> String {
+        hex::encode(Sha256::digest(count.to_be_bytes()))
+    }
+
+    fn terminal_key() -> String {
+        format!("{}:run:terminal", "11".repeat(32))
+    }
+
+    fn stale_terminal_event() -> SignedCiEvent {
+        SignedCiEvent {
+            event_id: "aa".repeat(32),
+            kind: KIND_CI_RUN_STATUS,
+            content: "{}".to_owned(),
+            tags: serde_json::json!([]),
+            signed_event: serde_json::json!({"id": "aa".repeat(32), "kind": KIND_CI_RUN_STATUS}),
+        }
+    }
+
+    /// The M12 production shape: the head request's run is already terminal
+    /// locally, its terminal kind-46101 publication is still pending, and the
+    /// cursor has not moved past the request.
+    fn stale_terminal_record() -> RunRecord {
+        let identity = run_identity(&accepted()).expect("identity");
+        RunRecord::queued(identity, 10)
+            .expect("queued")
+            .transition(
+                RunState::InfrastructureFailure,
+                12,
+                Some("relay".to_owned()),
+            )
+            .expect("terminal")
+    }
+
+    fn stale_terminal_store() -> MemoryStore {
+        MemoryStore {
+            run: Some((1, stale_terminal_record())),
+            publications: HashMap::from([(
+                terminal_key(),
+                StoredPublication::Pending(stale_terminal_event()),
+            )]),
+            ..MemoryStore::default()
+        }
+    }
+
+    type GrantOrderHandler = ProductionHandler<
+        ScriptedRelay,
+        CountingSigner,
+        FailingExecutor,
+        MemoryStore,
+        MemoryOutput,
+    >;
+
+    fn grant_order_handler(
+        answers: &[Result<(), Refusal>],
+        store: MemoryStore,
+        deferral: bool,
+    ) -> GrantOrderHandler {
+        let mut handler = ProductionHandler::new(
+            ScriptedRelay::new(Some(accepted()), answers),
+            CountingSigner(0),
+            FailingExecutor,
+            store,
+            MemoryOutput(Vec::new()),
+        );
+        handler.set_replay_deferral(deferral);
+        handler
+    }
+
+    #[test]
+    fn startup_replay_refused_as_unauthorized_signer_is_deferred_before_the_grant() {
+        // Exact retry fails on age, the read-back finds nothing, the re-signed
+        // event is refused as an unauthorized signer: deferred, not terminal.
+        let mut handler = grant_order_handler(
+            &[Err(Refusal::Other), Err(Refusal::Unauthorized)],
+            stale_terminal_store(),
+            true,
+        );
+        assert_eq!(
+            handler.poll_once(CHANNEL).expect("deferred poll"),
+            PollStep::Deferred
+        );
+        assert_eq!(
+            handler.relay.published,
+            vec!["aa".repeat(32), counted_id(1)]
+        );
+        assert_eq!(
+            handler.store.deferred_publications().expect("deferred"),
+            vec![terminal_key()]
+        );
+        assert!(matches!(
+            handler.store.publications.get(&terminal_key()),
+            Some(StoredPublication::Pending(signed)) if signed.event_id == counted_id(1)
+        ));
+        assert_eq!(handler.store.cursor, 0, "the head request is not consumed");
+        assert!(handler
+            .store
+            .run
+            .as_ref()
+            .expect("run")
+            .1
+            .terminal_event_id()
+            .is_none());
+
+        // While deferred and before the grant, later polls neither re-sign nor
+        // touch the relay; the deferral is answered by the grant approval.
+        assert_eq!(
+            handler.poll_once(CHANNEL).expect("still deferred"),
+            PollStep::Deferred
+        );
+        assert_eq!(handler.relay.published.len(), 2);
+        assert_eq!(handler.signer.0, 1);
+        assert_eq!(
+            handler.store.deferred_publications().expect("deferred"),
+            vec![terminal_key()]
+        );
+    }
+
+    #[test]
+    fn deferred_replay_is_retried_after_the_grant_and_settles_the_head() {
+        let mut handler = grant_order_handler(
+            &[Err(Refusal::Other), Err(Refusal::Unauthorized)],
+            stale_terminal_store(),
+            true,
+        );
+        assert_eq!(
+            handler.poll_once(CHANNEL).expect("deferred poll"),
+            PollStep::Deferred
+        );
+
+        // The grant is acknowledged: deferral is cleared and the replay goes
+        // through the ordinary pending path (exact retry succeeds here).
+        handler.set_replay_deferral(false);
+        assert_eq!(
+            handler
+                .replay_deferred_publications(CHANNEL)
+                .expect("replay"),
+            1
+        );
+        assert_eq!(
+            handler.relay.published,
+            vec!["aa".repeat(32), counted_id(1), counted_id(1)]
+        );
+        assert!(handler
+            .store
+            .deferred_publications()
+            .expect("deferred")
+            .is_empty());
+        assert!(matches!(
+            handler.store.publications.get(&terminal_key()),
+            Some(StoredPublication::Accepted { signed, relay_event_id })
+                if signed.event_id == counted_id(1) && *relay_event_id == counted_id(1)
+        ));
+        let (_, record) = handler.store.run.clone().expect("run");
+        assert_eq!(record.terminal_event_id(), Some(counted_id(1).as_str()));
+        assert_eq!(
+            handler.store.cursor, 7,
+            "the terminal head is settled and consumed"
+        );
+        assert_eq!(handler.poll_once(CHANNEL).expect("idle"), PollStep::Idle);
+        assert_eq!(
+            handler
+                .replay_deferred_publications(CHANNEL)
+                .expect("nothing left"),
+            0
+        );
+        assert_eq!(handler.relay.published.len(), 3);
+    }
+
+    #[test]
+    fn durable_deferral_survives_restart_and_replays_from_the_reopened_store() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = fs::canonicalize(directory.path()).expect("root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("root mode");
+        let uid = fs::metadata(&root).expect("metadata").uid();
+        let mut store = DurableControlStore::open(root.clone(), uid).expect("store");
+        let identity = run_identity(&accepted()).expect("identity");
+        store
+            .compare_and_swap_run(&identity, None, &stale_terminal_record())
+            .expect("write run");
+        assert!(store
+            .record_publication_intent(&terminal_key(), &stale_terminal_event())
+            .expect("intent"));
+        let mut handler = ProductionHandler::new(
+            ScriptedRelay::new(
+                Some(accepted()),
+                &[Err(Refusal::Other), Err(Refusal::Unauthorized)],
+            ),
+            CountingSigner(0),
+            FailingExecutor,
+            store,
+            MemoryOutput(Vec::new()),
+        );
+        handler.set_replay_deferral(true);
+        assert_eq!(
+            handler.poll_once(CHANNEL).expect("deferred poll"),
+            PollStep::Deferred
+        );
+        drop(handler);
+
+        let reopened = DurableControlStore::open(root.clone(), uid).expect("reopen");
+        assert_eq!(
+            reopened.deferred_publications().expect("deferred"),
+            vec![terminal_key()]
+        );
+        assert!(matches!(
+            reopened.load_publication(&terminal_key()).expect("publication"),
+            Some(StoredPublication::Pending(signed)) if signed.event_id == counted_id(1)
+        ));
+        assert_eq!(reopened.cursor(CHANNEL).expect("cursor"), 0);
+
+        // A restart before the grant keeps deferring without touching the relay.
+        let mut restarted = ProductionHandler::new(
+            ScriptedRelay::new(Some(accepted()), &[]),
+            CountingSigner(1),
+            FailingExecutor,
+            reopened,
+            MemoryOutput(Vec::new()),
+        );
+        restarted.set_replay_deferral(true);
+        assert_eq!(
+            restarted.poll_once(CHANNEL).expect("deferred poll"),
+            PollStep::Deferred
+        );
+        assert!(restarted.relay.published.is_empty());
+
+        // After the grant the reopened store replays and clears the marker.
+        restarted.set_replay_deferral(false);
+        assert_eq!(
+            restarted
+                .replay_deferred_publications(CHANNEL)
+                .expect("replay"),
+            1
+        );
+        assert_eq!(restarted.relay.published, vec![counted_id(1)]);
+        drop(restarted);
+        let settled = DurableControlStore::open(root, uid).expect("reopen settled");
+        assert!(settled
+            .deferred_publications()
+            .expect("deferred")
+            .is_empty());
+        assert!(matches!(
+            settled.load_publication(&terminal_key()).expect("publication"),
+            Some(StoredPublication::Accepted { relay_event_id, .. }) if relay_event_id == counted_id(1)
+        ));
+        assert_eq!(settled.cursor(CHANNEL).expect("cursor"), 7);
+        let (_, record) = settled
+            .load_run(&identity)
+            .expect("run")
+            .expect("stored run");
+        assert_eq!(record.terminal_event_id(), Some(counted_id(1).as_str()));
+    }
+
+    #[test]
+    fn an_unauthorized_refusal_after_the_grant_is_terminal_as_before() {
+        // Deferral cleared (grant approved, or a restart after it): terminal.
+        let mut handler = grant_order_handler(
+            &[Err(Refusal::Other), Err(Refusal::Unauthorized)],
+            stale_terminal_store(),
+            false,
+        );
+        assert!(matches!(
+            handler.poll_once(CHANNEL),
+            Err(ProductionError::Relay)
+        ));
+        assert!(handler
+            .store
+            .deferred_publications()
+            .expect("deferred")
+            .is_empty());
+        assert_eq!(handler.store.cursor, 0);
+
+        // The replay itself is refused after the grant: terminal, marker kept
+        // durable for the next activation's grant rather than dropped.
+        let mut store = stale_terminal_store();
+        store
+            .defer_publication(&terminal_key())
+            .expect("deferred marker");
+        let mut replaying = grant_order_handler(
+            &[Err(Refusal::Unauthorized), Err(Refusal::Unauthorized)],
+            store,
+            false,
+        );
+        assert!(matches!(
+            replaying.replay_deferred_publications(CHANNEL),
+            Err(ProductionError::Relay)
+        ));
+        assert_eq!(
+            replaying.store.deferred_publications().expect("deferred"),
+            vec![terminal_key()]
+        );
+        assert!(matches!(
+            replaying.store.publications.get(&terminal_key()),
+            Some(StoredPublication::Pending(_))
+        ));
+        assert_eq!(replaying.store.cursor, 0);
+    }
+
+    #[test]
+    fn other_refusals_keep_their_terminal_meaning_while_deferral_is_enabled() {
+        let mut handler = grant_order_handler(
+            &[Err(Refusal::Other), Err(Refusal::Other)],
+            stale_terminal_store(),
+            true,
+        );
+        assert!(matches!(
+            handler.poll_once(CHANNEL),
+            Err(ProductionError::Relay)
+        ));
+        assert!(handler
+            .store
+            .deferred_publications()
+            .expect("deferred")
+            .is_empty());
+        assert!(matches!(
+            handler.store.publications.get(&terminal_key()),
+            Some(StoredPublication::Pending(signed)) if signed.event_id == counted_id(1)
+        ));
+        assert_eq!(handler.store.cursor, 0);
+
+        // An unauthorized refusal of the exact retry followed by an ordinary
+        // refusal of the re-signed event is the ordinary terminal failure too.
+        let mut mixed = grant_order_handler(
+            &[Err(Refusal::Unauthorized), Err(Refusal::Other)],
+            stale_terminal_store(),
+            true,
+        );
+        assert!(matches!(
+            mixed.poll_once(CHANNEL),
+            Err(ProductionError::Relay)
+        ));
+        assert!(mixed
+            .store
+            .deferred_publications()
+            .expect("deferred")
+            .is_empty());
+    }
+
+    #[test]
+    fn replay_republishes_a_queued_head_without_executing_it() {
+        let identity = run_identity(&accepted()).expect("identity");
+        let queued_key = format!("{}:run:queued", "11".repeat(32));
+        let queued_event = SignedCiEvent {
+            event_id: "cc".repeat(32),
+            kind: KIND_CI_RUN_STATUS,
+            content: "{}".to_owned(),
+            tags: serde_json::json!([]),
+            signed_event: serde_json::json!({"id": "cc".repeat(32), "kind": KIND_CI_RUN_STATUS}),
+        };
+        let mut store = MemoryStore {
+            run: Some((1, RunRecord::queued(identity, 10).expect("queued"))),
+            publications: HashMap::from([(
+                queued_key.clone(),
+                StoredPublication::Pending(queued_event),
+            )]),
+            ..MemoryStore::default()
+        };
+        store
+            .defer_publication(&queued_key)
+            .expect("deferred marker");
+        let mut handler = grant_order_handler(&[], store, false);
+        assert_eq!(
+            handler
+                .replay_deferred_publications(CHANNEL)
+                .expect("replay"),
+            1
+        );
+        assert_eq!(handler.relay.published, vec!["cc".repeat(32)]);
+        assert!(matches!(
+            handler.store.publications.get(&queued_key),
+            Some(StoredPublication::Accepted { .. })
+        ));
+        assert!(handler
+            .store
+            .deferred_publications()
+            .expect("deferred")
+            .is_empty());
+        // The queued run is left to the ordinary poll: not executed, no
+        // terminal publication, cursor unchanged.
+        assert_eq!(
+            handler.store.run.as_ref().expect("run").1.state(),
+            RunState::Queued
+        );
+        assert!(!handler.store.publications.contains_key(&terminal_key()));
+        assert_eq!(handler.store.cursor, 0);
     }
 
     #[cfg(target_os = "linux")]

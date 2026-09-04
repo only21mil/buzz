@@ -11,8 +11,8 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::production::{
-    AttemptExecutor, CiSigner, ControlStore, EvidenceReader, ProductionError, ProductionHandler,
-    RelayControl, RunnerAttemptExecutor, RunnerAttemptPreparer,
+    AttemptExecutor, CiSigner, ControlStore, EvidenceReader, PollStep, ProductionError,
+    ProductionHandler, RelayControl, RunnerAttemptExecutor, RunnerAttemptPreparer,
 };
 use crate::runner_client::{RunnerClient, RunnerConnector};
 
@@ -286,6 +286,9 @@ impl From<&ProductionError> for TerminalInfrastructureReason {
             ProductionError::Invalid => Self::InvalidInput,
             ProductionError::State(_) => Self::State,
             ProductionError::PublicationConflict => Self::PublicationConflict,
+            // A deferral is absorbed by the handler's poll boundary; one that
+            // escapes it is the relay refusal it stands for.
+            ProductionError::DeferredPublication => Self::Relay,
         }
     }
 }
@@ -294,6 +297,9 @@ impl From<&ProductionError> for TerminalInfrastructureReason {
 pub enum PollOutcome {
     Idle,
     CompletedOne,
+    /// The head request's publication replay was deferred until the
+    /// activation grant is approved; the controller stays ready.
+    Deferred,
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -351,13 +357,46 @@ where
         }
         self.status = CapacityOneStatus::polling();
         match self.handler.poll_once(self.config.channel_id()) {
-            Ok(processed) => {
+            Ok(step) => {
                 self.status = CapacityOneStatus::ready();
-                Ok(if processed {
-                    PollOutcome::CompletedOne
-                } else {
-                    PollOutcome::Idle
+                Ok(match step {
+                    PollStep::Completed => PollOutcome::CompletedOne,
+                    PollStep::Idle => PollOutcome::Idle,
+                    PollStep::Deferred => PollOutcome::Deferred,
                 })
+            }
+            Err(error) => {
+                let reason = TerminalInfrastructureReason::from(&error);
+                self.status = CapacityOneStatus::terminal(reason);
+                Err(ControllerError::Infrastructure(reason))
+            }
+        }
+    }
+
+    /// Enable or clear replay deferral on the handler (see
+    /// `ProductionHandler::set_replay_deferral`).
+    pub fn set_replay_deferral(&mut self, enabled: bool) {
+        self.handler.set_replay_deferral(enabled);
+    }
+
+    pub const fn replay_deferral(&self) -> bool {
+        self.handler.replay_deferral()
+    }
+
+    /// Replay every deferred publication after the activation grant was
+    /// accepted by the relay. Any error is terminal exactly like a poll error.
+    pub fn replay_deferred_publications(&mut self) -> Result<usize, ControllerError> {
+        if let Some(reason) = self.status.terminal_reason() {
+            return Err(ControllerError::Terminal(reason));
+        }
+        self.status = CapacityOneStatus::polling();
+        match self
+            .handler
+            .replay_deferred_publications(self.config.channel_id())
+        {
+            Ok(replayed) => {
+                self.status = CapacityOneStatus::ready();
+                Ok(replayed)
             }
             Err(error) => {
                 let reason = TerminalInfrastructureReason::from(&error);
@@ -521,6 +560,14 @@ mod tests {
             Err(())
         }
 
+        fn defer_publication(&mut self, _key: &str) -> Result<(), Self::Error> {
+            Err(())
+        }
+
+        fn deferred_publications(&self) -> Result<Vec<String>, Self::Error> {
+            Ok(Vec::new())
+        }
+
         fn accept_publication(&mut self, _key: &str, _event_id: &str) -> Result<(), Self::Error> {
             Err(())
         }
@@ -607,6 +654,48 @@ mod tests {
         assert_eq!(controller.status().available_capacity(), 1);
         assert_eq!(controller.status().in_flight(), 0);
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn replay_deferral_is_a_handler_switch_and_replay_follows_the_poll_contract() {
+        let calls = Rc::new(Cell::new(0));
+        let mut controller =
+            CapacityOneController::activate(config(), providers(Rc::clone(&calls), false))
+                .expect("activate");
+        assert!(
+            !controller.replay_deferral(),
+            "deferral is off until the service enables it"
+        );
+        controller.set_replay_deferral(true);
+        assert!(controller.replay_deferral());
+        controller.set_replay_deferral(false);
+        assert!(!controller.replay_deferral());
+        // Nothing deferred: the replay is a no-op that leaves capacity open.
+        assert_eq!(controller.replay_deferred_publications(), Ok(0));
+        assert_eq!(controller.status(), CapacityOneStatus::ready());
+        assert_eq!(calls.get(), 0, "no deferred key, no relay read");
+        assert_eq!(
+            TerminalInfrastructureReason::from(&ProductionError::DeferredPublication),
+            TerminalInfrastructureReason::Relay,
+            "a deferral that escapes the poll boundary is the relay refusal it stands for"
+        );
+
+        let mut failed =
+            CapacityOneController::activate(config(), providers(Rc::clone(&calls), true))
+                .expect("activate");
+        assert_eq!(
+            failed.poll_once(),
+            Err(ControllerError::Infrastructure(
+                TerminalInfrastructureReason::Relay
+            ))
+        );
+        assert_eq!(
+            failed.replay_deferred_publications(),
+            Err(ControllerError::Terminal(
+                TerminalInfrastructureReason::Relay
+            )),
+            "a closed controller never replays"
+        );
     }
 
     #[test]

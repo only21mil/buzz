@@ -79,6 +79,16 @@ impl AcceptanceJournal {
         Duration::from_millis(self.binding.timeout_millis)
     }
 
+    /// Number of scenario operations this activation's ledger has completed.
+    /// Entries are recorded in protocol order (sequence 1 first), so a count of
+    /// at least `n` means every operation up to sequence `n` finished.
+    pub fn completed_sequences(&self) -> Result<u32, AcceptanceSocketError> {
+        self.with_locked(|ledger| {
+            ledger.validate(&self.binding)?;
+            Ok(u32::try_from(ledger.entries.len()).unwrap_or(u32::MAX))
+        })
+    }
+
     /// Validate activation, sequence, capacity, generation, and replay bindings
     /// before invoking an operation. Exact retries return the durable response.
     pub fn execute<E>(
@@ -882,13 +892,20 @@ mod tests {
         let request = request();
         let exact = serde_json::to_vec(&request).unwrap();
         let journal = AcceptanceJournal::open(root.path(), owner_uid, binding(&request)).unwrap();
+        assert_eq!(journal.completed_sequences().unwrap(), 0);
         let expected = Handler.handle(&request, &exact).unwrap();
         let first = journal
             .execute(&request, &exact, 0, |_| Ok::<_, ()>(expected.clone()))
             .unwrap();
         assert_eq!(first, expected);
+        assert_eq!(journal.completed_sequences().unwrap(), 1);
 
         let reopened = AcceptanceJournal::open(root.path(), owner_uid, binding(&request)).unwrap();
+        assert_eq!(
+            reopened.completed_sequences().unwrap(),
+            1,
+            "the completed count is durable across a controld restart"
+        );
         let replayed = reopened
             .execute(&request, &exact, 0, |_| {
                 Err::<AdapterResponse, _>("operation must not run")

@@ -43,6 +43,13 @@ use url::Url;
 
 use crate::config::DaemonConfig;
 
+/// Scenario sequence of `Operation::ApproveGrant`, the step that publishes the
+/// activation's kind-46107 grant. Until the ledger records it, a pending
+/// publication whose replay the relay refuses as an unauthorized status signer
+/// is deferred rather than terminal (the M12 canary failed because the stale
+/// terminal replay ran before this step and the grant needed the same key).
+const APPROVE_GRANT_SEQUENCE: u32 = 4;
+
 /// A locally validated daemon which owns no production capability.
 pub(crate) struct CapacityZeroService {
     status: CapacityOneStatus,
@@ -279,7 +286,7 @@ impl CapacityOneService {
             },
         )?;
         let store = DurableControlStore::open(config.store_root(), expected_owner_uid)?;
-        let controller = CapacityOneController::activate(
+        let mut controller = CapacityOneController::activate(
             controller_config,
             CapacityOneProviderSlots::new(
                 Some(relay),
@@ -297,6 +304,12 @@ impl CapacityOneService {
         }
         let acceptance = acceptance_journal(config, expected_owner_uid, acceptance_binding)?
             .ok_or(ServiceError::InvalidConfig)?;
+        // Startup replays pending publications before the acceptance protocol
+        // can approve this activation's grant. Defer unauthorized-signer
+        // refusals until that approval; after it (including a restart later in
+        // the same activation) they stay terminal.
+        let grant_approved = acceptance.completed_sequences()? >= APPROVE_GRANT_SEQUENCE;
+        controller.set_replay_deferral(!grant_approved);
         Ok(Self {
             status: controller.status(),
             controller: Some(controller),
@@ -493,6 +506,7 @@ impl AcceptanceOperationHandler for CapacityOneService {
             }
             (4, Operation::ApproveGrant) => {
                 self.publish_acceptance(AcceptanceMutation::Grant)?;
+                self.replay_deferred_after_grant()?;
                 Ok(approved_response(request))
             }
             (5, Operation::ResumeGrant) => {
@@ -591,6 +605,26 @@ impl CapacityOneService {
             return Err(AcceptanceSocketError::Operation);
         }
         Ok(())
+    }
+
+    /// The relay acknowledged this activation's grant: replay deferred
+    /// publications now, before the approval is answered, so the head of the
+    /// relay queue is settled before the driver resumes the attempt. Deferral
+    /// is cleared first; a refusal from here on is terminal as it always was.
+    fn replay_deferred_after_grant(&mut self) -> Result<(), AcceptanceSocketError> {
+        if self.controller_worker.is_some() {
+            return Err(AcceptanceSocketError::Operation);
+        }
+        let controller = self
+            .controller
+            .as_mut()
+            .ok_or(AcceptanceSocketError::Operation)?;
+        controller.set_replay_deferral(false);
+        let replayed = controller.replay_deferred_publications();
+        self.status = controller.status();
+        replayed
+            .map(|_| ())
+            .map_err(|_| AcceptanceSocketError::Operation)
     }
 
     fn cancel_active_attempt(
