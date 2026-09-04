@@ -4,8 +4,16 @@
     "integrated_candidate_sha": "784c368b2f268a05abf0782b0901837fdc4cf044",
     "activation_id": "buzz-ci-capacity-one-784c368b2f26-bbbbbbbbbbbb",
     "activation_package_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "run_id": "11111111111111111111111111111111",
-    "failure_run_id": "11111111111111111111ffffffffffff",
+    "run_id": "11111111111151119111111111111111",
+    "failure_run_id": "11111111111151119111111111111112",
+    "failure_selector": {
+      "schema_version": "buzz-ci-capacity-one-fixture-selector/v1",
+      "selector": "deterministic-failure",
+      "job_id": "capacity-one-fixture",
+      "run_id": "11111111-1111-5111-9111-111111111112",
+      "attempt": 1,
+      "sha256": "d4efa261072c10514cbbedd8c1eaebfcbbeaa415f64c4b7299d3dfe306844994"
+    },
     "job_id": "capacity-one-fixture",
     "request_digest": "2222222222222222222222222222222222222222222222222222222222222222",
     "failure_request_digest": "9999999999999999999999999999999999999999999999999999999999999999",

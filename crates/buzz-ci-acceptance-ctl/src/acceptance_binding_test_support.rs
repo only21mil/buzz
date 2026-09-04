@@ -4,7 +4,7 @@ use buzz_core::ci::{request_tags, CiRequestEnvelope, CiRequestType, CI_SCHEMA_VE
 use buzz_core::kind::{KIND_CI_GRANT, KIND_CI_REQUEST, KIND_DELETION};
 use sha2::{Digest, Sha256};
 
-use crate::acceptance::{EvidenceObject, FixtureSpec};
+use crate::acceptance::{EvidenceObject, FixtureSelector, FixtureSpec};
 use crate::acceptance_binding::{
     AcceptanceActorBinding, AcceptanceAuthorityBinding, AcceptanceBindingReceipt,
     ACCEPTANCE_BINDING_SCHEMA,
@@ -77,7 +77,7 @@ pub fn canonical_acceptance_binding() -> AcceptanceBindingReceipt {
         .expect("grant content")
     ]);
     let mut failure_run = run.clone();
-    failure_run.run_id = "13131313-1313-1313-1313-ffffffffffff".to_owned();
+    failure_run.run_id = "13131313-1313-5313-9313-131313131314".to_owned();
     failure_run.idempotency_key = "123e4567-e89b-12d3-a456-426614174014".to_owned();
     let failure_run_event = serde_json::json!([
         0,
@@ -115,6 +115,11 @@ pub fn canonical_acceptance_binding() -> AcceptanceBindingReceipt {
     let request_digest = event_id(&run_event);
     let failure_request_digest = event_id(&failure_run_event);
     let grant_event_id = event_id(&grant_event);
+    let selector_run_id = uuid::Uuid::parse_str(&run.run_id).expect("failure run UUID");
+    let selector_bytes = format!(
+        "buzz-ci:capacity-one:fixture-selector:v1\nbuzz-ci-capacity-one-fixture-selector/v1\ndeterministic-failure\ntest\n{}\n1\n",
+        selector_run_id.simple(),
+    );
     AcceptanceBindingReceipt {
         schema_version: ACCEPTANCE_BINDING_SCHEMA.to_owned(),
         activation_id: "activation-1".to_owned(),
@@ -130,7 +135,15 @@ pub fn canonical_acceptance_binding() -> AcceptanceBindingReceipt {
             activation_id: "activation-1".to_owned(),
             activation_package_digest: "12".repeat(32),
             run_id: "13".repeat(16),
-            failure_run_id: format!("{}{}", "13".repeat(10), "ff".repeat(6)),
+            failure_run_id: "13131313131353139313131313131314".to_owned(),
+            failure_selector: FixtureSelector {
+                schema_version: "buzz-ci-capacity-one-fixture-selector/v1".to_owned(),
+                selector: "deterministic-failure".to_owned(),
+                job_id: "test".to_owned(),
+                run_id: selector_run_id.hyphenated().to_string(),
+                attempt: 1,
+                sha256: hex::encode(Sha256::digest(selector_bytes.as_bytes())),
+            },
             job_id: "test".to_owned(),
             request_digest,
             failure_request_digest,

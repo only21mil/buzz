@@ -676,7 +676,7 @@ def _acceptance_binding(manifest: dict[str, Any], scenario: object) -> dict[str,
         raise ValueError("acceptance scenario schema is unsupported")
     fixture = scenario["fixture"]
     fixture_fields = (
-        "integrated_candidate_sha", "activation_id", "activation_package_digest", "run_id", "failure_run_id", "job_id",
+        "integrated_candidate_sha", "activation_id", "activation_package_digest", "run_id", "failure_run_id", "failure_selector", "job_id",
         "request_digest", "failure_request_digest", "manifest_digest", "source_oid", "approval_id", "grant_event_id", "grant_digest",
         "approved_by", "export_subject", "export_authorization_digest", "controller_generation",
         "runner_generation", "expected_log", "expected_failure_log", "expected_artifacts",
@@ -710,6 +710,7 @@ def _acceptance_binding(manifest: dict[str, Any], scenario: object) -> dict[str,
         "activation_package_digest": _scenario_hex(fixture["activation_package_digest"], {64}, "activation package digest"),
         "run_id": _scenario_hex(fixture["run_id"], {32}, "run id"),
         "failure_run_id": _scenario_hex(fixture["failure_run_id"], {32}, "failure run id"),
+        "failure_selector": activation_package.validate_fixture_selector(fixture["failure_selector"]),
         "job_id": job_id,
         "request_digest": _scenario_hex(fixture["request_digest"], {64}, "request digest"),
         "failure_request_digest": _scenario_hex(fixture["failure_request_digest"], {64}, "failure request digest"),
@@ -768,6 +769,7 @@ def _acceptance_binding(manifest: dict[str, Any], scenario: object) -> dict[str,
         or ordered_fixture["failure_request_digest"] != failure_request_digest
         or ordered_fixture["run_id"] != run["run_id"].replace("-", "")
         or ordered_fixture["failure_run_id"] != failure_run["run_id"].replace("-", "")
+        or ordered_fixture["failure_selector"] != template["failure_selector"]
     ):
         raise ValueError("acceptance scenario run binding differs from the frozen public template")
     acceptance = {
@@ -1071,6 +1073,7 @@ def _generated_acceptance_files(
         "schema_version": "buzz-ci-capacity-one-driver-config/v1",
         **common,
         "failure_run_id": fixture["failure_run_id"],
+        "failure_selector": fixture["failure_selector"],
         "failure_request_digest": fixture["failure_request_digest"],
         "controld_uid": controld["uid"],
         "controld_gid": controld["gid"],
@@ -1131,6 +1134,9 @@ def _render_execd_config(
         "runner_generation": fixture["runner_generation"],
     })
     execution = rendered.get("execution")
+    if not isinstance(execution, dict):
+        raise ValueError("execd execution declaration is absent")
+    execution["failure_selector"] = fixture["failure_selector"]
     activation_package.validate_execution_declaration(execution, allow_placeholder=True)
     if fixture.get("manifest_digest") != execution.get("fixture_manifest_sha256"):
         raise ValueError("acceptance fixture manifest digest differs from the execd execution fixture")

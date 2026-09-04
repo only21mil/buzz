@@ -554,6 +554,7 @@ class ActivationFixture:
                 "activation_package_digest": self.manifest["package_digest"],
                 "run_id": run_id,
                 "failure_run_id": failure_run_id,
+                "failure_selector": copy.deepcopy(self.acceptance_template["failure_selector"]),
                 "job_id": "capacity-one-fixture",
                 "request_digest": request_digest,
                 "failure_request_digest": failure_request_digest,

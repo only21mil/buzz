@@ -59,6 +59,43 @@ pub struct EvidenceObject {
     pub bytes: u64,
 }
 
+/// Public, digest-bound selector that makes only Run B attempt 1 fail.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureSelector {
+    pub schema_version: String,
+    pub selector: String,
+    pub job_id: String,
+    pub run_id: String,
+    pub attempt: u32,
+    pub sha256: String,
+}
+
+pub(crate) fn valid_fixture_selector(
+    value: &FixtureSelector,
+    failure_run_id: &str,
+    job_id: &str,
+) -> bool {
+    let Ok(run_id) = uuid::Uuid::parse_str(&value.run_id) else {
+        return false;
+    };
+    let encoded = format!(
+        "buzz-ci:capacity-one:fixture-selector:v1\n{}\n{}\n{}\n{}\n{}\n",
+        value.schema_version,
+        value.selector,
+        value.job_id,
+        run_id.simple(),
+        value.attempt,
+    );
+    value.schema_version == "buzz-ci-capacity-one-fixture-selector/v1"
+        && value.selector == "deterministic-failure"
+        && value.job_id == job_id
+        && value.attempt == 1
+        && value.run_id == run_id.hyphenated().to_string()
+        && run_id.simple().to_string() == failure_run_id
+        && value.sha256 == hex::encode(Sha256::digest(encoded.as_bytes()))
+}
+
 /// Immutable fixture identities and expected outputs.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -68,6 +105,7 @@ pub struct FixtureSpec {
     pub activation_package_digest: String,
     pub run_id: String,
     pub failure_run_id: String,
+    pub failure_selector: FixtureSelector,
     pub job_id: String,
     pub request_digest: String,
     pub failure_request_digest: String,
@@ -2117,6 +2155,20 @@ fn validate_scenario(scenario: &AcceptanceScenario) -> Result<(), ScenarioError>
     {
         return Err(ScenarioError::InvalidField("fixture.failure_run_id"));
     }
+    let run_uuid = uuid::Uuid::parse_str(&fixture.run_id)
+        .map_err(|_| ScenarioError::InvalidField("fixture.run_id"))?;
+    let failure_uuid = uuid::Uuid::parse_str(&fixture.failure_run_id)
+        .map_err(|_| ScenarioError::InvalidField("fixture.failure_run_id"))?;
+    if run_uuid.get_version_num() != 5
+        || failure_uuid.get_version_num() != 5
+        || !valid_fixture_selector(
+            &fixture.failure_selector,
+            &fixture.failure_run_id,
+            &fixture.job_id,
+        )
+    {
+        return Err(ScenarioError::InvalidField("fixture.failure_selector"));
+    }
     if fixture.activation_id.is_empty()
         || fixture.activation_id.len() > 128
         || !fixture
@@ -2514,6 +2566,22 @@ mod tests {
         }
     }
 
+    fn selector(run_id: &str, job_id: &str) -> FixtureSelector {
+        let parsed = uuid::Uuid::parse_str(run_id).unwrap();
+        let encoded = format!(
+            "buzz-ci:capacity-one:fixture-selector:v1\nbuzz-ci-capacity-one-fixture-selector/v1\ndeterministic-failure\n{job_id}\n{}\n1\n",
+            parsed.simple(),
+        );
+        FixtureSelector {
+            schema_version: "buzz-ci-capacity-one-fixture-selector/v1".into(),
+            selector: "deterministic-failure".into(),
+            job_id: job_id.into(),
+            run_id: parsed.hyphenated().to_string(),
+            attempt: 1,
+            sha256: hex::encode(Sha256::digest(encoded.as_bytes())),
+        }
+    }
+
     fn scenario() -> AcceptanceScenario {
         let endpoint = ProcessEndpoint {
             program: "/usr/libexec/buzz-ci-capacity-one-driver".to_owned(),
@@ -2525,8 +2593,9 @@ mod tests {
                 integrated_candidate_sha: hex('a', 40),
                 activation_id: "buzz-ci-capacity-one-test".to_owned(),
                 activation_package_digest: hex('8', 64),
-                run_id: hex('b', 32),
-                failure_run_id: format!("{}{}", hex('c', 20), hex('f', 12)),
+                run_id: "bbbbbbbbbbbb5bbb9bbbbbbbbbbbbbbb".into(),
+                failure_run_id: "cccccccccccc5ccc9ccccccccccccccc".into(),
+                failure_selector: selector("cccccccc-cccc-5ccc-9ccc-cccccccccccc", "fixture"),
                 job_id: "fixture".to_owned(),
                 request_digest: hex('c', 64),
                 failure_request_digest: hex('f', 64),

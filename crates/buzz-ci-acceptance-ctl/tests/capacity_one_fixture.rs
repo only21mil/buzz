@@ -65,6 +65,7 @@ fn checked_in_scenario_and_fixture_bytes_match() {
     fs::create_dir_all(&output_dir).unwrap();
     let output = Command::new(acceptance.join("fixtures/run-fixture.sh"))
         .arg(&output_dir)
+        .env("BUZZ_CI_FIXTURE_OUTCOME", "success")
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -77,8 +78,7 @@ fn checked_in_scenario_and_fixture_bytes_match() {
 
     let failed = Command::new(acceptance.join("fixtures/run-fixture.sh"))
         .arg(&output_dir)
-        .env("BUZZ_CI_RUN_ID", "123e4567-e89b-12d3-a456-ffffffffffff")
-        .env("BUZZ_CI_ATTEMPT", "1")
+        .env("BUZZ_CI_FIXTURE_OUTCOME", "deterministic-failure")
         .output()
         .unwrap();
     assert!(!failed.status.success());

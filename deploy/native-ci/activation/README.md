@@ -343,8 +343,9 @@ never frozen into the activation package.
 
 The templates also carry one closed `execution` declaration. Its digest is a
 domain-separated SHA-256 over the candidate OID, final package digest, lane and
-isolation digests, fixed workflow/job/artifact, the three fixture digests, and
-big-endian resource limits. The freezer accepts only a zero digest placeholder;
+isolation digests, fixed workflow/job/artifact, the three fixture digests, the
+hash-bound Run B failure selector, and big-endian resource limits. The freezer
+accepts only a zero digest placeholder;
 the controller computes the nonzero declaration after the final package digest
 and scenario manifest binding are known. The installed immutable sources are
 `/usr/share/buzzci/execd-v2/fixture/fixture-manifest.json` and `input.txt`

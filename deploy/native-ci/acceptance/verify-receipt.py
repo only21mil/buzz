@@ -8,6 +8,7 @@ import json
 import os
 import stat
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -328,7 +329,7 @@ def _ordered_scenario(value: Any) -> dict[str, Any]:
     _require(value["schema_version"] == "buzz-ci-capacity-one-scenario/v2", "scenario version rejected")
     fixture_fields = [
         "integrated_candidate_sha", "activation_id", "activation_package_digest", "run_id",
-        "failure_run_id", "job_id", "request_digest", "failure_request_digest", "manifest_digest", "source_oid", "approval_id",
+        "failure_run_id", "failure_selector", "job_id", "request_digest", "failure_request_digest", "manifest_digest", "source_oid", "approval_id",
         "grant_event_id", "grant_digest", "approved_by", "export_subject",
         "export_authorization_digest", "controller_generation", "runner_generation",
         "expected_log", "expected_failure_log", "expected_artifacts",
@@ -342,6 +343,33 @@ def _ordered_scenario(value: Any) -> dict[str, Any]:
     _require(fixture["run_id"] != fixture["failure_run_id"], "run identities must be distinct")
     _require(fixture["request_digest"] != fixture["failure_request_digest"], "request identities must be distinct")
     _require(isinstance(fixture["job_id"], str) and 0 < len(fixture["job_id"]) <= 64, "job ID rejected")
+    selector = _exact(
+        fixture["failure_selector"],
+        ["schema_version", "selector", "job_id", "run_id", "attempt", "sha256"],
+    )
+    _require(
+        selector["schema_version"] == "buzz-ci-capacity-one-fixture-selector/v1"
+        and selector["selector"] == "deterministic-failure"
+        and selector["job_id"] == fixture["job_id"]
+        and selector["attempt"] == 1,
+        "failure selector rejected",
+    )
+    try:
+        selector_run_id = str(uuid.UUID(selector["run_id"]))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ReceiptError("failure selector run ID rejected") from error
+    _require(selector_run_id == selector["run_id"], "failure selector run ID rejected")
+    selector_lines = (
+        "buzz-ci:capacity-one:fixture-selector:v1",
+        selector["schema_version"], selector["selector"], selector["job_id"],
+        uuid.UUID(selector_run_id).hex, str(selector["attempt"]),
+    )
+    selector_sha256 = hashlib.sha256(("\n".join(selector_lines) + "\n").encode("ascii")).hexdigest()
+    _require(
+        selector["sha256"] == selector_sha256
+        and uuid.UUID(selector_run_id).hex == fixture["failure_run_id"],
+        "failure selector binding rejected",
+    )
     _integer(fixture["controller_generation"], 1); _integer(fixture["runner_generation"], 1)
     _ordered_evidence(fixture["expected_log"])
     _ordered_evidence(fixture["expected_failure_log"])
@@ -356,6 +384,10 @@ def _ordered_scenario(value: Any) -> dict[str, Any]:
         _require(endpoint.get("args", []) == [], "driver arguments rejected")
     _integer(driver["timeout_seconds"], 1, 300)
     ordered_fixture = {name: fixture[name] for name in fixture_fields}
+    ordered_fixture["failure_selector"] = {
+        name: selector[name]
+        for name in ("schema_version", "selector", "job_id", "run_id", "attempt", "sha256")
+    }
     ordered_fixture["expected_log"] = _ordered_evidence(fixture["expected_log"])
     ordered_fixture["expected_failure_log"] = _ordered_evidence(fixture["expected_failure_log"])
     ordered_fixture["expected_artifacts"] = [_ordered_evidence(item) for item in fixture["expected_artifacts"]]

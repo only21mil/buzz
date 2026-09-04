@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::acceptance::valid_fixture_selector;
 use crate::acceptance::{
     AcceptanceDriver, AdmissionState, DriverRequest, DriverResponse, FixtureSpec, Operation,
     Outcome, Stage, ZeroOperation, ZeroPhaseReceipt, ZeroPhaseRequest, ZeroPhaseResponse,
@@ -95,6 +96,7 @@ pub struct ProductionDriverConfig {
     pub scenario_sha256: String,
     pub run_id: String,
     pub failure_run_id: String,
+    pub failure_selector: crate::acceptance::FixtureSelector,
     pub job_id: String,
     pub request_digest: String,
     pub failure_request_digest: String,
@@ -143,6 +145,7 @@ impl ProductionDriverConfig {
             || !lower_hex(&self.scenario_sha256, &[64])
             || !lower_hex(&self.run_id, &[32])
             || !lower_hex(&self.failure_run_id, &[32])
+            || !valid_fixture_selector(&self.failure_selector, &self.failure_run_id, &self.job_id)
             || !valid_name(&self.job_id, 64)
             || !lower_hex(&self.request_digest, &[64])
             || !lower_hex(&self.failure_request_digest, &[64])
@@ -164,6 +167,7 @@ impl ProductionDriverConfig {
             && request.fixture.integrated_candidate_sha == self.integrated_candidate_sha
             && request.fixture.run_id == self.run_id
             && request.fixture.failure_run_id == self.failure_run_id
+            && request.fixture.failure_selector == self.failure_selector
             && request.fixture.job_id == self.job_id
             && request.fixture.request_digest == self.request_digest
             && request.fixture.failure_request_digest == self.failure_request_digest
@@ -856,6 +860,11 @@ fn valid_request(request: &DriverRequest<'_>) -> bool {
         && lower_hex(&fixture.integrated_candidate_sha, &[40, 64])
         && lower_hex(&fixture.run_id, &[32])
         && lower_hex(&fixture.failure_run_id, &[32])
+        && valid_fixture_selector(
+            &fixture.failure_selector,
+            &fixture.failure_run_id,
+            &fixture.job_id,
+        )
         && valid_name(&fixture.job_id, 64)
         && lower_hex(&fixture.request_digest, &[64])
         && lower_hex(&fixture.failure_request_digest, &[64])
@@ -3120,12 +3129,26 @@ mod tests {
     }
 
     fn fixture() -> FixtureSpec {
+        let failure_run_id = "cccccccccccc5ccc9ccccccccccccccc";
+        let parsed = uuid::Uuid::parse_str(failure_run_id).unwrap();
+        let selector_bytes = format!(
+            "buzz-ci:capacity-one:fixture-selector:v1\nbuzz-ci-capacity-one-fixture-selector/v1\ndeterministic-failure\nfixture\n{}\n1\n",
+            parsed.simple(),
+        );
         FixtureSpec {
             integrated_candidate_sha: hex('a', 40),
             activation_id: "buzz-ci-capacity-one-test".into(),
             activation_package_digest: hex('b', 64),
-            run_id: hex('c', 32),
-            failure_run_id: format!("{}{}", hex('c', 20), hex('f', 12)),
+            run_id: "bbbbbbbbbbbb5bbb9bbbbbbbbbbbbbbb".into(),
+            failure_run_id: failure_run_id.into(),
+            failure_selector: crate::acceptance::FixtureSelector {
+                schema_version: "buzz-ci-capacity-one-fixture-selector/v1".into(),
+                selector: "deterministic-failure".into(),
+                job_id: "fixture".into(),
+                run_id: parsed.hyphenated().to_string(),
+                attempt: 1,
+                sha256: hex::encode(Sha256::digest(selector_bytes.as_bytes())),
+            },
             job_id: "fixture".into(),
             request_digest: hex('d', 64),
             failure_request_digest: hex('9', 64),
@@ -3158,14 +3181,16 @@ mod tests {
     }
 
     fn config() -> ProductionDriverConfig {
+        let fixture = fixture();
         ProductionDriverConfig {
             schema_version: CONFIG_SCHEMA.into(),
             activation_id: "buzz-ci-capacity-one-test".into(),
             activation_package_digest: hex('b', 64),
             integrated_candidate_sha: hex('a', 40),
             scenario_sha256: hex('9', 64),
-            run_id: hex('c', 32),
-            failure_run_id: format!("{}{}", hex('c', 20), hex('f', 12)),
+            run_id: fixture.run_id,
+            failure_run_id: fixture.failure_run_id,
+            failure_selector: fixture.failure_selector,
             job_id: "fixture".into(),
             request_digest: hex('d', 64),
             failure_request_digest: hex('9', 64),

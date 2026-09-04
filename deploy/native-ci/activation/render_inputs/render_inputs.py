@@ -681,6 +681,9 @@ def load_template_bindings(root: DescriptorRoot, descriptor: dict[str, Any], nam
         bindings["activation_failure_run_id"] = activation_failure_run_id(
             manifests["activation"],
         )
+        bindings["activation_failure_selector"] = activation_failure_selector(
+            manifests["activation"],
+        )
         bindings["activation_grant_event_id"] = activation_grant_event_id(
             manifests["activation"],
         )
@@ -756,7 +759,7 @@ def _activation_acceptance_template(activation: object) -> dict[str, Any]:
             activation["acceptance_template"],
         )
     except (AttributeError, KeyError, TypeError, ValueError) as error:
-        raise RenderError("activation acceptance template binding is invalid") from error
+        raise RenderError(f"activation acceptance template binding is invalid: {error}") from error
 
 
 def activation_request_digest(activation: object) -> str:
@@ -790,6 +793,13 @@ def activation_run_id(activation: object) -> str:
 
 def activation_failure_run_id(activation: object) -> str:
     return _template_run_id(activation, "failure_run_event")
+
+
+def activation_failure_selector(activation: object) -> dict[str, Any]:
+    """Return the exact public, hash-bound Run B fixture selector."""
+    return activation_package_module().validate_fixture_selector(
+        _activation_acceptance_template(activation)["failure_selector"],
+    )
 
 
 def activation_grant_event_id(activation: object) -> str:
@@ -938,7 +948,7 @@ def validate_scenario(value: object, bindings: dict[str, Any]) -> dict[str, Any]
         raise RenderError("capacity-one scenario fixture differs")
     required = {
         "integrated_candidate_sha", "activation_id", "activation_package_digest", "run_id",
-        "failure_run_id", "job_id", "request_digest", "failure_request_digest",
+        "failure_run_id", "failure_selector", "job_id", "request_digest", "failure_request_digest",
         "manifest_digest", "source_oid", "approval_id",
         "grant_event_id", "grant_digest", "approved_by", "export_subject",
         "export_authorization_digest", "controller_generation", "runner_generation",
@@ -972,6 +982,7 @@ def validate_scenario(value: object, bindings: dict[str, Any]) -> dict[str, Any]
         "failure_request_digest": failure_request_digest,
         "run_id": activation_run_id(activation),
         "failure_run_id": activation_failure_run_id(activation),
+        "failure_selector": activation_failure_selector(activation),
         "manifest_digest": activation_fixture_manifest_sha256(activation),
         "grant_event_id": grant_event_id,
         "approved_by": approved_by,

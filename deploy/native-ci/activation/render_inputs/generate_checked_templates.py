@@ -113,6 +113,7 @@ def checked_scenario_template(scenario: dict[str, Any]) -> dict[str, Any]:
         ("activation_package_digest", "packages.activation.package_digest"),
         ("run_id", "activation_run_id"),
         ("failure_run_id", "activation_failure_run_id"),
+        ("failure_selector", "activation_failure_selector"),
         ("request_digest", "activation_request_digest"),
         ("failure_request_digest", "activation_failure_request_digest"),
         ("manifest_digest", "activation_fixture_manifest_sha256"),

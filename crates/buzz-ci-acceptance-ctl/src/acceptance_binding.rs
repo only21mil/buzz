@@ -168,11 +168,15 @@ impl AcceptanceBindingReceipt {
 
         let event_bytes = self.event_bytes()?;
         let event_refs = event_bytes.each_ref().map(Vec::as_slice);
-        let templates = validate_acceptance_event_templates(actor_public_key, event_refs)?;
+        let templates = validate_event_templates(actor_public_key, event_refs)?;
         if self.fixture.request_digest != hex::encode(templates.event_ids[0])
             || self.fixture.failure_request_digest != hex::encode(templates.event_ids[4])
             || self.fixture.grant_event_id != hex::encode(templates.event_ids[1])
             || self.fixture.approved_by != self.acceptance.actor.public_key
+            || self.fixture.failure_run_id != hex::encode(templates.failure_run_id)
+            || Sha256::digest(self.fixture.failure_selector.job_id.as_bytes())
+                != templates.failure_job_digest
+            || self.fixture.failure_selector.attempt != templates.failure_attempt
         {
             return Err(AcceptanceBindingError::Invalid);
         }
@@ -275,6 +279,9 @@ impl AcceptanceBindingReceipt {
 struct ValidatedEventTemplates {
     event_ids: [[u8; 32]; 5],
     granted_ci_signer: [u8; 32],
+    failure_run_id: [u8; 16],
+    failure_job_digest: [u8; 32],
+    failure_attempt: u32,
 }
 
 /// Validate the exact Run/Grant/Rerun/Tombstone/FailureRun event set.
@@ -371,9 +378,15 @@ fn validate_event_templates(
     if event_ids.contains(&[0; 32]) || event_ids.iter().collect::<HashSet<_>>().len() != 5 {
         return Err(AcceptanceBindingError::Invalid);
     }
+    let failure_run_id = *Uuid::parse_str(&failure_run.run_id)
+        .map_err(|_| AcceptanceBindingError::Invalid)?
+        .as_bytes();
     Ok(ValidatedEventTemplates {
         event_ids,
         granted_ci_signer,
+        failure_run_id,
+        failure_job_digest: Sha256::digest(failure_run.job_ids[0].as_bytes()).into(),
+        failure_attempt: failure_run.attempt,
     })
 }
 
