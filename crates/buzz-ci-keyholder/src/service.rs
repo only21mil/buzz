@@ -1718,6 +1718,107 @@ pub(crate) mod tests {
         assert!(service.backend.calls.borrow().is_empty());
     }
 
+    #[test]
+    fn active_evidence_policy_rejects_every_canonical_off_plan_coordinate_before_signing() {
+        let request_id = "ab".repeat(32);
+        let sha256 = "cd".repeat(32);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for (index, (mutation, url)) in [
+            (
+                "log request",
+                format!(
+                    "https://relay.example.test/ci/logs/{}/123e4567-e89b-12d3-a456-426614174000/job_ID-1/1/{sha256}",
+                    "ac".repeat(32)
+                ),
+            ),
+            (
+                "log run",
+                format!("https://relay.example.test/ci/logs/{request_id}/223e4567-e89b-12d3-a456-426614174000/job_ID-1/1/{sha256}"),
+            ),
+            (
+                "log job",
+                format!("https://relay.example.test/ci/logs/{request_id}/123e4567-e89b-12d3-a456-426614174000/other_job/1/{sha256}"),
+            ),
+            (
+                "log attempt",
+                format!("https://relay.example.test/ci/logs/{request_id}/123e4567-e89b-12d3-a456-426614174000/job_ID-1/2/{sha256}"),
+            ),
+            (
+                "log hash",
+                format!(
+                    "https://relay.example.test/ci/logs/{request_id}/123e4567-e89b-12d3-a456-426614174000/job_ID-1/1/{}",
+                    "ce".repeat(32)
+                ),
+            ),
+            (
+                "artifact request",
+                format!(
+                    "https://relay.example.test/ci/artifacts/{}/123e4567-e89b-12d3-a456-426614174000/job_ID-1/1/result/{sha256}",
+                    "ac".repeat(32)
+                ),
+            ),
+            (
+                "artifact run",
+                format!("https://relay.example.test/ci/artifacts/{request_id}/223e4567-e89b-12d3-a456-426614174000/job_ID-1/1/result/{sha256}"),
+            ),
+            (
+                "artifact job",
+                format!("https://relay.example.test/ci/artifacts/{request_id}/123e4567-e89b-12d3-a456-426614174000/other_job/1/result/{sha256}"),
+            ),
+            (
+                "artifact attempt",
+                format!("https://relay.example.test/ci/artifacts/{request_id}/123e4567-e89b-12d3-a456-426614174000/job_ID-1/2/result/{sha256}"),
+            ),
+            (
+                "artifact hash",
+                format!(
+                    "https://relay.example.test/ci/artifacts/{request_id}/123e4567-e89b-12d3-a456-426614174000/job_ID-1/1/result/{}",
+                    "ce".repeat(32)
+                ),
+            ),
+            (
+                "artifact object",
+                format!("https://relay.example.test/ci/artifacts/{request_id}/123e4567-e89b-12d3-a456-426614174000/job_ID-1/1/other/{sha256}"),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let service = acceptance_service();
+            assert!(matches!(
+                service.handle(
+                    peer(),
+                    Request::Nip98Authorize(Nip98AuthorizeRequest {
+                        expected_generation: 8,
+                        signer: Nip98Signer::Nip98,
+                        method: HttpMethod::Get,
+                        url: Url::new(url).unwrap(),
+                        payload_digest: None,
+                        created_at: now,
+                        nonce: [u8::try_from(index + 91).unwrap(); 16],
+                        query_filter: None,
+                    })
+                ),
+                Response::Error {
+                    error: ErrorResponse {
+                        code: ErrorCode::PolicyDenied,
+                        ..
+                    },
+                    ..
+                }
+            ),
+                "{mutation} was not policy denied"
+            );
+            assert!(
+                service.backend.calls.borrow().is_empty(),
+                "off-plan {mutation} mutation {index} reached the signing backend"
+            );
+        }
+    }
+
     fn publish_request(
         signer: Nip98Signer,
         generation: u64,

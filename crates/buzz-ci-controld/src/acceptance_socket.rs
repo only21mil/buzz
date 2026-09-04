@@ -787,6 +787,7 @@ mod tests {
             grant_digest: "19".repeat(32),
             approved_by: acceptance.actor.public_key,
             export_subject: "1b".repeat(32),
+            export_generation: 11,
             export_authorization_digest: "1c".repeat(32),
             controller_generation: 7,
             runner_generation: 9,
@@ -945,6 +946,9 @@ mod tests {
             rerun_event,
             tombstone_event,
             failure_run_event,
+            export_subject: "1b".repeat(32),
+            export_generation: 11,
+            export_authorization_digest: "1c".repeat(32),
         }
     }
 
@@ -1323,6 +1327,65 @@ mod tests {
                 called = true;
                 Ok::<_, ()>(expected.clone())
             }),
+            Err(AcceptanceSocketError::Binding)
+        );
+        assert!(!called);
+        assert_eq!(fs::read(&ledger_path).unwrap(), before);
+
+        let mut bad_runner_generation = request.clone();
+        bad_runner_generation.expected_runner_generation = Some(10);
+        bad_runner_generation.operation_id =
+            expected_adapter_operation_id(&bad_runner_generation).unwrap();
+        let bad_runner_exact = serde_json::to_vec(&bad_runner_generation).unwrap();
+        let mut called = false;
+        assert_eq!(
+            journal.execute(&bad_runner_generation, &bad_runner_exact, 0, |_, _| {
+                called = true;
+                Ok::<_, ()>(expected.clone())
+            }),
+            Err(AcceptanceSocketError::Binding)
+        );
+        assert!(!called);
+        assert_eq!(fs::read(&ledger_path).unwrap(), before);
+
+        let mut bad_host_controller_generation = request.clone();
+        bad_host_controller_generation.host.controller_generation = 6;
+        bad_host_controller_generation.operation_id =
+            expected_adapter_operation_id(&bad_host_controller_generation).unwrap();
+        let bad_host_controller_exact =
+            serde_json::to_vec(&bad_host_controller_generation).unwrap();
+        let mut called = false;
+        assert_eq!(
+            journal.execute(
+                &bad_host_controller_generation,
+                &bad_host_controller_exact,
+                0,
+                |_, _| {
+                    called = true;
+                    Ok::<_, ()>(expected.clone())
+                }
+            ),
+            Err(AcceptanceSocketError::Binding)
+        );
+        assert!(!called);
+        assert_eq!(fs::read(&ledger_path).unwrap(), before);
+
+        let mut bad_host_runner_generation = request.clone();
+        bad_host_runner_generation.host.runner_generation = 8;
+        bad_host_runner_generation.operation_id =
+            expected_adapter_operation_id(&bad_host_runner_generation).unwrap();
+        let bad_host_runner_exact = serde_json::to_vec(&bad_host_runner_generation).unwrap();
+        let mut called = false;
+        assert_eq!(
+            journal.execute(
+                &bad_host_runner_generation,
+                &bad_host_runner_exact,
+                0,
+                |_, _| {
+                    called = true;
+                    Ok::<_, ()>(expected.clone())
+                }
+            ),
             Err(AcceptanceSocketError::Binding)
         );
         assert!(!called);
