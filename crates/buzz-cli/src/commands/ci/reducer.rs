@@ -187,6 +187,18 @@ fn reduce_checked(
         }
     }
 
+    let mut expected_cursor = 1_u64;
+    for cursor in seen_cursors.keys().copied().collect::<BTreeSet<_>>() {
+        if cursor != expected_cursor {
+            return Err(format!(
+                "CI run history has a global watch cursor gap before {cursor}"
+            ));
+        }
+        expected_cursor = expected_cursor
+            .checked_add(1)
+            .ok_or_else(|| "CI run history watch cursor overflow".to_string())?;
+    }
+
     let initial_request = requests
         .get(request_event_id)
         .ok_or_else(|| "CI run history omitted its immutable request".to_string())?;
@@ -1495,6 +1507,12 @@ mod tests {
         reduce_status(&id(REQUEST_ID), &request(), events, false)
     }
 
+    fn resequence(events: &mut [AcceptedCiEnvelope]) {
+        for (index, event) in events.iter_mut().enumerate() {
+            event.watch_cursor = index as u64 + 1;
+        }
+    }
+
     #[test]
     fn complete_success_is_green() {
         let result = reduce(&green_events(1, CiJobState::Success, CiSkipPolicy::Forbid));
@@ -1513,6 +1531,7 @@ mod tests {
                     | ValidatedCiEnvelope::TeardownAttestation(_)
             )
         });
+        resequence(&mut events);
         if let Some(ValidatedCiEnvelope::RunStatus(run)) =
             events.last_mut().map(|event| &mut event.envelope)
         {
@@ -1537,6 +1556,7 @@ mod tests {
                 ValidatedCiEnvelope::RunStatus(run) if run.state == CiRunState::Success
             )
         });
+        resequence(&mut events);
         assert_eq!(reduce(&events).state, CiReducedState::Pending);
     }
 
@@ -1560,6 +1580,7 @@ mod tests {
                     if job.job_id == "unit" && job.sequence == 2
             )
         });
+        resequence(&mut events);
         assert_eq!(reduce(&events).state, CiReducedState::InfrastructureFailure);
 
         events.retain(|event| {
@@ -1568,6 +1589,7 @@ mod tests {
                 ValidatedCiEnvelope::RunStatus(run) if run.state == CiRunState::Success
             )
         });
+        resequence(&mut events);
         assert_eq!(reduce(&events).state, CiReducedState::Pending);
     }
 
@@ -1658,6 +1680,48 @@ mod tests {
             }
         }
         assert_eq!(reduce(&stale).state, CiReducedState::InfrastructureFailure);
+    }
+
+    #[test]
+    fn omitted_conflicting_terminal_fact_leaves_a_gap_and_never_reduces_green() {
+        let mut events = green_events(1, CiJobState::Success, CiSkipPolicy::Forbid);
+        let fact_index = events
+            .iter()
+            .position(|event| matches!(event.envelope, ValidatedCiEnvelope::EvidenceFinalized(_)))
+            .unwrap();
+        let fact_cursor = events[fact_index].watch_cursor;
+        for event in events.iter_mut().skip(fact_index) {
+            event.watch_cursor += 1;
+        }
+        let mut conflicting = events[fact_index].clone();
+        conflicting.event_id = id(999);
+        conflicting.watch_cursor = fact_cursor;
+        if let ValidatedCiEnvelope::EvidenceFinalized(fact) = &mut conflicting.envelope {
+            fact.finalized_job_attempts[0].attempt += 1;
+        }
+        events.insert(fact_index, conflicting);
+        events.retain(|event| event.event_id != id(999));
+
+        let result = reduce(&events);
+        assert_eq!(result.state, CiReducedState::InfrastructureFailure);
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("global watch cursor gap")),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn stale_top_level_final_fact_request_id_never_satisfies_rerun() {
+        let mut events = green_events(2, CiJobState::Success, CiSkipPolicy::Forbid);
+        for event in &mut events {
+            if let ValidatedCiEnvelope::EvidenceFinalized(fact) = &mut event.envelope {
+                fact.request_event_id = id(REQUEST_ID);
+            }
+        }
+        assert_eq!(reduce(&events).state, CiReducedState::InfrastructureFailure);
     }
 
     #[test]
@@ -1768,7 +1832,17 @@ mod tests {
         let events = green_events(1, CiJobState::Success, CiSkipPolicy::Forbid);
 
         let mut conflicting = events.clone();
-        conflicting.push(accepted(999, 999, ValidatedCiEnvelope::Request(request())));
+        let next_cursor = conflicting
+            .iter()
+            .map(|event| event.watch_cursor)
+            .max()
+            .unwrap()
+            + 1;
+        conflicting.push(accepted(
+            999,
+            next_cursor,
+            ValidatedCiEnvelope::Request(request()),
+        ));
         let reason = validate_accepted_run(&id(REQUEST_ID), &request(), &conflicting)
             .expect_err("a second request event must fail validation");
         assert!(reason.contains("second initial request"), "{reason}");
