@@ -722,6 +722,16 @@ class BootstrapCompositionTests(unittest.TestCase):
             scenario["fixture"]["approved_by"] = (
                 activation_manifest["acceptance_template"]["actor"]["public_key"]
             )
+            scenario["fixture"].update({
+                "run_id": RENDER.activation_run_id(activation_manifest),
+                "failure_run_id": RENDER.activation_failure_run_id(activation_manifest),
+                "failure_selector": RENDER.activation_failure_selector(activation_manifest),
+                "failure_request_digest": RENDER.activation_failure_request_digest(activation_manifest),
+                "manifest_digest": RENDER.activation_fixture_manifest_sha256(activation_manifest),
+                "export_subject": RENDER.activation_export_subject(activation_manifest),
+                "export_generation": RENDER.activation_export_generation(activation_manifest),
+                "export_authorization_digest": RENDER.activation_export_authorization_digest(activation_manifest),
+            })
             scenario_descriptor = self._write_descriptor(ceremony, "scenario-descriptor.json", {
                 "schema_version": "buzz-ci-capacity-one-scenario-render-input/v1",
                 "candidate_sha": candidate,
