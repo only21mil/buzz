@@ -1007,6 +1007,27 @@ mod tests {
     }
 
     #[test]
+    fn omitted_attempt_selects_attempt_two_log_bound_to_accepted_rerun() {
+        let mut statuses = terminal_status("unit", 1, CiJobState::Failure);
+        statuses.extend(terminal_status("unit", 2, CiJobState::Success));
+        attach_log(&mut statuses);
+        let accepted = [accepted_rerun(2)];
+        let selected = select_log(
+            REQUEST_ID,
+            &request(),
+            &accepted,
+            &statuses,
+            &[log_event("unit", 2, b"new")],
+            RELAY,
+            "unit",
+            None,
+        )
+        .expect("select latest rerun log");
+        assert_eq!(selected.result().attempt, 2);
+        assert_eq!(selected.inline_raw().unwrap().as_bytes(), b"new");
+    }
+
+    #[test]
     fn inline_requires_canonical_base64_size_hash_cap_and_no_truncation() {
         let mut statuses = terminal_status("unit", 1, CiJobState::Success);
         attach_log(&mut statuses);
