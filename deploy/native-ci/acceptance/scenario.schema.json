@@ -55,8 +55,10 @@
         "activation_id",
         "activation_package_digest",
         "run_id",
+        "failure_run_id",
         "job_id",
         "request_digest",
+        "failure_request_digest",
         "manifest_digest",
         "source_oid",
         "approval_id",
@@ -68,6 +70,7 @@
         "controller_generation",
         "runner_generation",
         "expected_log",
+        "expected_failure_log",
         "expected_artifacts"
       ],
       "properties": {
@@ -78,6 +81,7 @@
         },
         "activation_package_digest": { "$ref": "#/$defs/hex64" },
         "run_id": { "$ref": "#/$defs/hex32" },
+        "failure_run_id": { "$ref": "#/$defs/hex32" },
         "job_id": {
           "type": "string",
           "minLength": 1,
@@ -85,6 +89,7 @@
           "pattern": "^[A-Za-z0-9._-]+$"
         },
         "request_digest": { "$ref": "#/$defs/hex64" },
+        "failure_request_digest": { "$ref": "#/$defs/hex64" },
         "manifest_digest": { "$ref": "#/$defs/hex64" },
         "source_oid": { "$ref": "#/$defs/gitOid" },
         "approval_id": { "$ref": "#/$defs/hex32" },
@@ -96,6 +101,7 @@
         "controller_generation": { "type": "integer", "minimum": 1 },
         "runner_generation": { "type": "integer", "minimum": 1 },
         "expected_log": { "$ref": "#/$defs/evidence" },
+        "expected_failure_log": { "$ref": "#/$defs/evidence" },
         "expected_artifacts": {
           "type": "array",
           "minItems": 1,

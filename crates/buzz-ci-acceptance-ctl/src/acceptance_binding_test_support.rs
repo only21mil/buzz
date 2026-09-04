@@ -76,6 +76,18 @@ pub fn canonical_acceptance_binding() -> AcceptanceBindingReceipt {
         }))
         .expect("grant content")
     ]);
+    let mut failure_run = run.clone();
+    failure_run.run_id = "13131313-1313-1313-1313-ffffffffffff".to_owned();
+    failure_run.idempotency_key = "123e4567-e89b-12d3-a456-426614174014".to_owned();
+    let failure_run_event = serde_json::json!([
+        0,
+        actor,
+        failure_run.issued_at,
+        KIND_CI_REQUEST,
+        request_tags(channel, &failure_run).expect("failure run tags"),
+        serde_json::to_string(&failure_run).expect("failure run content")
+    ]);
+    run = failure_run;
     run.request_type = CiRequestType::Rerun;
     run.attempt = 2;
     run.parent_attempt = Some(1);
@@ -101,6 +113,7 @@ pub fn canonical_acceptance_binding() -> AcceptanceBindingReceipt {
         ""
     ]);
     let request_digest = event_id(&run_event);
+    let failure_request_digest = event_id(&failure_run_event);
     let grant_event_id = event_id(&grant_event);
     AcceptanceBindingReceipt {
         schema_version: ACCEPTANCE_BINDING_SCHEMA.to_owned(),
@@ -117,8 +130,10 @@ pub fn canonical_acceptance_binding() -> AcceptanceBindingReceipt {
             activation_id: "activation-1".to_owned(),
             activation_package_digest: "12".repeat(32),
             run_id: "13".repeat(16),
+            failure_run_id: format!("{}{}", "13".repeat(10), "ff".repeat(6)),
             job_id: "test".to_owned(),
             request_digest,
+            failure_request_digest,
             manifest_digest: "15".repeat(32),
             source_oid: "16".repeat(20),
             approval_id: "17".repeat(16),
@@ -132,6 +147,11 @@ pub fn canonical_acceptance_binding() -> AcceptanceBindingReceipt {
             expected_log: EvidenceObject {
                 name: "job.log".to_owned(),
                 sha256: "1d".repeat(32),
+                bytes: 1,
+            },
+            expected_failure_log: EvidenceObject {
+                name: "job.log".to_owned(),
+                sha256: "1f".repeat(32),
                 bytes: 1,
             },
             expected_artifacts: vec![EvidenceObject {
@@ -150,6 +170,7 @@ pub fn canonical_acceptance_binding() -> AcceptanceBindingReceipt {
             grant_event,
             rerun_event,
             tombstone_event,
+            failure_run_event,
         },
     }
 }

@@ -13,6 +13,7 @@ import re
 import stat
 import subprocess
 import sys
+import uuid
 from typing import Any
 
 
@@ -673,6 +674,13 @@ def load_template_bindings(root: DescriptorRoot, descriptor: dict[str, Any], nam
         bindings["activation_request_digest"] = activation_request_digest(
             manifests["activation"],
         )
+        bindings["activation_failure_request_digest"] = activation_failure_request_digest(
+            manifests["activation"],
+        )
+        bindings["activation_run_id"] = activation_run_id(manifests["activation"])
+        bindings["activation_failure_run_id"] = activation_failure_run_id(
+            manifests["activation"],
+        )
         bindings["activation_grant_event_id"] = activation_grant_event_id(
             manifests["activation"],
         )
@@ -756,6 +764,32 @@ def activation_request_digest(activation: object) -> str:
     return hashlib.sha256(compact_declared(
         _activation_acceptance_template(activation)["run_event"],
     )).hexdigest()
+
+
+def activation_failure_request_digest(activation: object) -> str:
+    """Bind a scenario to the exact frozen failed-parent run-event bytes."""
+    return hashlib.sha256(compact_declared(
+        _activation_acceptance_template(activation)["failure_run_event"],
+    )).hexdigest()
+
+
+def _template_run_id(activation: object, event_name: str) -> str:
+    try:
+        envelope = json.loads(
+            _activation_acceptance_template(activation)[event_name][5],
+            object_pairs_hook=reject_duplicates,
+        )
+        return uuid.UUID(envelope["run_id"]).hex
+    except (KeyError, TypeError, ValueError) as error:
+        raise RenderError("activation acceptance run id binding is invalid") from error
+
+
+def activation_run_id(activation: object) -> str:
+    return _template_run_id(activation, "run_event")
+
+
+def activation_failure_run_id(activation: object) -> str:
+    return _template_run_id(activation, "failure_run_event")
 
 
 def activation_grant_event_id(activation: object) -> str:
@@ -904,10 +938,11 @@ def validate_scenario(value: object, bindings: dict[str, Any]) -> dict[str, Any]
         raise RenderError("capacity-one scenario fixture differs")
     required = {
         "integrated_candidate_sha", "activation_id", "activation_package_digest", "run_id",
-        "job_id", "request_digest", "manifest_digest", "source_oid", "approval_id",
+        "failure_run_id", "job_id", "request_digest", "failure_request_digest",
+        "manifest_digest", "source_oid", "approval_id",
         "grant_event_id", "grant_digest", "approved_by", "export_subject",
         "export_authorization_digest", "controller_generation", "runner_generation",
-        "expected_log", "expected_artifacts",
+        "expected_log", "expected_failure_log", "expected_artifacts",
     }
     require_keys(fixture, required, "capacity-one fixture")
     activation = bindings["packages"]["activation"]
@@ -919,6 +954,7 @@ def validate_scenario(value: object, bindings: dict[str, Any]) -> dict[str, Any]
     }:
         raise RenderError("activation package does not stage at closed capacity zero")
     request_digest = activation_request_digest(activation)
+    failure_request_digest = activation_failure_request_digest(activation)
     grant_event_id = activation_grant_event_id(activation)
     approved_by = activation_approved_by(activation)
     if bindings.get("activation_request_digest") != request_digest:
@@ -933,6 +969,9 @@ def validate_scenario(value: object, bindings: dict[str, Any]) -> dict[str, Any]
         "activation_id": activation["activation_id"],
         "activation_package_digest": activation["package_digest"],
         "request_digest": request_digest,
+        "failure_request_digest": failure_request_digest,
+        "run_id": activation_run_id(activation),
+        "failure_run_id": activation_failure_run_id(activation),
         "manifest_digest": activation_fixture_manifest_sha256(activation),
         "grant_event_id": grant_event_id,
         "approved_by": approved_by,

@@ -48,7 +48,7 @@ the package and scenario digests are final. Its exact schema is
 canonical JSON binds the activation, package, candidate, complete fixture,
 scenario, distinct keyholder and acceptance peer identities, generations,
 timeout, acceptance actor, and the four
-public Run/Grant/Rerun/Tombstone event templates. The regular file is root:root
+public Run/Grant/FailureRun/Rerun/Tombstone event templates. The regular file is root:root
 mode `0444`, link count one, beneath the exact root:root mode `0711` activation
 controller directory. Both controld and keyholder validate this same public
 receipt. The controld freezer is the sole source of the canonical staged config
@@ -83,7 +83,7 @@ Relay identities. The relay stores a `POST /events` only when the event's
 `pubkey` equals the NIP-98 token pubkey and that pubkey is a member of the
 event's private channel, so controld asks keyholder for a publish token signed
 by the key that signed the event: `ci-event.key` for kinds 46101 to 46106 and
-the acceptance actor for the four frozen acceptance events. The client refuses
+the acceptance actor for the five frozen acceptance events. The client refuses
 to send when the event pubkey equals no identity it holds or when the returned
 token identity differs from the event pubkey. `nip98.key` signs only the
 accepted read and the evidence `PUT`s, where the relay authorizes the caller as

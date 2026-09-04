@@ -251,7 +251,7 @@ pub enum Nip98Signer {
     /// it signed after the relay refused the publish.
     CiEvent = 2,
     /// The activation-bound acceptance actor: `POST /events` carrying one of
-    /// the four frozen acceptance events.
+    /// the five frozen acceptance events.
     AcceptanceActor = 3,
 }
 
@@ -291,6 +291,8 @@ pub enum AcceptanceMutation {
     Rerun = 3,
     /// Actor-authored kind 5 tombstone of the rerun request.
     Tombstone = 4,
+    /// Actor-authored kind 46100 initial request for the failed-parent lane.
+    FailureRun = 5,
 }
 
 impl TryFrom<u8> for AcceptanceMutation {
@@ -302,6 +304,7 @@ impl TryFrom<u8> for AcceptanceMutation {
             2 => Ok(Self::Grant),
             3 => Ok(Self::Rerun),
             4 => Ok(Self::Tombstone),
+            5 => Ok(Self::FailureRun),
             _ => Err(()),
         }
     }
@@ -442,8 +445,8 @@ pub struct DescribeAcceptanceResponse {
     pub actor: PublicIdentity,
     /// Exact activation scenario digest.
     pub scenario_sha256: [u8; 32],
-    /// Event IDs in Run, Grant, Rerun, Tombstone order.
-    pub event_ids: [[u8; 32]; 4],
+    /// Event IDs in Run, Grant, Rerun, Tombstone, FailureRun order.
+    pub event_ids: [[u8; 32]; 5],
 }
 
 /// Public result of a successful signing operation.

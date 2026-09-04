@@ -100,8 +100,8 @@ pub(crate) struct CapacityOneService {
 struct AcceptanceAuthority {
     actor: PublicIdentity,
     scenario_sha256: [u8; 32],
-    event_ids: [[u8; 32]; 4],
-    templates: [serde_json::Value; 4],
+    event_ids: [[u8; 32]; 5],
+    templates: [serde_json::Value; 5],
 }
 
 impl AcceptanceAuthority {
@@ -119,6 +119,7 @@ impl AcceptanceAuthority {
             config.grant_event.clone(),
             config.rerun_event.clone(),
             config.tombstone_event.clone(),
+            config.failure_run_event.clone(),
         ];
         Ok(Self {
             actor,
@@ -134,6 +135,7 @@ impl AcceptanceAuthority {
             AcceptanceMutation::Grant => 1,
             AcceptanceMutation::Rerun => 2,
             AcceptanceMutation::Tombstone => 3,
+            AcceptanceMutation::FailureRun => 4,
         }
     }
 }
@@ -487,7 +489,7 @@ impl AcceptanceOperationHandler for CapacityZeroService {
             Operation::ObserveInitial if request.sequence == 1 => {
                 Ok(host_response(request, None, 0))
             }
-            Operation::SetCapacityZero if request.sequence == 13 => {
+            Operation::SetCapacityZero if request.sequence == 16 => {
                 Ok(host_response(request, prior, 0))
             }
             _ => Err(AcceptanceSocketError::Operation),
@@ -510,8 +512,8 @@ impl AcceptanceOperationHandler for CapacityOneService {
             request.operation,
         ) {
             (2, Operation::SetCapacityOne)
-            | (11, Operation::RestartController)
-            | (12, Operation::RestartRunner) => {
+            | (14, Operation::RestartController)
+            | (15, Operation::RestartRunner) => {
                 Ok(host_response(request, prior, configured_capacity))
             }
             (3, Operation::SubmitManifest) => {
@@ -525,7 +527,7 @@ impl AcceptanceOperationHandler for CapacityOneService {
             }
             (5, Operation::ResumeGrant) => {
                 let active = self.begin_async_attempt()?;
-                Ok(running_response(request, prior, active, false)?)
+                Ok(running_response(request, prior, active, false, false)?)
             }
             (6, Operation::AwaitFirstTerminal) => {
                 let (terminal, evidence) = self.finish_async_attempt()?;
@@ -534,12 +536,26 @@ impl AcceptanceOperationHandler for CapacityOneService {
                 )?)
             }
             (7, Operation::ExportFirstEvidence) => Ok(export_response(request, prior)?),
-            (8, Operation::Rerun) => {
+            (8, Operation::SubmitFailureManifest) => {
+                self.publish_acceptance(AcceptanceMutation::FailureRun)?;
+                Ok(failed_submitted_response(request))
+            }
+            (9, Operation::ResumeFailure) => {
+                let active = self.begin_async_attempt()?;
+                Ok(running_response(request, prior, active, false, true)?)
+            }
+            (10, Operation::AwaitFailureTerminal) => {
+                let (terminal, evidence) = self.finish_async_attempt()?;
+                Ok(failure_terminal_response(
+                    request, prior, terminal, &evidence,
+                )?)
+            }
+            (11, Operation::Rerun) => {
                 self.publish_acceptance(AcceptanceMutation::Rerun)?;
                 let active = self.begin_async_attempt()?;
-                Ok(running_response(request, prior, active, true)?)
+                Ok(running_response(request, prior, active, true, true)?)
             }
-            (9, Operation::CancelRerun) => {
+            (12, Operation::CancelRerun) => {
                 let active = self
                     .active_attempt
                     .or_else(|| self.begin_async_attempt().ok())
@@ -552,7 +568,7 @@ impl AcceptanceOperationHandler for CapacityOneService {
                 }
                 Ok(cancelled_response(request, prior, cancelled)?)
             }
-            (10, Operation::TombstoneRerun) => {
+            (13, Operation::TombstoneRerun) => {
                 self.publish_acceptance(AcceptanceMutation::Tombstone)?;
                 Ok(tombstoned_response(request, prior)?)
             }
@@ -561,7 +577,10 @@ impl AcceptanceOperationHandler for CapacityOneService {
     }
 
     fn response_written(&mut self, request: &AdapterRequest) -> Result<(), Self::Error> {
-        if request.sequence == 5 && request.operation == Operation::ResumeGrant {
+        if matches!(
+            (request.sequence, request.operation),
+            (5, Operation::ResumeGrant) | (9, Operation::ResumeFailure)
+        ) {
             self.release_async_attempt()?;
         }
         Ok(())
@@ -827,11 +846,28 @@ fn approved_response(request: &AdapterRequest) -> AdapterResponse {
     )
 }
 
+fn failed_submitted_response(request: &AdapterRequest) -> AdapterResponse {
+    acceptance_response(
+        request,
+        failure_run_snapshot(
+            request,
+            RunState::GrantedAwaitingResume,
+            AcceptanceConclusion::None,
+            Some(approval_snapshot(request, false)),
+            None,
+            Vec::new(),
+        ),
+        0,
+        None,
+    )
+}
+
 fn running_response(
     request: &AdapterRequest,
     prior: Option<&AdapterResponse>,
     active: BoundAttempt,
     rerun: bool,
+    failure_lineage: bool,
 ) -> Result<AdapterResponse, AcceptanceSocketError> {
     let attempt_id = hex::encode(active.response.attempt_id);
     if active.admission.attempt != if rerun { 2 } else { 1 }
@@ -839,7 +875,7 @@ fn running_response(
     {
         return Err(AcceptanceSocketError::Operation);
     }
-    // The driver names the attempt it reruns at sequence 8 (the first
+    // The driver names the attempt it reruns at sequence 11 (the first
     // attempt, the only id it holds); the new attempt's id exists only in
     // this response. Sequence 5 carries no attempt id, so the first attempt
     // accepts none or its own.
@@ -859,17 +895,38 @@ fn running_response(
         }
         (Vec::new(), None)
     };
-    attempts.push(attempt_snapshot(
-        request,
-        attempt_id,
-        active.admission.attempt,
-        parent_attempt_id,
-        AttemptState::Running,
-        AcceptanceConclusion::None,
-        None,
-    ));
-    Ok(acceptance_response(
-        request,
+    let attempt = if failure_lineage {
+        failure_attempt_snapshot(
+            request,
+            attempt_id,
+            active.admission.attempt,
+            parent_attempt_id,
+            AttemptState::Running,
+            AcceptanceConclusion::None,
+            None,
+        )
+    } else {
+        attempt_snapshot(
+            request,
+            attempt_id,
+            active.admission.attempt,
+            parent_attempt_id,
+            AttemptState::Running,
+            AcceptanceConclusion::None,
+            None,
+        )
+    };
+    attempts.push(attempt);
+    let run = if failure_lineage {
+        failure_run_snapshot(
+            request,
+            RunState::Running,
+            AcceptanceConclusion::None,
+            Some(approval_snapshot(request, true)),
+            None,
+            attempts,
+        )
+    } else {
         run_snapshot(
             request,
             RunState::Running,
@@ -877,8 +934,55 @@ fn running_response(
             Some(approval_snapshot(request, true)),
             None,
             attempts,
-        ),
+        )
+    };
+    Ok(acceptance_response(request, run, 1, None))
+}
+
+fn failure_terminal_response(
+    request: &AdapterRequest,
+    prior: Option<&AdapterResponse>,
+    terminal: TerminalAttempt,
+    evidence: &VerifiedAttemptEvidence,
+) -> Result<AdapterResponse, AcceptanceSocketError> {
+    if terminal.admission.attempt != 1
+        || terminal.response.broker_state != BrokerState::Terminal
+        || terminal.response.conclusion != BrokerConclusion::Failure
+        || terminal.response.evidence_set_digest == [0; 32]
+        || terminal.response.teardown_digest == [0; 32]
+        || evidence.terminal != terminal
+        || evidence.descriptor_set_digest == [0; 32]
+        || evidence.log_sha256 != request.fixture.expected_failure_log.sha256
+        || evidence.log_bytes != request.fixture.expected_failure_log.bytes
+        || !evidence.artifacts.is_empty()
+    {
+        return Err(AcceptanceSocketError::Operation);
+    }
+    let running = prior_run(prior)?;
+    let attempt_id = hex::encode(terminal.response.attempt_id);
+    if running.attempts.len() != 1 || running.attempts[0].attempt_id != attempt_id {
+        return Err(AcceptanceSocketError::Operation);
+    }
+    let attempt = failure_attempt_snapshot(
+        request,
+        attempt_id.clone(),
         1,
+        None,
+        AttemptState::Terminal,
+        AcceptanceConclusion::Failure,
+        Some(hex::encode(evidence.descriptor_set_digest)),
+    );
+    Ok(acceptance_response(
+        request,
+        failure_run_snapshot(
+            request,
+            RunState::Terminal,
+            AcceptanceConclusion::Failure,
+            Some(approval_snapshot(request, true)),
+            Some(attempt_id),
+            vec![attempt],
+        ),
+        0,
         None,
     ))
 }
@@ -997,7 +1101,7 @@ fn cancelled_response(
     {
         return Err(AcceptanceSocketError::Operation);
     }
-    let second = attempt_snapshot(
+    let second = failure_attempt_snapshot(
         request,
         second_id.clone(),
         2,
@@ -1008,7 +1112,7 @@ fn cancelled_response(
     );
     Ok(acceptance_response(
         request,
-        run_snapshot(
+        failure_run_snapshot(
             request,
             RunState::Terminal,
             AcceptanceConclusion::Cancelled,
@@ -1037,10 +1141,10 @@ fn tombstoned_response(
     second.state = AttemptState::Tombstoned;
     Ok(acceptance_response(
         request,
-        run_snapshot(
+        failure_run_snapshot(
             request,
             RunState::Terminal,
-            AcceptanceConclusion::Success,
+            AcceptanceConclusion::Failure,
             Some(approval_snapshot(request, true)),
             Some(first.attempt_id.clone()),
             vec![first, second],
@@ -1102,6 +1206,28 @@ fn run_snapshot(
     }
 }
 
+fn failure_run_snapshot(
+    request: &AdapterRequest,
+    state: RunState,
+    aggregate_conclusion: AcceptanceConclusion,
+    approval: Option<ApprovalSnapshot>,
+    selected_attempt_id: Option<String>,
+    attempts: Vec<AttemptSnapshot>,
+) -> RunSnapshot {
+    RunSnapshot {
+        run_id: request.fixture.failure_run_id.clone(),
+        integrated_candidate_sha: request.fixture.integrated_candidate_sha.clone(),
+        request_digest: request.fixture.failure_request_digest.clone(),
+        manifest_digest: request.fixture.manifest_digest.clone(),
+        source_oid: request.fixture.source_oid.clone(),
+        state,
+        aggregate_conclusion,
+        approval,
+        selected_attempt_id,
+        attempts,
+    }
+}
+
 fn approval_snapshot(request: &AdapterRequest, resumed: bool) -> ApprovalSnapshot {
     ApprovalSnapshot {
         approval_id: request.fixture.approval_id.clone(),
@@ -1139,6 +1265,32 @@ fn attempt_snapshot(
         } else {
             Vec::new()
         },
+    }
+}
+
+fn failure_attempt_snapshot(
+    request: &AdapterRequest,
+    attempt_id: String,
+    attempt: u32,
+    parent_attempt_id: Option<String>,
+    state: AttemptState,
+    conclusion: AcceptanceConclusion,
+    evidence_set_digest: Option<String>,
+) -> AttemptSnapshot {
+    let terminal_failure = conclusion == AcceptanceConclusion::Failure;
+    AttemptSnapshot {
+        attempt_id,
+        attempt,
+        parent_attempt_id,
+        state,
+        conclusion,
+        integrated_candidate_sha: request.fixture.integrated_candidate_sha.clone(),
+        request_digest: request.fixture.failure_request_digest.clone(),
+        manifest_digest: request.fixture.manifest_digest.clone(),
+        source_oid: request.fixture.source_oid.clone(),
+        evidence_set_digest,
+        log: terminal_failure.then(|| request.fixture.expected_failure_log.clone()),
+        artifacts: Vec::new(),
     }
 }
 
@@ -1397,9 +1549,14 @@ mod tests {
             None,
         );
 
-        let response =
-            running_response(&rerun_request(Some(&first_id)), Some(&prior), active, true)
-                .expect("rerun bound to the first attempt");
+        let response = running_response(
+            &rerun_request(Some(&first_id)),
+            Some(&prior),
+            active,
+            true,
+            false,
+        )
+        .expect("rerun bound to the first attempt");
         let run = response.response.snapshot.run.expect("run snapshot");
         assert_eq!(run.state, RunState::Running);
         assert_eq!(run.aggregate_conclusion, AcceptanceConclusion::None);
@@ -1421,13 +1578,15 @@ mod tests {
             Some("ffffffffffffffffffffffffffffffff"),
         ] {
             assert_eq!(
-                running_response(&rerun_request(foreign), Some(&prior), active, true).map(|_| ()),
+                running_response(&rerun_request(foreign), Some(&prior), active, true, false)
+                    .map(|_| ()),
                 Err(AcceptanceSocketError::Operation),
                 "request attempt id {foreign:?}"
             );
         }
         assert_eq!(
-            running_response(&rerun_request(Some(&first_id)), None, active, true).map(|_| ()),
+            running_response(&rerun_request(Some(&first_id)), None, active, true, false)
+                .map(|_| ()),
             Err(AcceptanceSocketError::Operation)
         );
         // The first attempt (sequence 5) still carries no id or its own.
@@ -1439,14 +1598,14 @@ mod tests {
         resume.sequence = 5;
         resume.operation = Operation::ResumeGrant;
         let response =
-            running_response(&resume, None, first, false).expect("first attempt running");
+            running_response(&resume, None, first, false, false).expect("first attempt running");
         assert_eq!(
             response.response.snapshot.run.expect("run").attempts.len(),
             1
         );
         resume.attempt_id = Some(first_id.clone());
         assert_eq!(
-            running_response(&resume, None, first, false).map(|_| ()),
+            running_response(&resume, None, first, false, false).map(|_| ()),
             Err(AcceptanceSocketError::Operation)
         );
     }

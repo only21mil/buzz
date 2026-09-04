@@ -108,7 +108,7 @@ fn successful_and_error_responses_round_trip_and_bind_the_request() {
         Response::DescribeAcceptance(DescribeAcceptanceResponse {
             actor: identity(4, 10),
             scenario_sha256: [5; 32],
-            event_ids: [[6; 32], [7; 32], [8; 32], [9; 32]],
+            event_ids: [[6; 32], [7; 32], [8; 32], [9; 32], [10; 32]],
         }),
         Response::SignCiEvent(signature(4, 7)),
         Response::Nip98Authorize(signature(7, 8)),

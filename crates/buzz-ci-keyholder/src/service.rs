@@ -35,21 +35,21 @@ pub struct SigningPolicy {
     acceptance: Option<AcceptanceSigningPolicy>,
 }
 
-/// Four exact public event templates authorized for one activation scenario.
+/// Five exact public event templates authorized for one activation scenario.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AcceptanceSigningPolicy {
     actor: PublicIdentity,
     scenario_sha256: [u8; 32],
-    event_ids: [[u8; 32]; 4],
+    event_ids: [[u8; 32]; 5],
     granted_ci_signer: [u8; 32],
 }
 
 impl AcceptanceSigningPolicy {
-    /// Validate the actor, scenario, and complete Run/Grant/Rerun/Tombstone template set.
+    /// Validate the complete success-run, grant, failed-run, rerun, and tombstone set.
     pub fn new(
         actor: PublicIdentity,
         scenario_sha256: [u8; 32],
-        templates: [CanonicalPayload; 4],
+        templates: [CanonicalPayload; 5],
     ) -> Result<Self, ServiceError> {
         if actor.public_key == [0; 32] || actor.generation == 0 || scenario_sha256 == [0; 32] {
             return Err(ServiceError::InvalidRequest);
@@ -89,8 +89,8 @@ impl AcceptanceSigningPolicy {
         self.scenario_sha256
     }
 
-    /// Event IDs in Run, Grant, Rerun, Tombstone order.
-    pub const fn event_ids(&self) -> [[u8; 32]; 4] {
+    /// Event IDs in Run, Grant, Rerun, Tombstone, FailureRun order.
+    pub const fn event_ids(&self) -> [[u8; 32]; 5] {
         self.event_ids
     }
 
@@ -105,6 +105,7 @@ const fn mutation_index(mutation: AcceptanceMutation) -> usize {
         AcceptanceMutation::Grant => 1,
         AcceptanceMutation::Rerun => 2,
         AcceptanceMutation::Tombstone => 3,
+        AcceptanceMutation::FailureRun => 4,
     }
 }
 
@@ -890,7 +891,7 @@ pub(crate) mod tests {
         .expect("service")
     }
 
-    pub(crate) fn acceptance_templates() -> [CanonicalPayload; 4] {
+    pub(crate) fn acceptance_templates() -> [CanonicalPayload; 5] {
         let actor = hex::encode([4; 32]);
         let channel = "123e4567-e89b-12d3-a456-426614174099";
         let mut run = CiRequestEnvelope {
@@ -943,6 +944,21 @@ pub(crate) mod tests {
             }))
             .expect("grant content")
         ]);
+        let mut failure_run = run.clone();
+        failure_run.run_id = "123e4567-e89b-12d3-a456-ffffffffffff".to_owned();
+        failure_run.idempotency_key = "failure-run-key".to_owned();
+        failure_run.issued_at += 5;
+        failure_run.expires_at += 5;
+        let failure_run_tags = request_tags(channel, &failure_run).expect("failure run tags");
+        let failure_run_event = serde_json::json!([
+            0,
+            hex::encode([4; 32]),
+            1_800_000_005_u64,
+            KIND_CI_REQUEST,
+            failure_run_tags,
+            serde_json::to_string(&failure_run).expect("failure run content")
+        ]);
+        run = failure_run;
         run.request_type = CiRequestType::Rerun;
         run.attempt = 2;
         run.parent_attempt = Some(1);
@@ -968,7 +984,14 @@ pub(crate) mod tests {
             [["e", hex::encode(Sha256::digest(&rerun_bytes))]],
             ""
         ]);
-        [run_event, grant_event, rerun_event, tombstone_event].map(|value| {
+        [
+            run_event,
+            grant_event,
+            rerun_event,
+            tombstone_event,
+            failure_run_event,
+        ]
+        .map(|value| {
             CanonicalPayload::new(serde_json::to_vec(&value).expect("template bytes"))
                 .expect("template")
         })
@@ -1026,7 +1049,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn acceptance_mutations_sign_only_the_four_described_event_ids() {
+    fn acceptance_mutations_sign_only_the_five_described_event_ids() {
         let service = acceptance_service();
         let Response::DescribeAcceptance(description) = service.handle(
             peer(),
@@ -1048,6 +1071,7 @@ pub(crate) mod tests {
             AcceptanceMutation::Grant,
             AcceptanceMutation::Rerun,
             AcceptanceMutation::Tombstone,
+            AcceptanceMutation::FailureRun,
         ]
         .into_iter()
         .enumerate()

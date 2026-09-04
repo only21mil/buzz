@@ -646,38 +646,41 @@ where
                 Err(error) => return Err(error),
             };
 
-            let evidence = CiEvidenceFinalizedEnvelope {
-                schema_version: CI_SCHEMA_VERSION,
-                request_event_id: accepted.event_id.clone(),
-                run_id: accepted.envelope.run_id.clone(),
-                workflow_id: accepted.envelope.workflow_id.clone(),
-                target_repo_a: accepted.envelope.target_repo_a.clone(),
-                tip_oid: accepted.envelope.tip_oid.clone(),
-                attempt: accepted.envelope.attempt,
-                finalized_job_attempts,
-                finalized_at: completion.finished_at,
-                relay_signer: self.signer.pubkey().to_owned(),
-            };
-            let evidence_id = self.publish_envelope(
-                accepted,
-                KIND_CI_EVIDENCE_FINALIZED,
-                &evidence,
-                evidence_finalized_tags(&accepted.channel_id, &evidence)
-                    .map_err(|_| ProductionError::Invalid)?,
-                "evidence:finalized",
-            )?;
-            let teardown_id = self.publish_envelope(
-                accepted,
-                KIND_CI_TEARDOWN_ATTESTATION,
-                &completion.teardown,
-                teardown_attestation_tags(&accepted.channel_id, &completion.teardown)
-                    .map_err(|_| ProductionError::Invalid)?,
-                "teardown",
-            )?;
-            record = record.with_evidence_finalized(evidence_id)?;
-            record = record.with_teardown_attestation(teardown_id)?;
+            let terminal_state = terminal_run_state(&completion.jobs);
+            if terminal_state == RunState::Success {
+                let evidence = CiEvidenceFinalizedEnvelope {
+                    schema_version: CI_SCHEMA_VERSION,
+                    request_event_id: accepted.event_id.clone(),
+                    run_id: accepted.envelope.run_id.clone(),
+                    workflow_id: accepted.envelope.workflow_id.clone(),
+                    target_repo_a: accepted.envelope.target_repo_a.clone(),
+                    tip_oid: accepted.envelope.tip_oid.clone(),
+                    attempt: accepted.envelope.attempt,
+                    finalized_job_attempts,
+                    finalized_at: completion.finished_at,
+                    relay_signer: self.signer.pubkey().to_owned(),
+                };
+                let evidence_id = self.publish_envelope(
+                    accepted,
+                    KIND_CI_EVIDENCE_FINALIZED,
+                    &evidence,
+                    evidence_finalized_tags(&accepted.channel_id, &evidence)
+                        .map_err(|_| ProductionError::Invalid)?,
+                    "evidence:finalized",
+                )?;
+                let teardown_id = self.publish_envelope(
+                    accepted,
+                    KIND_CI_TEARDOWN_ATTESTATION,
+                    &completion.teardown,
+                    teardown_attestation_tags(&accepted.channel_id, &completion.teardown)
+                        .map_err(|_| ProductionError::Invalid)?,
+                    "teardown",
+                )?;
+                record = record.with_evidence_finalized(evidence_id)?;
+                record = record.with_teardown_attestation(teardown_id)?;
+            }
             let terminal = record.transition(
-                terminal_run_state(&completion.jobs),
+                terminal_state,
                 completion.finished_at,
                 terminal_reason(&completion.jobs),
             )?;
@@ -1796,6 +1799,46 @@ mod tests {
             handler.store.run.as_ref().unwrap().1.state(),
             RunState::Success
         );
+    }
+
+    #[test]
+    fn failed_run_publishes_completion_without_finalization_or_teardown_events() {
+        let log = b"deterministic failure\n".to_vec();
+        let accepted = accepted();
+        let mut failed = completion(&log);
+        failed.jobs[0].state = CiJobState::Failure;
+        failed.jobs[0].reason = Some("fixture_failure".into());
+        let relay = Relay {
+            accepted: Some(accepted.clone()),
+            published: Vec::new(),
+            job_statuses: Vec::new(),
+            intent_signal: None,
+            refuse_publication: false,
+        };
+        let mut handler = ProductionHandler::new(
+            relay,
+            DeterministicSigner,
+            Executor(failed),
+            MemoryStore::default(),
+            MemoryOutput(log),
+        );
+
+        assert_eq!(handler.poll_once(CHANNEL).unwrap(), PollStep::Completed);
+        assert!(!handler
+            .relay
+            .published
+            .contains(&KIND_CI_EVIDENCE_FINALIZED));
+        assert!(!handler
+            .relay
+            .published
+            .contains(&KIND_CI_TEARDOWN_ATTESTATION));
+        let record = &handler.store.run.as_ref().unwrap().1;
+        assert_eq!(record.state(), RunState::Failure);
+        assert_eq!(record.reason(), Some("fixture_failure"));
+        let wire = serde_json::to_value(record).unwrap();
+        assert!(wire["facts"]["evidence_finalized_event_id"].is_null());
+        assert!(wire["facts"]["teardown_attestation_event_id"].is_null());
+        assert!(record.terminal_event_id().is_some());
     }
 
     #[test]

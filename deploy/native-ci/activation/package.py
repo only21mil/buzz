@@ -140,7 +140,7 @@ EXECUTION_SCHEMA_VERSION = 1
 EXECUTION_DIGEST_DOMAIN = b"buzz-ci-execd:static-execution:v1\0"
 FIXTURE_MANIFEST_SHA256 = "f204b8fba64e972408f5a0ea1c0bb3140cfa696289903d96a8cb07d602af6b23"
 FIXTURE_INPUT_SHA256 = "967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6"
-FIXTURE_SCRIPT_SHA256 = "d081e43ebfde3ee67c3cd8d852d58410a79ad799bbfa2cf98d5e2ef7b8bed3b1"
+FIXTURE_SCRIPT_SHA256 = "6cfcbe7061c3e36fbf6c7147e6dd647a134c28db7bb6d43030699bb73952fe41"
 FIXTURE_MANIFEST_PATH = "/usr/share/buzzci/execd-v2/fixture/fixture-manifest.json"
 FIXTURE_INPUT_PATH = "/usr/share/buzzci/execd-v2/fixture/input.txt"
 FIXTURE_SCRIPT_PATH = "/usr/libexec/buzz-ci-capacity-one-fixture"
@@ -148,7 +148,7 @@ EXECUTOR_SOCKET_PATH = "/run/buzzci/executor.sock"
 RUNNER_REPLAY_JOURNAL = "/var/lib/buzzci/runner/v2-replay.json"
 SECCOMP_PROFILE_DIGEST = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
 SECCOMP_PROFILE_PATH = f"/var/lib/buzzci/seccomp/v1/sha256/{SECCOMP_PROFILE_DIGEST}.json"
-RECEIPT_VERIFIER_EXPECTED_STAGES_SHA256 = "c8addbb42bace522e99fc8fe00603c9245db61ac8a599ef5762c2744267189cd"
+RECEIPT_VERIFIER_EXPECTED_STAGES_SHA256 = "5129005b9fcbf56c1f67aeed7bd02bd2356626b6819120032b28ae4824371178"
 QUALIFICATION_SOURCE_COMMIT = "564e41fda889f25b094b79524b3fb409121794c7"
 LANE_MANIFEST_DIGEST_DOMAIN = b"buzz-ci:lane-activation-manifest:v1\0"
 
@@ -850,7 +850,7 @@ def production_acceptance_template(
     channel_id: str, repository_owner_public_key: str, repository_id: str,
     source_clone_url: str, time_reference: int,
 ) -> dict[str, Any]:
-    """Build the one canonical public Run/Grant/Rerun/Tombstone authority set.
+    """Build the canonical public Run/Grant/FailureRun/Rerun/Tombstone set.
 
     The set is static: its event ids are bound by digest into the keyholder
     signing policy, the controld acceptance authority, the scenario fixture,
@@ -908,12 +908,13 @@ def production_acceptance_template(
         ))
 
     run_id = request_identity("run")
+    failure_run_id = str(uuid.UUID(hex=f"{identity_digest[:20]}{'f' * 12}"))
     pr_event = "33" * 32
     issued_at = _positive_integer(
         time_reference, 0xFFFFFFFFFFFFFFFF - 601, "public acceptance time reference",
     )
 
-    def request(*, request_type: str, attempt: int, idempotency_key: str) -> dict[str, Any]:
+    def request(*, request_type: str, attempt: int, run_id: str, idempotency_key: str) -> dict[str, Any]:
         value: dict[str, Any] = {
             "schema_version": 1,
             "request_type": request_type,
@@ -948,18 +949,23 @@ def production_acceptance_template(
         return value
 
     run = request(
-        request_type="run", attempt=1,
+        request_type="run", attempt=1, run_id=run_id,
         idempotency_key=request_identity("request-attempt-1"),
     )
+    failure_run = request(
+        request_type="run", attempt=1, run_id=failure_run_id,
+        idempotency_key=request_identity("failure-request-attempt-1"),
+    )
     rerun = request(
-        request_type="rerun", attempt=2,
+        request_type="rerun", attempt=2, run_id=failure_run_id,
         idempotency_key=request_identity("request-attempt-2"),
     )
+    rerun.update({"parent_run_id": failure_run_id})
 
     def request_event(envelope: dict[str, Any]) -> list[object]:
         attempt = str(envelope["attempt"])
         tags = [
-            ["h", channel], ["a", target_repo], ["run", run_id],
+            ["h", channel], ["a", target_repo], ["run", envelope["run_id"]],
             ["workflow", workflow_id], ["c", candidate_sha], ["attempt", attempt],
         ]
         return [
@@ -968,6 +974,7 @@ def production_acceptance_template(
         ]
 
     run_event = request_event(run)
+    failure_run_event = request_event(failure_run)
     rerun_event = request_event(rerun)
     grant = {
         "schema_version": 1,
@@ -990,6 +997,7 @@ def production_acceptance_template(
         "grant_event": grant_event,
         "rerun_event": rerun_event,
         "tombstone_event": [0, actor, issued_at + 20, 5, [["e", rerun_event_id]], ""],
+        "failure_run_event": failure_run_event,
     })
 
 
@@ -1061,7 +1069,7 @@ def production_activation_draft(
 
 
 def validate_acceptance_template(value: object) -> dict[str, Any]:
-    fields = {"actor", "time_reference", "run_event", "grant_event", "rerun_event", "tombstone_event"}
+    fields = {"actor", "time_reference", "run_event", "grant_event", "rerun_event", "tombstone_event", "failure_run_event"}
     if not isinstance(value, dict) or set(value) != fields:
         raise ValueError("public acceptance template shape differs")
     actor = value["actor"]
@@ -1077,6 +1085,7 @@ def validate_acceptance_template(value: object) -> dict[str, Any]:
         "grant_event": 46_107,
         "rerun_event": 46_100,
         "tombstone_event": 5,
+        "failure_run_event": 46_100,
     }
     encoded: set[bytes] = set()
     for name, kind in expected_kinds.items():
@@ -1122,11 +1131,28 @@ def validate_acceptance_template(value: object) -> dict[str, Any]:
         or rerun["expires_at"] <= time_reference
     ):
         raise ValueError("public acceptance rerun template is not issued at the time reference")
+    failure_run_event = value["failure_run_event"]
+    try:
+        failure_run = json.loads(failure_run_event[5], object_pairs_hook=reject_duplicates)
+    except (TypeError, ValueError) as error:
+        raise ValueError("public acceptance failure-run template envelope is invalid") from error
+    if (
+        failure_run_event[2] != time_reference
+        or not isinstance(failure_run, dict)
+        or failure_run.get("issued_at") != time_reference
+        or failure_run.get("request_type") != "run"
+        or failure_run.get("attempt") != 1
+        or not isinstance(failure_run.get("run_id"), str)
+        or not failure_run["run_id"].endswith("-ffffffffffff")
+        or failure_run["run_id"] == run.get("run_id")
+    ):
+        raise ValueError("public acceptance failure-run template is invalid")
     channel = _event_tag_value(run_event[4], "h", "public acceptance run template")
     _canonical_channel_id(channel, "public acceptance run template channel")
     if (
         _event_tag_value(value["grant_event"][4], "h", "public acceptance grant template") != channel
         or _event_tag_value(rerun_event[4], "h", "public acceptance rerun template") != channel
+        or _event_tag_value(failure_run_event[4], "h", "public acceptance failure-run template") != channel
     ):
         raise ValueError("public acceptance templates name more than one channel")
     repository = run.get("target_repo_a")
@@ -1135,6 +1161,10 @@ def validate_acceptance_template(value: object) -> dict[str, Any]:
         or _event_tag_value(run_event[4], "a", "public acceptance run template") != repository
         or _event_tag_value(rerun_event[4], "a", "public acceptance rerun template") != repository
         or rerun.get("target_repo_a") != repository
+        or _event_tag_value(failure_run_event[4], "a", "public acceptance failure-run template") != repository
+        or failure_run.get("target_repo_a") != repository
+        or rerun.get("run_id") != failure_run.get("run_id")
+        or rerun.get("parent_run_id") != failure_run.get("run_id")
     ):
         raise ValueError("public acceptance templates name more than one repository")
     return value
