@@ -40,6 +40,25 @@ pub struct AcceptedRequest {
     pub envelope: CiRequestEnvelope,
 }
 
+/// Exact frozen request identity required for an acceptance-only poll.
+///
+/// The binding is checked before any run state, publication intent, runner
+/// dispatch, or channel cursor mutation can occur.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcceptedRequestBinding {
+    pub channel_id: String,
+    pub event_id: String,
+    pub envelope: CiRequestEnvelope,
+}
+
+impl AcceptedRequestBinding {
+    fn matches(&self, accepted: &AcceptedRequest) -> bool {
+        accepted.channel_id == self.channel_id
+            && accepted.event_id == self.event_id
+            && accepted.envelope == self.envelope
+    }
+}
+
 /// Trusted static manifest facts used in signed kind-46102 events.
 #[derive(Clone, Debug)]
 pub struct JobMetadata {
@@ -486,7 +505,16 @@ where
 {
     /// Consume at most one accepted request after the durable channel cursor.
     pub fn poll_once(&mut self, channel_id: &str) -> Result<PollStep, ProductionError> {
-        self.poll_head(channel_id, false)
+        self.poll_head(channel_id, false, None)
+    }
+
+    /// Consume only the exact frozen request selected by an acceptance stage.
+    pub fn poll_once_bound(
+        &mut self,
+        channel_id: &str,
+        expected: &AcceptedRequestBinding,
+    ) -> Result<PollStep, ProductionError> {
+        self.poll_head(channel_id, false, Some(expected))
     }
 
     /// Replay every deferred publication through the ordinary pending path
@@ -512,7 +540,7 @@ where
             self.republish(key, stored)?;
         }
         if !deferred.is_empty() {
-            while self.poll_head(channel_id, true)? == PollStep::Completed {}
+            while self.poll_head(channel_id, true, None)? == PollStep::Completed {}
         }
         Ok(deferred.len())
     }
@@ -521,6 +549,7 @@ where
         &mut self,
         channel_id: &str,
         terminal_only: bool,
+        expected: Option<&AcceptedRequestBinding>,
     ) -> Result<PollStep, ProductionError> {
         let cursor = self
             .store
@@ -534,6 +563,9 @@ where
             return Ok(PollStep::Idle);
         };
         if accepted.channel_id != channel_id || accepted.watch_cursor <= cursor {
+            return Err(ProductionError::Invalid);
+        }
+        if expected.is_some_and(|binding| !binding.matches(&accepted)) {
             return Err(ProductionError::Invalid);
         }
         if terminal_only {
@@ -1650,6 +1682,177 @@ mod tests {
                 issued_at: 10,
                 expires_at: 40,
             },
+        }
+    }
+
+    struct ChannelHeadRelay {
+        heads: Vec<AcceptedRequest>,
+        observed: Vec<String>,
+    }
+
+    impl RelayControl for ChannelHeadRelay {
+        type Error = ();
+
+        fn next_accepted(
+            &mut self,
+            _channel_id: &str,
+            after_cursor: u64,
+        ) -> Result<Option<AcceptedRequest>, Self::Error> {
+            let next = self
+                .heads
+                .iter()
+                .filter(|accepted| accepted.watch_cursor > after_cursor)
+                .min_by_key(|accepted| accepted.watch_cursor)
+                .cloned();
+            if let Some(accepted) = &next {
+                self.observed.push(accepted.event_id.clone());
+            }
+            Ok(next)
+        }
+
+        fn publish(&mut self, event: &SignedCiEvent) -> Result<String, Self::Error> {
+            Ok(event.event_id.clone())
+        }
+
+        fn publication_exists(&mut self, _event: &SignedCiEvent) -> Result<bool, Self::Error> {
+            Ok(false)
+        }
+
+        fn put_log(
+            &mut self,
+            _accepted: &AcceptedRequest,
+            _job: &JobCompletion,
+            _bytes: &[u8],
+        ) -> Result<StoredObject, Self::Error> {
+            Err(())
+        }
+
+        fn put_artifact(
+            &mut self,
+            _accepted: &AcceptedRequest,
+            _job: &JobCompletion,
+            _artifact: &ArtifactCompletion,
+            _bytes: &[u8],
+        ) -> Result<StoredObject, Self::Error> {
+            Err(())
+        }
+    }
+
+    fn frozen_binding(expected: &AcceptedRequest) -> AcceptedRequestBinding {
+        AcceptedRequestBinding {
+            channel_id: expected.channel_id.clone(),
+            event_id: expected.event_id.clone(),
+            envelope: expected.envelope.clone(),
+        }
+    }
+
+    #[test]
+    fn bound_poll_refuses_foreign_head_without_consuming_expected_request_behind_it() {
+        let mut expected = accepted();
+        expected.watch_cursor = 8;
+        let mut foreign = expected.clone();
+        foreign.watch_cursor = 7;
+        foreign.event_id = "99".repeat(32);
+        foreign.envelope.run_id = "123e4567-e89b-12d3-a456-426614174099".into();
+        let binding = frozen_binding(&expected);
+        let mut handler = ProductionHandler::new(
+            ChannelHeadRelay {
+                heads: vec![foreign.clone(), expected],
+                observed: Vec::new(),
+            },
+            DeterministicSigner,
+            FailingExecutor,
+            MemoryStore::default(),
+            MemoryOutput(Vec::new()),
+        );
+
+        for _ in 0..2 {
+            assert!(matches!(
+                handler.poll_once_bound(CHANNEL, &binding),
+                Err(ProductionError::Invalid)
+            ));
+            assert_eq!(handler.store.cursor, 0);
+            assert!(handler.store.run.is_none());
+            assert!(handler.store.publications.is_empty());
+        }
+        assert_eq!(handler.relay.observed, vec![foreign.event_id; 2]);
+    }
+
+    #[test]
+    fn frozen_binding_rejects_cross_lineage_and_authority_drift() {
+        let expected = accepted();
+        let binding = frozen_binding(&expected);
+        assert!(binding.matches(&expected));
+
+        let mut mismatches = Vec::new();
+        let mut drift = expected.clone();
+        drift.event_id = "99".repeat(32);
+        mismatches.push(("signed request digest", drift));
+        let mut drift = expected.clone();
+        drift.channel_id = "123e4567-e89b-12d3-a456-426614174098".into();
+        mismatches.push(("channel", drift));
+        let mut drift = expected.clone();
+        drift.envelope.actor = "99".repeat(32);
+        mismatches.push(("actor authority", drift));
+        let mut drift = expected.clone();
+        drift.envelope.run_id = "123e4567-e89b-12d3-a456-426614174099".into();
+        mismatches.push(("run UUID", drift));
+        let mut drift = expected.clone();
+        drift.envelope.target_repo_a = format!("30617:{}:foreign", "22".repeat(32));
+        mismatches.push(("repository", drift));
+        let mut drift = expected.clone();
+        drift.envelope.tip_oid = "77".repeat(20);
+        mismatches.push(("tip object", drift));
+        let mut drift = expected.clone();
+        drift.envelope.base_ref = "refs/heads/foreign".into();
+        mismatches.push(("base ref", drift));
+        let mut drift = expected.clone();
+        drift.envelope.base_oid = "77".repeat(20);
+        mismatches.push(("base object", drift));
+        let mut drift = expected.clone();
+        drift.envelope.workflow_id = "foreign".into();
+        mismatches.push(("workflow ID", drift));
+        let mut drift = expected.clone();
+        drift.envelope.workflow_digest = "77".repeat(32);
+        mismatches.push(("workflow digest", drift));
+        let mut drift = expected.clone();
+        drift.envelope.job_ids = vec!["foreign".into()];
+        mismatches.push(("job selection", drift));
+        let mut drift = expected.clone();
+        drift.envelope.attempt = 2;
+        drift.envelope.parent_attempt = Some(1);
+        drift.envelope.parent_run_id = Some(drift.envelope.run_id.clone());
+        mismatches.push(("attempt lineage", drift));
+
+        for (field, drift) in mismatches {
+            assert!(!binding.matches(&drift), "accepted drift in {field}");
+        }
+
+        let mut rerun = expected;
+        rerun.event_id = "aa".repeat(32);
+        rerun.envelope.request_type = CiRequestType::Rerun;
+        rerun.envelope.attempt = 2;
+        rerun.envelope.parent_attempt = Some(1);
+        rerun.envelope.parent_run_id = Some(rerun.envelope.run_id.clone());
+        let rerun_binding = frozen_binding(&rerun);
+        for (field, drift) in [
+            ("parent attempt", {
+                let mut drift = rerun.clone();
+                drift.envelope.parent_attempt = None;
+                drift
+            }),
+            ("parent run", {
+                let mut drift = rerun.clone();
+                drift.envelope.parent_run_id = None;
+                drift
+            }),
+            ("rerun attempt", {
+                let mut drift = rerun.clone();
+                drift.envelope.attempt = 1;
+                drift
+            }),
+        ] {
+            assert!(!rerun_binding.matches(&drift), "accepted drift in {field}");
         }
     }
 

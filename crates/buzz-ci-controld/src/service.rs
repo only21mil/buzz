@@ -12,9 +12,9 @@ use buzz_ci_acceptance_ctl::acceptance::{
 use buzz_ci_acceptance_ctl::production::{
     AdapterRequest, AdapterResponse, ADAPTER_RESPONSE_SCHEMA,
 };
-use buzz_ci_broker_protocol::v2::CancelAttemptRequest;
+use buzz_ci_broker_protocol::v2::{AdmitAttemptRequest, BrokerResponse, CancelAttemptRequest};
 use buzz_ci_broker_protocol::{
-    BrokerState, CancelReason, Conclusion as BrokerConclusion, ResponseCode,
+    BrokerState, CancelReason, Conclusion as BrokerConclusion, GitOid, ResponseCode,
 };
 use buzz_ci_controld::acceptance_socket::{
     AcceptanceBinding, AcceptanceJournal, AcceptanceOperationHandler, AcceptanceSocketError,
@@ -24,7 +24,9 @@ use buzz_ci_controld::controller::{
     ControllerError, TerminalInfrastructureReason,
 };
 use buzz_ci_controld::keyholder::{KeyholderError, UnixKeyholderClient};
-use buzz_ci_controld::production::{JobMetadata, RelayControl, SignedCiEvent};
+use buzz_ci_controld::production::{
+    AcceptedRequestBinding, JobMetadata, RelayControl, SignedCiEvent,
+};
 use buzz_ci_controld::production_v2::{
     compose_runner_v2, AttemptCommand, AttemptControl, AttemptObservation, ProductionV2Error,
     RunnerV2AttemptExecutor, RunnerV2EvidenceReader, VerifiedAttemptEvidence,
@@ -37,9 +39,11 @@ use buzz_ci_controld::runner_v2::{
 use buzz_ci_controld::source::{AuthenticatedRelay, ReqwestTransport, SourceError, TransportError};
 use buzz_ci_controld::store::{DurableControlStore, StoreError};
 use buzz_ci_keyholder::{AcceptanceMutation, PublicIdentity};
+use buzz_core::ci::CiRequestEnvelope;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
+use uuid::Uuid;
 
 use crate::config::DaemonConfig;
 
@@ -102,6 +106,7 @@ struct AcceptanceAuthority {
     scenario_sha256: [u8; 32],
     event_ids: [[u8; 32]; 5],
     templates: [serde_json::Value; 5],
+    request_bindings: [AcceptedRequestBinding; 3],
 }
 
 impl AcceptanceAuthority {
@@ -121,11 +126,17 @@ impl AcceptanceAuthority {
             config.tombstone_event.clone(),
             config.failure_run_event.clone(),
         ];
+        let request_bindings = [
+            Self::request_binding(&templates[0], validated.event_ids()[0])?,
+            Self::request_binding(&templates[4], validated.event_ids()[4])?,
+            Self::request_binding(&templates[2], validated.event_ids()[2])?,
+        ];
         Ok(Self {
             actor,
             scenario_sha256: validated.scenario_sha256(),
             event_ids: validated.event_ids(),
             templates,
+            request_bindings,
         })
     }
 
@@ -137,6 +148,55 @@ impl AcceptanceAuthority {
             AcceptanceMutation::Tombstone => 3,
             AcceptanceMutation::FailureRun => 4,
         }
+    }
+
+    fn expected_request(
+        &self,
+        mutation: AcceptanceMutation,
+    ) -> Result<AcceptedRequestBinding, AcceptanceSocketError> {
+        let index = match mutation {
+            AcceptanceMutation::Run => 0,
+            AcceptanceMutation::FailureRun => 1,
+            AcceptanceMutation::Rerun => 2,
+            AcceptanceMutation::Grant | AcceptanceMutation::Tombstone => {
+                return Err(AcceptanceSocketError::Operation)
+            }
+        };
+        Ok(self.request_bindings[index].clone())
+    }
+
+    fn request_binding(
+        template: &serde_json::Value,
+        event_id: [u8; 32],
+    ) -> Result<AcceptedRequestBinding, ServiceError> {
+        let fields = template.as_array().ok_or(ServiceError::InvalidConfig)?;
+        let tags = fields
+            .get(4)
+            .and_then(serde_json::Value::as_array)
+            .ok_or(ServiceError::InvalidConfig)?;
+        let mut channels = tags.iter().filter_map(|tag| {
+            let tag = tag.as_array()?;
+            (tag.first()?.as_str()? == "h")
+                .then(|| tag.get(1)?.as_str())
+                .flatten()
+        });
+        let channel_id = channels
+            .next()
+            .filter(|_| channels.next().is_none())
+            .ok_or(ServiceError::InvalidConfig)?
+            .to_owned();
+        let envelope = serde_json::from_str::<CiRequestEnvelope>(
+            fields
+                .get(5)
+                .and_then(serde_json::Value::as_str)
+                .ok_or(ServiceError::InvalidConfig)?,
+        )
+        .map_err(|_| ServiceError::InvalidConfig)?;
+        Ok(AcceptedRequestBinding {
+            channel_id,
+            event_id: hex::encode(event_id),
+            envelope,
+        })
     }
 }
 
@@ -219,6 +279,13 @@ impl CapacityOneService {
             relay_authorizer,
         )?;
         let acceptance_authority = AcceptanceAuthority::new(binding)?;
+        if acceptance_authority
+            .request_bindings
+            .iter()
+            .any(|expected| expected.channel_id != active.channel_id)
+        {
+            return Err(ServiceError::InvalidConfig);
+        }
         let described = acceptance_signer.describe_acceptance()?;
         if described.actor != acceptance_authority.actor
             || described.scenario_sha256 != acceptance_authority.scenario_sha256
@@ -379,7 +446,10 @@ impl CapacityOneService {
         self.poll_interval
     }
 
-    fn begin_async_attempt(&mut self) -> Result<BoundAttempt, AcceptanceSocketError> {
+    fn begin_async_attempt(
+        &mut self,
+        mutation: AcceptanceMutation,
+    ) -> Result<BoundAttempt, AcceptanceSocketError> {
         if let Some(active) = self.active_attempt {
             return Ok(active);
         }
@@ -391,18 +461,24 @@ impl CapacityOneService {
             .controller
             .take()
             .ok_or(AcceptanceSocketError::Operation)?;
+        let expected = self.acceptance_authority.expected_request(mutation)?;
+        let polled_expected = expected.clone();
         self.status = CapacityOneStatus::active_attempt();
         self.controller_worker = Some(thread::spawn(move || {
-            let result = controller.poll_once().map(|_| ());
+            let result = controller.poll_once_bound(&polled_expected).map(|_| ());
             (controller, result)
         }));
         match self.observations.recv_timeout(self.acceptance.timeout()) {
-            Ok(AttemptObservation::Active(active)) => {
+            Ok(AttemptObservation::Active(active))
+                if observed_admission_matches(&expected, active.admission, active.response) =>
+            {
                 self.active_attempt = Some(active);
                 self.gate_waiting = true;
                 Ok(active)
             }
-            Ok(AttemptObservation::Terminal(terminal)) => {
+            Ok(AttemptObservation::Terminal(terminal))
+                if observed_admission_matches(&expected, terminal.admission, terminal.response) =>
+            {
                 let recovered = BoundAttempt {
                     admission: terminal.admission,
                     response: terminal.response,
@@ -411,7 +487,7 @@ impl CapacityOneService {
                 self.terminal_attempt = Some(terminal);
                 Ok(recovered)
             }
-            Ok(AttemptObservation::Completed(_)) => self.fail_async_attempt(),
+            Ok(_) => self.fail_async_attempt(),
             Err(_) => self.fail_async_attempt(),
         }
     }
@@ -428,9 +504,10 @@ impl CapacityOneService {
 
     fn finish_async_attempt(
         &mut self,
+        mutation: AcceptanceMutation,
     ) -> Result<(TerminalAttempt, VerifiedAttemptEvidence), AcceptanceSocketError> {
         if self.controller_worker.is_none() {
-            self.begin_async_attempt()?;
+            self.begin_async_attempt(mutation)?;
             self.release_async_attempt()?;
         }
         let worker = self
@@ -457,6 +534,10 @@ impl CapacityOneService {
             terminal
         });
         let terminal = terminal.ok_or(AcceptanceSocketError::Operation)?;
+        let expected = self.acceptance_authority.expected_request(mutation)?;
+        if !observed_admission_matches(&expected, terminal.admission, terminal.response) {
+            return self.fail_async_attempt();
+        }
         let evidence = self
             .verified_evidence
             .take()
@@ -470,6 +551,72 @@ impl CapacityOneService {
     fn fail_async_attempt<T>(&mut self) -> Result<T, AcceptanceSocketError> {
         self.status = CapacityOneStatus::startup_failure(TerminalInfrastructureReason::State);
         Err(AcceptanceSocketError::Operation)
+    }
+}
+
+fn observed_admission_matches(
+    expected: &AcceptedRequestBinding,
+    admission: AdmitAttemptRequest,
+    response: BrokerResponse,
+) -> bool {
+    let Some(event_id) = decode_array::<32>(&expected.event_id) else {
+        return false;
+    };
+    let envelope = &expected.envelope;
+    let Some(actor) = decode_array::<32>(&envelope.actor) else {
+        return false;
+    };
+    let Some(workflow_digest) = decode_array::<32>(&envelope.workflow_digest) else {
+        return false;
+    };
+    let Some(source_pin_event_id) = decode_array::<32>(&envelope.trigger_event_id) else {
+        return false;
+    };
+    let Some(run_id) = Uuid::parse_str(&envelope.run_id).ok() else {
+        return false;
+    };
+    let Some(idempotency_key) = Uuid::parse_str(&envelope.idempotency_key).ok() else {
+        return false;
+    };
+    let Some(tip_oid) = decode_git_oid(&envelope.tip_oid) else {
+        return false;
+    };
+    let Some(base_oid) = decode_git_oid(&envelope.base_oid) else {
+        return false;
+    };
+    let Ok(wall_timeout_seconds) = u32::try_from(envelope.timeout_seconds) else {
+        return false;
+    };
+    let idempotency_digest: [u8; 32] = Sha256::digest(idempotency_key.as_bytes()).into();
+
+    admission.signed_request_digest == event_id
+        && admission.actor_pubkey == actor
+        && admission.idempotency_digest == idempotency_digest
+        && admission.source_pin_event_id == source_pin_event_id
+        && admission.workflow_digest == workflow_digest
+        && admission.run_id == *run_id.as_bytes()
+        && admission.tip_oid == tip_oid
+        && admission.base_oid == base_oid
+        && admission.issued_at == envelope.issued_at
+        && admission.expires_at == envelope.expires_at
+        && admission.wall_timeout_seconds == wall_timeout_seconds
+        && admission.attempt == envelope.attempt
+        && admission.parent_attempt == envelope.parent_attempt.unwrap_or(0)
+        && response.accepted_request_digest == event_id
+        && response.run_id == *run_id.as_bytes()
+        && response.tip_oid == Some(tip_oid)
+        && response.attempt == envelope.attempt
+}
+
+fn decode_array<const N: usize>(value: &str) -> Option<[u8; N]> {
+    hex::decode(value).ok()?.try_into().ok()
+}
+
+fn decode_git_oid(value: &str) -> Option<GitOid> {
+    match value.len() {
+        40 => decode_array::<20>(value).map(GitOid::Sha1),
+        64 => decode_array::<32>(value).map(GitOid::Sha256),
+        _ => None,
     }
 }
 
@@ -526,11 +673,11 @@ impl AcceptanceOperationHandler for CapacityOneService {
                 Ok(approved_response(request))
             }
             (5, Operation::ResumeGrant) => {
-                let active = self.begin_async_attempt()?;
+                let active = self.begin_async_attempt(AcceptanceMutation::Run)?;
                 Ok(running_response(request, prior, active, false, false)?)
             }
             (6, Operation::AwaitFirstTerminal) => {
-                let (terminal, evidence) = self.finish_async_attempt()?;
+                let (terminal, evidence) = self.finish_async_attempt(AcceptanceMutation::Run)?;
                 Ok(first_terminal_response(
                     request, prior, terminal, &evidence,
                 )?)
@@ -541,28 +688,29 @@ impl AcceptanceOperationHandler for CapacityOneService {
                 Ok(failed_submitted_response(request))
             }
             (9, Operation::ResumeFailure) => {
-                let active = self.begin_async_attempt()?;
+                let active = self.begin_async_attempt(AcceptanceMutation::FailureRun)?;
                 Ok(running_response(request, prior, active, false, true)?)
             }
             (10, Operation::AwaitFailureTerminal) => {
-                let (terminal, evidence) = self.finish_async_attempt()?;
+                let (terminal, evidence) =
+                    self.finish_async_attempt(AcceptanceMutation::FailureRun)?;
                 Ok(failure_terminal_response(
                     request, prior, terminal, &evidence,
                 )?)
             }
             (11, Operation::Rerun) => {
                 self.publish_acceptance(AcceptanceMutation::Rerun)?;
-                let active = self.begin_async_attempt()?;
+                let active = self.begin_async_attempt(AcceptanceMutation::Rerun)?;
                 Ok(running_response(request, prior, active, true, true)?)
             }
             (12, Operation::CancelRerun) => {
                 let active = self
                     .active_attempt
-                    .or_else(|| self.begin_async_attempt().ok())
+                    .or_else(|| self.begin_async_attempt(AcceptanceMutation::Rerun).ok())
                     .ok_or(AcceptanceSocketError::Operation)?;
                 let cancelled = self.cancel_active_attempt(request, active)?;
                 self.release_async_attempt()?;
-                let (reconciled, _) = self.finish_async_attempt()?;
+                let (reconciled, _) = self.finish_async_attempt(AcceptanceMutation::Rerun)?;
                 if !same_terminal_binding(cancelled, reconciled) {
                     return Err(AcceptanceSocketError::Operation);
                 }
@@ -1381,6 +1529,135 @@ mod tests {
     use buzz_ci_controld::acceptance_socket::ACCEPTANCE_BINDING_PATH;
 
     #[test]
+    fn acceptance_authority_selects_each_frozen_request_identity() {
+        let binding = canonical_acceptance_binding();
+        let validated = binding.validate().expect("validated binding");
+        let authority = AcceptanceAuthority::new(&binding).expect("acceptance authority");
+        assert_eq!(authority.event_ids, validated.event_ids());
+
+        let cases = [
+            (
+                AcceptanceMutation::Run,
+                0,
+                binding.fixture.run_id.as_str(),
+                1,
+                None,
+                None,
+            ),
+            (
+                AcceptanceMutation::FailureRun,
+                4,
+                binding.fixture.failure_run_id.as_str(),
+                1,
+                None,
+                None,
+            ),
+            (
+                AcceptanceMutation::Rerun,
+                2,
+                binding.fixture.failure_run_id.as_str(),
+                2,
+                Some(1),
+                Some(binding.fixture.failure_run_id.as_str()),
+            ),
+        ];
+        for (mutation, event_index, run_id, attempt, parent_attempt, parent_run_id) in cases {
+            let expected = authority
+                .expected_request(mutation)
+                .expect("request-bearing mutation");
+            assert_eq!(
+                expected.event_id,
+                hex::encode(authority.event_ids[event_index])
+            );
+            assert_eq!(expected.envelope.run_id.replace('-', ""), run_id);
+            assert_eq!(expected.envelope.attempt, attempt);
+            assert_eq!(expected.envelope.parent_attempt, parent_attempt);
+            assert_eq!(
+                expected
+                    .envelope
+                    .parent_run_id
+                    .as_deref()
+                    .map(|value| value.replace('-', "")),
+                parent_run_id.map(str::to_owned)
+            );
+            assert_eq!(expected.envelope.actor, binding.acceptance.actor.public_key);
+        }
+        assert_eq!(
+            authority.expected_request(AcceptanceMutation::Grant),
+            Err(AcceptanceSocketError::Operation)
+        );
+        assert_eq!(
+            authority.expected_request(AcceptanceMutation::Tombstone),
+            Err(AcceptanceSocketError::Operation)
+        );
+    }
+
+    #[test]
+    fn live_admission_matrix_keeps_rerun_distinct_from_failure_run_root() {
+        let binding = canonical_acceptance_binding();
+        let authority = AcceptanceAuthority::new(&binding).expect("acceptance authority");
+        let run_a = authority
+            .expected_request(AcceptanceMutation::Run)
+            .expect("Run A");
+        let run_b = authority
+            .expected_request(AcceptanceMutation::FailureRun)
+            .expect("Run B");
+        let rerun = authority
+            .expected_request(AcceptanceMutation::Rerun)
+            .expect("rerun");
+
+        for expected in [&run_a, &run_b, &rerun] {
+            let observed = observation_for(expected);
+            assert!(observed_admission_matches(
+                expected,
+                observed.admission,
+                observed.response
+            ));
+        }
+        assert_ne!(run_a.event_id, run_b.event_id);
+        assert_ne!(run_b.event_id, rerun.event_id);
+        assert_eq!(run_b.envelope.run_id, rerun.envelope.run_id);
+
+        let mut relabeled_rerun = observation_for(&rerun);
+        relabeled_rerun.admission.signed_request_digest = authority.event_ids[4];
+        relabeled_rerun.response.accepted_request_digest = authority.event_ids[4];
+        assert!(!observed_admission_matches(
+            &rerun,
+            relabeled_rerun.admission,
+            relabeled_rerun.response
+        ));
+
+        for drift in [
+            {
+                let mut drift = observation_for(&rerun);
+                drift.admission.parent_attempt = 0;
+                drift
+            },
+            {
+                let mut drift = observation_for(&rerun);
+                drift.admission.workflow_digest[0] ^= 1;
+                drift
+            },
+            {
+                let mut drift = observation_for(&rerun);
+                drift.admission.actor_pubkey[0] ^= 1;
+                drift
+            },
+            {
+                let mut drift = observation_for(&rerun);
+                drift.admission.base_oid = GitOid::Sha1([99; 20]);
+                drift
+            },
+        ] {
+            assert!(!observed_admission_matches(
+                &rerun,
+                drift.admission,
+                drift.response
+            ));
+        }
+    }
+
+    #[test]
     fn incomplete_acceptance_sequence_retains_socket_poll_ownership_after_restart() {
         for completed in 0..COMPLETE_ACCEPTANCE_SEQUENCE {
             assert!(
@@ -1492,6 +1769,34 @@ mod tests {
                 attempt: 2,
             },
         }
+    }
+
+    fn observation_for(expected: &AcceptedRequestBinding) -> BoundAttempt {
+        let mut observed = active_binding();
+        let envelope = &expected.envelope;
+        observed.admission.signed_request_digest = decode_array(&expected.event_id).unwrap();
+        observed.admission.actor_pubkey = decode_array(&envelope.actor).unwrap();
+        observed.admission.idempotency_digest = Sha256::digest(
+            Uuid::parse_str(&envelope.idempotency_key)
+                .unwrap()
+                .as_bytes(),
+        )
+        .into();
+        observed.admission.source_pin_event_id = decode_array(&envelope.trigger_event_id).unwrap();
+        observed.admission.workflow_digest = decode_array(&envelope.workflow_digest).unwrap();
+        observed.admission.run_id = *Uuid::parse_str(&envelope.run_id).unwrap().as_bytes();
+        observed.admission.tip_oid = decode_git_oid(&envelope.tip_oid).unwrap();
+        observed.admission.base_oid = decode_git_oid(&envelope.base_oid).unwrap();
+        observed.admission.issued_at = envelope.issued_at;
+        observed.admission.expires_at = envelope.expires_at;
+        observed.admission.wall_timeout_seconds = envelope.timeout_seconds.try_into().unwrap();
+        observed.admission.attempt = envelope.attempt;
+        observed.admission.parent_attempt = envelope.parent_attempt.unwrap_or(0);
+        observed.response.accepted_request_digest = observed.admission.signed_request_digest;
+        observed.response.run_id = observed.admission.run_id;
+        observed.response.tip_oid = Some(observed.admission.tip_oid);
+        observed.response.attempt = observed.admission.attempt;
+        observed
     }
 
     fn rerun_request(attempt_id: Option<&str>) -> AdapterRequest {
