@@ -102,10 +102,13 @@ readback. `nip98.key` signs the accepted read, evidence `PUT`s, and stage-7
 caller as a CI signer (`BUZZ_CI_STATUS_SIGNER_PUBKEYS` or an active kind-46107
 grant for the request's repository). A production channel therefore needs the
 acceptance actor as an owner or admin (it issues the grant), `ci-event.key` as
-a member, and `nip98.key` listed as a static CI signer; the relay also refuses
-any event whose `created_at` is more than 900 seconds from its clock, so the
-frozen acceptance events must be published within that window of the time
-reference.
+a member, and `nip98.key` both listed as a static CI signer and enrolled as an
+active member of the acceptance repository's private channel. Static-signer
+status alone does not authorize an evidence `GET`. The relay also refuses any
+event whose `created_at` is more than 900 seconds from its clock, so the frozen
+acceptance events must be published within that window of the time reference.
+Exact-event queries remain under the ci-event identity and its active channel
+membership, not the nip98 identity.
 
 The stage-7 operation identity and requested evidence remain fixed across
 recovery, but its NIP-98 tokens do not. Once the acceptance journal has staged

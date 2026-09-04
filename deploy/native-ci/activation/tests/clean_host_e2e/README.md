@@ -106,9 +106,12 @@ granted CI signer equal to `relay_signer`; a kind-5 tombstone must target the
 author's own stored event; the accepted read, evidence writes, and exact
 signed-reference evidence `GET`s need a static or granted CI signer for the
 request's repository. The guest rosters the acceptance actor as channel admin,
-the ci-event key as member, and the nip98 key as the static signer
-(`guest_entry.relay_public_config`), the same three facts production must hold
-for its channel.
+the ci-event key as member, and the nip98 key both as static signer and active
+member of the acceptance repository's private channel
+(`guest_entry.relay_public_config`). Static-signer status alone does not
+authorize an evidence `GET`. Those are the same facts production must hold for
+its repository and channel. Exact-event queries remain signed by the ci-event
+identity, whose active channel membership scopes their results.
 The relay also receives the candidate's frozen acceptance template and, only
 for the replay-before-grant fault, the distinct prior template. It derives the
 five actor event IDs in API order (`Run`, `Grant`, `Rerun`, `Tombstone`,

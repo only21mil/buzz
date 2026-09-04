@@ -111,10 +111,12 @@ The export response also adds:
 The harness requires the export objects to equal the fixture log plus artifact
 set, with no missing, duplicate, or extra object. It compares the export's
 evidence-set digest to the terminal attempt's digest. `authorization_digest` is
-a stable deterministic digest over the ordered, sanitized exact-event and
-object-request bindings plus their public selector identities and generations.
-It is never a digest of an Authorization header, bearer token, signature,
-nonce, timestamp, or volatile NIP-98 event ID.
+a stable deterministic digest over the ordered evidence-object `GET` bindings
+and the dedicated nip98 subject and generation. Exact-event `/query` proofs use
+the distinct ci-event subject and generation and are validated at runtime; the
+query operations and their volatile proof IDs are not part of this frozen
+digest. It is never a digest of an Authorization header, bearer token,
+signature, nonce, or timestamp.
 
 ## Adapter rules
 
