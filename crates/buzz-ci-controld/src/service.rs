@@ -26,8 +26,8 @@ use buzz_ci_controld::controller::{
 };
 use buzz_ci_controld::keyholder::{KeyholderError, UnixKeyholderClient};
 use buzz_ci_controld::production::{
-    AcceptedRequest, AcceptedRequestBinding, AttemptExecutor, CiSigner, ControlStore,
-    EvidenceReader, JobMetadata, RelayControl, SignedCiEvent,
+    AcceptedRequest, AcceptedRequestBinding, AttemptExecutor, AuthenticatedEvidenceExport,
+    CiSigner, ControlStore, EvidenceReader, JobMetadata, RelayControl, SignedCiEvent,
 };
 use buzz_ci_controld::production_v2::{
     compose_runner_v2, AttemptCommand, AttemptControl, AttemptObservation, ProductionV2Error,
@@ -167,6 +167,12 @@ pub(crate) trait ServiceController: Send + 'static {
         &mut self,
         expected: &AcceptedRequestBinding,
     ) -> Result<(), ControllerError>;
+    fn service_export_first_evidence(
+        &mut self,
+        expected: &AcceptedRequestBinding,
+        job_id: &str,
+        attempt: u32,
+    ) -> Result<AuthenticatedEvidenceExport, ControllerError>;
 }
 
 impl<R, S, X, P, O> ServiceController for CapacityOneController<R, S, X, P, O>
@@ -202,6 +208,15 @@ where
     ) -> Result<(), ControllerError> {
         self.replay_deferred_publications_bound(expected)
             .map(|_| ())
+    }
+
+    fn service_export_first_evidence(
+        &mut self,
+        expected: &AcceptedRequestBinding,
+        job_id: &str,
+        attempt: u32,
+    ) -> Result<AuthenticatedEvidenceExport, ControllerError> {
+        self.export_first_evidence(expected, job_id, attempt)
     }
 }
 
@@ -982,7 +997,23 @@ where
                     self.crash_after_provider_effect();
                     Ok(response)
                 }
-                (7, Operation::ExportFirstEvidence) => Ok(export_response(request, prior)?),
+                (7, Operation::ExportFirstEvidence) => {
+                    #[cfg(test)]
+                    self.crash_before_provider_effect();
+                    let expected = self
+                        .acceptance_authority
+                        .expected_request(AcceptanceMutation::Run)?;
+                    let export = self
+                        .controller
+                        .as_mut()
+                        .ok_or(AcceptanceSocketError::Operation)?
+                        .service_export_first_evidence(&expected, &request.fixture.job_id, 1)
+                        .map_err(|_| AcceptanceSocketError::Operation)?;
+                    let response = export_response(request, prior, export)?;
+                    #[cfg(test)]
+                    self.crash_after_provider_effect();
+                    Ok(response)
+                }
                 (8, Operation::SubmitFailureManifest) => {
                     self.publish_acceptance(AcceptanceMutation::FailureRun)?;
                     Ok(failed_submitted_response(request))
@@ -1644,6 +1675,7 @@ fn first_terminal_response(
 fn export_response(
     request: &AdapterRequest,
     prior: Option<&AdapterResponse>,
+    export: AuthenticatedEvidenceExport,
 ) -> Result<AdapterResponse, AcceptanceSocketError> {
     let run = prior_run(prior)?.clone();
     let selected = run
@@ -1662,19 +1694,50 @@ fn export_response(
         .evidence_set_digest
         .clone()
         .ok_or(AcceptanceSocketError::Operation)?;
-    let mut objects = Vec::with_capacity(1 + request.fixture.expected_artifacts.len());
-    objects.push(request.fixture.expected_log.clone());
-    objects.extend(request.fixture.expected_artifacts.clone());
+    if selected.len() != 32
+        || !selected
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || export.request_event_id != request.fixture.request_digest
+        || Uuid::parse_str(&export.run_id)
+            .map(|value| hex::encode(value.as_bytes()))
+            .as_deref()
+            != Ok(request.fixture.run_id.as_str())
+        || export.job_id != request.fixture.job_id
+        || export.attempt != 1
+        || export.subject != request.fixture.export_subject
+        || export.authorization_digest != request.fixture.export_authorization_digest
+        || export.objects.len() != 1 + request.fixture.expected_artifacts.len()
+    {
+        return Err(AcceptanceSocketError::Operation);
+    }
+    let expected_objects = std::iter::once(&request.fixture.expected_log)
+        .chain(request.fixture.expected_artifacts.iter());
+    let mut objects = Vec::with_capacity(export.objects.len());
+    for (actual, expected) in export.objects.into_iter().zip(expected_objects) {
+        if actual.name != expected.name
+            || actual.sha256 != expected.sha256
+            || actual.bytes.len() as u64 != expected.bytes
+            || hex::encode(Sha256::digest(&actual.bytes)) != actual.sha256
+        {
+            return Err(AcceptanceSocketError::Operation);
+        }
+        objects.push(buzz_ci_acceptance_ctl::acceptance::EvidenceObject {
+            name: actual.name,
+            sha256: actual.sha256,
+            bytes: actual.bytes.len() as u64,
+        });
+    }
     Ok(acceptance_response(
         request,
         run,
         0,
         Some(ExportSnapshot {
             authenticated: true,
-            subject: request.fixture.export_subject.clone(),
-            authorization_digest: request.fixture.export_authorization_digest.clone(),
+            subject: export.subject,
+            authorization_digest: export.authorization_digest,
             attempt_id: selected,
-            request_digest: request.fixture.request_digest.clone(),
+            request_digest: export.request_event_id,
             manifest_digest: request.fixture.manifest_digest.clone(),
             evidence_set_digest,
             objects,
@@ -1987,9 +2050,11 @@ mod tests {
     use crate::config::DaemonConfig;
     use buzz_ci_controld::acceptance_socket::ACCEPTANCE_BINDING_PATH;
     use buzz_ci_controld::production::{
-        ArtifactCompletion, JobCompletion, StoredObject, StoredPublication,
+        ArtifactCompletion, AuthenticatedEventRead, AuthenticatedObjectRead, ExportReadError,
+        JobCompletion, StoredObject, StoredPublication,
     };
     use buzz_ci_controld::runner_v2::AdmissionSigner;
+    use buzz_ci_controld::source::{HttpMethod, Nip98Binding, Nip98Proof};
     use buzz_ci_controld::{RunIdentity, RunRecord, StoreWrite};
     use buzz_core::ci::CiSkipPolicy;
 
@@ -2302,7 +2367,15 @@ mod tests {
     struct FakeRelayState {
         accepted: VecDeque<AcceptedRequest>,
         published: BTreeSet<String>,
+        events: HashMap<String, SignedCiEvent>,
+        objects: HashMap<String, Vec<u8>>,
         publish_calls: HashMap<String, usize>,
+        export_reads: usize,
+        event_proof_subject: Option<String>,
+        object_proof_subject: Option<String>,
+        object_proof_generation: Option<u64>,
+        export_error: Option<ExportReadError>,
+        put_url_drift: Option<String>,
     }
 
     #[derive(Clone, Default)]
@@ -2329,6 +2402,7 @@ mod tests {
         fn publish(&mut self, event: &SignedCiEvent) -> Result<String, Self::Error> {
             let mut state = self.0.lock().unwrap();
             state.published.insert(event.event_id.clone());
+            state.events.insert(event.event_id.clone(), event.clone());
             *state
                 .publish_calls
                 .entry(event.event_id.clone())
@@ -2342,27 +2416,151 @@ mod tests {
 
         fn put_log(
             &mut self,
-            _accepted: &AcceptedRequest,
-            _job: &JobCompletion,
+            accepted: &AcceptedRequest,
+            job: &JobCompletion,
             bytes: &[u8],
         ) -> Result<StoredObject, Self::Error> {
-            Ok(stored_object(bytes))
+            let request_id = if self.0.lock().unwrap().put_url_drift.as_deref() == Some("log") {
+                "ac".repeat(32)
+            } else {
+                accepted.event_id.clone()
+            };
+            let url = format!(
+                "https://relay.invalid/ci/logs/{}/{}/{}/{}/{}",
+                request_id,
+                accepted.envelope.run_id,
+                job.metadata.job_id,
+                job.attempt,
+                job.log.sha256
+            );
+            self.0
+                .lock()
+                .unwrap()
+                .objects
+                .insert(url.clone(), bytes.to_vec());
+            Ok(stored_object(url, bytes))
         }
 
         fn put_artifact(
             &mut self,
-            _accepted: &AcceptedRequest,
-            _job: &JobCompletion,
-            _artifact: &ArtifactCompletion,
+            accepted: &AcceptedRequest,
+            job: &JobCompletion,
+            artifact: &ArtifactCompletion,
             bytes: &[u8],
         ) -> Result<StoredObject, Self::Error> {
-            Ok(stored_object(bytes))
+            let artifact_id = if self.0.lock().unwrap().put_url_drift.as_deref() == Some("artifact")
+            {
+                "other"
+            } else {
+                artifact.artifact_id.as_str()
+            };
+            let url = format!(
+                "https://relay.invalid/ci/artifacts/{}/{}/{}/{}/{}/{}",
+                accepted.event_id,
+                accepted.envelope.run_id,
+                job.metadata.job_id,
+                job.attempt,
+                artifact_id,
+                artifact.descriptor.sha256
+            );
+            self.0
+                .lock()
+                .unwrap()
+                .objects
+                .insert(url.clone(), bytes.to_vec());
+            Ok(stored_object(url, bytes))
+        }
+
+        fn read_exact_event(
+            &mut self,
+            event_id: &str,
+            kind: u32,
+            author: &str,
+        ) -> Result<AuthenticatedEventRead, ExportReadError> {
+            let mut state = self.0.lock().unwrap();
+            state.export_reads += 1;
+            if let Some(error) = state.export_error {
+                return Err(error);
+            }
+            let event = state
+                .events
+                .get(event_id)
+                .cloned()
+                .ok_or(ExportReadError::Invalid)?;
+            if event.kind != kind {
+                return Err(ExportReadError::Invalid);
+            }
+            let url = Url::parse("https://relay.invalid/query").unwrap();
+            let filter = format!(
+                r#"[{{"ids":["{event_id}"],"authors":["{author}"],"kinds":[{kind}],"limit":1}}]"#
+            );
+            Ok(AuthenticatedEventRead {
+                event,
+                proof: Nip98Proof {
+                    subject: state
+                        .event_proof_subject
+                        .clone()
+                        .unwrap_or_else(|| author.to_owned()),
+                    generation: 7,
+                    event_id: "aa".repeat(32),
+                },
+                binding: Nip98Binding {
+                    method: HttpMethod::Post,
+                    url,
+                    payload_sha256: Some(hex::encode(Sha256::digest(filter.as_bytes()))),
+                    publisher: Some(author.to_owned()),
+                    query_filter: Some(filter.into_bytes()),
+                },
+            })
+        }
+
+        fn read_evidence_object(
+            &mut self,
+            url: &str,
+            expected_sha256: &str,
+            expected_bytes: u64,
+            maximum_bytes: u64,
+        ) -> Result<AuthenticatedObjectRead, ExportReadError> {
+            let mut state = self.0.lock().unwrap();
+            state.export_reads += 1;
+            if let Some(error) = state.export_error {
+                return Err(error);
+            }
+            let bytes = state
+                .objects
+                .get(url)
+                .cloned()
+                .ok_or(ExportReadError::Invalid)?;
+            if bytes.len() as u64 != expected_bytes
+                || maximum_bytes != expected_bytes
+                || hex::encode(Sha256::digest(&bytes)) != expected_sha256
+            {
+                return Err(ExportReadError::Invalid);
+            }
+            Ok(AuthenticatedObjectRead {
+                bytes,
+                proof: Nip98Proof {
+                    subject: state
+                        .object_proof_subject
+                        .clone()
+                        .unwrap_or_else(|| "1b".repeat(32)),
+                    generation: state.object_proof_generation.unwrap_or(8),
+                    event_id: "bb".repeat(32),
+                },
+                binding: Nip98Binding {
+                    method: HttpMethod::Get,
+                    url: Url::parse(url).map_err(|_| ExportReadError::Invalid)?,
+                    payload_sha256: None,
+                    publisher: None,
+                    query_filter: None,
+                },
+            })
         }
     }
 
-    fn stored_object(bytes: &[u8]) -> StoredObject {
+    fn stored_object(url: String, bytes: &[u8]) -> StoredObject {
         StoredObject {
-            url: "https://relay.invalid/object".to_owned(),
+            url,
             sha256: hex::encode(Sha256::digest(bytes)),
             byte_length: bytes.len() as u64,
         }
@@ -2378,25 +2576,30 @@ mod tests {
             &self.0
         }
 
+        fn generation(&self) -> u64 {
+            7
+        }
+
         fn sign(
             &mut self,
             kind: u32,
             content: &str,
             tags: serde_json::Value,
         ) -> Result<SignedCiEvent, Self::Error> {
-            let event_id = hex::encode(
-                Sha256::new()
-                    .chain_update(kind.to_be_bytes())
-                    .chain_update(content.as_bytes())
-                    .chain_update(serde_json::to_vec(&tags).unwrap())
-                    .finalize(),
-            );
+            let keys = nostr::Keys::parse(&format!("{}01", "00".repeat(31))).unwrap();
+            let parsed_tags: Vec<nostr::Tag> = serde_json::from_value(tags.clone()).unwrap();
+            let event = nostr::EventBuilder::new(nostr::Kind::Custom(kind as u16), content)
+                .tags(parsed_tags)
+                .custom_created_at(nostr::Timestamp::from(1_800_000_100_u64 + kind as u64))
+                .sign_with_keys(&keys)
+                .unwrap();
+            let event_id = event.id.to_hex();
             Ok(SignedCiEvent {
                 event_id: event_id.clone(),
                 kind,
                 content: content.to_owned(),
                 tags,
-                signed_event: serde_json::json!({"id": event_id}),
+                signed_event: serde_json::to_value(event).unwrap(),
             })
         }
     }
@@ -2446,6 +2649,7 @@ mod tests {
         last_request: Option<[u8; 32]>,
         cancels: usize,
         drift: bool,
+        exchanges: usize,
     }
 
     #[derive(Clone, Debug)]
@@ -2664,6 +2868,7 @@ mod tests {
         ) -> Result<Vec<u8>, Self::Error> {
             let (header, request) = v2::decode_request(request).unwrap();
             let mut state = self.0.lock().unwrap();
+            state.exchanges += 1;
             match request {
                 Request::RegisterJobIntent(value) => {
                     if state.last_request != Some(value.admission.signed_request_digest) {
@@ -2878,6 +3083,53 @@ mod tests {
         let artifact = serde_json::to_vec(&artifact).unwrap();
         binding.fixture.expected_artifacts[0].sha256 = hex::encode(Sha256::digest(&artifact));
         binding.fixture.expected_artifacts[0].bytes = artifact.len() as u64;
+        let plans = std::iter::once((
+            "log",
+            &binding.fixture.expected_log,
+            format!(
+                "https://relay.invalid/ci/logs/{}/{}/{}/1/{}",
+                hex::encode(event_id),
+                envelope.run_id,
+                binding.fixture.job_id,
+                binding.fixture.expected_log.sha256
+            ),
+        ))
+        .chain(binding.fixture.expected_artifacts.iter().map(|object| {
+            (
+                "artifact",
+                object,
+                format!(
+                    "https://relay.invalid/ci/artifacts/{}/{}/{}/1/result/{}",
+                    hex::encode(event_id),
+                    envelope.run_id,
+                    binding.fixture.job_id,
+                    object.sha256
+                ),
+            )
+        }));
+        let mut transcript = Vec::from(b"buzz-ci-acceptance-export-authority:v1\0".as_slice());
+        for (kind, object, url) in plans {
+            let event_id_hex = hex::encode(event_id);
+            let byte_length = object.bytes.to_string();
+            for field in [
+                "GET",
+                url.as_str(),
+                binding.fixture.export_subject.as_str(),
+                "8",
+                event_id_hex.as_str(),
+                envelope.run_id.as_str(),
+                binding.fixture.job_id.as_str(),
+                "1",
+                kind,
+                object.name.as_str(),
+                object.sha256.as_str(),
+                byte_length.as_str(),
+            ] {
+                transcript.extend_from_slice(&(field.len() as u64).to_be_bytes());
+                transcript.extend_from_slice(field.as_bytes());
+            }
+        }
+        binding.fixture.export_authorization_digest = hex::encode(Sha256::digest(transcript));
         binding
     }
 
@@ -3075,6 +3327,365 @@ mod tests {
         (root, owner_uid)
     }
 
+    fn drive_first_terminal(service: &mut FakeService) -> String {
+        prime_journal(&service.acceptance, 2, None);
+        handle(service, &sequence_request(3, None)).unwrap();
+        handle(service, &sequence_request(4, None)).unwrap();
+        let resume = sequence_request(5, None);
+        handle(service, &resume).unwrap();
+        AcceptanceOperationHandler::response_written(service, &resume).unwrap();
+        handle(service, &sequence_request(6, None))
+            .unwrap()
+            .response
+            .snapshot
+            .run
+            .unwrap()
+            .selected_attempt_id
+            .unwrap()
+    }
+
+    #[test]
+    fn stage_seven_reads_live_once_retries_fresh_after_crash_and_replays_staged() {
+        for crash_before in [None, Some(true), Some(false)] {
+            let binding = provider_binding();
+            let (root, owner_uid) = provider_root();
+            let relay = FakeRelay::default();
+            relay
+                .0
+                .lock()
+                .unwrap()
+                .accepted
+                .push_back(frozen_request(&binding, AcceptanceMutation::Run));
+            let store = FakeStore::default();
+            let runner_state = Arc::new(Mutex::new(FakeRunnerState {
+                conclusion: BrokerConclusion::Success,
+                active: None,
+                terminal: None,
+                evidence: None,
+                starts: 0,
+                starts_by_request: HashMap::new(),
+                last_request: None,
+                cancels: 0,
+                drift: false,
+                exchanges: 0,
+            }));
+            let runner = FakeRunnerTransport(runner_state.clone());
+            let mut service = fake_service(
+                root.path(),
+                owner_uid,
+                &binding,
+                relay.clone(),
+                store.clone(),
+                runner.clone(),
+            );
+            let attempt_id = drive_first_terminal(&mut service);
+            assert_eq!(attempt_id.len(), 32);
+            let request = sequence_request(7, Some(attempt_id));
+            let before_relay = relay.0.lock().unwrap().clone();
+            let before_store = store.0.lock().unwrap().clone();
+            let before_runner = {
+                let state = runner_state.lock().unwrap();
+                (state.starts, state.cancels, state.exchanges)
+            };
+            let response = if let Some(before) = crash_before {
+                service.inject_provider_crash(before);
+                assert!(catch_unwind(AssertUnwindSafe(|| handle(&mut service, &request))).is_err());
+                let reads_after_crash = relay.0.lock().unwrap().export_reads;
+                assert_eq!(reads_after_crash, if before { 0 } else { 8 });
+                let mut reopened = fake_service(
+                    root.path(),
+                    owner_uid,
+                    &binding,
+                    relay.clone(),
+                    store.clone(),
+                    runner.clone(),
+                );
+                let response = handle(&mut reopened, &request).unwrap();
+                assert!(response
+                    .response
+                    .export
+                    .as_ref()
+                    .is_some_and(|export| export.authenticated));
+                let reads_after_retry = relay.0.lock().unwrap().export_reads;
+                assert_eq!(reads_after_retry, if before { 8 } else { 16 });
+                let replay = handle(&mut reopened, &request).unwrap();
+                assert_eq!(
+                    serde_json::to_vec(&response).unwrap(),
+                    serde_json::to_vec(&replay).unwrap()
+                );
+                assert_eq!(relay.0.lock().unwrap().export_reads, reads_after_retry);
+                response
+            } else {
+                let result = handle(&mut service, &request);
+                assert!(
+                    result.is_ok(),
+                    "stage 7 failed: {result:?}; reads={}",
+                    relay.0.lock().unwrap().export_reads
+                );
+                let response = result.unwrap();
+                let reads = relay.0.lock().unwrap().export_reads;
+                assert_eq!(reads, 8);
+                assert!(response
+                    .response
+                    .export
+                    .as_ref()
+                    .is_some_and(|export| export.authenticated));
+                assert_eq!(handle(&mut service, &request).unwrap(), response);
+                assert_eq!(relay.0.lock().unwrap().export_reads, reads);
+                response
+            };
+            assert!(response.response.export.is_some());
+            let after_relay = relay.0.lock().unwrap().clone();
+            assert_eq!(after_relay.published, before_relay.published);
+            assert_eq!(after_relay.publish_calls, before_relay.publish_calls);
+            let after_store = store.0.lock().unwrap();
+            assert_eq!(after_store.cursor, before_store.cursor);
+            assert_eq!(after_store.runs, before_store.runs);
+            assert_eq!(after_store.publications, before_store.publications);
+            drop(after_store);
+            assert_eq!(
+                {
+                    let state = runner_state.lock().unwrap();
+                    (state.starts, state.cancels, state.exchanges)
+                },
+                before_runner
+            );
+
+            let mut mismatched = request.clone();
+            mismatched.host.integrated_candidate_sha = "00".repeat(32);
+            let reads_before_mismatch = relay.0.lock().unwrap().export_reads;
+            assert_eq!(
+                handle(&mut service, &mismatched),
+                Err(AcceptanceSocketError::Replay)
+            );
+            assert_eq!(relay.0.lock().unwrap().export_reads, reads_before_mismatch);
+        }
+    }
+
+    #[test]
+    fn stage_seven_after_restart_uses_only_relay_readback_and_prior_receipt() {
+        let binding = provider_binding();
+        let (root, owner_uid) = provider_root();
+        let relay = FakeRelay::default();
+        relay
+            .0
+            .lock()
+            .unwrap()
+            .accepted
+            .push_back(frozen_request(&binding, AcceptanceMutation::Run));
+        let store = FakeStore::default();
+        let runner_state = Arc::new(Mutex::new(FakeRunnerState {
+            conclusion: BrokerConclusion::Success,
+            active: None,
+            terminal: None,
+            evidence: None,
+            starts: 0,
+            starts_by_request: HashMap::new(),
+            last_request: None,
+            cancels: 0,
+            drift: false,
+            exchanges: 0,
+        }));
+        let runner = FakeRunnerTransport(runner_state.clone());
+        let mut service = fake_service(
+            root.path(),
+            owner_uid,
+            &binding,
+            relay.clone(),
+            store.clone(),
+            runner.clone(),
+        );
+        let attempt_id = drive_first_terminal(&mut service);
+        {
+            let mut state = runner_state.lock().unwrap();
+            state.active = None;
+            state.terminal = None;
+            state.evidence = None;
+            state.last_request = None;
+            state.drift = true;
+        }
+        let before_relay = relay.0.lock().unwrap().clone();
+        let before_store = store.0.lock().unwrap().clone();
+        let before_runner = {
+            let state = runner_state.lock().unwrap();
+            (state.starts, state.cancels, state.exchanges)
+        };
+        let mut reopened = fake_service(
+            root.path(),
+            owner_uid,
+            &binding,
+            relay.clone(),
+            store.clone(),
+            runner,
+        );
+        let response = handle(&mut reopened, &sequence_request(7, Some(attempt_id))).unwrap();
+        assert!(response.response.export.is_some());
+        let after_relay = relay.0.lock().unwrap();
+        assert_eq!(after_relay.export_reads, before_relay.export_reads + 8);
+        assert_eq!(after_relay.published, before_relay.published);
+        assert_eq!(after_relay.publish_calls, before_relay.publish_calls);
+        let after_store = store.0.lock().unwrap();
+        assert_eq!(after_store.cursor, before_store.cursor);
+        assert_eq!(after_store.runs, before_store.runs);
+        assert_eq!(after_store.publications, before_store.publications);
+        assert_eq!(
+            {
+                let state = runner_state.lock().unwrap();
+                (state.starts, state.cancels, state.exchanges)
+            },
+            before_runner
+        );
+        assert_eq!(
+            reopened.status.state(),
+            buzz_ci_controld::controller::ControllerState::Ready
+        );
+    }
+
+    #[test]
+    fn stage_seven_rejects_unavailable_tampered_and_fixture_echo_providers() {
+        for drift in [
+            "unavailable",
+            "event_subject",
+            "object_subject",
+            "generation",
+            "fixture_echo",
+        ] {
+            let binding = provider_binding();
+            let (root, owner_uid) = provider_root();
+            let relay = FakeRelay::default();
+            relay
+                .0
+                .lock()
+                .unwrap()
+                .accepted
+                .push_back(frozen_request(&binding, AcceptanceMutation::Run));
+            let store = FakeStore::default();
+            let runner_state = Arc::new(Mutex::new(FakeRunnerState {
+                conclusion: BrokerConclusion::Success,
+                active: None,
+                terminal: None,
+                evidence: None,
+                starts: 0,
+                starts_by_request: HashMap::new(),
+                last_request: None,
+                cancels: 0,
+                drift: false,
+                exchanges: 0,
+            }));
+            let runner = FakeRunnerTransport(runner_state.clone());
+            let mut service = fake_service(
+                root.path(),
+                owner_uid,
+                &binding,
+                relay.clone(),
+                store.clone(),
+                runner,
+            );
+            let attempt_id = drive_first_terminal(&mut service);
+            let before_store = store.0.lock().unwrap().clone();
+            let before_relay = relay.0.lock().unwrap().clone();
+            let before_runner = {
+                let state = runner_state.lock().unwrap();
+                (state.starts, state.cancels, state.exchanges)
+            };
+            {
+                let mut state = relay.0.lock().unwrap();
+                match drift {
+                    "unavailable" => state.export_error = Some(ExportReadError::Unavailable),
+                    "event_subject" => state.event_proof_subject = Some("ef".repeat(32)),
+                    "object_subject" => state.object_proof_subject = Some("ef".repeat(32)),
+                    "generation" => state.object_proof_generation = Some(9),
+                    "fixture_echo" => state.objects.clear(),
+                    _ => unreachable!(),
+                }
+            }
+            assert_eq!(
+                handle(&mut service, &sequence_request(7, Some(attempt_id))),
+                Err(AcceptanceSocketError::Operation),
+                "{drift}"
+            );
+            assert_eq!(
+                {
+                    let state = runner_state.lock().unwrap();
+                    (state.starts, state.cancels, state.exchanges)
+                },
+                before_runner
+            );
+            let after_relay = relay.0.lock().unwrap();
+            assert_eq!(after_relay.published, before_relay.published);
+            assert_eq!(after_relay.publish_calls, before_relay.publish_calls);
+            drop(after_relay);
+            let after_store = store.0.lock().unwrap();
+            assert_eq!(after_store.cursor, before_store.cursor);
+            assert_eq!(after_store.runs, before_store.runs);
+            assert_eq!(after_store.publications, before_store.publications);
+            assert_eq!(
+                service.status.state(),
+                buzz_ci_controld::controller::ControllerState::Ready
+            );
+        }
+    }
+
+    #[test]
+    fn stage_seven_rejects_signed_canonical_wrong_object_coordinates_before_get() {
+        for (drift, expected_queries) in [("log", 2), ("artifact", 3)] {
+            let binding = provider_binding();
+            let (root, owner_uid) = provider_root();
+            let relay = FakeRelay::default();
+            {
+                let mut state = relay.0.lock().unwrap();
+                state
+                    .accepted
+                    .push_back(frozen_request(&binding, AcceptanceMutation::Run));
+                state.put_url_drift = Some(drift.to_owned());
+            }
+            let store = FakeStore::default();
+            let runner_state = Arc::new(Mutex::new(FakeRunnerState {
+                conclusion: BrokerConclusion::Success,
+                active: None,
+                terminal: None,
+                evidence: None,
+                starts: 0,
+                starts_by_request: HashMap::new(),
+                last_request: None,
+                cancels: 0,
+                drift: false,
+                exchanges: 0,
+            }));
+            let mut service = fake_service(
+                root.path(),
+                owner_uid,
+                &binding,
+                relay.clone(),
+                store,
+                FakeRunnerTransport(runner_state.clone()),
+            );
+            let attempt_id = drive_first_terminal(&mut service);
+            let reads_before = relay.0.lock().unwrap().export_reads;
+            let runner_before = {
+                let state = runner_state.lock().unwrap();
+                (state.starts, state.cancels, state.exchanges)
+            };
+            assert_eq!(
+                handle(&mut service, &sequence_request(7, Some(attempt_id))),
+                Err(AcceptanceSocketError::Operation),
+                "{drift}"
+            );
+            assert_eq!(
+                relay.0.lock().unwrap().export_reads - reads_before,
+                expected_queries,
+                "the canonical tuple drift must fail before an object GET"
+            );
+            assert_eq!(
+                {
+                    let state = runner_state.lock().unwrap();
+                    (state.starts, state.cancels, state.exchanges)
+                },
+                runner_before
+            );
+        }
+    }
+
     #[test]
     fn capacity_one_handle_recovers_terminal_provider_crashes_without_reexecution() {
         for (sequence, mutation, conclusion, publish_sequence, resume_sequence) in [
@@ -3107,6 +3718,7 @@ mod tests {
                 last_request: None,
                 cancels: 0,
                 drift: false,
+                exchanges: 0,
             }));
             let runner = FakeRunnerTransport(runner_state.clone());
             let mut service = fake_service(
@@ -3194,6 +3806,7 @@ mod tests {
                 last_request: None,
                 cancels: 0,
                 drift: false,
+                exchanges: 0,
             }));
             let drift_runner = FakeRunnerTransport(drift_state.clone());
             let mut crashing = fake_service(
@@ -3263,6 +3876,7 @@ mod tests {
                 last_request: None,
                 cancels: 0,
                 drift: false,
+                exchanges: 0,
             }));
             let runner = FakeRunnerTransport(runner_state.clone());
             let mut service = fake_service(

@@ -81,7 +81,14 @@ fn run(config_path: PathBuf) -> ExitCode {
                     return ExitCode::from(4);
                 }
             };
-            match acceptance_signing_policy(&receipt, config.peer_policy) {
+            match acceptance_signing_policy(
+                &receipt,
+                config.peer_policy,
+                config
+                    .selectors
+                    .identity(buzz_ci_keyholder::KeySelector::Nip98),
+                &config.nip98_origin,
+            ) {
                 Ok(policy) => Some(policy),
                 Err(_) => {
                     eprintln!(r#"{{"error":"invalid_acceptance_binding"}}"#);

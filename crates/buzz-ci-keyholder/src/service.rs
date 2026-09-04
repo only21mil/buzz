@@ -1,4 +1,5 @@
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use url::Url as ParsedUrl;
@@ -42,6 +43,7 @@ pub struct AcceptanceSigningPolicy {
     scenario_sha256: [u8; 32],
     event_ids: [[u8; 32]; 5],
     granted_ci_signer: [u8; 32],
+    evidence_get_paths: BTreeSet<String>,
 }
 
 impl AcceptanceSigningPolicy {
@@ -64,18 +66,21 @@ impl AcceptanceSigningPolicy {
             scenario_sha256,
             event_ids: validated.event_ids(),
             granted_ci_signer: validated.granted_ci_signer(),
+            evidence_get_paths: BTreeSet::new(),
         })
     }
 
     pub(crate) fn from_validated(
         actor: PublicIdentity,
         validated: ValidatedAcceptanceBinding,
+        evidence_get_paths: BTreeSet<String>,
     ) -> Self {
         Self {
             actor,
             scenario_sha256: validated.scenario_sha256(),
             event_ids: validated.event_ids(),
             granted_ci_signer: validated.granted_ci_signer(),
+            evidence_get_paths,
         }
     }
 
@@ -92,6 +97,15 @@ impl AcceptanceSigningPolicy {
     /// Event IDs in Run, Grant, Rerun, Tombstone, FailureRun order.
     pub const fn event_ids(&self) -> [[u8; 32]; 5] {
         self.event_ids
+    }
+
+    #[cfg(test)]
+    fn bind_evidence_get_paths(mut self, paths: BTreeSet<String>) -> Result<Self, ServiceError> {
+        if paths.len() != 2 || paths.iter().any(|path| !canonical_evidence_get_path(path)) {
+            return Err(ServiceError::InvalidRequest);
+        }
+        self.evidence_get_paths = paths;
+        Ok(self)
     }
 
     fn event_id(&self, mutation: AcceptanceMutation) -> [u8; 32] {
@@ -201,6 +215,8 @@ impl SigningPolicy {
             || parsed.password().is_some()
             || parsed.fragment().is_some()
             || parsed.origin().ascii_serialization() != self.nip98_origin
+            || parsed.as_str() != request.url.as_str()
+            || request.url.as_str().contains('%')
         {
             return Err(ServiceError::PolicyDenied);
         }
@@ -212,7 +228,16 @@ impl SigningPolicy {
             if request.signer != Nip98Signer::Nip98 || request.query_filter.is_some() {
                 return Err(ServiceError::PolicyDenied);
             }
-            return authorize_accepted_read(&parsed, request);
+            authorize_get(&parsed, request)?;
+            if parsed.path() != "/ci/control/accepted"
+                && !self
+                    .acceptance
+                    .as_ref()
+                    .is_some_and(|acceptance| acceptance.evidence_get_paths.contains(parsed.path()))
+            {
+                return Err(ServiceError::PolicyDenied);
+            }
+            return Ok(());
         }
         if parsed.query().is_some()
             || !matches!(request.payload_digest, Some(digest) if digest != [0; 32])
@@ -322,12 +347,15 @@ impl SigningPolicy {
     }
 }
 
-fn authorize_accepted_read(
-    parsed: &ParsedUrl,
-    request: &Nip98AuthorizeRequest,
-) -> Result<(), ServiceError> {
-    if parsed.path() != "/ci/control/accepted" || request.payload_digest.is_some() {
+fn authorize_get(parsed: &ParsedUrl, request: &Nip98AuthorizeRequest) -> Result<(), ServiceError> {
+    if request.payload_digest.is_some() {
         return Err(ServiceError::PolicyDenied);
+    }
+    if parsed.path() != "/ci/control/accepted" {
+        if parsed.query().is_some() || !canonical_evidence_get_path(parsed.path()) {
+            return Err(ServiceError::PolicyDenied);
+        }
+        return Ok(());
     }
     let query = parsed.query().ok_or(ServiceError::PolicyDenied)?;
     let mut fields = query.split('&');
@@ -353,6 +381,64 @@ fn authorize_accepted_read(
         return Err(ServiceError::PolicyDenied);
     }
     Ok(())
+}
+
+fn canonical_evidence_get_path(path: &str) -> bool {
+    let fields = path
+        .strip_prefix('/')
+        .map(|value| value.split('/').collect::<Vec<_>>());
+    let Some(fields) = fields else {
+        return false;
+    };
+    let (request_id, run_id, job_id, attempt, object_id, sha256) = match fields.as_slice() {
+        ["ci", "logs", request_id, run_id, job_id, attempt, sha256] => {
+            (*request_id, *run_id, *job_id, *attempt, None, *sha256)
+        }
+        ["ci", "artifacts", request_id, run_id, job_id, attempt, object_id, sha256] => (
+            *request_id,
+            *run_id,
+            *job_id,
+            *attempt,
+            Some(*object_id),
+            *sha256,
+        ),
+        _ => return false,
+    };
+    let valid_job = |value: &str| {
+        (1..=64).contains(&value.len())
+            && value
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+            && value
+                .bytes()
+                .skip(1)
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    };
+    let valid_artifact = |value: &str| {
+        (1..=128).contains(&value.len())
+            && !matches!(value, "." | "..")
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    };
+    let canonical_number = attempt
+        .parse::<u32>()
+        .ok()
+        .is_some_and(|number| number > 0 && number.to_string() == attempt);
+    is_lower_hex(request_id, 64)
+        && Uuid::parse_str(run_id).is_ok_and(|value| value.hyphenated().to_string() == run_id)
+        && valid_job(job_id)
+        && object_id.is_none_or(valid_artifact)
+        && canonical_number
+        && is_lower_hex(sha256, 64)
+}
+
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Sanitized service failure mapped to the closed public protocol errors.
@@ -1022,7 +1108,20 @@ pub(crate) mod tests {
             [9; 32],
             acceptance_templates(),
         )
-        .expect("acceptance policy");
+        .expect("acceptance policy")
+        .bind_evidence_get_paths(BTreeSet::from([
+            format!(
+                "/ci/logs/{}/123e4567-e89b-12d3-a456-426614174000/job_ID-1/1/{}",
+                "ab".repeat(32),
+                "cd".repeat(32)
+            ),
+            format!(
+                "/ci/artifacts/{}/123e4567-e89b-12d3-a456-426614174000/job_ID-1/1/result/{}",
+                "ab".repeat(32),
+                "cd".repeat(32)
+            ),
+        ]))
+        .expect("evidence paths");
         let policy = SigningPolicy::new_with_acceptance(
             PeerPolicy {
                 uid: 1000,
@@ -1302,7 +1401,7 @@ pub(crate) mod tests {
 
     #[test]
     fn nip98_is_bound_to_the_exact_https_origin_and_canonical_event_digest() {
-        let service = service(OperationSet::only(Operation::Nip98Authorize));
+        let service = acceptance_service();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time")
@@ -1346,6 +1445,87 @@ pub(crate) mod tests {
             panic!("accepted read should sign");
         };
         assert_eq!(signature.signed_digest, expected);
+
+        let request_id = "ab".repeat(32);
+        let sha256 = "cd".repeat(32);
+        for url in [
+            format!("https://relay.example.test/ci/logs/{request_id}/123e4567-e89b-12d3-a456-426614174000/job_ID-1/1/{sha256}"),
+            format!("https://relay.example.test/ci/artifacts/{request_id}/123e4567-e89b-12d3-a456-426614174000/job_ID-1/1/result/{sha256}"),
+        ] {
+            assert!(service.policy.acceptance.as_ref().unwrap().evidence_get_paths.contains(ParsedUrl::parse(&url).unwrap().path()));
+            let response = service.handle(peer(), Request::Nip98Authorize(Nip98AuthorizeRequest {
+                    expected_generation: 8,
+                    signer: Nip98Signer::Nip98,
+                    method: HttpMethod::Get,
+                    url: Url::new(url.clone()).expect("url"),
+                    payload_digest: None,
+                    created_at: now,
+                    nonce: [7; 16],
+                    query_filter: None,
+                }));
+            assert!(matches!(response, Response::Nip98Authorize(_)), "{url}: {response:?}");
+        }
+
+        let calls_before_off_plan = service.backend.calls.borrow().len();
+        for (index, url) in [
+            format!("https://relay.example.test/ci/logs/{}/123e4567-e89b-12d3-a456-426614174000/job_ID-1/1/{sha256}", "ac".repeat(32)),
+            format!("https://relay.example.test/ci/logs/{request_id}/223e4567-e89b-12d3-a456-426614174000/job_ID-1/1/{sha256}"),
+            format!("https://relay.example.test/ci/logs/{request_id}/123e4567-e89b-12d3-a456-426614174000/other_job/1/{sha256}"),
+            format!("https://relay.example.test/ci/logs/{request_id}/123e4567-e89b-12d3-a456-426614174000/job_ID-1/2/{sha256}"),
+            format!("https://relay.example.test/ci/artifacts/{request_id}/123e4567-e89b-12d3-a456-426614174000/job_ID-1/1/other/{sha256}"),
+            format!("https://relay.example.test/ci/logs/{request_id}/123e4567-e89b-12d3-a456-426614174000/job_ID-1/1/{}", "ce".repeat(32)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(matches!(
+                service.handle(
+                    peer(),
+                    Request::Nip98Authorize(Nip98AuthorizeRequest {
+                        expected_generation: 8,
+                        signer: Nip98Signer::Nip98,
+                        method: HttpMethod::Get,
+                        url: Url::new(url).expect("url"),
+                        payload_digest: None,
+                        created_at: now,
+                        nonce: [u8::try_from(index + 80).expect("bounded index"); 16],
+                        query_filter: None,
+                    })
+                ),
+                Response::Error {
+                    error: ErrorResponse {
+                        code: ErrorCode::PolicyDenied,
+                        ..
+                    },
+                    ..
+                }
+            ));
+        }
+        assert_eq!(service.backend.calls.borrow().len(), calls_before_off_plan);
+        for url in [
+            format!("https://relay.example.test/ci/runs/{request_id}"),
+            format!("https://relay.example.test/ci/logs/{request_id}/123e4567-e89b-12d3-a456-426614174000/1job/1/{sha256}"),
+            format!("https://relay.example.test/ci/logs/{request_id}/123E4567-E89B-12D3-A456-426614174000/job/1/{sha256}"),
+            format!("https://relay.example.test/ci/logs/{request_id}/123e4567-e89b-12d3-a456-426614174000/job/01/{sha256}"),
+            format!("https://relay.example.test/ci/artifacts/{request_id}/123e4567-e89b-12d3-a456-426614174000/job/1/../{sha256}"),
+            format!("https://relay.example.test/ci/artifacts/{request_id}/123e4567-e89b-12d3-a456-426614174000/job/1/result%2Ejson/{sha256}"),
+            format!("https://relay.example.test/ci/logs/{request_id}//123e4567-e89b-12d3-a456-426614174000/job/1/{sha256}"),
+            format!("https://relay.example.test/ci/logs/{request_id}/123e4567-e89b-12d3-a456-426614174000/job/1/{sha256}?x=1"),
+        ] {
+            assert!(matches!(
+                service.handle(peer(), Request::Nip98Authorize(Nip98AuthorizeRequest {
+                    expected_generation: 8,
+                    signer: Nip98Signer::Nip98,
+                    method: HttpMethod::Get,
+                    url: Url::new(url).expect("url"),
+                    payload_digest: None,
+                    created_at: now,
+                    nonce: [8; 16],
+                    query_filter: None,
+                })),
+                Response::Error { error: ErrorResponse { code: ErrorCode::PolicyDenied, .. }, .. }
+            ));
+        }
 
         for (index, url) in [
             "https://relay.example.test/ci/control/accepted?after_cursor=42&limit=1",
@@ -1507,6 +1687,35 @@ pub(crate) mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn evidence_get_requires_the_activation_exact_path_set_before_backend_use() {
+        let service = service(OperationSet::only(Operation::Nip98Authorize));
+        let request = Nip98AuthorizeRequest {
+            expected_generation: 8,
+            signer: Nip98Signer::Nip98,
+            method: HttpMethod::Get,
+            url: Url::new(format!(
+                "https://relay.example.test/ci/logs/{}/123e4567-e89b-12d3-a456-426614174000/job/1/{}",
+                "ab".repeat(32), "cd".repeat(32)
+            )).unwrap(),
+            payload_digest: None,
+            created_at: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            nonce: [90; 16],
+            query_filter: None,
+        };
+        assert!(matches!(
+            service.handle(peer(), Request::Nip98Authorize(request)),
+            Response::Error {
+                error: ErrorResponse {
+                    code: ErrorCode::PolicyDenied,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(service.backend.calls.borrow().is_empty());
     }
 
     fn publish_request(

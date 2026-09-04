@@ -10,18 +10,23 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use buzz_core::ci::{validate_signed_ci_event, ValidatedCiEnvelope};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
+use uuid::Uuid;
 
 use crate::keyholder::KeyholderClientConfig;
 use crate::production::{
-    AcceptedRequest, ArtifactCompletion, JobCompletion, RelayControl, SignedCiEvent, StoredObject,
+    AcceptedRequest, ArtifactCompletion, AuthenticatedEventRead, AuthenticatedObjectRead,
+    ExportReadError, JobCompletion, RelayControl, SignedCiEvent, StoredObject,
 };
 
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BINARY_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+const NIP98_EVENT_KIND: u16 = 27_235;
 /// The exact `POST /events` refusal the relay returns when a kind-46101 to
 /// 46106 signer is neither a static status signer nor covered by an active
 /// kind-46107 grant at ingest time (`buzz_core::ci::validate_signed_ci_event`
@@ -185,10 +190,38 @@ impl Nip98Binding {
 pub trait Nip98Authorizer {
     type Error;
 
-    fn authorization(&mut self, binding: &Nip98Binding) -> Result<String, Self::Error>;
+    fn authorization(&mut self, binding: &Nip98Binding) -> Result<Nip98Authorization, Self::Error>;
 }
 
+/// Public identity and volatile event identity of one exact NIP-98 proof.
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Nip98Proof {
+    pub subject: String,
+    pub generation: u64,
+    pub event_id: String,
+}
+
+/// Authorization header plus the public facts needed to validate it.
+///
+/// The header stays private and this type deliberately has no `Debug`
+/// implementation so bearer material cannot enter diagnostic output.
+pub struct Nip98Authorization {
+    header: String,
+    pub proof: Nip98Proof,
+}
+
+impl Nip98Authorization {
+    pub fn new(header: String, proof: Nip98Proof) -> Self {
+        Self { header, proof }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn header(&self) -> &str {
+        &self.header
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub struct HttpRequest {
     pub method: HttpMethod,
     pub url: Url,
@@ -206,6 +239,14 @@ pub trait HttpTransport {
     type Error;
 
     fn execute(&mut self, request: HttpRequest) -> Result<HttpResponse, Self::Error>;
+
+    fn execute_bounded_binary(
+        &mut self,
+        request: HttpRequest,
+        _maximum_bytes: u64,
+    ) -> Result<HttpResponse, Self::Error> {
+        self.execute(request)
+    }
 }
 
 /// Zero-redirect production HTTP transport with bounded response reads.
@@ -277,6 +318,46 @@ impl HttpTransport for ReqwestTransport {
             .read_to_end(&mut body)
             .map_err(|_| TransportError::Unavailable)?;
         if body.len() > self.max_response_bytes {
+            return Err(TransportError::Oversized);
+        }
+        Ok(HttpResponse { status, body })
+    }
+
+    fn execute_bounded_binary(
+        &mut self,
+        request: HttpRequest,
+        maximum_bytes: u64,
+    ) -> Result<HttpResponse, Self::Error> {
+        if maximum_bytes == 0 || maximum_bytes > MAX_BINARY_RESPONSE_BYTES {
+            return Err(TransportError::InvalidConfig);
+        }
+        let method = match request.method {
+            HttpMethod::Get => reqwest::Method::GET,
+            HttpMethod::Post => reqwest::Method::POST,
+            HttpMethod::Put => reqwest::Method::PUT,
+        };
+        let mut builder = self.client.request(method, request.url);
+        for (name, value) in request.headers {
+            builder = builder.header(name, value);
+        }
+        let mut response = builder
+            .body(request.body)
+            .send()
+            .map_err(|_| TransportError::Unavailable)?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > maximum_bytes)
+        {
+            return Err(TransportError::Oversized);
+        }
+        let status = response.status().as_u16();
+        let mut body = Vec::new();
+        response
+            .by_ref()
+            .take(maximum_bytes.saturating_add(1))
+            .read_to_end(&mut body)
+            .map_err(|_| TransportError::Unavailable)?;
+        if body.len() as u64 > maximum_bytes {
             return Err(TransportError::Oversized);
         }
         Ok(HttpResponse { status, body })
@@ -355,14 +436,14 @@ where
             .map_err(|_| SourceError::InvalidConfig)
     }
 
-    fn request_raw(
+    fn request_raw_with_proof(
         &mut self,
         method: HttpMethod,
         url: Url,
         body: Vec<u8>,
         publisher: Option<String>,
         query_filter: Option<Vec<u8>>,
-    ) -> Result<HttpResponse, SourceError> {
+    ) -> Result<(HttpResponse, Nip98Proof, Nip98Binding), SourceError> {
         let payload_sha256 =
             (method != HttpMethod::Get).then(|| hex::encode(Sha256::digest(&body)));
         let binding = Nip98Binding {
@@ -377,11 +458,16 @@ where
             .authorizer
             .authorization(&binding)
             .map_err(|_| SourceError::Authorization)?;
-        if authorization.is_empty() || authorization.contains(['\r', '\n']) {
+        validate_authorization(&authorization, &binding)?;
+        if binding
+            .publisher
+            .as_ref()
+            .is_some_and(|publisher| publisher != &authorization.proof.subject)
+        {
             return Err(SourceError::Authorization);
         }
         let mut headers = BTreeMap::new();
-        headers.insert("authorization".to_owned(), authorization);
+        headers.insert("authorization".to_owned(), authorization.header);
         headers.insert("accept".to_owned(), "application/json".to_owned());
         headers.insert("content-length".to_owned(), body.len().to_string());
         match method {
@@ -408,7 +494,62 @@ where
         if response.body.len() > MAX_RESPONSE_BYTES {
             return Err(SourceError::InvalidResponse);
         }
-        Ok(response)
+        Ok((response, authorization.proof, binding))
+    }
+
+    fn request_raw(
+        &mut self,
+        method: HttpMethod,
+        url: Url,
+        body: Vec<u8>,
+        publisher: Option<String>,
+        query_filter: Option<Vec<u8>>,
+    ) -> Result<HttpResponse, SourceError> {
+        self.request_raw_with_proof(method, url, body, publisher, query_filter)
+            .map(|(response, _, _)| response)
+    }
+
+    fn request_bounded_binary_with_proof(
+        &mut self,
+        url: Url,
+        maximum_bytes: u64,
+    ) -> Result<(HttpResponse, Nip98Proof, Nip98Binding), SourceError> {
+        if maximum_bytes == 0 || maximum_bytes > MAX_BINARY_RESPONSE_BYTES {
+            return Err(SourceError::InvalidBinding);
+        }
+        let binding = Nip98Binding {
+            method: HttpMethod::Get,
+            url: url.clone(),
+            payload_sha256: None,
+            publisher: None,
+            query_filter: None,
+        };
+        binding.validate()?;
+        let authorization = self
+            .authorizer
+            .authorization(&binding)
+            .map_err(|_| SourceError::Authorization)?;
+        validate_authorization(&authorization, &binding)?;
+        let response = self
+            .transport
+            .execute_bounded_binary(
+                HttpRequest {
+                    method: HttpMethod::Get,
+                    url,
+                    headers: BTreeMap::from([
+                        ("authorization".to_owned(), authorization.header),
+                        ("accept".to_owned(), "application/octet-stream".to_owned()),
+                        ("content-length".to_owned(), "0".to_owned()),
+                    ]),
+                    body: Vec::new(),
+                },
+                maximum_bytes,
+            )
+            .map_err(|_| SourceError::Transport)?;
+        if response.body.len() as u64 > maximum_bytes {
+            return Err(SourceError::InvalidResponse);
+        }
+        Ok((response, authorization.proof, binding))
     }
 
     fn request(
@@ -441,6 +582,58 @@ where
             byte_length: stored.byte_length,
         })
     }
+}
+
+fn validate_authorization(
+    authorization: &Nip98Authorization,
+    binding: &Nip98Binding,
+) -> Result<(), SourceError> {
+    if authorization.header.is_empty()
+        || authorization.header.contains(['\r', '\n'])
+        || !is_lower_hex(&authorization.proof.subject, 64)
+        || authorization.proof.generation == 0
+        || !is_lower_hex(&authorization.proof.event_id, 64)
+    {
+        return Err(SourceError::Authorization);
+    }
+    let encoded = authorization
+        .header
+        .strip_prefix("Nostr ")
+        .ok_or(SourceError::Authorization)?;
+    let bytes = BASE64
+        .decode(encoded)
+        .map_err(|_| SourceError::Authorization)?;
+    let event: nostr::Event =
+        serde_json::from_slice(&bytes).map_err(|_| SourceError::Authorization)?;
+    event.verify().map_err(|_| SourceError::Authorization)?;
+    if event.kind.as_u16() != NIP98_EVENT_KIND
+        || event.id.to_hex() != authorization.proof.event_id
+        || event.pubkey.to_hex() != authorization.proof.subject
+        || !event.content.is_empty()
+    {
+        return Err(SourceError::Authorization);
+    }
+    let tags = serde_json::to_value(&event.tags).map_err(|_| SourceError::Authorization)?;
+    let tags = tags.as_array().ok_or(SourceError::Authorization)?;
+    let mut expected = vec![
+        serde_json::json!(["u", binding.url.as_str()]),
+        serde_json::json!(["method", binding.method.as_str()]),
+    ];
+    if let Some(payload) = &binding.payload_sha256 {
+        expected.push(serde_json::json!(["payload", payload]));
+    }
+    let nonce_valid = tags
+        .last()
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tag| {
+            tag.len() == 2
+                && tag[0].as_str() == Some("nonce")
+                && tag[1].as_str().is_some_and(|nonce| is_lower_hex(nonce, 32))
+        });
+    if tags.len() != expected.len() + 1 || tags[..expected.len()] != expected || !nonce_valid {
+        return Err(SourceError::Authorization);
+    }
+    Ok(())
 }
 
 impl<T, A> RelayControl for AuthenticatedRelay<T, A>
@@ -571,6 +764,105 @@ where
         }
     }
 
+    fn read_exact_event(
+        &mut self,
+        event_id: &str,
+        kind: u32,
+        author: &str,
+    ) -> Result<AuthenticatedEventRead, ExportReadError> {
+        if !is_lower_hex(event_id, 64)
+            || !is_lower_hex(author, 64)
+            || !(46_101..=46_106).contains(&kind)
+        {
+            return Err(ExportReadError::Invalid);
+        }
+        let body = format!(
+            r#"[{{"ids":["{event_id}"],"authors":["{author}"],"kinds":[{kind}],"limit":1}}]"#
+        )
+        .into_bytes();
+        let url = self
+            .endpoint("query")
+            .map_err(|_| ExportReadError::Unavailable)?;
+        let (response, proof, binding) = self
+            .request_raw_with_proof(
+                HttpMethod::Post,
+                url,
+                body.clone(),
+                Some(author.to_owned()),
+                Some(body),
+            )
+            .map_err(map_export_read_error)?;
+        if response.status != 200 {
+            return Err(ExportReadError::Refused);
+        }
+        let found: Vec<nostr::Event> =
+            serde_json::from_slice(&response.body).map_err(|_| ExportReadError::Invalid)?;
+        let [returned] = found.as_slice() else {
+            return Err(ExportReadError::Invalid);
+        };
+        returned.verify().map_err(|_| ExportReadError::Invalid)?;
+        if returned.id.to_hex() != event_id
+            || returned.pubkey.to_hex() != author
+            || returned.kind.as_u16() as u32 != kind
+        {
+            return Err(ExportReadError::Invalid);
+        }
+        Ok(AuthenticatedEventRead {
+            event: SignedCiEvent {
+                event_id: event_id.to_owned(),
+                kind,
+                content: returned.content.clone(),
+                tags: serde_json::to_value(&returned.tags).map_err(|_| ExportReadError::Invalid)?,
+                signed_event: serde_json::to_value(returned)
+                    .map_err(|_| ExportReadError::Invalid)?,
+            },
+            proof,
+            binding,
+        })
+    }
+
+    fn read_evidence_object(
+        &mut self,
+        url: &str,
+        expected_sha256: &str,
+        expected_bytes: u64,
+        maximum_bytes: u64,
+    ) -> Result<AuthenticatedObjectRead, ExportReadError> {
+        if url.contains('%') {
+            return Err(ExportReadError::Invalid);
+        }
+        let parsed = Url::parse(url).map_err(|_| ExportReadError::Invalid)?;
+        if parsed.as_str() != url
+            || parsed.scheme() != "https"
+            || parsed.origin() != self.base_url.origin()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+            || expected_bytes == 0
+            || maximum_bytes != expected_bytes
+            || !canonical_evidence_path(parsed.path(), expected_sha256, expected_bytes)
+        {
+            return Err(ExportReadError::Invalid);
+        }
+        let (response, proof, binding) = self
+            .request_bounded_binary_with_proof(parsed, maximum_bytes)
+            .map_err(map_export_read_error)?;
+        if response.status != 200 {
+            return Err(ExportReadError::Refused);
+        }
+        if response.body.len() as u64 != expected_bytes
+            || hex::encode(Sha256::digest(&response.body)) != expected_sha256
+        {
+            return Err(ExportReadError::Invalid);
+        }
+        Ok(AuthenticatedObjectRead {
+            bytes: response.body,
+            proof,
+            binding,
+        })
+    }
+
     fn put_log(
         &mut self,
         accepted: &AcceptedRequest,
@@ -684,6 +976,76 @@ fn is_lower_hex(value: &str, length: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn canonical_evidence_path(path: &str, expected_sha256: &str, expected_bytes: u64) -> bool {
+    let fields = path
+        .strip_prefix('/')
+        .map(|value| value.split('/').collect::<Vec<_>>());
+    let Some(fields) = fields else {
+        return false;
+    };
+    let (request_id, run_id, job_id, attempt, artifact_id, sha256, size_cap) =
+        match fields.as_slice() {
+            ["ci", "logs", request_id, run_id, job_id, attempt, sha256] => (
+                *request_id,
+                *run_id,
+                *job_id,
+                *attempt,
+                None,
+                *sha256,
+                16 * 1024 * 1024,
+            ),
+            ["ci", "artifacts", request_id, run_id, job_id, attempt, artifact_id, sha256] => (
+                *request_id,
+                *run_id,
+                *job_id,
+                *attempt,
+                Some(*artifact_id),
+                *sha256,
+                32 * 1024,
+            ),
+            _ => return false,
+        };
+    let valid_job = (1..=64).contains(&job_id.len())
+        && job_id
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && job_id
+            .bytes()
+            .skip(1)
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    let valid_artifact = artifact_id.is_none_or(|value| {
+        (1..=128).contains(&value.len())
+            && !matches!(value, "." | "..")
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    });
+    is_lower_hex(request_id, 64)
+        && Uuid::parse_str(run_id).is_ok_and(|value| value.hyphenated().to_string() == run_id)
+        && valid_job
+        && valid_artifact
+        && attempt
+            .parse::<u32>()
+            .is_ok_and(|value| value > 0 && value.to_string() == attempt)
+        && sha256 == expected_sha256
+        && is_lower_hex(sha256, 64)
+        && expected_bytes > 0
+        && expected_bytes <= size_cap
+}
+
+fn map_export_read_error(error: SourceError) -> ExportReadError {
+    match error {
+        SourceError::RelayRefused | SourceError::UnauthorizedStatusSigner => {
+            ExportReadError::Refused
+        }
+        SourceError::Transport | SourceError::Authorization | SourceError::ConfigUnavailable => {
+            ExportReadError::Unavailable
+        }
+        _ => ExportReadError::Invalid,
+    }
+}
+
 fn validate_config_path(path: &Path) -> Result<(), SourceError> {
     if !path.is_absolute()
         || path.components().any(|component| {
@@ -722,7 +1084,7 @@ mod tests {
 
     use buzz_core::ci::{request_tags, CiRequestEnvelope, CiRequestType, CI_SCHEMA_VERSION};
     use buzz_core::kind::KIND_CI_REQUEST;
-    use nostr::{EventBuilder, Keys, Kind};
+    use nostr::{EventBuilder, Keys, Kind, Tag};
 
     use super::*;
 
@@ -734,9 +1096,48 @@ mod tests {
     impl Nip98Authorizer for RecordingAuth {
         type Error = ();
 
-        fn authorization(&mut self, binding: &Nip98Binding) -> Result<String, Self::Error> {
+        fn authorization(
+            &mut self,
+            binding: &Nip98Binding,
+        ) -> Result<Nip98Authorization, Self::Error> {
             self.bindings.push(binding.clone());
-            Ok("Nostr synthetic".to_owned())
+            let keys = ["01", "02", "03"]
+                .into_iter()
+                .map(|byte| Keys::parse(&byte.repeat(32)).map_err(|_| ()))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .find(|keys| {
+                    binding
+                        .publisher
+                        .as_deref()
+                        .is_none_or(|value| value == keys.public_key().to_hex())
+                })
+                .ok_or(())?;
+            let mut tags = vec![
+                Tag::parse(["u", binding.url.as_str()]).map_err(|_| ())?,
+                Tag::parse(["method", binding.method.as_str()]).map_err(|_| ())?,
+            ];
+            if let Some(payload) = binding.payload_sha256.as_deref() {
+                tags.push(Tag::parse(["payload", payload]).map_err(|_| ())?);
+            }
+            tags.push(Tag::parse(["nonce", &"01".repeat(16)]).map_err(|_| ())?);
+            let event = EventBuilder::new(Kind::Custom(NIP98_EVENT_KIND), "")
+                .tags(tags)
+                .custom_created_at(nostr::Timestamp::from(1_700_000_000_u64))
+                .sign_with_keys(&keys)
+                .map_err(|_| ())?;
+            let header = format!(
+                "Nostr {}",
+                BASE64.encode(serde_json::to_vec(&event).map_err(|_| ())?)
+            );
+            Ok(Nip98Authorization::new(
+                header,
+                Nip98Proof {
+                    subject: event.pubkey.to_hex(),
+                    generation: 1,
+                    event_id: event.id.to_hex(),
+                },
+            ))
         }
     }
 
@@ -790,10 +1191,10 @@ mod tests {
         assert_eq!(binding.payload_sha256.as_deref(), Some(digest.as_str()));
         assert_eq!(binding.publisher, None);
         assert_eq!(request.body, bytes);
-        assert_eq!(
-            request.headers.get("authorization").map(String::as_str),
-            Some("Nostr synthetic")
-        );
+        assert!(request
+            .headers
+            .get("authorization")
+            .is_some_and(|header| header.starts_with("Nostr ")));
     }
 
     #[test]
@@ -814,6 +1215,226 @@ mod tests {
         assert_eq!(
             relay.put_object("ci/logs/id", b"body").unwrap_err(),
             SourceError::RelayRefused
+        );
+    }
+
+    #[test]
+    fn evidence_get_binds_canonical_url_size_digest_and_public_proof() {
+        let bytes = b"readback".to_vec();
+        let sha256 = hex::encode(Sha256::digest(&bytes));
+        let url = format!(
+            "https://relay.example/ci/logs/{}/123e4567-e89b-12d3-a456-426614174000/job_1/1/{sha256}",
+            "ab".repeat(32)
+        );
+        let transport = RecordingTransport {
+            response: HttpResponse {
+                status: 200,
+                body: bytes.clone(),
+            },
+            requests: Vec::new(),
+        };
+        let mut relay = AuthenticatedRelay::new(
+            Url::parse("https://relay.example/").unwrap(),
+            transport,
+            RecordingAuth::default(),
+        )
+        .unwrap();
+        let read = relay
+            .read_evidence_object(&url, &sha256, bytes.len() as u64, bytes.len() as u64)
+            .unwrap();
+        assert_eq!(read.bytes, bytes);
+        assert_eq!(read.binding.method, HttpMethod::Get);
+        assert_eq!(read.binding.url.as_str(), url);
+        assert!(read.binding.payload_sha256.is_none());
+        assert!(is_lower_hex(&read.proof.subject, 64));
+        let (transport, authorizer) = relay.into_parts();
+        assert_eq!(transport.requests.len(), 1);
+        assert_eq!(authorizer.bindings, vec![read.binding]);
+
+        for (bad_url, bad_sha, bad_len, bad_max, status) in [
+            (
+                url.clone(),
+                "00".repeat(32),
+                bytes.len() as u64,
+                bytes.len() as u64,
+                200,
+            ),
+            (
+                url.clone(),
+                sha256.clone(),
+                bytes.len() as u64,
+                bytes.len() as u64 + 1,
+                200,
+            ),
+            (
+                url.clone(),
+                sha256.clone(),
+                bytes.len() as u64,
+                bytes.len() as u64,
+                302,
+            ),
+            (
+                url.replace("https://relay.example", "https://other.example"),
+                sha256.clone(),
+                bytes.len() as u64,
+                bytes.len() as u64,
+                200,
+            ),
+            (
+                format!("{url}?download=1"),
+                sha256.clone(),
+                bytes.len() as u64,
+                bytes.len() as u64,
+                200,
+            ),
+        ] {
+            let transport = RecordingTransport {
+                response: HttpResponse {
+                    status,
+                    body: bytes.clone(),
+                },
+                requests: Vec::new(),
+            };
+            let mut relay = AuthenticatedRelay::new(
+                Url::parse("https://relay.example/").unwrap(),
+                transport,
+                RecordingAuth::default(),
+            )
+            .unwrap();
+            assert!(relay
+                .read_evidence_object(&bad_url, &bad_sha, bad_len, bad_max)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn evidence_path_caps_accept_the_exact_log_and_artifact_boundaries() {
+        let request_id = "ab".repeat(32);
+        let sha256 = "cd".repeat(32);
+        let run_id = "123e4567-e89b-12d3-a456-426614174000";
+        let log = format!("/ci/logs/{request_id}/{run_id}/job/1/{sha256}");
+        let artifact = format!("/ci/artifacts/{request_id}/{run_id}/job/1/result/{sha256}");
+
+        assert!(canonical_evidence_path(&log, &sha256, 16 * 1024 * 1024));
+        assert!(!canonical_evidence_path(
+            &log,
+            &sha256,
+            16 * 1024 * 1024 + 1
+        ));
+        assert!(canonical_evidence_path(&artifact, &sha256, 32 * 1024));
+        assert!(!canonical_evidence_path(&artifact, &sha256, 32 * 1024 + 1));
+        assert!(!canonical_evidence_path(&log, &sha256, 0));
+    }
+
+    #[test]
+    fn exact_event_read_rejects_wrong_identity_kind_status_and_cardinality() {
+        let keys = Keys::parse(&"01".repeat(32)).unwrap();
+        let event = EventBuilder::new(Kind::Custom(46_101), "{}")
+            .custom_created_at(nostr::Timestamp::from(1_700_000_001_u64))
+            .sign_with_keys(&keys)
+            .unwrap();
+        let event_id = event.id.to_hex();
+        let author = event.pubkey.to_hex();
+        let make = |status, body| {
+            AuthenticatedRelay::new(
+                Url::parse("https://relay.example/").unwrap(),
+                RecordingTransport {
+                    response: HttpResponse { status, body },
+                    requests: Vec::new(),
+                },
+                RecordingAuth::default(),
+            )
+            .unwrap()
+        };
+        let mut relay = make(200, serde_json::to_vec(&vec![event.clone()]).unwrap());
+        let read = relay.read_exact_event(&event_id, 46_101, &author).unwrap();
+        assert_eq!(read.event.event_id, event_id);
+        assert_eq!(
+            read.binding.query_filter.as_deref(),
+            Some(
+                format!(
+                    r#"[{{"ids":["{}"],"authors":["{}"],"kinds":[46101],"limit":1}}]"#,
+                    read.event.event_id, author
+                )
+                .as_bytes()
+            )
+        );
+
+        let mut refused = make(206, serde_json::to_vec(&vec![event.clone()]).unwrap());
+        assert_eq!(
+            refused.read_exact_event(&event_id, 46_101, &author),
+            Err(ExportReadError::Refused)
+        );
+        let mut duplicate = make(
+            200,
+            serde_json::to_vec(&vec![event.clone(), event.clone()]).unwrap(),
+        );
+        assert_eq!(
+            duplicate.read_exact_event(&event_id, 46_101, &author),
+            Err(ExportReadError::Invalid)
+        );
+        let mut wrong_kind = make(200, serde_json::to_vec(&vec![event.clone()]).unwrap());
+        assert_eq!(
+            wrong_kind.read_exact_event(&event_id, 46_102, &author),
+            Err(ExportReadError::Invalid)
+        );
+        let wrong_keys = Keys::parse(&"02".repeat(32)).unwrap();
+        let mut wrong_author = make(200, serde_json::to_vec(&vec![event]).unwrap());
+        assert_eq!(
+            wrong_author.read_exact_event(&event_id, 46_101, &wrong_keys.public_key().to_hex()),
+            Err(ExportReadError::Invalid)
+        );
+        assert_eq!(wrong_author.into_parts().0.requests.len(), 1);
+    }
+
+    #[test]
+    fn authorization_proof_tampering_is_rejected_before_transport() {
+        let binding = Nip98Binding {
+            method: HttpMethod::Get,
+            url: Url::parse("https://relay.example/ci/logs/exact").unwrap(),
+            payload_sha256: None,
+            publisher: None,
+            query_filter: None,
+        };
+        let valid = RecordingAuth::default().authorization(&binding).unwrap();
+        assert_eq!(validate_authorization(&valid, &binding), Ok(()));
+        let make = || RecordingAuth::default().authorization(&binding).unwrap();
+        let mut subject = make();
+        subject.proof.subject = "00".repeat(32);
+        assert_eq!(
+            validate_authorization(&subject, &binding),
+            Err(SourceError::Authorization)
+        );
+        let mut event_id = make();
+        event_id.proof.event_id = "00".repeat(32);
+        assert_eq!(
+            validate_authorization(&event_id, &binding),
+            Err(SourceError::Authorization)
+        );
+        let mut generation = make();
+        generation.proof.generation = 0;
+        assert_eq!(
+            validate_authorization(&generation, &binding),
+            Err(SourceError::Authorization)
+        );
+        let mut header = make();
+        header.header.push('\n');
+        assert_eq!(
+            validate_authorization(&header, &binding),
+            Err(SourceError::Authorization)
+        );
+        let mut tags = make();
+        let encoded = tags.header.strip_prefix("Nostr ").unwrap();
+        let mut event: serde_json::Value =
+            serde_json::from_slice(&BASE64.decode(encoded).unwrap()).unwrap();
+        event["tags"][0][1] = serde_json::json!("https://relay.example/wrong");
+        tags.header = format!(
+            "Nostr {}",
+            BASE64.encode(serde_json::to_vec(&event).unwrap())
+        );
+        assert_eq!(
+            validate_authorization(&tags, &binding),
+            Err(SourceError::Authorization)
         );
     }
 
@@ -862,6 +1483,48 @@ mod tests {
         assert!(request
             .to_ascii_lowercase()
             .contains("authorization: nostr synthetic"));
+    }
+
+    #[test]
+    fn reqwest_binary_transport_returns_redirect_without_following_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let fixture = thread::spawn(move || loop {
+            match listener.accept() {
+                Ok((mut socket, _)) => {
+                    let mut request = [0_u8; 2048];
+                    let _ = socket.read(&mut request).unwrap();
+                    socket.write_all(format!(
+                        "HTTP/1.1 307 Temporary Redirect\r\nlocation: http://{address}/second\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    ).as_bytes()).unwrap();
+                    thread::sleep(std::time::Duration::from_millis(50));
+                    assert!(listener.accept().is_err(), "redirect was followed");
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => thread::yield_now(),
+                Err(error) => panic!("accept: {error}"),
+            }
+        });
+        let mut transport = ReqwestTransport::new(
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+            128,
+        )
+        .unwrap();
+        let response = transport
+            .execute_bounded_binary(
+                HttpRequest {
+                    method: HttpMethod::Get,
+                    url: Url::parse(&format!("http://{address}/first")).unwrap(),
+                    headers: BTreeMap::new(),
+                    body: Vec::new(),
+                },
+                1,
+            )
+            .unwrap();
+        assert_eq!(response.status, 307);
+        fixture.join().unwrap();
     }
 
     #[test]
