@@ -34,6 +34,7 @@ pub fn acceptance_signing_policy(
         || origin.fragment().is_some()
         || nip98_identity.generation == 0
         || receipt.fixture.export_subject != hex::encode(nip98_identity.public_key)
+        || receipt.fixture.export_generation != nip98_identity.generation
         || receipt.fixture.expected_artifacts.len() != 1
         || receipt.fixture.expected_log.name != "job.log"
         || receipt.fixture.expected_artifacts[0].name != "result.json"
@@ -145,7 +146,7 @@ mod tests {
                 .unwrap()
                 .try_into()
                 .unwrap(),
-            generation: 8,
+            generation: receipt.fixture.export_generation,
         }
     }
 
@@ -196,7 +197,17 @@ mod tests {
                 transcript.extend_from_slice(field.as_bytes());
             }
         }
-        receipt.fixture.export_authorization_digest = hex::encode(sha2::Sha256::digest(transcript));
+        let digest = hex::encode(sha2::Sha256::digest(transcript));
+        receipt
+            .fixture
+            .export_authorization_digest
+            .clone_from(&digest);
+        receipt
+            .acceptance
+            .export_subject
+            .clone_from(&receipt.fixture.export_subject);
+        receipt.acceptance.export_generation = receipt.fixture.export_generation;
+        receipt.acceptance.export_authorization_digest = digest;
         receipt
     }
 
@@ -240,7 +251,7 @@ mod tests {
             },
             PublicIdentity {
                 public_key: public_key(&expected.fixture.export_subject),
-                generation: 8,
+                generation: expected.fixture.export_generation,
             },
             PublicIdentity {
                 public_key: public_key(

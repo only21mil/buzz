@@ -1706,6 +1706,7 @@ fn export_response(
         || export.job_id != request.fixture.job_id
         || export.attempt != 1
         || export.subject != request.fixture.export_subject
+        || export.generation != request.fixture.export_generation
         || export.authorization_digest != request.fixture.export_authorization_digest
         || export.objects.len() != 1 + request.fixture.expected_artifacts.len()
     {
@@ -1735,6 +1736,7 @@ fn export_response(
         Some(ExportSnapshot {
             authenticated: true,
             subject: export.subject,
+            generation: export.generation,
             authorization_digest: export.authorization_digest,
             attempt_id: selected,
             request_digest: export.request_event_id,
@@ -2374,6 +2376,7 @@ mod tests {
         event_proof_subject: Option<String>,
         object_proof_subject: Option<String>,
         object_proof_generation: Option<u64>,
+        nip98_generation: u64,
         export_error: Option<ExportReadError>,
         put_url_drift: Option<String>,
     }
@@ -2544,7 +2547,9 @@ mod tests {
                         .object_proof_subject
                         .clone()
                         .unwrap_or_else(|| "1b".repeat(32)),
-                    generation: state.object_proof_generation.unwrap_or(8),
+                    generation: state
+                        .object_proof_generation
+                        .unwrap_or(state.nip98_generation),
                     event_id: "bb".repeat(32),
                 },
                 binding: Nip98Binding {
@@ -3108,6 +3113,7 @@ mod tests {
             )
         }));
         let mut transcript = Vec::from(b"buzz-ci-acceptance-export-authority:v1\0".as_slice());
+        let generation = binding.fixture.export_generation.to_string();
         for (kind, object, url) in plans {
             let event_id_hex = hex::encode(event_id);
             let byte_length = object.bytes.to_string();
@@ -3115,7 +3121,7 @@ mod tests {
                 "GET",
                 url.as_str(),
                 binding.fixture.export_subject.as_str(),
-                "8",
+                generation.as_str(),
                 event_id_hex.as_str(),
                 envelope.run_id.as_str(),
                 binding.fixture.job_id.as_str(),
@@ -3130,6 +3136,15 @@ mod tests {
             }
         }
         binding.fixture.export_authorization_digest = hex::encode(Sha256::digest(transcript));
+        binding
+            .acceptance
+            .export_subject
+            .clone_from(&binding.fixture.export_subject);
+        binding.acceptance.export_generation = binding.fixture.export_generation;
+        binding
+            .acceptance
+            .export_authorization_digest
+            .clone_from(&binding.fixture.export_authorization_digest);
         binding
     }
 
@@ -3180,6 +3195,7 @@ mod tests {
         store: FakeStore,
         runner: FakeRunnerTransport,
     ) -> FakeService {
+        relay.0.lock().unwrap().nip98_generation = binding.fixture.export_generation;
         let bindings = runner_bindings(binding);
         let metadata = JobMetadata {
             job_id: binding.fixture.job_id.clone(),
@@ -3453,12 +3469,49 @@ mod tests {
 
             let mut mismatched = request.clone();
             mismatched.host.integrated_candidate_sha = "00".repeat(32);
-            let reads_before_mismatch = relay.0.lock().unwrap().export_reads;
+            let relay_before_mismatch = relay.0.lock().unwrap().clone();
+            let store_before_mismatch = store.0.lock().unwrap().clone();
+            let runner_before_mismatch = {
+                let state = runner_state.lock().unwrap();
+                (state.starts, state.cancels, state.exchanges)
+            };
             assert_eq!(
                 handle(&mut service, &mismatched),
                 Err(AcceptanceSocketError::Replay)
             );
-            assert_eq!(relay.0.lock().unwrap().export_reads, reads_before_mismatch);
+            let relay_after_mismatch = relay.0.lock().unwrap();
+            assert_eq!(
+                relay_after_mismatch.export_reads,
+                relay_before_mismatch.export_reads
+            );
+            assert_eq!(
+                relay_after_mismatch.published,
+                relay_before_mismatch.published
+            );
+            assert_eq!(
+                relay_after_mismatch.publish_calls,
+                relay_before_mismatch.publish_calls
+            );
+            drop(relay_after_mismatch);
+            let store_after_mismatch = store.0.lock().unwrap();
+            assert_eq!(store_after_mismatch.cursor, store_before_mismatch.cursor);
+            assert_eq!(store_after_mismatch.runs, store_before_mismatch.runs);
+            assert_eq!(
+                store_after_mismatch.publications,
+                store_before_mismatch.publications
+            );
+            assert_eq!(
+                store_after_mismatch.deferred,
+                store_before_mismatch.deferred
+            );
+            drop(store_after_mismatch);
+            assert_eq!(
+                {
+                    let state = runner_state.lock().unwrap();
+                    (state.starts, state.cancels, state.exchanges)
+                },
+                runner_before_mismatch
+            );
         }
     }
 
@@ -3594,7 +3647,10 @@ mod tests {
                     "unavailable" => state.export_error = Some(ExportReadError::Unavailable),
                     "event_subject" => state.event_proof_subject = Some("ef".repeat(32)),
                     "object_subject" => state.object_proof_subject = Some("ef".repeat(32)),
-                    "generation" => state.object_proof_generation = Some(9),
+                    "generation" => {
+                        state.object_proof_generation =
+                            Some(binding.fixture.export_generation.saturating_add(1))
+                    }
                     "fixture_echo" => state.objects.clear(),
                     _ => unreachable!(),
                 }
