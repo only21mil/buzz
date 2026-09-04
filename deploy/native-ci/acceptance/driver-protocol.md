@@ -4,9 +4,13 @@ Each endpoint is the manifest-bound
 `/usr/libexec/buzz-ci-capacity-one-driver` with no arguments. The harness starts
 it directly. No shell parses the program or arguments.
 The harness writes one JSON request to stdin and accepts one JSON response from
-stdout. Each command has a 1 MiB output limit and the scenario timeout, capped
-at 300 seconds. A nonzero exit, timeout, malformed response, wrong sequence,
-wrong operation, or wrong protocol version fails the gate.
+stdout. Each driver response frame has a 1 MiB stdout limit and the scenario
+timeout, capped at 300 seconds. This is not a relay-response limit. The stage-7
+adapter permits at most 8 MiB for an exact-event JSON response. Each evidence
+object is bounded by its signed expected byte length and by the adapter's 16 MiB
+hard ceiling, even though the public relay evidence route permits up to 32 MiB.
+A nonzero exit, timeout, malformed response, wrong sequence, wrong operation,
+or wrong protocol version fails the gate.
 
 The five endpoint classes are:
 
@@ -81,8 +85,9 @@ Later snapshots add one `run`. The run binds `run_id`, candidate SHA, request
 digest, manifest digest, source object, state, aggregate conclusion, approval,
 selected attempt, and all attempts. Each attempt binds its ID, number, parent,
 state, conclusion, all source identities, and terminal evidence. Attempt IDs
-are 16-byte lowercase hex strings. Digests and principals are normalized
-lowercase hex.
+are 16 bytes rendered as exactly 32 lowercase hex characters. They are not the
+evidence URL's `attempt` coordinate, which is a canonical positive decimal
+`u32` attempt number. Digests and principals are normalized lowercase hex.
 
 The export response also adds:
 
@@ -105,12 +110,20 @@ The export response also adds:
 
 The harness requires the export objects to equal the fixture log plus artifact
 set, with no missing, duplicate, or extra object. It compares the export's
-evidence-set digest to the terminal attempt's digest.
+evidence-set digest to the terminal attempt's digest. `authorization_digest` is
+a stable deterministic digest over the ordered, sanitized exact-event and
+object-request bindings plus their public selector identities and generations.
+It is never a digest of an Authorization header, bearer token, signature,
+nonce, timestamp, or volatile NIP-98 event ID.
 
 ## Adapter rules
 
-- Read actual controller, runner, ledger, and object-store state. Do not infer a
-  later state from an earlier successful command.
+- Read actual controller, runner, and ledger state. Stage 7 reads the relay's
+  exact signed events through `/query` and the objects at their signed evidence
+  `GET` URLs; controld receives no direct object-store credential. Require one
+  signature-valid event for each exact id, author, and kind, then verify every
+  object's canonical path, expected length, SHA-256, and set membership. Do not
+  infer a later state from an earlier successful command.
 - Authenticate through the deployed service boundary. Do not place credentials
   in arguments, responses, stdout diagnostics, or receipts.
 - Bind every operation to the canonical scenario digest and deterministic
@@ -119,5 +132,9 @@ evidence-set digest to the terminal attempt's digest.
 - Preserve tombstoned attempts in the normalized run so folding is observable.
 - Return only after the requested state is durable and readable. For wait and
   restart operations, time out and exit nonzero if that cannot be established.
+- Keep the stage-7 operation identity and target fixed across recovery. A retry
+  after response staging returns the stored response without another read; a
+  crash before staging may repeat the idempotent reads with fresh NIP-98 tokens.
+  Tokens and their volatile event IDs never enter a response or receipt.
 - Keep provider-specific fields inside the adapter. The normalized contract is
   deliberately provider-neutral.

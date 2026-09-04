@@ -19,6 +19,14 @@ keyholder package solely owns
 reference, peer operations, selectors, origin, owner, and mode but never writes
 the file.
 
+The frozen keyholder and controld packages must come from the same exact
+candidate. A shared wire-v2 label is insufficient compatibility evidence:
+stage-7 controld requires the matching keyholder policy for exact evidence
+`GET`s. Any change to that policy or to the normalized stage-7 response also
+requires freshly rendered scenario and acceptance-binding inputs and fresh
+receipt and verdict evidence; no prior generated input or qualification receipt
+is reusable across the change.
+
 The controld package solely owns
 `/etc/systemd/system/buzz-ci-controld-acceptance.socket`. Activation does not
 publish or roll back that path. Its manifest binds the canonical controld

@@ -103,11 +103,12 @@ must be within 900 seconds; an `h`-tagged event needs channel membership (the
 channel is private); a kind-46107 grant needs the owner or admin role and adds
 its signer for its repository and window; kinds 46101 to 46106 need a static or
 granted CI signer equal to `relay_signer`; a kind-5 tombstone must target the
-author's own stored event; the accepted read and evidence writes need a static
-or granted CI signer for the request's repository. The guest rosters the
-acceptance actor as channel admin, the ci-event key as member, and the nip98
-key as the static signer (`guest_entry.relay_public_config`), the same three
-facts production must hold for its channel.
+author's own stored event; the accepted read, evidence writes, and exact
+signed-reference evidence `GET`s need a static or granted CI signer for the
+request's repository. The guest rosters the acceptance actor as channel admin,
+the ci-event key as member, and the nip98 key as the static signer
+(`guest_entry.relay_public_config`), the same three facts production must hold
+for its channel.
 The relay also receives the candidate's frozen acceptance template and, only
 for the replay-before-grant fault, the distinct prior template. It derives the
 five actor event IDs in API order (`Run`, `Grant`, `Rerun`, `Tombstone`,
@@ -128,12 +129,20 @@ The relay also serves `POST /query` (api/bridge.rs `query_events`): a NIP-98
 token with the payload digest, a JSON array of filters that each name `kinds`
 (a kindless filter is refused with 403), `ids` lookups, `authors` narrowing to
 events that pubkey signed (controld's exact-event read-back names its own
-ci-event key), and results limited to the caller's channel access. A status
-event from a signer that is neither static nor under an active grant at ingest
-time is refused with the relay's exact `invalid CI envelope: unauthorized CI
-status signer` (`buzz_core::ci::validate_signed_ci_event`), the string controld
-matches. `run --relay-fault <mode>` arms one of two fault modes: the guest
-writes `/var/lib/buzzci-e2e-relay/fault` before the relay starts.
+ci-event key), and results limited to the caller's channel access. Stage 7 uses
+that route to read exactly one signature-valid evidence-reference or final-fact
+event for each requested id, author, and kind. The relay also serves the
+canonical signed-reference log and artifact paths to an exact-URL NIP-98
+`GET`; it checks the caller, path grammar, reference bindings, and stored bytes,
+and returns the full object without a redirect. The installed adapter adds its
+own declared-length and 16 MiB bounds and verifies length and SHA-256. The
+qualification rejects a generic or ranged `GET`, `HEAD`, redirect, wrong or
+duplicate event, mismatched coordinate, or extra, missing, or changed object.
+A status event from a signer that is neither static nor under an active grant
+at ingest time is refused with the relay's exact `invalid CI envelope:
+unauthorized CI status signer` (`buzz_core::ci::validate_signed_ci_event`), the
+string controld matches. `run --relay-fault <mode>` arms one of two fault modes:
+the guest writes `/var/lib/buzzci-e2e-relay/fault` before the relay starts.
 `stale-terminal-publication-recovery`: the relay answers the first publish of
 the terminal kind-46101 run status with the production drift refusal, stores
 nothing, and records the refused id plus whether controld read it back through
@@ -141,6 +150,8 @@ nothing, and records the refused id plus whether controld read it back through
 read-back and a controld snapshot in which every `run:terminal` publication is
 `Accepted`. This is the M11 production failure (PR #156 recovery, keyholder
 `POST /query` token): without the keyholder route the run stops in `canary`.
+That publication-recovery query is distinct from the stage-7 event and object
+readback, although both exact-event queries use the same closed filter shape.
 `stale-terminal-replay-before-grant`: the relay expires every active grant when
 the first terminal kind-46101 status arrives, so that publish and the re-signed
 one after the read-back are refused as an unauthorized signer. The guest runs
