@@ -110,8 +110,9 @@ key as the static signer (`guest_entry.relay_public_config`), the same three
 facts production must hold for its channel.
 The relay also serves `POST /query` (api/bridge.rs `query_events`): a NIP-98
 token with the payload digest, a JSON array of filters that each name `kinds`
-(a kindless filter is refused with 403), `ids` lookups, and results limited to
-the caller's channel access. `run --relay-fault stale-terminal-publication-recovery`
+(a kindless filter is refused with 403), `ids` lookups, `authors` narrowing to
+events that pubkey signed (controld's exact-event read-back names its own
+ci-event key), and results limited to the caller's channel access. `run --relay-fault stale-terminal-publication-recovery`
 arms the one fault mode: the guest writes `/var/lib/buzzci-e2e-relay/fault`
 before the relay starts; the relay answers the first publish of the terminal
 kind-46101 run status with the production drift refusal, stores nothing, and

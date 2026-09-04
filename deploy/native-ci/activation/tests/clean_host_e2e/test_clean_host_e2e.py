@@ -4579,6 +4579,13 @@ class RelayQueryAndFaultTests(unittest.TestCase):
         self.assertEqual(self.query(NIP98, exact), [], "a non-member sees nothing from the private channel")
         self.assertEqual(self.query(CI_EVENT, [{"ids": ["ab" * 32], "kinds": [46100], "limit": 1}]), [])
         self.assertEqual(self.query(CI_EVENT, [{"ids": [run["id"]], "kinds": [46101], "limit": 1}]), [])
+        # `authors` narrows the match to events that pubkey signed; controld's
+        # exact-event read-back names the ci-event key, so an actor-authored
+        # event is not returned to it even by exact id.
+        by_author = [{"ids": [run["id"]], "authors": [public_hex(ACTOR)], "kinds": [46100], "limit": 1}]
+        self.assertEqual(self.query(CI_EVENT, by_author), [run])
+        as_ci_event = [{"ids": [run["id"]], "authors": [public_hex(CI_EVENT)], "kinds": [46100], "limit": 1}]
+        self.assertEqual(self.query(CI_EVENT, as_ci_event), [], "another author's event is not the read-back")
         for body, status in (
             ([{"ids": [run["id"]], "limit": 1}], 403),
             ([{"ids": [run["id"]], "kinds": [], "limit": 1}], 403),
@@ -4608,7 +4615,8 @@ class RelayQueryAndFaultTests(unittest.TestCase):
             self.assertEqual(json.loads(record.read_bytes()), expected)
             self.assertEqual(self.query(CI_EVENT, [{"ids": [stale["id"]], "kinds": [46100], "limit": 1}]), [])
             self.assertEqual(json.loads(record.read_bytes()), expected, "another kind is not the read-back")
-            self.assertEqual(self.query(CI_EVENT, [{"ids": [stale["id"]], "kinds": [46101], "limit": 1}]), [])
+            read_back = [{"ids": [stale["id"]], "authors": [public_hex(CI_EVENT)], "kinds": [46101], "limit": 1}]
+            self.assertEqual(self.query(CI_EVENT, read_back), [])
             self.assertEqual(json.loads(record.read_bytes()), {**expected, "queried": True})
             # controld re-signs the same content; within one second the id is unchanged.
             self.assertEqual(self.admit(CI_EVENT, stale), (CHANNEL, True), "the fault fires once")

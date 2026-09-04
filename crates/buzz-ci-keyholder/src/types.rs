@@ -4,6 +4,8 @@ use std::fmt;
 pub const MAX_CANONICAL_PAYLOAD_SIZE: usize = 48 * 1024;
 /// Largest NIP-98 URL accepted by the protocol.
 pub const MAX_URL_SIZE: usize = 4096;
+/// Largest exact-event query filter bound into a `POST /query` token.
+pub const MAX_QUERY_FILTER_SIZE: usize = 512;
 
 /// Closed keyholder operation set.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,6 +147,31 @@ impl Url {
 
     /// Borrow the validated URL.
     pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Literal `POST /query` request body bound into a NIP-98 token.
+///
+/// The keyholder derives the payload digest from these bytes itself and
+/// checks their shape against the exact-event read-back before it signs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryFilter(Vec<u8>);
+
+impl QueryFilter {
+    /// Validate a non-empty filter within the protocol limit.
+    pub fn new(bytes: Vec<u8>) -> Result<Self, ValueError> {
+        if bytes.is_empty() {
+            return Err(ValueError::Empty);
+        }
+        if bytes.len() > MAX_QUERY_FILTER_SIZE {
+            return Err(ValueError::TooLarge);
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Borrow the exact filter bytes.
+    pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 }
@@ -328,6 +355,8 @@ pub struct Nip98AuthorizeRequest {
     pub nonce: [u8; 16],
     /// Key that signs the token; a `POST /events` token names the event's own signer.
     pub signer: Nip98Signer,
+    /// Literal request body of a `POST /query` token; absent on every other route.
+    pub query_filter: Option<QueryFilter>,
 }
 
 /// Request to sign one canonical CI manifest.
