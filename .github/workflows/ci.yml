@@ -850,7 +850,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.web == 'true'
+    # Protected main PRs need a successful check even when Web paths are unchanged.
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.web == 'true'
     permissions:
       contents: read
     steps:
@@ -885,7 +886,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.mobile == 'true'
+    # Protected main PRs need a successful check even when Mobile paths are unchanged.
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.mobile == 'true'
     permissions:
       contents: read
     steps:
