@@ -112,16 +112,38 @@ The relay also serves `POST /query` (api/bridge.rs `query_events`): a NIP-98
 token with the payload digest, a JSON array of filters that each name `kinds`
 (a kindless filter is refused with 403), `ids` lookups, `authors` narrowing to
 events that pubkey signed (controld's exact-event read-back names its own
-ci-event key), and results limited to the caller's channel access. `run --relay-fault stale-terminal-publication-recovery`
-arms the one fault mode: the guest writes `/var/lib/buzzci-e2e-relay/fault`
-before the relay starts; the relay answers the first publish of the terminal
-kind-46101 run status with the production drift refusal, stores nothing, and
-records the refused id plus whether controld read it back through `POST /query`;
-after the canary the guest requires that record to show the read-back and a
-controld snapshot in which every `run:terminal` publication is `Accepted`. This is the
-M11 production failure (PR #156 recovery, keyholder `POST /query` token): without
-the keyholder route the run stops in `canary`. A standard run carries
-`relay_fault: null` in its phase file and is unchanged.
+ci-event key), and results limited to the caller's channel access. A status
+event from a signer that is neither static nor under an active grant at ingest
+time is refused with the relay's exact `invalid CI envelope: unauthorized CI
+status signer` (`buzz_core::ci::validate_signed_ci_event`), the string controld
+matches. `run --relay-fault <mode>` arms one of two fault modes: the guest
+writes `/var/lib/buzzci-e2e-relay/fault` before the relay starts.
+`stale-terminal-publication-recovery`: the relay answers the first publish of
+the terminal kind-46101 run status with the production drift refusal, stores
+nothing, and records the refused id plus whether controld read it back through
+`POST /query`; after the canary the guest requires that record to show the
+read-back and a controld snapshot in which every `run:terminal` publication is
+`Accepted`. This is the M11 production failure (PR #156 recovery, keyholder
+`POST /query` token): without the keyholder route the run stops in `canary`.
+`stale-terminal-replay-before-grant`: the relay expires every active grant when
+the first terminal kind-46101 status arrives, so that publish and the re-signed
+one after the read-back are refused as an unauthorized signer. The guest runs
+the prior activation's canary under it inside `prior_controller_activate`
+(outside the frozen command inventory; the canary must fail and leave exactly
+one `run:terminal` publication `Pending`, the last refused id), rolls the prior
+activation back as usual, and then runs the candidate, whose controld replays
+that pending terminal at its first poll, before its own grant exists. The relay
+records the expiry, every unauthorized refusal, every read-back of a refused
+id, and the first terminal status it accepts after the expiry; after the
+candidate canary the guest requires at least three refusals and one read-back
+(a re-sign within the same second keeps the event id), the last refused id to
+be the accepted replay, all three `run:terminal`
+publications `Accepted` with the replay among them, and no
+`deferred_publications` left in the snapshot. This is the M12 production
+failure (fde3d4cb, grant approved after the startup replay): a controld that
+does not defer the refusal closes at its first poll and the run stops in
+`canary`. A standard run carries `relay_fault: null` in its phase file and is
+unchanged.
 The host records every staged ISO path with Rock Ridge owner and group `0:0`
 while retaining each frozen file and directory mode. Package manifests,
 payload bytes, and tree digests are unchanged, so the guest's strict root-owned

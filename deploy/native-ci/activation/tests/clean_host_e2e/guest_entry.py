@@ -34,7 +34,12 @@ PENDING_SCHEMA = "buzz-ci-clean-host-e2e-pending-evidence/v3"
 STATE_ROOT = Path("/var/lib/buzzci-e2e")
 RELAY_ROOT = Path("/var/lib/buzzci-e2e-relay")
 # local_tls_relay.py RELAY_FAULTS; the harness `run --relay-fault` choices.
-RELAY_FAULTS = frozenset({"stale-terminal-publication-recovery"})
+FAULT_STALE_TERMINAL = "stale-terminal-publication-recovery"
+FAULT_REPLAY_BEFORE_GRANT = "stale-terminal-replay-before-grant"
+RELAY_FAULTS = frozenset({FAULT_STALE_TERMINAL, FAULT_REPLAY_BEFORE_GRANT})
+REPLAY_FAULT_RECORD_KEYS = frozenset({
+    "mode", "grants_expired_at", "refused_event_ids", "queried_event_ids", "replayed_event_id",
+})
 # buzz-ci-controld store.rs SNAPSHOT_NAME under the frozen controld store_root.
 CONTROLD_SNAPSHOT = Path("/var/lib/buzzci/controld/control-store-v1.json")
 MAX_CONTROLD_SNAPSHOT = 8 * 1024 * 1024
@@ -1227,24 +1232,63 @@ def run_capacity_one_canary(
     ).stdout
 
 
-def prove_relay_fault_recovery(relay_fault: str | None) -> None:
-    """After the canary, require the armed relay fault to have fired, controld to
-    have read the refused event back through POST /query, and the terminal run
-    publication to be ``Accepted`` in the controld snapshot. Plain file reads;
-    no guest command."""
-    if relay_fault is None:
-        return
+def run_prior_canary_expecting_stale_terminal(
+    activation: dict[str, object], scenario: bytes, public: dict[str, object],
+) -> None:
+    """Replay-before-grant fault only: drive the prior activation's canary. The
+    relay expires its grant when the run's terminal status arrives, so the
+    terminal publish (and the re-signed one after the read-back) is refused as
+    an unauthorized signer, controld closes, the canary fails, and the run's
+    terminal publication stays pending with the request still at the head of
+    the relay queue: the state production carried from 2026-09-03 into M12."""
+    uid, gid, supplementary_gids = assert_live_acceptance_roles(activation, public)
+    result = command(
+        ["/usr/libexec/buzz-ci-capacity-one-canary"],
+        stdin=scenario,
+        timeout=timing_leaf("driver_operation") + timing_leaf("canary_orchestration_margin"),
+        allow_failure=True,
+        inventory=False,
+        uid=uid,
+        gid=gid,
+        supplementary_gids=supplementary_gids,
+    )
+    try:
+        receipt = json.loads(result.stdout, object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GuestError("prior canary receipt unreadable under the replay fault") from error
+    if result.returncode != 1 or not isinstance(receipt, dict) or receipt.get("outcome") != "fail":
+        raise GuestError("prior canary did not fail under the replay fault")
+    prove_stale_terminal_left_pending()
+
+
+def replay_fault_record() -> dict[str, object]:
+    """Read and shape-check the relay's replay-before-grant record."""
     try:
         record = load_json(RELAY_ROOT / "fault-fired.json")
     except FileNotFoundError as error:
         raise GuestError("relay fault did not fire") from error
     if (
-        not isinstance(record, dict) or set(record) != {"mode", "refused_event_id", "queried"}
-        or record["mode"] != relay_fault
-        or not isinstance(record["refused_event_id"], str) or HEX64.fullmatch(record["refused_event_id"]) is None
-        or record["queried"] is not True
+        not isinstance(record, dict) or set(record) != REPLAY_FAULT_RECORD_KEYS
+        or record["mode"] != FAULT_REPLAY_BEFORE_GRANT
+        or not isinstance(record["grants_expired_at"], int) or isinstance(record["grants_expired_at"], bool)
+        or record["grants_expired_at"] <= 0
+        or any(
+            not isinstance(record[name], list)
+            or any(not isinstance(item, str) or HEX64.fullmatch(item) is None for item in record[name])
+            for name in ("refused_event_ids", "queried_event_ids")
+        )
+        or not record["refused_event_ids"]
+        or any(item not in record["refused_event_ids"] for item in record["queried_event_ids"])
+        or record["replayed_event_id"] is not None and (
+            not isinstance(record["replayed_event_id"], str) or HEX64.fullmatch(record["replayed_event_id"]) is None
+        )
     ):
-        raise GuestError("relay fault record differs: refused publication was not read back")
+        raise GuestError("relay fault record differs: grant expiry was not recorded")
+    return record
+
+
+def controld_terminal_publications() -> tuple[dict[str, object], dict[str, object]]:
+    """Return (snapshot, run:terminal publications) from the controld store."""
     try:
         snapshot = json.loads(read_file(CONTROLD_SNAPSHOT, MAX_CONTROLD_SNAPSHOT), object_pairs_hook=reject_duplicates)
     except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -1252,12 +1296,71 @@ def prove_relay_fault_recovery(relay_fault: str | None) -> None:
     publications = snapshot.get("publications") if isinstance(snapshot, dict) else None
     if not isinstance(publications, dict):
         raise GuestError("controld snapshot differs")
+    return snapshot, {key: value for key, value in publications.items() if key.endswith(":run:terminal")}
+
+
+def prove_stale_terminal_left_pending() -> None:
+    """After the prior canary under the replay fault: the relay expired the
+    grant and refused the terminal publish and its re-signed replacement
+    (read back in between), and the controld store holds exactly one
+    run:terminal publication, still Pending, whose event is the last refused
+    id. No deferral marker exists: the prior activation's grant was approved,
+    so that refusal is terminal, as it was in production."""
+    record = replay_fault_record()
+    if record["replayed_event_id"] is not None or not record["queried_event_ids"]:
+        raise GuestError("relay fault record differs: prior terminal was not refused and read back")
+    snapshot, terminal = controld_terminal_publications()
+    if len(terminal) != 1 or snapshot.get("deferred_publications"):
+        raise GuestError("prior canary left an unexpected terminal publication state")
+    pending = next(iter(terminal.values()))
+    signed = pending.get("Pending") if isinstance(pending, dict) and set(pending) == {"Pending"} else None
+    if not isinstance(signed, dict) or signed.get("event_id") != record["refused_event_ids"][-1] or signed.get("kind") != 46101:
+        raise GuestError("prior terminal publication is not the pending refused event")
+
+
+def prove_relay_fault_recovery(relay_fault: str | None) -> None:
+    """After the canary, require the armed relay fault to have fired and the
+    controld snapshot to show the recovery: every terminal run publication
+    ``Accepted``, and for the replay-before-grant fault the pending terminal
+    accepted under the candidate grant with no deferral left. Plain file
+    reads; no guest command."""
+    if relay_fault is None:
+        return
+    if relay_fault == FAULT_REPLAY_BEFORE_GRANT:
+        record = replay_fault_record()
+        # The prior canary refused the terminal and its re-sign (the same id
+        # when re-signed within the second); the candidate startup refused the
+        # exact retry and its re-sign; the last refused id is the one the grant
+        # approval replayed and the relay accepted.
+        if (
+            len(record["refused_event_ids"]) < 3 or not record["queried_event_ids"]
+            or record["replayed_event_id"] is None or record["replayed_event_id"] != record["refused_event_ids"][-1]
+        ):
+            raise GuestError("relay fault record differs: pending terminal was not replayed after the grant")
+        replayed = record["replayed_event_id"]
+    else:
+        try:
+            record = load_json(RELAY_ROOT / "fault-fired.json")
+        except FileNotFoundError as error:
+            raise GuestError("relay fault did not fire") from error
+        if (
+            not isinstance(record, dict) or set(record) != {"mode", "refused_event_id", "queried"}
+            or record["mode"] != relay_fault
+            or not isinstance(record["refused_event_id"], str) or HEX64.fullmatch(record["refused_event_id"]) is None
+            or record["queried"] is not True
+        ):
+            raise GuestError("relay fault record differs: refused publication was not read back")
+        replayed = None
+    snapshot, terminal = controld_terminal_publications()
+    if snapshot.get("deferred_publications"):
+        raise GuestError("controld snapshot still defers a publication after the canary")
     # The canary runs an attempt and a rerun, so every accepted request has its
-    # own run:terminal key; the fault hit the first one and all must be Accepted.
-    terminal = [value for key, value in publications.items() if key.endswith(":run:terminal")]
-    if not terminal or any(not isinstance(value, dict) or set(value) != {"Accepted"} for value in terminal):
+    # own run:terminal key (the replay fault adds the prior activation's run);
+    # the fault hit the first one and all must be Accepted.
+    if not terminal or any(not isinstance(value, dict) or set(value) != {"Accepted"} for value in terminal.values()):
         raise GuestError("terminal run publication is not accepted after relay fault")
-    for accepted in (value["Accepted"] for value in terminal):
+    accepted_ids = set()
+    for accepted in (value["Accepted"] for value in terminal.values()):
         signed = accepted.get("signed") if isinstance(accepted, dict) else None
         relay_event_id = accepted.get("relay_event_id") if isinstance(accepted, dict) else None
         if (
@@ -1266,6 +1369,9 @@ def prove_relay_fault_recovery(relay_fault: str | None) -> None:
             or not isinstance(signed.get("signed_event"), dict) or signed["signed_event"].get("id") != relay_event_id
         ):
             raise GuestError("terminal run publication record is inconsistent after relay fault")
+        accepted_ids.add(relay_event_id)
+    if replayed is not None and (len(terminal) < 3 or replayed not in accepted_ids):
+        raise GuestError("replayed terminal publication is not the accepted one after relay fault")
 
 
 def verify_platform_systemd(platform_systemd: object) -> None:
@@ -1976,6 +2082,13 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
         prove_installed_units(expected_units)
         begin_phase("prior_controller_activate")
         command([installed_controller, "activate", "--package", str(prior_activation)], timeout=timing_leaf("controller_activate"), timing_terms={"controller_activate": 1})
+        if relay_fault == FAULT_REPLAY_BEFORE_GRANT:
+            # Outside the frozen command inventory: the failing prior canary
+            # exists only in this fault mode and must leave the pending
+            # terminal that the candidate activation replays before its grant.
+            run_prior_canary_expecting_stale_terminal(
+                package_manifest(prior_activation, "activation"), read_file(prior_inputs / "scenario.json"), public,
+            )
         begin_phase("prior_rollback")
         rolled_back = command([installed_controller, "rollback", "--package", str(prior_activation)], timeout=timing_leaf("rollback"), timing_terms={"rollback": 1})
         prior_proof = prior_rollback_proof(package_manifest(prior_activation, "activation"), rolled_back.stdout)

@@ -94,6 +94,23 @@ and `nip98.key` listed as a static CI signer; the relay also refuses any event
 whose `created_at` is more than 900 seconds from its clock, so the frozen
 acceptance events must be published within that window of the time reference.
 
+`ci-event.key` is authorized only while a kind-46107 grant is active at ingest
+time, and each activation's grant is published by the acceptance protocol
+(`ApproveGrant`, sequence 4) after controld is ready. controld's first poll
+replays pending publications from earlier activations before that step, so a
+replay whose signer the relay refuses (HTTP 400 `invalid CI envelope:
+unauthorized CI status signer`, exactly that message) is recorded as deferred
+in the control store (`deferred_publications`, present only while non-empty)
+instead of closing capacity. The controller stays ready, later polls leave the
+deferred key alone, and the grant approval replays every deferred key through
+the ordinary pending path (exact retry, exact-event read-back, re-sign) before
+it answers, then settles the relay queue head when that run is already
+terminal. After the ledger records the approval, including a controld restart
+later in the same activation, the same refusal is terminal as it always was;
+every other refusal is unchanged. Production M12 (fde3d4cb) failed at this
+ordering: the 2026-09-03 run's terminal status had been refused after its
+grant expired, and each later activation replayed it before its own grant.
+
 The disabled `buzz-ci-controld-acceptance.socket` binds
 `/run/buzzci/controld-acceptance.sock` as root:`buzzci-ctl` mode `0620` beneath
 a mode `0711` runtime directory and names the inherited descriptor

@@ -1824,8 +1824,11 @@ class TimingAndProgressTests(unittest.TestCase):
 
     def test_command_call_mutations_fail_exact_phase_inventory(self) -> None:
         source = Path(guest.__file__).read_text()
-        self.assertEqual(source.count("inventory=False"), 1)
+        # Two exemptions from the frozen inventory: the relay readiness probe
+        # and the prior canary that only the replay-before-grant fault runs.
+        self.assertEqual(source.count("inventory=False"), 2)
         self.assertIn('"openssl", "s_client"', source)
+        self.assertIn('def run_prior_canary_expecting_stale_terminal', source)
         with tempfile.TemporaryDirectory() as temporary, mock.patch.object(
             guest, "SCRATCH_ROOT", Path(temporary),
         ), mock.patch.object(guest.subprocess, "Popen") as popen, mock.patch.object(
@@ -4411,6 +4414,9 @@ class RelayAdmissionTests(unittest.TestCase):
             self.admit(token, event, now=now)
         self.assertEqual((caught.exception.status, caught.exception.message), (status, message))
 
+    def query(self, token: int, filters: object) -> list[dict[str, object]]:
+        return relay.query_events(self.state, public_hex(token), json.dumps(filters).encode())
+
     def test_old_pairing_nip98_token_with_actor_event_is_refused(self) -> None:
         # Before this change controld sent the actor's Run event under a
         # nip98.key token; the production relay refuses that pairing.
@@ -4452,7 +4458,7 @@ class RelayAdmissionTests(unittest.TestCase):
         self.refused(ACTOR, actor_signed_for_ci, 400, "invalid: request actor does not match event signer")
 
     def test_grant_needs_owner_or_admin_and_authorizes_status_signers_for_its_window(self) -> None:
-        self.refused(CI_EVENT, status_event(CI_EVENT, self.now), 400, "invalid: unauthorized CI status signer")
+        self.refused(CI_EVENT, status_event(CI_EVENT, self.now), 400, relay.UNAUTHORIZED_STATUS_SIGNER)
         self.refused(
             CI_EVENT, grant_event(CI_EVENT, self.now, CI_EVENT, valid_until=self.now + 600), 403,
             "restricted: only a channel owner or admin may issue a CI signer grant",
@@ -4463,11 +4469,11 @@ class RelayAdmissionTests(unittest.TestCase):
         )
         grant = grant_event(ACTOR, self.now + 1, CI_EVENT, valid_until=self.now + 601)
         self.assertEqual(self.admit(ACTOR, grant, now=self.now + 1), (CHANNEL, True))
-        self.refused(CI_EVENT, status_event(CI_EVENT, self.now), 400, "invalid: unauthorized CI status signer", now=self.now)
+        self.refused(CI_EVENT, status_event(CI_EVENT, self.now), 400, relay.UNAUTHORIZED_STATUS_SIGNER, now=self.now)
         self.assertEqual(self.admit(CI_EVENT, status_event(CI_EVENT, self.now + 2), now=self.now + 2), (CHANNEL, True))
         self.refused(
             CI_EVENT, status_event(CI_EVENT, self.now + 601), 400,
-            "invalid: unauthorized CI status signer", now=self.now + 601,
+            relay.UNAUTHORIZED_STATUS_SIGNER, now=self.now + 601,
         )
         self.refused(
             CI_EVENT, status_event(CI_EVENT, self.now + 3, relay_signer=NIP98), 400,
@@ -4484,6 +4490,60 @@ class RelayAdmissionTests(unittest.TestCase):
             ACTOR, grant_event(ACTOR, self.now + 4, CI_EVENT, valid_until=self.now + 3), 400,
             "invalid: CI grant content rejected", now=self.now + 4,
         )
+
+    def test_unauthorized_signer_message_is_the_relay_envelope_error(self) -> None:
+        # buzz-core ci.rs: CiValidationError("unauthorized CI status signer")
+        # displayed as "invalid CI envelope: {0}"; controld matches it exactly.
+        self.assertEqual(relay.UNAUTHORIZED_STATUS_SIGNER, "invalid CI envelope: unauthorized CI status signer")
+
+    def test_replay_before_grant_fault_expires_grants_at_the_first_terminal_and_records_the_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            flag = Path(temporary) / "fault"
+            record = Path(temporary) / "fault-fired.json"
+            flag.write_text("stale-terminal-replay-before-grant\n")
+            self.state.arm_fault(flag)
+            grant = grant_event(ACTOR, self.now, CI_EVENT, valid_until=self.now + 600)
+            self.assertEqual(self.admit(ACTOR, grant), (CHANNEL, True))
+            queued = status_event(CI_EVENT, self.now + 1, state="queued")
+            self.assertEqual(self.admit(CI_EVENT, queued, now=self.now + 1), (CHANNEL, True), "open states never fire the fault")
+            self.assertFalse(record.exists())
+            terminal = status_event(CI_EVENT, self.now + 2, state="success")
+            self.refused(CI_EVENT, terminal, 400, relay.UNAUTHORIZED_STATUS_SIGNER, now=self.now + 2)
+            self.assertNotIn(terminal["id"], self.state.events, "a refused event is not stored")
+            expected = {
+                "mode": "stale-terminal-replay-before-grant", "grants_expired_at": self.now + 2,
+                "refused_event_ids": [terminal["id"]], "queried_event_ids": [], "replayed_event_id": None,
+            }
+            self.assertEqual(json.loads(record.read_bytes()), expected)
+            self.assertEqual(self.state.active_signers(REPOSITORY, self.now + 2), {public_hex(NIP98)}, "the grant expired at the fault")
+            self.assertEqual(self.query(CI_EVENT, [{"ids": [terminal["id"]], "kinds": [46100], "limit": 1}]), [])
+            self.assertEqual(json.loads(record.read_bytes()), expected, "another kind is not the read-back")
+            read_back = [{"ids": [terminal["id"]], "authors": [public_hex(CI_EVENT)], "kinds": [46101], "limit": 1}]
+            self.assertEqual(self.query(CI_EVENT, read_back), [])
+            expected["queried_event_ids"] = [terminal["id"]]
+            self.assertEqual(json.loads(record.read_bytes()), expected)
+            self.assertEqual(self.query(CI_EVENT, read_back), [])
+            self.assertEqual(json.loads(record.read_bytes()), expected, "a repeated read-back is recorded once")
+            # controld re-signs after the read-back: still no grant, refused again.
+            resigned = status_event(CI_EVENT, self.now + 3, state="success")
+            self.refused(CI_EVENT, resigned, 400, relay.UNAUTHORIZED_STATUS_SIGNER, now=self.now + 3)
+            running = status_event(CI_EVENT, self.now + 3, state="running")
+            self.refused(CI_EVENT, running, 400, relay.UNAUTHORIZED_STATUS_SIGNER, now=self.now + 3)
+            expected["refused_event_ids"] = [terminal["id"], resigned["id"], running["id"]]
+            self.assertEqual(json.loads(record.read_bytes()), expected, "every unauthorized refusal after the expiry is recorded")
+            # The next activation approves its own grant; the first terminal
+            # status accepted after the expiry is the replayed pending event.
+            renewed = grant_event(ACTOR, self.now + 4, CI_EVENT, valid_until=self.now + 604)
+            self.assertEqual(self.admit(ACTOR, renewed, now=self.now + 4), (CHANNEL, True))
+            self.assertEqual(self.admit(CI_EVENT, status_event(CI_EVENT, self.now + 4, state="queued"), now=self.now + 4), (CHANNEL, True))
+            self.assertEqual(json.loads(record.read_bytes()), expected, "an open state is not the replay")
+            self.assertEqual(self.admit(CI_EVENT, resigned, now=self.now + 4), (CHANNEL, True), "the fault fires once")
+            expected["replayed_event_id"] = resigned["id"]
+            self.assertEqual(json.loads(record.read_bytes()), expected)
+            later = status_event(CI_EVENT, self.now + 5, state="failure")
+            self.assertEqual(self.admit(CI_EVENT, later, now=self.now + 5), (CHANNEL, True))
+            self.assertEqual(json.loads(record.read_bytes()), expected, "later terminals do not replace the replay")
+            self.assertEqual(self.query(CI_EVENT, [{"ids": [resigned["id"]], "kinds": [46101]}]), [resigned])
 
     def test_tombstone_must_target_the_authors_own_stored_event(self) -> None:
         rerun = request_event(ACTOR, self.now + 10, attempt=2)
@@ -4655,6 +4715,7 @@ class RelayQueryAndFaultTests(unittest.TestCase):
                     (lambda value: [value["publications"].pop(key) for key in list(value["publications"]) if key.endswith(":run:terminal")], "not accepted"),
                     (lambda value: value["publications"].__setitem__("9" * 64 + ":run:terminal", {"Pending": signed("2" * 64)}), "not accepted"),
                     (lambda value: value["publications"].__setitem__("9" * 64 + ":run:terminal", {"Accepted": {"signed": signed("4" * 64), "relay_event_id": "2" * 64}}), "inconsistent"),
+                    (lambda value: value.__setitem__("deferred_publications", ["9" * 64 + ":run:terminal"]), "still defers"),
                 ):
                     broken = copy.deepcopy(good)
                     mutate(broken)
@@ -4662,10 +4723,141 @@ class RelayQueryAndFaultTests(unittest.TestCase):
                     with self.assertRaisesRegex(guest.GuestError, message):
                         guest.prove_relay_fault_recovery("stale-terminal-publication-recovery")
 
+    def test_guest_replay_fault_proofs_require_expiry_refusal_read_back_and_the_replayed_terminal(self) -> None:
+        mode = "stale-terminal-replay-before-grant"
+
+        def signed(event_id: str) -> dict[str, object]:
+            return {"event_id": event_id, "kind": 46101, "content": "{}", "tags": [], "signed_event": {"id": event_id}}
+
+        def accepted(event_id: str) -> dict[str, object]:
+            return {"Accepted": {"signed": signed(event_id), "relay_event_id": event_id}}
+
+        first, resigned, replayed = "a" * 64, "b" * 64, "c" * 64
+        after_prior = {
+            "mode": mode, "grants_expired_at": 1_800_000_002, "refused_event_ids": [first, resigned],
+            "queried_event_ids": [first], "replayed_event_id": None,
+        }
+        # A re-sign within the same second keeps the id, so the prior canary's
+        # two refusals and the candidate's exact retry can share one id.
+        after_candidate = {
+            **after_prior, "refused_event_ids": [first, first, first, replayed],
+            "queried_event_ids": [first], "replayed_event_id": replayed,
+        }
+        pending_snapshot = {"schema_version": 1, "cursors": {}, "runs": {}, "finalizations": {}, "publications": {
+            "9" * 64 + ":run:queued": accepted("3" * 64),
+            "9" * 64 + ":run:terminal": {"Pending": signed(resigned)},
+        }}
+        settled_snapshot = {"schema_version": 1, "cursors": {}, "runs": {}, "finalizations": {}, "publications": {
+            "9" * 64 + ":run:terminal": accepted(replayed),
+            "8" * 64 + ":run:terminal": accepted("5" * 64),
+            "7" * 64 + ":run:terminal": accepted("6" * 64),
+        }}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot = root / "control-store-v1.json"
+            record = root / "fault-fired.json"
+            with mock.patch.object(guest, "RELAY_ROOT", root), mock.patch.object(guest, "CONTROLD_SNAPSHOT", snapshot):
+                with self.assertRaisesRegex(guest.GuestError, "did not fire"):
+                    guest.prove_stale_terminal_left_pending()
+                record.write_bytes(guest.canonical(after_prior))
+                snapshot.write_bytes(guest.canonical(pending_snapshot))
+                guest.prove_stale_terminal_left_pending()
+                for mutate_record, message in (
+                    (lambda value: value.__setitem__("replayed_event_id", replayed), "not refused and read back"),
+                    (lambda value: value.__setitem__("queried_event_ids", []), "not refused and read back"),
+                    (lambda value: value.__setitem__("refused_event_ids", []), "grant expiry was not recorded"),
+                    (lambda value: value.__setitem__("queried_event_ids", ["d" * 64]), "grant expiry was not recorded"),
+                    (lambda value: value.__setitem__("grants_expired_at", None), "grant expiry was not recorded"),
+                    (lambda value: value.__setitem__("mode", "stale-terminal-publication-recovery"), "grant expiry was not recorded"),
+                    (lambda value: value.pop("queried_event_ids"), "grant expiry was not recorded"),
+                ):
+                    broken = copy.deepcopy(after_prior)
+                    mutate_record(broken)
+                    record.write_bytes(guest.canonical(broken))
+                    with self.assertRaisesRegex(guest.GuestError, message):
+                        guest.prove_stale_terminal_left_pending()
+                record.write_bytes(guest.canonical(after_prior))
+                for mutate_snapshot, message in (
+                    (lambda value: value["publications"].__setitem__("8" * 64 + ":run:terminal", {"Pending": signed(first)}), "unexpected terminal publication state"),
+                    (lambda value: value.__setitem__("deferred_publications", ["9" * 64 + ":run:terminal"]), "unexpected terminal publication state"),
+                    (lambda value: value["publications"].__setitem__("9" * 64 + ":run:terminal", {"Pending": signed(first)}), "not the pending refused event"),
+                    (lambda value: value["publications"].__setitem__("9" * 64 + ":run:terminal", accepted(resigned)), "not the pending refused event"),
+                ):
+                    broken = copy.deepcopy(pending_snapshot)
+                    mutate_snapshot(broken)
+                    snapshot.write_bytes(guest.canonical(broken))
+                    with self.assertRaisesRegex(guest.GuestError, message):
+                        guest.prove_stale_terminal_left_pending()
+
+                # After the candidate canary: the replay record and a settled snapshot.
+                record.write_bytes(guest.canonical(after_candidate))
+                snapshot.write_bytes(guest.canonical(settled_snapshot))
+                guest.prove_relay_fault_recovery(mode)
+                for mutate_record, message in (
+                    (lambda value: value.__setitem__("replayed_event_id", None), "not replayed after the grant"),
+                    (lambda value: value.__setitem__("replayed_event_id", resigned), "not replayed after the grant"),
+                    (lambda value: value.__setitem__("refused_event_ids", [first, first, replayed, first]), "not replayed after the grant"),
+                    (lambda value: value.__setitem__("refused_event_ids", [first, replayed]), "not replayed after the grant"),
+                    (lambda value: value.__setitem__("queried_event_ids", []), "not replayed after the grant"),
+                ):
+                    broken = copy.deepcopy(after_candidate)
+                    mutate_record(broken)
+                    record.write_bytes(guest.canonical(broken))
+                    with self.assertRaisesRegex(guest.GuestError, message):
+                        guest.prove_relay_fault_recovery(mode)
+                record.write_bytes(guest.canonical(after_candidate))
+                for mutate_snapshot, message in (
+                    (lambda value: value["publications"].__setitem__("9" * 64 + ":run:terminal", {"Pending": signed(replayed)}), "not accepted"),
+                    (lambda value: value["publications"].__setitem__("9" * 64 + ":run:terminal", accepted("d" * 64)), "not the accepted one"),
+                    (lambda value: value["publications"].pop("7" * 64 + ":run:terminal"), "not the accepted one"),
+                    (lambda value: value.__setitem__("deferred_publications", ["9" * 64 + ":run:terminal"]), "still defers"),
+                ):
+                    broken = copy.deepcopy(settled_snapshot)
+                    mutate_snapshot(broken)
+                    snapshot.write_bytes(guest.canonical(broken))
+                    with self.assertRaisesRegex(guest.GuestError, message):
+                        guest.prove_relay_fault_recovery(mode)
+
+    def test_guest_prior_canary_under_the_replay_fault_must_fail_and_leave_the_pending_terminal(self) -> None:
+        def completed(returncode: int, stdout: bytes) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.CompletedProcess(["/usr/libexec/buzz-ci-capacity-one-canary"], returncode, stdout, b"")
+
+        failed = guest.canonical({"outcome": "fail", "checks": []})
+        with mock.patch.object(guest, "assert_live_acceptance_roles", return_value=(1203, 1203, [1201])), \
+                mock.patch.object(guest, "prove_stale_terminal_left_pending") as proof, \
+                mock.patch.object(guest, "command", return_value=completed(1, failed)) as command:
+            guest.run_prior_canary_expecting_stale_terminal({}, b"scenario", {})
+            proof.assert_called_once_with()
+            self.assertEqual(command.call_args.args, (["/usr/libexec/buzz-ci-capacity-one-canary"],))
+            keywords = command.call_args.kwargs
+            self.assertEqual(keywords["stdin"], b"scenario")
+            self.assertTrue(keywords["allow_failure"])
+            self.assertFalse(keywords["inventory"], "the fault-only canary is outside the frozen command inventory")
+            self.assertEqual(keywords["timeout"], guest.timing_leaf("driver_operation") + guest.timing_leaf("canary_orchestration_margin"))
+            self.assertEqual((keywords["uid"], keywords["gid"], keywords["supplementary_gids"]), (1203, 1203, [1201]))
+        for result, message in (
+            (completed(0, guest.canonical({"outcome": "pass"})), "did not fail"),
+            (completed(1, guest.canonical({"outcome": "pass"})), "did not fail"),
+            (completed(2, failed), "did not fail"),
+            (completed(1, b"not json"), "unreadable"),
+        ):
+            with mock.patch.object(guest, "assert_live_acceptance_roles", return_value=(1203, 1203, [1201])), \
+                    mock.patch.object(guest, "prove_stale_terminal_left_pending") as proof, \
+                    mock.patch.object(guest, "command", return_value=result):
+                with self.assertRaisesRegex(guest.GuestError, message):
+                    guest.run_prior_canary_expecting_stale_terminal({}, b"scenario", {})
+                proof.assert_not_called()
+
     def test_run_accepts_only_known_relay_faults_and_hands_them_to_the_terminal_run(self) -> None:
         calls: list[tuple[object, ...]] = []
         with mock.patch.object(harness, "terminal_run", side_effect=lambda *arguments: calls.append(arguments) or {"status": "pass"}):
-            for extra, expected in (([], None), (["--relay-fault", "stale-terminal-publication-recovery"], "stale-terminal-publication-recovery")):
+            self.assertEqual(set(harness.RELAY_FAULTS), relay.RELAY_FAULTS)
+            self.assertEqual(guest.RELAY_FAULTS, relay.RELAY_FAULTS)
+            for extra, expected in (
+                ([], None),
+                (["--relay-fault", "stale-terminal-publication-recovery"], "stale-terminal-publication-recovery"),
+                (["--relay-fault", "stale-terminal-replay-before-grant"], "stale-terminal-replay-before-grant"),
+            ):
                 with mock.patch.object(sys, "argv", ["harness.py", "run", "--contract", "c.json", "--results", "r", *extra]), \
                         contextlib.redirect_stdout(io.TextIOWrapper(io.BytesIO())):
                     self.assertEqual(harness.main(), 0)
