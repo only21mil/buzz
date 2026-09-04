@@ -40,6 +40,8 @@ RELAY_FAULTS = frozenset({FAULT_STALE_TERMINAL, FAULT_REPLAY_BEFORE_GRANT})
 REPLAY_FAULT_RECORD_KEYS = frozenset({
     "mode", "grants_expired_at", "refused_event_ids", "queried_event_ids", "replayed_event_id",
 })
+PROTOCOL_VERDICT = RELAY_ROOT / "protocol-verdict.json"
+PROTOCOL_VERDICT_KEYS = frozenset({"schema_version", "run_id", "state", "reason"})
 # buzz-ci-controld store.rs SNAPSHOT_NAME under the frozen controld store_root.
 CONTROLD_SNAPSHOT = Path("/var/lib/buzzci/controld/control-store-v1.json")
 MAX_CONTROLD_SNAPSHOT = 8 * 1024 * 1024
@@ -57,6 +59,7 @@ ROLLBACK_CLEANUP_PATH = Path("/var/lib/buzzci/activation-controller/rollback-cle
 EXECD_PACKAGE_STATE = Path("/var/lib/buzzci/execd-v2/package")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 VIRTIO_PORT_TARGET = re.compile(r"^\.\./(vport[0-9]+p[0-9]+)$")
 MAX_JSON = 1024 * 1024
 MAX_COMMAND = 4 * 1024 * 1024
@@ -1374,6 +1377,23 @@ def prove_relay_fault_recovery(relay_fault: str | None) -> None:
         raise GuestError("replayed terminal publication is not the accepted one after relay fault")
 
 
+def prove_relay_protocol_verdict() -> None:
+    """Require the loopback relay to close the successful run as green."""
+    try:
+        record = json.loads(
+            read_file(PROTOCOL_VERDICT, MAX_JSON), object_pairs_hook=reject_duplicates,
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise GuestError("relay protocol verdict is unreadable") from error
+    if (
+        not isinstance(record, dict) or set(record) != PROTOCOL_VERDICT_KEYS
+        or record.get("schema_version") != "buzz-ci-loopback-relay-verdict/v1"
+        or not isinstance(record.get("run_id"), str) or UUID.fullmatch(record["run_id"]) is None
+        or record.get("state") != "green" or record.get("reason") is not None
+    ):
+        raise GuestError("relay protocol verdict is not closed green")
+
+
 def verify_platform_systemd(platform_systemd: object) -> None:
     """Reject a clean-host image that differs from the frozen platform files."""
     if platform_systemd != PLATFORM_SYSTEMD:
@@ -2123,6 +2143,7 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
             read_file(inputs / "scenario.json"),
             public,
         )
+        prove_relay_protocol_verdict()
         prove_relay_fault_recovery(relay_fault)
         receipt_path = STATE_ROOT / "acceptance-receipt.json"
         receipt_path.write_bytes(receipt_raw)

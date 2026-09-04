@@ -1198,6 +1198,7 @@ class TimingAndProgressTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(guest, "prior_rollback_proof", side_effect=prior_proof))
             stack.enter_context(mock.patch.object(guest, "reinstall_execd", side_effect=reinstall))
             stack.enter_context(mock.patch.object(guest, "run_capacity_one_canary", return_value=b"receipt"))
+            stack.enter_context(mock.patch.object(guest, "prove_relay_protocol_verdict"))
             stack.enter_context(mock.patch.object(guest, "read_file", return_value=b"scenario"))
             stack.enter_context(mock.patch.object(guest, "parse_verdict"))
             stack.enter_context(mock.patch.object(guest, "cleanup", side_effect=cleanup))
@@ -4374,7 +4375,13 @@ def public_hex(secret: int) -> str:
 
 
 def request_event(secret: int, created_at: int, *, attempt: int = 1, channel: str = CHANNEL) -> dict[str, object]:
-    content = {"actor": public_hex(secret), "run_id": RUN_ID, "target_repo_a": REPOSITORY, "attempt": attempt}
+    content = {
+        "actor": public_hex(secret), "run_id": RUN_ID, "target_repo_a": REPOSITORY,
+        "request_type": "run" if attempt == 1 else "rerun", "attempt": attempt,
+        "job_ids": ["capacity-one-fixture"],
+    }
+    if attempt > 1:
+        content.update({"parent_attempt": attempt - 1, "parent_run_id": RUN_ID})
     tags = [["h", channel], ["a", REPOSITORY], ["run", RUN_ID], ["attempt", str(attempt)]]
     return signed_event(secret, 46100, tags, json.dumps(content, separators=(",", ":")), created_at)
 
@@ -4394,6 +4401,11 @@ def status_event(
     if state is not None:
         content["state"] = state
     return signed_event(secret, 46101, [["h", CHANNEL], ["run", RUN_ID]], json.dumps(content, separators=(",", ":")), created_at)
+
+
+def ci_fact_event(secret: int, kind: int, created_at: int, content: dict[str, object]) -> dict[str, object]:
+    envelope = {"relay_signer": public_hex(secret), "target_repo_a": REPOSITORY, "run_id": RUN_ID, **content}
+    return signed_event(secret, kind, [["h", CHANNEL], ["run", RUN_ID]], json.dumps(envelope, separators=(",", ":")), created_at)
 
 
 class RelayAdmissionTests(unittest.TestCase):
@@ -4431,9 +4443,132 @@ class RelayAdmissionTests(unittest.TestCase):
         self.assertEqual(self.admit(ACTOR, run), (CHANNEL, True))
         self.assertEqual(self.state.accepted, [(1, CHANNEL, run)])
         self.assertEqual(self.admit(ACTOR, run), (CHANNEL, False))
+        self.assertEqual(self.admit(ACTOR, grant_event(ACTOR, self.now + 1, CI_EVENT, valid_until=self.now + 600), now=self.now + 1), (CHANNEL, True))
+        failed = ci_fact_event(CI_EVENT, 46102, self.now + 2, {
+            "job_id": "capacity-one-fixture", "attempt": 1, "state": "failure",
+        })
+        self.assertEqual(self.admit(CI_EVENT, failed, now=self.now + 2), (CHANNEL, True))
         rerun = request_event(ACTOR, self.now + 10, attempt=2)
         self.assertEqual(self.admit(ACTOR, rerun), (CHANNEL, True))
         self.assertEqual([cursor for cursor, _channel, _event in self.state.accepted], [1, 2])
+
+    def test_rerun_requires_one_failed_parent_and_final_facts_seal_the_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            self.state = relay.RelayState(
+                Path(temporary) / "objects", "https://relay.test.invalid:3443", CHANNEL, "private",
+                {public_hex(ACTOR): "admin", public_hex(CI_EVENT): "member"}, {public_hex(NIP98)},
+            )
+            self.state.object_root.mkdir()
+            initial = request_event(ACTOR, self.now)
+            self.assertEqual(self.admit(ACTOR, initial), (CHANNEL, True))
+            self.assertEqual(self.admit(ACTOR, grant_event(ACTOR, self.now + 1, CI_EVENT, valid_until=self.now + 600), now=self.now + 1), (CHANNEL, True))
+            rerun = request_event(ACTOR, self.now + 4, attempt=2)
+            before = (
+                self.state.cursor, self.state.ci_cursor, dict(self.state.events),
+                list(self.state.accepted), copy.deepcopy(self.state.run_requests),
+                copy.deepcopy(self.state.run_events), copy.deepcopy(self.state.final_facts),
+            )
+            self.refused(ACTOR, rerun, 400, "invalid: CI rerun does not extend the selected failed job attempt", now=self.now + 4)
+            self.assertEqual((
+                self.state.cursor, self.state.ci_cursor, self.state.events,
+                self.state.accepted, self.state.run_requests, self.state.run_events,
+                self.state.final_facts,
+            ), before)
+            failure = ci_fact_event(CI_EVENT, 46102, self.now + 2, {
+                "job_id": "capacity-one-fixture", "attempt": 1, "state": "failure",
+            })
+            self.assertEqual(self.admit(CI_EVENT, failure, now=self.now + 2), (CHANNEL, True))
+            fact = ci_fact_event(CI_EVENT, 46105, self.now + 3, {
+                "attempt": 1, "finalized_at": self.now + 3, "finalized_job_attempts": [{
+                    "job_id": "capacity-one-fixture", "attempt": 1, "log_ref": "a" * 64, "artifact_refs": [],
+                }],
+            })
+            self.assertEqual(self.admit(CI_EVENT, fact, now=self.now + 3), (CHANNEL, True))
+            before = (
+                self.state.cursor, self.state.ci_cursor, dict(self.state.events),
+                list(self.state.accepted), copy.deepcopy(self.state.run_requests),
+                copy.deepcopy(self.state.run_events), copy.deepcopy(self.state.final_facts),
+            )
+            self.refused(ACTOR, rerun, 409, "conflict: CI run is already bound to terminal evidence and cannot be rerun", now=self.now + 4)
+            self.assertEqual((
+                self.state.cursor, self.state.ci_cursor, self.state.events,
+                self.state.accepted, self.state.run_requests, self.state.run_events,
+                self.state.final_facts,
+            ), before)
+
+    def test_teardown_fact_alone_seals_the_run_without_mutating_on_refusal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            self.state = relay.RelayState(
+                Path(temporary) / "objects", "https://relay.test.invalid:3443", CHANNEL, "private",
+                {public_hex(ACTOR): "admin", public_hex(CI_EVENT): "member"}, {public_hex(NIP98)},
+            )
+            self.state.object_root.mkdir()
+            self.assertEqual(self.admit(ACTOR, request_event(ACTOR, self.now)), (CHANNEL, True))
+            self.assertEqual(self.admit(ACTOR, grant_event(ACTOR, self.now + 1, CI_EVENT, valid_until=self.now + 600), now=self.now + 1), (CHANNEL, True))
+            failure = ci_fact_event(CI_EVENT, 46102, self.now + 2, {
+                "job_id": "capacity-one-fixture", "attempt": 1, "state": "failure",
+            })
+            self.assertEqual(self.admit(CI_EVENT, failure, now=self.now + 2), (CHANNEL, True))
+            teardown = ci_fact_event(CI_EVENT, 46106, self.now + 3, {"attempt": 1})
+            self.assertEqual(self.admit(CI_EVENT, teardown, now=self.now + 3), (CHANNEL, True))
+            before = (
+                self.state.cursor, self.state.ci_cursor, dict(self.state.events),
+                list(self.state.accepted), copy.deepcopy(self.state.run_requests),
+                copy.deepcopy(self.state.run_events), copy.deepcopy(self.state.final_facts),
+            )
+            self.refused(
+                ACTOR, request_event(ACTOR, self.now + 4, attempt=2), 409,
+                "conflict: CI run is already bound to terminal evidence and cannot be rerun", now=self.now + 4,
+            )
+            self.assertEqual((
+                self.state.cursor, self.state.ci_cursor, self.state.events,
+                self.state.accepted, self.state.run_requests, self.state.run_events,
+                self.state.final_facts,
+            ), before)
+
+    def test_closed_green_verdict_uses_cursor_order_and_accepts_same_second_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            self.state = relay.RelayState(
+                Path(temporary) / "objects", "https://relay.test.invalid:3443", CHANNEL, "private",
+                {public_hex(ACTOR): "admin", public_hex(CI_EVENT): "member"}, {public_hex(NIP98)},
+            )
+            self.state.object_root.mkdir()
+            self.assertEqual(self.admit(ACTOR, request_event(ACTOR, self.now)), (CHANNEL, True))
+            self.assertEqual(self.admit(ACTOR, grant_event(ACTOR, self.now + 1, CI_EVENT, valid_until=self.now + 600), now=self.now + 1), (CHANNEL, True))
+            log = ci_fact_event(CI_EVENT, 46103, self.now + 2, {
+                "job_id": "capacity-one-fixture", "attempt": 1, "created_at": self.now + 2,
+            })
+            artifact = ci_fact_event(CI_EVENT, 46104, self.now + 2, {
+                "job_id": "capacity-one-fixture", "attempt": 1, "created_at": self.now + 2,
+            })
+            for event in (log, artifact):
+                self.assertEqual(self.admit(CI_EVENT, event, now=self.now + 2), (CHANNEL, True))
+            terminal_job = ci_fact_event(CI_EVENT, 46102, self.now + 2, {
+                "job_id": "capacity-one-fixture", "attempt": 1, "state": "success",
+                "log_ref": log["id"], "artifact_refs": [artifact["id"]],
+            })
+            self.assertEqual(self.admit(CI_EVENT, terminal_job, now=self.now + 2), (CHANNEL, True))
+            evidence = ci_fact_event(CI_EVENT, 46105, self.now + 2, {
+                "attempt": 1, "finalized_at": self.now + 2, "finalized_job_attempts": [{
+                    "job_id": "capacity-one-fixture", "attempt": 1,
+                    "log_ref": log["id"], "artifact_refs": [artifact["id"]],
+                }],
+            })
+            teardown = ci_fact_event(CI_EVENT, 46106, self.now + 2, {"attempt": 1})
+            self.assertEqual(self.admit(CI_EVENT, evidence, now=self.now + 2), (CHANNEL, True))
+            self.assertEqual(self.admit(CI_EVENT, teardown, now=self.now + 2), (CHANNEL, True))
+            terminal = status_event(CI_EVENT, self.now + 2, state="success")
+            terminal_content = json.loads(terminal["content"])
+            terminal_content["attempt"] = 1
+            terminal = signed_event(CI_EVENT, 46101, terminal["tags"], json.dumps(terminal_content, separators=(",", ":")), self.now + 2)
+            self.assertEqual(self.admit(CI_EVENT, terminal, now=self.now + 2), (CHANNEL, True))
+            self.assertEqual(self.state.closed_verdict(RUN_ID), {"state": "green", "reason": None})
+            self.assertEqual(json.loads((Path(temporary) / "protocol-verdict.json").read_bytes())["state"], "green")
+            self.state.run_events[RUN_ID][2][2]["created_at"] = self.now + 3
+            self.assertEqual(
+                self.state.closed_verdict(RUN_ID),
+                {"state": "infrastructure_failure", "reason": "evidence-finalized fact does not link the selected durable evidence"},
+            )
 
     def test_membership_drift_and_channel_rules(self) -> None:
         self.refused(STRANGER, request_event(STRANGER, self.now), 400, "restricted: not a channel member")
@@ -4556,6 +4691,11 @@ class RelayAdmissionTests(unittest.TestCase):
             ACTOR, request_event(ACTOR, self.now + 1), 400,
             "invalid: CI run ID or initial request event ID already exists", now=self.now + 1,
         )
+        self.assertEqual(self.admit(ACTOR, grant_event(ACTOR, self.now + 2, CI_EVENT, valid_until=self.now + 600), now=self.now + 2), (CHANNEL, True))
+        failure = ci_fact_event(CI_EVENT, 46102, self.now + 3, {
+            "job_id": "capacity-one-fixture", "attempt": 1, "state": "failure",
+        })
+        self.assertEqual(self.admit(CI_EVENT, failure, now=self.now + 3), (CHANNEL, True))
         self.assertEqual(self.admit(ACTOR, rerun, now=self.now + 10), (CHANNEL, True))
         foreign = signed_event(CI_EVENT, 5, [["e", rerun["id"]]], "", self.now + 20)
         self.refused(CI_EVENT, foreign, 400, "invalid: must be event author", now=self.now + 20)
@@ -4686,6 +4826,30 @@ class RelayQueryAndFaultTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 flag.write_text("unknown-mode\n")
                 self.state.arm_fault(flag)
+
+    def test_guest_requires_one_closed_green_relay_protocol_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            verdict = Path(temporary) / "protocol-verdict.json"
+            with mock.patch.object(guest, "PROTOCOL_VERDICT", verdict):
+                with self.assertRaisesRegex(guest.GuestError, "unreadable"):
+                    guest.prove_relay_protocol_verdict()
+                good = {
+                    "schema_version": "buzz-ci-loopback-relay-verdict/v1",
+                    "run_id": RUN_ID, "state": "green", "reason": None,
+                }
+                verdict.write_bytes(guest.canonical(good))
+                guest.prove_relay_protocol_verdict()
+                for mutate in (
+                    lambda value: value.__setitem__("state", "infrastructure_failure"),
+                    lambda value: value.__setitem__("reason", "evidence mismatch"),
+                    lambda value: value.__setitem__("run_id", "not-a-run"),
+                    lambda value: value.__setitem__("extra", True),
+                ):
+                    broken = copy.deepcopy(good)
+                    mutate(broken)
+                    verdict.write_bytes(guest.canonical(broken))
+                    with self.assertRaisesRegex(guest.GuestError, "not closed green"):
+                        guest.prove_relay_protocol_verdict()
 
     def test_guest_requires_the_read_back_record_and_an_accepted_terminal_publication(self) -> None:
         def signed(event_id: str) -> dict[str, object]:
