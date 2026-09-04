@@ -116,6 +116,7 @@ pub struct FixtureSpec {
     pub grant_digest: String,
     pub approved_by: String,
     pub export_subject: String,
+    pub export_generation: u64,
     pub export_authorization_digest: String,
     pub controller_generation: u64,
     pub runner_generation: u64,
@@ -284,6 +285,7 @@ pub struct SystemSnapshot {
 pub struct ExportSnapshot {
     pub authenticated: bool,
     pub subject: String,
+    pub generation: u64,
     pub authorization_digest: String,
     pub attempt_id: String,
     pub request_digest: String,
@@ -1374,6 +1376,10 @@ fn validate_export(
         .ok_or(AcceptanceError::MissingEvidence("authenticated export"))?;
     require(export.authenticated, "export is not authenticated")?;
     exact(&export.subject, &fixture.export_subject, "export subject")?;
+    require(
+        export.generation == fixture.export_generation,
+        "export generation differs",
+    )?;
     exact(
         &export.authorization_digest,
         &fixture.export_authorization_digest,
@@ -2178,14 +2184,17 @@ fn validate_scenario(scenario: &AcceptanceScenario) -> Result<(), ScenarioError>
     {
         return Err(ScenarioError::InvalidField("fixture.activation_id"));
     }
-    if fixture.job_id.is_empty()
+    let mut job_bytes = fixture.job_id.bytes();
+    if !job_bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
         || fixture.job_id.len() > 64
-        || !fixture
-            .job_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || !job_bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     {
         return Err(ScenarioError::InvalidField("fixture.job_id"));
+    }
+    if fixture.export_generation == 0 || fixture.export_generation > 9_007_199_254_740_991 {
+        return Err(ScenarioError::InvalidField("fixture.export_generation"));
     }
     if fixture.controller_generation == 0 || fixture.runner_generation == 0 {
         return Err(ScenarioError::InvalidField("fixture.service_generation"));
@@ -2195,7 +2204,7 @@ fn validate_scenario(scenario: &AcceptanceScenario) -> Result<(), ScenarioError>
         &fixture.expected_failure_log,
         "fixture.expected_failure_log",
     )?;
-    if fixture.expected_artifacts.is_empty() {
+    if fixture.expected_artifacts.len() != 1 {
         return Err(ScenarioError::InvalidField("fixture.expected_artifacts"));
     }
     let mut names = BTreeSet::new();
@@ -2606,6 +2615,7 @@ mod tests {
                 grant_digest: hex('2', 64),
                 approved_by: hex('3', 64),
                 export_subject: hex('4', 64),
+                export_generation: 6,
                 export_authorization_digest: hex('5', 64),
                 controller_generation: 1,
                 runner_generation: 1,
@@ -2902,6 +2912,7 @@ mod tests {
         let export = ExportSnapshot {
             authenticated: true,
             subject: fixture.export_subject.clone(),
+            generation: fixture.export_generation,
             authorization_digest: fixture.export_authorization_digest.clone(),
             attempt_id: hex('9', 32),
             request_digest: fixture.request_digest.clone(),
@@ -3140,6 +3151,21 @@ mod tests {
     }
 
     #[test]
+    fn wrong_export_generation_fails_closed_before_rerun() {
+        let scenario = scenario();
+        let mut responses = passing_responses(&scenario);
+        responses[6].export.as_mut().unwrap().generation += 1;
+        let mut driver = ScriptedDriver {
+            responses,
+            index: 0,
+        };
+        let receipt = run_acceptance(&scenario, &mut driver);
+        assert_eq!(receipt.outcome, Outcome::Fail);
+        assert_eq!(receipt.failure.unwrap().stage, Stage::AuthenticatedExport);
+        assert_eq!(driver.index, 7);
+    }
+
+    #[test]
     fn reused_attempt_id_fails_closed() {
         let scenario = scenario();
         let mut responses = passing_responses(&scenario);
@@ -3213,5 +3239,31 @@ mod tests {
             validate_scenario(&scenario),
             Err(ScenarioError::InvalidField("driver endpoint"))
         ));
+    }
+
+    #[test]
+    fn scenario_rejects_export_generation_and_extra_artifact_drift() {
+        let mut invalid_generation = scenario();
+        invalid_generation.fixture.export_generation = 0;
+        assert!(matches!(
+            validate_scenario(&invalid_generation),
+            Err(ScenarioError::InvalidField("fixture.export_generation"))
+        ));
+
+        let mut extra_artifact = scenario();
+        extra_artifact
+            .fixture
+            .expected_artifacts
+            .push(evidence("extra.json", '8', 1));
+        assert!(matches!(
+            validate_scenario(&extra_artifact),
+            Err(ScenarioError::InvalidField("fixture.expected_artifacts"))
+        ));
+
+        for job_id in [".bad", "1bad", "bad.name"] {
+            let mut invalid_job = scenario();
+            invalid_job.fixture.job_id = job_id.to_owned();
+            assert!(validate_scenario(&invalid_job).is_err());
+        }
     }
 }

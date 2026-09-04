@@ -61,6 +61,12 @@ def checked_activation_template(draft: dict[str, Any]) -> dict[str, Any]:
     document["acceptance_template"]["actor"] = {
         "$copy": "public_binding.acceptance_actor",
     }
+    document["acceptance_template"]["export_subject"] = {
+        "$copy": "public_binding.keyholder_public_spec.selectors.nip98.public_key",
+    }
+    document["acceptance_template"]["export_generation"] = {
+        "$copy": "public_binding.keyholder_public_spec.selectors.nip98.generation",
+    }
     components = {
         component["name"]: component for component in document["components"]
     }
@@ -119,6 +125,9 @@ def checked_scenario_template(scenario: dict[str, Any]) -> dict[str, Any]:
         ("manifest_digest", "activation_fixture_manifest_sha256"),
         ("grant_event_id", "activation_grant_event_id"),
         ("approved_by", "activation_approved_by"),
+        ("export_subject", "activation_export_subject"),
+        ("export_generation", "activation_export_generation"),
+        ("export_authorization_digest", "activation_export_authorization_digest"),
     ):
         fixture[field] = {"$copy": binding}
     return {
