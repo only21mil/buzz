@@ -916,7 +916,7 @@ def _export_transcript_digest(
         artifact_id, name, sha256, byte_count = artifact
         if (
             not isinstance(artifact_id, str)
-            or re.fullmatch(r"[A-Za-z0-9._-]{1,64}", artifact_id) is None
+            or re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", artifact_id) is None
             or artifact_id in {".", ".."}
             or not isinstance(name, str)
             or not name or len(name) > 255 or "/" in name or "\\" in name or "\0" in name
