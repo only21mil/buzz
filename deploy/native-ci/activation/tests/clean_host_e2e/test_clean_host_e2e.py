@@ -4738,15 +4738,33 @@ def evidence_read_fixture(root: Path, now: int) -> tuple[relay.RelayState, dict[
     }
 
 
+SNAPSHOT_MAX_PATHS = 256
+SNAPSHOT_MAX_FILE_BYTES = harness.MAX_JSON
+SNAPSHOT_MAX_TOTAL_BYTES = 4 * harness.MAX_JSON
+
+
 def relay_evidence_snapshot(state: relay.RelayState) -> tuple[object, ...]:
+    root = state.object_root.parent
+    paths = sorted(root.rglob("*"))
+    if len(paths) > SNAPSHOT_MAX_PATHS:
+        raise AssertionError(f"evidence snapshot exceeds {SNAPSHOT_MAX_PATHS} paths: {root}")
     files = []
-    for path in sorted(state.object_root.parent.rglob("*")):
+    total = 0
+    for path in paths:
         metadata = path.lstat()
-        relative = path.relative_to(state.object_root.parent).as_posix()
+        relative = path.relative_to(root).as_posix()
         if path.is_symlink():
             value: object = ("symlink", os.readlink(path))
         elif path.is_file():
-            value = ("file", path.read_bytes())
+            raw = path.read_bytes()
+            if len(raw) > SNAPSHOT_MAX_FILE_BYTES:
+                raise AssertionError(
+                    f"evidence snapshot file exceeds {SNAPSHOT_MAX_FILE_BYTES} bytes: {relative}"
+                )
+            total += len(raw)
+            if total > SNAPSHOT_MAX_TOTAL_BYTES:
+                raise AssertionError(f"evidence snapshot exceeds {SNAPSHOT_MAX_TOTAL_BYTES} bytes: {root}")
+            value = ("file", raw)
         else:
             value = ("directory", None)
         files.append((relative, stat.S_IMODE(metadata.st_mode), metadata.st_nlink, value))
@@ -4858,7 +4876,9 @@ class RelayAdmissionTests(unittest.TestCase):
         )
         for mutation in mutations:
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
-                state, fixture = evidence_read_fixture(Path(temporary), self.now)
+                object_root = Path(temporary) / "objects"
+                object_root.mkdir()
+                state, fixture = evidence_read_fixture(object_root, self.now)
                 path = relay.parse_evidence_path(fixture["artifact_path"])
                 if mutation == "unsigned-reference":
                     state.events[fixture["artifact_ref"]["id"]]["content"] += " "
@@ -4932,7 +4952,9 @@ class RelayAdmissionTests(unittest.TestCase):
         )
         for name, event_name, mutate in cases:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
-                state, fixture = evidence_read_fixture(Path(temporary), self.now)
+                object_root = Path(temporary) / "objects"
+                object_root.mkdir()
+                state, fixture = evidence_read_fixture(object_root, self.now)
                 original = fixture[event_name]
                 body = json.loads(original["content"])
                 tags = copy.deepcopy(original["tags"])
