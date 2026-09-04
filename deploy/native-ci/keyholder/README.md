@@ -122,7 +122,8 @@ accepted only tags 1 through 7, so the required tag 8 could not be added under
 the old version. V1 and v2 peers now reject each other's frame headers.
 Keyholder and controld must come from the same frozen candidate. Activation
 stages and restarts those package versions together. A mixed-version deployment
-is unsupported and must fail closed before either acceptance socket is opened.
+is unsupported. A protocol mismatch fails closed before controld completes
+initialization, serves, or accepts any acceptance operation.
 
 ## Credentials
 
