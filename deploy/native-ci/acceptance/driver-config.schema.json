@@ -11,6 +11,7 @@
     "scenario_sha256",
     "run_id",
     "failure_run_id",
+    "failure_selector",
     "job_id",
     "request_digest",
     "failure_request_digest",
@@ -37,6 +38,7 @@
     "scenario_sha256": { "$ref": "#/$defs/sha256" },
     "run_id": { "$ref": "#/$defs/id32" },
     "failure_run_id": { "$ref": "#/$defs/id32" },
+    "failure_selector": { "$ref": "#/$defs/fixtureSelector" },
     "job_id": { "$ref": "#/$defs/name" },
     "request_digest": { "$ref": "#/$defs/sha256" },
     "failure_request_digest": { "$ref": "#/$defs/sha256" },
@@ -58,5 +60,18 @@
     "name": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9._-]+$" },
     "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "not": { "pattern": "^0+$" } },
     "gitOid": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$", "not": { "pattern": "^0+$" } }
+    ,"fixtureSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "selector", "job_id", "run_id", "attempt", "sha256"],
+      "properties": {
+        "schema_version": { "const": "buzz-ci-capacity-one-fixture-selector/v1" },
+        "selector": { "const": "deterministic-failure" },
+        "job_id": { "const": "capacity-one-fixture" },
+        "run_id": { "type": "string", "format": "uuid" },
+        "attempt": { "const": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
   }
 }

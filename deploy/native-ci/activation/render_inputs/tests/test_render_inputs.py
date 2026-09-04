@@ -338,6 +338,7 @@ class RendererTests(unittest.TestCase):
         bindings["activation_failure_request_digest"] = failure_request_digest
         bindings["activation_run_id"] = RENDER.activation_run_id(activation)
         bindings["activation_failure_run_id"] = RENDER.activation_failure_run_id(activation)
+        bindings["activation_failure_selector"] = RENDER.activation_failure_selector(activation)
         bindings["activation_approved_by"] = approved_by
         bindings["activation_fixture_manifest_sha256"] = (
             fixture["manifest_digest"]
@@ -358,6 +359,7 @@ class RendererTests(unittest.TestCase):
                     "failure_request_digest": {"$copy": "activation_failure_request_digest"},
                     "run_id": {"$copy": "activation_run_id"},
                     "failure_run_id": {"$copy": "activation_failure_run_id"},
+                    "failure_selector": {"$copy": "activation_failure_selector"},
                     "approved_by": {"$copy": "activation_approved_by"},
                 },
             },
@@ -394,6 +396,7 @@ class RendererTests(unittest.TestCase):
         scenario["fixture"]["failure_request_digest"] = failure_request_digest
         scenario["fixture"]["run_id"] = RENDER.activation_run_id(activation)
         scenario["fixture"]["failure_run_id"] = RENDER.activation_failure_run_id(activation)
+        scenario["fixture"]["failure_selector"] = RENDER.activation_failure_selector(activation)
         scenario["fixture"]["approved_by"] = approved_by
         self.assertEqual(rendered, scenario)
         wrong_bindings = {
@@ -480,8 +483,12 @@ class RendererTests(unittest.TestCase):
                 "    }:\n"
                 "        raise ValueError('default state differs')\n"
                 "def validate_acceptance_template(value):\n"
-                "    if set(value) != {'actor', 'time_reference', 'run_event', 'grant_event', 'rerun_event', 'tombstone_event', 'failure_run_event'}:\n"
+                "    if set(value) != {'actor', 'time_reference', 'run_event', 'grant_event', 'rerun_event', 'tombstone_event', 'failure_run_event', 'failure_selector'}:\n"
                 "        raise ValueError('template shape differs')\n"
+                "    return value\n"
+                "def validate_fixture_selector(value):\n"
+                "    if set(value) != {'schema_version', 'selector', 'job_id', 'run_id', 'attempt', 'sha256'}:\n"
+                "        raise ValueError('selector shape differs')\n"
                 "    return value\n"
             )
 
@@ -625,6 +632,7 @@ class RendererTests(unittest.TestCase):
                     "failure_request_digest": failure_request_digest,
                     "run_id": RENDER.activation_run_id(activation),
                     "failure_run_id": RENDER.activation_failure_run_id(activation),
+                    "failure_selector": RENDER.activation_failure_selector(activation),
                     "approved_by": approved_by,
                 }
             )

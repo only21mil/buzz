@@ -56,6 +56,7 @@
         "activation_package_digest",
         "run_id",
         "failure_run_id",
+        "failure_selector",
         "job_id",
         "request_digest",
         "failure_request_digest",
@@ -82,6 +83,7 @@
         "activation_package_digest": { "$ref": "#/$defs/hex64" },
         "run_id": { "$ref": "#/$defs/hex32" },
         "failure_run_id": { "$ref": "#/$defs/hex32" },
+        "failure_selector": { "$ref": "#/$defs/fixtureSelector" },
         "job_id": {
           "type": "string",
           "minLength": 1,
@@ -107,6 +109,19 @@
           "minItems": 1,
           "items": { "$ref": "#/$defs/evidence" }
         }
+      }
+    },
+    "fixtureSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "selector", "job_id", "run_id", "attempt", "sha256"],
+      "properties": {
+        "schema_version": { "const": "buzz-ci-capacity-one-fixture-selector/v1" },
+        "selector": { "const": "deterministic-failure" },
+        "job_id": { "const": "capacity-one-fixture" },
+        "run_id": { "type": "string", "format": "uuid" },
+        "attempt": { "const": 1 },
+        "sha256": { "$ref": "#/$defs/hex64" }
       }
     },
     "endpoint": {

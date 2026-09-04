@@ -17,11 +17,16 @@ if [ "$input_sha256" != "$expected_input_sha256" ]; then
   exit 1
 fi
 
-case "${BUZZ_CI_RUN_ID:-}:${BUZZ_CI_ATTEMPT:-}" in
-    *-ffffffffffff:1)
-        printf '%s\n' 'fixture=buzz-ci-capacity-one-v1 outcome=deterministic-failure'
-        exit 1
-        ;;
+case "${BUZZ_CI_FIXTURE_OUTCOME:-}" in
+  success) ;;
+  deterministic-failure)
+    printf '%s\n' 'fixture=buzz-ci-capacity-one-v1 outcome=deterministic-failure'
+    exit 1
+    ;;
+  *)
+    printf '%s\n' 'fixture selector rejected' >&2
+    exit 2
+    ;;
 esac
 
 # Hold before producing any evidence so a cancellation issued right after

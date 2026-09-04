@@ -73,9 +73,14 @@ other executable or arguments.
 The checked-in fixture runs
 [`fixtures/run-fixture.sh`](fixtures/run-fixture.sh). It verifies the source
 input digest, writes a byte-stable `result.json`, and emits one byte-stable success log
-line. A distinct frozen run ID ending in `ffffffffffff` makes only attempt 1
-emit the byte-stable failure log and exit nonzero without an artifact. Its
-attempt 2 enters the normal hold so cancellation remains deterministic.
+line. A distinct, domain-separated UUIDv5 identifies Run B without encoding
+fixture behavior in the identifier. The activation manifest freezes a public
+`failure_selector` bound to Run B's job ID, run ID, and attempt 1, and hashes
+that tuple separately. The controller copies it into the scenario, driver
+configuration, and execd static declaration. Execd injects the resulting
+`BUZZ_CI_FIXTURE_OUTCOME` only after the exact tuple matches; attempt 1 emits
+the byte-stable failure log and exits nonzero without an artifact, while Run A
+and Run B attempt 2 enter the normal success/hold path.
 [`fixtures/fixture-manifest.json`](fixtures/fixture-manifest.json) binds
 the command, input, and required evidence names. Recompute all scenario digests
 if any fixture byte changes.

@@ -1608,7 +1608,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "70573dffb1ea15ec16b6b35f12990adb5eca30491cbc49269575608e01dce568",
+            "e42c07656c179e80c82870c3a2c31e0e3d15bd1d05732c4418ec99e74aa3c196",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -3325,6 +3325,7 @@ class ActivationControllerTests(unittest.TestCase):
             "activation_failure_request_digest": failure_request_digest,
             "activation_run_id": RENDERER.activation_run_id(manifest),
             "activation_failure_run_id": RENDERER.activation_failure_run_id(manifest),
+            "activation_failure_selector": RENDERER.activation_failure_selector(manifest),
             "activation_approved_by": approved_by,
             "activation_fixture_manifest_sha256": RENDERER.activation_fixture_manifest_sha256(
                 manifest,
@@ -4130,6 +4131,7 @@ class ActivationControllerTests(unittest.TestCase):
         frozen_lane_manifest = dict(
             config["lane_manifest"], admission_verifying_key="20" * 32, admission_key_generation=9,
         )
+        config["execution"]["failure_selector"] = manifest["acceptance_template"]["failure_selector"]
         self.assertEqual(
             activation_package.lane_manifest_digest(frozen_lane_manifest),
             "12ede37672233a144707bc49efa5d8f86ec5803e6b9d623347472702b2c98f04",
@@ -4138,7 +4140,7 @@ class ActivationControllerTests(unittest.TestCase):
             activation_package.execution_declaration_digest(
                 "aa" * 20, "70" * 32, frozen_lane_manifest, config["execution"],
             ),
-            "217e574d5e7ba339924c2b64ec70bd8be04820fb86deca691714fcb2a1bc833c",
+            "8503abd897bbab6a86c42ea966de80c57752592d7f4d84ae84a68306a7df5452",
         )
 
     def test_lane_manifest_admission_key_must_be_the_keyholder_manifest_selector(self) -> None:
@@ -4397,12 +4399,32 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertNotEqual(first_run["run_id"], later_run["run_id"])
         self.assertNotEqual(first_run["idempotency_key"], later_run["idempotency_key"])
         self.assertNotEqual(first_rerun["idempotency_key"], later_rerun["idempotency_key"])
-        for value in (
+        values = (
             first_run["run_id"], first_run["idempotency_key"],
+            first_failure["run_id"], first_failure["idempotency_key"],
             first_rerun["idempotency_key"], later_run["run_id"],
             later_run["idempotency_key"], later_rerun["idempotency_key"],
+        )
+        self.assertEqual(len(set(values)), len(values))
+        for value in values:
+            parsed = uuid.UUID(value)
+            self.assertEqual(str(parsed), value)
+            self.assertEqual(parsed.version, 5)
+            self.assertEqual(parsed.variant, uuid.RFC_4122)
+        self.assertEqual(first["failure_selector"]["run_id"], first_failure["run_id"])
+        self.assertEqual(first["failure_selector"]["attempt"], 1)
+        self.assertEqual(first["failure_selector"]["job_id"], first_failure["job_ids"][0])
+
+        for field, replacement in (
+            ("run_id", first_run["run_id"]),
+            ("attempt", 2),
+            ("job_id", "other-job"),
+            ("sha256", "0" * 64),
         ):
-            self.assertEqual(str(uuid.UUID(value)), value)
+            tampered = copy.deepcopy(first)
+            tampered["failure_selector"][field] = replacement
+            with self.subTest(selector_field=field), self.assertRaises(ValueError):
+                activation_package.validate_acceptance_template(tampered)
 
     def test_clean_host_scaffold_binds_its_own_test_channel_and_repository(self) -> None:
         manifest, payloads, _driver = self.fixture.load()

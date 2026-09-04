@@ -138,9 +138,12 @@ EXECD_QUALIFICATION_ROOT = "/var/lib/buzzci/execd-v2/qualification"
 EXECD_DYNAMIC_DIGEST_PLACEHOLDER = "0" * 64
 EXECUTION_SCHEMA_VERSION = 1
 EXECUTION_DIGEST_DOMAIN = b"buzz-ci-execd:static-execution:v1\0"
+FIXTURE_SELECTOR_SCHEMA = "buzz-ci-capacity-one-fixture-selector/v1"
+FIXTURE_FAILURE_SELECTOR = "deterministic-failure"
+FIXTURE_SELECTOR_DIGEST_DOMAIN = "buzz-ci:capacity-one:fixture-selector:v1"
 FIXTURE_MANIFEST_SHA256 = "f204b8fba64e972408f5a0ea1c0bb3140cfa696289903d96a8cb07d602af6b23"
 FIXTURE_INPUT_SHA256 = "967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6"
-FIXTURE_SCRIPT_SHA256 = "6cfcbe7061c3e36fbf6c7147e6dd647a134c28db7bb6d43030699bb73952fe41"
+FIXTURE_SCRIPT_SHA256 = "8b2c335883399ad34033953d381a34519fc030577b875dcebe22f42843745ebf"
 FIXTURE_MANIFEST_PATH = "/usr/share/buzzci/execd-v2/fixture/fixture-manifest.json"
 FIXTURE_INPUT_PATH = "/usr/share/buzzci/execd-v2/fixture/input.txt"
 FIXTURE_SCRIPT_PATH = "/usr/libexec/buzz-ci-capacity-one-fixture"
@@ -822,6 +825,47 @@ def _canonical_channel_id(value: object, where: str) -> str:
     return value
 
 
+def fixture_selector_digest(value: object) -> str:
+    """Hash the public failure selector and its exact run/job/attempt scope."""
+    fields = {"schema_version", "selector", "job_id", "run_id", "attempt"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("fixture selector shape differs")
+    if value["schema_version"] != FIXTURE_SELECTOR_SCHEMA:
+        raise ValueError("fixture selector schema differs")
+    if value["selector"] != FIXTURE_FAILURE_SELECTOR:
+        raise ValueError("fixture selector value differs")
+    if value["job_id"] != "capacity-one-fixture":
+        raise ValueError("fixture selector job differs")
+    run_id = _canonical_channel_id(value["run_id"], "fixture selector run id")
+    if value["attempt"] != 1:
+        raise ValueError("fixture selector attempt differs")
+    lines = (
+        FIXTURE_SELECTOR_DIGEST_DOMAIN,
+        value["schema_version"],
+        value["selector"],
+        value["job_id"],
+        uuid.UUID(run_id).hex,
+        str(value["attempt"]),
+    )
+    return digest(("\n".join(lines) + "\n").encode("ascii"))
+
+
+def validate_fixture_selector(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("fixture selector must be an object")
+    require_keys(
+        value,
+        {"schema_version", "selector", "job_id", "run_id", "attempt", "sha256"},
+        "fixture selector",
+    )
+    unsigned = {key: value[key] for key in ("schema_version", "selector", "job_id", "run_id", "attempt")}
+    if value["sha256"] != fixture_selector_digest(unsigned):
+        raise ValueError("fixture selector digest differs")
+    return {key: value[key] for key in (
+        "schema_version", "selector", "job_id", "run_id", "attempt", "sha256",
+    )}
+
+
 def repository_coordinate(owner_public_key: object, repository_id: object) -> str:
     """Return the NIP-34 ``30617:<owner>:<repo id>`` coordinate the relay indexes."""
     owner = _nonzero_sha256(owner_public_key, "repository owner public key")
@@ -908,7 +952,15 @@ def production_acceptance_template(
         ))
 
     run_id = request_identity("run")
-    failure_run_id = str(uuid.UUID(hex=f"{identity_digest[:20]}{'f' * 12}"))
+    failure_run_id = request_identity("failure-run")
+    selector = {
+        "schema_version": FIXTURE_SELECTOR_SCHEMA,
+        "selector": FIXTURE_FAILURE_SELECTOR,
+        "job_id": job_id,
+        "run_id": failure_run_id,
+        "attempt": 1,
+    }
+    failure_selector = {**selector, "sha256": fixture_selector_digest(selector)}
     pr_event = "33" * 32
     issued_at = _positive_integer(
         time_reference, 0xFFFFFFFFFFFFFFFF - 601, "public acceptance time reference",
@@ -998,6 +1050,7 @@ def production_acceptance_template(
         "rerun_event": rerun_event,
         "tombstone_event": [0, actor, issued_at + 20, 5, [["e", rerun_event_id]], ""],
         "failure_run_event": failure_run_event,
+        "failure_selector": failure_selector,
     })
 
 
@@ -1069,7 +1122,7 @@ def production_activation_draft(
 
 
 def validate_acceptance_template(value: object) -> dict[str, Any]:
-    fields = {"actor", "time_reference", "run_event", "grant_event", "rerun_event", "tombstone_event", "failure_run_event"}
+    fields = {"actor", "time_reference", "run_event", "grant_event", "rerun_event", "tombstone_event", "failure_run_event", "failure_selector"}
     if not isinstance(value, dict) or set(value) != fields:
         raise ValueError("public acceptance template shape differs")
     actor = value["actor"]
@@ -1143,10 +1196,33 @@ def validate_acceptance_template(value: object) -> dict[str, Any]:
         or failure_run.get("request_type") != "run"
         or failure_run.get("attempt") != 1
         or not isinstance(failure_run.get("run_id"), str)
-        or not failure_run["run_id"].endswith("-ffffffffffff")
         or failure_run["run_id"] == run.get("run_id")
     ):
         raise ValueError("public acceptance failure-run template is invalid")
+    request_identities = [
+        run.get("run_id"), failure_run.get("run_id"),
+        run.get("idempotency_key"), failure_run.get("idempotency_key"),
+        rerun.get("idempotency_key"),
+    ]
+    try:
+        parsed_identities = [uuid.UUID(identity) for identity in request_identities]
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("public acceptance request identity is not a UUID") from error
+    if (
+        any(
+            parsed.version != 5 or parsed.variant != uuid.RFC_4122 or str(parsed) != identity
+            for parsed, identity in zip(parsed_identities, request_identities, strict=True)
+        )
+        or len(set(request_identities)) != len(request_identities)
+    ):
+        raise ValueError("public acceptance request identities lack full UUIDv5 separation")
+    failure_selector = validate_fixture_selector(value["failure_selector"])
+    if (
+        failure_selector["run_id"] != failure_run["run_id"]
+        or failure_selector["job_id"] != failure_run.get("job_ids", [None])[0]
+        or failure_selector["attempt"] != failure_run["attempt"]
+    ):
+        raise ValueError("public acceptance failure selector scope differs")
     channel = _event_tag_value(run_event[4], "h", "public acceptance run template")
     _canonical_channel_id(channel, "public acceptance run template channel")
     if (
@@ -1293,12 +1369,15 @@ def _wire_text64(value: object, where: str) -> bytes:
 
 
 def validate_execution_declaration(value: object, *, allow_placeholder: bool) -> dict[str, Any]:
-    fields = {
+    base_fields = {
         "schema_version", "declaration_digest", "workflow_id", "workflow_digest", "job_id", "artifact",
         "fixture_manifest_sha256", "fixture_input_sha256", "fixture_script_sha256", "max_stdout_bytes",
         "max_stderr_bytes", "max_memory_bytes", "max_processes", "max_wall_seconds",
     }
-    if not isinstance(value, dict) or set(value) != fields:
+    if not isinstance(value, dict) or (
+        set(value) != base_fields | {"failure_selector"}
+        and not (allow_placeholder and set(value) == base_fields)
+    ):
         raise ValueError("execd execution declaration shape differs from production")
     if isinstance(value["schema_version"], bool) or value["schema_version"] != EXECUTION_SCHEMA_VERSION:
         raise ValueError("execd execution declaration schema differs")
@@ -1311,6 +1390,10 @@ def validate_execution_declaration(value: object, *, allow_placeholder: bool) ->
     _nonzero_sha256(value["workflow_digest"], "execd workflow digest")
     if value["job_id"] != "capacity-one-fixture":
         raise ValueError("execd execution job id differs from the fixed fixture")
+    if "failure_selector" in value:
+        selector = validate_fixture_selector(value["failure_selector"])
+        if selector["job_id"] != value["job_id"]:
+            raise ValueError("execd execution selector job differs")
     artifact = value["artifact"]
     expected_artifact = {
         "artifact_id": "result", "name": "result.json", "media_type": "application/json",
@@ -1364,6 +1447,7 @@ def execution_declaration_digest(
     encoded.extend(struct.pack(">I", artifact["max_bytes"]))
     for field in ("fixture_manifest_sha256", "fixture_input_sha256", "fixture_script_sha256"):
         encoded.extend(bytes.fromhex(declaration[field]))
+    encoded.extend(bytes.fromhex(declaration["failure_selector"]["sha256"]))
     encoded.extend(struct.pack(">I", declaration["max_stdout_bytes"]))
     encoded.extend(struct.pack(">I", declaration["max_stderr_bytes"]))
     encoded.extend(struct.pack(">Q", declaration["max_memory_bytes"]))

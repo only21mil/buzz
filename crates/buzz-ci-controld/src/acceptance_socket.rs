@@ -605,6 +605,7 @@ mod tests {
 
     fn request() -> AdapterRequest {
         let acceptance = authority();
+        let failure_selector = canonical_acceptance_binding().fixture.failure_selector;
         let event_ids = [
             &acceptance.run_event,
             &acceptance.grant_event,
@@ -618,7 +619,8 @@ mod tests {
             activation_id: "activation-1".into(),
             activation_package_digest: "12".repeat(32),
             run_id: "13".repeat(16),
-            failure_run_id: format!("{}{}", "13".repeat(10), "ff".repeat(6)),
+            failure_run_id: "13131313131353139313131313131314".into(),
+            failure_selector,
             job_id: "test".into(),
             request_digest: hex::encode(event_ids[0]),
             failure_request_digest: hex::encode(event_ids[4]),
