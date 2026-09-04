@@ -482,6 +482,41 @@ where
         Ok(reply.event_id)
     }
 
+    fn publication_exists(&mut self, event: &SignedCiEvent) -> Result<bool, Self::Error> {
+        if !is_lower_hex(&event.event_id, 64) {
+            return Err(SourceError::InvalidRequest);
+        }
+        let signed: nostr::Event = serde_json::from_value(event.signed_event.clone())
+            .map_err(|_| SourceError::InvalidRequest)?;
+        signed.verify().map_err(|_| SourceError::InvalidRequest)?;
+        if signed.id.to_hex() != event.event_id
+            || signed.kind.as_u16() as u32 != event.kind
+            || signed.content != event.content
+            || serde_json::to_value(&signed.tags).map_err(|_| SourceError::InvalidRequest)?
+                != event.tags
+        {
+            return Err(SourceError::InvalidRequest);
+        }
+        // Name the exact kind alongside the id. The relay's read gates key on
+        // `kinds`, and the kind was just checked against the signed event, so
+        // the query can never match a different event than the pending one.
+        let body = serde_json::to_vec(&[serde_json::json!({
+            "ids": [event.event_id.as_str()],
+            "kinds": [event.kind],
+            "limit": 1
+        })])
+        .map_err(|_| SourceError::InvalidRequest)?;
+        let url = self.endpoint("query")?;
+        let response = self.request(HttpMethod::Post, url, body, Some(signed.pubkey.to_hex()))?;
+        let found: Vec<nostr::Event> =
+            serde_json::from_slice(&response.body).map_err(|_| SourceError::InvalidResponse)?;
+        match found.as_slice() {
+            [] => Ok(false),
+            [returned] if returned.id == signed.id && returned.verify().is_ok() => Ok(true),
+            _ => Err(SourceError::InvalidResponse),
+        }
+    }
+
     fn put_log(
         &mut self,
         accepted: &AcceptedRequest,
@@ -794,6 +829,51 @@ mod tests {
         assert_eq!(binding.method, HttpMethod::Post);
         assert_eq!(
             binding.publisher.as_deref(),
+            Some(keys.public_key().to_hex().as_str())
+        );
+    }
+
+    #[test]
+    fn pending_publication_reconciliation_queries_the_exact_event_and_kind_as_its_author() {
+        let keys = Keys::parse(&"03".repeat(32)).expect("synthetic key");
+        let event = EventBuilder::new(Kind::Custom(46101), "{}")
+            .sign_with_keys(&keys)
+            .expect("signed event");
+        let event_id = event.id.to_hex();
+        let signed = SignedCiEvent {
+            event_id: event_id.clone(),
+            kind: 46101,
+            content: "{}".to_owned(),
+            tags: serde_json::to_value(&event.tags).expect("tags"),
+            signed_event: serde_json::to_value(&event).expect("event"),
+        };
+        let transport = RecordingTransport {
+            response: HttpResponse {
+                status: 200,
+                body: serde_json::to_vec(&vec![event]).expect("response"),
+            },
+            requests: Vec::new(),
+        };
+        let mut relay = AuthenticatedRelay::new(
+            Url::parse("https://relay.example/").expect("url"),
+            transport,
+            RecordingAuth::default(),
+        )
+        .expect("relay");
+
+        assert!(relay
+            .publication_exists(&signed)
+            .expect("publication query"));
+        let (transport, authorizer) = relay.into_parts();
+        assert_eq!(transport.requests.len(), 1);
+        assert_eq!(transport.requests[0].url.path(), "/query");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&transport.requests[0].body)
+                .expect("filter"),
+            serde_json::json!([{"ids": [event_id], "kinds": [46101], "limit": 1}])
+        );
+        assert_eq!(
+            authorizer.bindings[0].publisher.as_deref(),
             Some(keys.public_key().to_hex().as_str())
         );
     }
