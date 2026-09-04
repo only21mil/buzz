@@ -26,6 +26,13 @@ to `/run/buzzci/controld-acceptance.sock`. Controld owns every relay, signer,
 durable-run, and evidence operation. A response synthesized from the request is
 not evidence.
 
+This is the API call order for every acceptance stage: root control first,
+controld second. For ordinary relay operations, the root call is only
+`observe`; the stage's semantic operation runs in controld. At sequences 14 and
+15 the root helper owns the systemd restart, then the restarted controld
+journals and returns its recovered snapshot. At sequence 16 the helper prepares
+staged zero before the capacity-zero controld journals the final snapshot.
+
 ## Request
 
 Every request has this shape:

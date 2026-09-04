@@ -80,6 +80,7 @@ fn describe_response() -> DescribeResponse {
 
 #[test]
 fn every_request_has_one_canonical_round_trip() {
+    assert_eq!(PROTOCOL_VERSION, 2);
     for request in requests() {
         let encoded = encode_request([42; 16], &request).expect("valid fixture request");
         assert!(encoded.as_bytes().len() <= MAX_FRAME_SIZE);
@@ -182,7 +183,7 @@ fn header_version_kind_flags_lengths_and_identifiers_fail_closed() {
         .expect("valid describe request");
 
     let mut version = encoded.as_bytes().to_vec();
-    version[4..6].copy_from_slice(&2_u16.to_be_bytes());
+    version[4..6].copy_from_slice(&1_u16.to_be_bytes());
     assert_eq!(
         decode_request(&version),
         Err(DecodeError::UnsupportedVersion)

@@ -11,7 +11,7 @@ use crate::types::{
 /// Keyholder frame magic.
 pub const MAGIC: [u8; 4] = *b"BZKH";
 /// Exact protocol version accepted by this codec.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 /// Fixed frame header size.
 pub const HEADER_SIZE: usize = 32;
 /// Maximum encoded body size.
