@@ -53,6 +53,12 @@ TEMPLATE_GENERATOR = load_module(
     "activation_test_checked_templates",
     ACTIVATION_ROOT / "render_inputs/generate_checked_templates.py",
 )
+# Standard unittest discovery does not put the guest's sibling directory on
+# sys.path. Register its relay dependency before loading the guest by file path.
+CLEAN_HOST_RELAY = load_registered_module(
+    "local_tls_relay",
+    ACTIVATION_ROOT / "tests/clean_host_e2e/local_tls_relay.py",
+)
 CLEAN_HOST_GUEST = load_module(
     "activation_test_clean_host_guest",
     ACTIVATION_ROOT / "tests/clean_host_e2e/guest_entry.py",
