@@ -105,6 +105,8 @@ def public_binding() -> dict[str, object]:
 
 def acceptance_template() -> dict[str, object]:
     package = RENDER.activation_package_module()
+    public = public_binding()
+    nip98 = public["keyholder_public_spec"]["selectors"]["nip98"]
     return package.production_acceptance_template(
         actor_public_key="79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
         actor_generation=1,
@@ -117,6 +119,9 @@ def acceptance_template() -> dict[str, object]:
         repository_owner_public_key="22" * 32,
         repository_id="buzz",
         source_clone_url="https://relay.example.invalid/git/buzz",
+        relay_http_origin=public["relay_http_origin"],
+        export_subject=nip98["public_key"],
+        export_generation=nip98["generation"],
         time_reference=1_800_000_000,
     )
 
@@ -340,6 +345,11 @@ class RendererTests(unittest.TestCase):
         bindings["activation_failure_run_id"] = RENDER.activation_failure_run_id(activation)
         bindings["activation_failure_selector"] = RENDER.activation_failure_selector(activation)
         bindings["activation_approved_by"] = approved_by
+        bindings["activation_export_subject"] = RENDER.activation_export_subject(activation)
+        bindings["activation_export_generation"] = RENDER.activation_export_generation(activation)
+        bindings["activation_export_authorization_digest"] = (
+            RENDER.activation_export_authorization_digest(activation)
+        )
         bindings["activation_fixture_manifest_sha256"] = (
             fixture["manifest_digest"]
         )
@@ -361,6 +371,11 @@ class RendererTests(unittest.TestCase):
                     "failure_run_id": {"$copy": "activation_failure_run_id"},
                     "failure_selector": {"$copy": "activation_failure_selector"},
                     "approved_by": {"$copy": "activation_approved_by"},
+                    "export_subject": {"$copy": "activation_export_subject"},
+                    "export_generation": {"$copy": "activation_export_generation"},
+                    "export_authorization_digest": {
+                        "$copy": "activation_export_authorization_digest",
+                    },
                 },
             },
         }
@@ -398,6 +413,11 @@ class RendererTests(unittest.TestCase):
         scenario["fixture"]["failure_run_id"] = RENDER.activation_failure_run_id(activation)
         scenario["fixture"]["failure_selector"] = RENDER.activation_failure_selector(activation)
         scenario["fixture"]["approved_by"] = approved_by
+        scenario["fixture"]["export_subject"] = RENDER.activation_export_subject(activation)
+        scenario["fixture"]["export_generation"] = RENDER.activation_export_generation(activation)
+        scenario["fixture"]["export_authorization_digest"] = (
+            RENDER.activation_export_authorization_digest(activation)
+        )
         self.assertEqual(rendered, scenario)
         wrong_bindings = {
             **bindings,
@@ -483,7 +503,7 @@ class RendererTests(unittest.TestCase):
                 "    }:\n"
                 "        raise ValueError('default state differs')\n"
                 "def validate_acceptance_template(value):\n"
-                "    if set(value) != {'actor', 'time_reference', 'run_event', 'grant_event', 'rerun_event', 'tombstone_event', 'failure_run_event', 'failure_selector'}:\n"
+                "    if set(value) != {'actor', 'time_reference', 'run_event', 'grant_event', 'rerun_event', 'tombstone_event', 'failure_run_event', 'failure_selector', 'export_subject', 'export_generation', 'export_authorization_digest'}:\n"
                 "        raise ValueError('template shape differs')\n"
                 "    return value\n"
                 "def validate_fixture_selector(value):\n"
@@ -634,6 +654,9 @@ class RendererTests(unittest.TestCase):
                     "failure_run_id": RENDER.activation_failure_run_id(activation),
                     "failure_selector": RENDER.activation_failure_selector(activation),
                     "approved_by": approved_by,
+                    "export_subject": RENDER.activation_export_subject(activation),
+                    "export_generation": RENDER.activation_export_generation(activation),
+                    "export_authorization_digest": RENDER.activation_export_authorization_digest(activation),
                 }
             )
             template_path = root / "inputs/scenario-template.json"

@@ -161,6 +161,7 @@ def valid_receipt():
     export = {
         "authenticated": True,
         "subject": fixture["export_subject"],
+        "generation": fixture["export_generation"],
         "authorization_digest": fixture["export_authorization_digest"],
         "attempt_id": first_id,
         "request_digest": fixture["request_digest"],
@@ -268,6 +269,23 @@ class ReceiptVerifierTests(unittest.TestCase):
             with self.subTest(field=failure_name), self.assertRaises(VERIFIER.ReceiptError):
                 VERIFIER._ordered_scenario(collapsed)
 
+    def test_fixed_export_plan_rejects_extra_artifacts(self):
+        scenario, stages, receipt = valid_receipt()
+        extra = {"name": "extra.json", "sha256": _h("e", 64), "bytes": 1}
+        changed_scenario = copy.deepcopy(scenario)
+        changed_scenario["fixture"]["expected_artifacts"].append(extra)
+        with self.assertRaises(VERIFIER.ReceiptError):
+            VERIFIER._ordered_scenario(changed_scenario)
+        changed_receipt = copy.deepcopy(receipt)
+        changed_receipt["checks"][6]["export"]["objects"].append(extra)
+        with self.assertRaises(VERIFIER.ReceiptError):
+            VERIFIER.verify(changed_receipt, scenario, stages)
+        for job_id in (".bad", "1bad", "bad.name"):
+            changed_scenario = copy.deepcopy(scenario)
+            changed_scenario["fixture"]["job_id"] = job_id
+            with self.subTest(job_id=job_id), self.assertRaises(VERIFIER.ReceiptError):
+                VERIFIER._ordered_scenario(changed_scenario)
+
     def test_partial_hash_only_wrong_binding_and_zero_faults_fail_closed(self):
         scenario, stages, receipt = valid_receipt()
         mutations = []
@@ -278,6 +296,7 @@ class ReceiptVerifierTests(unittest.TestCase):
         value = copy.deepcopy(receipt); value["checks"][5]["snapshot"]["run"]["attempts"][0]["manifest_digest"] = _h("e", 64); mutations.append(value)
         value = copy.deepcopy(receipt); value["checks"][4]["evidence_sha256"] = _h("e", 64); mutations.append(value)
         value = copy.deepcopy(receipt); value["checks"][6]["export"]["authenticated"] = False; mutations.append(value)
+        value = copy.deepcopy(receipt); value["checks"][6]["export"]["generation"] += 1; mutations.append(value)
         value = copy.deepcopy(receipt); value["zero_transition"]["phases"][0]["request"]["activation_package_digest"] = _h("e", 64); mutations.append(value)
         value = copy.deepcopy(receipt); value["zero_transition"]["phases"].reverse(); mutations.append(value)
         value = copy.deepcopy(receipt); value["zero_transition"]["phases"][0]["request_sha256"] = _h("e", 64); mutations.append(value)
