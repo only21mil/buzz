@@ -120,6 +120,27 @@ enum RecoveryAttempt {
     NoObservation,
 }
 
+trait AcceptanceRecoveryProvider {
+    fn poll_recovery(
+        &mut self,
+        mutation: AcceptanceMutation,
+    ) -> Result<RecoveryAttempt, AcceptanceSocketError>;
+    fn release_active(&mut self) -> Result<(), AcceptanceSocketError>;
+    fn finish_active(
+        &mut self,
+        mutation: AcceptanceMutation,
+    ) -> Result<(TerminalAttempt, VerifiedAttemptEvidence), AcceptanceSocketError>;
+    fn reconstruct_terminal(
+        &mut self,
+        mutation: AcceptanceMutation,
+    ) -> Result<(TerminalAttempt, VerifiedAttemptEvidence), AcceptanceSocketError>;
+    fn cancel_active(
+        &mut self,
+        request: &AdapterRequest,
+        active: BoundAttempt,
+    ) -> Result<TerminalAttempt, AcceptanceSocketError>;
+}
+
 impl AcceptanceAuthority {
     fn new(binding: &AcceptanceBinding) -> Result<Self, ServiceError> {
         let validated = binding
@@ -561,19 +582,12 @@ impl CapacityOneService {
         self.status = controller.status();
         self.controller = Some(controller);
         result.map_err(|_| AcceptanceSocketError::Operation)?;
-        let terminal = self.terminal_attempt.take().or_else(|| {
-            let mut terminal = None;
-            while let Ok(observation) = self.observations.try_recv() {
-                match observation {
-                    AttemptObservation::Active(active) => self.active_attempt = Some(active),
-                    AttemptObservation::Terminal(observed) => terminal = Some(observed),
-                    AttemptObservation::Completed(evidence) => {
-                        self.verified_evidence = Some(evidence)
-                    }
-                }
-            }
-            terminal
-        });
+        let (terminal, evidence) = merge_attempt_observations(
+            &mut self.active_attempt,
+            self.terminal_attempt.take(),
+            self.verified_evidence.take(),
+            std::iter::from_fn(|| self.observations.try_recv().ok()),
+        )?;
         let Some(terminal) = terminal else {
             self.active_attempt = None;
             self.gate_waiting = false;
@@ -583,11 +597,7 @@ impl CapacityOneService {
         if !observed_admission_matches(&expected, terminal.admission, terminal.response) {
             return self.fail_async_attempt();
         }
-        let Some(evidence) = self
-            .verified_evidence
-            .take()
-            .filter(|evidence| evidence.terminal == terminal)
-        else {
+        let Some(evidence) = evidence.filter(|evidence| evidence.terminal == terminal) else {
             return Err(AcceptanceSocketError::Operation);
         };
         self.active_attempt = None;
@@ -657,20 +667,6 @@ impl CapacityOneService {
                     return Err(AcceptanceSocketError::Operation)
                 }
             }
-        }
-    }
-
-    fn recover_terminal_attempt(
-        &mut self,
-        mutation: AcceptanceMutation,
-    ) -> Result<(TerminalAttempt, VerifiedAttemptEvidence), AcceptanceSocketError> {
-        match self.poll_recovery_attempt(mutation)? {
-            RecoveryAttempt::Active(_) => {
-                self.release_async_attempt()?;
-                self.finish_async_attempt(mutation)
-            }
-            RecoveryAttempt::Terminal(recovered) => Ok(*recovered),
-            RecoveryAttempt::NoObservation => self.reconstruct_runner_attempt(mutation),
         }
     }
 
@@ -848,7 +844,7 @@ impl AcceptanceOperationHandler for CapacityOneService {
                 }
                 (6, Operation::AwaitFirstTerminal) => {
                     let (terminal, evidence) = if execution == AcceptanceExecution::Recovering {
-                        self.recover_terminal_attempt(AcceptanceMutation::Run)?
+                        recover_terminal_with(self, AcceptanceMutation::Run)?
                     } else {
                         self.finish_async_attempt(AcceptanceMutation::Run)?
                     };
@@ -867,7 +863,7 @@ impl AcceptanceOperationHandler for CapacityOneService {
                 }
                 (10, Operation::AwaitFailureTerminal) => {
                     let (terminal, evidence) = if execution == AcceptanceExecution::Recovering {
-                        self.recover_terminal_attempt(AcceptanceMutation::FailureRun)?
+                        recover_terminal_with(self, AcceptanceMutation::FailureRun)?
                     } else {
                         self.finish_async_attempt(AcceptanceMutation::FailureRun)?
                     };
@@ -882,7 +878,7 @@ impl AcceptanceOperationHandler for CapacityOneService {
                 }
                 (12, Operation::CancelRerun) => {
                     let cancelled = if execution == AcceptanceExecution::Recovering {
-                        self.recover_cancelled_attempt(request)?
+                        recover_cancelled_with(self, request)?
                     } else {
                         let active = self
                             .active_attempt
@@ -1040,39 +1036,114 @@ impl CapacityOneService {
         validate_cancelled_terminal(active, terminal, true)?;
         Ok(terminal)
     }
+}
 
-    fn recover_cancelled_attempt(
+fn merge_attempt_observations(
+    active: &mut Option<BoundAttempt>,
+    mut terminal: Option<TerminalAttempt>,
+    mut evidence: Option<VerifiedAttemptEvidence>,
+    observations: impl IntoIterator<Item = AttemptObservation>,
+) -> Result<(Option<TerminalAttempt>, Option<VerifiedAttemptEvidence>), AcceptanceSocketError> {
+    for observation in observations {
+        match observation {
+            AttemptObservation::Active(observed) => *active = Some(observed),
+            AttemptObservation::Terminal(observed) => match terminal {
+                Some(cached) if cached != observed => return Err(AcceptanceSocketError::Operation),
+                Some(_) => {}
+                None => terminal = Some(observed),
+            },
+            AttemptObservation::Completed(observed) => match evidence.as_ref() {
+                Some(cached) if cached != &observed => {
+                    return Err(AcceptanceSocketError::Operation)
+                }
+                Some(_) => {}
+                None => evidence = Some(observed),
+            },
+        }
+    }
+    Ok((terminal, evidence))
+}
+
+impl AcceptanceRecoveryProvider for CapacityOneService {
+    fn poll_recovery(
+        &mut self,
+        mutation: AcceptanceMutation,
+    ) -> Result<RecoveryAttempt, AcceptanceSocketError> {
+        self.poll_recovery_attempt(mutation)
+    }
+
+    fn release_active(&mut self) -> Result<(), AcceptanceSocketError> {
+        self.release_async_attempt()
+    }
+
+    fn finish_active(
+        &mut self,
+        mutation: AcceptanceMutation,
+    ) -> Result<(TerminalAttempt, VerifiedAttemptEvidence), AcceptanceSocketError> {
+        self.finish_async_attempt(mutation)
+    }
+
+    fn reconstruct_terminal(
+        &mut self,
+        mutation: AcceptanceMutation,
+    ) -> Result<(TerminalAttempt, VerifiedAttemptEvidence), AcceptanceSocketError> {
+        self.reconstruct_runner_attempt(mutation)
+    }
+
+    fn cancel_active(
         &mut self,
         request: &AdapterRequest,
+        active: BoundAttempt,
     ) -> Result<TerminalAttempt, AcceptanceSocketError> {
-        match self.poll_recovery_attempt(AcceptanceMutation::Rerun)? {
-            RecoveryAttempt::Active(active) => {
-                let cancelled = self.cancel_active_attempt(request, *active)?;
-                self.release_async_attempt()?;
-                let (reconciled, _) = self.finish_async_attempt(AcceptanceMutation::Rerun)?;
-                if !same_terminal_binding(cancelled, reconciled) {
-                    return Err(AcceptanceSocketError::Operation);
-                }
-                Ok(cancelled)
+        self.cancel_active_attempt(request, active)
+    }
+}
+
+fn recover_terminal_with<P: AcceptanceRecoveryProvider>(
+    provider: &mut P,
+    mutation: AcceptanceMutation,
+) -> Result<(TerminalAttempt, VerifiedAttemptEvidence), AcceptanceSocketError> {
+    match provider.poll_recovery(mutation)? {
+        RecoveryAttempt::Active(_) => {
+            provider.release_active()?;
+            provider.finish_active(mutation)
+        }
+        RecoveryAttempt::Terminal(recovered) => Ok(*recovered),
+        RecoveryAttempt::NoObservation => provider.reconstruct_terminal(mutation),
+    }
+}
+
+fn recover_cancelled_with<P: AcceptanceRecoveryProvider>(
+    provider: &mut P,
+    request: &AdapterRequest,
+) -> Result<TerminalAttempt, AcceptanceSocketError> {
+    match provider.poll_recovery(AcceptanceMutation::Rerun)? {
+        RecoveryAttempt::Active(active) => {
+            let cancelled = provider.cancel_active(request, *active)?;
+            provider.release_active()?;
+            let (reconciled, _) = provider.finish_active(AcceptanceMutation::Rerun)?;
+            if !same_terminal_binding(cancelled, reconciled) {
+                return Err(AcceptanceSocketError::Operation);
             }
-            RecoveryAttempt::Terminal(recovered) => {
-                let (terminal, _) = *recovered;
-                let recovered = BoundAttempt {
-                    admission: terminal.admission,
-                    response: terminal.response,
-                };
-                validate_cancelled_terminal(recovered, terminal, false)?;
-                Ok(terminal)
-            }
-            RecoveryAttempt::NoObservation => {
-                let (terminal, _) = self.reconstruct_runner_attempt(AcceptanceMutation::Rerun)?;
-                let recovered = BoundAttempt {
-                    admission: terminal.admission,
-                    response: terminal.response,
-                };
-                validate_cancelled_terminal(recovered, terminal, false)?;
-                Ok(terminal)
-            }
+            Ok(cancelled)
+        }
+        RecoveryAttempt::Terminal(recovered) => {
+            let (terminal, _) = *recovered;
+            let bound = BoundAttempt {
+                admission: terminal.admission,
+                response: terminal.response,
+            };
+            validate_cancelled_terminal(bound, terminal, false)?;
+            Ok(terminal)
+        }
+        RecoveryAttempt::NoObservation => {
+            let (terminal, _) = provider.reconstruct_terminal(AcceptanceMutation::Rerun)?;
+            let bound = BoundAttempt {
+                admission: terminal.admission,
+                response: terminal.response,
+            };
+            validate_cancelled_terminal(bound, terminal, false)?;
+            Ok(terminal)
         }
     }
 }
@@ -2213,5 +2284,406 @@ mod tests {
             validate_cancelled_terminal(recovered, drift, false),
             Err(AcceptanceSocketError::Operation)
         );
+    }
+
+    struct RecoveryProviderFixture {
+        poll: Option<RecoveryAttempt>,
+        finish: Option<(TerminalAttempt, VerifiedAttemptEvidence)>,
+        reconstructed: Option<(TerminalAttempt, VerifiedAttemptEvidence)>,
+        cancelled: Option<TerminalAttempt>,
+        poll_calls: usize,
+        release_calls: usize,
+        finish_calls: usize,
+        reconstruct_calls: usize,
+        cancel_calls: usize,
+        execution_calls: usize,
+        expected_cancel_active: Option<BoundAttempt>,
+        publication_keys: Vec<String>,
+    }
+
+    impl AcceptanceRecoveryProvider for RecoveryProviderFixture {
+        fn poll_recovery(
+            &mut self,
+            _mutation: AcceptanceMutation,
+        ) -> Result<RecoveryAttempt, AcceptanceSocketError> {
+            self.poll_calls += 1;
+            self.poll.take().ok_or(AcceptanceSocketError::Operation)
+        }
+
+        fn release_active(&mut self) -> Result<(), AcceptanceSocketError> {
+            self.release_calls += 1;
+            Ok(())
+        }
+
+        fn finish_active(
+            &mut self,
+            _mutation: AcceptanceMutation,
+        ) -> Result<(TerminalAttempt, VerifiedAttemptEvidence), AcceptanceSocketError> {
+            self.finish_calls += 1;
+            self.finish.take().ok_or(AcceptanceSocketError::Operation)
+        }
+
+        fn reconstruct_terminal(
+            &mut self,
+            _mutation: AcceptanceMutation,
+        ) -> Result<(TerminalAttempt, VerifiedAttemptEvidence), AcceptanceSocketError> {
+            self.reconstruct_calls += 1;
+            self.reconstructed
+                .take()
+                .ok_or(AcceptanceSocketError::Operation)
+        }
+
+        fn cancel_active(
+            &mut self,
+            _request: &AdapterRequest,
+            active: BoundAttempt,
+        ) -> Result<TerminalAttempt, AcceptanceSocketError> {
+            self.cancel_calls += 1;
+            if self.expected_cancel_active != Some(active) {
+                return Err(AcceptanceSocketError::Operation);
+            }
+            self.cancelled
+                .take()
+                .ok_or(AcceptanceSocketError::Operation)
+        }
+    }
+
+    impl RecoveryProviderFixture {
+        fn record_original_execution(&mut self) {
+            self.execution_calls += 1;
+        }
+
+        fn record_original_cancel(&mut self) {
+            self.cancel_calls += 1;
+        }
+    }
+
+    fn recovery_provider(
+        poll: RecoveryAttempt,
+        terminal: TerminalAttempt,
+        evidence: VerifiedAttemptEvidence,
+    ) -> RecoveryProviderFixture {
+        RecoveryProviderFixture {
+            poll: Some(poll),
+            finish: Some((terminal, evidence.clone())),
+            reconstructed: Some((terminal, evidence)),
+            cancelled: Some(terminal),
+            poll_calls: 0,
+            release_calls: 0,
+            finish_calls: 0,
+            reconstruct_calls: 0,
+            cancel_calls: 0,
+            execution_calls: 0,
+            expected_cancel_active: None,
+            publication_keys: vec!["run:terminal".to_owned(), "evidence:finalized".to_owned()],
+        }
+    }
+
+    fn terminal_fixture(
+        request: &AdapterRequest,
+        conclusion: BrokerConclusion,
+        attempt: u32,
+    ) -> (TerminalAttempt, VerifiedAttemptEvidence) {
+        let mut active = active_binding();
+        active.admission.attempt = attempt;
+        active.admission.parent_attempt = attempt.saturating_sub(1);
+        active.response.attempt = attempt;
+        active.response.broker_state = BrokerState::Terminal;
+        active.response.conclusion = conclusion;
+        active.response.generation += 1;
+        active.response.updated_at += 1;
+        active.response.evidence_set_digest = [16; 32];
+        active.response.teardown_digest = [17; 32];
+        let terminal = TerminalAttempt {
+            admission: active.admission,
+            response: active.response,
+        };
+        let log = if conclusion == BrokerConclusion::Success {
+            &request.fixture.expected_log
+        } else {
+            &request.fixture.expected_failure_log
+        };
+        let artifacts = if conclusion == BrokerConclusion::Success {
+            request
+                .fixture
+                .expected_artifacts
+                .iter()
+                .map(
+                    |artifact| buzz_ci_controld::production_v2::VerifiedArtifactEvidence {
+                        name: artifact.name.clone(),
+                        sha256: artifact.sha256.clone(),
+                        bytes: artifact.bytes,
+                    },
+                )
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let evidence = VerifiedAttemptEvidence {
+            terminal,
+            descriptor_set_digest: [18; 32],
+            log_sha256: log.sha256.clone(),
+            log_bytes: log.bytes,
+            artifacts,
+        };
+        (terminal, evidence)
+    }
+
+    fn stage_request(
+        sequence: u32,
+        operation: Operation,
+        attempt_id: Option<String>,
+    ) -> AdapterRequest {
+        let mut request = rerun_request(attempt_id.as_deref());
+        request.sequence = sequence;
+        request.operation = operation;
+        request.operation_id = "ab".repeat(32);
+        request
+    }
+
+    fn running_prior(
+        request: &AdapterRequest,
+        attempt_id: String,
+        failure: bool,
+    ) -> AdapterResponse {
+        let attempt = if failure {
+            failure_attempt_snapshot(
+                request,
+                attempt_id,
+                1,
+                None,
+                AttemptState::Running,
+                AcceptanceConclusion::None,
+                None,
+            )
+        } else {
+            attempt_snapshot(
+                request,
+                attempt_id,
+                1,
+                None,
+                AttemptState::Running,
+                AcceptanceConclusion::None,
+                None,
+            )
+        };
+        let run = if failure {
+            failure_run_snapshot(
+                request,
+                RunState::Running,
+                AcceptanceConclusion::None,
+                Some(approval_snapshot(request, true)),
+                None,
+                vec![attempt],
+            )
+        } else {
+            run_snapshot(
+                request,
+                RunState::Running,
+                AcceptanceConclusion::None,
+                Some(approval_snapshot(request, true)),
+                None,
+                vec![attempt],
+            )
+        };
+        acceptance_response(request, run, 1, None)
+    }
+
+    #[test]
+    fn unstaged_terminal_recovery_reconstructs_exact_responses_without_execution_or_publication() {
+        for (sequence, operation, mutation, conclusion, failure) in [
+            (
+                6,
+                Operation::AwaitFirstTerminal,
+                AcceptanceMutation::Run,
+                BrokerConclusion::Success,
+                false,
+            ),
+            (
+                10,
+                Operation::AwaitFailureTerminal,
+                AcceptanceMutation::FailureRun,
+                BrokerConclusion::Failure,
+                true,
+            ),
+        ] {
+            let request = stage_request(sequence, operation, None);
+            let (terminal, evidence) = terminal_fixture(&request, conclusion, 1);
+            let attempt_id = hex::encode(terminal.response.attempt_id);
+            let prior = running_prior(&request, attempt_id, failure);
+            let expected = if failure {
+                failure_terminal_response(&request, Some(&prior), terminal, &evidence).unwrap()
+            } else {
+                first_terminal_response(&request, Some(&prior), terminal, &evidence).unwrap()
+            };
+            let mut provider =
+                recovery_provider(RecoveryAttempt::NoObservation, terminal, evidence.clone());
+            provider.record_original_execution();
+            let publications_before = provider.publication_keys.clone();
+            let (recovered, recovered_evidence) =
+                recover_terminal_with(&mut provider, mutation).unwrap();
+            let actual = if failure {
+                failure_terminal_response(&request, Some(&prior), recovered, &recovered_evidence)
+                    .unwrap()
+            } else {
+                first_terminal_response(&request, Some(&prior), recovered, &recovered_evidence)
+                    .unwrap()
+            };
+            assert_eq!(
+                serde_json::to_vec(&actual).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+            assert_eq!(provider.execution_calls, 1);
+            assert_eq!(provider.reconstruct_calls, 1);
+            assert_eq!(provider.cancel_calls, 0);
+            assert_eq!(provider.publication_keys, publications_before);
+
+            let mut drifted = terminal;
+            drifted.response.attempt_id[0] ^= 1;
+            let mut drifted_evidence = evidence;
+            drifted_evidence.terminal = drifted;
+            let drift = if failure {
+                failure_terminal_response(&request, Some(&prior), drifted, &drifted_evidence)
+            } else {
+                first_terminal_response(&request, Some(&prior), drifted, &drifted_evidence)
+            };
+            assert_eq!(drift.map(|_| ()), Err(AcceptanceSocketError::Operation));
+        }
+    }
+
+    #[test]
+    fn cancel_recovery_sends_once_for_active_and_never_resends_after_terminal() {
+        let active = active_binding();
+        let second_id = hex::encode(active.response.attempt_id);
+        let request = stage_request(12, Operation::CancelRerun, Some(second_id.clone()));
+        let (mut cancelled, evidence) = terminal_fixture(&request, BrokerConclusion::Cancelled, 2);
+        cancelled.response.code = ResponseCode::Ok;
+        let mut reconciled = cancelled;
+        reconciled.response.code = ResponseCode::Existing;
+        let mut reconciled_evidence = evidence.clone();
+        reconciled_evidence.terminal = reconciled;
+        let first_id = "cd".repeat(16);
+        let prior = acceptance_response(
+            &request,
+            failure_run_snapshot(
+                &request,
+                RunState::Running,
+                AcceptanceConclusion::None,
+                Some(approval_snapshot(&request, true)),
+                None,
+                vec![
+                    failure_attempt_snapshot(
+                        &request,
+                        first_id.clone(),
+                        1,
+                        None,
+                        AttemptState::Terminal,
+                        AcceptanceConclusion::Failure,
+                        Some("ef".repeat(32)),
+                    ),
+                    failure_attempt_snapshot(
+                        &request,
+                        second_id,
+                        2,
+                        Some(first_id),
+                        AttemptState::Running,
+                        AcceptanceConclusion::None,
+                        None,
+                    ),
+                ],
+            ),
+            1,
+            None,
+        );
+
+        let mut active_provider = recovery_provider(
+            RecoveryAttempt::Active(Box::new(active)),
+            reconciled,
+            reconciled_evidence,
+        );
+        active_provider.record_original_execution();
+        active_provider.expected_cancel_active = Some(active);
+        active_provider.cancelled = Some(cancelled);
+        let active_publications = active_provider.publication_keys.clone();
+        let active_result = recover_cancelled_with(&mut active_provider, &request).unwrap();
+        let active_response = cancelled_response(&request, Some(&prior), active_result).unwrap();
+        assert_eq!(active_provider.cancel_calls, 1);
+        assert_eq!(active_provider.execution_calls, 1);
+        assert_eq!(active_provider.publication_keys, active_publications);
+
+        let terminal_pair = (reconciled, evidence.clone());
+        let mut terminal_provider = recovery_provider(
+            RecoveryAttempt::Terminal(Box::new(terminal_pair.clone())),
+            terminal_pair.0,
+            terminal_pair.1,
+        );
+        terminal_provider.record_original_execution();
+        terminal_provider.record_original_cancel();
+        let terminal_publications = terminal_provider.publication_keys.clone();
+        let terminal_result = recover_cancelled_with(&mut terminal_provider, &request).unwrap();
+        let terminal_response =
+            cancelled_response(&request, Some(&prior), terminal_result).unwrap();
+        assert_eq!(terminal_provider.cancel_calls, 1);
+        assert_eq!(terminal_provider.execution_calls, 1);
+        assert_eq!(terminal_provider.publication_keys, terminal_publications);
+        assert_eq!(
+            serde_json::to_vec(&terminal_response).unwrap(),
+            serde_json::to_vec(&active_response).unwrap()
+        );
+
+        let mut advanced_provider =
+            recovery_provider(RecoveryAttempt::NoObservation, reconciled, evidence.clone());
+        advanced_provider.record_original_execution();
+        advanced_provider.record_original_cancel();
+        let advanced_publications = advanced_provider.publication_keys.clone();
+        let advanced_result = recover_cancelled_with(&mut advanced_provider, &request).unwrap();
+        let advanced_response =
+            cancelled_response(&request, Some(&prior), advanced_result).unwrap();
+        assert_eq!(advanced_provider.cancel_calls, 1);
+        assert_eq!(advanced_provider.reconstruct_calls, 1);
+        assert_eq!(advanced_provider.execution_calls, 1);
+        assert_eq!(advanced_provider.publication_keys, advanced_publications);
+        assert_eq!(
+            serde_json::to_vec(&advanced_response).unwrap(),
+            serde_json::to_vec(&active_response).unwrap()
+        );
+
+        let mut drifted = reconciled;
+        drifted.response.conclusion = BrokerConclusion::Failure;
+        let mut drifted_evidence = evidence;
+        drifted_evidence.terminal = drifted;
+        let mut drift_provider =
+            recovery_provider(RecoveryAttempt::NoObservation, drifted, drifted_evidence);
+        drift_provider.record_original_execution();
+        drift_provider.record_original_cancel();
+        assert_eq!(
+            recover_cancelled_with(&mut drift_provider, &request),
+            Err(AcceptanceSocketError::Operation)
+        );
+        assert_eq!(drift_provider.cancel_calls, 1);
+        assert_eq!(drift_provider.reconstruct_calls, 1);
+        assert_eq!(drift_provider.execution_calls, 1);
+    }
+
+    #[test]
+    fn cached_terminal_merges_the_completed_observation_queued_before_worker_exit() {
+        let request = stage_request(6, Operation::AwaitFirstTerminal, None);
+        let (terminal, evidence) = terminal_fixture(&request, BrokerConclusion::Success, 1);
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(AttemptObservation::Completed(evidence.clone()))
+            .unwrap();
+        let worker = thread::spawn(|| ());
+        worker.join().unwrap();
+        drop(sender);
+        let mut active = None;
+        let merged = merge_attempt_observations(
+            &mut active,
+            Some(terminal),
+            None,
+            std::iter::from_fn(|| receiver.try_recv().ok()),
+        )
+        .unwrap();
+        assert_eq!(merged, (Some(terminal), Some(evidence)));
     }
 }
