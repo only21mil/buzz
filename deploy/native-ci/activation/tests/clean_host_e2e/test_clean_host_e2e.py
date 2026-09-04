@@ -2384,6 +2384,33 @@ class TimingAndProgressTests(unittest.TestCase):
 
 
 class InputTests(unittest.TestCase):
+    def test_guest_dynamic_import_uses_its_sibling_without_search_path(self) -> None:
+        script = """
+import importlib.util
+from pathlib import Path
+import sys
+import types
+
+before = list(sys.path)
+if sys.argv[2] == "poison":
+    sys.modules["local_tls_relay"] = types.ModuleType("local_tls_relay")
+path = Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("isolated_guest", path)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+assert Path(module.relay_protocol.__file__) == path.with_name("local_tls_relay.py")
+assert module.EVIDENCE_READS.name == module.relay_protocol.EVIDENCE_READS_RECORD_NAME
+assert sys.path == before
+"""
+        with tempfile.TemporaryDirectory() as temporary:
+            for mode in ("absent", "poison"):
+                with self.subTest(module_cache=mode):
+                    result = subprocess.run(
+                        [sys.executable, "-I", "-B", "-c", script, str(HERE / "guest_entry.py"), mode],
+                        cwd=temporary, capture_output=True, text=True, timeout=15,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_guest_unit_inventory_accepts_direct_unit_and_valid_drop_in(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             inputs = Path(temporary) / "inputs"

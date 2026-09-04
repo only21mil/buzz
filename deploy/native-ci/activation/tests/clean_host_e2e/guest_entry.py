@@ -25,7 +25,21 @@ import tarfile
 import tempfile
 import time
 
-import local_tls_relay as relay_protocol
+def _load_relay_protocol():
+    # Guest callers may load this file directly without adding its directory to
+    # sys.path. Always use the frozen sibling, not an ambient module or cache.
+    spec = importlib.util.spec_from_file_location(
+        "buzzci_guest_relay_protocol", Path(__file__).with_name("local_tls_relay.py"),
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("guest relay protocol sibling is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+relay_protocol = _load_relay_protocol()
 
 PHASE_SCHEMA = "buzz-ci-clean-host-e2e-guest-phase/v3"
 FRAME_SCHEMA = "buzz-ci-clean-host-e2e-frame/v4"
