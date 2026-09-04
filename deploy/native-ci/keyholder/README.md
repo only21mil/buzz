@@ -121,8 +121,9 @@ validate the same bytes. The receipt has this declaration-order shape:
   "timeout_millis": 1000,
   "fixture": {
     "...": "capacity-one fixture",
-    "export_subject": "nip98 selector public key",
+    "export_subject": "6666666666666666666666666666666666666666666666666666666666666666",
     "export_generation": 1,
+    "export_authorization_digest": "7777777777777777777777777777777777777777777777777777777777777777",
     "expected_log": {
       "name": "job.log",
       "sha256": "64 lowercase hex",
@@ -143,7 +144,10 @@ validate the same bytes. The receipt has this declaration-order shape:
     "grant_event": [0, "actor public key", 0, 46107, [], "canonical content"],
     "rerun_event": [0, "actor public key", 0, 46100, [], "canonical content"],
     "tombstone_event": [0, "actor public key", 0, 5, [], ""],
-    "failure_run_event": [0, "actor public key", 0, 46100, [], "canonical content"]
+    "failure_run_event": [0, "actor public key", 0, 46100, [], "canonical content"],
+    "export_subject": "6666666666666666666666666666666666666666666666666666666666666666",
+    "export_generation": 1,
+    "export_authorization_digest": "7777777777777777777777777777777777777777777777777777777777777777"
   }
 }
 ```
@@ -152,11 +156,15 @@ The receipt is root:root mode `0444`, a regular one-link file, with a root:root
 mode `0711` immediate parent. It has no whitespace or trailing newline. The
 daemon rejects missing, linked, replaced, noncanonical, loose-mode, or
 semantically drifted receipts on every start. It verifies the fixture package,
-candidate, scenario, peer, actor generation, grant identity, all five event
-templates, and that `fixture.export_subject` and `fixture.export_generation`
-equal the loaded nip98 selector. It also requires exactly the declared
-`job.log` and `result.json` objects before deriving the two-path allowlist. The
-actor credential must be distinct from every existing selector.
+candidate, scenario, peer, actor generation, grant identity, and all five event
+templates. The fixture and nested acceptance copies of `export_subject`,
+`export_generation`, and `export_authorization_digest` must be equal. The
+subject and generation must also equal the loaded nip98 selector. The digest
+must equal the deterministic transcript over the ordered Run A attempt 1
+`job.log` and `result` artifact `GET` bindings reconstructed from the receipt;
+no token or volatile proof field enters it. The daemon requires exactly the
+declared `job.log` and `result.json` objects before deriving that two-path
+allowlist. The actor credential must be distinct from every existing selector.
 
 The keyholder wire codec is strict protocol v2. Its `describe_acceptance`
 response carries event IDs in Run, Grant, Rerun, Tombstone, FailureRun semantic
