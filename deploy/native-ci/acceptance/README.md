@@ -47,15 +47,25 @@ is a distinct failed-parent and rerun lane with different run and request IDs:
 11. Rerun creates Run B attempt two with a distinct ID and attempt one as its parent.
 12. Cancellation makes attempt two terminal with a cancelled conclusion.
 13. A tombstone keeps attempt two visible and folds Run B back to failed attempt one.
-14. Controller restart advances its generation without losing folded state.
-15. Runner restart advances its generation without losing folded state.
-16. The final durable controld snapshot is retained while capacity is prepared
-    for the root-only close.
+14. The root acceptance helper restarts controld. Its generation advances and
+    controld recovers the folded Run B state.
+15. The root acceptance helper restarts the runner. Its generation advances and
+    controld retains the folded Run B state.
+16. The root helper prepares staged zero first. The restarted capacity-zero
+    controld then journals and returns the final durable snapshot with capacity
+    zero, admission closed, no active work, and the folded Run B state intact.
 
 The receipt then retains two root-only phases. Sequence 17 finalizes capacity
 zero and stops the controld acceptance transport. Sequence 18 independently
 proves capacity zero, closed admission, and the absence of the controld service,
 socket unit, and socket path. These phases are not acceptance-stage entries.
+
+The activation binding freezes five actor-signed events. The keyholder's
+`describe_acceptance` response names their semantic slots as Run, Grant,
+Rerun, Tombstone, FailureRun. The gate publishes them in API call order as Run,
+Grant, FailureRun, Rerun, Tombstone because Run B must exist and fail before its
+rerun and tombstone. Do not treat the semantic field order as publication
+chronology.
 
 Any missing field, duplicate attempt, extra evidence object, identity mismatch,
 generation regression, or ambiguous active count stops the sequence. A failed

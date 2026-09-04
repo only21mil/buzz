@@ -113,12 +113,15 @@ candidate, scenario, peer, actor generation, grant identity, and all five event
 templates before constructing the existing closed operations 5 and 6 policy.
 The actor credential must be distinct from every existing selector.
 
-The keyholder wire codec remains strict protocol v1. Its
-`describe_acceptance` response carries the append-only event-ID array in
-Run, Grant, Rerun, Tombstone, FailureRun order; the fifth ID is required tag 8.
-An older peer rejects that tag and a newer peer rejects a response without it,
-so keyholder and controld must come from the same frozen candidate. Activation
-stages and restarts those package versions together; a mixed-version deployment
+The keyholder wire codec is strict protocol v2. Its `describe_acceptance`
+response carries event IDs in Run, Grant, Rerun, Tombstone, FailureRun semantic
+order; the fifth ID is required tag 8. Calls publish those frozen events in Run,
+Grant, FailureRun, Rerun, Tombstone order because the distinct failed run must
+exist before its rerun. Protocol v1 had only the first four IDs. A v1 peer
+accepted only tags 1 through 7, so the required tag 8 could not be added under
+the old version. V1 and v2 peers now reject each other's frame headers.
+Keyholder and controld must come from the same frozen candidate. Activation
+stages and restarts those package versions together. A mixed-version deployment
 is unsupported and must fail closed before either acceptance socket is opened.
 
 ## Credentials
