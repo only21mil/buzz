@@ -223,10 +223,14 @@ impl SigningPolicy {
             .collect::<Vec<_>>();
         // A publish token is signed by the event's own signer: the relay stores
         // an event only when `event.pubkey` equals the token pubkey, so a
-        // `nip98.key` token can never carry a publish. Every other route is
-        // authorized as a CI signer, which stays the `nip98.key` identity.
+        // `nip98.key` token can never carry a publish. The exact-event query
+        // that reconciles a refused CI publication reads back the CI event as
+        // its author, so it is signed by the `ci-event.key` selector alone.
+        // Every other route is authorized as a CI signer, which stays the
+        // `nip98.key` identity.
         let allowed = match (request.method, segments.as_slice()) {
             (HttpMethod::Post, ["events"]) => request.signer != Nip98Signer::Nip98,
+            (HttpMethod::Post, ["query"]) => request.signer == Nip98Signer::CiEvent,
             (HttpMethod::Put, ["ci", "logs", fields @ ..]) => {
                 fields.len() == 5 && request.signer == Nip98Signer::Nip98
             }
@@ -1519,6 +1523,146 @@ pub(crate) mod tests {
             ),
             ErrorCode::PolicyDenied
         ));
+    }
+
+    fn query_request(
+        signer: Nip98Signer,
+        generation: u64,
+        url: &str,
+        payload_digest: Option<[u8; 32]>,
+        nonce: u8,
+        now: u64,
+    ) -> Nip98AuthorizeRequest {
+        Nip98AuthorizeRequest {
+            expected_generation: generation,
+            signer,
+            method: HttpMethod::Post,
+            url: Url::new(url.to_owned()).expect("url"),
+            payload_digest,
+            created_at: now,
+            nonce: [nonce; 16],
+        }
+    }
+
+    #[test]
+    fn exact_event_query_tokens_are_signed_by_the_ci_event_key_and_nothing_else_opens() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_secs();
+        let query_url = "https://relay.example.test/query";
+        let service = service(OperationSet::only(Operation::Nip98Authorize));
+
+        // The controld principal reads back its own refused publication as
+        // the event author: signer `ci_event` at its generation, with the
+        // filter body digest bound into the token.
+        let request = query_request(Nip98Signer::CiEvent, 7, query_url, Some([4; 32]), 60, now);
+        let expected = nip98_event_digest([1_u8; 32], &request).expect("digest");
+        let Response::Nip98Authorize(signature) =
+            service.handle(peer(), Request::Nip98Authorize(request))
+        else {
+            panic!("exact-event query token should sign");
+        };
+        assert_eq!(signature.identity.public_key, [1_u8; 32]);
+        assert_eq!(signature.identity.generation, 7);
+        assert_eq!(signature.signed_digest, expected);
+        assert_eq!(
+            service.backend.calls.borrow().as_slice(),
+            &[(KeySelector::CiEvent, expected)]
+        );
+
+        // The query never opens for the nip98 key, for the acceptance actor,
+        // without a payload digest, with a query string, on a nested or
+        // unrelated path, or on another method.
+        let denied = [
+            query_request(Nip98Signer::Nip98, 8, query_url, Some([4; 32]), 61, now),
+            query_request(Nip98Signer::CiEvent, 7, query_url, None, 62, now),
+            query_request(Nip98Signer::CiEvent, 7, query_url, Some([0; 32]), 63, now),
+            query_request(
+                Nip98Signer::CiEvent,
+                7,
+                "https://relay.example.test/query?limit=1",
+                Some([4; 32]),
+                64,
+                now,
+            ),
+            query_request(
+                Nip98Signer::CiEvent,
+                7,
+                "https://relay.example.test/query/extra",
+                Some([4; 32]),
+                65,
+                now,
+            ),
+            query_request(
+                Nip98Signer::CiEvent,
+                7,
+                "https://relay.example.test/admin",
+                Some([4; 32]),
+                66,
+                now,
+            ),
+            query_request(
+                Nip98Signer::CiEvent,
+                7,
+                "https://relay.example.test/count",
+                Some([4; 32]),
+                67,
+                now,
+            ),
+            query_request(
+                Nip98Signer::CiEvent,
+                7,
+                "https://other.example.test/query",
+                Some([4; 32]),
+                68,
+                now,
+            ),
+            Nip98AuthorizeRequest {
+                method: HttpMethod::Put,
+                ..query_request(Nip98Signer::CiEvent, 7, query_url, Some([4; 32]), 69, now)
+            },
+            Nip98AuthorizeRequest {
+                method: HttpMethod::Head,
+                ..query_request(Nip98Signer::CiEvent, 7, query_url, Some([4; 32]), 70, now)
+            },
+        ];
+        for request in denied {
+            let label = format!(
+                "{:?} {:?} {}",
+                request.signer,
+                request.method,
+                request.url.as_str()
+            );
+            assert!(
+                denied_with(
+                    service.handle(peer(), Request::Nip98Authorize(request)),
+                    ErrorCode::PolicyDenied
+                ),
+                "{label}"
+            );
+        }
+        assert_eq!(service.backend.calls.borrow().len(), 1);
+
+        // Even with the activation binding loaded, the actor may publish its
+        // frozen events but never query.
+        let service = acceptance_service();
+        assert!(denied_with(
+            service.handle(
+                peer(),
+                Request::Nip98Authorize(query_request(
+                    Nip98Signer::AcceptanceActor,
+                    10,
+                    query_url,
+                    Some([4; 32]),
+                    71,
+                    now
+                ))
+            ),
+            ErrorCode::PolicyDenied
+        ));
+        assert!(service.backend.acceptance_calls.borrow().is_empty());
+        assert!(service.backend.calls.borrow().is_empty());
     }
 
     #[test]

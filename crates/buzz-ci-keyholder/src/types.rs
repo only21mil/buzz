@@ -220,7 +220,8 @@ pub enum Nip98Signer {
     /// The `nip98.key` selector: accepted reads and evidence object writes.
     Nip98 = 1,
     /// The `ci-event.key` selector: `POST /events` carrying a kind 46101 to
-    /// 46106 event it signed.
+    /// 46106 event it signed, and `POST /query` reading back one exact event
+    /// it signed after the relay refused the publish.
     CiEvent = 2,
     /// The activation-bound acceptance actor: `POST /events` carrying one of
     /// the four frozen acceptance events.
