@@ -30,7 +30,8 @@ driver connects directly and the kernel reports the connecting process.
 
 ## What the gate proves
 
-The 13 checks run in this order:
+The 16 checks run in this order. Run A is the successful evidence lane; Run B
+is a distinct failed-parent and rerun lane with different run and request IDs:
 
 1. Capacity is zero, admission is closed, and no work is active.
 2. Capacity becomes exactly one without starting work.
@@ -39,16 +40,20 @@ The 13 checks run in this order:
 5. Explicit resume starts exactly one first attempt.
 6. The first attempt terminates successfully with the expected log and artifact.
 7. An authenticated export returns the same evidence set and exact byte digests.
-8. Rerun creates attempt two with a distinct ID and attempt one as its parent.
-9. Cancellation makes attempt two terminal with a cancelled conclusion.
-10. A tombstone keeps attempt two visible and folds the run back to attempt one.
-11. Controller restart advances its generation without losing folded state.
-12. Runner restart advances its generation without losing folded state.
-13. The final durable controld snapshot is retained while capacity is prepared
+8. The exact Run B manifest enters the granted-but-not-resumed boundary without
+   starting work.
+9. Explicit resume starts exactly one Run B attempt.
+10. Run B attempt one terminates in failure with its exact failure log and no artifact.
+11. Rerun creates Run B attempt two with a distinct ID and attempt one as its parent.
+12. Cancellation makes attempt two terminal with a cancelled conclusion.
+13. A tombstone keeps attempt two visible and folds Run B back to failed attempt one.
+14. Controller restart advances its generation without losing folded state.
+15. Runner restart advances its generation without losing folded state.
+16. The final durable controld snapshot is retained while capacity is prepared
     for the root-only close.
 
-The receipt then retains two root-only phases. Sequence 14 finalizes capacity
-zero and stops the controld acceptance transport. Sequence 15 independently
+The receipt then retains two root-only phases. Sequence 17 finalizes capacity
+zero and stops the controld acceptance transport. Sequence 18 independently
 proves capacity zero, closed admission, and the absence of the controld service,
 socket unit, and socket path. These phases are not acceptance-stage entries.
 
@@ -146,5 +151,5 @@ Treat every nonzero canary or verifier exit as closed. A failure after capacity
 opened may retain a successful two-phase zero transition, but it never passes
 the verifier. Confirm capacity zero through an independent read path before
 retrying. Do not edit a failed receipt or reuse its grant, request, run, or
-attempt identities. If sequence 15 cannot prove the close, stop and use the
+attempt identities. If sequence 18 cannot prove the close, stop and use the
 approved service recovery procedure.

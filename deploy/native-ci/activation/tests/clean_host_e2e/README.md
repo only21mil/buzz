@@ -37,7 +37,7 @@ The flow has two user-visible phases and three isolated boots:
    rolled-back host (dry run, then install; both must report the central
    receipt as `rolled_back`). Only then does it run real
    systemd principals through staged-zero, closed qualification, fixed
-   capacity-one, the frozen fixture, all 13 acceptance stages, finalize/prove
+   capacity-one, the frozen fixture, all 16 acceptance stages, finalize/prove
    zero, strict installed verification, and rollback. Every run therefore
    proves that a host carrying a rolled-back activation takes the next
    activation through the documented verbs. It can write only a
@@ -210,13 +210,13 @@ candidate archive and its staged frozen timing asset.
 
 The frozen `timing-contract.json` is the single timing source. It records leaf
 command limits and an exact per-phase command inventory; the guest derives phase deadlines
-and the host derives each QEMU watchdog from those terms. The 7,222-second
+and the host derives each QEMU watchdog from those terms. The 7,582-second
 candidate watchdog covers a 220-second boot/cloud-init envelope, 1,452 seconds
 for install, 100 for the prior controller check, 680 for the prior stage and
 its 13-unit readback, 160 for the prior activation, 100 for the prior rollback,
 710 for the execd retirement and reinstall with its 13-unit readback, 100 for
 controller check, 680 for controller stage and its 13-unit readback, 160 for
-activation, 1,630 for the canary's 13 sequential 120-second driver operations
+activation, 1,990 for the canary's 16 sequential 120-second driver operations
 and margins, 100 for receipt verification, 100 for rollback, 990 for cleanup
 and dormant proof, 30 for guest poweroff, and 10 for host reap.
 Ceremony is 1,130 seconds (including all 21 bounded ceremony commands) and the

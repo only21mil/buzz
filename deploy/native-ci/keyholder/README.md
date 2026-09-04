@@ -57,7 +57,7 @@ domains onto one credential.
 A NIP-98 request names its `signer`. The relay stores a `POST /events` only
 when the event `pubkey` equals the token pubkey, so a publish token is signed
 by the key that signed the event: signer `ci_event` for kinds 46101 to 46106
-(the `ci-event.key` selector) and signer `acceptance_actor` for the four frozen
+(the `ci-event.key` selector) and signer `acceptance_actor` for the five frozen
 acceptance events (the `acceptance-actor.key` credential, only when the
 activation binding is loaded and at the actor's generation). Both are accepted
 for `POST {origin}/events` with a payload digest. Signer `ci_event` is also
@@ -99,7 +99,8 @@ validate the same bytes. The receipt has this declaration-order shape:
     "run_event": [0, "actor public key", 0, 46100, [], "canonical content"],
     "grant_event": [0, "actor public key", 0, 46107, [], "canonical content"],
     "rerun_event": [0, "actor public key", 0, 46100, [], "canonical content"],
-    "tombstone_event": [0, "actor public key", 0, 5, [], ""]
+    "tombstone_event": [0, "actor public key", 0, 5, [], ""],
+    "failure_run_event": [0, "actor public key", 0, 46100, [], "canonical content"]
   }
 }
 ```
@@ -108,9 +109,17 @@ The receipt is root:root mode `0444`, a regular one-link file, with a root:root
 mode `0711` immediate parent. It has no whitespace or trailing newline. The
 daemon rejects missing, linked, replaced, noncanonical, loose-mode, or
 semantically drifted receipts on every start. It verifies the fixture package,
-candidate, scenario, peer, actor generation, grant identity, and all four event
+candidate, scenario, peer, actor generation, grant identity, and all five event
 templates before constructing the existing closed operations 5 and 6 policy.
 The actor credential must be distinct from every existing selector.
+
+The keyholder wire codec remains strict protocol v1. Its
+`describe_acceptance` response carries the append-only event-ID array in
+Run, Grant, Rerun, Tombstone, FailureRun order; the fifth ID is required tag 8.
+An older peer rejects that tag and a newer peer rejects a response without it,
+so keyholder and controld must come from the same frozen candidate. Activation
+stages and restarts those package versions together; a mixed-version deployment
+is unsupported and must fail closed before either acceptance socket is opened.
 
 ## Credentials
 

@@ -26,6 +26,8 @@ const RECEIPT_VERSION: &str = "buzz-ci-capacity-one-acceptance-receipt/v2";
 pub const ZERO_REQUEST_VERSION: &str = "buzz-ci-capacity-one-zero-request/v1";
 pub const ZERO_PROOF_VERSION: &str = "buzz-ci-capacity-one-zero-proof/v1";
 pub const ZERO_TRANSITION_VERSION: &str = "buzz-ci-capacity-one-zero-transition/v1";
+/// Number of durable provider-facing operations in the closed acceptance sequence.
+pub const ACCEPTANCE_STAGE_COUNT: u32 = 16;
 
 /// One executable endpoint. The harness never invokes a shell.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -3100,6 +3102,38 @@ mod tests {
             Stage::ControllerRestartRecovery
         );
         assert_eq!(driver.index, 14);
+    }
+
+    #[test]
+    fn runner_restart_corruption_fails_closed() {
+        let scenario = scenario();
+        for fault in [
+            "runner generation",
+            "controller generation",
+            "persistent state",
+        ] {
+            let mut responses = passing_responses(&scenario);
+            match fault {
+                "runner generation" => responses[14].snapshot.runner_generation = 1,
+                "controller generation" => responses[14].snapshot.controller_generation = 1,
+                "persistent state" => {
+                    responses[14].snapshot.run.as_mut().unwrap().attempts.pop();
+                }
+                _ => unreachable!(),
+            }
+            let mut driver = ScriptedDriver {
+                responses,
+                index: 0,
+            };
+            let receipt = run_acceptance(&scenario, &mut driver);
+            assert_eq!(receipt.outcome, Outcome::Fail, "{fault}");
+            assert_eq!(
+                receipt.failure.unwrap().stage,
+                Stage::RunnerRestartRecovery,
+                "{fault}"
+            );
+            assert_eq!(driver.index, 15, "{fault}");
+        }
     }
 
     #[test]

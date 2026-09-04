@@ -257,6 +257,17 @@ class ReceiptVerifierTests(unittest.TestCase):
         scenario, stages, receipt = valid_receipt()
         VERIFIER.verify(receipt, scenario, stages)
 
+    def test_success_and_failure_lineages_cannot_collapse(self):
+        scenario, _stages, _receipt = valid_receipt()
+        for failure_name, success_name in (
+            ("failure_run_id", "run_id"),
+            ("failure_request_digest", "request_digest"),
+        ):
+            collapsed = copy.deepcopy(scenario)
+            collapsed["fixture"][failure_name] = collapsed["fixture"][success_name]
+            with self.subTest(field=failure_name), self.assertRaises(VERIFIER.ReceiptError):
+                VERIFIER._ordered_scenario(collapsed)
+
     def test_partial_hash_only_wrong_binding_and_zero_faults_fail_closed(self):
         scenario, stages, receipt = valid_receipt()
         mutations = []

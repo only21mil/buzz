@@ -2152,14 +2152,14 @@ class TimingAndProgressTests(unittest.TestCase):
         self.assertNotEqual(operations(stages[:-1]), declared)
 
     def test_watchdog_boundaries_cover_legal_sequences_cleanup_poweroff_and_reap(self) -> None:
-        expected = {"ceremony": 1130, "candidate": 7222, "verifier": 320}
+        expected = {"ceremony": 1130, "candidate": 7582, "verifier": 320}
         for role, phases in harness.TIMING_CONTRACT["role_phases"].items():
             legal_boundary = sum(harness.phase_seconds(phase) for phase in phases)
             complete_boundary = legal_boundary + harness.REAP_TIMEOUT
             self.assertEqual(harness.watchdog_seconds(role), complete_boundary)
             self.assertLess(harness.watchdog_seconds(role) - 1, complete_boundary)
             self.assertEqual(harness.watchdog_seconds(role), expected[role])
-        canary_inner = 13 * harness.TIMING_CONTRACT["leaf_seconds"]["driver_operation"]
+        canary_inner = 16 * harness.TIMING_CONTRACT["leaf_seconds"]["driver_operation"]
         self.assertEqual(guest.canary_command_seconds(), canary_inner + 30)
         self.assertGreater(harness.phase_seconds("canary"), guest.canary_command_seconds() + 10)
         self.assertGreater(harness.phase_seconds("ceremony"), 21 * 30 + 21 * 10)
@@ -2176,7 +2176,7 @@ class TimingAndProgressTests(unittest.TestCase):
         ), mock.patch.object(
             guest, "emit_progress", side_effect=lambda phase, event="start": events.append((phase, event)),
         ), mock.patch.object(
-            guest.time, "monotonic", side_effect=[0.0, 0.0, 0.0, 1831.0, 1831.0, 1831.0]
+            guest.time, "monotonic", side_effect=[0.0, 0.0, 0.0, 2191.0, 2191.0, 2191.0]
         ), mock.patch.object(guest.subprocess, "Popen") as popen, mock.patch.object(
             guest, "reap_process_group",
         ):

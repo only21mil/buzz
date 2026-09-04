@@ -7,7 +7,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use buzz_ci_acceptance_ctl::acceptance::{AdmissionState, DRIVER_VERSION};
+use buzz_ci_acceptance_ctl::acceptance::{AdmissionState, ACCEPTANCE_STAGE_COUNT, DRIVER_VERSION};
 pub use buzz_ci_acceptance_ctl::acceptance_binding::{
     AcceptanceActorBinding, AcceptanceAuthorityBinding,
     AcceptanceBindingReceipt as AcceptanceBinding, ACCEPTANCE_BINDING_PATH,
@@ -296,7 +296,7 @@ impl AcceptanceLedger {
             || self.scenario_sha256 != binding.scenario_sha256
             || self.activation_id != binding.activation_id
             || self.activation_package_digest != binding.activation_package_digest
-            || self.entries.len() > 13
+            || self.entries.len() > ACCEPTANCE_STAGE_COUNT as usize
             || self.entries.iter().enumerate().any(|(index, entry)| {
                 entry.sequence != u32::try_from(index + 1).unwrap_or(u32::MAX)
                     || !lower_hex(&entry.operation_id, 64)
@@ -961,6 +961,52 @@ mod tests {
             reopened.execute(&skipped, &skipped_exact, 0, |_| Ok::<_, ()>(expected)),
             Err(AcceptanceSocketError::Binding)
         );
+    }
+
+    #[test]
+    fn journal_reopens_and_validates_all_sixteen_acceptance_stages() {
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let owner_uid = fs::metadata(root.path()).unwrap().uid();
+        let mut request = request();
+        let binding = binding(&request);
+        let operations = [
+            Operation::ObserveInitial,
+            Operation::SetCapacityOne,
+            Operation::SubmitManifest,
+            Operation::ApproveGrant,
+            Operation::ResumeGrant,
+            Operation::AwaitFirstTerminal,
+            Operation::ExportFirstEvidence,
+            Operation::SubmitFailureManifest,
+            Operation::ResumeFailure,
+            Operation::AwaitFailureTerminal,
+            Operation::Rerun,
+            Operation::CancelRerun,
+            Operation::TombstoneRerun,
+            Operation::RestartController,
+            Operation::RestartRunner,
+            Operation::SetCapacityZero,
+        ];
+
+        for (index, operation) in operations.into_iter().enumerate() {
+            request.sequence = u32::try_from(index + 1).unwrap();
+            request.operation = operation;
+            request.expected_controller_generation = (index != 0).then_some(7);
+            request.expected_runner_generation = (index != 0).then_some(9);
+            request.operation_id = expected_adapter_operation_id(&request).unwrap();
+            let exact = serde_json::to_vec(&request).unwrap();
+            let expected = Handler.handle(&request, &exact).unwrap();
+            let journal = AcceptanceJournal::open(root.path(), owner_uid, binding.clone()).unwrap();
+            journal
+                .execute(&request, &exact, 0, |_| Ok::<_, ()>(expected))
+                .unwrap();
+            let reopened =
+                AcceptanceJournal::open(root.path(), owner_uid, binding.clone()).unwrap();
+            assert_eq!(reopened.completed_sequences().unwrap(), request.sequence);
+        }
     }
 
     #[test]

@@ -47,8 +47,8 @@ the package and scenario digests are final. Its exact schema is
 `/var/lib/buzzci/activation-controller/controld-acceptance-v2.json`. The compact
 canonical JSON binds the activation, package, candidate, complete fixture,
 scenario, distinct keyholder and acceptance peer identities, generations,
-timeout, acceptance actor, and the four
-public Run/Grant/FailureRun/Rerun/Tombstone event templates. The regular file is root:root
+timeout, acceptance actor, and the five public
+Run/Grant/Rerun/Tombstone/FailureRun event templates. The regular file is root:root
 mode `0444`, link count one, beneath the exact root:root mode `0711` activation
 controller directory. Both controld and keyholder validate this same public
 receipt. The controld freezer is the sole source of the canonical staged config

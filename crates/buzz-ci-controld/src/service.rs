@@ -7,7 +7,7 @@ use std::time::Duration;
 use buzz_ci_acceptance_ctl::acceptance::{
     AdmissionState, ApprovalSnapshot, AttemptSnapshot, AttemptState,
     Conclusion as AcceptanceConclusion, DriverResponse, ExportSnapshot, Operation, RunSnapshot,
-    RunState, SystemSnapshot, DRIVER_VERSION,
+    RunState, SystemSnapshot, ACCEPTANCE_STAGE_COUNT, DRIVER_VERSION,
 };
 use buzz_ci_acceptance_ctl::production::{
     AdapterRequest, AdapterResponse, ADAPTER_RESPONSE_SCHEMA,
@@ -51,7 +51,7 @@ use crate::config::DaemonConfig;
 const APPROVE_GRANT_SEQUENCE: u32 = 4;
 // The qualification socket owns relay polling through its final operation.
 // Persistent capacity one starts later against the completed journal.
-const COMPLETE_ACCEPTANCE_SEQUENCE: u32 = 13;
+const COMPLETE_ACCEPTANCE_SEQUENCE: u32 = ACCEPTANCE_STAGE_COUNT;
 
 const fn background_polling_enabled(completed_sequences: u32) -> bool {
     completed_sequences >= COMPLETE_ACCEPTANCE_SEQUENCE
@@ -1388,6 +1388,10 @@ mod tests {
                 "sequence {completed} must remain acceptance-owned"
             );
         }
+        assert!(!background_polling_enabled(13));
+        assert!(!background_polling_enabled(14));
+        assert!(!background_polling_enabled(15));
+        assert!(background_polling_enabled(16));
         assert!(background_polling_enabled(COMPLETE_ACCEPTANCE_SEQUENCE));
         assert!(background_polling_enabled(COMPLETE_ACCEPTANCE_SEQUENCE + 1));
     }

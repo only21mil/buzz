@@ -277,7 +277,7 @@ struct ValidatedEventTemplates {
     granted_ci_signer: [u8; 32],
 }
 
-/// Validate the exact success-run/grant/failed-run/rerun/tombstone event set.
+/// Validate the exact Run/Grant/Rerun/Tombstone/FailureRun event set.
 pub fn validate_acceptance_event_templates(
     actor: [u8; 32],
     templates: [&[u8]; 5],

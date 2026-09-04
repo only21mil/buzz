@@ -235,7 +235,7 @@ package or root path from the caller.
   both acceptance services available. The acceptance host then closes the
   capacity-one units and reopens controld at staged zero (socket and service
   stopped in the finalize order, then started), so the capacity-zero service
-  serves the stage-13 durable snapshot from the shared acceptance ledger.
+  serves the stage-16 durable snapshot from the shared acceptance ledger.
 - `finalize-qualification-zero` stops the controld acceptance socket first and
   controld second, closes the remaining capacity-one units, keeps the root
   acceptance-control service available, restores the prior controld binding,
@@ -315,13 +315,14 @@ kind-30617 repository, rendered as the `30617:<owner>:<id>` coordinate), and
 `source_clone_url` (that repository's credential-free https clone URL). Read
 those four values from the relay you activate against; the relay refuses a Run
 event whose channel it does not know. The materializer
-owns the canonical Run, Grant, Rerun, and Tombstone seed, supplies the fixed
+owns the canonical Run A, Grant, Rerun, Tombstone, and failure Run B seed,
+supplies the fixed
 closed contracts, and validates the complete draft; production bootstrap does
 not inherit a prior artifact or test fixture. `validate_phase_configs` requires
 the active controld `channel_id` to equal the channel frozen into the events,
 and `validate_acceptance_template` requires the successful run, failed-parent
 run, grant, and rerun events to name one channel and one repository. The rerun
-must name the failed-parent run, never the successful finalized run.
+must name failed-parent Run B, never successful Run A.
 
 The runner staged config is the exact runner-v2 `dormant` shape at
 `/etc/buzzci/runner-v2.json`. Its active config selects `mode=v2_proxy`, binds

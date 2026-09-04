@@ -339,6 +339,8 @@ def _ordered_scenario(value: Any) -> dict[str, Any]:
     for name in ["activation_package_digest", "request_digest", "failure_request_digest", "manifest_digest", "grant_event_id", "grant_digest", "approved_by", "export_subject", "export_authorization_digest"]:
         _hex(fixture[name], (64,))
     _hex(fixture["run_id"], (32,)); _hex(fixture["failure_run_id"], (32,)); _hex(fixture["approval_id"], (32,)); _hex(fixture["source_oid"], (40, 64))
+    _require(fixture["run_id"] != fixture["failure_run_id"], "run identities must be distinct")
+    _require(fixture["request_digest"] != fixture["failure_request_digest"], "request identities must be distinct")
     _require(isinstance(fixture["job_id"], str) and 0 < len(fixture["job_id"]) <= 64, "job ID rejected")
     _integer(fixture["controller_generation"], 1); _integer(fixture["runner_generation"], 1)
     _ordered_evidence(fixture["expected_log"])
