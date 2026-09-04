@@ -497,8 +497,12 @@ where
         {
             return Err(SourceError::InvalidRequest);
         }
+        // Name the exact kind alongside the id. The relay's read gates key on
+        // `kinds`, and the kind was just checked against the signed event, so
+        // the query can never match a different event than the pending one.
         let body = serde_json::to_vec(&[serde_json::json!({
             "ids": [event.event_id.as_str()],
+            "kinds": [event.kind],
             "limit": 1
         })])
         .map_err(|_| SourceError::InvalidRequest)?;
@@ -830,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_publication_reconciliation_queries_the_exact_event_as_its_author() {
+    fn pending_publication_reconciliation_queries_the_exact_event_and_kind_as_its_author() {
         let keys = Keys::parse(&"03".repeat(32)).expect("synthetic key");
         let event = EventBuilder::new(Kind::Custom(46101), "{}")
             .sign_with_keys(&keys)
@@ -866,7 +870,7 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&transport.requests[0].body)
                 .expect("filter"),
-            serde_json::json!([{"ids": [event_id], "limit": 1}])
+            serde_json::json!([{"ids": [event_id], "kinds": [46101], "limit": 1}])
         );
         assert_eq!(
             authorizer.bindings[0].publisher.as_deref(),
