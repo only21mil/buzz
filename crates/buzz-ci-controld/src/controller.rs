@@ -407,14 +407,35 @@ where
     /// Replay every deferred publication after the activation grant was
     /// accepted by the relay. Any error is terminal exactly like a poll error.
     pub fn replay_deferred_publications(&mut self) -> Result<usize, ControllerError> {
+        self.replay_deferred_publications_with_binding(None)
+    }
+
+    /// Replay deferred acceptance publications only behind the exact frozen
+    /// request selected by the current acceptance stage.
+    pub fn replay_deferred_publications_bound(
+        &mut self,
+        expected: &AcceptedRequestBinding,
+    ) -> Result<usize, ControllerError> {
+        self.replay_deferred_publications_with_binding(Some(expected))
+    }
+
+    fn replay_deferred_publications_with_binding(
+        &mut self,
+        expected: Option<&AcceptedRequestBinding>,
+    ) -> Result<usize, ControllerError> {
         if let Some(reason) = self.status.terminal_reason() {
             return Err(ControllerError::Terminal(reason));
         }
         self.status = CapacityOneStatus::polling();
-        match self
-            .handler
-            .replay_deferred_publications(self.config.channel_id())
-        {
+        let result = match expected {
+            Some(binding) => self
+                .handler
+                .replay_deferred_publications_bound(self.config.channel_id(), binding),
+            None => self
+                .handler
+                .replay_deferred_publications(self.config.channel_id()),
+        };
+        match result {
             Ok(replayed) => {
                 self.status = CapacityOneStatus::ready();
                 Ok(replayed)

@@ -800,8 +800,11 @@ impl CapacityOneService {
             .controller
             .as_mut()
             .ok_or(AcceptanceSocketError::Operation)?;
+        let expected = self
+            .acceptance_authority
+            .expected_request(AcceptanceMutation::Run)?;
         controller.set_replay_deferral(false);
-        let replayed = controller.replay_deferred_publications();
+        let replayed = controller.replay_deferred_publications_bound(&expected);
         self.status = controller.status();
         replayed
             .map(|_| ())

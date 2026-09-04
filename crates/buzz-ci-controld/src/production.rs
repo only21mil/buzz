@@ -545,6 +545,50 @@ where
         Ok(deferred.len())
     }
 
+    /// Replay deferred acceptance publications only when the channel head is
+    /// the exact frozen request selected by the acceptance stage.
+    ///
+    /// The head check precedes every publication retry. Unlike the general
+    /// post-qualification replay path, this settles at most that one request.
+    pub fn replay_deferred_publications_bound(
+        &mut self,
+        channel_id: &str,
+        expected: &AcceptedRequestBinding,
+    ) -> Result<usize, ProductionError> {
+        let deferred = self
+            .store
+            .deferred_publications()
+            .map_err(|_| ProductionError::Store)?;
+        if deferred.is_empty() {
+            return Ok(0);
+        }
+        let cursor = self
+            .store
+            .cursor(channel_id)
+            .map_err(|_| ProductionError::Store)?;
+        let accepted = self
+            .relay
+            .next_accepted(channel_id, cursor)
+            .map_err(|_| ProductionError::Relay)?
+            .ok_or(ProductionError::Invalid)?;
+        if accepted.watch_cursor <= cursor
+            || accepted.channel_id != channel_id
+            || !expected.matches(&accepted)
+        {
+            return Err(ProductionError::Invalid);
+        }
+        for key in &deferred {
+            let stored = self
+                .store
+                .load_publication(key)
+                .map_err(|_| ProductionError::Store)?
+                .ok_or(ProductionError::PublicationConflict)?;
+            self.republish(key, stored)?;
+        }
+        let _ = self.poll_head(channel_id, true, Some(expected))?;
+        Ok(deferred.len())
+    }
+
     fn poll_head(
         &mut self,
         channel_id: &str,
@@ -1779,6 +1823,69 @@ mod tests {
     }
 
     #[test]
+    fn bound_deferred_replay_refuses_foreign_terminal_head_before_any_mutation() {
+        let mut run_a = accepted();
+        run_a.watch_cursor = 8;
+        let mut foreign = run_a.clone();
+        foreign.watch_cursor = 7;
+        foreign.event_id = "99".repeat(32);
+        foreign.envelope.run_id = "123e4567-e89b-12d3-a456-426614174099".into();
+        let foreign_identity = run_identity(&foreign).expect("foreign identity");
+        let foreign_terminal = RunRecord::queued(foreign_identity, 10)
+            .expect("queued foreign run")
+            .transition(
+                RunState::InfrastructureFailure,
+                12,
+                Some("relay".to_owned()),
+            )
+            .expect("terminal foreign run");
+        let publication_key = format!("{}:run:terminal", foreign.event_id);
+        let pending = StoredPublication::Pending(SignedCiEvent {
+            event_id: "aa".repeat(32),
+            kind: KIND_CI_RUN_STATUS,
+            content: "{}".to_owned(),
+            tags: serde_json::json!([]),
+            signed_event: serde_json::json!({
+                "id": "aa".repeat(32),
+                "kind": KIND_CI_RUN_STATUS
+            }),
+        });
+        let store = MemoryStore {
+            cursor: 0,
+            run: Some((1, foreign_terminal.clone())),
+            publications: HashMap::from([(publication_key.clone(), pending.clone())]),
+            deferred: BTreeSet::from([publication_key.clone()]),
+        };
+        let binding = frozen_binding(&run_a);
+        let run_a_event_id = run_a.event_id.clone();
+        let mut handler = ProductionHandler::new(
+            ChannelHeadRelay {
+                heads: vec![foreign.clone(), run_a],
+                observed: Vec::new(),
+            },
+            CountingSigner(0),
+            FailingExecutor,
+            store,
+            MemoryOutput(Vec::new()),
+        );
+
+        assert!(matches!(
+            handler.replay_deferred_publications_bound(CHANNEL, &binding),
+            Err(ProductionError::Invalid)
+        ));
+        assert_eq!(handler.store.cursor, 0);
+        assert_eq!(handler.store.run, Some((1, foreign_terminal)));
+        assert_eq!(
+            handler.store.publications,
+            HashMap::from([(publication_key.clone(), pending)])
+        );
+        assert_eq!(handler.store.deferred, BTreeSet::from([publication_key]));
+        assert_eq!(handler.signer.0, 0);
+        assert_eq!(handler.relay.observed, vec![foreign.event_id]);
+        assert!(!handler.relay.observed.contains(&run_a_event_id));
+    }
+
+    #[test]
     fn frozen_binding_rejects_cross_lineage_and_authority_drift() {
         let expected = accepted();
         let binding = frozen_binding(&expected);
@@ -2756,6 +2863,35 @@ mod tests {
             0
         );
         assert_eq!(handler.relay.published.len(), 3);
+    }
+
+    #[test]
+    fn bound_deferred_replay_settles_only_the_exact_expected_head() {
+        let expected = accepted();
+        let binding = frozen_binding(&expected);
+        let mut handler = grant_order_handler(
+            &[Err(Refusal::Other), Err(Refusal::Unauthorized)],
+            stale_terminal_store(),
+            true,
+        );
+        assert_eq!(
+            handler.poll_once(CHANNEL).expect("deferred poll"),
+            PollStep::Deferred
+        );
+
+        handler.set_replay_deferral(false);
+        assert_eq!(
+            handler
+                .replay_deferred_publications_bound(CHANNEL, &binding)
+                .expect("bound replay"),
+            1
+        );
+        assert_eq!(handler.store.cursor, expected.watch_cursor);
+        assert!(handler
+            .store
+            .deferred_publications()
+            .expect("deferred")
+            .is_empty());
     }
 
     #[test]
