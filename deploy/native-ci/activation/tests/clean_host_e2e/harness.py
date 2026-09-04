@@ -110,7 +110,7 @@ FROZEN_ASSETS = (
 GUEST_ASSETS = tuple(name for name in FROZEN_ASSETS if name != "harness.py")
 # Opt-in loopback-relay fault modes (local_tls_relay.py RELAY_FAULTS). The
 # candidate phase file always carries `relay_fault`; None is the standard run.
-RELAY_FAULTS = ("stale-terminal-publication-recovery",)
+RELAY_FAULTS = ("stale-terminal-publication-recovery", "stale-terminal-replay-before-grant")
 REQUIRED_CANDIDATE = (
     "deploy/native-ci/runner/install.py",
     "deploy/native-ci/controld/install.py",
