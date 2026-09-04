@@ -245,6 +245,7 @@ class BootstrapCompositionTests(unittest.TestCase):
             item for item in draft["entries"] if item["role"] == "controld_config"
         )
         controld_active = json.loads(fixture.assets[controld_entry["active_source"]][0])
+        public = self._public_binding(draft["acceptance_template"]["actor"])
         draft["acceptance_template"] = ACTIVATION_PACKAGE.production_acceptance_template(
             actor_public_key=draft["acceptance_template"]["actor"]["public_key"],
             actor_generation=1,
@@ -257,6 +258,9 @@ class BootstrapCompositionTests(unittest.TestCase):
             repository_owner_public_key=ACTIVATION_SCAFFOLD.TEST_REPOSITORY_OWNER,
             repository_id=ACTIVATION_SCAFFOLD.TEST_REPOSITORY_ID,
             source_clone_url=ACTIVATION_SCAFFOLD.TEST_SOURCE_CLONE_URL,
+            relay_http_origin=public["relay_http_origin"],
+            export_subject=public["keyholder_public_spec"]["selectors"]["nip98"]["public_key"],
+            export_generation=public["keyholder_public_spec"]["selectors"]["nip98"]["generation"],
             time_reference=draft["acceptance_template"]["time_reference"],
         )
 
@@ -498,6 +502,9 @@ class BootstrapCompositionTests(unittest.TestCase):
                 repository_owner_public_key=ACTIVATION_SCAFFOLD.TEST_REPOSITORY_OWNER,
                 repository_id=ACTIVATION_SCAFFOLD.TEST_REPOSITORY_ID,
                 source_clone_url=ACTIVATION_SCAFFOLD.TEST_SOURCE_CLONE_URL,
+                relay_http_origin=public["relay_http_origin"],
+                export_subject=public["keyholder_public_spec"]["selectors"]["nip98"]["public_key"],
+                export_generation=public["keyholder_public_spec"]["selectors"]["nip98"]["generation"],
                 time_reference=draft["acceptance_template"]["time_reference"],
             )
             self.assertEqual(
@@ -766,6 +773,9 @@ class BootstrapCompositionTests(unittest.TestCase):
                 repository_owner_public_key=ACTIVATION_SCAFFOLD.TEST_REPOSITORY_OWNER,
                 repository_id=ACTIVATION_SCAFFOLD.TEST_REPOSITORY_ID + "-prior",
                 source_clone_url=ACTIVATION_SCAFFOLD.TEST_SOURCE_CLONE_URL,
+                relay_http_origin=public["relay_http_origin"],
+                export_subject=public["keyholder_public_spec"]["selectors"]["nip98"]["public_key"],
+                export_generation=public["keyholder_public_spec"]["selectors"]["nip98"]["generation"],
                 time_reference=draft["acceptance_template"]["time_reference"],
             )
             prior_root = ceremony / "prior"
