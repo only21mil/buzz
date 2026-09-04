@@ -1284,25 +1284,6 @@ async fn rerun_final_facts_bind_only_the_final_request_and_selected_graph() {
     )
     .await
     .expect("store rerun request");
-    for (sequence, state) in [(1, CiRunState::Queued), (2, CiRunState::Running)] {
-        let event = run_status(
-            &control,
-            channel_id,
-            &rerun,
-            &rerun_event.id.to_hex(),
-            sequence,
-            state,
-        );
-        store(
-            &pool,
-            community_id,
-            channel_id,
-            &event,
-            &authorized_status_signers,
-        )
-        .await
-        .expect("store rerun status");
-    }
     let log = store_terminal_job_chain(
         &pool,
         community_id,
@@ -1389,6 +1370,20 @@ async fn rerun_final_facts_bind_only_the_final_request_and_selected_graph() {
     )
     .await
     .expect("list final run history");
+    let rerun_event_id = rerun_event.id.to_hex();
+    let mut rerun_run_sequences = events
+        .iter()
+        .filter(|stored| {
+            stored.stored_event.event.kind.as_u16() as u32 == buzz_core::kind::KIND_CI_RUN_STATUS
+        })
+        .filter_map(|stored| {
+            let envelope: CiRunStatusEnvelope =
+                serde_json::from_str(&stored.stored_event.event.content).unwrap();
+            (envelope.request_event_id == rerun_event_id).then_some(envelope.sequence)
+        })
+        .collect::<Vec<_>>();
+    rerun_run_sequences.sort_unstable();
+    assert_eq!(rerun_run_sequences, vec![1, 2, 3]);
     let terminal_facts = events
         .iter()
         .filter(|stored| {
