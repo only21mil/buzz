@@ -7,6 +7,12 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(test)]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use buzz_ci_acceptance_ctl::acceptance::{AdmissionState, ACCEPTANCE_STAGE_COUNT, DRIVER_VERSION};
 pub use buzz_ci_acceptance_ctl::acceptance_binding::{
     AcceptanceActorBinding, AcceptanceAuthorityBinding,
@@ -23,7 +29,7 @@ use thiserror::Error;
 pub const ACCEPTANCE_SOCKET_PATH: &str = "/run/buzzci/controld-acceptance.sock";
 pub const ACCEPTANCE_FD_NAME: &str = "buzz-ci-controld-acceptance";
 pub const SYSTEMD_LISTEN_FD: i32 = 3;
-const ACCEPTANCE_LEDGER_SCHEMA: &str = "buzz-ci-controld-acceptance-ledger/v1";
+const ACCEPTANCE_LEDGER_SCHEMA: &str = "buzz-ci-controld-acceptance-ledger/v2";
 const ACCEPTANCE_LEDGER_NAME: &str = "acceptance-operation-ledger-v1.json";
 const ACCEPTANCE_LEDGER_NEXT: &str = ".acceptance-operation-ledger-v1.json.next";
 const ACCEPTANCE_LEDGER_LOCK: &str = ".acceptance-operation-ledger.lock";
@@ -31,12 +37,16 @@ const ACCEPTANCE_LEDGER_MODE: u32 = 0o600;
 const MAX_ACCEPTANCE_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Durable request replay and sequence boundary for one activation scenario.
-/// It stores only canonical request digests and bounded canonical responses.
+/// It stages each canonical response before promoting it to the completed
+/// sequence, so a restart in that finalization window never repeats the
+/// operation or consumes another relay event.
 #[derive(Clone, Debug)]
 pub struct AcceptanceJournal {
     root: PathBuf,
     expected_owner_uid: u32,
     binding: AcceptanceBinding,
+    #[cfg(test)]
+    fail_after_staged_response: Arc<AtomicBool>,
 }
 
 impl AcceptanceJournal {
@@ -62,6 +72,8 @@ impl AcceptanceJournal {
             root,
             expected_owner_uid,
             binding,
+            #[cfg(test)]
+            fail_after_staged_response: Arc::new(AtomicBool::new(false)),
         };
         journal.with_locked(|ledger| ledger.validate(&journal.binding))?;
         Ok(journal)
@@ -90,7 +102,8 @@ impl AcceptanceJournal {
     }
 
     /// Validate activation, sequence, capacity, generation, and replay bindings
-    /// before invoking an operation. Exact retries return the durable response.
+    /// before invoking an operation. Exact retries return either the completed
+    /// response or a response durably staged before final ledger promotion.
     pub fn execute<E>(
         &self,
         request: &AdapterRequest,
@@ -112,6 +125,28 @@ impl AcceptanceJournal {
                 return serde_json::from_slice(&entry.response)
                     .map_err(|_| AcceptanceSocketError::Replay);
             }
+            if let Some(in_progress) = ledger.in_progress.as_ref() {
+                if in_progress.sequence != request.sequence
+                    || in_progress.operation_id != request.operation_id
+                    || in_progress.request_sha256 != request_digest
+                {
+                    return Err(AcceptanceSocketError::Replay);
+                }
+                if let Some(encoded) = in_progress.response.clone() {
+                    let response: AdapterResponse = serde_json::from_slice(&encoded)
+                        .map_err(|_| AcceptanceSocketError::Replay)?;
+                    validate_bound_response(request, &response, configured_capacity)?;
+                    ledger.entries.push(AcceptanceLedgerEntry {
+                        sequence: in_progress.sequence,
+                        operation_id: in_progress.operation_id.clone(),
+                        request_sha256: in_progress.request_sha256.clone(),
+                        response: encoded,
+                    });
+                    ledger.in_progress = None;
+                    self.persist(ledger)?;
+                    return Ok(response);
+                }
+            }
             if configured_capacity > 1
                 || request.sequence != u32::try_from(ledger.entries.len() + 1).unwrap_or(u32::MAX)
                 || request.scenario_sha256 != self.binding.scenario_sha256
@@ -129,6 +164,15 @@ impl AcceptanceJournal {
                     }
             {
                 return Err(AcceptanceSocketError::Binding);
+            }
+            if ledger.in_progress.is_none() {
+                ledger.in_progress = Some(AcceptanceLedgerInProgress {
+                    sequence: request.sequence,
+                    operation_id: request.operation_id.clone(),
+                    request_sha256: request_digest.clone(),
+                    response: None,
+                });
+                self.persist(ledger)?;
             }
             let prior = ledger
                 .entries
@@ -161,19 +205,24 @@ impl AcceptanceJournal {
             }
             let response =
                 operation(prior.as_ref()).map_err(|_| AcceptanceSocketError::Operation)?;
-            validate_response(request, &response)?;
-            if response.response.snapshot.capacity != configured_capacity
-                || response.response.snapshot.admission != request.host.admission
-                || response.response.snapshot.controller_generation
-                    != request.host.controller_generation
-                || response.response.snapshot.runner_generation != request.host.runner_generation
-            {
-                return Err(AcceptanceSocketError::Binding);
-            }
+            validate_bound_response(request, &response, configured_capacity)?;
             let encoded =
                 serde_json::to_vec(&response).map_err(|_| AcceptanceSocketError::Frame)?;
             if encoded.len() > MAX_ADAPTER_FRAME_BYTES {
                 return Err(AcceptanceSocketError::Frame);
+            }
+            ledger
+                .in_progress
+                .as_mut()
+                .ok_or(AcceptanceSocketError::Replay)?
+                .response = Some(encoded.clone());
+            self.persist(ledger)?;
+            #[cfg(test)]
+            if self
+                .fail_after_staged_response
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(AcceptanceSocketError::Operation);
             }
             ledger.entries.push(AcceptanceLedgerEntry {
                 sequence: request.sequence,
@@ -181,9 +230,16 @@ impl AcceptanceJournal {
                 request_sha256: request_digest,
                 response: encoded,
             });
+            ledger.in_progress = None;
             self.persist(ledger)?;
             Ok(response)
         })
+    }
+
+    #[cfg(test)]
+    fn inject_failure_after_staged_response(&self) {
+        self.fail_after_staged_response
+            .store(true, Ordering::SeqCst);
     }
 
     fn with_locked<T>(
@@ -278,6 +334,7 @@ struct AcceptanceLedger {
     activation_id: String,
     activation_package_digest: String,
     entries: Vec<AcceptanceLedgerEntry>,
+    in_progress: Option<AcceptanceLedgerInProgress>,
 }
 
 impl AcceptanceLedger {
@@ -288,6 +345,7 @@ impl AcceptanceLedger {
             activation_id: binding.activation_id.clone(),
             activation_package_digest: binding.activation_package_digest.clone(),
             entries: Vec::new(),
+            in_progress: None,
         }
     }
 
@@ -297,6 +355,8 @@ impl AcceptanceLedger {
             || self.activation_id != binding.activation_id
             || self.activation_package_digest != binding.activation_package_digest
             || self.entries.len() > ACCEPTANCE_STAGE_COUNT as usize
+            || self.entries.len() + usize::from(self.in_progress.is_some())
+                > ACCEPTANCE_STAGE_COUNT as usize
             || self.entries.iter().enumerate().any(|(index, entry)| {
                 entry.sequence != u32::try_from(index + 1).unwrap_or(u32::MAX)
                     || !lower_hex(&entry.operation_id, 64)
@@ -304,11 +364,29 @@ impl AcceptanceLedger {
                     || entry.response.len() > MAX_ADAPTER_FRAME_BYTES
                     || serde_json::from_slice::<AdapterResponse>(&entry.response).is_err()
             })
+            || self.in_progress.as_ref().is_some_and(|in_progress| {
+                in_progress.sequence != u32::try_from(self.entries.len() + 1).unwrap_or(u32::MAX)
+                    || !lower_hex(&in_progress.operation_id, 64)
+                    || !lower_hex(&in_progress.request_sha256, 64)
+                    || in_progress.response.as_ref().is_some_and(|response| {
+                        response.len() > MAX_ADAPTER_FRAME_BYTES
+                            || serde_json::from_slice::<AdapterResponse>(response).is_err()
+                    })
+            })
         {
             return Err(AcceptanceSocketError::Replay);
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AcceptanceLedgerInProgress {
+    sequence: u32,
+    operation_id: String,
+    request_sha256: String,
+    response: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -536,6 +614,22 @@ fn validate_response(
         || response.response.operation != request.operation
     {
         return Err(AcceptanceSocketError::Frame);
+    }
+    Ok(())
+}
+
+fn validate_bound_response(
+    request: &AdapterRequest,
+    response: &AdapterResponse,
+    configured_capacity: u32,
+) -> Result<(), AcceptanceSocketError> {
+    validate_response(request, response)?;
+    if response.response.snapshot.capacity != configured_capacity
+        || response.response.snapshot.admission != request.host.admission
+        || response.response.snapshot.controller_generation != request.host.controller_generation
+        || response.response.snapshot.runner_generation != request.host.runner_generation
+    {
+        return Err(AcceptanceSocketError::Binding);
     }
     Ok(())
 }
@@ -963,6 +1057,102 @@ mod tests {
             reopened.execute(&skipped, &skipped_exact, 0, |_| Ok::<_, ()>(expected)),
             Err(AcceptanceSocketError::Binding)
         );
+    }
+
+    #[test]
+    fn journal_recovers_staged_terminal_and_cancel_responses_without_reexecution() {
+        let operations = [
+            Operation::ObserveInitial,
+            Operation::SetCapacityOne,
+            Operation::SubmitManifest,
+            Operation::ApproveGrant,
+            Operation::ResumeGrant,
+            Operation::AwaitFirstTerminal,
+            Operation::ExportFirstEvidence,
+            Operation::SubmitFailureManifest,
+            Operation::ResumeFailure,
+            Operation::AwaitFailureTerminal,
+            Operation::Rerun,
+            Operation::CancelRerun,
+        ];
+
+        for target in [6_usize, 10, 12] {
+            let root = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let owner_uid = fs::metadata(root.path()).unwrap().uid();
+            let mut request = request();
+            let binding = binding(&request);
+
+            for (index, operation) in operations.iter().copied().take(target).enumerate() {
+                request.sequence = u32::try_from(index + 1).unwrap();
+                request.operation = operation;
+                request.expected_controller_generation = (index != 0).then_some(7);
+                request.expected_runner_generation = (index != 0).then_some(9);
+                request.operation_id = expected_adapter_operation_id(&request).unwrap();
+                let exact = serde_json::to_vec(&request).unwrap();
+                let expected = Handler.handle(&request, &exact).unwrap();
+                let journal =
+                    AcceptanceJournal::open(root.path(), owner_uid, binding.clone()).unwrap();
+                if index + 1 == target {
+                    journal.inject_failure_after_staged_response();
+                    let mut side_effects = 0;
+                    assert_eq!(
+                        journal.execute(&request, &exact, 0, |_| {
+                            side_effects += 1;
+                            Ok::<_, ()>(expected.clone())
+                        }),
+                        Err(AcceptanceSocketError::Operation)
+                    );
+                    assert_eq!(side_effects, 1, "the operation completed before the crash");
+
+                    let reopened =
+                        AcceptanceJournal::open(root.path(), owner_uid, binding.clone()).unwrap();
+                    let replayed = reopened
+                        .execute(&request, &exact, 0, |_| -> Result<AdapterResponse, ()> {
+                            panic!("a staged response must not execute or poll again")
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_vec(&replayed).unwrap(),
+                        serde_json::to_vec(&expected).unwrap()
+                    );
+                    assert_eq!(reopened.completed_sequences().unwrap(), request.sequence);
+                } else {
+                    journal
+                        .execute(&request, &exact, 0, |_| Ok::<_, ()>(expected))
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn journal_rejects_a_mismatched_retry_of_a_staged_response() {
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let owner_uid = fs::metadata(root.path()).unwrap().uid();
+        let request = request();
+        let exact = serde_json::to_vec(&request).unwrap();
+        let expected = Handler.handle(&request, &exact).unwrap();
+        let journal = AcceptanceJournal::open(root.path(), owner_uid, binding(&request)).unwrap();
+        journal.inject_failure_after_staged_response();
+        assert_eq!(
+            journal.execute(&request, &exact, 0, |_| Ok::<_, ()>(expected.clone())),
+            Err(AcceptanceSocketError::Operation)
+        );
+
+        let reopened = AcceptanceJournal::open(root.path(), owner_uid, binding(&request)).unwrap();
+        let mut divergent = exact;
+        divergent.push(b' ');
+        assert_eq!(
+            reopened.execute(&request, &divergent, 0, |_| Ok::<_, ()>(expected)),
+            Err(AcceptanceSocketError::Replay)
+        );
+        assert_eq!(reopened.completed_sequences().unwrap(), 0);
     }
 
     #[test]
