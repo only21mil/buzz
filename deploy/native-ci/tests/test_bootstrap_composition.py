@@ -817,6 +817,14 @@ class BootstrapCompositionTests(unittest.TestCase):
             prior_scenario["fixture"].update({
                 "activation_id": prior_activation_manifest["activation_id"],
                 "activation_package_digest": prior_activation_manifest["package_digest"],
+                "run_id": RENDER.activation_run_id(prior_activation_manifest),
+                "failure_run_id": RENDER.activation_failure_run_id(prior_activation_manifest),
+                "failure_selector": RENDER.activation_failure_selector(prior_activation_manifest),
+                "failure_request_digest": RENDER.activation_failure_request_digest(prior_activation_manifest),
+                "manifest_digest": RENDER.activation_fixture_manifest_sha256(prior_activation_manifest),
+                "export_subject": RENDER.activation_export_subject(prior_activation_manifest),
+                "export_generation": RENDER.activation_export_generation(prior_activation_manifest),
+                "export_authorization_digest": RENDER.activation_export_authorization_digest(prior_activation_manifest),
                 "request_digest": ACTIVATION_PACKAGE.digest(
                     json.dumps(
                         prior_activation_manifest["acceptance_template"]["run_event"],
