@@ -108,6 +108,22 @@ or granted CI signer for the request's repository. The guest rosters the
 acceptance actor as channel admin, the ci-event key as member, and the nip98
 key as the static signer (`guest_entry.relay_public_config`), the same three
 facts production must hold for its channel.
+The relay also receives the candidate's frozen acceptance template and, only
+for the replay-before-grant fault, the distinct prior template. It derives the
+five actor event IDs in API order (`Run`, `Grant`, `Rerun`, `Tombstone`,
+`FailureRun`) and requires live order (`Run`, `Grant`, `FailureRun`, `Rerun`,
+`Tombstone`). Unknown or sixth actor events fail before storage. Run A's
+terminal success does not create a verdict. The relay writes only a canonical
+signed-event transcript, and the guest closes the v2 verdict after the
+installed verifier accepts all 16 checks and zero phases 17 and 18. Closure
+binds Run A evidence and both terminal facts, Run B's deterministic failure,
+rerun, cancellation and tombstone, the authenticated stage-7 export, and an
+unchanged whole-transcript seal. The guest publishes the complete verdict with
+a same-directory create-once link and fsync, then recomputes and reads it back.
+The transfer guest recomputes the canonical verdict from the frozen templates,
+signed transcript, stage fixture, and verified receipt. It emits the resulting
+verdict digest in its challenge-bound frame; the host checks that digest again
+before the value enters or is read back from the final evidence manifest.
 The relay also serves `POST /query` (api/bridge.rs `query_events`): a NIP-98
 token with the payload digest, a JSON array of filters that each name `kinds`
 (a kindless filter is refused with 403), `ids` lookups, `authors` narrowing to
