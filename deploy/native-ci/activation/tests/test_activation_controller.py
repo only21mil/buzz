@@ -1608,7 +1608,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "8092b57c60b02f35cf020075a48104093240f34e91c0a9ec5f02d9951f60b526",
+            "d75ddcb1438af17120066ca9857f79f2f1ed5a242ad682d0ae63997acb3f89cb",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -4474,6 +4474,31 @@ class ActivationControllerTests(unittest.TestCase):
             ):
                 activation_package._export_transcript_digest(
                     **arguments, artifacts=artifacts,
+                )
+        boundary_artifact = (
+            "a" * 128,
+            "result.json",
+            activation_package.EXPORT_ARTIFACTS[0][2],
+            107,
+        )
+        self.assertRegex(
+            activation_package._export_transcript_digest(
+                **arguments, artifacts=(boundary_artifact,),
+            ),
+            r"^[0-9a-f]{64}$",
+        )
+        for artifact_id in ("a" * 129, ".", ".."):
+            with self.subTest(artifact_id=artifact_id), self.assertRaisesRegex(
+                ValueError, "artifact plan entry is invalid",
+            ):
+                activation_package._export_transcript_digest(
+                    **arguments,
+                    artifacts=((
+                        artifact_id,
+                        "result.json",
+                        activation_package.EXPORT_ARTIFACTS[0][2],
+                        107,
+                    ),),
                 )
 
     def test_phase_validation_rederives_export_authority_from_nip98_selector(self) -> None:
