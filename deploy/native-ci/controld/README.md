@@ -79,20 +79,40 @@ and fetches terminal logs, the declared artifact, and teardown through the
 runner-forwarded bounded evidence operations. It never connects to execd or
 reads an evidence filesystem.
 
+Acceptance stage 7 is a separate relay readback, not an echo of those
+runner-forwarded bytes. Controld queries the exact signed evidence-reference
+and final-fact events, requires exactly one signature-valid event for each
+requested id, author, and kind, and verifies their complete run, job, attempt,
+request, manifest, URL, length, digest, and evidence-set coordinates. It then
+uses an authenticated full-body `GET` for each referenced log and artifact and
+checks the exact canonical path, declared byte length, and SHA-256 before
+returning normalized metadata. It follows no redirect and uses neither an
+evidence filesystem nor object-store credentials.
+
 Relay identities. The relay stores a `POST /events` only when the event's
 `pubkey` equals the NIP-98 token pubkey and that pubkey is a member of the
 event's private channel, so controld asks keyholder for a publish token signed
 by the key that signed the event: `ci-event.key` for kinds 46101 to 46106 and
 the acceptance actor for the five frozen acceptance events. The client refuses
 to send when the event pubkey equals no identity it holds or when the returned
-token identity differs from the event pubkey. `nip98.key` signs only the
-accepted read and the evidence `PUT`s, where the relay authorizes the caller as
-a CI signer (`BUZZ_CI_STATUS_SIGNER_PUBKEYS` or an active kind-46107 grant for
-the request's repository). A production channel therefore needs the acceptance
-actor as an owner or admin (it issues the grant), `ci-event.key` as a member,
-and `nip98.key` listed as a static CI signer; the relay also refuses any event
-whose `created_at` is more than 900 seconds from its clock, so the frozen
-acceptance events must be published within that window of the time reference.
+token identity differs from the event pubkey. `ci-event.key` also signs the
+exact `POST /query` tokens used for publication recovery and stage-7 event
+readback. `nip98.key` signs the accepted read, evidence `PUT`s, and stage-7
+`GET`s of exact signed-reference evidence paths, where the relay authorizes the
+caller as a CI signer (`BUZZ_CI_STATUS_SIGNER_PUBKEYS` or an active kind-46107
+grant for the request's repository). A production channel therefore needs the
+acceptance actor as an owner or admin (it issues the grant), `ci-event.key` as
+a member, and `nip98.key` listed as a static CI signer; the relay also refuses
+any event whose `created_at` is more than 900 seconds from its clock, so the
+frozen acceptance events must be published within that window of the time
+reference.
+
+The stage-7 operation identity and requested evidence remain fixed across
+recovery, but its NIP-98 tokens do not. Once the acceptance journal has staged
+the response, a retry returns those exact stored response bytes without another
+relay read or token. A crash before response staging may repeat the idempotent
+exact reads with freshly signed NIP-98 tokens. Authorization headers and their
+volatile signed-event identities are never journaled or returned.
 
 `ci-event.key` is authorized only while a kind-46107 grant is active at ingest
 time, and each activation's grant is published by the acceptance protocol

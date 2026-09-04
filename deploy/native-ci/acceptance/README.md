@@ -39,7 +39,9 @@ is a distinct failed-parent and rerun lane with different run and request IDs:
 4. The expected approver and grant are present, but no attempt starts.
 5. Explicit resume starts exactly one first attempt.
 6. The first attempt terminates successfully with the expected log and artifact.
-7. An authenticated export returns the same evidence set and exact byte digests.
+7. Authenticated relay queries read back the exact signed evidence references
+   and final facts, then bounded authenticated `GET`s return the referenced log
+   and artifact bytes with the same evidence set, lengths, and byte digests.
 8. The exact Run B manifest enters the granted-but-not-resumed boundary without
    starting work.
 9. Explicit resume starts exactly one Run B attempt.
@@ -125,6 +127,11 @@ target/release/buzz-ci-capacity-one-canary \
 The binary returns `0` only after all 16 checks and both root-only phases pass.
 It returns `1` with a failure receipt for a driver or evidence failure, and `2`
 for invalid input. It copies no raw adapter output or stderr into the receipt.
+The receipt never contains an Authorization header, encoded NIP-98 token, raw
+NIP-98 event, signature, nonce, NIP-98 timestamp, credential, or evidence-object
+bytes. It retains only stable public selector identity and generation facts,
+sanitized request bindings and object metadata, and deterministic digests of
+those values.
 
 Validate the receipt schema, then run the maintained semantic verifier against
 the exact rendered scenario:
@@ -165,6 +172,8 @@ until the separate activation decision and its approval are recorded.
 Treat every nonzero canary or verifier exit as closed. A failure after capacity
 opened may retain a successful two-phase zero transition, but it never passes
 the verifier. Confirm capacity zero through an independent read path before
-retrying. Do not edit a failed receipt or reuse its grant, request, run, or
-attempt identities. If sequence 18 cannot prove the close, stop and use the
-approved service recovery procedure.
+retrying. A stage-7 authentication, exact-event cardinality or binding,
+response-cap, object-length, or digest failure stops the gate before Run B and
+returns no partial export. Do not edit a failed receipt or reuse its grant,
+request, run, or attempt identities. If sequence 18 cannot prove the close,
+stop and use the approved service recovery procedure.

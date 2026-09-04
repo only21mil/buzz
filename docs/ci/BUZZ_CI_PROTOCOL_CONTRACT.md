@@ -192,6 +192,14 @@ Exactly one of `url` or `inline` is present. `inline` is canonical padded RFC 46
 
 A `url` is accepted only when it has the HTTP(S) origin corresponding to the active relay (`wss` maps to `https`, `ws` maps to `http`), contains no credentials/query/fragment, and its exact path is `/ci/logs/{request_event_id}/{run_id}/{job_id}/{attempt}/{log_sha256}`. `GET` and `HEAD` require fresh NIP-98 authentication for the exact method and URL before the relay performs any request, event, or object lookup. A caller must be a current member of the repository's bound channel. Missing evidence and evidence requested by a non-member have the same response, so the route does not expose an existence oracle. The relay requires one authorized log-reference event and a terminal job-status event that names it, with exact repository, channel, request, run, workflow, tip, job, attempt, URL, byte length, cap, and digest bindings. It then verifies stored size and SHA-256 before responding. The decoded-byte ceiling is 32 MiB. The route supports one RFC 9110 byte range and returns `Accept-Ranges`, `Content-Range`, `Content-Length`, and `Digest`; `HEAD` returns the corresponding verified headers with no body. It never redirects and storage keys are built only from validated, fixed-grammar coordinates.
 
+The capacity-one acceptance adapter deliberately exercises a narrower client
+surface than this public route: full-body `GET` with an exact `200` response,
+no `HEAD`, `Range`, or redirect, and a per-object bound equal to the signed
+expected byte length with an independent 16 MiB ceiling. Its URL `attempt` is
+the canonical positive decimal `u32` attempt number, not the broker's 16-byte
+attempt ID rendered as 32 lowercase hex characters. These adapter restrictions
+do not remove the public route's `GET`, `HEAD`, range, or 32 MiB contract.
+
 The CLI uses a redirect-disabled client, buffers no more than the signed `cap_bytes`, and rejects a changed final URL. `logs --raw` verifies authorized signer, exactly one location, canonical decoding when inline, cap, exact decoded byte length, SHA-256, and `truncated=false` before writing any byte to stdout.
 
 ### Artifact reference — kind 46104

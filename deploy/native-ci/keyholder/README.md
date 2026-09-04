@@ -66,14 +66,34 @@ the request carries the literal filter body (at most 512 bytes), the keyholder
 derives the payload digest from those bytes itself, and the bytes must be
 exactly `[{"ids":[<id>],"authors":[<ci-event key>],"kinds":[<kind>],"limit":1}]`
 with one 64-character lowercase hex id, the keyholder's own ci-event public key
-as the only author, one CI kind in 46100 to 46107, and limit 1. After the relay
-refuses a publish, controld reads back the exact event it signed with that
-filter before it re-signs; any other filter, and a filter on any other route,
-is denied. Signer `nip98` (the `nip98.key` selector) is
-accepted only for the accepted read and the evidence `PUT` routes, where the
-relay authorizes the caller as a CI signer rather than as the event author. A
-`POST /events` or `POST /query` request with signer `nip98` is denied, and the
-acceptance actor never queries.
+as the only author, one CI kind in 46100 to 46107, and limit 1. Controld uses
+this exact query both to recover a refused publication and to read back the
+signed evidence-reference and final-fact events required by acceptance stage
+7. A response must contain exactly the requested event, whose signature, id,
+author, and kind are checked before use. Any other filter, and a filter on any
+other route, is denied.
+
+Signer `nip98` (the `nip98.key` selector) is accepted for the accepted read,
+the evidence `PUT` routes, and full-body `GET` of only these exact
+signed-reference paths at the configured HTTPS origin:
+
+```text
+/ci/logs/{request-id}/{run-id}/{job-id}/{attempt}/{sha256}
+/ci/artifacts/{request-id}/{run-id}/{job-id}/{attempt}/{artifact-id}/{sha256}
+```
+
+`request-id` and `sha256` are 64-character lowercase hex; `run-id` is a
+canonical lowercase hyphenated UUID; `job-id` matches
+`[A-Za-z_][A-Za-z0-9_-]{0,63}`; `attempt` is canonical positive decimal `u32`;
+and `artifact-id` is 1 to 128 ASCII alphanumeric, dot, underscore, or hyphen
+characters other than `.` or `..`. The URL must reproduce the configured
+origin and canonical path byte-for-byte and contain no credentials, query,
+fragment, or percent encoding. These reads carry no payload. `HEAD`, range or
+generic `GET`, redirects, and object-store credentials are outside the
+acceptance adapter: keyholder signs no `HEAD` or generic path, and the adapter
+sends no `Range` header and follows no redirect. A `POST /events` or
+`POST /query` request with signer `nip98` is denied, and the acceptance actor
+never queries.
 
 The config never contains an activation package digest, scenario digest,
 acceptance actor identity, or event template. After the activation package and
@@ -121,9 +141,15 @@ exist before its rerun. Protocol v1 had only the first four IDs. A v1 peer
 accepted only tags 1 through 7, so the required tag 8 could not be added under
 the old version. V1 and v2 peers now reject each other's frame headers.
 Keyholder and controld must come from the same frozen candidate. Activation
-stages and restarts those package versions together. A mixed-version deployment
-is unsupported. A protocol mismatch fails closed before controld completes
-initialization, serves, or accepts any acceptance operation.
+stages and restarts those package versions together. Wire v2 does not by itself
+make two policy revisions deployment-compatible: an older v2 keyholder rejects
+the evidence `GET` authority required by a newer controld, which must then fail
+closed, while a newer keyholder with an older controld leaves the added
+authority unused. Either mixed package is unsupported. A wire-protocol mismatch
+fails closed before controld completes initialization, serves, or accepts any
+acceptance operation; systemd may already have opened its sockets. A same-v2
+policy mismatch is detected when the exact evidence `GET` authorization is
+denied and fails stage 7 without an export or passing qualification.
 
 ## Credentials
 
