@@ -201,7 +201,7 @@
     "acceptanceTemplate": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["actor", "time_reference", "run_event", "grant_event", "rerun_event", "tombstone_event"],
+      "required": ["actor", "time_reference", "run_event", "grant_event", "rerun_event", "tombstone_event", "failure_run_event", "failure_selector", "export_subject", "export_generation", "export_authorization_digest"],
       "properties": {
         "actor": {
           "type": "object",
@@ -216,7 +216,25 @@
         "run_event": { "$ref": "#/$defs/runEvent" },
         "grant_event": { "$ref": "#/$defs/grantEvent" },
         "rerun_event": { "$ref": "#/$defs/runEvent" },
-        "tombstone_event": { "$ref": "#/$defs/tombstoneEvent" }
+        "tombstone_event": { "$ref": "#/$defs/tombstoneEvent" },
+        "failure_run_event": { "$ref": "#/$defs/runEvent" },
+        "failure_selector": { "$ref": "#/$defs/fixtureSelector" },
+        "export_subject": { "$ref": "#/$defs/sha256" },
+        "export_generation": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "export_authorization_digest": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "fixtureSelector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "selector", "job_id", "run_id", "attempt", "sha256"],
+      "properties": {
+        "schema_version": { "const": "buzz-ci-capacity-one-fixture-selector/v1" },
+        "selector": { "const": "deterministic-failure" },
+        "job_id": { "const": "capacity-one-fixture" },
+        "run_id": { "type": "string", "format": "uuid" },
+        "attempt": { "const": 1 },
+        "sha256": { "$ref": "#/$defs/sha256" }
       }
     },
     "runEvent": { "$ref": "#/$defs/event46100" },

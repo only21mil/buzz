@@ -520,6 +520,66 @@ async fn store_terminal_job_chain(
     log
 }
 
+async fn assert_rejected_request_rolled_back(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    run_id: Uuid,
+    rejected: &Event,
+    cursors_before: &[i64],
+) {
+    let canonical_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM events WHERE community_id=$1 AND id=$2)")
+            .bind(community_id.as_uuid())
+            .bind(rejected.id.as_bytes().as_slice())
+            .fetch_one(pool)
+            .await
+            .expect("check rejected canonical event rollback");
+    assert!(!canonical_exists);
+
+    let events = list_ci_run_events(pool, community_id, channel_id, run_id, 0, 100)
+        .await
+        .expect("load run after rejected request");
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.watch_cursor)
+            .collect::<Vec<_>>(),
+        cursors_before
+    );
+    assert!(events
+        .iter()
+        .all(|event| event.stored_event.event.id != rejected.id));
+}
+
+#[test]
+fn existing_run_and_rerun_fanout_fixtures_remain_compatible() {
+    for (input, expected) in [
+        (
+            include_str!("fixtures/ci-graph-reducer/run.json"),
+            vec![("lint".to_owned(), 1), ("test".to_owned(), 1)],
+        ),
+        (
+            include_str!("fixtures/ci-graph-reducer/rerun-fanout.json"),
+            vec![("lint".to_owned(), 2), ("test".to_owned(), 2)],
+        ),
+    ] {
+        let input: SignedCiGraphInput = serde_json::from_str(input).expect("parse signed fixture");
+        let graph = reduce_signed_ci_graph(&input).expect("reduce existing fixture");
+        assert_eq!(graph.selected_job_attempts, expected);
+    }
+
+    let gap: SignedCiGraphInput =
+        serde_json::from_str(include_str!("fixtures/ci-graph-reducer/sequence-gap.json"))
+            .expect("parse sequence-gap fixture");
+    assert_eq!(
+        reduce_signed_ci_graph(&gap)
+            .expect_err("sequence gap must remain closed")
+            .code(),
+        "sequence_gap"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires Postgres"]
 async fn request_and_status_chain_round_trip_into_reducer() {
@@ -915,6 +975,248 @@ async fn request_and_status_chain_round_trip_into_reducer() {
 
 #[tokio::test]
 #[ignore = "requires Postgres"]
+async fn terminal_run_failure_permits_an_eligible_rerun() {
+    let pool = pool().await;
+    let (community_id, channel_id) = tenant_channel(&pool).await;
+    let actor = Keys::generate();
+    let control = Keys::generate();
+    let authorized_status_signers = HashSet::from([control.public_key().to_hex()]);
+    let initial = request(&actor, Uuid::new_v4());
+    let initial_event = signed_request(&actor, channel_id, &initial);
+    store(
+        &pool,
+        community_id,
+        channel_id,
+        &initial_event,
+        &authorized_status_signers,
+    )
+    .await
+    .expect("store initial request");
+
+    for (sequence, state) in [
+        (1, CiRunState::Queued),
+        (2, CiRunState::Running),
+        (3, CiRunState::Failure),
+    ] {
+        let event = run_status(
+            &control,
+            channel_id,
+            &initial,
+            &initial_event.id.to_hex(),
+            sequence,
+            state,
+        );
+        store(
+            &pool,
+            community_id,
+            channel_id,
+            &event,
+            &authorized_status_signers,
+        )
+        .await
+        .expect("store terminal run failure history");
+    }
+    store_selected_job_chain(
+        &pool,
+        community_id,
+        channel_id,
+        &control,
+        &initial,
+        &initial_event,
+        "test",
+        1,
+        None,
+        CiJobState::Failure,
+        &[],
+        &authorized_status_signers,
+    )
+    .await;
+
+    let rerun = rerun_request(&initial, "test", 1);
+    let rerun_event = signed_request(&actor, channel_id, &rerun);
+    assert!(matches!(
+        store(
+            &pool,
+            community_id,
+            channel_id,
+            &rerun_event,
+            &authorized_status_signers,
+        )
+        .await,
+        Ok(StoreCiEventOutcome::Stored(_))
+    ));
+
+    let run_id = Uuid::parse_str(&initial.run_id).unwrap();
+    let stored_initial = get_ci_run_request(&pool, community_id, channel_id, run_id)
+        .await
+        .expect("load initial request")
+        .expect("initial request exists");
+    assert_eq!(stored_initial.stored_event.event.id, initial_event.id);
+    let events = list_ci_run_events(&pool, community_id, channel_id, run_id, 0, 100)
+        .await
+        .expect("load rerun lineage");
+    let requests = events
+        .iter()
+        .filter(|event| {
+            event.stored_event.event.kind.as_u16() as u32 == buzz_core::kind::KIND_CI_REQUEST
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].stored_event.event.id, initial_event.id);
+    assert_eq!(requests[1].stored_event.event.id, rerun_event.id);
+    assert!(requests[0].watch_cursor < requests[1].watch_cursor);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn a_successful_selected_parent_rejects_rerun_without_storage_side_effects() {
+    let pool = pool().await;
+    let (community_id, channel_id) = tenant_channel(&pool).await;
+    let actor = Keys::generate();
+    let control = Keys::generate();
+    let authorized_status_signers = HashSet::from([control.public_key().to_hex()]);
+    let (initial, initial_event) = new_stored_request(
+        &pool,
+        community_id,
+        channel_id,
+        &actor,
+        &authorized_status_signers,
+    )
+    .await;
+    store_selected_job_chain(
+        &pool,
+        community_id,
+        channel_id,
+        &control,
+        &initial,
+        &initial_event,
+        "test",
+        1,
+        None,
+        CiJobState::Success,
+        &[],
+        &authorized_status_signers,
+    )
+    .await;
+
+    let run_id = Uuid::parse_str(&initial.run_id).unwrap();
+    let cursors_before = list_ci_run_events(&pool, community_id, channel_id, run_id, 0, 100)
+        .await
+        .expect("load run before rejected rerun")
+        .into_iter()
+        .map(|event| event.watch_cursor)
+        .collect::<Vec<_>>();
+    let rerun = rerun_request(&initial, "test", 1);
+    let rerun_event = signed_request(&actor, channel_id, &rerun);
+    assert!(matches!(
+        store(
+            &pool,
+            community_id,
+            channel_id,
+            &rerun_event,
+            &authorized_status_signers,
+        )
+        .await,
+        Err(buzz_db::DbError::InvalidData(message))
+            if message.contains("parent job is not a terminal failure")
+    ));
+    assert_rejected_request_rolled_back(
+        &pool,
+        community_id,
+        channel_id,
+        run_id,
+        &rerun_event,
+        &cursors_before,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn either_terminal_fact_seals_reruns_with_full_transaction_rollback() {
+    for terminal_fact in ["evidence", "teardown"] {
+        let pool = pool().await;
+        let (community_id, channel_id) = tenant_channel(&pool).await;
+        let actor = Keys::generate();
+        let control = Keys::generate();
+        let authorized_status_signers = HashSet::from([control.public_key().to_hex()]);
+        let (initial, initial_event) = new_stored_request(
+            &pool,
+            community_id,
+            channel_id,
+            &actor,
+            &authorized_status_signers,
+        )
+        .await;
+        let log = store_terminal_job_chain(
+            &pool,
+            community_id,
+            channel_id,
+            &control,
+            &initial,
+            &initial_event,
+            &authorized_status_signers,
+        )
+        .await;
+        let fact = match terminal_fact {
+            "evidence" => evidence_finalized(
+                &control,
+                channel_id,
+                &initial,
+                &initial_event.id.to_hex(),
+                "test",
+                &log.id.to_hex(),
+            ),
+            "teardown" => {
+                teardown_attestation(&control, channel_id, &initial, &initial_event.id.to_hex())
+            }
+            _ => unreachable!(),
+        };
+        store(
+            &pool,
+            community_id,
+            channel_id,
+            &fact,
+            &authorized_status_signers,
+        )
+        .await
+        .expect("store terminal fact");
+
+        let run_id = Uuid::parse_str(&initial.run_id).unwrap();
+        let cursors_before = list_ci_run_events(&pool, community_id, channel_id, run_id, 0, 100)
+            .await
+            .expect("load sealed run")
+            .into_iter()
+            .map(|event| event.watch_cursor)
+            .collect::<Vec<_>>();
+        let rerun = rerun_request(&initial, "test", 1);
+        let rerun_event = signed_request(&actor, channel_id, &rerun);
+        assert!(matches!(
+            store(
+                &pool,
+                community_id,
+                channel_id,
+                &rerun_event,
+                &authorized_status_signers,
+            )
+            .await,
+            Err(buzz_db::DbError::Conflict(message))
+                if message.contains("terminal evidence")
+        ));
+        assert_rejected_request_rolled_back(
+            &pool,
+            community_id,
+            channel_id,
+            run_id,
+            &rerun_event,
+            &cursors_before,
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
 async fn rerun_final_facts_bind_only_the_final_request_and_selected_graph() {
     let pool = pool().await;
     let (community_id, channel_id) = tenant_channel(&pool).await;
@@ -982,25 +1284,6 @@ async fn rerun_final_facts_bind_only_the_final_request_and_selected_graph() {
     )
     .await
     .expect("store rerun request");
-    for (sequence, state) in [(1, CiRunState::Queued), (2, CiRunState::Running)] {
-        let event = run_status(
-            &control,
-            channel_id,
-            &rerun,
-            &rerun_event.id.to_hex(),
-            sequence,
-            state,
-        );
-        store(
-            &pool,
-            community_id,
-            channel_id,
-            &event,
-            &authorized_status_signers,
-        )
-        .await
-        .expect("store rerun status");
-    }
     let log = store_terminal_job_chain(
         &pool,
         community_id,
@@ -1087,6 +1370,20 @@ async fn rerun_final_facts_bind_only_the_final_request_and_selected_graph() {
     )
     .await
     .expect("list final run history");
+    let rerun_event_id = rerun_event.id.to_hex();
+    let mut rerun_run_sequences = events
+        .iter()
+        .filter(|stored| {
+            stored.stored_event.event.kind.as_u16() as u32 == buzz_core::kind::KIND_CI_RUN_STATUS
+        })
+        .filter_map(|stored| {
+            let envelope: CiRunStatusEnvelope =
+                serde_json::from_str(&stored.stored_event.event.content).unwrap();
+            (envelope.request_event_id == rerun_event_id).then_some(envelope.sequence)
+        })
+        .collect::<Vec<_>>();
+    rerun_run_sequences.sort_unstable();
+    assert_eq!(rerun_run_sequences, vec![1, 2, 3]);
     let terminal_facts = events
         .iter()
         .filter(|stored| {

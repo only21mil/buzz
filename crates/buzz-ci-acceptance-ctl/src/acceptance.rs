@@ -26,6 +26,8 @@ const RECEIPT_VERSION: &str = "buzz-ci-capacity-one-acceptance-receipt/v2";
 pub const ZERO_REQUEST_VERSION: &str = "buzz-ci-capacity-one-zero-request/v1";
 pub const ZERO_PROOF_VERSION: &str = "buzz-ci-capacity-one-zero-proof/v1";
 pub const ZERO_TRANSITION_VERSION: &str = "buzz-ci-capacity-one-zero-transition/v1";
+/// Number of durable provider-facing operations in the closed acceptance sequence.
+pub const ACCEPTANCE_STAGE_COUNT: u32 = 16;
 
 /// One executable endpoint. The harness never invokes a shell.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -57,6 +59,43 @@ pub struct EvidenceObject {
     pub bytes: u64,
 }
 
+/// Public, digest-bound selector that makes only Run B attempt 1 fail.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FixtureSelector {
+    pub schema_version: String,
+    pub selector: String,
+    pub job_id: String,
+    pub run_id: String,
+    pub attempt: u32,
+    pub sha256: String,
+}
+
+pub(crate) fn valid_fixture_selector(
+    value: &FixtureSelector,
+    failure_run_id: &str,
+    job_id: &str,
+) -> bool {
+    let Ok(run_id) = uuid::Uuid::parse_str(&value.run_id) else {
+        return false;
+    };
+    let encoded = format!(
+        "buzz-ci:capacity-one:fixture-selector:v1\n{}\n{}\n{}\n{}\n{}\n",
+        value.schema_version,
+        value.selector,
+        value.job_id,
+        run_id.simple(),
+        value.attempt,
+    );
+    value.schema_version == "buzz-ci-capacity-one-fixture-selector/v1"
+        && value.selector == "deterministic-failure"
+        && value.job_id == job_id
+        && value.attempt == 1
+        && value.run_id == run_id.hyphenated().to_string()
+        && run_id.simple().to_string() == failure_run_id
+        && value.sha256 == hex::encode(Sha256::digest(encoded.as_bytes()))
+}
+
 /// Immutable fixture identities and expected outputs.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -65,8 +104,11 @@ pub struct FixtureSpec {
     pub activation_id: String,
     pub activation_package_digest: String,
     pub run_id: String,
+    pub failure_run_id: String,
+    pub failure_selector: FixtureSelector,
     pub job_id: String,
     pub request_digest: String,
+    pub failure_request_digest: String,
     pub manifest_digest: String,
     pub source_oid: String,
     pub approval_id: String,
@@ -74,10 +116,12 @@ pub struct FixtureSpec {
     pub grant_digest: String,
     pub approved_by: String,
     pub export_subject: String,
+    pub export_generation: u64,
     pub export_authorization_digest: String,
     pub controller_generation: u64,
     pub runner_generation: u64,
     pub expected_log: EvidenceObject,
+    pub expected_failure_log: EvidenceObject,
     pub expected_artifacts: Vec<EvidenceObject>,
 }
 
@@ -101,6 +145,9 @@ pub enum Operation {
     ResumeGrant,
     AwaitFirstTerminal,
     ExportFirstEvidence,
+    SubmitFailureManifest,
+    ResumeFailure,
+    AwaitFailureTerminal,
     Rerun,
     CancelRerun,
     TombstoneRerun,
@@ -238,6 +285,7 @@ pub struct SystemSnapshot {
 pub struct ExportSnapshot {
     pub authenticated: bool,
     pub subject: String,
+    pub generation: u64,
     pub authorization_digest: String,
     pub attempt_id: String,
     pub request_digest: String,
@@ -363,6 +411,9 @@ pub enum Stage {
     GrantResume,
     FirstAttemptTerminal,
     AuthenticatedExport,
+    FailedManifestIdentity,
+    FailedAttemptRunning,
+    FailedAttemptTerminal,
     RerunSeparation,
     CancellationTerminal,
     TombstoneFolding,
@@ -654,9 +705,9 @@ fn validate_zero_transition(
     }
     for (index, phase) in transition.phases.iter().enumerate() {
         let (sequence, operation) = if index == 0 {
-            (14, ZeroOperation::FinalizeCapacityZero)
+            (17, ZeroOperation::FinalizeCapacityZero)
         } else {
-            (15, ZeroOperation::ProveCapacityZero)
+            (18, ZeroOperation::ProveCapacityZero)
         };
         if phase.sequence != sequence
             || phase.operation != operation
@@ -697,7 +748,7 @@ pub fn validate_receipt(receipt: &AcceptanceReceipt) -> Result<(), AcceptanceErr
     if receipt.schema_version != RECEIPT_VERSION
         || receipt.outcome != Outcome::Pass
         || receipt.failure.is_some()
-        || receipt.checks.len() != 13
+        || receipt.checks.len() != 16
     {
         return Err(AcceptanceError::IntegrityMismatch("receipt shape"));
     }
@@ -709,6 +760,9 @@ pub fn validate_receipt(receipt: &AcceptanceReceipt) -> Result<(), AcceptanceErr
         Stage::GrantResume,
         Stage::FirstAttemptTerminal,
         Stage::AuthenticatedExport,
+        Stage::FailedManifestIdentity,
+        Stage::FailedAttemptRunning,
+        Stage::FailedAttemptTerminal,
         Stage::RerunSeparation,
         Stage::CancellationTerminal,
         Stage::TombstoneFolding,
@@ -781,6 +835,9 @@ const fn expected_operation_for_stage(stage: Stage) -> Operation {
         Stage::GrantResume => Operation::ResumeGrant,
         Stage::FirstAttemptTerminal => Operation::AwaitFirstTerminal,
         Stage::AuthenticatedExport => Operation::ExportFirstEvidence,
+        Stage::FailedManifestIdentity => Operation::SubmitFailureManifest,
+        Stage::FailedAttemptRunning => Operation::ResumeFailure,
+        Stage::FailedAttemptTerminal => Operation::AwaitFailureTerminal,
         Stage::RerunSeparation => Operation::Rerun,
         Stage::CancellationTerminal => Operation::CancelRerun,
         Stage::TombstoneFolding => Operation::TombstoneRerun,
@@ -887,17 +944,71 @@ fn run_sequence<D: AcceptanceDriver>(
         Some(&terminal_one),
         |response| validate_export(response, fixture, &terminal_one, &attempt_one_id),
     )?;
-    let rerun = step(
+    let failed_submitted = step(
         driver,
         fixture,
         scenario_sha256,
         checks,
         8,
+        Operation::SubmitFailureManifest,
+        Stage::FailedManifestIdentity,
+        None,
+        Some(&exported),
+        |response| validate_failure_submitted(&response.snapshot, fixture, &exported),
+    )?;
+    let failure_running = step(
+        driver,
+        fixture,
+        scenario_sha256,
+        checks,
+        9,
+        Operation::ResumeFailure,
+        Stage::FailedAttemptRunning,
+        None,
+        Some(&failed_submitted),
+        |response| validate_failure_running(&response.snapshot, fixture, &failed_submitted),
+    )?;
+    let failure_attempt_id = only_attempt(&failure_running)
+        .map_err(|error| (Stage::FailedAttemptRunning, error))?
+        .attempt_id
+        .clone();
+    let failure_terminal = step(
+        driver,
+        fixture,
+        scenario_sha256,
+        checks,
+        10,
+        Operation::AwaitFailureTerminal,
+        Stage::FailedAttemptTerminal,
+        Some(&failure_attempt_id),
+        Some(&failure_running),
+        |response| {
+            validate_failure_terminal(
+                &response.snapshot,
+                fixture,
+                &failure_running,
+                &failure_attempt_id,
+            )
+        },
+    )?;
+    let rerun = step(
+        driver,
+        fixture,
+        scenario_sha256,
+        checks,
+        11,
         Operation::Rerun,
         Stage::RerunSeparation,
-        Some(&attempt_one_id),
-        Some(&exported),
-        |response| validate_rerun(&response.snapshot, fixture, &exported, &attempt_one_id),
+        Some(&failure_attempt_id),
+        Some(&failure_terminal),
+        |response| {
+            validate_rerun(
+                &response.snapshot,
+                fixture,
+                &failure_terminal,
+                &failure_attempt_id,
+            )
+        },
     )?;
     let attempt_two_id = attempt_by_number(&rerun, 2)
         .map_err(|error| (Stage::RerunSeparation, error))?
@@ -908,7 +1019,7 @@ fn run_sequence<D: AcceptanceDriver>(
         fixture,
         scenario_sha256,
         checks,
-        9,
+        12,
         Operation::CancelRerun,
         Stage::CancellationTerminal,
         Some(&attempt_two_id),
@@ -918,7 +1029,7 @@ fn run_sequence<D: AcceptanceDriver>(
                 &response.snapshot,
                 fixture,
                 &rerun,
-                &attempt_one_id,
+                &failure_attempt_id,
                 &attempt_two_id,
             )
         },
@@ -928,7 +1039,7 @@ fn run_sequence<D: AcceptanceDriver>(
         fixture,
         scenario_sha256,
         checks,
-        10,
+        13,
         Operation::TombstoneRerun,
         Stage::TombstoneFolding,
         Some(&attempt_two_id),
@@ -938,7 +1049,7 @@ fn run_sequence<D: AcceptanceDriver>(
                 &response.snapshot,
                 fixture,
                 &cancelled,
-                &attempt_one_id,
+                &failure_attempt_id,
                 &attempt_two_id,
             )
         },
@@ -948,7 +1059,7 @@ fn run_sequence<D: AcceptanceDriver>(
         fixture,
         scenario_sha256,
         checks,
-        11,
+        14,
         Operation::RestartController,
         Stage::ControllerRestartRecovery,
         None,
@@ -960,7 +1071,7 @@ fn run_sequence<D: AcceptanceDriver>(
         fixture,
         scenario_sha256,
         checks,
-        12,
+        15,
         Operation::RestartRunner,
         Stage::RunnerRestartRecovery,
         None,
@@ -972,7 +1083,7 @@ fn run_sequence<D: AcceptanceDriver>(
         fixture,
         scenario_sha256,
         checks,
-        13,
+        16,
         Operation::SetCapacityZero,
         Stage::PrepareCapacityZero,
         None,
@@ -1265,6 +1376,10 @@ fn validate_export(
         .ok_or(AcceptanceError::MissingEvidence("authenticated export"))?;
     require(export.authenticated, "export is not authenticated")?;
     exact(&export.subject, &fixture.export_subject, "export subject")?;
+    require(
+        export.generation == fixture.export_generation,
+        "export generation differs",
+    )?;
     exact(
         &export.authorization_digest,
         &fixture.export_authorization_digest,
@@ -1306,6 +1421,99 @@ fn validate_export(
     Ok(())
 }
 
+fn validate_failure_submitted(
+    snapshot: &SystemSnapshot,
+    fixture: &FixtureSpec,
+    prior: &SystemSnapshot,
+) -> Result<(), AcceptanceError> {
+    validate_live_capacity(snapshot, prior)?;
+    let run = exact_failure_run(snapshot, fixture)?;
+    require(
+        run.state == RunState::GrantedAwaitingResume,
+        "failed-parent run did not stop at explicit resume boundary",
+    )?;
+    validate_resumed_state(run, fixture, false)?;
+    require(run.attempts.is_empty(), "failed-parent run started early")?;
+    require(
+        snapshot.active_run_count == 0 && snapshot.active_attempt_count == 0,
+        "failed-parent submission consumed capacity",
+    )
+}
+
+fn validate_failure_running(
+    snapshot: &SystemSnapshot,
+    fixture: &FixtureSpec,
+    prior: &SystemSnapshot,
+) -> Result<(), AcceptanceError> {
+    validate_live_capacity(snapshot, prior)?;
+    let run = exact_failure_run(snapshot, fixture)?;
+    validate_resumed_state(run, fixture, true)?;
+    require(
+        run.state == RunState::Running,
+        "failed-parent attempt is not running",
+    )?;
+    let attempt = only_attempt(snapshot)?;
+    validate_failure_attempt_identity(attempt, fixture)?;
+    require(
+        attempt.attempt == 1,
+        "failed-parent attempt number is not one",
+    )?;
+    require(
+        attempt.parent_attempt_id.is_none(),
+        "failed-parent attempt has a parent",
+    )?;
+    require(
+        attempt.conclusion == Conclusion::None,
+        "running failed-parent has a conclusion",
+    )?;
+    require(
+        snapshot.active_run_count == 1 && snapshot.active_attempt_count == 1,
+        "failed-parent counters are not exactly one",
+    )
+}
+
+fn validate_failure_terminal(
+    snapshot: &SystemSnapshot,
+    fixture: &FixtureSpec,
+    prior: &SystemSnapshot,
+    attempt_id: &str,
+) -> Result<(), AcceptanceError> {
+    validate_live_capacity(snapshot, prior)?;
+    let run = exact_failure_run(snapshot, fixture)?;
+    validate_resumed_state(run, fixture, true)?;
+    require(
+        run.state == RunState::Terminal,
+        "failed-parent run is not terminal",
+    )?;
+    require(
+        run.aggregate_conclusion == Conclusion::Failure,
+        "failed-parent run did not fail",
+    )?;
+    require(
+        run.selected_attempt_id.as_deref() == Some(attempt_id),
+        "failed parent is not selected",
+    )?;
+    require(
+        run.attempts.len() == 1,
+        "failed-parent run has extra attempts",
+    )?;
+    let attempt = attempt_by_id(run, attempt_id)?;
+    validate_failure_attempt_identity(attempt, fixture)?;
+    require(
+        attempt.state == AttemptState::Terminal,
+        "failed-parent attempt is not terminal",
+    )?;
+    require(
+        attempt.conclusion == Conclusion::Failure,
+        "failed-parent attempt did not fail",
+    )?;
+    validate_failure_attempt_evidence(attempt, fixture)?;
+    require(
+        snapshot.active_run_count == 0 && snapshot.active_attempt_count == 0,
+        "failed-parent run remains active",
+    )
+}
+
 fn validate_rerun(
     snapshot: &SystemSnapshot,
     fixture: &FixtureSpec,
@@ -1313,7 +1521,7 @@ fn validate_rerun(
     first_id: &str,
 ) -> Result<(), AcceptanceError> {
     validate_live_capacity(snapshot, prior)?;
-    let run = exact_run(snapshot, fixture)?;
+    let run = exact_failure_run(snapshot, fixture)?;
     validate_resumed_approval(run, fixture)?;
     require(run.state == RunState::Running, "rerun is not running")?;
     require(
@@ -1325,13 +1533,13 @@ fn validate_rerun(
         "rerun did not produce exactly two attempts",
     )?;
     let first = attempt_by_id(run, first_id)?;
-    validate_attempt_evidence(first, fixture)?;
+    validate_failure_attempt_evidence(first, fixture)?;
     require(
-        first.state == AttemptState::Terminal && first.conclusion == Conclusion::Success,
+        first.state == AttemptState::Terminal && first.conclusion == Conclusion::Failure,
         "rerun changed the first attempt",
     )?;
     let second = attempt_by_number(snapshot, 2)?;
-    validate_attempt_identity(second, fixture)?;
+    validate_failure_attempt_identity(second, fixture)?;
     require(
         second.attempt_id != first_id,
         "rerun reused the first attempt ID",
@@ -1363,7 +1571,7 @@ fn validate_cancelled(
     second_id: &str,
 ) -> Result<(), AcceptanceError> {
     validate_live_capacity(snapshot, prior)?;
-    let run = exact_run(snapshot, fixture)?;
+    let run = exact_failure_run(snapshot, fixture)?;
     validate_resumed_approval(run, fixture)?;
     require(
         run.attempts.len() == 2,
@@ -1383,10 +1591,10 @@ fn validate_cancelled(
     )?;
     let first = attempt_by_id(run, first_id)?;
     require(
-        first.state == AttemptState::Terminal && first.conclusion == Conclusion::Success,
+        first.state == AttemptState::Terminal && first.conclusion == Conclusion::Failure,
         "cancellation changed the first attempt",
     )?;
-    validate_attempt_evidence(first, fixture)?;
+    validate_failure_attempt_evidence(first, fixture)?;
     let second = attempt_by_id(run, second_id)?;
     require(
         second.state == AttemptState::Terminal,
@@ -1411,7 +1619,7 @@ fn validate_tombstoned(
     second_id: &str,
 ) -> Result<(), AcceptanceError> {
     validate_live_capacity(snapshot, prior)?;
-    let run = exact_run(snapshot, fixture)?;
+    let run = exact_failure_run(snapshot, fixture)?;
     validate_resumed_approval(run, fixture)?;
     require(
         run.attempts.len() == 2,
@@ -1422,8 +1630,8 @@ fn validate_tombstoned(
         "folded run is not terminal",
     )?;
     require(
-        run.aggregate_conclusion == Conclusion::Success,
-        "tombstone did not fold back to the successful attempt",
+        run.aggregate_conclusion == Conclusion::Failure,
+        "tombstone did not fold back to the failed attempt",
     )?;
     require(
         run.selected_attempt_id.as_deref() == Some(first_id),
@@ -1431,10 +1639,10 @@ fn validate_tombstoned(
     )?;
     let first = attempt_by_id(run, first_id)?;
     require(
-        first.state == AttemptState::Terminal && first.conclusion == Conclusion::Success,
+        first.state == AttemptState::Terminal && first.conclusion == Conclusion::Failure,
         "tombstone changed the surviving attempt",
     )?;
-    validate_attempt_evidence(first, fixture)?;
+    validate_failure_attempt_evidence(first, fixture)?;
     let second = attempt_by_id(run, second_id)?;
     require(
         second.state == AttemptState::Tombstoned && second.conclusion == Conclusion::Cancelled,
@@ -1582,6 +1790,42 @@ fn exact_run<'a>(
     Ok(run)
 }
 
+fn exact_failure_run<'a>(
+    snapshot: &'a SystemSnapshot,
+    fixture: &FixtureSpec,
+) -> Result<&'a RunSnapshot, AcceptanceError> {
+    let run = snapshot
+        .run
+        .as_ref()
+        .ok_or(AcceptanceError::MissingEvidence("failed-parent run"))?;
+    exact(&run.run_id, &fixture.failure_run_id, "failed-parent run ID")?;
+    exact(
+        &run.integrated_candidate_sha,
+        &fixture.integrated_candidate_sha,
+        "integrated candidate",
+    )?;
+    exact(
+        &run.request_digest,
+        &fixture.failure_request_digest,
+        "failed-parent request digest",
+    )?;
+    exact(
+        &run.manifest_digest,
+        &fixture.manifest_digest,
+        "manifest digest",
+    )?;
+    exact(&run.source_oid, &fixture.source_oid, "source object ID")?;
+    let mut ids = BTreeSet::new();
+    let mut numbers = BTreeSet::new();
+    for attempt in &run.attempts {
+        require_hex(&attempt.attempt_id, 32, "attempt ID")?;
+        if !ids.insert(attempt.attempt_id.as_str()) || !numbers.insert(attempt.attempt) {
+            return Err(AcceptanceError::AmbiguousEvidence("duplicate attempt"));
+        }
+    }
+    Ok(run)
+}
+
 fn validate_approval(
     approval: &ApprovalSnapshot,
     fixture: &FixtureSpec,
@@ -1617,6 +1861,18 @@ fn validate_resumed_approval(
     validate_approval(approval, fixture, true)
 }
 
+fn validate_resumed_state(
+    run: &RunSnapshot,
+    fixture: &FixtureSpec,
+    resumed: bool,
+) -> Result<(), AcceptanceError> {
+    let approval = run
+        .approval
+        .as_ref()
+        .ok_or(AcceptanceError::MissingEvidence("approval grant"))?;
+    validate_approval(approval, fixture, resumed)
+}
+
 fn validate_attempt_identity(
     attempt: &AttemptSnapshot,
     fixture: &FixtureSpec,
@@ -1640,6 +1896,57 @@ fn validate_attempt_identity(
         &attempt.source_oid,
         &fixture.source_oid,
         "attempt source object",
+    )
+}
+
+fn validate_failure_attempt_identity(
+    attempt: &AttemptSnapshot,
+    fixture: &FixtureSpec,
+) -> Result<(), AcceptanceError> {
+    exact(
+        &attempt.integrated_candidate_sha,
+        &fixture.integrated_candidate_sha,
+        "attempt candidate",
+    )?;
+    exact(
+        &attempt.request_digest,
+        &fixture.failure_request_digest,
+        "failed-parent attempt request digest",
+    )?;
+    exact(
+        &attempt.manifest_digest,
+        &fixture.manifest_digest,
+        "attempt manifest digest",
+    )?;
+    exact(
+        &attempt.source_oid,
+        &fixture.source_oid,
+        "attempt source object",
+    )
+}
+
+fn validate_failure_attempt_evidence(
+    attempt: &AttemptSnapshot,
+    fixture: &FixtureSpec,
+) -> Result<(), AcceptanceError> {
+    require_hex(
+        attempt
+            .evidence_set_digest
+            .as_deref()
+            .ok_or(AcceptanceError::MissingEvidence(
+                "failed-parent evidence set digest",
+            ))?,
+        64,
+        "failed-parent evidence set digest",
+    )?;
+    let log = attempt
+        .log
+        .as_ref()
+        .ok_or(AcceptanceError::MissingEvidence("failed-parent log"))?;
+    exact_evidence(log, &fixture.expected_failure_log)?;
+    require(
+        attempt.artifacts.is_empty(),
+        "failed-parent attempt emitted artifacts",
     )
 }
 
@@ -1823,7 +2130,13 @@ fn validate_scenario(scenario: &AcceptanceScenario) -> Result<(), ScenarioError>
             &[64][..],
         ),
         (&fixture.run_id, "fixture.run_id", &[32][..]),
+        (&fixture.failure_run_id, "fixture.failure_run_id", &[32][..]),
         (&fixture.request_digest, "fixture.request_digest", &[64][..]),
+        (
+            &fixture.failure_request_digest,
+            "fixture.failure_request_digest",
+            &[64][..],
+        ),
         (
             &fixture.manifest_digest,
             "fixture.manifest_digest",
@@ -1843,6 +2156,25 @@ fn validate_scenario(scenario: &AcceptanceScenario) -> Result<(), ScenarioError>
     ] {
         validate_hex_field(value, lengths, field)?;
     }
+    if fixture.run_id == fixture.failure_run_id
+        || fixture.request_digest == fixture.failure_request_digest
+    {
+        return Err(ScenarioError::InvalidField("fixture.failure_run_id"));
+    }
+    let run_uuid = uuid::Uuid::parse_str(&fixture.run_id)
+        .map_err(|_| ScenarioError::InvalidField("fixture.run_id"))?;
+    let failure_uuid = uuid::Uuid::parse_str(&fixture.failure_run_id)
+        .map_err(|_| ScenarioError::InvalidField("fixture.failure_run_id"))?;
+    if run_uuid.get_version_num() != 5
+        || failure_uuid.get_version_num() != 5
+        || !valid_fixture_selector(
+            &fixture.failure_selector,
+            &fixture.failure_run_id,
+            &fixture.job_id,
+        )
+    {
+        return Err(ScenarioError::InvalidField("fixture.failure_selector"));
+    }
     if fixture.activation_id.is_empty()
         || fixture.activation_id.len() > 128
         || !fixture
@@ -1852,20 +2184,27 @@ fn validate_scenario(scenario: &AcceptanceScenario) -> Result<(), ScenarioError>
     {
         return Err(ScenarioError::InvalidField("fixture.activation_id"));
     }
-    if fixture.job_id.is_empty()
+    let mut job_bytes = fixture.job_id.bytes();
+    if !job_bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
         || fixture.job_id.len() > 64
-        || !fixture
-            .job_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || !job_bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     {
         return Err(ScenarioError::InvalidField("fixture.job_id"));
+    }
+    if fixture.export_generation == 0 || fixture.export_generation > 9_007_199_254_740_991 {
+        return Err(ScenarioError::InvalidField("fixture.export_generation"));
     }
     if fixture.controller_generation == 0 || fixture.runner_generation == 0 {
         return Err(ScenarioError::InvalidField("fixture.service_generation"));
     }
     validate_expected_evidence(&fixture.expected_log, "fixture.expected_log")?;
-    if fixture.expected_artifacts.is_empty() {
+    validate_expected_evidence(
+        &fixture.expected_failure_log,
+        "fixture.expected_failure_log",
+    )?;
+    if fixture.expected_artifacts.len() != 1 {
         return Err(ScenarioError::InvalidField("fixture.expected_artifacts"));
     }
     let mut names = BTreeSet::new();
@@ -1987,6 +2326,9 @@ impl CommandAcceptanceDriver {
             | Operation::ApproveGrant
             | Operation::ResumeGrant
             | Operation::AwaitFirstTerminal
+            | Operation::SubmitFailureManifest
+            | Operation::ResumeFailure
+            | Operation::AwaitFailureTerminal
             | Operation::Rerun
             | Operation::CancelRerun
             | Operation::TombstoneRerun
@@ -2177,8 +2519,8 @@ mod tests {
             proof.controld_acceptance_socket_present = true;
         }
         let phases = [
-            (14, ZeroOperation::FinalizeCapacityZero),
-            (15, ZeroOperation::ProveCapacityZero),
+            (17, ZeroOperation::FinalizeCapacityZero),
+            (18, ZeroOperation::ProveCapacityZero),
         ]
         .into_iter()
         .map(|(sequence, operation)| {
@@ -2233,6 +2575,22 @@ mod tests {
         }
     }
 
+    fn selector(run_id: &str, job_id: &str) -> FixtureSelector {
+        let parsed = uuid::Uuid::parse_str(run_id).unwrap();
+        let encoded = format!(
+            "buzz-ci:capacity-one:fixture-selector:v1\nbuzz-ci-capacity-one-fixture-selector/v1\ndeterministic-failure\n{job_id}\n{}\n1\n",
+            parsed.simple(),
+        );
+        FixtureSelector {
+            schema_version: "buzz-ci-capacity-one-fixture-selector/v1".into(),
+            selector: "deterministic-failure".into(),
+            job_id: job_id.into(),
+            run_id: parsed.hyphenated().to_string(),
+            attempt: 1,
+            sha256: hex::encode(Sha256::digest(encoded.as_bytes())),
+        }
+    }
+
     fn scenario() -> AcceptanceScenario {
         let endpoint = ProcessEndpoint {
             program: "/usr/libexec/buzz-ci-capacity-one-driver".to_owned(),
@@ -2244,9 +2602,12 @@ mod tests {
                 integrated_candidate_sha: hex('a', 40),
                 activation_id: "buzz-ci-capacity-one-test".to_owned(),
                 activation_package_digest: hex('8', 64),
-                run_id: hex('b', 32),
+                run_id: "bbbbbbbbbbbb5bbb9bbbbbbbbbbbbbbb".into(),
+                failure_run_id: "cccccccccccc5ccc9ccccccccccccccc".into(),
+                failure_selector: selector("cccccccc-cccc-5ccc-9ccc-cccccccccccc", "fixture"),
                 job_id: "fixture".to_owned(),
                 request_digest: hex('c', 64),
+                failure_request_digest: hex('f', 64),
                 manifest_digest: hex('d', 64),
                 source_oid: hex('e', 40),
                 approval_id: hex('1', 32),
@@ -2254,10 +2615,12 @@ mod tests {
                 grant_digest: hex('2', 64),
                 approved_by: hex('3', 64),
                 export_subject: hex('4', 64),
+                export_generation: 6,
                 export_authorization_digest: hex('5', 64),
                 controller_generation: 1,
                 runner_generation: 1,
                 expected_log: evidence("job.log", '6', 12),
+                expected_failure_log: evidence("job.log", '5', 18),
                 expected_artifacts: vec![evidence("result.json", '7', 24)],
             },
             driver: DriverEndpoints {
@@ -2332,6 +2695,38 @@ mod tests {
         }
     }
 
+    fn failure_attempt(
+        fixture: &FixtureSpec,
+        id: char,
+        number: u32,
+        parent: Option<char>,
+        state: AttemptState,
+        conclusion: Conclusion,
+        with_evidence: bool,
+    ) -> AttemptSnapshot {
+        let mut value = attempt(fixture, id, number, parent, state, conclusion, false);
+        value.request_digest = fixture.failure_request_digest.clone();
+        if with_evidence {
+            value.evidence_set_digest = Some(hex('8', 64));
+            value.log = Some(fixture.expected_failure_log.clone());
+        }
+        value
+    }
+
+    fn failure_run(
+        fixture: &FixtureSpec,
+        state: RunState,
+        conclusion: Conclusion,
+        approval: Option<ApprovalSnapshot>,
+        selected: Option<char>,
+        attempts: Vec<AttemptSnapshot>,
+    ) -> RunSnapshot {
+        let mut value = run(fixture, state, conclusion, approval, selected, attempts);
+        value.run_id = fixture.failure_run_id.clone();
+        value.request_digest = fixture.failure_request_digest.clone();
+        value
+    }
+
     fn snapshot(
         capacity: u32,
         active: u32,
@@ -2389,29 +2784,47 @@ mod tests {
             Conclusion::Success,
             true,
         );
-        let second_running = attempt(
+        let failed_running = failure_attempt(
             fixture,
-            'a',
-            2,
-            Some('9'),
+            'b',
+            1,
+            None,
             AttemptState::Running,
             Conclusion::None,
             false,
         );
-        let second_cancelled = attempt(
+        let failed_terminal = failure_attempt(
+            fixture,
+            'b',
+            1,
+            None,
+            AttemptState::Terminal,
+            Conclusion::Failure,
+            true,
+        );
+        let second_running = failure_attempt(
             fixture,
             'a',
             2,
-            Some('9'),
+            Some('b'),
+            AttemptState::Running,
+            Conclusion::None,
+            false,
+        );
+        let second_cancelled = failure_attempt(
+            fixture,
+            'a',
+            2,
+            Some('b'),
             AttemptState::Terminal,
             Conclusion::Cancelled,
             false,
         );
-        let second_tombstoned = attempt(
+        let second_tombstoned = failure_attempt(
             fixture,
             'a',
             2,
-            Some('9'),
+            Some('b'),
             AttemptState::Tombstoned,
             Conclusion::Cancelled,
             false,
@@ -2448,33 +2861,58 @@ mod tests {
             Some('9'),
             vec![first_terminal.clone()],
         );
-        let rerun = run(
+        let failure_submitted = failure_run(
+            fixture,
+            RunState::GrantedAwaitingResume,
+            Conclusion::None,
+            Some(approval(fixture, false)),
+            None,
+            Vec::new(),
+        );
+        let failure_running = failure_run(
             fixture,
             RunState::Running,
             Conclusion::None,
             Some(approval(fixture, true)),
             None,
-            vec![first_terminal.clone(), second_running],
+            vec![failed_running],
         );
-        let cancelled = run(
+        let failure_terminal = failure_run(
+            fixture,
+            RunState::Terminal,
+            Conclusion::Failure,
+            Some(approval(fixture, true)),
+            Some('b'),
+            vec![failed_terminal.clone()],
+        );
+        let rerun = failure_run(
+            fixture,
+            RunState::Running,
+            Conclusion::None,
+            Some(approval(fixture, true)),
+            None,
+            vec![failed_terminal.clone(), second_running],
+        );
+        let cancelled = failure_run(
             fixture,
             RunState::Terminal,
             Conclusion::Cancelled,
             Some(approval(fixture, true)),
             Some('a'),
-            vec![first_terminal.clone(), second_cancelled],
+            vec![failed_terminal.clone(), second_cancelled],
         );
-        let folded = run(
+        let folded = failure_run(
             fixture,
             RunState::Terminal,
-            Conclusion::Success,
+            Conclusion::Failure,
             Some(approval(fixture, true)),
-            Some('9'),
-            vec![first_terminal, second_tombstoned],
+            Some('b'),
+            vec![failed_terminal, second_tombstoned],
         );
         let export = ExportSnapshot {
             authenticated: true,
             subject: fixture.export_subject.clone(),
+            generation: fixture.export_generation,
             authorization_digest: fixture.export_authorization_digest.clone(),
             attempt_id: hex('9', 32),
             request_digest: fixture.request_digest.clone(),
@@ -2528,33 +2966,56 @@ mod tests {
                 snapshot(1, 0, 1, 1, Some(terminal_one)),
                 Some(export),
             ),
-            response(8, Operation::Rerun, snapshot(1, 1, 1, 1, Some(rerun)), None),
+            response(
+                8,
+                Operation::SubmitFailureManifest,
+                snapshot(1, 0, 1, 1, Some(failure_submitted)),
+                None,
+            ),
             response(
                 9,
+                Operation::ResumeFailure,
+                snapshot(1, 1, 1, 1, Some(failure_running)),
+                None,
+            ),
+            response(
+                10,
+                Operation::AwaitFailureTerminal,
+                snapshot(1, 0, 1, 1, Some(failure_terminal)),
+                None,
+            ),
+            response(
+                11,
+                Operation::Rerun,
+                snapshot(1, 1, 1, 1, Some(rerun)),
+                None,
+            ),
+            response(
+                12,
                 Operation::CancelRerun,
                 snapshot(1, 0, 1, 1, Some(cancelled)),
                 None,
             ),
             response(
-                10,
+                13,
                 Operation::TombstoneRerun,
                 snapshot(1, 0, 1, 1, Some(folded.clone())),
                 None,
             ),
             response(
-                11,
+                14,
                 Operation::RestartController,
                 snapshot(1, 0, 2, 1, Some(folded.clone())),
                 None,
             ),
             response(
-                12,
+                15,
                 Operation::RestartRunner,
                 snapshot(1, 0, 2, 2, Some(folded.clone())),
                 None,
             ),
             response(
-                13,
+                16,
                 Operation::SetCapacityZero,
                 snapshot(0, 0, 2, 2, Some(folded)),
                 None,
@@ -2572,16 +3033,16 @@ mod tests {
         };
         let receipt = run_acceptance(&scenario, &mut driver);
         assert_eq!(receipt.outcome, Outcome::Pass);
-        assert_eq!(receipt.checks.len(), 13);
+        assert_eq!(receipt.checks.len(), 16);
         assert!(receipt.failure.is_none());
         validate_receipt(&receipt).unwrap();
-        assert_eq!(driver.index, 13);
+        assert_eq!(driver.index, 16);
     }
 
     #[test]
     fn every_error_after_capacity_one_compensates_and_proves_zero() {
         let scenario = scenario();
-        for sequence in 2..=13 {
+        for sequence in 2..=16 {
             let mut driver = FaultDriver {
                 responses: passing_responses(&scenario),
                 fail_sequence: sequence,
@@ -2595,9 +3056,9 @@ mod tests {
             let request = &driver.zero_requests[0];
             assert_eq!(
                 request.expected_controller_generation.is_none(),
-                sequence == 11
+                sequence == 14
             );
-            assert_eq!(request.expected_runner_generation.is_none(), sequence == 12);
+            assert_eq!(request.expected_runner_generation.is_none(), sequence == 15);
             assert_eq!(driver.zero_requests.len(), 1, "sequence {sequence}");
         }
     }
@@ -2690,11 +3151,26 @@ mod tests {
     }
 
     #[test]
+    fn wrong_export_generation_fails_closed_before_rerun() {
+        let scenario = scenario();
+        let mut responses = passing_responses(&scenario);
+        responses[6].export.as_mut().unwrap().generation += 1;
+        let mut driver = ScriptedDriver {
+            responses,
+            index: 0,
+        };
+        let receipt = run_acceptance(&scenario, &mut driver);
+        assert_eq!(receipt.outcome, Outcome::Fail);
+        assert_eq!(receipt.failure.unwrap().stage, Stage::AuthenticatedExport);
+        assert_eq!(driver.index, 7);
+    }
+
+    #[test]
     fn reused_attempt_id_fails_closed() {
         let scenario = scenario();
         let mut responses = passing_responses(&scenario);
-        let run = responses[7].snapshot.run.as_mut().unwrap();
-        run.attempts[1].attempt_id = hex('9', 32);
+        let run = responses[10].snapshot.run.as_mut().unwrap();
+        run.attempts[1].attempt_id = hex('b', 32);
         let mut driver = ScriptedDriver {
             responses,
             index: 0,
@@ -2702,14 +3178,14 @@ mod tests {
         let receipt = run_acceptance(&scenario, &mut driver);
         assert_eq!(receipt.outcome, Outcome::Fail);
         assert_eq!(receipt.failure.unwrap().stage, Stage::RerunSeparation);
-        assert_eq!(driver.index, 8);
+        assert_eq!(driver.index, 11);
     }
 
     #[test]
     fn restart_state_loss_fails_closed() {
         let scenario = scenario();
         let mut responses = passing_responses(&scenario);
-        responses[10].snapshot.run.as_mut().unwrap().attempts.pop();
+        responses[13].snapshot.run.as_mut().unwrap().attempts.pop();
         let mut driver = ScriptedDriver {
             responses,
             index: 0,
@@ -2720,7 +3196,39 @@ mod tests {
             receipt.failure.unwrap().stage,
             Stage::ControllerRestartRecovery
         );
-        assert_eq!(driver.index, 11);
+        assert_eq!(driver.index, 14);
+    }
+
+    #[test]
+    fn runner_restart_corruption_fails_closed() {
+        let scenario = scenario();
+        for fault in [
+            "runner generation",
+            "controller generation",
+            "persistent state",
+        ] {
+            let mut responses = passing_responses(&scenario);
+            match fault {
+                "runner generation" => responses[14].snapshot.runner_generation = 1,
+                "controller generation" => responses[14].snapshot.controller_generation = 1,
+                "persistent state" => {
+                    responses[14].snapshot.run.as_mut().unwrap().attempts.pop();
+                }
+                _ => unreachable!(),
+            }
+            let mut driver = ScriptedDriver {
+                responses,
+                index: 0,
+            };
+            let receipt = run_acceptance(&scenario, &mut driver);
+            assert_eq!(receipt.outcome, Outcome::Fail, "{fault}");
+            assert_eq!(
+                receipt.failure.unwrap().stage,
+                Stage::RunnerRestartRecovery,
+                "{fault}"
+            );
+            assert_eq!(driver.index, 15, "{fault}");
+        }
     }
 
     #[test]
@@ -2731,5 +3239,31 @@ mod tests {
             validate_scenario(&scenario),
             Err(ScenarioError::InvalidField("driver endpoint"))
         ));
+    }
+
+    #[test]
+    fn scenario_rejects_export_generation_and_extra_artifact_drift() {
+        let mut invalid_generation = scenario();
+        invalid_generation.fixture.export_generation = 0;
+        assert!(matches!(
+            validate_scenario(&invalid_generation),
+            Err(ScenarioError::InvalidField("fixture.export_generation"))
+        ));
+
+        let mut extra_artifact = scenario();
+        extra_artifact
+            .fixture
+            .expected_artifacts
+            .push(evidence("extra.json", '8', 1));
+        assert!(matches!(
+            validate_scenario(&extra_artifact),
+            Err(ScenarioError::InvalidField("fixture.expected_artifacts"))
+        ));
+
+        for job_id in [".bad", "1bad", "bad.name"] {
+            let mut invalid_job = scenario();
+            invalid_job.fixture.job_id = job_id.to_owned();
+            assert!(validate_scenario(&invalid_job).is_err());
+        }
     }
 }

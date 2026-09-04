@@ -245,6 +245,7 @@ class BootstrapCompositionTests(unittest.TestCase):
             item for item in draft["entries"] if item["role"] == "controld_config"
         )
         controld_active = json.loads(fixture.assets[controld_entry["active_source"]][0])
+        public = self._public_binding(draft["acceptance_template"]["actor"])
         draft["acceptance_template"] = ACTIVATION_PACKAGE.production_acceptance_template(
             actor_public_key=draft["acceptance_template"]["actor"]["public_key"],
             actor_generation=1,
@@ -257,6 +258,9 @@ class BootstrapCompositionTests(unittest.TestCase):
             repository_owner_public_key=ACTIVATION_SCAFFOLD.TEST_REPOSITORY_OWNER,
             repository_id=ACTIVATION_SCAFFOLD.TEST_REPOSITORY_ID,
             source_clone_url=ACTIVATION_SCAFFOLD.TEST_SOURCE_CLONE_URL,
+            relay_http_origin=public["relay_http_origin"],
+            export_subject=public["keyholder_public_spec"]["selectors"]["nip98"]["public_key"],
+            export_generation=public["keyholder_public_spec"]["selectors"]["nip98"]["generation"],
             time_reference=draft["acceptance_template"]["time_reference"],
         )
 
@@ -498,6 +502,9 @@ class BootstrapCompositionTests(unittest.TestCase):
                 repository_owner_public_key=ACTIVATION_SCAFFOLD.TEST_REPOSITORY_OWNER,
                 repository_id=ACTIVATION_SCAFFOLD.TEST_REPOSITORY_ID,
                 source_clone_url=ACTIVATION_SCAFFOLD.TEST_SOURCE_CLONE_URL,
+                relay_http_origin=public["relay_http_origin"],
+                export_subject=public["keyholder_public_spec"]["selectors"]["nip98"]["public_key"],
+                export_generation=public["keyholder_public_spec"]["selectors"]["nip98"]["generation"],
                 time_reference=draft["acceptance_template"]["time_reference"],
             )
             self.assertEqual(
@@ -715,6 +722,16 @@ class BootstrapCompositionTests(unittest.TestCase):
             scenario["fixture"]["approved_by"] = (
                 activation_manifest["acceptance_template"]["actor"]["public_key"]
             )
+            scenario["fixture"].update({
+                "run_id": RENDER.activation_run_id(activation_manifest),
+                "failure_run_id": RENDER.activation_failure_run_id(activation_manifest),
+                "failure_selector": RENDER.activation_failure_selector(activation_manifest),
+                "failure_request_digest": RENDER.activation_failure_request_digest(activation_manifest),
+                "manifest_digest": RENDER.activation_fixture_manifest_sha256(activation_manifest),
+                "export_subject": RENDER.activation_export_subject(activation_manifest),
+                "export_generation": RENDER.activation_export_generation(activation_manifest),
+                "export_authorization_digest": RENDER.activation_export_authorization_digest(activation_manifest),
+            })
             scenario_descriptor = self._write_descriptor(ceremony, "scenario-descriptor.json", {
                 "schema_version": "buzz-ci-capacity-one-scenario-render-input/v1",
                 "candidate_sha": candidate,
@@ -766,6 +783,9 @@ class BootstrapCompositionTests(unittest.TestCase):
                 repository_owner_public_key=ACTIVATION_SCAFFOLD.TEST_REPOSITORY_OWNER,
                 repository_id=ACTIVATION_SCAFFOLD.TEST_REPOSITORY_ID + "-prior",
                 source_clone_url=ACTIVATION_SCAFFOLD.TEST_SOURCE_CLONE_URL,
+                relay_http_origin=public["relay_http_origin"],
+                export_subject=public["keyholder_public_spec"]["selectors"]["nip98"]["public_key"],
+                export_generation=public["keyholder_public_spec"]["selectors"]["nip98"]["generation"],
                 time_reference=draft["acceptance_template"]["time_reference"],
             )
             prior_root = ceremony / "prior"
@@ -797,6 +817,14 @@ class BootstrapCompositionTests(unittest.TestCase):
             prior_scenario["fixture"].update({
                 "activation_id": prior_activation_manifest["activation_id"],
                 "activation_package_digest": prior_activation_manifest["package_digest"],
+                "run_id": RENDER.activation_run_id(prior_activation_manifest),
+                "failure_run_id": RENDER.activation_failure_run_id(prior_activation_manifest),
+                "failure_selector": RENDER.activation_failure_selector(prior_activation_manifest),
+                "failure_request_digest": RENDER.activation_failure_request_digest(prior_activation_manifest),
+                "manifest_digest": RENDER.activation_fixture_manifest_sha256(prior_activation_manifest),
+                "export_subject": RENDER.activation_export_subject(prior_activation_manifest),
+                "export_generation": RENDER.activation_export_generation(prior_activation_manifest),
+                "export_authorization_digest": RENDER.activation_export_authorization_digest(prior_activation_manifest),
                 "request_digest": ACTIVATION_PACKAGE.digest(
                     json.dumps(
                         prior_activation_manifest["acceptance_template"]["run_event"],

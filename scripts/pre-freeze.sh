@@ -8,7 +8,7 @@ set -u -o pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 RECEIPT_PATH="$REPO_ROOT/pre-freeze-receipt.json"
-RECORDS_FILE="$(mktemp "${TMPDIR:-/tmp}/buzz-pre-freeze-records.XXXXXX")"
+RECORDS_FILE=""
 DIFF_PATHS_FILE=""
 
 HEAD_SHA=""
@@ -146,8 +146,6 @@ finish() {
     exit "$process_status"
 }
 
-trap finish EXIT
-
 usage() {
     cat <<'USAGE'
 Usage: scripts/pre-freeze.sh [--base <ref>] [--full] [--test]
@@ -162,7 +160,7 @@ USAGE
 while (($# > 0)); do
     case "$1" in
         --base)
-            if (($# < 2)); then
+            if (($# < 2)) || [[ -z "$2" || "$2" == -* ]]; then
                 printf '%s\n' '--base requires a ref' >&2
                 exit 2
             fi
@@ -188,6 +186,12 @@ while (($# > 0)); do
             ;;
     esac
 done
+
+if ! RECORDS_FILE="$(mktemp "${TMPDIR:-/tmp}/buzz-pre-freeze-records.XXXXXX")"; then
+    printf '%s\n' 'could not create pre-freeze records file' >&2
+    exit 1
+fi
+trap finish EXIT
 
 cd -- "$REPO_ROOT" || exit 1
 export PATH="$REPO_ROOT/bin:$PATH"

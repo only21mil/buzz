@@ -173,6 +173,7 @@ pub(super) async fn cmd_logs(
     let selected = ev::select_log(
         &request_event_id,
         &request,
+        &accepted,
         &statuses,
         &log_events,
         client.relay_url(),

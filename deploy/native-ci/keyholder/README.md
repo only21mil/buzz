@@ -57,7 +57,7 @@ domains onto one credential.
 A NIP-98 request names its `signer`. The relay stores a `POST /events` only
 when the event `pubkey` equals the token pubkey, so a publish token is signed
 by the key that signed the event: signer `ci_event` for kinds 46101 to 46106
-(the `ci-event.key` selector) and signer `acceptance_actor` for the four frozen
+(the `ci-event.key` selector) and signer `acceptance_actor` for the five frozen
 acceptance events (the `acceptance-actor.key` credential, only when the
 activation binding is loaded and at the actor's generation). Both are accepted
 for `POST {origin}/events` with a payload digest. Signer `ci_event` is also
@@ -66,14 +66,41 @@ the request carries the literal filter body (at most 512 bytes), the keyholder
 derives the payload digest from those bytes itself, and the bytes must be
 exactly `[{"ids":[<id>],"authors":[<ci-event key>],"kinds":[<kind>],"limit":1}]`
 with one 64-character lowercase hex id, the keyholder's own ci-event public key
-as the only author, one CI kind in 46100 to 46107, and limit 1. After the relay
-refuses a publish, controld reads back the exact event it signed with that
-filter before it re-signs; any other filter, and a filter on any other route,
-is denied. Signer `nip98` (the `nip98.key` selector) is
-accepted only for the accepted read and the evidence `PUT` routes, where the
-relay authorizes the caller as a CI signer rather than as the event author. A
-`POST /events` or `POST /query` request with signer `nip98` is denied, and the
-acceptance actor never queries.
+as the only author, one CI kind in 46100 to 46107, and limit 1. Controld uses
+this exact query both to recover a refused publication and to read back the
+signed evidence-reference and final-fact events required by acceptance stage
+7. A response must contain exactly the requested event, whose signature, id,
+author, and kind are checked before use. Any other filter, and a filter on any
+other route, is denied.
+
+Signer `nip98` (the `nip98.key` selector) is accepted for the accepted read,
+the evidence `PUT` routes, and full-body `GET` of exactly two
+signed-reference paths at the configured HTTPS origin:
+
+```text
+/ci/logs/{request-id}/{run-id}/{job-id}/{attempt}/{sha256}
+/ci/artifacts/{request-id}/{run-id}/{job-id}/{attempt}/{artifact-id}/{sha256}
+```
+
+Those braces describe the grammar, not caller-selectable fields. At startup the
+keyholder reconstructs the sole log path and sole artifact path from the public
+acceptance receipt's Run A request digest, run ID, job ID, expected log and
+artifact hashes, fixed attempt `1`, and fixed artifact ID `result`. The receipt
+contains no evidence URL or path-list field. Even a third path that satisfies
+the grammar is denied because it is absent from that two-entry derived set.
+
+`request-id` and `sha256` are 64-character lowercase hex; `run-id` is a
+canonical lowercase hyphenated UUID; `job-id` matches
+`[A-Za-z_][A-Za-z0-9_-]{0,63}`; `attempt` is canonical positive decimal `u32`;
+and `artifact-id` is 1 to 128 ASCII alphanumeric, dot, underscore, or hyphen
+characters other than `.` or `..`. The URL must reproduce the configured
+origin and canonical path byte-for-byte and contain no credentials, query,
+fragment, or percent encoding. These reads carry no payload. `HEAD`, range or
+generic `GET`, redirects, and object-store credentials are outside the
+acceptance adapter: keyholder signs no `HEAD` or generic path, and the adapter
+sends no `Range` header and follows no redirect. A `POST /events` or
+`POST /query` request with signer `nip98` is denied, and the acceptance actor
+never queries.
 
 The config never contains an activation package digest, scenario digest,
 acceptance actor identity, or event template. After the activation package and
@@ -92,14 +119,35 @@ validate the same bytes. The receipt has this declaration-order shape:
   "acceptance_peer_uid": 961,
   "acceptance_peer_gid": 961,
   "timeout_millis": 1000,
-  "fixture": { "...": "capacity-one fixture" },
+  "fixture": {
+    "...": "capacity-one fixture",
+    "export_subject": "6666666666666666666666666666666666666666666666666666666666666666",
+    "export_generation": 1,
+    "export_authorization_digest": "7777777777777777777777777777777777777777777777777777777777777777",
+    "expected_log": {
+      "name": "job.log",
+      "sha256": "64 lowercase hex",
+      "bytes": 131
+    },
+    "expected_artifacts": [
+      {
+        "name": "result.json",
+        "sha256": "64 lowercase hex",
+        "bytes": 107
+      }
+    ]
+  },
   "acceptance": {
     "actor": { "public_key": "64 lowercase hex", "generation": 1 },
     "scenario_sha256": "same 64 lowercase hex",
     "run_event": [0, "actor public key", 0, 46100, [], "canonical content"],
     "grant_event": [0, "actor public key", 0, 46107, [], "canonical content"],
     "rerun_event": [0, "actor public key", 0, 46100, [], "canonical content"],
-    "tombstone_event": [0, "actor public key", 0, 5, [], ""]
+    "tombstone_event": [0, "actor public key", 0, 5, [], ""],
+    "failure_run_event": [0, "actor public key", 0, 46100, [], "canonical content"],
+    "export_subject": "6666666666666666666666666666666666666666666666666666666666666666",
+    "export_generation": 1,
+    "export_authorization_digest": "7777777777777777777777777777777777777777777777777777777777777777"
   }
 }
 ```
@@ -108,9 +156,33 @@ The receipt is root:root mode `0444`, a regular one-link file, with a root:root
 mode `0711` immediate parent. It has no whitespace or trailing newline. The
 daemon rejects missing, linked, replaced, noncanonical, loose-mode, or
 semantically drifted receipts on every start. It verifies the fixture package,
-candidate, scenario, peer, actor generation, grant identity, and all four event
-templates before constructing the existing closed operations 5 and 6 policy.
-The actor credential must be distinct from every existing selector.
+candidate, scenario, peer, actor generation, grant identity, and all five event
+templates. The fixture and nested acceptance copies of `export_subject`,
+`export_generation`, and `export_authorization_digest` must be equal. The
+subject and generation must also equal the loaded nip98 selector. The digest
+must equal the deterministic transcript over the ordered Run A attempt 1
+`job.log` and `result` artifact `GET` bindings reconstructed from the receipt;
+no token or volatile proof field enters it. The daemon requires exactly the
+declared `job.log` and `result.json` objects before deriving that two-path
+allowlist. The actor credential must be distinct from every existing selector.
+
+The keyholder wire codec is strict protocol v2. Its `describe_acceptance`
+response carries event IDs in Run, Grant, Rerun, Tombstone, FailureRun semantic
+order; the fifth ID is required tag 8. Calls publish those frozen events in Run,
+Grant, FailureRun, Rerun, Tombstone order because the distinct failed run must
+exist before its rerun. Protocol v1 had only the first four IDs. A v1 peer
+accepted only tags 1 through 7, so the required tag 8 could not be added under
+the old version. V1 and v2 peers now reject each other's frame headers.
+Keyholder and controld must come from the same frozen candidate. Activation
+stages and restarts those package versions together. Wire v2 does not by itself
+make two policy revisions deployment-compatible: an older v2 keyholder rejects
+the evidence `GET` authority required by a newer controld, which must then fail
+closed, while a newer keyholder with an older controld leaves the added
+authority unused. Either mixed package is unsupported. A wire-protocol mismatch
+fails closed before controld completes initialization, serves, or accepts any
+acceptance operation; systemd may already have opened its sockets. A same-v2
+policy mismatch is detected when the exact evidence `GET` authorization is
+denied and fails stage 7 without an export or passing qualification.
 
 ## Credentials
 

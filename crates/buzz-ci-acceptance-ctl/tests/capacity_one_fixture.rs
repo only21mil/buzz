@@ -43,6 +43,9 @@ fn checked_in_scenario_and_fixture_bytes_match() {
         Stage::GrantResume,
         Stage::FirstAttemptTerminal,
         Stage::AuthenticatedExport,
+        Stage::FailedManifestIdentity,
+        Stage::FailedAttemptRunning,
+        Stage::FailedAttemptTerminal,
         Stage::RerunSeparation,
         Stage::CancellationTerminal,
         Stage::TombstoneFolding,
@@ -62,6 +65,7 @@ fn checked_in_scenario_and_fixture_bytes_match() {
     fs::create_dir_all(&output_dir).unwrap();
     let output = Command::new(acceptance.join("fixtures/run-fixture.sh"))
         .arg(&output_dir)
+        .env("BUZZ_CI_FIXTURE_OUTCOME", "success")
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -71,6 +75,22 @@ fn checked_in_scenario_and_fixture_bytes_match() {
         scenario.fixture.expected_log.bytes
     );
     assert_eq!(sha256(&output.stdout), scenario.fixture.expected_log.sha256);
+
+    let failed = Command::new(acceptance.join("fixtures/run-fixture.sh"))
+        .arg(&output_dir)
+        .env("BUZZ_CI_FIXTURE_OUTCOME", "deterministic-failure")
+        .output()
+        .unwrap();
+    assert!(!failed.status.success());
+    assert!(failed.stderr.is_empty());
+    assert_eq!(
+        failed.stdout.len() as u64,
+        scenario.fixture.expected_failure_log.bytes
+    );
+    assert_eq!(
+        sha256(&failed.stdout),
+        scenario.fixture.expected_failure_log.sha256
+    );
 
     let artifact = fs::read(output_dir.join("result.json")).unwrap();
     let expected = &scenario.fixture.expected_artifacts[0];

@@ -11,8 +11,9 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::production::{
-    AttemptExecutor, CiSigner, ControlStore, EvidenceReader, PollStep, ProductionError,
-    ProductionHandler, RelayControl, RunnerAttemptExecutor, RunnerAttemptPreparer,
+    AcceptedRequestBinding, AttemptExecutor, AuthenticatedEvidenceExport, CiSigner, ControlStore,
+    EvidenceReader, PollStep, ProductionError, ProductionHandler, RelayControl,
+    RunnerAttemptExecutor, RunnerAttemptPreparer,
 };
 use crate::runner_client::{RunnerClient, RunnerConnector};
 
@@ -352,11 +353,32 @@ where
     /// terminal for this process, so a host cannot spin or admit later work on
     /// uncertain infrastructure state.
     pub fn poll_once(&mut self) -> Result<PollOutcome, ControllerError> {
+        self.poll_once_with_binding(None)
+    }
+
+    /// Poll only the exact frozen request selected by an acceptance stage.
+    pub fn poll_once_bound(
+        &mut self,
+        expected: &AcceptedRequestBinding,
+    ) -> Result<PollOutcome, ControllerError> {
+        self.poll_once_with_binding(Some(expected))
+    }
+
+    fn poll_once_with_binding(
+        &mut self,
+        expected: Option<&AcceptedRequestBinding>,
+    ) -> Result<PollOutcome, ControllerError> {
         if let Some(reason) = self.status.terminal_reason() {
             return Err(ControllerError::Terminal(reason));
         }
         self.status = CapacityOneStatus::polling();
-        match self.handler.poll_once(self.config.channel_id()) {
+        let result = match expected {
+            Some(binding) => self
+                .handler
+                .poll_once_bound(self.config.channel_id(), binding),
+            None => self.handler.poll_once(self.config.channel_id()),
+        };
+        match result {
             Ok(step) => {
                 self.status = CapacityOneStatus::ready();
                 Ok(match step {
@@ -386,14 +408,61 @@ where
     /// Replay every deferred publication after the activation grant was
     /// accepted by the relay. Any error is terminal exactly like a poll error.
     pub fn replay_deferred_publications(&mut self) -> Result<usize, ControllerError> {
+        self.replay_deferred_publications_with_binding(None)
+    }
+
+    /// Replay deferred acceptance publications only behind the exact frozen
+    /// request selected by the current acceptance stage.
+    pub fn replay_deferred_publications_bound(
+        &mut self,
+        expected: &AcceptedRequestBinding,
+    ) -> Result<usize, ControllerError> {
+        self.replay_deferred_publications_with_binding(Some(expected))
+    }
+
+    pub fn export_first_evidence(
+        &mut self,
+        expected: &AcceptedRequestBinding,
+        job_id: &str,
+        attempt: u32,
+    ) -> Result<AuthenticatedEvidenceExport, ControllerError> {
         if let Some(reason) = self.status.terminal_reason() {
             return Err(ControllerError::Terminal(reason));
         }
         self.status = CapacityOneStatus::polling();
         match self
             .handler
-            .replay_deferred_publications(self.config.channel_id())
+            .export_first_evidence(expected, job_id, attempt)
         {
+            Ok(export) => {
+                self.status = CapacityOneStatus::ready();
+                Ok(export)
+            }
+            Err(error) => {
+                let reason = TerminalInfrastructureReason::from(&error);
+                self.status = CapacityOneStatus::ready();
+                Err(ControllerError::Infrastructure(reason))
+            }
+        }
+    }
+
+    fn replay_deferred_publications_with_binding(
+        &mut self,
+        expected: Option<&AcceptedRequestBinding>,
+    ) -> Result<usize, ControllerError> {
+        if let Some(reason) = self.status.terminal_reason() {
+            return Err(ControllerError::Terminal(reason));
+        }
+        self.status = CapacityOneStatus::polling();
+        let result = match expected {
+            Some(binding) => self
+                .handler
+                .replay_deferred_publications_bound(self.config.channel_id(), binding),
+            None => self
+                .handler
+                .replay_deferred_publications(self.config.channel_id()),
+        };
+        match result {
             Ok(replayed) => {
                 self.status = CapacityOneStatus::ready();
                 Ok(replayed)

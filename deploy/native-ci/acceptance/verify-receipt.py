@@ -6,8 +6,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +21,8 @@ ZERO_TRANSITION_VERSION = "buzz-ci-capacity-one-zero-transition/v1"
 ZERO_PROOF_VERSION = "buzz-ci-capacity-one-zero-proof/v1"
 EXPECTED_STAGES_PATH = Path("/usr/libexec/buzz-ci-acceptance-expected-stages.json")
 EXPECTED_STAGES_MODE = 0o644
-EXPECTED_STAGES_SHA256 = "c8addbb42bace522e99fc8fe00603c9245db61ac8a599ef5762c2744267189cd"
-EXPECTED_STAGES_CANONICAL_SHA256 = "24e57234328b8d994c90ba3f47e42f7b29ca580c7a3ab036a981839c1537ba68"
+EXPECTED_STAGES_SHA256 = "5129005b9fcbf56c1f67aeed7bd02bd2356626b6819120032b28ae4824371178"
+EXPECTED_STAGES_CANONICAL_SHA256 = "9a02a936620acb6fea03d9d71141d6b7f9b2d625ad0e194534a84149c705eae6"
 EXPECTED_STAGES = (
     "capacity_zero_closed",
     "capacity_one_open",
@@ -29,6 +31,9 @@ EXPECTED_STAGES = (
     "grant_resume",
     "first_attempt_terminal",
     "authenticated_export",
+    "failed_manifest_identity",
+    "failed_attempt_running",
+    "failed_attempt_terminal",
     "rerun_separation",
     "cancellation_terminal",
     "tombstone_folding",
@@ -44,6 +49,9 @@ OPERATIONS = [
     "resume_grant",
     "await_first_terminal",
     "export_first_evidence",
+    "submit_failure_manifest",
+    "resume_failure",
+    "await_failure_terminal",
     "rerun",
     "cancel_rerun",
     "tombstone_rerun",
@@ -299,7 +307,7 @@ def _ordered_snapshot(value: Any) -> dict[str, Any]:
 
 def _ordered_export(value: Any) -> dict[str, Any]:
     required = [
-        "authenticated", "subject", "authorization_digest", "attempt_id",
+        "authenticated", "subject", "generation", "authorization_digest", "attempt_id",
         "request_digest", "manifest_digest", "evidence_set_digest", "objects",
     ]
     value = _exact(value, required)
@@ -308,6 +316,7 @@ def _ordered_export(value: Any) -> dict[str, Any]:
     return {
         "authenticated": True,
         "subject": _hex(value["subject"], (64,)),
+        "generation": _integer(value["generation"], 1, 9_007_199_254_740_991),
         "authorization_digest": _hex(value["authorization_digest"], (64,)),
         "attempt_id": _hex(value["attempt_id"], (32,)),
         "request_digest": _hex(value["request_digest"], (64,)),
@@ -322,21 +331,56 @@ def _ordered_scenario(value: Any) -> dict[str, Any]:
     _require(value["schema_version"] == "buzz-ci-capacity-one-scenario/v2", "scenario version rejected")
     fixture_fields = [
         "integrated_candidate_sha", "activation_id", "activation_package_digest", "run_id",
-        "job_id", "request_digest", "manifest_digest", "source_oid", "approval_id",
+        "failure_run_id", "failure_selector", "job_id", "request_digest", "failure_request_digest", "manifest_digest", "source_oid", "approval_id",
         "grant_event_id", "grant_digest", "approved_by", "export_subject",
-        "export_authorization_digest", "controller_generation", "runner_generation",
-        "expected_log", "expected_artifacts",
+        "export_generation", "export_authorization_digest", "controller_generation", "runner_generation",
+        "expected_log", "expected_failure_log", "expected_artifacts",
     ]
     fixture = _exact(value["fixture"], fixture_fields)
     _hex(fixture["integrated_candidate_sha"], (40, 64))
     _require(isinstance(fixture["activation_id"], str) and 0 < len(fixture["activation_id"]) <= 128, "activation ID rejected")
-    for name in ["activation_package_digest", "request_digest", "manifest_digest", "grant_event_id", "grant_digest", "approved_by", "export_subject", "export_authorization_digest"]:
+    for name in ["activation_package_digest", "request_digest", "failure_request_digest", "manifest_digest", "grant_event_id", "grant_digest", "approved_by", "export_subject", "export_authorization_digest"]:
         _hex(fixture[name], (64,))
-    _hex(fixture["run_id"], (32,)); _hex(fixture["approval_id"], (32,)); _hex(fixture["source_oid"], (40, 64))
-    _require(isinstance(fixture["job_id"], str) and 0 < len(fixture["job_id"]) <= 64, "job ID rejected")
+    _integer(fixture["export_generation"], 1, 9_007_199_254_740_991)
+    _hex(fixture["run_id"], (32,)); _hex(fixture["failure_run_id"], (32,)); _hex(fixture["approval_id"], (32,)); _hex(fixture["source_oid"], (40, 64))
+    _require(fixture["run_id"] != fixture["failure_run_id"], "run identities must be distinct")
+    _require(fixture["request_digest"] != fixture["failure_request_digest"], "request identities must be distinct")
+    _require(
+        isinstance(fixture["job_id"], str)
+        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", fixture["job_id"]) is not None,
+        "job ID rejected",
+    )
+    selector = _exact(
+        fixture["failure_selector"],
+        ["schema_version", "selector", "job_id", "run_id", "attempt", "sha256"],
+    )
+    _require(
+        selector["schema_version"] == "buzz-ci-capacity-one-fixture-selector/v1"
+        and selector["selector"] == "deterministic-failure"
+        and selector["job_id"] == fixture["job_id"]
+        and selector["attempt"] == 1,
+        "failure selector rejected",
+    )
+    try:
+        selector_run_id = str(uuid.UUID(selector["run_id"]))
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ReceiptError("failure selector run ID rejected") from error
+    _require(selector_run_id == selector["run_id"], "failure selector run ID rejected")
+    selector_lines = (
+        "buzz-ci:capacity-one:fixture-selector:v1",
+        selector["schema_version"], selector["selector"], selector["job_id"],
+        uuid.UUID(selector_run_id).hex, str(selector["attempt"]),
+    )
+    selector_sha256 = hashlib.sha256(("\n".join(selector_lines) + "\n").encode("ascii")).hexdigest()
+    _require(
+        selector["sha256"] == selector_sha256
+        and uuid.UUID(selector_run_id).hex == fixture["failure_run_id"],
+        "failure selector binding rejected",
+    )
     _integer(fixture["controller_generation"], 1); _integer(fixture["runner_generation"], 1)
     _ordered_evidence(fixture["expected_log"])
-    _require(isinstance(fixture["expected_artifacts"], list) and 0 < len(fixture["expected_artifacts"]) <= 64, "expected artifacts rejected")
+    _ordered_evidence(fixture["expected_failure_log"])
+    _require(isinstance(fixture["expected_artifacts"], list) and len(fixture["expected_artifacts"]) == 1, "expected artifacts rejected")
     for item in fixture["expected_artifacts"]:
         _ordered_evidence(item)
     driver_fields = ["control", "observe", "export", "controller_process", "runner_process", "timeout_seconds"]
@@ -347,7 +391,12 @@ def _ordered_scenario(value: Any) -> dict[str, Any]:
         _require(endpoint.get("args", []) == [], "driver arguments rejected")
     _integer(driver["timeout_seconds"], 1, 300)
     ordered_fixture = {name: fixture[name] for name in fixture_fields}
+    ordered_fixture["failure_selector"] = {
+        name: selector[name]
+        for name in ("schema_version", "selector", "job_id", "run_id", "attempt", "sha256")
+    }
     ordered_fixture["expected_log"] = _ordered_evidence(fixture["expected_log"])
+    ordered_fixture["expected_failure_log"] = _ordered_evidence(fixture["expected_failure_log"])
     ordered_fixture["expected_artifacts"] = [_ordered_evidence(item) for item in fixture["expected_artifacts"]]
     ordered_driver: dict[str, Any] = {}
     for name in driver_fields[:-1]:
@@ -356,12 +405,16 @@ def _ordered_scenario(value: Any) -> dict[str, Any]:
     return {"schema_version": value["schema_version"], "fixture": ordered_fixture, "driver": ordered_driver}
 
 
-def _validate_run_binding(run: dict[str, Any], fixture: dict[str, Any]) -> None:
-    for name in ["run_id", "integrated_candidate_sha", "request_digest", "manifest_digest", "source_oid"]:
+def _validate_run_binding(run: dict[str, Any], fixture: dict[str, Any], failure: bool = False) -> None:
+    run_id = fixture["failure_run_id"] if failure else fixture["run_id"]
+    request_digest = fixture["failure_request_digest"] if failure else fixture["request_digest"]
+    _require(run["run_id"] == run_id and run["request_digest"] == request_digest, "run binding rejected")
+    for name in ["integrated_candidate_sha", "manifest_digest", "source_oid"]:
         _require(run[name] == fixture[name], "run binding rejected")
     ids: set[str] = set()
     for attempt in run["attempts"]:
-        for name in ["integrated_candidate_sha", "request_digest", "manifest_digest", "source_oid"]:
+        _require(attempt["request_digest"] == request_digest, "attempt binding rejected")
+        for name in ["integrated_candidate_sha", "manifest_digest", "source_oid"]:
             _require(attempt[name] == fixture[name], "attempt binding rejected")
         _require(attempt["attempt_id"] not in ids, "duplicate attempt rejected")
         ids.add(attempt["attempt_id"])
@@ -387,27 +440,39 @@ def _validate_first(attempt: dict[str, Any], fixture: dict[str, Any], terminal: 
     _hex(attempt.get("evidence_set_digest"), (64,))
 
 
+def _validate_failed_first(attempt: dict[str, Any], fixture: dict[str, Any], terminal: bool) -> None:
+    _require(attempt["attempt"] == 1 and "parent_attempt_id" not in attempt, "failed-parent lineage rejected")
+    if not terminal:
+        _require(attempt["state"] == "running" and attempt["conclusion"] == "none", "failed-parent running state rejected")
+        _require("evidence_set_digest" not in attempt and "log" not in attempt and attempt["artifacts"] == [], "premature failed-parent evidence rejected")
+        return
+    _require(attempt["state"] == "terminal" and attempt["conclusion"] == "failure", "failed-parent terminal rejected")
+    _require(attempt.get("log") == fixture["expected_failure_log"], "failed-parent log rejected")
+    _require(attempt["artifacts"] == [], "failed-parent artifacts rejected")
+    _hex(attempt.get("evidence_set_digest"), (64,))
+
+
 def _validate_snapshots(checks: list[dict[str, Any]], fixture: dict[str, Any]) -> None:
     snapshots = [check["snapshot"] for check in checks]
     for index, snapshot in enumerate(snapshots, start=1):
-        expected_capacity = 0 if index in {1, 13} else 1
+        expected_capacity = 0 if index in {1, 16} else 1
         expected_admission = "closed" if expected_capacity == 0 else "open"
         _require(snapshot["capacity"] == expected_capacity and snapshot["admission"] == expected_admission, "capacity snapshot rejected")
-        active = 1 if index in {5, 8} else 0
+        active = 1 if index in {5, 9, 11} else 0
         _require(snapshot["active_run_count"] == active and snapshot["active_attempt_count"] == active, "active count rejected")
         if index <= 2:
             _require("run" not in snapshot, "run exists before submission")
         else:
             _require("run" in snapshot, "run snapshot missing")
-            _validate_run_binding(snapshot["run"], fixture)
+            _validate_run_binding(snapshot["run"], fixture, failure=index >= 8)
     _require(snapshots[0]["controller_generation"] == fixture["controller_generation"] and snapshots[0]["runner_generation"] == fixture["runner_generation"], "initial generation rejected")
-    for index in range(1, 10):
+    for index in range(1, 13):
         _require(snapshots[index]["controller_generation"] == snapshots[index - 1]["controller_generation"] and snapshots[index]["runner_generation"] == snapshots[index - 1]["runner_generation"], "unexpected generation change")
-    _require(snapshots[10]["controller_generation"] > snapshots[9]["controller_generation"] and snapshots[10]["runner_generation"] >= snapshots[9]["runner_generation"], "controller restart generation rejected")
-    _require(snapshots[11]["runner_generation"] > snapshots[10]["runner_generation"] and snapshots[11]["controller_generation"] >= snapshots[10]["controller_generation"], "runner restart generation rejected")
-    _require((snapshots[12]["controller_generation"], snapshots[12]["runner_generation"]) == (snapshots[11]["controller_generation"], snapshots[11]["runner_generation"]), "prepare-zero generation rejected")
+    _require(snapshots[13]["controller_generation"] > snapshots[12]["controller_generation"] and snapshots[13]["runner_generation"] >= snapshots[12]["runner_generation"], "controller restart generation rejected")
+    _require(snapshots[14]["runner_generation"] > snapshots[13]["runner_generation"] and snapshots[14]["controller_generation"] >= snapshots[13]["controller_generation"], "runner restart generation rejected")
+    _require((snapshots[15]["controller_generation"], snapshots[15]["runner_generation"]) == (snapshots[14]["controller_generation"], snapshots[14]["runner_generation"]), "prepare-zero generation rejected")
 
-    run3, run4, run5, run6, run7, run8, run9, run10, run11, run12, run13 = [snapshot["run"] for snapshot in snapshots[2:]]
+    run3, run4, run5, run6, run7, run8, run9, run10, run11, run12, run13, run14, run15, run16 = [snapshot["run"] for snapshot in snapshots[2:]]
     _require(run3["state"] == "awaiting_approval" and run3["aggregate_conclusion"] == "none" and "approval" not in run3 and "selected_attempt_id" not in run3 and run3["attempts"] == [], "submission snapshot rejected")
     _validate_approval(run4, fixture, False)
     _require(run4["state"] == "granted_awaiting_resume" and run4["aggregate_conclusion"] == "none" and "selected_attempt_id" not in run4 and run4["attempts"] == [], "grant snapshot rejected")
@@ -421,26 +486,40 @@ def _validate_snapshots(checks: list[dict[str, Any]], fixture: dict[str, Any]) -
         _validate_first(run["attempts"][0], fixture, True)
         _require(run["attempts"][0]["attempt_id"] == first_id, "first attempt identity changed")
     _require(run7 == run6, "export changed durable snapshot")
-    for run in [run8, run9, run10, run11, run12, run13]:
+    _validate_approval(run8, fixture, False)
+    _require(run8["state"] == "granted_awaiting_resume" and run8["aggregate_conclusion"] == "none" and "selected_attempt_id" not in run8 and run8["attempts"] == [], "failed-parent submission rejected")
+    _validate_approval(run9, fixture, True)
+    _require(run9["state"] == "running" and run9["aggregate_conclusion"] == "none" and len(run9["attempts"]) == 1, "failed-parent running rejected")
+    failed_id = run9["attempts"][0]["attempt_id"]
+    _validate_failed_first(run9["attempts"][0], fixture, False)
+    _validate_approval(run10, fixture, True)
+    _require(run10["state"] == "terminal" and run10["aggregate_conclusion"] == "failure" and run10.get("selected_attempt_id") == failed_id and len(run10["attempts"]) == 1, "failed-parent terminal snapshot rejected")
+    _validate_failed_first(run10["attempts"][0], fixture, True)
+    _require(run10["attempts"][0]["attempt_id"] == failed_id, "failed-parent attempt identity changed")
+    for run in [run11, run12, run13, run14, run15, run16]:
         _validate_approval(run, fixture, True)
         _require(len(run["attempts"]) == 2, "rerun evidence missing")
-        _validate_first(run["attempts"][0], fixture, True)
-        _require(run["attempts"][0]["attempt_id"] == first_id, "first attempt changed")
-        _require(run["attempts"][0] == run6["attempts"][0], "first attempt evidence changed")
-    second_id = run8["attempts"][1]["attempt_id"]
-    _require(second_id != first_id and run8["attempts"][1].get("parent_attempt_id") == first_id and run8["attempts"][1]["attempt"] == 2, "rerun lineage rejected")
-    _require(run8["state"] == "running" and run8["aggregate_conclusion"] == "none" and "selected_attempt_id" not in run8 and run8["attempts"][1]["state"] == "running" and run8["attempts"][1]["conclusion"] == "none", "rerun snapshot rejected")
-    for run in [run8, run9, run10, run11, run12, run13]:
+        _validate_failed_first(run["attempts"][0], fixture, True)
+        _require(run["attempts"][0] == run10["attempts"][0], "failed-parent evidence changed")
+    second_id = run11["attempts"][1]["attempt_id"]
+    _require(second_id != failed_id and run11["attempts"][1].get("parent_attempt_id") == failed_id and run11["attempts"][1]["attempt"] == 2, "rerun lineage rejected")
+    _require(run11["state"] == "running" and run11["aggregate_conclusion"] == "none" and "selected_attempt_id" not in run11 and run11["attempts"][1]["state"] == "running" and run11["attempts"][1]["conclusion"] == "none", "rerun snapshot rejected")
+    for run in [run11, run12, run13, run14, run15, run16]:
         second = run["attempts"][1]
-        _require(second["attempt_id"] == second_id and second["attempt"] == 2 and second.get("parent_attempt_id") == first_id, "second attempt lineage changed")
+        _require(second["attempt_id"] == second_id and second["attempt"] == 2 and second.get("parent_attempt_id") == failed_id, "second attempt lineage changed")
         _require("evidence_set_digest" not in second and "log" not in second and second["artifacts"] == [], "cancelled attempt evidence rejected")
-    _require(run9["state"] == "terminal" and run9["aggregate_conclusion"] == "cancelled" and run9.get("selected_attempt_id") == second_id and run9["attempts"][1]["state"] == "terminal" and run9["attempts"][1]["conclusion"] == "cancelled", "cancellation snapshot rejected")
-    _require(run10["state"] == "terminal" and run10["aggregate_conclusion"] == "success" and run10.get("selected_attempt_id") == first_id and run10["attempts"][1]["state"] == "tombstoned" and run10["attempts"][1]["conclusion"] == "cancelled", "tombstone fold rejected")
-    _require(run11 == run10 and run12 == run10 and run13 == run10, "restart or zero prepare changed durable run")
+    _require(run12["state"] == "terminal" and run12["aggregate_conclusion"] == "cancelled" and run12.get("selected_attempt_id") == second_id and run12["attempts"][1]["state"] == "terminal" and run12["attempts"][1]["conclusion"] == "cancelled", "cancellation snapshot rejected")
+    _require(run13["state"] == "terminal" and run13["aggregate_conclusion"] == "failure" and run13.get("selected_attempt_id") == failed_id and run13["attempts"][1]["state"] == "tombstoned" and run13["attempts"][1]["conclusion"] == "cancelled", "tombstone fold rejected")
+    _require(run14 == run13 and run15 == run13 and run16 == run13, "restart or zero prepare changed durable run")
 
     export = checks[6]["export"]
     terminal = run6["attempts"][0]
-    _require(export["subject"] == fixture["export_subject"] and export["authorization_digest"] == fixture["export_authorization_digest"], "export authority rejected")
+    _require(
+        export["subject"] == fixture["export_subject"]
+        and export["generation"] == fixture["export_generation"]
+        and export["authorization_digest"] == fixture["export_authorization_digest"],
+        "export authority rejected",
+    )
     _require(export["attempt_id"] == first_id and export["request_digest"] == fixture["request_digest"] and export["manifest_digest"] == fixture["manifest_digest"], "export binding rejected")
     _require(export["evidence_set_digest"] == terminal["evidence_set_digest"], "export evidence set rejected")
     _require(export["objects"] == [fixture["expected_log"], *fixture["expected_artifacts"]], "export objects rejected")
@@ -469,7 +548,7 @@ def _ordered_zero_request(value: Any) -> dict[str, Any]:
     optional = ["final_response_sha256", "expected_controller_generation", "expected_runner_generation"]
     value = _exact(value, required, optional)
     result: dict[str, Any] = {
-        "sequence": _integer(value["sequence"], 14, 15),
+        "sequence": _integer(value["sequence"], 17, 18),
         "operation": value["operation"],
         "operation_id": _hex(value["operation_id"], (64,)),
         "scenario_sha256": _hex(value["scenario_sha256"], (64,)),
@@ -521,7 +600,7 @@ def verify(receipt: Any, scenario: Any, expected_stages: Any) -> None:
     scenario_sha256 = _digest(scenario)
     _require(receipt["scenario_sha256"] == scenario_sha256, "scenario digest rejected")
     _require(receipt["integrated_candidate_sha"] == fixture["integrated_candidate_sha"] and receipt["run_id"] == fixture["run_id"], "receipt identity rejected")
-    _require(isinstance(receipt["checks"], list) and len(receipt["checks"]) == 13, "full stage coverage required")
+    _require(isinstance(receipt["checks"], list) and len(receipt["checks"]) == 16, "full stage coverage required")
     checks: list[dict[str, Any]] = []
     for index, raw_check in enumerate(receipt["checks"], start=1):
         check = _exact(raw_check, ["sequence", "stage", "outcome", "evidence_sha256", "snapshot"], ["export"])
@@ -556,8 +635,8 @@ def verify(receipt: Any, scenario: Any, expected_stages: Any) -> None:
     phase_proofs: list[dict[str, Any]] = []
     operation_ids: set[str] = set()
     for offset, raw_phase in enumerate(transition["phases"]):
-        sequence = 14 + offset
-        operation = "finalize_capacity_zero" if sequence == 14 else "prove_capacity_zero"
+        sequence = 17 + offset
+        operation = "finalize_capacity_zero" if sequence == 17 else "prove_capacity_zero"
         phase = _exact(raw_phase, ["sequence", "operation", "outcome", "attempts", "request_sha256", "response_sha256", "request", "response"])
         _require(phase["sequence"] == sequence and phase["operation"] == operation and phase["outcome"] == "pass", "zero phase ordering rejected")
         _integer(phase["attempts"], 1, 2)

@@ -37,7 +37,7 @@ The flow has two user-visible phases and three isolated boots:
    rolled-back host (dry run, then install; both must report the central
    receipt as `rolled_back`). Only then does it run real
    systemd principals through staged-zero, closed qualification, fixed
-   capacity-one, the frozen fixture, all 13 acceptance stages, finalize/prove
+   capacity-one, the frozen fixture, all 16 acceptance stages, finalize/prove
    zero, strict installed verification, and rollback. Every run therefore
    proves that a host carrying a rolled-back activation takes the next
    activation through the documented verbs. It can write only a
@@ -103,21 +103,55 @@ must be within 900 seconds; an `h`-tagged event needs channel membership (the
 channel is private); a kind-46107 grant needs the owner or admin role and adds
 its signer for its repository and window; kinds 46101 to 46106 need a static or
 granted CI signer equal to `relay_signer`; a kind-5 tombstone must target the
-author's own stored event; the accepted read and evidence writes need a static
-or granted CI signer for the request's repository. The guest rosters the
-acceptance actor as channel admin, the ci-event key as member, and the nip98
-key as the static signer (`guest_entry.relay_public_config`), the same three
-facts production must hold for its channel.
+author's own stored event. Static or granted CI signer authority governs the
+accepted read, evidence writes, and evidence-reference authors. Evidence `GET`
+instead requires the caller to be an active member of the acceptance
+repository's private channel. The guest rosters the acceptance actor as channel
+admin, the ci-event key as an active member and authorized reference author,
+and the nip98 key as the static signer for accepted reads and evidence writes
+and as an active member for evidence `GET`
+(`guest_entry.relay_public_config`). Exact-event queries remain signed by the
+ci-event identity, whose active channel membership scopes their results.
+The relay also receives the candidate's frozen acceptance template and, only
+for the replay-before-grant fault, the distinct prior template. It derives the
+five actor event IDs in API order (`Run`, `Grant`, `Rerun`, `Tombstone`,
+`FailureRun`) and requires live order (`Run`, `Grant`, `FailureRun`, `Rerun`,
+`Tombstone`). Unknown or sixth actor events fail before storage. Run A's
+terminal success does not create a verdict. The relay writes only a canonical
+signed-event transcript, and the guest closes the v2 verdict after the
+installed verifier accepts all 16 checks and zero phases 17 and 18. Closure
+binds Run A evidence and both terminal facts, Run B's deterministic failure,
+rerun, cancellation and tombstone, the authenticated stage-7 export, and an
+unchanged whole-transcript seal. The guest publishes the complete verdict with
+a same-directory create-once link and fsync, then recomputes and reads it back.
+The transfer guest recomputes the canonical verdict from the frozen templates,
+signed transcript, stage fixture, and verified receipt. It emits the resulting
+verdict digest in its challenge-bound frame; the host checks that digest again
+before the value enters or is read back from the final evidence manifest.
 The relay also serves `POST /query` (api/bridge.rs `query_events`): a NIP-98
 token with the payload digest, a JSON array of filters that each name `kinds`
 (a kindless filter is refused with 403), `ids` lookups, `authors` narrowing to
 events that pubkey signed (controld's exact-event read-back names its own
-ci-event key), and results limited to the caller's channel access. A status
-event from a signer that is neither static nor under an active grant at ingest
-time is refused with the relay's exact `invalid CI envelope: unauthorized CI
-status signer` (`buzz_core::ci::validate_signed_ci_event`), the string controld
-matches. `run --relay-fault <mode>` arms one of two fault modes: the guest
-writes `/var/lib/buzzci-e2e-relay/fault` before the relay starts.
+ci-event key), and results limited to the caller's channel access. Stage 7 uses
+that route to read exactly one signature-valid evidence-reference or final-fact
+event for each requested id, author, and kind. The relay also serves the
+canonical signed-reference log and artifact paths to an exact-URL NIP-98
+`GET`; it checks the caller, path grammar, reference bindings, and stored bytes,
+and returns the full object without a redirect. The installed adapter adds its
+own declared-length and 16 MiB bounds and verifies length and SHA-256. The
+qualification rejects a generic or ranged `GET`, `HEAD`, redirect, wrong or
+duplicate event, mismatched coordinate, or extra, missing, or changed object.
+The receipt supplies no URL or path list. Keyholder and the guest independently
+derive exactly two allowed paths from its Run A request, run, job, log/artifact
+hashes, fixed attempt `1`, and fixed `result` artifact declaration. The gate
+proves a third otherwise-canonical path is denied. It also requires the export
+response subject and generation to equal the receipt's `export_subject` and
+`export_generation` and the nip98 selector.
+A status event from a signer that is neither static nor under an active grant
+at ingest time is refused with the relay's exact `invalid CI envelope:
+unauthorized CI status signer` (`buzz_core::ci::validate_signed_ci_event`), the
+string controld matches. `run --relay-fault <mode>` arms one of two fault modes:
+the guest writes `/var/lib/buzzci-e2e-relay/fault` before the relay starts.
 `stale-terminal-publication-recovery`: the relay answers the first publish of
 the terminal kind-46101 run status with the production drift refusal, stores
 nothing, and records the refused id plus whether controld read it back through
@@ -125,6 +159,8 @@ nothing, and records the refused id plus whether controld read it back through
 read-back and a controld snapshot in which every `run:terminal` publication is
 `Accepted`. This is the M11 production failure (PR #156 recovery, keyholder
 `POST /query` token): without the keyholder route the run stops in `canary`.
+That publication-recovery query is distinct from the stage-7 event and object
+readback, although both exact-event queries use the same closed filter shape.
 `stale-terminal-replay-before-grant`: the relay expires every active grant when
 the first terminal kind-46101 status arrives, so that publish and the re-signed
 one after the read-back are refused as an unauthorized signer. The guest runs
@@ -210,13 +246,13 @@ candidate archive and its staged frozen timing asset.
 
 The frozen `timing-contract.json` is the single timing source. It records leaf
 command limits and an exact per-phase command inventory; the guest derives phase deadlines
-and the host derives each QEMU watchdog from those terms. The 7,222-second
+and the host derives each QEMU watchdog from those terms. The 7,582-second
 candidate watchdog covers a 220-second boot/cloud-init envelope, 1,452 seconds
 for install, 100 for the prior controller check, 680 for the prior stage and
 its 13-unit readback, 160 for the prior activation, 100 for the prior rollback,
 710 for the execd retirement and reinstall with its 13-unit readback, 100 for
 controller check, 680 for controller stage and its 13-unit readback, 160 for
-activation, 1,630 for the canary's 13 sequential 120-second driver operations
+activation, 1,990 for the canary's 16 sequential 120-second driver operations
 and margins, 100 for receipt verification, 100 for rollback, 990 for cleanup
 and dormant proof, 30 for guest poweroff, and 10 for host reap.
 Ceremony is 1,130 seconds (including all 21 bounded ceremony commands) and the

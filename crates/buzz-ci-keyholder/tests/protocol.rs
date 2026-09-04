@@ -80,6 +80,7 @@ fn describe_response() -> DescribeResponse {
 
 #[test]
 fn every_request_has_one_canonical_round_trip() {
+    assert_eq!(PROTOCOL_VERSION, 2);
     for request in requests() {
         let encoded = encode_request([42; 16], &request).expect("valid fixture request");
         assert!(encoded.as_bytes().len() <= MAX_FRAME_SIZE);
@@ -108,7 +109,7 @@ fn successful_and_error_responses_round_trip_and_bind_the_request() {
         Response::DescribeAcceptance(DescribeAcceptanceResponse {
             actor: identity(4, 10),
             scenario_sha256: [5; 32],
-            event_ids: [[6; 32], [7; 32], [8; 32], [9; 32]],
+            event_ids: [[6; 32], [7; 32], [8; 32], [9; 32], [10; 32]],
         }),
         Response::SignCiEvent(signature(4, 7)),
         Response::Nip98Authorize(signature(7, 8)),
@@ -182,7 +183,7 @@ fn header_version_kind_flags_lengths_and_identifiers_fail_closed() {
         .expect("valid describe request");
 
     let mut version = encoded.as_bytes().to_vec();
-    version[4..6].copy_from_slice(&2_u16.to_be_bytes());
+    version[4..6].copy_from_slice(&1_u16.to_be_bytes());
     assert_eq!(
         decode_request(&version),
         Err(DecodeError::UnsupportedVersion)

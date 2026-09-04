@@ -6,6 +6,8 @@ verify="${repo_root}/scripts/verify-release-ref.sh"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
+"$repo_root/scripts/test-pre-freeze-arguments.sh"
+
 git -C "$tmp" init -q
 git -C "$tmp" config user.name test
 git -C "$tmp" config user.email test@example.com
