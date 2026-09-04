@@ -52,7 +52,7 @@ For each status stream, `sequence` is strictly increasing:
 - run stream key: `(run_id, attempt)`
 - job stream key: `(run_id, job_id, attempt)`
 
-Readers select by sequence, never `created_at`. A gap leaves state pending reconciliation. Two different events for the same stream key and sequence are equivocation and fail the run closed as `infrastructure_failure`. State transitions must follow the closed transition table in §7.
+Readers select within a status stream by sequence, never `created_at`. A gap leaves state pending reconciliation. Two different events for the same stream key and sequence are equivocation and fail the run closed as `infrastructure_failure`. State transitions must follow the closed transition table in §7. Global accepted-event order comes from the relay's durable `watch_cursor`; same-second event timestamps do not break ties or establish causality.
 
 ## 3. CI request envelope — kind 46100
 
@@ -85,7 +85,7 @@ Readers select by sequence, never `created_at`. A gap leaves state pending recon
 }
 ```
 
-`request_type="run"` requires `attempt=1` and forbids `parent_attempt`/`parent_run_id`. `request_type="rerun"` requires exactly one requested `job_id`, the same `run_id`, and both `parent_attempt` and `parent_run_id`; dependency fan-out is broker-computed and returned as `also_reruns`, never hidden in the request. A rerun is eligible only when the selected parent job is `failure`. Non-terminal `queued|running` returns `job_not_terminal`; terminal `success|skipped|cancelled|timed_out` returns `job_not_failed`.
+`request_type="run"` is the one initial request for a `run_id`. It requires `attempt=1` and forbids `parent_attempt`/`parent_run_id`. `request_type="rerun"` appends a distinct kind-46100 request event to that run's lineage. It requires exactly one requested `job_id`, the same `run_id`, and both `parent_attempt` and `parent_run_id`; dependency fan-out is broker-computed and returned as `also_reruns`, never hidden in the request. A rerun is eligible only when the selected parent job is `failure`. Non-terminal `queued|running` returns `job_not_terminal`; terminal `success|skipped|cancelled|timed_out` returns `job_not_failed`. A terminal run-status `failure` does not by itself close the lineage, but acceptance of either terminal provenance fact, kind 46105 or kind 46106, does.
 
 A rerun copies the original accepted request's complete immutable source/workflow tuple byte-for-byte: `target_repo_a`, PR event IDs, clone URL, immutable source ref, `tip_oid`, source branch, base ref/OID, workflow ID/digest, and trigger event ID. It never resolves current refs or current workflow state. Only request identity, exactly one selected `job_id`, attempt lineage, actor, timeout/expiry, and idempotency fields may change.
 
@@ -235,7 +235,7 @@ queued -> running | cancelled | infrastructure_failure
 running -> success | failure | cancelled | timed_out | infrastructure_failure
 ```
 
-Terminal states never transition. A rerun creates a new job-attempt stream; it never mutates prior attempts. Unknown states or illegal transitions fail closed.
+Terminal states never transition within their `(run_id, attempt)` or `(run_id, job_id, attempt)` stream. An eligible rerun after a failed job, including after terminal run-status `failure`, creates new run-status and job-status attempt streams. It never mutates prior attempts. Unknown states or illegal transitions fail closed.
 
 Verdict is green only when the requested `expect_sha` equals `tip_oid`, all signed-manifest required jobs are terminal-good at their selected attempt lineage, each required skip is permitted by signed `skip_policy`, and the reducer independently verifies the authorized kind-46105 evidence-finalized fact and kind-46106 exact selected-job lease-set fact before terminal run success. Any non-terminal required job is pending. Required `failure`, `cancelled`, or `timed_out` is red. Infrastructure failure is separately reported and never presented as a code failure. Mixed-attempt selection, next-attempt derivation, transport routes, unique run lookup, signer authority, and watch replay/order are bound by `BUZZ_CI_RELAY_API_CONTRACT.md` v1.1.
 
