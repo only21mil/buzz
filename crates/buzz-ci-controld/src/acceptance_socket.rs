@@ -46,6 +46,8 @@ pub struct AcceptanceJournal {
     expected_owner_uid: u32,
     binding: AcceptanceBinding,
     #[cfg(test)]
+    fail_before_staged_response: Arc<AtomicBool>,
+    #[cfg(test)]
     fail_after_staged_response: Arc<AtomicBool>,
 }
 
@@ -72,6 +74,8 @@ impl AcceptanceJournal {
             root,
             expected_owner_uid,
             binding,
+            #[cfg(test)]
+            fail_before_staged_response: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             fail_after_staged_response: Arc::new(AtomicBool::new(false)),
         };
@@ -109,7 +113,10 @@ impl AcceptanceJournal {
         request: &AdapterRequest,
         exact_request: &[u8],
         configured_capacity: u32,
-        operation: impl FnOnce(Option<&AdapterResponse>) -> Result<AdapterResponse, E>,
+        operation: impl FnOnce(
+            Option<&AdapterResponse>,
+            AcceptanceExecution,
+        ) -> Result<AdapterResponse, E>,
     ) -> Result<AdapterResponse, AcceptanceSocketError> {
         self.with_locked(|ledger| {
             ledger.validate(&self.binding)?;
@@ -165,7 +172,7 @@ impl AcceptanceJournal {
             {
                 return Err(AcceptanceSocketError::Binding);
             }
-            if ledger.in_progress.is_none() {
+            let execution = if ledger.in_progress.is_none() {
                 ledger.in_progress = Some(AcceptanceLedgerInProgress {
                     sequence: request.sequence,
                     operation_id: request.operation_id.clone(),
@@ -173,7 +180,10 @@ impl AcceptanceJournal {
                     response: None,
                 });
                 self.persist(ledger)?;
-            }
+                AcceptanceExecution::Fresh
+            } else {
+                AcceptanceExecution::Recovering
+            };
             let prior = ledger
                 .entries
                 .last()
@@ -203,8 +213,15 @@ impl AcceptanceJournal {
                 }
                 _ => {}
             }
-            let response =
-                operation(prior.as_ref()).map_err(|_| AcceptanceSocketError::Operation)?;
+            let response = operation(prior.as_ref(), execution)
+                .map_err(|_| AcceptanceSocketError::Operation)?;
+            #[cfg(test)]
+            if self
+                .fail_before_staged_response
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(AcceptanceSocketError::Operation);
+            }
             validate_bound_response(request, &response, configured_capacity)?;
             let encoded =
                 serde_json::to_vec(&response).map_err(|_| AcceptanceSocketError::Frame)?;
@@ -234,6 +251,12 @@ impl AcceptanceJournal {
             self.persist(ledger)?;
             Ok(response)
         })
+    }
+
+    #[cfg(test)]
+    fn inject_failure_before_staged_response(&self) {
+        self.fail_before_staged_response
+            .store(true, Ordering::SeqCst);
     }
 
     #[cfg(test)]
@@ -324,6 +347,14 @@ impl AcceptanceJournal {
             .and_then(|directory| directory.sync_all())
             .map_err(|_| AcceptanceSocketError::Replay)
     }
+}
+
+/// Whether an operation starts from a new durable request intent or resumes
+/// an intent whose response was not yet staged when the process stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcceptanceExecution {
+    Fresh,
+    Recovering,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1012,7 +1043,7 @@ mod tests {
         assert_eq!(journal.completed_sequences().unwrap(), 0);
         let expected = Handler.handle(&request, &exact).unwrap();
         let first = journal
-            .execute(&request, &exact, 0, |_| Ok::<_, ()>(expected.clone()))
+            .execute(&request, &exact, 0, |_, _| Ok::<_, ()>(expected.clone()))
             .unwrap();
         assert_eq!(first, expected);
         assert_eq!(journal.completed_sequences().unwrap(), 1);
@@ -1024,7 +1055,7 @@ mod tests {
             "the completed count is durable across a controld restart"
         );
         let replayed = reopened
-            .execute(&request, &exact, 0, |_| {
+            .execute(&request, &exact, 0, |_, _| {
                 Err::<AdapterResponse, _>("operation must not run")
             })
             .unwrap();
@@ -1044,7 +1075,9 @@ mod tests {
         let mut divergent = exact.clone();
         divergent.push(b' ');
         assert_eq!(
-            reopened.execute(&request, &divergent, 0, |_| Ok::<_, ()>(expected.clone())),
+            reopened.execute(&request, &divergent, 0, |_, _| Ok::<_, ()>(
+                expected.clone()
+            )),
             Err(AcceptanceSocketError::Replay)
         );
 
@@ -1054,7 +1087,7 @@ mod tests {
         skipped.operation_id = expected_adapter_operation_id(&skipped).unwrap();
         let skipped_exact = serde_json::to_vec(&skipped).unwrap();
         assert_eq!(
-            reopened.execute(&skipped, &skipped_exact, 0, |_| Ok::<_, ()>(expected)),
+            reopened.execute(&skipped, &skipped_exact, 0, |_, _| Ok::<_, ()>(expected)),
             Err(AcceptanceSocketError::Binding)
         );
     }
@@ -1099,7 +1132,7 @@ mod tests {
                     journal.inject_failure_after_staged_response();
                     let mut side_effects = 0;
                     assert_eq!(
-                        journal.execute(&request, &exact, 0, |_| {
+                        journal.execute(&request, &exact, 0, |_, _| {
                             side_effects += 1;
                             Ok::<_, ()>(expected.clone())
                         }),
@@ -1110,7 +1143,7 @@ mod tests {
                     let reopened =
                         AcceptanceJournal::open(root.path(), owner_uid, binding.clone()).unwrap();
                     let replayed = reopened
-                        .execute(&request, &exact, 0, |_| -> Result<AdapterResponse, ()> {
+                        .execute(&request, &exact, 0, |_, _| -> Result<AdapterResponse, ()> {
                             panic!("a staged response must not execute or poll again")
                         })
                         .unwrap();
@@ -1121,7 +1154,84 @@ mod tests {
                     assert_eq!(reopened.completed_sequences().unwrap(), request.sequence);
                 } else {
                     journal
-                        .execute(&request, &exact, 0, |_| Ok::<_, ()>(expected))
+                        .execute(&request, &exact, 0, |_, _| Ok::<_, ()>(expected))
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn journal_recovers_unstaged_terminal_and_cancel_intents_from_provider_state() {
+        let operations = [
+            Operation::ObserveInitial,
+            Operation::SetCapacityOne,
+            Operation::SubmitManifest,
+            Operation::ApproveGrant,
+            Operation::ResumeGrant,
+            Operation::AwaitFirstTerminal,
+            Operation::ExportFirstEvidence,
+            Operation::SubmitFailureManifest,
+            Operation::ResumeFailure,
+            Operation::AwaitFailureTerminal,
+            Operation::Rerun,
+            Operation::CancelRerun,
+        ];
+
+        for target in [6_usize, 10, 12] {
+            let root = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let owner_uid = fs::metadata(root.path()).unwrap().uid();
+            let mut request = request();
+            let binding = binding(&request);
+
+            for (index, operation) in operations.iter().copied().take(target).enumerate() {
+                request.sequence = u32::try_from(index + 1).unwrap();
+                request.operation = operation;
+                request.expected_controller_generation = (index != 0).then_some(7);
+                request.expected_runner_generation = (index != 0).then_some(9);
+                request.operation_id = expected_adapter_operation_id(&request).unwrap();
+                let exact = serde_json::to_vec(&request).unwrap();
+                let expected = Handler.handle(&request, &exact).unwrap();
+                let journal =
+                    AcceptanceJournal::open(root.path(), owner_uid, binding.clone()).unwrap();
+                if index + 1 == target {
+                    journal.inject_failure_before_staged_response();
+                    let mut side_effects = 0;
+                    assert_eq!(
+                        journal.execute(&request, &exact, 0, |_, execution| {
+                            assert_eq!(execution, AcceptanceExecution::Fresh);
+                            side_effects += 1;
+                            Ok::<_, ()>(expected.clone())
+                        }),
+                        Err(AcceptanceSocketError::Operation)
+                    );
+                    assert_eq!(side_effects, 1, "the provider side effect happened once");
+
+                    let reopened =
+                        AcceptanceJournal::open(root.path(), owner_uid, binding.clone()).unwrap();
+                    let mut provider_reconciliations = 0;
+                    let recovered = reopened
+                        .execute(&request, &exact, 0, |_, execution| {
+                            assert_eq!(execution, AcceptanceExecution::Recovering);
+                            provider_reconciliations += 1;
+                            Ok::<_, ()>(expected.clone())
+                        })
+                        .unwrap();
+                    assert_eq!(provider_reconciliations, 1);
+                    assert_eq!(
+                        serde_json::to_vec(&recovered).unwrap(),
+                        serde_json::to_vec(&expected).unwrap()
+                    );
+                    assert_eq!(reopened.completed_sequences().unwrap(), request.sequence);
+                } else {
+                    journal
+                        .execute(&request, &exact, 0, |_, execution| {
+                            assert_eq!(execution, AcceptanceExecution::Fresh);
+                            Ok::<_, ()>(expected)
+                        })
                         .unwrap();
                 }
             }
@@ -1141,7 +1251,7 @@ mod tests {
         let journal = AcceptanceJournal::open(root.path(), owner_uid, binding(&request)).unwrap();
         journal.inject_failure_after_staged_response();
         assert_eq!(
-            journal.execute(&request, &exact, 0, |_| Ok::<_, ()>(expected.clone())),
+            journal.execute(&request, &exact, 0, |_, _| Ok::<_, ()>(expected.clone())),
             Err(AcceptanceSocketError::Operation)
         );
 
@@ -1149,7 +1259,7 @@ mod tests {
         let mut divergent = exact;
         divergent.push(b' ');
         assert_eq!(
-            reopened.execute(&request, &divergent, 0, |_| Ok::<_, ()>(expected)),
+            reopened.execute(&request, &divergent, 0, |_, _| Ok::<_, ()>(expected)),
             Err(AcceptanceSocketError::Replay)
         );
         assert_eq!(reopened.completed_sequences().unwrap(), 0);
@@ -1193,7 +1303,7 @@ mod tests {
             let expected = Handler.handle(&request, &exact).unwrap();
             let journal = AcceptanceJournal::open(root.path(), owner_uid, binding.clone()).unwrap();
             journal
-                .execute(&request, &exact, 0, |_| Ok::<_, ()>(expected))
+                .execute(&request, &exact, 0, |_, _| Ok::<_, ()>(expected))
                 .unwrap();
             let reopened =
                 AcceptanceJournal::open(root.path(), owner_uid, binding.clone()).unwrap();

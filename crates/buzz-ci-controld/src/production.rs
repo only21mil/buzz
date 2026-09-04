@@ -2029,6 +2029,36 @@ mod tests {
     }
 
     #[test]
+    fn expected_recovery_poll_rejects_a_later_head_without_consuming_it() {
+        let log = b"ok\n".to_vec();
+        let accepted = accepted();
+        let mut expected = frozen_binding(&accepted);
+        expected.event_id = "22".repeat(32);
+        let relay = Relay {
+            accepted: Some(accepted),
+            published: Vec::new(),
+            job_statuses: Vec::new(),
+            intent_signal: None,
+            refuse_publication: false,
+        };
+        let mut handler = ProductionHandler::new(
+            relay,
+            DeterministicSigner,
+            Executor(completion(&log)),
+            MemoryStore::default(),
+            MemoryOutput(log),
+        );
+
+        assert!(matches!(
+            handler.poll_once_bound(CHANNEL, &expected),
+            Err(ProductionError::Invalid)
+        ));
+        assert_eq!(handler.store.cursor, 0);
+        assert!(handler.store.run.is_none());
+        assert!(handler.relay.published.is_empty());
+    }
+
+    #[test]
     fn accepted_request_bypasses_legacy_job_keys_and_publishes_full_signed_lifecycle() {
         let log = b"ok\n".to_vec();
         let accepted = accepted();
@@ -2274,6 +2304,7 @@ mod tests {
             .expect("running")
             .transition(RunState::Failure, 12, Some("failed".to_owned()))
             .expect("terminal");
+        let expected = frozen_binding(&accepted);
         let mut handler = ProductionHandler::new(
             Relay {
                 accepted: Some(accepted),
@@ -2283,7 +2314,7 @@ mod tests {
                 refuse_publication: false,
             },
             DeterministicSigner,
-            Executor(completion(b"unused")),
+            FailingExecutor,
             MemoryStore {
                 cursor: 0,
                 run: Some((3, terminal)),
@@ -2294,7 +2325,9 @@ mod tests {
         );
 
         assert_eq!(
-            handler.poll_once(CHANNEL).expect("reconcile terminal"),
+            handler
+                .poll_once_bound(CHANNEL, &expected)
+                .expect("reconcile exact terminal without re-execution"),
             PollStep::Completed
         );
         assert_eq!(handler.relay.published, vec![KIND_CI_RUN_STATUS]);

@@ -2,7 +2,7 @@
 
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use buzz_ci_acceptance_ctl::acceptance::{
     AdmissionState, ApprovalSnapshot, AttemptSnapshot, AttemptState,
@@ -17,7 +17,8 @@ use buzz_ci_broker_protocol::{
     BrokerState, CancelReason, Conclusion as BrokerConclusion, GitOid, ResponseCode,
 };
 use buzz_ci_controld::acceptance_socket::{
-    AcceptanceBinding, AcceptanceJournal, AcceptanceOperationHandler, AcceptanceSocketError,
+    AcceptanceBinding, AcceptanceExecution, AcceptanceJournal, AcceptanceOperationHandler,
+    AcceptanceSocketError,
 };
 use buzz_ci_controld::controller::{
     CapacityOneConfig, CapacityOneController, CapacityOneProviderSlots, CapacityOneStatus,
@@ -25,7 +26,8 @@ use buzz_ci_controld::controller::{
 };
 use buzz_ci_controld::keyholder::{KeyholderError, UnixKeyholderClient};
 use buzz_ci_controld::production::{
-    AcceptedRequestBinding, JobMetadata, RelayControl, SignedCiEvent,
+    AcceptedRequest, AcceptedRequestBinding, AttemptExecutor, JobMetadata, RelayControl,
+    SignedCiEvent,
 };
 use buzz_ci_controld::production_v2::{
     compose_runner_v2, AttemptCommand, AttemptControl, AttemptObservation, ProductionV2Error,
@@ -91,6 +93,9 @@ pub(crate) struct CapacityOneService {
     verified_evidence: Option<VerifiedAttemptEvidence>,
     gate_waiting: bool,
     cancel_client: RunnerV2Client<UnixRunnerConnector>,
+    recovery_executor: ProductionExecutor,
+    recovery_observations: Receiver<AttemptObservation>,
+    acceptance_channel_id: String,
     acceptance_relay: ProductionRelay,
     acceptance_signer: UnixKeyholderClient,
     acceptance_authority: AcceptanceAuthority,
@@ -107,6 +112,12 @@ struct AcceptanceAuthority {
     event_ids: [[u8; 32]; 5],
     templates: [serde_json::Value; 5],
     request_bindings: [AcceptedRequestBinding; 3],
+}
+
+enum RecoveryAttempt {
+    Active(Box<BoundAttempt>),
+    Terminal(Box<(TerminalAttempt, VerifiedAttemptEvidence)>),
+    NoObservation,
 }
 
 impl AcceptanceAuthority {
@@ -263,9 +274,14 @@ impl CapacityOneService {
         let runner = UnixRunnerConnector::new(active.runner.clone())?;
         let runner = RunnerV2Client::new(runner, active.runner_transport_attempts)
             .map_err(|_| ServiceError::InvalidConfig)?;
+        let recovery_runner = UnixRunnerConnector::new(active.runner.clone())?;
+        let recovery_runner =
+            RunnerV2Client::new(recovery_runner, active.runner_transport_attempts)
+                .map_err(|_| ServiceError::InvalidConfig)?;
         let relay_authorizer = UnixKeyholderClient::connect(active.keyholder.clone())?;
         let relay_signer = UnixKeyholderClient::connect(active.keyholder.clone())?;
         let admission_signer = UnixKeyholderClient::connect(active.keyholder.clone())?;
+        let recovery_admission_signer = UnixKeyholderClient::connect(active.keyholder.clone())?;
         let acceptance_signer = UnixKeyholderClient::connect(active.keyholder.clone())?;
         let mut acceptance_authorizer = UnixKeyholderClient::connect(active.keyholder.clone())?;
         let relay_transport = ReqwestTransport::new(
@@ -345,11 +361,12 @@ impl CapacityOneService {
         };
         let (observation_sender, observations) = mpsc::channel();
         let (attempt_commands, command_receiver) = mpsc::channel();
+        let (recovery_observation_sender, recovery_observations) = mpsc::channel();
         let (executor, output) = compose_runner_v2(
             runner,
             admission_signer,
-            bindings,
-            metadata,
+            bindings.clone(),
+            metadata.clone(),
             active
                 .keyholder
                 .keyholder_selectors
@@ -360,6 +377,23 @@ impl CapacityOneService {
             AttemptControl {
                 observer: Some(observation_sender),
                 command: Some(command_receiver),
+            },
+        )?;
+        let (recovery_executor, _recovery_output) = compose_runner_v2(
+            recovery_runner,
+            recovery_admission_signer,
+            bindings,
+            metadata,
+            active
+                .keyholder
+                .keyholder_selectors
+                .ci_event
+                .public_key
+                .clone(),
+            poll_interval,
+            AttemptControl {
+                observer: Some(recovery_observation_sender),
+                command: None,
             },
         )?;
         let store = DurableControlStore::open(config.store_root(), expected_owner_uid)?;
@@ -400,6 +434,9 @@ impl CapacityOneService {
             verified_evidence: None,
             gate_waiting: false,
             cancel_client,
+            recovery_executor,
+            recovery_observations,
+            acceptance_channel_id: active.channel_id.clone(),
             acceptance_relay,
             acceptance_signer,
             acceptance_authority,
@@ -446,13 +483,10 @@ impl CapacityOneService {
         self.poll_interval
     }
 
-    fn begin_async_attempt(
+    fn start_async_attempt(
         &mut self,
         mutation: AcceptanceMutation,
-    ) -> Result<BoundAttempt, AcceptanceSocketError> {
-        if let Some(active) = self.active_attempt {
-            return Ok(active);
-        }
+    ) -> Result<AcceptedRequestBinding, AcceptanceSocketError> {
         if self.controller_worker.is_some() {
             return Err(AcceptanceSocketError::Operation);
         }
@@ -468,6 +502,17 @@ impl CapacityOneService {
             let result = controller.poll_once_bound(&polled_expected).map(|_| ());
             (controller, result)
         }));
+        Ok(expected)
+    }
+
+    fn begin_async_attempt(
+        &mut self,
+        mutation: AcceptanceMutation,
+    ) -> Result<BoundAttempt, AcceptanceSocketError> {
+        if let Some(active) = self.active_attempt {
+            return Ok(active);
+        }
+        let expected = self.start_async_attempt(mutation)?;
         match self.observations.recv_timeout(self.acceptance.timeout()) {
             Ok(AttemptObservation::Active(active))
                 if observed_admission_matches(&expected, active.admission, active.response) =>
@@ -502,14 +547,10 @@ impl CapacityOneService {
         Ok(())
     }
 
-    fn finish_async_attempt(
+    fn join_async_attempt(
         &mut self,
         mutation: AcceptanceMutation,
-    ) -> Result<(TerminalAttempt, VerifiedAttemptEvidence), AcceptanceSocketError> {
-        if self.controller_worker.is_none() {
-            self.begin_async_attempt(mutation)?;
-            self.release_async_attempt()?;
-        }
+    ) -> Result<Option<(TerminalAttempt, VerifiedAttemptEvidence)>, AcceptanceSocketError> {
         let worker = self
             .controller_worker
             .take()
@@ -533,19 +574,142 @@ impl CapacityOneService {
             }
             terminal
         });
-        let terminal = terminal.ok_or(AcceptanceSocketError::Operation)?;
+        let Some(terminal) = terminal else {
+            self.active_attempt = None;
+            self.gate_waiting = false;
+            return Ok(None);
+        };
         let expected = self.acceptance_authority.expected_request(mutation)?;
         if !observed_admission_matches(&expected, terminal.admission, terminal.response) {
             return self.fail_async_attempt();
         }
-        let evidence = self
+        let Some(evidence) = self
             .verified_evidence
             .take()
             .filter(|evidence| evidence.terminal == terminal)
-            .ok_or(AcceptanceSocketError::Operation)?;
+        else {
+            return Err(AcceptanceSocketError::Operation);
+        };
         self.active_attempt = None;
         self.gate_waiting = false;
+        Ok(Some((terminal, evidence)))
+    }
+
+    fn finish_async_attempt(
+        &mut self,
+        mutation: AcceptanceMutation,
+    ) -> Result<(TerminalAttempt, VerifiedAttemptEvidence), AcceptanceSocketError> {
+        if self.controller_worker.is_none() {
+            self.begin_async_attempt(mutation)?;
+            self.release_async_attempt()?;
+        }
+        self.join_async_attempt(mutation)?
+            .ok_or(AcceptanceSocketError::Operation)
+    }
+
+    fn poll_recovery_attempt(
+        &mut self,
+        mutation: AcceptanceMutation,
+    ) -> Result<RecoveryAttempt, AcceptanceSocketError> {
+        let expected = self.start_async_attempt(mutation)?;
+        let deadline = Instant::now() + self.acceptance.timeout();
+        loop {
+            if self
+                .controller_worker
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
+            {
+                return Ok(match self.join_async_attempt(mutation)? {
+                    Some(recovered) => RecoveryAttempt::Terminal(Box::new(recovered)),
+                    None => RecoveryAttempt::NoObservation,
+                });
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return self.fail_async_attempt();
+            }
+            match self
+                .observations
+                .recv_timeout(remaining.min(Duration::from_millis(10)))
+            {
+                Ok(AttemptObservation::Active(active))
+                    if observed_admission_matches(&expected, active.admission, active.response) =>
+                {
+                    self.active_attempt = Some(active);
+                    self.gate_waiting = true;
+                    return Ok(RecoveryAttempt::Active(Box::new(active)));
+                }
+                Ok(AttemptObservation::Terminal(terminal))
+                    if observed_admission_matches(
+                        &expected,
+                        terminal.admission,
+                        terminal.response,
+                    ) =>
+                {
+                    self.terminal_attempt = Some(terminal)
+                }
+                Ok(AttemptObservation::Completed(evidence)) => {
+                    self.verified_evidence = Some(evidence)
+                }
+                Ok(_) => return self.fail_async_attempt(),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(AcceptanceSocketError::Operation)
+                }
+            }
+        }
+    }
+
+    fn recover_terminal_attempt(
+        &mut self,
+        mutation: AcceptanceMutation,
+    ) -> Result<(TerminalAttempt, VerifiedAttemptEvidence), AcceptanceSocketError> {
+        match self.poll_recovery_attempt(mutation)? {
+            RecoveryAttempt::Active(_) => {
+                self.release_async_attempt()?;
+                self.finish_async_attempt(mutation)
+            }
+            RecoveryAttempt::Terminal(recovered) => Ok(*recovered),
+            RecoveryAttempt::NoObservation => self.reconstruct_runner_attempt(mutation),
+        }
+    }
+
+    fn reconstruct_runner_attempt(
+        &mut self,
+        mutation: AcceptanceMutation,
+    ) -> Result<(TerminalAttempt, VerifiedAttemptEvidence), AcceptanceSocketError> {
+        while self.recovery_observations.try_recv().is_ok() {}
+        let accepted = self.frozen_accepted_request(mutation)?;
+        self.recovery_executor
+            .execute(&accepted)
+            .map_err(|_| AcceptanceSocketError::Operation)?;
+        let mut terminal = None;
+        let mut evidence = None;
+        while let Ok(observation) = self.recovery_observations.try_recv() {
+            match observation {
+                AttemptObservation::Active(_) => return Err(AcceptanceSocketError::Operation),
+                AttemptObservation::Terminal(observed) => terminal = Some(observed),
+                AttemptObservation::Completed(verified) => evidence = Some(verified),
+            }
+        }
+        let terminal = terminal.ok_or(AcceptanceSocketError::Operation)?;
+        let evidence = evidence
+            .filter(|verified| verified.terminal == terminal)
+            .ok_or(AcceptanceSocketError::Operation)?;
         Ok((terminal, evidence))
+    }
+
+    fn frozen_accepted_request(
+        &self,
+        mutation: AcceptanceMutation,
+    ) -> Result<AcceptedRequest, AcceptanceSocketError> {
+        let expected = self.acceptance_authority.expected_request(mutation)?;
+        Ok(AcceptedRequest {
+            channel_id: self.acceptance_channel_id.clone(),
+            watch_cursor: 0,
+            event_id: expected.event_id,
+            envelope: expected.envelope,
+        })
     }
 
     fn fail_async_attempt<T>(&mut self) -> Result<T, AcceptanceSocketError> {
@@ -632,15 +796,20 @@ impl AcceptanceOperationHandler for CapacityZeroService {
             .acceptance
             .as_ref()
             .ok_or(AcceptanceSocketError::Activation)?;
-        journal.execute(request, exact_request, 0, |prior| match request.operation {
-            Operation::ObserveInitial if request.sequence == 1 => {
-                Ok(host_response(request, None, 0))
-            }
-            Operation::SetCapacityZero if request.sequence == 16 => {
-                Ok(host_response(request, prior, 0))
-            }
-            _ => Err(AcceptanceSocketError::Operation),
-        })
+        journal.execute(
+            request,
+            exact_request,
+            0,
+            |prior, _execution| match request.operation {
+                Operation::ObserveInitial if request.sequence == 1 => {
+                    Ok(host_response(request, None, 0))
+                }
+                Operation::SetCapacityZero if request.sequence == 16 => {
+                    Ok(host_response(request, prior, 0))
+                }
+                _ => Err(AcceptanceSocketError::Operation),
+            },
+        )
     }
 }
 
@@ -654,74 +823,89 @@ impl AcceptanceOperationHandler for CapacityOneService {
     ) -> Result<AdapterResponse, Self::Error> {
         let configured_capacity = self.status.configured_capacity();
         let journal = self.acceptance.clone();
-        journal.execute(request, exact_request, configured_capacity, |prior| match (
-            request.sequence,
-            request.operation,
-        ) {
-            (2, Operation::SetCapacityOne)
-            | (14, Operation::RestartController)
-            | (15, Operation::RestartRunner) => {
-                Ok(host_response(request, prior, configured_capacity))
-            }
-            (3, Operation::SubmitManifest) => {
-                self.publish_acceptance(AcceptanceMutation::Run)?;
-                Ok(submitted_response(request))
-            }
-            (4, Operation::ApproveGrant) => {
-                self.publish_acceptance(AcceptanceMutation::Grant)?;
-                self.replay_deferred_after_grant()?;
-                Ok(approved_response(request))
-            }
-            (5, Operation::ResumeGrant) => {
-                let active = self.begin_async_attempt(AcceptanceMutation::Run)?;
-                Ok(running_response(request, prior, active, false, false)?)
-            }
-            (6, Operation::AwaitFirstTerminal) => {
-                let (terminal, evidence) = self.finish_async_attempt(AcceptanceMutation::Run)?;
-                Ok(first_terminal_response(
-                    request, prior, terminal, &evidence,
-                )?)
-            }
-            (7, Operation::ExportFirstEvidence) => Ok(export_response(request, prior)?),
-            (8, Operation::SubmitFailureManifest) => {
-                self.publish_acceptance(AcceptanceMutation::FailureRun)?;
-                Ok(failed_submitted_response(request))
-            }
-            (9, Operation::ResumeFailure) => {
-                let active = self.begin_async_attempt(AcceptanceMutation::FailureRun)?;
-                Ok(running_response(request, prior, active, false, true)?)
-            }
-            (10, Operation::AwaitFailureTerminal) => {
-                let (terminal, evidence) =
-                    self.finish_async_attempt(AcceptanceMutation::FailureRun)?;
-                Ok(failure_terminal_response(
-                    request, prior, terminal, &evidence,
-                )?)
-            }
-            (11, Operation::Rerun) => {
-                self.publish_acceptance(AcceptanceMutation::Rerun)?;
-                let active = self.begin_async_attempt(AcceptanceMutation::Rerun)?;
-                Ok(running_response(request, prior, active, true, true)?)
-            }
-            (12, Operation::CancelRerun) => {
-                let active = self
-                    .active_attempt
-                    .or_else(|| self.begin_async_attempt(AcceptanceMutation::Rerun).ok())
-                    .ok_or(AcceptanceSocketError::Operation)?;
-                let cancelled = self.cancel_active_attempt(request, active)?;
-                self.release_async_attempt()?;
-                let (reconciled, _) = self.finish_async_attempt(AcceptanceMutation::Rerun)?;
-                if !same_terminal_binding(cancelled, reconciled) {
-                    return Err(AcceptanceSocketError::Operation);
+        journal.execute(
+            request,
+            exact_request,
+            configured_capacity,
+            |prior, execution| match (request.sequence, request.operation) {
+                (2, Operation::SetCapacityOne)
+                | (14, Operation::RestartController)
+                | (15, Operation::RestartRunner) => {
+                    Ok(host_response(request, prior, configured_capacity))
                 }
-                Ok(cancelled_response(request, prior, cancelled)?)
-            }
-            (13, Operation::TombstoneRerun) => {
-                self.publish_acceptance(AcceptanceMutation::Tombstone)?;
-                Ok(tombstoned_response(request, prior)?)
-            }
-            _ => Err(AcceptanceSocketError::Operation),
-        })
+                (3, Operation::SubmitManifest) => {
+                    self.publish_acceptance(AcceptanceMutation::Run)?;
+                    Ok(submitted_response(request))
+                }
+                (4, Operation::ApproveGrant) => {
+                    self.publish_acceptance(AcceptanceMutation::Grant)?;
+                    self.replay_deferred_after_grant()?;
+                    Ok(approved_response(request))
+                }
+                (5, Operation::ResumeGrant) => {
+                    let active = self.begin_async_attempt(AcceptanceMutation::Run)?;
+                    Ok(running_response(request, prior, active, false, false)?)
+                }
+                (6, Operation::AwaitFirstTerminal) => {
+                    let (terminal, evidence) = if execution == AcceptanceExecution::Recovering {
+                        self.recover_terminal_attempt(AcceptanceMutation::Run)?
+                    } else {
+                        self.finish_async_attempt(AcceptanceMutation::Run)?
+                    };
+                    Ok(first_terminal_response(
+                        request, prior, terminal, &evidence,
+                    )?)
+                }
+                (7, Operation::ExportFirstEvidence) => Ok(export_response(request, prior)?),
+                (8, Operation::SubmitFailureManifest) => {
+                    self.publish_acceptance(AcceptanceMutation::FailureRun)?;
+                    Ok(failed_submitted_response(request))
+                }
+                (9, Operation::ResumeFailure) => {
+                    let active = self.begin_async_attempt(AcceptanceMutation::FailureRun)?;
+                    Ok(running_response(request, prior, active, false, true)?)
+                }
+                (10, Operation::AwaitFailureTerminal) => {
+                    let (terminal, evidence) = if execution == AcceptanceExecution::Recovering {
+                        self.recover_terminal_attempt(AcceptanceMutation::FailureRun)?
+                    } else {
+                        self.finish_async_attempt(AcceptanceMutation::FailureRun)?
+                    };
+                    Ok(failure_terminal_response(
+                        request, prior, terminal, &evidence,
+                    )?)
+                }
+                (11, Operation::Rerun) => {
+                    self.publish_acceptance(AcceptanceMutation::Rerun)?;
+                    let active = self.begin_async_attempt(AcceptanceMutation::Rerun)?;
+                    Ok(running_response(request, prior, active, true, true)?)
+                }
+                (12, Operation::CancelRerun) => {
+                    let cancelled = if execution == AcceptanceExecution::Recovering {
+                        self.recover_cancelled_attempt(request)?
+                    } else {
+                        let active = self
+                            .active_attempt
+                            .or_else(|| self.begin_async_attempt(AcceptanceMutation::Rerun).ok())
+                            .ok_or(AcceptanceSocketError::Operation)?;
+                        let cancelled = self.cancel_active_attempt(request, active)?;
+                        self.release_async_attempt()?;
+                        let (reconciled, _) =
+                            self.finish_async_attempt(AcceptanceMutation::Rerun)?;
+                        if !same_terminal_binding(cancelled, reconciled) {
+                            return Err(AcceptanceSocketError::Operation);
+                        }
+                        cancelled
+                    };
+                    Ok(cancelled_response(request, prior, cancelled)?)
+                }
+                (13, Operation::TombstoneRerun) => {
+                    self.publish_acceptance(AcceptanceMutation::Tombstone)?;
+                    Ok(tombstoned_response(request, prior)?)
+                }
+                _ => Err(AcceptanceSocketError::Operation),
+            },
+        )
     }
 
     fn response_written(&mut self, request: &AdapterRequest) -> Result<(), Self::Error> {
@@ -855,6 +1039,41 @@ impl CapacityOneService {
         };
         validate_cancelled_terminal(active, terminal, true)?;
         Ok(terminal)
+    }
+
+    fn recover_cancelled_attempt(
+        &mut self,
+        request: &AdapterRequest,
+    ) -> Result<TerminalAttempt, AcceptanceSocketError> {
+        match self.poll_recovery_attempt(AcceptanceMutation::Rerun)? {
+            RecoveryAttempt::Active(active) => {
+                let cancelled = self.cancel_active_attempt(request, *active)?;
+                self.release_async_attempt()?;
+                let (reconciled, _) = self.finish_async_attempt(AcceptanceMutation::Rerun)?;
+                if !same_terminal_binding(cancelled, reconciled) {
+                    return Err(AcceptanceSocketError::Operation);
+                }
+                Ok(cancelled)
+            }
+            RecoveryAttempt::Terminal(recovered) => {
+                let (terminal, _) = *recovered;
+                let recovered = BoundAttempt {
+                    admission: terminal.admission,
+                    response: terminal.response,
+                };
+                validate_cancelled_terminal(recovered, terminal, false)?;
+                Ok(terminal)
+            }
+            RecoveryAttempt::NoObservation => {
+                let (terminal, _) = self.reconstruct_runner_attempt(AcceptanceMutation::Rerun)?;
+                let recovered = BoundAttempt {
+                    admission: terminal.admission,
+                    response: terminal.response,
+                };
+                validate_cancelled_terminal(recovered, terminal, false)?;
+                Ok(terminal)
+            }
+        }
     }
 }
 
