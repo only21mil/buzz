@@ -183,8 +183,15 @@ async fn cmd_rerun(
         max_attempts: 5,
     };
 
-    let plan = ev::derive_rerun_plan(&request_event_id, &request, &statuses, job, parameters)
-        .map_err(|e| CliError::Other(format!("failed to derive rerun plan: {e}")))?;
+    let plan = ev::derive_rerun_plan(
+        &request_event_id,
+        &request,
+        &accepted,
+        &statuses,
+        job,
+        parameters,
+    )
+    .map_err(|e| CliError::Other(format!("failed to derive rerun plan: {e}")))?;
 
     // Build and sign the rerun request event (kind 46100).
     let content = serde_json::to_string(&plan.request)
@@ -393,9 +400,12 @@ pub(super) async fn fetch_ci_run_events_page(
     let mut previous = after_cursor;
     let mut accepted = Vec::with_capacity(response.events.len());
     for stored in response.events {
-        if !valid_watch_cursor(stored.watch_cursor) || stored.watch_cursor <= previous {
+        let expected = previous.checked_add(1).ok_or_else(|| {
+            CliError::Other("CI events exporter cursor overflowed the safe range".into())
+        })?;
+        if !valid_watch_cursor(stored.watch_cursor) || stored.watch_cursor != expected {
             return Err(CliError::Other(
-                "CI events exporter returned a non-increasing cursor page".into(),
+                "CI events exporter returned a non-contiguous cursor page".into(),
             ));
         }
         previous = stored.watch_cursor;
@@ -759,7 +769,7 @@ mod tests {
             let (keys, event) = ci_request_fixture();
             std::env::set_var("BUZZ_CI_CHANNEL", CHANNEL);
             std::env::set_var("BUZZ_CI_STATUS_SIGNERS", keys.public_key().to_hex());
-            let (url, calls) = mock_ci_exporter(&event, 37).await;
+            let (url, calls) = mock_ci_exporter(&event, 1).await;
             let cmd = CiCmd::Status { run: RUN_ID.into() };
             let result = dispatch(cmd, &test_client(&url)).await;
             assert!(
@@ -780,7 +790,7 @@ mod tests {
             std::env::remove_var("BUZZ_CI_CHANNEL");
             std::env::remove_var("BUZZ_CI_STATUS_SIGNERS");
             let (keys, event) = ci_request_fixture();
-            let (url, calls) = mock_ci_exporter(&event, 37).await;
+            let (url, calls) = mock_ci_exporter(&event, 1).await;
             drop(keys);
             let cmd = CiCmd::Status { run: RUN_ID.into() };
             assert!(matches!(
@@ -795,7 +805,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_preserves_exported_cursor_not_event_created_at() {
         let (keys, event) = ci_request_fixture();
-        let (url, _) = mock_ci_exporter(&event, 37).await;
+        let (url, _) = mock_ci_exporter(&event, 1).await;
         let trusted = RunTrustedContext {
             channel_id: CHANNEL.into(),
             status_signers: HashSet::from([keys.public_key().to_hex()]),
@@ -803,7 +813,7 @@ mod tests {
         let snapshot = fetch_ci_run_snapshot(&test_client(&url), RUN_ID, &trusted)
             .await
             .unwrap();
-        assert_eq!(snapshot.accepted[0].watch_cursor, 37);
+        assert_eq!(snapshot.accepted[0].watch_cursor, 1);
         assert_eq!(event.created_at.as_secs(), 1_700_000_000);
     }
 
@@ -1083,7 +1093,7 @@ mod tests {
     async fn events_exporter_rejects_conflicting_pages() {
         let (keys, event) = ci_request_fixture();
         let trusted = trusted_for(&keys);
-        let (request_url, _) = mock_ci_exporter(&event, 37).await;
+        let (request_url, _) = mock_ci_exporter(&event, 1).await;
         let request = fetch_ci_run_request(&test_client(&request_url), RUN_ID, &trusted)
             .await
             .unwrap();
@@ -1119,15 +1129,15 @@ mod tests {
             "unexpected error: {error:?}"
         );
 
-        // Cursors must strictly increase and stay above zero.
-        for cursors in [[7, 7], [7, 6], [0, 1]] {
+        // Cursors must advance exactly once from the requested checkpoint.
+        for cursors in [[2, 3], [1, 3], [1, 1], [1, 0]] {
             let mut page = run_event_page(&event, 1..=2);
             for (index, cursor) in cursors.iter().enumerate() {
                 page["events"][index]["watch_cursor"] = serde_json::json!(cursor);
             }
             let error = conflict(page).await;
             assert!(
-                error.to_string().contains("non-increasing cursor page"),
+                error.to_string().contains("non-contiguous cursor page"),
                 "unexpected error for cursors {cursors:?}: {error:?}"
             );
         }
@@ -1154,7 +1164,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn events_exporter_preserves_cursor_ordering_on_a_valid_page() {
+    async fn events_exporter_preserves_contiguous_cursor_ordering_on_a_valid_page() {
         let (keys, event) = ci_request_fixture();
         let trusted = trusted_for(&keys);
         let status_event = ci_job_status_fixture(&keys, &event.id.to_hex());
@@ -1163,9 +1173,9 @@ mod tests {
             "request_event_id": event.id.to_hex(),
             "events": [
                 run_event_entry(5, &event),
-                run_event_entry(9, &status_event),
+                run_event_entry(6, &status_event),
             ],
-            "next_cursor": 9,
+            "next_cursor": 6,
         });
         let (url, _calls) =
             mock_ci_run_routes(serde_json::json!({}), Arc::new(move |_| page.clone())).await;
@@ -1184,7 +1194,7 @@ mod tests {
             accepted[1].envelope,
             buzz_core::ci::ValidatedCiEnvelope::JobStatus(_)
         ));
-        assert_eq!(next_cursor, 9);
+        assert_eq!(next_cursor, 6);
     }
 
     #[test]
@@ -1313,5 +1323,50 @@ mod tests {
         assert_eq!(snapshot.accepted[0].watch_cursor, 1);
         assert_eq!(snapshot.accepted[1_000].watch_cursor, 1_001);
         assert_eq!(snapshot.request.run_id, RUN_ID);
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_an_omitted_event_between_pages() {
+        let (keys, event) = ci_request_fixture();
+        let trusted = trusted_for(&keys);
+        let status_event = ci_job_status_fixture(&keys, &event.id.to_hex());
+        let first_page = serde_json::json!({
+            "run_id": RUN_ID,
+            "request_event_id": event.id.to_hex(),
+            "events": (1..=1_000)
+                .map(|cursor| run_event_entry(
+                    cursor,
+                    if cursor == 1 { &event } else { &status_event },
+                ))
+                .collect::<Vec<_>>(),
+            "next_cursor": 1_000,
+        });
+        let second_page = serde_json::json!({
+            "run_id": RUN_ID,
+            "request_event_id": event.id.to_hex(),
+            "events": [run_event_entry(1_002, &status_event)],
+            "next_cursor": 1_002,
+        });
+        let pages = [first_page, second_page];
+        let request_body = serde_json::json!({
+            "run_id": RUN_ID,
+            "request_event_id": event.id.to_hex(),
+            "watch_cursor": 1,
+            "accepted_at": "2026-08-29T00:00:00Z",
+            "event": &event,
+        });
+        let (url, _) = mock_ci_run_routes(
+            request_body,
+            Arc::new(move |page| pages[page.min(1) as usize].clone()),
+        )
+        .await;
+        let error = fetch_ci_run_snapshot(&test_client(&url), RUN_ID, &trusted)
+            .await
+            .err()
+            .expect("an omitted interior event must fail closed");
+        assert!(
+            error.to_string().contains("non-contiguous cursor page"),
+            "unexpected error: {error:?}"
+        );
     }
 }

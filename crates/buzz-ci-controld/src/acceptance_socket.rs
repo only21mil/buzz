@@ -7,7 +7,15 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use buzz_ci_acceptance_ctl::acceptance::{AdmissionState, DRIVER_VERSION};
+#[cfg(test)]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
+use buzz_ci_acceptance_ctl::acceptance::{
+    AdmissionState, Operation, ACCEPTANCE_STAGE_COUNT, DRIVER_VERSION,
+};
 pub use buzz_ci_acceptance_ctl::acceptance_binding::{
     AcceptanceActorBinding, AcceptanceAuthorityBinding,
     AcceptanceBindingReceipt as AcceptanceBinding, ACCEPTANCE_BINDING_PATH,
@@ -23,7 +31,7 @@ use thiserror::Error;
 pub const ACCEPTANCE_SOCKET_PATH: &str = "/run/buzzci/controld-acceptance.sock";
 pub const ACCEPTANCE_FD_NAME: &str = "buzz-ci-controld-acceptance";
 pub const SYSTEMD_LISTEN_FD: i32 = 3;
-const ACCEPTANCE_LEDGER_SCHEMA: &str = "buzz-ci-controld-acceptance-ledger/v1";
+const ACCEPTANCE_LEDGER_SCHEMA: &str = "buzz-ci-controld-acceptance-ledger/v2";
 const ACCEPTANCE_LEDGER_NAME: &str = "acceptance-operation-ledger-v1.json";
 const ACCEPTANCE_LEDGER_NEXT: &str = ".acceptance-operation-ledger-v1.json.next";
 const ACCEPTANCE_LEDGER_LOCK: &str = ".acceptance-operation-ledger.lock";
@@ -31,12 +39,18 @@ const ACCEPTANCE_LEDGER_MODE: u32 = 0o600;
 const MAX_ACCEPTANCE_LEDGER_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Durable request replay and sequence boundary for one activation scenario.
-/// It stores only canonical request digests and bounded canonical responses.
+/// It stages each canonical response before promoting it to the completed
+/// sequence, so a restart in that finalization window never repeats the
+/// operation or consumes another relay event.
 #[derive(Clone, Debug)]
 pub struct AcceptanceJournal {
     root: PathBuf,
     expected_owner_uid: u32,
     binding: AcceptanceBinding,
+    #[cfg(test)]
+    fail_before_staged_response: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_after_staged_response: Arc<AtomicBool>,
 }
 
 impl AcceptanceJournal {
@@ -62,6 +76,10 @@ impl AcceptanceJournal {
             root,
             expected_owner_uid,
             binding,
+            #[cfg(test)]
+            fail_before_staged_response: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_after_staged_response: Arc::new(AtomicBool::new(false)),
         };
         journal.with_locked(|ledger| ledger.validate(&journal.binding))?;
         Ok(journal)
@@ -90,13 +108,17 @@ impl AcceptanceJournal {
     }
 
     /// Validate activation, sequence, capacity, generation, and replay bindings
-    /// before invoking an operation. Exact retries return the durable response.
+    /// before invoking an operation. Exact retries return either the completed
+    /// response or a response durably staged before final ledger promotion.
     pub fn execute<E>(
         &self,
         request: &AdapterRequest,
         exact_request: &[u8],
         configured_capacity: u32,
-        operation: impl FnOnce(Option<&AdapterResponse>) -> Result<AdapterResponse, E>,
+        operation: impl FnOnce(
+            Option<&AdapterResponse>,
+            AcceptanceExecution,
+        ) -> Result<AdapterResponse, E>,
     ) -> Result<AdapterResponse, AcceptanceSocketError> {
         self.with_locked(|ledger| {
             ledger.validate(&self.binding)?;
@@ -111,6 +133,28 @@ impl AcceptanceJournal {
                 }
                 return serde_json::from_slice(&entry.response)
                     .map_err(|_| AcceptanceSocketError::Replay);
+            }
+            if let Some(in_progress) = ledger.in_progress.as_ref() {
+                if in_progress.sequence != request.sequence
+                    || in_progress.operation_id != request.operation_id
+                    || in_progress.request_sha256 != request_digest
+                {
+                    return Err(AcceptanceSocketError::Replay);
+                }
+                if let Some(encoded) = in_progress.response.clone() {
+                    let response: AdapterResponse = serde_json::from_slice(&encoded)
+                        .map_err(|_| AcceptanceSocketError::Replay)?;
+                    validate_bound_response(request, &response, configured_capacity)?;
+                    ledger.entries.push(AcceptanceLedgerEntry {
+                        sequence: in_progress.sequence,
+                        operation_id: in_progress.operation_id.clone(),
+                        request_sha256: in_progress.request_sha256.clone(),
+                        response: encoded,
+                    });
+                    ledger.in_progress = None;
+                    self.persist(ledger)?;
+                    return Ok(response);
+                }
             }
             if configured_capacity > 1
                 || request.sequence != u32::try_from(ledger.entries.len() + 1).unwrap_or(u32::MAX)
@@ -159,21 +203,53 @@ impl AcceptanceJournal {
                 }
                 _ => {}
             }
-            let response =
-                operation(prior.as_ref()).map_err(|_| AcceptanceSocketError::Operation)?;
-            validate_response(request, &response)?;
-            if response.response.snapshot.capacity != configured_capacity
-                || response.response.snapshot.admission != request.host.admission
-                || response.response.snapshot.controller_generation
-                    != request.host.controller_generation
-                || response.response.snapshot.runner_generation != request.host.runner_generation
+            let execution = if ledger.in_progress.is_none() {
+                ledger.in_progress = Some(AcceptanceLedgerInProgress {
+                    sequence: request.sequence,
+                    operation_id: request.operation_id.clone(),
+                    request_sha256: request_digest.clone(),
+                    response: None,
+                });
+                self.persist(ledger)?;
+                AcceptanceExecution::Fresh
+            } else {
+                AcceptanceExecution::Recovering
+            };
+            let response = match operation(prior.as_ref(), execution) {
+                Ok(response) => response,
+                Err(_) => {
+                    if request.operation == Operation::ExportFirstEvidence {
+                        ledger.in_progress = None;
+                        self.persist(ledger)?;
+                    }
+                    return Err(AcceptanceSocketError::Operation);
+                }
+            };
+            #[cfg(test)]
+            if self
+                .fail_before_staged_response
+                .swap(false, Ordering::SeqCst)
             {
-                return Err(AcceptanceSocketError::Binding);
+                return Err(AcceptanceSocketError::Operation);
             }
+            validate_bound_response(request, &response, configured_capacity)?;
             let encoded =
                 serde_json::to_vec(&response).map_err(|_| AcceptanceSocketError::Frame)?;
             if encoded.len() > MAX_ADAPTER_FRAME_BYTES {
                 return Err(AcceptanceSocketError::Frame);
+            }
+            ledger
+                .in_progress
+                .as_mut()
+                .ok_or(AcceptanceSocketError::Replay)?
+                .response = Some(encoded.clone());
+            self.persist(ledger)?;
+            #[cfg(test)]
+            if self
+                .fail_after_staged_response
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(AcceptanceSocketError::Operation);
             }
             ledger.entries.push(AcceptanceLedgerEntry {
                 sequence: request.sequence,
@@ -181,9 +257,22 @@ impl AcceptanceJournal {
                 request_sha256: request_digest,
                 response: encoded,
             });
+            ledger.in_progress = None;
             self.persist(ledger)?;
             Ok(response)
         })
+    }
+
+    #[cfg(test)]
+    fn inject_failure_before_staged_response(&self) {
+        self.fail_before_staged_response
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn inject_failure_after_staged_response(&self) {
+        self.fail_after_staged_response
+            .store(true, Ordering::SeqCst);
     }
 
     fn with_locked<T>(
@@ -270,6 +359,14 @@ impl AcceptanceJournal {
     }
 }
 
+/// Whether an operation starts from a new durable request intent or resumes
+/// an intent whose response was not yet staged when the process stopped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcceptanceExecution {
+    Fresh,
+    Recovering,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct AcceptanceLedger {
@@ -278,6 +375,7 @@ struct AcceptanceLedger {
     activation_id: String,
     activation_package_digest: String,
     entries: Vec<AcceptanceLedgerEntry>,
+    in_progress: Option<AcceptanceLedgerInProgress>,
 }
 
 impl AcceptanceLedger {
@@ -288,6 +386,7 @@ impl AcceptanceLedger {
             activation_id: binding.activation_id.clone(),
             activation_package_digest: binding.activation_package_digest.clone(),
             entries: Vec::new(),
+            in_progress: None,
         }
     }
 
@@ -296,7 +395,9 @@ impl AcceptanceLedger {
             || self.scenario_sha256 != binding.scenario_sha256
             || self.activation_id != binding.activation_id
             || self.activation_package_digest != binding.activation_package_digest
-            || self.entries.len() > 13
+            || self.entries.len() > ACCEPTANCE_STAGE_COUNT as usize
+            || self.entries.len() + usize::from(self.in_progress.is_some())
+                > ACCEPTANCE_STAGE_COUNT as usize
             || self.entries.iter().enumerate().any(|(index, entry)| {
                 entry.sequence != u32::try_from(index + 1).unwrap_or(u32::MAX)
                     || !lower_hex(&entry.operation_id, 64)
@@ -304,11 +405,29 @@ impl AcceptanceLedger {
                     || entry.response.len() > MAX_ADAPTER_FRAME_BYTES
                     || serde_json::from_slice::<AdapterResponse>(&entry.response).is_err()
             })
+            || self.in_progress.as_ref().is_some_and(|in_progress| {
+                in_progress.sequence != u32::try_from(self.entries.len() + 1).unwrap_or(u32::MAX)
+                    || !lower_hex(&in_progress.operation_id, 64)
+                    || !lower_hex(&in_progress.request_sha256, 64)
+                    || in_progress.response.as_ref().is_some_and(|response| {
+                        response.len() > MAX_ADAPTER_FRAME_BYTES
+                            || serde_json::from_slice::<AdapterResponse>(response).is_err()
+                    })
+            })
         {
             return Err(AcceptanceSocketError::Replay);
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AcceptanceLedgerInProgress {
+    sequence: u32,
+    operation_id: String,
+    request_sha256: String,
+    response: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -540,6 +659,22 @@ fn validate_response(
     Ok(())
 }
 
+fn validate_bound_response(
+    request: &AdapterRequest,
+    response: &AdapterResponse,
+    configured_capacity: u32,
+) -> Result<(), AcceptanceSocketError> {
+    validate_response(request, response)?;
+    if response.response.snapshot.capacity != configured_capacity
+        || response.response.snapshot.admission != request.host.admission
+        || response.response.snapshot.controller_generation != request.host.controller_generation
+        || response.response.snapshot.runner_generation != request.host.runner_generation
+    {
+        return Err(AcceptanceSocketError::Binding);
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 fn parse_env_u32(key: &str) -> Result<u32, AcceptanceSocketError> {
     std::env::var(key)
@@ -555,7 +690,8 @@ mod tests {
     use std::thread;
 
     use buzz_ci_acceptance_ctl::acceptance::{
-        AdmissionState, DriverResponse, EvidenceObject, FixtureSpec, Operation, SystemSnapshot,
+        AdmissionState, DriverResponse, EvidenceObject, FixtureSelector, FixtureSpec, Operation,
+        SystemSnapshot,
     };
     use buzz_ci_acceptance_ctl::acceptance_binding::AcceptanceBindingError;
     use buzz_ci_acceptance_ctl::acceptance_binding_test_support::{
@@ -569,6 +705,22 @@ mod tests {
     use buzz_core::kind::{KIND_CI_GRANT, KIND_CI_REQUEST, KIND_DELETION};
 
     struct Handler;
+
+    fn failure_selector(run_id: &str, job_id: &str) -> FixtureSelector {
+        let parsed = uuid::Uuid::parse_str(run_id).unwrap();
+        let encoded = format!(
+            "buzz-ci:capacity-one:fixture-selector:v1\nbuzz-ci-capacity-one-fixture-selector/v1\ndeterministic-failure\n{job_id}\n{}\n1\n",
+            parsed.simple(),
+        );
+        FixtureSelector {
+            schema_version: "buzz-ci-capacity-one-fixture-selector/v1".into(),
+            selector: "deterministic-failure".into(),
+            job_id: job_id.into(),
+            run_id: parsed.hyphenated().to_string(),
+            attempt: 1,
+            sha256: hex::encode(Sha256::digest(encoded.as_bytes())),
+        }
+    }
 
     impl AcceptanceOperationHandler for Handler {
         type Error = ();
@@ -605,11 +757,14 @@ mod tests {
 
     fn request() -> AdapterRequest {
         let acceptance = authority();
+        let failure_run_id = "13131313-1313-5313-9313-131313131314";
+        let failure_selector = failure_selector(failure_run_id, "test");
         let event_ids = [
             &acceptance.run_event,
             &acceptance.grant_event,
             &acceptance.rerun_event,
             &acceptance.tombstone_event,
+            &acceptance.failure_run_event,
         ]
         .map(|event| Sha256::digest(serde_json::to_vec(event).unwrap()));
         let fixture = FixtureSpec {
@@ -617,8 +772,14 @@ mod tests {
             activation_id: "activation-1".into(),
             activation_package_digest: "12".repeat(32),
             run_id: "13".repeat(16),
+            failure_run_id: uuid::Uuid::parse_str(failure_run_id)
+                .unwrap()
+                .simple()
+                .to_string(),
+            failure_selector,
             job_id: "test".into(),
             request_digest: hex::encode(event_ids[0]),
+            failure_request_digest: hex::encode(event_ids[4]),
             manifest_digest: "15".repeat(32),
             source_oid: "16".repeat(20),
             approval_id: "17".repeat(16),
@@ -626,12 +787,18 @@ mod tests {
             grant_digest: "19".repeat(32),
             approved_by: acceptance.actor.public_key,
             export_subject: "1b".repeat(32),
+            export_generation: 11,
             export_authorization_digest: "1c".repeat(32),
             controller_generation: 7,
             runner_generation: 9,
             expected_log: EvidenceObject {
                 name: "job.log".into(),
                 sha256: "1d".repeat(32),
+                bytes: 1,
+            },
+            expected_failure_log: EvidenceObject {
+                name: "job.log".into(),
+                sha256: "1f".repeat(32),
                 bytes: 1,
             },
             expected_artifacts: vec![EvidenceObject {
@@ -732,6 +899,18 @@ mod tests {
             }))
             .unwrap()
         ]);
+        let mut failure_run = run.clone();
+        failure_run.run_id = "13131313-1313-5313-9313-131313131314".into();
+        failure_run.idempotency_key = "123e4567-e89b-12d3-a456-426614174014".into();
+        let failure_run_event = serde_json::json!([
+            0,
+            actor,
+            failure_run.issued_at,
+            KIND_CI_REQUEST,
+            request_tags(channel, &failure_run).unwrap(),
+            serde_json::to_string(&failure_run).unwrap()
+        ]);
+        run = failure_run;
         run.request_type = CiRequestType::Rerun;
         run.attempt = 2;
         run.parent_attempt = Some(1);
@@ -766,6 +945,10 @@ mod tests {
             grant_event,
             rerun_event,
             tombstone_event,
+            failure_run_event,
+            export_subject: "1b".repeat(32),
+            export_generation: 11,
+            export_authorization_digest: "1c".repeat(32),
         }
     }
 
@@ -895,7 +1078,7 @@ mod tests {
         assert_eq!(journal.completed_sequences().unwrap(), 0);
         let expected = Handler.handle(&request, &exact).unwrap();
         let first = journal
-            .execute(&request, &exact, 0, |_| Ok::<_, ()>(expected.clone()))
+            .execute(&request, &exact, 0, |_, _| Ok::<_, ()>(expected.clone()))
             .unwrap();
         assert_eq!(first, expected);
         assert_eq!(journal.completed_sequences().unwrap(), 1);
@@ -907,7 +1090,7 @@ mod tests {
             "the completed count is durable across a controld restart"
         );
         let replayed = reopened
-            .execute(&request, &exact, 0, |_| {
+            .execute(&request, &exact, 0, |_, _| {
                 Err::<AdapterResponse, _>("operation must not run")
             })
             .unwrap();
@@ -927,7 +1110,9 @@ mod tests {
         let mut divergent = exact.clone();
         divergent.push(b' ');
         assert_eq!(
-            reopened.execute(&request, &divergent, 0, |_| Ok::<_, ()>(expected.clone())),
+            reopened.execute(&request, &divergent, 0, |_, _| Ok::<_, ()>(
+                expected.clone()
+            )),
             Err(AcceptanceSocketError::Replay)
         );
 
@@ -937,9 +1122,460 @@ mod tests {
         skipped.operation_id = expected_adapter_operation_id(&skipped).unwrap();
         let skipped_exact = serde_json::to_vec(&skipped).unwrap();
         assert_eq!(
-            reopened.execute(&skipped, &skipped_exact, 0, |_| Ok::<_, ()>(expected)),
+            reopened.execute(&skipped, &skipped_exact, 0, |_, _| Ok::<_, ()>(expected)),
             Err(AcceptanceSocketError::Binding)
         );
+    }
+
+    #[test]
+    fn journal_recovers_staged_terminal_and_cancel_responses_without_reexecution() {
+        let operations = [
+            Operation::ObserveInitial,
+            Operation::SetCapacityOne,
+            Operation::SubmitManifest,
+            Operation::ApproveGrant,
+            Operation::ResumeGrant,
+            Operation::AwaitFirstTerminal,
+            Operation::ExportFirstEvidence,
+            Operation::SubmitFailureManifest,
+            Operation::ResumeFailure,
+            Operation::AwaitFailureTerminal,
+            Operation::Rerun,
+            Operation::CancelRerun,
+        ];
+
+        for target in [6_usize, 7, 10, 12] {
+            let root = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let owner_uid = fs::metadata(root.path()).unwrap().uid();
+            let mut request = request();
+            let binding = binding(&request);
+
+            for (index, operation) in operations.iter().copied().take(target).enumerate() {
+                request.sequence = u32::try_from(index + 1).unwrap();
+                request.operation = operation;
+                request.expected_controller_generation = (index != 0).then_some(7);
+                request.expected_runner_generation = (index != 0).then_some(9);
+                request.operation_id = expected_adapter_operation_id(&request).unwrap();
+                let exact = serde_json::to_vec(&request).unwrap();
+                let expected = Handler.handle(&request, &exact).unwrap();
+                let journal =
+                    AcceptanceJournal::open(root.path(), owner_uid, binding.clone()).unwrap();
+                if index + 1 == target {
+                    journal.inject_failure_after_staged_response();
+                    let mut side_effects = 0;
+                    assert_eq!(
+                        journal.execute(&request, &exact, 0, |_, _| {
+                            side_effects += 1;
+                            Ok::<_, ()>(expected.clone())
+                        }),
+                        Err(AcceptanceSocketError::Operation)
+                    );
+                    assert_eq!(side_effects, 1, "the operation completed before the crash");
+
+                    let reopened =
+                        AcceptanceJournal::open(root.path(), owner_uid, binding.clone()).unwrap();
+                    let replayed = reopened
+                        .execute(&request, &exact, 0, |_, _| -> Result<AdapterResponse, ()> {
+                            panic!("a staged response must not execute or poll again")
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::to_vec(&replayed).unwrap(),
+                        serde_json::to_vec(&expected).unwrap()
+                    );
+                    assert_eq!(reopened.completed_sequences().unwrap(), request.sequence);
+                } else {
+                    journal
+                        .execute(&request, &exact, 0, |_, _| Ok::<_, ()>(expected))
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn journal_recovers_unstaged_terminal_and_cancel_intents_from_provider_state() {
+        let operations = [
+            Operation::ObserveInitial,
+            Operation::SetCapacityOne,
+            Operation::SubmitManifest,
+            Operation::ApproveGrant,
+            Operation::ResumeGrant,
+            Operation::AwaitFirstTerminal,
+            Operation::ExportFirstEvidence,
+            Operation::SubmitFailureManifest,
+            Operation::ResumeFailure,
+            Operation::AwaitFailureTerminal,
+            Operation::Rerun,
+            Operation::CancelRerun,
+        ];
+
+        for target in [6_usize, 10, 12] {
+            let root = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let owner_uid = fs::metadata(root.path()).unwrap().uid();
+            let mut request = request();
+            let binding = binding(&request);
+
+            for (index, operation) in operations.iter().copied().take(target).enumerate() {
+                request.sequence = u32::try_from(index + 1).unwrap();
+                request.operation = operation;
+                request.expected_controller_generation = (index != 0).then_some(7);
+                request.expected_runner_generation = (index != 0).then_some(9);
+                request.operation_id = expected_adapter_operation_id(&request).unwrap();
+                let exact = serde_json::to_vec(&request).unwrap();
+                let expected = Handler.handle(&request, &exact).unwrap();
+                let journal =
+                    AcceptanceJournal::open(root.path(), owner_uid, binding.clone()).unwrap();
+                if index + 1 == target {
+                    journal.inject_failure_before_staged_response();
+                    let mut side_effects = 0;
+                    assert_eq!(
+                        journal.execute(&request, &exact, 0, |_, execution| {
+                            assert_eq!(execution, AcceptanceExecution::Fresh);
+                            side_effects += 1;
+                            Ok::<_, ()>(expected.clone())
+                        }),
+                        Err(AcceptanceSocketError::Operation)
+                    );
+                    assert_eq!(side_effects, 1, "the provider side effect happened once");
+
+                    let reopened =
+                        AcceptanceJournal::open(root.path(), owner_uid, binding.clone()).unwrap();
+                    let mut provider_reconciliations = 0;
+                    let recovered = reopened
+                        .execute(&request, &exact, 0, |_, execution| {
+                            assert_eq!(execution, AcceptanceExecution::Recovering);
+                            provider_reconciliations += 1;
+                            Ok::<_, ()>(expected.clone())
+                        })
+                        .unwrap();
+                    assert_eq!(provider_reconciliations, 1);
+                    assert_eq!(
+                        serde_json::to_vec(&recovered).unwrap(),
+                        serde_json::to_vec(&expected).unwrap()
+                    );
+                    assert_eq!(reopened.completed_sequences().unwrap(), request.sequence);
+                } else {
+                    journal
+                        .execute(&request, &exact, 0, |_, execution| {
+                            assert_eq!(execution, AcceptanceExecution::Fresh);
+                            Ok::<_, ()>(expected)
+                        })
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_export_clears_its_intent_and_retries_fresh_after_reopen() {
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let owner_uid = fs::metadata(root.path()).unwrap().uid();
+        let mut request = request();
+        let binding = binding(&request);
+        for (index, operation) in [
+            Operation::ObserveInitial,
+            Operation::SetCapacityOne,
+            Operation::SubmitManifest,
+            Operation::ApproveGrant,
+            Operation::ResumeGrant,
+            Operation::AwaitFirstTerminal,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            request.sequence = u32::try_from(index + 1).unwrap();
+            request.operation = operation;
+            request.expected_controller_generation = (index != 0).then_some(7);
+            request.expected_runner_generation = (index != 0).then_some(9);
+            request.operation_id = expected_adapter_operation_id(&request).unwrap();
+            let exact = serde_json::to_vec(&request).unwrap();
+            let expected = Handler.handle(&request, &exact).unwrap();
+            AcceptanceJournal::open(root.path(), owner_uid, binding.clone())
+                .unwrap()
+                .execute(&request, &exact, 0, |_, _| Ok::<_, ()>(expected))
+                .unwrap();
+        }
+
+        request.sequence = 7;
+        request.operation = Operation::ExportFirstEvidence;
+        request.expected_controller_generation = Some(7);
+        request.expected_runner_generation = Some(9);
+        request.operation_id = expected_adapter_operation_id(&request).unwrap();
+        let exact = serde_json::to_vec(&request).unwrap();
+        let expected = Handler.handle(&request, &exact).unwrap();
+        let ledger_path = root.path().join(ACCEPTANCE_LEDGER_NAME);
+        let before = fs::read(&ledger_path).unwrap();
+        let journal = AcceptanceJournal::open(root.path(), owner_uid, binding.clone()).unwrap();
+
+        let mut bad_generation = request.clone();
+        bad_generation.expected_controller_generation = Some(8);
+        bad_generation.operation_id = expected_adapter_operation_id(&bad_generation).unwrap();
+        let bad_exact = serde_json::to_vec(&bad_generation).unwrap();
+        let mut called = false;
+        assert_eq!(
+            journal.execute(&bad_generation, &bad_exact, 0, |_, _| {
+                called = true;
+                Ok::<_, ()>(expected.clone())
+            }),
+            Err(AcceptanceSocketError::Binding)
+        );
+        assert!(!called);
+        assert_eq!(fs::read(&ledger_path).unwrap(), before);
+
+        let mut bad_runner_generation = request.clone();
+        bad_runner_generation.expected_runner_generation = Some(10);
+        bad_runner_generation.operation_id =
+            expected_adapter_operation_id(&bad_runner_generation).unwrap();
+        let bad_runner_exact = serde_json::to_vec(&bad_runner_generation).unwrap();
+        let mut called = false;
+        assert_eq!(
+            journal.execute(&bad_runner_generation, &bad_runner_exact, 0, |_, _| {
+                called = true;
+                Ok::<_, ()>(expected.clone())
+            }),
+            Err(AcceptanceSocketError::Binding)
+        );
+        assert!(!called);
+        assert_eq!(fs::read(&ledger_path).unwrap(), before);
+
+        let mut bad_host_controller_generation = request.clone();
+        bad_host_controller_generation.host.controller_generation = 6;
+        bad_host_controller_generation.operation_id =
+            expected_adapter_operation_id(&bad_host_controller_generation).unwrap();
+        let bad_host_controller_exact =
+            serde_json::to_vec(&bad_host_controller_generation).unwrap();
+        let mut called = false;
+        assert_eq!(
+            journal.execute(
+                &bad_host_controller_generation,
+                &bad_host_controller_exact,
+                0,
+                |_, _| {
+                    called = true;
+                    Ok::<_, ()>(expected.clone())
+                }
+            ),
+            Err(AcceptanceSocketError::Binding)
+        );
+        assert!(!called);
+        assert_eq!(fs::read(&ledger_path).unwrap(), before);
+
+        let mut bad_host_runner_generation = request.clone();
+        bad_host_runner_generation.host.runner_generation = 8;
+        bad_host_runner_generation.operation_id =
+            expected_adapter_operation_id(&bad_host_runner_generation).unwrap();
+        let bad_host_runner_exact = serde_json::to_vec(&bad_host_runner_generation).unwrap();
+        let mut called = false;
+        assert_eq!(
+            journal.execute(
+                &bad_host_runner_generation,
+                &bad_host_runner_exact,
+                0,
+                |_, _| {
+                    called = true;
+                    Ok::<_, ()>(expected.clone())
+                }
+            ),
+            Err(AcceptanceSocketError::Binding)
+        );
+        assert!(!called);
+        assert_eq!(fs::read(&ledger_path).unwrap(), before);
+
+        assert_eq!(
+            journal.execute(&request, &exact, 0, |_, execution| {
+                assert_eq!(execution, AcceptanceExecution::Fresh);
+                Err::<AdapterResponse, _>(())
+            }),
+            Err(AcceptanceSocketError::Operation)
+        );
+        assert_eq!(journal.completed_sequences().unwrap(), 6);
+        assert_eq!(fs::read(&ledger_path).unwrap(), before);
+
+        let reopened = AcceptanceJournal::open(root.path(), owner_uid, binding).unwrap();
+        let response = reopened
+            .execute(&request, &exact, 0, |_, execution| {
+                assert_eq!(execution, AcceptanceExecution::Fresh);
+                Ok::<_, ()>(expected.clone())
+            })
+            .unwrap();
+        assert_eq!(response, expected);
+        assert_eq!(reopened.completed_sequences().unwrap(), 7);
+    }
+
+    #[test]
+    fn export_panic_recovers_then_an_ordinary_refusal_restores_fresh_execution() {
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let owner_uid = fs::metadata(root.path()).unwrap().uid();
+        let mut request = request();
+        let binding = binding(&request);
+        for (index, operation) in [
+            Operation::ObserveInitial,
+            Operation::SetCapacityOne,
+            Operation::SubmitManifest,
+            Operation::ApproveGrant,
+            Operation::ResumeGrant,
+            Operation::AwaitFirstTerminal,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            request.sequence = u32::try_from(index + 1).unwrap();
+            request.operation = operation;
+            request.expected_controller_generation = (index != 0).then_some(7);
+            request.expected_runner_generation = (index != 0).then_some(9);
+            request.operation_id = expected_adapter_operation_id(&request).unwrap();
+            let exact = serde_json::to_vec(&request).unwrap();
+            let expected = Handler.handle(&request, &exact).unwrap();
+            AcceptanceJournal::open(root.path(), owner_uid, binding.clone())
+                .unwrap()
+                .execute(&request, &exact, 0, |_, _| Ok::<_, ()>(expected))
+                .unwrap();
+        }
+        request.sequence = 7;
+        request.operation = Operation::ExportFirstEvidence;
+        request.expected_controller_generation = Some(7);
+        request.expected_runner_generation = Some(9);
+        request.operation_id = expected_adapter_operation_id(&request).unwrap();
+        let exact = serde_json::to_vec(&request).unwrap();
+        let journal = AcceptanceJournal::open(root.path(), owner_uid, binding.clone()).unwrap();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = journal.execute(&request, &exact, 0, |_, execution| -> Result<_, ()> {
+                assert_eq!(execution, AcceptanceExecution::Fresh);
+                panic!("provider crash")
+            });
+        }))
+        .is_err());
+
+        let recovering = AcceptanceJournal::open(root.path(), owner_uid, binding.clone()).unwrap();
+        assert_eq!(
+            recovering.execute(&request, &exact, 0, |_, execution| {
+                assert_eq!(execution, AcceptanceExecution::Recovering);
+                Err::<AdapterResponse, _>(())
+            }),
+            Err(AcceptanceSocketError::Operation)
+        );
+        let fresh = AcceptanceJournal::open(root.path(), owner_uid, binding).unwrap();
+        assert_eq!(
+            fresh.execute(&request, &exact, 0, |_, execution| {
+                assert_eq!(execution, AcceptanceExecution::Fresh);
+                Err::<AdapterResponse, _>(())
+            }),
+            Err(AcceptanceSocketError::Operation)
+        );
+    }
+
+    #[test]
+    fn ordinary_non_export_error_keeps_its_recoverable_intent() {
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let owner_uid = fs::metadata(root.path()).unwrap().uid();
+        let request = request();
+        let exact = serde_json::to_vec(&request).unwrap();
+        let binding = binding(&request);
+        let journal = AcceptanceJournal::open(root.path(), owner_uid, binding.clone()).unwrap();
+        assert_eq!(
+            journal.execute(&request, &exact, 0, |_, execution| {
+                assert_eq!(execution, AcceptanceExecution::Fresh);
+                Err::<AdapterResponse, _>(())
+            }),
+            Err(AcceptanceSocketError::Operation)
+        );
+        let reopened = AcceptanceJournal::open(root.path(), owner_uid, binding).unwrap();
+        assert_eq!(
+            reopened.execute(&request, &exact, 0, |_, execution| {
+                assert_eq!(execution, AcceptanceExecution::Recovering);
+                Err::<AdapterResponse, _>(())
+            }),
+            Err(AcceptanceSocketError::Operation)
+        );
+    }
+
+    #[test]
+    fn journal_rejects_a_mismatched_retry_of_a_staged_response() {
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let owner_uid = fs::metadata(root.path()).unwrap().uid();
+        let request = request();
+        let exact = serde_json::to_vec(&request).unwrap();
+        let expected = Handler.handle(&request, &exact).unwrap();
+        let journal = AcceptanceJournal::open(root.path(), owner_uid, binding(&request)).unwrap();
+        journal.inject_failure_after_staged_response();
+        assert_eq!(
+            journal.execute(&request, &exact, 0, |_, _| Ok::<_, ()>(expected.clone())),
+            Err(AcceptanceSocketError::Operation)
+        );
+
+        let reopened = AcceptanceJournal::open(root.path(), owner_uid, binding(&request)).unwrap();
+        let mut divergent = exact;
+        divergent.push(b' ');
+        assert_eq!(
+            reopened.execute(&request, &divergent, 0, |_, _| Ok::<_, ()>(expected)),
+            Err(AcceptanceSocketError::Replay)
+        );
+        assert_eq!(reopened.completed_sequences().unwrap(), 0);
+    }
+
+    #[test]
+    fn journal_reopens_and_validates_all_sixteen_acceptance_stages() {
+        let root = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let owner_uid = fs::metadata(root.path()).unwrap().uid();
+        let mut request = request();
+        let binding = binding(&request);
+        let operations = [
+            Operation::ObserveInitial,
+            Operation::SetCapacityOne,
+            Operation::SubmitManifest,
+            Operation::ApproveGrant,
+            Operation::ResumeGrant,
+            Operation::AwaitFirstTerminal,
+            Operation::ExportFirstEvidence,
+            Operation::SubmitFailureManifest,
+            Operation::ResumeFailure,
+            Operation::AwaitFailureTerminal,
+            Operation::Rerun,
+            Operation::CancelRerun,
+            Operation::TombstoneRerun,
+            Operation::RestartController,
+            Operation::RestartRunner,
+            Operation::SetCapacityZero,
+        ];
+
+        for (index, operation) in operations.into_iter().enumerate() {
+            request.sequence = u32::try_from(index + 1).unwrap();
+            request.operation = operation;
+            request.expected_controller_generation = (index != 0).then_some(7);
+            request.expected_runner_generation = (index != 0).then_some(9);
+            request.operation_id = expected_adapter_operation_id(&request).unwrap();
+            let exact = serde_json::to_vec(&request).unwrap();
+            let expected = Handler.handle(&request, &exact).unwrap();
+            let journal = AcceptanceJournal::open(root.path(), owner_uid, binding.clone()).unwrap();
+            journal
+                .execute(&request, &exact, 0, |_, _| Ok::<_, ()>(expected))
+                .unwrap();
+            let reopened =
+                AcceptanceJournal::open(root.path(), owner_uid, binding.clone()).unwrap();
+            assert_eq!(reopened.completed_sequences().unwrap(), request.sequence);
+        }
     }
 
     #[test]

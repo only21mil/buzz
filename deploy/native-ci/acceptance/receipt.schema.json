@@ -13,7 +13,7 @@
     "run_id": { "$ref": "#/$defs/hex32" },
     "checks": {
       "type": "array",
-      "maxItems": 13,
+      "maxItems": 16,
       "prefixItems": [
         { "$ref": "#/$defs/check1" }, { "$ref": "#/$defs/check2" },
         { "$ref": "#/$defs/check3" }, { "$ref": "#/$defs/check4" },
@@ -21,7 +21,8 @@
         { "$ref": "#/$defs/check7" }, { "$ref": "#/$defs/check8" },
         { "$ref": "#/$defs/check9" }, { "$ref": "#/$defs/check10" },
         { "$ref": "#/$defs/check11" }, { "$ref": "#/$defs/check12" },
-        { "$ref": "#/$defs/check13" }
+        { "$ref": "#/$defs/check13" }, { "$ref": "#/$defs/check14" },
+        { "$ref": "#/$defs/check15" }, { "$ref": "#/$defs/check16" }
       ],
       "items": false
     },
@@ -33,7 +34,7 @@
       "then": {
       "required": ["zero_transition"],
       "properties": {
-        "checks": { "minItems": 13, "maxItems": 13 },
+        "checks": { "minItems": 16, "maxItems": 16 },
         "zero_transition": { "$ref": "#/$defs/passZeroTransition" }
       },
         "allOf": [
@@ -64,7 +65,8 @@
       "enum": [
         "capacity_zero_closed", "capacity_one_open", "manifest_identity",
         "approval_grant", "grant_resume", "first_attempt_terminal",
-        "authenticated_export", "rerun_separation", "cancellation_terminal",
+        "authenticated_export", "failed_manifest_identity", "failed_attempt_running",
+        "failed_attempt_terminal", "rerun_separation", "cancellation_terminal",
         "tombstone_folding", "controller_restart_recovery",
         "runner_restart_recovery", "prepare_capacity_zero"
       ]
@@ -104,7 +106,7 @@
         "source_oid": { "$ref": "#/$defs/gitOid" },
         "evidence_set_digest": { "$ref": "#/$defs/hex64" },
         "log": { "$ref": "#/$defs/evidence" },
-        "artifacts": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/evidence" } }
+        "artifacts": { "type": "array", "maxItems": 1, "items": { "$ref": "#/$defs/evidence" } }
       }
     },
     "run": {
@@ -138,23 +140,24 @@
     },
     "export": {
       "type": "object", "additionalProperties": false,
-      "required": ["authenticated", "subject", "authorization_digest", "attempt_id", "request_digest", "manifest_digest", "evidence_set_digest", "objects"],
+      "required": ["authenticated", "subject", "generation", "authorization_digest", "attempt_id", "request_digest", "manifest_digest", "evidence_set_digest", "objects"],
       "properties": {
         "authenticated": { "const": true },
         "subject": { "$ref": "#/$defs/hex64" },
+        "generation": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
         "authorization_digest": { "$ref": "#/$defs/hex64" },
         "attempt_id": { "$ref": "#/$defs/hex32" },
         "request_digest": { "$ref": "#/$defs/hex64" },
         "manifest_digest": { "$ref": "#/$defs/hex64" },
         "evidence_set_digest": { "$ref": "#/$defs/hex64" },
-        "objects": { "type": "array", "minItems": 1, "maxItems": 65, "items": { "$ref": "#/$defs/evidence" } }
+        "objects": { "type": "array", "minItems": 2, "maxItems": 2, "items": { "$ref": "#/$defs/evidence" } }
       }
     },
     "check": {
       "type": "object", "additionalProperties": false,
       "required": ["sequence", "stage", "outcome", "evidence_sha256", "snapshot"],
       "properties": {
-        "sequence": { "type": "integer", "minimum": 1, "maximum": 13 },
+        "sequence": { "type": "integer", "minimum": 1, "maximum": 16 },
         "stage": { "$ref": "#/$defs/stage" },
         "outcome": { "$ref": "#/$defs/outcome" },
         "evidence_sha256": { "$ref": "#/$defs/hex64" },
@@ -169,12 +172,15 @@
     "check5": { "allOf": [{ "$ref": "#/$defs/check" }, { "properties": { "sequence": { "const": 5 }, "stage": { "const": "grant_resume" } } }, { "not": { "required": ["export"] } }] },
     "check6": { "allOf": [{ "$ref": "#/$defs/check" }, { "properties": { "sequence": { "const": 6 }, "stage": { "const": "first_attempt_terminal" } } }, { "not": { "required": ["export"] } }] },
     "check7": { "allOf": [{ "$ref": "#/$defs/check" }, { "properties": { "sequence": { "const": 7 }, "stage": { "const": "authenticated_export" } }, "required": ["export"] }] },
-    "check8": { "allOf": [{ "$ref": "#/$defs/check" }, { "properties": { "sequence": { "const": 8 }, "stage": { "const": "rerun_separation" } } }, { "not": { "required": ["export"] } }] },
-    "check9": { "allOf": [{ "$ref": "#/$defs/check" }, { "properties": { "sequence": { "const": 9 }, "stage": { "const": "cancellation_terminal" } } }, { "not": { "required": ["export"] } }] },
-    "check10": { "allOf": [{ "$ref": "#/$defs/check" }, { "properties": { "sequence": { "const": 10 }, "stage": { "const": "tombstone_folding" } } }, { "not": { "required": ["export"] } }] },
-    "check11": { "allOf": [{ "$ref": "#/$defs/check" }, { "properties": { "sequence": { "const": 11 }, "stage": { "const": "controller_restart_recovery" } } }, { "not": { "required": ["export"] } }] },
-    "check12": { "allOf": [{ "$ref": "#/$defs/check" }, { "properties": { "sequence": { "const": 12 }, "stage": { "const": "runner_restart_recovery" } } }, { "not": { "required": ["export"] } }] },
-    "check13": { "allOf": [{ "$ref": "#/$defs/check" }, { "properties": { "sequence": { "const": 13 }, "stage": { "const": "prepare_capacity_zero" } } }, { "not": { "required": ["export"] } }] },
+    "check8": { "allOf": [{ "$ref": "#/$defs/check" }, { "properties": { "sequence": { "const": 8 }, "stage": { "const": "failed_manifest_identity" } } }, { "not": { "required": ["export"] } }] },
+    "check9": { "allOf": [{ "$ref": "#/$defs/check" }, { "properties": { "sequence": { "const": 9 }, "stage": { "const": "failed_attempt_running" } } }, { "not": { "required": ["export"] } }] },
+    "check10": { "allOf": [{ "$ref": "#/$defs/check" }, { "properties": { "sequence": { "const": 10 }, "stage": { "const": "failed_attempt_terminal" } } }, { "not": { "required": ["export"] } }] },
+    "check11": { "allOf": [{ "$ref": "#/$defs/check" }, { "properties": { "sequence": { "const": 11 }, "stage": { "const": "rerun_separation" } } }, { "not": { "required": ["export"] } }] },
+    "check12": { "allOf": [{ "$ref": "#/$defs/check" }, { "properties": { "sequence": { "const": 12 }, "stage": { "const": "cancellation_terminal" } } }, { "not": { "required": ["export"] } }] },
+    "check13": { "allOf": [{ "$ref": "#/$defs/check" }, { "properties": { "sequence": { "const": 13 }, "stage": { "const": "tombstone_folding" } } }, { "not": { "required": ["export"] } }] },
+    "check14": { "allOf": [{ "$ref": "#/$defs/check" }, { "properties": { "sequence": { "const": 14 }, "stage": { "const": "controller_restart_recovery" } } }, { "not": { "required": ["export"] } }] },
+    "check15": { "allOf": [{ "$ref": "#/$defs/check" }, { "properties": { "sequence": { "const": 15 }, "stage": { "const": "runner_restart_recovery" } } }, { "not": { "required": ["export"] } }] },
+    "check16": { "allOf": [{ "$ref": "#/$defs/check" }, { "properties": { "sequence": { "const": 16 }, "stage": { "const": "prepare_capacity_zero" } } }, { "not": { "required": ["export"] } }] },
     "zeroProof": {
       "type": "object", "additionalProperties": false,
       "required": ["schema_version", "scenario_sha256", "activation_id", "activation_package_digest", "integrated_candidate_sha", "capacity", "admission", "controller_generation", "runner_generation", "controld_service_active", "controld_acceptance_socket_active", "controld_acceptance_socket_present"],
@@ -196,7 +202,7 @@
       "type": "object", "additionalProperties": false,
       "required": ["sequence", "operation", "operation_id", "scenario_sha256", "activation_id", "activation_package_digest", "integrated_candidate_sha", "failed_stage"],
       "properties": {
-        "sequence": { "type": "integer", "minimum": 14, "maximum": 15 },
+        "sequence": { "type": "integer", "minimum": 17, "maximum": 18 },
         "operation": { "enum": ["finalize_capacity_zero", "prove_capacity_zero"] },
         "operation_id": { "$ref": "#/$defs/hex64" },
         "scenario_sha256": { "$ref": "#/$defs/hex64" },
@@ -228,7 +234,7 @@
       "type": "object", "additionalProperties": false,
       "required": ["sequence", "operation", "outcome", "attempts", "request_sha256", "response_sha256", "request", "response"],
       "properties": {
-        "sequence": { "type": "integer", "minimum": 14, "maximum": 15 },
+        "sequence": { "type": "integer", "minimum": 17, "maximum": 18 },
         "operation": { "enum": ["finalize_capacity_zero", "prove_capacity_zero"] },
         "outcome": { "const": "pass" },
         "attempts": { "type": "integer", "minimum": 1, "maximum": 2 },
@@ -238,8 +244,8 @@
         "response": { "$ref": "#/$defs/zeroResponse" }
       }
     },
-    "zeroPhase14": { "allOf": [{ "$ref": "#/$defs/zeroPhase" }, { "properties": { "sequence": { "const": 14 }, "operation": { "const": "finalize_capacity_zero" }, "request": { "allOf": [{ "$ref": "#/$defs/zeroRequest" }, { "properties": { "sequence": { "const": 14 }, "operation": { "const": "finalize_capacity_zero" } } }] } } }] },
-    "zeroPhase15": { "allOf": [{ "$ref": "#/$defs/zeroPhase" }, { "properties": { "sequence": { "const": 15 }, "operation": { "const": "prove_capacity_zero" }, "request": { "allOf": [{ "$ref": "#/$defs/zeroRequest" }, { "properties": { "sequence": { "const": 15 }, "operation": { "const": "prove_capacity_zero" } } }] } } }] },
+    "zeroPhase17": { "allOf": [{ "$ref": "#/$defs/zeroPhase" }, { "properties": { "sequence": { "const": 17 }, "operation": { "const": "finalize_capacity_zero" }, "request": { "allOf": [{ "$ref": "#/$defs/zeroRequest" }, { "properties": { "sequence": { "const": 17 }, "operation": { "const": "finalize_capacity_zero" } } }] } } }] },
+    "zeroPhase18": { "allOf": [{ "$ref": "#/$defs/zeroPhase" }, { "properties": { "sequence": { "const": 18 }, "operation": { "const": "prove_capacity_zero" }, "request": { "allOf": [{ "$ref": "#/$defs/zeroRequest" }, { "properties": { "sequence": { "const": 18 }, "operation": { "const": "prove_capacity_zero" } } }] } } }] },
     "zeroTransition": {
       "type": "object", "additionalProperties": false,
       "required": ["schema_version", "outcome", "attempts", "phases", "zero_proof"],
@@ -247,15 +253,15 @@
         "schema_version": { "const": "buzz-ci-capacity-one-zero-transition/v1" },
         "outcome": { "const": "pass" },
         "attempts": { "type": "integer", "minimum": 1, "maximum": 2 },
-        "phases": { "type": "array", "minItems": 2, "maxItems": 2, "prefixItems": [{ "$ref": "#/$defs/zeroPhase14" }, { "$ref": "#/$defs/zeroPhase15" }], "items": false },
+        "phases": { "type": "array", "minItems": 2, "maxItems": 2, "prefixItems": [{ "$ref": "#/$defs/zeroPhase17" }, { "$ref": "#/$defs/zeroPhase18" }], "items": false },
         "zero_proof": { "$ref": "#/$defs/zeroProof" }
       }
     },
     "passZeroTransition": {
       "allOf": [{ "$ref": "#/$defs/zeroTransition" }, { "properties": { "phases": {
         "prefixItems": [
-          { "allOf": [{ "$ref": "#/$defs/zeroPhase14" }, { "properties": { "request": { "$ref": "#/$defs/passZeroRequest" } } }] },
-          { "allOf": [{ "$ref": "#/$defs/zeroPhase15" }, { "properties": { "request": { "$ref": "#/$defs/passZeroRequest" } } }] }
+          { "allOf": [{ "$ref": "#/$defs/zeroPhase17" }, { "properties": { "request": { "$ref": "#/$defs/passZeroRequest" } } }] },
+          { "allOf": [{ "$ref": "#/$defs/zeroPhase18" }, { "properties": { "request": { "$ref": "#/$defs/passZeroRequest" } } }] }
         ]
       } } }]
     },

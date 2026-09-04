@@ -30,7 +30,8 @@ driver connects directly and the kernel reports the connecting process.
 
 ## What the gate proves
 
-The 13 checks run in this order:
+The 16 checks run in this order. Run A is the successful evidence lane; Run B
+is a distinct failed-parent and rerun lane with different run and request IDs:
 
 1. Capacity is zero, admission is closed, and no work is active.
 2. Capacity becomes exactly one without starting work.
@@ -38,19 +39,37 @@ The 13 checks run in this order:
 4. The expected approver and grant are present, but no attempt starts.
 5. Explicit resume starts exactly one first attempt.
 6. The first attempt terminates successfully with the expected log and artifact.
-7. An authenticated export returns the same evidence set and exact byte digests.
-8. Rerun creates attempt two with a distinct ID and attempt one as its parent.
-9. Cancellation makes attempt two terminal with a cancelled conclusion.
-10. A tombstone keeps attempt two visible and folds the run back to attempt one.
-11. Controller restart advances its generation without losing folded state.
-12. Runner restart advances its generation without losing folded state.
-13. The final durable controld snapshot is retained while capacity is prepared
-    for the root-only close.
+7. Authenticated relay queries read back the exact signed evidence references
+   and final facts, then bounded authenticated `GET`s return exactly Run A
+   attempt 1 `job.log` and the declared `result` artifact (`result.json`) with
+   the same evidence set, lengths, and byte digests. The returned nip98 subject
+   and generation equal the frozen `export_subject` and `export_generation`.
+8. The exact Run B manifest enters the granted-but-not-resumed boundary without
+   starting work.
+9. Explicit resume starts exactly one Run B attempt.
+10. Run B attempt one terminates in failure with its exact failure log and no artifact.
+11. Rerun creates Run B attempt two with a distinct ID and attempt one as its parent.
+12. Cancellation makes attempt two terminal with a cancelled conclusion.
+13. A tombstone keeps attempt two visible and folds Run B back to failed attempt one.
+14. The root acceptance helper restarts controld. Its generation advances and
+    controld recovers the folded Run B state.
+15. The root acceptance helper restarts the runner. Its generation advances and
+    controld retains the folded Run B state.
+16. The root helper prepares staged zero first. The restarted capacity-zero
+    controld then journals and returns the final durable snapshot with capacity
+    zero, admission closed, no active work, and the folded Run B state intact.
 
-The receipt then retains two root-only phases. Sequence 14 finalizes capacity
-zero and stops the controld acceptance transport. Sequence 15 independently
+The receipt then retains two root-only phases. Sequence 17 finalizes capacity
+zero and stops the controld acceptance transport. Sequence 18 independently
 proves capacity zero, closed admission, and the absence of the controld service,
 socket unit, and socket path. These phases are not acceptance-stage entries.
+
+The activation binding freezes five actor-signed events. The keyholder's
+`describe_acceptance` response names their semantic slots as Run, Grant,
+Rerun, Tombstone, FailureRun. The gate publishes them in API call order as Run,
+Grant, FailureRun, Rerun, Tombstone because Run B must exist and fail before its
+rerun and tombstone. Do not treat the semantic field order as publication
+chronology.
 
 Any missing field, duplicate attempt, extra evidence object, identity mismatch,
 generation regression, or ambiguous active count stops the sequence. A failed
@@ -65,10 +84,24 @@ candidate path is pinned to the integrated base. All five endpoint entries are
 the same installed driver with an empty argument list. The schema rejects any
 other executable or arguments.
 
+The scenario and shared acceptance receipt contain the Run A request digest,
+run ID, job ID, expected hashes, fixed object declarations, and export selector
+identity; they contain no evidence URL or path list. Keyholder independently
+reconstructs the one log path and one artifact path with attempt `1` and
+artifact ID `result`. A third path is denied even when it has canonical syntax.
+
 The checked-in fixture runs
 [`fixtures/run-fixture.sh`](fixtures/run-fixture.sh). It verifies the source
-input digest, writes a byte-stable `result.json`, and emits one byte-stable log
-line. [`fixtures/fixture-manifest.json`](fixtures/fixture-manifest.json) binds
+input digest, writes a byte-stable `result.json`, and emits one byte-stable success log
+line. A distinct, domain-separated UUIDv5 identifies Run B without encoding
+fixture behavior in the identifier. The activation manifest freezes a public
+`failure_selector` bound to Run B's job ID, run ID, and attempt 1, and hashes
+that tuple separately. The controller copies it into the scenario, driver
+configuration, and execd static declaration. Execd injects the resulting
+`BUZZ_CI_FIXTURE_OUTCOME` only after the exact tuple matches; attempt 1 emits
+the byte-stable failure log and exits nonzero without an artifact, while Run A
+and Run B attempt 2 enter the normal success/hold path.
+[`fixtures/fixture-manifest.json`](fixtures/fixture-manifest.json) binds
 the command, input, and required evidence names. Recompute all scenario digests
 if any fixture byte changes.
 
@@ -99,9 +132,14 @@ target/release/buzz-ci-capacity-one-canary \
   > /protected/path/capacity-one-receipt.json
 ```
 
-The binary returns `0` only after all 13 checks and both root-only phases pass.
+The binary returns `0` only after all 16 checks and both root-only phases pass.
 It returns `1` with a failure receipt for a driver or evidence failure, and `2`
 for invalid input. It copies no raw adapter output or stderr into the receipt.
+The receipt never contains an Authorization header, encoded NIP-98 token, raw
+NIP-98 event, signature, nonce, NIP-98 timestamp, credential, or evidence-object
+bytes. It retains only stable public selector identity and generation facts,
+sanitized request bindings and object metadata, and deterministic digests of
+those values.
 
 Validate the receipt schema, then run the maintained semantic verifier against
 the exact rendered scenario:
@@ -123,7 +161,7 @@ materialize it as `0700`. Packaging must validate the tracked execute intent
 and hardened file metadata through `verifier_source.py`, then install and read
 back the declared `0755` mode.
 
-The verifier reads its fixed 13-stage vector only from
+The verifier reads its fixed 16-stage vector only from
 `/usr/libexec/buzz-ci-acceptance-expected-stages.json`. The activation package
 installs that tracked data asset as `root:root` mode `0644`; the verifier rejects
 missing, linked, multiply linked, ownership- or mode-drifted, noncanonical, or
@@ -132,7 +170,7 @@ digest-drifted data. There is no argument or environment override for the path.
 The verifier rejects reordered, duplicate, partial, or hash-only stage records.
 It recomputes every retained driver-response and root-phase digest; binds the
 scenario, activation package, candidate, run, evidence, and service generations;
-and requires the sequence-15 proof to equal the retained final zero proof. Its
+and requires the sequence-18 proof to equal the retained final zero proof. Its
 single JSON success line is acceptance evidence for that exact scenario. It is
 not a deployment receipt and does not activate capacity. Keep capacity zero
 until the separate activation decision and its approval are recorded.
@@ -142,6 +180,8 @@ until the separate activation decision and its approval are recorded.
 Treat every nonzero canary or verifier exit as closed. A failure after capacity
 opened may retain a successful two-phase zero transition, but it never passes
 the verifier. Confirm capacity zero through an independent read path before
-retrying. Do not edit a failed receipt or reuse its grant, request, run, or
-attempt identities. If sequence 15 cannot prove the close, stop and use the
-approved service recovery procedure.
+retrying. A stage-7 authentication, exact-event cardinality or binding,
+response-cap, object-length, or digest failure stops the gate before Run B and
+returns no partial export. Do not edit a failed receipt or reuse its grant,
+request, run, or attempt identities. If sequence 18 cannot prove the close,
+stop and use the approved service recovery procedure.

@@ -4,7 +4,7 @@ use buzz_core::ci::{request_tags, CiRequestEnvelope, CiRequestType, CI_SCHEMA_VE
 use buzz_core::kind::{KIND_CI_GRANT, KIND_CI_REQUEST, KIND_DELETION};
 use sha2::{Digest, Sha256};
 
-use crate::acceptance::{EvidenceObject, FixtureSpec};
+use crate::acceptance::{EvidenceObject, FixtureSelector, FixtureSpec};
 use crate::acceptance_binding::{
     AcceptanceActorBinding, AcceptanceAuthorityBinding, AcceptanceBindingReceipt,
     ACCEPTANCE_BINDING_SCHEMA,
@@ -76,6 +76,18 @@ pub fn canonical_acceptance_binding() -> AcceptanceBindingReceipt {
         }))
         .expect("grant content")
     ]);
+    let mut failure_run = run.clone();
+    failure_run.run_id = "13131313-1313-5313-9313-131313131314".to_owned();
+    failure_run.idempotency_key = "123e4567-e89b-12d3-a456-426614174014".to_owned();
+    let failure_run_event = serde_json::json!([
+        0,
+        actor,
+        failure_run.issued_at,
+        KIND_CI_REQUEST,
+        request_tags(channel, &failure_run).expect("failure run tags"),
+        serde_json::to_string(&failure_run).expect("failure run content")
+    ]);
+    run = failure_run;
     run.request_type = CiRequestType::Rerun;
     run.attempt = 2;
     run.parent_attempt = Some(1);
@@ -101,7 +113,13 @@ pub fn canonical_acceptance_binding() -> AcceptanceBindingReceipt {
         ""
     ]);
     let request_digest = event_id(&run_event);
+    let failure_request_digest = event_id(&failure_run_event);
     let grant_event_id = event_id(&grant_event);
+    let selector_run_id = uuid::Uuid::parse_str(&run.run_id).expect("failure run UUID");
+    let selector_bytes = format!(
+        "buzz-ci:capacity-one:fixture-selector:v1\nbuzz-ci-capacity-one-fixture-selector/v1\ndeterministic-failure\ntest\n{}\n1\n",
+        selector_run_id.simple(),
+    );
     AcceptanceBindingReceipt {
         schema_version: ACCEPTANCE_BINDING_SCHEMA.to_owned(),
         activation_id: "activation-1".to_owned(),
@@ -117,8 +135,18 @@ pub fn canonical_acceptance_binding() -> AcceptanceBindingReceipt {
             activation_id: "activation-1".to_owned(),
             activation_package_digest: "12".repeat(32),
             run_id: "13".repeat(16),
+            failure_run_id: "13131313131353139313131313131314".to_owned(),
+            failure_selector: FixtureSelector {
+                schema_version: "buzz-ci-capacity-one-fixture-selector/v1".to_owned(),
+                selector: "deterministic-failure".to_owned(),
+                job_id: "test".to_owned(),
+                run_id: selector_run_id.hyphenated().to_string(),
+                attempt: 1,
+                sha256: hex::encode(Sha256::digest(selector_bytes.as_bytes())),
+            },
             job_id: "test".to_owned(),
             request_digest,
+            failure_request_digest,
             manifest_digest: "15".repeat(32),
             source_oid: "16".repeat(20),
             approval_id: "17".repeat(16),
@@ -126,12 +154,18 @@ pub fn canonical_acceptance_binding() -> AcceptanceBindingReceipt {
             grant_digest: "19".repeat(32),
             approved_by: actor.to_owned(),
             export_subject: "1b".repeat(32),
+            export_generation: 11,
             export_authorization_digest: "1c".repeat(32),
             controller_generation: 7,
             runner_generation: 9,
             expected_log: EvidenceObject {
                 name: "job.log".to_owned(),
                 sha256: "1d".repeat(32),
+                bytes: 1,
+            },
+            expected_failure_log: EvidenceObject {
+                name: "job.log".to_owned(),
+                sha256: "1f".repeat(32),
                 bytes: 1,
             },
             expected_artifacts: vec![EvidenceObject {
@@ -150,6 +184,10 @@ pub fn canonical_acceptance_binding() -> AcceptanceBindingReceipt {
             grant_event,
             rerun_event,
             tombstone_event,
+            failure_run_event,
+            export_subject: "1b".repeat(32),
+            export_generation: 11,
+            export_authorization_digest: "1c".repeat(32),
         },
     }
 }
@@ -216,6 +254,18 @@ pub fn acceptance_binding_mutation_corpus() -> Vec<AcceptanceBindingMutation> {
     });
     push_receipt_mutation(&mut cases, "generation", |receipt| {
         receipt.acceptance.actor.generation = 0
+    });
+    push_receipt_mutation(&mut cases, "export_generation", |receipt| {
+        receipt.fixture.export_generation += 1
+    });
+    push_receipt_mutation(&mut cases, "acceptance_export_subject", |receipt| {
+        receipt.acceptance.export_subject = "2a".repeat(32)
+    });
+    push_receipt_mutation(&mut cases, "acceptance_export_generation", |receipt| {
+        receipt.acceptance.export_generation += 1
+    });
+    push_receipt_mutation(&mut cases, "acceptance_export_digest", |receipt| {
+        receipt.acceptance.export_authorization_digest = "2b".repeat(32)
     });
     push_receipt_mutation(&mut cases, "request_id", |receipt| {
         receipt.fixture.request_digest = "26".repeat(32)

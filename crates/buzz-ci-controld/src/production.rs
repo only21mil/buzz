@@ -11,10 +11,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use buzz_core::ci::{
     artifact_reference_tags, evidence_finalized_tags, job_status_tags, log_reference_tags,
-    run_status_tags, teardown_attestation_tags, CiArtifactReferenceEnvelope,
-    CiEvidenceFinalizedEnvelope, CiFinalizedJobAttempt, CiJobState, CiJobStatusEnvelope,
-    CiLogReferenceEnvelope, CiRequestEnvelope, CiRunState, CiRunStatusEnvelope, CiSkipPolicy,
-    CiTeardownAttestationEnvelope, CI_SCHEMA_VERSION,
+    run_status_tags, teardown_attestation_tags, validate_signed_ci_event,
+    CiArtifactReferenceEnvelope, CiEvidenceFinalizedEnvelope, CiFinalizedJobAttempt, CiJobState,
+    CiJobStatusEnvelope, CiLogReferenceEnvelope, CiRequestEnvelope, CiRunState,
+    CiRunStatusEnvelope, CiSkipPolicy, CiTeardownAttestationEnvelope, ValidatedCiEnvelope,
+    CI_SCHEMA_VERSION,
 };
 use buzz_core::kind::{
     KIND_CI_ARTIFACT_REFERENCE, KIND_CI_EVIDENCE_FINALIZED, KIND_CI_JOB_STATUS,
@@ -38,6 +39,25 @@ pub struct AcceptedRequest {
     pub watch_cursor: u64,
     pub event_id: String,
     pub envelope: CiRequestEnvelope,
+}
+
+/// Exact frozen request identity required for an acceptance-only poll.
+///
+/// The binding is checked before any run state, publication intent, runner
+/// dispatch, or channel cursor mutation can occur.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AcceptedRequestBinding {
+    pub channel_id: String,
+    pub event_id: String,
+    pub envelope: CiRequestEnvelope,
+}
+
+impl AcceptedRequestBinding {
+    fn matches(&self, accepted: &AcceptedRequest) -> bool {
+        accepted.channel_id == self.channel_id
+            && accepted.event_id == self.event_id
+            && accepted.envelope == self.envelope
+    }
 }
 
 /// Trusted static manifest facts used in signed kind-46102 events.
@@ -115,6 +135,49 @@ pub struct StoredObject {
     pub byte_length: u64,
 }
 
+/// One authenticated exact-event relay readback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedEventRead {
+    pub event: SignedCiEvent,
+    pub proof: crate::source::Nip98Proof,
+    pub binding: crate::source::Nip98Binding,
+}
+
+/// One authenticated, bounded evidence-object readback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedObjectRead {
+    pub bytes: Vec<u8>,
+    pub proof: crate::source::Nip98Proof,
+    pub binding: crate::source::Nip98Binding,
+}
+
+/// Closed failure of the acceptance-only authenticated export surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExportReadError {
+    Unavailable,
+    Refused,
+    Invalid,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExportedEvidenceObject {
+    pub name: String,
+    pub sha256: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedEvidenceExport {
+    pub subject: String,
+    pub generation: u64,
+    pub authorization_digest: String,
+    pub request_event_id: String,
+    pub run_id: String,
+    pub job_id: String,
+    pub attempt: u32,
+    pub objects: Vec<ExportedEvidenceObject>,
+}
+
 /// Relay intake and evidence/publication transport.
 pub trait RelayControl {
     type Error;
@@ -158,6 +221,27 @@ pub trait RelayControl {
         artifact: &ArtifactCompletion,
         bytes: &[u8],
     ) -> Result<StoredObject, Self::Error>;
+
+    /// Read one exact CI event through the existing author-bound query path.
+    fn read_exact_event(
+        &mut self,
+        _event_id: &str,
+        _kind: u32,
+        _author: &str,
+    ) -> Result<AuthenticatedEventRead, ExportReadError> {
+        Err(ExportReadError::Unavailable)
+    }
+
+    /// Read one signed-reference evidence URL with an exact byte ceiling.
+    fn read_evidence_object(
+        &mut self,
+        _url: &str,
+        _expected_sha256: &str,
+        _expected_bytes: u64,
+        _maximum_bytes: u64,
+    ) -> Result<AuthenticatedObjectRead, ExportReadError> {
+        Err(ExportReadError::Unavailable)
+    }
 }
 
 /// Dedicated keyholder. Implementations must sign exact content and tags.
@@ -165,6 +249,9 @@ pub trait CiSigner {
     type Error;
 
     fn pubkey(&self) -> &str;
+    fn generation(&self) -> u64 {
+        0
+    }
     fn sign(
         &mut self,
         kind: u32,
@@ -486,7 +573,16 @@ where
 {
     /// Consume at most one accepted request after the durable channel cursor.
     pub fn poll_once(&mut self, channel_id: &str) -> Result<PollStep, ProductionError> {
-        self.poll_head(channel_id, false)
+        self.poll_head(channel_id, false, None)
+    }
+
+    /// Consume only the exact frozen request selected by an acceptance stage.
+    pub fn poll_once_bound(
+        &mut self,
+        channel_id: &str,
+        expected: &AcceptedRequestBinding,
+    ) -> Result<PollStep, ProductionError> {
+        self.poll_head(channel_id, false, Some(expected))
     }
 
     /// Replay every deferred publication through the ordinary pending path
@@ -512,15 +608,377 @@ where
             self.republish(key, stored)?;
         }
         if !deferred.is_empty() {
-            while self.poll_head(channel_id, true)? == PollStep::Completed {}
+            while self.poll_head(channel_id, true, None)? == PollStep::Completed {}
         }
         Ok(deferred.len())
+    }
+
+    /// Replay deferred acceptance publications only when the channel head is
+    /// the exact frozen request selected by the acceptance stage.
+    ///
+    /// The head check precedes every publication retry. Unlike the general
+    /// post-qualification replay path, this settles at most that one request.
+    pub fn replay_deferred_publications_bound(
+        &mut self,
+        channel_id: &str,
+        expected: &AcceptedRequestBinding,
+    ) -> Result<usize, ProductionError> {
+        let deferred = self
+            .store
+            .deferred_publications()
+            .map_err(|_| ProductionError::Store)?;
+        if deferred.is_empty() {
+            return Ok(0);
+        }
+        let cursor = self
+            .store
+            .cursor(channel_id)
+            .map_err(|_| ProductionError::Store)?;
+        let accepted = self
+            .relay
+            .next_accepted(channel_id, cursor)
+            .map_err(|_| ProductionError::Relay)?
+            .ok_or(ProductionError::Invalid)?;
+        if accepted.watch_cursor <= cursor
+            || accepted.channel_id != channel_id
+            || !expected.matches(&accepted)
+        {
+            return Err(ProductionError::Invalid);
+        }
+        for key in &deferred {
+            let stored = self
+                .store
+                .load_publication(key)
+                .map_err(|_| ProductionError::Store)?
+                .ok_or(ProductionError::PublicationConflict)?;
+            self.republish(key, stored)?;
+        }
+        let _ = self.poll_head(channel_id, true, Some(expected))?;
+        Ok(deferred.len())
+    }
+
+    /// Re-read the selected successful attempt through authenticated relay
+    /// APIs. No locally stored content or runner output is exported.
+    pub fn export_first_evidence(
+        &mut self,
+        expected: &AcceptedRequestBinding,
+        job_id: &str,
+        attempt: u32,
+    ) -> Result<AuthenticatedEvidenceExport, ProductionError> {
+        let accepted = AcceptedRequest {
+            channel_id: expected.channel_id.clone(),
+            watch_cursor: 1,
+            event_id: expected.event_id.clone(),
+            envelope: expected.envelope.clone(),
+        };
+        if attempt == 0
+            || expected.envelope.attempt != attempt
+            || !expected.envelope.job_ids.iter().any(|id| id == job_id)
+        {
+            return Err(ProductionError::Invalid);
+        }
+        let identity = run_identity(&accepted)?;
+        let (_, record) = self
+            .store
+            .load_run(&identity)
+            .map_err(|_| ProductionError::Store)?
+            .ok_or(ProductionError::Invalid)?;
+        if record.state() != RunState::Success {
+            return Err(ProductionError::Invalid);
+        }
+        let signer = self.signer.pubkey().to_owned();
+        let signer_generation = self.signer.generation();
+        if signer_generation == 0 {
+            return Err(ProductionError::Invalid);
+        }
+        let status_id = accepted_publication_id(
+            &self.store,
+            &format!("{}:job:{job_id}:{attempt}:status:3", accepted.event_id),
+        )?;
+        let status = read_validated_event(
+            &mut self.relay,
+            &status_id,
+            KIND_CI_JOB_STATUS,
+            &signer,
+            signer_generation,
+            &accepted.channel_id,
+        )?;
+        let ValidatedCiEnvelope::JobStatus(status) = status else {
+            return Err(ProductionError::Invalid);
+        };
+        if !matches!(status.state, CiJobState::Success)
+            || status.sequence != 3
+            || status.job_id != job_id
+            || status.attempt != attempt
+            || status.request_event_id != accepted.event_id
+            || status.run_id != accepted.envelope.run_id
+            || status.workflow_id != accepted.envelope.workflow_id
+            || status.target_repo_a != accepted.envelope.target_repo_a
+            || status.tip_oid != accepted.envelope.tip_oid
+            || status.base_oid != accepted.envelope.base_oid
+            || status.relay_signer != signer
+            || status.artifact_refs.len() != 1
+        {
+            return Err(ProductionError::Invalid);
+        }
+        let log_id = status.log_ref.ok_or(ProductionError::Invalid)?;
+        let log = read_validated_event(
+            &mut self.relay,
+            &log_id,
+            KIND_CI_LOG_REFERENCE,
+            &signer,
+            signer_generation,
+            &accepted.channel_id,
+        )?;
+        let ValidatedCiEnvelope::LogReference(log) = log else {
+            return Err(ProductionError::Invalid);
+        };
+        if log.request_event_id != accepted.event_id
+            || log.run_id != accepted.envelope.run_id
+            || log.workflow_id != accepted.envelope.workflow_id
+            || log.target_repo_a != accepted.envelope.target_repo_a
+            || log.tip_oid != accepted.envelope.tip_oid
+            || log.job_id != job_id
+            || log.attempt != attempt
+            || log.truncated
+            || log.inline.is_some()
+            || log.byte_length > 16 * 1024 * 1024
+            || log.cap_bytes < log.byte_length
+            || log.relay_signer != signer
+        {
+            return Err(ProductionError::Invalid);
+        }
+        let log_url = log.url.ok_or(ProductionError::Invalid)?;
+        if url::Url::parse(&log_url)
+            .map_err(|_| ProductionError::Invalid)?
+            .path()
+            != format!(
+                "/ci/logs/{}/{}/{}/{}/{}",
+                accepted.event_id, accepted.envelope.run_id, job_id, attempt, log.log_sha256
+            )
+        {
+            return Err(ProductionError::Invalid);
+        }
+        let mut plans = vec![(
+            "log",
+            "job.log".to_owned(),
+            log.log_sha256,
+            log.byte_length,
+            log_url,
+        )];
+        let mut object_names = std::collections::BTreeSet::from(["job.log".to_owned()]);
+        let mut object_urls = std::collections::BTreeSet::from([plans[0].4.clone()]);
+        for artifact_id in &status.artifact_refs {
+            let event = read_validated_event(
+                &mut self.relay,
+                artifact_id,
+                KIND_CI_ARTIFACT_REFERENCE,
+                &signer,
+                signer_generation,
+                &accepted.channel_id,
+            )?;
+            let ValidatedCiEnvelope::ArtifactReference(artifact) = event else {
+                return Err(ProductionError::Invalid);
+            };
+            if artifact.request_event_id != accepted.event_id
+                || artifact.run_id != accepted.envelope.run_id
+                || artifact.workflow_id != accepted.envelope.workflow_id
+                || artifact.target_repo_a != accepted.envelope.target_repo_a
+                || artifact.tip_oid != accepted.envelope.tip_oid
+                || artifact.job_id != job_id
+                || artifact.attempt != attempt
+                || artifact.byte_length > 32 * 1024
+                || artifact.relay_signer != signer
+                || artifact.artifact_id != "result"
+                || !object_names.insert(artifact.name.clone())
+                || !object_urls.insert(artifact.url.clone())
+            {
+                return Err(ProductionError::Invalid);
+            }
+            if url::Url::parse(&artifact.url)
+                .map_err(|_| ProductionError::Invalid)?
+                .path()
+                != format!(
+                    "/ci/artifacts/{}/{}/{}/{}/{}/{}",
+                    accepted.event_id,
+                    accepted.envelope.run_id,
+                    job_id,
+                    attempt,
+                    artifact.artifact_id,
+                    artifact.sha256
+                )
+            {
+                return Err(ProductionError::Invalid);
+            }
+            plans.push((
+                "artifact",
+                artifact.name,
+                artifact.sha256,
+                artifact.byte_length,
+                artifact.url,
+            ));
+        }
+
+        let evidence_id = record
+            .terminal_facts()
+            .evidence_finalized_event_id()
+            .ok_or(ProductionError::Invalid)?;
+        let evidence = read_validated_event(
+            &mut self.relay,
+            evidence_id,
+            KIND_CI_EVIDENCE_FINALIZED,
+            &signer,
+            signer_generation,
+            &accepted.channel_id,
+        )?;
+        let ValidatedCiEnvelope::EvidenceFinalized(evidence) = evidence else {
+            return Err(ProductionError::Invalid);
+        };
+        if evidence.request_event_id != accepted.event_id
+            || evidence.run_id != accepted.envelope.run_id
+            || evidence.workflow_id != accepted.envelope.workflow_id
+            || evidence.target_repo_a != accepted.envelope.target_repo_a
+            || evidence.tip_oid != accepted.envelope.tip_oid
+            || evidence.relay_signer != signer
+            || evidence.attempt != attempt
+            || evidence.finalized_job_attempts.len() != 1
+            || evidence.finalized_job_attempts[0].job_id != job_id
+            || evidence.finalized_job_attempts[0].attempt != attempt
+            || evidence.finalized_job_attempts[0].log_ref != log_id
+            || evidence.finalized_job_attempts[0].artifact_refs != status.artifact_refs
+        {
+            return Err(ProductionError::Invalid);
+        }
+        let teardown_id = record
+            .terminal_facts()
+            .teardown_attestation_event_id()
+            .ok_or(ProductionError::Invalid)?;
+        let teardown = read_validated_event(
+            &mut self.relay,
+            teardown_id,
+            KIND_CI_TEARDOWN_ATTESTATION,
+            &signer,
+            signer_generation,
+            &accepted.channel_id,
+        )?;
+        let ValidatedCiEnvelope::TeardownAttestation(teardown) = teardown else {
+            return Err(ProductionError::Invalid);
+        };
+        if teardown
+            .validate_context(
+                &accepted.event_id,
+                &accepted.envelope,
+                &[(job_id.to_owned(), attempt)],
+            )
+            .is_err()
+            || teardown.request_event_id != accepted.event_id
+            || teardown.run_id != accepted.envelope.run_id
+            || teardown.workflow_id != accepted.envelope.workflow_id
+            || teardown.target_repo_a != accepted.envelope.target_repo_a
+            || teardown.tip_oid != accepted.envelope.tip_oid
+            || teardown.base_oid != accepted.envelope.base_oid
+            || teardown.attempt != attempt
+            || !teardown.lease_empty
+            || teardown.relay_signer != signer
+        {
+            return Err(ProductionError::Invalid);
+        }
+        let terminal_id = record.terminal_event_id().ok_or(ProductionError::Invalid)?;
+        let terminal = read_validated_event(
+            &mut self.relay,
+            terminal_id,
+            KIND_CI_RUN_STATUS,
+            &signer,
+            signer_generation,
+            &accepted.channel_id,
+        )?;
+        let ValidatedCiEnvelope::RunStatus(terminal) = terminal else {
+            return Err(ProductionError::Invalid);
+        };
+        if !matches!(terminal.state, CiRunState::Success)
+            || terminal.request_event_id != accepted.event_id
+            || terminal.run_id != accepted.envelope.run_id
+            || terminal.workflow_id != accepted.envelope.workflow_id
+            || terminal.target_repo_a != accepted.envelope.target_repo_a
+            || terminal.tip_oid != accepted.envelope.tip_oid
+            || terminal.base_oid != accepted.envelope.base_oid
+            || terminal.attempt != attempt
+            || terminal.sequence != record.sequence()
+            || terminal.job_ids != accepted.envelope.job_ids
+            || terminal.relay_signer != signer
+        {
+            return Err(ProductionError::Invalid);
+        }
+
+        let mut subject = None;
+        let mut generation = None;
+        let mut objects = Vec::with_capacity(plans.len());
+        let mut transcript = Vec::from(b"buzz-ci-acceptance-export-authority:v1\0".as_slice());
+        for (kind, name, sha256, byte_length, url) in plans {
+            let maximum = byte_length;
+            let read = self
+                .relay
+                .read_evidence_object(&url, &sha256, byte_length, maximum)
+                .map_err(map_export_error)?;
+            if read.binding.method != crate::source::HttpMethod::Get
+                || read.binding.url.as_str() != url
+                || read.binding.payload_sha256.is_some()
+                || read.binding.publisher.is_some()
+                || read.binding.query_filter.is_some()
+                || read.bytes.len() as u64 != byte_length
+                || hex::encode(Sha256::digest(&read.bytes)) != sha256
+            {
+                return Err(ProductionError::Invalid);
+            }
+            if subject
+                .as_ref()
+                .is_some_and(|value| value != &read.proof.subject)
+                || generation.is_some_and(|value| value != read.proof.generation)
+            {
+                return Err(ProductionError::Invalid);
+            }
+            subject.get_or_insert(read.proof.subject.clone());
+            generation.get_or_insert(read.proof.generation);
+            for field in [
+                "GET",
+                url.as_str(),
+                read.proof.subject.as_str(),
+                &read.proof.generation.to_string(),
+                accepted.event_id.as_str(),
+                accepted.envelope.run_id.as_str(),
+                job_id,
+                &attempt.to_string(),
+                kind,
+                name.as_str(),
+                sha256.as_str(),
+                &byte_length.to_string(),
+            ] {
+                transcript.extend_from_slice(&(field.len() as u64).to_be_bytes());
+                transcript.extend_from_slice(field.as_bytes());
+            }
+            objects.push(ExportedEvidenceObject {
+                name,
+                sha256,
+                bytes: read.bytes,
+            });
+        }
+        Ok(AuthenticatedEvidenceExport {
+            subject: subject.ok_or(ProductionError::Invalid)?,
+            generation: generation.ok_or(ProductionError::Invalid)?,
+            authorization_digest: hex::encode(Sha256::digest(transcript)),
+            request_event_id: accepted.event_id,
+            run_id: accepted.envelope.run_id,
+            job_id: job_id.to_owned(),
+            attempt,
+            objects,
+        })
     }
 
     fn poll_head(
         &mut self,
         channel_id: &str,
         terminal_only: bool,
+        expected: Option<&AcceptedRequestBinding>,
     ) -> Result<PollStep, ProductionError> {
         let cursor = self
             .store
@@ -534,6 +992,9 @@ where
             return Ok(PollStep::Idle);
         };
         if accepted.channel_id != channel_id || accepted.watch_cursor <= cursor {
+            return Err(ProductionError::Invalid);
+        }
+        if expected.is_some_and(|binding| !binding.matches(&accepted)) {
             return Err(ProductionError::Invalid);
         }
         if terminal_only {
@@ -646,38 +1107,41 @@ where
                 Err(error) => return Err(error),
             };
 
-            let evidence = CiEvidenceFinalizedEnvelope {
-                schema_version: CI_SCHEMA_VERSION,
-                request_event_id: accepted.event_id.clone(),
-                run_id: accepted.envelope.run_id.clone(),
-                workflow_id: accepted.envelope.workflow_id.clone(),
-                target_repo_a: accepted.envelope.target_repo_a.clone(),
-                tip_oid: accepted.envelope.tip_oid.clone(),
-                attempt: accepted.envelope.attempt,
-                finalized_job_attempts,
-                finalized_at: completion.finished_at,
-                relay_signer: self.signer.pubkey().to_owned(),
-            };
-            let evidence_id = self.publish_envelope(
-                accepted,
-                KIND_CI_EVIDENCE_FINALIZED,
-                &evidence,
-                evidence_finalized_tags(&accepted.channel_id, &evidence)
-                    .map_err(|_| ProductionError::Invalid)?,
-                "evidence:finalized",
-            )?;
-            let teardown_id = self.publish_envelope(
-                accepted,
-                KIND_CI_TEARDOWN_ATTESTATION,
-                &completion.teardown,
-                teardown_attestation_tags(&accepted.channel_id, &completion.teardown)
-                    .map_err(|_| ProductionError::Invalid)?,
-                "teardown",
-            )?;
-            record = record.with_evidence_finalized(evidence_id)?;
-            record = record.with_teardown_attestation(teardown_id)?;
+            let terminal_state = terminal_run_state(&completion.jobs);
+            if terminal_state == RunState::Success {
+                let evidence = CiEvidenceFinalizedEnvelope {
+                    schema_version: CI_SCHEMA_VERSION,
+                    request_event_id: accepted.event_id.clone(),
+                    run_id: accepted.envelope.run_id.clone(),
+                    workflow_id: accepted.envelope.workflow_id.clone(),
+                    target_repo_a: accepted.envelope.target_repo_a.clone(),
+                    tip_oid: accepted.envelope.tip_oid.clone(),
+                    attempt: accepted.envelope.attempt,
+                    finalized_job_attempts,
+                    finalized_at: completion.finished_at,
+                    relay_signer: self.signer.pubkey().to_owned(),
+                };
+                let evidence_id = self.publish_envelope(
+                    accepted,
+                    KIND_CI_EVIDENCE_FINALIZED,
+                    &evidence,
+                    evidence_finalized_tags(&accepted.channel_id, &evidence)
+                        .map_err(|_| ProductionError::Invalid)?,
+                    "evidence:finalized",
+                )?;
+                let teardown_id = self.publish_envelope(
+                    accepted,
+                    KIND_CI_TEARDOWN_ATTESTATION,
+                    &completion.teardown,
+                    teardown_attestation_tags(&accepted.channel_id, &completion.teardown)
+                        .map_err(|_| ProductionError::Invalid)?,
+                    "teardown",
+                )?;
+                record = record.with_evidence_finalized(evidence_id)?;
+                record = record.with_teardown_attestation(teardown_id)?;
+            }
             let terminal = record.transition(
-                terminal_run_state(&completion.jobs),
+                terminal_state,
                 completion.finished_at,
                 terminal_reason(&completion.jobs),
             )?;
@@ -1149,6 +1613,80 @@ fn verify_stored(
         return Err(ProductionError::Evidence);
     }
     Ok(())
+}
+
+fn accepted_publication_id<P: ControlStore>(
+    store: &P,
+    key: &str,
+) -> Result<String, ProductionError> {
+    match store
+        .load_publication(key)
+        .map_err(|_| ProductionError::Store)?
+    {
+        Some(StoredPublication::Accepted {
+            signed,
+            relay_event_id,
+        }) if signed.event_id == relay_event_id => Ok(relay_event_id),
+        _ => Err(ProductionError::Invalid),
+    }
+}
+
+fn read_validated_event<R: RelayControl>(
+    relay: &mut R,
+    event_id: &str,
+    kind: u32,
+    signer: &str,
+    signer_generation: u64,
+    channel_id: &str,
+) -> Result<ValidatedCiEnvelope, ProductionError> {
+    let read = relay
+        .read_exact_event(event_id, kind, signer)
+        .map_err(map_export_error)?;
+    let expected_filter =
+        format!(r#"[{{"ids":["{event_id}"],"authors":["{signer}"],"kinds":[{kind}],"limit":1}}]"#)
+            .into_bytes();
+    let expected_digest = hex::encode(Sha256::digest(&expected_filter));
+    if read.event.event_id != event_id
+        || read.event.kind != kind
+        || read.proof.subject != signer
+        || read.proof.generation != signer_generation
+        || read.binding.method != crate::source::HttpMethod::Post
+        || read.binding.publisher.as_deref() != Some(signer)
+        || read.binding.query_filter.as_deref() != Some(expected_filter.as_slice())
+        || read.binding.payload_sha256.as_deref() != Some(expected_digest.as_str())
+        || read.binding.url.path() != "/query"
+        || read.binding.url.query().is_some()
+        || read.binding.url.fragment().is_some()
+    {
+        return Err(ProductionError::Invalid);
+    }
+    let event: nostr::Event =
+        serde_json::from_value(read.event.signed_event).map_err(|_| ProductionError::Invalid)?;
+    if event.id.to_hex() != read.event.event_id
+        || event.kind.as_u16() as u32 != read.event.kind
+        || event.content != read.event.content
+        || serde_json::to_value(&event.tags).map_err(|_| ProductionError::Invalid)?
+            != read.event.tags
+        || !lower_hex(&read.proof.event_id, 64)
+    {
+        return Err(ProductionError::Invalid);
+    }
+    let authorized = std::collections::HashSet::from([signer.to_owned()]);
+    validate_signed_ci_event(&event, channel_id, &authorized).map_err(|_| ProductionError::Invalid)
+}
+
+fn lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn map_export_error(error: ExportReadError) -> ProductionError {
+    match error {
+        ExportReadError::Unavailable | ExportReadError::Refused => ProductionError::Relay,
+        ExportReadError::Invalid => ProductionError::Invalid,
+    }
 }
 
 fn first_started(completion: &AttemptCompletion) -> u64 {
@@ -1650,6 +2188,240 @@ mod tests {
         }
     }
 
+    struct ChannelHeadRelay {
+        heads: Vec<AcceptedRequest>,
+        observed: Vec<String>,
+    }
+
+    impl RelayControl for ChannelHeadRelay {
+        type Error = ();
+
+        fn next_accepted(
+            &mut self,
+            _channel_id: &str,
+            after_cursor: u64,
+        ) -> Result<Option<AcceptedRequest>, Self::Error> {
+            let next = self
+                .heads
+                .iter()
+                .filter(|accepted| accepted.watch_cursor > after_cursor)
+                .min_by_key(|accepted| accepted.watch_cursor)
+                .cloned();
+            if let Some(accepted) = &next {
+                self.observed.push(accepted.event_id.clone());
+            }
+            Ok(next)
+        }
+
+        fn publish(&mut self, event: &SignedCiEvent) -> Result<String, Self::Error> {
+            Ok(event.event_id.clone())
+        }
+
+        fn publication_exists(&mut self, _event: &SignedCiEvent) -> Result<bool, Self::Error> {
+            Ok(false)
+        }
+
+        fn put_log(
+            &mut self,
+            _accepted: &AcceptedRequest,
+            _job: &JobCompletion,
+            _bytes: &[u8],
+        ) -> Result<StoredObject, Self::Error> {
+            Err(())
+        }
+
+        fn put_artifact(
+            &mut self,
+            _accepted: &AcceptedRequest,
+            _job: &JobCompletion,
+            _artifact: &ArtifactCompletion,
+            _bytes: &[u8],
+        ) -> Result<StoredObject, Self::Error> {
+            Err(())
+        }
+    }
+
+    fn frozen_binding(expected: &AcceptedRequest) -> AcceptedRequestBinding {
+        AcceptedRequestBinding {
+            channel_id: expected.channel_id.clone(),
+            event_id: expected.event_id.clone(),
+            envelope: expected.envelope.clone(),
+        }
+    }
+
+    #[test]
+    fn bound_poll_refuses_foreign_head_without_consuming_expected_request_behind_it() {
+        let mut expected = accepted();
+        expected.watch_cursor = 8;
+        let mut foreign = expected.clone();
+        foreign.watch_cursor = 7;
+        foreign.event_id = "99".repeat(32);
+        foreign.envelope.run_id = "123e4567-e89b-12d3-a456-426614174099".into();
+        let binding = frozen_binding(&expected);
+        let mut handler = ProductionHandler::new(
+            ChannelHeadRelay {
+                heads: vec![foreign.clone(), expected],
+                observed: Vec::new(),
+            },
+            DeterministicSigner,
+            FailingExecutor,
+            MemoryStore::default(),
+            MemoryOutput(Vec::new()),
+        );
+
+        for _ in 0..2 {
+            assert!(matches!(
+                handler.poll_once_bound(CHANNEL, &binding),
+                Err(ProductionError::Invalid)
+            ));
+            assert_eq!(handler.store.cursor, 0);
+            assert!(handler.store.run.is_none());
+            assert!(handler.store.publications.is_empty());
+        }
+        assert_eq!(handler.relay.observed, vec![foreign.event_id; 2]);
+    }
+
+    #[test]
+    fn bound_deferred_replay_refuses_foreign_terminal_head_before_any_mutation() {
+        let mut run_a = accepted();
+        run_a.watch_cursor = 8;
+        let mut foreign = run_a.clone();
+        foreign.watch_cursor = 7;
+        foreign.event_id = "99".repeat(32);
+        foreign.envelope.run_id = "123e4567-e89b-12d3-a456-426614174099".into();
+        let foreign_identity = run_identity(&foreign).expect("foreign identity");
+        let foreign_terminal = RunRecord::queued(foreign_identity, 10)
+            .expect("queued foreign run")
+            .transition(
+                RunState::InfrastructureFailure,
+                12,
+                Some("relay".to_owned()),
+            )
+            .expect("terminal foreign run");
+        let publication_key = format!("{}:run:terminal", foreign.event_id);
+        let pending = StoredPublication::Pending(SignedCiEvent {
+            event_id: "aa".repeat(32),
+            kind: KIND_CI_RUN_STATUS,
+            content: "{}".to_owned(),
+            tags: serde_json::json!([]),
+            signed_event: serde_json::json!({
+                "id": "aa".repeat(32),
+                "kind": KIND_CI_RUN_STATUS
+            }),
+        });
+        let store = MemoryStore {
+            cursor: 0,
+            run: Some((1, foreign_terminal.clone())),
+            publications: HashMap::from([(publication_key.clone(), pending.clone())]),
+            deferred: BTreeSet::from([publication_key.clone()]),
+        };
+        let binding = frozen_binding(&run_a);
+        let run_a_event_id = run_a.event_id.clone();
+        let mut handler = ProductionHandler::new(
+            ChannelHeadRelay {
+                heads: vec![foreign.clone(), run_a],
+                observed: Vec::new(),
+            },
+            CountingSigner(0),
+            FailingExecutor,
+            store,
+            MemoryOutput(Vec::new()),
+        );
+
+        assert!(matches!(
+            handler.replay_deferred_publications_bound(CHANNEL, &binding),
+            Err(ProductionError::Invalid)
+        ));
+        assert_eq!(handler.store.cursor, 0);
+        assert_eq!(handler.store.run, Some((1, foreign_terminal)));
+        assert_eq!(
+            handler.store.publications,
+            HashMap::from([(publication_key.clone(), pending)])
+        );
+        assert_eq!(handler.store.deferred, BTreeSet::from([publication_key]));
+        assert_eq!(handler.signer.0, 0);
+        assert_eq!(handler.relay.observed, vec![foreign.event_id]);
+        assert!(!handler.relay.observed.contains(&run_a_event_id));
+    }
+
+    #[test]
+    fn frozen_binding_rejects_cross_lineage_and_authority_drift() {
+        let expected = accepted();
+        let binding = frozen_binding(&expected);
+        assert!(binding.matches(&expected));
+
+        let mut mismatches = Vec::new();
+        let mut drift = expected.clone();
+        drift.event_id = "99".repeat(32);
+        mismatches.push(("signed request digest", drift));
+        let mut drift = expected.clone();
+        drift.channel_id = "123e4567-e89b-12d3-a456-426614174098".into();
+        mismatches.push(("channel", drift));
+        let mut drift = expected.clone();
+        drift.envelope.actor = "99".repeat(32);
+        mismatches.push(("actor authority", drift));
+        let mut drift = expected.clone();
+        drift.envelope.run_id = "123e4567-e89b-12d3-a456-426614174099".into();
+        mismatches.push(("run UUID", drift));
+        let mut drift = expected.clone();
+        drift.envelope.target_repo_a = format!("30617:{}:foreign", "22".repeat(32));
+        mismatches.push(("repository", drift));
+        let mut drift = expected.clone();
+        drift.envelope.tip_oid = "77".repeat(20);
+        mismatches.push(("tip object", drift));
+        let mut drift = expected.clone();
+        drift.envelope.base_ref = "refs/heads/foreign".into();
+        mismatches.push(("base ref", drift));
+        let mut drift = expected.clone();
+        drift.envelope.base_oid = "77".repeat(20);
+        mismatches.push(("base object", drift));
+        let mut drift = expected.clone();
+        drift.envelope.workflow_id = "foreign".into();
+        mismatches.push(("workflow ID", drift));
+        let mut drift = expected.clone();
+        drift.envelope.workflow_digest = "77".repeat(32);
+        mismatches.push(("workflow digest", drift));
+        let mut drift = expected.clone();
+        drift.envelope.job_ids = vec!["foreign".into()];
+        mismatches.push(("job selection", drift));
+        let mut drift = expected.clone();
+        drift.envelope.attempt = 2;
+        drift.envelope.parent_attempt = Some(1);
+        drift.envelope.parent_run_id = Some(drift.envelope.run_id.clone());
+        mismatches.push(("attempt lineage", drift));
+
+        for (field, drift) in mismatches {
+            assert!(!binding.matches(&drift), "accepted drift in {field}");
+        }
+
+        let mut rerun = expected;
+        rerun.event_id = "aa".repeat(32);
+        rerun.envelope.request_type = CiRequestType::Rerun;
+        rerun.envelope.attempt = 2;
+        rerun.envelope.parent_attempt = Some(1);
+        rerun.envelope.parent_run_id = Some(rerun.envelope.run_id.clone());
+        let rerun_binding = frozen_binding(&rerun);
+        for (field, drift) in [
+            ("parent attempt", {
+                let mut drift = rerun.clone();
+                drift.envelope.parent_attempt = None;
+                drift
+            }),
+            ("parent run", {
+                let mut drift = rerun.clone();
+                drift.envelope.parent_run_id = None;
+                drift
+            }),
+            ("rerun attempt", {
+                let mut drift = rerun.clone();
+                drift.envelope.attempt = 1;
+                drift
+            }),
+        ] {
+            assert!(!rerun_binding.matches(&drift), "accepted drift in {field}");
+        }
+    }
+
     fn completion(log: &[u8]) -> AttemptCompletion {
         let accepted = accepted();
         AttemptCompletion {
@@ -1713,6 +2485,36 @@ mod tests {
         DeterministicSigner
             .sign(KIND_CI_JOB_STATUS, &content, tags)
             .expect("signed job status")
+    }
+
+    #[test]
+    fn expected_recovery_poll_rejects_a_later_head_without_consuming_it() {
+        let log = b"ok\n".to_vec();
+        let accepted = accepted();
+        let mut expected = frozen_binding(&accepted);
+        expected.event_id = "22".repeat(32);
+        let relay = Relay {
+            accepted: Some(accepted),
+            published: Vec::new(),
+            job_statuses: Vec::new(),
+            intent_signal: None,
+            refuse_publication: false,
+        };
+        let mut handler = ProductionHandler::new(
+            relay,
+            DeterministicSigner,
+            Executor(completion(&log)),
+            MemoryStore::default(),
+            MemoryOutput(log),
+        );
+
+        assert!(matches!(
+            handler.poll_once_bound(CHANNEL, &expected),
+            Err(ProductionError::Invalid)
+        ));
+        assert_eq!(handler.store.cursor, 0);
+        assert!(handler.store.run.is_none());
+        assert!(handler.relay.published.is_empty());
     }
 
     #[test]
@@ -1796,6 +2598,46 @@ mod tests {
             handler.store.run.as_ref().unwrap().1.state(),
             RunState::Success
         );
+    }
+
+    #[test]
+    fn failed_run_publishes_completion_without_finalization_or_teardown_events() {
+        let log = b"deterministic failure\n".to_vec();
+        let accepted = accepted();
+        let mut failed = completion(&log);
+        failed.jobs[0].state = CiJobState::Failure;
+        failed.jobs[0].reason = Some("fixture_failure".into());
+        let relay = Relay {
+            accepted: Some(accepted.clone()),
+            published: Vec::new(),
+            job_statuses: Vec::new(),
+            intent_signal: None,
+            refuse_publication: false,
+        };
+        let mut handler = ProductionHandler::new(
+            relay,
+            DeterministicSigner,
+            Executor(failed),
+            MemoryStore::default(),
+            MemoryOutput(log),
+        );
+
+        assert_eq!(handler.poll_once(CHANNEL).unwrap(), PollStep::Completed);
+        assert!(!handler
+            .relay
+            .published
+            .contains(&KIND_CI_EVIDENCE_FINALIZED));
+        assert!(!handler
+            .relay
+            .published
+            .contains(&KIND_CI_TEARDOWN_ATTESTATION));
+        let record = &handler.store.run.as_ref().unwrap().1;
+        assert_eq!(record.state(), RunState::Failure);
+        assert_eq!(record.reason(), Some("fixture_failure"));
+        let wire = serde_json::to_value(record).unwrap();
+        assert!(wire["facts"]["evidence_finalized_event_id"].is_null());
+        assert!(wire["facts"]["teardown_attestation_event_id"].is_null());
+        assert!(record.terminal_event_id().is_some());
     }
 
     #[test]
@@ -1921,6 +2763,7 @@ mod tests {
             .expect("running")
             .transition(RunState::Failure, 12, Some("failed".to_owned()))
             .expect("terminal");
+        let expected = frozen_binding(&accepted);
         let mut handler = ProductionHandler::new(
             Relay {
                 accepted: Some(accepted),
@@ -1930,7 +2773,7 @@ mod tests {
                 refuse_publication: false,
             },
             DeterministicSigner,
-            Executor(completion(b"unused")),
+            FailingExecutor,
             MemoryStore {
                 cursor: 0,
                 run: Some((3, terminal)),
@@ -1941,7 +2784,9 @@ mod tests {
         );
 
         assert_eq!(
-            handler.poll_once(CHANNEL).expect("reconcile terminal"),
+            handler
+                .poll_once_bound(CHANNEL, &expected)
+                .expect("reconcile exact terminal without re-execution"),
             PollStep::Completed
         );
         assert_eq!(handler.relay.published, vec![KIND_CI_RUN_STATUS]);
@@ -2510,6 +3355,35 @@ mod tests {
             0
         );
         assert_eq!(handler.relay.published.len(), 3);
+    }
+
+    #[test]
+    fn bound_deferred_replay_settles_only_the_exact_expected_head() {
+        let expected = accepted();
+        let binding = frozen_binding(&expected);
+        let mut handler = grant_order_handler(
+            &[Err(Refusal::Other), Err(Refusal::Unauthorized)],
+            stale_terminal_store(),
+            true,
+        );
+        assert_eq!(
+            handler.poll_once(CHANNEL).expect("deferred poll"),
+            PollStep::Deferred
+        );
+
+        handler.set_replay_deferral(false);
+        assert_eq!(
+            handler
+                .replay_deferred_publications_bound(CHANNEL, &binding)
+                .expect("bound replay"),
+            1
+        );
+        assert_eq!(handler.store.cursor, expected.watch_cursor);
+        assert!(handler
+            .store
+            .deferred_publications()
+            .expect("deferred")
+            .is_empty());
     }
 
     #[test]

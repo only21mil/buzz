@@ -11,7 +11,7 @@ use crate::types::{
 /// Keyholder frame magic.
 pub const MAGIC: [u8; 4] = *b"BZKH";
 /// Exact protocol version accepted by this codec.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 /// Fixed frame header size.
 pub const HEADER_SIZE: usize = 32;
 /// Maximum encoded body size.
@@ -430,7 +430,7 @@ fn encode_describe_acceptance(
     encode_public_identity(body, 1, 2, value.actor)?;
     require_nonzero(&value.scenario_sha256)?;
     body.field(3, &value.scenario_sha256)?;
-    for (tag, event_id) in (4_u16..=7).zip(value.event_ids) {
+    for (tag, event_id) in (4_u16..=8).zip(value.event_ids) {
         require_nonzero(&event_id)?;
         body.field(tag, &event_id)?;
     }
@@ -440,7 +440,7 @@ fn encode_describe_acceptance(
 fn decode_describe_acceptance(
     fields: &[Field<'_>],
 ) -> Result<DescribeAcceptanceResponse, DecodeError> {
-    expect_tags(fields, &[1, 2, 3, 4, 5, 6, 7])?;
+    expect_tags(fields, &[1, 2, 3, 4, 5, 6, 7, 8])?;
     Ok(DescribeAcceptanceResponse {
         actor: decode_public_identity(fields[0].value, fields[1].value)?,
         scenario_sha256: nonzero_array(fields[2].value)?,
@@ -449,6 +449,7 @@ fn decode_describe_acceptance(
             nonzero_array(fields[4].value)?,
             nonzero_array(fields[5].value)?,
             nonzero_array(fields[6].value)?,
+            nonzero_array(fields[7].value)?,
         ],
     })
 }
