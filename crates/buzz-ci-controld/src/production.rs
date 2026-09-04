@@ -11,10 +11,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use buzz_core::ci::{
     artifact_reference_tags, evidence_finalized_tags, job_status_tags, log_reference_tags,
-    run_status_tags, teardown_attestation_tags, CiArtifactReferenceEnvelope,
-    CiEvidenceFinalizedEnvelope, CiFinalizedJobAttempt, CiJobState, CiJobStatusEnvelope,
-    CiLogReferenceEnvelope, CiRequestEnvelope, CiRunState, CiRunStatusEnvelope, CiSkipPolicy,
-    CiTeardownAttestationEnvelope, CI_SCHEMA_VERSION,
+    run_status_tags, teardown_attestation_tags, validate_signed_ci_event,
+    CiArtifactReferenceEnvelope, CiEvidenceFinalizedEnvelope, CiFinalizedJobAttempt, CiJobState,
+    CiJobStatusEnvelope, CiLogReferenceEnvelope, CiRequestEnvelope, CiRunState,
+    CiRunStatusEnvelope, CiSkipPolicy, CiTeardownAttestationEnvelope, ValidatedCiEnvelope,
+    CI_SCHEMA_VERSION,
 };
 use buzz_core::kind::{
     KIND_CI_ARTIFACT_REFERENCE, KIND_CI_EVIDENCE_FINALIZED, KIND_CI_JOB_STATUS,
@@ -134,6 +135,49 @@ pub struct StoredObject {
     pub byte_length: u64,
 }
 
+/// One authenticated exact-event relay readback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedEventRead {
+    pub event: SignedCiEvent,
+    pub proof: crate::source::Nip98Proof,
+    pub binding: crate::source::Nip98Binding,
+}
+
+/// One authenticated, bounded evidence-object readback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedObjectRead {
+    pub bytes: Vec<u8>,
+    pub proof: crate::source::Nip98Proof,
+    pub binding: crate::source::Nip98Binding,
+}
+
+/// Closed failure of the acceptance-only authenticated export surface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExportReadError {
+    Unavailable,
+    Refused,
+    Invalid,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExportedEvidenceObject {
+    pub name: String,
+    pub sha256: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthenticatedEvidenceExport {
+    pub subject: String,
+    pub generation: u64,
+    pub authorization_digest: String,
+    pub request_event_id: String,
+    pub run_id: String,
+    pub job_id: String,
+    pub attempt: u32,
+    pub objects: Vec<ExportedEvidenceObject>,
+}
+
 /// Relay intake and evidence/publication transport.
 pub trait RelayControl {
     type Error;
@@ -177,6 +221,27 @@ pub trait RelayControl {
         artifact: &ArtifactCompletion,
         bytes: &[u8],
     ) -> Result<StoredObject, Self::Error>;
+
+    /// Read one exact CI event through the existing author-bound query path.
+    fn read_exact_event(
+        &mut self,
+        _event_id: &str,
+        _kind: u32,
+        _author: &str,
+    ) -> Result<AuthenticatedEventRead, ExportReadError> {
+        Err(ExportReadError::Unavailable)
+    }
+
+    /// Read one signed-reference evidence URL with an exact byte ceiling.
+    fn read_evidence_object(
+        &mut self,
+        _url: &str,
+        _expected_sha256: &str,
+        _expected_bytes: u64,
+        _maximum_bytes: u64,
+    ) -> Result<AuthenticatedObjectRead, ExportReadError> {
+        Err(ExportReadError::Unavailable)
+    }
 }
 
 /// Dedicated keyholder. Implementations must sign exact content and tags.
@@ -184,6 +249,9 @@ pub trait CiSigner {
     type Error;
 
     fn pubkey(&self) -> &str;
+    fn generation(&self) -> u64 {
+        0
+    }
     fn sign(
         &mut self,
         kind: u32,
@@ -587,6 +655,323 @@ where
         }
         let _ = self.poll_head(channel_id, true, Some(expected))?;
         Ok(deferred.len())
+    }
+
+    /// Re-read the selected successful attempt through authenticated relay
+    /// APIs. No locally stored content or runner output is exported.
+    pub fn export_first_evidence(
+        &mut self,
+        expected: &AcceptedRequestBinding,
+        job_id: &str,
+        attempt: u32,
+    ) -> Result<AuthenticatedEvidenceExport, ProductionError> {
+        let accepted = AcceptedRequest {
+            channel_id: expected.channel_id.clone(),
+            watch_cursor: 1,
+            event_id: expected.event_id.clone(),
+            envelope: expected.envelope.clone(),
+        };
+        if attempt == 0
+            || expected.envelope.attempt != attempt
+            || !expected.envelope.job_ids.iter().any(|id| id == job_id)
+        {
+            return Err(ProductionError::Invalid);
+        }
+        let identity = run_identity(&accepted)?;
+        let (_, record) = self
+            .store
+            .load_run(&identity)
+            .map_err(|_| ProductionError::Store)?
+            .ok_or(ProductionError::Invalid)?;
+        if record.state() != RunState::Success {
+            return Err(ProductionError::Invalid);
+        }
+        let signer = self.signer.pubkey().to_owned();
+        let signer_generation = self.signer.generation();
+        if signer_generation == 0 {
+            return Err(ProductionError::Invalid);
+        }
+        let status_id = accepted_publication_id(
+            &self.store,
+            &format!("{}:job:{job_id}:{attempt}:status:3", accepted.event_id),
+        )?;
+        let status = read_validated_event(
+            &mut self.relay,
+            &status_id,
+            KIND_CI_JOB_STATUS,
+            &signer,
+            signer_generation,
+            &accepted.channel_id,
+        )?;
+        let ValidatedCiEnvelope::JobStatus(status) = status else {
+            return Err(ProductionError::Invalid);
+        };
+        if !matches!(status.state, CiJobState::Success)
+            || status.sequence != 3
+            || status.job_id != job_id
+            || status.attempt != attempt
+            || status.request_event_id != accepted.event_id
+            || status.run_id != accepted.envelope.run_id
+            || status.workflow_id != accepted.envelope.workflow_id
+            || status.target_repo_a != accepted.envelope.target_repo_a
+            || status.tip_oid != accepted.envelope.tip_oid
+            || status.base_oid != accepted.envelope.base_oid
+            || status.relay_signer != signer
+            || status.artifact_refs.len() != 1
+        {
+            return Err(ProductionError::Invalid);
+        }
+        let log_id = status.log_ref.ok_or(ProductionError::Invalid)?;
+        let log = read_validated_event(
+            &mut self.relay,
+            &log_id,
+            KIND_CI_LOG_REFERENCE,
+            &signer,
+            signer_generation,
+            &accepted.channel_id,
+        )?;
+        let ValidatedCiEnvelope::LogReference(log) = log else {
+            return Err(ProductionError::Invalid);
+        };
+        if log.request_event_id != accepted.event_id
+            || log.run_id != accepted.envelope.run_id
+            || log.workflow_id != accepted.envelope.workflow_id
+            || log.target_repo_a != accepted.envelope.target_repo_a
+            || log.tip_oid != accepted.envelope.tip_oid
+            || log.job_id != job_id
+            || log.attempt != attempt
+            || log.truncated
+            || log.inline.is_some()
+            || log.byte_length > 16 * 1024 * 1024
+            || log.cap_bytes < log.byte_length
+            || log.relay_signer != signer
+        {
+            return Err(ProductionError::Invalid);
+        }
+        let log_url = log.url.ok_or(ProductionError::Invalid)?;
+        if url::Url::parse(&log_url)
+            .map_err(|_| ProductionError::Invalid)?
+            .path()
+            != format!(
+                "/ci/logs/{}/{}/{}/{}/{}",
+                accepted.event_id, accepted.envelope.run_id, job_id, attempt, log.log_sha256
+            )
+        {
+            return Err(ProductionError::Invalid);
+        }
+        let mut plans = vec![(
+            "log",
+            "job.log".to_owned(),
+            log.log_sha256,
+            log.byte_length,
+            log_url,
+        )];
+        let mut object_names = std::collections::BTreeSet::from(["job.log".to_owned()]);
+        let mut object_urls = std::collections::BTreeSet::from([plans[0].4.clone()]);
+        for artifact_id in &status.artifact_refs {
+            let event = read_validated_event(
+                &mut self.relay,
+                artifact_id,
+                KIND_CI_ARTIFACT_REFERENCE,
+                &signer,
+                signer_generation,
+                &accepted.channel_id,
+            )?;
+            let ValidatedCiEnvelope::ArtifactReference(artifact) = event else {
+                return Err(ProductionError::Invalid);
+            };
+            if artifact.request_event_id != accepted.event_id
+                || artifact.run_id != accepted.envelope.run_id
+                || artifact.workflow_id != accepted.envelope.workflow_id
+                || artifact.target_repo_a != accepted.envelope.target_repo_a
+                || artifact.tip_oid != accepted.envelope.tip_oid
+                || artifact.job_id != job_id
+                || artifact.attempt != attempt
+                || artifact.byte_length > 32 * 1024
+                || artifact.relay_signer != signer
+                || artifact.artifact_id != "result"
+                || !object_names.insert(artifact.name.clone())
+                || !object_urls.insert(artifact.url.clone())
+            {
+                return Err(ProductionError::Invalid);
+            }
+            if url::Url::parse(&artifact.url)
+                .map_err(|_| ProductionError::Invalid)?
+                .path()
+                != format!(
+                    "/ci/artifacts/{}/{}/{}/{}/{}/{}",
+                    accepted.event_id,
+                    accepted.envelope.run_id,
+                    job_id,
+                    attempt,
+                    artifact.artifact_id,
+                    artifact.sha256
+                )
+            {
+                return Err(ProductionError::Invalid);
+            }
+            plans.push((
+                "artifact",
+                artifact.name,
+                artifact.sha256,
+                artifact.byte_length,
+                artifact.url,
+            ));
+        }
+
+        let evidence_id = record
+            .terminal_facts()
+            .evidence_finalized_event_id()
+            .ok_or(ProductionError::Invalid)?;
+        let evidence = read_validated_event(
+            &mut self.relay,
+            evidence_id,
+            KIND_CI_EVIDENCE_FINALIZED,
+            &signer,
+            signer_generation,
+            &accepted.channel_id,
+        )?;
+        let ValidatedCiEnvelope::EvidenceFinalized(evidence) = evidence else {
+            return Err(ProductionError::Invalid);
+        };
+        if evidence.request_event_id != accepted.event_id
+            || evidence.run_id != accepted.envelope.run_id
+            || evidence.workflow_id != accepted.envelope.workflow_id
+            || evidence.target_repo_a != accepted.envelope.target_repo_a
+            || evidence.tip_oid != accepted.envelope.tip_oid
+            || evidence.relay_signer != signer
+            || evidence.attempt != attempt
+            || evidence.finalized_job_attempts.len() != 1
+            || evidence.finalized_job_attempts[0].job_id != job_id
+            || evidence.finalized_job_attempts[0].attempt != attempt
+            || evidence.finalized_job_attempts[0].log_ref != log_id
+            || evidence.finalized_job_attempts[0].artifact_refs != status.artifact_refs
+        {
+            return Err(ProductionError::Invalid);
+        }
+        let teardown_id = record
+            .terminal_facts()
+            .teardown_attestation_event_id()
+            .ok_or(ProductionError::Invalid)?;
+        let teardown = read_validated_event(
+            &mut self.relay,
+            teardown_id,
+            KIND_CI_TEARDOWN_ATTESTATION,
+            &signer,
+            signer_generation,
+            &accepted.channel_id,
+        )?;
+        let ValidatedCiEnvelope::TeardownAttestation(teardown) = teardown else {
+            return Err(ProductionError::Invalid);
+        };
+        if teardown
+            .validate_context(
+                &accepted.event_id,
+                &accepted.envelope,
+                &[(job_id.to_owned(), attempt)],
+            )
+            .is_err()
+            || teardown.request_event_id != accepted.event_id
+            || teardown.run_id != accepted.envelope.run_id
+            || teardown.workflow_id != accepted.envelope.workflow_id
+            || teardown.target_repo_a != accepted.envelope.target_repo_a
+            || teardown.tip_oid != accepted.envelope.tip_oid
+            || teardown.base_oid != accepted.envelope.base_oid
+            || teardown.attempt != attempt
+            || !teardown.lease_empty
+            || teardown.relay_signer != signer
+        {
+            return Err(ProductionError::Invalid);
+        }
+        let terminal_id = record.terminal_event_id().ok_or(ProductionError::Invalid)?;
+        let terminal = read_validated_event(
+            &mut self.relay,
+            terminal_id,
+            KIND_CI_RUN_STATUS,
+            &signer,
+            signer_generation,
+            &accepted.channel_id,
+        )?;
+        let ValidatedCiEnvelope::RunStatus(terminal) = terminal else {
+            return Err(ProductionError::Invalid);
+        };
+        if !matches!(terminal.state, CiRunState::Success)
+            || terminal.request_event_id != accepted.event_id
+            || terminal.run_id != accepted.envelope.run_id
+            || terminal.workflow_id != accepted.envelope.workflow_id
+            || terminal.target_repo_a != accepted.envelope.target_repo_a
+            || terminal.tip_oid != accepted.envelope.tip_oid
+            || terminal.base_oid != accepted.envelope.base_oid
+            || terminal.attempt != attempt
+            || terminal.sequence != record.sequence()
+            || terminal.job_ids != accepted.envelope.job_ids
+            || terminal.relay_signer != signer
+        {
+            return Err(ProductionError::Invalid);
+        }
+
+        let mut subject = None;
+        let mut generation = None;
+        let mut objects = Vec::with_capacity(plans.len());
+        let mut transcript = Vec::from(b"buzz-ci-acceptance-export-authority:v1\0".as_slice());
+        for (kind, name, sha256, byte_length, url) in plans {
+            let maximum = byte_length;
+            let read = self
+                .relay
+                .read_evidence_object(&url, &sha256, byte_length, maximum)
+                .map_err(map_export_error)?;
+            if read.binding.method != crate::source::HttpMethod::Get
+                || read.binding.url.as_str() != url
+                || read.binding.payload_sha256.is_some()
+                || read.binding.publisher.is_some()
+                || read.binding.query_filter.is_some()
+                || read.bytes.len() as u64 != byte_length
+                || hex::encode(Sha256::digest(&read.bytes)) != sha256
+            {
+                return Err(ProductionError::Invalid);
+            }
+            if subject
+                .as_ref()
+                .is_some_and(|value| value != &read.proof.subject)
+                || generation.is_some_and(|value| value != read.proof.generation)
+            {
+                return Err(ProductionError::Invalid);
+            }
+            subject.get_or_insert(read.proof.subject.clone());
+            generation.get_or_insert(read.proof.generation);
+            for field in [
+                "GET",
+                url.as_str(),
+                read.proof.subject.as_str(),
+                &read.proof.generation.to_string(),
+                accepted.event_id.as_str(),
+                accepted.envelope.run_id.as_str(),
+                job_id,
+                &attempt.to_string(),
+                kind,
+                name.as_str(),
+                sha256.as_str(),
+                &byte_length.to_string(),
+            ] {
+                transcript.extend_from_slice(&(field.len() as u64).to_be_bytes());
+                transcript.extend_from_slice(field.as_bytes());
+            }
+            objects.push(ExportedEvidenceObject {
+                name,
+                sha256,
+                bytes: read.bytes,
+            });
+        }
+        Ok(AuthenticatedEvidenceExport {
+            subject: subject.ok_or(ProductionError::Invalid)?,
+            generation: generation.ok_or(ProductionError::Invalid)?,
+            authorization_digest: hex::encode(Sha256::digest(transcript)),
+            request_event_id: accepted.event_id,
+            run_id: accepted.envelope.run_id,
+            job_id: job_id.to_owned(),
+            attempt,
+            objects,
+        })
     }
 
     fn poll_head(
@@ -1228,6 +1613,80 @@ fn verify_stored(
         return Err(ProductionError::Evidence);
     }
     Ok(())
+}
+
+fn accepted_publication_id<P: ControlStore>(
+    store: &P,
+    key: &str,
+) -> Result<String, ProductionError> {
+    match store
+        .load_publication(key)
+        .map_err(|_| ProductionError::Store)?
+    {
+        Some(StoredPublication::Accepted {
+            signed,
+            relay_event_id,
+        }) if signed.event_id == relay_event_id => Ok(relay_event_id),
+        _ => Err(ProductionError::Invalid),
+    }
+}
+
+fn read_validated_event<R: RelayControl>(
+    relay: &mut R,
+    event_id: &str,
+    kind: u32,
+    signer: &str,
+    signer_generation: u64,
+    channel_id: &str,
+) -> Result<ValidatedCiEnvelope, ProductionError> {
+    let read = relay
+        .read_exact_event(event_id, kind, signer)
+        .map_err(map_export_error)?;
+    let expected_filter =
+        format!(r#"[{{"ids":["{event_id}"],"authors":["{signer}"],"kinds":[{kind}],"limit":1}}]"#)
+            .into_bytes();
+    let expected_digest = hex::encode(Sha256::digest(&expected_filter));
+    if read.event.event_id != event_id
+        || read.event.kind != kind
+        || read.proof.subject != signer
+        || read.proof.generation != signer_generation
+        || read.binding.method != crate::source::HttpMethod::Post
+        || read.binding.publisher.as_deref() != Some(signer)
+        || read.binding.query_filter.as_deref() != Some(expected_filter.as_slice())
+        || read.binding.payload_sha256.as_deref() != Some(expected_digest.as_str())
+        || read.binding.url.path() != "/query"
+        || read.binding.url.query().is_some()
+        || read.binding.url.fragment().is_some()
+    {
+        return Err(ProductionError::Invalid);
+    }
+    let event: nostr::Event =
+        serde_json::from_value(read.event.signed_event).map_err(|_| ProductionError::Invalid)?;
+    if event.id.to_hex() != read.event.event_id
+        || event.kind.as_u16() as u32 != read.event.kind
+        || event.content != read.event.content
+        || serde_json::to_value(&event.tags).map_err(|_| ProductionError::Invalid)?
+            != read.event.tags
+        || !lower_hex(&read.proof.event_id, 64)
+    {
+        return Err(ProductionError::Invalid);
+    }
+    let authorized = std::collections::HashSet::from([signer.to_owned()]);
+    validate_signed_ci_event(&event, channel_id, &authorized).map_err(|_| ProductionError::Invalid)
+}
+
+fn lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn map_export_error(error: ExportReadError) -> ProductionError {
+    match error {
+        ExportReadError::Unavailable | ExportReadError::Refused => ProductionError::Relay,
+        ExportReadError::Invalid => ProductionError::Invalid,
+    }
 }
 
 fn first_started(completion: &AttemptCompletion) -> u64 {

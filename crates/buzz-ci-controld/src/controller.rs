@@ -11,8 +11,9 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::production::{
-    AcceptedRequestBinding, AttemptExecutor, CiSigner, ControlStore, EvidenceReader, PollStep,
-    ProductionError, ProductionHandler, RelayControl, RunnerAttemptExecutor, RunnerAttemptPreparer,
+    AcceptedRequestBinding, AttemptExecutor, AuthenticatedEvidenceExport, CiSigner, ControlStore,
+    EvidenceReader, PollStep, ProductionError, ProductionHandler, RelayControl,
+    RunnerAttemptExecutor, RunnerAttemptPreparer,
 };
 use crate::runner_client::{RunnerClient, RunnerConnector};
 
@@ -417,6 +418,32 @@ where
         expected: &AcceptedRequestBinding,
     ) -> Result<usize, ControllerError> {
         self.replay_deferred_publications_with_binding(Some(expected))
+    }
+
+    pub fn export_first_evidence(
+        &mut self,
+        expected: &AcceptedRequestBinding,
+        job_id: &str,
+        attempt: u32,
+    ) -> Result<AuthenticatedEvidenceExport, ControllerError> {
+        if let Some(reason) = self.status.terminal_reason() {
+            return Err(ControllerError::Terminal(reason));
+        }
+        self.status = CapacityOneStatus::polling();
+        match self
+            .handler
+            .export_first_evidence(expected, job_id, attempt)
+        {
+            Ok(export) => {
+                self.status = CapacityOneStatus::ready();
+                Ok(export)
+            }
+            Err(error) => {
+                let reason = TerminalInfrastructureReason::from(&error);
+                self.status = CapacityOneStatus::ready();
+                Err(ControllerError::Infrastructure(reason))
+            }
+        }
     }
 
     fn replay_deferred_publications_with_binding(
