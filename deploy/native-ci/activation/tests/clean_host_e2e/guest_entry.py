@@ -33,7 +33,7 @@ PROGRESS_SCHEMA = "buzz-ci-clean-host-e2e-progress/v1"
 BINDING_SCHEMA = "buzz-ci-clean-host-e2e-public-binding/v3"
 STAGE_SCHEMA = "buzz-ci-clean-host-e2e-stage/v3"
 PENDING_SCHEMA = "buzz-ci-clean-host-e2e-pending-evidence/v5"
-PROTOCOL_INPUT_SCHEMA = "buzz-ci-loopback-relay-close-input/v1"
+PROTOCOL_INPUT_SCHEMA = "buzz-ci-loopback-relay-close-input/v2"
 STATE_ROOT = Path("/var/lib/buzzci-e2e")
 RELAY_ROOT = Path("/var/lib/buzzci-e2e-relay")
 # local_tls_relay.py RELAY_FAULTS; the harness `run --relay-fault` choices.
@@ -45,6 +45,7 @@ REPLAY_FAULT_RECORD_KEYS = frozenset({
 })
 PROTOCOL_VERDICT = RELAY_ROOT / "protocol-verdict.json"
 PROTOCOL_TRANSCRIPT = RELAY_ROOT / "protocol-transcript.json"
+EVIDENCE_READS = RELAY_ROOT / relay_protocol.EVIDENCE_READS_RECORD_NAME
 # buzz-ci-controld store.rs SNAPSHOT_NAME under the frozen controld store_root.
 CONTROLD_SNAPSHOT = Path("/var/lib/buzzci/controld/control-store-v1.json")
 MAX_CONTROLD_SNAPSHOT = 8 * 1024 * 1024
@@ -1409,20 +1410,25 @@ def recompute_protocol_verdict(
 ) -> dict[str, object]:
     fields = {
         "schema_version", "acceptance_template", "prior_acceptance_template",
-        "transcript_base64", "foreign_pending_event_id", "fault_mode",
+        "transcript_base64", "evidence_reads_base64", "foreign_pending_event_id", "fault_mode",
     }
     if not isinstance(binding, dict) or set(binding) != fields \
             or binding.get("schema_version") != PROTOCOL_INPUT_SCHEMA:
         raise GuestError("protocol close input binding differs")
     try:
         transcript_raw = base64.b64decode(binding["transcript_base64"], validate=True)
+        evidence_reads_raw = base64.b64decode(binding["evidence_reads_base64"], validate=True)
     except (TypeError, ValueError) as error:
         raise GuestError("protocol transcript binding differs") from error
-    if not transcript_raw or len(transcript_raw) > MAX_COMMAND:
+    if (
+        not transcript_raw or len(transcript_raw) > MAX_COMMAND
+        or not evidence_reads_raw or len(evidence_reads_raw) > MAX_JSON
+    ):
         raise GuestError("protocol transcript binding differs")
     try:
         return relay_protocol.build_closed_verdict(
             binding["acceptance_template"], fixture, transcript_raw, receipt_raw,
+            evidence_reads_raw,
             foreign_pending_event_id=binding["foreign_pending_event_id"],
             prior_acceptance_template=binding["prior_acceptance_template"],
             fault_mode=binding["fault_mode"],
@@ -1451,6 +1457,7 @@ def close_relay_protocol_verdict(
     """Close once, after the verified 16 checks and zero phases 17 and 18 exist."""
     try:
         transcript_raw = read_file(PROTOCOL_TRANSCRIPT, MAX_COMMAND)
+        evidence_reads_raw = read_file(EVIDENCE_READS, MAX_JSON)
         foreign = None
         if relay_fault == FAULT_REPLAY_BEFORE_GRANT:
             foreign = replay_fault_record().get("replayed_event_id")
@@ -1459,6 +1466,7 @@ def close_relay_protocol_verdict(
             "acceptance_template": activation["acceptance_template"],
             "prior_acceptance_template": prior_acceptance_template,
             "transcript_base64": base64.b64encode(transcript_raw).decode(),
+            "evidence_reads_base64": base64.b64encode(evidence_reads_raw).decode(),
             "foreign_pending_event_id": foreign, "fault_mode": relay_fault,
         }
         record = recompute_protocol_verdict(binding, scenario["fixture"], receipt_raw)
@@ -1958,11 +1966,21 @@ def relay_public_config(
     NIP-98 token pubkey and is a member of the private channel; a kind-46107
     grant needs the owner or admin role; the accepted read and evidence writes
     need a static or granted CI signer. So the acceptance actor is a channel
-    admin, the ci-event key a channel member, and the nip98 key a static signer
-    with no channel membership. Production must provide the same three facts
-    for its channel before the canary.
+    admin, and both the ci-event and dedicated nip98 keys channel members. The
+    nip98 key is also a static signer, but that signer status alone cannot
+    authorize evidence reads. Production must provide the same facts.
     """
     selectors = public["keyholder_public_spec"]["selectors"]
+    export_generation = selectors["nip98"]["generation"]
+    if (
+        acceptance_fixture.get("export_generation") != export_generation
+        or acceptance_fixture.get("export_subject") != selectors["nip98"]["public_key"]
+        or candidate_acceptance.get("export_subject") != selectors["nip98"]["public_key"]
+        or candidate_acceptance.get("export_generation") != export_generation
+        or candidate_acceptance.get("export_authorization_digest")
+            != acceptance_fixture.get("export_authorization_digest")
+    ):
+        raise GuestError("acceptance export authority differs from dedicated nip98 selector")
     return {
         "origin": public["relay_http_origin"],
         "channel": {
@@ -1971,9 +1989,11 @@ def relay_public_config(
             "members": {
                 public["acceptance_actor"]["public_key"]: "admin",
                 selectors["ci_event"]["public_key"]: "member",
+                selectors["nip98"]["public_key"]: "member",
             },
         },
         "ci_status_signer_pubkeys": [selectors["nip98"]["public_key"]],
+        "export_generation": export_generation,
         "candidate_acceptance": candidate_acceptance,
         "prior_acceptance": prior_acceptance,
         "acceptance_fixture": acceptance_fixture,

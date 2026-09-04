@@ -7,6 +7,7 @@ import base64
 import contextlib
 import copy
 import hashlib
+import http.client
 import importlib.util
 import io
 import json
@@ -19,6 +20,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -271,7 +273,7 @@ def protocol_verdict(receipt_raw: bytes) -> dict[str, object]:
         "observed_actor_event_ids": [str(index) * 64 for index in (1, 2, 5, 3, 4)],
         "run_ids": {"run_a": RUN_ID, "run_b": "123e4567-e89b-12d3-a456-426614174012"},
         "transcript": {"sha256": "6" * 64, "event_count": 28, "last_cursor": 28},
-        "receipt": {"sha256": hashlib.sha256(receipt_raw).hexdigest(), "run_id": "4" * 32, "checks": 16, "zero_phases": [17, 18], "manifest_digest": "7" * 64, "export_subject": "8" * 64, "export_authorization_digest": "9" * 64, "export_request_digest": "a" * 64, "export_attempt_id": "b" * 64, "export_evidence_set_digest": "c" * 64, "export_objects_sha256": "d" * 64},
+        "receipt": {"sha256": hashlib.sha256(receipt_raw).hexdigest(), "run_id": "4" * 32, "checks": 16, "zero_phases": [17, 18], "manifest_digest": "7" * 64, "export_subject": "8" * 64, "export_authorization_digest": "9" * 64, "export_request_digest": "a" * 64, "export_attempt_id": "b" * 32, "export_evidence_set_digest": "c" * 64, "export_objects_sha256": "d" * 64, "export_generation": 1},
         "run_a": {"request_event_id": api[0], "selected_job_attempts": [{"job_id": "job", "attempt": 1}], "log_event_ids": [bound[0]], "artifact_event_ids": [bound[1]], "evidence_finalized_event_id": bound[2], "teardown_attestation_event_id": bound[3], "terminal_event_id": bound[4]},
         "run_b": {"initial_request_event_id": api[4], "final_request_event_id": api[2], "failure_log_event_id": bound[5], "failure_job_event_id": bound[6], "failure_run_event_id": bound[7], "rerun_request_event_id": api[2], "cancel_job_event_id": bound[8], "cancel_run_event_id": bound[9], "tombstone_event_id": api[3], "final_fact_count": 0},
         "sealed_projection_sha256": "a" * 64,
@@ -4463,13 +4465,20 @@ def acceptance_template(
     failure = request_event(secret, now, run_id=failure_run_id)
     rerun = request_event(secret, now, attempt=2, run_id=failure_run_id)
     tombstone = signed_event(secret, 5, [["e", rerun["id"]]], "", now + 20)
-    return {
+    template = {
         "actor": {"public_key": public_hex(secret), "generation": 1},
         "time_reference": now,
         "run_event": relay.template_preimage(run), "grant_event": relay.template_preimage(grant),
         "rerun_event": relay.template_preimage(rerun), "tombstone_event": relay.template_preimage(tombstone),
         "failure_run_event": relay.template_preimage(failure),
+        "export_subject": public_hex(NIP98), "export_generation": 1,
     }
+    request_id = hashlib.sha256(relay.canonical_json(template["run_event"])).hexdigest()
+    template["export_authorization_digest"] = relay.export_authorization_digest(
+        relay.EXPORT_ORIGIN, template["export_subject"], template["export_generation"],
+        request_id, run_id, "capacity-one-fixture",
+    )
+    return template
 
 
 def failure_selector(template: dict[str, object]) -> dict[str, object]:
@@ -4495,10 +4504,12 @@ def acceptance_fixture(template: dict[str, object]) -> dict[str, object]:
         "failure_run_id": "123e4567e89b12d3a456426614174012",
         "request_digest": ids[0], "grant_event_id": ids[1], "failure_request_digest": ids[4],
         "job_id": "capacity-one-fixture", "manifest_digest": "a" * 64,
-        "export_subject": "b" * 64, "export_authorization_digest": "c" * 64,
-        "expected_log": {"name": "job.log", "sha256": "d" * 64, "bytes": 1},
+        "export_subject": template["export_subject"],
+        "export_authorization_digest": template["export_authorization_digest"],
+        "export_generation": template["export_generation"],
+        "expected_log": {"name": relay.EXPORT_LOG[0], "sha256": relay.EXPORT_LOG[1], "bytes": relay.EXPORT_LOG[2]},
         "expected_failure_log": {"name": "job.log", "sha256": "e" * 64, "bytes": 1},
-        "expected_artifacts": [{"name": "result.json", "sha256": "f" * 64, "bytes": 1}],
+        "expected_artifacts": [{"name": relay.EXPORT_ARTIFACT[1], "sha256": relay.EXPORT_ARTIFACT[2], "bytes": relay.EXPORT_ARTIFACT[3]}],
     }
 
 
@@ -4524,7 +4535,7 @@ def ci_fact_event(secret: int, kind: int, created_at: int, content: dict[str, ob
     return signed_event(secret, kind, [["h", CHANNEL], ["run", RUN_ID]], json.dumps(envelope, separators=(",", ":")), created_at)
 
 
-def protocol_close_inputs() -> tuple[dict[str, object], dict[str, object], bytes, bytes]:
+def protocol_close_inputs() -> tuple[dict[str, object], dict[str, object], bytes, bytes, bytes]:
     template = acceptance_template()
     template["failure_selector"] = failure_selector(template)
     fixture = acceptance_fixture(template)
@@ -4561,8 +4572,10 @@ def protocol_close_inputs() -> tuple[dict[str, object], dict[str, object], bytes
     append(46101, run_a, run_request, attempt=1, sequence=2, state="running")
     append(46102, run_a, run_request, job_id=fixture["job_id"], attempt=1, sequence=1, state="queued", artifact_refs=[])
     append(46102, run_a, run_request, job_id=fixture["job_id"], attempt=1, sequence=2, state="running", artifact_refs=[])
-    log_id = append(46103, run_a, run_request, job_id=fixture["job_id"], attempt=1, log_sha256=fixture["expected_log"]["sha256"], byte_length=fixture["expected_log"]["bytes"])
-    artifact_id = append(46104, run_a, run_request, job_id=fixture["job_id"], attempt=1, name="result.json", sha256=fixture["expected_artifacts"][0]["sha256"], byte_length=fixture["expected_artifacts"][0]["bytes"])
+    log_path = f"/ci/logs/{run_request}/{run_a}/{fixture['job_id']}/1/{fixture['expected_log']['sha256']}"
+    artifact_path = f"/ci/artifacts/{run_request}/{run_a}/{fixture['job_id']}/1/result/{fixture['expected_artifacts'][0]['sha256']}"
+    log_id = append(46103, run_a, run_request, job_id=fixture["job_id"], attempt=1, log_sha256=fixture["expected_log"]["sha256"], byte_length=fixture["expected_log"]["bytes"], url="https://relay.test.invalid:3443" + log_path)
+    artifact_id = append(46104, run_a, run_request, job_id=fixture["job_id"], attempt=1, artifact_id="result", name="result.json", sha256=fixture["expected_artifacts"][0]["sha256"], byte_length=fixture["expected_artifacts"][0]["bytes"], url="https://relay.test.invalid:3443" + artifact_path)
     append(46102, run_a, run_request, job_id=fixture["job_id"], attempt=1, sequence=3, state="success", log_ref=log_id, artifact_refs=[artifact_id])
     append(46105, run_a, run_request, attempt=1, finalized_job_attempts=[{"job_id": fixture["job_id"], "attempt": 1, "log_ref": log_id, "artifact_refs": [artifact_id]}])
     append(46106, run_a, run_request, attempt=1, lease_empty=True, leases=[{"job_id": fixture["job_id"], "attempt": 1, "lease_id": "lease-a"}])
@@ -4595,13 +4608,14 @@ def protocol_close_inputs() -> tuple[dict[str, object], dict[str, object], bytes
         "foreign_pending_event": None,
     }
     terminal_attempt = {
-        "attempt_id": "1" * 64, "evidence_set_digest": "2" * 64,
+        "attempt_id": "1" * 32, "evidence_set_digest": "2" * 64,
         "manifest_digest": fixture["manifest_digest"],
     }
     checks = [
         {"sequence": index, "stage": stage, "outcome": "pass", **({
             "export": {
                 "authenticated": True,
+                "generation": fixture["export_generation"],
                 "manifest_digest": fixture["manifest_digest"], "request_digest": fixture["request_digest"],
                 "subject": fixture["export_subject"], "authorization_digest": fixture["export_authorization_digest"],
                 "attempt_id": terminal_attempt["attempt_id"],
@@ -4620,7 +4634,127 @@ def protocol_close_inputs() -> tuple[dict[str, object], dict[str, object], bytes
             {"sequence": 18, "operation": "prove_capacity_zero", "outcome": "pass"},
         ]},
     }
-    return template, fixture, relay.canonical_json(transcript) + b"\n", relay.canonical_json(receipt) + b"\n"
+    reads = {
+        "schema_version": relay.EVIDENCE_READS_SCHEMA,
+        "export_generation": fixture["export_generation"],
+        "reads": [{
+            "type": kind, "path": path, "request_event_id": run_request,
+            "run_id": run_a, "job_id": fixture["job_id"], "attempt": 1,
+            "artifact_id": artifact, "sha256": descriptor["sha256"],
+            "byte_length": descriptor["bytes"], "subject": fixture["export_subject"],
+        } for kind, path, artifact, descriptor in (
+            ("log", log_path, None, fixture["expected_log"]),
+            ("artifact", artifact_path, "result", fixture["expected_artifacts"][0]),
+        )],
+    }
+    return (
+        template, fixture, relay.canonical_json(transcript) + b"\n",
+        relay.canonical_json(receipt) + b"\n", relay.canonical_json(reads) + b"\n",
+    )
+
+
+def evidence_read_fixture(root: Path, now: int) -> tuple[relay.RelayState, dict[str, object]]:
+    state = relay.RelayState(
+        root, "https://relay.test.invalid:3443", CHANNEL, "private",
+        {
+            public_hex(ACTOR): "admin", public_hex(CI_EVENT): "member",
+            public_hex(NIP98): "member",
+        },
+        {public_hex(CI_EVENT), public_hex(NIP98)},
+        export_generation=1,
+    )
+    request_content = {
+        "schema_version": 1, "actor": public_hex(ACTOR), "run_id": RUN_ID,
+        "target_repo_a": REPOSITORY,
+        "request_type": "run", "attempt": 1, "job_ids": ["capacity_one"],
+        "workflow_id": "workflow", "tip_oid": "1" * 40, "base_oid": "2" * 40,
+        "workflow_digest": "3" * 64, "pr_root_event_id": "4" * 64,
+        "source_clone_url": "https://example.invalid/repo.git",
+        "immutable_source_ref": "refs/buzz-ci/source", "source_branch": "topic",
+        "base_ref": "refs/heads/main", "trigger_event_id": "4" * 64,
+        "timeout_seconds": 60, "idempotency_key": "stage7", "issued_at": now,
+        "expires_at": now + 600,
+    }
+    request_tags = [
+        ["h", CHANNEL], ["a", REPOSITORY], ["run", RUN_ID], ["workflow", "workflow"],
+        ["c", "1" * 40], ["attempt", "1"],
+    ]
+    request = signed_event(
+        ACTOR, 46100, request_tags,
+        json.dumps(request_content, separators=(",", ":")), now,
+    )
+    relay.admit_event(state, public_hex(ACTOR), request, now)
+    log_raw, artifact_raw = b"exact stage-7 log\n", b'{"outcome":"pass"}\n'
+    log_sha, artifact_sha = hashlib.sha256(log_raw).hexdigest(), hashlib.sha256(artifact_raw).hexdigest()
+    log_path = f"/ci/logs/{request['id']}/{RUN_ID}/capacity_one/1/{log_sha}"
+    artifact_path = f"/ci/artifacts/{request['id']}/{RUN_ID}/capacity_one/1/result/{artifact_sha}"
+
+    def ci_event(kind: int, content: dict[str, object], created_at: int) -> dict[str, object]:
+        envelope = {
+            "schema_version": 1, "relay_signer": public_hex(CI_EVENT),
+            "request_event_id": request["id"],
+            "run_id": RUN_ID, "workflow_id": "workflow", "target_repo_a": REPOSITORY,
+            "tip_oid": "1" * 40, "job_id": "capacity_one", "attempt": 1, **content,
+        }
+        digest = envelope.get("log_sha256", envelope.get("sha256"))
+        tags = [
+            ["h", CHANNEL], ["a", REPOSITORY], ["run", RUN_ID], ["workflow", "workflow"],
+            ["c", "1" * 40], ["attempt", "1"], ["job", "capacity_one"],
+            ["e", request["id"], "", "request"],
+        ]
+        if digest is not None:
+            tags.append(["x", digest])
+        return signed_event(
+            CI_EVENT, kind, tags,
+            json.dumps(envelope, separators=(",", ":")), created_at,
+        )
+
+    log_ref = ci_event(46103, {
+        "log_sha256": log_sha, "byte_length": len(log_raw), "cap_bytes": len(log_raw),
+        "truncated": False, "url": state.origin + log_path, "created_at": now + 1,
+    }, now + 1)
+    artifact_ref = ci_event(46104, {
+        "artifact_id": "result", "sha256": artifact_sha, "byte_length": len(artifact_raw),
+        "name": "result.json", "media_type": "application/json",
+        "url": state.origin + artifact_path, "created_at": now + 2,
+    }, now + 2)
+    terminal = ci_event(46102, {
+        "base_oid": "2" * 40, "sequence": 1, "state": "success",
+        "name": "Capacity one", "required": True, "skip_policy": "forbid",
+        "selected_job_instance": "capacity_one", "also_reruns": [],
+        "started_at": now + 1, "finished_at": now + 3,
+        "log_ref": log_ref["id"], "artifact_refs": [artifact_ref["id"]],
+    }, now + 3)
+    for event in (log_ref, artifact_ref, terminal):
+        relay.admit_event(state, public_hex(CI_EVENT), event, int(event["created_at"]))
+    parsed_log = relay.parse_evidence_path(log_path)
+    parsed_artifact = relay.parse_evidence_path(artifact_path)
+    relay.store_evidence_object(state, parsed_log, request_content, CHANNEL, log_raw)
+    relay.store_evidence_object(state, parsed_artifact, request_content, CHANNEL, artifact_raw)
+    return state, {
+        "request": request, "log_ref": log_ref, "artifact_ref": artifact_ref, "terminal": terminal,
+        "log_path": log_path, "artifact_path": artifact_path,
+        "log_raw": log_raw, "artifact_raw": artifact_raw,
+    }
+
+
+def relay_evidence_snapshot(state: relay.RelayState) -> tuple[object, ...]:
+    files = []
+    for path in sorted(state.object_root.parent.rglob("*")):
+        metadata = path.lstat()
+        relative = path.relative_to(state.object_root.parent).as_posix()
+        if path.is_symlink():
+            value: object = ("symlink", os.readlink(path))
+        elif path.is_file():
+            value = ("file", path.read_bytes())
+        else:
+            value = ("directory", None)
+        files.append((relative, stat.S_IMODE(metadata.st_mode), metadata.st_nlink, value))
+    return (
+        copy.deepcopy(state.events), copy.deepcopy(state.event_channels),
+        copy.deepcopy(state.object_owners), set(state.seen_tokens),
+        copy.deepcopy(state.evidence_reads), tuple(files),
+    )
 
 
 class RelayAdmissionTests(unittest.TestCase):
@@ -4647,6 +4781,337 @@ class RelayAdmissionTests(unittest.TestCase):
 
     def query(self, token: int, filters: object) -> list[dict[str, object]]:
         return relay.query_events(self.state, public_hex(token), json.dumps(filters).encode())
+
+    def test_evidence_get_paths_are_exact_and_canonical(self) -> None:
+        request_id, digest = "a" * 64, "b" * 64
+        valid_log = f"/ci/logs/{request_id}/{RUN_ID}/job_1/1/{digest}"
+        valid_artifact = f"/ci/artifacts/{request_id}/{RUN_ID}/job_1/4294967295/result/{digest}"
+        self.assertEqual(relay.parse_evidence_path(valid_log)["attempt"], 1)
+        self.assertEqual(relay.parse_evidence_path(valid_artifact)["artifact_id"], "result")
+        invalid = (
+            valid_log.replace(request_id, "a" * 63),
+            valid_log.replace(request_id, "a" * 65),
+            valid_log.replace(request_id, "A" * 64),
+            valid_log.replace(RUN_ID, RUN_ID.upper()),
+            valid_log.replace(RUN_ID, RUN_ID.replace("-", "")),
+            valid_log.replace("/job_1/", "/1job/"),
+            valid_log.replace("/job_1/", "/job.1/"),
+            valid_log.replace("/job_1/1/", "/job_1/0/"),
+            valid_log.replace("/job_1/1/", "/job_1/01/"),
+            valid_log.replace("/job_1/1/", "/job_1/4294967296/"),
+            valid_artifact.replace("/result/", "//"),
+            valid_artifact.replace("/result/", "/result%2fjson/"),
+            valid_log.replace(digest, "B" * 64),
+            valid_log.replace(digest, "b" * 63),
+            valid_log.replace(digest, "b" * 65),
+            valid_log + "/extra",
+        )
+        for path in invalid:
+            with self.subTest(path=path), self.assertRaises(relay.Refusal):
+                relay.parse_evidence_path(path)
+
+    def test_evidence_read_requires_one_time_auth_and_repo_channel_membership_without_lookup_mutation(self) -> None:
+        state, fixture = evidence_read_fixture(Path(self.relay_temporary.name) / "objects", self.now)
+        path = relay.parse_evidence_path(fixture["log_path"])
+        url = state.origin + fixture["log_path"]
+        bad_token = nip98(NIP98, "GET", url + "/wrong", b"", self.now)
+        tokens_before = set(state.seen_tokens)
+        with self.assertRaisesRegex(relay.Refusal, "NIP-98"):
+            relay.authenticate_once(state, bad_token, "GET", url, b"", now=self.now)
+        self.assertEqual(state.seen_tokens, tokens_before)
+        token = nip98(NIP98, "GET", url, b"", self.now)
+        caller = relay.authenticate_once(state, token, "GET", url, b"", now=self.now)
+        events_before = copy.deepcopy(state.events)
+        owners_before = copy.deepcopy(state.object_owners)
+        raw, headers = relay.read_evidence_object(state, caller, path, now=self.now)
+        self.assertEqual(raw, fixture["log_raw"])
+        self.assertEqual(headers["Content-Length"], str(len(raw)))
+        self.assertEqual(headers["Digest"], "sha-256=" + base64.b64encode(hashlib.sha256(raw).digest()).decode())
+        self.assertEqual((state.events, state.object_owners), (events_before, owners_before))
+        with self.assertRaisesRegex(relay.Refusal, "replayed authorization"):
+            relay.authenticate_once(state, token, "GET", url, b"", now=self.now)
+
+        state.members.pop(public_hex(NIP98))
+        self.assertIn(public_hex(NIP98), state.static_signers)
+        later = nip98(NIP98, "GET", url, b"", self.now + 1)
+        static_only = relay.authenticate_once(state, later, "GET", url, b"", now=self.now + 1)
+        with self.assertRaisesRegex(relay.Refusal, "CI log not found"):
+            relay.read_evidence_object(state, static_only, path, now=self.now + 1)
+        self.assertEqual((state.events, state.object_owners), (events_before, owners_before))
+
+        missing_url = url[:-64] + "0" * 64
+        missing_token = nip98(CI_EVENT, "GET", missing_url, b"", self.now + 2)
+        missing_caller = relay.authenticate_once(state, missing_token, "GET", missing_url, b"", now=self.now + 2)
+        with self.assertRaisesRegex(relay.Refusal, "not found"):
+            relay.read_evidence_object(
+                state, missing_caller, relay.parse_evidence_path(missing_url.removeprefix(state.origin)),
+                now=self.now + 2,
+            )
+        with self.assertRaisesRegex(relay.Refusal, "replayed authorization"):
+            relay.authenticate_once(state, missing_token, "GET", missing_url, b"", now=self.now + 2)
+
+    def test_evidence_read_rejects_unsigned_unselected_unowned_and_corrupt_objects_without_mutation(self) -> None:
+        mutations = (
+            "unsigned-reference", "duplicate-reference", "unselected", "owner-missing",
+            "owner-content", "owner-mode", "owner-hardlink", "object-hardlink",
+            "corrupt", "symlink",
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                state, fixture = evidence_read_fixture(Path(temporary), self.now)
+                path = relay.parse_evidence_path(fixture["artifact_path"])
+                if mutation == "unsigned-reference":
+                    state.events[fixture["artifact_ref"]["id"]]["content"] += " "
+                elif mutation == "duplicate-reference":
+                    original = fixture["artifact_ref"]
+                    duplicate = signed_event(
+                        CI_EVENT, original["kind"], original["tags"], original["content"],
+                        original["created_at"] + 10,
+                    )
+                    state.events[duplicate["id"]] = duplicate
+                    state.event_channels[duplicate["id"]] = CHANNEL
+                elif mutation == "unselected":
+                    original = state.events.pop(fixture["terminal"]["id"])
+                    state.event_channels.pop(fixture["terminal"]["id"])
+                    body = json.loads(original["content"])
+                    body["artifact_refs"] = []
+                    replacement = signed_event(
+                        CI_EVENT, original["kind"], original["tags"],
+                        json.dumps(body, separators=(",", ":")), original["created_at"],
+                    )
+                    state.events[replacement["id"]] = replacement
+                    state.event_channels[replacement["id"]] = CHANNEL
+                elif mutation == "owner-missing":
+                    state.object_owners.clear()
+                    owner_name, _owner_raw = relay._owner_record(CHANNEL, json.loads(fixture["request"]["content"]), path)
+                    (state.object_root / owner_name).unlink()
+                elif mutation.startswith("owner-"):
+                    owner_name, _owner_raw = relay._owner_record(CHANNEL, json.loads(fixture["request"]["content"]), path)
+                    owner = state.object_root / owner_name
+                    if mutation == "owner-content":
+                        owner.chmod(0o600)
+                        owner.write_bytes(b"{}\n")
+                        owner.chmod(0o400)
+                    elif mutation == "owner-mode":
+                        owner.chmod(0o600)
+                    else:
+                        os.link(owner, Path(temporary) / "owner-link")
+                elif mutation == "object-hardlink":
+                    os.link(state.object_root / path["sha256"], Path(temporary) / "object-link")
+                elif mutation == "corrupt":
+                    target = state.object_root / path["sha256"]
+                    target.chmod(0o600)
+                    target.write_bytes(b"corrupt")
+                    target.chmod(0o400)
+                else:
+                    target = state.object_root / path["sha256"]
+                    target.unlink()
+                    outside = Path(temporary) / "outside"
+                    outside.write_bytes(fixture["artifact_raw"])
+                    target.symlink_to(outside)
+                before = relay_evidence_snapshot(state)
+                expected = "unavailable" if mutation == "corrupt" else "not found"
+                with self.assertRaisesRegex(relay.Refusal, expected):
+                    relay.read_evidence_object(state, public_hex(NIP98), path, now=self.now)
+                self.assertEqual(relay_evidence_snapshot(state), before)
+
+    def test_evidence_read_rejects_wrong_signed_graph_fields_without_mutation(self) -> None:
+        cases = (
+            ("request-schema", "request", lambda body, tags: body.__setitem__("schema_version", 2)),
+            ("request-tag", "request", lambda body, tags: tags.__setitem__(0, ["h", RUN_ID])),
+            ("ref-schema", "artifact_ref", lambda body, tags: body.__setitem__("schema_version", 2)),
+            ("ref-signer", "artifact_ref", lambda body, tags: body.__setitem__("relay_signer", public_hex(NIP98))),
+            ("ref-created-at", "artifact_ref", lambda body, tags: body.__setitem__("created_at", 0)),
+            ("ref-tag", "artifact_ref", lambda body, tags: tags[-1].__setitem__(1, "0" * 64)),
+            ("ref-url", "artifact_ref", lambda body, tags: body.__setitem__("url", body["url"] + "/wrong")),
+            ("ref-length", "artifact_ref", lambda body, tags: body.__setitem__("byte_length", body["byte_length"] + 1)),
+            ("ref-media", "artifact_ref", lambda body, tags: body.__setitem__("media_type", "application/json\r\nX: y")),
+            ("terminal-state", "terminal", lambda body, tags: body.__setitem__("state", "failure")),
+            ("terminal-sequence", "terminal", lambda body, tags: body.__setitem__("sequence", 0)),
+            ("terminal-shape", "terminal", lambda body, tags: body.pop("selected_job_instance")),
+        )
+        for name, event_name, mutate in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                state, fixture = evidence_read_fixture(Path(temporary), self.now)
+                original = fixture[event_name]
+                body = json.loads(original["content"])
+                tags = copy.deepcopy(original["tags"])
+                mutate(body, tags)
+                replacement = signed_event(
+                    ACTOR if event_name == "request" else CI_EVENT,
+                    original["kind"], tags, json.dumps(body, separators=(",", ":")),
+                    original["created_at"],
+                )
+                state.events.pop(original["id"])
+                state.event_channels.pop(original["id"])
+                state.events[replacement["id"]] = replacement
+                state.event_channels[replacement["id"]] = CHANNEL
+                path = relay.parse_evidence_path(fixture["artifact_path"])
+                before = relay_evidence_snapshot(state)
+                with self.assertRaisesRegex(relay.Refusal, "not found"):
+                    relay.read_evidence_object(state, public_hex(NIP98), path, now=self.now)
+                self.assertEqual(relay_evidence_snapshot(state), before)
+
+    def test_artifact_media_type_matches_header_value_semantics(self) -> None:
+        self.assertTrue(relay.valid_header_value("application/json; charset=utf-8"))
+        self.assertTrue(relay.valid_header_value("opaque header value\t"))
+        for value in ("", "snowman-☃", "application/json\r", "application/json\n", "x\x7f"):
+            with self.subTest(value=value):
+                self.assertFalse(relay.valid_header_value(value))
+
+    def test_evidence_get_serves_exact_raw_bytes_headers_and_rejects_token_replay(self) -> None:
+        state, fixture = evidence_read_fixture(Path(self.relay_temporary.name) / "objects", self.now)
+        server = relay.RelayServer(("127.0.0.1", 0), state)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            path = fixture["artifact_path"]
+            now = int(time.time())
+            unauthorized = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            unauthorized.request("GET", path)
+            unauthorized_response = unauthorized.getresponse()
+            self.assertEqual(unauthorized_response.status, 401)
+            unauthorized_response.read()
+            unauthorized.close()
+            self.assertEqual(state.seen_tokens, set())
+            token = nip98(NIP98, "GET", state.origin + path, b"", now)
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            connection.request("GET", path, headers={"Authorization": token})
+            response = connection.getresponse()
+            raw = response.read()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(raw, fixture["artifact_raw"])
+            self.assertEqual(response.getheader("Content-Type"), "application/json")
+            self.assertEqual(response.getheader("Content-Length"), str(len(raw)))
+            self.assertEqual(response.getheader("Digest"), "sha-256=" + base64.b64encode(hashlib.sha256(raw).digest()).decode())
+            connection.close()
+            log_path = fixture["log_path"]
+            log_token = nip98(NIP98, "GET", state.origin + log_path, b"", now + 1)
+            log_connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            log_connection.request("GET", log_path, headers={"Authorization": log_token})
+            log_response = log_connection.getresponse()
+            self.assertEqual((log_response.status, log_response.read()), (200, fixture["log_raw"]))
+            log_connection.close()
+            # Stage 7 consumes log then artifact. Reorder the deliberately
+            # artifact-first probe to prove closure enforces that plan.
+            record_path = state.object_root.parent / relay.EVIDENCE_READS_RECORD_NAME
+            reversed_record = json.loads(record_path.read_bytes())
+            with self.assertRaisesRegex(relay.RelayError, "GET plan"):
+                relay.validate_evidence_reads(
+                    record_path.read_bytes(), 1, public_hex(NIP98),
+                    {"event": fixture["log_ref"]}, {"event": fixture["artifact_ref"]},
+                )
+            reversed_record["reads"].reverse()
+            ordered_raw = relay.canonical_json(reversed_record) + b"\n"
+            relay.validate_evidence_reads(
+                ordered_raw, 1, public_hex(NIP98),
+                {"event": fixture["log_ref"]}, {"event": fixture["artifact_ref"]},
+            )
+            replay = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            replay.request("GET", path, headers={"Authorization": token})
+            replay_response = replay.getresponse()
+            self.assertEqual(replay_response.status, 401)
+            self.assertIn(b"replayed authorization", replay_response.read())
+            replay.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_evidence_handler_authenticates_before_coordinate_parse_and_lookup(self) -> None:
+        state, fixture = evidence_read_fixture(Path(self.relay_temporary.name) / "objects", self.now)
+        server = relay.RelayServer(("127.0.0.1", 0), state)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def get(path: str, header: str | None) -> tuple[int, bytes]:
+            connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+            headers = {} if header is None else {"Authorization": header}
+            connection.request("GET", path, headers=headers)
+            response = connection.getresponse()
+            result = response.status, response.read()
+            connection.close()
+            return result
+
+        try:
+            malformed = fixture["log_path"].replace(fixture["request"]["id"], fixture["request"]["id"].upper())
+            now = int(time.time())
+            malformed_token = nip98(NIP98, "GET", state.origin + malformed, b"", now)
+            token_id = relay.verify_nip98(
+                malformed_token, "GET", state.origin + malformed, b"", now=now,
+            )["id"]
+            before = relay_evidence_snapshot(state)
+            self.assertEqual(get(malformed, malformed_token)[0], 404)
+            after = relay_evidence_snapshot(state)
+            self.assertEqual(after[:3] + after[4:], before[:3] + before[4:])
+            self.assertEqual(after[3], before[3] | {token_id})
+            self.assertEqual(get(malformed, malformed_token)[0], 401)
+
+            wrong_arity = fixture["log_path"] + "/extra"
+            wrong_arity_token = nip98(NIP98, "GET", state.origin + wrong_arity, b"", now + 1)
+            tokens_before = set(state.seen_tokens)
+            self.assertEqual(get(wrong_arity, wrong_arity_token)[0], 404)
+            self.assertEqual(state.seen_tokens, tokens_before)
+
+            bad_auth_before = relay_evidence_snapshot(state)
+            self.assertEqual(get(fixture["log_path"], "Nostr !!!")[0], 401)
+            self.assertEqual(relay_evidence_snapshot(state), bad_auth_before)
+
+            missing = fixture["log_path"][:-64] + "0" * 64
+            missing_token = nip98(NIP98, "GET", state.origin + missing, b"", now + 2)
+            missing_id = relay.verify_nip98(missing_token, "GET", state.origin + missing, b"", now=now + 2)["id"]
+            missing_before = relay_evidence_snapshot(state)
+            self.assertEqual(get(missing, missing_token)[0], 404)
+            missing_after = relay_evidence_snapshot(state)
+            self.assertEqual(missing_after[:3] + missing_after[4:], missing_before[:3] + missing_before[4:])
+            self.assertEqual(missing_after[3], missing_before[3] | {missing_id})
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_evidence_handler_concurrent_replay_and_fresh_token_behavior(self) -> None:
+        state, fixture = evidence_read_fixture(Path(self.relay_temporary.name) / "objects", self.now)
+        server = relay.RelayServer(("127.0.0.1", 0), state)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            path = fixture["log_path"]
+            now = int(time.time())
+            token = nip98(NIP98, "GET", state.origin + path, b"", now)
+            barrier = threading.Barrier(3)
+            results: list[int] = []
+
+            def request(header: str) -> None:
+                barrier.wait()
+                connection = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+                connection.request("GET", path, headers={"Authorization": header})
+                response = connection.getresponse()
+                response.read()
+                results.append(response.status)
+                connection.close()
+
+            workers = [threading.Thread(target=request, args=(token,)) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            barrier.wait()
+            for worker in workers:
+                worker.join(timeout=5)
+            self.assertEqual(sorted(results), [200, 401])
+            self.assertEqual(len(state.evidence_reads), 1)
+            fresh = nip98(NIP98, "GET", state.origin + path, b"", now + 1)
+            barrier = threading.Barrier(2)
+            one = threading.Thread(target=request, args=(fresh,))
+            one.start()
+            barrier.wait()
+            one.join(timeout=5)
+            self.assertEqual(results[-1], 200)
+            self.assertEqual(len(state.evidence_reads), 2)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
     def test_old_pairing_nip98_token_with_actor_event_is_refused(self) -> None:
         # Before this change controld sent the actor's Run event under a
@@ -4955,9 +5420,13 @@ class RelayAdmissionTests(unittest.TestCase):
             "origin": "https://relay.test.invalid:3443",
             "channel": {
                 "id": CHANNEL, "visibility": "private",
-                "members": {public_hex(ACTOR): "admin", public_hex(CI_EVENT): "member"},
+                "members": {
+                    public_hex(ACTOR): "admin", public_hex(CI_EVENT): "member",
+                    public_hex(NIP98): "member",
+                },
             },
             "ci_status_signer_pubkeys": [public_hex(NIP98)],
+            "export_generation": 1,
             "candidate_acceptance": template,
             "prior_acceptance": None,
             "acceptance_fixture": fixture,
@@ -4965,19 +5434,28 @@ class RelayAdmissionTests(unittest.TestCase):
         state = relay.state_from_config(config, Path("/nonexistent"))
         self.assertEqual(state.members, config["channel"]["members"])
         self.assertEqual(state.static_signers, {public_hex(NIP98)})
+        query = b'[{"kinds":[46100]}]'
+        self.assertEqual(relay.query_events(state, public_hex(CI_EVENT), query), [])
+        with self.assertRaisesRegex(relay.Refusal, "query signer differs"):
+            relay.query_events(state, public_hex(NIP98), query)
+        wrong_subject_fixture = copy.deepcopy(fixture)
+        wrong_subject_fixture["export_subject"] = public_hex(CI_EVENT)
+        with self.assertRaisesRegex(guest.GuestError, "export authority differs"):
+            guest.relay_public_config(public, CHANNEL, template, wrong_subject_fixture, None)
         for broken in (
             {**config, "extra": 1},
             {**config, "channel": {**config["channel"], "visibility": "hidden"}},
             {**config, "channel": {**config["channel"], "members": {"zz": "admin"}}},
             {**config, "channel": {**config["channel"], "members": {public_hex(ACTOR): "guest"}}},
             {**config, "ci_status_signer_pubkeys": ["nope"]},
+            {**config, "acceptance_fixture": {**fixture, "export_subject": public_hex(CI_EVENT)}},
         ):
             with self.assertRaises(ValueError):
                 relay.state_from_config(broken, Path("/nonexistent"))
 
     def test_close_verdict_binds_both_runs_five_events_failure_and_zero_phases(self) -> None:
-        template, fixture, transcript, receipt = protocol_close_inputs()
-        verdict = relay.build_closed_verdict(template, fixture, transcript, receipt)
+        template, fixture, transcript, receipt, evidence_reads = protocol_close_inputs()
+        verdict = relay.build_closed_verdict(template, fixture, transcript, receipt, evidence_reads)
         authority = relay.validate_acceptance_template(template, label="test")
         self.assertEqual(verdict["state"], "green")
         self.assertTrue(verdict["sealed"])
@@ -4988,12 +5466,81 @@ class RelayAdmissionTests(unittest.TestCase):
         self.assertEqual(verdict["receipt"]["zero_phases"], [17, 18])
         self.assertEqual(verdict["receipt"]["export_request_digest"], fixture["request_digest"])
 
+    def test_close_requires_exact_two_authenticated_evidence_reads(self) -> None:
+        template, fixture, transcript, receipt, evidence_reads = protocol_close_inputs()
+        relay.build_closed_verdict(template, fixture, transcript, receipt, evidence_reads)
+        cases = {
+            "missing": lambda value: value["reads"].pop(),
+            "extra": lambda value: value["reads"].append(copy.deepcopy(value["reads"][0])),
+            "duplicate": lambda value: value["reads"].__setitem__(1, copy.deepcopy(value["reads"][0])),
+            "order": lambda value: value["reads"].reverse(),
+            "subject": lambda value: value["reads"][0].__setitem__("subject", "0" * 64),
+            "path": lambda value: value["reads"][0].__setitem__("path", value["reads"][0]["path"] + "/wrong"),
+            "generation": lambda value: value.__setitem__("export_generation", 2),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                changed = json.loads(evidence_reads)
+                mutate(changed)
+                with self.assertRaises(relay.RelayError):
+                    relay.build_closed_verdict(
+                        template, fixture, transcript, receipt,
+                        relay.canonical_json(changed) + b"\n",
+                    )
+
+    def test_acceptance_export_authority_is_exact_and_fixture_bound(self) -> None:
+        template, fixture, transcript, receipt, evidence_reads = protocol_close_inputs()
+        authority = relay.validate_acceptance_template(template, label="candidate")
+        self.assertEqual(authority["export_subject"], public_hex(NIP98))
+        for field, value in (
+            ("export_subject", "1" * 64),
+            ("export_generation", 0),
+            ("export_generation", 9_007_199_254_740_992),
+            ("export_authorization_digest", "2" * 64),
+        ):
+            with self.subTest(field=field, value=value):
+                changed = copy.deepcopy(template)
+                changed[field] = value
+                with self.assertRaises(ValueError):
+                    relay.validate_acceptance_template(changed, label="candidate")
+        for field in ("export_subject", "export_generation", "export_authorization_digest"):
+            with self.subTest(fixture=field):
+                changed_fixture = copy.deepcopy(fixture)
+                changed_fixture[field] = 2 if field == "export_generation" else "3" * 64
+                with self.assertRaises(relay.RelayError):
+                    relay.build_closed_verdict(
+                        template, changed_fixture, transcript, receipt, evidence_reads,
+                    )
+
+    def test_export_attempt_id_is_exactly_32_lowercase_hex(self) -> None:
+        template, fixture, transcript_raw, receipt_raw, evidence_reads = protocol_close_inputs()
+        good = relay.build_closed_verdict(template, fixture, transcript_raw, receipt_raw, evidence_reads)
+        self.assertEqual(len(good["receipt"]["export_attempt_id"]), 32)
+        for bad in ("a" * 31, "a" * 33, "a" * 64, "A" * 32):
+            with self.subTest(source="verdict", bad=bad):
+                changed = copy.deepcopy(good)
+                changed["receipt"]["export_attempt_id"] = bad
+                with self.assertRaises(relay.RelayError):
+                    relay.validate_closed_verdict(changed)
+            with self.subTest(source="receipt", bad=bad):
+                changed_receipt = json.loads(receipt_raw)
+                for index in (5, 6):
+                    changed_receipt["checks"][index]["snapshot"]["run"]["attempts"][0]["attempt_id"] = bad
+                changed_receipt["checks"][6]["export"]["attempt_id"] = bad
+                with self.assertRaisesRegex(relay.RelayError, "authenticated export binding rejected"):
+                    relay.build_closed_verdict(
+                        template, fixture, transcript_raw,
+                        relay.canonical_json(changed_receipt) + b"\n",
+                        evidence_reads,
+                    )
+
     def test_exact_binding_rejects_valid_hex_substitutions_at_transfer_and_construction_readback(self) -> None:
-        template, fixture, transcript_raw, receipt_raw = protocol_close_inputs()
+        template, fixture, transcript_raw, receipt_raw, evidence_reads = protocol_close_inputs()
         binding = {
             "schema_version": guest.PROTOCOL_INPUT_SCHEMA,
             "acceptance_template": template, "prior_acceptance_template": None,
             "transcript_base64": base64.b64encode(transcript_raw).decode(),
+            "evidence_reads_base64": base64.b64encode(evidence_reads).decode(),
             "foreign_pending_event_id": None, "fault_mode": None,
         }
         good = guest.recompute_protocol_verdict(binding, fixture, receipt_raw)
@@ -5010,13 +5557,17 @@ class RelayAdmissionTests(unittest.TestCase):
             with self.subTest(reader="construction", field=name), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 transcript_path = root / "protocol-transcript.json"
+                reads_path = root / "evidence-reads.json"
                 verdict_path = root / "protocol-verdict.json"
                 transcript_path.write_bytes(transcript_raw)
+                reads_path.write_bytes(evidence_reads)
 
                 def publish(_path: Path, _raw: bytes, _mode: int, changed=changed) -> None:
                     verdict_path.write_bytes(guest.canonical(changed))
 
                 with mock.patch.object(guest, "PROTOCOL_TRANSCRIPT", transcript_path), mock.patch.object(
+                    guest, "EVIDENCE_READS", reads_path,
+                ), mock.patch.object(
                     guest, "PROTOCOL_VERDICT", verdict_path,
                 ), mock.patch.object(guest, "publish_atomic_create_once", side_effect=publish):
                     with self.assertRaisesRegex(guest.GuestError, "did not close"):
@@ -5025,11 +5576,12 @@ class RelayAdmissionTests(unittest.TestCase):
                         )
 
     def test_transfer_recomputation_requires_current_candidate_failure_selector(self) -> None:
-        template, fixture, transcript_raw, receipt_raw = protocol_close_inputs()
+        template, fixture, transcript_raw, receipt_raw, evidence_reads = protocol_close_inputs()
         binding = {
             "schema_version": guest.PROTOCOL_INPUT_SCHEMA,
             "acceptance_template": template, "prior_acceptance_template": None,
             "transcript_base64": base64.b64encode(transcript_raw).decode(),
+            "evidence_reads_base64": base64.b64encode(evidence_reads).decode(),
             "foreign_pending_event_id": None, "fault_mode": None,
         }
         omitted = copy.deepcopy(binding)
@@ -5039,13 +5591,13 @@ class RelayAdmissionTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(relay.RelayError, "failure selector differs"):
             relay.build_closed_verdict(
-                omitted["acceptance_template"], fixture, transcript_raw, receipt_raw,
+                omitted["acceptance_template"], fixture, transcript_raw, receipt_raw, evidence_reads,
             )
         with self.assertRaisesRegex(guest.GuestError, "protocol close input binding differs"):
             guest.recompute_protocol_verdict(omitted, fixture, receipt_raw)
 
     def test_transfer_recomputation_rejects_internally_valid_selector_that_differs_from_fixture(self) -> None:
-        template, fixture, transcript_raw, receipt_raw = protocol_close_inputs()
+        template, fixture, transcript_raw, receipt_raw, evidence_reads = protocol_close_inputs()
         changed_template = copy.deepcopy(template)
         failure = json.loads(changed_template["failure_run_event"][5])
         failure["job_ids"] = ["other-capacity-one-fixture"]
@@ -5059,18 +5611,19 @@ class RelayAdmissionTests(unittest.TestCase):
             "schema_version": guest.PROTOCOL_INPUT_SCHEMA,
             "acceptance_template": changed_template, "prior_acceptance_template": None,
             "transcript_base64": base64.b64encode(transcript_raw).decode(),
+            "evidence_reads_base64": base64.b64encode(evidence_reads).decode(),
             "foreign_pending_event_id": None, "fault_mode": None,
         }
         with self.assertRaisesRegex(relay.RelayError, "failure selector differs"):
             relay.build_closed_verdict(
-                changed_template, fixture, transcript_raw, receipt_raw,
+                changed_template, fixture, transcript_raw, receipt_raw, evidence_reads,
             )
         with self.assertRaisesRegex(guest.GuestError, "protocol close input binding differs"):
             guest.recompute_protocol_verdict(binding, fixture, receipt_raw)
 
     def test_shared_closed_verdict_validator_rejects_nested_mutation_matrix(self) -> None:
-        template, fixture, transcript, receipt = protocol_close_inputs()
-        good = relay.build_closed_verdict(template, fixture, transcript, receipt)
+        template, fixture, transcript, receipt, evidence_reads = protocol_close_inputs()
+        good = relay.build_closed_verdict(template, fixture, transcript, receipt, evidence_reads)
         relay.validate_closed_verdict(good)
         mutations = []
         for index in range(5):
@@ -5112,7 +5665,7 @@ class RelayAdmissionTests(unittest.TestCase):
             self.assertEqual([item.name for item in path.parent.iterdir()], [path.name])
 
     def test_prior_replay_exception_requires_exact_prefix_mode_and_one_named_terminal(self) -> None:
-        template, fixture, transcript_raw, receipt = protocol_close_inputs()
+        template, fixture, transcript_raw, receipt, evidence_reads = protocol_close_inputs()
         prior = acceptance_template(
             now=1_800_001_000, run_id="123e4567-e89b-12d3-a456-426614174021",
             failure_run_id="123e4567-e89b-12d3-a456-426614174022",
@@ -5133,7 +5686,7 @@ class RelayAdmissionTests(unittest.TestCase):
         transcript_raw = relay.canonical_json(transcript) + b"\n"
         foreign = foreign_event["id"]
         verdict = relay.build_closed_verdict(
-            template, fixture, transcript_raw, receipt,
+            template, fixture, transcript_raw, receipt, evidence_reads,
             foreign_pending_event_id=foreign, prior_acceptance_template=prior,
             fault_mode=relay.FAULT_REPLAY_BEFORE_GRANT,
         )
@@ -5144,7 +5697,7 @@ class RelayAdmissionTests(unittest.TestCase):
             ("wrong-prior", {"foreign_pending_event_id": foreign, "prior_acceptance_template": acceptance_template(now=1_800_002_000, run_id="123e4567-e89b-12d3-a456-426614174031", failure_run_id="123e4567-e89b-12d3-a456-426614174032"), "fault_mode": relay.FAULT_REPLAY_BEFORE_GRANT}),
         ):
             with self.subTest(name=name), self.assertRaises(relay.RelayError):
-                relay.build_closed_verdict(template, fixture, transcript_raw, receipt, **kwargs)
+                relay.build_closed_verdict(template, fixture, transcript_raw, receipt, evidence_reads, **kwargs)
 
         for name, mutate in (
             ("wrong-id", lambda value: value["foreign_pending_event"].__setitem__("id", "9" * 64)),
@@ -5162,11 +5715,12 @@ class RelayAdmissionTests(unittest.TestCase):
                 }
                 with self.assertRaises(relay.RelayError):
                     relay.build_closed_verdict(
-                        template, fixture, relay.canonical_json(changed) + b"\n", receipt, **kwargs,
+                        template, fixture, relay.canonical_json(changed) + b"\n", receipt,
+                        evidence_reads, **kwargs,
                     )
 
     def test_close_rejects_run_a_only_receipt_echo_and_every_mutated_required_field(self) -> None:
-        template, fixture, transcript_raw, receipt_raw = protocol_close_inputs()
+        template, fixture, transcript_raw, receipt_raw, evidence_reads = protocol_close_inputs()
         transcript = json.loads(transcript_raw)
         receipt = json.loads(receipt_raw)
         run_b = relay.validate_acceptance_template(template, label="test")["failure_run_id"]
@@ -5191,10 +5745,11 @@ class RelayAdmissionTests(unittest.TestCase):
                     template, fixture,
                     relay.canonical_json(changed_transcript) + b"\n",
                     relay.canonical_json(changed_receipt) + b"\n",
+                    evidence_reads,
                 )
 
     def test_close_rejects_signed_transcript_graph_order_and_cardinality_mutations(self) -> None:
-        template, fixture, transcript_raw, receipt_raw = protocol_close_inputs()
+        template, fixture, transcript_raw, receipt_raw, evidence_reads = protocol_close_inputs()
         authority = relay.validate_acceptance_template(template, label="test")
 
         def content(record: dict[str, object]) -> dict[str, object]:
@@ -5297,6 +5852,7 @@ class RelayAdmissionTests(unittest.TestCase):
                 with self.assertRaises(relay.RelayError):
                     relay.build_closed_verdict(
                         template, fixture, relay.canonical_json(changed) + b"\n", receipt_raw,
+                        evidence_reads,
                     )
 
     def test_template_ids_are_exact_unique_and_unknown_sixth_actor_event_is_refused(self) -> None:
