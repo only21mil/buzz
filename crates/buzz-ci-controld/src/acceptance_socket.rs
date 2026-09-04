@@ -610,6 +610,7 @@ mod tests {
             &acceptance.grant_event,
             &acceptance.rerun_event,
             &acceptance.tombstone_event,
+            &acceptance.failure_run_event,
         ]
         .map(|event| Sha256::digest(serde_json::to_vec(event).unwrap()));
         let fixture = FixtureSpec {
@@ -617,8 +618,10 @@ mod tests {
             activation_id: "activation-1".into(),
             activation_package_digest: "12".repeat(32),
             run_id: "13".repeat(16),
+            failure_run_id: format!("{}{}", "13".repeat(10), "ff".repeat(6)),
             job_id: "test".into(),
             request_digest: hex::encode(event_ids[0]),
+            failure_request_digest: hex::encode(event_ids[4]),
             manifest_digest: "15".repeat(32),
             source_oid: "16".repeat(20),
             approval_id: "17".repeat(16),
@@ -632,6 +635,11 @@ mod tests {
             expected_log: EvidenceObject {
                 name: "job.log".into(),
                 sha256: "1d".repeat(32),
+                bytes: 1,
+            },
+            expected_failure_log: EvidenceObject {
+                name: "job.log".into(),
+                sha256: "1f".repeat(32),
                 bytes: 1,
             },
             expected_artifacts: vec![EvidenceObject {
@@ -732,6 +740,18 @@ mod tests {
             }))
             .unwrap()
         ]);
+        let mut failure_run = run.clone();
+        failure_run.run_id = "13131313-1313-1313-1313-ffffffffffff".into();
+        failure_run.idempotency_key = "123e4567-e89b-12d3-a456-426614174014".into();
+        let failure_run_event = serde_json::json!([
+            0,
+            actor,
+            failure_run.issued_at,
+            KIND_CI_REQUEST,
+            request_tags(channel, &failure_run).unwrap(),
+            serde_json::to_string(&failure_run).unwrap()
+        ]);
+        run = failure_run;
         run.request_type = CiRequestType::Rerun;
         run.attempt = 2;
         run.parent_attempt = Some(1);
@@ -766,6 +786,7 @@ mod tests {
             grant_event,
             rerun_event,
             tombstone_event,
+            failure_run_event,
         }
     }
 

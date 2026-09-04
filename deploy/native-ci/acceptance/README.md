@@ -67,8 +67,11 @@ other executable or arguments.
 
 The checked-in fixture runs
 [`fixtures/run-fixture.sh`](fixtures/run-fixture.sh). It verifies the source
-input digest, writes a byte-stable `result.json`, and emits one byte-stable log
-line. [`fixtures/fixture-manifest.json`](fixtures/fixture-manifest.json) binds
+input digest, writes a byte-stable `result.json`, and emits one byte-stable success log
+line. A distinct frozen run ID ending in `ffffffffffff` makes only attempt 1
+emit the byte-stable failure log and exit nonzero without an artifact. Its
+attempt 2 enters the normal hold so cancellation remains deterministic.
+[`fixtures/fixture-manifest.json`](fixtures/fixture-manifest.json) binds
 the command, input, and required evidence names. Recompute all scenario digests
 if any fixture byte changes.
 
@@ -99,7 +102,7 @@ target/release/buzz-ci-capacity-one-canary \
   > /protected/path/capacity-one-receipt.json
 ```
 
-The binary returns `0` only after all 13 checks and both root-only phases pass.
+The binary returns `0` only after all 16 checks and both root-only phases pass.
 It returns `1` with a failure receipt for a driver or evidence failure, and `2`
 for invalid input. It copies no raw adapter output or stderr into the receipt.
 
@@ -123,7 +126,7 @@ materialize it as `0700`. Packaging must validate the tracked execute intent
 and hardened file metadata through `verifier_source.py`, then install and read
 back the declared `0755` mode.
 
-The verifier reads its fixed 13-stage vector only from
+The verifier reads its fixed 16-stage vector only from
 `/usr/libexec/buzz-ci-acceptance-expected-stages.json`. The activation package
 installs that tracked data asset as `root:root` mode `0644`; the verifier rejects
 missing, linked, multiply linked, ownership- or mode-drifted, noncanonical, or
@@ -132,7 +135,7 @@ digest-drifted data. There is no argument or environment override for the path.
 The verifier rejects reordered, duplicate, partial, or hash-only stage records.
 It recomputes every retained driver-response and root-phase digest; binds the
 scenario, activation package, candidate, run, evidence, and service generations;
-and requires the sequence-15 proof to equal the retained final zero proof. Its
+and requires the sequence-18 proof to equal the retained final zero proof. Its
 single JSON success line is acceptance evidence for that exact scenario. It is
 not a deployment receipt and does not activate capacity. Keep capacity zero
 until the separate activation decision and its approval are recorded.

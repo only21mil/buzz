@@ -1608,7 +1608,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "fc1aac69f5b666d50ac71b6ad17632e7cf6c91d27e28dc76605cbc4bdbd7d050",
+            "a92c25b5eb5af241d76997bde3bfc51556cdc3c5b09066b43b15d746b15b08c3",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -1654,7 +1654,7 @@ class ActivationControllerTests(unittest.TestCase):
             "timeout_millis", "fixture", "acceptance",
         ])
         self.assertEqual(list(self.fixture.binding["acceptance"]), [
-            "actor", "scenario_sha256", "run_event", "grant_event", "rerun_event", "tombstone_event",
+            "actor", "scenario_sha256", "run_event", "grant_event", "rerun_event", "tombstone_event", "failure_run_event",
         ])
         self.assertEqual(list(self.fixture.binding["acceptance"]["actor"]), ["public_key", "generation"])
         controld = json.loads((self.fixture.root / activation_package.CONFIG_TARGETS["controld_config"].lstrip("/")).read_bytes())
@@ -3293,7 +3293,9 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, _payloads, _driver = self.fixture.load()
         template = manifest["acceptance_template"]
         self.assertNotIn("scenario_sha256", template)
-        for field in ("run_event", "grant_event", "rerun_event", "tombstone_event"):
+        for field in (
+            "run_event", "grant_event", "rerun_event", "tombstone_event", "failure_run_event",
+        ):
             event_id = activation_package.digest(json.dumps(
                 template[field], ensure_ascii=False, separators=(",", ":"),
             ).encode())
@@ -3313,12 +3315,16 @@ class ActivationControllerTests(unittest.TestCase):
         checked = TEMPLATE_GENERATOR.checked_scenario_template(source)
         grant_event_id = RENDERER.activation_grant_event_id(manifest)
         request_digest = RENDERER.activation_request_digest(manifest)
+        failure_request_digest = RENDERER.activation_failure_request_digest(manifest)
         approved_by = RENDERER.activation_approved_by(manifest)
         bindings = {
             "candidate_sha": manifest["source_commit"],
             "packages": {"activation": manifest},
             "activation_grant_event_id": grant_event_id,
             "activation_request_digest": request_digest,
+            "activation_failure_request_digest": failure_request_digest,
+            "activation_run_id": RENDERER.activation_run_id(manifest),
+            "activation_failure_run_id": RENDERER.activation_failure_run_id(manifest),
             "activation_approved_by": approved_by,
             "activation_fixture_manifest_sha256": RENDERER.activation_fixture_manifest_sha256(
                 manifest,
@@ -3330,6 +3336,13 @@ class ActivationControllerTests(unittest.TestCase):
         rendered = RENDERER.validate_scenario(rendered, bindings)
         self.assertEqual(rendered["fixture"]["grant_event_id"], grant_event_id)
         self.assertEqual(rendered["fixture"]["request_digest"], request_digest)
+        self.assertEqual(
+            rendered["fixture"]["failure_request_digest"], failure_request_digest,
+        )
+        self.assertEqual(
+            rendered["fixture"]["failure_run_id"],
+            RENDERER.activation_failure_run_id(manifest),
+        )
         self.assertEqual(rendered["fixture"]["approved_by"], approved_by)
         self.assertEqual(
             rendered["fixture"]["manifest_digest"],
@@ -3371,6 +3384,10 @@ class ActivationControllerTests(unittest.TestCase):
         stale_request["fixture"]["request_digest"] = "8" * 64
         with self.assertRaisesRegex(RENDERER.RenderError, "cross-binding differs"):
             RENDERER.validate_scenario(stale_request, bindings)
+        stale_failure_request = copy.deepcopy(rendered)
+        stale_failure_request["fixture"]["failure_request_digest"] = "8" * 64
+        with self.assertRaisesRegex(RENDERER.RenderError, "cross-binding differs"):
+            RENDERER.validate_scenario(stale_failure_request, bindings)
         stale_approver = copy.deepcopy(rendered)
         stale_approver["fixture"]["approved_by"] = "8" * 64
         with self.assertRaisesRegex(RENDERER.RenderError, "cross-binding differs"):
@@ -4121,7 +4138,7 @@ class ActivationControllerTests(unittest.TestCase):
             activation_package.execution_declaration_digest(
                 "aa" * 20, "70" * 32, frozen_lane_manifest, config["execution"],
             ),
-            "a699a308fae53c2109af532c06ed6a345e1ad76323c0817a1ef8e8d015b0be55",
+            "217e574d5e7ba339924c2b64ec70bd8be04820fb86deca691714fcb2a1bc833c",
         )
 
     def test_lane_manifest_admission_key_must_be_the_keyholder_manifest_selector(self) -> None:
@@ -4371,10 +4388,12 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertEqual(first, repeated)
         first_run = json.loads(first["run_event"][5])
         first_rerun = json.loads(first["rerun_event"][5])
+        first_failure = json.loads(first["failure_run_event"][5])
         later_run = json.loads(later["run_event"][5])
         later_rerun = json.loads(later["rerun_event"][5])
-        self.assertEqual(first_run["run_id"], first_rerun["run_id"])
-        self.assertEqual(first_rerun["parent_run_id"], first_run["run_id"])
+        self.assertNotEqual(first_run["run_id"], first_failure["run_id"])
+        self.assertEqual(first_failure["run_id"], first_rerun["run_id"])
+        self.assertEqual(first_rerun["parent_run_id"], first_failure["run_id"])
         self.assertNotEqual(first_run["run_id"], later_run["run_id"])
         self.assertNotEqual(first_run["idempotency_key"], later_run["idempotency_key"])
         self.assertNotEqual(first_rerun["idempotency_key"], later_rerun["idempotency_key"])

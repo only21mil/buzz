@@ -155,7 +155,7 @@ pub struct UnixKeyholderClient {
     ci_pubkey: String,
     /// Activation-bound acceptance actor, bound after the keyholder's
     /// `describe_acceptance` matched the receipt. Only a client that publishes
-    /// the four frozen acceptance events binds one.
+    /// the five frozen acceptance events binds one.
     acceptance_actor: Option<PublicIdentity>,
 }
 
@@ -1003,7 +1003,7 @@ mod tests {
                                 generation: 10,
                             },
                             scenario_sha256: [9; 32],
-                            event_ids: [[1; 32], [2; 32], [3; 32], [4; 32]],
+                            event_ids: [[1; 32], [2; 32], [3; 32], [4; 32], [5; 32]],
                         }),
                     ),
                     Reply::SignAcceptance => {

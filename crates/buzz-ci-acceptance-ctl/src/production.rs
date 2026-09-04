@@ -94,8 +94,10 @@ pub struct ProductionDriverConfig {
     pub integrated_candidate_sha: String,
     pub scenario_sha256: String,
     pub run_id: String,
+    pub failure_run_id: String,
     pub job_id: String,
     pub request_digest: String,
+    pub failure_request_digest: String,
     pub manifest_digest: String,
     pub approval_id: String,
     pub grant_event_id: String,
@@ -140,8 +142,10 @@ impl ProductionDriverConfig {
             || !lower_hex(&self.integrated_candidate_sha, &[40, 64])
             || !lower_hex(&self.scenario_sha256, &[64])
             || !lower_hex(&self.run_id, &[32])
+            || !lower_hex(&self.failure_run_id, &[32])
             || !valid_name(&self.job_id, 64)
             || !lower_hex(&self.request_digest, &[64])
+            || !lower_hex(&self.failure_request_digest, &[64])
             || !lower_hex(&self.manifest_digest, &[64])
             || !lower_hex(&self.approval_id, &[32])
             || !lower_hex(&self.grant_event_id, &[64])
@@ -159,8 +163,10 @@ impl ProductionDriverConfig {
             && request.fixture.activation_package_digest == self.activation_package_digest
             && request.fixture.integrated_candidate_sha == self.integrated_candidate_sha
             && request.fixture.run_id == self.run_id
+            && request.fixture.failure_run_id == self.failure_run_id
             && request.fixture.job_id == self.job_id
             && request.fixture.request_digest == self.request_digest
+            && request.fixture.failure_request_digest == self.failure_request_digest
             && request.fixture.manifest_digest == self.manifest_digest
             && request.fixture.approval_id == self.approval_id
             && request.fixture.grant_event_id == self.grant_event_id
@@ -593,7 +599,7 @@ where
         if !self.config.binds_zero(request) {
             return Err(DriverError::BindingMismatch);
         }
-        let finalize = zero_control_request(request, 14, ControlOperation::FinalizeCapacityZero)?;
+        let finalize = zero_control_request(request, 17, ControlOperation::FinalizeCapacityZero)?;
         let (finalized, finalize_attempts) = self.exchange_control_retry(&finalize)?;
         let finalize_phase = zero_phase_receipt(
             request,
@@ -603,7 +609,7 @@ where
             finalize_attempts,
         )?;
 
-        let prove = zero_control_request(request, 15, ControlOperation::ProveCapacityZero)?;
+        let prove = zero_control_request(request, 18, ControlOperation::ProveCapacityZero)?;
         let (proved, prove_attempts) = self.exchange_control_retry(&prove)?;
         let prove_phase = zero_phase_receipt(
             request,
@@ -835,8 +841,10 @@ fn valid_request(request: &DriverRequest<'_>) -> bool {
         && lower_hex(&fixture.activation_package_digest, &[64])
         && lower_hex(&fixture.integrated_candidate_sha, &[40, 64])
         && lower_hex(&fixture.run_id, &[32])
+        && lower_hex(&fixture.failure_run_id, &[32])
         && valid_name(&fixture.job_id, 64)
         && lower_hex(&fixture.request_digest, &[64])
+        && lower_hex(&fixture.failure_request_digest, &[64])
         && lower_hex(&fixture.manifest_digest, &[64])
         && lower_hex(&fixture.source_oid, &[40, 64])
         && lower_hex(&fixture.approval_id, &[32])
@@ -851,7 +859,7 @@ fn valid_request(request: &DriverRequest<'_>) -> bool {
             .attempt_id
             .is_none_or(|value| lower_hex(value, &[32]))
         && match request.sequence {
-            6..=10 => request.attempt_id.is_some(),
+            6..=7 | 10..=13 => request.attempt_id.is_some(),
             _ => request.attempt_id.is_none(),
         }
         && match (request.sequence, request.expected_controller_generation) {
@@ -875,12 +883,15 @@ fn expected_operation(sequence: u32) -> Option<Operation> {
         5 => Operation::ResumeGrant,
         6 => Operation::AwaitFirstTerminal,
         7 => Operation::ExportFirstEvidence,
-        8 => Operation::Rerun,
-        9 => Operation::CancelRerun,
-        10 => Operation::TombstoneRerun,
-        11 => Operation::RestartController,
-        12 => Operation::RestartRunner,
-        13 => Operation::SetCapacityZero,
+        8 => Operation::SubmitFailureManifest,
+        9 => Operation::ResumeFailure,
+        10 => Operation::AwaitFailureTerminal,
+        11 => Operation::Rerun,
+        12 => Operation::CancelRerun,
+        13 => Operation::TombstoneRerun,
+        14 => Operation::RestartController,
+        15 => Operation::RestartRunner,
+        16 => Operation::SetCapacityZero,
         _ => return None,
     })
 }
@@ -930,7 +941,7 @@ fn digest_operation_id(
 }
 
 fn control_operation_id(request: &ControlRequest) -> Result<String, ControlError> {
-    if request.sequence >= 14 {
+    if request.sequence >= 17 {
         return zero_control_operation_id(request).map_err(|_| ControlError::BindingMismatch);
     }
     let operation = expected_operation(request.sequence).ok_or(ControlError::BindingMismatch)?;
@@ -1325,7 +1336,7 @@ impl AcceptanceControlConfig {
             && request.activation_package_digest == self.activation_package_digest
             && request.integrated_candidate_sha == self.integrated_candidate_sha
             && request.run_id == self.run_id;
-        core && if request.sequence >= 14 {
+        core && if request.sequence >= 17 {
             true
         } else {
             request.job_id == self.job_id
@@ -2707,7 +2718,7 @@ pub fn handle_control<H: HostControl>(
     config.validate()?;
     let bound_operation_id = control_operation_id(request)?;
     if !config.binds(request)
-        || !(1..=15).contains(&request.sequence)
+        || !(1..=18).contains(&request.sequence)
         || expected_control_operation(request.sequence) != Some(request.operation)
         || bound_operation_id != request.operation_id
         || !lower_hex(&request.operation_id, &[64])
@@ -2722,8 +2733,8 @@ pub fn handle_control<H: HostControl>(
             .attempt_id
             .as_deref()
             .is_some_and(|value| !lower_hex(value, &[32]))
-        || (request.sequence >= 14) != request.failed_stage.is_some()
-        || (request.sequence <= 13
+        || (request.sequence >= 17) != request.failed_stage.is_some()
+        || (request.sequence <= 16
             && (request.failed_stage.is_some() || request.final_response_sha256.is_some()))
         || request
             .final_response_sha256
@@ -2731,7 +2742,7 @@ pub fn handle_control<H: HostControl>(
             .is_some_and(|value| !lower_hex(value, &[64]))
         || (request.final_response_sha256.is_some()
             && request.failed_stage != Some(Stage::PrepareCapacityZero))
-        || (request.sequence >= 14 && request.attempt_id.is_some())
+        || (request.sequence >= 17 && request.attempt_id.is_some())
     {
         return Err(ControlError::BindingMismatch);
     }
@@ -2847,12 +2858,12 @@ fn proof_readback(proof: &ZeroProof) -> ControlReadback {
 fn expected_control_operation(sequence: u32) -> Option<ControlOperation> {
     Some(match sequence {
         2 => ControlOperation::SetCapacityOne,
-        11 => ControlOperation::RestartController,
-        12 => ControlOperation::RestartRunner,
-        13 => ControlOperation::PrepareCapacityZero,
-        14 => ControlOperation::FinalizeCapacityZero,
-        15 => ControlOperation::ProveCapacityZero,
-        1 | 3..=10 => ControlOperation::Observe,
+        14 => ControlOperation::RestartController,
+        15 => ControlOperation::RestartRunner,
+        16 => ControlOperation::PrepareCapacityZero,
+        17 => ControlOperation::FinalizeCapacityZero,
+        18 => ControlOperation::ProveCapacityZero,
+        1 | 3..=13 => ControlOperation::Observe,
         _ => return None,
     })
 }
@@ -2943,7 +2954,7 @@ fn load_control_ledger(config: &AcceptanceControlConfig) -> Result<ControlLedger
         return Ok(new_control_ledger(config));
     }
     let ledger: ControlLedger = serde_json::from_value(value).map_err(|_| ControlError::Ledger)?;
-    if ledger.schema_version != "buzz-ci-acceptance-control-ledger/v2" || ledger.entries.len() > 15
+    if ledger.schema_version != "buzz-ci-acceptance-control-ledger/v2" || ledger.entries.len() > 18
     {
         return Err(ControlError::Ledger);
     }
@@ -2956,7 +2967,7 @@ fn load_control_ledger(config: &AcceptanceControlConfig) -> Result<ControlLedger
 fn persist_control_ledger(ledger: &ControlLedger) -> Result<(), ControlError> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    if ledger.entries.len() > 15 {
+    if ledger.entries.len() > 18 {
         return Err(ControlError::Ledger);
     }
     let bytes = serde_json::to_vec(ledger).map_err(|_| ControlError::Ledger)?;
@@ -3100,8 +3111,10 @@ mod tests {
             activation_id: "buzz-ci-capacity-one-test".into(),
             activation_package_digest: hex('b', 64),
             run_id: hex('c', 32),
+            failure_run_id: format!("{}{}", hex('c', 20), hex('f', 12)),
             job_id: "fixture".into(),
             request_digest: hex('d', 64),
+            failure_request_digest: hex('9', 64),
             manifest_digest: hex('e', 64),
             source_oid: hex('f', 40),
             approval_id: hex('1', 32),
@@ -3116,6 +3129,11 @@ mod tests {
                 name: "job.log".into(),
                 sha256: hex('7', 64),
                 bytes: 1,
+            },
+            expected_failure_log: crate::acceptance::EvidenceObject {
+                name: "job.log".into(),
+                sha256: hex('9', 64),
+                bytes: 2,
             },
             expected_artifacts: vec![crate::acceptance::EvidenceObject {
                 name: "result.json".into(),
@@ -3133,8 +3151,10 @@ mod tests {
             integrated_candidate_sha: hex('a', 40),
             scenario_sha256: hex('9', 64),
             run_id: hex('c', 32),
+            failure_run_id: format!("{}{}", hex('c', 20), hex('f', 12)),
             job_id: "fixture".into(),
             request_digest: hex('d', 64),
+            failure_request_digest: hex('9', 64),
             manifest_digest: hex('e', 64),
             approval_id: hex('1', 32),
             grant_event_id: hex('2', 64),
@@ -3453,7 +3473,7 @@ mod tests {
         let fixture = fixture();
         let driver_config = config();
         let mut base = request(&fixture, &driver_config.scenario_sha256);
-        base.sequence = 11;
+        base.sequence = 14;
         base.operation = Operation::RestartController;
         let mut control = control_request(&base, &operation_id(&base).unwrap());
         let control_config = AcceptanceControlConfig {
@@ -3494,7 +3514,7 @@ mod tests {
             Err(ControlError::BindingMismatch)
         );
 
-        control.sequence = 11;
+        control.sequence = 14;
         control.grant_digest = hex('a', 64);
         assert_eq!(
             handle_control(&control_config, &control, &mut host),
@@ -3554,7 +3574,7 @@ mod tests {
                 if sequence == 2 && self.fault == Fault::CapacityActivation {
                     return Err("capacity-one activation rejected");
                 }
-                if sequence == 14 && self.finalize_failures > 0 {
+                if sequence == 17 && self.finalize_failures > 0 {
                     self.finalize_failures -= 1;
                     return Err("transport lost after durable finalize");
                 }
@@ -3564,24 +3584,24 @@ mod tests {
                     let request: ControlRequest = serde_json::from_slice(request).unwrap();
                     let (mut capacity, mut controller, runner) = match request.sequence {
                         1 => (0, 7, 9),
-                        2..=10 => (1, 7, 9),
-                        11 => (1, 8, 9),
-                        12 => (1, 8, 10),
-                        13 => (0, 8, 10),
-                        14 | 15 => (
+                        2..=13 => (1, 7, 9),
+                        14 => (1, 8, 9),
+                        15 => (1, 8, 10),
+                        16 => (0, 8, 10),
+                        17 | 18 => (
                             0,
                             request.expected_controller_generation.unwrap_or(8),
                             request.expected_runner_generation.unwrap_or(10),
                         ),
                         _ => unreachable!(),
                     };
-                    if self.fault == Fault::StaleRestart && request.sequence == 11 {
+                    if self.fault == Fault::StaleRestart && request.sequence == 14 {
                         controller = 7;
                     }
                     if self.fault == Fault::BadCapacity && request.sequence == 2 {
                         capacity = 2;
                     }
-                    let zero_proof = (request.sequence >= 14).then(|| ZeroProof {
+                    let zero_proof = (request.sequence >= 17).then(|| ZeroProof {
                         schema_version: ZERO_PROOF_VERSION.into(),
                         scenario_sha256: request.scenario_sha256.clone(),
                         activation_id: request.activation_id.clone(),
@@ -3617,7 +3637,7 @@ mod tests {
                         zero_proof,
                         controller_receipt_sha256: (request.sequence == 2)
                             .then(|| hex('6', 64))
-                            .or_else(|| (request.sequence >= 14).then(|| hex('7', 64))),
+                            .or_else(|| (request.sequence >= 17).then(|| hex('7', 64))),
                     };
                     serde_json::to_vec(&response).unwrap()
                 }
@@ -3664,29 +3684,47 @@ mod tests {
             Conclusion::Success,
             true,
         );
-        let second_running = attempt(
+        let failed_running = failure_attempt(
             fixture,
-            'b',
-            2,
-            Some('a'),
+            'c',
+            1,
+            None,
             AttemptState::Running,
             Conclusion::None,
             false,
         );
-        let second_cancelled = attempt(
+        let failed_terminal = failure_attempt(
+            fixture,
+            'c',
+            1,
+            None,
+            AttemptState::Terminal,
+            Conclusion::Failure,
+            true,
+        );
+        let second_running = failure_attempt(
             fixture,
             'b',
             2,
-            Some('a'),
+            Some('c'),
+            AttemptState::Running,
+            Conclusion::None,
+            false,
+        );
+        let second_cancelled = failure_attempt(
+            fixture,
+            'b',
+            2,
+            Some('c'),
             AttemptState::Terminal,
             Conclusion::Cancelled,
             false,
         );
-        let second_tombstoned = attempt(
+        let second_tombstoned = failure_attempt(
             fixture,
             'b',
             2,
-            Some('a'),
+            Some('c'),
             AttemptState::Tombstoned,
             Conclusion::Cancelled,
             false,
@@ -3732,29 +3770,53 @@ mod tests {
                 Some('a'),
                 vec![first_terminal],
             )),
-            8 => Some(run(
+            8 => Some(failure_run(
+                fixture,
+                RunState::GrantedAwaitingResume,
+                Conclusion::None,
+                Some(approval(false)),
+                None,
+                vec![],
+            )),
+            9 => Some(failure_run(
                 fixture,
                 RunState::Running,
                 Conclusion::None,
                 Some(approval(true)),
                 None,
-                vec![first_terminal, second_running],
+                vec![failed_running],
             )),
-            9 => Some(run(
+            10 => Some(failure_run(
+                fixture,
+                RunState::Terminal,
+                Conclusion::Failure,
+                Some(approval(true)),
+                Some('c'),
+                vec![failed_terminal],
+            )),
+            11 => Some(failure_run(
+                fixture,
+                RunState::Running,
+                Conclusion::None,
+                Some(approval(true)),
+                None,
+                vec![failed_terminal, second_running],
+            )),
+            12 => Some(failure_run(
                 fixture,
                 RunState::Terminal,
                 Conclusion::Cancelled,
                 Some(approval(true)),
                 Some('b'),
-                vec![first_terminal, second_cancelled],
+                vec![failed_terminal, second_cancelled],
             )),
-            10..=13 => Some(run(
+            13..=16 => Some(failure_run(
                 fixture,
                 RunState::Terminal,
-                Conclusion::Success,
+                Conclusion::Failure,
                 Some(approval(true)),
-                Some('a'),
-                vec![first_terminal, second_tombstoned],
+                Some('c'),
+                vec![failed_terminal, second_tombstoned],
             )),
             _ => unreachable!(),
         };
@@ -3771,7 +3833,7 @@ mod tests {
                 fixture.expected_artifacts[0].clone(),
             ],
         });
-        let active = u32::from(matches!(request.sequence, 5 | 8));
+        let active = u32::from(matches!(request.sequence, 5 | 9 | 11));
         DriverResponse {
             schema_version: DRIVER_VERSION.into(),
             sequence: request.sequence,
@@ -3840,6 +3902,38 @@ mod tests {
         }
     }
 
+    fn failure_attempt(
+        fixture: &FixtureSpec,
+        id: char,
+        number: u32,
+        parent: Option<char>,
+        state: AttemptState,
+        conclusion: Conclusion,
+        evidence: bool,
+    ) -> AttemptSnapshot {
+        let mut value = attempt(fixture, id, number, parent, state, conclusion, false);
+        value.request_digest = fixture.failure_request_digest.clone();
+        if evidence {
+            value.evidence_set_digest = Some(hex('9', 64));
+            value.log = Some(fixture.expected_failure_log.clone());
+        }
+        value
+    }
+
+    fn failure_run(
+        fixture: &FixtureSpec,
+        state: RunState,
+        conclusion: Conclusion,
+        approval: Option<ApprovalSnapshot>,
+        selected: Option<char>,
+        attempts: Vec<AttemptSnapshot>,
+    ) -> RunSnapshot {
+        let mut value = run(fixture, state, conclusion, approval, selected, attempts);
+        value.run_id = fixture.failure_run_id.clone();
+        value.request_digest = fixture.failure_request_digest.clone();
+        value
+    }
+
     fn scenario() -> AcceptanceScenario {
         let endpoint = ProcessEndpoint {
             program: DRIVER_PROGRAM.into(),
@@ -3893,17 +3987,17 @@ mod tests {
     }
 
     #[test]
-    fn full_production_adapter_simulation_passes_all_thirteen_stages() {
+    fn full_production_adapter_simulation_passes_all_sixteen_stages() {
         let (receipt, transport) = run_simulation_with_transport(0);
         assert_eq!(receipt.outcome, Outcome::Pass);
-        assert_eq!(receipt.checks.len(), 13);
+        assert_eq!(receipt.checks.len(), 16);
         assert_eq!(
             &transport.trace[transport.trace.len() - 4..],
             &[
-                (AdapterEndpoint::Control, 13),
-                (AdapterEndpoint::Controld, 13),
-                (AdapterEndpoint::Control, 14),
-                (AdapterEndpoint::Control, 15),
+                (AdapterEndpoint::Control, 16),
+                (AdapterEndpoint::Controld, 16),
+                (AdapterEndpoint::Control, 17),
+                (AdapterEndpoint::Control, 18),
             ]
         );
     }
@@ -3915,18 +4009,18 @@ mod tests {
         let finalize: Vec<_> = transport
             .control_frames
             .iter()
-            .filter(|(sequence, _)| *sequence == 14)
+            .filter(|(sequence, _)| *sequence == 17)
             .collect();
         assert_eq!(finalize.len(), 2);
         assert_eq!(finalize[0].1, finalize[1].1);
         assert_eq!(
             &transport.trace[transport.trace.len() - 5..],
             &[
-                (AdapterEndpoint::Control, 13),
-                (AdapterEndpoint::Controld, 13),
-                (AdapterEndpoint::Control, 14),
-                (AdapterEndpoint::Control, 14),
-                (AdapterEndpoint::Control, 15),
+                (AdapterEndpoint::Control, 16),
+                (AdapterEndpoint::Controld, 16),
+                (AdapterEndpoint::Control, 17),
+                (AdapterEndpoint::Control, 17),
+                (AdapterEndpoint::Control, 18),
             ]
         );
     }
@@ -3962,9 +4056,9 @@ mod tests {
         let zero_transition = receipt.zero_transition.as_ref().unwrap();
         assert_eq!(zero_transition.outcome, Outcome::Pass);
         assert_eq!(zero_transition.phases.len(), 2);
-        assert_eq!(zero_transition.phases[0].sequence, 14);
+        assert_eq!(zero_transition.phases[0].sequence, 17);
         assert_eq!(zero_transition.phases[0].outcome, Outcome::Pass);
-        assert_eq!(zero_transition.phases[1].sequence, 15);
+        assert_eq!(zero_transition.phases[1].sequence, 18);
         assert_eq!(zero_transition.phases[1].outcome, Outcome::Pass);
         assert_eq!(zero_transition.zero_proof.capacity, 0);
         assert_eq!(zero_transition.zero_proof.admission, AdmissionState::Closed);
@@ -3979,8 +4073,8 @@ mod tests {
         assert_eq!(
             &transport.trace[transport.trace.len() - 2..],
             &[
-                (AdapterEndpoint::Control, 14),
-                (AdapterEndpoint::Control, 15),
+                (AdapterEndpoint::Control, 17),
+                (AdapterEndpoint::Control, 18),
             ]
         );
     }

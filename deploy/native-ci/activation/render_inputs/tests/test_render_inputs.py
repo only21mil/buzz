@@ -327,6 +327,7 @@ class RendererTests(unittest.TestCase):
         }
         grant_event_id = RENDER.activation_grant_event_id(activation)
         request_digest = RENDER.activation_request_digest(activation)
+        failure_request_digest = RENDER.activation_failure_request_digest(activation)
         approved_by = RENDER.activation_approved_by(activation)
         self.assertEqual(
             grant_event_id,
@@ -334,6 +335,9 @@ class RendererTests(unittest.TestCase):
         )
         bindings["activation_grant_event_id"] = grant_event_id
         bindings["activation_request_digest"] = request_digest
+        bindings["activation_failure_request_digest"] = failure_request_digest
+        bindings["activation_run_id"] = RENDER.activation_run_id(activation)
+        bindings["activation_failure_run_id"] = RENDER.activation_failure_run_id(activation)
         bindings["activation_approved_by"] = approved_by
         bindings["activation_fixture_manifest_sha256"] = (
             fixture["manifest_digest"]
@@ -351,6 +355,9 @@ class RendererTests(unittest.TestCase):
                     },
                     "grant_event_id": {"$copy": "activation_grant_event_id"},
                     "request_digest": {"$copy": "activation_request_digest"},
+                    "failure_request_digest": {"$copy": "activation_failure_request_digest"},
+                    "run_id": {"$copy": "activation_run_id"},
+                    "failure_run_id": {"$copy": "activation_failure_run_id"},
                     "approved_by": {"$copy": "activation_approved_by"},
                 },
             },
@@ -384,6 +391,9 @@ class RendererTests(unittest.TestCase):
             rendered = RENDER.render_scenario(mock.Mock(), descriptor)
         scenario["fixture"]["grant_event_id"] = grant_event_id
         scenario["fixture"]["request_digest"] = request_digest
+        scenario["fixture"]["failure_request_digest"] = failure_request_digest
+        scenario["fixture"]["run_id"] = RENDER.activation_run_id(activation)
+        scenario["fixture"]["failure_run_id"] = RENDER.activation_failure_run_id(activation)
         scenario["fixture"]["approved_by"] = approved_by
         self.assertEqual(rendered, scenario)
         wrong_bindings = {
@@ -470,7 +480,7 @@ class RendererTests(unittest.TestCase):
                 "    }:\n"
                 "        raise ValueError('default state differs')\n"
                 "def validate_acceptance_template(value):\n"
-                "    if set(value) != {'actor', 'time_reference', 'run_event', 'grant_event', 'rerun_event', 'tombstone_event'}:\n"
+                "    if set(value) != {'actor', 'time_reference', 'run_event', 'grant_event', 'rerun_event', 'tombstone_event', 'failure_run_event'}:\n"
                 "        raise ValueError('template shape differs')\n"
                 "    return value\n"
             )
@@ -596,6 +606,9 @@ class RendererTests(unittest.TestCase):
             request_digest = hashlib.sha256(
                 RENDER.compact_declared(activation["acceptance_template"]["run_event"]),
             ).hexdigest()
+            failure_request_digest = hashlib.sha256(
+                RENDER.compact_declared(activation["acceptance_template"]["failure_run_event"]),
+            ).hexdigest()
             approved_by = activation["acceptance_template"]["actor"]["public_key"]
             self.assertEqual(
                 grant_event_id,
@@ -609,6 +622,9 @@ class RendererTests(unittest.TestCase):
                     "activation_package_digest": activation_digest,
                     "grant_event_id": grant_event_id,
                     "request_digest": request_digest,
+                    "failure_request_digest": failure_request_digest,
+                    "run_id": RENDER.activation_run_id(activation),
+                    "failure_run_id": RENDER.activation_failure_run_id(activation),
                     "approved_by": approved_by,
                 }
             )

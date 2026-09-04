@@ -90,7 +90,7 @@ const FIXTURE_MANIFEST_SHA256: &str =
 const FIXTURE_INPUT_SHA256: &str =
     "967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6";
 const FIXTURE_SCRIPT_SHA256: &str =
-    "d081e43ebfde3ee67c3cd8d852d58410a79ad799bbfa2cf98d5e2ef7b8bed3b1";
+    "6cfcbe7061c3e36fbf6c7147e6dd647a134c28db7bb6d43030699bb73952fe41";
 const CONFIG_SCHEMA: u16 = 2;
 const RPC_SCHEMA: u16 = 1;
 const MAX_CONFIG: u64 = 64 * 1024;
@@ -5735,7 +5735,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(static_execution_digest(&execution)),
-            "a699a308fae53c2109af532c06ed6a345e1ad76323c0817a1ef8e8d015b0be55"
+            "217e574d5e7ba339924c2b64ec70bd8be04820fb86deca691714fcb2a1bc833c"
         );
     }
 

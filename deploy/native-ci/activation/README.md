@@ -319,8 +319,9 @@ owns the canonical Run, Grant, Rerun, and Tombstone seed, supplies the fixed
 closed contracts, and validates the complete draft; production bootstrap does
 not inherit a prior artifact or test fixture. `validate_phase_configs` requires
 the active controld `channel_id` to equal the channel frozen into the events,
-and `validate_acceptance_template` requires the run, grant, and rerun events to
-name one channel and one repository.
+and `validate_acceptance_template` requires the successful run, failed-parent
+run, grant, and rerun events to name one channel and one repository. The rerun
+must name the failed-parent run, never the successful finalized run.
 
 The runner staged config is the exact runner-v2 `dormant` shape at
 `/etc/buzzci/runner-v2.json`. Its active config selects `mode=v2_proxy`, binds
