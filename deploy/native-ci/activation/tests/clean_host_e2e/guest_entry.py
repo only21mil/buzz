@@ -32,6 +32,12 @@ BINDING_SCHEMA = "buzz-ci-clean-host-e2e-public-binding/v3"
 STAGE_SCHEMA = "buzz-ci-clean-host-e2e-stage/v3"
 PENDING_SCHEMA = "buzz-ci-clean-host-e2e-pending-evidence/v3"
 STATE_ROOT = Path("/var/lib/buzzci-e2e")
+RELAY_ROOT = Path("/var/lib/buzzci-e2e-relay")
+# local_tls_relay.py RELAY_FAULTS; the harness `run --relay-fault` choices.
+RELAY_FAULTS = frozenset({"stale-terminal-publication-recovery"})
+# buzz-ci-controld store.rs SNAPSHOT_NAME under the frozen controld store_root.
+CONTROLD_SNAPSHOT = Path("/var/lib/buzzci/controld/control-store-v1.json")
+MAX_CONTROLD_SNAPSHOT = 8 * 1024 * 1024
 EVIDENCE_DEVICE = Path("/dev/virtio-ports/buzzci.evidence")
 PROGRESS_DEVICE = Path("/dev/virtio-ports/buzzci.progress")
 TRANSFER_DEVICE = Path("/dev/vdb")
@@ -1221,6 +1227,47 @@ def run_capacity_one_canary(
     ).stdout
 
 
+def prove_relay_fault_recovery(relay_fault: str | None) -> None:
+    """After the canary, require the armed relay fault to have fired, controld to
+    have read the refused event back through POST /query, and the terminal run
+    publication to be ``Accepted`` in the controld snapshot. Plain file reads;
+    no guest command."""
+    if relay_fault is None:
+        return
+    try:
+        record = load_json(RELAY_ROOT / "fault-fired.json")
+    except FileNotFoundError as error:
+        raise GuestError("relay fault did not fire") from error
+    if (
+        not isinstance(record, dict) or set(record) != {"mode", "refused_event_id", "queried"}
+        or record["mode"] != relay_fault
+        or not isinstance(record["refused_event_id"], str) or HEX64.fullmatch(record["refused_event_id"]) is None
+        or record["queried"] is not True
+    ):
+        raise GuestError("relay fault record differs: refused publication was not read back")
+    try:
+        snapshot = json.loads(read_file(CONTROLD_SNAPSHOT, MAX_CONTROLD_SNAPSHOT), object_pairs_hook=reject_duplicates)
+    except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise GuestError("controld snapshot unreadable after canary") from error
+    publications = snapshot.get("publications") if isinstance(snapshot, dict) else None
+    if not isinstance(publications, dict):
+        raise GuestError("controld snapshot differs")
+    # The canary runs an attempt and a rerun, so every accepted request has its
+    # own run:terminal key; the fault hit the first one and all must be Accepted.
+    terminal = [value for key, value in publications.items() if key.endswith(":run:terminal")]
+    if not terminal or any(not isinstance(value, dict) or set(value) != {"Accepted"} for value in terminal):
+        raise GuestError("terminal run publication is not accepted after relay fault")
+    for accepted in (value["Accepted"] for value in terminal):
+        signed = accepted.get("signed") if isinstance(accepted, dict) else None
+        relay_event_id = accepted.get("relay_event_id") if isinstance(accepted, dict) else None
+        if (
+            not isinstance(signed, dict) or not isinstance(relay_event_id, str) or HEX64.fullmatch(relay_event_id) is None
+            or signed.get("event_id") != relay_event_id or signed.get("kind") != 46101
+            or not isinstance(signed.get("signed_event"), dict) or signed["signed_event"].get("id") != relay_event_id
+        ):
+            raise GuestError("terminal run publication record is inconsistent after relay fault")
+
+
 def verify_platform_systemd(platform_systemd: object) -> None:
     """Reject a clean-host image that differs from the frozen platform files."""
     if platform_systemd != PLATFORM_SYSTEMD:
@@ -1714,7 +1761,7 @@ def relay_public_config(public: dict[str, object], channel_id: str) -> dict[str,
     }
 
 
-def start_relay(public: dict[str, object], channel_id: str) -> None:
+def start_relay(public: dict[str, object], channel_id: str, relay_fault: str | None = None) -> None:
     ca_target, ca_install, _ca_remove = ca_backend()
     hosts = Path("/etc/hosts")
     if not relay_mapping_present():
@@ -1726,8 +1773,12 @@ def start_relay(public: dict[str, object], channel_id: str) -> None:
     config = STATE_ROOT / "relay-public.json"
     config.write_bytes(canonical(relay_public_config(public, channel_id)))
     config.chmod(0o444)
-    relay_root = Path("/var/lib/buzzci-e2e-relay")
+    relay_root = RELAY_ROOT
     relay_root.mkdir(mode=0o700, parents=True, exist_ok=False)
+    if relay_fault is not None:
+        # Armed before the unit starts; the relay reads it once at startup.
+        (relay_root / "fault").write_bytes(relay_fault.encode() + b"\n")
+        (relay_root / "fault").chmod(0o400)
     unit = Path("/run/systemd/system/buzzci-e2e-relay.service")
     unit.write_text(
         "[Unit]\nDescription=Disposable Buzz CI E2E relay\n"
@@ -1738,7 +1789,8 @@ def start_relay(public: dict[str, object], channel_id: str) -> None:
         "--certificate=/var/lib/buzzci-e2e/relay.crt "
         "--private-key=/run/credentials/buzzci-e2e-relay.service/relay.key "
         "--public-config=/var/lib/buzzci-e2e/relay-public.json "
-        "--object-root=/var/lib/buzzci-e2e-relay/objects\n"
+        "--object-root=/var/lib/buzzci-e2e-relay/objects "
+        "--fault-flag=/var/lib/buzzci-e2e-relay/fault\n"
     )
     unit.chmod(0o444)
     command(["systemctl", "daemon-reload"])
@@ -1869,6 +1921,9 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
     if hashlib.sha256(canonical(descriptor)).hexdigest() != phase.get("descriptor_sha256"):
         raise GuestError("stage descriptor digest differs")
     candidate, _scenario, public, channel_id = cross_bind(stage, descriptor)
+    relay_fault = phase.get("relay_fault")
+    if relay_fault is not None and relay_fault not in RELAY_FAULTS:
+        raise GuestError("relay fault mode differs")
     inputs = stage / "inputs"
     activation_package = inputs / "activation"
     prior_inputs = inputs / "prior"
@@ -1884,7 +1939,7 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
     hosts_added = False
     try:
         hosts_added = not relay_mapping_present()
-        start_relay(public, channel_id)
+        start_relay(public, channel_id, relay_fault)
         emit_progress("relay_ready")
         preinstall_units = unit_state()
         if any(state["LoadState"] != "not-found" for state in preinstall_units.values()):
@@ -1955,6 +2010,7 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
             read_file(inputs / "scenario.json"),
             public,
         )
+        prove_relay_fault_recovery(relay_fault)
         receipt_path = STATE_ROOT / "acceptance-receipt.json"
         receipt_path.write_bytes(receipt_raw)
         receipt_path.chmod(0o400)
@@ -2139,9 +2195,11 @@ def main(argv: list[str]) -> int:
         elif phase.get("phase") == "run":
             if set(phase) != {
                 "schema_version", "phase", "challenge", "descriptor_sha256",
-                "timing", "timing_sha256",
+                "timing", "timing_sha256", "relay_fault",
             }:
                 raise GuestError("candidate phase fields differ")
+            if phase["relay_fault"] is not None and phase["relay_fault"] not in RELAY_FAULTS:
+                raise GuestError("relay fault mode differs")
             if evidence_device_present():
                 raise GuestError("candidate execution must not have an evidence transport")
             transfer_fd = os.open(TRANSFER_DEVICE, os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)

@@ -3,9 +3,19 @@
 
 The rules mirror ``crates/buzz-relay`` for the routes the native-CI daemons use:
 ``POST /events`` (api/bridge.rs ``submit_event`` and handlers/ingest.rs),
+``POST /query`` (api/bridge.rs ``query_events``: the exact-event read-back
+controld issues before it re-signs a refused publication),
 ``GET /ci/control/accepted`` (api/ci.rs ``next_accepted_control``), and
 ``PUT /ci/logs|artifacts/...`` (api/ci.rs ``put_ci_evidence``). Every request
 carries a NIP-98 token; the token pubkey is the only identity the relay knows.
+
+One opt-in fault mode, ``stale-terminal-publication-recovery``, is armed by a
+flag file the guest writes before the relay starts. It answers the first publish
+of the terminal kind-46101 run status with the production drift refusal and
+stores nothing, so controld must read the event back through ``POST /query``
+before it re-signs and publishes again. The relay records the refused id and
+whether that read-back happened next to the flag, so the guest can prove the
+fault fired and the recovery path ran (M11 failed exactly there: no query).
 """
 
 from __future__ import annotations
@@ -42,9 +52,16 @@ MAX_CONTENT_BYTES = 256 * 1024
 MAX_TOKEN_DRIFT = 60
 KIND_DELETION = 5
 KIND_CI_REQUEST = 46_100
+KIND_CI_RUN_STATUS = 46_101
 KIND_CI_STATUS_MIN = 46_101
 KIND_CI_STATUS_MAX = 46_106
 KIND_CI_GRANT = 46_107
+# buzz-core ci.rs CiRunState: every other state is terminal.
+OPEN_RUN_STATES = frozenset({"queued", "running"})
+FAULT_STALE_TERMINAL = "stale-terminal-publication-recovery"
+RELAY_FAULTS = frozenset({FAULT_STALE_TERMINAL})
+FAULT_RECORD_NAME = "fault-fired.json"
+MAX_QUERY_FILTERS = 16
 # handlers/ingest.rs: kinds that bypass the generic member-or-open gate.
 MEMBERSHIP_EXEMPT_KINDS = frozenset({9021, 9007, 40003, 9002, 9005, 9008})
 GRANT_ROLES = frozenset({"owner", "admin"})
@@ -232,6 +249,58 @@ class RelayState:
         self.seen_tokens: set[str] = set()
         self.cursor = 0
         self.lock = threading.Lock()
+        self.fault: str | None = None
+        self.fault_root: Path | None = None
+        self.stale_event_id: str | None = None
+        self.stale_queried = False
+
+    def arm_fault(self, flag: Path) -> None:
+        """Read the guest's flag file; an unknown mode is a configuration error."""
+        mode = flag.read_bytes().decode().strip()
+        if mode not in RELAY_FAULTS:
+            raise ValueError("relay fault mode rejected")
+        self.fault = mode
+        self.fault_root = flag.parent
+
+    def refuses_as_stale(self, event: dict[str, object]) -> bool:
+        """Stale-terminal fault, one shot: the first terminal run status fails
+        the production drift check and is not stored. The caller holds ``lock``."""
+        if self.fault != FAULT_STALE_TERMINAL or self.stale_event_id is not None or event["kind"] != KIND_CI_RUN_STATUS:
+            return False
+        try:
+            state = parse_content(event, "CI event").get("state")
+        except Refusal:
+            return False
+        if not isinstance(state, str) or state in OPEN_RUN_STATES:
+            return False
+        self.stale_event_id = str(event["id"])
+        self.write_fault_record()
+        return True
+
+    def note_query(self, ids: set[str] | None, kinds: list[object]) -> None:
+        """Record the exact-event read-back of the refused publication."""
+        if self.stale_event_id is None or self.stale_queried or ids is None or self.stale_event_id not in ids or KIND_CI_RUN_STATUS not in kinds:
+            return
+        self.stale_queried = True
+        self.write_fault_record()
+
+    def write_fault_record(self) -> None:
+        assert self.fault_root is not None
+        record = json.dumps({
+            "mode": self.fault, "refused_event_id": self.stale_event_id, "queried": self.stale_queried,
+        }, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        pending = self.fault_root / (FAULT_RECORD_NAME + ".next")
+        pending.write_bytes(record)
+        pending.chmod(0o400)
+        pending.replace(self.fault_root / FAULT_RECORD_NAME)
+
+    def visible_to(self, event: dict[str, object], caller: str) -> bool:
+        # api/bridge.rs event_in_accessible_channel: a channel-scoped event is
+        # readable only by a member (or by anyone when the channel is open).
+        channel = self.event_channels.get(str(event["id"]))
+        if channel is None:
+            return True
+        return channel == self.channel_id and (caller in self.members or self.visibility == "open")
 
     def active_signers(self, target_repo_a: str, now: int) -> set[str]:
         signers = set(self.static_signers)
@@ -268,7 +337,7 @@ def admit_event(state: RelayState, token_pubkey: str, event: dict[str, object], 
     kind = int(event["kind"])
     tags = event["tags"]
     assert isinstance(tags, list)
-    if abs(int(event["created_at"]) - now) > MAX_EVENT_DRIFT:
+    if state.refuses_as_stale(event) or abs(int(event["created_at"]) - now) > MAX_EVENT_DRIFT:
         raise Refusal(400, "invalid: event timestamp too far from server time")
     if len(str(event["content"]).encode()) > MAX_CONTENT_BYTES:
         raise Refusal(400, "invalid: content exceeds maximum size")
@@ -352,6 +421,70 @@ def admit_event(state: RelayState, token_pubkey: str, event: dict[str, object], 
     return channel, True
 
 
+def hex_list(filter_value: dict[str, object], name: str) -> set[str] | None:
+    values = filter_value.get(name)
+    if values is None:
+        return None
+    if not isinstance(values, list) or any(not isinstance(item, str) or HEX64.fullmatch(item) is None for item in values):
+        raise Refusal(400, f"invalid filters: {name}")
+    return set(values)
+
+
+def bounded_int(filter_value: dict[str, object], name: str) -> int | None:
+    value = filter_value.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise Refusal(400, f"invalid filters: {name}")
+    return value
+
+
+def query_events(state: RelayState, caller: str, raw: bytes) -> list[dict[str, object]]:
+    """Apply the production POST /query rules; return the matching events.
+
+    api/bridge.rs ``query_events_authed``: the body is a JSON array of filters;
+    the kind gates run before any read; results are limited to channels the
+    caller can access and follow the ``created_at DESC, id ASC`` order. The
+    caller holds ``state.lock``.
+    """
+    try:
+        filters = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise Refusal(400, "invalid filters: body is not JSON") from error
+    if not isinstance(filters, list) or not filters or len(filters) > MAX_QUERY_FILTERS or any(not isinstance(item, dict) for item in filters):
+        raise Refusal(400, "invalid filters: expected an array of filter objects")
+    results: list[dict[str, object]] = []
+    for filter_value in filters:
+        kinds = filter_value.get("kinds")
+        # handlers/req.rs p_gated_filters_authorized: a filter that names no
+        # kind can match every gated kind, so the relay refuses it before any
+        # read. controld always names the exact kind (source.rs
+        # publication_exists); the stub applies the gate regardless of `ids`.
+        if (
+            not isinstance(kinds, list) or not kinds
+            or any(not isinstance(kind, int) or isinstance(kind, bool) or not 0 <= kind <= 65535 for kind in kinds)
+        ):
+            raise Refusal(403, "restricted: p-gated kinds require #p tag matching your pubkey")
+        ids = hex_list(filter_value, "ids")
+        state.note_query(ids, kinds)
+        authors = hex_list(filter_value, "authors")
+        since = bounded_int(filter_value, "since")
+        until = bounded_int(filter_value, "until")
+        limit = bounded_int(filter_value, "limit")
+        matched = [
+            event for event in state.events.values()
+            if event["kind"] in kinds
+            and (ids is None or event["id"] in ids)
+            and (authors is None or event["pubkey"] in authors)
+            and (since is None or int(event["created_at"]) >= since)
+            and (until is None or int(event["created_at"]) <= until)
+            and state.visible_to(event, caller)
+        ]
+        matched.sort(key=lambda event: (-int(event["created_at"]), str(event["id"])))
+        results.extend(matched if limit is None else matched[:limit])
+    return results
+
+
 class Handler(BaseHTTPRequestHandler):
     server: "RelayServer"
 
@@ -429,9 +562,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         raw = self._body()
         try:
-            if self.path != "/events" or raw is None:
+            if self.path not in {"/events", "/query"} or raw is None:
                 raise Refusal(404, "not found")
             caller = self._authenticate("POST", raw)
+            if self.path == "/query":
+                with self.server.state.lock:
+                    found = query_events(self.server.state, caller, raw)
+                self._json(200, found)
+                return
             try:
                 event = verify_event(json.loads(raw))
             except (json.JSONDecodeError, RelayError) as error:
@@ -505,11 +643,14 @@ def main() -> int:
     parser.add_argument("--private-key", type=Path, required=True)
     parser.add_argument("--public-config", type=Path, required=True)
     parser.add_argument("--object-root", type=Path, required=True)
+    parser.add_argument("--fault-flag", type=Path, help="opt-in fault mode file; absent means no fault")
     arguments = parser.parse_args()
     try:
         config = json.loads(arguments.public_config.read_bytes())
         arguments.object_root.mkdir(mode=0o700, parents=True, exist_ok=False)
         state = state_from_config(config, arguments.object_root)
+        if arguments.fault_flag is not None and arguments.fault_flag.is_file():
+            state.arm_fault(arguments.fault_flag)
     except (OSError, ValueError):
         return 1
     server = RelayServer(("127.0.0.1", 3443), state)

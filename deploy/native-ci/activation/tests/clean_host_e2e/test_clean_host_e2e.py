@@ -1166,7 +1166,7 @@ class TimingAndProgressTests(unittest.TestCase):
             ))
             stack.enter_context(mock.patch.object(guest, "relay_mapping_present", return_value=False))
             stack.enter_context(mock.patch.object(
-                guest, "start_relay", side_effect=lambda _public, _channel: completed("relay_ready"),
+                guest, "start_relay", side_effect=lambda _public, _channel, _fault=None: completed("relay_ready"),
             ))
             stack.enter_context(mock.patch.object(
                 guest, "unit_state", side_effect=lambda: completed(
@@ -4384,8 +4384,12 @@ def grant_event(secret: int, created_at: int, signer: int, *, valid_until: int |
     return signed_event(secret, 46107, [["h", CHANNEL]], json.dumps(content, separators=(",", ":")), created_at)
 
 
-def status_event(secret: int, created_at: int, *, relay_signer: int | None = None) -> dict[str, object]:
+def status_event(
+    secret: int, created_at: int, *, relay_signer: int | None = None, state: str | None = None,
+) -> dict[str, object]:
     content = {"relay_signer": public_hex(relay_signer or secret), "target_repo_a": REPOSITORY, "run_id": RUN_ID}
+    if state is not None:
+        content["state"] = state
     return signed_event(secret, 46101, [["h", CHANNEL], ["run", RUN_ID]], json.dumps(content, separators=(",", ":")), created_at)
 
 
@@ -4546,6 +4550,123 @@ class RelayAdmissionTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 relay.state_from_config(broken, Path("/nonexistent"))
+
+
+class RelayQueryAndFaultTests(unittest.TestCase):
+    """POST /query mirrors api/bridge.rs; the stale-terminal fault reproduces M11."""
+
+    STALE = "invalid: event timestamp too far from server time"
+
+    def setUp(self) -> None:
+        self.now = 1_800_000_000
+        self.state = relay.RelayState(
+            Path("/nonexistent"), "https://relay.test.invalid:3443", CHANNEL, "private",
+            {public_hex(ACTOR): "admin", public_hex(CI_EVENT): "member"}, {public_hex(NIP98), public_hex(CI_EVENT)},
+        )
+
+    def admit(self, token: int, event: dict[str, object]) -> tuple[str | None, bool]:
+        return relay.admit_event(self.state, public_hex(token), event, self.now)
+
+    def query(self, token: int, filters: object) -> list[dict[str, object]]:
+        return relay.query_events(self.state, public_hex(token), json.dumps(filters).encode())
+
+    def test_query_is_gated_on_kinds_and_channel_access_and_finds_exact_ids(self) -> None:
+        run = request_event(ACTOR, self.now)
+        self.assertEqual(self.admit(ACTOR, run), (CHANNEL, True))
+        exact = [{"ids": [run["id"]], "kinds": [46100], "limit": 1}]
+        self.assertEqual(self.query(CI_EVENT, exact), [run])
+        self.assertEqual(self.query(ACTOR, exact), [run])
+        self.assertEqual(self.query(NIP98, exact), [], "a non-member sees nothing from the private channel")
+        self.assertEqual(self.query(CI_EVENT, [{"ids": ["ab" * 32], "kinds": [46100], "limit": 1}]), [])
+        self.assertEqual(self.query(CI_EVENT, [{"ids": [run["id"]], "kinds": [46101], "limit": 1}]), [])
+        for body, status in (
+            ([{"ids": [run["id"]], "limit": 1}], 403),
+            ([{"ids": [run["id"]], "kinds": [], "limit": 1}], 403),
+            ([{"ids": ["nope"], "kinds": [46100]}], 400),
+            ([], 400),
+            ({"kinds": [46100]}, 400),
+        ):
+            with self.assertRaises(relay.Refusal) as caught:
+                self.query(CI_EVENT, body)
+            self.assertEqual(caught.exception.status, status, body)
+
+    def test_stale_terminal_fault_refuses_the_first_terminal_publish_once_and_records_the_read_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            flag = Path(temporary) / "fault"
+            record = Path(temporary) / "fault-fired.json"
+            flag.write_text("stale-terminal-publication-recovery\n")
+            self.state.arm_fault(flag)
+            queued = status_event(CI_EVENT, self.now, state="queued")
+            self.assertEqual(self.admit(CI_EVENT, queued), (CHANNEL, True), "open states are never stale")
+            self.assertFalse(record.exists())
+            stale = status_event(CI_EVENT, self.now + 1, state="success")
+            with self.assertRaises(relay.Refusal) as caught:
+                self.admit(CI_EVENT, stale)
+            self.assertEqual((caught.exception.status, caught.exception.message), (400, self.STALE))
+            self.assertNotIn(stale["id"], self.state.events, "a refused event is not stored")
+            expected = {"mode": "stale-terminal-publication-recovery", "refused_event_id": stale["id"], "queried": False}
+            self.assertEqual(json.loads(record.read_bytes()), expected)
+            self.assertEqual(self.query(CI_EVENT, [{"ids": [stale["id"]], "kinds": [46100], "limit": 1}]), [])
+            self.assertEqual(json.loads(record.read_bytes()), expected, "another kind is not the read-back")
+            self.assertEqual(self.query(CI_EVENT, [{"ids": [stale["id"]], "kinds": [46101], "limit": 1}]), [])
+            self.assertEqual(json.loads(record.read_bytes()), {**expected, "queried": True})
+            # controld re-signs the same content; within one second the id is unchanged.
+            self.assertEqual(self.admit(CI_EVENT, stale), (CHANNEL, True), "the fault fires once")
+            self.assertEqual(self.query(CI_EVENT, [{"ids": [stale["id"]], "kinds": [46101]}]), [stale])
+            later = status_event(CI_EVENT, self.now + 2, state="success")
+            self.assertEqual(self.admit(CI_EVENT, later), (CHANNEL, True))
+            with self.assertRaises(ValueError):
+                flag.write_text("unknown-mode\n")
+                self.state.arm_fault(flag)
+
+    def test_guest_requires_the_read_back_record_and_an_accepted_terminal_publication(self) -> None:
+        def signed(event_id: str) -> dict[str, object]:
+            return {"event_id": event_id, "kind": 46101, "content": "{}", "tags": [], "signed_event": {"id": event_id}}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot = root / "control-store-v1.json"
+            record = root / "fault-fired.json"
+            with mock.patch.object(guest, "RELAY_ROOT", root), mock.patch.object(guest, "CONTROLD_SNAPSHOT", snapshot):
+                guest.prove_relay_fault_recovery(None)
+                with self.assertRaisesRegex(guest.GuestError, "did not fire"):
+                    guest.prove_relay_fault_recovery("stale-terminal-publication-recovery")
+                record.write_bytes(guest.canonical({"mode": "stale-terminal-publication-recovery", "refused_event_id": "2" * 64, "queried": False}))
+                with self.assertRaisesRegex(guest.GuestError, "not read back"):
+                    guest.prove_relay_fault_recovery("stale-terminal-publication-recovery")
+                record.write_bytes(guest.canonical({"mode": "stale-terminal-publication-recovery", "refused_event_id": "2" * 64, "queried": True}))
+                # An attempt and its rerun: two accepted requests, two run:terminal keys.
+                good = {"schema_version": 1, "cursors": {}, "runs": {}, "finalizations": {}, "publications": {
+                    "9" * 64 + ":run:queued": {"Accepted": {"signed": signed("3" * 64), "relay_event_id": "3" * 64}},
+                    "9" * 64 + ":run:terminal": {"Accepted": {"signed": signed("2" * 64), "relay_event_id": "2" * 64}},
+                    "8" * 64 + ":run:terminal": {"Accepted": {"signed": signed("5" * 64), "relay_event_id": "5" * 64}},
+                }}
+                snapshot.write_bytes(guest.canonical(good))
+                guest.prove_relay_fault_recovery("stale-terminal-publication-recovery")
+                for mutate, message in (
+                    (lambda value: [value["publications"].pop(key) for key in list(value["publications"]) if key.endswith(":run:terminal")], "not accepted"),
+                    (lambda value: value["publications"].__setitem__("9" * 64 + ":run:terminal", {"Pending": signed("2" * 64)}), "not accepted"),
+                    (lambda value: value["publications"].__setitem__("9" * 64 + ":run:terminal", {"Accepted": {"signed": signed("4" * 64), "relay_event_id": "2" * 64}}), "inconsistent"),
+                ):
+                    broken = copy.deepcopy(good)
+                    mutate(broken)
+                    snapshot.write_bytes(guest.canonical(broken))
+                    with self.assertRaisesRegex(guest.GuestError, message):
+                        guest.prove_relay_fault_recovery("stale-terminal-publication-recovery")
+
+    def test_run_accepts_only_known_relay_faults_and_hands_them_to_the_terminal_run(self) -> None:
+        calls: list[tuple[object, ...]] = []
+        with mock.patch.object(harness, "terminal_run", side_effect=lambda *arguments: calls.append(arguments) or {"status": "pass"}):
+            for extra, expected in (([], None), (["--relay-fault", "stale-terminal-publication-recovery"], "stale-terminal-publication-recovery")):
+                with mock.patch.object(sys, "argv", ["harness.py", "run", "--contract", "c.json", "--results", "r", *extra]), \
+                        contextlib.redirect_stdout(io.TextIOWrapper(io.BytesIO())):
+                    self.assertEqual(harness.main(), 0)
+                self.assertEqual(calls[-1][2], expected)
+            with mock.patch.object(sys, "argv", ["harness.py", "run", "--contract", "c.json", "--results", "r", "--relay-fault", "other"]), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                harness.main()
+        with self.assertRaisesRegex(harness.HarnessError, "relay fault mode differs"):
+            harness.create_run_stage({}, Path("/nonexistent"), {}, b"", b"", b"", "other")
 
 
 if __name__ == "__main__":
