@@ -104,6 +104,9 @@ pub struct ProductionDriverConfig {
     pub approval_id: String,
     pub grant_event_id: String,
     pub grant_digest: String,
+    pub export_subject: String,
+    pub export_generation: u64,
+    pub export_authorization_digest: String,
     pub qualification_uid: u32,
     pub qualification_gid: u32,
     pub controld_uid: u32,
@@ -146,13 +149,17 @@ impl ProductionDriverConfig {
             || !lower_hex(&self.run_id, &[32])
             || !lower_hex(&self.failure_run_id, &[32])
             || !valid_fixture_selector(&self.failure_selector, &self.failure_run_id, &self.job_id)
-            || !valid_name(&self.job_id, 64)
+            || !valid_job_id(&self.job_id)
             || !lower_hex(&self.request_digest, &[64])
             || !lower_hex(&self.failure_request_digest, &[64])
             || !lower_hex(&self.manifest_digest, &[64])
             || !lower_hex(&self.approval_id, &[32])
             || !lower_hex(&self.grant_event_id, &[64])
             || !lower_hex(&self.grant_digest, &[64])
+            || !lower_hex(&self.export_subject, &[64])
+            || self.export_generation == 0
+            || self.export_generation > 9_007_199_254_740_991
+            || !lower_hex(&self.export_authorization_digest, &[64])
         {
             return Err(DriverError::InvalidConfig);
         }
@@ -175,6 +182,9 @@ impl ProductionDriverConfig {
             && request.fixture.approval_id == self.approval_id
             && request.fixture.grant_event_id == self.grant_event_id
             && request.fixture.grant_digest == self.grant_digest
+            && request.fixture.export_subject == self.export_subject
+            && request.fixture.export_generation == self.export_generation
+            && request.fixture.export_authorization_digest == self.export_authorization_digest
     }
 
     fn binds_zero(&self, request: &ZeroRequest) -> bool {
@@ -865,7 +875,7 @@ fn valid_request(request: &DriverRequest<'_>) -> bool {
             &fixture.failure_run_id,
             &fixture.job_id,
         )
-        && valid_name(&fixture.job_id, 64)
+        && valid_job_id(&fixture.job_id)
         && lower_hex(&fixture.request_digest, &[64])
         && lower_hex(&fixture.failure_request_digest, &[64])
         && lower_hex(&fixture.manifest_digest, &[64])
@@ -875,6 +885,7 @@ fn valid_request(request: &DriverRequest<'_>) -> bool {
         && lower_hex(&fixture.grant_digest, &[64])
         && lower_hex(&fixture.approved_by, &[64])
         && lower_hex(&fixture.export_subject, &[64])
+        && (1..=9_007_199_254_740_991).contains(&fixture.export_generation)
         && lower_hex(&fixture.export_authorization_digest, &[64])
         && fixture.controller_generation > 0
         && fixture.runner_generation > 0
@@ -1188,6 +1199,15 @@ fn valid_name(value: &str, max: usize) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+fn valid_job_id(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && value.len() <= 64
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 fn lower_hex(value: &str, lengths: &[usize]) -> bool {
     lengths.contains(&value.len())
         && value.bytes().any(|byte| byte != b'0')
@@ -1340,7 +1360,7 @@ impl AcceptanceControlConfig {
             || !lower_hex(&self.integrated_candidate_sha, &[40, 64])
             || !lower_hex(&self.scenario_sha256, &[64])
             || !lower_hex(&self.run_id, &[32])
-            || !valid_name(&self.job_id, 64)
+            || !valid_job_id(&self.job_id)
             || !lower_hex(&self.request_digest, &[64])
             || !lower_hex(&self.manifest_digest, &[64])
             || !lower_hex(&self.approval_id, &[32])
@@ -2746,7 +2766,7 @@ pub fn handle_control<H: HostControl>(
         || bound_operation_id != request.operation_id
         || !lower_hex(&request.operation_id, &[64])
         || !lower_hex(&request.run_id, &[32])
-        || !valid_name(&request.job_id, 64)
+        || !valid_job_id(&request.job_id)
         || !lower_hex(&request.request_digest, &[64])
         || !lower_hex(&request.manifest_digest, &[64])
         || !lower_hex(&request.approval_id, &[32])
@@ -3159,6 +3179,7 @@ mod tests {
             grant_digest: hex('3', 64),
             approved_by: hex('4', 64),
             export_subject: hex('5', 64),
+            export_generation: 6,
             export_authorization_digest: hex('6', 64),
             controller_generation: 7,
             runner_generation: 9,
@@ -3198,6 +3219,9 @@ mod tests {
             approval_id: hex('1', 32),
             grant_event_id: hex('2', 64),
             grant_digest: hex('3', 64),
+            export_subject: hex('5', 64),
+            export_generation: 6,
+            export_authorization_digest: hex('6', 64),
             qualification_uid: 1001,
             qualification_gid: 1001,
             controld_uid: 1002,
@@ -3560,6 +3584,42 @@ mod tests {
         };
         let mut driver = ProductionDriver::new(driver_config.clone(), transport).unwrap();
         assert_eq!(driver.execute(&request), Err(DriverError::BindingMismatch));
+    }
+
+    #[test]
+    fn driver_config_and_request_bind_export_authority() {
+        let mut bad_subject = config();
+        bad_subject.export_subject = "0".repeat(64);
+        assert_eq!(bad_subject.validate(), Err(DriverError::InvalidConfig));
+        let mut bad_generation = config();
+        bad_generation.export_generation = 0;
+        assert_eq!(bad_generation.validate(), Err(DriverError::InvalidConfig));
+        let mut bad_digest = config();
+        bad_digest.export_authorization_digest = "0".repeat(64);
+        assert_eq!(bad_digest.validate(), Err(DriverError::InvalidConfig));
+
+        for field in ["subject", "generation", "digest"] {
+            let driver_config = config();
+            let mut bad_fixture = fixture();
+            match field {
+                "subject" => bad_fixture.export_subject = hex('a', 64),
+                "generation" => bad_fixture.export_generation += 1,
+                "digest" => bad_fixture.export_authorization_digest = hex('a', 64),
+                _ => unreachable!(),
+            }
+            let scenario_sha256 = driver_config.scenario_sha256.clone();
+            let request = request(&bad_fixture, &scenario_sha256);
+            let transport = FakeTransport {
+                replies: VecDeque::new(),
+                endpoints: Vec::new(),
+            };
+            let mut driver = ProductionDriver::new(driver_config, transport).unwrap();
+            assert_eq!(
+                driver.execute(&request),
+                Err(DriverError::BindingMismatch),
+                "{field}",
+            );
+        }
     }
 
     #[test]
@@ -3957,6 +4017,7 @@ mod tests {
         let export = (request.sequence == 7).then(|| ExportSnapshot {
             authenticated: true,
             subject: fixture.export_subject.clone(),
+            generation: fixture.export_generation,
             authorization_digest: fixture.export_authorization_digest.clone(),
             attempt_id: hex('a', 32),
             request_digest: fixture.request_digest.clone(),

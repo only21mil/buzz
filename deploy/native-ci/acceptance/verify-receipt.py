@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 import uuid
@@ -306,7 +307,7 @@ def _ordered_snapshot(value: Any) -> dict[str, Any]:
 
 def _ordered_export(value: Any) -> dict[str, Any]:
     required = [
-        "authenticated", "subject", "authorization_digest", "attempt_id",
+        "authenticated", "subject", "generation", "authorization_digest", "attempt_id",
         "request_digest", "manifest_digest", "evidence_set_digest", "objects",
     ]
     value = _exact(value, required)
@@ -315,6 +316,7 @@ def _ordered_export(value: Any) -> dict[str, Any]:
     return {
         "authenticated": True,
         "subject": _hex(value["subject"], (64,)),
+        "generation": _integer(value["generation"], 1, 9_007_199_254_740_991),
         "authorization_digest": _hex(value["authorization_digest"], (64,)),
         "attempt_id": _hex(value["attempt_id"], (32,)),
         "request_digest": _hex(value["request_digest"], (64,)),
@@ -331,7 +333,7 @@ def _ordered_scenario(value: Any) -> dict[str, Any]:
         "integrated_candidate_sha", "activation_id", "activation_package_digest", "run_id",
         "failure_run_id", "failure_selector", "job_id", "request_digest", "failure_request_digest", "manifest_digest", "source_oid", "approval_id",
         "grant_event_id", "grant_digest", "approved_by", "export_subject",
-        "export_authorization_digest", "controller_generation", "runner_generation",
+        "export_generation", "export_authorization_digest", "controller_generation", "runner_generation",
         "expected_log", "expected_failure_log", "expected_artifacts",
     ]
     fixture = _exact(value["fixture"], fixture_fields)
@@ -339,10 +341,15 @@ def _ordered_scenario(value: Any) -> dict[str, Any]:
     _require(isinstance(fixture["activation_id"], str) and 0 < len(fixture["activation_id"]) <= 128, "activation ID rejected")
     for name in ["activation_package_digest", "request_digest", "failure_request_digest", "manifest_digest", "grant_event_id", "grant_digest", "approved_by", "export_subject", "export_authorization_digest"]:
         _hex(fixture[name], (64,))
+    _integer(fixture["export_generation"], 1, 9_007_199_254_740_991)
     _hex(fixture["run_id"], (32,)); _hex(fixture["failure_run_id"], (32,)); _hex(fixture["approval_id"], (32,)); _hex(fixture["source_oid"], (40, 64))
     _require(fixture["run_id"] != fixture["failure_run_id"], "run identities must be distinct")
     _require(fixture["request_digest"] != fixture["failure_request_digest"], "request identities must be distinct")
-    _require(isinstance(fixture["job_id"], str) and 0 < len(fixture["job_id"]) <= 64, "job ID rejected")
+    _require(
+        isinstance(fixture["job_id"], str)
+        and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", fixture["job_id"]) is not None,
+        "job ID rejected",
+    )
     selector = _exact(
         fixture["failure_selector"],
         ["schema_version", "selector", "job_id", "run_id", "attempt", "sha256"],
@@ -373,7 +380,7 @@ def _ordered_scenario(value: Any) -> dict[str, Any]:
     _integer(fixture["controller_generation"], 1); _integer(fixture["runner_generation"], 1)
     _ordered_evidence(fixture["expected_log"])
     _ordered_evidence(fixture["expected_failure_log"])
-    _require(isinstance(fixture["expected_artifacts"], list) and 0 < len(fixture["expected_artifacts"]) <= 64, "expected artifacts rejected")
+    _require(isinstance(fixture["expected_artifacts"], list) and len(fixture["expected_artifacts"]) == 1, "expected artifacts rejected")
     for item in fixture["expected_artifacts"]:
         _ordered_evidence(item)
     driver_fields = ["control", "observe", "export", "controller_process", "runner_process", "timeout_seconds"]
@@ -507,7 +514,12 @@ def _validate_snapshots(checks: list[dict[str, Any]], fixture: dict[str, Any]) -
 
     export = checks[6]["export"]
     terminal = run6["attempts"][0]
-    _require(export["subject"] == fixture["export_subject"] and export["authorization_digest"] == fixture["export_authorization_digest"], "export authority rejected")
+    _require(
+        export["subject"] == fixture["export_subject"]
+        and export["generation"] == fixture["export_generation"]
+        and export["authorization_digest"] == fixture["export_authorization_digest"],
+        "export authority rejected",
+    )
     _require(export["attempt_id"] == first_id and export["request_digest"] == fixture["request_digest"] and export["manifest_digest"] == fixture["manifest_digest"], "export binding rejected")
     _require(export["evidence_set_digest"] == terminal["evidence_set_digest"], "export evidence set rejected")
     _require(export["objects"] == [fixture["expected_log"], *fixture["expected_artifacts"]], "export objects rejected")

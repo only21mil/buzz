@@ -201,7 +201,7 @@
     "acceptanceTemplate": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["actor", "time_reference", "run_event", "grant_event", "rerun_event", "tombstone_event", "failure_run_event", "failure_selector"],
+      "required": ["actor", "time_reference", "run_event", "grant_event", "rerun_event", "tombstone_event", "failure_run_event", "failure_selector", "export_subject", "export_generation", "export_authorization_digest"],
       "properties": {
         "actor": {
           "type": "object",
@@ -218,7 +218,10 @@
         "rerun_event": { "$ref": "#/$defs/runEvent" },
         "tombstone_event": { "$ref": "#/$defs/tombstoneEvent" },
         "failure_run_event": { "$ref": "#/$defs/runEvent" },
-        "failure_selector": { "$ref": "#/$defs/fixtureSelector" }
+        "failure_selector": { "$ref": "#/$defs/fixtureSelector" },
+        "export_subject": { "$ref": "#/$defs/sha256" },
+        "export_generation": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "export_authorization_digest": { "$ref": "#/$defs/sha256" }
       }
     },
     "fixtureSelector": {

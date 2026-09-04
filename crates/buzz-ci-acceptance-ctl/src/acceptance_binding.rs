@@ -51,6 +51,9 @@ pub struct AcceptanceAuthorityBinding {
     pub rerun_event: serde_json::Value,
     pub tombstone_event: serde_json::Value,
     pub failure_run_event: serde_json::Value,
+    pub export_subject: String,
+    pub export_generation: u64,
+    pub export_authorization_digest: String,
 }
 
 /// Root-authored binding created only after package and scenario freeze.
@@ -177,6 +180,10 @@ impl AcceptanceBindingReceipt {
             || Sha256::digest(self.fixture.failure_selector.job_id.as_bytes())
                 != templates.failure_job_digest
             || self.fixture.failure_selector.attempt != templates.failure_attempt
+            || self.fixture.export_subject != self.acceptance.export_subject
+            || self.fixture.export_generation != self.acceptance.export_generation
+            || self.fixture.export_authorization_digest
+                != self.acceptance.export_authorization_digest
         {
             return Err(AcceptanceBindingError::Invalid);
         }

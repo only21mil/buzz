@@ -154,6 +154,7 @@ pub fn canonical_acceptance_binding() -> AcceptanceBindingReceipt {
             grant_digest: "19".repeat(32),
             approved_by: actor.to_owned(),
             export_subject: "1b".repeat(32),
+            export_generation: 11,
             export_authorization_digest: "1c".repeat(32),
             controller_generation: 7,
             runner_generation: 9,
@@ -184,6 +185,9 @@ pub fn canonical_acceptance_binding() -> AcceptanceBindingReceipt {
             rerun_event,
             tombstone_event,
             failure_run_event,
+            export_subject: "1b".repeat(32),
+            export_generation: 11,
+            export_authorization_digest: "1c".repeat(32),
         },
     }
 }
@@ -250,6 +254,18 @@ pub fn acceptance_binding_mutation_corpus() -> Vec<AcceptanceBindingMutation> {
     });
     push_receipt_mutation(&mut cases, "generation", |receipt| {
         receipt.acceptance.actor.generation = 0
+    });
+    push_receipt_mutation(&mut cases, "export_generation", |receipt| {
+        receipt.fixture.export_generation += 1
+    });
+    push_receipt_mutation(&mut cases, "acceptance_export_subject", |receipt| {
+        receipt.acceptance.export_subject = "2a".repeat(32)
+    });
+    push_receipt_mutation(&mut cases, "acceptance_export_generation", |receipt| {
+        receipt.acceptance.export_generation += 1
+    });
+    push_receipt_mutation(&mut cases, "acceptance_export_digest", |receipt| {
+        receipt.acceptance.export_authorization_digest = "2b".repeat(32)
     });
     push_receipt_mutation(&mut cases, "request_id", |receipt| {
         receipt.fixture.request_digest = "26".repeat(32)

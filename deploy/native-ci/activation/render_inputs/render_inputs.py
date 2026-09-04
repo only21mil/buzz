@@ -690,6 +690,15 @@ def load_template_bindings(root: DescriptorRoot, descriptor: dict[str, Any], nam
         bindings["activation_approved_by"] = activation_approved_by(
             manifests["activation"],
         )
+        bindings["activation_export_subject"] = activation_export_subject(
+            manifests["activation"],
+        )
+        bindings["activation_export_generation"] = activation_export_generation(
+            manifests["activation"],
+        )
+        bindings["activation_export_authorization_digest"] = (
+            activation_export_authorization_digest(manifests["activation"])
+        )
         bindings["activation_fixture_manifest_sha256"] = (
             activation_fixture_manifest_sha256(manifests["activation"])
         )
@@ -814,6 +823,18 @@ def activation_approved_by(activation: object) -> str:
     return _activation_acceptance_template(activation)["actor"]["public_key"]
 
 
+def activation_export_subject(activation: object) -> str:
+    return _activation_acceptance_template(activation)["export_subject"]
+
+
+def activation_export_generation(activation: object) -> int:
+    return _activation_acceptance_template(activation)["export_generation"]
+
+
+def activation_export_authorization_digest(activation: object) -> str:
+    return _activation_acceptance_template(activation)["export_authorization_digest"]
+
+
 def activation_fixture_manifest_sha256(activation: object) -> str:
     """Return the sole fixture-manifest digest frozen by the activation package."""
     if not isinstance(activation, dict) or not isinstance(activation.get("entries"), list):
@@ -936,6 +957,16 @@ def render_draft(root: DescriptorRoot, descriptor: dict[str, Any]) -> dict[str, 
         raise RenderError("activation draft candidate differs")
     if value["acceptance_template"]["actor"] != bindings["public_binding"]["acceptance_actor"]:
         raise RenderError("activation draft public actor differs")
+    nip98 = bindings["public_binding"]["keyholder_public_spec"]["selectors"]["nip98"]
+    expected_export = activation_package_module().capacity_one_export_authority(
+        relay_http_origin=bindings["public_binding"]["relay_http_origin"],
+        subject=nip98["public_key"],
+        generation=nip98["generation"],
+        run_event=value["acceptance_template"]["run_event"],
+        job_id=json.loads(value["acceptance_template"]["run_event"][5])["job_ids"][0],
+    )
+    if any(value["acceptance_template"][field] != expected_export[field] for field in expected_export):
+        raise RenderError("activation draft export authority differs")
     return value
 
 
@@ -951,7 +982,7 @@ def validate_scenario(value: object, bindings: dict[str, Any]) -> dict[str, Any]
         "failure_run_id", "failure_selector", "job_id", "request_digest", "failure_request_digest",
         "manifest_digest", "source_oid", "approval_id",
         "grant_event_id", "grant_digest", "approved_by", "export_subject",
-        "export_authorization_digest", "controller_generation", "runner_generation",
+        "export_generation", "export_authorization_digest", "controller_generation", "runner_generation",
         "expected_log", "expected_failure_log", "expected_artifacts",
     }
     require_keys(fixture, required, "capacity-one fixture")
@@ -986,6 +1017,9 @@ def validate_scenario(value: object, bindings: dict[str, Any]) -> dict[str, Any]
         "manifest_digest": activation_fixture_manifest_sha256(activation),
         "grant_event_id": grant_event_id,
         "approved_by": approved_by,
+        "export_subject": activation_export_subject(activation),
+        "export_generation": activation_export_generation(activation),
+        "export_authorization_digest": activation_export_authorization_digest(activation),
     }
     if any(fixture.get(key) != wanted for key, wanted in expected.items()):
         raise RenderError("capacity-one scenario cross-binding differs")
