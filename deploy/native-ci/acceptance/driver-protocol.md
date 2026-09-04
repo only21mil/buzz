@@ -55,6 +55,8 @@ Every request has this shape:
 `fixture` is the exact fixture object from the scenario. It includes the
 activation ID and package digest, candidate, run, job, grant event and digest,
 source and manifest digests, export identity, and initial service generations.
+The export identity is the exact `export_subject` plus nonzero
+`export_generation` of the frozen nip98 selector.
 `attempt_id` appears when the operation targets an attempt already observed by
 the harness. After sequence one, every request also carries the controller and
 runner generations returned by the prior step. Either service rejects stale
@@ -96,13 +98,15 @@ The export response also adds:
   "export": {
     "authenticated": true,
     "subject": "64-lowercase-hex",
+    "generation": 1,
     "authorization_digest": "64-lowercase-hex",
     "attempt_id": "32-lowercase-hex",
     "request_digest": "64-lowercase-hex",
     "manifest_digest": "64-lowercase-hex",
     "evidence_set_digest": "64-lowercase-hex",
     "objects": [
-      {"name": "job.log", "sha256": "64-lowercase-hex", "bytes": 131}
+      {"name": "job.log", "sha256": "64-lowercase-hex", "bytes": 131},
+      {"name": "result.json", "sha256": "64-lowercase-hex", "bytes": 107}
     ]
   }
 }
@@ -117,6 +121,14 @@ the distinct ci-event subject and generation and are validated at runtime; the
 query operations and their volatile proof IDs are not part of this frozen
 digest. It is never a digest of an Authorization header, bearer token,
 signature, nonce, or timestamp.
+The harness requires the response `subject` and `generation` to equal fixture
+`export_subject` and `export_generation` exactly.
+
+The two ordered object bindings are not supplied as URLs or a path list. They
+are reconstructed from the fixture's Run A request digest, run ID, job ID,
+expected hashes, fixed attempt `1`, and fixed `job.log` and `result` artifact
+declaration (`result.json`). Only those two paths may be signed or read; a third
+canonical evidence path fails the stage.
 
 ## Adapter rules
 

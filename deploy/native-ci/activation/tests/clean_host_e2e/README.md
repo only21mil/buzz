@@ -103,15 +103,15 @@ must be within 900 seconds; an `h`-tagged event needs channel membership (the
 channel is private); a kind-46107 grant needs the owner or admin role and adds
 its signer for its repository and window; kinds 46101 to 46106 need a static or
 granted CI signer equal to `relay_signer`; a kind-5 tombstone must target the
-author's own stored event; the accepted read, evidence writes, and exact
-signed-reference evidence `GET`s need a static or granted CI signer for the
-request's repository. The guest rosters the acceptance actor as channel admin,
-the ci-event key as member, and the nip98 key both as static signer and active
-member of the acceptance repository's private channel
-(`guest_entry.relay_public_config`). Static-signer status alone does not
-authorize an evidence `GET`. Those are the same facts production must hold for
-its repository and channel. Exact-event queries remain signed by the ci-event
-identity, whose active channel membership scopes their results.
+author's own stored event. Static or granted CI signer authority governs the
+accepted read, evidence writes, and evidence-reference authors. Evidence `GET`
+instead requires the caller to be an active member of the acceptance
+repository's private channel. The guest rosters the acceptance actor as channel
+admin, the ci-event key as an active member and authorized reference author,
+and the nip98 key as the static signer for accepted reads and evidence writes
+and as an active member for evidence `GET`
+(`guest_entry.relay_public_config`). Exact-event queries remain signed by the
+ci-event identity, whose active channel membership scopes their results.
 The relay also receives the candidate's frozen acceptance template and, only
 for the replay-before-grant fault, the distinct prior template. It derives the
 five actor event IDs in API order (`Run`, `Grant`, `Rerun`, `Tombstone`,
@@ -141,6 +141,12 @@ and returns the full object without a redirect. The installed adapter adds its
 own declared-length and 16 MiB bounds and verifies length and SHA-256. The
 qualification rejects a generic or ranged `GET`, `HEAD`, redirect, wrong or
 duplicate event, mismatched coordinate, or extra, missing, or changed object.
+The receipt supplies no URL or path list. Keyholder and the guest independently
+derive exactly two allowed paths from its Run A request, run, job, log/artifact
+hashes, fixed attempt `1`, and fixed `result` artifact declaration. The gate
+proves a third otherwise-canonical path is denied. It also requires the export
+response subject and generation to equal the receipt's `export_subject` and
+`export_generation` and the nip98 selector.
 A status event from a signer that is neither static nor under an active grant
 at ingest time is refused with the relay's exact `invalid CI envelope:
 unauthorized CI status signer` (`buzz_core::ci::validate_signed_ci_event`), the

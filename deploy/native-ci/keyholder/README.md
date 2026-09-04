@@ -74,13 +74,20 @@ author, and kind are checked before use. Any other filter, and a filter on any
 other route, is denied.
 
 Signer `nip98` (the `nip98.key` selector) is accepted for the accepted read,
-the evidence `PUT` routes, and full-body `GET` of only these exact
+the evidence `PUT` routes, and full-body `GET` of exactly two
 signed-reference paths at the configured HTTPS origin:
 
 ```text
 /ci/logs/{request-id}/{run-id}/{job-id}/{attempt}/{sha256}
 /ci/artifacts/{request-id}/{run-id}/{job-id}/{attempt}/{artifact-id}/{sha256}
 ```
+
+Those braces describe the grammar, not caller-selectable fields. At startup the
+keyholder reconstructs the sole log path and sole artifact path from the public
+acceptance receipt's Run A request digest, run ID, job ID, expected log and
+artifact hashes, fixed attempt `1`, and fixed artifact ID `result`. The receipt
+contains no evidence URL or path-list field. Even a third path that satisfies
+the grammar is denied because it is absent from that two-entry derived set.
 
 `request-id` and `sha256` are 64-character lowercase hex; `run-id` is a
 canonical lowercase hyphenated UUID; `job-id` matches
@@ -112,7 +119,23 @@ validate the same bytes. The receipt has this declaration-order shape:
   "acceptance_peer_uid": 961,
   "acceptance_peer_gid": 961,
   "timeout_millis": 1000,
-  "fixture": { "...": "capacity-one fixture" },
+  "fixture": {
+    "...": "capacity-one fixture",
+    "export_subject": "nip98 selector public key",
+    "export_generation": 1,
+    "expected_log": {
+      "name": "job.log",
+      "sha256": "64 lowercase hex",
+      "bytes": 131
+    },
+    "expected_artifacts": [
+      {
+        "name": "result.json",
+        "sha256": "64 lowercase hex",
+        "bytes": 107
+      }
+    ]
+  },
   "acceptance": {
     "actor": { "public_key": "64 lowercase hex", "generation": 1 },
     "scenario_sha256": "same 64 lowercase hex",
@@ -129,9 +152,11 @@ The receipt is root:root mode `0444`, a regular one-link file, with a root:root
 mode `0711` immediate parent. It has no whitespace or trailing newline. The
 daemon rejects missing, linked, replaced, noncanonical, loose-mode, or
 semantically drifted receipts on every start. It verifies the fixture package,
-candidate, scenario, peer, actor generation, grant identity, and all five event
-templates before constructing the existing closed operations 5 and 6 policy.
-The actor credential must be distinct from every existing selector.
+candidate, scenario, peer, actor generation, grant identity, all five event
+templates, and that `fixture.export_subject` and `fixture.export_generation`
+equal the loaded nip98 selector. It also requires exactly the declared
+`job.log` and `result.json` objects before deriving the two-path allowlist. The
+actor credential must be distinct from every existing selector.
 
 The keyholder wire codec is strict protocol v2. Its `describe_acceptance`
 response carries event IDs in Run, Grant, Rerun, Tombstone, FailureRun semantic
