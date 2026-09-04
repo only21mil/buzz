@@ -60,10 +60,14 @@ by the key that signed the event: signer `ci_event` for kinds 46101 to 46106
 (the `ci-event.key` selector) and signer `acceptance_actor` for the four frozen
 acceptance events (the `acceptance-actor.key` credential, only when the
 activation binding is loaded and at the actor's generation). Both are accepted
-only for `POST {origin}/events` with a payload digest. Signer `nip98` (the
-`nip98.key` selector) is accepted only for the accepted read and the evidence
-`PUT` routes, where the relay authorizes the caller as a CI signer rather than
-as the event author. A `POST /events` request with signer `nip98` is denied.
+for `POST {origin}/events` with a payload digest. Signer `ci_event` is also
+accepted for `POST {origin}/query` with a payload digest: after the relay
+refuses a publish, controld reads back the exact event id and kind as the
+event author before it re-signs. Signer `nip98` (the `nip98.key` selector) is
+accepted only for the accepted read and the evidence `PUT` routes, where the
+relay authorizes the caller as a CI signer rather than as the event author. A
+`POST /events` or `POST /query` request with signer `nip98` is denied, and the
+acceptance actor never queries.
 
 The config never contains an activation package digest, scenario digest,
 acceptance actor identity, or event template. After the activation package and
