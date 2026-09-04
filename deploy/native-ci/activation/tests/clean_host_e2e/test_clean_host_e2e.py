@@ -4472,6 +4472,22 @@ def acceptance_template(
     }
 
 
+def failure_selector(template: dict[str, object]) -> dict[str, object]:
+    failure = json.loads(template["failure_run_event"][5])
+    selector = {
+        "schema_version": "buzz-ci-capacity-one-fixture-selector/v1",
+        "selector": "deterministic-failure", "job_id": failure["job_ids"][0],
+        "run_id": failure["run_id"], "attempt": 1,
+    }
+    preimage = (
+        "buzz-ci:capacity-one:fixture-selector:v1\n"
+        f"{selector['schema_version']}\n{selector['selector']}\n{selector['job_id']}\n"
+        f"{selector['run_id'].replace('-', '')}\n1\n"
+    ).encode()
+    selector["sha256"] = hashlib.sha256(preimage).hexdigest()
+    return selector
+
+
 def acceptance_fixture(template: dict[str, object]) -> dict[str, object]:
     ids = [hashlib.sha256(relay.canonical_json(template[name])).hexdigest() for name in relay.TEMPLATE_NAMES]
     return {
@@ -4510,7 +4526,9 @@ def ci_fact_event(secret: int, kind: int, created_at: int, content: dict[str, ob
 
 def protocol_close_inputs() -> tuple[dict[str, object], dict[str, object], bytes, bytes]:
     template = acceptance_template()
+    template["failure_selector"] = failure_selector(template)
     fixture = acceptance_fixture(template)
+    fixture["failure_selector"] = copy.deepcopy(template["failure_selector"])
     authority = relay.validate_acceptance_template(template, label="test")
     run_a, run_b = authority["run_id"], authority["failure_run_id"]
     run_request, grant_id, rerun_request, tombstone_id, failure_request = authority["api_ids"]
@@ -5005,6 +5023,50 @@ class RelayAdmissionTests(unittest.TestCase):
                         guest.close_relay_protocol_verdict(
                             {"acceptance_template": template}, {"fixture": fixture}, receipt_raw, None,
                         )
+
+    def test_transfer_recomputation_requires_current_candidate_failure_selector(self) -> None:
+        template, fixture, transcript_raw, receipt_raw = protocol_close_inputs()
+        binding = {
+            "schema_version": guest.PROTOCOL_INPUT_SCHEMA,
+            "acceptance_template": template, "prior_acceptance_template": None,
+            "transcript_base64": base64.b64encode(transcript_raw).decode(),
+            "foreign_pending_event_id": None, "fault_mode": None,
+        }
+        omitted = copy.deepcopy(binding)
+        omitted["acceptance_template"].pop("failure_selector")
+        self.assertIsNone(
+            relay.validate_acceptance_template(omitted["acceptance_template"], label="prior-compatible")["failure_selector"],
+        )
+        with self.assertRaisesRegex(relay.RelayError, "failure selector differs"):
+            relay.build_closed_verdict(
+                omitted["acceptance_template"], fixture, transcript_raw, receipt_raw,
+            )
+        with self.assertRaisesRegex(guest.GuestError, "protocol close input binding differs"):
+            guest.recompute_protocol_verdict(omitted, fixture, receipt_raw)
+
+    def test_transfer_recomputation_rejects_internally_valid_selector_that_differs_from_fixture(self) -> None:
+        template, fixture, transcript_raw, receipt_raw = protocol_close_inputs()
+        changed_template = copy.deepcopy(template)
+        failure = json.loads(changed_template["failure_run_event"][5])
+        failure["job_ids"] = ["other-capacity-one-fixture"]
+        changed_template["failure_run_event"][5] = json.dumps(failure, separators=(",", ":"))
+        changed_template["failure_selector"] = failure_selector(changed_template)
+        self.assertEqual(
+            relay.validate_acceptance_template(changed_template, label="internally-valid")["failure_selector"],
+            changed_template["failure_selector"],
+        )
+        binding = {
+            "schema_version": guest.PROTOCOL_INPUT_SCHEMA,
+            "acceptance_template": changed_template, "prior_acceptance_template": None,
+            "transcript_base64": base64.b64encode(transcript_raw).decode(),
+            "foreign_pending_event_id": None, "fault_mode": None,
+        }
+        with self.assertRaisesRegex(relay.RelayError, "failure selector differs"):
+            relay.build_closed_verdict(
+                changed_template, fixture, transcript_raw, receipt_raw,
+            )
+        with self.assertRaisesRegex(guest.GuestError, "protocol close input binding differs"):
+            guest.recompute_protocol_verdict(binding, fixture, receipt_raw)
 
     def test_shared_closed_verdict_validator_rejects_nested_mutation_matrix(self) -> None:
         template, fixture, transcript, receipt = protocol_close_inputs()

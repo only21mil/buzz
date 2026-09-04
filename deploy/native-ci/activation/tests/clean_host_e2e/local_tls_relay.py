@@ -1132,6 +1132,8 @@ def build_closed_verdict(
     authority = validate_acceptance_template(acceptance_template, label="candidate")
     if not isinstance(fixture, dict):
         raise RelayError("acceptance fixture rejected")
+    if authority["failure_selector"] is None or fixture.get("failure_selector") != authority["failure_selector"]:
+        raise RelayError("candidate failure selector differs from acceptance fixture")
     try:
         transcript = json.loads(transcript_raw, object_pairs_hook=reject_duplicates)
         receipt = json.loads(receipt_raw, object_pairs_hook=reject_duplicates)
