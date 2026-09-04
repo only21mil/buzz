@@ -680,7 +680,8 @@ mod tests {
     use std::thread;
 
     use buzz_ci_acceptance_ctl::acceptance::{
-        AdmissionState, DriverResponse, EvidenceObject, FixtureSpec, Operation, SystemSnapshot,
+        AdmissionState, DriverResponse, EvidenceObject, FixtureSelector, FixtureSpec, Operation,
+        SystemSnapshot,
     };
     use buzz_ci_acceptance_ctl::acceptance_binding::AcceptanceBindingError;
     use buzz_ci_acceptance_ctl::acceptance_binding_test_support::{
@@ -694,6 +695,22 @@ mod tests {
     use buzz_core::kind::{KIND_CI_GRANT, KIND_CI_REQUEST, KIND_DELETION};
 
     struct Handler;
+
+    fn failure_selector(run_id: &str, job_id: &str) -> FixtureSelector {
+        let parsed = uuid::Uuid::parse_str(run_id).unwrap();
+        let encoded = format!(
+            "buzz-ci:capacity-one:fixture-selector:v1\nbuzz-ci-capacity-one-fixture-selector/v1\ndeterministic-failure\n{job_id}\n{}\n1\n",
+            parsed.simple(),
+        );
+        FixtureSelector {
+            schema_version: "buzz-ci-capacity-one-fixture-selector/v1".into(),
+            selector: "deterministic-failure".into(),
+            job_id: job_id.into(),
+            run_id: parsed.hyphenated().to_string(),
+            attempt: 1,
+            sha256: hex::encode(Sha256::digest(encoded.as_bytes())),
+        }
+    }
 
     impl AcceptanceOperationHandler for Handler {
         type Error = ();
@@ -730,7 +747,8 @@ mod tests {
 
     fn request() -> AdapterRequest {
         let acceptance = authority();
-        let failure_selector = canonical_acceptance_binding().fixture.failure_selector;
+        let failure_run_id = "13131313-1313-5313-9313-131313131314";
+        let failure_selector = failure_selector(failure_run_id, "test");
         let event_ids = [
             &acceptance.run_event,
             &acceptance.grant_event,
@@ -744,7 +762,10 @@ mod tests {
             activation_id: "activation-1".into(),
             activation_package_digest: "12".repeat(32),
             run_id: "13".repeat(16),
-            failure_run_id: "13131313131353139313131313131314".into(),
+            failure_run_id: uuid::Uuid::parse_str(failure_run_id)
+                .unwrap()
+                .simple()
+                .to_string(),
             failure_selector,
             job_id: "test".into(),
             request_digest: hex::encode(event_ids[0]),
@@ -868,7 +889,7 @@ mod tests {
             .unwrap()
         ]);
         let mut failure_run = run.clone();
-        failure_run.run_id = "13131313-1313-1313-1313-ffffffffffff".into();
+        failure_run.run_id = "13131313-1313-5313-9313-131313131314".into();
         failure_run.idempotency_key = "123e4567-e89b-12d3-a456-426614174014".into();
         let failure_run_event = serde_json::json!([
             0,
