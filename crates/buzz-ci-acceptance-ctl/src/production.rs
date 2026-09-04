@@ -532,6 +532,23 @@ impl<T: AdapterTransport> ProductionDriver<T> {
         }
         Err(last)
     }
+
+    fn exchange_controld_retry(
+        &mut self,
+        request: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, DriverError> {
+        for _ in 0..2 {
+            match self
+                .transport
+                .exchange(AdapterEndpoint::Controld, request, timeout)
+            {
+                Ok(response) if !response.is_empty() => return Ok(response),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        Err(DriverError::Transport)
+    }
 }
 
 impl<T> AcceptanceDriver for ProductionDriver<T>
@@ -569,10 +586,7 @@ where
         };
         adapter.validate()?;
         let adapter_bytes = canonical_json(&adapter)?;
-        let response = self
-            .transport
-            .exchange(AdapterEndpoint::Controld, &adapter_bytes, timeout)
-            .map_err(|_| DriverError::Transport)?;
+        let response = self.exchange_controld_retry(&adapter_bytes, timeout)?;
         let response: AdapterResponse = parse_bounded(&response)?;
         if response.schema_version != ADAPTER_RESPONSE_SCHEMA
             || response.sequence != request.sequence
@@ -3241,6 +3255,25 @@ mod tests {
         }
     }
 
+    struct RetryTransport {
+        replies: VecDeque<Result<Vec<u8>, &'static str>>,
+        requests: Vec<(AdapterEndpoint, Vec<u8>)>,
+    }
+
+    impl AdapterTransport for RetryTransport {
+        type Error = &'static str;
+
+        fn exchange(
+            &mut self,
+            endpoint: AdapterEndpoint,
+            request: &[u8],
+            _timeout: Duration,
+        ) -> Result<Vec<u8>, Self::Error> {
+            self.requests.push((endpoint, request.to_vec()));
+            self.replies.pop_front().unwrap_or(Ok(Vec::new()))
+        }
+    }
+
     #[test]
     fn driver_routes_host_then_controld_and_binds_generations() {
         let fixture = fixture();
@@ -3328,6 +3361,82 @@ mod tests {
             driver.into_transport().endpoints,
             [AdapterEndpoint::Control]
         );
+    }
+
+    #[test]
+    fn driver_retries_identical_controld_request_after_transport_loss() {
+        let fixture = fixture();
+        let driver_config = config();
+        let request = request(&fixture, &driver_config.scenario_sha256);
+        let operation_id = operation_id(&request).unwrap();
+        let host = ControlReadback {
+            activation_id: fixture.activation_id.clone(),
+            activation_package_digest: fixture.activation_package_digest.clone(),
+            integrated_candidate_sha: fixture.integrated_candidate_sha.clone(),
+            capacity: 1,
+            admission: AdmissionState::Open,
+            controller_generation: 7,
+            runner_generation: 9,
+        };
+        let control = ControlResponse {
+            schema_version: CONTROL_RESPONSE_SCHEMA.into(),
+            sequence: request.sequence,
+            operation: ControlOperation::SetCapacityOne,
+            scenario_sha256: request.scenario_sha256.into(),
+            operation_id: operation_id.clone(),
+            readback: host,
+            zero_proof: None,
+            controller_receipt_sha256: Some(hex('6', 64)),
+        };
+        let driver_response = DriverResponse {
+            schema_version: DRIVER_VERSION.into(),
+            sequence: request.sequence,
+            operation: request.operation,
+            snapshot: SystemSnapshot {
+                capacity: 1,
+                admission: AdmissionState::Open,
+                active_run_count: 0,
+                active_attempt_count: 0,
+                controller_generation: 7,
+                runner_generation: 9,
+                run: None,
+            },
+            export: None,
+        };
+        let adapter = AdapterResponse {
+            schema_version: ADAPTER_RESPONSE_SCHEMA.into(),
+            sequence: request.sequence,
+            operation: request.operation,
+            scenario_sha256: request.scenario_sha256.into(),
+            operation_id,
+            response: driver_response.clone(),
+        };
+        for first_failure in [Err("transport lost"), Ok(Vec::new())] {
+            let transport = RetryTransport {
+                replies: VecDeque::from([
+                    Ok(serde_json::to_vec(&control).unwrap()),
+                    first_failure,
+                    Ok(serde_json::to_vec(&adapter).unwrap()),
+                ]),
+                requests: Vec::new(),
+            };
+            let mut driver = ProductionDriver::new(driver_config.clone(), transport).unwrap();
+
+            assert_eq!(driver.execute(&request).unwrap(), driver_response);
+            let requests = driver.into_transport().requests;
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|(endpoint, _)| *endpoint)
+                    .collect::<Vec<_>>(),
+                [
+                    AdapterEndpoint::Control,
+                    AdapterEndpoint::Controld,
+                    AdapterEndpoint::Controld
+                ]
+            );
+            assert_eq!(requests[1].1, requests[2].1);
+        }
     }
 
     #[test]

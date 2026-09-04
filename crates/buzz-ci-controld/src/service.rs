@@ -49,6 +49,13 @@ use crate::config::DaemonConfig;
 /// is deferred rather than terminal (the M12 canary failed because the stale
 /// terminal replay ran before this step and the grant needed the same key).
 const APPROVE_GRANT_SEQUENCE: u32 = 4;
+// The qualification socket owns relay polling through its final operation.
+// Persistent capacity one starts later against the completed journal.
+const COMPLETE_ACCEPTANCE_SEQUENCE: u32 = 13;
+
+const fn background_polling_enabled(completed_sequences: u32) -> bool {
+    completed_sequences >= COMPLETE_ACCEPTANCE_SEQUENCE
+}
 
 /// A locally validated daemon which owns no production capability.
 pub(crate) struct CapacityZeroService {
@@ -86,6 +93,7 @@ pub(crate) struct CapacityOneService {
     status: CapacityOneStatus,
     poll_interval: Duration,
     acceptance: AcceptanceJournal,
+    background_polling: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -308,7 +316,9 @@ impl CapacityOneService {
         // can approve this activation's grant. Defer unauthorized-signer
         // refusals until that approval; after it (including a restart later in
         // the same activation) they stay terminal.
-        let grant_approved = acceptance.completed_sequences()? >= APPROVE_GRANT_SEQUENCE;
+        let completed_sequences = acceptance.completed_sequences()?;
+        let grant_approved = completed_sequences >= APPROVE_GRANT_SEQUENCE;
+        let background_polling = background_polling_enabled(completed_sequences);
         controller.set_replay_deferral(!grant_approved);
         Ok(Self {
             status: controller.status(),
@@ -326,6 +336,7 @@ impl CapacityOneService {
             acceptance_authority,
             poll_interval,
             acceptance,
+            background_polling,
         })
     }
 
@@ -345,6 +356,9 @@ impl CapacityOneService {
     /// terminal closed readback and returns so systemd can restart into durable
     /// reconciliation.
     pub(crate) fn poll_once(&mut self) -> Result<(), ControllerError> {
+        if !self.background_polling {
+            return Ok(());
+        }
         if self.controller_worker.is_some() {
             return Ok(());
         }
@@ -1213,6 +1227,18 @@ mod tests {
     use super::*;
     use crate::config::DaemonConfig;
     use buzz_ci_controld::acceptance_socket::ACCEPTANCE_BINDING_PATH;
+
+    #[test]
+    fn incomplete_acceptance_sequence_retains_socket_poll_ownership_after_restart() {
+        for completed in 0..COMPLETE_ACCEPTANCE_SEQUENCE {
+            assert!(
+                !background_polling_enabled(completed),
+                "sequence {completed} must remain acceptance-owned"
+            );
+        }
+        assert!(background_polling_enabled(COMPLETE_ACCEPTANCE_SEQUENCE));
+        assert!(background_polling_enabled(COMPLETE_ACCEPTANCE_SEQUENCE + 1));
+    }
 
     fn config_fixture(store_mode: u32) -> (TempDir, DaemonConfig, u32) {
         let root = tempfile::tempdir().expect("temporary directory");
