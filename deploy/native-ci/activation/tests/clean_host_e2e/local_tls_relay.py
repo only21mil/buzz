@@ -83,6 +83,18 @@ RELAY_FAULTS = frozenset({FAULT_STALE_TERMINAL, FAULT_REPLAY_BEFORE_GRANT})
 UNAUTHORIZED_STATUS_SIGNER = "invalid CI envelope: unauthorized CI status signer"
 FAULT_RECORD_NAME = "fault-fired.json"
 PROTOCOL_RECORD_NAME = "protocol-verdict.json"
+TRANSCRIPT_RECORD_NAME = "protocol-transcript.json"
+TRANSCRIPT_SCHEMA = "buzz-ci-loopback-relay-transcript/v2"
+VERDICT_SCHEMA = "buzz-ci-loopback-relay-verdict/v2"
+TEMPLATE_NAMES = ("run_event", "grant_event", "rerun_event", "tombstone_event", "failure_run_event")
+LIVE_TEMPLATE_NAMES = ("run_event", "grant_event", "failure_run_event", "rerun_event", "tombstone_event")
+EXPECTED_RECEIPT_STAGES = (
+    "capacity_zero_closed", "capacity_one_open", "manifest_identity", "approval_grant",
+    "grant_resume", "first_attempt_terminal", "authenticated_export",
+    "failed_manifest_identity", "failed_attempt_running", "failed_attempt_terminal",
+    "rerun_separation", "cancellation_terminal", "tombstone_folding",
+    "controller_restart_recovery", "runner_restart_recovery", "prepare_capacity_zero",
+)
 MAX_QUERY_FILTERS = 16
 # handlers/ingest.rs: kinds that bypass the generic member-or-open gate.
 MEMBERSHIP_EXEMPT_KINDS = frozenset({9021, 9007, 40003, 9002, 9005, 9008})
@@ -92,6 +104,15 @@ MEMBER_ROLES = GRANT_ROLES | {"member"}
 
 class RelayError(ValueError):
     pass
+
+
+def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise RelayError("duplicate JSON field")
+        result[key] = value
+    return result
 
 
 class Refusal(Exception):
@@ -168,6 +189,212 @@ def event_id(event: dict[str, object]) -> str:
         ensure_ascii=False, separators=(",", ":"),
     ).encode()
     return hashlib.sha256(serialized).hexdigest()
+
+
+def canonical_json(value: object) -> bytes:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
+
+
+def template_preimage(event: dict[str, object]) -> list[object]:
+    return [0, event["pubkey"], event["created_at"], event["kind"], event["tags"], event["content"]]
+
+
+def validate_closed_verdict(value: object) -> dict[str, object]:
+    """Validate the exact nested v2 verdict exported beyond the guest."""
+    top = {
+        "schema_version", "state", "reason", "sealed", "template_set_sha256",
+        "actor_event_ids", "observed_actor_event_ids", "run_ids", "transcript",
+        "receipt", "run_a", "run_b", "sealed_projection_sha256", "foreign_pending_event_id",
+    }
+    if not isinstance(value, dict) or set(value) != top:
+        raise RelayError("closed verdict shape rejected")
+    actor = value.get("actor_event_ids")
+    api = actor.get("api_order") if isinstance(actor, dict) else None
+    live = actor.get("live_order") if isinstance(actor, dict) else None
+    run_ids = value.get("run_ids")
+    transcript = value.get("transcript")
+    receipt = value.get("receipt")
+    run_a = value.get("run_a")
+    run_b = value.get("run_b")
+    receipt_fields = {
+        "sha256", "run_id", "checks", "zero_phases", "manifest_digest", "export_subject",
+        "export_authorization_digest", "export_request_digest", "export_attempt_id",
+        "export_evidence_set_digest", "export_objects_sha256",
+    }
+    run_a_fields = {
+        "request_event_id", "selected_job_attempts", "log_event_ids", "artifact_event_ids",
+        "evidence_finalized_event_id", "teardown_attestation_event_id", "terminal_event_id",
+    }
+    run_b_fields = {
+        "initial_request_event_id", "final_request_event_id", "failure_log_event_id",
+        "failure_job_event_id", "failure_run_event_id", "rerun_request_event_id",
+        "cancel_job_event_id", "cancel_run_event_id", "tombstone_event_id", "final_fact_count",
+    }
+    hex_fields = [value.get("template_set_sha256"), value.get("sealed_projection_sha256")]
+    if isinstance(receipt, dict):
+        hex_fields += [receipt.get(name) for name in (
+            "sha256", "manifest_digest", "export_subject", "export_authorization_digest",
+            "export_request_digest", "export_attempt_id", "export_evidence_set_digest",
+            "export_objects_sha256",
+        )]
+    lists_ready = (
+        isinstance(run_a, dict) and isinstance(run_b, dict)
+        and isinstance(run_a.get("log_event_ids"), list)
+        and isinstance(run_a.get("artifact_event_ids"), list)
+    )
+    bound_event_ids = [] if not lists_ready else [
+        *run_a["log_event_ids"], *run_a["artifact_event_ids"],
+        run_a.get("evidence_finalized_event_id"), run_a.get("teardown_attestation_event_id"),
+        run_a.get("terminal_event_id"), run_b.get("failure_log_event_id"),
+        run_b.get("failure_job_event_id"), run_b.get("failure_run_event_id"),
+        run_b.get("cancel_job_event_id"), run_b.get("cancel_run_event_id"),
+    ]
+    if (
+        value.get("schema_version") != VERDICT_SCHEMA or value.get("state") != "green"
+        or value.get("reason") is not None or value.get("sealed") is not True
+        or not isinstance(actor, dict) or set(actor) != {"api_order", "live_order"}
+        or not isinstance(api, list) or len(api) != 5
+        or any(not isinstance(item, str) or HEX64.fullmatch(item) is None for item in api)
+        or len(set(api)) != 5
+        or live != [api[index] for index in (0, 1, 4, 2, 3)]
+        or value.get("observed_actor_event_ids") != live
+        or not isinstance(run_ids, dict) or set(run_ids) != {"run_a", "run_b"}
+        or any(not isinstance(item, str) or UUID.fullmatch(item) is None for item in run_ids.values())
+        or run_ids["run_a"] == run_ids["run_b"]
+        or not isinstance(transcript, dict) or set(transcript) != {"sha256", "event_count", "last_cursor"}
+        or not isinstance(transcript.get("event_count"), int) or isinstance(transcript["event_count"], bool)
+        or transcript["event_count"] < 1 or transcript.get("last_cursor") != transcript["event_count"]
+        or not isinstance(run_a, dict)
+        or not isinstance(run_a.get("artifact_event_ids"), list)
+        or transcript["event_count"] != 27 + len(run_a["artifact_event_ids"])
+        or not isinstance(receipt, dict) or set(receipt) != receipt_fields
+        or receipt.get("checks") != 16 or receipt.get("zero_phases") != [17, 18]
+        or not isinstance(receipt.get("run_id"), str) or re.fullmatch(r"[0-9a-f]{32}", receipt["run_id"]) is None
+        or set(run_a) != run_a_fields
+        or not isinstance(run_b, dict) or set(run_b) != run_b_fields
+        or run_a.get("request_event_id") != api[0]
+        or run_b.get("initial_request_event_id") != api[4]
+        or run_b.get("final_request_event_id") != api[2]
+        or run_b.get("rerun_request_event_id") != api[2]
+        or run_b.get("tombstone_event_id") != api[3]
+        or run_b.get("final_fact_count") != 0
+        or not isinstance(run_a.get("selected_job_attempts"), list) or len(run_a["selected_job_attempts"]) != 1
+        or not isinstance(run_a["selected_job_attempts"][0], dict)
+        or set(run_a["selected_job_attempts"][0]) != {"job_id", "attempt"}
+        or run_a["selected_job_attempts"][0].get("attempt") != 1
+        or not isinstance(run_a["selected_job_attempts"][0].get("job_id"), str)
+        or not run_a["selected_job_attempts"][0]["job_id"]
+        or not isinstance(run_a.get("log_event_ids"), list) or len(run_a["log_event_ids"]) != 1
+        or not isinstance(run_a.get("artifact_event_ids"), list) or not run_a["artifact_event_ids"]
+        or any(not isinstance(item, str) or HEX64.fullmatch(item) is None for item in (
+            bound_event_ids
+        ))
+        or len(set(bound_event_ids)) != len(bound_event_ids)
+        or set(api) & set(bound_event_ids)
+        or any(not isinstance(item, str) or HEX64.fullmatch(item) is None for item in hex_fields)
+        or not isinstance(transcript.get("sha256"), str) or HEX64.fullmatch(transcript["sha256"]) is None
+        or value.get("foreign_pending_event_id") is not None and (
+            not isinstance(value["foreign_pending_event_id"], str)
+            or HEX64.fullmatch(value["foreign_pending_event_id"]) is None
+            or value["foreign_pending_event_id"] in set(api) | set(bound_event_ids)
+        )
+    ):
+        raise RelayError("closed verdict binding rejected")
+    return value
+
+
+def validate_acceptance_template(value: object, *, label: str) -> dict[str, object]:
+    """Close and derive one frozen five-preimage actor authority."""
+    fields = {"actor", "time_reference", *TEMPLATE_NAMES}
+    if not isinstance(value, dict) or set(value) not in (fields, fields | {"failure_selector"}):
+        raise ValueError(f"{label} acceptance template shape rejected")
+    actor = value.get("actor")
+    if (
+        not isinstance(actor, dict) or set(actor) != {"public_key", "generation"}
+        or not isinstance(actor.get("public_key"), str) or HEX64.fullmatch(actor["public_key"]) is None
+        or not isinstance(actor.get("generation"), int) or isinstance(actor["generation"], bool)
+        or actor["generation"] < 1
+        or not isinstance(value.get("time_reference"), int) or isinstance(value["time_reference"], bool)
+        or value["time_reference"] < 1
+    ):
+        raise ValueError(f"{label} acceptance actor rejected")
+    expected_kinds = (KIND_CI_REQUEST, KIND_CI_GRANT, KIND_CI_REQUEST, KIND_DELETION, KIND_CI_REQUEST)
+    preimages: list[list[object]] = []
+    envelopes: dict[str, dict[str, object]] = {}
+    for name, kind in zip(TEMPLATE_NAMES, expected_kinds, strict=True):
+        item = value.get(name)
+        if (
+            not isinstance(item, list) or len(item) != 6 or item[0] != 0
+            or item[1] != actor["public_key"]
+            or not isinstance(item[2], int) or isinstance(item[2], bool) or item[2] < 1
+            or item[3] != kind or not isinstance(item[4], list) or not isinstance(item[5], str)
+            or canonical_json(item) != json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode()
+        ):
+            raise ValueError(f"{label} acceptance preimage rejected: {name}")
+        preimages.append(item)
+        if kind in {KIND_CI_REQUEST, KIND_CI_GRANT}:
+            try:
+                content = json.loads(item[5], object_pairs_hook=reject_duplicates)
+            except (json.JSONDecodeError, RelayError) as error:
+                raise ValueError(f"{label} acceptance content rejected: {name}") from error
+            if not isinstance(content, dict):
+                raise ValueError(f"{label} acceptance content rejected: {name}")
+            if canonical_json(content).decode() != item[5]:
+                raise ValueError(f"{label} acceptance content is not canonical: {name}")
+            envelopes[name] = content
+    ids = [hashlib.sha256(canonical_json(item)).hexdigest() for item in preimages]
+    if len(set(ids)) != 5:
+        raise ValueError(f"{label} acceptance event IDs are not unique")
+    run, grant, rerun, failure = (
+        envelopes["run_event"], envelopes["grant_event"], envelopes["rerun_event"],
+        envelopes["failure_run_event"],
+    )
+    run_id, failure_run_id = run.get("run_id"), failure.get("run_id")
+    if (
+        run.get("request_type") != "run" or run.get("attempt") != 1
+        or failure.get("request_type") != "run" or failure.get("attempt") != 1
+        or rerun.get("request_type") != "rerun" or rerun.get("attempt") != 2
+        or not isinstance(run_id, str) or UUID.fullmatch(run_id) is None
+        or not isinstance(failure_run_id, str) or UUID.fullmatch(failure_run_id) is None
+        or run_id == failure_run_id or rerun.get("run_id") != failure_run_id
+        or rerun.get("parent_run_id") != failure_run_id or rerun.get("parent_attempt") != 1
+        or grant.get("target_repo_a") != run.get("target_repo_a")
+        or grant.get("signer_pubkey") is None
+        or preimages[3][4] != [["e", ids[2]]] or preimages[3][5] != ""
+    ):
+        raise ValueError(f"{label} acceptance lineage rejected")
+    selector = value.get("failure_selector")
+    if selector is not None:
+        if not isinstance(selector, dict) or list(selector) != [
+            "schema_version", "selector", "job_id", "run_id", "attempt", "sha256",
+        ]:
+            raise ValueError(f"{label} failure selector shape rejected")
+        jobs = failure.get("job_ids")
+        if (
+            selector.get("schema_version") != "buzz-ci-capacity-one-fixture-selector/v1"
+            or selector.get("selector") != "deterministic-failure"
+            or not isinstance(jobs, list) or len(jobs) != 1
+            or selector.get("job_id") != jobs[0] or selector.get("run_id") != failure_run_id
+            or selector.get("attempt") != failure.get("attempt") or selector.get("attempt") != 1
+        ):
+            raise ValueError(f"{label} failure selector binding rejected")
+        selector_preimage = (
+            "buzz-ci:capacity-one:fixture-selector:v1\n"
+            f"{selector['schema_version']}\n{selector['selector']}\n{selector['job_id']}\n"
+            f"{str(failure_run_id).replace('-', '')}\n1\n"
+        ).encode()
+        if selector.get("sha256") != hashlib.sha256(selector_preimage).hexdigest():
+            raise ValueError(f"{label} failure selector digest rejected")
+    live_ids = [ids[TEMPLATE_NAMES.index(name)] for name in LIVE_TEMPLATE_NAMES]
+    return {
+        "actor": actor["public_key"], "api_ids": ids, "live_ids": live_ids,
+        "id_to_name": dict(zip(ids, TEMPLATE_NAMES, strict=True)),
+        "preimages": dict(zip(TEMPLATE_NAMES, preimages, strict=True)),
+        "run": run, "failure_run": failure, "rerun": rerun, "grant": grant,
+        "run_id": run_id, "failure_run_id": failure_run_id,
+        "template_set_sha256": hashlib.sha256(canonical_json({name: value[name] for name in TEMPLATE_NAMES})).hexdigest(),
+        "failure_selector": selector,
+    }
 
 
 def verify_event(value: object) -> dict[str, object]:
@@ -250,6 +477,9 @@ class RelayState:
     def __init__(
         self, object_root: Path, origin: str, channel_id: str, visibility: str,
         members: dict[str, str], static_signers: set[str],
+        candidate_acceptance: dict[str, object] | None = None,
+        prior_acceptance: dict[str, object] | None = None,
+        acceptance_fixture: dict[str, object] | None = None,
     ) -> None:
         if UUID.fullmatch(channel_id) is None or visibility not in {"open", "private"}:
             raise ValueError("relay channel rejected")
@@ -263,6 +493,9 @@ class RelayState:
         self.visibility = visibility
         self.members = dict(members)
         self.static_signers = set(static_signers)
+        self.candidate_acceptance = candidate_acceptance
+        self.prior_acceptance = prior_acceptance
+        self.acceptance_fixture = acceptance_fixture
         self.events: dict[str, dict[str, object]] = {}
         self.event_channels: dict[str, str | None] = {}
         self.accepted: list[tuple[int, str, dict[str, object]]] = []
@@ -283,6 +516,108 @@ class RelayState:
         self.refused_event_ids: list[str] = []
         self.queried_event_ids: list[str] = []
         self.replayed_event_id: str | None = None
+        self.transcript_cursor = 0
+        self.transcript_events: list[dict[str, object]] = []
+        self.observed_actor_event_ids: list[str] = []
+        self.prior_actor_event_ids: list[str] = []
+        self.foreign_pending_event: dict[str, object] | None = None
+        self.candidate_sealed = False
+        self.sealed_projection_sha256: str | None = None
+
+    def classify_actor_event(self, event: dict[str, object]) -> tuple[str, str] | None:
+        """Map an actor event to one frozen template before any state change."""
+        if self.candidate_acceptance is None:
+            return None
+        identifier = str(event["id"])
+        candidate_name = self.candidate_acceptance["id_to_name"].get(identifier)
+        prior_name = None if self.prior_acceptance is None else self.prior_acceptance["id_to_name"].get(identifier)
+        if candidate_name is not None:
+            expected = self.candidate_acceptance["preimages"][candidate_name]
+            if template_preimage(event) != expected:
+                raise Refusal(400, "invalid: acceptance event differs from frozen preimage")
+            if identifier not in self.events:
+                position = len(self.observed_actor_event_ids)
+                expected_live = self.candidate_acceptance["live_ids"]
+                if position >= len(expected_live) or identifier != expected_live[position]:
+                    raise Refusal(409, "conflict: acceptance actor event order differs")
+            return "candidate", str(candidate_name)
+        if prior_name is not None:
+            if self.fault != FAULT_REPLAY_BEFORE_GRANT:
+                raise Refusal(409, "conflict: prior acceptance event is not active")
+            expected = self.prior_acceptance["preimages"][prior_name]
+            if template_preimage(event) != expected:
+                raise Refusal(400, "invalid: prior acceptance event differs from frozen preimage")
+            if identifier not in self.events:
+                expected_prior = self.prior_acceptance["live_ids"][:2]
+                position = len(self.prior_actor_event_ids)
+                if position >= len(expected_prior) or identifier != expected_prior[position]:
+                    raise Refusal(409, "conflict: prior acceptance actor event order differs")
+            return "prior", str(prior_name)
+        if event["pubkey"] == self.candidate_acceptance["actor"] and int(event["kind"]) in {
+            KIND_DELETION, KIND_CI_REQUEST, KIND_CI_GRANT,
+        }:
+            raise Refusal(409, "conflict: unknown acceptance actor event")
+        return None
+
+    def note_actor_event(self, classification: tuple[str, str] | None, event: dict[str, object]) -> None:
+        if classification is None:
+            return
+        partition, _name = classification
+        if partition == "candidate":
+            self.observed_actor_event_ids.append(str(event["id"]))
+            if self.observed_actor_event_ids == self.candidate_acceptance["live_ids"]:
+                self.candidate_sealed = True
+        else:
+            self.prior_actor_event_ids.append(str(event["id"]))
+
+    def is_candidate_event(self, event: dict[str, object]) -> bool:
+        if self.candidate_acceptance is None:
+            return False
+        if str(event["id"]) in self.candidate_acceptance["api_ids"]:
+            return True
+        if KIND_CI_STATUS_MIN <= int(event["kind"]) <= KIND_CI_STATUS_MAX:
+            try:
+                return parse_content(event, "CI event").get("run_id") in {
+                    self.candidate_acceptance["run_id"], self.candidate_acceptance["failure_run_id"],
+                }
+            except Refusal:
+                return False
+        return False
+
+    def write_protocol_transcript(self) -> None:
+        if self.candidate_acceptance is None:
+            return
+        root = self.object_root.parent
+        record = {
+            "schema_version": TRANSCRIPT_SCHEMA,
+            "template_set_sha256": self.candidate_acceptance["template_set_sha256"],
+            "actor_event_ids": {
+                "api_order": self.candidate_acceptance["api_ids"],
+                "live_order": self.candidate_acceptance["live_ids"],
+            },
+            "observed_actor_event_ids": self.observed_actor_event_ids,
+            "events": self.transcript_events,
+            "sealed": self.candidate_sealed,
+            "sealed_projection_sha256": self.sealed_projection_sha256,
+            "foreign_pending_event_ids": self.prior_actor_event_ids,
+            "foreign_pending_event": self.foreign_pending_event,
+        }
+        pending = root / (TRANSCRIPT_RECORD_NAME + ".next")
+        pending.write_bytes(canonical_json(record) + b"\n")
+        pending.chmod(0o400)
+        pending.replace(root / TRANSCRIPT_RECORD_NAME)
+
+    def record_transcript_event(self, event: dict[str, object]) -> None:
+        if not self.is_candidate_event(event):
+            return
+        self.transcript_cursor += 1
+        self.transcript_events.append({
+            "cursor": self.transcript_cursor,
+            "event": event,
+        })
+        if self.candidate_sealed and self.sealed_projection_sha256 is None:
+            self.sealed_projection_sha256 = hashlib.sha256(canonical_json(self.transcript_events)).hexdigest()
+        self.write_protocol_transcript()
 
     def record_ci_event(self, event: dict[str, object]) -> None:
         """Retain relay acceptance order and the validated envelope for verdict parity."""
@@ -297,11 +632,6 @@ class RelayState:
         self.run_events.setdefault(run_id, []).append((self.ci_cursor, event, content))
         if kind in {KIND_CI_EVIDENCE_FINALIZED, KIND_CI_TEARDOWN_ATTESTATION}:
             self.final_facts.setdefault(run_id, set()).add(kind)
-        if (
-            kind == KIND_CI_RUN_STATUS and content.get("state") == "success"
-            and self.final_facts.get(run_id) == {KIND_CI_EVIDENCE_FINALIZED, KIND_CI_TEARDOWN_ATTESTATION}
-        ):
-            self.write_protocol_verdict(run_id)
 
     def rerun_allowed(self, channel: str, content: dict[str, object]) -> bool:
         """A rerun extends one failed job on an unsealed run, exactly once."""
@@ -401,14 +731,6 @@ class RelayState:
                 reason = "evidence-finalized fact does not match terminal attempt"
         return {"state": "green" if reason is None else "infrastructure_failure", "reason": reason}
 
-    def write_protocol_verdict(self, run_id: str) -> None:
-        root = self.object_root.parent
-        record = {"schema_version": "buzz-ci-loopback-relay-verdict/v1", "run_id": run_id, **self.closed_verdict(run_id)}
-        pending = root / (PROTOCOL_RECORD_NAME + ".next")
-        pending.write_bytes(json.dumps(record, sort_keys=True, separators=(",", ":")).encode() + b"\n")
-        pending.chmod(0o400)
-        pending.replace(root / PROTOCOL_RECORD_NAME)
-
     def arm_fault(self, flag: Path) -> None:
         """Read the guest's flag file; an unknown mode is a configuration error."""
         mode = flag.read_bytes().decode().strip()
@@ -483,8 +805,23 @@ class RelayState:
         state = parse_content(event, "CI event").get("state")
         if not isinstance(state, str) or state in OPEN_RUN_STATES:
             return
+        content = parse_content(event, "CI event")
+        if self.candidate_acceptance is not None:
+            if (
+                self.prior_acceptance is None
+                or content.get("run_id") != self.prior_acceptance["run_id"]
+                or content.get("request_event_id") != self.prior_acceptance["api_ids"][0]
+                or content.get("attempt") != 1 or state != "success"
+                or event.get("pubkey") != self.prior_acceptance["grant"].get("signer_pubkey")
+                or str(event["id"]) not in self.refused_event_ids
+            ):
+                return
         self.replayed_event_id = str(event["id"])
+        if self.prior_acceptance is not None:
+            self.foreign_pending_event = event
         self.write_fault_record()
+        if self.candidate_acceptance is not None:
+            self.write_protocol_transcript()
 
     def fault_record(self) -> dict[str, object]:
         if self.fault == FAULT_REPLAY_BEFORE_GRANT:
@@ -553,6 +890,10 @@ def admit_event(state: RelayState, token_pubkey: str, event: dict[str, object], 
     if event["pubkey"] != token_pubkey:
         raise Refusal(403, "invalid: event pubkey does not match authenticated identity")
     pubkey = str(event["pubkey"])
+    identifier = str(event["id"])
+    actor_classification = state.classify_actor_event(event)
+    if identifier in state.events:
+        return state.event_channels.get(identifier), False
     channel = first_tag(tags, "h")
     if kind == KIND_DELETION:
         targets = [tag[1] for tag in tags if len(tag) >= 2 and tag[0] == "e"]
@@ -623,11 +964,48 @@ def admit_event(state: RelayState, token_pubkey: str, event: dict[str, object], 
         if pubkey not in state.active_signers(content["target_repo_a"], now):
             state.note_unauthorized(event)
             raise Refusal(400, UNAUTHORIZED_STATUS_SIGNER)
-    identifier = str(event["id"])
-    if identifier in state.events:
-        return channel, False
+        if state.candidate_acceptance is not None:
+            current_runs = {state.candidate_acceptance["run_id"], state.candidate_acceptance["failure_run_id"]}
+            prior_runs = set() if state.prior_acceptance is None else {
+                state.prior_acceptance["run_id"], state.prior_acceptance["failure_run_id"],
+            }
+            if content.get("run_id") not in current_runs | prior_runs:
+                raise Refusal(409, "conflict: foreign CI event is outside the acceptance partition")
+            if content.get("run_id") in prior_runs:
+                if state.fault != FAULT_REPLAY_BEFORE_GRANT:
+                    raise Refusal(409, "conflict: prior CI event is not active")
+                if state.observed_actor_event_ids and identifier not in state.refused_event_ids:
+                    raise Refusal(409, "conflict: foreign CI event is not the named pending replay")
+        if state.candidate_acceptance is not None and content.get("run_id") in current_runs:
+            if state.candidate_sealed:
+                raise Refusal(409, "conflict: sealed acceptance transcript cannot be mutated")
+            run_id = str(content["run_id"])
+            attempt = content.get("attempt")
+            requests = state.run_requests.get((str(channel), run_id), {})
+            request_id = content.get("request_event_id")
+            request_event = state.events.get(str(request_id))
+            if (
+                not isinstance(attempt, int) or isinstance(attempt, bool)
+                or requests.get(attempt) != request_id
+                or request_event is None
+            ):
+                raise Refusal(400, "invalid: CI event request provenance rejected")
+            request = parse_content(request_event, "CI request")
+            shared = ("run_id", "workflow_id", "target_repo_a", "tip_oid")
+            if any(content.get(name) != request.get(name) for name in shared):
+                raise Refusal(400, "invalid: CI event request provenance rejected")
+            if kind in {KIND_CI_RUN_STATUS, KIND_CI_JOB_STATUS, KIND_CI_TEARDOWN_ATTESTATION} \
+                    and content.get("base_oid") != request.get("base_oid"):
+                raise Refusal(400, "invalid: CI event request provenance rejected")
+            if kind in {KIND_CI_EVIDENCE_FINALIZED, KIND_CI_TEARDOWN_ATTESTATION}:
+                if run_id != state.candidate_acceptance["run_id"]:
+                    raise Refusal(409, "conflict: failure run cannot publish terminal facts")
+                latest = requests[max(requests)] if requests else None
+                if request_id != latest:
+                    raise Refusal(409, "conflict: terminal fact does not name the latest request")
     state.events[identifier] = event
     state.event_channels[identifier] = channel
+    state.note_actor_event(actor_classification, event)
     state.record_ci_event(event)
     if KIND_CI_STATUS_MIN <= kind <= KIND_CI_STATUS_MAX:
         state.note_terminal_accepted(event)
@@ -645,6 +1023,7 @@ def admit_event(state: RelayState, token_pubkey: str, event: dict[str, object], 
         state.run_requests.setdefault((channel, run_id), {})[int(content["attempt"])] = identifier
         state.cursor += 1
         state.accepted.append((state.cursor, channel, event))
+    state.record_transcript_event(event)
     return channel, True
 
 
@@ -710,6 +1089,305 @@ def query_events(state: RelayState, caller: str, raw: bytes) -> list[dict[str, o
         matched.sort(key=lambda event: (-int(event["created_at"]), str(event["id"])))
         results.extend(matched if limit is None else matched[:limit])
     return results
+
+
+def _content(record: dict[str, object]) -> dict[str, object]:
+    event = record.get("event")
+    if not isinstance(event, dict):
+        raise RelayError("transcript event rejected")
+    try:
+        content = json.loads(str(event["content"]), object_pairs_hook=reject_duplicates)
+    except (json.JSONDecodeError, RelayError) as error:
+        raise RelayError("transcript event content rejected") from error
+    if not isinstance(content, dict) or canonical_json(content).decode() != event["content"]:
+        raise RelayError("transcript event content is not canonical")
+    return content
+
+
+def _matching(
+    records: list[dict[str, object]], kind: int, run_id: str, **fields: object,
+) -> list[dict[str, object]]:
+    matched = []
+    for record in records:
+        event = record.get("event")
+        if not isinstance(event, dict) or event.get("kind") != kind:
+            continue
+        content = _content(record) if kind != KIND_DELETION else {}
+        if content.get("run_id") == run_id and all(content.get(name) == value for name, value in fields.items()):
+            matched.append(record)
+    return matched
+
+
+def build_closed_verdict(
+    acceptance_template: object,
+    fixture: object,
+    transcript_raw: bytes,
+    receipt_raw: bytes,
+    *,
+    foreign_pending_event_id: str | None = None,
+    prior_acceptance_template: object | None = None,
+    fault_mode: str | None = None,
+) -> dict[str, object]:
+    """Recompute the M15 close verdict from a sealed relay transcript and receipt."""
+    authority = validate_acceptance_template(acceptance_template, label="candidate")
+    if not isinstance(fixture, dict):
+        raise RelayError("acceptance fixture rejected")
+    try:
+        transcript = json.loads(transcript_raw, object_pairs_hook=reject_duplicates)
+        receipt = json.loads(receipt_raw, object_pairs_hook=reject_duplicates)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RelayError("protocol close input is not JSON") from error
+    if canonical_json(transcript) + b"\n" != transcript_raw or canonical_json(receipt) + b"\n" != receipt_raw:
+        raise RelayError("protocol close input is not canonical JSON")
+    transcript_fields = {
+        "schema_version", "template_set_sha256", "actor_event_ids", "observed_actor_event_ids",
+        "events", "sealed", "sealed_projection_sha256", "foreign_pending_event_ids",
+        "foreign_pending_event",
+    }
+    if (
+        not isinstance(transcript, dict) or set(transcript) != transcript_fields
+        or transcript.get("schema_version") != TRANSCRIPT_SCHEMA
+        or transcript.get("template_set_sha256") != authority["template_set_sha256"]
+        or transcript.get("actor_event_ids") != {"api_order": authority["api_ids"], "live_order": authority["live_ids"]}
+        or transcript.get("observed_actor_event_ids") != authority["live_ids"]
+        or transcript.get("sealed") is not True
+        or not isinstance(transcript.get("events"), list) or not transcript["events"]
+    ):
+        raise RelayError("relay transcript binding rejected")
+    records = transcript["events"]
+    if any(
+        not isinstance(record, dict) or set(record) != {"cursor", "event"}
+        or record.get("cursor") != index
+        for index, record in enumerate(records, 1)
+    ):
+        raise RelayError("relay transcript cursor rejected")
+    for record in records:
+        event = record["event"]
+        try:
+            verified = verify_event(event)
+        except RelayError as error:
+            raise RelayError("relay transcript signature rejected") from error
+        if canonical_json(verified) != canonical_json(event):
+            raise RelayError("relay transcript event encoding rejected")
+        if event["kind"] != KIND_DELETION and event["id"] not in authority["api_ids"]:
+            _content(record)
+    sealed_projection = hashlib.sha256(canonical_json(records)).hexdigest()
+    if transcript.get("sealed_projection_sha256") != sealed_projection:
+        raise RelayError("relay sealed projection changed")
+    actor_ids = [
+        str(record["event"]["id"]) for record in records
+        if isinstance(record.get("event"), dict) and str(record["event"].get("id")) in authority["api_ids"]
+    ]
+    if actor_ids != authority["live_ids"]:
+        raise RelayError("relay actor transcript rejected")
+    foreign_actor_ids = transcript.get("foreign_pending_event_ids")
+    foreign_event = transcript.get("foreign_pending_event")
+    if foreign_pending_event_id is None:
+        if foreign_actor_ids != [] or foreign_event is not None or prior_acceptance_template is not None or fault_mode is not None:
+            raise RelayError("foreign pending event partition rejected")
+    else:
+        if fault_mode != FAULT_REPLAY_BEFORE_GRANT or prior_acceptance_template is None:
+            raise RelayError("foreign pending event mode rejected")
+        prior = validate_acceptance_template(prior_acceptance_template, label="prior")
+        try:
+            verified_foreign = verify_event(foreign_event)
+            foreign_content = _content({"event": verified_foreign})
+        except RelayError as error:
+            raise RelayError("foreign pending event signature rejected") from error
+        if (
+            foreign_actor_ids != prior["live_ids"][:2]
+            or set(prior["api_ids"]) & set(authority["api_ids"])
+            or prior["actor"] != authority["actor"]
+            or {prior["run_id"], prior["failure_run_id"]}
+                & {authority["run_id"], authority["failure_run_id"]}
+            or foreign_pending_event_id in set(authority["api_ids"])
+            or HEX64.fullmatch(foreign_pending_event_id) is None
+            or verified_foreign.get("id") != foreign_pending_event_id
+            or verified_foreign.get("pubkey") != prior["grant"].get("signer_pubkey")
+            or verified_foreign.get("kind") != KIND_CI_RUN_STATUS
+            or foreign_content.get("run_id") != prior["run_id"]
+            or foreign_content.get("request_event_id") != prior["api_ids"][0]
+            or foreign_content.get("attempt") != 1 or foreign_content.get("state") != "success"
+        ):
+            raise RelayError("foreign pending event identity rejected")
+
+    run_a = str(authority["run_id"])
+    run_b = str(authority["failure_run_id"])
+    job_id = fixture.get("job_id")
+    if not isinstance(job_id, str):
+        raise RelayError("fixture job identity rejected")
+
+    def exact_states(kind: int, run_id: str, request_id: str, states: list[str]) -> list[dict[str, object]]:
+        found = _matching(records, kind, run_id, request_event_id=request_id)
+        observed = [_content(record).get("state") for record in found]
+        if observed != states or [_content(record).get("sequence") for record in found] != list(range(1, len(states) + 1)):
+            raise RelayError("relay status transition rejected")
+        return found
+
+    run_a_request = authority["api_ids"][0]
+    run_b_request = authority["api_ids"][4]
+    rerun_request = authority["api_ids"][2]
+    run_a_status = exact_states(KIND_CI_RUN_STATUS, run_a, run_a_request, ["queued", "running", "success"])
+    run_a_job = exact_states(KIND_CI_JOB_STATUS, run_a, run_a_request, ["queued", "running", "success"])
+    run_b_status = exact_states(KIND_CI_RUN_STATUS, run_b, run_b_request, ["queued", "running", "failure"])
+    run_b_job = exact_states(KIND_CI_JOB_STATUS, run_b, run_b_request, ["queued", "running", "failure"])
+    rerun_status = exact_states(KIND_CI_RUN_STATUS, run_b, rerun_request, ["queued", "running", "cancelled"])
+    rerun_job = exact_states(KIND_CI_JOB_STATUS, run_b, rerun_request, ["queued", "running", "cancelled"])
+    for group, attempt in ((run_a_job, 1), (run_b_job, 1), (rerun_job, 2)):
+        if any(_content(record).get("job_id") != job_id or _content(record).get("attempt") != attempt for record in group):
+            raise RelayError("relay job lineage rejected")
+    if any(_content(record).get("attempt") != attempt for group, attempt in (
+        (run_a_status, 1), (run_b_status, 1), (rerun_status, 2),
+    ) for record in group):
+        raise RelayError("relay run lineage rejected")
+    if any(_content(record).get("parent_attempt") != 1 for record in rerun_job):
+        raise RelayError("relay rerun parent rejected")
+
+    run_a_logs = _matching(records, KIND_CI_LOG_REFERENCE, run_a, request_event_id=run_a_request, attempt=1, job_id=job_id)
+    run_a_artifacts = _matching(records, KIND_CI_ARTIFACT_REFERENCE, run_a, request_event_id=run_a_request, attempt=1, job_id=job_id)
+    run_b_logs = _matching(records, KIND_CI_LOG_REFERENCE, run_b, request_event_id=run_b_request, attempt=1, job_id=job_id)
+    run_b_artifacts = _matching(records, KIND_CI_ARTIFACT_REFERENCE, run_b)
+    expected_log = fixture.get("expected_log")
+    expected_failure_log = fixture.get("expected_failure_log")
+    expected_artifacts = fixture.get("expected_artifacts")
+    if (
+        len(run_a_logs) != 1 or len(run_b_logs) != 1 or run_b_artifacts
+        or not isinstance(expected_log, dict) or not isinstance(expected_failure_log, dict)
+        or not isinstance(expected_artifacts, list) or len(run_a_artifacts) != len(expected_artifacts)
+    ):
+        raise RelayError("relay evidence cardinality rejected")
+    for record, expected in ((run_a_logs[0], expected_log), (run_b_logs[0], expected_failure_log)):
+        content = _content(record)
+        if content.get("log_sha256") != expected.get("sha256") or content.get("byte_length") != expected.get("bytes"):
+            raise RelayError("relay deterministic log rejected")
+    observed_artifacts = [
+        {"name": _content(record).get("name"), "sha256": _content(record).get("sha256"), "bytes": _content(record).get("byte_length")}
+        for record in run_a_artifacts
+    ]
+    if observed_artifacts != expected_artifacts:
+        raise RelayError("relay selected artifacts rejected")
+    run_a_log_id = str(run_a_logs[0]["event"]["id"])
+    artifact_ids = [str(record["event"]["id"]) for record in run_a_artifacts]
+    failure_log_id = str(run_b_logs[0]["event"]["id"])
+    if (
+        _content(run_a_job[-1]).get("log_ref") != run_a_log_id
+        or _content(run_a_job[-1]).get("artifact_refs") != artifact_ids
+        or _content(run_b_job[-1]).get("log_ref") != failure_log_id
+        or _content(run_b_job[-1]).get("artifact_refs") != []
+        or any(_content(record).get("log_ref") is not None or _content(record).get("artifact_refs") != [] for record in rerun_job)
+    ):
+        raise RelayError("relay terminal evidence selection rejected")
+
+    evidence = _matching(records, KIND_CI_EVIDENCE_FINALIZED, run_a)
+    teardown = _matching(records, KIND_CI_TEARDOWN_ATTESTATION, run_a)
+    failure_facts = _matching(records, KIND_CI_EVIDENCE_FINALIZED, run_b) + _matching(records, KIND_CI_TEARDOWN_ATTESTATION, run_b)
+    if len(evidence) != 1 or len(teardown) != 1 or failure_facts:
+        raise RelayError("relay final fact cardinality rejected")
+    evidence_content, teardown_content = _content(evidence[0]), _content(teardown[0])
+    selected = [{"job_id": job_id, "attempt": 1, "log_ref": run_a_log_id, "artifact_refs": artifact_ids}]
+    leases = teardown_content.get("leases")
+    if (
+        evidence_content.get("request_event_id") != run_a_request
+        or evidence_content.get("finalized_job_attempts") != selected
+        or teardown_content.get("request_event_id") != run_a_request
+        or teardown_content.get("lease_empty") is not True
+        or not isinstance(leases, list) or len(leases) != 1
+        or [(item.get("job_id"), item.get("attempt"), item.get("lease_id")) for item in leases if isinstance(item, dict)]
+            != sorted((item.get("job_id"), item.get("attempt"), item.get("lease_id")) for item in leases if isinstance(item, dict))
+        or {(item.get("job_id"), item.get("attempt")) for item in leases if isinstance(item, dict)} != {(job_id, 1)}
+    ):
+        raise RelayError("relay final facts rejected")
+    if not (evidence[0]["cursor"] < run_a_status[-1]["cursor"] and teardown[0]["cursor"] < run_a_status[-1]["cursor"]):
+        raise RelayError("relay final fact order rejected")
+
+    tombstone_id = authority["api_ids"][3]
+    tombstones = [record for record in records if record["event"].get("id") == tombstone_id]
+    if len(tombstones) != 1 or tombstones[0]["event"].get("tags") != [["e", rerun_request]] \
+            or rerun_status[-1]["cursor"] >= tombstones[0]["cursor"]:
+        raise RelayError("relay rerun tombstone rejected")
+
+    bound_records = [
+        *[record for record in records if record["event"].get("id") in authority["api_ids"]],
+        *run_a_status, *run_a_job, *run_a_logs, *run_a_artifacts, *evidence, *teardown,
+        *run_b_status, *run_b_job, *run_b_logs, *rerun_status, *rerun_job,
+    ]
+    bound_ids = [str(record["event"]["id"]) for record in bound_records]
+    transcript_ids = [str(record["event"]["id"]) for record in records]
+    if len(set(transcript_ids)) != len(transcript_ids) or sorted(bound_ids) != sorted(transcript_ids):
+        raise RelayError("relay transcript contains an unbound or duplicate event")
+
+    receipt_fields = {"schema_version", "outcome", "scenario_sha256", "integrated_candidate_sha", "run_id", "checks", "zero_transition"}
+    if (
+        not isinstance(receipt, dict) or set(receipt) != receipt_fields
+        or receipt.get("outcome") != "pass" or receipt.get("run_id") != fixture.get("run_id")
+        or not isinstance(receipt.get("checks"), list) or len(receipt["checks"]) != 16
+        or [(item.get("sequence"), item.get("stage"), item.get("outcome")) for item in receipt["checks"] if isinstance(item, dict)]
+            != [(index, stage, "pass") for index, stage in enumerate(EXPECTED_RECEIPT_STAGES, 1)]
+        or not isinstance(receipt.get("zero_transition"), dict)
+        or [(item.get("sequence"), item.get("operation"), item.get("outcome")) for item in receipt["zero_transition"].get("phases", []) if isinstance(item, dict)]
+            != [(17, "finalize_capacity_zero", "pass"), (18, "prove_capacity_zero", "pass")]
+    ):
+        raise RelayError("acceptance receipt closure rejected")
+    export = receipt["checks"][6].get("export")
+    first_terminal_attempt = receipt["checks"][5].get("snapshot", {}).get("run", {}).get("attempts", [])
+    exported_terminal_attempt = receipt["checks"][6].get("snapshot", {}).get("run", {}).get("attempts", [])
+    terminal_attempt = first_terminal_attempt[0] if isinstance(first_terminal_attempt, list) and len(first_terminal_attempt) == 1 else None
+    exported_attempt = exported_terminal_attempt[0] if isinstance(exported_terminal_attempt, list) and len(exported_terminal_attempt) == 1 else None
+    if (
+        not isinstance(export, dict) or export.get("authenticated") is not True
+        or not isinstance(terminal_attempt, dict) or exported_attempt != terminal_attempt
+        or export.get("attempt_id") != terminal_attempt.get("attempt_id")
+        or export.get("evidence_set_digest") != terminal_attempt.get("evidence_set_digest")
+        or not isinstance(export.get("attempt_id"), str) or HEX64.fullmatch(export["attempt_id"]) is None
+        or not isinstance(export.get("evidence_set_digest"), str) or HEX64.fullmatch(export["evidence_set_digest"]) is None
+        or export.get("manifest_digest") != terminal_attempt.get("manifest_digest")
+        or export.get("manifest_digest") != fixture.get("manifest_digest")
+        or export.get("request_digest") != fixture.get("request_digest")
+        or export.get("subject") != fixture.get("export_subject")
+        or export.get("authorization_digest") != fixture.get("export_authorization_digest")
+        or export.get("objects") != [expected_log, *expected_artifacts]
+    ):
+        raise RelayError("authenticated export binding rejected")
+
+    verdict = {
+        "schema_version": VERDICT_SCHEMA,
+        "state": "green", "reason": None, "sealed": True,
+        "template_set_sha256": authority["template_set_sha256"],
+        "actor_event_ids": {"api_order": authority["api_ids"], "live_order": authority["live_ids"]},
+        "observed_actor_event_ids": authority["live_ids"],
+        "run_ids": {"run_a": run_a, "run_b": run_b},
+        "transcript": {"sha256": hashlib.sha256(transcript_raw).hexdigest(), "event_count": len(records), "last_cursor": len(records)},
+        "receipt": {
+            "sha256": hashlib.sha256(receipt_raw).hexdigest(), "run_id": receipt["run_id"],
+            "checks": 16, "zero_phases": [17, 18], "manifest_digest": export["manifest_digest"],
+            "export_subject": export["subject"], "export_authorization_digest": export["authorization_digest"],
+            "export_request_digest": export["request_digest"],
+            "export_attempt_id": export["attempt_id"],
+            "export_evidence_set_digest": export["evidence_set_digest"],
+            "export_objects_sha256": hashlib.sha256(canonical_json(export["objects"])).hexdigest(),
+        },
+        "run_a": {
+            "request_event_id": run_a_request,
+            "selected_job_attempts": [{"job_id": job_id, "attempt": 1}],
+            "log_event_ids": [run_a_log_id], "artifact_event_ids": artifact_ids,
+            "evidence_finalized_event_id": evidence[0]["event"]["id"],
+            "teardown_attestation_event_id": teardown[0]["event"]["id"],
+            "terminal_event_id": run_a_status[-1]["event"]["id"],
+        },
+        "run_b": {
+            "initial_request_event_id": run_b_request, "final_request_event_id": rerun_request,
+            "failure_log_event_id": failure_log_id,
+            "failure_job_event_id": run_b_job[-1]["event"]["id"],
+            "failure_run_event_id": run_b_status[-1]["event"]["id"],
+            "rerun_request_event_id": rerun_request,
+            "cancel_job_event_id": rerun_job[-1]["event"]["id"],
+            "cancel_run_event_id": rerun_status[-1]["event"]["id"],
+            "tombstone_event_id": tombstone_id, "final_fact_count": 0,
+        },
+        "sealed_projection_sha256": sealed_projection,
+        "foreign_pending_event_id": foreign_pending_event_id,
+    }
+    return validate_closed_verdict(verdict)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -848,19 +1526,44 @@ class RelayServer(ThreadingHTTPServer):
 def state_from_config(config: object, object_root: Path) -> RelayState:
     if (
         not isinstance(config, dict)
-        or set(config) != {"origin", "channel", "ci_status_signer_pubkeys"}
+        or set(config) != {
+            "origin", "channel", "ci_status_signer_pubkeys", "candidate_acceptance",
+            "prior_acceptance", "acceptance_fixture",
+        }
         or not isinstance(config["origin"], str)
         or not isinstance(config["channel"], dict)
         or set(config["channel"]) != {"id", "visibility", "members"}
         or not isinstance(config["channel"]["members"], dict)
         or not isinstance(config["ci_status_signer_pubkeys"], list)
+        or not isinstance(config["acceptance_fixture"], dict)
     ):
         raise ValueError("relay public config rejected")
     channel = config["channel"]
+    candidate = validate_acceptance_template(config["candidate_acceptance"], label="candidate")
+    prior = None
+    if config["prior_acceptance"] is not None:
+        prior = validate_acceptance_template(config["prior_acceptance"], label="prior")
+        if (
+            set(candidate["api_ids"]) & set(prior["api_ids"])
+            or {candidate["run_id"], candidate["failure_run_id"]}
+                & {prior["run_id"], prior["failure_run_id"]}
+        ):
+            raise ValueError("candidate and prior acceptance identities overlap")
+    fixture = config["acceptance_fixture"]
+    if (
+        fixture.get("run_id") != str(candidate["run_id"]).replace("-", "")
+        or fixture.get("failure_run_id") != str(candidate["failure_run_id"]).replace("-", "")
+        or fixture.get("request_digest") != candidate["api_ids"][0]
+        or fixture.get("grant_event_id") != candidate["api_ids"][1]
+        or fixture.get("failure_request_digest") != candidate["api_ids"][4]
+        or fixture.get("failure_selector") != candidate["failure_selector"]
+    ):
+        raise ValueError("relay acceptance fixture differs from candidate templates")
     return RelayState(
         object_root, config["origin"], str(channel["id"]), str(channel["visibility"]),
         {str(key): str(role) for key, role in channel["members"].items()},
         {str(key) for key in config["ci_status_signer_pubkeys"]},
+        candidate, prior, fixture,
     )
 
 

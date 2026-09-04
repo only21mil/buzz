@@ -246,6 +246,7 @@ def passing_frame(contract: dict[str, object]) -> dict[str, object]:
         "zero_transition": {},
     }
     verifier = {"outcome": "pass", "status": "verified"}
+    protocol = protocol_verdict(harness.canonical(receipt))
     return {
         "schema_version": harness.FRAME_SCHEMA,
         "phase": "run",
@@ -255,7 +256,46 @@ def passing_frame(contract: dict[str, object]) -> dict[str, object]:
         "verifier_base64": base64.b64encode(harness.canonical(verifier)).decode(),
         "dormant_proof": proof,
         "prior_activation": prior_activation_proof(),
+        "protocol_verdict": protocol,
+        "protocol_verdict_sha256": hashlib.sha256(harness.canonical(protocol)).hexdigest(),
     }
+
+
+def protocol_verdict(receipt_raw: bytes) -> dict[str, object]:
+    api = [str(index) * 64 for index in range(1, 6)]
+    bound = [f"{index:064x}" for index in range(10, 20)]
+    return {
+        "schema_version": "buzz-ci-loopback-relay-verdict/v2", "state": "green",
+        "reason": None, "sealed": True, "template_set_sha256": "1" * 64,
+        "actor_event_ids": {"api_order": api, "live_order": [api[index] for index in (0, 1, 4, 2, 3)]},
+        "observed_actor_event_ids": [str(index) * 64 for index in (1, 2, 5, 3, 4)],
+        "run_ids": {"run_a": RUN_ID, "run_b": "123e4567-e89b-12d3-a456-426614174012"},
+        "transcript": {"sha256": "6" * 64, "event_count": 28, "last_cursor": 28},
+        "receipt": {"sha256": hashlib.sha256(receipt_raw).hexdigest(), "run_id": "4" * 32, "checks": 16, "zero_phases": [17, 18], "manifest_digest": "7" * 64, "export_subject": "8" * 64, "export_authorization_digest": "9" * 64, "export_request_digest": "a" * 64, "export_attempt_id": "b" * 64, "export_evidence_set_digest": "c" * 64, "export_objects_sha256": "d" * 64},
+        "run_a": {"request_event_id": api[0], "selected_job_attempts": [{"job_id": "job", "attempt": 1}], "log_event_ids": [bound[0]], "artifact_event_ids": [bound[1]], "evidence_finalized_event_id": bound[2], "teardown_attestation_event_id": bound[3], "terminal_event_id": bound[4]},
+        "run_b": {"initial_request_event_id": api[4], "final_request_event_id": api[2], "failure_log_event_id": bound[5], "failure_job_event_id": bound[6], "failure_run_event_id": bound[7], "rerun_request_event_id": api[2], "cancel_job_event_id": bound[8], "cancel_run_event_id": bound[9], "tombstone_event_id": api[3], "final_fact_count": 0},
+        "sealed_projection_sha256": "a" * 64,
+        "foreign_pending_event_id": None,
+    }
+
+
+def valid_closed_verdict_substitutions(value: dict[str, object]) -> list[tuple[str, dict[str, object]]]:
+    mutations: list[tuple[str, tuple[str, ...], str]] = [
+        ("template-set", ("template_set_sha256",), "a1" * 32),
+        ("sealed-projection", ("sealed_projection_sha256",), "b1" * 32),
+        ("run-a-terminal", ("run_a", "terminal_event_id"), "c1" * 32),
+        ("foreign-pending", ("foreign_pending_event_id",), "d1" * 32),
+        ("export-subject", ("receipt", "export_subject"), "e1" * 32),
+    ]
+    results = []
+    for name, path, replacement in mutations:
+        changed = copy.deepcopy(value)
+        target = changed
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = replacement
+        results.append((name, changed))
+    return results
 
 
 def progress_frame(
@@ -1162,11 +1202,14 @@ class TimingAndProgressTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(guest, "STATE_ROOT", state))
             stack.enter_context(mock.patch.object(guest, "load_json", return_value=descriptor))
             stack.enter_context(mock.patch.object(
-                guest, "cross_bind", return_value=(candidate, {}, {}, "12345678-1234-4abc-8def-123456789abc"),
+                guest, "cross_bind", return_value=(candidate, {"fixture": {}}, {}, "12345678-1234-4abc-8def-123456789abc"),
+            ))
+            stack.enter_context(mock.patch.object(
+                guest, "package_manifest", return_value={"acceptance_template": {}},
             ))
             stack.enter_context(mock.patch.object(guest, "relay_mapping_present", return_value=False))
             stack.enter_context(mock.patch.object(
-                guest, "start_relay", side_effect=lambda _public, _channel, _fault=None: completed("relay_ready"),
+                guest, "start_relay", side_effect=lambda *_arguments: completed("relay_ready"),
             ))
             stack.enter_context(mock.patch.object(
                 guest, "unit_state", side_effect=lambda: completed(
@@ -1198,7 +1241,9 @@ class TimingAndProgressTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(guest, "prior_rollback_proof", side_effect=prior_proof))
             stack.enter_context(mock.patch.object(guest, "reinstall_execd", side_effect=reinstall))
             stack.enter_context(mock.patch.object(guest, "run_capacity_one_canary", return_value=b"receipt"))
-            stack.enter_context(mock.patch.object(guest, "prove_relay_protocol_verdict"))
+            stack.enter_context(mock.patch.object(
+                guest, "close_relay_protocol_verdict", return_value=({"state": "green"}, {"input": True}),
+            ))
             stack.enter_context(mock.patch.object(guest, "read_file", return_value=b"scenario"))
             stack.enter_context(mock.patch.object(guest, "parse_verdict"))
             stack.enter_context(mock.patch.object(guest, "cleanup", side_effect=cleanup))
@@ -2733,6 +2778,8 @@ class InputTests(unittest.TestCase):
                 "harness_asset_sha256": assets, "package_tree_sha256": {},
                 "prior_package_tree_sha256": {}, "prior_scenario_sha256": "8" * 64,
                 "prior_activation": prior_activation_proof(),
+                "protocol_verdict": protocol_verdict(receipt_raw),
+                "protocol_verdict_sha256": hashlib.sha256(harness.canonical(protocol_verdict(receipt_raw))).hexdigest(),
                 "timing": harness.TIMING_CONTRACT,
                 "timing_sha256": harness.timing_sha256(),
                 "scenario_sha256": scenario_sha,
@@ -4162,6 +4209,8 @@ class InputTests(unittest.TestCase):
                 "verifier_base64": base64.b64encode(harness.canonical(verifier)).decode(),
                 "dormant_proof": proof,
                 "prior_activation": prior_activation_proof(),
+                "protocol_verdict": protocol_verdict(harness.canonical(receipt)),
+                "protocol_verdict_sha256": hashlib.sha256(harness.canonical(protocol_verdict(harness.canonical(receipt)))).hexdigest(),
             }
 
             def create_image(image_state, name, _backing):
@@ -4286,6 +4335,8 @@ class InputTests(unittest.TestCase):
             "verifier_base64": base64.b64encode(harness.canonical(verifier)).decode(),
             "dormant_proof": {"processes_absent": True},
             "prior_activation": prior_activation_proof(),
+            "protocol_verdict": protocol_verdict(harness.canonical(receipt)),
+            "protocol_verdict_sha256": hashlib.sha256(harness.canonical(protocol_verdict(harness.canonical(receipt)))).hexdigest(),
         }
         with self.assertRaisesRegex(harness.HarnessError, "identity"):
             harness.validate_final_frame(frame, contract, "4" * 64)
@@ -4320,9 +4371,23 @@ class InputTests(unittest.TestCase):
             "verifier_base64": base64.b64encode(harness.canonical(verifier)).decode(),
             "dormant_proof": proof,
             "prior_activation": prior_activation_proof(),
+            "protocol_verdict": protocol_verdict(harness.canonical(receipt)),
+            "protocol_verdict_sha256": hashlib.sha256(harness.canonical(protocol_verdict(harness.canonical(receipt)))).hexdigest(),
         }
         with self.assertRaisesRegex(harness.HarnessError, "identity"):
             harness.validate_final_frame(frame, contract, "6" * 64)
+
+    def test_host_rejects_valid_hex_verdict_substitutions_against_verifier_digest(self) -> None:
+        contract = {"candidate_sha": "2" * 40, "scenario": {"sha256": "3" * 64}}
+        frame = passing_frame(contract)
+        harness.validate_final_frame(frame, contract, "1" * 64)
+        for name, changed in valid_closed_verdict_substitutions(frame["protocol_verdict"]):
+            with self.subTest(field=name):
+                relay.validate_closed_verdict(changed)
+                mutated = copy.deepcopy(frame)
+                mutated["protocol_verdict"] = changed
+                with self.assertRaisesRegex(harness.HarnessError, "digest differs"):
+                    harness.validate_final_frame(mutated, contract, "1" * 64)
 
 
 class RelayCryptoTests(unittest.TestCase):
@@ -4374,16 +4439,51 @@ def public_hex(secret: int) -> str:
     return point[0].to_bytes(32, "big").hex()
 
 
-def request_event(secret: int, created_at: int, *, attempt: int = 1, channel: str = CHANNEL) -> dict[str, object]:
+def request_event(
+    secret: int, created_at: int, *, attempt: int = 1, channel: str = CHANNEL,
+    run_id: str = RUN_ID,
+) -> dict[str, object]:
     content = {
-        "actor": public_hex(secret), "run_id": RUN_ID, "target_repo_a": REPOSITORY,
+        "actor": public_hex(secret), "run_id": run_id, "target_repo_a": REPOSITORY,
         "request_type": "run" if attempt == 1 else "rerun", "attempt": attempt,
         "job_ids": ["capacity-one-fixture"],
     }
     if attempt > 1:
-        content.update({"parent_attempt": attempt - 1, "parent_run_id": RUN_ID})
-    tags = [["h", channel], ["a", REPOSITORY], ["run", RUN_ID], ["attempt", str(attempt)]]
+        content.update({"parent_attempt": attempt - 1, "parent_run_id": run_id})
+    tags = [["h", channel], ["a", REPOSITORY], ["run", run_id], ["attempt", str(attempt)]]
     return signed_event(secret, 46100, tags, json.dumps(content, separators=(",", ":")), created_at)
+
+
+def acceptance_template(
+    secret: int = ACTOR, now: int = 1_800_000_000, *, run_id: str = RUN_ID,
+    failure_run_id: str = "123e4567-e89b-12d3-a456-426614174012",
+) -> dict[str, object]:
+    run = request_event(secret, now, run_id=run_id)
+    grant = grant_event(secret, now + 1, CI_EVENT, valid_until=now + 600)
+    failure = request_event(secret, now, run_id=failure_run_id)
+    rerun = request_event(secret, now, attempt=2, run_id=failure_run_id)
+    tombstone = signed_event(secret, 5, [["e", rerun["id"]]], "", now + 20)
+    return {
+        "actor": {"public_key": public_hex(secret), "generation": 1},
+        "time_reference": now,
+        "run_event": relay.template_preimage(run), "grant_event": relay.template_preimage(grant),
+        "rerun_event": relay.template_preimage(rerun), "tombstone_event": relay.template_preimage(tombstone),
+        "failure_run_event": relay.template_preimage(failure),
+    }
+
+
+def acceptance_fixture(template: dict[str, object]) -> dict[str, object]:
+    ids = [hashlib.sha256(relay.canonical_json(template[name])).hexdigest() for name in relay.TEMPLATE_NAMES]
+    return {
+        "run_id": RUN_ID.replace("-", ""),
+        "failure_run_id": "123e4567e89b12d3a456426614174012",
+        "request_digest": ids[0], "grant_event_id": ids[1], "failure_request_digest": ids[4],
+        "job_id": "capacity-one-fixture", "manifest_digest": "a" * 64,
+        "export_subject": "b" * 64, "export_authorization_digest": "c" * 64,
+        "expected_log": {"name": "job.log", "sha256": "d" * 64, "bytes": 1},
+        "expected_failure_log": {"name": "job.log", "sha256": "e" * 64, "bytes": 1},
+        "expected_artifacts": [{"name": "result.json", "sha256": "f" * 64, "bytes": 1}],
+    }
 
 
 def grant_event(secret: int, created_at: int, signer: int, *, valid_until: int | None) -> dict[str, object]:
@@ -4408,13 +4508,114 @@ def ci_fact_event(secret: int, kind: int, created_at: int, content: dict[str, ob
     return signed_event(secret, kind, [["h", CHANNEL], ["run", RUN_ID]], json.dumps(envelope, separators=(",", ":")), created_at)
 
 
+def protocol_close_inputs() -> tuple[dict[str, object], dict[str, object], bytes, bytes]:
+    template = acceptance_template()
+    fixture = acceptance_fixture(template)
+    authority = relay.validate_acceptance_template(template, label="test")
+    run_a, run_b = authority["run_id"], authority["failure_run_id"]
+    run_request, grant_id, rerun_request, tombstone_id, failure_request = authority["api_ids"]
+    actor_events = {
+        hashlib.sha256(relay.canonical_json(template[name])).hexdigest(): signed_event(
+            ACTOR, template[name][3], template[name][4], template[name][5], template[name][2],
+        )
+        for name in relay.TEMPLATE_NAMES
+    }
+    events: list[dict[str, object]] = []
+
+    def append_actor(identifier: str) -> None:
+        events.append(actor_events[identifier])
+
+    def append(kind: int, run_id: str, request_id: str, **content: object) -> str:
+        body = {
+            "relay_signer": public_hex(CI_EVENT), "target_repo_a": REPOSITORY,
+            "run_id": run_id, "request_event_id": request_id, **content,
+        }
+        event = signed_event(
+            CI_EVENT, kind, [["h", CHANNEL], ["run", run_id]],
+            json.dumps(body, separators=(",", ":")), 1_800_000_100 + len(events),
+        )
+        events.append(event)
+        return str(event["id"])
+
+    append_actor(run_request)
+    append(46101, run_a, run_request, attempt=1, sequence=1, state="queued")
+    append_actor(grant_id)
+    append(46101, run_a, run_request, attempt=1, sequence=2, state="running")
+    append(46102, run_a, run_request, job_id=fixture["job_id"], attempt=1, sequence=1, state="queued", artifact_refs=[])
+    append(46102, run_a, run_request, job_id=fixture["job_id"], attempt=1, sequence=2, state="running", artifact_refs=[])
+    log_id = append(46103, run_a, run_request, job_id=fixture["job_id"], attempt=1, log_sha256=fixture["expected_log"]["sha256"], byte_length=fixture["expected_log"]["bytes"])
+    artifact_id = append(46104, run_a, run_request, job_id=fixture["job_id"], attempt=1, name="result.json", sha256=fixture["expected_artifacts"][0]["sha256"], byte_length=fixture["expected_artifacts"][0]["bytes"])
+    append(46102, run_a, run_request, job_id=fixture["job_id"], attempt=1, sequence=3, state="success", log_ref=log_id, artifact_refs=[artifact_id])
+    append(46105, run_a, run_request, attempt=1, finalized_job_attempts=[{"job_id": fixture["job_id"], "attempt": 1, "log_ref": log_id, "artifact_refs": [artifact_id]}])
+    append(46106, run_a, run_request, attempt=1, lease_empty=True, leases=[{"job_id": fixture["job_id"], "attempt": 1, "lease_id": "lease-a"}])
+    append(46101, run_a, run_request, attempt=1, sequence=3, state="success")
+    append_actor(failure_request)
+    append(46101, run_b, failure_request, attempt=1, sequence=1, state="queued")
+    append(46101, run_b, failure_request, attempt=1, sequence=2, state="running")
+    append(46102, run_b, failure_request, job_id=fixture["job_id"], attempt=1, sequence=1, state="queued", artifact_refs=[])
+    append(46102, run_b, failure_request, job_id=fixture["job_id"], attempt=1, sequence=2, state="running", artifact_refs=[])
+    failure_log_id = append(46103, run_b, failure_request, job_id=fixture["job_id"], attempt=1, log_sha256=fixture["expected_failure_log"]["sha256"], byte_length=fixture["expected_failure_log"]["bytes"])
+    append(46102, run_b, failure_request, job_id=fixture["job_id"], attempt=1, sequence=3, state="failure", log_ref=failure_log_id, artifact_refs=[])
+    append(46101, run_b, failure_request, attempt=1, sequence=3, state="failure")
+    append_actor(rerun_request)
+    append(46101, run_b, rerun_request, attempt=2, sequence=1, state="queued")
+    append(46101, run_b, rerun_request, attempt=2, sequence=2, state="running")
+    append(46102, run_b, rerun_request, job_id=fixture["job_id"], attempt=2, parent_attempt=1, sequence=1, state="queued", artifact_refs=[])
+    append(46102, run_b, rerun_request, job_id=fixture["job_id"], attempt=2, parent_attempt=1, sequence=2, state="running", artifact_refs=[])
+    append(46102, run_b, rerun_request, job_id=fixture["job_id"], attempt=2, parent_attempt=1, sequence=3, state="cancelled", artifact_refs=[])
+    append(46101, run_b, rerun_request, attempt=2, sequence=3, state="cancelled")
+    append_actor(tombstone_id)
+    records = [{"cursor": index, "event": event} for index, event in enumerate(events, 1)]
+    transcript = {
+        "schema_version": relay.TRANSCRIPT_SCHEMA,
+        "template_set_sha256": authority["template_set_sha256"],
+        "actor_event_ids": {"api_order": authority["api_ids"], "live_order": authority["live_ids"]},
+        "observed_actor_event_ids": authority["live_ids"], "events": records,
+        "sealed": True,
+        "sealed_projection_sha256": hashlib.sha256(relay.canonical_json(records)).hexdigest(),
+        "foreign_pending_event_ids": [],
+        "foreign_pending_event": None,
+    }
+    terminal_attempt = {
+        "attempt_id": "1" * 64, "evidence_set_digest": "2" * 64,
+        "manifest_digest": fixture["manifest_digest"],
+    }
+    checks = [
+        {"sequence": index, "stage": stage, "outcome": "pass", **({
+            "export": {
+                "authenticated": True,
+                "manifest_digest": fixture["manifest_digest"], "request_digest": fixture["request_digest"],
+                "subject": fixture["export_subject"], "authorization_digest": fixture["export_authorization_digest"],
+                "attempt_id": terminal_attempt["attempt_id"],
+                "evidence_set_digest": terminal_attempt["evidence_set_digest"],
+                "objects": [fixture["expected_log"], *fixture["expected_artifacts"]],
+            },
+        } if index == 7 else {}), **({"snapshot": {"run": {"attempts": [terminal_attempt]}}} if index in (6, 7) else {})}
+        for index, stage in enumerate(relay.EXPECTED_RECEIPT_STAGES, 1)
+    ]
+    receipt = {
+        "schema_version": "buzz-ci-capacity-one-acceptance-receipt/v2", "outcome": "pass",
+        "scenario_sha256": "1" * 64, "integrated_candidate_sha": "2" * 40,
+        "run_id": fixture["run_id"], "checks": checks,
+        "zero_transition": {"phases": [
+            {"sequence": 17, "operation": "finalize_capacity_zero", "outcome": "pass"},
+            {"sequence": 18, "operation": "prove_capacity_zero", "outcome": "pass"},
+        ]},
+    }
+    return template, fixture, relay.canonical_json(transcript) + b"\n", relay.canonical_json(receipt) + b"\n"
+
+
 class RelayAdmissionTests(unittest.TestCase):
     """The loopback relay refuses what crates/buzz-relay refuses on POST /events."""
 
     def setUp(self) -> None:
         self.now = 1_800_000_000
+        self.relay_temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.relay_temporary.cleanup)
+        object_root = Path(self.relay_temporary.name) / "objects"
+        object_root.mkdir()
         self.state = relay.RelayState(
-            Path("/nonexistent"), "https://relay.test.invalid:3443", CHANNEL, "private",
+            object_root, "https://relay.test.invalid:3443", CHANNEL, "private",
             {public_hex(ACTOR): "admin", public_hex(CI_EVENT): "member"}, {public_hex(NIP98)},
         )
 
@@ -4563,7 +4764,7 @@ class RelayAdmissionTests(unittest.TestCase):
             terminal = signed_event(CI_EVENT, 46101, terminal["tags"], json.dumps(terminal_content, separators=(",", ":")), self.now + 2)
             self.assertEqual(self.admit(CI_EVENT, terminal, now=self.now + 2), (CHANNEL, True))
             self.assertEqual(self.state.closed_verdict(RUN_ID), {"state": "green", "reason": None})
-            self.assertEqual(json.loads((Path(temporary) / "protocol-verdict.json").read_bytes())["state"], "green")
+            self.assertFalse((Path(temporary) / "protocol-verdict.json").exists(), "Run A cannot emit the close verdict")
             self.state.run_events[RUN_ID][2][2]["created_at"] = self.now + 3
             self.assertEqual(
                 self.state.closed_verdict(RUN_ID),
@@ -4729,7 +4930,9 @@ class RelayAdmissionTests(unittest.TestCase):
                 "manifest": {"public_key": public_hex(3), "generation": 1},
             }},
         }
-        config = guest.relay_public_config(public, CHANNEL)
+        template = acceptance_template()
+        fixture = acceptance_fixture(template)
+        config = guest.relay_public_config(public, CHANNEL, template, fixture, None)
         self.assertEqual(config, {
             "origin": "https://relay.test.invalid:3443",
             "channel": {
@@ -4737,6 +4940,9 @@ class RelayAdmissionTests(unittest.TestCase):
                 "members": {public_hex(ACTOR): "admin", public_hex(CI_EVENT): "member"},
             },
             "ci_status_signer_pubkeys": [public_hex(NIP98)],
+            "candidate_acceptance": template,
+            "prior_acceptance": None,
+            "acceptance_fixture": fixture,
         })
         state = relay.state_from_config(config, Path("/nonexistent"))
         self.assertEqual(state.members, config["channel"]["members"])
@@ -4750,6 +4956,392 @@ class RelayAdmissionTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 relay.state_from_config(broken, Path("/nonexistent"))
+
+    def test_close_verdict_binds_both_runs_five_events_failure_and_zero_phases(self) -> None:
+        template, fixture, transcript, receipt = protocol_close_inputs()
+        verdict = relay.build_closed_verdict(template, fixture, transcript, receipt)
+        authority = relay.validate_acceptance_template(template, label="test")
+        self.assertEqual(verdict["state"], "green")
+        self.assertTrue(verdict["sealed"])
+        self.assertEqual(verdict["actor_event_ids"]["api_order"], authority["api_ids"])
+        self.assertEqual(verdict["observed_actor_event_ids"], authority["live_ids"])
+        self.assertEqual(verdict["run_ids"], {"run_a": authority["run_id"], "run_b": authority["failure_run_id"]})
+        self.assertEqual(verdict["run_b"]["final_fact_count"], 0)
+        self.assertEqual(verdict["receipt"]["zero_phases"], [17, 18])
+        self.assertEqual(verdict["receipt"]["export_request_digest"], fixture["request_digest"])
+
+    def test_exact_binding_rejects_valid_hex_substitutions_at_transfer_and_construction_readback(self) -> None:
+        template, fixture, transcript_raw, receipt_raw = protocol_close_inputs()
+        binding = {
+            "schema_version": guest.PROTOCOL_INPUT_SCHEMA,
+            "acceptance_template": template, "prior_acceptance_template": None,
+            "transcript_base64": base64.b64encode(transcript_raw).decode(),
+            "foreign_pending_event_id": None, "fault_mode": None,
+        }
+        good = guest.recompute_protocol_verdict(binding, fixture, receipt_raw)
+        self.assertEqual(
+            guest.validate_bound_protocol_verdict(good, binding, fixture, receipt_raw), good,
+        )
+        for name, changed in valid_closed_verdict_substitutions(good):
+            with self.subTest(reader="transfer", field=name):
+                relay.validate_closed_verdict(changed)
+                with self.assertRaisesRegex(guest.GuestError, "binding differs"):
+                    guest.validate_bound_protocol_verdict(changed, binding, fixture, receipt_raw)
+
+        for name, changed in valid_closed_verdict_substitutions(good):
+            with self.subTest(reader="construction", field=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                transcript_path = root / "protocol-transcript.json"
+                verdict_path = root / "protocol-verdict.json"
+                transcript_path.write_bytes(transcript_raw)
+
+                def publish(_path: Path, _raw: bytes, _mode: int, changed=changed) -> None:
+                    verdict_path.write_bytes(guest.canonical(changed))
+
+                with mock.patch.object(guest, "PROTOCOL_TRANSCRIPT", transcript_path), mock.patch.object(
+                    guest, "PROTOCOL_VERDICT", verdict_path,
+                ), mock.patch.object(guest, "publish_atomic_create_once", side_effect=publish):
+                    with self.assertRaisesRegex(guest.GuestError, "did not close"):
+                        guest.close_relay_protocol_verdict(
+                            {"acceptance_template": template}, {"fixture": fixture}, receipt_raw, None,
+                        )
+
+    def test_shared_closed_verdict_validator_rejects_nested_mutation_matrix(self) -> None:
+        template, fixture, transcript, receipt = protocol_close_inputs()
+        good = relay.build_closed_verdict(template, fixture, transcript, receipt)
+        relay.validate_closed_verdict(good)
+        mutations = []
+        for index in range(5):
+            mutations.append((f"actor-id-{index}", lambda value, index=index: value["actor_event_ids"]["api_order"].__setitem__(index, "z" * 64)))
+        mutations.extend((
+            ("live-order", lambda value: value["actor_event_ids"]["live_order"].reverse()),
+            ("observed-order", lambda value: value["observed_actor_event_ids"].reverse()),
+            ("run-a-id", lambda value: value["run_ids"].__setitem__("run_a", value["run_ids"]["run_b"])),
+            ("selected-attempt", lambda value: value["run_a"]["selected_job_attempts"][0].__setitem__("attempt", 2)),
+            ("selected-artifact", lambda value: value["run_a"].__setitem__("artifact_event_ids", [])),
+            ("rerun-request", lambda value: value["run_b"].__setitem__("rerun_request_event_id", "f" * 64)),
+            ("tombstone", lambda value: value["run_b"].__setitem__("tombstone_event_id", "f" * 64)),
+            ("run-b-final-fact", lambda value: value["run_b"].__setitem__("final_fact_count", 1)),
+            ("forged-seal", lambda value: value.__setitem__("sealed", False)),
+            ("seal-digest", lambda value: value.__setitem__("sealed_projection_sha256", "short")),
+            ("checks", lambda value: value["receipt"].__setitem__("checks", 15)),
+            ("phases", lambda value: value["receipt"].__setitem__("zero_phases", [17])),
+            ("export-request", lambda value: value["receipt"].__setitem__("export_request_digest", "short")),
+            ("export-attempt", lambda value: value["receipt"].__setitem__("export_attempt_id", "short")),
+            ("missing-nested", lambda value: value["run_a"].pop("terminal_event_id")),
+            ("extra-nested", lambda value: value["run_b"].__setitem__("extra", True)),
+        ))
+        for name, mutate in mutations:
+            with self.subTest(name=name):
+                broken = copy.deepcopy(good)
+                mutate(broken)
+                with self.assertRaises(relay.RelayError):
+                    relay.validate_closed_verdict(broken)
+
+    def test_protocol_verdict_publish_is_complete_create_once_and_directory_durable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "protocol-verdict.json"
+            guest.publish_atomic_create_once(path, b"first\n", 0o400)
+            self.assertEqual(path.read_bytes(), b"first\n")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o400)
+            with self.assertRaises(FileExistsError):
+                guest.publish_atomic_create_once(path, b"second\n", 0o400)
+            self.assertEqual(path.read_bytes(), b"first\n")
+            self.assertEqual([item.name for item in path.parent.iterdir()], [path.name])
+
+    def test_prior_replay_exception_requires_exact_prefix_mode_and_one_named_terminal(self) -> None:
+        template, fixture, transcript_raw, receipt = protocol_close_inputs()
+        prior = acceptance_template(
+            now=1_800_001_000, run_id="123e4567-e89b-12d3-a456-426614174021",
+            failure_run_id="123e4567-e89b-12d3-a456-426614174022",
+        )
+        prior_authority = relay.validate_acceptance_template(prior, label="prior")
+        transcript = json.loads(transcript_raw)
+        transcript["foreign_pending_event_ids"] = prior_authority["live_ids"][:2]
+        foreign_event = signed_event(
+            CI_EVENT, 46101, [["h", CHANNEL], ["run", prior_authority["run_id"]]],
+            json.dumps({
+                "relay_signer": public_hex(CI_EVENT), "target_repo_a": REPOSITORY,
+                "run_id": prior_authority["run_id"],
+                "request_event_id": prior_authority["api_ids"][0],
+                "attempt": 1, "state": "success",
+            }, separators=(",", ":")), 1_800_001_900,
+        )
+        transcript["foreign_pending_event"] = foreign_event
+        transcript_raw = relay.canonical_json(transcript) + b"\n"
+        foreign = foreign_event["id"]
+        verdict = relay.build_closed_verdict(
+            template, fixture, transcript_raw, receipt,
+            foreign_pending_event_id=foreign, prior_acceptance_template=prior,
+            fault_mode=relay.FAULT_REPLAY_BEFORE_GRANT,
+        )
+        self.assertEqual(verdict["foreign_pending_event_id"], foreign)
+        for name, kwargs in (
+            ("missing-mode", {"foreign_pending_event_id": foreign, "prior_acceptance_template": prior}),
+            ("missing-id", {"prior_acceptance_template": prior, "fault_mode": relay.FAULT_REPLAY_BEFORE_GRANT}),
+            ("wrong-prior", {"foreign_pending_event_id": foreign, "prior_acceptance_template": acceptance_template(now=1_800_002_000, run_id="123e4567-e89b-12d3-a456-426614174031", failure_run_id="123e4567-e89b-12d3-a456-426614174032"), "fault_mode": relay.FAULT_REPLAY_BEFORE_GRANT}),
+        ):
+            with self.subTest(name=name), self.assertRaises(relay.RelayError):
+                relay.build_closed_verdict(template, fixture, transcript_raw, receipt, **kwargs)
+
+        for name, mutate in (
+            ("wrong-id", lambda value: value["foreign_pending_event"].__setitem__("id", "9" * 64)),
+            ("wrong-state", lambda value: value["foreign_pending_event"].__setitem__("content", value["foreign_pending_event"]["content"].replace('"success"', '"failure"'))),
+            ("missing-event", lambda value: value.__setitem__("foreign_pending_event", None)),
+            ("extra-event-standard", lambda value: value.__setitem__("foreign_pending_event_ids", [])),
+        ):
+            with self.subTest(name=name):
+                changed = json.loads(transcript_raw)
+                mutate(changed)
+                kwargs = {} if name == "extra-event-standard" else {
+                    "foreign_pending_event_id": foreign,
+                    "prior_acceptance_template": prior,
+                    "fault_mode": relay.FAULT_REPLAY_BEFORE_GRANT,
+                }
+                with self.assertRaises(relay.RelayError):
+                    relay.build_closed_verdict(
+                        template, fixture, relay.canonical_json(changed) + b"\n", receipt, **kwargs,
+                    )
+
+    def test_close_rejects_run_a_only_receipt_echo_and_every_mutated_required_field(self) -> None:
+        template, fixture, transcript_raw, receipt_raw = protocol_close_inputs()
+        transcript = json.loads(transcript_raw)
+        receipt = json.loads(receipt_raw)
+        run_b = relay.validate_acceptance_template(template, label="test")["failure_run_id"]
+        run_a_only = copy.deepcopy(transcript)
+        run_a_only["events"] = [
+            record for record in run_a_only["events"]
+            if record["event"]["id"] not in set(run_a_only["actor_event_ids"]["live_order"][2:])
+            and (record["event"]["kind"] == 5 or relay._content(record).get("run_id") != run_b)
+        ]
+        run_a_only["observed_actor_event_ids"] = run_a_only["actor_event_ids"]["live_order"][:2]
+        run_a_only["sealed"] = False
+        run_a_only["sealed_projection_sha256"] = None
+        cases = {
+            "run-a-only": (run_a_only, receipt),
+            "missing-terminal-fact": ({**transcript, "events": [record for record in transcript["events"] if record["event"]["kind"] != 46106]}, receipt),
+            "fixture-only-export": (transcript, {**receipt, "checks": [{key: value for key, value in item.items() if key != "export"} for item in receipt["checks"]]}),
+            "missing-phase-18": (transcript, {**receipt, "zero_transition": {"phases": receipt["zero_transition"]["phases"][:1]}}),
+        }
+        for name, (changed_transcript, changed_receipt) in cases.items():
+            with self.subTest(name=name), self.assertRaises((relay.RelayError, relay.Refusal)):
+                relay.build_closed_verdict(
+                    template, fixture,
+                    relay.canonical_json(changed_transcript) + b"\n",
+                    relay.canonical_json(changed_receipt) + b"\n",
+                )
+
+    def test_close_rejects_signed_transcript_graph_order_and_cardinality_mutations(self) -> None:
+        template, fixture, transcript_raw, receipt_raw = protocol_close_inputs()
+        authority = relay.validate_acceptance_template(template, label="test")
+
+        def content(record: dict[str, object]) -> dict[str, object]:
+            return json.loads(record["event"]["content"])
+
+        def find_record(
+            transcript: dict[str, object], kind: int, run_id: str, *,
+            state: str | None = None, request_id: str | None = None,
+        ) -> dict[str, object]:
+            for record in transcript["events"]:
+                event = record["event"]
+                if event["kind"] != kind:
+                    continue
+                body = content(record)
+                if body.get("run_id") != run_id or state is not None and body.get("state") != state:
+                    continue
+                if request_id is None or body.get("request_event_id") == request_id:
+                    return record
+            raise AssertionError("test transcript record not found")
+
+        def resign(record: dict[str, object], **changes: object) -> None:
+            event = record["event"]
+            body = content(record)
+            body.update(changes)
+            record["event"] = signed_event(
+                CI_EVENT, event["kind"], event["tags"],
+                json.dumps(body, separators=(",", ":")), event["created_at"],
+            )
+
+        def run_b_missing_running(value: dict[str, object]) -> None:
+            target = find_record(value, 46101, authority["failure_run_id"], state="running", request_id=authority["api_ids"][4])
+            value["events"].remove(target)
+
+        def duplicate_run_a_log(value: dict[str, object]) -> None:
+            value["events"].append(copy.deepcopy(find_record(value, 46103, authority["run_id"])))
+
+        def wrong_failure_log(value: dict[str, object]) -> None:
+            resign(find_record(value, 46103, authority["failure_run_id"]), log_sha256="0" * 64)
+
+        def wrong_cancel(value: dict[str, object]) -> None:
+            resign(find_record(value, 46102, authority["failure_run_id"], state="cancelled", request_id=authority["api_ids"][2]), state="success")
+
+        def run_b_final_fact(value: dict[str, object]) -> None:
+            body = {
+                "relay_signer": public_hex(CI_EVENT), "target_repo_a": REPOSITORY,
+                "run_id": authority["failure_run_id"], "request_event_id": authority["api_ids"][4],
+                "attempt": 1, "finalized_job_attempts": [],
+            }
+            value["events"].append(signed_event(
+                CI_EVENT, 46105, [["h", CHANNEL], ["run", authority["failure_run_id"]]],
+                json.dumps(body, separators=(",", ":")), 1_800_000_900,
+            ))
+
+        def wrong_selected_graph(value: dict[str, object]) -> None:
+            resign(find_record(value, 46105, authority["run_id"]), finalized_job_attempts=[])
+
+        def stale_final_request(value: dict[str, object]) -> None:
+            resign(find_record(value, 46106, authority["run_id"]), request_event_id=authority["api_ids"][4])
+
+        def tombstone_before_cancel(value: dict[str, object]) -> None:
+            tombstone = next(record for record in value["events"] if record["event"]["id"] == authority["api_ids"][3])
+            cancel = find_record(value, 46101, authority["failure_run_id"], state="cancelled", request_id=authority["api_ids"][2])
+            value["events"].remove(tombstone)
+            value["events"].insert(value["events"].index(cancel), tombstone)
+
+        def unknown_signed_event(value: dict[str, object]) -> None:
+            body = {
+                "relay_signer": public_hex(CI_EVENT), "target_repo_a": REPOSITORY,
+                "run_id": authority["run_id"], "request_event_id": authority["api_ids"][0],
+                "attempt": 1,
+            }
+            value["events"].append(signed_event(
+                CI_EVENT, 46999, [["h", CHANNEL], ["run", authority["run_id"]]],
+                json.dumps(body, separators=(",", ":")), 1_800_000_901,
+            ))
+
+        def bad_signature(value: dict[str, object]) -> None:
+            signature = value["events"][3]["event"]["sig"]
+            value["events"][3]["event"]["sig"] = signature[:-1] + ("0" if signature[-1] != "0" else "1")
+
+        mutations = (
+            ("signature", bad_signature),
+            ("missing-run-b-running", run_b_missing_running),
+            ("duplicate-log", duplicate_run_a_log),
+            ("failure-log", wrong_failure_log),
+            ("cancel-state", wrong_cancel),
+            ("run-b-final-fact", run_b_final_fact),
+            ("selected-evidence", wrong_selected_graph),
+            ("stale-final-request", stale_final_request),
+            ("tombstone-order", tombstone_before_cancel),
+            ("unknown-signed-event", unknown_signed_event),
+        )
+        for name, mutate in mutations:
+            with self.subTest(name=name):
+                changed = json.loads(transcript_raw)
+                mutate(changed)
+                for cursor, record in enumerate(changed["events"], 1):
+                    record["cursor"] = cursor
+                changed["sealed_projection_sha256"] = hashlib.sha256(relay.canonical_json(changed["events"])).hexdigest()
+                with self.assertRaises(relay.RelayError):
+                    relay.build_closed_verdict(
+                        template, fixture, relay.canonical_json(changed) + b"\n", receipt_raw,
+                    )
+
+    def test_template_ids_are_exact_unique_and_unknown_sixth_actor_event_is_refused(self) -> None:
+        template = acceptance_template()
+        fixture = acceptance_fixture(template)
+        config = guest.relay_public_config({
+            "relay_http_origin": "https://relay.test.invalid:3443",
+            "acceptance_actor": template["actor"],
+            "keyholder_public_spec": {"selectors": {
+                "ci_event": {"public_key": public_hex(CI_EVENT), "generation": 1},
+                "nip98": {"public_key": public_hex(NIP98), "generation": 1},
+                "manifest": {"public_key": public_hex(3), "generation": 1},
+            }},
+        }, CHANNEL, template, fixture, None)
+        state = relay.state_from_config(config, Path(self.relay_temporary.name) / "objects")
+        authority = state.candidate_acceptance
+        self.assertEqual(len(set(authority["api_ids"])), 5)
+        run = signed_event(ACTOR, template["run_event"][3], template["run_event"][4], template["run_event"][5], template["run_event"][2])
+        self.assertEqual(relay.admit_event(state, public_hex(ACTOR), run, self.now), (CHANNEL, True))
+        unknown = request_event(ACTOR, self.now, run_id="123e4567-e89b-12d3-a456-426614174013")
+        before = copy.deepcopy(state.events)
+        with self.assertRaisesRegex(relay.Refusal, "unknown acceptance actor event"):
+            relay.admit_event(state, public_hex(ACTOR), unknown, self.now)
+        self.assertEqual(state.events, before)
+
+    def test_failure_selector_is_exactly_bound_to_run_b_job_attempt_and_digest(self) -> None:
+        template = acceptance_template()
+        failure = json.loads(template["failure_run_event"][5])
+        selector = {
+            "schema_version": "buzz-ci-capacity-one-fixture-selector/v1",
+            "selector": "deterministic-failure", "job_id": failure["job_ids"][0],
+            "run_id": failure["run_id"], "attempt": 1,
+        }
+        preimage = (
+            "buzz-ci:capacity-one:fixture-selector:v1\n"
+            f"{selector['schema_version']}\n{selector['selector']}\n{selector['job_id']}\n"
+            f"{selector['run_id'].replace('-', '')}\n1\n"
+        ).encode()
+        selector["sha256"] = hashlib.sha256(preimage).hexdigest()
+        template["failure_selector"] = selector
+        self.assertEqual(
+            relay.validate_acceptance_template(template, label="test")["failure_selector"], selector,
+        )
+        for field, value in (("job_id", "other"), ("run_id", RUN_ID), ("attempt", 2), ("sha256", "f" * 64)):
+            broken = copy.deepcopy(template)
+            broken["failure_selector"][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                relay.validate_acceptance_template(broken, label="test")
+        reordered = copy.deepcopy(template)
+        reordered["failure_selector"] = {
+            name: reordered["failure_selector"][name]
+            for name in ("selector", "schema_version", "job_id", "run_id", "attempt", "sha256")
+        }
+        with self.assertRaises(ValueError):
+            relay.validate_acceptance_template(reordered, label="test")
+
+    def test_stale_final_fact_and_post_seal_status_refuse_without_mutation(self) -> None:
+        template = acceptance_template()
+        fixture = acceptance_fixture(template)
+        config = guest.relay_public_config({
+            "relay_http_origin": "https://relay.test.invalid:3443", "acceptance_actor": template["actor"],
+            "keyholder_public_spec": {"selectors": {
+                "ci_event": {"public_key": public_hex(CI_EVENT), "generation": 1},
+                "nip98": {"public_key": public_hex(NIP98), "generation": 1},
+                "manifest": {"public_key": public_hex(3), "generation": 1},
+            }},
+        }, CHANNEL, template, fixture, None)
+        state = relay.state_from_config(config, Path(self.relay_temporary.name) / "objects")
+        run = signed_event(ACTOR, template["run_event"][3], template["run_event"][4], template["run_event"][5], template["run_event"][2])
+        grant = signed_event(ACTOR, template["grant_event"][3], template["grant_event"][4], template["grant_event"][5], template["grant_event"][2])
+        relay.admit_event(state, public_hex(ACTOR), run, self.now)
+        relay.admit_event(state, public_hex(ACTOR), grant, self.now + 1)
+        fake_latest = copy.deepcopy(run)
+        fake_latest["id"] = "f" * 64
+        state.events[fake_latest["id"]] = fake_latest
+        state.run_requests[(CHANNEL, RUN_ID)][2] = fake_latest["id"]
+        stale = ci_fact_event(CI_EVENT, 46105, self.now + 2, {
+            "request_event_id": run["id"], "attempt": 1,
+        })
+        before = (
+            copy.deepcopy(state.events), copy.deepcopy(state.run_events),
+            copy.deepcopy(state.final_facts), list(state.transcript_events),
+        )
+        with self.assertRaisesRegex(relay.Refusal, "latest request"):
+            relay.admit_event(state, public_hex(CI_EVENT), stale, self.now + 2)
+        self.assertEqual((state.events, state.run_events, state.final_facts, state.transcript_events), before)
+        state.run_requests[(CHANNEL, RUN_ID)].pop(2)
+        state.events.pop(fake_latest["id"])
+        state.candidate_sealed = True
+        late = status_event(CI_EVENT, self.now + 3, state="running")
+        late_content = json.loads(late["content"])
+        late_content.update({"request_event_id": run["id"], "attempt": 1})
+        late = signed_event(CI_EVENT, 46101, late["tags"], json.dumps(late_content, separators=(",", ":")), self.now + 3)
+        before = copy.deepcopy(state.events)
+        with self.assertRaisesRegex(relay.Refusal, "sealed acceptance transcript"):
+            relay.admit_event(state, public_hex(CI_EVENT), late, self.now + 3)
+        self.assertEqual(state.events, before)
+        post_seal_rerun = request_event(ACTOR, self.now + 4, attempt=3)
+        before = (
+            copy.deepcopy(state.events), copy.deepcopy(state.run_requests),
+            list(state.transcript_events), list(state.observed_actor_event_ids),
+        )
+        with self.assertRaisesRegex(relay.Refusal, "unknown acceptance actor event"):
+            relay.admit_event(state, public_hex(ACTOR), post_seal_rerun, self.now + 4)
+        self.assertEqual((
+            state.events, state.run_requests, state.transcript_events, state.observed_actor_event_ids,
+        ), before)
 
 
 class RelayQueryAndFaultTests(unittest.TestCase):
@@ -4827,29 +5419,19 @@ class RelayQueryAndFaultTests(unittest.TestCase):
                 flag.write_text("unknown-mode\n")
                 self.state.arm_fault(flag)
 
-    def test_guest_requires_one_closed_green_relay_protocol_verdict(self) -> None:
+    def test_guest_cannot_close_without_the_sealed_transcript_and_validated_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            verdict = Path(temporary) / "protocol-verdict.json"
-            with mock.patch.object(guest, "PROTOCOL_VERDICT", verdict):
-                with self.assertRaisesRegex(guest.GuestError, "unreadable"):
-                    guest.prove_relay_protocol_verdict()
-                good = {
-                    "schema_version": "buzz-ci-loopback-relay-verdict/v1",
-                    "run_id": RUN_ID, "state": "green", "reason": None,
-                }
-                verdict.write_bytes(guest.canonical(good))
-                guest.prove_relay_protocol_verdict()
-                for mutate in (
-                    lambda value: value.__setitem__("state", "infrastructure_failure"),
-                    lambda value: value.__setitem__("reason", "evidence mismatch"),
-                    lambda value: value.__setitem__("run_id", "not-a-run"),
-                    lambda value: value.__setitem__("extra", True),
-                ):
-                    broken = copy.deepcopy(good)
-                    mutate(broken)
-                    verdict.write_bytes(guest.canonical(broken))
-                    with self.assertRaisesRegex(guest.GuestError, "not closed green"):
-                        guest.prove_relay_protocol_verdict()
+            root = Path(temporary)
+            template = acceptance_template()
+            fixture = acceptance_fixture(template)
+            with mock.patch.object(guest, "PROTOCOL_TRANSCRIPT", root / "missing-transcript.json"), mock.patch.object(
+                guest, "PROTOCOL_VERDICT", root / "protocol-verdict.json",
+            ):
+                with self.assertRaisesRegex(guest.GuestError, "did not close"):
+                    guest.close_relay_protocol_verdict(
+                        {"acceptance_template": template}, {"fixture": fixture}, b"{}\n", None,
+                    )
+            self.assertFalse((root / "protocol-verdict.json").exists())
 
     def test_guest_requires_the_read_back_record_and_an_accepted_terminal_publication(self) -> None:
         def signed(event_id: str) -> dict[str, object]:

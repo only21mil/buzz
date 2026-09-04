@@ -25,12 +25,15 @@ import tarfile
 import tempfile
 import time
 
+import local_tls_relay as relay_protocol
+
 PHASE_SCHEMA = "buzz-ci-clean-host-e2e-guest-phase/v3"
-FRAME_SCHEMA = "buzz-ci-clean-host-e2e-frame/v2"
+FRAME_SCHEMA = "buzz-ci-clean-host-e2e-frame/v4"
 PROGRESS_SCHEMA = "buzz-ci-clean-host-e2e-progress/v1"
 BINDING_SCHEMA = "buzz-ci-clean-host-e2e-public-binding/v3"
 STAGE_SCHEMA = "buzz-ci-clean-host-e2e-stage/v3"
-PENDING_SCHEMA = "buzz-ci-clean-host-e2e-pending-evidence/v3"
+PENDING_SCHEMA = "buzz-ci-clean-host-e2e-pending-evidence/v5"
+PROTOCOL_INPUT_SCHEMA = "buzz-ci-loopback-relay-close-input/v1"
 STATE_ROOT = Path("/var/lib/buzzci-e2e")
 RELAY_ROOT = Path("/var/lib/buzzci-e2e-relay")
 # local_tls_relay.py RELAY_FAULTS; the harness `run --relay-fault` choices.
@@ -41,7 +44,7 @@ REPLAY_FAULT_RECORD_KEYS = frozenset({
     "mode", "grants_expired_at", "refused_event_ids", "queried_event_ids", "replayed_event_id",
 })
 PROTOCOL_VERDICT = RELAY_ROOT / "protocol-verdict.json"
-PROTOCOL_VERDICT_KEYS = frozenset({"schema_version", "run_id", "state", "reason"})
+PROTOCOL_TRANSCRIPT = RELAY_ROOT / "protocol-transcript.json"
 # buzz-ci-controld store.rs SNAPSHOT_NAME under the frozen controld store_root.
 CONTROLD_SNAPSHOT = Path("/var/lib/buzzci/controld/control-store-v1.json")
 MAX_CONTROLD_SNAPSHOT = 8 * 1024 * 1024
@@ -844,6 +847,30 @@ def write_exclusive(path: Path, raw: bytes, mode: int) -> None:
         os.close(fd)
 
 
+def publish_atomic_create_once(path: Path, raw: bytes, mode: int) -> None:
+    """Publish a complete same-directory inode without replacing an existing verdict."""
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.next")
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        write_exclusive(temporary, raw, mode)
+        file_fd = os.open(temporary, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            os.fsync(file_fd)
+        finally:
+            os.close(file_fd)
+        os.link(temporary, path, follow_symlinks=False)
+        temporary.unlink()
+        os.fsync(directory_fd)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        os.close(directory_fd)
+
+
 def openssl_key(path: Path) -> str:
     pem = command(["openssl", "ecparam", "-name", "secp256k1", "-genkey", "-noout"]).stdout
     path.write_bytes(pem)
@@ -1377,21 +1404,81 @@ def prove_relay_fault_recovery(relay_fault: str | None) -> None:
         raise GuestError("replayed terminal publication is not the accepted one after relay fault")
 
 
-def prove_relay_protocol_verdict() -> None:
-    """Require the loopback relay to close the successful run as green."""
+def recompute_protocol_verdict(
+    binding: object, fixture: object, receipt_raw: bytes,
+) -> dict[str, object]:
+    fields = {
+        "schema_version", "acceptance_template", "prior_acceptance_template",
+        "transcript_base64", "foreign_pending_event_id", "fault_mode",
+    }
+    if not isinstance(binding, dict) or set(binding) != fields \
+            or binding.get("schema_version") != PROTOCOL_INPUT_SCHEMA:
+        raise GuestError("protocol close input binding differs")
     try:
-        record = json.loads(
-            read_file(PROTOCOL_VERDICT, MAX_JSON), object_pairs_hook=reject_duplicates,
+        transcript_raw = base64.b64decode(binding["transcript_base64"], validate=True)
+    except (TypeError, ValueError) as error:
+        raise GuestError("protocol transcript binding differs") from error
+    if not transcript_raw or len(transcript_raw) > MAX_COMMAND:
+        raise GuestError("protocol transcript binding differs")
+    try:
+        return relay_protocol.build_closed_verdict(
+            binding["acceptance_template"], fixture, transcript_raw, receipt_raw,
+            foreign_pending_event_id=binding["foreign_pending_event_id"],
+            prior_acceptance_template=binding["prior_acceptance_template"],
+            fault_mode=binding["fault_mode"],
         )
-    except (OSError, ValueError, json.JSONDecodeError) as error:
-        raise GuestError("relay protocol verdict is unreadable") from error
+    except (ValueError, relay_protocol.RelayError) as error:
+        raise GuestError("protocol close input binding differs") from error
+
+
+def validate_bound_protocol_verdict(
+    value: object, binding: object, fixture: object, receipt_raw: bytes,
+) -> dict[str, object]:
+    try:
+        relay_protocol.validate_closed_verdict(value)
+    except relay_protocol.RelayError as error:
+        raise GuestError("protocol verdict binding differs") from error
+    expected = recompute_protocol_verdict(binding, fixture, receipt_raw)
+    if canonical(value) != canonical(expected):
+        raise GuestError("protocol verdict binding differs")
+    return expected
+
+
+def close_relay_protocol_verdict(
+    activation: dict[str, object], scenario: dict[str, object], receipt_raw: bytes,
+    relay_fault: str | None, prior_acceptance_template: object | None = None,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Close once, after the verified 16 checks and zero phases 17 and 18 exist."""
+    try:
+        transcript_raw = read_file(PROTOCOL_TRANSCRIPT, MAX_COMMAND)
+        foreign = None
+        if relay_fault == FAULT_REPLAY_BEFORE_GRANT:
+            foreign = replay_fault_record().get("replayed_event_id")
+        binding = {
+            "schema_version": PROTOCOL_INPUT_SCHEMA,
+            "acceptance_template": activation["acceptance_template"],
+            "prior_acceptance_template": prior_acceptance_template,
+            "transcript_base64": base64.b64encode(transcript_raw).decode(),
+            "foreign_pending_event_id": foreign, "fault_mode": relay_fault,
+        }
+        record = recompute_protocol_verdict(binding, scenario["fixture"], receipt_raw)
+        raw = canonical(record)
+        publish_atomic_create_once(PROTOCOL_VERDICT, raw, 0o400)
+        stored = read_file(PROTOCOL_VERDICT, MAX_COMMAND)
+        stored_record = json.loads(stored, object_pairs_hook=reject_duplicates)
+        replayed = validate_bound_protocol_verdict(
+            stored_record, binding, scenario["fixture"], receipt_raw,
+        )
+    except (OSError, ValueError, relay_protocol.RelayError, GuestError) as error:
+        raise GuestError("relay protocol verdict did not close") from error
     if (
-        not isinstance(record, dict) or set(record) != PROTOCOL_VERDICT_KEYS
-        or record.get("schema_version") != "buzz-ci-loopback-relay-verdict/v1"
-        or not isinstance(record.get("run_id"), str) or UUID.fullmatch(record["run_id"]) is None
+        stored != raw or stored_record != record or replayed != record
+        or record.get("schema_version") != relay_protocol.VERDICT_SCHEMA
         or record.get("state") != "green" or record.get("reason") is not None
+        or record.get("sealed") is not True
     ):
         raise GuestError("relay protocol verdict is not closed green")
+    return record, binding
 
 
 def verify_platform_systemd(platform_systemd: object) -> None:
@@ -1861,7 +1948,10 @@ def relay_mapping_present() -> bool:
     return any(fields and fields[0] == "127.0.0.1" and "relay.test.invalid" in fields[1:] for fields in mappings)
 
 
-def relay_public_config(public: dict[str, object], channel_id: str) -> dict[str, object]:
+def relay_public_config(
+    public: dict[str, object], channel_id: str, candidate_acceptance: dict[str, object],
+    acceptance_fixture: dict[str, object], prior_acceptance: dict[str, object] | None,
+) -> dict[str, object]:
     """Roster the loopback relay enforces, shaped like the production prerequisites.
 
     The relay stores a ``POST /events`` only when the event pubkey equals the
@@ -1884,10 +1974,17 @@ def relay_public_config(public: dict[str, object], channel_id: str) -> dict[str,
             },
         },
         "ci_status_signer_pubkeys": [selectors["nip98"]["public_key"]],
+        "candidate_acceptance": candidate_acceptance,
+        "prior_acceptance": prior_acceptance,
+        "acceptance_fixture": acceptance_fixture,
     }
 
 
-def start_relay(public: dict[str, object], channel_id: str, relay_fault: str | None = None) -> None:
+def start_relay(
+    public: dict[str, object], channel_id: str, candidate_acceptance: dict[str, object],
+    acceptance_fixture: dict[str, object], prior_acceptance: dict[str, object] | None,
+    relay_fault: str | None = None,
+) -> None:
     ca_target, ca_install, _ca_remove = ca_backend()
     hosts = Path("/etc/hosts")
     if not relay_mapping_present():
@@ -1897,7 +1994,9 @@ def start_relay(public: dict[str, object], channel_id: str, relay_fault: str | N
     ca_target.chmod(0o644)
     command(list(ca_install))
     config = STATE_ROOT / "relay-public.json"
-    config.write_bytes(canonical(relay_public_config(public, channel_id)))
+    config.write_bytes(canonical(relay_public_config(
+        public, channel_id, candidate_acceptance, acceptance_fixture, prior_acceptance,
+    )))
     config.chmod(0o444)
     relay_root = RELAY_ROOT
     relay_root.mkdir(mode=0o700, parents=True, exist_ok=False)
@@ -2046,7 +2145,7 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
         raise GuestError("stage descriptor schema differs")
     if hashlib.sha256(canonical(descriptor)).hexdigest() != phase.get("descriptor_sha256"):
         raise GuestError("stage descriptor digest differs")
-    candidate, _scenario, public, channel_id = cross_bind(stage, descriptor)
+    candidate, scenario, public, channel_id = cross_bind(stage, descriptor)
     relay_fault = phase.get("relay_fault")
     if relay_fault is not None and relay_fault not in RELAY_FAULTS:
         raise GuestError("relay fault mode differs")
@@ -2054,6 +2153,8 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
     activation_package = inputs / "activation"
     prior_inputs = inputs / "prior"
     prior_activation = prior_inputs / "activation"
+    activation_manifest = package_manifest(activation_package, "activation")
+    prior_activation_manifest = package_manifest(prior_activation, "activation")
     rollback_package = prior_activation
     prior_proof: dict[str, object] | None = None
     attempted_stage = False
@@ -2065,7 +2166,12 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
     hosts_added = False
     try:
         hosts_added = not relay_mapping_present()
-        start_relay(public, channel_id, relay_fault)
+        start_relay(
+            public, channel_id, activation_manifest["acceptance_template"], scenario["fixture"],
+            prior_activation_manifest["acceptance_template"]
+            if relay_fault == FAULT_REPLAY_BEFORE_GRANT else None,
+            relay_fault,
+        )
         emit_progress("relay_ready")
         preinstall_units = unit_state()
         if any(state["LoadState"] != "not-found" for state in preinstall_units.values()):
@@ -2139,11 +2245,10 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
         command(["/usr/libexec/buzz-ci-activation-controller", "activate", "--package", str(activation_package)], timeout=timing_leaf("controller_activate"), timing_terms={"controller_activate": 1})
         begin_phase("canary")
         receipt_raw = run_capacity_one_canary(
-            package_manifest(activation_package, "activation"),
+            activation_manifest,
             read_file(inputs / "scenario.json"),
             public,
         )
-        prove_relay_protocol_verdict()
         prove_relay_fault_recovery(relay_fault)
         receipt_path = STATE_ROOT / "acceptance-receipt.json"
         receipt_path.write_bytes(receipt_raw)
@@ -2151,6 +2256,11 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
         begin_phase("receipt_verifier")
         verifier_raw = command(["/usr/libexec/buzz-ci-verify-acceptance-receipt", str(inputs / "scenario.json"), str(receipt_path)], timeout=timing_leaf("receipt_verifier"), timing_terms={"receipt_verifier": 1}).stdout
         parse_verdict(verifier_raw)
+        protocol_verdict, protocol_inputs = close_relay_protocol_verdict(
+            activation_manifest, scenario, receipt_raw, relay_fault,
+            prior_activation_manifest["acceptance_template"]
+            if relay_fault == FAULT_REPLAY_BEFORE_GRANT else None,
+        )
     except BaseException as error:
         primary = error
         abandon_command_inventory()
@@ -2185,6 +2295,8 @@ def run_acceptance(phase: dict[str, object], stage: Path) -> dict[str, object]:
         "receipt_base64": base64.b64encode(receipt_raw).decode(),
         "dormant_proof": proof,
         "prior_activation": prior_proof,
+        "protocol_verdict": protocol_verdict,
+        "protocol_inputs": protocol_inputs,
     }
     write_transfer(pending)
     complete_progress()
@@ -2198,7 +2310,8 @@ def verify_pending(phase: dict[str, object], stage: Path) -> dict[str, object]:
         not isinstance(pending, dict)
         or set(pending) != {
             "schema_version", "challenge", "candidate_sha", "scenario_sha256",
-            "receipt_base64", "dormant_proof", "prior_activation",
+            "receipt_base64", "dormant_proof", "prior_activation", "protocol_verdict",
+            "protocol_inputs",
         }
         or pending.get("schema_version") != PENDING_SCHEMA
         or pending.get("challenge") != phase["challenge"]
@@ -2279,6 +2392,22 @@ def verify_pending(phase: dict[str, object], stage: Path) -> dict[str, object]:
         or HEX64.fullmatch(prior_activation["rollback_cleanup_sha256"]) is None
     ):
         raise GuestError("prior activation proof differs")
+    protocol_verdict = pending.get("protocol_verdict")
+    try:
+        scenario = load_json(stage / "scenario.json")
+        validate_bound_protocol_verdict(
+            protocol_verdict, pending.get("protocol_inputs"),
+            scenario.get("fixture") if isinstance(scenario, dict) else None,
+            receipt_raw,
+        )
+    except (relay_protocol.RelayError, GuestError) as error:
+        raise GuestError("protocol verdict transfer differs") from error
+    if (
+        protocol_verdict.get("receipt", {}).get("sha256") != hashlib.sha256(receipt_raw).hexdigest()
+        or protocol_verdict.get("receipt", {}).get("checks") != 16
+        or protocol_verdict.get("receipt", {}).get("zero_phases") != [17, 18]
+    ):
+        raise GuestError("protocol verdict transfer differs")
     receipt_path.unlink()
     trusted_binary.unlink()
     stages_path.unlink()
@@ -2288,6 +2417,8 @@ def verify_pending(phase: dict[str, object], stage: Path) -> dict[str, object]:
         "verifier_base64": base64.b64encode(canonical({"outcome": "pass", "status": "verified"})).decode(),
         "dormant_proof": pending["dormant_proof"],
         "prior_activation": prior_activation,
+        "protocol_verdict": protocol_verdict,
+        "protocol_verdict_sha256": hashlib.sha256(canonical(protocol_verdict)).hexdigest(),
     }
     complete_progress()
     return result
