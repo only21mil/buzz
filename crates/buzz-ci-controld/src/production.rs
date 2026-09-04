@@ -486,7 +486,24 @@ where
 {
     /// Consume at most one accepted request after the durable channel cursor.
     pub fn poll_once(&mut self, channel_id: &str) -> Result<PollStep, ProductionError> {
-        self.poll_head(channel_id, false)
+        self.poll_head(channel_id, false, None)
+    }
+
+    /// Reconcile only the expected acceptance request. A different head is a
+    /// binding failure and is never executed or consumed.
+    pub fn poll_expected(
+        &mut self,
+        channel_id: &str,
+        expected_event_id: &str,
+    ) -> Result<PollStep, ProductionError> {
+        if expected_event_id.len() != 64
+            || !expected_event_id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ProductionError::Invalid);
+        }
+        self.poll_head(channel_id, false, Some(expected_event_id))
     }
 
     /// Replay every deferred publication through the ordinary pending path
@@ -512,7 +529,7 @@ where
             self.republish(key, stored)?;
         }
         if !deferred.is_empty() {
-            while self.poll_head(channel_id, true)? == PollStep::Completed {}
+            while self.poll_head(channel_id, true, None)? == PollStep::Completed {}
         }
         Ok(deferred.len())
     }
@@ -521,6 +538,7 @@ where
         &mut self,
         channel_id: &str,
         terminal_only: bool,
+        expected_event_id: Option<&str>,
     ) -> Result<PollStep, ProductionError> {
         let cursor = self
             .store
@@ -534,6 +552,9 @@ where
             return Ok(PollStep::Idle);
         };
         if accepted.channel_id != channel_id || accepted.watch_cursor <= cursor {
+            return Err(ProductionError::Invalid);
+        }
+        if expected_event_id.is_some_and(|expected| accepted.event_id != expected) {
             return Err(ProductionError::Invalid);
         }
         if terminal_only {
@@ -1719,6 +1740,33 @@ mod tests {
     }
 
     #[test]
+    fn expected_recovery_poll_rejects_a_later_head_without_consuming_it() {
+        let log = b"ok\n".to_vec();
+        let relay = Relay {
+            accepted: Some(accepted()),
+            published: Vec::new(),
+            job_statuses: Vec::new(),
+            intent_signal: None,
+            refuse_publication: false,
+        };
+        let mut handler = ProductionHandler::new(
+            relay,
+            DeterministicSigner,
+            Executor(completion(&log)),
+            MemoryStore::default(),
+            MemoryOutput(log),
+        );
+
+        assert!(matches!(
+            handler.poll_expected(CHANNEL, &"22".repeat(32)),
+            Err(ProductionError::Invalid)
+        ));
+        assert_eq!(handler.store.cursor, 0);
+        assert!(handler.store.run.is_none());
+        assert!(handler.relay.published.is_empty());
+    }
+
+    #[test]
     fn accepted_request_bypasses_legacy_job_keys_and_publishes_full_signed_lifecycle() {
         let log = b"ok\n".to_vec();
         let accepted = accepted();
@@ -1973,7 +2021,7 @@ mod tests {
                 refuse_publication: false,
             },
             DeterministicSigner,
-            Executor(completion(b"unused")),
+            FailingExecutor,
             MemoryStore {
                 cursor: 0,
                 run: Some((3, terminal)),
@@ -1984,7 +2032,9 @@ mod tests {
         );
 
         assert_eq!(
-            handler.poll_once(CHANNEL).expect("reconcile terminal"),
+            handler
+                .poll_expected(CHANNEL, &"11".repeat(32))
+                .expect("reconcile exact terminal without re-execution"),
             PollStep::Completed
         );
         assert_eq!(handler.relay.published, vec![KIND_CI_RUN_STATUS]);

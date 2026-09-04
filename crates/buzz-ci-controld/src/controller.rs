@@ -373,6 +373,36 @@ where
         }
     }
 
+    /// Poll only the request identity pinned by an unfinished acceptance
+    /// journal intent. A later relay head is rejected without consumption.
+    pub fn poll_expected(
+        &mut self,
+        expected_event_id: &str,
+    ) -> Result<PollOutcome, ControllerError> {
+        if let Some(reason) = self.status.terminal_reason() {
+            return Err(ControllerError::Terminal(reason));
+        }
+        self.status = CapacityOneStatus::polling();
+        match self
+            .handler
+            .poll_expected(self.config.channel_id(), expected_event_id)
+        {
+            Ok(step) => {
+                self.status = CapacityOneStatus::ready();
+                Ok(match step {
+                    PollStep::Completed => PollOutcome::CompletedOne,
+                    PollStep::Idle => PollOutcome::Idle,
+                    PollStep::Deferred => PollOutcome::Deferred,
+                })
+            }
+            Err(error) => {
+                let reason = TerminalInfrastructureReason::from(&error);
+                self.status = CapacityOneStatus::terminal(reason);
+                Err(ControllerError::Infrastructure(reason))
+            }
+        }
+    }
+
     /// Enable or clear replay deferral on the handler (see
     /// `ProductionHandler::set_replay_deferral`).
     pub fn set_replay_deferral(&mut self, enabled: bool) {
