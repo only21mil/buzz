@@ -1224,6 +1224,82 @@ mod tests {
     }
 
     #[test]
+    fn pending_publication_reconciliation_requests_an_exact_event_query_token_as_the_author() {
+        use crate::production::RelayControl as _;
+        use crate::source::{AuthenticatedRelay, HttpRequest, HttpResponse, HttpTransport};
+        use nostr::{EventBuilder, Keys, Kind};
+
+        struct RecordingTransport {
+            requests: Vec<HttpRequest>,
+        }
+
+        impl HttpTransport for RecordingTransport {
+            type Error = ();
+
+            fn execute(&mut self, request: HttpRequest) -> Result<HttpResponse, Self::Error> {
+                self.requests.push(request);
+                Ok(HttpResponse {
+                    status: 200,
+                    body: b"[]".to_vec(),
+                })
+            }
+        }
+
+        // The pending event was signed by the ci-event key the keyholder holds.
+        let keys = Keys::parse(&format!("{}01", "00".repeat(31))).expect("ci-event key");
+        assert_eq!(keys.public_key().to_hex(), CI_KEY);
+        let event = EventBuilder::new(Kind::Custom(46101), "{}")
+            .sign_with_keys(&keys)
+            .expect("signed event");
+        let signed = SignedCiEvent {
+            event_id: event.id.to_hex(),
+            kind: 46101,
+            content: "{}".to_owned(),
+            tags: serde_json::to_value(&event.tags).expect("tags"),
+            signed_event: serde_json::to_value(&event).expect("event"),
+        };
+
+        let (_directory, path, server) = spawn_server(vec![Reply::Describe, Reply::Nip98]);
+        let client = UnixKeyholderClient::connect_for_test(config(path, 500, 1))
+            .expect("authenticated client");
+        let mut relay = AuthenticatedRelay::new(
+            url::Url::parse("https://relay.example.test/").expect("url"),
+            RecordingTransport {
+                requests: Vec::new(),
+            },
+            client,
+        )
+        .expect("relay");
+
+        assert!(!relay
+            .publication_exists(&signed)
+            .expect("exact-event query"));
+        let (transport, _client) = relay.into_parts();
+        server.join().expect("server");
+
+        let [request] = transport.requests.as_slice() else {
+            panic!("exactly one relay request");
+        };
+        assert_eq!(request.method, HttpMethod::Post);
+        assert_eq!(request.url.as_str(), "https://relay.example.test/query");
+        let token = token_event(&request.headers["authorization"]);
+        assert_eq!(token.pubkey.to_hex(), CI_KEY);
+        assert_eq!(token.kind.as_u16() as u32, NIP98_EVENT_KIND);
+        let tag = |name: &str| {
+            token
+                .tags
+                .iter()
+                .map(|tag| tag.as_slice())
+                .find(|tag| tag.first().map(String::as_str) == Some(name))
+                .map(|tag| tag[1].clone())
+                .expect(name)
+        };
+        assert_eq!(tag("u"), "https://relay.example.test/query");
+        assert_eq!(tag("method"), "POST");
+        assert_eq!(tag("payload"), hex::encode(Sha256::digest(&request.body)));
+    }
+
+    #[test]
     fn publish_with_an_unknown_author_is_refused_before_any_keyholder_request() {
         let (_directory, path, server) = spawn_server(vec![Reply::Describe]);
         let mut client = UnixKeyholderClient::connect_for_test(config(path, 500, 1))
