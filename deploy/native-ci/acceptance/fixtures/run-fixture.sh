@@ -17,8 +17,20 @@ if [ "$input_sha256" != "$expected_input_sha256" ]; then
   exit 1
 fi
 
+case "${BUZZ_CI_FIXTURE_OUTCOME:-}" in
+  success) ;;
+  deterministic-failure)
+    printf '%s\n' 'fixture=buzz-ci-capacity-one-v1 outcome=deterministic-failure'
+    exit 1
+    ;;
+  *)
+    printf '%s\n' 'fixture selector rejected' >&2
+    exit 2
+    ;;
+esac
+
 # Hold before producing any evidence so a cancellation issued right after
-# admission (acceptance stage 9, cancellation_terminal) reaches a running job:
+# admission (acceptance stage 12, cancellation_terminal) reaches a running job:
 # the executor kills the process group and the attempt ends cancelled with no
 # artifact. The first attempt (stage 6) waits the hold out. Bounded well inside
 # the 120 s wall timeout and the driver operation budget.

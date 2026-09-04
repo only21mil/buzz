@@ -1608,7 +1608,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "fc1aac69f5b666d50ac71b6ad17632e7cf6c91d27e28dc76605cbc4bdbd7d050",
+            "203c1dfc85a2fae37301c3bc44e05c81d04aa7a0fc7f28e82fe704d598f9af70",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -1654,7 +1654,8 @@ class ActivationControllerTests(unittest.TestCase):
             "timeout_millis", "fixture", "acceptance",
         ])
         self.assertEqual(list(self.fixture.binding["acceptance"]), [
-            "actor", "scenario_sha256", "run_event", "grant_event", "rerun_event", "tombstone_event",
+            "actor", "scenario_sha256", "run_event", "grant_event", "rerun_event", "tombstone_event", "failure_run_event",
+            "export_subject", "export_generation", "export_authorization_digest",
         ])
         self.assertEqual(list(self.fixture.binding["acceptance"]["actor"]), ["public_key", "generation"])
         controld = json.loads((self.fixture.root / activation_package.CONFIG_TARGETS["controld_config"].lstrip("/")).read_bytes())
@@ -3293,7 +3294,9 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, _payloads, _driver = self.fixture.load()
         template = manifest["acceptance_template"]
         self.assertNotIn("scenario_sha256", template)
-        for field in ("run_event", "grant_event", "rerun_event", "tombstone_event"):
+        for field in (
+            "run_event", "grant_event", "rerun_event", "tombstone_event", "failure_run_event",
+        ):
             event_id = activation_package.digest(json.dumps(
                 template[field], ensure_ascii=False, separators=(",", ":"),
             ).encode())
@@ -3313,13 +3316,21 @@ class ActivationControllerTests(unittest.TestCase):
         checked = TEMPLATE_GENERATOR.checked_scenario_template(source)
         grant_event_id = RENDERER.activation_grant_event_id(manifest)
         request_digest = RENDERER.activation_request_digest(manifest)
+        failure_request_digest = RENDERER.activation_failure_request_digest(manifest)
         approved_by = RENDERER.activation_approved_by(manifest)
         bindings = {
             "candidate_sha": manifest["source_commit"],
             "packages": {"activation": manifest},
             "activation_grant_event_id": grant_event_id,
             "activation_request_digest": request_digest,
+            "activation_failure_request_digest": failure_request_digest,
+            "activation_run_id": RENDERER.activation_run_id(manifest),
+            "activation_failure_run_id": RENDERER.activation_failure_run_id(manifest),
+            "activation_failure_selector": RENDERER.activation_failure_selector(manifest),
             "activation_approved_by": approved_by,
+            "activation_export_subject": RENDERER.activation_export_subject(manifest),
+            "activation_export_generation": RENDERER.activation_export_generation(manifest),
+            "activation_export_authorization_digest": RENDERER.activation_export_authorization_digest(manifest),
             "activation_fixture_manifest_sha256": RENDERER.activation_fixture_manifest_sha256(
                 manifest,
             ),
@@ -3330,6 +3341,13 @@ class ActivationControllerTests(unittest.TestCase):
         rendered = RENDERER.validate_scenario(rendered, bindings)
         self.assertEqual(rendered["fixture"]["grant_event_id"], grant_event_id)
         self.assertEqual(rendered["fixture"]["request_digest"], request_digest)
+        self.assertEqual(
+            rendered["fixture"]["failure_request_digest"], failure_request_digest,
+        )
+        self.assertEqual(
+            rendered["fixture"]["failure_run_id"],
+            RENDERER.activation_failure_run_id(manifest),
+        )
         self.assertEqual(rendered["fixture"]["approved_by"], approved_by)
         self.assertEqual(
             rendered["fixture"]["manifest_digest"],
@@ -3371,6 +3389,10 @@ class ActivationControllerTests(unittest.TestCase):
         stale_request["fixture"]["request_digest"] = "8" * 64
         with self.assertRaisesRegex(RENDERER.RenderError, "cross-binding differs"):
             RENDERER.validate_scenario(stale_request, bindings)
+        stale_failure_request = copy.deepcopy(rendered)
+        stale_failure_request["fixture"]["failure_request_digest"] = "8" * 64
+        with self.assertRaisesRegex(RENDERER.RenderError, "cross-binding differs"):
+            RENDERER.validate_scenario(stale_failure_request, bindings)
         stale_approver = copy.deepcopy(rendered)
         stale_approver["fixture"]["approved_by"] = "8" * 64
         with self.assertRaisesRegex(RENDERER.RenderError, "cross-binding differs"):
@@ -4113,6 +4135,7 @@ class ActivationControllerTests(unittest.TestCase):
         frozen_lane_manifest = dict(
             config["lane_manifest"], admission_verifying_key="20" * 32, admission_key_generation=9,
         )
+        config["execution"]["failure_selector"] = manifest["acceptance_template"]["failure_selector"]
         self.assertEqual(
             activation_package.lane_manifest_digest(frozen_lane_manifest),
             "12ede37672233a144707bc49efa5d8f86ec5803e6b9d623347472702b2c98f04",
@@ -4121,7 +4144,7 @@ class ActivationControllerTests(unittest.TestCase):
             activation_package.execution_declaration_digest(
                 "aa" * 20, "70" * 32, frozen_lane_manifest, config["execution"],
             ),
-            "a699a308fae53c2109af532c06ed6a345e1ad76323c0817a1ef8e8d015b0be55",
+            "8503abd897bbab6a86c42ea966de80c57752592d7f4d84ae84a68306a7df5452",
         )
 
     def test_lane_manifest_admission_key_must_be_the_keyholder_manifest_selector(self) -> None:
@@ -4242,6 +4265,9 @@ class ActivationControllerTests(unittest.TestCase):
             repository_owner_public_key=run["target_repo_a"].split(":")[1],
             repository_id=run["target_repo_a"].split(":")[2],
             source_clone_url=run["source_clone_url"],
+            relay_http_origin=ACTIVATION_SCAFFOLD.TEST_RELAY_HTTP_ORIGIN,
+            export_subject=template["export_subject"],
+            export_generation=template["export_generation"],
             time_reference=reference + 7,
         )
         self.assertEqual(rebuilt["time_reference"], reference + 7)
@@ -4284,6 +4310,9 @@ class ActivationControllerTests(unittest.TestCase):
             "repository_owner_public_key": run["target_repo_a"].split(":")[1],
             "repository_id": run["target_repo_a"].split(":")[2],
             "source_clone_url": run["source_clone_url"],
+            "relay_http_origin": ACTIVATION_SCAFFOLD.TEST_RELAY_HTTP_ORIGIN,
+            "export_subject": template["export_subject"],
+            "export_generation": template["export_generation"],
             "time_reference": template["time_reference"],
         }
 
@@ -4371,19 +4400,137 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertEqual(first, repeated)
         first_run = json.loads(first["run_event"][5])
         first_rerun = json.loads(first["rerun_event"][5])
+        first_failure = json.loads(first["failure_run_event"][5])
         later_run = json.loads(later["run_event"][5])
         later_rerun = json.loads(later["rerun_event"][5])
-        self.assertEqual(first_run["run_id"], first_rerun["run_id"])
-        self.assertEqual(first_rerun["parent_run_id"], first_run["run_id"])
+        self.assertNotEqual(first_run["run_id"], first_failure["run_id"])
+        self.assertEqual(first_failure["run_id"], first_rerun["run_id"])
+        self.assertEqual(first_rerun["parent_run_id"], first_failure["run_id"])
         self.assertNotEqual(first_run["run_id"], later_run["run_id"])
         self.assertNotEqual(first_run["idempotency_key"], later_run["idempotency_key"])
         self.assertNotEqual(first_rerun["idempotency_key"], later_rerun["idempotency_key"])
-        for value in (
+        values = (
             first_run["run_id"], first_run["idempotency_key"],
+            first_failure["run_id"], first_failure["idempotency_key"],
             first_rerun["idempotency_key"], later_run["run_id"],
             later_run["idempotency_key"], later_rerun["idempotency_key"],
+        )
+        self.assertEqual(len(set(values)), len(values))
+        for value in values:
+            parsed = uuid.UUID(value)
+            self.assertEqual(str(parsed), value)
+            self.assertEqual(parsed.version, 5)
+            self.assertEqual(parsed.variant, uuid.RFC_4122)
+        self.assertEqual(first["failure_selector"]["run_id"], first_failure["run_id"])
+        self.assertEqual(first["failure_selector"]["attempt"], 1)
+        self.assertEqual(first["failure_selector"]["job_id"], first_failure["job_ids"][0])
+
+        for field, replacement in (
+            ("run_id", first_run["run_id"]),
+            ("attempt", 2),
+            ("job_id", "other-job"),
+            ("sha256", "0" * 64),
         ):
-            self.assertEqual(str(uuid.UUID(value)), value)
+            tampered = copy.deepcopy(first)
+            tampered["failure_selector"][field] = replacement
+            with self.subTest(selector_field=field), self.assertRaises(ValueError):
+                activation_package.validate_acceptance_template(tampered)
+
+    def test_export_authority_digest_binds_the_exact_stable_get_plan(self) -> None:
+        arguments = {
+            "relay_http_origin": "https://relay.example.invalid",
+            "subject": ACTIVATION_SCAFFOLD.TEST_NIP98_PUBLIC_KEY,
+            "generation": ACTIVATION_SCAFFOLD.TEST_NIP98_GENERATION,
+            "request_event_id": "2" * 64,
+            "run_id": "11111111-1111-5111-9111-111111111111",
+            "job_id": "capacity-one-fixture",
+            "attempt": 1,
+        }
+        expected = activation_package._export_transcript_digest(**arguments)
+        self.assertEqual(
+            expected,
+            "304a38e4780ecf0f6e4bc9b4fa9e5babd57c2a8a47e473c683b330ec5027a3cf",
+        )
+        mutations = (
+            {"request_event_id": "3" * 64},
+            {"run_id": "11111111-1111-5111-9111-111111111113"},
+            {"job_id": "other-job"},
+            {"subject": "4" * 64},
+            {"generation": 3},
+            {"relay_http_origin": "https://other.example.invalid"},
+            {"artifacts": (("result", "result.json", "5" * 64, 107),)},
+            {"artifacts": (("result", "result.json", activation_package.EXPORT_ARTIFACTS[0][2], 108),)},
+            {"artifacts": (("result.json", "result", activation_package.EXPORT_ARTIFACTS[0][2], 107),)},
+        )
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.assertNotEqual(
+                    activation_package._export_transcript_digest(**{**arguments, **mutation}),
+                    expected,
+                )
+        for artifacts in ((), activation_package.EXPORT_ARTIFACTS * 2):
+            with self.subTest(cardinality=len(artifacts)), self.assertRaisesRegex(
+                ValueError, "exactly one artifact",
+            ):
+                activation_package._export_transcript_digest(
+                    **arguments, artifacts=artifacts,
+                )
+        boundary_artifact = (
+            "a" * 128,
+            "result.json",
+            activation_package.EXPORT_ARTIFACTS[0][2],
+            107,
+        )
+        self.assertRegex(
+            activation_package._export_transcript_digest(
+                **arguments, artifacts=(boundary_artifact,),
+            ),
+            r"^[0-9a-f]{64}$",
+        )
+        for artifact_id in ("a" * 129, ".", ".."):
+            with self.subTest(artifact_id=artifact_id), self.assertRaisesRegex(
+                ValueError, "artifact plan entry is invalid",
+            ):
+                activation_package._export_transcript_digest(
+                    **arguments,
+                    artifacts=((
+                        artifact_id,
+                        "result.json",
+                        activation_package.EXPORT_ARTIFACTS[0][2],
+                        107,
+                    ),),
+                )
+
+    def test_phase_validation_rederives_export_authority_from_nip98_selector(self) -> None:
+        manifest, payloads, _driver = self.fixture.load()
+        entries = {entry["role"]: entry for entry in manifest["entries"]}
+        active_source = entries["controld_config"]["active_source"]
+        for field, replacement in (
+            ("export_subject", "4" * 64),
+            ("export_generation", manifest["acceptance_template"]["export_generation"] + 1),
+            ("export_authorization_digest", "5" * 64),
+        ):
+            changed = copy.deepcopy(manifest)
+            changed["acceptance_template"][field] = replacement
+            with self.subTest(template_field=field), self.assertRaisesRegex(
+                ValueError, "export authority differs",
+            ):
+                CONTROLLER._validate_phase_configs(changed, payloads)
+        for mutate in ("subject", "generation", "origin"):
+            changed_payloads = dict(payloads)
+            active = json.loads(changed_payloads[active_source])
+            if mutate == "subject":
+                active["keyholder_selectors"]["nip98"]["public_key"] = "4" * 64
+            elif mutate == "generation":
+                active["keyholder_selectors"]["nip98"]["generation"] += 1
+            else:
+                active["relay_http_origin"] = "https://other.example.invalid"
+                active["relay_url"] = "wss://other.example.invalid"
+            changed_payloads[active_source] = activation_package.canonical_json(active)
+            with self.subTest(active_field=mutate), self.assertRaisesRegex(
+                ValueError, "export authority differs",
+            ):
+                CONTROLLER._validate_phase_configs(manifest, changed_payloads)
 
     def test_clean_host_scaffold_binds_its_own_test_channel_and_repository(self) -> None:
         manifest, payloads, _driver = self.fixture.load()

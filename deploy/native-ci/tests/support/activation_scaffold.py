@@ -30,6 +30,9 @@ TEST_CHANNEL_ID = "12345678-1234-4abc-8def-123456789abc"
 TEST_REPOSITORY_OWNER = "22" * 32
 TEST_REPOSITORY_ID = "buzz"
 TEST_SOURCE_CLONE_URL = "https://relay.example.invalid/git/buzz"
+TEST_RELAY_HTTP_ORIGIN = "https://relay.example.invalid"
+TEST_NIP98_PUBLIC_KEY = "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"
+TEST_NIP98_GENERATION = 2
 FREEZER = load_module("activation_scaffold_freezer", ACTIVATION_ROOT / "freeze_package.py")
 
 QUALIFICATION_SCRIPT = b'''#!/usr/bin/python3
@@ -108,6 +111,9 @@ class ActivationFixture:
             repository_owner_public_key=TEST_REPOSITORY_OWNER,
             repository_id=TEST_REPOSITORY_ID,
             source_clone_url=TEST_SOURCE_CLONE_URL,
+            relay_http_origin=TEST_RELAY_HTTP_ORIGIN,
+            export_subject=TEST_NIP98_PUBLIC_KEY,
+            export_generation=TEST_NIP98_GENERATION,
             time_reference=1_800_000_000,
         )
         self.manifest = self._manifest()
@@ -156,7 +162,7 @@ class ActivationFixture:
         # package.validate_phase_configs); the lane manifest copies it.
         keyholder_selectors = {
             "ci_event": {"public_key": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5", "generation": 1},
-            "nip98": {"public_key": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9", "generation": 2},
+            "nip98": {"public_key": TEST_NIP98_PUBLIC_KEY, "generation": TEST_NIP98_GENERATION},
             "manifest": {"public_key": "e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13", "generation": 3},
         }
         lane_manifest = {
@@ -536,6 +542,13 @@ class ActivationFixture:
         request_digest = activation_package.digest(json.dumps(
             self.acceptance_template["run_event"], ensure_ascii=False, separators=(",", ":"),
         ).encode())
+        failure_request_digest = activation_package.digest(json.dumps(
+            self.acceptance_template["failure_run_event"], ensure_ascii=False, separators=(",", ":"),
+        ).encode())
+        run_id = json.loads(self.acceptance_template["run_event"][5])["run_id"].replace("-", "")
+        failure_run_id = json.loads(
+            self.acceptance_template["failure_run_event"][5],
+        )["run_id"].replace("-", "")
         grant_event_id = activation_package.digest(json.dumps(
             self.acceptance_template["grant_event"], ensure_ascii=False, separators=(",", ":"),
         ).encode())
@@ -545,20 +558,29 @@ class ActivationFixture:
                 "integrated_candidate_sha": self.manifest["source_commit"],
                 "activation_id": self.manifest["activation_id"],
                 "activation_package_digest": self.manifest["package_digest"],
-                "run_id": "1" * 32,
+                "run_id": run_id,
+                "failure_run_id": failure_run_id,
+                "failure_selector": copy.deepcopy(self.acceptance_template["failure_selector"]),
                 "job_id": "capacity-one-fixture",
                 "request_digest": request_digest,
+                "failure_request_digest": failure_request_digest,
                 "manifest_digest": activation_package.FIXTURE_MANIFEST_SHA256,
                 "source_oid": "a" * 40,
                 "approval_id": "4" * 32,
                 "grant_event_id": grant_event_id,
                 "grant_digest": "6" * 64,
                 "approved_by": self.acceptance_template["actor"]["public_key"],
-                "export_subject": "8" * 64,
-                "export_authorization_digest": "9" * 64,
+                "export_subject": self.acceptance_template["export_subject"],
+                "export_generation": self.acceptance_template["export_generation"],
+                "export_authorization_digest": self.acceptance_template["export_authorization_digest"],
                 "controller_generation": 7,
                 "runner_generation": 11,
                 "expected_log": {"name": "job.log", "sha256": "a" * 64, "bytes": 10},
+                "expected_failure_log": {
+                    "name": "job.log",
+                    "sha256": "4d4dcd1542349cdb9104434dcba375a5de3ae7274690c135cfd36b8a8f14b7e1",
+                    "bytes": 62,
+                },
                 "expected_artifacts": [{"name": "result.json", "sha256": "b" * 64, "bytes": 20}],
             },
             "driver": {
@@ -634,7 +656,7 @@ class ActivationFixture:
             },
             "selectors": {
                 "ci_event": {"public_key": "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5", "generation": 1},
-                "nip98": {"public_key": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9", "generation": 2},
+                "nip98": {"public_key": TEST_NIP98_PUBLIC_KEY, "generation": TEST_NIP98_GENERATION},
                 "manifest": {"public_key": "e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13", "generation": 3},
             },
             "nip98_origin": "https://relay.example.invalid",

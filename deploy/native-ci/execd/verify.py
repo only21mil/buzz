@@ -128,7 +128,8 @@ def verify(source_root: Path) -> None:
         "job_id": {"const": "capacity-one-fixture"},
         "fixture_manifest_sha256": {"const": "f204b8fba64e972408f5a0ea1c0bb3140cfa696289903d96a8cb07d602af6b23"},
         "fixture_input_sha256": {"const": "967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6"},
-        "fixture_script_sha256": {"const": "d081e43ebfde3ee67c3cd8d852d58410a79ad799bbfa2cf98d5e2ef7b8bed3b1"},
+        "fixture_script_sha256": {"const": "8b2c335883399ad34033953d381a34519fc030577b875dcebe22f42843745ebf"},
+        "failure_selector": {"$ref": "#/$defs/fixtureSelector"},
         "max_stdout_bytes": {"const": 32768},
         "max_stderr_bytes": {"const": 32768},
         "max_memory_bytes": {"const": 134217728},
@@ -141,6 +142,15 @@ def verify(source_root: Path) -> None:
         raise ValueError("static execution config is optional")
     if any(execution["properties"].get(name) != value for name, value in expected_execution.items()):
         raise ValueError("static execution limits or fixture provenance drift")
+    selector = schema["$defs"]["fixtureSelector"]
+    if (
+        selector["properties"].get("schema_version") != {"const": "buzz-ci-capacity-one-fixture-selector/v1"}
+        or selector["properties"].get("selector") != {"const": "deterministic-failure"}
+        or selector["properties"].get("job_id") != {"const": "capacity-one-fixture"}
+        or selector["properties"].get("attempt") != {"const": 1}
+        or set(selector["required"]) != set(selector["properties"])
+    ):
+        raise ValueError("static failure selector schema drift")
     expected_artifact = {
         "artifact_id": {"const": "result"},
         "name": {"const": "result.json"},

@@ -25,7 +25,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::production::{CiSigner, SignedCiEvent};
-use crate::source::{HttpMethod, Nip98Authorizer, Nip98Binding};
+use crate::source::{HttpMethod, Nip98Authorization, Nip98Authorizer, Nip98Binding, Nip98Proof};
 
 const MAX_TIMEOUT_MILLIS: u64 = 5_000;
 const MAX_TRANSPORT_ATTEMPTS: u32 = 8;
@@ -155,7 +155,7 @@ pub struct UnixKeyholderClient {
     ci_pubkey: String,
     /// Activation-bound acceptance actor, bound after the keyholder's
     /// `describe_acceptance` matched the receipt. Only a client that publishes
-    /// the four frozen acceptance events binds one.
+    /// the five frozen acceptance events binds one.
     acceptance_actor: Option<PublicIdentity>,
 }
 
@@ -515,6 +515,10 @@ impl CiSigner for UnixKeyholderClient {
         &self.ci_pubkey
     }
 
+    fn generation(&self) -> u64 {
+        self.config.keyholder_selectors.ci_event.generation
+    }
+
     fn sign(
         &mut self,
         kind: u32,
@@ -554,7 +558,7 @@ impl CiSigner for UnixKeyholderClient {
 impl Nip98Authorizer for UnixKeyholderClient {
     type Error = KeyholderError;
 
-    fn authorization(&mut self, binding: &Nip98Binding) -> Result<String, Self::Error> {
+    fn authorization(&mut self, binding: &Nip98Binding) -> Result<Nip98Authorization, Self::Error> {
         binding
             .validate()
             .map_err(|_| KeyholderError::InvalidInput)?;
@@ -603,9 +607,17 @@ impl Nip98Authorizer for UnixKeyholderClient {
             tags.push(serde_json::json!(["payload", hex::encode(digest)]));
         }
         tags.push(serde_json::json!(["nonce", hex::encode(nonce)]));
+        let proof = Nip98Proof {
+            subject: hex::encode(response.identity.public_key),
+            generation: response.identity.generation,
+            event_id: hex::encode(response.signed_digest),
+        };
         let event = signed_event(response, created_at, NIP98_EVENT_KIND, tags, "")?;
         let json = serde_json::to_vec(&event).map_err(|_| KeyholderError::Protocol)?;
-        Ok(format!("Nostr {}", BASE64.encode(json)))
+        Ok(Nip98Authorization::new(
+            format!("Nostr {}", BASE64.encode(json)),
+            proof,
+        ))
     }
 }
 
@@ -1003,7 +1015,7 @@ mod tests {
                                 generation: 10,
                             },
                             scenario_sha256: [9; 32],
-                            event_ids: [[1; 32], [2; 32], [3; 32], [4; 32]],
+                            event_ids: [[1; 32], [2; 32], [3; 32], [4; 32], [5; 32]],
                         }),
                     ),
                     Reply::SignAcceptance => {
@@ -1226,22 +1238,21 @@ mod tests {
             publisher: None,
             query_filter: None,
         };
-        let token = token_event(&client.authorization(&read).expect("read token"));
+        let authorization = client.authorization(&read).expect("read token");
+        let token = token_event(authorization.header());
         assert_eq!(token.pubkey.to_hex(), NIP98_KEY);
         assert_eq!(token.kind.as_u16() as u32, NIP98_EVENT_KIND);
 
-        let token = token_event(
-            &client
-                .authorization(&publish_binding(CI_KEY))
-                .expect("status publish token"),
-        );
+        let authorization = client
+            .authorization(&publish_binding(CI_KEY))
+            .expect("status publish token");
+        let token = token_event(authorization.header());
         assert_eq!(token.pubkey.to_hex(), CI_KEY);
 
-        let token = token_event(
-            &client
-                .authorization(&publish_binding(&actor_hex))
-                .expect("acceptance publish token"),
-        );
+        let authorization = client
+            .authorization(&publish_binding(&actor_hex))
+            .expect("acceptance publish token");
+        let token = token_event(authorization.header());
         assert_eq!(token.pubkey.to_hex(), actor_hex);
         server.join().expect("server");
     }
@@ -1345,11 +1356,10 @@ mod tests {
             MANIFEST_KEY,
             &hex::encode(actor_identity().public_key),
         ] {
-            assert_eq!(
+            assert!(matches!(
                 client.authorization(&publish_binding(publisher)),
-                Err(KeyholderError::WrongIdentity),
-                "{publisher}"
-            );
+                Err(KeyholderError::WrongIdentity)
+            ));
         }
         // The actor may not collide with a selector.
         assert_eq!(
@@ -1367,10 +1377,10 @@ mod tests {
         let (_directory, path, server) = spawn_server(vec![Reply::Describe, Reply::Nip98WrongKey]);
         let mut client = UnixKeyholderClient::connect_for_test(config(path, 500, 1))
             .expect("authenticated client");
-        assert_eq!(
+        assert!(matches!(
             client.authorization(&publish_binding(CI_KEY)),
             Err(KeyholderError::WrongIdentity)
-        );
+        ));
         server.join().expect("server");
     }
 

@@ -91,7 +91,8 @@ class AcceptancePackageTests(unittest.TestCase):
             env = dict(os.environ, PATH=f"{stub_bin}:{os.environ.get('PATH', '/usr/bin:/bin')}")
             completed = subprocess.run(
                 [str(fixture_dir / "run-fixture.sh"), str(artifact_dir)],
-                capture_output=True, check=True, env=env, timeout=30,
+                capture_output=True, check=True,
+                env=dict(env, BUZZ_CI_FIXTURE_OUTCOME="success"), timeout=30,
             )
             self.assertEqual(
                 completed.stdout.decode(),
@@ -117,6 +118,20 @@ class AcceptancePackageTests(unittest.TestCase):
         self.assertIn(f'FIXTURE_SCRIPT_SHA256 = "{digest}"', package_source)
         for relative in ("deploy/native-ci/execd/execd-config.schema.json", "deploy/native-ci/execd/verify.py", "crates/buzz-ci-execd/src/production_v2.rs"):
             self.assertIn(digest, (ROOT / relative).read_text(), relative)
+
+    def test_fixture_rejects_missing_or_unknown_selector(self) -> None:
+        script = ACCEPTANCE / "fixtures/run-fixture.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            for value in (None, "failure", "deterministic-failure "):
+                env = os.environ.copy()
+                if value is not None:
+                    env["BUZZ_CI_FIXTURE_OUTCOME"] = value
+                completed = subprocess.run(
+                    [str(script), str(Path(temporary) / "artifacts")],
+                    capture_output=True, check=False, env=env,
+                )
+                self.assertEqual(completed.returncode, 2)
+                self.assertEqual(completed.stderr, b"fixture selector rejected\n")
 
     def test_systemd_assets_freeze_socket_principals_and_paths(self) -> None:
         templates = ACCEPTANCE / "templates"

@@ -31,7 +31,7 @@
     "controller_check": {"phase_margin": 1},
     "controller_stage": {"phase_margin": 1},
     "controller_activate": {"phase_margin": 1},
-    "canary": {"driver_operation": 13, "canary_orchestration_margin": 1, "phase_margin": 1},
+    "canary": {"driver_operation": 16, "canary_orchestration_margin": 1, "phase_margin": 1},
     "receipt_verifier": {"phase_margin": 1},
     "rollback": {"phase_margin": 1},
     "cleanup": {"phase_margin": 1},

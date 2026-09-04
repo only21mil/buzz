@@ -217,7 +217,8 @@ def live_unix_now() -> int:
     The qualification request is minted here at activation with a fresh
     request ID and nonce and a 60-second delivery validity; execd judges that
     same request with its own host clock. It is not package material. The
-    package-bound windows (the frozen Run/Grant/Rerun/Tombstone templates) are
+    package-bound windows (the frozen Run/Grant/FailureRun/Rerun/Tombstone
+    templates) are
     never judged here; the runner and execd judge them against
     ``acceptance_time_reference``. See deploy/native-ci/README.md, "Clock
     model". This is the controller's only wall-clock read (pinned by a
@@ -650,8 +651,8 @@ def _scenario_hex(value: object, lengths: set[int], where: str) -> str:
     return value
 
 
-def _scenario_u64(value: object, where: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 0xFFFFFFFFFFFFFFFF:
+def _scenario_u64(value: object, where: str, maximum: int = 0xFFFFFFFFFFFFFFFF) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
         raise ValueError(f"acceptance scenario {where} is invalid")
     return value
 
@@ -675,10 +676,10 @@ def _acceptance_binding(manifest: dict[str, Any], scenario: object) -> dict[str,
         raise ValueError("acceptance scenario schema is unsupported")
     fixture = scenario["fixture"]
     fixture_fields = (
-        "integrated_candidate_sha", "activation_id", "activation_package_digest", "run_id", "job_id",
-        "request_digest", "manifest_digest", "source_oid", "approval_id", "grant_event_id", "grant_digest",
-        "approved_by", "export_subject", "export_authorization_digest", "controller_generation",
-        "runner_generation", "expected_log", "expected_artifacts",
+        "integrated_candidate_sha", "activation_id", "activation_package_digest", "run_id", "failure_run_id", "failure_selector", "job_id",
+        "request_digest", "failure_request_digest", "manifest_digest", "source_oid", "approval_id", "grant_event_id", "grant_digest",
+        "approved_by", "export_subject", "export_generation", "export_authorization_digest", "controller_generation",
+        "runner_generation", "expected_log", "expected_failure_log", "expected_artifacts",
     )
     if not isinstance(fixture, dict):
         raise ValueError("acceptance scenario fixture must be an object")
@@ -698,7 +699,7 @@ def _acceptance_binding(manifest: dict[str, Any], scenario: object) -> dict[str,
     if fixture["integrated_candidate_sha"] != manifest["source_commit"]:
         raise ValueError("acceptance scenario integrated candidate differs from the package source commit")
     job_id = fixture["job_id"]
-    if not isinstance(job_id, str) or not 1 <= len(job_id) <= 64 or re.fullmatch(r"[A-Za-z0-9._-]+", job_id) is None:
+    if not isinstance(job_id, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", job_id) is None:
         raise ValueError("acceptance scenario job id is invalid")
     artifacts = fixture["expected_artifacts"]
     if not isinstance(artifacts, list) or len(artifacts) != 1:
@@ -708,8 +709,11 @@ def _acceptance_binding(manifest: dict[str, Any], scenario: object) -> dict[str,
         "activation_id": activation_id,
         "activation_package_digest": _scenario_hex(fixture["activation_package_digest"], {64}, "activation package digest"),
         "run_id": _scenario_hex(fixture["run_id"], {32}, "run id"),
+        "failure_run_id": _scenario_hex(fixture["failure_run_id"], {32}, "failure run id"),
+        "failure_selector": activation_package.validate_fixture_selector(fixture["failure_selector"]),
         "job_id": job_id,
         "request_digest": _scenario_hex(fixture["request_digest"], {64}, "request digest"),
+        "failure_request_digest": _scenario_hex(fixture["failure_request_digest"], {64}, "failure request digest"),
         "manifest_digest": _scenario_hex(fixture["manifest_digest"], {64}, "manifest digest"),
         "source_oid": _scenario_hex(fixture["source_oid"], {40, 64}, "source oid"),
         "approval_id": _scenario_hex(fixture["approval_id"], {32}, "approval id"),
@@ -717,11 +721,17 @@ def _acceptance_binding(manifest: dict[str, Any], scenario: object) -> dict[str,
         "grant_digest": _scenario_hex(fixture["grant_digest"], {64}, "grant digest"),
         "approved_by": _scenario_hex(fixture["approved_by"], {64}, "approved by"),
         "export_subject": _scenario_hex(fixture["export_subject"], {64}, "export subject"),
+        "export_generation": _scenario_u64(
+            fixture["export_generation"], "export generation", 9_007_199_254_740_991,
+        ),
         "export_authorization_digest": _scenario_hex(fixture["export_authorization_digest"], {64}, "export authorization digest"),
         "controller_generation": _scenario_u64(fixture["controller_generation"], "controller generation"),
         "runner_generation": _scenario_u64(fixture["runner_generation"], "runner generation"),
         "expected_log": _ordered_evidence(fixture["expected_log"], "expected log"),
-        "expected_artifacts": [_ordered_evidence(artifacts[0], "expected artifact")],
+        "expected_failure_log": _ordered_evidence(fixture["expected_failure_log"], "expected failure log"),
+        "expected_artifacts": [
+            _ordered_evidence(artifact, "expected artifact") for artifact in artifacts
+        ],
     }
     driver = scenario["driver"]
     driver_fields = ("control", "observe", "export", "controller_process", "runner_process", "timeout_seconds")
@@ -744,11 +754,32 @@ def _acceptance_binding(manifest: dict[str, Any], scenario: object) -> dict[str,
     rust_bytes = json.dumps(ordered_scenario, ensure_ascii=False, separators=(",", ":")).encode()
     scenario_sha256 = activation_package.digest(rust_bytes)
     template = activation_package.validate_acceptance_template(manifest["acceptance_template"])
+    run = json.loads(template["run_event"][5], object_pairs_hook=activation_package.reject_duplicates)
+    failure_run = json.loads(
+        template["failure_run_event"][5], object_pairs_hook=activation_package.reject_duplicates,
+    )
+    request_digest = activation_package.digest(json.dumps(
+        template["run_event"], ensure_ascii=False, separators=(",", ":"),
+    ).encode())
+    failure_request_digest = activation_package.digest(json.dumps(
+        template["failure_run_event"], ensure_ascii=False, separators=(",", ":"),
+    ).encode())
     grant_event_id = activation_package.digest(json.dumps(
         template["grant_event"], ensure_ascii=False, separators=(",", ":"),
     ).encode())
     if ordered_fixture["grant_event_id"] != grant_event_id:
         raise ValueError("acceptance grant event id differs from the frozen public template")
+    if (
+        ordered_fixture["request_digest"] != request_digest
+        or ordered_fixture["failure_request_digest"] != failure_request_digest
+        or ordered_fixture["run_id"] != run["run_id"].replace("-", "")
+        or ordered_fixture["failure_run_id"] != failure_run["run_id"].replace("-", "")
+        or ordered_fixture["failure_selector"] != template["failure_selector"]
+        or ordered_fixture["export_subject"] != template["export_subject"]
+        or ordered_fixture["export_generation"] != template["export_generation"]
+        or ordered_fixture["export_authorization_digest"] != template["export_authorization_digest"]
+    ):
+        raise ValueError("acceptance scenario run binding differs from the frozen public template")
     acceptance = {
         "actor": {
             "public_key": template["actor"]["public_key"],
@@ -759,6 +790,10 @@ def _acceptance_binding(manifest: dict[str, Any], scenario: object) -> dict[str,
         "grant_event": template["grant_event"],
         "rerun_event": template["rerun_event"],
         "tombstone_event": template["tombstone_event"],
+        "failure_run_event": template["failure_run_event"],
+        "export_subject": template["export_subject"],
+        "export_generation": template["export_generation"],
+        "export_authorization_digest": template["export_authorization_digest"],
     }
     controld = manifest["identities"]["controld"]
     qualification = manifest["identities"]["qualification"]
@@ -787,7 +822,8 @@ def _acceptance_binding_bytes(
         "timeout_millis", "fixture", "acceptance",
     ]
     expected_acceptance = [
-        "actor", "scenario_sha256", "run_event", "grant_event", "rerun_event", "tombstone_event",
+        "actor", "scenario_sha256", "run_event", "grant_event", "rerun_event", "tombstone_event", "failure_run_event",
+        "export_subject", "export_generation", "export_authorization_digest",
     ]
     acceptance = binding.get("acceptance")
     controld = manifest.get("identities", {}).get("controld", {})
@@ -1048,6 +1084,12 @@ def _generated_acceptance_files(
     driver = {
         "schema_version": "buzz-ci-capacity-one-driver-config/v1",
         **common,
+        "failure_run_id": fixture["failure_run_id"],
+        "failure_selector": fixture["failure_selector"],
+        "failure_request_digest": fixture["failure_request_digest"],
+        "export_subject": fixture["export_subject"],
+        "export_generation": fixture["export_generation"],
+        "export_authorization_digest": fixture["export_authorization_digest"],
         "controld_uid": controld["uid"],
         "controld_gid": controld["gid"],
         "control_socket": activation_package.SOCKET_POLICY["acceptance_control"]["path"],
@@ -1107,6 +1149,9 @@ def _render_execd_config(
         "runner_generation": fixture["runner_generation"],
     })
     execution = rendered.get("execution")
+    if not isinstance(execution, dict):
+        raise ValueError("execd execution declaration is absent")
+    execution["failure_selector"] = fixture["failure_selector"]
     activation_package.validate_execution_declaration(execution, allow_placeholder=True)
     if fixture.get("manifest_digest") != execution.get("fixture_manifest_sha256"):
         raise ValueError("acceptance fixture manifest digest differs from the execd execution fixture")
