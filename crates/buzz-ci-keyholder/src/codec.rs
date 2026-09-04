@@ -4,8 +4,8 @@ use crate::types::{
     AcceptanceMutation, CanonicalPayload, DescribeAcceptanceRequest, DescribeAcceptanceResponse,
     DescribeRequest, DescribeResponse, ErrorCode, ErrorResponse, HttpMethod, ManifestKind,
     Nip98AuthorizeRequest, Nip98Signer, Operation, OperationSet, PeerPolicy, PublicIdentity,
-    Request, Response, SignAcceptanceMutationRequest, SignCiEventRequest, SignManifestRequest,
-    SignatureResponse, Url, ValueError,
+    QueryFilter, Request, Response, SignAcceptanceMutationRequest, SignCiEventRequest,
+    SignManifestRequest, SignatureResponse, Url, ValueError,
 };
 
 /// Keyholder frame magic.
@@ -333,11 +333,18 @@ fn encode_nip98(body: &mut BodyEncoder, value: &Nip98AuthorizeRequest) -> Result
     body.field(4, value.payload_digest.as_ref().map_or(&[], |value| value))?;
     body.field(5, &value.created_at.to_be_bytes())?;
     body.field(6, &value.nonce)?;
-    body.field(7, &[value.signer as u8])
+    body.field(7, &[value.signer as u8])?;
+    body.field(
+        8,
+        value
+            .query_filter
+            .as_ref()
+            .map_or(&[], QueryFilter::as_bytes),
+    )
 }
 
 fn decode_nip98(fields: &[Field<'_>]) -> Result<Nip98AuthorizeRequest, DecodeError> {
-    expect_tags(fields, &[1, 2, 3, 4, 5, 6, 7])?;
+    expect_tags(fields, &[1, 2, 3, 4, 5, 6, 7, 8])?;
     let method =
         HttpMethod::try_from(read_u8(fields[1].value)?).map_err(|_| DecodeError::UnknownEnum)?;
     let signer =
@@ -349,6 +356,11 @@ fn decode_nip98(fields: &[Field<'_>]) -> Result<Nip98AuthorizeRequest, DecodeErr
         32 => Some(nonzero_array(fields[3].value)?),
         _ => return Err(DecodeError::WrongFieldLength),
     };
+    let query_filter = if fields[7].value.is_empty() {
+        None
+    } else {
+        Some(QueryFilter::new(fields[7].value.to_vec()).map_err(map_value_error)?)
+    };
     Ok(Nip98AuthorizeRequest {
         expected_generation: nonzero_u64(fields[0].value)?,
         method,
@@ -357,6 +369,7 @@ fn decode_nip98(fields: &[Field<'_>]) -> Result<Nip98AuthorizeRequest, DecodeErr
         created_at: nonzero_u64(fields[4].value)?,
         nonce: nonzero_array(fields[5].value)?,
         signer,
+        query_filter,
     })
 }
 

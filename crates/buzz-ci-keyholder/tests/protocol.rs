@@ -3,9 +3,10 @@ use buzz_ci_keyholder::{
     CanonicalPayload, DecodeError, DescribeAcceptanceRequest, DescribeAcceptanceResponse,
     DescribeRequest, DescribeResponse, EncodeError, ErrorCode, ErrorResponse, FrameHeader,
     HttpMethod, KeyholderClient, KeyholderServer, ManifestKind, Nip98AuthorizeRequest, Nip98Signer,
-    Operation, OperationSet, PeerIdentity, PeerPolicy, PublicIdentity, Request, Response,
-    SignAcceptanceMutationRequest, SignCiEventRequest, SignManifestRequest, SignatureResponse, Url,
-    HEADER_SIZE, MAX_BODY_SIZE, MAX_CANONICAL_PAYLOAD_SIZE, MAX_FRAME_SIZE, PROTOCOL_VERSION,
+    Operation, OperationSet, PeerIdentity, PeerPolicy, PublicIdentity, QueryFilter, Request,
+    Response, SignAcceptanceMutationRequest, SignCiEventRequest, SignManifestRequest,
+    SignatureResponse, Url, HEADER_SIZE, MAX_BODY_SIZE, MAX_CANONICAL_PAYLOAD_SIZE, MAX_FRAME_SIZE,
+    PROTOCOL_VERSION,
 };
 use proptest::prelude::*;
 
@@ -49,6 +50,7 @@ fn requests() -> Vec<Request> {
             created_at: 1_800_000_000,
             nonce: [3; 16],
             signer: Nip98Signer::CiEvent,
+            query_filter: Some(QueryFilter::new(b"[{}]".to_vec()).expect("filter")),
         }),
         Request::SignManifest(SignManifestRequest {
             expected_generation: 9,

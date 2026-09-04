@@ -46,7 +46,7 @@ pub use types::{
     AcceptanceMutation, CanonicalPayload, DescribeAcceptanceRequest, DescribeAcceptanceResponse,
     DescribeRequest, DescribeResponse, ErrorCode, ErrorResponse, HttpMethod, ManifestKind,
     Nip98AuthorizeRequest, Nip98Signer, Operation, OperationSet, PeerIdentity, PeerPolicy,
-    PublicIdentity, Request, Response, SignAcceptanceMutationRequest, SignCiEventRequest,
-    SignManifestRequest, SignatureResponse, Url, ValueError, MAX_CANONICAL_PAYLOAD_SIZE,
-    MAX_URL_SIZE,
+    PublicIdentity, QueryFilter, Request, Response, SignAcceptanceMutationRequest,
+    SignCiEventRequest, SignManifestRequest, SignatureResponse, Url, ValueError,
+    MAX_CANONICAL_PAYLOAD_SIZE, MAX_QUERY_FILTER_SIZE, MAX_URL_SIZE,
 };

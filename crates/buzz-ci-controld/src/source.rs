@@ -124,13 +124,16 @@ impl HttpMethod {
 /// `publisher`: the relay stores an event only when that pubkey equals the
 /// NIP-98 token pubkey, so the authorizer signs the token with that key or
 /// refuses. Reads and evidence writes carry no publisher and keep the
-/// dedicated NIP-98 identity.
+/// dedicated NIP-98 identity. The exact-event `POST /query` read-back also
+/// carries its literal request body as `query_filter`, so the keyholder can
+/// check the filter itself rather than trust the digest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Nip98Binding {
     pub method: HttpMethod,
     pub url: Url,
     pub payload_sha256: Option<String>,
     pub publisher: Option<String>,
+    pub query_filter: Option<Vec<u8>>,
 }
 
 impl Nip98Binding {
@@ -148,12 +151,25 @@ impl Nip98Binding {
             self.payload_sha256.as_deref(),
             self.publisher.as_deref(),
         ) {
-            (HttpMethod::Get, None, None) => Ok(()),
-            (HttpMethod::Put, Some(digest), None) if is_lower_hex(digest, 64) => Ok(()),
+            (HttpMethod::Get, None, None) if self.query_filter.is_none() => Ok(()),
+            (HttpMethod::Put, Some(digest), None)
+                if is_lower_hex(digest, 64) && self.query_filter.is_none() =>
+            {
+                Ok(())
+            }
             (HttpMethod::Post, Some(digest), Some(publisher))
                 if is_lower_hex(digest, 64) && is_lower_hex(publisher, 64) =>
             {
-                Ok(())
+                // A carried filter is exactly the body the digest covers.
+                match &self.query_filter {
+                    None => Ok(()),
+                    Some(filter)
+                        if !filter.is_empty() && hex::encode(Sha256::digest(filter)) == digest =>
+                    {
+                        Ok(())
+                    }
+                    Some(_) => Err(SourceError::InvalidBinding),
+                }
             }
             _ => Err(SourceError::InvalidBinding),
         }
@@ -337,6 +353,7 @@ where
         url: Url,
         body: Vec<u8>,
         publisher: Option<String>,
+        query_filter: Option<Vec<u8>>,
     ) -> Result<HttpResponse, SourceError> {
         let payload_sha256 =
             (method != HttpMethod::Get).then(|| hex::encode(Sha256::digest(&body)));
@@ -345,6 +362,7 @@ where
             url: url.clone(),
             payload_sha256,
             publisher,
+            query_filter,
         };
         binding.validate()?;
         let authorization = self
@@ -390,7 +408,7 @@ where
 
     fn put_object(&mut self, path: &str, bytes: &[u8]) -> Result<StoredObject, SourceError> {
         let url = self.endpoint(path)?;
-        let response = self.request(HttpMethod::Put, url.clone(), bytes.to_vec(), None)?;
+        let response = self.request(HttpMethod::Put, url.clone(), bytes.to_vec(), None, None)?;
         let stored: StoredObjectWire =
             serde_json::from_slice(&response.body).map_err(|_| SourceError::InvalidResponse)?;
         stored.validate()?;
@@ -425,7 +443,7 @@ where
             .append_pair("channel_id", channel_id)
             .append_pair("after_cursor", &after_cursor.to_string())
             .append_pair("limit", "1");
-        let response = self.request(HttpMethod::Get, url, Vec::new(), None)?;
+        let response = self.request(HttpMethod::Get, url, Vec::new(), None, None)?;
         let wire: AcceptedResponse =
             serde_json::from_slice(&response.body).map_err(|_| SourceError::InvalidResponse)?;
         let Some(item) = wire.accepted else {
@@ -472,7 +490,7 @@ where
         // The token must be signed by the event's own author (relay rule:
         // `event.pubkey` equals the authenticated pubkey), so bind it here.
         let publisher = event_value.pubkey.to_hex();
-        let response = self.request(HttpMethod::Post, url, body, Some(publisher))?;
+        let response = self.request(HttpMethod::Post, url, body, Some(publisher), None)?;
         let reply: PublishResponse =
             serde_json::from_slice(&response.body).map_err(|_| SourceError::InvalidResponse)?;
         let exact_duplicate = !reply.accepted && reply.message.starts_with("duplicate:");
@@ -497,17 +515,26 @@ where
         {
             return Err(SourceError::InvalidRequest);
         }
-        // Name the exact kind alongside the id. The relay's read gates key on
-        // `kinds`, and the kind was just checked against the signed event, so
-        // the query can never match a different event than the pending one.
-        let body = serde_json::to_vec(&[serde_json::json!({
-            "ids": [event.event_id.as_str()],
-            "kinds": [event.kind],
-            "limit": 1
-        })])
-        .map_err(|_| SourceError::InvalidRequest)?;
+        // Name the exact id, its author, and its kind. The relay's read gates
+        // key on `kinds`, the author is the signer whose token carries the
+        // query, and both were just checked against the signed event, so the
+        // query can never match a different event than the pending one. The
+        // keyholder signs a `POST /query` token only for this literal filter,
+        // so the same bytes are the request body and the token's filter.
+        let author = signed.pubkey.to_hex();
+        let body = format!(
+            r#"[{{"ids":["{}"],"authors":["{author}"],"kinds":[{}],"limit":1}}]"#,
+            event.event_id, event.kind
+        )
+        .into_bytes();
         let url = self.endpoint("query")?;
-        let response = self.request(HttpMethod::Post, url, body, Some(signed.pubkey.to_hex()))?;
+        let response = self.request(
+            HttpMethod::Post,
+            url,
+            body.clone(),
+            Some(author),
+            Some(body),
+        )?;
         let found: Vec<nostr::Event> =
             serde_json::from_slice(&response.body).map_err(|_| SourceError::InvalidResponse)?;
         match found.as_slice() {
@@ -867,14 +894,23 @@ mod tests {
         let (transport, authorizer) = relay.into_parts();
         assert_eq!(transport.requests.len(), 1);
         assert_eq!(transport.requests[0].url.path(), "/query");
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&transport.requests[0].body)
-                .expect("filter"),
-            serde_json::json!([{"ids": [event_id], "kinds": [46101], "limit": 1}])
+        let author = keys.public_key().to_hex();
+        let expected = format!(
+            r#"[{{"ids":["{event_id}"],"authors":["{author}"],"kinds":[46101],"limit":1}}]"#
         );
+        assert_eq!(transport.requests[0].body, expected.as_bytes());
+        // The token request carries the exact body bytes and their digest.
         assert_eq!(
             authorizer.bindings[0].publisher.as_deref(),
-            Some(keys.public_key().to_hex().as_str())
+            Some(author.as_str())
+        );
+        assert_eq!(
+            authorizer.bindings[0].query_filter.as_deref(),
+            Some(expected.as_bytes())
+        );
+        assert_eq!(
+            authorizer.bindings[0].payload_sha256.as_deref(),
+            Some(hex::encode(Sha256::digest(expected.as_bytes())).as_str())
         );
     }
 
@@ -955,18 +991,21 @@ mod tests {
                 url: Url::parse("https://relay.example/a").expect("url"),
                 payload_sha256: Some("11".repeat(32)),
                 publisher: None,
+                query_filter: None,
             },
             Nip98Binding {
                 method: HttpMethod::Post,
                 url: Url::parse("https://user@relay.example/a").expect("url"),
                 payload_sha256: Some("11".repeat(32)),
                 publisher: Some("22".repeat(32)),
+                query_filter: None,
             },
             Nip98Binding {
                 method: HttpMethod::Put,
                 url: Url::parse("https://relay.example/a").expect("url"),
                 payload_sha256: None,
                 publisher: None,
+                query_filter: None,
             },
             // A publish without its author, and a read or write with one.
             Nip98Binding {
@@ -974,29 +1013,70 @@ mod tests {
                 url: Url::parse("https://relay.example/events").expect("url"),
                 payload_sha256: Some("11".repeat(32)),
                 publisher: None,
+                query_filter: None,
             },
             Nip98Binding {
                 method: HttpMethod::Post,
                 url: Url::parse("https://relay.example/events").expect("url"),
                 payload_sha256: Some("11".repeat(32)),
                 publisher: Some("not-a-pubkey".to_owned()),
+                query_filter: None,
             },
             Nip98Binding {
                 method: HttpMethod::Put,
                 url: Url::parse("https://relay.example/a").expect("url"),
                 payload_sha256: Some("11".repeat(32)),
                 publisher: Some("22".repeat(32)),
+                query_filter: None,
             },
             Nip98Binding {
                 method: HttpMethod::Get,
                 url: Url::parse("https://relay.example/a").expect("url"),
                 payload_sha256: None,
                 publisher: Some("22".repeat(32)),
+                query_filter: None,
+            },
+            // A query filter on a read or write, and one whose digest is not the body's.
+            Nip98Binding {
+                method: HttpMethod::Get,
+                url: Url::parse("https://relay.example/a").expect("url"),
+                payload_sha256: None,
+                publisher: None,
+                query_filter: Some(b"[{}]".to_vec()),
+            },
+            Nip98Binding {
+                method: HttpMethod::Put,
+                url: Url::parse("https://relay.example/a").expect("url"),
+                payload_sha256: Some(hex::encode(Sha256::digest(b"[{}]"))),
+                publisher: None,
+                query_filter: Some(b"[{}]".to_vec()),
+            },
+            Nip98Binding {
+                method: HttpMethod::Post,
+                url: Url::parse("https://relay.example/query").expect("url"),
+                payload_sha256: Some("11".repeat(32)),
+                publisher: Some("22".repeat(32)),
+                query_filter: Some(b"[{}]".to_vec()),
+            },
+            Nip98Binding {
+                method: HttpMethod::Post,
+                url: Url::parse("https://relay.example/query").expect("url"),
+                payload_sha256: Some(hex::encode(Sha256::digest(b""))),
+                publisher: Some("22".repeat(32)),
+                query_filter: Some(Vec::new()),
             },
         ];
         for binding in cases {
             assert_eq!(binding.validate(), Err(SourceError::InvalidBinding));
         }
+        let bound = Nip98Binding {
+            method: HttpMethod::Post,
+            url: Url::parse("https://relay.example/query").expect("url"),
+            payload_sha256: Some(hex::encode(Sha256::digest(b"[{}]"))),
+            publisher: Some("22".repeat(32)),
+            query_filter: Some(b"[{}]".to_vec()),
+        };
+        assert_eq!(bound.validate(), Ok(()));
     }
 
     fn valid_config_json(root: &Path) -> serde_json::Value {

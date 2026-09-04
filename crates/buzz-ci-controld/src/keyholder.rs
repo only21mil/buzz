@@ -13,7 +13,7 @@ use buzz_ci_keyholder::{
     DescribeAcceptanceRequest, DescribeAcceptanceResponse, DescribeRequest, DescribeResponse,
     ErrorCode, FrameHeader, HttpMethod as KeyholderHttpMethod, KeySelector, KeyholderClient,
     ManifestKind, Nip98AuthorizeRequest, Nip98Signer, OperationSet, PeerPolicy, PublicIdentity,
-    Request, Response, SelectorSet, SignAcceptanceMutationRequest, SignCiEventRequest,
+    QueryFilter, Request, Response, SelectorSet, SignAcceptanceMutationRequest, SignCiEventRequest,
     SignManifestRequest, SignatureResponse, Url as KeyholderUrl, HEADER_SIZE,
     KEYHOLDER_SOCKET_PATH, MAX_BODY_SIZE,
 };
@@ -568,6 +568,14 @@ impl Nip98Authorizer for UnixKeyholderClient {
         let identity = self.nip98_identity(signer)?;
         let created_at = unix_time()?;
         let nonce = *Uuid::new_v4().as_bytes();
+        // The exact-event query carries its literal body so the keyholder
+        // checks the filter itself before it signs.
+        let query_filter = binding
+            .query_filter
+            .clone()
+            .map(QueryFilter::new)
+            .transpose()
+            .map_err(|_| KeyholderError::InvalidInput)?;
         let request = Nip98AuthorizeRequest {
             expected_generation: identity.generation,
             method,
@@ -577,6 +585,7 @@ impl Nip98Authorizer for UnixKeyholderClient {
             created_at,
             nonce,
             signer,
+            query_filter,
         };
         let response = KeyholderClient::nip98_authorize(self, request)?;
         // The keyholder answered with the identity chosen above; a publish
@@ -900,6 +909,7 @@ mod tests {
             url: url::Url::parse("https://relay.example.test/events").expect("url"),
             payload_sha256: Some("11".repeat(32)),
             publisher: Some(publisher.to_owned()),
+            query_filter: None,
         }
     }
 
@@ -1032,6 +1042,18 @@ mod tests {
                         let Request::Nip98Authorize(request) = request else {
                             panic!("nip98 request")
                         };
+                        // A query token carries the literal filter whose
+                        // SHA-256 is the payload digest; no other route does.
+                        let is_query = request.url.as_str().ends_with("/query");
+                        match (&request.query_filter, request.payload_digest) {
+                            (Some(filter), Some(digest)) if is_query => assert_eq!(
+                                <[u8; 32]>::from(Sha256::digest(filter.as_bytes())),
+                                digest,
+                                "query filter bytes must be the digested body"
+                            ),
+                            (None, _) if !is_query => {}
+                            other => panic!("query filter binding: {other:?}"),
+                        }
                         let (scalar, generation) = match (reply, request.signer) {
                             (Reply::Nip98WrongKey, _) | (_, Nip98Signer::Nip98) => (2, 8),
                             (_, Nip98Signer::CiEvent) => (1, 7),
@@ -1202,6 +1224,7 @@ mod tests {
             .expect("url"),
             payload_sha256: None,
             publisher: None,
+            query_filter: None,
         };
         let token = token_event(&client.authorization(&read).expect("read token"));
         assert_eq!(token.pubkey.to_hex(), NIP98_KEY);
@@ -1221,6 +1244,93 @@ mod tests {
         );
         assert_eq!(token.pubkey.to_hex(), actor_hex);
         server.join().expect("server");
+    }
+
+    #[test]
+    fn pending_publication_reconciliation_requests_an_exact_event_query_token_as_the_author() {
+        use crate::production::RelayControl as _;
+        use crate::source::{AuthenticatedRelay, HttpRequest, HttpResponse, HttpTransport};
+        use nostr::{EventBuilder, Keys, Kind};
+
+        struct RecordingTransport {
+            requests: Vec<HttpRequest>,
+        }
+
+        impl HttpTransport for RecordingTransport {
+            type Error = ();
+
+            fn execute(&mut self, request: HttpRequest) -> Result<HttpResponse, Self::Error> {
+                self.requests.push(request);
+                Ok(HttpResponse {
+                    status: 200,
+                    body: b"[]".to_vec(),
+                })
+            }
+        }
+
+        // The pending event was signed by the ci-event key the keyholder holds.
+        let keys = Keys::parse(&format!("{}01", "00".repeat(31))).expect("ci-event key");
+        assert_eq!(keys.public_key().to_hex(), CI_KEY);
+        let event = EventBuilder::new(Kind::Custom(46101), "{}")
+            .sign_with_keys(&keys)
+            .expect("signed event");
+        let signed = SignedCiEvent {
+            event_id: event.id.to_hex(),
+            kind: 46101,
+            content: "{}".to_owned(),
+            tags: serde_json::to_value(&event.tags).expect("tags"),
+            signed_event: serde_json::to_value(&event).expect("event"),
+        };
+
+        let (_directory, path, server) = spawn_server(vec![Reply::Describe, Reply::Nip98]);
+        let client = UnixKeyholderClient::connect_for_test(config(path, 500, 1))
+            .expect("authenticated client");
+        let mut relay = AuthenticatedRelay::new(
+            url::Url::parse("https://relay.example.test/").expect("url"),
+            RecordingTransport {
+                requests: Vec::new(),
+            },
+            client,
+        )
+        .expect("relay");
+
+        assert!(!relay
+            .publication_exists(&signed)
+            .expect("exact-event query"));
+        let (transport, _client) = relay.into_parts();
+        server.join().expect("server");
+
+        let [request] = transport.requests.as_slice() else {
+            panic!("exactly one relay request");
+        };
+        assert_eq!(request.method, HttpMethod::Post);
+        assert_eq!(request.url.as_str(), "https://relay.example.test/query");
+        let token = token_event(&request.headers["authorization"]);
+        assert_eq!(token.pubkey.to_hex(), CI_KEY);
+        assert_eq!(token.kind.as_u16() as u32, NIP98_EVENT_KIND);
+        let tag = |name: &str| {
+            token
+                .tags
+                .iter()
+                .map(|tag| tag.as_slice())
+                .find(|tag| tag.first().map(String::as_str) == Some(name))
+                .map(|tag| tag[1].clone())
+                .expect(name)
+        };
+        assert_eq!(tag("u"), "https://relay.example.test/query");
+        assert_eq!(tag("method"), "POST");
+        assert_eq!(tag("payload"), hex::encode(Sha256::digest(&request.body)));
+        // The body is the canonical one-event filter naming the ci-event key
+        // as author; the fake keyholder checked that the token request carried
+        // exactly these bytes as its filter before it signed.
+        assert_eq!(
+            request.body,
+            format!(
+                r#"[{{"ids":["{}"],"authors":["{CI_KEY}"],"kinds":[46101],"limit":1}}]"#,
+                event.id.to_hex()
+            )
+            .into_bytes()
+        );
     }
 
     #[test]

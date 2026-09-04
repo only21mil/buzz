@@ -108,6 +108,20 @@ or granted CI signer for the request's repository. The guest rosters the
 acceptance actor as channel admin, the ci-event key as member, and the nip98
 key as the static signer (`guest_entry.relay_public_config`), the same three
 facts production must hold for its channel.
+The relay also serves `POST /query` (api/bridge.rs `query_events`): a NIP-98
+token with the payload digest, a JSON array of filters that each name `kinds`
+(a kindless filter is refused with 403), `ids` lookups, `authors` narrowing to
+events that pubkey signed (controld's exact-event read-back names its own
+ci-event key), and results limited to the caller's channel access. `run --relay-fault stale-terminal-publication-recovery`
+arms the one fault mode: the guest writes `/var/lib/buzzci-e2e-relay/fault`
+before the relay starts; the relay answers the first publish of the terminal
+kind-46101 run status with the production drift refusal, stores nothing, and
+records the refused id plus whether controld read it back through `POST /query`;
+after the canary the guest requires that record to show the read-back and a
+controld snapshot in which every `run:terminal` publication is `Accepted`. This is the
+M11 production failure (PR #156 recovery, keyholder `POST /query` token): without
+the keyholder route the run stops in `canary`. A standard run carries
+`relay_fault: null` in its phase file and is unchanged.
 The host records every staged ISO path with Rock Ridge owner and group `0:0`
 while retaining each frozen file and directory mode. Package manifests,
 payload bytes, and tree digests are unchanged, so the guest's strict root-owned

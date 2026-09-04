@@ -108,6 +108,9 @@ FROZEN_ASSETS = (
     "receipt_verifier.py", "expected-stages.json",
 )
 GUEST_ASSETS = tuple(name for name in FROZEN_ASSETS if name != "harness.py")
+# Opt-in loopback-relay fault modes (local_tls_relay.py RELAY_FAULTS). The
+# candidate phase file always carries `relay_fault`; None is the standard run.
+RELAY_FAULTS = ("stale-terminal-publication-recovery",)
 REQUIRED_CANDIDATE = (
     "deploy/native-ci/runner/install.py",
     "deploy/native-ci/controld/install.py",
@@ -2108,19 +2111,20 @@ def claim_run_state(binding: dict[str, str]) -> tuple[Path, StateIdentity, bool]
         release_claim_lock(parent_fd)
 
 
-def terminal_run(contract_path: Path, results: Path) -> dict[str, object]:
+def terminal_run(contract_path: Path, results: Path, relay_fault: str | None = None) -> dict[str, object]:
     """Own cleanup from prepared-state selection through terminal run exit."""
     value = validate_contract_envelope(load_json(contract_path))
     binding = run_binding(value, results)
     parent_fd = acquire_claim_lock(binding)
     try:
-        return _terminal_run_locked(value, binding, results, parent_fd)
+        return _terminal_run_locked(value, binding, results, parent_fd, relay_fault)
     finally:
         release_claim_lock(parent_fd)
 
 
 def _terminal_run_locked(
     value: dict[str, object], binding: dict[str, str], results: Path, parent_fd: int,
+    relay_fault: str | None = None,
 ) -> dict[str, object]:
     publication = load_publication(binding)
     try:
@@ -2165,6 +2169,7 @@ def _terminal_run_locked(
             contract, state, records, scenario_raw, seccomp_raw, results,
             prior_scenario_raw=prior_scenario_raw,
             expected_state=expected, binding=binding, resumed=resumed,
+            relay_fault=relay_fault,
         )
     except BaseException as run_error:
         if handed_to_run:
@@ -2509,8 +2514,10 @@ def finish_publication(
 def create_run_stage(
     contract: dict[str, object], state: Path,
     records: dict[str, list[tuple[str, int, bytes]]], scenario_raw: bytes, seccomp_raw: bytes,
-    prior_scenario_raw: bytes,
+    prior_scenario_raw: bytes, relay_fault: str | None = None,
 ) -> None:
+    if relay_fault is not None and relay_fault not in RELAY_FAULTS:
+        raise HarnessError("relay fault mode differs")
     stage = state / "stage"
     stage.mkdir(mode=0o700)
     candidate_tar = stage / "candidate.tar"
@@ -2560,6 +2567,7 @@ def create_run_stage(
         "phase": "run", "challenge": state_record["challenge"],
         "descriptor_sha256": hashlib.sha256(canonical(descriptor)).hexdigest(),
         "timing": TIMING_CONTRACT, "timing_sha256": timing_sha256(),
+        "relay_fault": relay_fault,
     })
     make_iso(stage, state / "stage.iso", "BUZZCI_STAGE")
     shutil.rmtree(stage)
@@ -2667,6 +2675,7 @@ def run_vm(
     scenario_raw: bytes, seccomp_raw: bytes, results_arg: Path,
     *, prior_scenario_raw: bytes = b"", expected_state: StateIdentity | None = None,
     binding: dict[str, str] | None = None, resumed: bool = False,
+    relay_fault: str | None = None,
 ) -> dict[str, object]:
     if expected_state is None:
         expected_state = state_identity(state)
@@ -2686,7 +2695,7 @@ def run_vm(
                 raise HarnessError("prior VM run residue exists")
             qemu_img_create(state, "candidate.qcow2", "trusted.qcow2")
             create_transfer(state)
-            create_run_stage(contract, state, records, scenario_raw, seccomp_raw, prior_scenario_raw)
+            create_run_stage(contract, state, records, scenario_raw, seccomp_raw, prior_scenario_raw, relay_fault)
             boot(
                 state, watchdog_seconds("candidate"), overlay="candidate.qcow2",
                 evidence_expected=False, transfer="read-write",
@@ -2803,6 +2812,10 @@ def main() -> int:
         child.add_argument("--contract", type=Path, required=True)
         if name == "run":
             child.add_argument("--results", type=Path, required=True)
+            child.add_argument(
+                "--relay-fault", choices=RELAY_FAULTS, default=None,
+                help="arm one loopback-relay fault mode; absent means the standard lifecycle",
+            )
     arguments = parser.parse_args()
     try:
         if arguments.action == "capabilities":
@@ -2811,7 +2824,7 @@ def main() -> int:
             result = prepare(arguments)
         else:
             if arguments.action == "run":
-                result = terminal_run(arguments.contract, arguments.results)
+                result = terminal_run(arguments.contract, arguments.results, arguments.relay_fault)
             else:
                 contract, _state, _records, _scenario_raw, _seccomp_raw, _prior_scenario_raw = validate_contract(arguments.contract)
                 result = {

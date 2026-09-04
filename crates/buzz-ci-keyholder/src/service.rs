@@ -21,6 +21,8 @@ use crate::{
 
 const CI_EVENT_KIND_MIN: u32 = 46_101;
 const CI_EVENT_KIND_MAX: u32 = 46_106;
+const QUERY_KIND_MIN: u64 = 46_100;
+const QUERY_KIND_MAX: u64 = 46_107;
 const NIP98_EVENT_KIND: u32 = 27_235;
 const NIP98_TIMESTAMP_TOLERANCE_SECONDS: u64 = 60;
 
@@ -206,7 +208,7 @@ impl SigningPolicy {
             return Err(ServiceError::PolicyDenied);
         }
         if request.method == HttpMethod::Get {
-            if request.signer != Nip98Signer::Nip98 {
+            if request.signer != Nip98Signer::Nip98 || request.query_filter.is_some() {
                 return Err(ServiceError::PolicyDenied);
             }
             return authorize_accepted_read(&parsed, request);
@@ -223,15 +225,28 @@ impl SigningPolicy {
             .collect::<Vec<_>>();
         // A publish token is signed by the event's own signer: the relay stores
         // an event only when `event.pubkey` equals the token pubkey, so a
-        // `nip98.key` token can never carry a publish. Every other route is
-        // authorized as a CI signer, which stays the `nip98.key` identity.
+        // `nip98.key` token can never carry a publish. The exact-event query
+        // that reconciles a refused CI publication reads back the CI event as
+        // its author, so it is signed by the `ci-event.key` selector alone and
+        // only for the literal one-event filter that names that key as the
+        // author. Every other route is authorized as a CI signer, which stays
+        // the `nip98.key` identity, and never carries a query filter.
         let allowed = match (request.method, segments.as_slice()) {
-            (HttpMethod::Post, ["events"]) => request.signer != Nip98Signer::Nip98,
+            (HttpMethod::Post, ["events"]) => {
+                request.signer != Nip98Signer::Nip98 && request.query_filter.is_none()
+            }
+            (HttpMethod::Post, ["query"]) => {
+                request.signer == Nip98Signer::CiEvent && self.exact_event_query_is_bound(request)
+            }
             (HttpMethod::Put, ["ci", "logs", fields @ ..]) => {
-                fields.len() == 5 && request.signer == Nip98Signer::Nip98
+                fields.len() == 5
+                    && request.signer == Nip98Signer::Nip98
+                    && request.query_filter.is_none()
             }
             (HttpMethod::Put, ["ci", "artifacts", fields @ ..]) => {
-                fields.len() == 6 && request.signer == Nip98Signer::Nip98
+                fields.len() == 6
+                    && request.signer == Nip98Signer::Nip98
+                    && request.query_filter.is_none()
             }
             _ => false,
         };
@@ -248,6 +263,61 @@ impl SigningPolicy {
             return Err(ServiceError::PolicyDenied);
         }
         Ok(())
+    }
+
+    /// Return whether a `POST /query` token is bound to the exact-event read-back.
+    ///
+    /// The request must carry the literal filter body, the payload digest
+    /// must be the SHA-256 of exactly those bytes, and the bytes must be the
+    /// canonical single filter
+    /// `[{"ids":[<id>],"authors":[<ci-event key>],"kinds":[<kind>],"limit":1}]`
+    /// with one 64-character lowercase hex id, this keyholder's own ci-event
+    /// public key as the only author, one CI kind, and limit 1. Any other
+    /// filter, including a whitespace or key-order variant, is denied.
+    fn exact_event_query_is_bound(&self, request: &Nip98AuthorizeRequest) -> bool {
+        let (Some(filter), Some(digest)) = (&request.query_filter, request.payload_digest) else {
+            return false;
+        };
+        if <[u8; 32]>::from(Sha256::digest(filter.as_bytes())) != digest {
+            return false;
+        }
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(filter.as_bytes()) else {
+            return false;
+        };
+        let Some([object]) = value.as_array().map(Vec::as_slice) else {
+            return false;
+        };
+        let Some(object) = object.as_object() else {
+            return false;
+        };
+        if object.len() != 4 {
+            return false;
+        }
+        let single = |key: &str| match object.get(key).and_then(serde_json::Value::as_array) {
+            Some(values) if values.len() == 1 => Some(&values[0]),
+            _ => None,
+        };
+        let (Some(id), Some(author), Some(kind), Some(limit)) = (
+            single("ids").and_then(serde_json::Value::as_str),
+            single("authors").and_then(serde_json::Value::as_str),
+            single("kinds").and_then(serde_json::Value::as_u64),
+            object.get("limit").and_then(serde_json::Value::as_u64),
+        ) else {
+            return false;
+        };
+        if id.len() != 64
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || author != hex::encode(self.selectors.ci_event().public_key)
+            || !(QUERY_KIND_MIN..=QUERY_KIND_MAX).contains(&kind)
+            || limit != 1
+        {
+            return false;
+        }
+        let canonical =
+            format!(r#"[{{"ids":["{id}"],"authors":["{author}"],"kinds":[{kind}],"limit":1}}]"#);
+        filter.as_bytes() == canonical.as_bytes()
     }
 }
 
@@ -732,7 +802,10 @@ pub(crate) mod tests {
     use buzz_core::kind::{KIND_CI_GRANT, KIND_CI_REQUEST, KIND_DELETION};
 
     use super::*;
-    use crate::{CanonicalPayload, ManifestKind, OperationSet, Url};
+    use crate::{
+        CanonicalPayload, ManifestKind, OperationSet, QueryFilter, Url, ValueError,
+        MAX_QUERY_FILTER_SIZE,
+    };
 
     #[derive(Debug)]
     struct FakeBackend {
@@ -1218,6 +1291,7 @@ pub(crate) mod tests {
             payload_digest: Some([4_u8; 32]),
             created_at: now,
             nonce: [5_u8; 16],
+            query_filter: None,
         };
         let expected = nip98_event_digest([1_u8; 32], &request).expect("digest");
         let response = service.handle(peer(), Request::Nip98Authorize(request));
@@ -1240,6 +1314,7 @@ pub(crate) mod tests {
             payload_digest: None,
             created_at: now,
             nonce: [6; 16],
+            query_filter: None,
         };
         let expected = nip98_event_digest([2; 32], &accepted_read).expect("digest");
         let response = service.handle(peer(), Request::Nip98Authorize(accepted_read));
@@ -1276,6 +1351,7 @@ pub(crate) mod tests {
                 payload_digest: None,
                 created_at: now,
                 nonce: [u8::try_from(index + 20).expect("bounded index"); 16],
+                query_filter: None,
             };
             assert!(matches!(
                 service.handle(peer(), Request::Nip98Authorize(denied)),
@@ -1297,6 +1373,7 @@ pub(crate) mod tests {
             payload_digest: Some([9; 32]),
             created_at: now,
             nonce: [40; 16],
+            query_filter: None,
         };
         assert!(matches!(
             service.handle(peer(), Request::Nip98Authorize(payload_on_get)),
@@ -1318,6 +1395,7 @@ pub(crate) mod tests {
                 payload_digest: Some([4; 32]),
                 created_at: now,
                 nonce: [8; 16],
+                query_filter: None,
             },
             Nip98AuthorizeRequest {
                 expected_generation: 8,
@@ -1327,6 +1405,7 @@ pub(crate) mod tests {
                 payload_digest: Some([4; 32]),
                 created_at: now,
                 nonce: [9; 16],
+                query_filter: None,
             },
             Nip98AuthorizeRequest {
                 expected_generation: 8,
@@ -1337,6 +1416,7 @@ pub(crate) mod tests {
                 payload_digest: None,
                 created_at: now,
                 nonce: [10; 16],
+                query_filter: None,
             },
             Nip98AuthorizeRequest {
                 expected_generation: 8,
@@ -1347,6 +1427,7 @@ pub(crate) mod tests {
                 payload_digest: Some([0; 32]),
                 created_at: now,
                 nonce: [11; 16],
+                query_filter: None,
             },
         ] {
             assert!(matches!(
@@ -1369,6 +1450,7 @@ pub(crate) mod tests {
             payload_digest: None,
             created_at: now,
             nonce: [6_u8; 16],
+            query_filter: None,
         };
         assert!(matches!(
             service.handle(peer(), Request::Nip98Authorize(denied)),
@@ -1389,6 +1471,7 @@ pub(crate) mod tests {
             payload_digest: None,
             created_at: now.saturating_sub(NIP98_TIMESTAMP_TOLERANCE_SECONDS + 1),
             nonce: [7_u8; 16],
+            query_filter: None,
         };
         assert!(matches!(
             service.handle(peer(), Request::Nip98Authorize(stale)),
@@ -1416,6 +1499,7 @@ pub(crate) mod tests {
             payload_digest: Some([4_u8; 32]),
             created_at: now,
             nonce: [nonce; 16],
+            query_filter: None,
         }
     }
 
@@ -1454,6 +1538,7 @@ pub(crate) mod tests {
                 payload_digest: None,
                 created_at: now,
                 nonce: [51; 16],
+                query_filter: None,
             };
             let put = Nip98AuthorizeRequest {
                 expected_generation: generation,
@@ -1464,6 +1549,7 @@ pub(crate) mod tests {
                 payload_digest: Some([4; 32]),
                 created_at: now,
                 nonce: [52; 16],
+                query_filter: None,
             };
             for request in [read, put] {
                 let response = service.handle(peer(), Request::Nip98Authorize(request));
@@ -1519,6 +1605,471 @@ pub(crate) mod tests {
             ),
             ErrorCode::PolicyDenied
         ));
+    }
+
+    const CI_EVENT_HEX: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+    const QUERY_URL: &str = "https://relay.example.test/query";
+
+    fn exact_event_filter(id: &str, author: &str, kind: &str, limit: &str) -> Vec<u8> {
+        format!(r#"[{{"ids":["{id}"],"authors":["{author}"],"kinds":[{kind}],"limit":{limit}}}]"#)
+            .into_bytes()
+    }
+
+    fn canonical_filter() -> Vec<u8> {
+        exact_event_filter(&"ab".repeat(32), CI_EVENT_HEX, "46101", "1")
+    }
+
+    /// A `POST /query` request whose payload digest is the SHA-256 of `filter`.
+    fn bound_query(
+        signer: Nip98Signer,
+        generation: u64,
+        url: &str,
+        filter: Vec<u8>,
+        nonce: u8,
+        now: u64,
+    ) -> Nip98AuthorizeRequest {
+        let digest = Sha256::digest(&filter).into();
+        query_request(
+            signer,
+            generation,
+            url,
+            Some(digest),
+            Some(QueryFilter::new(filter).expect("bounded filter")),
+            nonce,
+            now,
+        )
+    }
+
+    fn query_request(
+        signer: Nip98Signer,
+        generation: u64,
+        url: &str,
+        payload_digest: Option<[u8; 32]>,
+        query_filter: Option<QueryFilter>,
+        nonce: u8,
+        now: u64,
+    ) -> Nip98AuthorizeRequest {
+        Nip98AuthorizeRequest {
+            expected_generation: generation,
+            signer,
+            method: HttpMethod::Post,
+            url: Url::new(url.to_owned()).expect("url"),
+            payload_digest,
+            created_at: now,
+            nonce: [nonce; 16],
+            query_filter,
+        }
+    }
+
+    #[test]
+    fn exact_event_query_tokens_are_signed_by_the_ci_event_key_and_nothing_else_opens() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_secs();
+        let service = service(OperationSet::only(Operation::Nip98Authorize));
+
+        // The controld principal reads back its own refused publication as
+        // the event author: signer `ci_event` at its generation, carrying the
+        // literal one-event filter that names its own key, with the digest of
+        // exactly those bytes bound into the token.
+        let request = bound_query(
+            Nip98Signer::CiEvent,
+            7,
+            QUERY_URL,
+            canonical_filter(),
+            60,
+            now,
+        );
+        let expected = nip98_event_digest([1_u8; 32], &request).expect("digest");
+        let Response::Nip98Authorize(signature) =
+            service.handle(peer(), Request::Nip98Authorize(request))
+        else {
+            panic!("exact-event query token should sign");
+        };
+        assert_eq!(signature.identity.public_key, [1_u8; 32]);
+        assert_eq!(signature.identity.generation, 7);
+        assert_eq!(signature.signed_digest, expected);
+        assert_eq!(
+            service.backend.calls.borrow().as_slice(),
+            &[(KeySelector::CiEvent, expected)]
+        );
+        // Every CI kind in the query range signs; the range edges are the gate.
+        for kind in ["46100", "46107"] {
+            let filter = exact_event_filter(&"cd".repeat(32), CI_EVENT_HEX, kind, "1");
+            assert!(
+                matches!(
+                    service.handle(
+                        peer(),
+                        Request::Nip98Authorize(bound_query(
+                            Nip98Signer::CiEvent,
+                            7,
+                            QUERY_URL,
+                            filter,
+                            61,
+                            now
+                        ))
+                    ),
+                    Response::Nip98Authorize(_)
+                ),
+                "kind {kind}"
+            );
+        }
+        let signed = service.backend.calls.borrow().len();
+        assert_eq!(signed, 3);
+
+        // The query never opens for the nip98 key, for the acceptance actor,
+        // without a filter or digest, with a digest that is not the filter's
+        // own SHA-256, with a query string, on a nested or unrelated path, or
+        // on another method.
+        let canonical_digest: [u8; 32] = Sha256::digest(canonical_filter()).into();
+        let canonical = || Some(QueryFilter::new(canonical_filter()).expect("filter"));
+        let denied = [
+            bound_query(
+                Nip98Signer::Nip98,
+                8,
+                QUERY_URL,
+                canonical_filter(),
+                62,
+                now,
+            ),
+            query_request(
+                Nip98Signer::CiEvent,
+                7,
+                QUERY_URL,
+                Some([4; 32]),
+                None,
+                63,
+                now,
+            ),
+            query_request(
+                Nip98Signer::CiEvent,
+                7,
+                QUERY_URL,
+                None,
+                canonical(),
+                64,
+                now,
+            ),
+            query_request(
+                Nip98Signer::CiEvent,
+                7,
+                QUERY_URL,
+                Some([0; 32]),
+                canonical(),
+                65,
+                now,
+            ),
+            query_request(
+                Nip98Signer::CiEvent,
+                7,
+                QUERY_URL,
+                Some([4; 32]),
+                canonical(),
+                66,
+                now,
+            ),
+            query_request(
+                Nip98Signer::CiEvent,
+                7,
+                QUERY_URL,
+                Some(canonical_digest),
+                Some(
+                    QueryFilter::new(exact_event_filter(
+                        &"ef".repeat(32),
+                        CI_EVENT_HEX,
+                        "46101",
+                        "1",
+                    ))
+                    .expect("filter"),
+                ),
+                67,
+                now,
+            ),
+            bound_query(
+                Nip98Signer::CiEvent,
+                7,
+                "https://relay.example.test/query?limit=1",
+                canonical_filter(),
+                68,
+                now,
+            ),
+            bound_query(
+                Nip98Signer::CiEvent,
+                7,
+                "https://relay.example.test/query/extra",
+                canonical_filter(),
+                69,
+                now,
+            ),
+            bound_query(
+                Nip98Signer::CiEvent,
+                7,
+                "https://relay.example.test/admin",
+                canonical_filter(),
+                70,
+                now,
+            ),
+            bound_query(
+                Nip98Signer::CiEvent,
+                7,
+                "https://relay.example.test/count",
+                canonical_filter(),
+                71,
+                now,
+            ),
+            bound_query(
+                Nip98Signer::CiEvent,
+                7,
+                "https://other.example.test/query",
+                canonical_filter(),
+                72,
+                now,
+            ),
+            Nip98AuthorizeRequest {
+                method: HttpMethod::Put,
+                ..bound_query(
+                    Nip98Signer::CiEvent,
+                    7,
+                    QUERY_URL,
+                    canonical_filter(),
+                    73,
+                    now,
+                )
+            },
+            Nip98AuthorizeRequest {
+                method: HttpMethod::Head,
+                ..bound_query(
+                    Nip98Signer::CiEvent,
+                    7,
+                    QUERY_URL,
+                    canonical_filter(),
+                    74,
+                    now,
+                )
+            },
+        ];
+        for request in denied {
+            let label = format!(
+                "{:?} {:?} {}",
+                request.signer,
+                request.method,
+                request.url.as_str()
+            );
+            assert!(
+                denied_with(
+                    service.handle(peer(), Request::Nip98Authorize(request)),
+                    ErrorCode::PolicyDenied
+                ),
+                "{label}"
+            );
+        }
+        assert_eq!(service.backend.calls.borrow().len(), signed);
+
+        // Even with the activation binding loaded, the actor may publish its
+        // frozen events but never query.
+        let service = acceptance_service();
+        assert!(denied_with(
+            service.handle(
+                peer(),
+                Request::Nip98Authorize(bound_query(
+                    Nip98Signer::AcceptanceActor,
+                    10,
+                    QUERY_URL,
+                    canonical_filter(),
+                    75,
+                    now
+                ))
+            ),
+            ErrorCode::PolicyDenied
+        ));
+        assert!(service.backend.acceptance_calls.borrow().is_empty());
+        assert!(service.backend.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn exact_event_query_filters_that_widen_the_read_back_are_denied() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_secs();
+        let service = service(OperationSet::only(Operation::Nip98Authorize));
+        let id = "ab".repeat(32);
+        let other_author = "02".repeat(32);
+        let two_ids = format!(r#""{id}","{}""#, "cd".repeat(32));
+        let widened: [(&str, Vec<u8>); 17] = [
+            (
+                "authors other than self",
+                exact_event_filter(&id, &other_author, "46101", "1"),
+            ),
+            (
+                "self plus another author",
+                format!(
+                    r#"[{{"ids":["{id}"],"authors":["{CI_EVENT_HEX}","{other_author}"],"kinds":[46101],"limit":1}}]"#
+                )
+                .into_bytes(),
+            ),
+            (
+                "two ids",
+                format!(
+                    r#"[{{"ids":[{two_ids}],"authors":["{CI_EVENT_HEX}"],"kinds":[46101],"limit":1}}]"#
+                )
+                .into_bytes(),
+            ),
+            (
+                "no ids",
+                format!(r#"[{{"ids":[],"authors":["{CI_EVENT_HEX}"],"kinds":[46101],"limit":1}}]"#)
+                    .into_bytes(),
+            ),
+            (
+                "uppercase id",
+                exact_event_filter(&"AB".repeat(32), CI_EVENT_HEX, "46101", "1"),
+            ),
+            (
+                "short id",
+                exact_event_filter(&"ab".repeat(31), CI_EVENT_HEX, "46101", "1"),
+            ),
+            (
+                "extra key",
+                format!(
+                    r#"[{{"ids":["{id}"],"authors":["{CI_EVENT_HEX}"],"kinds":[46101],"limit":1,"since":0}}]"#
+                )
+                .into_bytes(),
+            ),
+            (
+                "kind below the CI range",
+                exact_event_filter(&id, CI_EVENT_HEX, "46099", "1"),
+            ),
+            (
+                "kind above the CI range",
+                exact_event_filter(&id, CI_EVENT_HEX, "46108", "1"),
+            ),
+            (
+                "two kinds",
+                exact_event_filter(&id, CI_EVENT_HEX, "46101,46102", "1"),
+            ),
+            (
+                "kindless",
+                format!(r#"[{{"ids":["{id}"],"authors":["{CI_EVENT_HEX}"],"limit":1,"since":0}}]"#)
+                    .into_bytes(),
+            ),
+            ("limit 2", exact_event_filter(&id, CI_EVENT_HEX, "46101", "2")),
+            (
+                "two filters",
+                format!(
+                    r#"[{{"ids":["{id}"],"authors":["{CI_EVENT_HEX}"],"kinds":[46101],"limit":1}},{{"kinds":[46100]}}]"#
+                )
+                .into_bytes(),
+            ),
+            (
+                "bare object",
+                format!(r#"{{"ids":["{id}"],"authors":["{CI_EVENT_HEX}"],"kinds":[46101],"limit":1}}"#)
+                    .into_bytes(),
+            ),
+            (
+                "whitespace variant",
+                format!(
+                    r#"[{{"ids": ["{id}"], "authors": ["{CI_EVENT_HEX}"], "kinds": [46101], "limit": 1}}]"#
+                )
+                .into_bytes(),
+            ),
+            (
+                "key-order variant",
+                format!(
+                    r#"[{{"authors":["{CI_EVENT_HEX}"],"ids":["{id}"],"kinds":[46101],"limit":1}}]"#
+                )
+                .into_bytes(),
+            ),
+            (
+                "padded to the size bound",
+                {
+                    let mut filter = canonical_filter();
+                    filter.resize(MAX_QUERY_FILTER_SIZE, b' ');
+                    filter
+                },
+            ),
+        ];
+        for (nonce, (label, filter)) in (80_u8..).zip(widened) {
+            assert!(
+                denied_with(
+                    service.handle(
+                        peer(),
+                        Request::Nip98Authorize(bound_query(
+                            Nip98Signer::CiEvent,
+                            7,
+                            QUERY_URL,
+                            filter,
+                            nonce,
+                            now
+                        ))
+                    ),
+                    ErrorCode::PolicyDenied
+                ),
+                "{label}"
+            );
+        }
+        assert!(service.backend.calls.borrow().is_empty());
+
+        // A filter past the protocol bound never reaches the policy.
+        assert_eq!(
+            QueryFilter::new(vec![b' '; MAX_QUERY_FILTER_SIZE + 1]),
+            Err(ValueError::TooLarge)
+        );
+        assert_eq!(QueryFilter::new(Vec::new()), Err(ValueError::Empty));
+    }
+
+    #[test]
+    fn a_query_filter_on_any_other_route_is_denied() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_secs();
+        let service = service(OperationSet::only(Operation::Nip98Authorize));
+        let filter = || Some(QueryFilter::new(canonical_filter()).expect("filter"));
+        let digest: [u8; 32] = Sha256::digest(canonical_filter()).into();
+        let carried = [
+            Nip98AuthorizeRequest {
+                query_filter: filter(),
+                payload_digest: Some(digest),
+                ..publish_request(Nip98Signer::CiEvent, 7, 90, now)
+            },
+            Nip98AuthorizeRequest {
+                expected_generation: 8,
+                signer: Nip98Signer::Nip98,
+                method: HttpMethod::Put,
+                url: Url::new("https://relay.example.test/ci/logs/a/b/c/d/e".to_owned())
+                    .expect("url"),
+                payload_digest: Some(digest),
+                created_at: now,
+                nonce: [91; 16],
+                query_filter: filter(),
+            },
+            Nip98AuthorizeRequest {
+                expected_generation: 8,
+                signer: Nip98Signer::Nip98,
+                method: HttpMethod::Get,
+                url: Url::new(
+                    "https://relay.example.test/ci/control/accepted?channel_id=123e4567-e89b-12d3-a456-426614174000&after_cursor=0&limit=1"
+                        .to_owned(),
+                )
+                .expect("url"),
+                payload_digest: None,
+                created_at: now,
+                nonce: [92; 16],
+                query_filter: filter(),
+            },
+        ];
+        for request in carried {
+            let label = format!("{:?} {}", request.method, request.url.as_str());
+            assert!(
+                denied_with(
+                    service.handle(peer(), Request::Nip98Authorize(request)),
+                    ErrorCode::PolicyDenied
+                ),
+                "{label}"
+            );
+        }
+        assert!(service.backend.calls.borrow().is_empty());
     }
 
     #[test]
