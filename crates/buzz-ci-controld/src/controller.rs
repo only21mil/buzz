@@ -11,8 +11,8 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::production::{
-    AttemptExecutor, CiSigner, ControlStore, EvidenceReader, PollStep, ProductionError,
-    ProductionHandler, RelayControl, RunnerAttemptExecutor, RunnerAttemptPreparer,
+    AcceptedRequestBinding, AttemptExecutor, CiSigner, ControlStore, EvidenceReader, PollStep,
+    ProductionError, ProductionHandler, RelayControl, RunnerAttemptExecutor, RunnerAttemptPreparer,
 };
 use crate::runner_client::{RunnerClient, RunnerConnector};
 
@@ -352,11 +352,32 @@ where
     /// terminal for this process, so a host cannot spin or admit later work on
     /// uncertain infrastructure state.
     pub fn poll_once(&mut self) -> Result<PollOutcome, ControllerError> {
+        self.poll_once_with_binding(None)
+    }
+
+    /// Poll only the exact frozen request selected by an acceptance stage.
+    pub fn poll_once_bound(
+        &mut self,
+        expected: &AcceptedRequestBinding,
+    ) -> Result<PollOutcome, ControllerError> {
+        self.poll_once_with_binding(Some(expected))
+    }
+
+    fn poll_once_with_binding(
+        &mut self,
+        expected: Option<&AcceptedRequestBinding>,
+    ) -> Result<PollOutcome, ControllerError> {
         if let Some(reason) = self.status.terminal_reason() {
             return Err(ControllerError::Terminal(reason));
         }
         self.status = CapacityOneStatus::polling();
-        match self.handler.poll_once(self.config.channel_id()) {
+        let result = match expected {
+            Some(binding) => self
+                .handler
+                .poll_once_bound(self.config.channel_id(), binding),
+            None => self.handler.poll_once(self.config.channel_id()),
+        };
+        match result {
             Ok(step) => {
                 self.status = CapacityOneStatus::ready();
                 Ok(match step {
