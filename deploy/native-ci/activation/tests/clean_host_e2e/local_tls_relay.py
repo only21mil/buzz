@@ -64,6 +64,11 @@ MAX_TOKEN_DRIFT = 60
 KIND_DELETION = 5
 KIND_CI_REQUEST = 46_100
 KIND_CI_RUN_STATUS = 46_101
+KIND_CI_JOB_STATUS = 46_102
+KIND_CI_LOG_REFERENCE = 46_103
+KIND_CI_ARTIFACT_REFERENCE = 46_104
+KIND_CI_EVIDENCE_FINALIZED = 46_105
+KIND_CI_TEARDOWN_ATTESTATION = 46_106
 KIND_CI_STATUS_MIN = 46_101
 KIND_CI_STATUS_MAX = 46_106
 KIND_CI_GRANT = 46_107
@@ -77,6 +82,7 @@ RELAY_FAULTS = frozenset({FAULT_STALE_TERMINAL, FAULT_REPLAY_BEFORE_GRANT})
 # HTTP 400 {"error": ...}. controld matches this exact string.
 UNAUTHORIZED_STATUS_SIGNER = "invalid CI envelope: unauthorized CI status signer"
 FAULT_RECORD_NAME = "fault-fired.json"
+PROTOCOL_RECORD_NAME = "protocol-verdict.json"
 MAX_QUERY_FILTERS = 16
 # handlers/ingest.rs: kinds that bypass the generic member-or-open gate.
 MEMBERSHIP_EXEMPT_KINDS = frozenset({9021, 9007, 40003, 9002, 9005, 9008})
@@ -262,6 +268,10 @@ class RelayState:
         self.accepted: list[tuple[int, str, dict[str, object]]] = []
         self.grants: list[tuple[str, str, int, int | None]] = []
         self.run_ids: set[tuple[str, str]] = set()
+        self.run_requests: dict[tuple[str, str], dict[int, str]] = {}
+        self.run_events: dict[str, list[tuple[int, dict[str, object], dict[str, object]]]] = {}
+        self.final_facts: dict[str, set[int]] = {}
+        self.ci_cursor = 0
         self.seen_tokens: set[str] = set()
         self.cursor = 0
         self.lock = threading.Lock()
@@ -273,6 +283,131 @@ class RelayState:
         self.refused_event_ids: list[str] = []
         self.queried_event_ids: list[str] = []
         self.replayed_event_id: str | None = None
+
+    def record_ci_event(self, event: dict[str, object]) -> None:
+        """Retain relay acceptance order and the validated envelope for verdict parity."""
+        kind = int(event["kind"])
+        if not KIND_CI_REQUEST <= kind <= KIND_CI_TEARDOWN_ATTESTATION:
+            return
+        content = parse_content(event, "CI event")
+        run_id = content.get("run_id")
+        if not isinstance(run_id, str):
+            return
+        self.ci_cursor += 1
+        self.run_events.setdefault(run_id, []).append((self.ci_cursor, event, content))
+        if kind in {KIND_CI_EVIDENCE_FINALIZED, KIND_CI_TEARDOWN_ATTESTATION}:
+            self.final_facts.setdefault(run_id, set()).add(kind)
+        if (
+            kind == KIND_CI_RUN_STATUS and content.get("state") == "success"
+            and self.final_facts.get(run_id) == {KIND_CI_EVIDENCE_FINALIZED, KIND_CI_TEARDOWN_ATTESTATION}
+        ):
+            self.write_protocol_verdict(run_id)
+
+    def rerun_allowed(self, channel: str, content: dict[str, object]) -> bool:
+        """A rerun extends one failed job on an unsealed run, exactly once."""
+        run_id = content.get("run_id")
+        attempt = content.get("attempt")
+        parent_attempt = content.get("parent_attempt")
+        jobs = content.get("job_ids")
+        if (
+            not isinstance(run_id, str) or not isinstance(attempt, int) or isinstance(attempt, bool)
+            or not isinstance(parent_attempt, int) or isinstance(parent_attempt, bool)
+            or attempt != parent_attempt + 1
+            or not isinstance(jobs, list) or len(jobs) != 1 or not isinstance(jobs[0], str)
+        ):
+            return False
+        requests = self.run_requests.get((channel, run_id), {})
+        if parent_attempt not in requests or attempt in requests or self.final_facts.get(run_id):
+            return False
+        terminals = [
+            envelope for _cursor, event, envelope in self.run_events.get(run_id, [])
+            if event["kind"] == KIND_CI_JOB_STATUS
+            and envelope.get("job_id") == jobs[0]
+            and envelope.get("attempt") == parent_attempt
+            and envelope.get("state") == "failure"
+        ]
+        return len(terminals) == 1
+
+    def closed_verdict(self, run_id: str) -> dict[str, object]:
+        """Reduce one successful run using relay order as the ordering authority."""
+        events = self.run_events.get(run_id, [])
+        successes = [item for item in events if item[1]["kind"] == KIND_CI_RUN_STATUS and item[2].get("state") == "success"]
+        evidence = [item for item in events if item[1]["kind"] == KIND_CI_EVIDENCE_FINALIZED]
+        teardown = [item for item in events if item[1]["kind"] == KIND_CI_TEARDOWN_ATTESTATION]
+        reason: str | None = None
+        if len(successes) != 1 or len(evidence) != 1 or len(teardown) != 1:
+            reason = "terminal success requires exactly one evidence and teardown fact"
+        else:
+            terminal_cursor, _terminal_event, terminal = successes[0]
+            evidence_cursor, _evidence_event, fact = evidence[0]
+            teardown_cursor = teardown[0][0]
+            finalized = fact.get("finalized_job_attempts")
+            if evidence_cursor >= terminal_cursor or teardown_cursor >= terminal_cursor:
+                reason = "terminal run success was accepted before its terminal facts"
+            elif not isinstance(finalized, list) or not finalized:
+                reason = "evidence-finalized fact does not link the selected durable evidence"
+            else:
+                selected_jobs = {
+                    envelope.get("job_id") for _cursor, event, envelope in events
+                    if event["kind"] == KIND_CI_JOB_STATUS
+                    and envelope.get("attempt") == fact.get("attempt")
+                    and envelope.get("state") == "success" and envelope.get("required", True) is True
+                }
+                finalized_jobs = {
+                    item.get("job_id") for item in finalized if isinstance(item, dict)
+                }
+                if selected_jobs != finalized_jobs or None in finalized_jobs:
+                    reason = "evidence-finalized fact does not link the selected durable evidence"
+                for item in finalized:
+                    if reason is not None:
+                        break
+                    if not isinstance(item, dict):
+                        reason = "evidence-finalized fact does not link the selected durable evidence"
+                        break
+                    job_id, attempt, log_ref = item.get("job_id"), item.get("attempt"), item.get("log_ref")
+                    artifact_refs = item.get("artifact_refs")
+                    statuses = [
+                        envelope for _cursor, event, envelope in events
+                        if event["kind"] == KIND_CI_JOB_STATUS and envelope.get("job_id") == job_id
+                        and envelope.get("attempt") == attempt and envelope.get("state") == "success"
+                    ]
+                    refs = [
+                        (cursor, event, envelope) for cursor, event, envelope in events
+                        if str(event["id"]) == log_ref and event["kind"] == KIND_CI_LOG_REFERENCE
+                    ]
+                    artifacts = {
+                        str(event["id"]): (cursor, envelope) for cursor, event, envelope in events
+                        if event["kind"] == KIND_CI_ARTIFACT_REFERENCE
+                    }
+                    finalized_at = fact.get("finalized_at")
+                    if (
+                        len(statuses) != 1 or len(refs) != 1 or not isinstance(artifact_refs, list)
+                        or not isinstance(finalized_at, int) or isinstance(finalized_at, bool)
+                        or statuses[0].get("log_ref") != log_ref
+                        or set(statuses[0].get("artifact_refs", [])) != set(artifact_refs)
+                        or refs[0][0] >= evidence_cursor or refs[0][2].get("created_at", finalized_at + 1) > finalized_at
+                        or refs[0][2].get("job_id") != job_id or refs[0][2].get("attempt") != attempt
+                        or any(
+                            artifact not in artifacts or artifacts[artifact][0] >= evidence_cursor
+                            or artifacts[artifact][1].get("created_at", finalized_at + 1) > finalized_at
+                            or artifacts[artifact][1].get("job_id") != job_id
+                            or artifacts[artifact][1].get("attempt") != attempt
+                            for artifact in artifact_refs
+                        )
+                    ):
+                        reason = "evidence-finalized fact does not link the selected durable evidence"
+                        break
+            if terminal.get("attempt") != fact.get("attempt") or teardown[0][2].get("attempt") != fact.get("attempt"):
+                reason = "evidence-finalized fact does not match terminal attempt"
+        return {"state": "green" if reason is None else "infrastructure_failure", "reason": reason}
+
+    def write_protocol_verdict(self, run_id: str) -> None:
+        root = self.object_root.parent
+        record = {"schema_version": "buzz-ci-loopback-relay-verdict/v1", "run_id": run_id, **self.closed_verdict(run_id)}
+        pending = root / (PROTOCOL_RECORD_NAME + ".next")
+        pending.write_bytes(json.dumps(record, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+        pending.chmod(0o400)
+        pending.replace(root / PROTOCOL_RECORD_NAME)
 
     def arm_fault(self, flag: Path) -> None:
         """Read the guest's flag file; an unknown mode is a configuration error."""
@@ -466,8 +601,15 @@ def admit_event(state: RelayState, token_pubkey: str, event: dict[str, object], 
         if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
             raise Refusal(400, "invalid: CI request attempt rejected")
         exists = (channel, run_id) in state.run_ids
-        if event["id"] not in state.events and exists == (attempt == 1):
-            raise Refusal(400, "invalid: CI run ID or initial request event ID already exists" if exists else "invalid: CI rerun names an unknown run")
+        if event["id"] not in state.events:
+            if attempt == 1 and exists:
+                raise Refusal(400, "invalid: CI run ID or initial request event ID already exists")
+            if attempt > 1 and not exists:
+                raise Refusal(400, "invalid: CI rerun names an unknown run")
+            if attempt > 1 and state.final_facts.get(str(run_id)):
+                raise Refusal(409, "conflict: CI run is already bound to terminal evidence and cannot be rerun")
+            if attempt > 1 and not state.rerun_allowed(str(channel), content):
+                raise Refusal(400, "invalid: CI rerun does not extend the selected failed job attempt")
     elif KIND_CI_STATUS_MIN <= kind <= KIND_CI_STATUS_MAX:
         content = parse_content(event, "CI event")
         if content.get("relay_signer") != pubkey:
@@ -486,6 +628,7 @@ def admit_event(state: RelayState, token_pubkey: str, event: dict[str, object], 
         return channel, False
     state.events[identifier] = event
     state.event_channels[identifier] = channel
+    state.record_ci_event(event)
     if KIND_CI_STATUS_MIN <= kind <= KIND_CI_STATUS_MAX:
         state.note_terminal_accepted(event)
     if kind == KIND_CI_GRANT:
@@ -496,7 +639,10 @@ def admit_event(state: RelayState, token_pubkey: str, event: dict[str, object], 
         ))
     if kind == KIND_CI_REQUEST:
         assert channel is not None
-        state.run_ids.add((channel, str(parse_content(event, "CI request")["run_id"])))
+        content = parse_content(event, "CI request")
+        run_id = str(content["run_id"])
+        state.run_ids.add((channel, run_id))
+        state.run_requests.setdefault((channel, run_id), {})[int(content["attempt"])] = identifier
         state.cursor += 1
         state.accepted.append((state.cursor, channel, event))
     return channel, True
