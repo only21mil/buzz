@@ -26,7 +26,8 @@ use buzz_ci_controld::controller::{
 };
 use buzz_ci_controld::keyholder::{KeyholderError, UnixKeyholderClient};
 use buzz_ci_controld::production::{
-    AcceptedRequest, AttemptExecutor, JobMetadata, RelayControl, SignedCiEvent,
+    AcceptedRequest, AttemptExecutor, CiSigner, ControlStore, EvidenceReader, JobMetadata,
+    RelayControl, SignedCiEvent,
 };
 use buzz_ci_controld::production_v2::{
     compose_runner_v2, AttemptCommand, AttemptControl, AttemptObservation, ProductionV2Error,
@@ -34,8 +35,8 @@ use buzz_ci_controld::production_v2::{
 };
 use buzz_ci_controld::runner_client::{UnixRunnerConnector, UnixRunnerConnectorError};
 use buzz_ci_controld::runner_v2::{
-    live_bound_now, BoundAttempt, RunnerV2Client, StaticAdmissionBindings, StaticArtifactBinding,
-    TerminalAttempt,
+    live_bound_now, BoundAttempt, RunnerV2Client, RunnerV2Transport, StaticAdmissionBindings,
+    StaticArtifactBinding, TerminalAttempt,
 };
 use buzz_ci_controld::source::{AuthenticatedRelay, ReqwestTransport, SourceError, TransportError};
 use buzz_ci_controld::store::{DurableControlStore, StoreError};
@@ -81,26 +82,36 @@ type ProductionController = CapacityOneController<
 
 /// Fully composed capacity-one service. Every constructor performs its own
 /// identity, endpoint, or persistence validation before the controller opens.
-pub(crate) struct CapacityOneService {
-    controller: Option<ProductionController>,
-    controller_worker: Option<JoinHandle<(ProductionController, Result<(), ControllerError>)>>,
+pub(crate) struct CapacityOneService<
+    C = ProductionController,
+    T = UnixRunnerConnector,
+    X = ProductionExecutor,
+    R = ProductionRelay,
+    S = UnixKeyholderClient,
+> {
+    controller: Option<C>,
+    controller_worker: Option<JoinHandle<(C, Result<(), ControllerError>)>>,
     observations: Receiver<AttemptObservation>,
     attempt_commands: Sender<AttemptCommand>,
     active_attempt: Option<BoundAttempt>,
     terminal_attempt: Option<TerminalAttempt>,
     verified_evidence: Option<VerifiedAttemptEvidence>,
     gate_waiting: bool,
-    cancel_client: RunnerV2Client<UnixRunnerConnector>,
-    recovery_executor: ProductionExecutor,
+    cancel_client: RunnerV2Client<T>,
+    recovery_executor: X,
     recovery_observations: Receiver<AttemptObservation>,
     acceptance_channel_id: String,
-    acceptance_relay: ProductionRelay,
-    acceptance_signer: UnixKeyholderClient,
+    acceptance_relay: R,
+    acceptance_signer: S,
     acceptance_authority: AcceptanceAuthority,
     status: CapacityOneStatus,
     poll_interval: Duration,
     acceptance: AcceptanceJournal,
     background_polling: bool,
+    #[cfg(test)]
+    crash_before_provider_effect: bool,
+    #[cfg(test)]
+    crash_after_provider_effect: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -139,6 +150,66 @@ trait AcceptanceRecoveryProvider {
         &mut self,
         request: &AdapterRequest,
     ) -> Result<TerminalAttempt, AcceptanceSocketError>;
+}
+
+pub(crate) trait ServiceController: Send + 'static {
+    fn service_status(&self) -> CapacityOneStatus;
+    fn service_poll_once(&mut self) -> Result<(), ControllerError>;
+    fn service_poll_expected(&mut self, expected_event_id: &str) -> Result<(), ControllerError>;
+    fn service_set_replay_deferral(&mut self, enabled: bool);
+    fn service_replay_deferred_publications(&mut self) -> Result<(), ControllerError>;
+}
+
+impl<R, S, X, P, O> ServiceController for CapacityOneController<R, S, X, P, O>
+where
+    R: RelayControl + Send + 'static,
+    S: CiSigner + Send + 'static,
+    X: AttemptExecutor + Send + 'static,
+    P: ControlStore + Send + 'static,
+    O: EvidenceReader + Send + 'static,
+{
+    fn service_status(&self) -> CapacityOneStatus {
+        self.status()
+    }
+
+    fn service_poll_once(&mut self) -> Result<(), ControllerError> {
+        self.poll_once().map(|_| ())
+    }
+
+    fn service_poll_expected(&mut self, expected_event_id: &str) -> Result<(), ControllerError> {
+        self.poll_expected(expected_event_id).map(|_| ())
+    }
+
+    fn service_set_replay_deferral(&mut self, enabled: bool) {
+        self.set_replay_deferral(enabled);
+    }
+
+    fn service_replay_deferred_publications(&mut self) -> Result<(), ControllerError> {
+        self.replay_deferred_publications().map(|_| ())
+    }
+}
+
+pub(crate) trait AcceptanceMutationSigner {
+    fn sign_mutation(
+        &mut self,
+        actor: PublicIdentity,
+        scenario_sha256: [u8; 32],
+        mutation: AcceptanceMutation,
+        event_id: [u8; 32],
+    ) -> Result<buzz_ci_keyholder::SignatureResponse, ()>;
+}
+
+impl AcceptanceMutationSigner for UnixKeyholderClient {
+    fn sign_mutation(
+        &mut self,
+        actor: PublicIdentity,
+        scenario_sha256: [u8; 32],
+        mutation: AcceptanceMutation,
+        event_id: [u8; 32],
+    ) -> Result<buzz_ci_keyholder::SignatureResponse, ()> {
+        self.sign_acceptance_mutation(actor, scenario_sha256, mutation, event_id)
+            .map_err(|_| ())
+    }
 }
 
 impl AcceptanceAuthority {
@@ -402,9 +473,22 @@ impl CapacityOneService {
             poll_interval,
             acceptance,
             background_polling,
+            #[cfg(test)]
+            crash_before_provider_effect: false,
+            #[cfg(test)]
+            crash_after_provider_effect: false,
         })
     }
+}
 
+impl<C, T, X, R, S> CapacityOneService<C, T, X, R, S>
+where
+    C: ServiceController,
+    T: RunnerV2Transport,
+    X: AttemptExecutor,
+    R: RelayControl,
+    S: AcceptanceMutationSigner,
+{
     pub(crate) const fn status(&self) -> CapacityOneStatus {
         self.status
     }
@@ -433,8 +517,8 @@ impl CapacityOneService {
             .ok_or(ControllerError::Infrastructure(
                 TerminalInfrastructureReason::State,
             ))?;
-        let result = controller.poll_once().map(|_| ());
-        self.status = controller.status();
+        let result = controller.service_poll_once();
+        self.status = controller.service_status();
         result
     }
 
@@ -457,8 +541,8 @@ impl CapacityOneService {
         self.status = CapacityOneStatus::active_attempt();
         self.controller_worker = Some(thread::spawn(move || {
             let result = match expected_event_id {
-                Some(expected) => controller.poll_expected(&expected).map(|_| ()),
-                None => controller.poll_once().map(|_| ()),
+                Some(expected) => controller.service_poll_expected(&expected),
+                None => controller.service_poll_once(),
             };
             (controller, result)
         }));
@@ -510,7 +594,7 @@ impl CapacityOneService {
         let (controller, result) = worker
             .join()
             .map_err(|_| AcceptanceSocketError::Operation)?;
-        self.status = controller.status();
+        self.status = controller.service_status();
         self.controller = Some(controller);
         result.map_err(|_| AcceptanceSocketError::Operation)?;
         let (terminal, evidence) = merge_attempt_observations(
@@ -636,9 +720,29 @@ impl CapacityOneService {
         })
     }
 
-    fn fail_async_attempt<T>(&mut self) -> Result<T, AcceptanceSocketError> {
+    fn fail_async_attempt<V>(&mut self) -> Result<V, AcceptanceSocketError> {
         self.status = CapacityOneStatus::startup_failure(TerminalInfrastructureReason::State);
         Err(AcceptanceSocketError::Operation)
+    }
+
+    #[cfg(test)]
+    fn inject_provider_crash(&mut self, before_effect: bool) {
+        self.crash_before_provider_effect = before_effect;
+        self.crash_after_provider_effect = !before_effect;
+    }
+
+    #[cfg(test)]
+    fn crash_before_provider_effect(&mut self) {
+        if std::mem::take(&mut self.crash_before_provider_effect) {
+            panic!("injected crash before provider effect");
+        }
+    }
+
+    #[cfg(test)]
+    fn crash_after_provider_effect(&mut self) {
+        if std::mem::take(&mut self.crash_after_provider_effect) {
+            panic!("injected crash after provider effect");
+        }
     }
 }
 
@@ -671,7 +775,14 @@ impl AcceptanceOperationHandler for CapacityZeroService {
     }
 }
 
-impl AcceptanceOperationHandler for CapacityOneService {
+impl<C, T, X, R, S> AcceptanceOperationHandler for CapacityOneService<C, T, X, R, S>
+where
+    C: ServiceController,
+    T: RunnerV2Transport,
+    X: AttemptExecutor,
+    R: RelayControl,
+    S: AcceptanceMutationSigner,
+{
     type Error = AcceptanceSocketError;
 
     fn handle(
@@ -681,25 +792,11 @@ impl AcceptanceOperationHandler for CapacityOneService {
     ) -> Result<AdapterResponse, Self::Error> {
         let configured_capacity = self.status.configured_capacity();
         let journal = self.acceptance.clone();
-        if matches!(
-            (request.sequence, request.operation),
-            (6, Operation::AwaitFirstTerminal)
-                | (10, Operation::AwaitFailureTerminal)
-                | (12, Operation::CancelRerun)
-        ) {
-            return Self::handle_recovery_sensitive(
-                &journal,
-                self,
-                request,
-                exact_request,
-                configured_capacity,
-            );
-        }
         journal.execute(
             request,
             exact_request,
             configured_capacity,
-            |prior, _execution| match (request.sequence, request.operation) {
+            |prior, execution| match (request.sequence, request.operation) {
                 (2, Operation::SetCapacityOne)
                 | (14, Operation::RestartController)
                 | (15, Operation::RestartRunner) => {
@@ -718,6 +815,19 @@ impl AcceptanceOperationHandler for CapacityOneService {
                     let active = self.begin_async_attempt()?;
                     Ok(running_response(request, prior, active, false, false)?)
                 }
+                (6, Operation::AwaitFirstTerminal) => {
+                    #[cfg(test)]
+                    self.crash_before_provider_effect();
+                    let (terminal, evidence) = if execution == AcceptanceExecution::Recovering {
+                        recover_terminal_with(self, AcceptanceMutation::Run)?
+                    } else {
+                        self.finish_async_attempt()?
+                    };
+                    let response = first_terminal_response(request, prior, terminal, &evidence)?;
+                    #[cfg(test)]
+                    self.crash_after_provider_effect();
+                    Ok(response)
+                }
                 (7, Operation::ExportFirstEvidence) => Ok(export_response(request, prior)?),
                 (8, Operation::SubmitFailureManifest) => {
                     self.publish_acceptance(AcceptanceMutation::FailureRun)?;
@@ -727,10 +837,36 @@ impl AcceptanceOperationHandler for CapacityOneService {
                     let active = self.begin_async_attempt()?;
                     Ok(running_response(request, prior, active, false, true)?)
                 }
+                (10, Operation::AwaitFailureTerminal) => {
+                    #[cfg(test)]
+                    self.crash_before_provider_effect();
+                    let (terminal, evidence) = if execution == AcceptanceExecution::Recovering {
+                        recover_terminal_with(self, AcceptanceMutation::FailureRun)?
+                    } else {
+                        self.finish_async_attempt()?
+                    };
+                    let response = failure_terminal_response(request, prior, terminal, &evidence)?;
+                    #[cfg(test)]
+                    self.crash_after_provider_effect();
+                    Ok(response)
+                }
                 (11, Operation::Rerun) => {
                     self.publish_acceptance(AcceptanceMutation::Rerun)?;
                     let active = self.begin_async_attempt()?;
                     Ok(running_response(request, prior, active, true, true)?)
+                }
+                (12, Operation::CancelRerun) => {
+                    #[cfg(test)]
+                    self.crash_before_provider_effect();
+                    let cancelled = if execution == AcceptanceExecution::Recovering {
+                        recover_cancelled_with(self, request)?
+                    } else {
+                        self.cancel_fresh(request)?
+                    };
+                    let response = cancelled_response(request, prior, cancelled)?;
+                    #[cfg(test)]
+                    self.crash_after_provider_effect();
+                    Ok(response)
                 }
                 (13, Operation::TombstoneRerun) => {
                     self.publish_acceptance(AcceptanceMutation::Tombstone)?;
@@ -752,7 +888,14 @@ impl AcceptanceOperationHandler for CapacityOneService {
     }
 }
 
-impl CapacityOneService {
+impl<C, T, X, R, S> CapacityOneService<C, T, X, R, S>
+where
+    C: ServiceController,
+    T: RunnerV2Transport,
+    X: AttemptExecutor,
+    R: RelayControl,
+    S: AcceptanceMutationSigner,
+{
     fn publish_acceptance(
         &mut self,
         mutation: AcceptanceMutation,
@@ -761,7 +904,7 @@ impl CapacityOneService {
         let event_id = self.acceptance_authority.event_ids[index];
         let signature = self
             .acceptance_signer
-            .sign_acceptance_mutation(
+            .sign_mutation(
                 self.acceptance_authority.actor,
                 self.acceptance_authority.scenario_sha256,
                 mutation,
@@ -817,12 +960,10 @@ impl CapacityOneService {
             .controller
             .as_mut()
             .ok_or(AcceptanceSocketError::Operation)?;
-        controller.set_replay_deferral(false);
-        let replayed = controller.replay_deferred_publications();
-        self.status = controller.status();
-        replayed
-            .map(|_| ())
-            .map_err(|_| AcceptanceSocketError::Operation)
+        controller.service_set_replay_deferral(false);
+        let replayed = controller.service_replay_deferred_publications();
+        self.status = controller.service_status();
+        replayed.map_err(|_| AcceptanceSocketError::Operation)
     }
 
     fn cancel_active_attempt(
@@ -898,7 +1039,14 @@ fn merge_attempt_observations(
     Ok((terminal, evidence))
 }
 
-impl AcceptanceRecoveryProvider for CapacityOneService {
+impl<C, T, X, R, S> AcceptanceRecoveryProvider for CapacityOneService<C, T, X, R, S>
+where
+    C: ServiceController,
+    T: RunnerV2Transport,
+    X: AttemptExecutor,
+    R: RelayControl,
+    S: AcceptanceMutationSigner,
+{
     fn poll_recovery(
         &mut self,
         mutation: AcceptanceMutation,
@@ -946,75 +1094,6 @@ impl AcceptanceRecoveryProvider for CapacityOneService {
             return Err(AcceptanceSocketError::Operation);
         }
         Ok(cancelled)
-    }
-}
-
-impl CapacityOneService {
-    fn handle_recovery_sensitive<P: AcceptanceRecoveryProvider>(
-        journal: &AcceptanceJournal,
-        provider: &mut P,
-        request: &AdapterRequest,
-        exact_request: &[u8],
-        configured_capacity: u32,
-    ) -> Result<AdapterResponse, AcceptanceSocketError> {
-        Self::handle_recovery_sensitive_with_hook(
-            journal,
-            provider,
-            request,
-            exact_request,
-            configured_capacity,
-            (|| Ok(()), || Ok(())),
-        )
-    }
-
-    fn handle_recovery_sensitive_with_hook<P: AcceptanceRecoveryProvider>(
-        journal: &AcceptanceJournal,
-        provider: &mut P,
-        request: &AdapterRequest,
-        exact_request: &[u8],
-        configured_capacity: u32,
-        hooks: (
-            impl FnOnce() -> Result<(), AcceptanceSocketError>,
-            impl FnOnce() -> Result<(), AcceptanceSocketError>,
-        ),
-    ) -> Result<AdapterResponse, AcceptanceSocketError> {
-        journal.execute(
-            request,
-            exact_request,
-            configured_capacity,
-            |prior, execution| {
-                (hooks.0)()?;
-                let response = match (request.sequence, request.operation) {
-                    (6, Operation::AwaitFirstTerminal) => {
-                        let (terminal, evidence) = if execution == AcceptanceExecution::Recovering {
-                            recover_terminal_with(provider, AcceptanceMutation::Run)?
-                        } else {
-                            provider.finish_active()?
-                        };
-                        first_terminal_response(request, prior, terminal, &evidence)
-                    }
-                    (10, Operation::AwaitFailureTerminal) => {
-                        let (terminal, evidence) = if execution == AcceptanceExecution::Recovering {
-                            recover_terminal_with(provider, AcceptanceMutation::FailureRun)?
-                        } else {
-                            provider.finish_active()?
-                        };
-                        failure_terminal_response(request, prior, terminal, &evidence)
-                    }
-                    (12, Operation::CancelRerun) => {
-                        let cancelled = if execution == AcceptanceExecution::Recovering {
-                            recover_cancelled_with(provider, request)?
-                        } else {
-                            provider.cancel_fresh(request)?
-                        };
-                        cancelled_response(request, prior, cancelled)
-                    }
-                    _ => Err(AcceptanceSocketError::Operation),
-                }?;
-                (hooks.1)()?;
-                Ok::<AdapterResponse, AcceptanceSocketError>(response)
-            },
-        )
     }
 }
 
@@ -1727,12 +1806,20 @@ fn decode_digest(value: &str) -> Result<[u8; 32], ServiceError> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    use std::collections::{BTreeSet, HashMap, VecDeque};
     use std::fs;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::{Arc, Mutex};
 
     use buzz_ci_acceptance_ctl::acceptance_binding_test_support::canonical_acceptance_binding;
     use buzz_ci_acceptance_ctl::production::{
         expected_adapter_operation_id, ControlReadback, ADAPTER_REQUEST_SCHEMA,
+    };
+    use buzz_ci_broker_protocol::v2::{
+        self, admission_signature_message, intent_registration_key_digest, BrokerResponse,
+        EvidenceChunkResponse, EvidenceDescriptionResponse, EvidenceDescriptor, EvidenceKind,
+        IntentRegistrationResponse, Request, WireText64,
     };
     use buzz_ci_broker_protocol::v2::{AdmissionSignatureAlgorithm, AdmitAttemptRequest};
     use buzz_ci_broker_protocol::{GitOid, TrustClass};
@@ -1741,6 +1828,12 @@ mod tests {
     use super::*;
     use crate::config::DaemonConfig;
     use buzz_ci_controld::acceptance_socket::ACCEPTANCE_BINDING_PATH;
+    use buzz_ci_controld::production::{
+        ArtifactCompletion, JobCompletion, StoredObject, StoredPublication,
+    };
+    use buzz_ci_controld::runner_v2::AdmissionSigner;
+    use buzz_ci_controld::{RunIdentity, RunRecord, StoreWrite};
+    use buzz_core::ci::CiSkipPolicy;
 
     #[test]
     fn incomplete_acceptance_sequence_retains_socket_poll_ownership_after_restart() {
@@ -1773,6 +1866,1280 @@ mod tests {
         }))
         .expect("configuration fixture");
         (root, config, owner_uid)
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeStoreState {
+        cursor: u64,
+        runs: Vec<(RunIdentity, u64, RunRecord)>,
+        publications: HashMap<String, StoredPublication>,
+        deferred: BTreeSet<String>,
+        fail_cursor_once: bool,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeStore(Arc<Mutex<FakeStoreState>>);
+
+    impl ControlStore for FakeStore {
+        type Error = ();
+
+        fn cursor(&self, _channel_id: &str) -> Result<u64, Self::Error> {
+            Ok(self.0.lock().unwrap().cursor)
+        }
+
+        fn advance_cursor(
+            &mut self,
+            _channel_id: &str,
+            expected: u64,
+            next: u64,
+        ) -> Result<bool, Self::Error> {
+            let mut state = self.0.lock().unwrap();
+            if std::mem::take(&mut state.fail_cursor_once) {
+                return Err(());
+            }
+            if state.cursor != expected {
+                return Ok(false);
+            }
+            state.cursor = next;
+            Ok(true)
+        }
+
+        fn load_run(
+            &self,
+            identity: &RunIdentity,
+        ) -> Result<Option<(u64, RunRecord)>, Self::Error> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .runs
+                .iter()
+                .find(|(stored, _, _)| stored == identity)
+                .map(|(_, revision, run)| (*revision, run.clone())))
+        }
+
+        fn compare_and_swap_run(
+            &mut self,
+            identity: &RunIdentity,
+            expected_revision: Option<u64>,
+            next: &RunRecord,
+        ) -> Result<StoreWrite, Self::Error> {
+            let mut state = self.0.lock().unwrap();
+            let existing = state
+                .runs
+                .iter_mut()
+                .find(|(stored, _, _)| stored == identity);
+            let actual = existing.as_ref().map(|(_, revision, _)| *revision);
+            if actual != expected_revision {
+                return Ok(StoreWrite::Conflict {
+                    actual_revision: actual,
+                });
+            }
+            let revision = actual.unwrap_or(0) + 1;
+            if let Some((_, stored_revision, stored)) = existing {
+                *stored_revision = revision;
+                *stored = next.clone();
+            } else {
+                state.runs.push((identity.clone(), revision, next.clone()));
+            }
+            Ok(StoreWrite::Written { revision })
+        }
+
+        fn load_publication(&self, key: &str) -> Result<Option<StoredPublication>, Self::Error> {
+            Ok(self.0.lock().unwrap().publications.get(key).cloned())
+        }
+
+        fn record_publication_intent(
+            &mut self,
+            key: &str,
+            event: &SignedCiEvent,
+        ) -> Result<bool, Self::Error> {
+            let mut state = self.0.lock().unwrap();
+            if state.publications.contains_key(key) {
+                return Ok(false);
+            }
+            state
+                .publications
+                .insert(key.to_owned(), StoredPublication::Pending(event.clone()));
+            Ok(true)
+        }
+
+        fn refresh_pending_publication(
+            &mut self,
+            key: &str,
+            expected_event_id: &str,
+            replacement: &SignedCiEvent,
+        ) -> Result<bool, Self::Error> {
+            let mut state = self.0.lock().unwrap();
+            let Some(StoredPublication::Pending(stored)) = state.publications.get(key) else {
+                return Err(());
+            };
+            if stored.event_id != expected_event_id {
+                return Err(());
+            }
+            state.publications.insert(
+                key.to_owned(),
+                StoredPublication::Pending(replacement.clone()),
+            );
+            Ok(true)
+        }
+
+        fn defer_publication(&mut self, key: &str) -> Result<(), Self::Error> {
+            self.0.lock().unwrap().deferred.insert(key.to_owned());
+            Ok(())
+        }
+
+        fn deferred_publications(&self) -> Result<Vec<String>, Self::Error> {
+            Ok(self.0.lock().unwrap().deferred.iter().cloned().collect())
+        }
+
+        fn accept_publication(&mut self, key: &str, event_id: &str) -> Result<(), Self::Error> {
+            let mut state = self.0.lock().unwrap();
+            let Some(StoredPublication::Pending(signed)) = state.publications.get(key).cloned()
+            else {
+                return Err(());
+            };
+            state.publications.insert(
+                key.to_owned(),
+                StoredPublication::Accepted {
+                    signed,
+                    relay_event_id: event_id.to_owned(),
+                },
+            );
+            state.deferred.remove(key);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeRelayState {
+        accepted: VecDeque<AcceptedRequest>,
+        published: BTreeSet<String>,
+        publish_calls: HashMap<String, usize>,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeRelay(Arc<Mutex<FakeRelayState>>);
+
+    impl RelayControl for FakeRelay {
+        type Error = ();
+
+        fn next_accepted(
+            &mut self,
+            _channel_id: &str,
+            after_cursor: u64,
+        ) -> Result<Option<AcceptedRequest>, Self::Error> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .accepted
+                .iter()
+                .find(|request| request.watch_cursor > after_cursor)
+                .cloned())
+        }
+
+        fn publish(&mut self, event: &SignedCiEvent) -> Result<String, Self::Error> {
+            let mut state = self.0.lock().unwrap();
+            state.published.insert(event.event_id.clone());
+            *state
+                .publish_calls
+                .entry(event.event_id.clone())
+                .or_default() += 1;
+            Ok(event.event_id.clone())
+        }
+
+        fn publication_exists(&mut self, event: &SignedCiEvent) -> Result<bool, Self::Error> {
+            Ok(self.0.lock().unwrap().published.contains(&event.event_id))
+        }
+
+        fn put_log(
+            &mut self,
+            _accepted: &AcceptedRequest,
+            _job: &JobCompletion,
+            bytes: &[u8],
+        ) -> Result<StoredObject, Self::Error> {
+            Ok(stored_object(bytes))
+        }
+
+        fn put_artifact(
+            &mut self,
+            _accepted: &AcceptedRequest,
+            _job: &JobCompletion,
+            _artifact: &ArtifactCompletion,
+            bytes: &[u8],
+        ) -> Result<StoredObject, Self::Error> {
+            Ok(stored_object(bytes))
+        }
+    }
+
+    fn stored_object(bytes: &[u8]) -> StoredObject {
+        StoredObject {
+            url: "https://relay.invalid/object".to_owned(),
+            sha256: hex::encode(Sha256::digest(bytes)),
+            byte_length: bytes.len() as u64,
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeCiSigner(String);
+
+    impl CiSigner for FakeCiSigner {
+        type Error = ();
+
+        fn pubkey(&self) -> &str {
+            &self.0
+        }
+
+        fn sign(
+            &mut self,
+            kind: u32,
+            content: &str,
+            tags: serde_json::Value,
+        ) -> Result<SignedCiEvent, Self::Error> {
+            let event_id = hex::encode(
+                Sha256::new()
+                    .chain_update(kind.to_be_bytes())
+                    .chain_update(content.as_bytes())
+                    .chain_update(serde_json::to_vec(&tags).unwrap())
+                    .finalize(),
+            );
+            Ok(SignedCiEvent {
+                event_id: event_id.clone(),
+                kind,
+                content: content.to_owned(),
+                tags,
+                signed_event: serde_json::json!({"id": event_id}),
+            })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct FakeAcceptanceSigner;
+
+    impl AcceptanceMutationSigner for FakeAcceptanceSigner {
+        fn sign_mutation(
+            &mut self,
+            actor: PublicIdentity,
+            _scenario_sha256: [u8; 32],
+            _mutation: AcceptanceMutation,
+            event_id: [u8; 32],
+        ) -> Result<buzz_ci_keyholder::SignatureResponse, ()> {
+            Ok(buzz_ci_keyholder::SignatureResponse {
+                identity: actor,
+                signed_digest: event_id,
+                signature: [42; 64],
+            })
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct FakeAdmissionSigner;
+
+    impl AdmissionSigner for FakeAdmissionSigner {
+        type Error = ();
+
+        fn sign_admission(&mut self, request: &mut AdmitAttemptRequest) -> Result<(), Self::Error> {
+            request.admission_signature = [41; 64];
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeRunnerTransport(Arc<Mutex<FakeRunnerState>>);
+
+    #[derive(Debug)]
+    struct FakeRunnerState {
+        conclusion: BrokerConclusion,
+        active: Option<BoundAttempt>,
+        terminal: Option<TerminalAttempt>,
+        evidence: Option<FakeEvidence>,
+        starts: usize,
+        starts_by_request: HashMap<[u8; 32], usize>,
+        last_request: Option<[u8; 32]>,
+        cancels: usize,
+        drift: bool,
+    }
+
+    #[derive(Clone, Debug)]
+    struct FakeEvidence {
+        descriptors: Vec<EvidenceDescriptor>,
+        bytes: Vec<Vec<u8>>,
+        descriptor_set_digest: [u8; 32],
+    }
+
+    #[derive(serde::Serialize)]
+    struct FakeArtifactDocument<'a> {
+        schema_version: u16,
+        execution_binding_digest: String,
+        request_event_id: String,
+        run_id: String,
+        workflow_id: &'a str,
+        workflow_digest: String,
+        job_id: &'a str,
+        attempt: u32,
+        artifact_id: String,
+        name: String,
+        media_type: String,
+        sha256: String,
+        byte_length: u32,
+        content_hex: String,
+    }
+
+    fn fake_descriptor_set_digest(
+        terminal: TerminalAttempt,
+        descriptors: &[EvidenceDescriptor],
+    ) -> [u8; 32] {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"buzz-ci-execd:evidence-descriptor-set:v2\0");
+        bytes.extend_from_slice(&terminal.response.execution_binding_digest);
+        for descriptor in descriptors {
+            bytes.push(descriptor.kind as u8);
+            bytes.extend_from_slice(&descriptor.digest);
+            bytes.extend_from_slice(&descriptor.length.to_be_bytes());
+            bytes.extend_from_slice(&descriptor.artifact_name_digest);
+            bytes.extend_from_slice(&descriptor.artifact_media_type_digest);
+            bytes.extend_from_slice(&descriptor.teardown_lease_id);
+            bytes.extend_from_slice(&descriptor.teardown_lease_generation.to_be_bytes());
+            bytes.extend_from_slice(&descriptor.teardown_attestation_digest);
+            for text in [
+                descriptor.artifact_id,
+                descriptor.artifact_name,
+                descriptor.artifact_media_type,
+            ] {
+                bytes.push(text.len);
+                bytes.extend_from_slice(&text.bytes);
+            }
+        }
+        Sha256::digest(bytes).into()
+    }
+
+    fn fake_terminal(
+        active: BoundAttempt,
+        conclusion: BrokerConclusion,
+    ) -> (TerminalAttempt, FakeEvidence) {
+        let output = match conclusion {
+            BrokerConclusion::Success => b's',
+            _ => b'f',
+        };
+        let stdout = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "execution_binding_digest": hex::encode(active.response.execution_binding_digest),
+            "conclusion": match conclusion {
+                BrokerConclusion::Success => "success",
+                BrokerConclusion::Failure => "failure",
+                BrokerConclusion::Cancelled => "cancelled",
+                _ => "timed_out",
+            },
+            "output_sha256": hex::encode(Sha256::digest([output])),
+            "output_length": 1,
+            "output": char::from(output).to_string(),
+        }))
+        .unwrap();
+        let stdout_digest: [u8; 32] = Sha256::digest(&stdout).into();
+        let mut response = active.response;
+        response.code = ResponseCode::Existing;
+        response.broker_state = BrokerState::Terminal;
+        response.conclusion = conclusion;
+        response.generation += 1;
+        response.updated_at += 1;
+        response.evidence_set_digest = stdout_digest;
+        let mut terminal = TerminalAttempt {
+            admission: active.admission,
+            response,
+        };
+        let stdout_descriptor = EvidenceDescriptor {
+            kind: EvidenceKind::Stdout,
+            digest: stdout_digest,
+            length: stdout.len() as u32,
+            artifact_name_digest: [0; 32],
+            artifact_media_type_digest: [0; 32],
+            artifact_id: WireText64::EMPTY,
+            artifact_name: WireText64::EMPTY,
+            artifact_media_type: WireText64::EMPTY,
+            teardown_lease_id: [0; 16],
+            teardown_lease_generation: 0,
+            teardown_attestation_digest: [0; 32],
+        };
+        let mut descriptors = vec![stdout_descriptor];
+        let mut evidence_bytes = vec![stdout];
+        let mut artifact_receipt_digests: Vec<[u8; 32]> = Vec::new();
+        if conclusion == BrokerConclusion::Success {
+            let content = b"a";
+            let artifact_document = FakeArtifactDocument {
+                schema_version: 1,
+                execution_binding_digest: hex::encode(response.execution_binding_digest),
+                request_event_id: hex::encode(response.accepted_request_digest),
+                run_id: hex::encode(response.run_id),
+                workflow_id: "native-ci",
+                workflow_digest: hex::encode(active.admission.workflow_digest),
+                job_id: "test",
+                attempt: active.admission.attempt,
+                artifact_id: "result".to_owned(),
+                name: "result.json".to_owned(),
+                media_type: "application/json".to_owned(),
+                sha256: hex::encode(Sha256::digest(content)),
+                byte_length: 1,
+                content_hex: hex::encode(content),
+            };
+            let bytes = serde_json::to_vec(&artifact_document).unwrap();
+            let digest: [u8; 32] = Sha256::digest(&bytes).into();
+            let receipt = FakeArtifactDocument {
+                schema_version: 1,
+                execution_binding_digest: hex::encode(response.execution_binding_digest),
+                request_event_id: hex::encode(response.accepted_request_digest),
+                run_id: hex::encode(response.run_id),
+                workflow_id: "native-ci",
+                workflow_digest: hex::encode(active.admission.workflow_digest),
+                job_id: "test",
+                attempt: active.admission.attempt,
+                artifact_id: "result".to_owned(),
+                name: "result.json".to_owned(),
+                media_type: "application/json".to_owned(),
+                sha256: hex::encode(digest),
+                byte_length: bytes.len() as u32,
+                content_hex: hex::encode(&bytes),
+            };
+            artifact_receipt_digests
+                .push(Sha256::digest(serde_json::to_vec(&receipt).unwrap()).into());
+            descriptors.push(EvidenceDescriptor {
+                kind: EvidenceKind::Artifact,
+                digest,
+                length: bytes.len() as u32,
+                artifact_name_digest: Sha256::digest(b"result.json").into(),
+                artifact_media_type_digest: Sha256::digest(b"application/json").into(),
+                artifact_id: WireText64::from_ascii("result").unwrap(),
+                artifact_name: WireText64::from_ascii("result.json").unwrap(),
+                artifact_media_type: WireText64::from_ascii("application/json").unwrap(),
+                teardown_lease_id: [0; 16],
+                teardown_lease_generation: 0,
+                teardown_attestation_digest: [0; 32],
+            });
+            evidence_bytes.push(bytes);
+        }
+        let mut receipt_set = b"buzz-ci-execd:artifact-receipt-set:v1\0".to_vec();
+        receipt_set.extend_from_slice(&response.execution_binding_digest);
+        for digest in &artifact_receipt_digests {
+            receipt_set.extend_from_slice(digest);
+        }
+        let teardown = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "execution_binding_digest": hex::encode(response.execution_binding_digest),
+            "evidence_set_digest": hex::encode(response.evidence_set_digest),
+            "stop_reason": if conclusion == BrokerConclusion::Cancelled { "cancelled" } else { "completed" },
+            "executor_receipt_digest": "aa".repeat(32),
+            "request_event_id": hex::encode(response.accepted_request_digest),
+            "run_id": hex::encode(response.run_id),
+            "workflow_id": "native-ci",
+            "workflow_digest": hex::encode(active.admission.workflow_digest),
+            "job_id": "test",
+            "attempt": active.admission.attempt,
+            "lease_id": "bb".repeat(16),
+            "lease_generation": response.lease_generation,
+            "artifact_receipt_set_digest": hex::encode(Sha256::digest(receipt_set)),
+        }))
+        .unwrap();
+        let teardown_digest: [u8; 32] = Sha256::digest(&teardown).into();
+        terminal.response.teardown_digest = teardown_digest;
+        descriptors.push(EvidenceDescriptor {
+            kind: EvidenceKind::Teardown,
+            digest: teardown_digest,
+            length: teardown.len() as u32,
+            artifact_name_digest: [0; 32],
+            artifact_media_type_digest: [0; 32],
+            artifact_id: WireText64::EMPTY,
+            artifact_name: WireText64::EMPTY,
+            artifact_media_type: WireText64::EMPTY,
+            teardown_lease_id: [0xbb; 16],
+            teardown_lease_generation: response.lease_generation,
+            teardown_attestation_digest: teardown_digest,
+        });
+        evidence_bytes.push(teardown);
+        let descriptor_set_digest = fake_descriptor_set_digest(terminal, &descriptors);
+        (
+            terminal,
+            FakeEvidence {
+                descriptors,
+                bytes: evidence_bytes,
+                descriptor_set_digest,
+            },
+        )
+    }
+
+    impl RunnerV2Transport for FakeRunnerTransport {
+        type Error = ();
+
+        fn exchange_frame(
+            &mut self,
+            request: &[u8],
+            response_length: usize,
+            _transport_attempts: u32,
+        ) -> Result<Vec<u8>, Self::Error> {
+            let (header, request) = v2::decode_request(request).unwrap();
+            let mut state = self.0.lock().unwrap();
+            match request {
+                Request::RegisterJobIntent(value) => {
+                    if state.last_request != Some(value.admission.signed_request_digest) {
+                        state.last_request = Some(value.admission.signed_request_digest);
+                        state.active = None;
+                        state.terminal = None;
+                        state.evidence = None;
+                    }
+                    Ok(v2::encode_intent_registration_response(
+                        header,
+                        IntentRegistrationResponse {
+                            code: if state.active.is_some() {
+                                ResponseCode::Existing
+                            } else {
+                                ResponseCode::Ok
+                            },
+                            retry_after_millis: 0,
+                            signed_request_digest: value.admission.signed_request_digest,
+                            job_intent_digest: value.admission.job_intent_digest,
+                            request_frame_digest: value.request_frame_digest,
+                            admission_message_digest: Sha256::digest(admission_signature_message(
+                                &value.admission,
+                            ))
+                            .into(),
+                            registration_key_digest: intent_registration_key_digest(&value),
+                            lane_manifest_digest: value.admission.lane_manifest_digest,
+                            run_id: value.admission.run_id,
+                            lane_epoch: value.admission.lane_epoch,
+                            admission_key_generation: value.admission.admission_key_generation,
+                            issued_at: value.admission.issued_at,
+                            expires_at: value.admission.expires_at,
+                            attempt: value.admission.attempt,
+                        },
+                    )
+                    .as_bytes()
+                    .to_vec())
+                }
+                Request::AdmitAttempt(admission) => {
+                    let response = if let Some(terminal) = state.terminal {
+                        let mut response = terminal.response;
+                        if state.drift {
+                            response.attempt_id[0] ^= 1;
+                        }
+                        response
+                    } else if let Some(active) = state.active {
+                        let mut response = active.response;
+                        response.code = ResponseCode::Existing;
+                        response
+                    } else {
+                        state.starts += 1;
+                        *state
+                            .starts_by_request
+                            .entry(admission.signed_request_digest)
+                            .or_default() += 1;
+                        let active = BoundAttempt {
+                            admission,
+                            response: BrokerResponse {
+                                code: ResponseCode::Ok,
+                                retry_after_millis: 0,
+                                attempt_id: [admission.attempt as u8; 16],
+                                run_id: admission.run_id,
+                                accepted_request_digest: admission.signed_request_digest,
+                                job_intent_digest: admission.job_intent_digest,
+                                execution_binding_digest: [admission.attempt as u8 + 20; 32],
+                                tip_oid: Some(admission.tip_oid),
+                                broker_state: BrokerState::Leased,
+                                conclusion: BrokerConclusion::None,
+                                terminal_reason: 0,
+                                generation: 1,
+                                accepted_at: admission.issued_at,
+                                updated_at: admission.issued_at,
+                                lease_generation: 1,
+                                evidence_set_digest: [0; 32],
+                                teardown_digest: [0; 32],
+                                attempt: admission.attempt,
+                            },
+                        };
+                        state.active = Some(active);
+                        active.response
+                    };
+                    Ok(v2::encode_response(header, response).as_bytes().to_vec())
+                }
+                Request::GetAttempt(_) => {
+                    if state.terminal.is_none() {
+                        let active = state.active.unwrap();
+                        let (terminal, evidence) = fake_terminal(active, state.conclusion);
+                        state.terminal = Some(terminal);
+                        state.evidence = Some(evidence);
+                    }
+                    Ok(
+                        v2::encode_response(header, state.terminal.unwrap().response)
+                            .as_bytes()
+                            .to_vec(),
+                    )
+                }
+                Request::CancelAttempt(_) => {
+                    if state.terminal.is_none() {
+                        state.cancels += 1;
+                        let active = state.active.unwrap();
+                        let (mut terminal, evidence) =
+                            fake_terminal(active, BrokerConclusion::Cancelled);
+                        terminal.response.code = ResponseCode::Ok;
+                        state.terminal = Some(terminal);
+                        state.evidence = Some(evidence);
+                    }
+                    Ok(
+                        v2::encode_response(header, state.terminal.unwrap().response)
+                            .as_bytes()
+                            .to_vec(),
+                    )
+                }
+                Request::DescribeAttemptEvidence(value) => {
+                    let evidence = state.evidence.as_ref().unwrap();
+                    let mut items = [None; v2::MAX_EVIDENCE_ITEMS];
+                    for (slot, descriptor) in items.iter_mut().zip(&evidence.descriptors) {
+                        *slot = Some(*descriptor);
+                    }
+                    let mut coordinates = value.coordinates;
+                    if state.drift {
+                        coordinates.attempt_id[0] ^= 1;
+                    }
+                    let response = EvidenceDescriptionResponse {
+                        code: ResponseCode::Ok,
+                        execution_binding_digest: coordinates.execution_binding_digest,
+                        generation: coordinates.expected_generation,
+                        request_frame_digest: value.request_frame_digest,
+                        descriptor_set_digest: evidence.descriptor_set_digest,
+                        item_count: evidence.descriptors.len() as u8,
+                        items,
+                        request_event_id: coordinates.request_event_id,
+                        run_id: coordinates.run_id,
+                        workflow_id: coordinates.workflow_id,
+                        workflow_digest: coordinates.workflow_digest,
+                        job_id: coordinates.job_id,
+                        attempt: coordinates.attempt,
+                    };
+                    Ok(v2::encode_evidence_description_response(header, response)
+                        .as_bytes()
+                        .to_vec())
+                }
+                Request::ReadAttemptEvidence(value) => {
+                    let bytes =
+                        state.evidence.as_ref().unwrap().bytes[value.item_index as usize].clone();
+                    let response = EvidenceChunkResponse {
+                        code: ResponseCode::Ok,
+                        execution_binding_digest: value.coordinates.execution_binding_digest,
+                        generation: value.coordinates.expected_generation,
+                        request_frame_digest: value.request_frame_digest,
+                        kind: value.kind,
+                        item_index: value.item_index,
+                        descriptor_digest: value.descriptor_digest,
+                        offset: value.offset,
+                        total_length: bytes.len() as u32,
+                        bytes,
+                        request_event_id: value.coordinates.request_event_id,
+                        run_id: value.coordinates.run_id,
+                        workflow_id: value.coordinates.workflow_id,
+                        workflow_digest: value.coordinates.workflow_digest,
+                        job_id: value.coordinates.job_id,
+                        attempt: value.coordinates.attempt,
+                    };
+                    Ok(v2::encode_evidence_chunk_response(header, &response)
+                        .as_bytes()
+                        .to_vec())
+                }
+                _ => unreachable!(),
+            }
+            .inspect(|response| assert_eq!(response.len(), response_length))
+        }
+    }
+
+    type FakeExecutor = RunnerV2AttemptExecutor<FakeRunnerTransport, FakeAdmissionSigner>;
+    type FakeController = CapacityOneController<
+        FakeRelay,
+        FakeCiSigner,
+        FakeExecutor,
+        FakeStore,
+        RunnerV2EvidenceReader<FakeRunnerTransport>,
+    >;
+    type FakeService = CapacityOneService<
+        FakeController,
+        FakeRunnerTransport,
+        FakeExecutor,
+        FakeRelay,
+        FakeAcceptanceSigner,
+    >;
+
+    fn provider_binding() -> AcceptanceBinding {
+        let mut binding = canonical_acceptance_binding();
+        binding.fixture.expected_log.sha256 = hex::encode(Sha256::digest(b"s"));
+        binding.fixture.expected_failure_log.sha256 = hex::encode(Sha256::digest(b"f"));
+        let event_id = Sha256::digest(serde_json::to_vec(&binding.acceptance.run_event).unwrap());
+        let fields = binding.acceptance.run_event.as_array().unwrap();
+        let envelope: CiRequestEnvelope =
+            serde_json::from_str(fields[5].as_str().unwrap()).unwrap();
+        let artifact = FakeArtifactDocument {
+            schema_version: 1,
+            execution_binding_digest: hex::encode([21; 32]),
+            request_event_id: hex::encode(event_id),
+            run_id: hex::encode(uuid::Uuid::parse_str(&envelope.run_id).unwrap().as_bytes()),
+            workflow_id: &envelope.workflow_id,
+            workflow_digest: envelope.workflow_digest,
+            job_id: &binding.fixture.job_id,
+            attempt: 1,
+            artifact_id: "result".to_owned(),
+            name: "result.json".to_owned(),
+            media_type: "application/json".to_owned(),
+            sha256: hex::encode(Sha256::digest(b"a")),
+            byte_length: 1,
+            content_hex: hex::encode(b"a"),
+        };
+        let artifact = serde_json::to_vec(&artifact).unwrap();
+        binding.fixture.expected_artifacts[0].sha256 = hex::encode(Sha256::digest(&artifact));
+        binding.fixture.expected_artifacts[0].bytes = artifact.len() as u64;
+        binding
+    }
+
+    fn frozen_request(
+        binding: &AcceptanceBinding,
+        mutation: AcceptanceMutation,
+    ) -> AcceptedRequest {
+        let authority = AcceptanceAuthority::new(binding).unwrap();
+        let index = AcceptanceAuthority::index(mutation);
+        let fields = authority.templates[index].as_array().unwrap();
+        AcceptedRequest {
+            channel_id: "123e4567-e89b-12d3-a456-426614174099".to_owned(),
+            watch_cursor: 1,
+            event_id: hex::encode(authority.event_ids[index]),
+            envelope: serde_json::from_str(fields[5].as_str().unwrap()).unwrap(),
+        }
+    }
+
+    fn runner_bindings(binding: &AcceptanceBinding) -> StaticAdmissionBindings {
+        let request = frozen_request(binding, AcceptanceMutation::Run);
+        StaticAdmissionBindings {
+            audience_digest: [31; 32],
+            isolation_profile_digest: [32; 32],
+            lane_manifest_digest: [33; 32],
+            lane_epoch: 1,
+            admission_key_generation: 1,
+            workflow_id: request.envelope.workflow_id.clone(),
+            workflow_digest: hex::decode(&request.envelope.workflow_digest)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            job_ids: vec![binding.fixture.job_id.clone()],
+            artifacts: vec![StaticArtifactBinding {
+                artifact_id: "result".to_owned(),
+                name: binding.fixture.expected_artifacts[0].name.clone(),
+                media_type: "application/json".to_owned(),
+                relative_name: "result.json".to_owned(),
+                max_bytes: 4096,
+            }],
+        }
+    }
+
+    fn fake_service(
+        root: &std::path::Path,
+        owner_uid: u32,
+        binding: &AcceptanceBinding,
+        relay: FakeRelay,
+        store: FakeStore,
+        runner: FakeRunnerTransport,
+    ) -> FakeService {
+        let bindings = runner_bindings(binding);
+        let metadata = JobMetadata {
+            job_id: binding.fixture.job_id.clone(),
+            name: "test".to_owned(),
+            required: true,
+            skip_policy: CiSkipPolicy::Forbid,
+            selected_job_instance: "test".to_owned(),
+            also_reruns: Vec::new(),
+        };
+        let poll_interval = Duration::from_millis(1);
+        let (observation_sender, observations) = mpsc::channel();
+        let (attempt_commands, command_receiver) = mpsc::channel();
+        let (recovery_sender, recovery_observations) = mpsc::channel();
+        let (executor, output) = compose_runner_v2(
+            RunnerV2Client::new(runner.clone(), 1).unwrap(),
+            FakeAdmissionSigner,
+            bindings.clone(),
+            metadata.clone(),
+            binding.acceptance.actor.public_key.clone(),
+            poll_interval,
+            AttemptControl {
+                observer: Some(observation_sender),
+                command: Some(command_receiver),
+            },
+        )
+        .unwrap();
+        let (recovery_executor, _) = compose_runner_v2(
+            RunnerV2Client::new(runner.clone(), 1).unwrap(),
+            FakeAdmissionSigner,
+            bindings,
+            metadata,
+            binding.acceptance.actor.public_key.clone(),
+            poll_interval,
+            AttemptControl {
+                observer: Some(recovery_sender),
+                command: None,
+            },
+        )
+        .unwrap();
+        let config = CapacityOneConfig::new(
+            "123e4567-e89b-12d3-a456-426614174099".to_owned(),
+            poll_interval,
+            1,
+        )
+        .unwrap();
+        let controller = CapacityOneController::activate(
+            config,
+            CapacityOneProviderSlots::new(
+                Some(relay.clone()),
+                Some(FakeCiSigner(binding.acceptance.actor.public_key.clone())),
+                Some(executor),
+                Some(store),
+                Some(output),
+            ),
+        )
+        .unwrap();
+        let status = controller.status();
+        FakeService {
+            controller: Some(controller),
+            controller_worker: None,
+            observations,
+            attempt_commands,
+            active_attempt: None,
+            terminal_attempt: None,
+            verified_evidence: None,
+            gate_waiting: false,
+            cancel_client: RunnerV2Client::new(runner, 1).unwrap(),
+            recovery_executor,
+            recovery_observations,
+            acceptance_channel_id: "123e4567-e89b-12d3-a456-426614174099".to_owned(),
+            acceptance_relay: relay,
+            acceptance_signer: FakeAcceptanceSigner,
+            acceptance_authority: AcceptanceAuthority::new(binding).unwrap(),
+            status,
+            poll_interval,
+            acceptance: AcceptanceJournal::open(
+                root.canonicalize().unwrap(),
+                owner_uid,
+                binding.clone(),
+            )
+            .unwrap(),
+            background_polling: false,
+            crash_before_provider_effect: false,
+            crash_after_provider_effect: false,
+        }
+    }
+
+    fn prime_journal(
+        journal: &AcceptanceJournal,
+        through: u32,
+        last_response: Option<AdapterResponse>,
+    ) {
+        for sequence in 1..=through {
+            let request = sequence_request(sequence, None);
+            let exact = serde_json::to_vec(&request).unwrap();
+            let capacity = u32::from(sequence != 1);
+            let response = if sequence == through {
+                last_response
+                    .clone()
+                    .map(|response| rebind_response(response, &request))
+                    .unwrap_or_else(|| host_response(&request, None, capacity))
+            } else {
+                host_response(&request, None, capacity)
+            };
+            journal
+                .execute(&request, &exact, capacity, |_, _| {
+                    Ok::<_, AcceptanceSocketError>(response)
+                })
+                .unwrap();
+        }
+    }
+
+    fn rebind_response(mut response: AdapterResponse, request: &AdapterRequest) -> AdapterResponse {
+        response.sequence = request.sequence;
+        response.operation = request.operation;
+        response
+            .scenario_sha256
+            .clone_from(&request.scenario_sha256);
+        response.operation_id.clone_from(&request.operation_id);
+        response.response.sequence = request.sequence;
+        response.response.operation = request.operation;
+        response
+    }
+
+    fn handle(
+        service: &mut FakeService,
+        request: &AdapterRequest,
+    ) -> Result<AdapterResponse, AcceptanceSocketError> {
+        AcceptanceOperationHandler::handle(service, request, &serde_json::to_vec(request).unwrap())
+    }
+
+    fn quiesce_crashed_worker(service: &mut FakeService) {
+        let (replacement, _receiver) = mpsc::channel();
+        let sender = std::mem::replace(&mut service.attempt_commands, replacement);
+        drop(sender);
+        if let Some(worker) = service.controller_worker.take() {
+            let _ = worker.join().unwrap();
+        }
+    }
+
+    fn provider_root() -> (TempDir, u32) {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let owner_uid = fs::metadata(root.path()).unwrap().uid();
+        (root, owner_uid)
+    }
+
+    #[test]
+    fn capacity_one_handle_recovers_terminal_provider_crashes_without_reexecution() {
+        for (sequence, mutation, conclusion, publish_sequence, resume_sequence) in [
+            (6, AcceptanceMutation::Run, BrokerConclusion::Success, 3, 5),
+            (
+                10,
+                AcceptanceMutation::FailureRun,
+                BrokerConclusion::Failure,
+                8,
+                9,
+            ),
+        ] {
+            let binding = provider_binding();
+            let (root, owner_uid) = provider_root();
+            let relay = FakeRelay::default();
+            relay
+                .0
+                .lock()
+                .unwrap()
+                .accepted
+                .push_back(frozen_request(&binding, mutation));
+            let store = FakeStore::default();
+            let runner_state = Arc::new(Mutex::new(FakeRunnerState {
+                conclusion,
+                active: None,
+                terminal: None,
+                evidence: None,
+                starts: 0,
+                starts_by_request: HashMap::new(),
+                last_request: None,
+                cancels: 0,
+                drift: false,
+            }));
+            let runner = FakeRunnerTransport(runner_state.clone());
+            let mut service = fake_service(
+                root.path(),
+                owner_uid,
+                &binding,
+                relay.clone(),
+                store.clone(),
+                runner.clone(),
+            );
+            prime_journal(&service.acceptance, publish_sequence - 1, None);
+            for stage in publish_sequence..=resume_sequence {
+                let request = sequence_request(stage, None);
+                handle(&mut service, &request).unwrap();
+                if stage == resume_sequence {
+                    AcceptanceOperationHandler::response_written(&mut service, &request).unwrap();
+                }
+            }
+            let target = sequence_request(sequence, None);
+            service.inject_provider_crash(false);
+            let crash = catch_unwind(AssertUnwindSafe(|| handle(&mut service, &target)));
+            assert!(
+                crash.is_err(),
+                "unexpected target result: {crash:?}, status: {:?}",
+                service.status
+            );
+            let published = relay.0.lock().unwrap().published.clone();
+            assert!(!published.is_empty());
+            assert_eq!(runner_state.lock().unwrap().starts, 1);
+
+            let mut reopened = fake_service(
+                root.path(),
+                owner_uid,
+                &binding,
+                relay.clone(),
+                store.clone(),
+                runner.clone(),
+            );
+            let exact = serde_json::to_vec(&target).unwrap();
+            let calls_before = {
+                let state = runner_state.lock().unwrap();
+                (state.starts, state.cancels)
+            };
+            let mut mismatched = exact.clone();
+            mismatched.push(b' ');
+            assert_eq!(
+                AcceptanceOperationHandler::handle(&mut reopened, &target, &mismatched),
+                Err(AcceptanceSocketError::Replay)
+            );
+            assert_eq!(
+                {
+                    let state = runner_state.lock().unwrap();
+                    (state.starts, state.cancels)
+                },
+                calls_before
+            );
+            let recovered =
+                AcceptanceOperationHandler::handle(&mut reopened, &target, &exact).unwrap();
+            let recovered_bytes = serde_json::to_vec(&recovered).unwrap();
+            let replayed =
+                AcceptanceOperationHandler::handle(&mut reopened, &target, &exact).unwrap();
+            assert_eq!(serde_json::to_vec(&replayed).unwrap(), recovered_bytes);
+            assert_eq!(runner_state.lock().unwrap().starts, 1);
+            let relay_state = relay.0.lock().unwrap();
+            assert_eq!(relay_state.published, published);
+            assert!(relay_state.publish_calls.values().all(|calls| *calls == 1));
+
+            let drift_binding = provider_binding();
+            let (drift_root, drift_owner) = provider_root();
+            let drift_relay = FakeRelay::default();
+            drift_relay
+                .0
+                .lock()
+                .unwrap()
+                .accepted
+                .push_back(frozen_request(&drift_binding, mutation));
+            let drift_store = FakeStore::default();
+            let drift_state = Arc::new(Mutex::new(FakeRunnerState {
+                conclusion,
+                active: None,
+                terminal: None,
+                evidence: None,
+                starts: 0,
+                starts_by_request: HashMap::new(),
+                last_request: None,
+                cancels: 0,
+                drift: false,
+            }));
+            let drift_runner = FakeRunnerTransport(drift_state.clone());
+            let mut crashing = fake_service(
+                drift_root.path(),
+                drift_owner,
+                &drift_binding,
+                drift_relay.clone(),
+                drift_store.clone(),
+                drift_runner.clone(),
+            );
+            prime_journal(&crashing.acceptance, publish_sequence - 1, None);
+            for stage in publish_sequence..=resume_sequence {
+                let request = sequence_request(stage, None);
+                handle(&mut crashing, &request).unwrap();
+                if stage == resume_sequence {
+                    AcceptanceOperationHandler::response_written(&mut crashing, &request).unwrap();
+                }
+            }
+            crashing.inject_provider_crash(false);
+            assert!(catch_unwind(AssertUnwindSafe(|| handle(&mut crashing, &target))).is_err());
+            drift_state.lock().unwrap().drift = true;
+            let drift_published = drift_relay.0.lock().unwrap().published.clone();
+            let mut drifted = fake_service(
+                drift_root.path(),
+                drift_owner,
+                &drift_binding,
+                drift_relay.clone(),
+                drift_store,
+                drift_runner,
+            );
+            assert_eq!(
+                handle(&mut drifted, &target),
+                Err(AcceptanceSocketError::Operation)
+            );
+            let state = drift_state.lock().unwrap();
+            assert_eq!((state.starts, state.cancels), (1, 0));
+            let relay_state = drift_relay.0.lock().unwrap();
+            assert_eq!(relay_state.published, drift_published);
+            assert!(relay_state.publish_calls.values().all(|calls| *calls == 1));
+        }
+    }
+
+    #[test]
+    fn capacity_one_handle_recovers_cancel_across_active_terminal_and_advanced_cursor() {
+        let mut canonical_bytes: Option<Vec<u8>> = None;
+        for recovery in ["active", "terminal", "cursor_advanced", "drift"] {
+            let binding = provider_binding();
+            let (root, owner_uid) = provider_root();
+            let relay = FakeRelay::default();
+            let failure_accepted = frozen_request(&binding, AcceptanceMutation::FailureRun);
+            let mut rerun_accepted = frozen_request(&binding, AcceptanceMutation::Rerun);
+            rerun_accepted.watch_cursor = 2;
+            relay
+                .0
+                .lock()
+                .unwrap()
+                .accepted
+                .extend([failure_accepted, rerun_accepted]);
+            let store = FakeStore::default();
+            let runner_state = Arc::new(Mutex::new(FakeRunnerState {
+                conclusion: BrokerConclusion::Failure,
+                active: None,
+                terminal: None,
+                evidence: None,
+                starts: 0,
+                starts_by_request: HashMap::new(),
+                last_request: None,
+                cancels: 0,
+                drift: false,
+            }));
+            let runner = FakeRunnerTransport(runner_state.clone());
+            let mut service = fake_service(
+                root.path(),
+                owner_uid,
+                &binding,
+                relay.clone(),
+                store.clone(),
+                runner.clone(),
+            );
+            prime_journal(&service.acceptance, 7, None);
+            handle(&mut service, &sequence_request(8, None)).unwrap();
+            let resume_failure = sequence_request(9, None);
+            handle(&mut service, &resume_failure).unwrap();
+            AcceptanceOperationHandler::response_written(&mut service, &resume_failure).unwrap();
+            let failure_result = handle(&mut service, &sequence_request(10, None));
+            assert!(
+                failure_result.is_ok(),
+                "failure finish failed: {failure_result:?}; status: {:?}",
+                service.status
+            );
+            let failure_response = failure_result.unwrap();
+            let first_id = failure_response
+                .response
+                .snapshot
+                .run
+                .as_ref()
+                .unwrap()
+                .attempts[0]
+                .attempt_id
+                .clone();
+            let rerun = sequence_request(11, Some(first_id));
+            let rerun_result = handle(&mut service, &rerun);
+            assert!(
+                rerun_result.is_ok(),
+                "rerun failed: {rerun_result:?}; status: {:?}; store: {:?}",
+                service.status,
+                store.0.lock().unwrap().runs
+            );
+            let rerun_response = rerun_result.unwrap();
+            let second_id = rerun_response
+                .response
+                .snapshot
+                .run
+                .as_ref()
+                .unwrap()
+                .attempts[1]
+                .attempt_id
+                .clone();
+            let cancel = sequence_request(12, Some(second_id));
+
+            if recovery == "active" {
+                service.inject_provider_crash(true);
+                assert!(catch_unwind(AssertUnwindSafe(|| handle(&mut service, &cancel))).is_err());
+            } else {
+                if recovery == "terminal" {
+                    store.0.lock().unwrap().fail_cursor_once = true;
+                    assert_eq!(
+                        handle(&mut service, &cancel),
+                        Err(AcceptanceSocketError::Operation)
+                    );
+                } else {
+                    service.inject_provider_crash(false);
+                    assert!(
+                        catch_unwind(AssertUnwindSafe(|| handle(&mut service, &cancel))).is_err()
+                    );
+                }
+            }
+            let published = relay.0.lock().unwrap().published.clone();
+            let calls = {
+                let state = runner_state.lock().unwrap();
+                (state.starts, state.cancels)
+            };
+            assert_eq!(calls.0, 2);
+            assert_eq!(calls.1, usize::from(recovery != "active"));
+            let rerun_event: [u8; 32] =
+                hex::decode(&frozen_request(&binding, AcceptanceMutation::Rerun).event_id)
+                    .unwrap()
+                    .try_into()
+                    .unwrap();
+            assert_eq!(
+                runner_state.lock().unwrap().starts_by_request[&rerun_event],
+                1
+            );
+
+            let store_at_crash = store.0.lock().unwrap().clone();
+            let relay_at_crash = relay.0.lock().unwrap().clone();
+            quiesce_crashed_worker(&mut service);
+            if recovery == "active" {
+                *store.0.lock().unwrap() = store_at_crash;
+                *relay.0.lock().unwrap() = relay_at_crash;
+            }
+            drop(service);
+            let mut reopened = fake_service(
+                root.path(),
+                owner_uid,
+                &binding,
+                relay.clone(),
+                store.clone(),
+                runner.clone(),
+            );
+            if recovery == "drift" {
+                runner_state.lock().unwrap().drift = true;
+            }
+            let exact = serde_json::to_vec(&cancel).unwrap();
+            let before_retry = {
+                let state = runner_state.lock().unwrap();
+                (state.starts, state.cancels)
+            };
+            let mut mismatched = exact.clone();
+            mismatched.push(b' ');
+            assert_eq!(
+                AcceptanceOperationHandler::handle(&mut reopened, &cancel, &mismatched),
+                Err(AcceptanceSocketError::Replay)
+            );
+            assert_eq!(
+                {
+                    let state = runner_state.lock().unwrap();
+                    (state.starts, state.cancels)
+                },
+                before_retry
+            );
+
+            if recovery == "drift" {
+                assert_eq!(
+                    AcceptanceOperationHandler::handle(&mut reopened, &cancel, &exact),
+                    Err(AcceptanceSocketError::Operation)
+                );
+                let state = runner_state.lock().unwrap();
+                assert_eq!((state.starts, state.cancels), (2, 1));
+            } else {
+                let recovery_result =
+                    AcceptanceOperationHandler::handle(&mut reopened, &cancel, &exact);
+                assert!(
+                    recovery_result.is_ok(),
+                    "{recovery} recovery failed: {recovery_result:?}; status: {:?}; runs: {:?}; runner: {:?}",
+                    reopened.status,
+                    store.0.lock().unwrap().runs,
+                    runner_state.lock().unwrap()
+                );
+                let response = recovery_result.unwrap();
+                let bytes = serde_json::to_vec(&response).unwrap();
+                if let Some(canonical) = &canonical_bytes {
+                    assert_eq!(
+                        &bytes, canonical,
+                        "{recovery} changed cancel response bytes"
+                    );
+                } else {
+                    canonical_bytes = Some(bytes.clone());
+                }
+                let replay =
+                    AcceptanceOperationHandler::handle(&mut reopened, &cancel, &exact).unwrap();
+                assert_eq!(serde_json::to_vec(&replay).unwrap(), bytes);
+                let state = runner_state.lock().unwrap();
+                assert_eq!((state.starts, state.cancels), (2, 1));
+            }
+            let relay_state = relay.0.lock().unwrap();
+            if recovery == "active" {
+                assert!(published.is_subset(&relay_state.published));
+            } else {
+                assert_eq!(relay_state.published, published);
+            }
+            assert!(relay_state.publish_calls.values().all(|calls| *calls == 1));
+        }
     }
 
     #[test]
@@ -1857,7 +3224,7 @@ mod tests {
     }
 
     fn rerun_request(attempt_id: Option<&str>) -> AdapterRequest {
-        let binding = canonical_acceptance_binding();
+        let binding = provider_binding();
         AdapterRequest {
             schema_version: ADAPTER_REQUEST_SCHEMA.to_owned(),
             sequence: 8,
@@ -2050,119 +3417,6 @@ mod tests {
         );
     }
 
-    struct RecoveryProviderFixture {
-        poll: Option<RecoveryAttempt>,
-        finish: Option<(TerminalAttempt, VerifiedAttemptEvidence)>,
-        reconstructed: Option<(TerminalAttempt, VerifiedAttemptEvidence)>,
-        cancelled: Option<TerminalAttempt>,
-        poll_calls: usize,
-        release_calls: usize,
-        finish_calls: usize,
-        reconstruct_calls: usize,
-        cancel_calls: usize,
-        execution_calls: usize,
-        expected_cancel_active: Option<BoundAttempt>,
-        publication_keys: Vec<String>,
-    }
-
-    impl AcceptanceRecoveryProvider for RecoveryProviderFixture {
-        fn poll_recovery(
-            &mut self,
-            _mutation: AcceptanceMutation,
-        ) -> Result<RecoveryAttempt, AcceptanceSocketError> {
-            self.poll_calls += 1;
-            self.poll.take().ok_or(AcceptanceSocketError::Operation)
-        }
-
-        fn release_active(&mut self) -> Result<(), AcceptanceSocketError> {
-            self.release_calls += 1;
-            Ok(())
-        }
-
-        fn finish_active(
-            &mut self,
-        ) -> Result<(TerminalAttempt, VerifiedAttemptEvidence), AcceptanceSocketError> {
-            self.finish_calls += 1;
-            self.finish.take().ok_or(AcceptanceSocketError::Operation)
-        }
-
-        fn reconstruct_terminal(
-            &mut self,
-            _mutation: AcceptanceMutation,
-        ) -> Result<(TerminalAttempt, VerifiedAttemptEvidence), AcceptanceSocketError> {
-            self.reconstruct_calls += 1;
-            self.reconstructed
-                .take()
-                .ok_or(AcceptanceSocketError::Operation)
-        }
-
-        fn cancel_active(
-            &mut self,
-            request: &AdapterRequest,
-            active: BoundAttempt,
-        ) -> Result<TerminalAttempt, AcceptanceSocketError> {
-            self.cancel_calls += 1;
-            if self.expected_cancel_active != Some(active)
-                || request.attempt_id.as_deref()
-                    != Some(hex::encode(active.response.attempt_id).as_str())
-            {
-                return Err(AcceptanceSocketError::Operation);
-            }
-            self.cancelled
-                .take()
-                .ok_or(AcceptanceSocketError::Operation)
-        }
-
-        fn cancel_fresh(
-            &mut self,
-            request: &AdapterRequest,
-        ) -> Result<TerminalAttempt, AcceptanceSocketError> {
-            self.cancel_calls += 1;
-            let active = self
-                .expected_cancel_active
-                .ok_or(AcceptanceSocketError::Operation)?;
-            if request.attempt_id.as_deref()
-                != Some(hex::encode(active.response.attempt_id).as_str())
-            {
-                return Err(AcceptanceSocketError::Operation);
-            }
-            self.cancelled
-                .take()
-                .ok_or(AcceptanceSocketError::Operation)
-        }
-    }
-
-    impl RecoveryProviderFixture {
-        fn record_original_execution(&mut self) {
-            self.execution_calls += 1;
-        }
-
-        fn publish(&mut self, key: &str) {
-            self.publication_keys.push(key.to_owned());
-        }
-    }
-
-    fn recovery_provider(
-        poll: RecoveryAttempt,
-        terminal: TerminalAttempt,
-        evidence: VerifiedAttemptEvidence,
-    ) -> RecoveryProviderFixture {
-        RecoveryProviderFixture {
-            poll: Some(poll),
-            finish: Some((terminal, evidence.clone())),
-            reconstructed: Some((terminal, evidence)),
-            cancelled: Some(terminal),
-            poll_calls: 0,
-            release_calls: 0,
-            finish_calls: 0,
-            reconstruct_calls: 0,
-            cancel_calls: 0,
-            execution_calls: 0,
-            expected_cancel_active: None,
-            publication_keys: Vec::new(),
-        }
-    }
-
     fn terminal_fixture(
         request: &AdapterRequest,
         conclusion: BrokerConclusion,
@@ -2225,54 +3479,6 @@ mod tests {
         request
     }
 
-    fn running_prior(
-        request: &AdapterRequest,
-        attempt_id: String,
-        failure: bool,
-    ) -> AdapterResponse {
-        let attempt = if failure {
-            failure_attempt_snapshot(
-                request,
-                attempt_id,
-                1,
-                None,
-                AttemptState::Running,
-                AcceptanceConclusion::None,
-                None,
-            )
-        } else {
-            attempt_snapshot(
-                request,
-                attempt_id,
-                1,
-                None,
-                AttemptState::Running,
-                AcceptanceConclusion::None,
-                None,
-            )
-        };
-        let run = if failure {
-            failure_run_snapshot(
-                request,
-                RunState::Running,
-                AcceptanceConclusion::None,
-                Some(approval_snapshot(request, true)),
-                None,
-                vec![attempt],
-            )
-        } else {
-            run_snapshot(
-                request,
-                RunState::Running,
-                AcceptanceConclusion::None,
-                Some(approval_snapshot(request, true)),
-                None,
-                vec![attempt],
-            )
-        };
-        acceptance_response(request, run, 1, None)
-    }
-
     const ACCEPTANCE_OPERATIONS: [Operation; 16] = [
         Operation::ObserveInitial,
         Operation::SetCapacityOne,
@@ -2311,401 +3517,6 @@ mod tests {
         }
         request.operation_id = expected_adapter_operation_id(&request).unwrap();
         request
-    }
-
-    fn rebind_response(mut response: AdapterResponse, request: &AdapterRequest) -> AdapterResponse {
-        response.sequence = request.sequence;
-        response.operation = request.operation;
-        response
-            .scenario_sha256
-            .clone_from(&request.scenario_sha256);
-        response.operation_id.clone_from(&request.operation_id);
-        response.response.sequence = request.sequence;
-        response.response.operation = request.operation;
-        response
-    }
-
-    fn open_composed_journal() -> (TempDir, AcceptanceJournal, u32) {
-        let root = tempfile::tempdir().unwrap();
-        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let owner_uid = fs::metadata(root.path()).unwrap().uid();
-        let journal = AcceptanceJournal::open(
-            root.path().canonicalize().unwrap(),
-            owner_uid,
-            canonical_acceptance_binding(),
-        )
-        .unwrap();
-        (root, journal, owner_uid)
-    }
-
-    fn prime_composed_journal(
-        journal: &AcceptanceJournal,
-        target_sequence: u32,
-        target_prior: &AdapterResponse,
-        provider: &mut RecoveryProviderFixture,
-    ) {
-        for sequence in 1..target_sequence {
-            let request = sequence_request(sequence, None);
-            let exact = serde_json::to_vec(&request).unwrap();
-            let configured_capacity = u32::from(sequence != 1);
-            let response = if sequence + 1 == target_sequence {
-                rebind_response(target_prior.clone(), &request)
-            } else {
-                host_response(&request, None, configured_capacity)
-            };
-            if matches!(sequence, 5 | 9 | 11) && sequence + 1 == target_sequence {
-                provider.record_original_execution();
-            }
-            match sequence {
-                3 => provider.publish("run"),
-                4 => provider.publish("grant"),
-                8 => provider.publish("failure_run"),
-                11 => provider.publish("rerun"),
-                _ => {}
-            }
-            let expected = response.clone();
-            let actual = journal
-                .execute(&request, &exact, configured_capacity, |_, execution| {
-                    assert_eq!(execution, AcceptanceExecution::Fresh);
-                    Ok::<_, AcceptanceSocketError>(response)
-                })
-                .unwrap();
-            assert_eq!(actual, expected);
-        }
-    }
-
-    fn cancellation_prior(request: &AdapterRequest, active: BoundAttempt) -> AdapterResponse {
-        let second_id = hex::encode(active.response.attempt_id);
-        let first_id = "cd".repeat(16);
-        acceptance_response(
-            request,
-            failure_run_snapshot(
-                request,
-                RunState::Running,
-                AcceptanceConclusion::None,
-                Some(approval_snapshot(request, true)),
-                None,
-                vec![
-                    failure_attempt_snapshot(
-                        request,
-                        first_id.clone(),
-                        1,
-                        None,
-                        AttemptState::Terminal,
-                        AcceptanceConclusion::Failure,
-                        Some("ef".repeat(32)),
-                    ),
-                    failure_attempt_snapshot(
-                        request,
-                        second_id,
-                        2,
-                        Some(first_id),
-                        AttemptState::Running,
-                        AcceptanceConclusion::None,
-                        None,
-                    ),
-                ],
-            ),
-            1,
-            None,
-        )
-    }
-
-    #[test]
-    fn composed_journal_recovers_unstaged_terminal_responses_without_reexecution() {
-        for (sequence, mutation, conclusion, failure) in [
-            (6, AcceptanceMutation::Run, BrokerConclusion::Success, false),
-            (
-                10,
-                AcceptanceMutation::FailureRun,
-                BrokerConclusion::Failure,
-                true,
-            ),
-        ] {
-            let request = sequence_request(sequence, None);
-            let exact = serde_json::to_vec(&request).unwrap();
-            let (terminal, evidence) = terminal_fixture(&request, conclusion, 1);
-            let prior = running_prior(&request, hex::encode(terminal.response.attempt_id), failure);
-            let expected = if failure {
-                failure_terminal_response(&request, Some(&prior), terminal, &evidence).unwrap()
-            } else {
-                first_terminal_response(&request, Some(&prior), terminal, &evidence).unwrap()
-            };
-            let (root, journal, owner_uid) = open_composed_journal();
-            let mut provider =
-                recovery_provider(RecoveryAttempt::NoObservation, terminal, evidence.clone());
-            prime_composed_journal(&journal, sequence, &prior, &mut provider);
-            let publication_keys = provider.publication_keys.clone();
-            assert_eq!(publication_keys.len(), if sequence == 6 { 2 } else { 3 });
-
-            assert_eq!(
-                CapacityOneService::handle_recovery_sensitive_with_hook(
-                    &journal,
-                    &mut provider,
-                    &request,
-                    &exact,
-                    1,
-                    (|| Ok(()), || Err(AcceptanceSocketError::Operation),),
-                ),
-                Err(AcceptanceSocketError::Operation)
-            );
-            assert_eq!(provider.execution_calls, 1);
-            assert_eq!(provider.finish_calls, 1);
-            let provider_calls = (
-                provider.execution_calls,
-                provider.finish_calls,
-                provider.reconstruct_calls,
-                provider.cancel_calls,
-            );
-            let mut mismatched_exact = exact.clone();
-            mismatched_exact.push(b' ');
-            assert_eq!(
-                CapacityOneService::handle_recovery_sensitive(
-                    &journal,
-                    &mut provider,
-                    &request,
-                    &mismatched_exact,
-                    1,
-                ),
-                Err(AcceptanceSocketError::Replay)
-            );
-            assert_eq!(
-                (
-                    provider.execution_calls,
-                    provider.finish_calls,
-                    provider.reconstruct_calls,
-                    provider.cancel_calls,
-                ),
-                provider_calls
-            );
-
-            let reopened = AcceptanceJournal::open(
-                root.path().canonicalize().unwrap(),
-                owner_uid,
-                canonical_acceptance_binding(),
-            )
-            .unwrap();
-            let recovered = CapacityOneService::handle_recovery_sensitive(
-                &reopened,
-                &mut provider,
-                &request,
-                &exact,
-                1,
-            )
-            .unwrap();
-            assert_eq!(
-                serde_json::to_vec(&recovered).unwrap(),
-                serde_json::to_vec(&expected).unwrap()
-            );
-            assert_eq!(provider.execution_calls, 1);
-            assert_eq!(provider.reconstruct_calls, 1);
-            assert_eq!(provider.cancel_calls, 0);
-            assert_eq!(provider.publication_keys, publication_keys);
-            assert_eq!(provider.publication_keys.len(), publication_keys.len());
-
-            let (drift_root, drift_journal, drift_owner_uid) = open_composed_journal();
-            let mut drifted = terminal;
-            drifted.response.attempt_id[0] ^= 1;
-            let mut drifted_evidence = evidence.clone();
-            drifted_evidence.terminal = drifted;
-            let mut drift_provider =
-                recovery_provider(RecoveryAttempt::NoObservation, terminal, evidence);
-            drift_provider.reconstructed = Some((drifted, drifted_evidence));
-            prime_composed_journal(&drift_journal, sequence, &prior, &mut drift_provider);
-            let drift_publications = drift_provider.publication_keys.clone();
-            assert_eq!(
-                CapacityOneService::handle_recovery_sensitive_with_hook(
-                    &drift_journal,
-                    &mut drift_provider,
-                    &request,
-                    &exact,
-                    1,
-                    (|| Ok(()), || Err(AcceptanceSocketError::Operation),),
-                ),
-                Err(AcceptanceSocketError::Operation)
-            );
-            let drift_reopened = AcceptanceJournal::open(
-                drift_root.path().canonicalize().unwrap(),
-                drift_owner_uid,
-                canonical_acceptance_binding(),
-            )
-            .unwrap();
-            assert_eq!(
-                CapacityOneService::handle_recovery_sensitive(
-                    &drift_reopened,
-                    &mut drift_provider,
-                    &request,
-                    &exact,
-                    1,
-                ),
-                Err(AcceptanceSocketError::Operation),
-                "{mutation:?} drift must fail closed"
-            );
-            assert_eq!(drift_provider.execution_calls, 1);
-            assert_eq!(drift_provider.cancel_calls, 0);
-            assert_eq!(drift_provider.publication_keys, drift_publications);
-        }
-    }
-
-    #[test]
-    fn composed_journal_cancel_recovery_sends_exactly_one_cancel() {
-        for recovery in ["active", "terminal", "cursor_advanced"] {
-            let active = active_binding();
-            let request = sequence_request(12, Some(hex::encode(active.response.attempt_id)));
-            let exact = serde_json::to_vec(&request).unwrap();
-            let (mut cancelled, evidence) =
-                terminal_fixture(&request, BrokerConclusion::Cancelled, 2);
-            cancelled.response.code = ResponseCode::Ok;
-            let mut reconciled = cancelled;
-            reconciled.response.code = ResponseCode::Existing;
-            let mut reconciled_evidence = evidence.clone();
-            reconciled_evidence.terminal = reconciled;
-            let prior = cancellation_prior(&request, active);
-            let expected = cancelled_response(&request, Some(&prior), cancelled).unwrap();
-            let poll = match recovery {
-                "active" => RecoveryAttempt::Active(Box::new(active)),
-                "terminal" => {
-                    RecoveryAttempt::Terminal(Box::new((reconciled, reconciled_evidence.clone())))
-                }
-                "cursor_advanced" => RecoveryAttempt::NoObservation,
-                _ => unreachable!(),
-            };
-            let (root, journal, owner_uid) = open_composed_journal();
-            let mut provider = recovery_provider(poll, reconciled, reconciled_evidence);
-            provider.cancelled = Some(cancelled);
-            provider.expected_cancel_active = Some(active);
-            prime_composed_journal(&journal, 12, &prior, &mut provider);
-            let publication_keys = provider.publication_keys.clone();
-            assert_eq!(publication_keys.len(), 4);
-
-            let crashed = if recovery == "active" {
-                CapacityOneService::handle_recovery_sensitive_with_hook(
-                    &journal,
-                    &mut provider,
-                    &request,
-                    &exact,
-                    1,
-                    (|| Err(AcceptanceSocketError::Operation), || Ok(())),
-                )
-            } else {
-                CapacityOneService::handle_recovery_sensitive_with_hook(
-                    &journal,
-                    &mut provider,
-                    &request,
-                    &exact,
-                    1,
-                    (|| Ok(()), || Err(AcceptanceSocketError::Operation)),
-                )
-            };
-            assert_eq!(crashed, Err(AcceptanceSocketError::Operation));
-            let provider_calls = (
-                provider.execution_calls,
-                provider.finish_calls,
-                provider.reconstruct_calls,
-                provider.cancel_calls,
-            );
-            let mut mismatched_exact = exact.clone();
-            mismatched_exact.push(b' ');
-            assert_eq!(
-                CapacityOneService::handle_recovery_sensitive(
-                    &journal,
-                    &mut provider,
-                    &request,
-                    &mismatched_exact,
-                    1,
-                ),
-                Err(AcceptanceSocketError::Replay)
-            );
-            assert_eq!(
-                (
-                    provider.execution_calls,
-                    provider.finish_calls,
-                    provider.reconstruct_calls,
-                    provider.cancel_calls,
-                ),
-                provider_calls
-            );
-
-            let reopened = AcceptanceJournal::open(
-                root.path().canonicalize().unwrap(),
-                owner_uid,
-                canonical_acceptance_binding(),
-            )
-            .unwrap();
-            let recovered = CapacityOneService::handle_recovery_sensitive(
-                &reopened,
-                &mut provider,
-                &request,
-                &exact,
-                1,
-            )
-            .unwrap();
-            assert_eq!(
-                serde_json::to_vec(&recovered).unwrap(),
-                serde_json::to_vec(&expected).unwrap(),
-                "{recovery} replay must reproduce the bound bytes"
-            );
-            assert_eq!(provider.execution_calls, 1);
-            assert_eq!(provider.cancel_calls, 1);
-            assert_eq!(provider.publication_keys, publication_keys);
-            assert_eq!(provider.publication_keys.len(), publication_keys.len());
-            if recovery == "cursor_advanced" {
-                assert_eq!(provider.reconstruct_calls, 1);
-            }
-        }
-    }
-
-    #[test]
-    fn composed_journal_cancel_drift_fails_without_mutating_provider_state() {
-        let active = active_binding();
-        let request = sequence_request(12, Some(hex::encode(active.response.attempt_id)));
-        let exact = serde_json::to_vec(&request).unwrap();
-        let (mut cancelled, evidence) = terminal_fixture(&request, BrokerConclusion::Cancelled, 2);
-        cancelled.response.code = ResponseCode::Ok;
-        let mut drifted = cancelled;
-        drifted.response.code = ResponseCode::Existing;
-        drifted.response.conclusion = BrokerConclusion::Failure;
-        let mut drifted_evidence = evidence;
-        drifted_evidence.terminal = drifted;
-        let prior = cancellation_prior(&request, active);
-        let (root, journal, owner_uid) = open_composed_journal();
-        let mut provider =
-            recovery_provider(RecoveryAttempt::NoObservation, drifted, drifted_evidence);
-        provider.cancelled = Some(cancelled);
-        prime_composed_journal(&journal, 12, &prior, &mut provider);
-        let publication_keys = provider.publication_keys.clone();
-        assert_eq!(publication_keys.len(), 4);
-        assert_eq!(
-            CapacityOneService::handle_recovery_sensitive_with_hook(
-                &journal,
-                &mut provider,
-                &request,
-                &exact,
-                1,
-                (|| Ok(()), || Err(AcceptanceSocketError::Operation),),
-            ),
-            Err(AcceptanceSocketError::Operation)
-        );
-        let reopened = AcceptanceJournal::open(
-            root.path().canonicalize().unwrap(),
-            owner_uid,
-            canonical_acceptance_binding(),
-        )
-        .unwrap();
-        assert_eq!(
-            CapacityOneService::handle_recovery_sensitive(
-                &reopened,
-                &mut provider,
-                &request,
-                &exact,
-                1,
-            ),
-            Err(AcceptanceSocketError::Operation)
-        );
-        assert_eq!(provider.execution_calls, 1);
-        assert_eq!(provider.cancel_calls, 1);
-        assert_eq!(provider.reconstruct_calls, 1);
-        assert_eq!(provider.publication_keys, publication_keys);
     }
 
     #[test]
