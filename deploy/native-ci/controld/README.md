@@ -88,6 +88,11 @@ uses an authenticated full-body `GET` for each referenced log and artifact and
 checks the exact canonical path, declared byte length, and SHA-256 before
 returning normalized metadata. It follows no redirect and uses neither an
 evidence filesystem nor object-store credentials.
+For this frozen fixture those are exactly two receipt-derived paths: Run A
+attempt 1 `job.log` and the declared `result` artifact (`result.json`). The
+receipt supplies request/run/job coordinates and hashes, not URLs or an
+allowlist. Keyholder reconstructs the same two paths and denies every third
+path, including another path that is otherwise canonical.
 
 Relay identities. The relay stores a `POST /events` only when the event's
 `pubkey` equals the NIP-98 token pubkey and that pubkey is a member of the
@@ -98,15 +103,17 @@ to send when the event pubkey equals no identity it holds or when the returned
 token identity differs from the event pubkey. `ci-event.key` also signs the
 exact `POST /query` tokens used for publication recovery and stage-7 event
 readback. `nip98.key` signs the accepted read, evidence `PUT`s, and stage-7
-`GET`s of exact signed-reference evidence paths, where the relay authorizes the
-caller as a CI signer (`BUZZ_CI_STATUS_SIGNER_PUBKEYS` or an active kind-46107
-grant for the request's repository). A production channel therefore needs the
-acceptance actor as an owner or admin (it issues the grant), `ci-event.key` as
-a member, and `nip98.key` both listed as a static CI signer and enrolled as an
-active member of the acceptance repository's private channel. Static-signer
-status alone does not authorize an evidence `GET`. The relay also refuses any
-event whose `created_at` is more than 900 seconds from its clock, so the frozen
-acceptance events must be published within that window of the time reference.
+`GET`s of the two exact signed-reference evidence paths. Static or granted CI
+signer authority applies to the accepted read, evidence `PUT`, and evidence
+reference authors; it does not authorize the evidence `GET` caller. That caller
+is authorized by active membership in the acceptance repository's private
+channel. A production channel therefore needs the acceptance actor as an owner
+or admin (it issues the grant), `ci-event.key` as a member and authorized
+reference author, and `nip98.key` as both the static signer used for accepted
+reads and evidence `PUT`s and an active channel member for evidence `GET`s. The
+relay also refuses any event whose `created_at` is more than 900 seconds from
+its clock, so the frozen acceptance events must be published within that window
+of the time reference.
 Exact-event queries remain under the ci-event identity and its active channel
 membership, not the nip98 identity.
 
@@ -116,6 +123,9 @@ the response, a retry returns those exact stored response bytes without another
 relay read or token. A crash before response staging may repeat the idempotent
 exact reads with freshly signed NIP-98 tokens. Authorization headers and their
 volatile signed-event identities are never journaled or returned.
+The exported `subject` and required `generation` must equal the receipt's
+`export_subject` and `export_generation` and the loaded nip98 selector; retries
+cannot substitute another selector generation.
 
 `ci-event.key` is authorized only while a kind-46107 grant is active at ingest
 time, and each activation's grant is published by the acceptance protocol

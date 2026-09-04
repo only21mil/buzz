@@ -26,6 +26,11 @@ stage-7 controld requires the matching keyholder policy for exact evidence
 requires freshly rendered scenario and acceptance-binding inputs and fresh
 receipt and verdict evidence; no prior generated input or qualification receipt
 is reusable across the change.
+The rendered fixture binds `export_subject` and required nonzero
+`export_generation` to the exact nip98 selector. It carries no evidence URL or
+path list: keyholder reconstructs exactly the Run A attempt 1 log path and
+`result` artifact path from the receipt's request, run, job, and hash fields and
+denies any third path.
 
 The controld package solely owns
 `/etc/systemd/system/buzz-ci-controld-acceptance.socket`. Activation does not

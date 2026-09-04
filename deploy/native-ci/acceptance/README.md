@@ -40,8 +40,10 @@ is a distinct failed-parent and rerun lane with different run and request IDs:
 5. Explicit resume starts exactly one first attempt.
 6. The first attempt terminates successfully with the expected log and artifact.
 7. Authenticated relay queries read back the exact signed evidence references
-   and final facts, then bounded authenticated `GET`s return the referenced log
-   and artifact bytes with the same evidence set, lengths, and byte digests.
+   and final facts, then bounded authenticated `GET`s return exactly Run A
+   attempt 1 `job.log` and the declared `result` artifact (`result.json`) with
+   the same evidence set, lengths, and byte digests. The returned nip98 subject
+   and generation equal the frozen `export_subject` and `export_generation`.
 8. The exact Run B manifest enters the granted-but-not-resumed boundary without
    starting work.
 9. Explicit resume starts exactly one Run B attempt.
@@ -81,6 +83,12 @@ grant event, and initial systemd generations with frozen-package readback. The
 candidate path is pinned to the integrated base. All five endpoint entries are
 the same installed driver with an empty argument list. The schema rejects any
 other executable or arguments.
+
+The scenario and shared acceptance receipt contain the Run A request digest,
+run ID, job ID, expected hashes, fixed object declarations, and export selector
+identity; they contain no evidence URL or path list. Keyholder independently
+reconstructs the one log path and one artifact path with attempt `1` and
+artifact ID `result`. A third path is denied even when it has canonical syntax.
 
 The checked-in fixture runs
 [`fixtures/run-fixture.sh`](fixtures/run-fixture.sh). It verifies the source
