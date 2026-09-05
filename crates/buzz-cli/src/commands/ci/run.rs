@@ -165,7 +165,22 @@ pub async fn execute_run(
         workflow_selector: args.workflow.clone(),
         requested_job_ids: args.jobs.clone(),
     };
-    let response: PreflightResponse = client.post_authed_json(PREFLIGHT_PATH, &request).await?;
+    let request_binding = serde_json::to_string(&request).map_err(|error| {
+        CliError::Other(format!("preflight request serialization failed: {error}"))
+    })?;
+    let response: PreflightResponse = client
+        .post_authed_json(PREFLIGHT_PATH, &request)
+        .await
+        .map_err(|source| CliError::CiPreflight {
+            request: request_binding,
+            source: Box::new(match source {
+                CliError::Relay { status: 404, ref body } if body.is_empty() => CliError::Other(
+                    "relay returned an empty HTTP 404 for /ci/preflight; the endpoint may be unavailable"
+                        .into(),
+                ),
+                other => other,
+            }),
+        })?;
     let preflight = validate_preflight(response, &request, client.relay_url())?;
 
     let identity = fresh_run_identity()?;

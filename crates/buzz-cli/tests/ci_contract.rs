@@ -271,3 +271,6 @@ async fn mock_relay_records_raw_retry_bodies_without_normalizing_them() {
     assert_eq!(recorded[0].body, recorded[1].body);
     assert_eq!(recorded[0].path_and_query, "/events");
 }
+
+#[path = "ci/preflight_errors.rs"]
+mod preflight_errors;

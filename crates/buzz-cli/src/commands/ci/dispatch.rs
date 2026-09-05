@@ -22,12 +22,6 @@ pub(super) const CI_RUN_EVENT_PAGE_LIMIT: u32 = 1_000;
 const MAX_CI_RUN_EVENTS: usize = 10_000;
 const MAX_SAFE_CURSOR: u64 = (1_u64 << 53) - 1;
 
-/// Honest message for the missing CI execution plane.
-const EXECUTION_PLANE_UNAVAILABLE: &str =
-    "CI execution plane unavailable: the relay does not expose the /ci/preflight endpoint. \
-     Host backends are missing (canonical() is fail-closed). \
-     See issue fedbc43e.";
-
 /// Dispatch a parsed CI subcommand to the appropriate handler.
 pub async fn dispatch(cmd: CiCmd, client: &BuzzClient) -> Result<(), CliError> {
     match cmd {
@@ -140,13 +134,7 @@ async fn cmd_run(
     args: &RunArgs,
     trusted: &RunTrustedContext,
 ) -> Result<(), CliError> {
-    match crate::commands::ci::run::cmd_run(client, args, trusted).await {
-        Ok(()) => Ok(()),
-        Err(CliError::Relay { status: 404, .. }) => {
-            Err(CliError::Other(EXECUTION_PLANE_UNAVAILABLE.into()))
-        }
-        Err(e) => Err(e),
-    }
+    crate::commands::ci::run::cmd_run(client, args, trusted).await
 }
 
 // ── Rerun ──
@@ -738,10 +726,9 @@ mod tests {
         .await;
     }
 
-    /// Run dispatch returns the honest "execution plane unavailable" message
-    /// when the relay 404s on preflight.
+    /// Run dispatch preserves the stage and cause of a preflight 404.
     #[tokio::test]
-    async fn run_dispatch_reports_execution_plane_unavailable_on_404() {
+    async fn run_dispatch_preserves_preflight_404() {
         env_lock(|| async {
             std::env::set_var("BUZZ_CI_CHANNEL", CHANNEL);
             std::env::set_var("BUZZ_CI_STATUS_SIGNERS", signer());
@@ -753,8 +740,8 @@ mod tests {
             let err = dispatch(run_cmd(), &test_client(&url)).await.unwrap_err();
             assert!(pf_ctr.load(Ordering::SeqCst) >= 1, "preflight should have been attempted");
             assert!(
-                matches!(err, CliError::Other(ref msg) if msg.contains("execution plane unavailable")),
-                "expected honest 'execution plane unavailable' message, got: {err:?}"
+                matches!(err, CliError::CiPreflight { ref source, .. } if matches!(source.as_ref(), CliError::Relay { status: 404, body } if body == r#"{"error":"not found"}"#)),
+                "expected the preflight HTTP status and body, got: {err:?}"
             );
             std::env::remove_var("BUZZ_CI_CHANNEL");
             std::env::remove_var("BUZZ_CI_STATUS_SIGNERS");
