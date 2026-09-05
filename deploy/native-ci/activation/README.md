@@ -19,6 +19,19 @@ keyholder package solely owns
 reference, peer operations, selectors, origin, owner, and mode but never writes
 the file.
 
+The frozen keyholder and controld packages must come from the same exact
+candidate. A shared wire-v2 label is insufficient compatibility evidence:
+stage-7 controld requires the matching keyholder policy for exact evidence
+`GET`s. Any change to that policy or to the normalized stage-7 response also
+requires freshly rendered scenario and acceptance-binding inputs and fresh
+receipt and verdict evidence; no prior generated input or qualification receipt
+is reusable across the change.
+The rendered fixture binds `export_subject` and required nonzero
+`export_generation` to the exact nip98 selector. It carries no evidence URL or
+path list: keyholder reconstructs exactly the Run A attempt 1 log path and
+`result` artifact path from the receipt's request, run, job, and hash fields and
+denies any third path.
+
 The controld package solely owns
 `/etc/systemd/system/buzz-ci-controld-acceptance.socket`. Activation does not
 publish or roll back that path. Its manifest binds the canonical controld
@@ -235,7 +248,7 @@ package or root path from the caller.
   both acceptance services available. The acceptance host then closes the
   capacity-one units and reopens controld at staged zero (socket and service
   stopped in the finalize order, then started), so the capacity-zero service
-  serves the stage-13 durable snapshot from the shared acceptance ledger.
+  serves the stage-16 durable snapshot from the shared acceptance ledger.
 - `finalize-qualification-zero` stops the controld acceptance socket first and
   controld second, closes the remaining capacity-one units, keeps the root
   acceptance-control service available, restores the prior controld binding,
@@ -315,12 +328,14 @@ kind-30617 repository, rendered as the `30617:<owner>:<id>` coordinate), and
 `source_clone_url` (that repository's credential-free https clone URL). Read
 those four values from the relay you activate against; the relay refuses a Run
 event whose channel it does not know. The materializer
-owns the canonical Run, Grant, Rerun, and Tombstone seed, supplies the fixed
+owns the canonical Run A, Grant, Rerun, Tombstone, and failure Run B seed,
+supplies the fixed
 closed contracts, and validates the complete draft; production bootstrap does
 not inherit a prior artifact or test fixture. `validate_phase_configs` requires
 the active controld `channel_id` to equal the channel frozen into the events,
-and `validate_acceptance_template` requires the run, grant, and rerun events to
-name one channel and one repository.
+and `validate_acceptance_template` requires the successful run, failed-parent
+run, grant, and rerun events to name one channel and one repository. The rerun
+must name failed-parent Run B, never successful Run A.
 
 The runner staged config is the exact runner-v2 `dormant` shape at
 `/etc/buzzci/runner-v2.json`. Its active config selects `mode=v2_proxy`, binds
@@ -341,8 +356,9 @@ never frozen into the activation package.
 
 The templates also carry one closed `execution` declaration. Its digest is a
 domain-separated SHA-256 over the candidate OID, final package digest, lane and
-isolation digests, fixed workflow/job/artifact, the three fixture digests, and
-big-endian resource limits. The freezer accepts only a zero digest placeholder;
+isolation digests, fixed workflow/job/artifact, the three fixture digests, the
+hash-bound Run B failure selector, and big-endian resource limits. The freezer
+accepts only a zero digest placeholder;
 the controller computes the nonzero declaration after the final package digest
 and scenario manifest binding are known. The installed immutable sources are
 `/usr/share/buzzci/execd-v2/fixture/fixture-manifest.json` and `input.txt`

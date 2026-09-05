@@ -4,23 +4,39 @@
     "integrated_candidate_sha": "784c368b2f268a05abf0782b0901837fdc4cf044",
     "activation_id": "buzz-ci-capacity-one-784c368b2f26-bbbbbbbbbbbb",
     "activation_package_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "run_id": "11111111111111111111111111111111",
+    "run_id": "11111111111151119111111111111111",
+    "failure_run_id": "11111111111151119111111111111112",
+    "failure_selector": {
+      "schema_version": "buzz-ci-capacity-one-fixture-selector/v1",
+      "selector": "deterministic-failure",
+      "job_id": "capacity-one-fixture",
+      "run_id": "11111111-1111-5111-9111-111111111112",
+      "attempt": 1,
+      "sha256": "d4efa261072c10514cbbedd8c1eaebfcbbeaa415f64c4b7299d3dfe306844994"
+    },
     "job_id": "capacity-one-fixture",
     "request_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "failure_request_digest": "9999999999999999999999999999999999999999999999999999999999999999",
     "manifest_digest": "f204b8fba64e972408f5a0ea1c0bb3140cfa696289903d96a8cb07d602af6b23",
     "source_oid": "784c368b2f268a05abf0782b0901837fdc4cf044",
     "approval_id": "33333333333333333333333333333333",
     "grant_event_id": "8888888888888888888888888888888888888888888888888888888888888888",
     "grant_digest": "4444444444444444444444444444444444444444444444444444444444444444",
     "approved_by": "5555555555555555555555555555555555555555555555555555555555555555",
-    "export_subject": "6666666666666666666666666666666666666666666666666666666666666666",
-    "export_authorization_digest": "7777777777777777777777777777777777777777777777777777777777777777",
+    "export_subject": "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+    "export_generation": 2,
+    "export_authorization_digest": "304a38e4780ecf0f6e4bc9b4fa9e5babd57c2a8a47e473c683b330ec5027a3cf",
     "controller_generation": 1,
     "runner_generation": 1,
     "expected_log": {
       "name": "job.log",
       "sha256": "54e15345b0e920fd0b3c3864422c336f4f66f023b5b2a9cf7874c8a6fe2984ff",
       "bytes": 131
+    },
+    "expected_failure_log": {
+      "name": "job.log",
+      "sha256": "4d4dcd1542349cdb9104434dcba375a5de3ae7274690c135cfd36b8a8f14b7e1",
+      "bytes": 62
     },
     "expected_artifacts": [
       {

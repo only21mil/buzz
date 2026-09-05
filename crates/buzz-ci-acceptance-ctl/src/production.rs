@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::acceptance::valid_fixture_selector;
 use crate::acceptance::{
     AcceptanceDriver, AdmissionState, DriverRequest, DriverResponse, FixtureSpec, Operation,
     Outcome, Stage, ZeroOperation, ZeroPhaseReceipt, ZeroPhaseRequest, ZeroPhaseResponse,
@@ -94,12 +95,18 @@ pub struct ProductionDriverConfig {
     pub integrated_candidate_sha: String,
     pub scenario_sha256: String,
     pub run_id: String,
+    pub failure_run_id: String,
+    pub failure_selector: crate::acceptance::FixtureSelector,
     pub job_id: String,
     pub request_digest: String,
+    pub failure_request_digest: String,
     pub manifest_digest: String,
     pub approval_id: String,
     pub grant_event_id: String,
     pub grant_digest: String,
+    pub export_subject: String,
+    pub export_generation: u64,
+    pub export_authorization_digest: String,
     pub qualification_uid: u32,
     pub qualification_gid: u32,
     pub controld_uid: u32,
@@ -140,12 +147,19 @@ impl ProductionDriverConfig {
             || !lower_hex(&self.integrated_candidate_sha, &[40, 64])
             || !lower_hex(&self.scenario_sha256, &[64])
             || !lower_hex(&self.run_id, &[32])
-            || !valid_name(&self.job_id, 64)
+            || !lower_hex(&self.failure_run_id, &[32])
+            || !valid_fixture_selector(&self.failure_selector, &self.failure_run_id, &self.job_id)
+            || !valid_job_id(&self.job_id)
             || !lower_hex(&self.request_digest, &[64])
+            || !lower_hex(&self.failure_request_digest, &[64])
             || !lower_hex(&self.manifest_digest, &[64])
             || !lower_hex(&self.approval_id, &[32])
             || !lower_hex(&self.grant_event_id, &[64])
             || !lower_hex(&self.grant_digest, &[64])
+            || !lower_hex(&self.export_subject, &[64])
+            || self.export_generation == 0
+            || self.export_generation > 9_007_199_254_740_991
+            || !lower_hex(&self.export_authorization_digest, &[64])
         {
             return Err(DriverError::InvalidConfig);
         }
@@ -159,12 +173,18 @@ impl ProductionDriverConfig {
             && request.fixture.activation_package_digest == self.activation_package_digest
             && request.fixture.integrated_candidate_sha == self.integrated_candidate_sha
             && request.fixture.run_id == self.run_id
+            && request.fixture.failure_run_id == self.failure_run_id
+            && request.fixture.failure_selector == self.failure_selector
             && request.fixture.job_id == self.job_id
             && request.fixture.request_digest == self.request_digest
+            && request.fixture.failure_request_digest == self.failure_request_digest
             && request.fixture.manifest_digest == self.manifest_digest
             && request.fixture.approval_id == self.approval_id
             && request.fixture.grant_event_id == self.grant_event_id
             && request.fixture.grant_digest == self.grant_digest
+            && request.fixture.export_subject == self.export_subject
+            && request.fixture.export_generation == self.export_generation
+            && request.fixture.export_authorization_digest == self.export_authorization_digest
     }
 
     fn binds_zero(&self, request: &ZeroRequest) -> bool {
@@ -532,6 +552,23 @@ impl<T: AdapterTransport> ProductionDriver<T> {
         }
         Err(last)
     }
+
+    fn exchange_controld_retry(
+        &mut self,
+        request: &[u8],
+        timeout: Duration,
+    ) -> Result<Vec<u8>, DriverError> {
+        for _ in 0..2 {
+            match self
+                .transport
+                .exchange(AdapterEndpoint::Controld, request, timeout)
+            {
+                Ok(response) if !response.is_empty() => return Ok(response),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        Err(DriverError::Transport)
+    }
 }
 
 impl<T> AcceptanceDriver for ProductionDriver<T>
@@ -569,10 +606,7 @@ where
         };
         adapter.validate()?;
         let adapter_bytes = canonical_json(&adapter)?;
-        let response = self
-            .transport
-            .exchange(AdapterEndpoint::Controld, &adapter_bytes, timeout)
-            .map_err(|_| DriverError::Transport)?;
+        let response = self.exchange_controld_retry(&adapter_bytes, timeout)?;
         let response: AdapterResponse = parse_bounded(&response)?;
         if response.schema_version != ADAPTER_RESPONSE_SCHEMA
             || response.sequence != request.sequence
@@ -593,7 +627,7 @@ where
         if !self.config.binds_zero(request) {
             return Err(DriverError::BindingMismatch);
         }
-        let finalize = zero_control_request(request, 14, ControlOperation::FinalizeCapacityZero)?;
+        let finalize = zero_control_request(request, 17, ControlOperation::FinalizeCapacityZero)?;
         let (finalized, finalize_attempts) = self.exchange_control_retry(&finalize)?;
         let finalize_phase = zero_phase_receipt(
             request,
@@ -603,7 +637,7 @@ where
             finalize_attempts,
         )?;
 
-        let prove = zero_control_request(request, 15, ControlOperation::ProveCapacityZero)?;
+        let prove = zero_control_request(request, 18, ControlOperation::ProveCapacityZero)?;
         let (proved, prove_attempts) = self.exchange_control_retry(&prove)?;
         let prove_phase = zero_phase_receipt(
             request,
@@ -835,8 +869,15 @@ fn valid_request(request: &DriverRequest<'_>) -> bool {
         && lower_hex(&fixture.activation_package_digest, &[64])
         && lower_hex(&fixture.integrated_candidate_sha, &[40, 64])
         && lower_hex(&fixture.run_id, &[32])
-        && valid_name(&fixture.job_id, 64)
+        && lower_hex(&fixture.failure_run_id, &[32])
+        && valid_fixture_selector(
+            &fixture.failure_selector,
+            &fixture.failure_run_id,
+            &fixture.job_id,
+        )
+        && valid_job_id(&fixture.job_id)
         && lower_hex(&fixture.request_digest, &[64])
+        && lower_hex(&fixture.failure_request_digest, &[64])
         && lower_hex(&fixture.manifest_digest, &[64])
         && lower_hex(&fixture.source_oid, &[40, 64])
         && lower_hex(&fixture.approval_id, &[32])
@@ -844,6 +885,7 @@ fn valid_request(request: &DriverRequest<'_>) -> bool {
         && lower_hex(&fixture.grant_digest, &[64])
         && lower_hex(&fixture.approved_by, &[64])
         && lower_hex(&fixture.export_subject, &[64])
+        && (1..=9_007_199_254_740_991).contains(&fixture.export_generation)
         && lower_hex(&fixture.export_authorization_digest, &[64])
         && fixture.controller_generation > 0
         && fixture.runner_generation > 0
@@ -851,7 +893,7 @@ fn valid_request(request: &DriverRequest<'_>) -> bool {
             .attempt_id
             .is_none_or(|value| lower_hex(value, &[32]))
         && match request.sequence {
-            6..=10 => request.attempt_id.is_some(),
+            6..=7 | 10..=13 => request.attempt_id.is_some(),
             _ => request.attempt_id.is_none(),
         }
         && match (request.sequence, request.expected_controller_generation) {
@@ -875,12 +917,15 @@ fn expected_operation(sequence: u32) -> Option<Operation> {
         5 => Operation::ResumeGrant,
         6 => Operation::AwaitFirstTerminal,
         7 => Operation::ExportFirstEvidence,
-        8 => Operation::Rerun,
-        9 => Operation::CancelRerun,
-        10 => Operation::TombstoneRerun,
-        11 => Operation::RestartController,
-        12 => Operation::RestartRunner,
-        13 => Operation::SetCapacityZero,
+        8 => Operation::SubmitFailureManifest,
+        9 => Operation::ResumeFailure,
+        10 => Operation::AwaitFailureTerminal,
+        11 => Operation::Rerun,
+        12 => Operation::CancelRerun,
+        13 => Operation::TombstoneRerun,
+        14 => Operation::RestartController,
+        15 => Operation::RestartRunner,
+        16 => Operation::SetCapacityZero,
         _ => return None,
     })
 }
@@ -930,7 +975,7 @@ fn digest_operation_id(
 }
 
 fn control_operation_id(request: &ControlRequest) -> Result<String, ControlError> {
-    if request.sequence >= 14 {
+    if request.sequence >= 17 {
         return zero_control_operation_id(request).map_err(|_| ControlError::BindingMismatch);
     }
     let operation = expected_operation(request.sequence).ok_or(ControlError::BindingMismatch)?;
@@ -1154,6 +1199,15 @@ fn valid_name(value: &str, max: usize) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+fn valid_job_id(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        && value.len() <= 64
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 fn lower_hex(value: &str, lengths: &[usize]) -> bool {
     lengths.contains(&value.len())
         && value.bytes().any(|byte| byte != b'0')
@@ -1306,7 +1360,7 @@ impl AcceptanceControlConfig {
             || !lower_hex(&self.integrated_candidate_sha, &[40, 64])
             || !lower_hex(&self.scenario_sha256, &[64])
             || !lower_hex(&self.run_id, &[32])
-            || !valid_name(&self.job_id, 64)
+            || !valid_job_id(&self.job_id)
             || !lower_hex(&self.request_digest, &[64])
             || !lower_hex(&self.manifest_digest, &[64])
             || !lower_hex(&self.approval_id, &[32])
@@ -1325,7 +1379,7 @@ impl AcceptanceControlConfig {
             && request.activation_package_digest == self.activation_package_digest
             && request.integrated_candidate_sha == self.integrated_candidate_sha
             && request.run_id == self.run_id;
-        core && if request.sequence >= 14 {
+        core && if request.sequence >= 17 {
             true
         } else {
             request.job_id == self.job_id
@@ -2707,12 +2761,12 @@ pub fn handle_control<H: HostControl>(
     config.validate()?;
     let bound_operation_id = control_operation_id(request)?;
     if !config.binds(request)
-        || !(1..=15).contains(&request.sequence)
+        || !(1..=18).contains(&request.sequence)
         || expected_control_operation(request.sequence) != Some(request.operation)
         || bound_operation_id != request.operation_id
         || !lower_hex(&request.operation_id, &[64])
         || !lower_hex(&request.run_id, &[32])
-        || !valid_name(&request.job_id, 64)
+        || !valid_job_id(&request.job_id)
         || !lower_hex(&request.request_digest, &[64])
         || !lower_hex(&request.manifest_digest, &[64])
         || !lower_hex(&request.approval_id, &[32])
@@ -2722,8 +2776,8 @@ pub fn handle_control<H: HostControl>(
             .attempt_id
             .as_deref()
             .is_some_and(|value| !lower_hex(value, &[32]))
-        || (request.sequence >= 14) != request.failed_stage.is_some()
-        || (request.sequence <= 13
+        || (request.sequence >= 17) != request.failed_stage.is_some()
+        || (request.sequence <= 16
             && (request.failed_stage.is_some() || request.final_response_sha256.is_some()))
         || request
             .final_response_sha256
@@ -2731,7 +2785,7 @@ pub fn handle_control<H: HostControl>(
             .is_some_and(|value| !lower_hex(value, &[64]))
         || (request.final_response_sha256.is_some()
             && request.failed_stage != Some(Stage::PrepareCapacityZero))
-        || (request.sequence >= 14 && request.attempt_id.is_some())
+        || (request.sequence >= 17 && request.attempt_id.is_some())
     {
         return Err(ControlError::BindingMismatch);
     }
@@ -2847,12 +2901,12 @@ fn proof_readback(proof: &ZeroProof) -> ControlReadback {
 fn expected_control_operation(sequence: u32) -> Option<ControlOperation> {
     Some(match sequence {
         2 => ControlOperation::SetCapacityOne,
-        11 => ControlOperation::RestartController,
-        12 => ControlOperation::RestartRunner,
-        13 => ControlOperation::PrepareCapacityZero,
-        14 => ControlOperation::FinalizeCapacityZero,
-        15 => ControlOperation::ProveCapacityZero,
-        1 | 3..=10 => ControlOperation::Observe,
+        14 => ControlOperation::RestartController,
+        15 => ControlOperation::RestartRunner,
+        16 => ControlOperation::PrepareCapacityZero,
+        17 => ControlOperation::FinalizeCapacityZero,
+        18 => ControlOperation::ProveCapacityZero,
+        1 | 3..=13 => ControlOperation::Observe,
         _ => return None,
     })
 }
@@ -2943,7 +2997,7 @@ fn load_control_ledger(config: &AcceptanceControlConfig) -> Result<ControlLedger
         return Ok(new_control_ledger(config));
     }
     let ledger: ControlLedger = serde_json::from_value(value).map_err(|_| ControlError::Ledger)?;
-    if ledger.schema_version != "buzz-ci-acceptance-control-ledger/v2" || ledger.entries.len() > 15
+    if ledger.schema_version != "buzz-ci-acceptance-control-ledger/v2" || ledger.entries.len() > 18
     {
         return Err(ControlError::Ledger);
     }
@@ -2956,7 +3010,7 @@ fn load_control_ledger(config: &AcceptanceControlConfig) -> Result<ControlLedger
 fn persist_control_ledger(ledger: &ControlLedger) -> Result<(), ControlError> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    if ledger.entries.len() > 15 {
+    if ledger.entries.len() > 18 {
         return Err(ControlError::Ledger);
     }
     let bytes = serde_json::to_vec(ledger).map_err(|_| ControlError::Ledger)?;
@@ -3095,13 +3149,29 @@ mod tests {
     }
 
     fn fixture() -> FixtureSpec {
+        let failure_run_id = "cccccccccccc5ccc9ccccccccccccccc";
+        let parsed = uuid::Uuid::parse_str(failure_run_id).unwrap();
+        let selector_bytes = format!(
+            "buzz-ci:capacity-one:fixture-selector:v1\nbuzz-ci-capacity-one-fixture-selector/v1\ndeterministic-failure\nfixture\n{}\n1\n",
+            parsed.simple(),
+        );
         FixtureSpec {
             integrated_candidate_sha: hex('a', 40),
             activation_id: "buzz-ci-capacity-one-test".into(),
             activation_package_digest: hex('b', 64),
-            run_id: hex('c', 32),
+            run_id: "bbbbbbbbbbbb5bbb9bbbbbbbbbbbbbbb".into(),
+            failure_run_id: failure_run_id.into(),
+            failure_selector: crate::acceptance::FixtureSelector {
+                schema_version: "buzz-ci-capacity-one-fixture-selector/v1".into(),
+                selector: "deterministic-failure".into(),
+                job_id: "fixture".into(),
+                run_id: parsed.hyphenated().to_string(),
+                attempt: 1,
+                sha256: hex::encode(Sha256::digest(selector_bytes.as_bytes())),
+            },
             job_id: "fixture".into(),
             request_digest: hex('d', 64),
+            failure_request_digest: hex('9', 64),
             manifest_digest: hex('e', 64),
             source_oid: hex('f', 40),
             approval_id: hex('1', 32),
@@ -3109,6 +3179,7 @@ mod tests {
             grant_digest: hex('3', 64),
             approved_by: hex('4', 64),
             export_subject: hex('5', 64),
+            export_generation: 6,
             export_authorization_digest: hex('6', 64),
             controller_generation: 7,
             runner_generation: 9,
@@ -3116,6 +3187,11 @@ mod tests {
                 name: "job.log".into(),
                 sha256: hex('7', 64),
                 bytes: 1,
+            },
+            expected_failure_log: crate::acceptance::EvidenceObject {
+                name: "job.log".into(),
+                sha256: hex('9', 64),
+                bytes: 2,
             },
             expected_artifacts: vec![crate::acceptance::EvidenceObject {
                 name: "result.json".into(),
@@ -3126,19 +3202,26 @@ mod tests {
     }
 
     fn config() -> ProductionDriverConfig {
+        let fixture = fixture();
         ProductionDriverConfig {
             schema_version: CONFIG_SCHEMA.into(),
             activation_id: "buzz-ci-capacity-one-test".into(),
             activation_package_digest: hex('b', 64),
             integrated_candidate_sha: hex('a', 40),
             scenario_sha256: hex('9', 64),
-            run_id: hex('c', 32),
+            run_id: fixture.run_id,
+            failure_run_id: fixture.failure_run_id,
+            failure_selector: fixture.failure_selector,
             job_id: "fixture".into(),
             request_digest: hex('d', 64),
+            failure_request_digest: hex('9', 64),
             manifest_digest: hex('e', 64),
             approval_id: hex('1', 32),
             grant_event_id: hex('2', 64),
             grant_digest: hex('3', 64),
+            export_subject: hex('5', 64),
+            export_generation: 6,
+            export_authorization_digest: hex('6', 64),
             qualification_uid: 1001,
             qualification_gid: 1001,
             controld_uid: 1002,
@@ -3241,6 +3324,25 @@ mod tests {
         }
     }
 
+    struct RetryTransport {
+        replies: VecDeque<Result<Vec<u8>, &'static str>>,
+        requests: Vec<(AdapterEndpoint, Vec<u8>)>,
+    }
+
+    impl AdapterTransport for RetryTransport {
+        type Error = &'static str;
+
+        fn exchange(
+            &mut self,
+            endpoint: AdapterEndpoint,
+            request: &[u8],
+            _timeout: Duration,
+        ) -> Result<Vec<u8>, Self::Error> {
+            self.requests.push((endpoint, request.to_vec()));
+            self.replies.pop_front().unwrap_or(Ok(Vec::new()))
+        }
+    }
+
     #[test]
     fn driver_routes_host_then_controld_and_binds_generations() {
         let fixture = fixture();
@@ -3331,6 +3433,82 @@ mod tests {
     }
 
     #[test]
+    fn driver_retries_identical_controld_request_after_transport_loss() {
+        let fixture = fixture();
+        let driver_config = config();
+        let request = request(&fixture, &driver_config.scenario_sha256);
+        let operation_id = operation_id(&request).unwrap();
+        let host = ControlReadback {
+            activation_id: fixture.activation_id.clone(),
+            activation_package_digest: fixture.activation_package_digest.clone(),
+            integrated_candidate_sha: fixture.integrated_candidate_sha.clone(),
+            capacity: 1,
+            admission: AdmissionState::Open,
+            controller_generation: 7,
+            runner_generation: 9,
+        };
+        let control = ControlResponse {
+            schema_version: CONTROL_RESPONSE_SCHEMA.into(),
+            sequence: request.sequence,
+            operation: ControlOperation::SetCapacityOne,
+            scenario_sha256: request.scenario_sha256.into(),
+            operation_id: operation_id.clone(),
+            readback: host,
+            zero_proof: None,
+            controller_receipt_sha256: Some(hex('6', 64)),
+        };
+        let driver_response = DriverResponse {
+            schema_version: DRIVER_VERSION.into(),
+            sequence: request.sequence,
+            operation: request.operation,
+            snapshot: SystemSnapshot {
+                capacity: 1,
+                admission: AdmissionState::Open,
+                active_run_count: 0,
+                active_attempt_count: 0,
+                controller_generation: 7,
+                runner_generation: 9,
+                run: None,
+            },
+            export: None,
+        };
+        let adapter = AdapterResponse {
+            schema_version: ADAPTER_RESPONSE_SCHEMA.into(),
+            sequence: request.sequence,
+            operation: request.operation,
+            scenario_sha256: request.scenario_sha256.into(),
+            operation_id,
+            response: driver_response.clone(),
+        };
+        for first_failure in [Err("transport lost"), Ok(Vec::new())] {
+            let transport = RetryTransport {
+                replies: VecDeque::from([
+                    Ok(serde_json::to_vec(&control).unwrap()),
+                    first_failure,
+                    Ok(serde_json::to_vec(&adapter).unwrap()),
+                ]),
+                requests: Vec::new(),
+            };
+            let mut driver = ProductionDriver::new(driver_config.clone(), transport).unwrap();
+
+            assert_eq!(driver.execute(&request).unwrap(), driver_response);
+            let requests = driver.into_transport().requests;
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|(endpoint, _)| *endpoint)
+                    .collect::<Vec<_>>(),
+                [
+                    AdapterEndpoint::Control,
+                    AdapterEndpoint::Controld,
+                    AdapterEndpoint::Controld
+                ]
+            );
+            assert_eq!(requests[1].1, requests[2].1);
+        }
+    }
+
+    #[test]
     fn durable_ledger_scope_is_activation_scenario_and_generation_bound() {
         let driver = config();
         let control = AcceptanceControlConfig {
@@ -3409,6 +3587,42 @@ mod tests {
     }
 
     #[test]
+    fn driver_config_and_request_bind_export_authority() {
+        let mut bad_subject = config();
+        bad_subject.export_subject = "0".repeat(64);
+        assert_eq!(bad_subject.validate(), Err(DriverError::InvalidConfig));
+        let mut bad_generation = config();
+        bad_generation.export_generation = 0;
+        assert_eq!(bad_generation.validate(), Err(DriverError::InvalidConfig));
+        let mut bad_digest = config();
+        bad_digest.export_authorization_digest = "0".repeat(64);
+        assert_eq!(bad_digest.validate(), Err(DriverError::InvalidConfig));
+
+        for field in ["subject", "generation", "digest"] {
+            let driver_config = config();
+            let mut bad_fixture = fixture();
+            match field {
+                "subject" => bad_fixture.export_subject = hex('a', 64),
+                "generation" => bad_fixture.export_generation += 1,
+                "digest" => bad_fixture.export_authorization_digest = hex('a', 64),
+                _ => unreachable!(),
+            }
+            let scenario_sha256 = driver_config.scenario_sha256.clone();
+            let request = request(&bad_fixture, &scenario_sha256);
+            let transport = FakeTransport {
+                replies: VecDeque::new(),
+                endpoints: Vec::new(),
+            };
+            let mut driver = ProductionDriver::new(driver_config, transport).unwrap();
+            assert_eq!(
+                driver.execute(&request),
+                Err(DriverError::BindingMismatch),
+                "{field}",
+            );
+        }
+    }
+
+    #[test]
     fn control_rejects_stale_restart_generation() {
         struct FakeHost(ControlReadback);
         impl HostControl for FakeHost {
@@ -3453,7 +3667,7 @@ mod tests {
         let fixture = fixture();
         let driver_config = config();
         let mut base = request(&fixture, &driver_config.scenario_sha256);
-        base.sequence = 11;
+        base.sequence = 14;
         base.operation = Operation::RestartController;
         let mut control = control_request(&base, &operation_id(&base).unwrap());
         let control_config = AcceptanceControlConfig {
@@ -3494,7 +3708,7 @@ mod tests {
             Err(ControlError::BindingMismatch)
         );
 
-        control.sequence = 11;
+        control.sequence = 14;
         control.grant_digest = hex('a', 64);
         assert_eq!(
             handle_control(&control_config, &control, &mut host),
@@ -3554,7 +3768,7 @@ mod tests {
                 if sequence == 2 && self.fault == Fault::CapacityActivation {
                     return Err("capacity-one activation rejected");
                 }
-                if sequence == 14 && self.finalize_failures > 0 {
+                if sequence == 17 && self.finalize_failures > 0 {
                     self.finalize_failures -= 1;
                     return Err("transport lost after durable finalize");
                 }
@@ -3564,24 +3778,24 @@ mod tests {
                     let request: ControlRequest = serde_json::from_slice(request).unwrap();
                     let (mut capacity, mut controller, runner) = match request.sequence {
                         1 => (0, 7, 9),
-                        2..=10 => (1, 7, 9),
-                        11 => (1, 8, 9),
-                        12 => (1, 8, 10),
-                        13 => (0, 8, 10),
-                        14 | 15 => (
+                        2..=13 => (1, 7, 9),
+                        14 => (1, 8, 9),
+                        15 => (1, 8, 10),
+                        16 => (0, 8, 10),
+                        17 | 18 => (
                             0,
                             request.expected_controller_generation.unwrap_or(8),
                             request.expected_runner_generation.unwrap_or(10),
                         ),
                         _ => unreachable!(),
                     };
-                    if self.fault == Fault::StaleRestart && request.sequence == 11 {
+                    if self.fault == Fault::StaleRestart && request.sequence == 14 {
                         controller = 7;
                     }
                     if self.fault == Fault::BadCapacity && request.sequence == 2 {
                         capacity = 2;
                     }
-                    let zero_proof = (request.sequence >= 14).then(|| ZeroProof {
+                    let zero_proof = (request.sequence >= 17).then(|| ZeroProof {
                         schema_version: ZERO_PROOF_VERSION.into(),
                         scenario_sha256: request.scenario_sha256.clone(),
                         activation_id: request.activation_id.clone(),
@@ -3617,7 +3831,7 @@ mod tests {
                         zero_proof,
                         controller_receipt_sha256: (request.sequence == 2)
                             .then(|| hex('6', 64))
-                            .or_else(|| (request.sequence >= 14).then(|| hex('7', 64))),
+                            .or_else(|| (request.sequence >= 17).then(|| hex('7', 64))),
                     };
                     serde_json::to_vec(&response).unwrap()
                 }
@@ -3664,29 +3878,47 @@ mod tests {
             Conclusion::Success,
             true,
         );
-        let second_running = attempt(
+        let failed_running = failure_attempt(
             fixture,
-            'b',
-            2,
-            Some('a'),
+            'c',
+            1,
+            None,
             AttemptState::Running,
             Conclusion::None,
             false,
         );
-        let second_cancelled = attempt(
+        let failed_terminal = failure_attempt(
+            fixture,
+            'c',
+            1,
+            None,
+            AttemptState::Terminal,
+            Conclusion::Failure,
+            true,
+        );
+        let second_running = failure_attempt(
             fixture,
             'b',
             2,
-            Some('a'),
+            Some('c'),
+            AttemptState::Running,
+            Conclusion::None,
+            false,
+        );
+        let second_cancelled = failure_attempt(
+            fixture,
+            'b',
+            2,
+            Some('c'),
             AttemptState::Terminal,
             Conclusion::Cancelled,
             false,
         );
-        let second_tombstoned = attempt(
+        let second_tombstoned = failure_attempt(
             fixture,
             'b',
             2,
-            Some('a'),
+            Some('c'),
             AttemptState::Tombstoned,
             Conclusion::Cancelled,
             false,
@@ -3732,35 +3964,60 @@ mod tests {
                 Some('a'),
                 vec![first_terminal],
             )),
-            8 => Some(run(
+            8 => Some(failure_run(
+                fixture,
+                RunState::GrantedAwaitingResume,
+                Conclusion::None,
+                Some(approval(false)),
+                None,
+                vec![],
+            )),
+            9 => Some(failure_run(
                 fixture,
                 RunState::Running,
                 Conclusion::None,
                 Some(approval(true)),
                 None,
-                vec![first_terminal, second_running],
+                vec![failed_running],
             )),
-            9 => Some(run(
+            10 => Some(failure_run(
+                fixture,
+                RunState::Terminal,
+                Conclusion::Failure,
+                Some(approval(true)),
+                Some('c'),
+                vec![failed_terminal],
+            )),
+            11 => Some(failure_run(
+                fixture,
+                RunState::Running,
+                Conclusion::None,
+                Some(approval(true)),
+                None,
+                vec![failed_terminal, second_running],
+            )),
+            12 => Some(failure_run(
                 fixture,
                 RunState::Terminal,
                 Conclusion::Cancelled,
                 Some(approval(true)),
                 Some('b'),
-                vec![first_terminal, second_cancelled],
+                vec![failed_terminal, second_cancelled],
             )),
-            10..=13 => Some(run(
+            13..=16 => Some(failure_run(
                 fixture,
                 RunState::Terminal,
-                Conclusion::Success,
+                Conclusion::Failure,
                 Some(approval(true)),
-                Some('a'),
-                vec![first_terminal, second_tombstoned],
+                Some('c'),
+                vec![failed_terminal, second_tombstoned],
             )),
             _ => unreachable!(),
         };
         let export = (request.sequence == 7).then(|| ExportSnapshot {
             authenticated: true,
             subject: fixture.export_subject.clone(),
+            generation: fixture.export_generation,
             authorization_digest: fixture.export_authorization_digest.clone(),
             attempt_id: hex('a', 32),
             request_digest: fixture.request_digest.clone(),
@@ -3771,7 +4028,7 @@ mod tests {
                 fixture.expected_artifacts[0].clone(),
             ],
         });
-        let active = u32::from(matches!(request.sequence, 5 | 8));
+        let active = u32::from(matches!(request.sequence, 5 | 9 | 11));
         DriverResponse {
             schema_version: DRIVER_VERSION.into(),
             sequence: request.sequence,
@@ -3840,6 +4097,38 @@ mod tests {
         }
     }
 
+    fn failure_attempt(
+        fixture: &FixtureSpec,
+        id: char,
+        number: u32,
+        parent: Option<char>,
+        state: AttemptState,
+        conclusion: Conclusion,
+        evidence: bool,
+    ) -> AttemptSnapshot {
+        let mut value = attempt(fixture, id, number, parent, state, conclusion, false);
+        value.request_digest = fixture.failure_request_digest.clone();
+        if evidence {
+            value.evidence_set_digest = Some(hex('9', 64));
+            value.log = Some(fixture.expected_failure_log.clone());
+        }
+        value
+    }
+
+    fn failure_run(
+        fixture: &FixtureSpec,
+        state: RunState,
+        conclusion: Conclusion,
+        approval: Option<ApprovalSnapshot>,
+        selected: Option<char>,
+        attempts: Vec<AttemptSnapshot>,
+    ) -> RunSnapshot {
+        let mut value = run(fixture, state, conclusion, approval, selected, attempts);
+        value.run_id = fixture.failure_run_id.clone();
+        value.request_digest = fixture.failure_request_digest.clone();
+        value
+    }
+
     fn scenario() -> AcceptanceScenario {
         let endpoint = ProcessEndpoint {
             program: DRIVER_PROGRAM.into(),
@@ -3893,17 +4182,17 @@ mod tests {
     }
 
     #[test]
-    fn full_production_adapter_simulation_passes_all_thirteen_stages() {
+    fn full_production_adapter_simulation_passes_all_sixteen_stages() {
         let (receipt, transport) = run_simulation_with_transport(0);
         assert_eq!(receipt.outcome, Outcome::Pass);
-        assert_eq!(receipt.checks.len(), 13);
+        assert_eq!(receipt.checks.len(), 16);
         assert_eq!(
             &transport.trace[transport.trace.len() - 4..],
             &[
-                (AdapterEndpoint::Control, 13),
-                (AdapterEndpoint::Controld, 13),
-                (AdapterEndpoint::Control, 14),
-                (AdapterEndpoint::Control, 15),
+                (AdapterEndpoint::Control, 16),
+                (AdapterEndpoint::Controld, 16),
+                (AdapterEndpoint::Control, 17),
+                (AdapterEndpoint::Control, 18),
             ]
         );
     }
@@ -3915,18 +4204,18 @@ mod tests {
         let finalize: Vec<_> = transport
             .control_frames
             .iter()
-            .filter(|(sequence, _)| *sequence == 14)
+            .filter(|(sequence, _)| *sequence == 17)
             .collect();
         assert_eq!(finalize.len(), 2);
         assert_eq!(finalize[0].1, finalize[1].1);
         assert_eq!(
             &transport.trace[transport.trace.len() - 5..],
             &[
-                (AdapterEndpoint::Control, 13),
-                (AdapterEndpoint::Controld, 13),
-                (AdapterEndpoint::Control, 14),
-                (AdapterEndpoint::Control, 14),
-                (AdapterEndpoint::Control, 15),
+                (AdapterEndpoint::Control, 16),
+                (AdapterEndpoint::Controld, 16),
+                (AdapterEndpoint::Control, 17),
+                (AdapterEndpoint::Control, 17),
+                (AdapterEndpoint::Control, 18),
             ]
         );
     }
@@ -3962,9 +4251,9 @@ mod tests {
         let zero_transition = receipt.zero_transition.as_ref().unwrap();
         assert_eq!(zero_transition.outcome, Outcome::Pass);
         assert_eq!(zero_transition.phases.len(), 2);
-        assert_eq!(zero_transition.phases[0].sequence, 14);
+        assert_eq!(zero_transition.phases[0].sequence, 17);
         assert_eq!(zero_transition.phases[0].outcome, Outcome::Pass);
-        assert_eq!(zero_transition.phases[1].sequence, 15);
+        assert_eq!(zero_transition.phases[1].sequence, 18);
         assert_eq!(zero_transition.phases[1].outcome, Outcome::Pass);
         assert_eq!(zero_transition.zero_proof.capacity, 0);
         assert_eq!(zero_transition.zero_proof.admission, AdmissionState::Closed);
@@ -3979,8 +4268,8 @@ mod tests {
         assert_eq!(
             &transport.trace[transport.trace.len() - 2..],
             &[
-                (AdapterEndpoint::Control, 14),
-                (AdapterEndpoint::Control, 15),
+                (AdapterEndpoint::Control, 17),
+                (AdapterEndpoint::Control, 18),
             ]
         );
     }

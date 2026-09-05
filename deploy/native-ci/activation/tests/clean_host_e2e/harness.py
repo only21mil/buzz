@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import errno
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -26,10 +27,10 @@ import time
 from collections.abc import Callable
 
 SCHEMA = "buzz-ci-clean-host-e2e-vm-contract/v4"
-EVIDENCE_SCHEMA = "buzz-ci-clean-host-e2e-evidence/v4"
+EVIDENCE_SCHEMA = "buzz-ci-clean-host-e2e-evidence/v6"
 STAGE_SCHEMA = "buzz-ci-clean-host-e2e-stage/v3"
 STATE_SCHEMA = "buzz-ci-clean-host-e2e-vm-state/v3"
-FRAME_SCHEMA = "buzz-ci-clean-host-e2e-frame/v2"
+FRAME_SCHEMA = "buzz-ci-clean-host-e2e-frame/v4"
 PROGRESS_SCHEMA = "buzz-ci-clean-host-e2e-progress/v1"
 PACKAGE_NAMES = ("runner", "controld", "keyholder", "execd", "activation")
 PRIOR_PACKAGE_NAMES = ("execd", "activation")
@@ -38,6 +39,26 @@ PRIOR_ACTIVATION_PROOF_KEYS = frozenset({
 })
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def validate_protocol_verdict(value: object, expected_sha256: object) -> None:
+    module = sys.modules.get("local_tls_relay")
+    if module is None:
+        path = Path(__file__).with_name("local_tls_relay.py")
+        spec = importlib.util.spec_from_file_location("buzzci_clean_host_protocol", path)
+        if spec is None or spec.loader is None:
+            raise HarnessError("protocol validator is unavailable")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    try:
+        module.validate_closed_verdict(value)
+    except (AttributeError, ValueError) as error:
+        raise HarnessError("closed protocol verdict differs") from error
+    if (
+        not isinstance(expected_sha256, str) or HEX64.fullmatch(expected_sha256) is None
+        or hashlib.sha256(canonical(value)).hexdigest() != expected_sha256
+    ):
+        raise HarnessError("closed protocol verdict digest differs")
 MAX_JSON = 1024 * 1024
 MAX_FRAME = 4 * 1024 * 1024
 MAX_FILE = 64 * 1024 * 1024
@@ -2343,6 +2364,7 @@ def validate_result_set_fd(
         "timing", "timing_sha256",
         "package_tree_sha256", "scenario_sha256",
         "prior_package_tree_sha256", "prior_scenario_sha256", "prior_activation",
+        "protocol_verdict", "protocol_verdict_sha256",
         "seccomp_source_sha256", "transfer_bytes", "transfer_sha256",
         "receipt_sha256", "verifier_sha256", "dormant_proof",
     }
@@ -2405,6 +2427,8 @@ def validate_result_set_fd(
         "verifier_base64": base64.b64encode(verifier_raw).decode(),
         "dormant_proof": evidence["dormant_proof"],
         "prior_activation": evidence["prior_activation"],
+        "protocol_verdict": evidence["protocol_verdict"],
+        "protocol_verdict_sha256": evidence["protocol_verdict_sha256"],
     }
     validate_final_frame(frame, contract, "0" * 64)
     replay_frozen_verifier(contract, receipt_raw, evidence)
@@ -2419,6 +2443,8 @@ def validate_result_set_fd(
         "evidence_manifest_sha256": hashlib.sha256(evidence_raw).hexdigest(),
         "dormant_proof": evidence["dormant_proof"],
         "vm_state_absent": True,
+        "protocol_verdict": evidence["protocol_verdict"],
+        "protocol_verdict_sha256": evidence["protocol_verdict_sha256"],
     }
     if outcome is not None and outcome != expected_outcome:
         raise HarnessError("result publication outcome differs")
@@ -2609,7 +2635,7 @@ def validate_final_frame(
 ) -> tuple[bytes, bytes, dict[str, object]]:
     expected = {
         "schema_version", "phase", "challenge", "outcome", "receipt_base64", "verifier_base64",
-        "dormant_proof", "prior_activation",
+        "dormant_proof", "prior_activation", "protocol_verdict", "protocol_verdict_sha256",
     }
     if set(frame) != expected or frame["phase"] != "run" or frame["challenge"] != challenge or frame["outcome"] != "pass":
         raise HarnessError("final evidence frame differs")
@@ -2643,6 +2669,8 @@ def validate_final_frame(
     except json.JSONDecodeError as error:
         raise HarnessError("final evidence JSON differs") from error
     proof = frame["dormant_proof"]
+    protocol_verdict = frame["protocol_verdict"]
+    validate_protocol_verdict(protocol_verdict, frame["protocol_verdict_sha256"])
     if (
         not isinstance(receipt, dict)
         or set(receipt) != {
@@ -2665,6 +2693,9 @@ def validate_final_frame(
             "sockets_absent", "processes_absent", "encrypted_credentials_absent", "relay_residue_absent",
         ))
         or any(not isinstance(proof.get(name), str) or HEX64.fullmatch(proof[name]) is None for name in ("configs_sha256", "units_sha256"))
+        or protocol_verdict.get("receipt", {}).get("sha256") != hashlib.sha256(receipt_raw).hexdigest()
+        or protocol_verdict.get("receipt", {}).get("checks") != 16
+        or protocol_verdict.get("receipt", {}).get("zero_phases") != [17, 18]
     ):
         raise HarnessError("final receipt identity or dormant proof differs")
     return receipt_raw, verifier_raw, proof
@@ -2739,6 +2770,8 @@ def run_vm(
                 "prior_package_tree_sha256": {name: tree_digest(records[f"prior/{name}"]) for name in PRIOR_PACKAGE_NAMES},
                 "prior_scenario_sha256": contract["prior_scenario"]["sha256"],
                 "prior_activation": frame["prior_activation"],
+                "protocol_verdict": frame["protocol_verdict"],
+                "protocol_verdict_sha256": frame["protocol_verdict_sha256"],
                 "seccomp_source_sha256": SECCOMP_SHA256,
                 "transfer_bytes": TRANSFER_SIZE,
                 "transfer_sha256": file_sha256(state / "transfer.raw"),
@@ -2762,6 +2795,8 @@ def run_vm(
                 "receipt_sha256": receipt_digest, "verifier_sha256": verifier_digest,
                 "evidence_manifest_sha256": hashlib.sha256(canonical(evidence_manifest)).hexdigest(),
                 "dormant_proof": proof, "vm_state_absent": True,
+                "protocol_verdict": frame["protocol_verdict"],
+                "protocol_verdict_sha256": frame["protocol_verdict_sha256"],
             }
             publication_checkpoint("after-third-file", results, Path(binding["results"]))
             validate_result_set(contract, results, outcome, results_identity)

@@ -138,9 +138,24 @@ EXECD_QUALIFICATION_ROOT = "/var/lib/buzzci/execd-v2/qualification"
 EXECD_DYNAMIC_DIGEST_PLACEHOLDER = "0" * 64
 EXECUTION_SCHEMA_VERSION = 1
 EXECUTION_DIGEST_DOMAIN = b"buzz-ci-execd:static-execution:v1\0"
+FIXTURE_SELECTOR_SCHEMA = "buzz-ci-capacity-one-fixture-selector/v1"
+FIXTURE_FAILURE_SELECTOR = "deterministic-failure"
+FIXTURE_SELECTOR_DIGEST_DOMAIN = "buzz-ci:capacity-one:fixture-selector:v1"
+EXPORT_AUTHORIZATION_DIGEST_DOMAIN = b"buzz-ci-acceptance-export-authority:v1\0"
+EXPORT_LOG = (
+    "job.log",
+    "54e15345b0e920fd0b3c3864422c336f4f66f023b5b2a9cf7874c8a6fe2984ff",
+    131,
+)
+EXPORT_ARTIFACTS = ((
+    "result",
+    "result.json",
+    "fde27be36048dd6a5bdc9961882391f46102d86dac76c106787dba9ff7551d66",
+    107,
+),)
 FIXTURE_MANIFEST_SHA256 = "f204b8fba64e972408f5a0ea1c0bb3140cfa696289903d96a8cb07d602af6b23"
 FIXTURE_INPUT_SHA256 = "967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6"
-FIXTURE_SCRIPT_SHA256 = "d081e43ebfde3ee67c3cd8d852d58410a79ad799bbfa2cf98d5e2ef7b8bed3b1"
+FIXTURE_SCRIPT_SHA256 = "8b2c335883399ad34033953d381a34519fc030577b875dcebe22f42843745ebf"
 FIXTURE_MANIFEST_PATH = "/usr/share/buzzci/execd-v2/fixture/fixture-manifest.json"
 FIXTURE_INPUT_PATH = "/usr/share/buzzci/execd-v2/fixture/input.txt"
 FIXTURE_SCRIPT_PATH = "/usr/libexec/buzz-ci-capacity-one-fixture"
@@ -148,7 +163,7 @@ EXECUTOR_SOCKET_PATH = "/run/buzzci/executor.sock"
 RUNNER_REPLAY_JOURNAL = "/var/lib/buzzci/runner/v2-replay.json"
 SECCOMP_PROFILE_DIGEST = "2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4"
 SECCOMP_PROFILE_PATH = f"/var/lib/buzzci/seccomp/v1/sha256/{SECCOMP_PROFILE_DIGEST}.json"
-RECEIPT_VERIFIER_EXPECTED_STAGES_SHA256 = "c8addbb42bace522e99fc8fe00603c9245db61ac8a599ef5762c2744267189cd"
+RECEIPT_VERIFIER_EXPECTED_STAGES_SHA256 = "5129005b9fcbf56c1f67aeed7bd02bd2356626b6819120032b28ae4824371178"
 QUALIFICATION_SOURCE_COMMIT = "564e41fda889f25b094b79524b3fb409121794c7"
 LANE_MANIFEST_DIGEST_DOMAIN = b"buzz-ci:lane-activation-manifest:v1\0"
 
@@ -822,6 +837,151 @@ def _canonical_channel_id(value: object, where: str) -> str:
     return value
 
 
+def fixture_selector_digest(value: object) -> str:
+    """Hash the public failure selector and its exact run/job/attempt scope."""
+    fields = {"schema_version", "selector", "job_id", "run_id", "attempt"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ValueError("fixture selector shape differs")
+    if value["schema_version"] != FIXTURE_SELECTOR_SCHEMA:
+        raise ValueError("fixture selector schema differs")
+    if value["selector"] != FIXTURE_FAILURE_SELECTOR:
+        raise ValueError("fixture selector value differs")
+    if value["job_id"] != "capacity-one-fixture":
+        raise ValueError("fixture selector job differs")
+    run_id = _canonical_channel_id(value["run_id"], "fixture selector run id")
+    if value["attempt"] != 1:
+        raise ValueError("fixture selector attempt differs")
+    lines = (
+        FIXTURE_SELECTOR_DIGEST_DOMAIN,
+        value["schema_version"],
+        value["selector"],
+        value["job_id"],
+        uuid.UUID(run_id).hex,
+        str(value["attempt"]),
+    )
+    return digest(("\n".join(lines) + "\n").encode("ascii"))
+
+
+def validate_fixture_selector(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("fixture selector must be an object")
+    require_keys(
+        value,
+        {"schema_version", "selector", "job_id", "run_id", "attempt", "sha256"},
+        "fixture selector",
+    )
+    unsigned = {key: value[key] for key in ("schema_version", "selector", "job_id", "run_id", "attempt")}
+    if value["sha256"] != fixture_selector_digest(unsigned):
+        raise ValueError("fixture selector digest differs")
+    return {key: value[key] for key in (
+        "schema_version", "selector", "job_id", "run_id", "attempt", "sha256",
+    )}
+
+
+def _export_transcript_digest(
+    *, relay_http_origin: object, subject: object, generation: object,
+    request_event_id: object, run_id: object, job_id: object, attempt: object,
+    artifacts: tuple[tuple[str, str, str, int], ...] = EXPORT_ARTIFACTS,
+) -> str:
+    """Hash the stable, ordered evidence GET plan without bearer material."""
+    parts = urlsplit(relay_http_origin if isinstance(relay_http_origin, str) else "")
+    origin = f"{parts.scheme}://{parts.netloc}"
+    if (
+        parts.scheme != "https" or not parts.hostname or parts.username is not None
+        or parts.password is not None or parts.path not in {"", "/"}
+        or parts.query or parts.fragment or relay_http_origin != origin
+    ):
+        raise ValueError("export relay HTTP origin is not canonical https")
+    export_subject = _nonzero_sha256(subject, "export subject")
+    export_generation = _positive_integer(
+        generation, 9_007_199_254_740_991, "export generation",
+    )
+    request_digest = _nonzero_sha256(request_event_id, "export request event id")
+    canonical_run_id = _canonical_channel_id(run_id, "export run id")
+    if not isinstance(job_id, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", job_id) is None:
+        raise ValueError("export job id is invalid")
+    if attempt != 1:
+        raise ValueError("export attempt differs from the capacity-one plan")
+    if not isinstance(artifacts, tuple) or len(artifacts) != 1:
+        raise ValueError("export artifact plan must contain exactly one artifact")
+
+    log_name, log_sha256, log_bytes = EXPORT_LOG
+    plan = [(
+        "log", log_name, log_sha256, log_bytes,
+        f"{origin}/ci/logs/{request_digest}/{canonical_run_id}/{job_id}/{attempt}/{log_sha256}",
+    )]
+    for artifact in artifacts:
+        if not isinstance(artifact, tuple) or len(artifact) != 4:
+            raise ValueError("export artifact plan entry is invalid")
+        artifact_id, name, sha256, byte_count = artifact
+        if (
+            not isinstance(artifact_id, str)
+            or re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", artifact_id) is None
+            or artifact_id in {".", ".."}
+            or not isinstance(name, str)
+            or not name or len(name) > 255 or "/" in name or "\\" in name or "\0" in name
+            or not isinstance(byte_count, int) or isinstance(byte_count, bool) or byte_count <= 0
+        ):
+            raise ValueError("export artifact plan entry is invalid")
+        artifact_sha256 = _nonzero_sha256(sha256, "export artifact sha256")
+        plan.append((
+            "artifact", name, artifact_sha256, byte_count,
+            f"{origin}/ci/artifacts/{request_digest}/{canonical_run_id}/{job_id}/{attempt}/{artifact_id}/{artifact_sha256}",
+        ))
+
+    transcript = bytearray(EXPORT_AUTHORIZATION_DIGEST_DOMAIN)
+    for kind, name, sha256, byte_count, url in plan:
+        for field in (
+            "GET", url, export_subject, str(export_generation), request_digest,
+            canonical_run_id, job_id, str(attempt), kind, name, sha256, str(byte_count),
+        ):
+            encoded = field.encode("utf-8")
+            transcript.extend(struct.pack(">Q", len(encoded)))
+            transcript.extend(encoded)
+    return digest(bytes(transcript))
+
+
+def capacity_one_export_authority(
+    *, relay_http_origin: object, subject: object, generation: object,
+    run_event: object, job_id: object,
+) -> dict[str, object]:
+    """Derive the frozen public authority for Run A's evidence GET plan."""
+    if not isinstance(run_event, list) or len(run_event) != 6 or run_event[3] != 46_100:
+        raise ValueError("export Run A event is invalid")
+    try:
+        envelope = json.loads(run_event[5], object_pairs_hook=reject_duplicates)
+    except (TypeError, json.JSONDecodeError) as error:
+        raise ValueError("export Run A envelope is invalid") from error
+    if (
+        not isinstance(envelope, dict)
+        or envelope.get("request_type") != "run"
+        or envelope.get("attempt") != 1
+        or envelope.get("job_ids") != [job_id]
+    ):
+        raise ValueError("export Run A scope differs")
+    export_subject = _nonzero_sha256(subject, "export subject")
+    export_generation = _positive_integer(
+        generation, 9_007_199_254_740_991, "export generation",
+    )
+    request_event_id = digest(json.dumps(
+        run_event, ensure_ascii=False, separators=(",", ":"),
+    ).encode())
+    authorization_digest = _export_transcript_digest(
+        relay_http_origin=relay_http_origin,
+        subject=export_subject,
+        generation=export_generation,
+        request_event_id=request_event_id,
+        run_id=envelope.get("run_id"),
+        job_id=job_id,
+        attempt=1,
+    )
+    return {
+        "export_subject": export_subject,
+        "export_generation": export_generation,
+        "export_authorization_digest": authorization_digest,
+    }
+
+
 def repository_coordinate(owner_public_key: object, repository_id: object) -> str:
     """Return the NIP-34 ``30617:<owner>:<repo id>`` coordinate the relay indexes."""
     owner = _nonzero_sha256(owner_public_key, "repository owner public key")
@@ -848,9 +1008,10 @@ def production_acceptance_template(
     *, actor_public_key: str, actor_generation: int, ci_signer_public_key: str,
     candidate_sha: str, workflow_id: str, workflow_digest: str, job_id: str,
     channel_id: str, repository_owner_public_key: str, repository_id: str,
-    source_clone_url: str, time_reference: int,
+    source_clone_url: str, relay_http_origin: str, export_subject: str,
+    export_generation: int, time_reference: int,
 ) -> dict[str, Any]:
-    """Build the one canonical public Run/Grant/Rerun/Tombstone authority set.
+    """Build the canonical public Run/Grant/FailureRun/Rerun/Tombstone set.
 
     The set is static: its event ids are bound by digest into the keyholder
     signing policy, the controld acceptance authority, the scenario fixture,
@@ -908,12 +1069,21 @@ def production_acceptance_template(
         ))
 
     run_id = request_identity("run")
+    failure_run_id = request_identity("failure-run")
+    selector = {
+        "schema_version": FIXTURE_SELECTOR_SCHEMA,
+        "selector": FIXTURE_FAILURE_SELECTOR,
+        "job_id": job_id,
+        "run_id": failure_run_id,
+        "attempt": 1,
+    }
+    failure_selector = {**selector, "sha256": fixture_selector_digest(selector)}
     pr_event = "33" * 32
     issued_at = _positive_integer(
         time_reference, 0xFFFFFFFFFFFFFFFF - 601, "public acceptance time reference",
     )
 
-    def request(*, request_type: str, attempt: int, idempotency_key: str) -> dict[str, Any]:
+    def request(*, request_type: str, attempt: int, run_id: str, idempotency_key: str) -> dict[str, Any]:
         value: dict[str, Any] = {
             "schema_version": 1,
             "request_type": request_type,
@@ -948,18 +1118,23 @@ def production_acceptance_template(
         return value
 
     run = request(
-        request_type="run", attempt=1,
+        request_type="run", attempt=1, run_id=run_id,
         idempotency_key=request_identity("request-attempt-1"),
     )
+    failure_run = request(
+        request_type="run", attempt=1, run_id=failure_run_id,
+        idempotency_key=request_identity("failure-request-attempt-1"),
+    )
     rerun = request(
-        request_type="rerun", attempt=2,
+        request_type="rerun", attempt=2, run_id=failure_run_id,
         idempotency_key=request_identity("request-attempt-2"),
     )
+    rerun.update({"parent_run_id": failure_run_id})
 
     def request_event(envelope: dict[str, Any]) -> list[object]:
         attempt = str(envelope["attempt"])
         tags = [
-            ["h", channel], ["a", target_repo], ["run", run_id],
+            ["h", channel], ["a", target_repo], ["run", envelope["run_id"]],
             ["workflow", workflow_id], ["c", candidate_sha], ["attempt", attempt],
         ]
         return [
@@ -968,6 +1143,7 @@ def production_acceptance_template(
         ]
 
     run_event = request_event(run)
+    failure_run_event = request_event(failure_run)
     rerun_event = request_event(rerun)
     grant = {
         "schema_version": 1,
@@ -983,6 +1159,13 @@ def production_acceptance_template(
     rerun_event_id = digest(json.dumps(
         rerun_event, ensure_ascii=False, separators=(",", ":"),
     ).encode())
+    export_authority = capacity_one_export_authority(
+        relay_http_origin=relay_http_origin,
+        subject=export_subject,
+        generation=export_generation,
+        run_event=run_event,
+        job_id=job_id,
+    )
     return validate_acceptance_template({
         "actor": {"public_key": actor, "generation": actor_generation},
         "time_reference": issued_at,
@@ -990,6 +1173,9 @@ def production_acceptance_template(
         "grant_event": grant_event,
         "rerun_event": rerun_event,
         "tombstone_event": [0, actor, issued_at + 20, 5, [["e", rerun_event_id]], ""],
+        "failure_run_event": failure_run_event,
+        "failure_selector": failure_selector,
+        **export_authority,
     })
 
 
@@ -1000,6 +1186,7 @@ def production_activation_draft(
     actor_generation: int, ci_signer_public_key: str, workflow_id: str,
     workflow_digest: str, job_id: str, channel_id: str,
     repository_owner_public_key: str, repository_id: str, source_clone_url: str,
+    relay_http_origin: str, export_subject: str, export_generation: int,
     time_reference: int,
 ) -> dict[str, Any]:
     """Materialize a new closed activation draft from explicit ready inputs.
@@ -1034,6 +1221,9 @@ def production_activation_draft(
             repository_owner_public_key=repository_owner_public_key,
             repository_id=repository_id,
             source_clone_url=source_clone_url,
+            relay_http_origin=relay_http_origin,
+            export_subject=export_subject,
+            export_generation=export_generation,
             time_reference=time_reference,
         ),
         "entries": detached(entries),
@@ -1061,7 +1251,11 @@ def production_activation_draft(
 
 
 def validate_acceptance_template(value: object) -> dict[str, Any]:
-    fields = {"actor", "time_reference", "run_event", "grant_event", "rerun_event", "tombstone_event"}
+    fields = {
+        "actor", "time_reference", "run_event", "grant_event", "rerun_event",
+        "tombstone_event", "failure_run_event", "failure_selector",
+        "export_subject", "export_generation", "export_authorization_digest",
+    }
     if not isinstance(value, dict) or set(value) != fields:
         raise ValueError("public acceptance template shape differs")
     actor = value["actor"]
@@ -1077,6 +1271,7 @@ def validate_acceptance_template(value: object) -> dict[str, Any]:
         "grant_event": 46_107,
         "rerun_event": 46_100,
         "tombstone_event": 5,
+        "failure_run_event": 46_100,
     }
     encoded: set[bytes] = set()
     for name, kind in expected_kinds.items():
@@ -1122,11 +1317,60 @@ def validate_acceptance_template(value: object) -> dict[str, Any]:
         or rerun["expires_at"] <= time_reference
     ):
         raise ValueError("public acceptance rerun template is not issued at the time reference")
+    failure_run_event = value["failure_run_event"]
+    try:
+        failure_run = json.loads(failure_run_event[5], object_pairs_hook=reject_duplicates)
+    except (TypeError, ValueError) as error:
+        raise ValueError("public acceptance failure-run template envelope is invalid") from error
+    if (
+        failure_run_event[2] != time_reference
+        or not isinstance(failure_run, dict)
+        or failure_run.get("issued_at") != time_reference
+        or failure_run.get("request_type") != "run"
+        or failure_run.get("attempt") != 1
+        or not isinstance(failure_run.get("run_id"), str)
+        or failure_run["run_id"] == run.get("run_id")
+    ):
+        raise ValueError("public acceptance failure-run template is invalid")
+    request_identities = [
+        run.get("run_id"), failure_run.get("run_id"),
+        run.get("idempotency_key"), failure_run.get("idempotency_key"),
+        rerun.get("idempotency_key"),
+    ]
+    try:
+        parsed_identities = [uuid.UUID(identity) for identity in request_identities]
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("public acceptance request identity is not a UUID") from error
+    if (
+        any(
+            parsed.version != 5 or parsed.variant != uuid.RFC_4122 or str(parsed) != identity
+            for parsed, identity in zip(parsed_identities, request_identities, strict=True)
+        )
+        or len(set(request_identities)) != len(request_identities)
+    ):
+        raise ValueError("public acceptance request identities lack full UUIDv5 separation")
+    failure_selector = validate_fixture_selector(value["failure_selector"])
+    if (
+        failure_selector["run_id"] != failure_run["run_id"]
+        or failure_selector["job_id"] != failure_run.get("job_ids", [None])[0]
+        or failure_selector["attempt"] != failure_run["attempt"]
+    ):
+        raise ValueError("public acceptance failure selector scope differs")
+    _nonzero_sha256(value["export_subject"], "public acceptance export subject")
+    _positive_integer(
+        value["export_generation"], 9_007_199_254_740_991,
+        "public acceptance export generation",
+    )
+    _nonzero_sha256(
+        value["export_authorization_digest"],
+        "public acceptance export authorization digest",
+    )
     channel = _event_tag_value(run_event[4], "h", "public acceptance run template")
     _canonical_channel_id(channel, "public acceptance run template channel")
     if (
         _event_tag_value(value["grant_event"][4], "h", "public acceptance grant template") != channel
         or _event_tag_value(rerun_event[4], "h", "public acceptance rerun template") != channel
+        or _event_tag_value(failure_run_event[4], "h", "public acceptance failure-run template") != channel
     ):
         raise ValueError("public acceptance templates name more than one channel")
     repository = run.get("target_repo_a")
@@ -1135,6 +1379,10 @@ def validate_acceptance_template(value: object) -> dict[str, Any]:
         or _event_tag_value(run_event[4], "a", "public acceptance run template") != repository
         or _event_tag_value(rerun_event[4], "a", "public acceptance rerun template") != repository
         or rerun.get("target_repo_a") != repository
+        or _event_tag_value(failure_run_event[4], "a", "public acceptance failure-run template") != repository
+        or failure_run.get("target_repo_a") != repository
+        or rerun.get("run_id") != failure_run.get("run_id")
+        or rerun.get("parent_run_id") != failure_run.get("run_id")
     ):
         raise ValueError("public acceptance templates name more than one repository")
     return value
@@ -1263,12 +1511,15 @@ def _wire_text64(value: object, where: str) -> bytes:
 
 
 def validate_execution_declaration(value: object, *, allow_placeholder: bool) -> dict[str, Any]:
-    fields = {
+    base_fields = {
         "schema_version", "declaration_digest", "workflow_id", "workflow_digest", "job_id", "artifact",
         "fixture_manifest_sha256", "fixture_input_sha256", "fixture_script_sha256", "max_stdout_bytes",
         "max_stderr_bytes", "max_memory_bytes", "max_processes", "max_wall_seconds",
     }
-    if not isinstance(value, dict) or set(value) != fields:
+    if not isinstance(value, dict) or (
+        set(value) != base_fields | {"failure_selector"}
+        and not (allow_placeholder and set(value) == base_fields)
+    ):
         raise ValueError("execd execution declaration shape differs from production")
     if isinstance(value["schema_version"], bool) or value["schema_version"] != EXECUTION_SCHEMA_VERSION:
         raise ValueError("execd execution declaration schema differs")
@@ -1281,6 +1532,10 @@ def validate_execution_declaration(value: object, *, allow_placeholder: bool) ->
     _nonzero_sha256(value["workflow_digest"], "execd workflow digest")
     if value["job_id"] != "capacity-one-fixture":
         raise ValueError("execd execution job id differs from the fixed fixture")
+    if "failure_selector" in value:
+        selector = validate_fixture_selector(value["failure_selector"])
+        if selector["job_id"] != value["job_id"]:
+            raise ValueError("execd execution selector job differs")
     artifact = value["artifact"]
     expected_artifact = {
         "artifact_id": "result", "name": "result.json", "media_type": "application/json",
@@ -1334,6 +1589,7 @@ def execution_declaration_digest(
     encoded.extend(struct.pack(">I", artifact["max_bytes"]))
     for field in ("fixture_manifest_sha256", "fixture_input_sha256", "fixture_script_sha256"):
         encoded.extend(bytes.fromhex(declaration[field]))
+    encoded.extend(bytes.fromhex(declaration["failure_selector"]["sha256"]))
     encoded.extend(struct.pack(">I", declaration["max_stdout_bytes"]))
     encoded.extend(struct.pack(">I", declaration["max_stderr_bytes"]))
     encoded.extend(struct.pack(">Q", declaration["max_memory_bytes"]))
@@ -1642,6 +1898,20 @@ def validate_phase_configs(manifest: dict[str, Any], payloads: dict[str, bytes])
             raise ValueError(f"controld keyholder selector is invalid: {name}")
         _nonzero_sha256(selector["public_key"], f"controld keyholder selector {name}")
         _positive_integer(selector["generation"], 9_007_199_254_740_991, f"controld keyholder generation {name}")
+    expected_export_authority = capacity_one_export_authority(
+        relay_http_origin=controld_active["relay_http_origin"],
+        subject=selectors["nip98"]["public_key"],
+        generation=selectors["nip98"]["generation"],
+        run_event=manifest["acceptance_template"]["run_event"],
+        job_id=job["job_id"],
+    )
+    if any(
+        manifest["acceptance_template"][field] != expected_export_authority[field]
+        for field in (
+            "export_subject", "export_generation", "export_authorization_digest",
+        )
+    ):
+        raise ValueError("public acceptance export authority differs from the active NIP-98 selector")
     # The keyholder's manifest selector is the one source of the admission key
     # and its generation: keyholder signs admissions with that key at that
     # generation, controld derives admission_key_generation from this selector,

@@ -90,7 +90,7 @@ const FIXTURE_MANIFEST_SHA256: &str =
 const FIXTURE_INPUT_SHA256: &str =
     "967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6";
 const FIXTURE_SCRIPT_SHA256: &str =
-    "d081e43ebfde3ee67c3cd8d852d58410a79ad799bbfa2cf98d5e2ef7b8bed3b1";
+    "8b2c335883399ad34033953d381a34519fc030577b875dcebe22f42843745ebf";
 const CONFIG_SCHEMA: u16 = 2;
 const RPC_SCHEMA: u16 = 1;
 const MAX_CONFIG: u64 = 64 * 1024;
@@ -103,6 +103,9 @@ const MAX_RAW_OUTPUT: usize = 32 * 1024;
 const MAX_QUALIFICATION_RECEIPTS: usize = 16;
 const STATIC_EXECUTION_SCHEMA: u16 = 1;
 const STATIC_EXECUTION_DIGEST_DOMAIN: &[u8] = b"buzz-ci-execd:static-execution:v1\0";
+const FIXTURE_SELECTOR_SCHEMA: &str = "buzz-ci-capacity-one-fixture-selector/v1";
+const FIXTURE_FAILURE_OUTCOME: &str = "deterministic-failure";
+const FIXTURE_SUCCESS_OUTCOME: &str = "success";
 const EXECUTOR_RECEIPT_DOMAIN: &[u8] = b"buzz-ci-executor:receipt:v2\0";
 const FIXED_MAX_STDOUT_BYTES: u32 = 32 * 1024;
 const FIXED_MAX_STDERR_BYTES: u32 = 32 * 1024;
@@ -242,11 +245,59 @@ struct StaticExecutionConfig {
     fixture_manifest_sha256: String,
     fixture_input_sha256: String,
     fixture_script_sha256: String,
+    failure_selector: FixtureSelectorDocument,
     max_stdout_bytes: u32,
     max_stderr_bytes: u32,
     max_memory_bytes: u64,
     max_processes: u32,
     max_wall_seconds: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct FixtureSelectorDocument {
+    schema_version: String,
+    selector: String,
+    job_id: String,
+    run_id: String,
+    attempt: u32,
+    sha256: String,
+}
+
+impl FixtureSelectorDocument {
+    fn valid(&self) -> bool {
+        let Ok(run_id) = uuid::Uuid::parse_str(&self.run_id) else {
+            return false;
+        };
+        let encoded = format!(
+            "buzz-ci:capacity-one:fixture-selector:v1\n{}\n{}\n{}\n{}\n{}\n",
+            self.schema_version,
+            self.selector,
+            self.job_id,
+            run_id.simple(),
+            self.attempt,
+        );
+        self.schema_version == FIXTURE_SELECTOR_SCHEMA
+            && self.selector == FIXTURE_FAILURE_OUTCOME
+            && !self.job_id.is_empty()
+            && self.job_id.len() <= 64
+            && self
+                .job_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            && self.attempt == 1
+            && self.run_id == run_id.hyphenated().to_string()
+            && run_id.get_version_num() == 5
+            && self.sha256 == hex::encode(Sha256::digest(encoded.as_bytes()))
+    }
+
+    fn selects(&self, run_id: &str, attempt: u32, job_id: &str) -> bool {
+        self.valid()
+            && uuid::Uuid::parse_str(&self.run_id)
+                .is_ok_and(|value| value.simple().to_string() == run_id)
+            && self.attempt == attempt
+            && self.job_id == job_id
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -347,6 +398,10 @@ struct ExecutorRequest {
     fixture_manifest_sha256: String,
     fixture_input_sha256: String,
     fixture_script_sha256: String,
+    failure_selector: FixtureSelectorDocument,
+    run_id: String,
+    attempt: u32,
+    fixture_outcome: String,
     deadline_at: u64,
     max_stdout_bytes: u32,
     max_stderr_bytes: u32,
@@ -962,6 +1017,7 @@ struct StaticExecutionContract {
     fixture_manifest: ProgramProvenance,
     fixture_input: ProgramProvenance,
     fixture_script: ProgramProvenance,
+    failure_selector: FixtureSelectorDocument,
     max_stdout_bytes: u32,
     max_stderr_bytes: u32,
     max_memory_bytes: u64,
@@ -1185,6 +1241,17 @@ impl LocalHostSystem {
         verify_program(&self.executor).map_err(binding_error)?;
         self.seccomp.validate().map_err(binding_error)?;
         let mut stream = self.connect_executor()?;
+        let run_id = hex::encode(binding.run_id);
+        let attempt = binding.attempt;
+        let fixture_outcome = if self.static_job.failure_selector.selects(
+            &run_id,
+            attempt,
+            binding.job_id.as_str().unwrap_or_default(),
+        ) {
+            FIXTURE_FAILURE_OUTCOME
+        } else {
+            FIXTURE_SUCCESS_OUTCOME
+        };
         let request = ExecutorRequest {
             schema_version: RPC_SCHEMA,
             operation: operation.to_owned(),
@@ -1195,6 +1262,10 @@ impl LocalHostSystem {
             fixture_manifest_sha256: self.static_job.fixture_manifest.sha256.clone(),
             fixture_input_sha256: self.static_job.fixture_input.sha256.clone(),
             fixture_script_sha256: self.static_job.fixture_script.sha256.clone(),
+            failure_selector: self.static_job.failure_selector.clone(),
+            run_id,
+            attempt,
+            fixture_outcome: fixture_outcome.to_owned(),
             deadline_at: binding.deadline_at,
             max_stdout_bytes: self.static_job.max_stdout_bytes,
             max_stderr_bytes: self.static_job.max_stderr_bytes,
@@ -2458,6 +2529,8 @@ fn validate_config(
         || config.execution.fixture_manifest_sha256 != FIXTURE_MANIFEST_SHA256
         || config.execution.fixture_input_sha256 != FIXTURE_INPUT_SHA256
         || config.execution.fixture_script_sha256 != FIXTURE_SCRIPT_SHA256
+        || !config.execution.failure_selector.valid()
+        || config.execution.failure_selector.job_id != config.execution.job_id
         || config.execution.max_stdout_bytes != FIXED_MAX_STDOUT_BYTES
         || config.execution.max_stderr_bytes != FIXED_MAX_STDERR_BYTES
         || config.execution.max_memory_bytes != FIXED_MAX_MEMORY_BYTES
@@ -2602,6 +2675,7 @@ fn static_execution_contract(
             &execution.fixture_script_sha256,
             0o555,
         )?,
+        failure_selector: execution.failure_selector.clone(),
         max_stdout_bytes: execution.max_stdout_bytes,
         max_stderr_bytes: execution.max_stderr_bytes,
         max_memory_bytes: execution.max_memory_bytes,
@@ -2634,6 +2708,7 @@ fn static_execution_digest(value: &StaticExecutionContract) -> [u8; 32] {
     digest.update(decode_hex::<32>(&value.fixture_manifest.sha256).unwrap_or([0; 32]));
     digest.update(decode_hex::<32>(&value.fixture_input.sha256).unwrap_or([0; 32]));
     digest.update(decode_hex::<32>(&value.fixture_script.sha256).unwrap_or([0; 32]));
+    digest.update(decode_hex::<32>(&value.failure_selector.sha256).unwrap_or([0; 32]));
     digest.update(value.max_stdout_bytes.to_be_bytes());
     digest.update(value.max_stderr_bytes.to_be_bytes());
     digest.update(value.max_memory_bytes.to_be_bytes());
@@ -3345,6 +3420,10 @@ struct ExecutorBinding {
     fixture_manifest_sha256: String,
     fixture_input_sha256: String,
     fixture_script_sha256: String,
+    failure_selector: FixtureSelectorDocument,
+    run_id: String,
+    attempt: u32,
+    fixture_outcome: String,
     deadline_at: u64,
     max_stdout_bytes: u32,
     max_stderr_bytes: u32,
@@ -3509,6 +3588,10 @@ fn executor_transition(
         digest.update(request.fixture_manifest_sha256.as_bytes());
         digest.update(request.fixture_input_sha256.as_bytes());
         digest.update(request.fixture_script_sha256.as_bytes());
+        digest.update(request.failure_selector.sha256.as_bytes());
+        digest.update(request.run_id.as_bytes());
+        digest.update(request.attempt.to_be_bytes());
+        digest.update(request.fixture_outcome.as_bytes());
         digest.update(request.deadline_at.to_be_bytes());
         digest.update(request.max_stdout_bytes.to_be_bytes());
         digest.update(request.max_stderr_bytes.to_be_bytes());
@@ -3693,6 +3776,10 @@ impl ExecutorBinding {
             fixture_manifest_sha256: request.fixture_manifest_sha256.clone(),
             fixture_input_sha256: request.fixture_input_sha256.clone(),
             fixture_script_sha256: request.fixture_script_sha256.clone(),
+            failure_selector: request.failure_selector.clone(),
+            run_id: request.run_id.clone(),
+            attempt: request.attempt,
+            fixture_outcome: request.fixture_outcome.clone(),
             deadline_at: request.deadline_at,
             max_stdout_bytes: request.max_stdout_bytes,
             max_stderr_bytes: request.max_stderr_bytes,
@@ -3715,6 +3802,20 @@ impl ExecutorBinding {
             && self.fixture_manifest_sha256 == FIXTURE_MANIFEST_SHA256
             && self.fixture_input_sha256 == FIXTURE_INPUT_SHA256
             && self.fixture_script_sha256 == FIXTURE_SCRIPT_SHA256
+            && self.failure_selector.valid()
+            && lower_hex(&self.run_id)
+            && self.run_id.len() == 32
+            && self.attempt > 0
+            && self.fixture_outcome
+                == if self.failure_selector.selects(
+                    &self.run_id,
+                    self.attempt,
+                    "capacity-one-fixture",
+                ) {
+                    FIXTURE_FAILURE_OUTCOME
+                } else {
+                    FIXTURE_SUCCESS_OUTCOME
+                }
             && self.deadline_at > 0
             && self.deadline_at <= MAX_SAFE_INTEGER
             && self.max_stdout_bytes == FIXED_MAX_STDOUT_BYTES
@@ -3736,6 +3837,20 @@ fn valid_executor_request(request: &ExecutorRequest) -> bool {
         && digest(&request.fixture_manifest_sha256)
         && digest(&request.fixture_input_sha256)
         && digest(&request.fixture_script_sha256)
+        && request.failure_selector.valid()
+        && request.run_id.len() == 32
+        && lower_hex(&request.run_id)
+        && request.attempt > 0
+        && request.fixture_outcome
+            == if request.failure_selector.selects(
+                &request.run_id,
+                request.attempt,
+                "capacity-one-fixture",
+            ) {
+                FIXTURE_FAILURE_OUTCOME
+            } else {
+                FIXTURE_SUCCESS_OUTCOME
+            }
         && request.deadline_at > 0
         && request.deadline_at <= MAX_SAFE_INTEGER
         && request.max_stdout_bytes == FIXED_MAX_STDOUT_BYTES
@@ -3805,6 +3920,7 @@ fn spawn_fixed_job(
         .env("LANG", "C")
         .env("LC_ALL", "C")
         .env("HOME", "/var/empty")
+        .env("BUZZ_CI_FIXTURE_OUTCOME", &request.fixture_outcome)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3901,6 +4017,8 @@ fn finish_running_job(
     let conclusion = forced.unwrap_or_else(|| {
         if status.success() && stderr.is_empty() {
             Conclusion::Success
+        } else if status.code().is_some() && stderr.is_empty() {
+            Conclusion::Failure
         } else {
             Conclusion::InfrastructureFailure
         }
@@ -4219,6 +4337,7 @@ mod tests {
             fixture_manifest: provenance(FIXTURE_MANIFEST_SOURCE, FIXTURE_MANIFEST_SHA256, 0o444),
             fixture_input: provenance(FIXTURE_INPUT_SOURCE, FIXTURE_INPUT_SHA256, 0o444),
             fixture_script: provenance(FIXTURE_SCRIPT_SOURCE, FIXTURE_SCRIPT_SHA256, 0o555),
+            failure_selector: failure_selector_fixture(),
             max_stdout_bytes: FIXED_MAX_STDOUT_BYTES,
             max_stderr_bytes: FIXED_MAX_STDERR_BYTES,
             max_memory_bytes: FIXED_MAX_MEMORY_BYTES,
@@ -4227,6 +4346,26 @@ mod tests {
         };
         contract.declaration_digest = static_execution_digest(&contract);
         contract
+    }
+
+    fn failure_selector_fixture() -> FixtureSelectorDocument {
+        let run_id = "7b6160c1-ef32-50ba-bda8-2bfba4c66f45";
+        let encoded = concat!(
+            "buzz-ci:capacity-one:fixture-selector:v1\n",
+            "buzz-ci-capacity-one-fixture-selector/v1\n",
+            "deterministic-failure\n",
+            "capacity-one-fixture\n",
+            "7b6160c1ef3250babda82bfba4c66f45\n",
+            "1\n",
+        );
+        FixtureSelectorDocument {
+            schema_version: FIXTURE_SELECTOR_SCHEMA.into(),
+            selector: FIXTURE_FAILURE_OUTCOME.into(),
+            job_id: "capacity-one-fixture".into(),
+            run_id: run_id.into(),
+            attempt: 1,
+            sha256: hex::encode(Sha256::digest(encoded.as_bytes())),
+        }
     }
 
     fn no_artifact_fixture() -> ArtifactDeclarationV1 {
@@ -4300,6 +4439,10 @@ mod tests {
             fixture_manifest_sha256: FIXTURE_MANIFEST_SHA256.into(),
             fixture_input_sha256: FIXTURE_INPUT_SHA256.into(),
             fixture_script_sha256: FIXTURE_SCRIPT_SHA256.into(),
+            failure_selector: failure_selector_fixture(),
+            run_id: hex::encode([12; 16]),
+            attempt: 1,
+            fixture_outcome: FIXTURE_SUCCESS_OUTCOME.into(),
             deadline_at,
             max_stdout_bytes: FIXED_MAX_STDOUT_BYTES,
             max_stderr_bytes: FIXED_MAX_STDERR_BYTES,
@@ -5103,6 +5246,10 @@ mod tests {
             fixture_manifest_sha256: FIXTURE_MANIFEST_SHA256.into(),
             fixture_input_sha256: FIXTURE_INPUT_SHA256.into(),
             fixture_script_sha256: FIXTURE_SCRIPT_SHA256.into(),
+            failure_selector: failure_selector_fixture(),
+            run_id: hex::encode([12; 16]),
+            attempt: 1,
+            fixture_outcome: FIXTURE_SUCCESS_OUTCOME.into(),
             deadline_at: 100,
             max_stdout_bytes: FIXED_MAX_STDOUT_BYTES,
             max_stderr_bytes: FIXED_MAX_STDERR_BYTES,
@@ -5383,6 +5530,109 @@ mod tests {
         assert_eq!(terminal.conclusion, Conclusion::Success);
         assert!(!attempts.join(hex::encode(attempt_id)).exists());
 
+        fn run_selector_case(
+            attempts: &Path,
+            static_execution_digest: [u8; 32],
+            attempt_id: [u8; 16],
+            binding_digest: [u8; 32],
+            run_id: &str,
+            attempt: u32,
+            outcome: &str,
+        ) -> (ExecutorResponse, bool) {
+            create_materialized_attempt(attempts, attempt_id);
+            let deadline = live_bound_now().unwrap() + 30;
+            let request = |operation: &str| {
+                let mut request =
+                    executor_request_fixture(operation, binding_digest, attempt_id, deadline);
+                request.static_execution_digest = hex::encode(static_execution_digest);
+                request.run_id = run_id.into();
+                request.attempt = attempt;
+                request.fixture_outcome = outcome.into();
+                request
+            };
+            let mut active = BTreeMap::new();
+            let mut handoff = request("executor_handoff");
+            handoff.job_intent_digest = Some(hex::encode([31; 32]));
+            executor_transition(handoff, &mut active, attempts).unwrap();
+            executor_transition(request("runtime_descriptor"), &mut active, attempts).unwrap();
+            let mut materialized = request("materialization");
+            materialized.job_intent_digest = Some(hex::encode([31; 32]));
+            executor_transition(materialized, &mut active, attempts).unwrap();
+            executor_transition(request("proxy_lease"), &mut active, attempts).unwrap();
+            let response = loop {
+                let response =
+                    executor_transition(request("terminal_evidence"), &mut active, attempts)
+                        .unwrap();
+                if response.running != Some(true) {
+                    break response;
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            let artifact_exists = attempts
+                .join(hex::encode(attempt_id))
+                .join(MATERIALIZED_ARTIFACT_ROOT)
+                .join("result.json")
+                .exists();
+            let mut teardown = request("teardown");
+            teardown.stop_reason = Some(
+                if response.conclusion.as_deref() == Some("success") {
+                    "completed"
+                } else {
+                    "recovery"
+                }
+                .into(),
+            );
+            executor_transition(teardown, &mut active, attempts).unwrap();
+            (response, artifact_exists)
+        }
+
+        let failure_id = uuid::Uuid::parse_str(&failure_selector_fixture().run_id)
+            .unwrap()
+            .simple()
+            .to_string();
+        let mut cross_run = executor_request_fixture(
+            "executor_handoff",
+            [40; 32],
+            [40; 16],
+            live_bound_now().unwrap() + 30,
+        );
+        cross_run.fixture_outcome = FIXTURE_FAILURE_OUTCOME.into();
+        assert!(!valid_executor_request(&cross_run));
+        let mut selector_tamper = cross_run;
+        selector_tamper.fixture_outcome = FIXTURE_SUCCESS_OUTCOME.into();
+        selector_tamper.failure_selector.sha256 = "00".repeat(32);
+        assert!(!valid_executor_request(&selector_tamper));
+
+        let (failed, failed_artifact) = run_selector_case(
+            &attempts,
+            static_execution_digest,
+            [41; 16],
+            [41; 32],
+            &failure_id,
+            1,
+            FIXTURE_FAILURE_OUTCOME,
+        );
+        assert_eq!(failed.conclusion.as_deref(), Some("failure"));
+        assert_eq!(failed.exit_code, Some(1));
+        assert_eq!(
+            failed.raw_stdout.as_deref(),
+            Some("fixture=buzz-ci-capacity-one-v1 outcome=deterministic-failure\n"),
+        );
+        assert!(!failed_artifact);
+
+        let (rerun, rerun_artifact) = run_selector_case(
+            &attempts,
+            static_execution_digest,
+            [42; 16],
+            [42; 32],
+            &failure_id,
+            2,
+            FIXTURE_SUCCESS_OUTCOME,
+        );
+        assert_eq!(rerun.conclusion.as_deref(), Some("success"));
+        assert_eq!(rerun.exit_code, Some(0));
+        assert!(rerun_artifact);
+
         let hostile_attempt = [9; 16];
         let hostile = create_materialized_attempt(&attempts, hostile_attempt);
         fs::set_permissions(
@@ -5655,7 +5905,7 @@ mod tests {
                      if cat \"$BUZZ_EXECD_DAC_TEST_ROOT/var/lib/buzzci/execd-v2/intents/private.json\" >/dev/null 2>&1; then exit 34; fi\n\
                      test \"$(cat \"$BUZZ_EXECD_DAC_TEST_ROOT/var/lib/buzzci/seccomp/v1/sha256/profile.json\")\" = \"pinned profile\"\n\
                      cd \"$BUZZ_EXECD_DAC_TEST_ROOT/var/lib/buzzci/execd-v2/attempts/4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d\"\n\
-                     exec source/deploy/native-ci/acceptance/fixtures/run-fixture.sh artifacts",
+                     BUZZ_CI_FIXTURE_OUTCOME=success exec source/deploy/native-ci/acceptance/fixtures/run-fixture.sh artifacts",
                 )
                 .env(TEST_ROOT, temporary.path())
                 .uid(uid)
@@ -5735,7 +5985,7 @@ mod tests {
         );
         assert_eq!(
             hex::encode(static_execution_digest(&execution)),
-            "a699a308fae53c2109af532c06ed6a345e1ad76323c0817a1ef8e8d015b0be55"
+            "8503abd897bbab6a86c42ea966de80c57752592d7f4d84ae84a68306a7df5452"
         );
     }
 
@@ -6018,6 +6268,7 @@ mod tests {
                 fixture_manifest_sha256: FIXTURE_MANIFEST_SHA256.into(),
                 fixture_input_sha256: FIXTURE_INPUT_SHA256.into(),
                 fixture_script_sha256: FIXTURE_SCRIPT_SHA256.into(),
+                failure_selector: failure_selector_fixture(),
                 max_stdout_bytes: FIXED_MAX_STDOUT_BYTES,
                 max_stderr_bytes: FIXED_MAX_STDERR_BYTES,
                 max_memory_bytes: FIXED_MAX_MEMORY_BYTES,
@@ -6189,6 +6440,7 @@ sys.stdout.buffer.write(rendered)
                     "controller_generation": expected.qualification.controller_generation,
                     "runner_generation": expected.qualification.runner_generation,
                     "manifest_digest": FIXTURE_MANIFEST_SHA256,
+                    "failure_selector": expected.execution.failure_selector,
                 },
             },
             "capacity": expected.capacity,
@@ -6278,7 +6530,7 @@ sys.stdout.buffer.write(rendered)
     /// the installed `/etc/buzzci/execd-v2.json` (without its trailing LF)
     /// and the production qualification request the activation controller
     /// persisted. execd answered `policy_denied` to this request.
-    const RECORDED_EXECD_CONFIG: &str = r#"{"acceptance_time_reference":1788322400,"capacity":0,"enabled_protocol":2,"execution":{"artifact":{"artifact_id":"result","max_bytes":32768,"media_type":"application/json","name":"result.json","relative_name":"result.json"},"declaration_digest":"880ecdbe623808f5356c008b6d35e9e0a016b9ecdc6cac1e1d0e3fc5f27837a3","fixture_input_sha256":"967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6","fixture_manifest_sha256":"f204b8fba64e972408f5a0ea1c0bb3140cfa696289903d96a8cb07d602af6b23","fixture_script_sha256":"d081e43ebfde3ee67c3cd8d852d58410a79ad799bbfa2cf98d5e2ef7b8bed3b1","job_id":"capacity-one-fixture","max_memory_bytes":134217728,"max_processes":16,"max_stderr_bytes":32768,"max_stdout_bytes":32768,"max_wall_seconds":120,"schema_version":1,"workflow_digest":"8080808080808080808080808080808080808080808080808080808080808080","workflow_id":"capacity-one"},"executor":{"gid":0,"mode":493,"path":"/usr/libexec/buzz-ci-executor","sha256":"ac9ef9987b627eded1d40e30726ec02b24fa6591b394513007218ef91a22ba7b","source_commit":"cbca8b1371206688fde40d6f370ee65b97bb145a","uid":0},"identities":{"access_group":"buzzci-execd","access_group_gid":1204,"access_group_members":["buzzci-ctl","buzzci-runner"],"control_gid":961,"control_group":"buzzci-ctl","control_home":"/var/lib/buzzci/principals/ctl","control_shell":"/usr/sbin/nologin","control_supplementary_groups":["buzzci-execd"],"control_uid":961,"control_user":"buzzci-ctl","execd_gid":0,"execd_uid":0,"job_gid":1205,"job_uid":1205,"runner_gid":1200,"runner_uid":1200},"lane_manifest":{"admission_key_generation":9,"admission_verifying_key":"2020202020202020202020202020202020202020202020202020202020202020","broker_build_identity":"3030303030303030303030303030303030303030303030303030303030303030","expires_at":4102444800,"host_profile_digest":"4040404040404040404040404040404040404040404040404040404040404040","isolation_profile_digest":"6060606060606060606060606060606060606060606060606060606060606060","lane_epoch":4,"lane_id":"1010101010101010101010101010101010101010101010101010101010101010","max_wall_timeout_seconds":300,"not_before":1,"schema_version":1,"suite_identity":"5050505050505050505050505050505050505050505050505050505050505050"},"lane_manifest_digest":"12ede37672233a144707bc49efa5d8f86ec5803e6b9d623347472702b2c98f04","paths":{"attempt_root":"/var/lib/buzzci/execd-v2/attempts","binding_root":"/var/lib/buzzci/execd-v2/bindings","evidence_root":"/var/lib/buzzci/execd-v2/evidence","executor_socket":"/run/buzzci/executor.sock","intent_root":"/var/lib/buzzci/execd-v2/intents","qualification_root":"/var/lib/buzzci/execd-v2/qualification","teardown_root":"/var/lib/buzzci/execd-v2/teardown"},"qualification":{"activation_package_digest":"1c390e3a93e17d5b7d874b4a3f749cfbf5b5273448e62c72bce8d33a3bb91a0d","controller_generation":1,"fixture_digest":"10a308a084aef26b2c15f35464aee2bead575ed46f38713af9683d07d75f9667","integrated_candidate_sha":"cbca8b1371206688fde40d6f370ee65b97bb145a","runner_generation":1},"schema_version":2}"#;
+    const RECORDED_EXECD_CONFIG: &str = r#"{"acceptance_time_reference":1788322400,"capacity":0,"enabled_protocol":2,"execution":{"artifact":{"artifact_id":"result","max_bytes":32768,"media_type":"application/json","name":"result.json","relative_name":"result.json"},"declaration_digest":"880ecdbe623808f5356c008b6d35e9e0a016b9ecdc6cac1e1d0e3fc5f27837a3","failure_selector":{"attempt":1,"job_id":"capacity-one-fixture","run_id":"7b6160c1-ef32-50ba-bda8-2bfba4c66f45","schema_version":"buzz-ci-capacity-one-fixture-selector/v1","selector":"deterministic-failure","sha256":"4846f557f80188d722ac546532b874d987e8b118e1fb5db73136a21088e7dca2"},"fixture_input_sha256":"967723f42ed249ff3c4b81884d8fc3b9601a426dead66a5925bb9c7d4cb136f6","fixture_manifest_sha256":"f204b8fba64e972408f5a0ea1c0bb3140cfa696289903d96a8cb07d602af6b23","fixture_script_sha256":"d081e43ebfde3ee67c3cd8d852d58410a79ad799bbfa2cf98d5e2ef7b8bed3b1","job_id":"capacity-one-fixture","max_memory_bytes":134217728,"max_processes":16,"max_stderr_bytes":32768,"max_stdout_bytes":32768,"max_wall_seconds":120,"schema_version":1,"workflow_digest":"8080808080808080808080808080808080808080808080808080808080808080","workflow_id":"capacity-one"},"executor":{"gid":0,"mode":493,"path":"/usr/libexec/buzz-ci-executor","sha256":"ac9ef9987b627eded1d40e30726ec02b24fa6591b394513007218ef91a22ba7b","source_commit":"cbca8b1371206688fde40d6f370ee65b97bb145a","uid":0},"identities":{"access_group":"buzzci-execd","access_group_gid":1204,"access_group_members":["buzzci-ctl","buzzci-runner"],"control_gid":961,"control_group":"buzzci-ctl","control_home":"/var/lib/buzzci/principals/ctl","control_shell":"/usr/sbin/nologin","control_supplementary_groups":["buzzci-execd"],"control_uid":961,"control_user":"buzzci-ctl","execd_gid":0,"execd_uid":0,"job_gid":1205,"job_uid":1205,"runner_gid":1200,"runner_uid":1200},"lane_manifest":{"admission_key_generation":9,"admission_verifying_key":"2020202020202020202020202020202020202020202020202020202020202020","broker_build_identity":"3030303030303030303030303030303030303030303030303030303030303030","expires_at":4102444800,"host_profile_digest":"4040404040404040404040404040404040404040404040404040404040404040","isolation_profile_digest":"6060606060606060606060606060606060606060606060606060606060606060","lane_epoch":4,"lane_id":"1010101010101010101010101010101010101010101010101010101010101010","max_wall_timeout_seconds":300,"not_before":1,"schema_version":1,"suite_identity":"5050505050505050505050505050505050505050505050505050505050505050"},"lane_manifest_digest":"12ede37672233a144707bc49efa5d8f86ec5803e6b9d623347472702b2c98f04","paths":{"attempt_root":"/var/lib/buzzci/execd-v2/attempts","binding_root":"/var/lib/buzzci/execd-v2/bindings","evidence_root":"/var/lib/buzzci/execd-v2/evidence","executor_socket":"/run/buzzci/executor.sock","intent_root":"/var/lib/buzzci/execd-v2/intents","qualification_root":"/var/lib/buzzci/execd-v2/qualification","teardown_root":"/var/lib/buzzci/execd-v2/teardown"},"qualification":{"activation_package_digest":"1c390e3a93e17d5b7d874b4a3f749cfbf5b5273448e62c72bce8d33a3bb91a0d","controller_generation":1,"fixture_digest":"10a308a084aef26b2c15f35464aee2bead575ed46f38713af9683d07d75f9667","integrated_candidate_sha":"cbca8b1371206688fde40d6f370ee65b97bb145a","runner_generation":1},"schema_version":2}"#;
     const RECORDED_QUALIFICATION_REQUEST: &str = r#"{"schema_version":"buzz-ci-production-qualification-request/v2","request_id":"113099804cb3fde2a6681257809ae38e","integrated_candidate_sha":"cbca8b1371206688fde40d6f370ee65b97bb145a","activation_package_digest":"1c390e3a93e17d5b7d874b4a3f749cfbf5b5273448e62c72bce8d33a3bb91a0d","fixture_digest":"10a308a084aef26b2c15f35464aee2bead575ed46f38713af9683d07d75f9667","principal_digest":"ee22ba0c8e462a5cba4cf2fc6fde6f1a65c663199a9021b01f9108ad56aa5a2e","lane_manifest_digest":"12ede37672233a144707bc49efa5d8f86ec5803e6b9d623347472702b2c98f04","broker_build_identity_digest":"3030303030303030303030303030303030303030303030303030303030303030","host_profile_digest":"4040404040404040404040404040404040404040404040404040404040404040","suite_digest":"5050505050505050505050505050505050505050505050505050505050505050","isolation_profile_digest":"6060606060606060606060606060606060606060606060606060606060606060","seccomp_profile_digest":"2598b3b98e6970f37f917e210202fa8976aefcd99abf8955803a6e35bba17eb4","executor_program_digest":"ac9ef9987b627eded1d40e30726ec02b24fa6591b394513007218ef91a22ba7b","executor_provenance_digest":"112e3fda1d0f1c4409fd8bacd198d9a96d41db885ac544d9f1353a7c2753f0c0","nonce":"fe13709b692cd3a459ad05baee42fefed49384c4437e213a1d2913e7712b0927","controller_generation":1,"runner_generation":1,"lane_epoch":4,"admission_key_generation":9,"issued_at":1788322456,"expires_at":1788322516}"#;
 
     fn recorded_qualification_request(value: &serde_json::Value) -> ProductionQualificationRequest {

@@ -40,7 +40,7 @@ pub struct AcceptanceActorBinding {
     pub generation: u64,
 }
 
-/// Exact four-template authority for one activation scenario.
+/// Exact five-template authority for one activation scenario.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptanceAuthorityBinding {
@@ -50,6 +50,10 @@ pub struct AcceptanceAuthorityBinding {
     pub grant_event: serde_json::Value,
     pub rerun_event: serde_json::Value,
     pub tombstone_event: serde_json::Value,
+    pub failure_run_event: serde_json::Value,
+    pub export_subject: String,
+    pub export_generation: u64,
+    pub export_authorization_digest: String,
 }
 
 /// Root-authored binding created only after package and scenario freeze.
@@ -76,7 +80,7 @@ pub struct ValidatedAcceptanceBinding {
     actor_public_key: [u8; 32],
     actor_generation: u64,
     scenario_sha256: [u8; 32],
-    event_ids: [[u8; 32]; 4],
+    event_ids: [[u8; 32]; 5],
     granted_ci_signer: [u8; 32],
 }
 
@@ -96,8 +100,8 @@ impl ValidatedAcceptanceBinding {
         self.scenario_sha256
     }
 
-    /// Return event IDs in Run, Grant, Rerun, Tombstone order.
-    pub const fn event_ids(&self) -> [[u8; 32]; 4] {
+    /// Return event IDs in Run, Grant, Rerun, Tombstone, FailureRun order.
+    pub const fn event_ids(&self) -> [[u8; 32]; 5] {
         self.event_ids
     }
 
@@ -135,7 +139,7 @@ impl AcceptanceBindingReceipt {
     }
 
     /// Validate the package, fixture, peer, actor, generation, scenario, and
-    /// exact Run/Grant/Rerun/Tombstone event bindings.
+    /// exact success-run/grant/failed-run/rerun/tombstone event bindings.
     pub fn validate(&self) -> Result<ValidatedAcceptanceBinding, AcceptanceBindingError> {
         if self.schema_version != ACCEPTANCE_BINDING_SCHEMA
             || self.activation_id != self.fixture.activation_id
@@ -167,10 +171,19 @@ impl AcceptanceBindingReceipt {
 
         let event_bytes = self.event_bytes()?;
         let event_refs = event_bytes.each_ref().map(Vec::as_slice);
-        let templates = validate_acceptance_event_templates(actor_public_key, event_refs)?;
+        let templates = validate_event_templates(actor_public_key, event_refs)?;
         if self.fixture.request_digest != hex::encode(templates.event_ids[0])
+            || self.fixture.failure_request_digest != hex::encode(templates.event_ids[4])
             || self.fixture.grant_event_id != hex::encode(templates.event_ids[1])
             || self.fixture.approved_by != self.acceptance.actor.public_key
+            || self.fixture.failure_run_id != hex::encode(templates.failure_run_id)
+            || Sha256::digest(self.fixture.failure_selector.job_id.as_bytes())
+                != templates.failure_job_digest
+            || self.fixture.failure_selector.attempt != templates.failure_attempt
+            || self.fixture.export_subject != self.acceptance.export_subject
+            || self.fixture.export_generation != self.acceptance.export_generation
+            || self.fixture.export_authorization_digest
+                != self.acceptance.export_authorization_digest
         {
             return Err(AcceptanceBindingError::Invalid);
         }
@@ -184,12 +197,13 @@ impl AcceptanceBindingReceipt {
         })
     }
 
-    fn event_bytes(&self) -> Result<[Vec<u8>; 4], AcceptanceBindingError> {
+    fn event_bytes(&self) -> Result<[Vec<u8>; 5], AcceptanceBindingError> {
         [
             &self.acceptance.run_event,
             &self.acceptance.grant_event,
             &self.acceptance.rerun_event,
             &self.acceptance.tombstone_event,
+            &self.acceptance.failure_run_event,
         ]
         .map(|event| serde_json::to_vec(event).map_err(|_| AcceptanceBindingError::Invalid))
         .into_iter()
@@ -270,14 +284,17 @@ impl AcceptanceBindingReceipt {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ValidatedEventTemplates {
-    event_ids: [[u8; 32]; 4],
+    event_ids: [[u8; 32]; 5],
     granted_ci_signer: [u8; 32],
+    failure_run_id: [u8; 16],
+    failure_job_digest: [u8; 32],
+    failure_attempt: u32,
 }
 
-/// Validate the exact Run/Grant/Rerun/Tombstone event template set.
+/// Validate the exact Run/Grant/Rerun/Tombstone/FailureRun event set.
 pub fn validate_acceptance_event_templates(
     actor: [u8; 32],
-    templates: [&[u8]; 4],
+    templates: [&[u8]; 5],
 ) -> Result<ValidatedAcceptanceEvents, AcceptanceBindingError> {
     if actor == [0; 32]
         || templates
@@ -293,16 +310,16 @@ pub fn validate_acceptance_event_templates(
     })
 }
 
-/// Validated IDs and grant signer derived from four event templates.
+/// Validated IDs and grant signer derived from five event templates.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ValidatedAcceptanceEvents {
-    event_ids: [[u8; 32]; 4],
+    event_ids: [[u8; 32]; 5],
     granted_ci_signer: [u8; 32],
 }
 
 impl ValidatedAcceptanceEvents {
-    /// Return event IDs in Run, Grant, Rerun, Tombstone order.
-    pub const fn event_ids(&self) -> [[u8; 32]; 4] {
+    /// Return event IDs in Run, Grant, Rerun, Tombstone, FailureRun order.
+    pub const fn event_ids(&self) -> [[u8; 32]; 5] {
         self.event_ids
     }
 
@@ -314,7 +331,7 @@ impl ValidatedAcceptanceEvents {
 
 fn validate_event_templates(
     actor: [u8; 32],
-    templates: [&[u8]; 4],
+    templates: [&[u8]; 5],
 ) -> Result<ValidatedEventTemplates, AcceptanceBindingError> {
     let values = templates
         .into_iter()
@@ -323,11 +340,13 @@ fn validate_event_templates(
             KIND_CI_GRANT,
             KIND_CI_REQUEST,
             KIND_DELETION,
+            KIND_CI_REQUEST,
         ])
         .map(|(template, kind)| validate_event(template, actor, kind))
         .collect::<Result<Vec<_>, _>>()?;
     let run = request_from_template(&values[0], CiRequestType::Run)?;
     let rerun = request_from_template(&values[2], CiRequestType::Rerun)?;
+    let failure_run = request_from_template(&values[4], CiRequestType::Run)?;
     let run_tags = values[0][4]
         .as_array()
         .ok_or(AcceptanceBindingError::Invalid)?;
@@ -340,21 +359,20 @@ fn validate_event_templates(
         channel,
         &rerun,
     )?;
-    if run.target_repo_a != rerun.target_repo_a
-        || run.pr_root_event_id != rerun.pr_root_event_id
-        || run.pr_update_event_id != rerun.pr_update_event_id
-        || run.source_clone_url != rerun.source_clone_url
-        || run.immutable_source_ref != rerun.immutable_source_ref
-        || run.tip_oid != rerun.tip_oid
-        || run.source_branch != rerun.source_branch
-        || run.base_ref != rerun.base_ref
-        || run.base_oid != rerun.base_oid
-        || run.workflow_id != rerun.workflow_id
-        || run.workflow_digest != rerun.workflow_digest
-        || run.run_id != rerun.run_id
-        || run.actor != rerun.actor
+    validate_request_template(
+        values[4][4]
+            .as_array()
+            .ok_or(AcceptanceBindingError::Invalid)?,
+        channel,
+        &failure_run,
+    )?;
+    if !same_workload(&run, &failure_run)
+        || !same_workload(&failure_run, &rerun)
+        || run.run_id == failure_run.run_id
+        || failure_run.run_id != rerun.run_id
         || run.actor != hex::encode(actor)
-        || rerun.parent_run_id.as_deref() != Some(run.run_id.as_str())
+        || failure_run.actor != run.actor
+        || rerun.parent_run_id.as_deref() != Some(failure_run.run_id.as_str())
         || rerun.parent_attempt != Some(1)
         || rerun.attempt != 2
         || rerun.job_ids.len() != 1
@@ -362,15 +380,36 @@ fn validate_event_templates(
         return Err(AcceptanceBindingError::Invalid);
     }
     let granted_ci_signer = validate_grant_template(&values[1], channel, &run.target_repo_a)?;
-    let event_ids: [[u8; 32]; 4] = templates.map(|template| Sha256::digest(template).into());
+    let event_ids: [[u8; 32]; 5] = templates.map(|template| Sha256::digest(template).into());
     validate_tombstone_template(&values[3], event_ids[2])?;
-    if event_ids.contains(&[0; 32]) || event_ids.iter().collect::<HashSet<_>>().len() != 4 {
+    if event_ids.contains(&[0; 32]) || event_ids.iter().collect::<HashSet<_>>().len() != 5 {
         return Err(AcceptanceBindingError::Invalid);
     }
+    let failure_run_id = *Uuid::parse_str(&failure_run.run_id)
+        .map_err(|_| AcceptanceBindingError::Invalid)?
+        .as_bytes();
     Ok(ValidatedEventTemplates {
         event_ids,
         granted_ci_signer,
+        failure_run_id,
+        failure_job_digest: Sha256::digest(failure_run.job_ids[0].as_bytes()).into(),
+        failure_attempt: failure_run.attempt,
     })
+}
+
+fn same_workload(left: &CiRequestEnvelope, right: &CiRequestEnvelope) -> bool {
+    left.target_repo_a == right.target_repo_a
+        && left.pr_root_event_id == right.pr_root_event_id
+        && left.pr_update_event_id == right.pr_update_event_id
+        && left.source_clone_url == right.source_clone_url
+        && left.immutable_source_ref == right.immutable_source_ref
+        && left.tip_oid == right.tip_oid
+        && left.source_branch == right.source_branch
+        && left.base_ref == right.base_ref
+        && left.base_oid == right.base_oid
+        && left.workflow_id == right.workflow_id
+        && left.workflow_digest == right.workflow_digest
+        && left.job_ids == right.job_ids
 }
 
 fn validate_event(
@@ -651,7 +690,7 @@ mod tests {
     };
 
     #[test]
-    fn canonical_receipt_derives_all_four_ids() {
+    fn canonical_receipt_derives_all_five_ids() {
         let receipt = canonical_acceptance_binding();
         let bytes = serde_json::to_vec(&receipt).expect("receipt bytes");
         let parsed = AcceptanceBindingReceipt::from_canonical_bytes(&bytes).expect("receipt");
@@ -665,6 +704,10 @@ mod tests {
         assert_eq!(
             hex::encode(validated.event_ids()[1]),
             receipt.fixture.grant_event_id
+        );
+        assert_eq!(
+            hex::encode(validated.event_ids()[4]),
+            receipt.fixture.failure_request_digest
         );
         for mutation in acceptance_binding_mutation_corpus() {
             assert_eq!(

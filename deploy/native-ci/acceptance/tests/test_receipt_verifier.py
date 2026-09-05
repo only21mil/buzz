@@ -58,14 +58,14 @@ def _h(character: str, length: int) -> str:
     return character * length
 
 
-def _attempt(fixture, attempt_id, number, state, conclusion, parent=None, evidence=False):
+def _attempt(fixture, attempt_id, number, state, conclusion, parent=None, evidence=False, failure=False):
     value = {
         "attempt_id": attempt_id,
         "attempt": number,
         "state": state,
         "conclusion": conclusion,
         "integrated_candidate_sha": fixture["integrated_candidate_sha"],
-        "request_digest": fixture["request_digest"],
+        "request_digest": fixture["failure_request_digest"] if failure else fixture["request_digest"],
         "manifest_digest": fixture["manifest_digest"],
         "source_oid": fixture["source_oid"],
         "artifacts": [],
@@ -74,8 +74,8 @@ def _attempt(fixture, attempt_id, number, state, conclusion, parent=None, eviden
         value["parent_attempt_id"] = parent
     if evidence:
         value["evidence_set_digest"] = _h("9", 64)
-        value["log"] = copy.deepcopy(fixture["expected_log"])
-        value["artifacts"] = copy.deepcopy(fixture["expected_artifacts"])
+        value["log"] = copy.deepcopy(fixture["expected_failure_log"] if failure else fixture["expected_log"])
+        value["artifacts"] = [] if failure else copy.deepcopy(fixture["expected_artifacts"])
     return value
 
 
@@ -89,11 +89,11 @@ def _approval(fixture, resumed):
     }
 
 
-def _run(fixture, state, conclusion, attempts, approval=None, selected=None):
+def _run(fixture, state, conclusion, attempts, approval=None, selected=None, failure=False):
     value = {
-        "run_id": fixture["run_id"],
+        "run_id": fixture["failure_run_id"] if failure else fixture["run_id"],
         "integrated_candidate_sha": fixture["integrated_candidate_sha"],
-        "request_digest": fixture["request_digest"],
+        "request_digest": fixture["failure_request_digest"] if failure else fixture["request_digest"],
         "manifest_digest": fixture["manifest_digest"],
         "source_oid": fixture["source_oid"],
         "state": state,
@@ -130,29 +130,38 @@ def valid_receipt():
     second_id = _h("b", 32)
     first_running = _attempt(fixture, first_id, 1, "running", "none")
     first_terminal = _attempt(fixture, first_id, 1, "terminal", "success", evidence=True)
-    second_running = _attempt(fixture, second_id, 2, "running", "none", first_id)
-    second_cancelled = _attempt(fixture, second_id, 2, "terminal", "cancelled", first_id)
-    second_tombstoned = _attempt(fixture, second_id, 2, "tombstoned", "cancelled", first_id)
+    failed_id = _h("c", 32)
+    failed_running = _attempt(fixture, failed_id, 1, "running", "none", failure=True)
+    failed_terminal = _attempt(fixture, failed_id, 1, "terminal", "failure", evidence=True, failure=True)
+    second_running = _attempt(fixture, second_id, 2, "running", "none", failed_id, failure=True)
+    second_cancelled = _attempt(fixture, second_id, 2, "terminal", "cancelled", failed_id, failure=True)
+    second_tombstoned = _attempt(fixture, second_id, 2, "tombstoned", "cancelled", failed_id, failure=True)
     granted = _approval(fixture, False)
     resumed = _approval(fixture, True)
     run3 = _run(fixture, "awaiting_approval", "none", [])
     run4 = _run(fixture, "granted_awaiting_resume", "none", [], granted)
     run5 = _run(fixture, "running", "none", [first_running], resumed)
     run6 = _run(fixture, "terminal", "success", [first_terminal], resumed, first_id)
-    run8 = _run(fixture, "running", "none", [first_terminal, second_running], resumed)
-    run9 = _run(fixture, "terminal", "cancelled", [first_terminal, second_cancelled], resumed, second_id)
-    folded = _run(fixture, "terminal", "success", [first_terminal, second_tombstoned], resumed, first_id)
+    run8 = _run(fixture, "granted_awaiting_resume", "none", [], granted, failure=True)
+    run9 = _run(fixture, "running", "none", [failed_running], resumed, failure=True)
+    run10 = _run(fixture, "terminal", "failure", [failed_terminal], resumed, failed_id, failure=True)
+    run11 = _run(fixture, "running", "none", [failed_terminal, second_running], resumed, failure=True)
+    run12 = _run(fixture, "terminal", "cancelled", [failed_terminal, second_cancelled], resumed, second_id, failure=True)
+    folded = _run(fixture, "terminal", "failure", [failed_terminal, second_tombstoned], resumed, failed_id, failure=True)
     snapshots = [
         _snapshot(0, 1, 1), _snapshot(1, 1, 1), _snapshot(1, 1, 1, run3),
         _snapshot(1, 1, 1, run4), _snapshot(1, 1, 1, run5, 1),
         _snapshot(1, 1, 1, run6), _snapshot(1, 1, 1, run6),
-        _snapshot(1, 1, 1, run8, 1), _snapshot(1, 1, 1, run9),
-        _snapshot(1, 1, 1, folded), _snapshot(1, 2, 1, folded),
-        _snapshot(1, 2, 2, folded), _snapshot(0, 2, 2, folded),
+        _snapshot(1, 1, 1, run8), _snapshot(1, 1, 1, run9, 1),
+        _snapshot(1, 1, 1, run10), _snapshot(1, 1, 1, run11, 1),
+        _snapshot(1, 1, 1, run12), _snapshot(1, 1, 1, folded),
+        _snapshot(1, 2, 1, folded), _snapshot(1, 2, 2, folded),
+        _snapshot(0, 2, 2, folded),
     ]
     export = {
         "authenticated": True,
         "subject": fixture["export_subject"],
+        "generation": fixture["export_generation"],
         "authorization_digest": fixture["export_authorization_digest"],
         "attempt_id": first_id,
         "request_digest": fixture["request_digest"],
@@ -196,7 +205,7 @@ def valid_receipt():
         "controld_acceptance_socket_present": False,
     }
     phases = []
-    for sequence, operation in [(14, "finalize_capacity_zero"), (15, "prove_capacity_zero")]:
+    for sequence, operation in [(17, "finalize_capacity_zero"), (18, "prove_capacity_zero")]:
         request = {
             "sequence": sequence,
             "operation": operation,
@@ -213,7 +222,7 @@ def valid_receipt():
         request["operation_id"] = VERIFIER._zero_operation_id(request, fixture["run_id"])
         response = {
             "operation_id": request["operation_id"],
-            "controller_receipt_sha256": _h("c" if sequence == 14 else "d", 64),
+            "controller_receipt_sha256": _h("c" if sequence == 17 else "d", 64),
             "proof": copy.deepcopy(proof),
         }
         phases.append({
@@ -249,6 +258,34 @@ class ReceiptVerifierTests(unittest.TestCase):
         scenario, stages, receipt = valid_receipt()
         VERIFIER.verify(receipt, scenario, stages)
 
+    def test_success_and_failure_lineages_cannot_collapse(self):
+        scenario, _stages, _receipt = valid_receipt()
+        for failure_name, success_name in (
+            ("failure_run_id", "run_id"),
+            ("failure_request_digest", "request_digest"),
+        ):
+            collapsed = copy.deepcopy(scenario)
+            collapsed["fixture"][failure_name] = collapsed["fixture"][success_name]
+            with self.subTest(field=failure_name), self.assertRaises(VERIFIER.ReceiptError):
+                VERIFIER._ordered_scenario(collapsed)
+
+    def test_fixed_export_plan_rejects_extra_artifacts(self):
+        scenario, stages, receipt = valid_receipt()
+        extra = {"name": "extra.json", "sha256": _h("e", 64), "bytes": 1}
+        changed_scenario = copy.deepcopy(scenario)
+        changed_scenario["fixture"]["expected_artifacts"].append(extra)
+        with self.assertRaises(VERIFIER.ReceiptError):
+            VERIFIER._ordered_scenario(changed_scenario)
+        changed_receipt = copy.deepcopy(receipt)
+        changed_receipt["checks"][6]["export"]["objects"].append(extra)
+        with self.assertRaises(VERIFIER.ReceiptError):
+            VERIFIER.verify(changed_receipt, scenario, stages)
+        for job_id in (".bad", "1bad", "bad.name"):
+            changed_scenario = copy.deepcopy(scenario)
+            changed_scenario["fixture"]["job_id"] = job_id
+            with self.subTest(job_id=job_id), self.assertRaises(VERIFIER.ReceiptError):
+                VERIFIER._ordered_scenario(changed_scenario)
+
     def test_partial_hash_only_wrong_binding_and_zero_faults_fail_closed(self):
         scenario, stages, receipt = valid_receipt()
         mutations = []
@@ -259,6 +296,7 @@ class ReceiptVerifierTests(unittest.TestCase):
         value = copy.deepcopy(receipt); value["checks"][5]["snapshot"]["run"]["attempts"][0]["manifest_digest"] = _h("e", 64); mutations.append(value)
         value = copy.deepcopy(receipt); value["checks"][4]["evidence_sha256"] = _h("e", 64); mutations.append(value)
         value = copy.deepcopy(receipt); value["checks"][6]["export"]["authenticated"] = False; mutations.append(value)
+        value = copy.deepcopy(receipt); value["checks"][6]["export"]["generation"] += 1; mutations.append(value)
         value = copy.deepcopy(receipt); value["zero_transition"]["phases"][0]["request"]["activation_package_digest"] = _h("e", 64); mutations.append(value)
         value = copy.deepcopy(receipt); value["zero_transition"]["phases"].reverse(); mutations.append(value)
         value = copy.deepcopy(receipt); value["zero_transition"]["phases"][0]["request_sha256"] = _h("e", 64); mutations.append(value)
@@ -394,8 +432,8 @@ class ReceiptVerifierTests(unittest.TestCase):
             VERIFIER.EXPECTED_STAGES_CANONICAL_SHA256,
         )
         self.assertEqual(schema["properties"]["schema_version"]["const"], VERIFIER.RECEIPT_VERSION)
-        self.assertEqual(schema["properties"]["checks"]["maxItems"], 13)
-        self.assertEqual(len(schema["properties"]["checks"]["prefixItems"]), 13)
+        self.assertEqual(schema["properties"]["checks"]["maxItems"], 16)
+        self.assertEqual(len(schema["properties"]["checks"]["prefixItems"]), 16)
         references = []
 
         def collect(value):

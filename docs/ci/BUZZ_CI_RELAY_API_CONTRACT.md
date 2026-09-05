@@ -71,7 +71,7 @@ Response:
 }
 ```
 
-`request_event` is the complete canonical signed kind-46100 event. The relay maintains a unique transactional index `run_id -> request_event_id`. A conflicting second accepted request for one `run_id` is rejected; byte-identical redelivery returns the existing mapping. The CLI verifies event ID/signature, kind, actor binding, exact tags, channel membership scope, and content `run_id` before using the response. Subsequent event reads use exact `e=request_event_id` and `h=channel_id` filters.
+`request_event` is the complete canonical signed initial kind-46100 event. The relay maintains a unique transactional index `run_id -> initial_request_event_id`; a conflicting second attempt-one request for the same `run_id` is rejected, and byte-identical redelivery returns the existing mapping. Accepted reruns keep the same `run_id` but have distinct request event IDs and attempts. They do not replace the initial mapping. `GET /ci/runs/{run_id}/request` therefore always returns the initial request, while `GET /ci/runs/{run_id}/events` returns the initial request, every accepted rerun request, and the linked run history in acceptance order. The CLI verifies event ID/signature, kind, actor binding, exact tags, channel membership scope, and content `run_id` before using the response.
 
 ## 4. Context-aware event acceptance
 
@@ -82,6 +82,8 @@ Kind 46100 requires `event.pubkey == actor`. Kinds 46101–46106 require `event.
 - `queued|running` -> `job_not_terminal`
 - terminal non-failure -> `job_not_failed`
 - `failure` -> eligible
+
+Eligibility follows the selected job stream, not the run stream. A terminal kind-46101 `failure` for the prior attempt does not close the `run_id`; an eligible kind-46100 rerun starts a new run-status and job-status attempt. Once either kind 46105 or kind 46106 has been accepted, the selected graph has terminal provenance and no later rerun request may be accepted for that `run_id`. The relay enforces these decisions transactionally. Client-side checks are advisory and cannot authorize a stale or racing request.
 
 Status acceptance enforces signed-manifest equality for required/skip/matrix/fan-out policy; strictly increasing stream sequence without gaps; no equivocation; legal transitions; and `finished_at >= started_at`.
 
@@ -133,9 +135,9 @@ Kind 46106 content:
 }
 ```
 
-`leases` is a non-empty set encoded in strict ascending `(job_id,attempt,lease_id)` order. Job IDs use the static job grammar, attempts are one-based, every `{job_id,attempt}` occurs once, and every non-empty `lease_id` occurs once. The top-level `attempt` equals the maximum selected job attempt. The reducer derives the complete selected `{job_id,attempt}` graph from the accepted request and gap-free status lineage and requires exact set equality and cardinality: no missing, extra, duplicated, or stale lease can satisfy green.
+`leases` is a non-empty set encoded in strict ascending `(job_id,attempt,lease_id)` order. Job IDs use the static job grammar, attempts are one-based, every `{job_id,attempt}` occurs once, and every non-empty `lease_id` occurs once. The top-level `attempt` equals the maximum selected job attempt. The reducer derives the complete selected `{job_id,attempt}` graph from the initial request, every accepted rerun, and their gap-free status lineage. It requires exact set equality and cardinality: no missing, extra, duplicated, or stale lease can satisfy green.
 
-The context-aware validator resolves `request_event_id` to the accepted kind-46100 request and requires exact equality of `run_id`, repository `a`, `tip_oid`, `base_oid`, `workflow_id`, and `workflow_digest`; `tip_oid` and `base_oid` must use the same supported OID width. The attestation is emitted only after the isolation substrate proves every listed per-job lease has no surviving workspace, process, mount, namespace, network rule, secret material, or writable state across its dedicated materializer, executor, and runtime principals. `lease_empty=false` is invalid and cannot satisfy teardown.
+The context-aware validator requires `request_event_id` to identify the final accepted kind-46100 request in the selected lineage and requires exact equality of `run_id`, repository `a`, `tip_oid`, `base_oid`, `workflow_id`, and `workflow_digest`; `tip_oid` and `base_oid` must use the same supported OID width. Both kind 46105 and kind 46106 use that final request provenance, including an initial request when no rerun exists. The attestation is emitted only after the isolation substrate proves every listed per-job lease has no surviving workspace, process, mount, namespace, network rule, secret material, or writable state across its dedicated materializer, executor, and runtime principals. `lease_empty=false` is invalid and cannot satisfy teardown.
 
 A terminal run `success` event alone is never green. The reducer independently verifies one authorized evidence-finalized event and one authorized exact-selected-graph lease-empty teardown event, both stored before the terminal success event. Missing, malformed, unauthorized, conflicting, or out-of-order facts produce `pending` while facts may still arrive, or `infrastructure_failure` once the run is terminal/fact deadline expires; they never produce green.
 
@@ -151,7 +153,7 @@ terminal failure. Promotion evidence proves the same ordering with durable
 
 ## 7. Watch ordering and replay
 
-Per-envelope `sequence` remains stream-local and is never presented as a global order. On accepted CI event insertion, the relay transactionally assigns a durable, strictly increasing `watch_cursor` within the run's unique request index. The cursor orders storage acceptance, not event `created_at`.
+Per-envelope `sequence` remains stream-local and is never presented as a global order. On accepted CI event insertion, the relay transactionally assigns a durable, strictly increasing `watch_cursor` within the run's unique request index. The cursor orders storage acceptance, not event `created_at`. Events created in the same second, or carrying timestamps that do not reflect arrival order, remain unambiguous because replay and final-fact ordering use `watch_cursor` only.
 
 `GET /ci/runs/<run_id>/events` includes every accepted kind-46100 request in
 that same cursor stream, beginning with the immutable initial request at cursor

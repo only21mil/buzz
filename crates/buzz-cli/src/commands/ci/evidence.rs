@@ -15,6 +15,8 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 use uuid::Uuid;
 
+use super::reducer::AcceptedCiEnvelope;
+
 /// CI envelope/CLI protocol implemented by these checks.
 pub const CI_PROTOCOL_VERSION: &str = "1.4";
 /// Relay/API attempt-selection protocol implemented by these checks.
@@ -228,9 +230,11 @@ impl SelectedLog {
 /// Omitted `attempt` means the greatest known attempt, even when an older
 /// attempt is the latest one carrying a log. The selected latest status must
 /// be terminal and point to exactly one supplied durable log event.
+#[allow(clippy::too_many_arguments)]
 pub fn select_log(
     request_event_id: &str,
     request: &CiRequestEnvelope,
+    accepted: &[AcceptedCiEnvelope],
     statuses: &[CiJobStatusEnvelope],
     log_events: &[DurableLogEvent],
     relay_url: &str,
@@ -238,7 +242,14 @@ pub fn select_log(
     attempt: Option<u32>,
 ) -> Result<SelectedLog, EvidenceError> {
     validate_request_context(request_event_id, request)?;
-    let status = select_job_attempt(request_event_id, request, statuses, job_id, attempt)?;
+    let status = select_job_attempt(
+        request_event_id,
+        request,
+        accepted,
+        statuses,
+        job_id,
+        attempt,
+    )?;
     if !status.state.is_terminal() {
         return Err(EvidenceError::JobNotTerminal {
             job_id: job_id.to_owned(),
@@ -263,7 +274,7 @@ pub fn select_log(
             "referenced event is duplicated",
         ));
     }
-    validate_log_binding(request_event_id, request, &status, log_event)?;
+    validate_log_binding(request_event_id, request, accepted, &status, log_event)?;
 
     let envelope = &log_event.envelope;
     let (url_or_inline, source) = if let Some(inline) = &envelope.inline {
@@ -391,6 +402,7 @@ pub struct RerunPlan {
 pub fn derive_rerun_plan(
     original_request_event_id: &str,
     original_request: &CiRequestEnvelope,
+    accepted: &[AcceptedCiEnvelope],
     statuses: &[CiJobStatusEnvelope],
     job_id: &str,
     parameters: RerunParameters,
@@ -399,6 +411,7 @@ pub fn derive_rerun_plan(
     let parent = select_job_attempt(
         original_request_event_id,
         original_request,
+        accepted,
         statuses,
         job_id,
         None,
@@ -564,6 +577,7 @@ fn validate_event_id(event_id: &str) -> Result<(), EvidenceError> {
 fn select_job_attempt(
     request_event_id: &str,
     request: &CiRequestEnvelope,
+    accepted: &[AcceptedCiEnvelope],
     statuses: &[CiJobStatusEnvelope],
     job_id: &str,
     requested_attempt: Option<u32>,
@@ -579,7 +593,13 @@ fn select_job_attempt(
         status
             .validate()
             .map_err(|error| EvidenceError::InvalidEnvelope(error.to_string()))?;
-        validate_status_binding(request_event_id, request, status)?;
+        let bound = resolve_request(
+            request_event_id,
+            request,
+            accepted,
+            &status.request_event_id,
+        )?;
+        validate_status_binding(&status.request_event_id, bound, status)?;
         attempts.entry(status.attempt).or_default().push(status);
     }
     if attempts.is_empty() {
@@ -677,12 +697,16 @@ fn validate_status_binding(
     if status.tip_oid != request.tip_oid || status.base_oid != request.base_oid {
         return Err(EvidenceError::RequestMismatch("source tuple mismatch"));
     }
+    if status.attempt != request.attempt {
+        return Err(EvidenceError::RequestMismatch("attempt mismatch"));
+    }
     Ok(())
 }
 
 fn validate_log_binding(
     request_event_id: &str,
     request: &CiRequestEnvelope,
+    accepted: &[AcceptedCiEnvelope],
     status: &CiJobStatusEnvelope,
     log_event: &DurableLogEvent,
 ) -> Result<(), EvidenceError> {
@@ -697,13 +721,15 @@ fn validate_log_binding(
     let log = &log_event.envelope;
     log.validate()
         .map_err(|error| EvidenceError::InvalidEnvelope(error.to_string()))?;
-    if log.request_event_id != request_event_id
-        || log.run_id != request.run_id
-        || log.workflow_id != request.workflow_id
-        || log.target_repo_a != request.target_repo_a
-        || log.tip_oid != request.tip_oid
+    let bound = resolve_request(request_event_id, request, accepted, &log.request_event_id)?;
+    if log.request_event_id != status.request_event_id
+        || log.run_id != bound.run_id
+        || log.workflow_id != bound.workflow_id
+        || log.target_repo_a != bound.target_repo_a
+        || log.tip_oid != bound.tip_oid
         || log.job_id != status.job_id
         || log.attempt != status.attempt
+        || log.attempt != bound.attempt
     {
         return Err(EvidenceError::InvalidLogReference(
             "log identity does not match selected attempt",
@@ -712,13 +738,66 @@ fn validate_log_binding(
     Ok(())
 }
 
+fn resolve_request<'a>(
+    initial_request_event_id: &str,
+    initial: &'a CiRequestEnvelope,
+    accepted: &'a [AcceptedCiEnvelope],
+    request_event_id: &str,
+) -> Result<&'a CiRequestEnvelope, EvidenceError> {
+    if request_event_id == initial_request_event_id {
+        return Ok(initial);
+    }
+    let mut matches = accepted
+        .iter()
+        .filter_map(|event| (event.event_id == request_event_id).then_some(&event.envelope));
+    let envelope = matches
+        .next()
+        .ok_or(EvidenceError::RequestMismatch("unknown request event ID"))?;
+    if matches.next().is_some() {
+        return Err(EvidenceError::RequestMismatch(
+            "duplicated request event ID",
+        ));
+    }
+    let buzz_core::ci::ValidatedCiEnvelope::Request(candidate) = envelope else {
+        return Err(EvidenceError::RequestMismatch(
+            "request event ID names a non-request event",
+        ));
+    };
+    candidate
+        .validate()
+        .map_err(|error| EvidenceError::InvalidEnvelope(error.to_string()))?;
+    if candidate.request_type != CiRequestType::Rerun
+        || candidate.schema_version != initial.schema_version
+        || candidate.target_repo_a != initial.target_repo_a
+        || candidate.pr_root_event_id != initial.pr_root_event_id
+        || candidate.pr_update_event_id != initial.pr_update_event_id
+        || candidate.source_clone_url != initial.source_clone_url
+        || candidate.immutable_source_ref != initial.immutable_source_ref
+        || candidate.tip_oid != initial.tip_oid
+        || candidate.source_branch != initial.source_branch
+        || candidate.base_ref != initial.base_ref
+        || candidate.base_oid != initial.base_oid
+        || candidate.workflow_id != initial.workflow_id
+        || candidate.workflow_digest != initial.workflow_digest
+        || candidate.run_id != initial.run_id
+        || candidate.trigger_event_id != initial.trigger_event_id
+    {
+        return Err(EvidenceError::RequestMismatch(
+            "rerun changed immutable run coordinates",
+        ));
+    }
+    Ok(candidate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buzz_core::ci::{CiSkipPolicy, CI_SCHEMA_VERSION};
+    use buzz_core::ci::{CiSkipPolicy, ValidatedCiEnvelope, CI_SCHEMA_VERSION};
 
     const REQUEST_ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const LOG_EVENT_ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const RERUN_REQUEST_ID: &str =
+        "9999999999999999999999999999999999999999999999999999999999999999";
     const SIGNER: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const ACTOR: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     const TIP: &str = "1111111111111111111111111111111111111111";
@@ -756,10 +835,35 @@ mod tests {
         }
     }
 
+    fn rerun_request(attempt: u32) -> CiRequestEnvelope {
+        let mut request = request();
+        request.request_type = CiRequestType::Rerun;
+        request.job_ids = vec!["unit".into()];
+        request.attempt = attempt;
+        request.parent_attempt = Some(attempt - 1);
+        request.parent_run_id = Some(request.run_id.clone());
+        request.idempotency_key = format!("rerun-{attempt}");
+        request.issued_at += u64::from(attempt);
+        request.expires_at += u64::from(attempt);
+        request
+    }
+
+    fn accepted_rerun(attempt: u32) -> AcceptedCiEnvelope {
+        AcceptedCiEnvelope {
+            event_id: RERUN_REQUEST_ID.into(),
+            watch_cursor: 10,
+            envelope: ValidatedCiEnvelope::Request(rerun_request(attempt)),
+        }
+    }
+
     fn status(job_id: &str, attempt: u32, sequence: u64, state: CiJobState) -> CiJobStatusEnvelope {
         CiJobStatusEnvelope {
             schema_version: CI_SCHEMA_VERSION,
-            request_event_id: REQUEST_ID.into(),
+            request_event_id: if attempt == 1 {
+                REQUEST_ID.into()
+            } else {
+                RERUN_REQUEST_ID.into()
+            },
             run_id: request().run_id,
             workflow_id: "required_ci".into(),
             target_repo_a: format!("30617:{ACTOR}:buzz"),
@@ -799,7 +903,11 @@ mod tests {
             event_id: LOG_EVENT_ID.into(),
             envelope: CiLogReferenceEnvelope {
                 schema_version: CI_SCHEMA_VERSION,
-                request_event_id: REQUEST_ID.into(),
+                request_event_id: if attempt == 1 {
+                    REQUEST_ID.into()
+                } else {
+                    RERUN_REQUEST_ID.into()
+                },
                 run_id: request().run_id,
                 workflow_id: "required_ci".into(),
                 target_repo_a: format!("30617:{ACTOR}:buzz"),
@@ -838,9 +946,11 @@ mod tests {
         attach_log(&mut statuses);
         statuses.push(status("unit", 2, 1, CiJobState::Queued));
         statuses.push(status("unit", 2, 2, CiJobState::Running));
+        let accepted = [accepted_rerun(2)];
         let result = select_log(
             REQUEST_ID,
             &request(),
+            &accepted,
             &statuses,
             &[log_event("unit", 1, b"old")],
             RELAY,
@@ -858,9 +968,11 @@ mod tests {
         let mut statuses = terminal_status("unit", 1, CiJobState::Failure);
         attach_log(&mut statuses);
         statuses.extend(terminal_status("unit", 2, CiJobState::Success));
+        let accepted = [accepted_rerun(2)];
         let result = select_log(
             REQUEST_ID,
             &request(),
+            &accepted,
             &statuses,
             &[log_event("unit", 1, b"old")],
             RELAY,
@@ -878,9 +990,11 @@ mod tests {
         let mut statuses = terminal_status("unit", 1, CiJobState::Failure);
         attach_log(&mut statuses);
         statuses.push(status("unit", 2, 1, CiJobState::Queued));
+        let accepted = [accepted_rerun(2)];
         let selected = select_log(
             REQUEST_ID,
             &request(),
+            &accepted,
             &statuses,
             &[log_event("unit", 1, b"old")],
             RELAY,
@@ -893,6 +1007,27 @@ mod tests {
     }
 
     #[test]
+    fn omitted_attempt_selects_attempt_two_log_bound_to_accepted_rerun() {
+        let mut statuses = terminal_status("unit", 1, CiJobState::Failure);
+        statuses.extend(terminal_status("unit", 2, CiJobState::Success));
+        attach_log(&mut statuses);
+        let accepted = [accepted_rerun(2)];
+        let selected = select_log(
+            REQUEST_ID,
+            &request(),
+            &accepted,
+            &statuses,
+            &[log_event("unit", 2, b"new")],
+            RELAY,
+            "unit",
+            None,
+        )
+        .expect("select latest rerun log");
+        assert_eq!(selected.result().attempt, 2);
+        assert_eq!(selected.inline_raw().unwrap().as_bytes(), b"new");
+    }
+
+    #[test]
     fn inline_requires_canonical_base64_size_hash_cap_and_no_truncation() {
         let mut statuses = terminal_status("unit", 1, CiJobState::Success);
         attach_log(&mut statuses);
@@ -900,6 +1035,7 @@ mod tests {
         assert!(select_log(
             REQUEST_ID,
             &request(),
+            &[],
             &statuses,
             std::slice::from_ref(&valid),
             RELAY,
@@ -929,6 +1065,7 @@ mod tests {
             assert!(select_log(
                 REQUEST_ID,
                 &request(),
+                &[],
                 &statuses,
                 &[event],
                 RELAY,
@@ -965,6 +1102,7 @@ mod tests {
             assert!(select_log(
                 REQUEST_ID,
                 &request(),
+                &[],
                 &statuses,
                 &[event],
                 RELAY,
@@ -977,6 +1115,7 @@ mod tests {
         let selected = select_log(
             REQUEST_ID,
             &request(),
+            &[],
             &statuses,
             &[valid],
             RELAY,
@@ -1012,7 +1151,14 @@ mod tests {
     fn rerun_rejects_nonfailed_terminal_parent() {
         let statuses = terminal_status("unit", 1, CiJobState::Success);
         assert!(matches!(
-            derive_rerun_plan(REQUEST_ID, &request(), &statuses, "unit", parameters(3)),
+            derive_rerun_plan(
+                REQUEST_ID,
+                &request(),
+                &[],
+                &statuses,
+                "unit",
+                parameters(3)
+            ),
             Err(EvidenceError::JobNotFailed { .. })
         ));
     }
@@ -1020,8 +1166,15 @@ mod tests {
     #[test]
     fn rerun_uses_contiguous_selected_lineage_and_immutable_tuple() {
         let statuses = terminal_status("unit", 1, CiJobState::Failure);
-        let plan =
-            derive_rerun_plan(REQUEST_ID, &request(), &statuses, "unit", parameters(3)).unwrap();
+        let plan = derive_rerun_plan(
+            REQUEST_ID,
+            &request(),
+            &[],
+            &statuses,
+            "unit",
+            parameters(3),
+        )
+        .unwrap();
         assert_eq!(plan.request.attempt, 2);
         assert_eq!(plan.request.parent_attempt, Some(1));
         assert_eq!(plan.request.parent_run_id, Some(request().run_id));
@@ -1043,16 +1196,50 @@ mod tests {
                 .get_version(),
             Some(uuid::Version::SortRand)
         );
-        let second =
-            derive_rerun_plan(REQUEST_ID, &request(), &statuses, "unit", parameters(3)).unwrap();
+        let second = derive_rerun_plan(
+            REQUEST_ID,
+            &request(),
+            &[],
+            &statuses,
+            "unit",
+            parameters(3),
+        )
+        .unwrap();
         assert_ne!(plan.request.idempotency_key, second.request.idempotency_key);
+    }
+
+    #[test]
+    fn rerun_advances_a_parent_bound_to_an_accepted_rerun_request() {
+        let mut statuses = terminal_status("unit", 1, CiJobState::Failure);
+        statuses.extend(terminal_status("unit", 2, CiJobState::Failure));
+        let accepted = [accepted_rerun(2)];
+        let plan = derive_rerun_plan(
+            REQUEST_ID,
+            &request(),
+            &accepted,
+            &statuses,
+            "unit",
+            parameters(3),
+        )
+        .unwrap();
+        assert_eq!(plan.selected_parent.request_event_id, RERUN_REQUEST_ID);
+        assert_eq!(plan.request.attempt, 3);
+        assert_eq!(plan.request.parent_attempt, Some(2));
     }
 
     #[test]
     fn rerun_refuses_noncontiguous_attempt_history() {
         let statuses = terminal_status("unit", 2, CiJobState::Failure);
+        let accepted = [accepted_rerun(2)];
         assert!(matches!(
-            derive_rerun_plan(REQUEST_ID, &request(), &statuses, "unit", parameters(3)),
+            derive_rerun_plan(
+                REQUEST_ID,
+                &request(),
+                &accepted,
+                &statuses,
+                "unit",
+                parameters(3)
+            ),
             Err(EvidenceError::InvalidLineage(_))
         ));
     }
@@ -1060,8 +1247,15 @@ mod tests {
     #[test]
     fn queued_ack_returns_explicit_signed_fanout() {
         let statuses = terminal_status("unit", 1, CiJobState::Failure);
-        let plan =
-            derive_rerun_plan(REQUEST_ID, &request(), &statuses, "unit", parameters(3)).unwrap();
+        let plan = derive_rerun_plan(
+            REQUEST_ID,
+            &request(),
+            &[],
+            &statuses,
+            "unit",
+            parameters(3),
+        )
+        .unwrap();
         let rerun_event_id = "9".repeat(64);
         let mut ack = status("unit", 2, 1, CiJobState::Queued);
         ack.request_event_id = rerun_event_id.clone();
@@ -1077,7 +1271,14 @@ mod tests {
     fn rerun_honors_max_attempts() {
         let statuses = terminal_status("unit", 1, CiJobState::Failure);
         assert!(matches!(
-            derive_rerun_plan(REQUEST_ID, &request(), &statuses, "unit", parameters(1)),
+            derive_rerun_plan(
+                REQUEST_ID,
+                &request(),
+                &[],
+                &statuses,
+                "unit",
+                parameters(1)
+            ),
             Err(EvidenceError::AttemptLimit { limit: 1, .. })
         ));
     }
