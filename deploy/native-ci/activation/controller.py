@@ -3907,6 +3907,24 @@ def _finalize_qualification_zero_unlocked(
     _bind_receipt(receipt, manifest)
     _verify_fixed_package(manifest, root)
     state = receipt["qualification_zero"]
+    if state is None or state["phase"] == "preparing":
+        # Early qualification failures have not reached the staged-zero step.
+        # Prepare under this same operator lock and bind its replay to the exact
+        # finalize request. Existing preparations retain their own operation.
+        prepare = {**request, "action": "prepare_qualification_zero"}
+        prepare["operation_id"] = activation_package.digest(
+            b"buzz-ci:qualification-zero:compensation-prepare:v1\n" + request_sha256.encode("ascii")
+        )
+        prepare, prepare_sha256 = _parse_zero_request(
+            _wire_json(prepare), "prepare-qualification-zero", receipt,
+        )
+        if state is not None and state["prepare"] != {
+            "operation_id": prepare["operation_id"], "request_sha256": prepare_sha256,
+        }:
+            raise ValueError("qualification-zero compensation prepare replay differs")
+        _prepare_qualification_zero_unlocked(manifest, payloads, root, driver, prepare, prepare_sha256)
+        receipt = _read_receipt(root)
+        state = receipt["qualification_zero"]
     if not isinstance(state, dict):
         raise ValueError("qualification-zero finalize requires prepare")
     _bind_zero_scope(state, request)

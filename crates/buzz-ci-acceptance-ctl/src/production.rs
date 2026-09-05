@@ -1998,37 +1998,53 @@ impl SystemdHostControl {
         action: QualificationZeroAction,
         request: &ControlRequest,
     ) -> Result<String, ControlError> {
-        let body = QualificationZeroRequest {
-            schema_version: QUALIFICATION_ZERO_REQUEST_SCHEMA,
-            action,
-            activation_id: &request.activation_id,
-            activation_package_digest: &request.activation_package_digest,
-            scenario_sha256: &request.scenario_sha256,
-            initial_controller_generation: self.config.controller_generation,
-            initial_runner_generation: self.config.runner_generation,
-            operation_id: &request.operation_id,
-            failed_stage: request.failed_stage,
-            final_response_sha256: request.final_response_sha256.as_deref(),
-            expected_controller_generation: request.expected_controller_generation,
-            expected_runner_generation: request.expected_runner_generation,
-        };
-        let input = serde_json::to_vec(&body).map_err(|_| ControlError::HostAction)?;
+        let input = qualification_zero_input(&self.config, action, request)?;
         let output = run_bounded_controller(action.argument(), &input, self.timeout)?;
-        let response: QualificationZeroResponse =
-            serde_json::from_slice(&output).map_err(|_| ControlError::HostAction)?;
-        if response.schema_version != QUALIFICATION_ZERO_RESPONSE_SCHEMA
-            || response.action != action
-            || response.activation_id != request.activation_id
-            || response.activation_package_digest != request.activation_package_digest
-            || response.scenario_sha256 != request.scenario_sha256
-            || response.operation_id != request.operation_id
-            || response.state != "staged_zero"
-            || !lower_hex(&response.receipt_sha256, &[64])
-        {
-            return Err(ControlError::BindingMismatch);
-        }
-        Ok(response.receipt_sha256)
+        qualification_zero_response(action, request, &output)
     }
+}
+
+fn qualification_zero_input(
+    config: &AcceptanceControlConfig,
+    action: QualificationZeroAction,
+    request: &ControlRequest,
+) -> Result<Vec<u8>, ControlError> {
+    let body = QualificationZeroRequest {
+        schema_version: QUALIFICATION_ZERO_REQUEST_SCHEMA,
+        action,
+        activation_id: &request.activation_id,
+        activation_package_digest: &request.activation_package_digest,
+        scenario_sha256: &request.scenario_sha256,
+        initial_controller_generation: config.controller_generation,
+        initial_runner_generation: config.runner_generation,
+        operation_id: &request.operation_id,
+        failed_stage: request.failed_stage,
+        final_response_sha256: request.final_response_sha256.as_deref(),
+        expected_controller_generation: request.expected_controller_generation,
+        expected_runner_generation: request.expected_runner_generation,
+    };
+    serde_json::to_vec(&body).map_err(|_| ControlError::HostAction)
+}
+
+fn qualification_zero_response(
+    action: QualificationZeroAction,
+    request: &ControlRequest,
+    output: &[u8],
+) -> Result<String, ControlError> {
+    let response: QualificationZeroResponse =
+        serde_json::from_slice(output).map_err(|_| ControlError::HostAction)?;
+    if response.schema_version != QUALIFICATION_ZERO_RESPONSE_SCHEMA
+        || response.action != action
+        || response.activation_id != request.activation_id
+        || response.activation_package_digest != request.activation_package_digest
+        || response.scenario_sha256 != request.scenario_sha256
+        || response.operation_id != request.operation_id
+        || response.state != "staged_zero"
+        || !lower_hex(&response.receipt_sha256, &[64])
+    {
+        return Err(ControlError::BindingMismatch);
+    }
+    Ok(response.receipt_sha256)
 }
 
 impl HostControl for SystemdHostControl {
@@ -2124,10 +2140,8 @@ impl HostControl for SystemdHostControl {
         request: &ControlRequest,
     ) -> Result<HostZeroResult, Self::Error> {
         self.close_capacity()?;
-        self.systemctl
-            .stop("buzz-ci-controld-acceptance.socket", self.timeout)?;
-        self.systemctl
-            .stop("buzz-ci-controld.service", self.timeout)?;
+        // The controller prepares an early failure while controld is still
+        // available, then owns the ordered stops and durable zero receipt.
         let controller_receipt_sha256 =
             self.controller_zero_action(QualificationZeroAction::Finalize, request)?;
         Ok(HostZeroResult {
@@ -3143,6 +3157,8 @@ mod tests {
         Conclusion, DriverEndpoints, ExportSnapshot, Outcome, ProcessEndpoint, RunSnapshot,
         RunState, SystemSnapshot,
     };
+
+    include!("production_zero_protocol_tests.rs");
 
     fn hex(byte: char, length: usize) -> String {
         std::iter::repeat_n(byte, length).collect()

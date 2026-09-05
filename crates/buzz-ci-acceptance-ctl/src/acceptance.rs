@@ -466,6 +466,9 @@ pub struct AcceptanceReceipt {
     pub zero_transition: Option<ZeroTransition>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<FailureReceipt>,
+    /// Cleanup failure, retained separately from the primary stage failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compensation_failure: Option<FailureReceipt>,
 }
 
 /// Invalid or ambiguous scenario input.
@@ -564,6 +567,7 @@ pub fn run_acceptance<D: AcceptanceDriver>(
                 run_id: scenario.fixture.run_id.clone(),
                 checks: Vec::new(),
                 zero_transition: None,
+                compensation_failure: None,
                 failure: Some(FailureReceipt {
                     stage: Stage::CapacityZeroClosed,
                     code: "integrity_mismatch".to_owned(),
@@ -581,6 +585,7 @@ pub fn run_acceptance<D: AcceptanceDriver>(
         checks: Vec::new(),
         zero_transition: None,
         failure: None,
+        compensation_failure: None,
     };
 
     let result = run_sequence(
@@ -650,11 +655,13 @@ pub fn run_acceptance<D: AcceptanceDriver>(
         }
         if let Some(error) = zero_error {
             receipt.outcome = Outcome::Fail;
-            receipt.failure = Some(FailureReceipt {
+            let failure = FailureReceipt {
                 stage: failed_stage,
                 code: error.code().to_owned(),
                 message: format!("capacity-zero compensation failed: {error}"),
-            });
+            };
+            receipt.failure.get_or_insert_with(|| failure.clone());
+            receipt.compensation_failure = Some(failure);
         }
     }
     receipt
@@ -748,6 +755,7 @@ pub fn validate_receipt(receipt: &AcceptanceReceipt) -> Result<(), AcceptanceErr
     if receipt.schema_version != RECEIPT_VERSION
         || receipt.outcome != Outcome::Pass
         || receipt.failure.is_some()
+        || receipt.compensation_failure.is_some()
         || receipt.checks.len() != 16
     {
         return Err(AcceptanceError::IntegrityMismatch("receipt shape"));
@@ -3093,11 +3101,82 @@ mod tests {
         let receipt = run_acceptance(&scenario, &mut driver);
         assert_eq!(receipt.outcome, Outcome::Fail);
         assert!(receipt.zero_transition.is_none());
-        assert!(receipt
+        assert_eq!(receipt.failure.as_ref().unwrap().stage, Stage::GrantResume);
+        assert!(!receipt
             .failure
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("compensation"));
+        assert!(receipt
+            .compensation_failure
+            .as_ref()
             .unwrap()
             .message
             .starts_with("capacity-zero compensation failed:"));
+        let encoded = serde_json::to_vec(&receipt).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<AcceptanceReceipt>(&encoded).unwrap(),
+            receipt
+        );
+    }
+
+    #[test]
+    fn export_and_compensation_failures_remain_separate_receipt_facts() {
+        let scenario = scenario();
+        let mut driver = FaultDriver {
+            responses: passing_responses(&scenario),
+            fail_sequence: 7,
+            zero_failures: 2,
+            zero_requests: Vec::new(),
+            wrong_zero: false,
+        };
+        let receipt = run_acceptance(&scenario, &mut driver);
+        assert_eq!(receipt.outcome, Outcome::Fail);
+        assert_eq!(
+            receipt.failure.as_ref().unwrap().stage,
+            Stage::AuthenticatedExport
+        );
+        assert!(!receipt
+            .failure
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("compensation"));
+        assert!(receipt
+            .compensation_failure
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("compensation"));
+        assert_eq!(driver.zero_requests.len(), 2);
+        assert_eq!(driver.zero_requests[0], driver.zero_requests[1]);
+    }
+
+    #[test]
+    fn compensation_failure_alone_fails_the_receipt_and_cannot_be_verified_as_pass() {
+        let scenario = scenario();
+        let mut driver = FaultDriver {
+            responses: passing_responses(&scenario),
+            fail_sequence: 0,
+            zero_failures: 2,
+            zero_requests: Vec::new(),
+            wrong_zero: false,
+        };
+        let failed = run_acceptance(&scenario, &mut driver);
+        assert_eq!(failed.outcome, Outcome::Fail);
+        assert_eq!(failed.checks.len(), 16);
+        assert!(failed.compensation_failure.is_some());
+        assert_eq!(failed.failure, failed.compensation_failure);
+        let mut good = run_acceptance(
+            &scenario,
+            &mut ScriptedDriver {
+                responses: passing_responses(&scenario),
+                index: 0,
+            },
+        );
+        good.compensation_failure = failed.compensation_failure;
+        assert!(validate_receipt(&good).is_err());
     }
 
     #[test]
