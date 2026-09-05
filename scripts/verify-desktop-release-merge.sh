@@ -8,26 +8,10 @@ set -euo pipefail
 : "${PR_NUMBER:?}"
 : "${GH_TOKEN:?}"
 
-# Keep this list aligned with the main ruleset. Producer IDs prevent a check
-# with a copied display name from authorizing a release. Every current required
-# gate is a check run; add explicit legacy-status verification before introducing
-# any required context that reports only through the commit-status API.
-required_checks=(
-  "Desktop E2E Integration:15368"
-  "Desktop:15368"
-  "Rust Lint:15368"
-  "Security:15368"
-  "Unit Tests:15368"
-  "Windows Rust (x86_64-pc-windows-msvc):15368"
-  "Mobile:15368"
-  "Web:15368"
-  "Backend Integration (relay e2e):15368"
-  "Desktop E2E Relay:15368"
-  "Relay E2E:15368"
-  "Desktop Build (macOS):15368"
-  "DCO Check:1455659"
-  "Desktop Release Candidate:15368"
-)
+# The repository's app-bound main rules own the check inventory. Read them
+# through GitHub rather than assuming the fork has upstream-only CI producers.
+: "${GITHUB_REPOSITORY:?}"
+release_remote="${RELEASE_REMOTE:-origin}"
 
 expected_branch="version-bump/$VERSION"
 [[ "${PR_HEAD_REF:-}" == "$expected_branch" ]] || { echo "unexpected release branch" >&2; exit 1; }
@@ -49,14 +33,14 @@ jq -e \
 
 # Pin trusted verifier code from the candidate's frozen base, not from the
 # candidate or its squash. A release PR cannot alter the code that validates it.
-git fetch origin main --no-tags
-git fetch origin "$PR_HEAD_SHA" --no-tags
+git fetch "$release_remote" refs/heads/main:refs/release-verification/main --no-tags
+git fetch "$release_remote" "$PR_HEAD_SHA" --no-tags
 candidate_parents="$(git show -s --format=%P "$PR_HEAD_SHA")"
 [[ "$candidate_parents" =~ ^[0-9a-f]{40}$ ]] || {
   echo "desktop candidate must have exactly one parent before validation" >&2
   exit 1
 }
-git merge-base --is-ancestor "$candidate_parents" origin/main || {
+git merge-base --is-ancestor "$candidate_parents" refs/release-verification/main || {
   echo "desktop candidate base is not protected main history" >&2
   exit 1
 }
@@ -64,6 +48,9 @@ verifier_dir="$(mktemp -d)"
 trap 'rm -rf "$verifier_dir"' EXIT
 git show "$candidate_parents:scripts/desktop_release.py" > "$verifier_dir/desktop_release.py"
 git show "$candidate_parents:scripts/required-check-succeeded.jq" > "$verifier_dir/required-check-succeeded.jq"
+git show "$candidate_parents:scripts/desktop-release-required-checks.jq" > "$verifier_dir/desktop-release-required-checks.jq"
+rules="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/rules/branches/main")"
+required_checks="$(jq -er -f "$verifier_dir/desktop-release-required-checks.jq" <<<"$rules")"
 
 git checkout --detach "$PR_HEAD_SHA"
 DESKTOP_RELEASE_ROOT="$PWD" python3 "$verifier_dir/desktop_release.py" \
@@ -72,7 +59,7 @@ DESKTOP_RELEASE_ROOT="$PWD" python3 "$verifier_dir/desktop_release.py" \
 # `filter=latest` is deliberate: GitHub exposes no per-rerun creation time. A
 # post-merge rerun replaces the visible attempt and fails closed below.
 checks="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/commits/$PR_HEAD_SHA/check-runs?filter=latest&per_page=100")"
-for entry in "${required_checks[@]}"; do
+while IFS= read -r entry; do
   required="${entry%:*}"
   integration_id="${entry##*:}"
   jq -e --arg name "$required" --argjson integration_id "$integration_id" \
@@ -81,6 +68,12 @@ for entry in "${required_checks[@]}"; do
     echo "trusted required check was not successful at merge: $required" >&2
     exit 1
   }
-done
+done <<<"$required_checks"
+# A policy change while checking must not authorize the old inventory.
+current_rules="$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/rules/branches/main")"
+[[ "$(jq -Sc . <<<"$rules")" == "$(jq -Sc . <<<"$current_rules")" ]] || {
+  echo "main release requirements changed during verification" >&2
+  exit 1
+}
 
 echo "verified immutable desktop candidate $PR_HEAD_SHA authorized by merged PR $PR_NUMBER"
