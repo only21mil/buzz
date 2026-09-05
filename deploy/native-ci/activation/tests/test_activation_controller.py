@@ -1737,7 +1737,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "1efd2e5e0dc3b4ea0c6249981963609a597651532dd609032831e9a9ba522bb8",
+            "b71fa0055f981301b608bb730940d29f1b3474e20302d76975f0d21fa872eb05",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
@@ -2342,6 +2342,107 @@ class ActivationControllerTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertEqual(proven["receipt_sha256"], finalized["receipt_sha256"])
         self.assertEqual(CONTROLLER.check_current(manifest, self.fixture.root, driver)["status"], "qualification_zero_finalized")
+
+    def test_early_finalize_prepares_exact_scope_and_preserves_retry(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        self.activate_one(manifest, payloads, driver)
+        self.assertIsNone(CONTROLLER._read_receipt(self.fixture.root)["qualification_zero"])
+        request, digest = self.parsed_zero_request(
+            "finalize-qualification-zero", "d", failed_stage="authenticated_export",
+            expected_controller_generation=7, expected_runner_generation=11,
+        )
+        response = CONTROLLER._finalize_qualification_zero(
+            manifest, payloads, self.fixture.root, driver, request, digest,
+        )
+        state = CONTROLLER._read_receipt(self.fixture.root)["qualification_zero"]
+        self.assertEqual(state["phase"], "finalized")
+        self.assertEqual(state["finalize"], {"operation_id": request["operation_id"], "request_sha256": digest})
+        prepare = {**request, "action": "prepare_qualification_zero"}
+        prepare["operation_id"] = activation_package.digest(
+            b"buzz-ci:qualification-zero:compensation-prepare:v1\n" + digest.encode("ascii")
+        )
+        self.assertEqual(state["prepare"], {
+            "operation_id": prepare["operation_id"],
+            "request_sha256": activation_package.digest(CONTROLLER._wire_json(prepare)),
+        })
+        for field in ("activation_id", "activation_package_digest", "scenario_sha256",
+                      "initial_controller_generation", "initial_runner_generation"):
+            self.assertEqual(state[field], request[field])
+        self.assertEqual(CONTROLLER._finalize_qualification_zero(
+            manifest, payloads, self.fixture.root, driver, request, digest,
+        ), response)
+        changed, changed_sha = self.parsed_zero_request("finalize-qualification-zero", "e")
+        with self.assertRaisesRegex(ValueError, "finalize replay differs"):
+            CONTROLLER._finalize_qualification_zero(
+                manifest, payloads, self.fixture.root, driver, changed, changed_sha,
+            )
+        self.assertEqual(CONTROLLER._read_receipt(self.fixture.root)["qualification_zero"], state)
+
+    def test_early_finalize_rejects_binding_drift_before_preparation(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        self.activate_one(manifest, payloads, driver)
+        before = CONTROLLER._receipt_sha256(self.fixture.root)
+        request, _digest = self.parsed_zero_request("finalize-qualification-zero", "d")
+        for field in ("activation_id", "activation_package_digest", "scenario_sha256",
+                      "initial_controller_generation", "initial_runner_generation"):
+            changed = {**request, field: request[field] + 1 if isinstance(request[field], int) else "e" * 64}
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "different activation|acceptance binding"):
+                CONTROLLER._finalize_qualification_zero(
+                    manifest, payloads, self.fixture.root, driver, changed,
+                    activation_package.digest(CONTROLLER._wire_json(changed)),
+                )
+            self.assertEqual(CONTROLLER._receipt_sha256(self.fixture.root), before)
+
+    def test_early_finalize_resumes_exact_prepare_after_interrupted_receipt_write(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        self.activate_one(manifest, payloads, driver)
+        request, digest = self.parsed_zero_request("finalize-qualification-zero", "d")
+        original_write = CONTROLLER._write_receipt
+
+        def interrupted_write(*args):
+            original_write(*args)
+            raise ValueError("interrupted after durable preparation reservation")
+
+        with mock.patch.object(CONTROLLER, "_write_receipt", side_effect=interrupted_write):
+            with self.assertRaisesRegex(ValueError, "interrupted after durable"):
+                CONTROLLER._finalize_qualification_zero(
+                    manifest, payloads, self.fixture.root, driver, request, digest,
+                )
+        before = CONTROLLER._receipt_sha256(self.fixture.root)
+        state = CONTROLLER._read_receipt(self.fixture.root)["qualification_zero"]
+        self.assertEqual(state["phase"], "preparing")
+        changed, changed_digest = self.parsed_zero_request("finalize-qualification-zero", "e")
+        with self.assertRaisesRegex(ValueError, "compensation prepare replay differs"):
+            CONTROLLER._finalize_qualification_zero(
+                manifest, payloads, self.fixture.root, driver, changed, changed_digest,
+            )
+        self.assertEqual(CONTROLLER._receipt_sha256(self.fixture.root), before)
+        CONTROLLER._finalize_qualification_zero(manifest, payloads, self.fixture.root, driver, request, digest)
+        recovered = CONTROLLER._read_receipt(self.fixture.root)["qualification_zero"]
+        self.assertEqual(recovered["phase"], "finalized")
+        self.assertEqual(recovered["prepare"], state["prepare"])
+
+    def test_early_prepare_failure_retains_evidence_and_finalize_retry_recovers(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        self.activate_one(manifest, payloads, driver)
+        request, digest = self.parsed_zero_request("finalize-qualification-zero", "d")
+        with mock.patch.object(CONTROLLER, "_apply_staged_configs", side_effect=ValueError("injected staging failure")):
+            with self.assertRaisesRegex(ValueError, "injected staging failure"):
+                CONTROLLER._finalize_qualification_zero(
+                    manifest, payloads, self.fixture.root, driver, request, digest,
+                )
+        state = CONTROLLER._read_receipt(self.fixture.root)["qualification_zero"]
+        self.assertEqual(state["phase"], "prepare_failed")
+        prepared = state["prepare"]
+        self.assertEqual(state["last_error"], "injected staging failure")
+        CONTROLLER._finalize_qualification_zero(manifest, payloads, self.fixture.root, driver, request, digest)
+        state = CONTROLLER._read_receipt(self.fixture.root)["qualification_zero"]
+        self.assertEqual(state["prepare"], prepared)
+        self.assertEqual(state["phase"], "finalized")
 
     def test_zero_wire_rejects_order_generation_and_replay_drift(self) -> None:
         manifest, payloads, driver = self.fixture.load()
