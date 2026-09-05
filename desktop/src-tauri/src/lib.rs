@@ -10,6 +10,8 @@ mod egress_guard;
 mod event_sync;
 mod events;
 mod huddle;
+#[cfg(any(test, all(target_os = "macos", feature = "system-keyring")))]
+mod identity_startup;
 mod identity_storage;
 mod initial_window;
 mod key_backup;
@@ -368,13 +370,16 @@ pub fn run() {
             // present), all owner-keyed side effects (event sync, agent restore,
             // relay publish) are skipped. The frontend shows a recovery screen;
             // the user must relaunch after restoring the identity.
-            let identity_lost = state
-                .identity_lost
-                .load(std::sync::atomic::Ordering::Acquire);
-            let keyring_locked = state
-                .keyring_locked
-                .load(std::sync::atomic::Ordering::Acquire);
+            let (identity_lost, keyring_locked) = state.identity_recovery_flags();
             let recovery_mode = identity_lost || keyring_locked;
+
+            // Recovery must reach the webview without another Keychain read.
+            // Persona backfill and nest regeneration below hydrate agent keys,
+            // so merely skipping restore and event flush would block again.
+            #[cfg(all(target_os = "macos", feature = "system-keyring"))]
+            if keyring_locked {
+                return Ok(());
+            }
 
             // Backfill the pinned persona snapshot for any pre-existing agent
             // that predates the record-authoritative-spawn cutover (persona_id
