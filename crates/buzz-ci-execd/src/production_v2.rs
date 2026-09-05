@@ -1403,6 +1403,45 @@ impl LocalHostSystem {
         Ok(Some(digest))
     }
 
+    fn selects_failure(&self, binding: ExecutionBindingV1) -> bool {
+        self.static_job.failure_selector.selects(
+            &hex::encode(binding.run_id),
+            binding.attempt,
+            binding.job_id.as_str().unwrap_or_default(),
+        )
+    }
+
+    fn completed_response(&self, binding: ExecutionBindingV1, response: &ExecutorResponse) -> bool {
+        let expected = if self.selects_failure(binding) {
+            ("failure", 1)
+        } else {
+            ("success", 0)
+        };
+        response.conclusion.as_deref() == Some(expected.0)
+            && response.exit_code == Some(expected.1)
+            && response.raw_stderr.as_deref().is_none_or(str::is_empty)
+            && (!self.selects_failure(binding)
+                || response.raw_stdout.as_deref()
+                    == Some("fixture=buzz-ci-capacity-one-v1 outcome=deterministic-failure\n"))
+    }
+
+    fn completed_artifact_set(
+        &mut self,
+        binding: ExecutionBindingV1,
+    ) -> Result<[u8; 32], BindingError> {
+        if !self.selects_failure(binding) {
+            return self.sealed_artifacts(binding).map(|(_, digest)| digest);
+        }
+        // The selected failure exits before writing its declared artifact.
+        let attempt = self
+            .attempts
+            .open_child(&hex::encode(binding.attempt_id), self.job_uid, 0o500)
+            .map_err(binding_error)?;
+        verify_materialized_attempt(&attempt, self.job_uid, &self.static_job, false)
+            .map_err(binding_error)?;
+        Ok(empty_artifact_receipt_set_digest(binding))
+    }
+
     fn sealed_artifacts(
         &self,
         binding: ExecutionBindingV1,
@@ -1804,16 +1843,10 @@ impl PrivilegedHostSystem for LocalHostSystem {
             return Err(BindingError::HostRefused);
         }
         let conclusion = parse_conclusion(response.conclusion.as_deref())?;
-        if conclusion != Conclusion::Success
-            || response.exit_code != Some(0)
-            || response
-                .raw_stderr
-                .as_deref()
-                .is_some_and(|value| !value.is_empty())
-        {
+        if !self.completed_response(binding, &response) {
             return Err(BindingError::HostRefused);
         }
-        self.sealed_artifacts(binding)?;
+        self.completed_artifact_set(binding)?;
         let digest = self.write_evidence(
             binding,
             conclusion,
@@ -1835,15 +1868,13 @@ impl PrivilegedHostSystem for LocalHostSystem {
         reason: HostStopReason,
     ) -> Result<HostTerminalReceipt, BindingError> {
         let captured = (reason == HostStopReason::Completed)
-            .then(|| self.sealed_artifacts(binding))
+            .then(|| self.completed_artifact_set(binding))
             .transpose()?;
         let response = self.request("teardown", binding, None, None, None, Some(reason))?;
-        self.persist_teardown(
-            binding,
-            reason,
-            response,
-            captured.map(|(_, digest)| digest),
-        )
+        if reason == HostStopReason::Completed && !self.completed_response(binding, &response) {
+            return Err(BindingError::HostRefused);
+        }
+        self.persist_teardown(binding, reason, response, captured)
     }
 
     fn crash_recovery_coordinator(
@@ -1876,17 +1907,11 @@ impl PrivilegedHostSystem for LocalHostSystem {
             return Ok(None);
         }
         let conclusion = parse_conclusion(response.conclusion.as_deref())?;
-        if conclusion != Conclusion::Success
-            || response.exit_code != Some(0)
-            || response
-                .raw_stderr
-                .as_deref()
-                .is_some_and(|value| !value.is_empty())
-        {
+        if !self.completed_response(binding, &response) {
             let terminal = self.teardown_provider(binding, HostStopReason::Recovery)?;
             return Ok(Some(terminal));
         }
-        self.sealed_artifacts(binding)?;
+        self.completed_artifact_set(binding)?;
         let digest = self.write_evidence(
             binding,
             conclusion,
@@ -1931,13 +1956,12 @@ impl PrivilegedHostSystem for LocalHostSystem {
             .map_err(binding_error)?;
         let teardown: TeardownDocument = canonical_parse(&teardown_bytes).map_err(binding_error)?;
         let teardown_digest: [u8; 32] = Sha256::digest(&teardown_bytes).into();
-        // A stopped attempt (cancelled, expired, recovery) sealed no artifacts:
-        // the executor killed the job, the attempt tree is gone, and the
-        // teardown recorded the empty receipt set. Only that exact record
-        // skips the capture; a completed attempt still seals every declared
-        // artifact or is refused.
+        // Stopped attempts and the selected fixture failure bind the empty
+        // receipt set. Successful completion still requires every artifact.
         let empty_receipt_set = empty_artifact_receipt_set_digest(binding);
-        let (artifact_items, artifact_receipt_set_digest) = if teardown.stop_reason != "completed"
+        let selected_failure = self.selects_failure(binding) && evidence.conclusion == "failure";
+        let (artifact_items, artifact_receipt_set_digest) = if (teardown.stop_reason != "completed"
+            || selected_failure)
             && teardown.artifact_receipt_set_digest == hex::encode(empty_receipt_set)
         {
             (Vec::new(), empty_receipt_set)
@@ -3730,7 +3754,14 @@ fn executor_transition(
             });
             if let Some(conclusion) = forced {
                 result.conclusion = conclusion;
-            } else if result.conclusion != Conclusion::Success {
+            } else if result.conclusion != Conclusion::Success
+                && !(request.fixture_outcome == FIXTURE_FAILURE_OUTCOME
+                    && result.conclusion == Conclusion::Failure
+                    && result.exit_code == 1
+                    && result.stderr.is_empty()
+                    && result.stdout
+                        == b"fixture=buzz-ci-capacity-one-v1 outcome=deterministic-failure\n")
+            {
                 return Err(ProductionV2Error::Closed);
             }
             fill_job_response(&mut response, &result)?;
@@ -4853,6 +4884,188 @@ mod tests {
         assert_eq!(fs::read_dir(&attempts).unwrap().count(), 1);
     }
 
+    #[test]
+    fn selected_failure_completes_through_production_provider_and_executor() {
+        for (selected, exit_code, stdout, stderr, expected) in [
+            (
+                true,
+                1,
+                "fixture=buzz-ci-capacity-one-v1 outcome=deterministic-failure\n",
+                "",
+                Conclusion::Failure,
+            ),
+            (
+                false,
+                1,
+                "fixture=buzz-ci-capacity-one-v1 outcome=deterministic-failure\n",
+                "",
+                Conclusion::InfrastructureFailure,
+            ),
+            (
+                true,
+                2,
+                "fixture=buzz-ci-capacity-one-v1 outcome=deterministic-failure\n",
+                "",
+                Conclusion::InfrastructureFailure,
+            ),
+            (
+                true,
+                1,
+                "unexpected output\n",
+                "",
+                Conclusion::InfrastructureFailure,
+            ),
+            (
+                true,
+                1,
+                "fixture=buzz-ci-capacity-one-v1 outcome=deterministic-failure\n",
+                "unexpected stderr",
+                Conclusion::InfrastructureFailure,
+            ),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let evidence_path = temporary.path().join("evidence");
+            let teardown_path = temporary.path().join("teardown");
+            let attempts_path = temporary.path().join("attempts");
+            for (path, mode) in [
+                (&evidence_path, 0o700),
+                (&teardown_path, 0o700),
+                (&attempts_path, 0o711),
+            ] {
+                fs::create_dir(path).unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+            }
+            let owner = Uid::effective().as_raw();
+            let group = Gid::effective().as_raw();
+            let program = temporary.path().join("executor");
+            fs::write(&program, b"fixture executor provenance").unwrap();
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+            let socket = temporary.path().join("executor.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+            let mut system = LocalHostSystem {
+                identity: HostIdentity {
+                    broker_build_identity: [1; 32],
+                    host_profile_digest: [2; 32],
+                    suite_identity: [3; 32],
+                },
+                socket,
+                executor_uid: owner,
+                executor_gid: group,
+                executor: ProgramProvenance {
+                    path: program.to_string_lossy().into_owned(),
+                    sha256: hex::encode(Sha256::digest(b"fixture executor provenance")),
+                    source_commit: "1".repeat(40),
+                    uid: owner,
+                    gid: group,
+                    mode: 0o755,
+                },
+                seccomp: SeccompRuntimeBinding::fixture(),
+                evidence: SafeDirectory::open(evidence_path, owner, 0o700).unwrap(),
+                teardown: SafeDirectory::open(teardown_path.clone(), owner, 0o700).unwrap(),
+                evidence_by_binding: BTreeMap::new(),
+                attempts: SafeDirectory::open(attempts_path.clone(), owner, 0o711).unwrap(),
+                job_uid: owner,
+                job_gid: group,
+                static_job: static_job_fixture(no_artifact_fixture()),
+            };
+            let mut binding = valid_record().binding;
+            binding.run_id = *uuid::Uuid::parse_str(&system.static_job.failure_selector.run_id)
+                .unwrap()
+                .as_bytes();
+            binding.job_id = wire_text("capacity-one-fixture").unwrap();
+            binding.attempt = if selected { 1 } else { 2 };
+            binding.deadline_at = live_bound_now().unwrap() + 30;
+            binding.artifact_count = 1;
+            binding.artifacts = [Some(no_artifact_fixture())];
+            binding.execution_binding_digest = binding.computed_digest();
+            create_materialized_attempt(&attempts_path, binding.attempt_id);
+            let server_attempts = attempts_path.clone();
+            let worker = thread::spawn(move || {
+                let mut active = BTreeMap::new();
+                let mut operations = Vec::new();
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut length = [0; 4];
+                    stream.read_exact(&mut length).unwrap();
+                    let mut bytes = vec![0; u32::from_be_bytes(length) as usize];
+                    stream.read_exact(&mut bytes).unwrap();
+                    let request: ExecutorRequest = canonical_parse(&bytes).unwrap();
+                    if active.is_empty() {
+                        let contract = ExecutorBinding::from_request(
+                            &request,
+                            &hex::encode(binding.job_intent_digest),
+                        )
+                        .unwrap();
+                        active.insert(
+                            request.execution_binding_digest.clone(),
+                            ExecutorLease {
+                                stage: ExecutorStage::Terminal,
+                                contract,
+                                process: None,
+                                result: Some(JobResult {
+                                    conclusion: Conclusion::Failure,
+                                    exit_code,
+                                    stdout: stdout.as_bytes().to_vec(),
+                                    stderr: stderr.as_bytes().to_vec(),
+                                }),
+                            },
+                        );
+                    }
+                    operations.push((request.operation.clone(), request.stop_reason.clone()));
+                    let response =
+                        executor_transition(request, &mut active, &server_attempts).unwrap();
+                    let bytes = canonical_bytes(&response).unwrap();
+                    stream
+                        .write_all(&(bytes.len() as u32).to_be_bytes())
+                        .unwrap();
+                    stream.write_all(&bytes).unwrap();
+                }
+                assert!(active.is_empty());
+                operations
+            });
+            let terminal = system.poll_terminal(binding).unwrap().unwrap();
+            assert_eq!(
+                terminal.conclusion, expected,
+                "selected={selected}, exit={exit_code}, stdout={stdout:?}, stderr={stderr:?}"
+            );
+            let operations = worker.join().unwrap();
+            let stop = if expected == Conclusion::Failure {
+                "completed"
+            } else {
+                "recovery"
+            };
+            assert_eq!(
+                operations,
+                vec![
+                    ("terminal_evidence".into(), None),
+                    ("teardown".into(), Some(stop.into()))
+                ]
+            );
+            assert!(!attempts_path.join(hex::encode(binding.attempt_id)).exists());
+            // Reopen durable evidence after the in-memory evidence cache is gone.
+            system.evidence_by_binding.clear();
+            let items = system.sealed_attempt_evidence(binding).unwrap();
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0].descriptor.kind, EvidenceKind::Stdout);
+            assert_eq!(items[0].descriptor.digest, terminal.evidence_set_digest);
+            assert_eq!(items[1].descriptor.kind, EvidenceKind::Teardown);
+            assert_eq!(items[1].descriptor.digest, terminal.teardown_digest);
+            let evidence: EvidenceDocument = canonical_parse(&items[0].bytes).unwrap();
+            assert_eq!(evidence.conclusion, conclusion_name(expected));
+            if expected == Conclusion::Failure {
+                assert_eq!(evidence.output, stdout);
+                // Empty artifacts remain forbidden for another run or a rerun.
+                let mut foreign = binding;
+                foreign.attempt = 2;
+                assert!(system.sealed_attempt_evidence(foreign).is_err());
+            }
+        }
+    }
+
     /// H10 clean host, boot 3: a cancelled attempt is torn down without
     /// artifacts (the executor killed the job, the tree is removed, the
     /// teardown records the empty receipt set), so describing its evidence
@@ -5574,15 +5787,10 @@ mod tests {
                 .join("result.json")
                 .exists();
             let mut teardown = request("teardown");
-            teardown.stop_reason = Some(
-                if response.conclusion.as_deref() == Some("success") {
-                    "completed"
-                } else {
-                    "recovery"
-                }
-                .into(),
-            );
-            executor_transition(teardown, &mut active, attempts).unwrap();
+            teardown.stop_reason = Some("completed".into());
+            let terminal = executor_transition(teardown, &mut active, attempts).unwrap();
+            assert_eq!(terminal.conclusion, response.conclusion);
+            assert!(active.is_empty());
             (response, artifact_exists)
         }
 
