@@ -1,5 +1,11 @@
 # Releasing Buzz
 
+For `only21mil/buzz`, use the [fork desktop release procedure](docs/desktop-fork-release.md)
+for relay-first tags, repository selection and signing prerequisites.
+
+For local signed Android releases on `only21mil/buzz`, use
+[the local Android release procedure](docs/android-local-release.md).
+
 Buzz has three independent release lanes. Desktop and relay use release PRs.
 Mobile uses immutable release-candidate tags cut directly from remote `main`:
 
