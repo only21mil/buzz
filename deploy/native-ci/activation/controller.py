@@ -1543,6 +1543,36 @@ def _rollback_cleanup_value(manifest: dict[str, Any]) -> dict[str, object]:
     }
 
 
+# One already-rolled-back production package predates the M15 acceptance contract.
+# Its complete canonical manifest is pinned, including the old six-field template,
+# fixture script and receipt-stage digests, identities, paths and payload hashes.
+# This is a retirement-only migration, not general support for old-schema packages.
+# Provenance: tests/fixtures/rollback-manifest-009d2f06.json and tests/fixtures/README.md.
+_RETAINED_ROLLBACK_MANIFEST = {
+    "source_commit": "009d2f06d373d0e2d4960db2306ba9144c105052",
+    "activation_id": "buzz-ci-capacity-one-009d2f06d373-71bdc8878f8c",
+    "package_digest": "71bdc8878f8c887bd4c79533063c981e5bdd69aaff51c0b4ccde00feda7963e2",
+}
+_RETAINED_ROLLBACK_MANIFEST_SHA256 = "302e600cf5c729c125551c781a7d11ffe4402fce1c9c4b0b28c2ebc61eff12ab"
+
+
+def _validate_rollback_manifest(manifest: dict[str, Any]) -> None:
+    """Recognize one immutable historical record only for rollback retirement.
+
+    New package loading always uses validate_manifest directly. No field is
+    inserted, removed or translated here: the complete old record must match.
+    Cleanup metadata/canonical encoding, marker and receipt bindings, retained
+    program readback and retirement authorization remain checked by callers.
+    """
+    if (
+        all(manifest.get(key) == value for key, value in _RETAINED_ROLLBACK_MANIFEST.items())
+        and activation_package.digest(activation_package.canonical_json(manifest))
+        == _RETAINED_ROLLBACK_MANIFEST_SHA256
+    ):
+        return
+    activation_package.validate_manifest(manifest)
+
+
 def _read_rollback_cleanup(root: Path) -> dict[str, Any] | None:
     opened = _read_target(root, ROLLBACK_CLEANUP_PATH, activation_package.MAX_JSON_BYTES)
     if opened is None:
@@ -1560,7 +1590,7 @@ def _read_rollback_cleanup(root: Path) -> dict[str, Any] | None:
     manifest = value.get("manifest")
     if not isinstance(manifest, dict):
         raise ValueError("rollback cleanup marker lacks its manifest")
-    activation_package.validate_manifest(manifest)
+    _validate_rollback_manifest(manifest)
     if value != _rollback_cleanup_value(manifest):
         raise ValueError("rollback cleanup marker binding differs")
     return value
@@ -1646,7 +1676,7 @@ def _validate_rollback_retirement(value: dict[str, Any]) -> None:
     manifest = marker.get("manifest")
     if not isinstance(manifest, dict):
         raise ValueError("rollback retirement cleanup marker lacks its manifest")
-    activation_package.validate_manifest(manifest)
+    _validate_rollback_manifest(manifest)
     if marker != _rollback_cleanup_value(manifest):
         raise ValueError("rollback retirement cleanup marker binding differs")
     if value.get("marker_sha256") != _rollback_marker_sha256(marker):
