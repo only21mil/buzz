@@ -14,6 +14,8 @@ env:
   BUZZ_TEST_POSTGRES_PASSWORD: buzz_dev
   PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
 
+# Protected main PRs and manual dispatches execute every required check and its
+# dependencies. Path filters still limit PRs targeting other branches.
 jobs:
   changes:
     name: Detect Changed Paths
@@ -132,7 +134,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.desktop-rust == 'true'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.rust == 'true' || needs.changes.outputs.desktop-rust == 'true'
     permissions:
       contents: read
     steps:
@@ -153,7 +155,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.rust == 'true'
     permissions:
       contents: read
     steps:
@@ -191,7 +193,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
     permissions:
       contents: read
     steps:
@@ -283,7 +285,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -349,7 +351,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs: [changes, desktop-core, desktop-smoke-e2e]
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true')
+    if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true')
     permissions:
       contents: read
     steps:
@@ -370,7 +372,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
     permissions:
       contents: read
     steps:
@@ -439,7 +441,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [changes, desktop-e2e-relay]
-    if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -615,7 +617,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs: [changes, desktop-e2e-integration-shard]
-    if: always() && (github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true')
+    if: always() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true')
     permissions:
       contents: read
     steps:
@@ -632,7 +634,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [changes, desktop-e2e-relay]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.rust == 'true'
     permissions:
       contents: read
     steps:
@@ -796,7 +798,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [changes, desktop-e2e-relay]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.rust == 'true'
     permissions:
       contents: read
     steps:
@@ -851,7 +853,7 @@ jobs:
     timeout-minutes: 15
     needs: [changes]
     # Protected main PRs need a successful check even when Web paths are unchanged.
-    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.web == 'true'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.web == 'true'
     permissions:
       contents: read
     steps:
@@ -887,7 +889,7 @@ jobs:
     timeout-minutes: 30
     needs: [changes]
     # Protected main PRs need a successful check even when Mobile paths are unchanged.
-    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.mobile == 'true'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.mobile == 'true'
     permissions:
       contents: read
     steps:
@@ -964,7 +966,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.rust == 'true'
     permissions:
       contents: read
     steps:
@@ -1038,7 +1040,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 45
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.desktop == 'true' || needs.changes.outputs.desktop-rust == 'true' || needs.changes.outputs.rust == 'true'
     permissions:
       contents: read
     steps:
