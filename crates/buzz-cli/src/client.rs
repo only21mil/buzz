@@ -964,6 +964,8 @@ impl BuzzClient {
     ///
     /// The request body is serialized once before the retry loop. Every retry
     /// therefore sends identical bytes while receiving a fresh NIP-98 nonce.
+    /// Non-success responses retain the complete body and HTTP status; a body
+    /// read failure remains a network error.
     pub async fn post_authed_json<Request, Response>(
         &self,
         path: &str,
@@ -993,7 +995,16 @@ impl BuzzClient {
                     )
                     .send()
                     .await?;
-                let raw = self.handle_response(resp).await?;
+                // Preflight callers need the complete error body and must not
+                // mistake an unreadable body for a missing endpoint's empty 404.
+                let status = resp.status();
+                let raw = resp.text().await?;
+                if !status.is_success() {
+                    return Err(CliError::Relay {
+                        status: status.as_u16(),
+                        body: raw,
+                    });
+                }
                 serde_json::from_str(&raw).map_err(|e| {
                     CliError::Other(format!("failed to parse authenticated POST response: {e}"))
                 })

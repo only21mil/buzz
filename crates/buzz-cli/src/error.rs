@@ -10,6 +10,13 @@ pub enum CliError {
     #[error("relay error {status}: {body}")]
     Relay { status: u16, body: String },
 
+    /// Failure of the read-only CI preflight, before signing a CI request.
+    #[error("CI preflight failed before request signing for {request}: {source}")]
+    CiPreflight {
+        request: String,
+        source: Box<CliError>,
+    },
+
     /// Network-level failure (connect, timeout, DNS)
     #[error("network error: {}", fmt_reqwest_error(.0))]
     Network(#[from] reqwest::Error),
@@ -71,6 +78,7 @@ fn fmt_reqwest_error(e: &reqwest::Error) -> String {
 /// errors.
 pub fn is_retryable_error(e: &CliError) -> bool {
     match e {
+        CliError::CiPreflight { source, .. } => is_retryable_error(source),
         CliError::Network(ref net_err) => {
             net_err.is_connect()
                 || net_err.is_timeout()
@@ -89,6 +97,7 @@ pub fn is_retryable_error(e: &CliError) -> bool {
 /// 4=other, 5=write conflict (NIP-33 dominated head).
 pub fn exit_code(e: &CliError) -> i32 {
     match e {
+        CliError::CiPreflight { source, .. } => exit_code(source),
         CliError::Usage(_) => 1,
         CliError::Relay { status, .. } => {
             if *status == 401 || *status == 403 {
@@ -110,7 +119,17 @@ pub fn exit_code(e: &CliError) -> i32 {
 /// Serialize error to JSON and write to stderr.
 /// Format: {"error": "<category>", "message": "<human-readable detail>", "retryable": <bool>}
 pub fn print_error(e: &CliError) {
-    let category = match e {
+    let obj = serde_json::json!({
+        "error": error_category(e),
+        "message": e.to_string(),
+        "retryable": is_retryable_error(e),
+    });
+    eprintln!("{}", obj);
+}
+
+fn error_category(e: &CliError) -> &'static str {
+    match e {
+        CliError::CiPreflight { source, .. } => error_category(source),
         CliError::Usage(_) => "user_error",
         CliError::Relay { status, .. } => {
             if *status == 401 || *status == 403 {
@@ -126,13 +145,7 @@ pub fn print_error(e: &CliError) {
         CliError::NotFound(_) => "not_found",
         CliError::DeliveryUnknown(_) => "delivery_unknown",
         CliError::Other(_) => "error",
-    };
-    let obj = serde_json::json!({
-        "error": category,
-        "message": e.to_string(),
-        "retryable": is_retryable_error(e),
-    });
-    eprintln!("{}", obj);
+    }
 }
 
 #[cfg(test)]
