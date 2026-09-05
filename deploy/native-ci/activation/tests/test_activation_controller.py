@@ -257,6 +257,135 @@ class ActivationControllerTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def historical_rollback_manifest(self) -> dict[str, object]:
+        raw = (ACTIVATION_ROOT / "tests/fixtures/rollback-manifest-009d2f06.json").read_bytes()
+        self.assertEqual(activation_package.digest(raw), CONTROLLER._RETAINED_ROLLBACK_MANIFEST_SHA256)
+        manifest = json.loads(raw)
+        self.assertEqual(activation_package.canonical_json(manifest), raw)
+        return manifest
+
+    def test_historical_manifest_is_retirement_only(self) -> None:
+        old = self.historical_rollback_manifest()
+        before = activation_package.canonical_json(old)
+        CONTROLLER._validate_rollback_manifest(old)
+        self.assertEqual(activation_package.canonical_json(old), before)
+        CONTROLLER._validate_rollback_manifest(self.fixture.manifest)
+        with self.assertRaisesRegex(ValueError, "public acceptance template shape differs"):
+            activation_package.validate_manifest(old)
+        write_file(self.fixture.package / "activation-manifest.json", before, 0o600)
+        with self.assertRaisesRegex(ValueError, "public acceptance template shape differs"):
+            CONTROLLER.load_package(self.fixture.package, live=False)
+
+    def test_historical_manifest_mutations_are_not_compatibility(self) -> None:
+        old = self.historical_rollback_manifest()
+        mutations = (
+            lambda m: m.update(source_commit="f" * 40),
+            lambda m: m.update(package_digest="f" * 64),
+            lambda m: m.update(activation_id="buzz-ci-capacity-one-other"),
+            lambda m: m["acceptance_template"]["actor"].update(public_key="f" * 64),
+            lambda m: m["acceptance_template"]["actor"].update(generation=99),
+            lambda m: m["identities"]["qualification"].update(uid=0),
+            lambda m: m["entries"][0].update(target="/etc/other"),
+            lambda m: next(e for e in m["entries"] if e["role"] == "fixture_script").update(sha256=activation_package.FIXTURE_SCRIPT_SHA256),
+            lambda m: next(e for e in m["entries"] if e["role"] == "receipt_verifier_expected_stages").update(sha256=activation_package.RECEIPT_VERIFIER_EXPECTED_STAGES_SHA256),
+            lambda m: m["acceptance_template"].update(export_generation=1),
+            lambda m: m.update(extra=True),
+        )
+        for number, mutate in enumerate(mutations):
+            with self.subTest(mutation=number):
+                changed = copy.deepcopy(old)
+                mutate(changed)
+                with self.assertRaises(ValueError):
+                    CONTROLLER._validate_rollback_manifest(changed)
+        changed = copy.deepcopy(old)
+        changed["acceptance_template"]["actor"]["generation"] += 1
+        draft = {k: v for k, v in changed.items() if k not in {"package_digest", "activation_id"}}
+        draft["schema"] = activation_package.DRAFT_SCHEMA
+        changed["package_digest"] = activation_package.digest(activation_package.canonical_json(draft))
+        changed["activation_id"] = f"buzz-ci-capacity-one-{changed['source_commit'][:12]}-{changed['package_digest'][:12]}"
+        with self.assertRaises(ValueError):
+            CONTROLLER._validate_rollback_manifest(changed)
+        # Missing M15 fields cannot select a historical contract for a new source.
+        current = copy.deepcopy(self.fixture.manifest)
+        del current["acceptance_template"]["export_subject"]
+        with self.assertRaisesRegex(ValueError, "public acceptance template shape differs"):
+            CONTROLLER._validate_rollback_manifest(current)
+
+    def test_historical_marker_metadata_and_retirement_bindings_stay_strict(self) -> None:
+        old = self.historical_rollback_manifest()
+        marker = CONTROLLER._rollback_cleanup_value(old)
+        path = self.fixture.root / CONTROLLER.ROLLBACK_CLEANUP_PATH.lstrip("/")
+        raw = activation_package.canonical_json(marker)
+        write_file(path, raw, 0o644)
+        with self.assertRaisesRegex(ValueError, "metadata is unsafe"):
+            CONTROLLER._read_rollback_cleanup(self.fixture.root)
+        write_file(path, raw + b"\n", 0o600)
+        with self.assertRaisesRegex(ValueError, "noncanonical"):
+            CONTROLLER._read_rollback_cleanup(self.fixture.root)
+        changed = copy.deepcopy(marker)
+        changed["manifest_sha256"] = "f" * 64
+        write_file(path, activation_package.canonical_json(changed), 0o600)
+        with self.assertRaisesRegex(ValueError, "binding differs"):
+            CONTROLLER._read_rollback_cleanup(self.fixture.root)
+        write_file(path, raw, 0o600)
+        self.assertEqual(CONTROLLER._read_rollback_cleanup(self.fixture.root), marker)
+        retirement = CONTROLLER._rollback_retirement_value(marker, self.fixture.manifest)
+        CONTROLLER._validate_rollback_retirement(retirement)
+        for field in ("archive_path", "marker_sha256"):
+            with self.subTest(field=field):
+                changed = copy.deepcopy(retirement)
+                changed[field] = "f" * 64
+                with self.assertRaises(ValueError):
+                    CONTROLLER._validate_rollback_retirement(changed)
+        changed = copy.deepcopy(retirement)
+        changed["marker"]["manifest"]["acceptance_template"]["actor"]["generation"] += 1
+        with self.assertRaises(ValueError):
+            CONTROLLER._validate_rollback_retirement(changed)
+
+    def test_historical_cleanup_mixed_dormant_state_stages_and_archives_exactly(self) -> None:
+        manifest, payloads, driver = self.fixture.load()
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        old = self.historical_rollback_manifest()
+        marker = CONTROLLER._rollback_cleanup_value(old)
+        receipt = CONTROLLER._read_receipt(self.fixture.root)
+        for key in ("activation_id", "package_digest", "source_commit"):
+            receipt[key] = old[key]
+        receipt["fixed_package"]["manifest_sha256"] = activation_package.digest(activation_package.canonical_json(old))
+        CONTROLLER._write_receipt(self.fixture.root, receipt, manifest["identities"]["controld"]["gid"])
+        marker_path = self.fixture.root / CONTROLLER.ROLLBACK_CLEANUP_PATH.lstrip("/")
+        old_raw = activation_package.canonical_json(marker)
+        write_file(marker_path, old_raw, 0o600)
+        # New dormant component files coexist with the old controller receipt.
+        # The retained program verifier must prove the permitted next bytes.
+        receipt_path = self.fixture.root / CONTROLLER.RECEIPT_PATH.lstrip("/")
+        receipt_before = receipt_path.read_bytes()
+        wrong_receipt = copy.deepcopy(receipt)
+        wrong_receipt["package_digest"] = "f" * 64
+        CONTROLLER._write_receipt(self.fixture.root, wrong_receipt, manifest["identities"]["controld"]["gid"])
+        with self.assertRaisesRegex(ValueError, "receipt belongs to a different activation package"):
+            CONTROLLER.check_current(manifest, self.fixture.root, driver)
+        write_file(receipt_path, receipt_before, 0o600)
+        checked = CONTROLLER.check_current(manifest, self.fixture.root, driver)
+        self.assertEqual(checked["status"], "ready_to_stage")
+        self.assertEqual(checked["retained_recovery_targets"], {
+            "activation_controller": "next", "activation_package_module": "next",
+        })
+        self.assertEqual(marker_path.read_bytes(), old_raw)
+        self.assertEqual(receipt_path.read_bytes(), receipt_before)
+        CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
+        self.assertIsNone(CONTROLLER._read_rollback_cleanup(self.fixture.root))
+        self.assertIsNone(CONTROLLER._read_rollback_retirement(self.fixture.root))
+        archives = list((self.fixture.root / CONTROLLER.ROLLBACK_ARCHIVE_ROOT.lstrip("/")).iterdir())
+        self.assertEqual(len(archives), 1)
+        archive = json.loads(archives[0].read_bytes())
+        self.assertEqual(activation_package.canonical_json(archive["marker"]), old_raw)
+        self.assertEqual(archive["retired_by_package_digest"], manifest["package_digest"])
+        self.assertEqual(CONTROLLER._read_receipt(self.fixture.root)["state"], "staged_zero")
+        CONTROLLER.rollback(manifest, self.fixture.root, driver)
+        self.assertEqual(CONTROLLER._read_receipt(self.fixture.root)["state"], "rolled_back")
+        self.assertEqual(CONTROLLER._read_rollback_cleanup(self.fixture.root)["manifest"], manifest)
+
     def legacy_pre_fixed_boundaries(self, manifest: dict[str, object]) -> list[tuple[str, int]]:
         targets = [entry for entry in manifest["entries"] if entry["role"] != "execd_config"]
         return [("apply", cut) for cut in range(len(targets) + 1)] + [("provision", 0), ("tmpfiles", 0)]
@@ -1608,7 +1737,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "203c1dfc85a2fae37301c3bc44e05c81d04aa7a0fc7f28e82fe704d598f9af70",
+            "1efd2e5e0dc3b4ea0c6249981963609a597651532dd609032831e9a9ba522bb8",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")
