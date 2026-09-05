@@ -1,5 +1,8 @@
 # Releasing Buzz
 
+For `only21mil/buzz`, use the [fork desktop release procedure](docs/desktop-fork-release.md)
+for relay-first tags, repository selection and signing prerequisites.
+
 Buzz has three independent release lanes. Desktop and relay use release PRs.
 Mobile uses immutable release-candidate tags cut directly from remote `main`:
 

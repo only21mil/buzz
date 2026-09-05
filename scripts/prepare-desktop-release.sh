@@ -8,21 +8,43 @@ mode="${2:-publish}"
   exit 1
 }
 
+[[ "$mode" == publish || "$mode" == validate-only ]] || { echo "unknown mode: $mode" >&2; exit 1; }
+[[ -z "$(git status --porcelain)" ]] || { echo "working tree is dirty" >&2; exit 1; }
 remote="${RELEASE_REMOTE:-origin}"
-git fetch "$remote" refs/heads/main:refs/remotes/origin/main --no-tags
-git fetch "$remote" '+refs/tags/v*:refs/tags/v*' '+refs/tags/desktop-v*:refs/tags/desktop-v*'
-base_sha="$(git rev-parse refs/remotes/origin/main)"
+repository="${RELEASE_REPOSITORY:-${GITHUB_REPOSITORY:-}}"
+if [[ -z "$repository" ]]; then
+  remote_url="$(git remote get-url "$remote")"
+  case "$remote_url" in
+    https://github.com/*) repository="${remote_url#https://github.com/}" ;;
+    git@github.com:*) repository="${remote_url#git@github.com:}" ;;
+    *) echo "set RELEASE_REPOSITORY=owner/repo for a non-GitHub release remote" >&2; exit 1 ;;
+  esac
+  repository="${repository%.git}"
+fi
+[[ "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "invalid release repository" >&2; exit 1; }
+# Use a dedicated fetched ref; the authoritative relay must not overwrite an
+# unrelated upstream origin/main tracking ref.
+base_ref=refs/release-preparation/main
+git fetch "$remote" "refs/heads/main:$base_ref" --no-tags
+git fetch "$remote" 'refs/tags/desktop-v*:refs/tags/desktop-v*'
+remote_tags="$(git ls-remote --refs "$remote" 'refs/tags/desktop-v*' | sort)"
+local_tags="$(git for-each-ref --format='%(objectname)%09%(refname)' 'refs/tags/desktop-v*' | sort)"
+[[ "$local_tags" == "$remote_tags" ]] || {
+  echo "desktop tags differ from release remote; use a fresh --no-tags clone of that remote" >&2
+  exit 1
+}
+base_sha="$(git rev-parse "$base_ref")"
 branch="version-bump/$version"
 
 remote_branch="refs/heads/$branch"
 remote_oid=""
 if remote_oid="$(git ls-remote "$remote" "$remote_branch" | awk '{print $1}')" && [[ -n "$remote_oid" ]]; then
-  git fetch "$remote" "$remote_branch:refs/remotes/origin/$branch"
+  git fetch "$remote" "$remote_branch" --no-tags
 fi
 
 git checkout -B "$branch" "$base_sha"
 just bump-desktop-version "$version"
-scripts/desktop_release.py generate "$version" --base "$base_sha" --repo block/buzz
+scripts/desktop_release.py generate "$version" --base "$base_sha" --repo "$repository"
 
 git add \
   .release/desktop-candidate.json \
@@ -44,7 +66,7 @@ Co-authored-by: $agent_name <$agent_email>
 EOF
 git -c user.name='Wes' -c user.email='wesbillman@users.noreply.github.com' \
   commit -s -F "$msg"
-scripts/desktop_release.py validate --candidate HEAD --version "$version" --repo block/buzz
+scripts/desktop_release.py validate --candidate HEAD --version "$version" --repo "$repository"
 
 candidate_sha="$(git rev-parse HEAD)"
 previous_tag="$(python3 -c 'import json; print(json.load(open(".release/desktop-candidate.json"))["previous_tag"] or "initial")')"
@@ -75,9 +97,9 @@ This PR may be **squash merged** after the Desktop Release Candidate check and a
 
 The checked-in changelog accounts for every non-merge commit in the release range. The Desktop tag points to the reviewed candidate commit, not the later squash commit. Publication remains bound to that immutable candidate tag.
 EOF
-if existing="$(gh pr list --head "$branch" --state open --json number --jq '.[0].number')" && [[ -n "$existing" ]]; then
-  gh pr edit "$existing" --title "chore(release): release Buzz Desktop version $version" --body-file "$body"
+if existing="$(gh pr list --repo "$repository" --head "$branch" --state open --json number --jq '.[0].number')" && [[ -n "$existing" ]]; then
+  gh pr edit "$existing" --repo "$repository" --title "chore(release): release Buzz Desktop version $version" --body-file "$body"
 else
-  gh pr create --base main --head "$branch" \
+  gh pr create --repo "$repository" --base main --head "$branch" \
     --title "chore(release): release Buzz Desktop version $version" --body-file "$body"
 fi

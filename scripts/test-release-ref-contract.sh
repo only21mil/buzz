@@ -271,8 +271,8 @@ dco_fixture fail 2026-01-02T00:05:01Z
 # The verifier must request production endpoint semantics and pin helpers before checkout.
 verify_merge="$repo_root/scripts/verify-desktop-release-merge.sh"
 grep -Fq 'check-runs?filter=latest&per_page=100' "$verify_merge"
-grep -Fq 'git fetch origin main --no-tags' "$verify_merge"
-grep -Fq 'git merge-base --is-ancestor "$candidate_parents" origin/main' "$verify_merge"
+grep -Fq 'git fetch "$release_remote" refs/heads/main:refs/release-verification/main --no-tags' "$verify_merge"
+grep -Fq 'git merge-base --is-ancestor "$candidate_parents" refs/release-verification/main' "$verify_merge"
 grep -Fq 'git show "$candidate_parents:scripts/desktop_release.py"' "$verify_merge"
 grep -Fq 'git show "$candidate_parents:scripts/required-check-succeeded.jq"' "$verify_merge"
 grep -Fq 'DESKTOP_RELEASE_ROOT="$PWD" python3 "$verifier_dir/desktop_release.py"' "$verify_merge"
@@ -307,5 +307,7 @@ if grep -q 'gh workflow run' "$auto_tag"; then
   echo "auto-tag still dispatches a publisher instead of using the tag push" >&2
   exit 1
 fi
+
+"$repo_root/scripts/test-desktop-fork-release.sh"
 
 echo "release ref contract passed"

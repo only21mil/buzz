@@ -61,6 +61,11 @@ jobs:
           # and its version differs from the PR's base commit.
           case "$BRANCH" in
             version-bump/*)
+              if [[ "$GITHUB_REPOSITORY" == only21mil/buzz ]]; then
+                echo "Fork desktop tags are published relay-first after operator verification; see docs/desktop-fork-release.md"
+                echo "enabled=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
               VERSION="${BRANCH#version-bump/}"
               TAG_PREFIX="desktop-v" ;;
             relay-release/*)
