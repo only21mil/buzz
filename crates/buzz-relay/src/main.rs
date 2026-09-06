@@ -181,7 +181,8 @@ async fn main() -> anyhow::Result<()> {
         max_connections: config.db_pool_size,
         read_max_connections: config.db_read_pool_size,
         ..DbConfig::default()
-    };
+    }
+    .with_session_timeouts_from_env();
     let db = Db::new(&db_config).await.map_err(|e| {
         error!("Failed to connect to Postgres: {e}");
         anyhow::anyhow!("DB connection failed: {e}")
@@ -348,12 +349,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let audit = if config.audit_enabled {
-        let audit_pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(5)
-            .min_connections(1)
-            .connect(&config.database_url)
-            .await
-            .map_err(|e| anyhow::anyhow!("Audit DB connection failed: {e}"))?;
+        let audit_pool = Db::connect_writer_pool(&DbConfig {
+            max_connections: 5,
+            min_connections: 1,
+            ..db_config.clone()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Audit DB connection failed: {e}"))?;
         info!("Audit service ready");
         Some(AuditService::new(audit_pool))
     } else {

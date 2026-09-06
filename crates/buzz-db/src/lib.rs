@@ -28,6 +28,8 @@ pub mod ci_grants;
 pub mod dm;
 /// Database error types.
 pub mod error;
+mod session_policy;
+pub use session_policy::{DEFAULT_IDLE_TXN_TIMEOUT_MS, DEFAULT_LOCK_TIMEOUT_MS};
 /// Event storage and retrieval.
 pub mod event;
 /// Home feed queries.
@@ -642,6 +644,12 @@ pub struct DbConfig {
     /// than the staleness gate never routes anyway, so a larger budget
     /// would only misrepresent the config.
     pub replica_read_max_age_ms: u64,
+    /// Writer lock wait limit in milliseconds; zero disables it.
+    pub lock_timeout_ms: u64,
+    /// Writer idle transaction lifetime in milliseconds; zero disables it.
+    pub idle_txn_timeout_ms: u64,
+    /// Writer statement limit in milliseconds; zero disables it.
+    pub statement_timeout_ms: u64,
 }
 
 impl Default for DbConfig {
@@ -659,6 +667,9 @@ impl Default for DbConfig {
             max_lifetime_secs: 1800,
             idle_timeout_secs: 600,
             replica_read_max_age_ms: 0,
+            lock_timeout_ms: DEFAULT_LOCK_TIMEOUT_MS,
+            idle_txn_timeout_ms: DEFAULT_IDLE_TXN_TIMEOUT_MS,
+            statement_timeout_ms: 0,
         }
     }
 }
@@ -764,7 +775,7 @@ impl Db {
     /// `buzz.created_at_floor` GUC — this is what makes the replica fence
     /// proof hold for every insert path that goes through this pool.
     pub async fn new(config: &DbConfig) -> Result<Self> {
-        let pool = Self::connect_pool(config, &config.database_url, true).await?;
+        let pool = Self::connect_writer_pool(config).await?;
         let read_max_connections = config
             .read_max_connections
             .unwrap_or(config.max_connections);
@@ -784,32 +795,19 @@ impl Db {
         })
     }
 
-    /// Connect one pool with the sizing knobs from `config`.
-    ///
-    /// `arm_floor_guard` sets the `buzz.created_at_floor` session GUC on
-    /// every connection, arming the deferred commit-time trigger from
-    /// migration 0021. Writer pools must arm it; replica pools are read-only
-    /// so the trigger never fires there.
-    async fn connect_pool(config: &DbConfig, url: &str, arm_floor_guard: bool) -> Result<PgPool> {
-        let mut options = PgPoolOptions::new()
+    /// Connect an additional writer pool using the shared timeout, replica floor,
+    /// and read-committed isolation policy. Audit writers use this constructor too.
+    /// SQLx retains only one after-connect hook; all session policy lives in it.
+    pub async fn connect_writer_pool(config: &DbConfig) -> Result<PgPool> {
+        let policy = session_policy::SessionPolicy::from(config);
+        let options = PgPoolOptions::new()
             .max_connections(config.max_connections)
             .min_connections(config.min_connections)
             .acquire_timeout(Duration::from_secs(config.acquire_timeout_secs))
             .max_lifetime(Duration::from_secs(config.max_lifetime_secs))
-            .idle_timeout(Duration::from_secs(config.idle_timeout_secs));
-        if arm_floor_guard {
-            options = options.after_connect(|conn, _meta| {
-                Box::pin(async move {
-                    // `SET` cannot take bind parameters; `set_config` can.
-                    sqlx::query("SELECT set_config('buzz.created_at_floor', $1, false)")
-                        .bind(replica_fence::CREATED_AT_FLOOR_SECS.to_string())
-                        .execute(conn)
-                        .await?;
-                    Ok(())
-                })
-            });
-        }
-        Ok(options.connect(url).await?)
+            .idle_timeout(Duration::from_secs(config.idle_timeout_secs))
+            .after_connect(move |conn, _meta| Box::pin(policy.apply(conn)));
+        Ok(options.connect(&config.database_url).await?)
     }
 
     /// Reader acquire timeout — deliberately far below the writer's
@@ -834,7 +832,7 @@ impl Db {
     /// the pool back up, which is fine — routed reads re-fill it on demand.
     ///
     /// No floor guard: replica sessions are read-only, the trigger never
-    /// fires there (see [`Db::connect_pool`]).
+    /// fires there (see [`Db::connect_writer_pool`]).
     fn connect_read_pool(config: &DbConfig, url: &str, max_connections: u32) -> Result<PgPool> {
         Ok(PgPoolOptions::new()
             .max_connections(max_connections)

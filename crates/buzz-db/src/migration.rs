@@ -12,8 +12,15 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
 /// Run all pending Buzz database migrations.
 pub async fn run_migrations(pool: &PgPool) -> Result<()> {
-    reject_legacy_nip_rs_cardinality_ambiguity(pool).await?;
-    MIGRATOR.run(pool).await?;
+    // A migration owns its session. Drop/cancellation closes it, so relaxed
+    // budgets and advisory locks can never return to the serving pool.
+    let mut connection = pool.acquire().await?.detach();
+    sqlx::raw_sql("SET lock_timeout = 0; SET statement_timeout = 0")
+        .execute(&mut connection)
+        .await?;
+    reject_legacy_nip_rs_cardinality_ambiguity(&mut connection).await?;
+    MIGRATOR.run(&mut connection).await?;
+    sqlx::Connection::close(connection).await?;
     // The replica-fence proof (see `replica_fence`) requires the commit-time
     // `created_at` floor trigger from migration 0021 — correctly shaped — on
     // the `events` parent and every partition. `CREATE TABLE .. PARTITION OF`
@@ -29,17 +36,19 @@ pub async fn run_migrations(pool: &PgPool) -> Result<()> {
 /// enforcement. A populated database still on 0001-0006 must not let 0007
 /// irreversibly purge duplicate-tag history. Fail before sqlx starts its
 /// migration transaction so an operator can inspect and repair those rows.
-async fn reject_legacy_nip_rs_cardinality_ambiguity(pool: &PgPool) -> Result<()> {
+async fn reject_legacy_nip_rs_cardinality_ambiguity(
+    connection: &mut sqlx::PgConnection,
+) -> Result<()> {
     let migrations_table: Option<String> =
         sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations')::text")
-            .fetch_one(pool)
+            .fetch_one(&mut *connection)
             .await?;
     if migrations_table.is_none() {
         return Ok(());
     }
     let applied: Option<i64> =
         sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations WHERE success")
-            .fetch_one(pool)
+            .fetch_one(&mut *connection)
             .await?;
     if applied.is_none_or(|version| version >= 7) {
         return Ok(());
@@ -83,7 +92,7 @@ async fn reject_legacy_nip_rs_cardinality_ambiguity(pool: &PgPool) -> Result<()>
                )\
          )",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *connection)
     .await?;
 
     if ambiguous {
