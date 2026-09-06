@@ -207,12 +207,13 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
         // storage and of `require_auth_token` (which governs the REST API, not
         // media). On open relays (membership disabled) any valid Blossom signer
         // may upload, matching the WS door's admission policy.
-        let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
+        let auth_tag = crate::api::relay_members::extract_auth_tag_header(headers);
         crate::api::relay_members::enforce_relay_membership(
             state,
             tenant.community(),
             auth_event.pubkey.as_bytes(),
             auth_tag,
+            Some(auth_event.created_at.as_secs()),
         )
         .await
         .map_err(|_| MediaError::RelayMembershipRequired)?;
@@ -497,12 +498,13 @@ async fn authenticate_media_read(
     let sha256 = sha256_ext.split('.').next().unwrap_or(sha256_ext);
     buzz_media::auth::verify_blossom_get_auth(&auth_event, sha256, Some(tenant.host()), 3600)?;
 
-    let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
+    let auth_tag = crate::api::relay_members::extract_auth_tag_header(headers);
     crate::api::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
         auth_event.pubkey.as_bytes(),
         auth_tag,
+        Some(auth_event.created_at.as_secs()),
     )
     .await
     .map_err(|_| MediaError::RelayMembershipRequired)?;
@@ -878,9 +880,7 @@ async fn resolve_s3_key(
 fn extract_blossom_auth(headers: &HeaderMap) -> Result<nostr::Event, MediaError> {
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 
-    let header = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
+    let header = crate::api::relay_members::unique_header(headers, "authorization")
         .ok_or(MediaError::MissingAuth)?;
 
     let token = header
@@ -912,6 +912,74 @@ mod tests {
     use uuid::Uuid;
 
     const VALID_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    #[test]
+    fn nip_oa_blossom_upload_and_read_use_signed_time() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let now = Timestamp::now();
+        for verb in ["get", "upload"] {
+            for (condition, admitted) in [
+                (format!("created_at<{}", now.as_secs() + 1), true),
+                (format!("created_at<{}", now.as_secs()), false),
+                (format!("created_at>{}", now.as_secs()), false),
+            ] {
+                let event = EventBuilder::new(Kind::from(24242), "Authorize test media")
+                    .custom_created_at(now)
+                    .tags([
+                        Tag::parse(["t", verb]).unwrap(),
+                        Tag::parse(["server", "relay.example"]).unwrap(),
+                        Tag::parse(["x", VALID_HASH]).unwrap(),
+                        Tag::parse(["expiration", &(now.as_secs() + 300).to_string()]).unwrap(),
+                    ])
+                    .sign_with_keys(&agent)
+                    .unwrap();
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    "authorization",
+                    format!(
+                        "Nostr {}",
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(event.as_json())
+                    )
+                    .parse()
+                    .unwrap(),
+                );
+                let verified = extract_blossom_auth(&headers).unwrap();
+                if verb == "get" {
+                    buzz_media::auth::verify_blossom_get_auth(
+                        &verified,
+                        VALID_HASH,
+                        Some("relay.example"),
+                        3600,
+                    )
+                    .unwrap();
+                } else {
+                    buzz_media::auth::verify_blossom_auth_event(
+                        &verified,
+                        Some("relay.example"),
+                        3600,
+                    )
+                    .unwrap();
+                }
+                let credential =
+                    buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), &condition)
+                        .unwrap();
+                headers.insert("x-auth-tag", credential.parse().unwrap());
+                let owner = |headers: &HeaderMap| {
+                    crate::api::relay_members::extract_nip_oa_owner(
+                        verified.pubkey.as_bytes(),
+                        crate::api::relay_members::extract_auth_tag_header(headers),
+                        Some(verified.created_at.as_secs()),
+                    )
+                };
+                assert_eq!(owner(&headers).is_some(), admitted);
+                headers.append("x-auth-tag", credential.parse().unwrap());
+                assert_eq!(owner(&headers), None);
+                headers.append("authorization", headers["authorization"].clone());
+                assert!(extract_blossom_auth(&headers).is_err());
+            }
+        }
+    }
 
     #[test]
     fn upload_routes_distinguish_standard_and_legacy_modes() {
@@ -988,6 +1056,180 @@ mod tests {
                 axum::routing::get(get_blob).head(head_blob),
             )
             .with_state(state)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL fixture"]
+    async fn nip_oa_membership_ingress_rejects_invalid_time_and_preserves_direct_members() {
+        use crate::api::relay_members::{check_relay_membership, MembershipDecision};
+        let mut state = test_state().await;
+        let config = Arc::make_mut(&mut Arc::get_mut(&mut state).unwrap().config);
+        config.require_relay_membership = true;
+        config.allow_nip_oa_auth = true;
+        config.relay_url = "wss://relay.example".into();
+        config.media_uploads_per_minute = 1000;
+        let tenant = crate::tenant::bind_community(&state.db, "relay.example")
+            .await
+            .unwrap();
+        let other = state
+            .db
+            .ensure_configured_community("other.example")
+            .await
+            .unwrap();
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        state
+            .db
+            .add_relay_member(
+                tenant.community(),
+                &owner.public_key().to_hex(),
+                "owner",
+                None,
+            )
+            .await
+            .unwrap();
+        let now = Timestamp::now();
+        for (condition, admitted) in [
+            (format!("created_at<{}", now.as_secs() + 1), true),
+            (format!("created_at<{}", now.as_secs()), false),
+            (format!("created_at>{}", now.as_secs()), false),
+        ] {
+            let credential =
+                buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), &condition)
+                    .unwrap();
+            for verb in ["get", "upload"] {
+                let event = EventBuilder::new(Kind::from(24242), "Authorize test media")
+                    .custom_created_at(now)
+                    .tags([
+                        Tag::parse(["t", verb]).unwrap(),
+                        Tag::parse(["server", "relay.example"]).unwrap(),
+                        Tag::parse(["x", VALID_HASH]).unwrap(),
+                        Tag::parse(["expiration", &(now.as_secs() + 300).to_string()]).unwrap(),
+                    ])
+                    .sign_with_keys(&agent)
+                    .unwrap();
+                let mut headers = HeaderMap::new();
+                headers.insert("host", "relay.example".parse().unwrap());
+                headers.insert(
+                    "authorization",
+                    format!(
+                        "Nostr {}",
+                        base64::engine::general_purpose::STANDARD.encode(event.as_json())
+                    )
+                    .parse()
+                    .unwrap(),
+                );
+                headers.insert("x-auth-tag", credential.parse().unwrap());
+                headers.insert("x-sha-256", VALID_HASH.parse().unwrap());
+                if verb == "get" {
+                    assert_eq!(
+                        authenticate_media_read(&state, &headers, VALID_HASH)
+                            .await
+                            .is_ok(),
+                        admitted
+                    );
+                    headers.append("x-auth-tag", credential.parse().unwrap());
+                    assert!(matches!(
+                        authenticate_media_read(&state, &headers, VALID_HASH).await,
+                        Err(MediaError::RelayMembershipRequired)
+                    ));
+                } else {
+                    let (mut parts, _) = Request::builder()
+                        .uri("/upload")
+                        .body(())
+                        .unwrap()
+                        .into_parts();
+                    parts.headers = headers;
+                    assert_eq!(
+                        AuthenticatedUpload::from_request_parts(&mut parts, &state)
+                            .await
+                            .is_ok(),
+                        admitted
+                    );
+                    parts
+                        .headers
+                        .append("x-auth-tag", credential.parse().unwrap());
+                    assert!(matches!(
+                        AuthenticatedUpload::from_request_parts(&mut parts, &state).await,
+                        Err(MediaError::RelayMembershipRequired)
+                    ));
+                }
+            }
+            // Git carries delegation inside its signed NIP-98 event.
+            let event = EventBuilder::new(Kind::HttpAuth, "")
+                .custom_created_at(now)
+                .tags([
+                    Tag::parse(["u", "https://relay.example/git/owner/repo"]).unwrap(),
+                    Tag::parse(["method", "GET"]).unwrap(),
+                    buzz_sdk::nip_oa::parse_auth_tag(&credential).unwrap(),
+                ])
+                .sign_with_keys(&agent)
+                .unwrap();
+            let (mut parts, _) = Request::builder()
+                .uri("/git/owner/repo/info/refs?service=git-upload-pack")
+                .header("host", "relay.example")
+                .header(
+                    "authorization",
+                    format!(
+                        "Nostr {}",
+                        base64::engine::general_purpose::STANDARD.encode(event.as_json())
+                    ),
+                )
+                .body(())
+                .unwrap()
+                .into_parts();
+            assert_eq!(
+                crate::api::git::transport::GitAuth::from_request_parts(&mut parts, &state)
+                    .await
+                    .is_ok(),
+                admitted
+            );
+            parts
+                .headers
+                .append("authorization", parts.headers["authorization"].clone());
+            assert!(
+                crate::api::git::transport::GitAuth::from_request_parts(&mut parts, &state)
+                    .await
+                    .is_err()
+            );
+
+            assert_eq!(
+                check_relay_membership(
+                    &state,
+                    other.id,
+                    agent.public_key().as_bytes(),
+                    Some(&credential),
+                    Some(now.as_secs())
+                )
+                .await
+                .unwrap(),
+                MembershipDecision::Denied
+            );
+            assert_eq!(
+                check_relay_membership(
+                    &state,
+                    tenant.community(),
+                    agent.public_key().as_bytes(),
+                    Some(&credential),
+                    None
+                )
+                .await
+                .unwrap(),
+                MembershipDecision::Denied
+            );
+            assert_eq!(
+                check_relay_membership(
+                    &state,
+                    tenant.community(),
+                    owner.public_key().as_bytes(),
+                    Some(&credential),
+                    None
+                )
+                .await
+                .unwrap(),
+                MembershipDecision::Member
+            );
+        }
     }
 
     fn media_get_auth_header(keys: &Keys, tags: Vec<Tag>) -> String {

@@ -76,6 +76,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
     // The tag is integrity-protected by the event's Schnorr signature — if
     // tampered, NIP-42 verification will fail before we ever inspect it.
     let auth_tag_json = extract_auth_tag_json(&event);
+    let signed_auth_created_at = event.created_at.as_secs();
 
     let relay_url =
         crate::api::bridge::nip42_expected_relay_url(&state.config.relay_url, &conn.tenant);
@@ -137,6 +138,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                     if let Some(owner) = crate::api::relay_members::extract_nip_oa_owner(
                         pubkey.as_bytes(),
                         auth_tag_json.as_deref(),
+                        Some(signed_auth_created_at),
                     ) {
                         outcome = match state
                             .db
@@ -219,6 +221,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 conn.tenant.community(),
                 pubkey.as_bytes(),
                 auth_tag_json.as_deref(),
+                Some(signed_auth_created_at),
             )
             .await
             {
@@ -246,6 +249,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                     crate::api::relay_members::extract_nip_oa_owner(
                         pubkey.as_bytes(),
                         auth_tag_json.as_deref(),
+                        Some(signed_auth_created_at),
                     )
                 } else {
                     None
@@ -346,5 +350,45 @@ mod tests {
             Tag::parse(["auth", b.as_str(), "", sig.as_str()]).unwrap(),
         ]);
         assert_eq!(extract_auth_tag_json(&event), None);
+    }
+
+    #[tokio::test]
+    async fn nip_oa_websocket_and_audio_auth_use_signed_time() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let now = nostr::Timestamp::now();
+        let relay = "wss://relay.example";
+        let challenge = "test-challenge";
+        let auth = buzz_auth::AuthService::new(buzz_auth::AuthConfig::default());
+        for (conditions, admitted) in [
+            (format!("created_at<{}", now.as_secs() + 1), true),
+            (format!("created_at<{}", now.as_secs()), false),
+            (format!("created_at>{}", now.as_secs()), false),
+        ] {
+            let credential =
+                buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), &conditions)
+                    .unwrap();
+            let event = EventBuilder::new(Kind::Authentication, "")
+                .custom_created_at(now)
+                .tags([
+                    Tag::parse(["relay", relay]).unwrap(),
+                    Tag::parse(["challenge", challenge]).unwrap(),
+                    buzz_sdk::nip_oa::parse_auth_tag(&credential).unwrap(),
+                ])
+                .sign_with_keys(&agent)
+                .unwrap();
+            let auth_tag = extract_auth_tag_json(&event);
+            let signed_time = event.created_at.as_secs();
+            let verified = auth
+                .verify_auth_event(event, challenge, relay)
+                .await
+                .unwrap();
+            let extracted = crate::api::relay_members::extract_nip_oa_owner(
+                verified.pubkey.as_bytes(),
+                auth_tag.as_deref(),
+                Some(signed_time),
+            );
+            assert_eq!(extracted.is_some(), admitted);
+        }
     }
 }

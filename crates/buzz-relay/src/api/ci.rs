@@ -244,7 +244,11 @@ pub async fn ci_preflight(
 
     // NIP-98 authentication — same pattern as submit_event in bridge.rs.
     let url = super::bridge::nip98_expected_url(&state.config.relay_url, &tenant, "/ci/preflight");
-    let (pubkey, _event_id_bytes) = super::bridge::verify_bridge_auth(
+    let super::bridge::VerifiedBridgeAuth {
+        pubkey,
+        event_id_bytes: _event_id_bytes,
+        ..
+    } = super::bridge::verify_bridge_auth(
         &headers,
         "POST",
         &url,
@@ -1300,7 +1304,11 @@ pub async fn next_accepted_control(
     let raw_query = raw_query.ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "missing query"))?;
     let path = format!("/ci/control/accepted?{raw_query}");
     let url = super::bridge::nip98_expected_url(&state.config.relay_url, &tenant, &path);
-    let (caller, event_id) = super::bridge::verify_bridge_auth(&headers, "GET", &url, None, true)?;
+    let super::bridge::VerifiedBridgeAuth {
+        pubkey: caller,
+        event_id_bytes: event_id,
+        ..
+    } = super::bridge::verify_bridge_auth(&headers, "GET", &url, None, true)?;
     super::bridge::check_nip98_replay(&state, &tenant, event_id).await?;
 
     let events = state
@@ -1467,7 +1475,11 @@ async fn authenticate_ci_run_read(
         .path_and_query()
         .map_or_else(|| uri.path(), axum::http::uri::PathAndQuery::as_str);
     let url = super::bridge::nip98_expected_url(&state.config.relay_url, &tenant, request_path);
-    let (caller, auth_id) = super::bridge::verify_bridge_auth(headers, "GET", &url, None, true)?;
+    let super::bridge::VerifiedBridgeAuth {
+        pubkey: caller,
+        event_id_bytes: auth_id,
+        ..
+    } = super::bridge::verify_bridge_auth(headers, "GET", &url, None, true)?;
     super::bridge::check_nip98_replay(state, &tenant, auth_id).await?;
     Ok((tenant, caller))
 }
@@ -1630,7 +1642,11 @@ async fn read_ci_log(
     // Authenticate the exact method and URL before any request, repository,
     // event, or object lookup. A valid non-member receives the same 404 as a
     // missing object, so this endpoint is not an existence oracle.
-    let (caller, auth_id) = super::bridge::verify_bridge_auth(&headers, method, &url, None, true)?;
+    let super::bridge::VerifiedBridgeAuth {
+        pubkey: caller,
+        event_id_bytes: auth_id,
+        ..
+    } = super::bridge::verify_bridge_auth(&headers, method, &url, None, true)?;
     super::bridge::check_nip98_replay(&state, &tenant, auth_id).await?;
     validate_log_read_path(&path)?;
 
@@ -2056,7 +2072,11 @@ async fn read_ci_artifact(
 
     // Authenticate before any request, repository, event, or object lookup so
     // absence and membership denial remain indistinguishable to valid callers.
-    let (caller, auth_id) = super::bridge::verify_bridge_auth(&headers, method, &url, None, true)?;
+    let super::bridge::VerifiedBridgeAuth {
+        pubkey: caller,
+        event_id_bytes: auth_id,
+        ..
+    } = super::bridge::verify_bridge_auth(&headers, method, &url, None, true)?;
     super::bridge::check_nip98_replay(&state, &tenant, auth_id).await?;
     validate_artifact_read_path(&path)?;
 
@@ -2262,8 +2282,11 @@ async fn put_ci_evidence(
 
     // Validate signature, method, URL, and payload-tag presence before polling
     // the body stream. The exact digest is verified after the bounded read.
-    let (caller, preauth_id) =
-        super::bridge::verify_bridge_auth_with_options(&headers, "PUT", &url, None, true, true)?;
+    let super::bridge::VerifiedBridgeAuth {
+        pubkey: caller,
+        event_id_bytes: preauth_id,
+        ..
+    } = super::bridge::verify_bridge_auth_with_options(&headers, "PUT", &url, None, true, true)?;
     let request_bytes = hex::decode(&path.request_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid request event ID"))?;
     let stored = state
@@ -2320,7 +2343,11 @@ async fn put_ci_evidence(
             "CI evidence length mismatch",
         ));
     }
-    let (_, auth_id) = super::bridge::verify_bridge_auth_with_options(
+    let super::bridge::VerifiedBridgeAuth {
+        pubkey: _,
+        event_id_bytes: auth_id,
+        ..
+    } = super::bridge::verify_bridge_auth_with_options(
         &headers,
         "PUT",
         &url,
