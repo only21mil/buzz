@@ -4,6 +4,7 @@ import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import { decode, npubEncode, nsecEncode } from "nostr-tools/nip19";
 import { finalizeEvent, getPublicKey } from "nostr-tools/pure";
 import { parse as yamlParse } from "yaml";
+import { MockPublicationAuthority } from "./e2eBridgePublicationScope.ts";
 import {
   mergeMockCustomHarnesses,
   handleSaveCustomHarness,
@@ -3590,6 +3591,7 @@ const mockFeedOverrides: RawHomeFeedResponse["feed"] = {
 };
 
 let installed = false;
+const mockPublicationAuthority = new MockPublicationAuthority();
 let nextSocketId = 1;
 
 function syncMockRelayAgentsFromManagedAgents() {
@@ -3688,6 +3690,7 @@ function importMockIdentity(nsec: string) {
     username,
   };
   writeStoredIdentityOverride(identity);
+  mockPublicationAuthority.update(pubkey, getRelayWsUrl(getConfig()));
   if (!mockProfiles.has(pubkey)) {
     mockProfiles.set(pubkey, {
       pubkey,
@@ -10086,9 +10089,8 @@ export function maybeInstallE2eTauriMocks() {
   resetMockPendingCommunityDeepLinks(config);
   initializeMockHuddle(config.mock?.huddle, config);
   mockWebsocketSendMutexWedged = false;
-  if (config.mock?.windowLabel) {
-    (window as Window & { isTauri?: boolean }).isTauri = true;
-  }
+  // The API's isTauri() reads this flag, including for the default main window.
+  (window as Window & { isTauri?: boolean }).isTauri = true;
   mockWindows(config.mock?.windowLabel ?? "main");
   window.__BUZZ_E2E_COMMANDS__ = [];
   window.__BUZZ_E2E_COMMAND_PAYLOADS__ = [];
@@ -10457,6 +10459,10 @@ export function maybeInstallE2eTauriMocks() {
   ): Promise<unknown> => {
     const activeConfig = getConfig();
     const identity = getActiveIdentity(activeConfig);
+    const publicationScope = mockPublicationAuthority.update(
+      identity?.pubkey ?? DEFAULT_MOCK_IDENTITY.pubkey,
+      getRelayWsUrl(activeConfig),
+    );
     window.__BUZZ_E2E_COMMANDS__?.push(command);
     const loggedPayload = (() => {
       if (payload instanceof Uint8Array) {
@@ -11069,6 +11075,8 @@ export function maybeInstallE2eTauriMocks() {
         mockMeshState.nodeMode = null;
         mockMeshState.activeModel = null;
         return meshNodeStatus("off", null);
+      case "get_message_publication_scope":
+        return publicationScope;
       case "get_identity": {
         const isLost =
           !mockIdentityLostCleared && activeConfig?.mock?.identityLost === true;
@@ -11256,10 +11264,20 @@ export function maybeInstallE2eTauriMocks() {
       case "apply_workspace": {
         const applyDelayMs = activeConfig?.mock?.applyCommunityDelayMs ?? 0;
         if (applyDelayMs > 0) {
-          return new Promise((resolve) =>
+          await new Promise((resolve) =>
             window.setTimeout(resolve, applyDelayMs),
           );
         }
+        const relayUrl = (payload as { relayUrl: string }).relayUrl;
+        if (activeConfig) {
+          activeConfig.relayWsUrl = relayUrl;
+          activeConfig.relayHttpUrl = relayUrl.replace(/^ws/, "http");
+        }
+        mockPublicationAuthority.update(
+          getActiveIdentity(activeConfig)?.pubkey ??
+            DEFAULT_MOCK_IDENTITY.pubkey,
+          relayUrl,
+        );
         return;
       }
       case "update_tray_agent_activity":
@@ -12724,6 +12742,10 @@ export function maybeInstallE2eTauriMocks() {
           activeConfig,
         );
       case "sign_event":
+        mockPublicationAuthority.validate(
+          (payload as { expectedScope?: typeof publicationScope })
+            .expectedScope,
+        );
         window.__BUZZ_E2E_SIGNED_EVENTS__?.push({
           content: (payload as { content: string }).content,
           createdAt: (payload as { createdAt?: number }).createdAt,
