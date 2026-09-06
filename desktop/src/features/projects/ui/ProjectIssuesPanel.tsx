@@ -195,7 +195,6 @@ export function ProjectIssueDetail({
           mediaTags,
           mentionPubkeys,
         });
-        toast.success("Comment posted.");
       } catch (error) {
         toast.error(
           error instanceof Error ? error.message : "Failed to post comment.",
