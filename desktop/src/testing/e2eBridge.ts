@@ -9021,6 +9021,11 @@ async function handleSendChannelMessage(
     );
   }
 
+  // Media and thread sends use native IPC instead of the WebSocket mock.
+  // Reject before recording/echoing, matching the same one-shot relay failure.
+  const sendMessageError = config?.mock?.sendMessageErrors?.shift();
+  if (sendMessageError) throw new Error(sendMessageError);
+
   // NIP-92 imeta attachments. The real relay echoes these back on the stored
   // event; mirror that here so attachment renderers (FileCard, images, video)
   // have the imeta tags they key on. `null`/empty → no extra tags.
