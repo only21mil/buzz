@@ -850,6 +850,12 @@ test("routes an agent mention from an existing DM to the expanded conversation",
   ).toBeVisible();
   await input.press("Enter");
   await page.keyboard.type(" in this DM");
+  // No settlement wait between Enter and typing: assert the literal body and
+  // selected chip before send so a lost separator fails at its source.
+  expect(await input.textContent()).toBe("Ask @Fizz  in this DM");
+  expect(
+    await input.locator(".mention-chip.agent-mention-highlight").textContent(),
+  ).toBe("Fizz");
   const baselineCommands = await readCommandPayloadLog(page);
   await page.getByTestId("send-message").click();
 
@@ -875,6 +881,33 @@ test("routes an agent mention from an existing DM to the expanded conversation",
       }),
     ]),
   );
+  const startAgent = sendCommands.find(
+    (entry) => entry.command === "start_managed_agent",
+  );
+  const fizzPubkey = (startAgent?.payload as { pubkey?: string } | undefined)
+    ?.pubkey;
+  expect(fizzPubkey).toMatch(/^[0-9a-f]{64}$/);
+  const outgoing = sendCommands.flatMap((entry) => {
+    if (entry.command !== "plugin:websocket|send") return [];
+    const data = (entry.payload as { message?: { data?: string } })?.message
+      ?.data;
+    if (!data) return [];
+    const [type, event] = JSON.parse(data) as [
+      string,
+      { content?: string; tags?: string[][] },
+    ];
+    return type === "EVENT" && event.content?.includes(messageTail)
+      ? [event]
+      : [];
+  });
+  expect(outgoing).toHaveLength(1);
+  expect(outgoing[0].content).toBe("Ask @Fizz  in this DM");
+  expect(
+    outgoing[0].tags
+      ?.filter((tag) => tag[0] === "p")
+      .map((tag) => tag[1])
+      .sort(),
+  ).toEqual([TEST_IDENTITIES.alice.pubkey, fizzPubkey].sort());
   expect(sendCommands.map((entry) => entry.command)).toEqual(
     expect.arrayContaining(["open_dm", "start_managed_agent"]),
   );

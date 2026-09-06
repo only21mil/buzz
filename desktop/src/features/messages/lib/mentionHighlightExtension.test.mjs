@@ -604,3 +604,75 @@ for (const [kind, label, literal] of [
     );
   });
 }
+
+// The failing Chromium trace rewrites the separator to NBSP for the typed
+// leading space, then replaces that same range with "i". Capture the literal
+// beforeinput data before those DOM rewrites lose the user's new space.
+function literalBeforeInput(state, data) {
+  let current = state;
+  let prevented = false;
+  const view = {
+    get state() {
+      return current;
+    },
+    dispatch(tr) {
+      current = current.apply(tr);
+    },
+    domAtPos: () => ({ node: {}, offset: 0 }),
+    root: undefined,
+  };
+  const event = {
+    inputType: "insertText",
+    data,
+    isComposing: false,
+    cancelable: true,
+    preventDefault() {
+      prevented = true;
+    },
+  };
+  const handled = current.plugins.some(
+    (plugin) =>
+      plugin.props.handleDOMEvents?.beforeinput?.(view, event) === true,
+  );
+  return { state: current, handled, prevented };
+}
+
+test("immediate leading space after autocomplete survives Chromium's separator rewrite", () => {
+  const picked = pickMentionAt(
+    editorStateWithMentionHighlight("Ask @fi", ["Fizz"]),
+    5,
+    8,
+    "@Fizz ",
+  );
+  const space = literalBeforeInput(picked, " ");
+  const afterSpace = space.handled
+    ? space.state
+    : textInput(picked, 10, 11, "\u00a0");
+  const letter = literalBeforeInput(afterSpace, "i");
+  const afterLetter = letter.handled
+    ? letter.state
+    : textInput(afterSpace, 10, 11, "i");
+  const cursor = afterLetter.selection.from;
+  const continued = textInput(afterLetter, cursor, cursor, "n this DM");
+  assert.equal(continued.doc.textContent, "Ask @Fizz  in this DM");
+  assert.equal(space.prevented, true);
+  assert.equal(letter.prevented, true);
+});
+
+test("literal beforeinput honors deliberate movement after a mention pick", () => {
+  const picked = pickMentionAt(
+    editorStateWithMentionHighlight("Ask @fi", ["Fizz"]),
+    5,
+    8,
+    "@Fizz ",
+  );
+  const view = {
+    state: picked,
+    dispatch() {},
+    domAtPos: () => ({ node: {}, offset: 0 }),
+    root: undefined,
+  };
+  for (const plugin of picked.plugins)
+    plugin.props.handleKeyDown?.(view, { key: "ArrowRight" });
+  assert.equal(literalBeforeInput(picked, "x").handled, false);
+});

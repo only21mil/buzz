@@ -469,6 +469,50 @@ export const MentionHighlightExtension = Extension.create({
           decorations(state) {
             return this.getState(state) ?? DecorationSet.empty;
           },
+          handleDOMEvents: {
+            beforeinput(view, event) {
+              if (
+                settlement.peek() === null ||
+                event.inputType !== "insertText" ||
+                !event.data ||
+                event.isComposing ||
+                !event.cancelable ||
+                !view.state.selection.empty
+              ) {
+                return false;
+              }
+              const { doc, selection } = view.state;
+              let spaceStart = selection.from;
+              while (
+                spaceStart > 0 &&
+                SPACE_RUN.test(doc.textBetween(spaceStart - 1, spaceStart))
+              ) {
+                spaceStart -= 1;
+              }
+              const boundary = mentionTrailingSpaceBoundary(
+                doc,
+                spaceStart,
+                knownNames(),
+              );
+              if (boundary === null) return false;
+              // Chromium may collapse a typed space into the existing
+              // separator, then replace that separator with the next letter.
+              // beforeinput still has the literal keystroke. Commit it before
+              // DOM whitespace normalization can discard that information.
+              event.preventDefault();
+              const insertAt = Math.max(selection.from, boundary);
+              const tr = view.state.tr.insertText(event.data, insertAt);
+              const caret = insertAt + event.data.length;
+              tr.setSelection(TextSelection.create(tr.doc, caret));
+              view.dispatch(tr);
+              // A whitespace run can be rewritten again by the next letter.
+              // Keep this local settlement until that letter or a deliberate
+              // caret move, both of which end the autocomplete boundary.
+              if (!SPACE_RUN.test(event.data)) settlement.cancel();
+              setDomCaretAtPos(view, caret);
+              return true;
+            },
+          },
           handleTextInput(view, from, to, text) {
             const insertion = mentionTextInputInsertion(
               view.state.doc,
