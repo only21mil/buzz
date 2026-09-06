@@ -1,5 +1,5 @@
 mod profile_join;
-use profile_join::{profile_join_pubkeys, MEMBER_PROFILE_JOIN_LIMIT};
+use profile_join::query_member_profiles;
 
 use nostr::Keys;
 use tauri::{AppHandle, State};
@@ -495,32 +495,23 @@ pub async fn get_channel_members(
         .transpose()?
         .ok_or_else(|| "channel members not found".to_string())?;
 
-    // Batch-fetch kind:0 profiles to populate display names, capped so the
-    // query cost is bounded on large rosters (see MEMBER_PROFILE_JOIN_LIMIT).
-    let pubkeys = profile_join_pubkeys(&response.members, MEMBER_PROFILE_JOIN_LIMIT);
-    if !pubkeys.is_empty() {
-        let profile_events = query_relay_at(
-            &state,
-            &relay_scope,
-            &[serde_json::json!({
-                "kinds": [0],
-                "authors": pubkeys,
-                "limit": pubkeys.len()
-            })],
-        )
-        .await;
-        let mut profile_cache = state
-            .channel_member_profile_cache
-            .lock()
-            .map_err(|_| "channel member profile cache lock poisoned".to_string())?;
-        enrich_channel_members_from_profile_events(
-            &mut response,
-            profile_events.as_deref(),
-            &relay_scope,
-            request_id,
-            &mut profile_cache,
-        );
-    }
+    let profile_events = query_member_profiles(&response.members, |filter| {
+        let relay_scope = &relay_scope;
+        let state = &state;
+        async move { query_relay_at(state, relay_scope, &[filter]).await }
+    })
+    .await;
+    let mut profile_cache = state
+        .channel_member_profile_cache
+        .lock()
+        .map_err(|_| "channel member profile cache lock poisoned".to_string())?;
+    enrich_channel_members_from_profile_events(
+        &mut response,
+        Ok::<_, String>(&profile_events),
+        &relay_scope,
+        request_id,
+        &mut profile_cache,
+    );
 
     Ok(response)
 }
