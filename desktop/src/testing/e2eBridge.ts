@@ -12018,6 +12018,10 @@ export function maybeInstallE2eTauriMocks() {
           payload as Parameters<typeof handleSetPersonaShared>[0],
           activeConfig,
         );
+      case "fetch_team_catalog":
+        // Local team seeds are not community publications. This fixture starts
+        // with no published teams, so the unified chooser can settle empty.
+        return [];
       case "list_teams":
         return handleListTeams();
       case "list_channel_templates":
