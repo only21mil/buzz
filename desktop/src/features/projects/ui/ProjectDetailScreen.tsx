@@ -85,6 +85,8 @@ import {
 type ProjectDetailScreenProps = {
   commitHash?: string;
   projectId: string;
+  entityNavigationId?: string;
+  tab?: import("@/shared/lib/entityLink").EntityLinkTab;
   pullRequestId?: string;
   issueId?: string;
   repositoryId?: string;
@@ -161,14 +163,19 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   const [selectedPullRequestId, setSelectedPullRequestId] = React.useState<
     string | null
   >(pullRequestId ?? null);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: repeated entity links must reapply selection.
   React.useEffect(
     () => setSelectedPullRequestId(pullRequestId ?? null),
-    [pullRequestId],
+    [pullRequestId, props.entityNavigationId],
   );
   const [selectedIssueId, setSelectedIssueId] = React.useState<string | null>(
     issueId ?? null,
   );
-  React.useEffect(() => setSelectedIssueId(issueId ?? null), [issueId]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: repeated entity links must reapply selection.
+  React.useEffect(
+    () => setSelectedIssueId(issueId ?? null),
+    [issueId, props.entityNavigationId],
+  );
   const [selectedCommitHash, setSelectedCommitHash] = React.useState<
     string | null
   >(commitHash ?? null);
@@ -902,7 +909,8 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
               </section>
 
               <WorkspaceTabs
-                key={`${project.id}:${repository.id}:${tabsResetKey}`}
+                key={`${project.id}:${repository.id}:${tabsResetKey}:${props.entityNavigationId ?? ""}`}
+                initialTab={props.tab === "commits" ? "activity" : props.tab}
                 commitDiff={commitDiffQuery.data}
                 commitDiffError={commitDiffQuery.error}
                 commitDiffLoading={commitDiffQuery.isLoading}

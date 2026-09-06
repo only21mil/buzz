@@ -11,6 +11,7 @@ import { resolveSearchHitDestination } from "@/app/navigation/resolveSearchHitDe
 import type { SearchHit } from "@/shared/api/types";
 
 type NavigationBehavior = {
+  force?: boolean;
   replace?: boolean;
   resetScroll?: boolean;
 };
@@ -28,12 +29,13 @@ export function useAppNavigation() {
         params?: Record<string, string>;
         state?: Record<string, unknown>;
         search?: Record<string, string | undefined>;
+        state?: Record<string, unknown>;
       },
       behavior: NavigationBehavior = {},
     ) => {
       const nextLocation = router.buildLocation(next as never);
 
-      if (location.href === nextLocation.href) {
+      if (location.href === nextLocation.href && !behavior.force) {
         return false;
       }
 
@@ -111,6 +113,11 @@ export function useAppNavigation() {
         pullRequestId?: string;
         issueId?: string;
         repositoryId?: string;
+        /** Workspace tab requested by a share link (link vocabulary). */
+        tab?: string;
+        /** Unique per entity-link activation so repeating the same link can
+         * re-apply an unchanged tab selection. */
+        entityNavigationId?: string;
       },
     ) =>
       commitNavigation(
@@ -130,9 +137,16 @@ export function useAppNavigation() {
             ...(behavior?.repositoryId
               ? { repositoryId: behavior.repositoryId }
               : {}),
+            ...(behavior?.tab ? { tab: behavior.tab } : {}),
           },
+          state: behavior?.entityNavigationId
+            ? { entityNavigationId: behavior.entityNavigationId }
+            : undefined,
         },
-        behavior,
+        {
+          ...behavior,
+          force: Boolean(behavior?.entityNavigationId),
+        },
       ),
     [commitNavigation],
   );

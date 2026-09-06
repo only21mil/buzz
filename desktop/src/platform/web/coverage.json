@@ -1,6 +1,7 @@
 {
   "implemented": [
     "acknowledge_pending_community_deep_link",
+    "acknowledge_pending_entity_deep_link",
     "add_channel_members",
     "add_reaction",
     "add_relay_member",
@@ -102,6 +103,7 @@
     "sign_nostr_identity_binding",
     "sign_out",
     "take_pending_community_deep_link",
+    "take_pending_entity_deep_link",
     "trigger_workflow",
     "unarchive_channel",
     "unarchive_identity",

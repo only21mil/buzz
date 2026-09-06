@@ -121,6 +121,7 @@ function WorkItemListHeader({
 }
 
 export function WorkspaceTabs({
+  initialTab = "overview",
   commitDiff,
   commitDiffError,
   commitDiffLoading,
@@ -159,6 +160,7 @@ export function WorkspaceTabs({
   terminalTitle,
   viewerGitIdentity,
 }: {
+  initialTab?: string;
   commitDiff: ProjectRepoDiff | null | undefined;
   commitDiffError: unknown;
   commitDiffLoading: boolean;
@@ -253,7 +255,7 @@ export function WorkspaceTabs({
     [pullRequests, selectedCommitHash],
   );
   const isPullRequestSelected = Boolean(selectedPullRequest);
-  const [selectedTab, setSelectedTab] = React.useState("overview");
+  const [selectedTab, setSelectedTab] = React.useState(initialTab);
   const [pullRequestCommentTarget, setPullRequestCommentTarget] =
     React.useState<{
       anchor: ProjectPullRequestCommentAnchor;

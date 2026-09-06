@@ -90,7 +90,7 @@ import { joinChannel } from "@/shared/api/tauri";
 import type { Channel, ChannelVisibility, SearchHit } from "@/shared/api/types";
 import { ChannelNavigationProvider } from "@/shared/context/ChannelNavigationContext";
 import { hasPrimaryShortcutModifier } from "@/shared/lib/platform";
-import { useMessageDeepLinks } from "@/shared/useMessageDeepLinks";
+import { useAppDeepLinks } from "@/shared/useAppDeepLinks";
 import { SidebarProvider } from "@/shared/ui/sidebar";
 import { RelayConnectionOverlay } from "@/app/RelayConnectionOverlay";
 import { useSidebarRelayConnectionCard } from "@/features/sidebar/ui/useSidebarRelayConnectionCard";
@@ -636,7 +636,7 @@ export function AppShell() {
     unreadChannelNotificationCount,
   });
   // Dispatch `buzz://message` deep links only from the main window; the companion is dedicated to its active Huddle route.
-  useMessageDeepLinks(!isHuddleRoom);
+  useAppDeepLinks(!isHuddleRoom);
   const handleOpenCreateChannel = React.useCallback(
     () => setIsCreateChannelOpen(true),
     [],
