@@ -169,3 +169,60 @@ test("keeps unsupported expressions in advanced mode", () => {
     null,
   );
 });
+
+for (const expression of [
+  '!str_starts_with(trigger_text, "deploy")',
+  '!str_ends_with(trigger_text, "deploy")',
+  'trigger_text == " deploy "',
+  'trigger_text == ""',
+  'trigger_text != ""',
+  'str_contains(trigger_text, " ")',
+  'str_starts_with(trigger_text, " deploy")',
+  'str_ends_with(trigger_text, "deploy ")',
+  'trigger_author == ""',
+  `trigger_author == "${AUTHOR.toUpperCase()}"`,
+]) {
+  test(`retains ${expression} in Advanced`, () => {
+    assert.equal(
+      parseConditionExpression(expression, "message_posted"),
+      null,
+      expression,
+    );
+    assert.equal(
+      parseConditionExpressions(
+        `${expression} && trigger_author != "${MESSAGE_ID}"`,
+        "message_posted",
+      ),
+      null,
+      expression,
+    );
+  });
+}
+
+test("supported Basic predicates keep their literal when another condition changes", () => {
+  for (const expression of [
+    'str_contains(trigger_text, "deploy now")',
+    '!str_contains(trigger_text, "deploy")',
+    'str_starts_with(trigger_text, "deploy")',
+    'str_ends_with(trigger_text, "deploy")',
+    'trigger_text == "deploy"',
+    "str_len(trigger_text) == 0",
+    'trigger_text == "one && two"',
+    'trigger_text == "say \\"go\\""',
+  ]) {
+    const parsed = parseConditionExpressions(expression, "message_posted");
+    assert.ok(parsed, expression);
+    assert.equal(
+      buildConditionExpressions([
+        ...parsed,
+        {
+          field: "trigger_author",
+          operator: "equals",
+          value: AUTHOR,
+          webhookField: "",
+        },
+      ]),
+      `${expression} && trigger_author == "${AUTHOR}"`,
+    );
+  }
+});

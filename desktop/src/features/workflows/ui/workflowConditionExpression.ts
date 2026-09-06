@@ -166,6 +166,7 @@ export function parseConditionExpression(
     `^(!)?str_(contains|starts_with|ends_with)\\(([A-Za-z_][A-Za-z0-9_]*), ${literal}\\)$`,
   ).exec(trimmed);
   if (fn && parseField(fn[3], triggerType)) {
+    if (fn[1] && fn[2] !== "contains") return null;
     const operator: ConditionOperator = fn[1]
       ? "not_contains"
       : fn[2] === "starts_with"
@@ -179,7 +180,10 @@ export function parseConditionExpression(
       value: unescapeEvalexprString(fn[4]),
       webhookField: "",
     };
-    return conditionOperatorsForField(result.field).includes(result.operator)
+    // Basic edits rebuild every condition. Keep literals the builder would
+    // normalize or omit in Advanced so unrelated edits cannot change them.
+    return conditionOperatorsForField(result.field).includes(result.operator) &&
+      buildConditionExpression(result) === trimmed
       ? result
       : null;
   }
@@ -194,7 +198,7 @@ export function parseConditionExpression(
       value: unescapeEvalexprString(equality[3]),
       webhookField: "",
     };
-    return conditionValueError(result.field, result.value) ? null : result;
+    return buildConditionExpression(result) === trimmed ? result : null;
   }
   return null;
 }
