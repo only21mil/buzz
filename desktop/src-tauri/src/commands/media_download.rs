@@ -271,6 +271,9 @@ pub(super) async fn fetch_blob_bytes_with_cap(
     cap: u64,
     cancellation: Option<&CancellationToken>,
 ) -> Result<Vec<u8>, String> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err("media fetch cancelled".to_string());
+    }
     // Fetch bytes via the no-redirect media client (goes through the VPN tunnel).
     // A no-redirect client keeps the minted media auth token from being
     // forwarded across origins by a relay-issued 3xx (redirect-hop SSRF); a
@@ -288,6 +291,7 @@ pub(super) async fn fetch_blob_bytes_with_cap(
     let request = req.send();
     let resp = if let Some(cancellation) = cancellation {
         tokio::select! {
+            biased;
             _ = cancellation.cancelled() => return Err("media fetch cancelled".to_string()),
             result = request => result,
         }

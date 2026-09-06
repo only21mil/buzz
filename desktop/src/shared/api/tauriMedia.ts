@@ -95,26 +95,30 @@ export async function fetchAudioBytes(
   });
   if (!signal || !requestId) return new Uint8Array(await request);
 
-  let rejectCancellation: ((reason?: unknown) => void) | undefined;
-  const cancellation = new Promise<never>((_resolve, reject) => {
-    rejectCancellation = reject;
-  });
+  let cancellation: Promise<unknown> | undefined;
   const onAbort = () => {
-    void invokeTauri("cancel_media_fetch", { requestId })
-      .catch(() => undefined)
-      .finally(() => {
-        rejectCancellation?.(
-          new DOMException("Media fetch cancelled", "AbortError"),
-        );
-      });
+    cancellation ??= invokeTauri("cancel_media_fetch", { requestId }).catch(
+      () => undefined,
+    );
   };
   signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) onAbort();
 
   try {
-    const bytes = await Promise.race([request, cancellation]);
+    // Keep the scheduler slot and the cancel-before-begin token until the
+    // original IPC settles. An abort race must not release native ownership.
+    const bytes = await request;
+    if (signal.aborted)
+      throw new DOMException("Media fetch cancelled", "AbortError");
     return new Uint8Array(bytes);
+  } catch (error) {
+    if (signal.aborted)
+      throw new DOMException("Media fetch cancelled", "AbortError");
+    throw error;
   } finally {
     signal.removeEventListener("abort", onAbort);
+    // A late cancel acknowledgement can recreate a token after native finish.
+    await cancellation;
     await invokeTauri("release_media_fetch", { requestId }).catch(
       () => undefined,
     );
