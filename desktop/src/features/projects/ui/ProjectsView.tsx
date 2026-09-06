@@ -18,7 +18,6 @@ import {
   useProjectsWorkItemsQuery,
 } from "@/features/projects/hooks";
 import { useRepositoryActivitySummariesQuery } from "@/features/projects/repositoryActivityHooks";
-import { useCreateProjectMutation } from "@/features/projects/useCreateProject";
 import { selectProjectRepository } from "@/features/projects/projectModels";
 import { useProjectsRepoSnapshotsQuery } from "@/features/projects/useProjectsRepoSnapshots";
 import {
@@ -36,7 +35,7 @@ import {
   ProjectGridCard,
   ProjectListRow,
 } from "@/features/projects/ui/ProjectCards";
-import { CreateProjectDialog } from "@/features/projects/ui/CreateProjectDialog";
+import { ProjectCreationDialog } from "@/features/projects/ui/ProjectCreationDialog";
 import { CreateProjectIssueDialog } from "@/features/projects/ui/CreateProjectIssueDialog";
 import { CreatePullRequestDialog } from "@/features/projects/ui/CreatePullRequestDialog";
 import { ProjectsCreateMenu } from "@/features/projects/ui/ProjectsCreateMenu";
@@ -198,7 +197,6 @@ export function ProjectsView() {
   const [createIssueOpen, setCreateIssueOpen] = React.useState(false);
   const [createPullRequestOpen, setCreatePullRequestOpen] =
     React.useState(false);
-  const createProjectMutation = useCreateProjectMutation();
   const [storedViewMode, setStoredViewMode] =
     React.useState<ProjectsViewMode | null>(() => readStoredViewMode());
   const [sort, setSort] = React.useState<ProjectsSort>(() => readStoredSort());
@@ -578,6 +576,18 @@ export function ProjectsView() {
   const projectMountCount = useIncrementalMount(visibleProjects.length);
   const repositoryMountCount = useIncrementalMount(visibleRepositories.length);
 
+  const projectCreationDialog = (
+    <ProjectCreationDialog
+      onCreated={() => {
+        // Keep the fork's complete-list landing after either entry point.
+        handleRepositoryScopeChange("all");
+        handleFilterChange("projects");
+      }}
+      onOpenChange={setCreateProjectOpen}
+      open={createProjectOpen}
+    />
+  );
+
   if (projectsQuery.isLoading) {
     return <ViewLoadingFallback kind="projects" />;
   }
@@ -598,7 +608,27 @@ export function ProjectsView() {
   }
 
   if (projects.length === 0) {
-    return <EmptyState />;
+    return (
+      <>
+        {projectCreationDialog}
+        {projectsQuery.isError ? (
+          <div
+            role="status"
+            className="px-4 py-2 text-sm text-muted-foreground"
+          >
+            Project refresh failed. Showing saved rows.{" "}
+            <Button
+              onClick={() => void projectsQuery.refetch()}
+              size="sm"
+              variant="ghost"
+            >
+              Retry
+            </Button>
+          </div>
+        ) : null}
+        <EmptyState onCreateProject={() => setCreateProjectOpen(true)} />
+      </>
+    );
   }
 
   const projectItems =
@@ -821,24 +851,7 @@ export function ProjectsView() {
       {/* Create button pinned to the pane's top-right corner: it never
           scrolls with the page, it just stays put. */}
       <div className="absolute right-4 top-4 z-40">{createMenu}</div>
-      <CreateProjectDialog
-        isCreating={createProjectMutation.isPending}
-        onCreate={async (input) => {
-          const result = await createProjectMutation.mutateAsync(input);
-          if (result.compatibilityWarning) {
-            toast.warning("Created as a standalone project", {
-              description: result.compatibilityWarning,
-            });
-          } else {
-            toast.success(`Project "${result.project.name}" created.`);
-          }
-          // Land on the complete project list after creation.
-          handleRepositoryScopeChange("all");
-          handleFilterChange("projects");
-        }}
-        onOpenChange={setCreateProjectOpen}
-        open={createProjectOpen}
-      />
+      {projectCreationDialog}
       {createPullRequestOpen ? (
         <CreatePullRequestDialog
           onCreated={async (
