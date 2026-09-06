@@ -1,8 +1,3 @@
-import { preparePublicationScope } from "@/shared/api/preparePublicationScope";
-import {
-  assertPublicationScope,
-  capturePublicationScope,
-} from "@/shared/api/publicationScope";
 import * as React from "react";
 import { EditorContent } from "@tiptap/react";
 import {
@@ -67,6 +62,7 @@ import { useDraftPersistLifecycle } from "./useDraftPersistSnapshot";
 import { useImplicitAgentMentionProvenance } from "./useImplicitAgentMentionProvenance";
 import { useThreadAgentAudience } from "./useThreadAgentAudience";
 import { submitMessageEdit } from "./submitMessageEdit";
+import { useEditSubmissionOwnership } from "./useEditSubmissionOwnership";
 import { useComposerLinkPreviews } from "./useComposerLinkPreviews";
 import * as ownership from "./MessageComposerMediaOwnership";
 
@@ -222,6 +218,10 @@ function MessageComposerImpl({
       syncComposerContentFromEditor,
       getImplicitAgentMentionPrefix: implicitAgentMentionProvenance.getPrefix,
     });
+  const captureEditSubmission = useEditSubmissionOwnership(
+    editTarget?.id ?? null,
+    getComposerRevision,
+  );
   // biome-ignore lint/correctness/useExhaustiveDependencies: effectiveDraftKey is the sole trigger
   React.useEffect(() => {
     media.setUploadState({ status: "idle" });
@@ -554,7 +554,6 @@ function MessageComposerImpl({
     onToggle: toggleAlwaysAddressAgent,
   });
   const submitMessage = React.useCallback(async () => {
-    let publicationScope = capturePublicationScope();
     const trimmed = syncComposerContentFromEditor().trim();
     // Edit mode
     if (editTargetRef.current && onEditSaveRef.current) {
@@ -564,14 +563,11 @@ function MessageComposerImpl({
       if (isEditSubmissionLocked || voiceNote.statusRef.current !== "idle") {
         return;
       }
-      // An edit extracts from the same mention map a pasted identity binds
-      // into, so wait on any check still deciding. Bounded internally.
-      publicationScope = await preparePublicationScope(publicationScope);
-      await mentions.settlePendingMentionBindings();
-      assertPublicationScope(publicationScope);
       // Empty edits delete the message through handleEditSave.
+      const isCurrent = captureEditSubmission();
       await submitMessageEdit({
-        publicationScope,
+        isCurrent,
+        settlePendingMentionBindings: mentions.settlePendingMentionBindings,
         content: trimmed,
         editTargetId: editTargetRef.current.id,
         customEmoji,
@@ -584,24 +580,26 @@ function MessageComposerImpl({
         spoileredAttachmentUrls,
         extractMentionPubkeys: extractMentionPubkeysRef.current,
         save: onEditSaveRef.current,
-        clearComposer: () => {
-          setComposerContent("");
-          richText.clearContent();
-          media.setPendingImeta([]);
-          media.clearQueuedAttachments();
-          setSpoileredAttachmentUrls(new Set());
-          mentions.clearMentions();
-          channelLinks.clearChannels();
-          emojiAutocomplete.clearEmojis();
-          setIsEmojiPickerOpen(false);
-        },
-        restoreComposer: (draft) => {
-          setComposerContent(draft.content);
-          richText.setContent(draft.content);
-          media.setPendingImeta(draft.pendingImeta);
-          media.restoreQueuedAttachments(draft.queuedAttachments);
-          setSpoileredAttachmentUrls(draft.spoileredAttachmentUrls);
-        },
+        clearComposer: () =>
+          runComposerUpdate(() => {
+            setComposerContent("");
+            richText.clearContent();
+            media.setPendingImeta([]);
+            media.clearQueuedAttachments();
+            setSpoileredAttachmentUrls(new Set());
+            mentions.clearMentions();
+            channelLinks.clearChannels();
+            emojiAutocomplete.clearEmojis();
+            setIsEmojiPickerOpen(false);
+          }),
+        restoreComposer: (draft) =>
+          runComposerUpdate(() => {
+            setComposerContent(draft.content);
+            richText.setContent(draft.content);
+            media.setPendingImeta(draft.pendingImeta);
+            media.restoreQueuedAttachments(draft.queuedAttachments);
+            setSpoileredAttachmentUrls(draft.spoileredAttachmentUrls);
+          }, draft.pendingImeta),
         restoreMentionRefs: mentions.restoreDraftMentionRefs,
         revalidateMentionPubkeys: mentions.revalidateMentionPubkeys,
         shouldRestoreComposer: () => canRestoreEditDraftRef.current,
@@ -659,6 +657,8 @@ function MessageComposerImpl({
       onPreparingMentionSendChange?.(false);
     }
   }, [
+    captureEditSubmission,
+    runComposerUpdate,
     channelId,
     channelLinks.clearChannels,
     customEmoji,

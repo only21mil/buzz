@@ -38,6 +38,9 @@ type SubmitMessageEditOptions = Omit<
   "mentionRefs" | "unresolvedMentionPubkeys"
 > & {
   publicationScope?: PublicationScope;
+  /** A cancelled/replaced edit or newer authored revision revokes this save. */
+  isCurrent?: () => boolean;
+  settlePendingMentionBindings?: () => Promise<void>;
   clearComposer: () => void;
   customEmoji: ReadonlyArray<CustomEmoji>;
   extractMentionPubkeys: (
@@ -78,6 +81,8 @@ type SubmitMessageEditOptions = Omit<
 
 export async function submitMessageEdit({
   publicationScope = capturePublicationScope(),
+  isCurrent = () => true,
+  settlePendingMentionBindings = async () => {},
   clearComposer,
   content,
   customEmoji,
@@ -101,8 +106,14 @@ export async function submitMessageEdit({
 }: SubmitMessageEditOptions): Promise<void> {
   try {
     publicationScope = await preparePublicationScope(publicationScope);
+    if (!isCurrent()) return;
+    // Pasted identities must settle before reading the captured edit's refs.
+    await settlePendingMentionBindings();
+    if (!isCurrent()) return;
+    assertPublicationScope(publicationScope);
   } catch (error) {
-    setUploadError(error instanceof Error ? error.message : String(error));
+    if (isCurrent())
+      setUploadError(error instanceof Error ? error.message : String(error));
     return;
   }
   const historicalNames = (editTarget.unresolvedMentionRefs ?? []).map(
@@ -128,6 +139,7 @@ export async function submitMessageEdit({
   const restoreDraft = () => {
     if (
       isPublicationScopeCurrent(publicationScope) &&
+      isCurrent() &&
       shouldRestoreComposer()
     ) {
       restoreComposer(draft);
@@ -167,7 +179,7 @@ export async function submitMessageEdit({
         ),
       ]),
     );
-    if (signal?.aborted) return;
+    if (signal?.aborted || !isCurrent()) return;
     assertPublicationScope(publicationScope);
     const revalidatedMentionPubkeys = await revalidateMentionPubkeys(
       addedMentionPubkeys,
@@ -178,7 +190,7 @@ export async function submitMessageEdit({
           .map((ref) => ref.pubkey),
       },
     );
-    if (signal?.aborted) return;
+    if (signal?.aborted || !isCurrent()) return;
     assertPublicationScope(publicationScope);
     const outgoingTags = mergeOutgoingTagsWithReferenceMentions(
       mergeOutgoingTags(
@@ -211,7 +223,7 @@ export async function submitMessageEdit({
           await finishEdit(uploaded, signal);
         } catch (error) {
           restoreDraft();
-          if (error instanceof AgentMentionAuthorizationError)
+          if (isCurrent() && error instanceof AgentMentionAuthorizationError)
             setUploadError(error.message);
         } finally {
           setDeferredUploadPending(false);
@@ -219,7 +231,7 @@ export async function submitMessageEdit({
       },
       onError: (error) => {
         restoreDraft();
-        setUploadError(String(error));
+        if (isCurrent()) setUploadError(String(error));
         setDeferredUploadPending(false);
       },
       onCancel: () => {
@@ -234,7 +246,7 @@ export async function submitMessageEdit({
     await finishEdit([]);
   } catch (error) {
     restoreDraft();
-    if (error instanceof AgentMentionAuthorizationError)
+    if (isCurrent() && error instanceof AgentMentionAuthorizationError)
       setUploadError(error.message);
   }
 }
