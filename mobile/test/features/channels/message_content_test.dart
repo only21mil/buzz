@@ -212,6 +212,46 @@ void main() {
       expect(openedHeaders?['Authorization'], startsWith('Nostr '));
     });
 
+    for (final filename in ['report.html', 'report.htm', 'REPORT.HTML']) {
+      testWidgets(
+        'HTML stays an explicit authenticated file action: $filename',
+        (tester) async {
+          final url = 'https://relay.example/media/${'a' * 64}.html';
+          var calls = 0;
+          final auth = MediaGetAuthService(
+            baseUrl: 'https://relay.example',
+            nsec: nostr.Keys.generate().nsec,
+          );
+          await tester.pumpWidget(
+            _testable(
+              MessageContent(content: '[$filename]($url)'),
+              overrides: [
+                mediaGetAuthServiceProvider.overrideWithValue(auth),
+                openDownloadedFileProvider.overrideWithValue((
+                  openedUrl,
+                  headers,
+                  name,
+                ) async {
+                  calls++;
+                  expect(openedUrl, url);
+                  expect(name, filename);
+                  expect(headers['Authorization'], startsWith('Nostr '));
+                  throw Exception('No external HTML handler');
+                }),
+              ],
+            ),
+          );
+          expect(calls, 0);
+          expect(find.byType(Image), findsNothing);
+          await tester.tap(find.text(filename));
+          await tester.pump();
+          expect(calls, 1);
+          expect(find.text('Could not open attachment'), findsOneWidget);
+          expect(find.byType(Image), findsNothing);
+        },
+      );
+    }
+
     test('buildImageViewerRoute uses modal-style page route builder', () {
       final route = buildImageViewerRoute(
         imageUrl: 'https://example.com/media/image.png',

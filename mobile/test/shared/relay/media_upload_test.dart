@@ -1158,6 +1158,66 @@ void main() {
       );
     });
 
+    for (final filename in [
+      'report.html',
+      'report.htm',
+      'REPORT.HTML',
+      'misleading.txt',
+    ]) {
+      test('uploads HTML as an exact-byte named file: $filename', () async {
+        final bytes = Uint8List.fromList(
+          utf8.encode(
+            '\ufeff<!-- keep -->\n<html><script>alert(1)</script></html>',
+          ),
+        );
+        var uploads = 0;
+        final service = MediaUploadService(
+          baseUrl: 'https://relay.example',
+          nsec: nostr.Keys.generate().nsec,
+          httpClient: http_testing.MockClient((request) async {
+            uploads++;
+            expect(request.method, 'PUT');
+            expect(request.url.path, '/upload');
+            expect(request.headers['content-type'], 'application/octet-stream');
+            expect(request.bodyBytes, bytes);
+            final hash = request.headers['x-sha-256']!;
+            final event =
+                jsonDecode(
+                      utf8.decode(
+                        base64Url.decode(
+                          base64Url.normalize(
+                            request.headers['authorization']!.substring(
+                              'Nostr '.length,
+                            ),
+                          ),
+                        ),
+                      ),
+                    )
+                    as Map<String, dynamic>;
+            expect(event['tags'], contains(equals(['x', hash])));
+            return http.Response(
+              jsonEncode({
+                'url': 'https://relay.example/media/$hash.bin',
+                'sha256': hash,
+                'size': bytes.length,
+                'type': 'application/octet-stream',
+                'uploaded': 1,
+              }),
+              HttpStatus.ok,
+            );
+          }),
+          pickGalleryVideo: () async => null,
+          pickGalleryImage: () async => null,
+          pickAttachmentFile: () async => _NamedXFile(bytes, '../../$filename'),
+        );
+        final descriptor = await service.pickAndUploadFile();
+        expect(uploads, 1);
+        expect(descriptor!.filename, filename);
+        expect(descriptor.size, bytes.length);
+        expect(descriptor.type, 'application/octet-stream');
+      });
+    }
+
     test('rejects empty generic file attachments before upload', () async {
       var uploadRequested = false;
       final service = MediaUploadService(

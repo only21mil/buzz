@@ -736,3 +736,154 @@ async fn test_ws_invalid_imeta_missing_fields() {
 
     client.disconnect().await.unwrap();
 }
+
+/// Requires an explicitly selected, disposable relay with S3-compatible storage.
+/// An ignored test is not evidence that the response contract has been exercised.
+#[tokio::test]
+#[ignore = "requires an isolated relay and S3-backed media storage"]
+async fn test_upload_html_served_as_inert_attachment() {
+    let base = std::env::var("RELAY_HTTP_URL")
+        .expect("set RELAY_HTTP_URL to an authorized disposable test relay");
+    let client = http_client();
+    let keys = Keys::generate();
+    for advisory_mime in [
+        None,
+        Some("text/html"),
+        Some("image/png"),
+        Some("text/plain"),
+    ] {
+        let html = format!(
+            "<!DOCTYPE html><html><script>globalThis.__buzzHtmlExecuted=true</script><p>{}</p></html>",
+            keys.public_key()
+        ).into_bytes();
+        let hash = hex::encode(Sha256::digest(&html));
+        let auth = sign_blossom_auth(&keys, &hash);
+        let mut request = client
+            .put(format!("{base}/upload"))
+            .header("Authorization", blossom_auth_header(&auth))
+            .header("X-SHA-256", &hash)
+            .body(html.clone());
+        if let Some(mime) = advisory_mime {
+            request = request.header("Content-Type", mime);
+        }
+        let uploaded = request.send().await.unwrap();
+        assert!(
+            uploaded.status().is_success(),
+            "HTML upload: {}",
+            uploaded.status()
+        );
+        let descriptor: serde_json::Value = uploaded.json().await.unwrap();
+        assert_eq!(descriptor["sha256"], hash);
+        assert_eq!(descriptor["size"], html.len());
+        assert_eq!(descriptor["type"], "text/html");
+        assert!(descriptor["url"]
+            .as_str()
+            .unwrap()
+            .ends_with(&format!("/{hash}.html")));
+
+        let authorization = blossom_auth_header(&sign_blossom_get_auth(&keys, &hash));
+        for suffix in [format!("{hash}.html"), hash.clone()] {
+            let url = format!("{base}/media/{suffix}");
+            for range in [false, true] {
+                let mut get = client.get(&url).header("Authorization", &authorization);
+                if range {
+                    get = get.header("Range", "bytes=0-15");
+                }
+                let response = get.send().await.unwrap();
+                assert_eq!(response.status().as_u16(), if range { 206 } else { 200 });
+                assert_eq!(response.headers()["content-type"], "text/html");
+                assert_eq!(response.headers()["content-disposition"], "attachment");
+                assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+                assert_eq!(
+                    response.headers()["content-security-policy"],
+                    "default-src 'none'"
+                );
+                if range {
+                    assert_eq!(
+                        response.headers()["content-range"],
+                        format!("bytes 0-15/{}", html.len())
+                    );
+                    assert_eq!(response.bytes().await.unwrap().as_ref(), &html[..16]);
+                } else {
+                    let body = response.bytes().await.unwrap();
+                    assert_eq!(body.as_ref(), html.as_slice());
+                    assert_eq!(hex::encode(Sha256::digest(&body)), hash);
+                }
+                let mut anonymous = client.get(&url);
+                if range {
+                    anonymous = anonymous.header("Range", "bytes=0-15");
+                }
+                assert_eq!(anonymous.send().await.unwrap().status(), 401);
+            }
+            let expired = EventBuilder::new(Kind::from(24242), "Expired HTML read")
+                .tags([
+                    Tag::parse(["t", "get"]).unwrap(),
+                    Tag::parse(["x", &hash]).unwrap(),
+                    Tag::parse(["expiration", &(Timestamp::now().as_secs() - 1).to_string()])
+                        .unwrap(),
+                ])
+                .sign_with_keys(&keys)
+                .unwrap();
+            assert_eq!(
+                client
+                    .get(&url)
+                    .header("Authorization", blossom_auth_header(&expired))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                401
+            );
+            assert_eq!(
+                client
+                    .get(&url)
+                    .header("Authorization", "Nostr invalid")
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                401
+            );
+        }
+        assert_eq!(
+            client
+                .get(format!("{base}/media/{hash}.txt"))
+                .header("Authorization", &authorization)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            404
+        );
+
+        // The legacy media-only route must never become an HTML escape hatch.
+        assert!(!client
+            .put(format!("{base}/media/upload"))
+            .header(
+                "Authorization",
+                blossom_auth_header(&sign_blossom_auth(&keys, &hash))
+            )
+            .header("X-SHA-256", &hash)
+            .header("Content-Type", "image/png")
+            .body(html.clone())
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+        let wrong_hash = "0".repeat(64);
+        assert!(!client
+            .put(format!("{base}/upload"))
+            .header(
+                "Authorization",
+                blossom_auth_header(&sign_blossom_auth(&keys, &wrong_hash))
+            )
+            .header("X-SHA-256", wrong_hash)
+            .body(html)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+    }
+}

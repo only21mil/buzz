@@ -59,6 +59,16 @@ fn validate_download_url(url: &str, relay_base: &str) -> Result<(), String> {
     Ok(())
 }
 
+// The generic detector also accepts HTML and opaque files. Image commands
+// must reject those before returning bytes to the editor or clipboard.
+fn validate_image_bytes(bytes: &[u8]) -> Result<(), String> {
+    let mime = detect_and_validate_mime(bytes)?;
+    if !mime.starts_with("image/") {
+        return Err("media response is not an image".to_string());
+    }
+    Ok(())
+}
+
 /// Download an image from a URL and save it via a native save-file dialog.
 #[tauri::command]
 pub async fn download_image(
@@ -91,7 +101,7 @@ pub async fn download_image(
     let bytes = fetch_blob_bytes(&url, &state).await?;
 
     // Validate the downloaded content is actually a supported media type.
-    detect_and_validate_mime(&bytes)?;
+    validate_image_bytes(&bytes)?;
 
     save_bytes_with_dialog(&app, &filename, "Images", &[&ext], &bytes).await
 }
@@ -129,9 +139,8 @@ pub async fn download_file(
 
     let bytes = fetch_blob_bytes(&url, &state).await?;
 
-    // Reuse the upload-side allow/deny policy: rejects executables, HTML, and
-    // other types the relay would never have accepted, while permitting the
-    // arbitrary `application/octet-stream` / text payloads that uploads allow.
+    // Reuse the upload policy, including HTML and opaque text attachments.
+    // These bytes go only to the user-selected file, never to an app preview.
     detect_and_validate_mime(&bytes)?;
 
     // Generic filter: an arbitrary attachment is not necessarily an image.
@@ -161,7 +170,7 @@ pub async fn fetch_media_bytes(
     validate_download_url(&url, &relay_base)?;
 
     let bytes = fetch_blob_bytes(&url, &state).await?;
-    detect_and_validate_mime(&bytes)?;
+    validate_image_bytes(&bytes)?;
     Ok(tauri::ipc::Response::new(bytes))
 }
 
@@ -184,7 +193,7 @@ pub async fn copy_image_to_clipboard(
     validate_download_url(&url, &relay_base)?;
 
     let bytes = fetch_blob_bytes(&url, &state).await?;
-    detect_and_validate_mime(&bytes)?;
+    validate_image_bytes(&bytes)?;
 
     let img =
         image::load_from_memory(&bytes).map_err(|e| format!("failed to decode image: {e}"))?;
@@ -988,5 +997,27 @@ mod tests {
         assert!(redirect_refusal_error(reqwest::StatusCode::TEMPORARY_REDIRECT).is_some());
         assert!(redirect_refusal_error(reqwest::StatusCode::OK).is_none());
         assert!(redirect_refusal_error(reqwest::StatusCode::NOT_FOUND).is_none());
+    }
+}
+
+#[cfg(test)]
+mod html_download_tests {
+    use super::*;
+
+    #[test]
+    fn html_is_downloadable_but_never_an_image() {
+        for bytes in [
+            b"<!DOCTYPE html><html><script>alert(1)</script></html>".as_slice(),
+            b"  \n<!DOCTYPE html><html>whitespace</html>",
+            b"\xef\xbb\xbf<html>BOM</html>",
+            b"<!-- comment --><html>comment</html>",
+            b"<p>fragment</p>",
+            b"",
+        ] {
+            assert!(detect_and_validate_mime(bytes).is_ok());
+            assert!(validate_image_bytes(bytes).is_err());
+        }
+        assert!(validate_image_bytes(&[0xff, 0xd8, 0xff, 0xe0]).is_ok());
+        assert!(detect_and_validate_mime(b"MZ\x90\x00").is_err());
     }
 }

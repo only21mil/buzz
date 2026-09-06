@@ -322,3 +322,23 @@ test("resolveSnapshotCard: .TEAM.PNG classifies as team snapshot card", () => {
   assert.ok(card !== null);
   assert.equal(card.snapshotKind, "team");
 });
+
+for (const filename of [
+  "report.html",
+  "report.htm",
+  "REPORT.HTML",
+  "misleading.txt",
+]) {
+  for (const mime of ["text/html", "application/octet-stream"]) {
+    test(`HTML attachment ${filename} (${mime}) stays a named generic card`, () => {
+      const href = `https://relay.example/media/${"c".repeat(64)}.${mime === "text/html" ? "html" : "bin"}`;
+      const imeta = { m: mime, filename, size: 93 };
+      assert.deepEqual(resolveFileCard(imeta, href, ""), {
+        href,
+        filename,
+        size: 93,
+      });
+      assert.equal(resolveSnapshotCard(imeta, href, ""), null);
+    });
+  }
+}
