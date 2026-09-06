@@ -183,6 +183,8 @@ pub fn load_teams<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<Vec<TeamRecor
     let records = if path.exists() {
         let content = fs::read_to_string(&path)
             .map_err(|error| format!("failed to read teams store: {error}"))?;
+        #[cfg(test)]
+        super::poll_read_probe::record_read(app, |probe| &probe.teams);
         serde_json::from_str::<Vec<TeamRecord>>(&content)
             .map_err(|error| format!("failed to parse teams store: {error}"))?
     } else {

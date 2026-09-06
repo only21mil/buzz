@@ -489,7 +489,9 @@ use provider_deploy::deploy_to_provider;
 // from the owned AppHandle inside the closure because `State<'_, _>` is borrowed
 // and `std::sync::MutexGuard` is not `Send`.
 #[tauri::command]
-pub async fn list_managed_agents(app: AppHandle) -> Result<Vec<ManagedAgentSummary>, String> {
+pub async fn list_managed_agents<R: tauri::Runtime>(
+    app: AppHandle<R>,
+) -> Result<Vec<ManagedAgentSummary>, String> {
     use tauri::Manager;
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -1344,3 +1346,7 @@ pub(crate) use profile::{reconcile_agent_profile, ProfileReconcileData};
 #[cfg(test)]
 #[path = "agents_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix, not(feature = "system-keyring")))]
+#[path = "agents_poll_tests.rs"]
+mod poll_tests;

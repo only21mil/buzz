@@ -194,6 +194,16 @@ pub fn build_app_state() -> AppState {
         None => (Keys::generate(), IdentityStorage::Ephemeral),
     };
 
+    app_state_with_identity(keys, identity_storage)
+}
+
+/// Construct fixture state without consulting process-global identity settings.
+#[cfg(all(test, unix, not(feature = "system-keyring")))]
+pub(crate) fn build_ephemeral_test_app_state() -> AppState {
+    app_state_with_identity(Keys::generate(), IdentityStorage::Ephemeral)
+}
+
+fn app_state_with_identity(keys: Keys, identity_storage: IdentityStorage) -> AppState {
     AppState {
         keys: Mutex::new(keys),
         publication_epoch: Arc::new(Mutex::new(0)),

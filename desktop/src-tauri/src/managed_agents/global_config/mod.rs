@@ -190,6 +190,8 @@ pub fn load_global_agent_config<R: tauri::Runtime>(
     }
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("failed to read global agent config: {e}"))?;
+    #[cfg(test)]
+    super::poll_read_probe::record_read(app, |probe| &probe.global);
     serde_json::from_str(&content).map_err(|e| format!("failed to parse global agent config: {e}"))
 }
 
