@@ -47,7 +47,11 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
     final cancelled = useRef(false);
     void cancel() {
       cancelled.value = true;
-      unawaited(recorder.cancel());
+      unawaited(
+        recorder.cancel().catchError((Object _) {
+          // Unmount cleanup still attempts native disposal after cancel fails.
+        }),
+      );
       if (context.mounted) onCancel();
     }
 
@@ -141,10 +145,16 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
         unawaited(() async {
           try {
             await recorder.cancel();
-          } finally {
-            await recorder.dispose();
-            releaseMicrophone?.call();
+          } catch (_) {
+            // Native disposal below remains responsible for releasing capture.
           }
+          try {
+            await recorder.dispose();
+          } catch (_) {
+            // Keep capture owned when native release fails.
+            return;
+          }
+          releaseMicrophone?.call();
         }());
       };
     }, [recorder, microphoneCapture]);
