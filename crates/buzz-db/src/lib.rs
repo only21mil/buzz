@@ -20,6 +20,8 @@ pub mod api_token;
 pub mod archived_identities;
 /// Channel and membership persistence.
 pub mod channel;
+/// Channel membership reads and serialized role changes.
+pub mod channel_members;
 /// Durable Buzz-native CI ingest index and queries.
 pub mod ci;
 /// CI control-plane signer grants.
@@ -1815,85 +1817,6 @@ impl Db {
         channel::set_canvas(&self.pool, community_id, channel_id, canvas).await
     }
 
-    /// Adds a member to a channel.
-    pub async fn add_member(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-        pubkey: &[u8],
-        role: channel::MemberRole,
-        invited_by: Option<&[u8]>,
-    ) -> Result<channel::MemberRecord> {
-        channel::add_member(
-            &self.pool,
-            community_id,
-            channel_id,
-            pubkey,
-            role,
-            invited_by,
-        )
-        .await
-    }
-
-    /// Removes a member from a channel.
-    pub async fn remove_member(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-        pubkey: &[u8],
-        actor_pubkey: &[u8],
-    ) -> Result<()> {
-        channel::remove_member(&self.pool, community_id, channel_id, pubkey, actor_pubkey).await
-    }
-
-    /// Returns `true` if the pubkey is an active member.
-    pub async fn is_member(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-        pubkey: &[u8],
-    ) -> Result<bool> {
-        channel::is_member(&self.pool, community_id, channel_id, pubkey).await
-    }
-
-    /// Return the active (channel, pubkey) membership pairs among the given
-    /// sets, in one statement.
-    pub async fn membership_pairs(
-        &self,
-        community_id: CommunityId,
-        channel_ids: &[Uuid],
-        pubkeys: &[Vec<u8>],
-    ) -> Result<Vec<(Uuid, Vec<u8>)>> {
-        channel::membership_pairs(&self.pool, community_id, channel_ids, pubkeys).await
-    }
-
-    /// Returns all active members of a channel.
-    pub async fn get_members(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-    ) -> Result<Vec<channel::MemberRecord>> {
-        channel::get_members(&self.pool, community_id, channel_id).await
-    }
-
-    /// Returns active members for multiple channels in a single query.
-    pub async fn get_members_bulk(
-        &self,
-        community_id: CommunityId,
-        channel_ids: &[Uuid],
-    ) -> Result<Vec<channel::MemberRecord>> {
-        channel::get_members_bulk(&self.pool, community_id, channel_ids).await
-    }
-
-    /// Get all channel IDs accessible to a pubkey.
-    pub async fn get_accessible_channel_ids(
-        &self,
-        community_id: CommunityId,
-        pubkey: &[u8],
-    ) -> Result<Vec<Uuid>> {
-        channel::get_accessible_channel_ids(&self.pool, community_id, pubkey).await
-    }
-
     /// Lists channels, optionally filtered by visibility.
     pub async fn list_channels(
         &self,
@@ -1901,46 +1824,6 @@ impl Db {
         visibility: Option<&str>,
     ) -> Result<Vec<channel::ChannelRecord>> {
         channel::list_channels(&self.pool, community_id, visibility).await
-    }
-
-    /// Returns full channel records for all channels a user can access.
-    pub async fn get_accessible_channels(
-        &self,
-        community_id: CommunityId,
-        pubkey: &[u8],
-        visibility_filter: Option<&str>,
-        member_only: Option<bool>,
-    ) -> Result<Vec<channel::AccessibleChannel>> {
-        channel::get_accessible_channels(
-            &self.pool,
-            community_id,
-            pubkey,
-            visibility_filter,
-            member_only,
-        )
-        .await
-    }
-
-    /// Returns all bot-role members with their aggregated channel names in one community.
-    pub async fn get_bot_members(
-        &self,
-        community_id: CommunityId,
-    ) -> Result<Vec<channel::BotMemberRecord>> {
-        channel::get_bot_members(&self.pool, community_id).await
-    }
-
-    /// Returns the pubkeys of all agent identities in one community.
-    pub async fn get_agent_pubkeys(&self, community_id: CommunityId) -> Result<Vec<Vec<u8>>> {
-        channel::get_agent_pubkeys(&self.pool, community_id).await
-    }
-
-    /// Bulk-fetch user records by pubkey.
-    pub async fn get_users_bulk(
-        &self,
-        community_id: CommunityId,
-        pubkeys: &[Vec<u8>],
-    ) -> Result<Vec<channel::UserRecord>> {
-        channel::get_users_bulk(&self.pool, community_id, pubkeys).await
     }
 
     /// Updates a channel's name and/or description.
@@ -1996,34 +1879,6 @@ impl Db {
         channel_id: Uuid,
     ) -> Result<bool> {
         channel::soft_delete_channel(&self.pool, community_id, channel_id).await
-    }
-
-    /// Returns the count of active members in a channel.
-    pub async fn get_member_count(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-    ) -> Result<i64> {
-        channel::get_member_count(&self.pool, community_id, channel_id).await
-    }
-
-    /// Bulk-fetch member counts for a set of channel IDs.
-    pub async fn get_member_counts_bulk(
-        &self,
-        community_id: CommunityId,
-        channel_ids: &[Uuid],
-    ) -> Result<std::collections::HashMap<Uuid, i64>> {
-        channel::get_member_counts_bulk(&self.pool, community_id, channel_ids).await
-    }
-
-    /// Get the active role of a pubkey in a channel.
-    pub async fn get_member_role(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-        pubkey: &[u8],
-    ) -> Result<Option<String>> {
-        channel::get_member_role(&self.pool, community_id, channel_id, pubkey).await
     }
 
     /// Archive ephemeral channels whose TTL deadline has passed.
