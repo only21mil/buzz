@@ -313,7 +313,6 @@ pub fn run() {
                 macos_notifications::init(&app_handle)?;
             }
 
-            // ── Phase 2: boot-time sentinel wipe ──────────────────────────────
             // Must run before migrations and identity resolution so the wipe
             // completes atomically on crash recovery.
             //
@@ -728,6 +727,7 @@ pub fn run() {
             add_reaction,
             remove_reaction,
             get_event,
+            get_events,
             show_native_notification,
             #[cfg(target_os = "macos")]
             macos_notifications::take_pending_activations,

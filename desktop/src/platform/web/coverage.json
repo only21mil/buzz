@@ -211,6 +211,7 @@
     "get_agent_models",
     "get_builderlab_auth",
     "get_builderlab_nostr_identity",
+    "get_events",
     "get_global_agent_config",
     "get_managed_agent_log",
     "get_project_local_repo_diff",

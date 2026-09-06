@@ -5,7 +5,7 @@ import { JSDOM } from "jsdom";
 // Mount the real dialog, popover, detail panel and trace. Only relay data is
 // supplied locally through React Query; a source-text check cannot catch a
 // missing or inert entry point.
-test("clicking Run history opens the existing run panel and approval trace", async () => {
+test("activation confirmation Back preserves the draft; Keep off and Turn on save their chosen state", async () => {
   const dom = new JSDOM("<!doctype html><html><body></body></html>", {
     url: "http://localhost",
   });
@@ -40,7 +40,9 @@ test("clicking Run history opens the existing run panel and approval trace", asy
             : dom.window[key],
     });
   const { createElement: h } = await import("react");
-  const { render, fireEvent, cleanup } = await import("@testing-library/react");
+  const { render, fireEvent, cleanup, waitFor } = await import(
+    "@testing-library/react"
+  );
   const { QueryClient, QueryClientProvider } = await import(
     "@tanstack/react-query"
   );
@@ -62,9 +64,30 @@ test("clicking Run history opens the existing run panel and approval trace", asy
   const { WorkflowDialog } = await import("./WorkflowDialog.tsx");
   const client = new QueryClient({
     defaultOptions: {
-      queries: { retry: false },
+      queries: { retry: false, gcTime: 0 },
       mutations: { gcTime: 0 },
     },
+  });
+  const { mockIPC, clearMocks } = await import("@tauri-apps/api/mocks");
+  const { parse } = await import("yaml");
+  const writes = [];
+  mockIPC((command, args) => {
+    if (command === "create_workflow") {
+      writes.push(args);
+      return {
+        id: "saved",
+        revision: "saved-revision",
+        name: "Activation",
+        owner_pubkey: "a".repeat(64),
+        channel_id: "channel",
+        definition: parse(args.yamlDefinition),
+        status: "active",
+        created_at: 1,
+        updated_at: 1,
+      };
+    }
+    if (command === "get_current_user_pubkey") return "a".repeat(64);
+    return [];
   });
   client.setQueryData(["identity"], { pubkey: "a".repeat(64) });
   const workflow = {
@@ -74,44 +97,17 @@ test("clicking Run history opens the existing run panel and approval trace", asy
     revision: "revision",
     definition: {
       name: "History fixture",
-      trigger: { on: "manual" },
-      steps: [{ id: "pause", action: "wait", seconds: 1 }],
+      trigger: { on: "message_posted" },
+      steps: [
+        {
+          id: "pause",
+          action: "extract",
+          source: "{{trigger.text}}",
+          matchers: { name: "(.*)" },
+        },
+      ],
     },
   };
-  const run = {
-    id: "run",
-    workflowId: "workflow",
-    status: "completed",
-    currentStep: 0,
-    executionTrace: [],
-    startedAt: 1,
-    completedAt: 2,
-    errorMessage: null,
-    createdAt: 1,
-  };
-  client.setQueryData(["workflow", "workflow"], workflow);
-  client.setQueryData(["workflow-runs", "workflow"], {
-    pages: [{ runs: [run], next: { createdAt: 1, id: "run" } }],
-    pageParams: [null],
-  });
-  client.setQueryData(
-    ["run-approvals", "workflow", "run"],
-    [
-      {
-        approvalRef: "fixture",
-        workflowId: "workflow",
-        runId: "run",
-        stepId: "gate",
-        stepIndex: 0,
-        approverSpec: "owner",
-        status: "granted",
-        approverPubkey: null,
-        note: "Approved fixture",
-        expiresAt: null,
-        createdAt: 1,
-      },
-    ],
-  );
   const router = createRouter({
     routeTree: createRootRoute(),
     history: createMemoryHistory({ initialEntries: ["/"] }),
@@ -132,8 +128,9 @@ test("clicking Run history opens the existing run panel and approval trace", asy
               RouterContextProvider,
               { router },
               h(WorkflowDialog, {
-                channels: [],
-                mode: "edit",
+                channels: [{ id: "channel", name: "Channel", kind: "public" }],
+                initialChannelId: "channel",
+                mode: "create",
                 onDeleteWorkflow: noop,
                 onDuplicateWorkflow: noop,
                 onEditWorkflow: noop,
@@ -149,15 +146,33 @@ test("clicking Run history opens the existing run panel and approval trace", asy
         ),
       ),
     );
-    assert.equal(view.queryByTestId("workflow-detail-panel"), null);
-    fireEvent.click(view.getByRole("button", { name: "Run history" }));
-    const panel = await view.findByTestId("workflow-detail-panel");
-    assert.ok(view.getByTestId("workflow-history-dropdown"));
-    assert.match(panel.textContent, /Load (more|older)/i);
-    fireEvent.click(panel.querySelector("button[aria-expanded]"));
-    assert.match(panel.textContent, /Approval: granted/);
-    assert.match(panel.textContent, /Approved fixture/);
+    const submit = () =>
+      fireEvent.click(view.getByTestId("workflow-dialog-primary-action"));
+    submit();
+    assert.ok(await view.findByTestId("workflow-activation-confirmation"));
+    fireEvent.click(view.getByRole("button", { name: "Back" }));
+    await waitFor(() =>
+      assert.equal(
+        view.queryByTestId("workflow-activation-confirmation"),
+        null,
+      ),
+    );
+    assert.equal(writes.length, 0);
+    assert.match(
+      view.getByRole("textbox", { name: "Workflow YAML" }).value,
+      /action: extract/,
+    );
+    submit();
+    fireEvent.click(await view.findByRole("button", { name: "Keep off" }));
+    await waitFor(() => assert.equal(writes.length, 1));
+    assert.equal(parse(writes[0].yamlDefinition).enabled, false);
+    submit();
+    fireEvent.click(await view.findByRole("button", { name: "Turn on" }));
+    await waitFor(() => assert.equal(writes.length, 2));
+    assert.notEqual(parse(writes[1].yamlDefinition).enabled, false);
+    await waitFor(() => assert.equal(client.isMutating(), 0));
   } finally {
+    clearMocks();
     cleanup();
     client.clear();
     // Radix restores focus in a deferred task when its portals unmount.

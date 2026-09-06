@@ -41,6 +41,7 @@ import {
   type WorkflowFormBuilderHandle,
 } from "./WorkflowFormBuilder";
 import { WorkflowWebhookSecretDialog } from "./WorkflowWebhookSecretDialog";
+import { getWorkflowActivationWarning } from "./workflowActivationWarning";
 import { getWorkflowEnabled } from "./workflowDefinition";
 import type { WorkflowEditorPane } from "./workflowEditorPane";
 import {
@@ -49,6 +50,7 @@ import {
   yamlToFormState,
 } from "./workflowFormTypes";
 import {
+  readWorkflowDocumentFields,
   readWorkflowHeaderState,
   yamlWithWorkflowEnabled,
   yamlWithWorkflowName,
@@ -125,7 +127,7 @@ function WorkflowNameEditor({
   generating: boolean;
   name: string;
   onCommit: (name: string) => boolean;
-  onEditingChange: (editing: boolean) => void;
+  onEditingChange?: (editing: boolean) => void;
 }) {
   const [editing, setEditing] = React.useState(false);
   const [draft, setDraft] = React.useState(name);
@@ -142,7 +144,7 @@ function WorkflowNameEditor({
   const changeEditing = React.useCallback(
     (nextEditing: boolean) => {
       setEditing(nextEditing);
-      onEditingChange(nextEditing);
+      onEditingChange?.(nextEditing);
     },
     [onEditingChange],
   );
@@ -255,13 +257,10 @@ export function WorkflowDialog({
   const [editorParseError, setEditorParseError] = React.useState<string | null>(
     null,
   );
-  const [workflowNameEditing, setWorkflowNameEditing] = React.useState(false);
   const [historyOpen, setHistoryOpen] = React.useState(false);
   const [channelAutoOpenPending, setChannelAutoOpenPending] = React.useState(
     mode === "create" && !channelId,
   );
-  const [nameLeadingElement, setNameLeadingElement] =
-    React.useState<HTMLDivElement | null>(null);
   const [savedWebhookInfo, setSavedWebhookInfo] = React.useState<{
     relayHttpUrl: string | null;
     relayUrlError: string | null;
@@ -270,6 +269,12 @@ export function WorkflowDialog({
   } | null>(null);
   const [discardConfirmationOpen, setDiscardConfirmationOpen] =
     React.useState(false);
+  const [activationConfirmationOpen, setActivationConfirmationOpen] =
+    React.useState(false);
+  const [pendingCreateYaml, setPendingCreateYaml] = React.useState<
+    string | null
+  >(null);
+  const [formValid, setFormValid] = React.useState(true);
   const [secretConfirmationOpen, setSecretConfirmationOpen] =
     React.useState(false);
   const [generatingName, setGeneratingName] = React.useState(false);
@@ -307,6 +312,9 @@ export function WorkflowDialog({
     let active = true;
     setSavedWebhookInfo(null);
     setDiscardConfirmationOpen(false);
+    setActivationConfirmationOpen(false);
+    setPendingCreateYaml(null);
+    setFormValid(true);
     resetCreate();
     resetUpdate();
 
@@ -346,6 +354,8 @@ export function WorkflowDialog({
     resetCreate();
     resetUpdate();
     setDiscardConfirmationOpen(false);
+    setActivationConfirmationOpen(false);
+    setPendingCreateYaml(null);
     onOpenChange(false);
   }, [onOpenChange, resetCreate, resetUpdate]);
 
@@ -410,14 +420,12 @@ export function WorkflowDialog({
     [closeDialog, isDirty, onOpenChange, savedWebhookInfo],
   );
 
-  async function handleSubmit() {
-    if (!selectedChannelId || !yamlDefinition.trim()) return;
-
+  async function saveWorkflow(yaml: string) {
     try {
-      const saved = await mutation.mutateAsync(yamlDefinition);
+      const saved = await mutation.mutateAsync(yaml);
       initialValuesRef.current = {
         channelId: selectedChannelId,
-        yaml: yamlDefinition,
+        yaml,
       };
       if (saved.webhookSecret) {
         allowNavigationRef.current = false;
@@ -447,6 +455,37 @@ export function WorkflowDialog({
     } catch {
       // React Query stores the error; keep the dialog open and dirty.
     }
+  }
+
+  function handleSubmit() {
+    if (!selectedChannelId || !yamlDefinition.trim() || !formValid) return;
+
+    const documentEnabled = readWorkflowDocumentFields(yamlDefinition).enabled;
+    const savedEnabled = workflowSnapshot
+      ? getWorkflowEnabled(workflowSnapshot.definition)
+      : null;
+    const enablesWorkflow =
+      documentEnabled !== false && (mode !== "edit" || savedEnabled === false);
+    if (enablesWorkflow && getWorkflowActivationWarning(yamlDefinition)) {
+      const disabledYaml = yamlWithWorkflowEnabled(yamlDefinition, false);
+      if (disabledYaml === null) return;
+      setPendingCreateYaml(disabledYaml);
+      setActivationConfirmationOpen(true);
+      return;
+    }
+
+    void saveWorkflow(yamlDefinition);
+  }
+
+  function handleCreateActivation(enabled: boolean) {
+    if (pendingCreateYaml === null) return;
+    const yaml = enabled
+      ? yamlWithWorkflowEnabled(pendingCreateYaml, true)
+      : pendingCreateYaml;
+    if (yaml === null) return;
+    setActivationConfirmationOpen(false);
+    setPendingCreateYaml(null);
+    void saveWorkflow(yaml);
   }
 
   const handleEditorModeChange = React.useCallback(
@@ -512,6 +551,10 @@ export function WorkflowDialog({
     setYamlDefinition(nextYaml);
   }, [mutation.reset, workflowEnabled]);
   const showChannelSelector = mode !== "edit";
+  const activationWarning =
+    pendingCreateYaml === null
+      ? null
+      : getWorkflowActivationWarning(pendingCreateYaml);
 
   return (
     <>
@@ -522,6 +565,13 @@ export function WorkflowDialog({
         <DialogContent
           className="flex h-[88vh] max-h-[88vh] w-[calc(100vw-2rem)] max-w-6xl flex-col gap-0 overflow-hidden p-0"
           onEscapeKeyDown={(event) => {
+            if (
+              event.target instanceof HTMLElement &&
+              event.target.closest("[data-workflow-filter-picker-search]")
+            ) {
+              event.preventDefault();
+              return;
+            }
             if (formBuilderRef.current?.closeInspector()) {
               event.preventDefault();
               event.stopPropagation();
@@ -547,17 +597,6 @@ export function WorkflowDialog({
                   generating={generatingName}
                   name={workflowName}
                   onCommit={handleWorkflowNameCommit}
-                  onEditingChange={setWorkflowNameEditing}
-                />
-                <div
-                  className={
-                    mode !== "edit" &&
-                    editorMode === "form" &&
-                    !workflowNameEditing
-                      ? "flex items-center"
-                      : "hidden"
-                  }
-                  ref={setNameLeadingElement}
                 />
               </div>
             </div>
@@ -638,13 +677,14 @@ export function WorkflowDialog({
               channels={channels}
               disabled={mutation.isPending}
               mode={editorMode}
-              nameLeadingContainer={mode === "edit" ? null : nameLeadingElement}
+              nameLeadingContainer={null}
               onChange={(yaml) => {
                 mutation.reset();
                 yamlDefinitionRef.current = yaml;
                 setYamlDefinition(yaml);
               }}
               onSelectedNodeChange={onEditorPaneChange}
+              onValidityChange={setFormValid}
               parseError={editorParseError}
               ref={formBuilderRef}
               scopeField={
@@ -748,6 +788,7 @@ export function WorkflowDialog({
                   disabled={
                     !selectedChannelId ||
                     !yamlDefinition.trim() ||
+                    !formValid ||
                     mutation.isPending
                   }
                   onClick={handleSubmit}
@@ -762,6 +803,48 @@ export function WorkflowDialog({
           </div>
         </DialogContent>
       </Dialog>
+
+      <AlertDialog
+        onOpenChange={(nextOpen) => {
+          setActivationConfirmationOpen(nextOpen);
+          if (!nextOpen) setPendingCreateYaml(null);
+        }}
+        open={activationConfirmationOpen}
+      >
+        <AlertDialogContent data-testid="workflow-activation-confirmation">
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {activationWarning?.title ?? "Turn on this workflow?"}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {activationWarning?.description ??
+                "Turn it on to let it run immediately, or keep it off until you’re ready."}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel asChild>
+              <Button type="button" variant="ghost">
+                Back
+              </Button>
+            </AlertDialogCancel>
+            <Button
+              onClick={() => handleCreateActivation(false)}
+              type="button"
+              variant="outline"
+            >
+              Keep off
+            </Button>
+            <AlertDialogAction asChild>
+              <Button
+                onClick={() => handleCreateActivation(true)}
+                type="button"
+              >
+                Turn on
+              </Button>
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog
         onOpenChange={(nextOpen) => {
