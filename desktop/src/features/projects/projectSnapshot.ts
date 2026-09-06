@@ -1,16 +1,14 @@
 import type { RelayEvent } from "@/shared/api/types";
 import { buildProjectReadModels, type Project } from "./projectModels";
+import { markProjectSnapshotRow } from "./projectSnapshotProvenance";
+
+export { isProjectSnapshotRow } from "./projectSnapshotProvenance";
 
 export type ProjectSnapshotScope = { relayOrigin: string; pubkey: string };
 const PREFIX = "buzz.projects.events.v1:";
 const MAX_BYTES = 2_000_000;
 const MAX_EVENTS = 10_000;
 const MAX_AGE_MS = 24 * 60 * 60_000;
-const snapshotRows = new WeakSet<object>();
-
-export function isProjectSnapshotRow(project: object): boolean {
-  return snapshotRows.has(project);
-}
 function normalizedScope(scope: ProjectSnapshotScope): ProjectSnapshotScope {
   const url = new URL(scope.relayOrigin);
   if (
@@ -109,7 +107,7 @@ export function readProjectSnapshot(
       deletionEvents: events.filter((event) => event.kind === 5),
       relayOrigin: expected.relayOrigin,
     });
-    for (const project of projects) snapshotRows.add(project);
+    for (const project of projects) markProjectSnapshotRow(project);
     return projects;
   } catch {
     return undefined;

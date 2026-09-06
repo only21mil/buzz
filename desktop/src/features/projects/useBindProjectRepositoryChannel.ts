@@ -1,6 +1,7 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { projectCollectionMutationOptions } from "./projectCollectionMutation";
 import type { ProjectSnapshotScope } from "./projectSnapshot";
+import { preserveProjectSnapshotProvenance } from "./projectSnapshotProvenance";
 import { useProjectCollectionScope } from "./useProjectCollectionScope";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
@@ -68,13 +69,21 @@ export function bindProjectRepositoryChannelMutationOptions(
     scope,
     mutationFn,
     (current, repository) =>
-      current.map((project) => ({
-        ...project,
-        repositories: project.repositories.map((candidate) =>
-          candidate.repoAddress === repository.repoAddress
-            ? repository
-            : candidate,
-        ),
-      })),
+      current.map((project) => {
+        if (
+          !project.repositories.some(
+            (candidate) => candidate.repoAddress === repository.repoAddress,
+          )
+        )
+          return project;
+        return preserveProjectSnapshotProvenance(project, {
+          ...project,
+          repositories: project.repositories.map((candidate) =>
+            candidate.repoAddress === repository.repoAddress
+              ? repository
+              : candidate,
+          ),
+        });
+      }),
   );
 }

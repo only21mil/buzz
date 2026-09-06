@@ -4,6 +4,7 @@ import {
   KIND_REPO_ANNOUNCEMENT,
 } from "@/shared/constants/kinds";
 import { effectiveCloneUrls } from "./lib/projectCloneUrl";
+import { preserveProjectSnapshotProvenance } from "./projectSnapshotProvenance";
 
 export type Repository = {
   id: string;
@@ -594,7 +595,7 @@ export function addRepositoryToProject(
     repository,
   ].sort((left, right) => left.repoAddress.localeCompare(right.repoAddress));
 
-  return {
+  return preserveProjectSnapshotProvenance(project, {
     ...project,
     id: projectAddress,
     createdAt,
@@ -611,7 +612,7 @@ export function addRepositoryToProject(
       project.unavailableRepositoryAddresses?.filter(
         (address) => address !== repository.repoAddress,
       ) ?? [],
-  };
+  });
 }
 
 /** Returns the optimistic read model after linking an extra project stream. */
@@ -625,9 +626,9 @@ export function addRelatedChannelToProject(
   ].filter(
     (id) => id !== project.projectChannelId && isValidProjectChannelId(id),
   );
-  return {
+  return preserveProjectSnapshotProvenance(project, {
     ...project,
     createdAt,
     relatedChannelIds: relatedChannelIds.slice(0, MAX_PROJECT_RELATED_CHANNELS),
-  };
+  });
 }
