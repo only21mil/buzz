@@ -18,8 +18,7 @@ use crate::{
     util::now_iso,
 };
 
-/// Read the workspace owner pubkey without holding the lock. Used to populate `BUZZ_ACP_AGENT_OWNER`
-/// as a fallback for legacy agent records that have no NIP-OA `auth_tag`.
+/// Read the owner pubkey for legacy `BUZZ_ACP_AGENT_OWNER` fallback when `auth_tag` is absent.
 pub(super) fn workspace_owner_hex(state: &AppState) -> Result<String, String> {
     let keys = state.keys.lock().map_err(|e| e.to_string())?;
     Ok(keys.public_key().to_hex())

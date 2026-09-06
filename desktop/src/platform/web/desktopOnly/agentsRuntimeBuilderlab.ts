@@ -33,6 +33,10 @@ const CAPABILITY_OFF_MUTATIONS: ReadonlyArray<readonly [string, string]> = [
     "Builderlab communities need the desktop app",
   ],
 
+  ["fetch_team_catalog", "local team storage needs the desktop app"],
+  ["set_team_shared", "local team storage needs the desktop app"],
+  ["add_team_from_catalog", "local team storage needs the desktop app"],
+
   // Persona cards and snapshots.
   ["card_mint_save_openai_key", "persona card keys need the desktop app"],
   [
@@ -49,6 +53,11 @@ const CAPABILITY_OFF_MUTATIONS: ReadonlyArray<readonly [string, string]> = [
   ],
   ["export_agent_snapshot", "agent snapshot exports need the desktop app"],
   ["mint_agent_card", "persona cards need the desktop app"],
+
+  [
+    "revalidate_relay_agents",
+    "relay agent authority revalidation needs the desktop app",
+  ],
 
   // Local ACP runtimes and harnesses.
   ["connect_acp_runtime", "local runtime authentication needs the desktop app"],

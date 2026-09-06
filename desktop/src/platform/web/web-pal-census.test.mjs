@@ -70,13 +70,23 @@ test("Rust command extraction handles module paths and cfg attributes", () => {
 });
 
 test("census check is independent of the caller working directory", async () => {
+  const committed = JSON.parse(
+    await readFile(
+      path.join(DESKTOP_DIR, "docs/web-pal-commands.json"),
+      "utf8",
+    ),
+  );
   for (const cwd of [REPO_DIR, DESKTOP_DIR]) {
     const { stdout } = await execFileAsync(
       process.execPath,
       [CENSUS_SCRIPT, "--check"],
       { cwd },
     );
-    assert.match(stdout, /Renderer commands: 294 distinct/);
+    assert.ok(
+      stdout.includes(
+        `Renderer commands: ${committed.renderer.commandCount} distinct`,
+      ),
+    );
     assert.match(stdout, /Committed manifest matches current command names/);
   }
 });
