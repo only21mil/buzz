@@ -14,6 +14,7 @@ import 'channel.dart';
 import 'channel_management_provider.dart'
     show channelDetailsProvider, ChannelMember;
 import 'channel_mutes/channel_mutes_provider.dart';
+import 'huddle_channel_filter.dart';
 import '../../shared/read_state/read_state_provider.dart';
 import 'thread_follows/thread_follows_provider.dart';
 import 'unread_badge/is_high_priority_event.dart';
@@ -254,6 +255,10 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
               ),
             ),
           );
+    final huddleBackingIds = huddleBackingChannelIds(
+      await _fenced(fence, _fetchHuddleStarts(session, memberCountChannelIds)),
+      memberEvents,
+    );
     final channels = <Channel>[];
     for (final event in dedupedMetas) {
       final id = event.getTagValue('d');
@@ -266,6 +271,11 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
       );
       if (!isMember && (channel.isPrivate || channel.isDm)) continue;
       if (channel.isDm && hiddenDmIds.contains(channel.id)) continue;
+      if (huddleBackingIds.contains(channel.id) &&
+          channel.isStream &&
+          channel.isPrivate) {
+        continue;
+      }
       // Ephemeral (TTL) channels are surfaced in the list with an
       // `_EphemeralBadge` rendered in `channels_page.dart` — they shouldn't be
       // hidden. Desktop shows them too. Previously dropped here unconditionally,
@@ -381,6 +391,29 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
     // caller assigns whatever this returns, so the last check belongs here.
     fence.ensureCurrent();
     return channels;
+  }
+
+  Future<List<NostrEvent>> _fetchHuddleStarts(
+    RelaySessionNotifier session,
+    List<String> parentChannelIds,
+  ) async {
+    if (parentChannelIds.isEmpty) return const [];
+    try {
+      final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+      return await session.fetchHistory(
+        NostrFilter(
+          kinds: const [EventKind.huddleStarted],
+          tags: {'#h': parentChannelIds},
+          since: now - const Duration(hours: 2).inSeconds,
+          limit: 500,
+        ),
+      );
+    } catch (error) {
+      debugPrint(
+        '[ChannelsNotifier] Huddle backing-channel query failed: $error',
+      );
+      return const [];
+    }
   }
 
   /// Build a [Channel] from a kind:39000 metadata event.

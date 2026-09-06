@@ -11,6 +11,7 @@ import UserNotifications
   private var concentricSheetSurfaceChannel: FlutterMethodChannel?
   private var nativeAttachmentPopoverCoordinator: NativeAttachmentPopoverCoordinator?
   private var nativeProfileTextEditorCoordinator: NativeProfileTextEditorCoordinator?
+  private var huddleMediaPlugin: HuddleMediaPlugin?
 
   override func application(
     _ application: UIApplication,
@@ -23,6 +24,7 @@ import UserNotifications
   func didInitializeImplicitFlutterEngine(_ engineBridge: FlutterImplicitEngineBridge) {
     GeneratedPluginRegistrant.register(with: engineBridge.pluginRegistry)
     let messenger = engineBridge.applicationRegistrar.messenger()
+    huddleMediaPlugin = HuddleMediaPlugin(messenger: messenger)
     mediaUploadChannel = FlutterMethodChannel(
       name: "buzz/media_upload",
       binaryMessenger: messenger
@@ -69,7 +71,7 @@ import UserNotifications
       forPlugin: "BuzzConcentricSheetSurface"
     ) {
       concentricSheetRegistrar.register(
-        ConcentricSheetSurfaceFactory(),
+        ConcentricSheetSurfaceFactory(messenger: messenger),
         withId: "buzz/concentric_sheet_surface"
       )
       concentricSheetSurfaceChannel = FlutterMethodChannel(

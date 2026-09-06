@@ -19,6 +19,8 @@ import 'relay_provider.dart';
 import 'relay_rate_limit_gate.dart';
 import 'relay_socket.dart';
 
+part 'relay_session_huddle_lifecycle.dart';
+
 enum SessionStatus { disconnected, connecting, connected, reconnecting }
 
 @immutable
@@ -75,8 +77,7 @@ class _BufferedEvent {
   _BufferedEvent(this.subId, this.event);
 }
 
-/// Manages websocket subscriptions, event batching, reconnection with replay,
-/// and pending event tracking. Equivalent to the desktop's RelayClientSession.
+/// Manages websocket subscriptions, batching, reconnection, and pending events.
 typedef RelaySocketFactory =
     RelaySocket Function({
       required String wsUrl,
@@ -139,6 +140,7 @@ class RelaySessionNotifier extends Notifier<SessionState> {
   bool _hasConnectedOnce = false;
   int _connectionGeneration = 0;
   final Map<Object, String> _visibleChannelsByOwner = {};
+  final Map<Object, Future<void> Function()> _beforePauseCallbacks = {};
   bool _socketConnected = false;
   bool _closedRetryReplayScheduled = false;
 
@@ -396,13 +398,6 @@ class RelaySessionNotifier extends Notifier<SessionState> {
     _reconnectDelayMs = _baseReconnectDelayMs;
     final config = ref.read(relayConfigProvider);
     await _connect(config);
-  }
-
-  /// Called by the app lifecycle provider when the app goes to background.
-  void onAppPaused() {
-    _backgroundedAt = _now();
-    _backgroundGraceTimer?.cancel();
-    _backgroundGraceTimer = Timer(_backgroundGraceDuration, _pauseNow);
   }
 
   void _pauseNow() {
@@ -917,6 +912,7 @@ class RelaySessionNotifier extends Notifier<SessionState> {
 
   void _dispose() {
     _disposed = true;
+    _beforePauseCallbacks.clear();
     _connectionGeneration++;
     _reconnectTimer?.cancel();
     _flushTimer?.cancel();

@@ -80,10 +80,14 @@ internal object AndroidImageProcessor {
 
 class MainActivity : FlutterActivity() {
     private var mediaUploadChannel: MethodChannel? = null
+    private var huddleMediaPlugin: HuddleMediaPlugin? = null
     private var notificationBridge: AndroidNotificationBridge? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+
+        huddleMediaPlugin?.dispose()
+        huddleMediaPlugin = HuddleMediaPlugin(this, flutterEngine.dartExecutor.binaryMessenger)
 
         notificationBridge?.dispose()
         notificationBridge = AndroidNotificationBridge(
@@ -135,9 +139,12 @@ class MainActivity : FlutterActivity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         notificationBridge?.handlePermissionResult(requestCode, permissions, grantResults)
+        huddleMediaPlugin?.onRequestPermissionsResult(requestCode, permissions, grantResults)
     }
 
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        huddleMediaPlugin?.dispose()
+        huddleMediaPlugin = null
         notificationBridge?.dispose()
         notificationBridge = null
         super.cleanUpFlutterEngine(flutterEngine)
