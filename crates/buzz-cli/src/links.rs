@@ -23,6 +23,7 @@
 /// before building a link and omit the field when it returns false, rather
 /// than emitting a link no client can parse. Mirrors `isValidDtag` in
 /// `desktop/src/shared/lib/entityLink.ts`.
+#[cfg(test)]
 pub fn is_linkable_dtag(dtag: &str) -> bool {
     !dtag.is_empty()
         && dtag.len() <= 64
@@ -39,6 +40,7 @@ pub fn repo_link(owner: &str, repo_id: &str) -> String {
 }
 
 /// Build a canonical repository commit link. Callers validate the hash first.
+#[cfg(test)]
 pub fn commit_link(owner: &str, repo_id: &str, commit: &str) -> String {
     format!(
         "buzz://repo?owner={}&d={repo_id}&tab=commits&commit={}",
@@ -48,6 +50,7 @@ pub fn commit_link(owner: &str, repo_id: &str, commit: &str) -> String {
 }
 
 /// Build a `buzz://project` link for a project announcement (kind 30621).
+#[cfg(test)]
 pub fn project_link(owner: &str, project_id: &str) -> String {
     format!("buzz://project?owner={owner}&d={project_id}")
 }
