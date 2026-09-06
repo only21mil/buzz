@@ -30,9 +30,8 @@ fn trim_optional(value: Option<String>) -> Option<String> {
 /// instances, best-effort. Loads the agent store, applies the roster delta via
 /// [`apply_team_membership_delta`], and re-saves only when something changed;
 /// any load/save error is logged and swallowed. Called after the authoritative
-/// `save_teams` succeeds — the team already exists on disk and boot repair is
-/// the designed retry for a stale/unset binding, so a secondary-store hiccup
-/// must not fail a command whose team write already landed (a UI retry would
+/// `save_teams` succeeds — the team already exists on disk, so a secondary-store
+/// hiccup must not fail a command whose team write already landed (a UI retry would
 /// then mint a duplicate team).
 ///
 /// `load_agents`/`save_agents` are injected so the command wiring (prior-roster
@@ -66,10 +65,8 @@ pub(in crate::commands) fn propagate_membership_best_effort(
     }
 }
 
-/// Fixture for full-roster membership propagation with injected persistence.
-/// Production `create_team` persists and publishes through its command path;
-/// these tests exercise the propagation helper, not that command's wiring.
-#[cfg(test)]
+/// Persist a newly created team authoritatively, then propagate its full roster
+/// to unbound instances best-effort. The command supplies real store callbacks.
 fn commit_team_create(
     teams: &mut Vec<TeamRecord>,
     team: TeamRecord,
@@ -244,7 +241,11 @@ pub(crate) fn tombstone_team_catalog_head<R: tauri::Runtime>(
 /// Unlike `retain_managed_agent_pending`, no projection-equality short-circuit:
 /// teams have no start/stop runtime churn, so a republish only happens on an
 /// actual user edit.
-pub(super) fn retain_team_pending(app: &AppHandle, state: &AppState, team: &TeamRecord) {
+pub(super) fn retain_team_pending<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    team: &TeamRecord,
+) {
     let result = (|| -> Result<(), String> {
         let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
         retain_team_pending_at(&scope, team)
@@ -406,7 +407,10 @@ pub async fn list_teams(app: AppHandle) -> Result<Vec<TeamRecord>, String> {
 }
 
 #[tauri::command]
-pub async fn create_team(input: CreateTeamRequest, app: AppHandle) -> Result<TeamRecord, String> {
+pub async fn create_team<R: tauri::Runtime>(
+    input: CreateTeamRequest,
+    app: AppHandle<R>,
+) -> Result<TeamRecord, String> {
     use tauri::Manager;
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -440,8 +444,13 @@ pub async fn create_team(input: CreateTeamRequest, app: AppHandle) -> Result<Tea
             created_at: now.clone(),
             updated_at: now,
         };
-        teams.push(team.clone());
-        save_teams(&app, &teams)?;
+        let team = commit_team_create(
+            &mut teams,
+            team,
+            |teams| save_teams(&app, teams),
+            || load_managed_agents(&app),
+            |records| save_managed_agents(&app, records),
+        )?;
         // Created teams are always non-builtin; publish to the relay.
         retain_team_pending(&app, &state, &team);
         Ok(team)
@@ -528,3 +537,7 @@ pub async fn delete_team(id: String, app: AppHandle) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests;
+
+// Real store IO without touching the OS keyring. Run with --no-default-features.
+#[cfg(all(test, not(feature = "system-keyring")))]
+mod create_command_tests;
