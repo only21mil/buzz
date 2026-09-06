@@ -1,3 +1,4 @@
+import { selectProjectRepository } from "../projectModels";
 import { setCanvas } from "@/shared/api/tauri";
 import type { ChannelTemplate } from "@/shared/api/types";
 import type { Project } from "@/features/projects/hooks";
@@ -71,7 +72,7 @@ export function renderProjectHomeCanvas(input: {
   channelId: string;
   project: Project;
 }) {
-  const repository = input.project.repositories[0];
+  const repository = selectProjectRepository(input.project, null);
   const values: Record<string, string> = {
     CHANNEL_UUID: input.channelId,
     PROJECT_NAME: input.project.name,

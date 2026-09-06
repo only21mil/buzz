@@ -41,6 +41,8 @@ export type Project = {
   status: string;
   projectAddress: string;
   primaryRepositoryAddress: string | null;
+  /** First authoritative home member in the signed project tag order. */
+  homeRepositoryAddress?: string | null;
   repositoryAddresses: string[];
   repositoryRelayHints?: Record<string, string>;
   repositories: Repository[];
@@ -364,6 +366,20 @@ export function eventToExplicitProject(
   const channel = getTag(event, "buzz-channel");
   const projectChannelId =
     channel && isValidProjectChannelId(channel) ? channel : null;
+  const homeRepositoryAddress = projectChannelId
+    ? (membershipTags
+        .map((tag) => tag[1])
+        .find((address) => {
+          const repository = visibleRepositoriesByAddress.get(address);
+          return (
+            repository?.channelId === projectChannelId &&
+            (repository.owner.toLowerCase() === owner ||
+              repository.maintainers?.some(
+                (maintainer) => maintainer.toLowerCase() === owner,
+              ))
+          );
+        }) ?? null)
+    : null;
   const relatedChannelIds = [
     ...new Set(
       getAllTags(event, PROJECT_RELATED_CHANNEL_TAG).filter(
@@ -384,6 +400,7 @@ export function eventToExplicitProject(
     status: visibility === "listed" ? "active" : "unlisted",
     projectAddress,
     primaryRepositoryAddress,
+    homeRepositoryAddress,
     repositoryAddresses,
     repositoryRelayHints,
     repositories: repositoryAddresses.flatMap((address) => {
@@ -548,6 +565,9 @@ export function selectProjectRepository(
   if (requested) return requested;
 
   return (
+    project.repositories.find(
+      (repository) => repository.repoAddress === project.homeRepositoryAddress,
+    ) ??
     project.repositories.find(
       (repository) =>
         repository.repoAddress === project.primaryRepositoryAddress,

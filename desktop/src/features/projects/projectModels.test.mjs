@@ -765,3 +765,28 @@ test("buildProjectReadModels applies deletion beyond the 2000-event boundary", (
     "project at deletion event 2001+ must be suppressed when all tombstones are applied",
   );
 });
+
+test("home default follows the first authorized signed member like CLI and ACP", () => {
+  const home = "11111111-1111-4111-8111-111111111111";
+  const repos = [
+    repositoryEvent(PROJECT_OWNER, "alpha"),
+    repositoryEvent(PROJECT_OWNER, "zeta"),
+    repositoryEvent(FRONTEND_OWNER, "foreign"),
+  ];
+  for (const repo of repos) repo.tags.push(["buzz-channel", home]);
+  const event = projectEvent([
+    ["a", `30617:${FRONTEND_OWNER}:foreign`],
+    ["a", `30617:${PROJECT_OWNER}:zeta`],
+    ["a", `30617:${PROJECT_OWNER}:alpha`],
+  ]);
+  const project = buildProjectReadModels({
+    projectEvents: [event],
+    repositoryEvents: repos,
+  })[0];
+  assert.equal(project.homeRepositoryAddress, `30617:${PROJECT_OWNER}:zeta`);
+  assert.equal(selectProjectRepository(project, null).dtag, "zeta");
+  assert.equal(
+    selectProjectRepository(project, `${PROJECT_OWNER}:alpha`).dtag,
+    "alpha",
+  );
+});
