@@ -578,7 +578,7 @@ mod tests {
 
         assert_eq!(
             migrations.len(),
-            36,
+            37,
             "embedded migration matrix must contain the frozen prefix plus admitted tail"
         );
         assert_eq!(migrations[0].version, 1);
@@ -1568,6 +1568,146 @@ mod tests {
         assert_eq!(applied_versions(&pool).await.last().copied(), Some(latest));
     }
 
+    async fn assert_push_message_kinds(pool: &PgPool, community: uuid::Uuid) {
+        for kind in [7, 9, 1059, 40002, 40007, 45001, 45003, 46010] {
+            sqlx::query(
+                "INSERT INTO events (community_id,id,pubkey,created_at,kind,tags,content,sig) \
+                 VALUES ($1,$2,$3,now(),$4,'[]','push migration',$5)",
+            )
+            .bind(community)
+            .bind(vec![(kind % 251) as u8; 32])
+            .bind(vec![21_u8; 32])
+            .bind(kind)
+            .bind(vec![22_u8; 64])
+            .execute(pool)
+            .await
+            .expect("insert eligible and excluded events");
+        }
+        let kinds: Vec<i32> = sqlx::query_scalar(
+            "SELECT e.kind FROM push_match_queue q JOIN events e \
+             ON e.community_id=q.community_id AND e.id=q.event_id \
+             WHERE q.community_id=$1 ORDER BY e.kind",
+        )
+        .bind(community)
+        .fetch_all(pool)
+        .await
+        .expect("read matched kinds");
+        assert_eq!(kinds, [9, 40002, 45001, 45003]);
+    }
+
+    async fn seed_push_migration_lease(pool: &PgPool) -> uuid::Uuid {
+        let community = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO communities(id,host) VALUES($1,$2)")
+            .bind(community)
+            .bind(format!("push-migration-{community}.example"))
+            .execute(pool)
+            .await
+            .expect("seed community");
+        sqlx::query(
+            "INSERT INTO push_leases(community_id,author,installation_id,source_event_id,\
+             source_created_at,generation,active,app_profile,endpoint_hash,endpoint_grant,\
+             max_class,subscriptions,expires_at) \
+             VALUES($1,$2,'legacy',$3,1,1,true,'buzz-ios-production',$4,'retained-grant',\
+             'time_sensitive','[]',9223372036854775806)",
+        )
+        .bind(community)
+        .bind(vec![11_u8; 32])
+        .bind(vec![12_u8; 32])
+        .bind(vec![13_u8; 32])
+        .execute(pool)
+        .await
+        .expect("seed legacy lease");
+        community
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres initialized with desired schema"]
+    async fn desired_schema_push_message_kinds() {
+        assert_eq!(
+            std::env::var("BUZZ_TEST_SCHEMA_MODE").as_deref(),
+            Ok("desired")
+        );
+        let pool = connect_test_pool().await;
+        let community = seed_push_migration_lease(&pool).await;
+        assert_push_message_kinds(&pool, community).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn push_message_kinds_fresh_install() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        run_migrations(&pool).await.expect("fresh migrations");
+        let community = seed_push_migration_lease(&pool).await;
+        assert_push_message_kinds(&pool, community).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn push_message_kinds_populated_upgrade_preserves_authority() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        MIGRATOR
+            .run_to(36, &pool)
+            .await
+            .expect("frozen fork prefix");
+        let community = seed_push_migration_lease(&pool).await;
+        let installation = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO push_gateway_installations(id,app_attest_key_id,app_attest_public_key,\
+             assertion_counter,app_profile,token_ciphertext,token_fingerprint,endpoint_epoch,expires_at) \
+             VALUES($1,$2,$3,0,'buzz-ios-sandbox',$4,$5,1,now()+interval '1 day')",
+        )
+        .bind(installation).bind(vec![1_u8; 32]).bind(vec![2_u8; 33])
+        .bind(vec![3_u8; 32]).bind(vec![4_u8; 32])
+        .execute(&pool).await.expect("seed gateway installation");
+        sqlx::query(
+            "INSERT INTO push_gateway_delegations(id,installation_id,relay_pubkey,endpoint_epoch,\
+             generation,not_before,expires_at) VALUES($1,$2,$3,1,1,now(),now()+interval '1 hour')",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(installation)
+        .bind(vec![5_u8; 32])
+        .execute(&pool)
+        .await
+        .expect("seed gateway delegation");
+        let snapshot_sql = "SELECT jsonb_build_array(\
+            (SELECT jsonb_agg(to_jsonb(l)) FROM push_leases l),\
+            (SELECT jsonb_agg(to_jsonb(i)) FROM push_gateway_installations i),\
+            (SELECT jsonb_agg(to_jsonb(d)) FROM push_gateway_delegations d))";
+        let before: serde_json::Value = sqlx::query_scalar(snapshot_sql)
+            .fetch_one(&pool)
+            .await
+            .expect("snapshot existing authority");
+        run_migrations(&pool)
+            .await
+            .expect("admit only migration 0037");
+        let after: serde_json::Value = sqlx::query_scalar(snapshot_sql)
+            .fetch_one(&pool)
+            .await
+            .expect("read preserved authority");
+        assert_eq!(
+            before, after,
+            "profile authority and leases must remain byte-equivalent"
+        );
+        let checksum: Vec<u8> = sqlx::query_scalar(
+            "SELECT checksum FROM _sqlx_migrations WHERE version=37 AND success",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("successful adopted migration ledger");
+        assert_eq!(
+            checksum,
+            MIGRATOR
+                .iter()
+                .find(|m| m.version == 37)
+                .unwrap()
+                .checksum
+                .as_ref()
+        );
+        assert_push_message_kinds(&pool, community).await;
+    }
+
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn populated_upgrade_preserves_search_policy_except_for_push_leases() {
@@ -1726,7 +1866,7 @@ mod b1_ci_grants_ordering {
                 .skip(35)
                 .map(|m| (m.version, m.description.as_ref()))
                 .collect::<Vec<_>>(),
-            vec![(36, "workflow run error codes")]
+            vec![(36, "workflow run error codes"), (37, "push message kinds")]
         );
         let ci_grants = migrations
             .iter()

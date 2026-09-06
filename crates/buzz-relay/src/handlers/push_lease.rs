@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 use sha2::Digest as _;
 
-pub(crate) const PUSH_KINDS: &[u64] = &[7, 9, 1059, 40007, 46010];
+pub(crate) const PUSH_KINDS: &[u64] = &[9, 40_002, 45_001, 45_003];
 pub(crate) const URGENT_KINDS: &[u64] = &[];
 
 /// NIP-PL addressable push-lease event kind.
@@ -477,7 +477,7 @@ pub async fn accept(
     const MAX_CONTENT: usize = 65_536;
     const MAX_PLAINTEXT: usize = 32_768;
     const MAX_ACTIVE_LEASES: i64 = 16;
-    if state.config.push_gateway_delivery_url.is_none() {
+    if !state.config.push_enabled {
         return Err(AcceptError::Validation("push not supported".to_string()));
     }
     let envelope = validate_envelope(event, now, ALLOWED_SKEW, MAX_LEASE_TTL, MAX_CONTENT)?;
@@ -702,7 +702,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(", ");
         let predicate = format!("NEW.kind IN ({kinds})");
-        let migration = include_str!("../../../../migrations/0018_push_match_queue.sql");
+        let migration = include_str!("../../../../migrations/0037_push_message_kinds.sql");
         assert!(
             migration.contains(&predicate),
             "migration trigger must use PUSH_KINDS exactly: {predicate}"
