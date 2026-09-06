@@ -11,8 +11,8 @@ import { normalizePubkey } from "@/shared/lib/pubkey";
  * mirror fences only warning delivery, so community A's agent name and error
  * detail never surface while community B is on screen.
  *
- * Set by `useCommunityInit` when a community apply completes; cleared in
- * `resetCommunityState()` like every community-scoped module singleton. The
+ * Set by the applied app shell on mount and identity changes; cleared on
+ * layout cleanup and community reset. The
  * mirror is compared, not counted: an A→B→A round-trip restores A's scope, so
  * a slow start fired in A may still warn once the user is back in A — which
  * is exactly where "mention the agent again" is actionable. A reset
@@ -26,9 +26,12 @@ type DetachedToastScope = {
 
 let activeScope: DetachedToastScope | null = null;
 
-/** Records the scope the just-applied community renders under. */
-export function setDetachedToastScope(scope: DetachedToastScope): void {
+/** Records the visible scope and returns cleanup owned by this registration. */
+export function setDetachedToastScope(scope: DetachedToastScope): () => void {
   activeScope = scope;
+  return () => {
+    if (activeScope === scope) activeScope = null;
+  };
 }
 
 /**

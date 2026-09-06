@@ -76,6 +76,7 @@ function detachedStartFailureDetail(error: unknown): string {
 function warnAgentMayNotRespond(agentName: string, detail: string): void {
   toast.error(
     `Could not start ${agentName} — your message was sent, but the agent may not respond. ${detail}`,
+    { closeButton: true },
   );
 }
 

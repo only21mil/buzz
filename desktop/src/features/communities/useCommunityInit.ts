@@ -1,3 +1,4 @@
+import { resetDetachedToastScope } from "@/features/messages/lib/detachedToastScope";
 import { resetAudioMediaLoadScheduler } from "@/features/messages/lib/audioMediaLoadScheduler";
 import { resetPersistentAgentAudienceStore } from "@/features/messages/lib/persistentAgentAudience";
 import { useEffect, useRef, useState } from "react";
@@ -56,6 +57,7 @@ function resetCommunityState({
 }: {
   resetAvatarState: boolean;
 }): void {
+  resetDetachedToastScope();
   relayClient.disconnect();
   resetRateLimitGate();
   clearTimeoutState();

@@ -1,3 +1,4 @@
+import { useDetachedToastScope } from "@/features/messages/ui/useDetachedToastScope";
 import { OwnerReviewDialogs } from "./OwnerReviewDialogs";
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
@@ -134,6 +135,10 @@ export function AppShell() {
   const location = useLocation();
   const queryClient = useQueryClient();
   const identityQuery = useIdentityQuery();
+  useDetachedToastScope(
+    communitiesHook.activeCommunity?.relayUrl,
+    identityQuery.data?.pubkey,
+  );
   useManagedAgentRuntimeReconciliation(communitiesHook.communities); // sync storage snapshot
   const {
     goAgents,
