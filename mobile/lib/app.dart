@@ -45,30 +45,6 @@ const _starterChannels = [
   ),
 ];
 
-final _inviteRelayConnectedProvider = FutureProvider.family<void, String>((
-  ref,
-  expectedRelayUrl,
-) async {
-  final currentConfig = ref.read(relayConfigProvider);
-  if (currentConfig.baseUrl != expectedRelayUrl) {
-    throw StateError('Active community changed before invite recovery');
-  }
-  if (ref.read(relaySessionProvider).status == SessionStatus.connected) return;
-
-  final connected = Completer<void>();
-  ref.listen(relaySessionProvider, (_, next) {
-    if (connected.isCompleted) return;
-    if (ref.read(relayConfigProvider).baseUrl != expectedRelayUrl) {
-      connected.completeError(
-        StateError('Active community changed during invite recovery'),
-      );
-    } else if (next.status == SessionStatus.connected) {
-      connected.complete();
-    }
-  });
-  await connected.future;
-});
-
 /// App-level bridge from invite joining to the channels feature.
 class MobileInviteJoinRecovery implements InviteJoinRecovery {
   final Future<List<Channel>> Function() _loadChannels;
@@ -140,11 +116,7 @@ class MobileInviteJoinRecovery implements InviteJoinRecovery {
           _ensureScopeCurrent();
           channels = await _loadChannels();
           _ensureScopeCurrent();
-          channel =
-              _findStarterChannel(channels, starter.slug) ??
-              channels
-                  .where((candidate) => candidate.id == channelId)
-                  .firstOrNull;
+          channel = _findStarterChannel(channels, starter.slug);
           if (channel == null) rethrow;
         }
       }
@@ -224,14 +196,49 @@ InviteJoinRecovery buildMobileInviteJoinRecovery(
     }
   }
 
+  Future<void> waitForConnection() async {
+    ensureScopeCurrent();
+    if (ref.read(relaySessionProvider).status == SessionStatus.connected) {
+      return;
+    }
+
+    // Each attempt owns its wait. A timeout or scope change must not leave a
+    // cached failure (or a cached connection) for the next Retry setup.
+    final connected = Completer<void>();
+    void checkConnection() {
+      if (connected.isCompleted) return;
+      if (!isScopeCurrent()) {
+        connected.completeError(
+          StateError('Active community changed during invite recovery'),
+        );
+      } else if (ref.read(relaySessionProvider).status ==
+          SessionStatus.connected) {
+        connected.complete();
+      }
+    }
+
+    final configSubscription = ref.listen(
+      relayConfigProvider,
+      (_, _) => checkConnection(),
+    );
+    final sessionSubscription = ref.listen(
+      relaySessionProvider,
+      (_, _) => checkConnection(),
+    );
+    try {
+      await connected.future.timeout(const Duration(seconds: 15));
+    } finally {
+      configSubscription.close();
+      sessionSubscription.close();
+    }
+  }
+
   return MobileInviteJoinRecovery(
     loadChannels: () async {
       ensureScopeCurrent();
       await ref.read(activeCommunityProvider.future);
       ensureScopeCurrent();
-      await ref
-          .read(_inviteRelayConnectedProvider(scope.relayHttpOrigin).future)
-          .timeout(const Duration(seconds: 15));
+      await waitForConnection();
       ensureScopeCurrent();
       await ref.read(channelsProvider.notifier).refresh(fetchDirectory: true);
       ensureScopeCurrent();
