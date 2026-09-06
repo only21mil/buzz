@@ -43,3 +43,28 @@ historical tests run before the namespace fence existed.
 Production URL defaults and signed CI context names are unchanged. This fence
 qualifies the PostgreSQL-only inventory; it does not provide the Redis, relay,
 APNs or other services required by external fixtures.
+
+The Relay E2E invite selection also requires a live relay, Redis and MinIO. These seven
+cases remain `external` in the PostgreSQL-only inventory. CI invokes
+`postgres-test-ci.sh --relay-invites --relay-binary target/ci/buzz-relay
+--s3-tools-dir target/invite-tools` to keep
+the hosted Ubuntu admission profile alive around `relay-invite-test-local.py`.
+That command compiles the `e2e_relay` target, then uses the same production fence
+for complete libtest inventory reconciliation and execution. It starts owned
+PostgreSQL (Unix socket only), Redis, MinIO and the relay inside that fence and passes
+an explicit database URL to both relay and tests. No host relay is used.
+
+For local reproduction with already compiled binaries:
+
+```sh
+python3 scripts/relay-invite-test-local.py --task-root /absolute/task \
+  --pg-bin-dir /absolute/pg/bin --redis-binary /absolute/redis-server \
+  --s3-tools-dir /absolute/minio-tools \
+  --relay-binary /absolute/buzz-relay --test-binary /absolute/e2e_relay
+```
+
+Each exact selector must report one passing test. The command reaps relay and
+Redis and MinIO, stops PostgreSQL, removes private data, and fails on incomplete cleanup.
+Fixture logs are printed before removal. Discovery drift fails before any
+service starts. `test-relay-invite-test-local.py` checks that admission behavior
+without starting services.

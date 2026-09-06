@@ -816,10 +816,25 @@ jobs:
           chmod +x ./target/ci/buzz-relay ./target/ci/git-credential-nostr
           export BUZZ_RELAY_PRIVATE_KEY="$(openssl rand -hex 32)"
           ./scripts/start-relay-for-tests.sh --no-build
+      - name: Install isolated invite fixture tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql postgresql-contrib redis-server bubblewrap iproute2 util-linux apparmor
+      - name: Download pinned invite S3 tools
+        run: |
+          mkdir -p target/invite-tools
+          curl --fail --location --retry 3 --output target/invite-tools/minio https://dl.min.io/server/minio/release/linux-amd64/archive/minio.RELEASE.2025-09-07T16-13-09Z
+          curl --fail --location --retry 3 --output target/invite-tools/mc https://dl.min.io/client/mc/release/linux-amd64/archive/mc.RELEASE.2025-08-13T08-35-41Z
+          sha256sum --check <<'CHECKSUMS'
+          7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f  target/invite-tools/minio
+          01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891  target/invite-tools/mc
+          CHECKSUMS
+          chmod +x target/invite-tools/minio target/invite-tools/mc
+      - name: Isolated relay invite E2E
+        run: bash scripts/postgres-test-ci.sh --relay-invites --relay-binary target/ci/buzz-relay --s3-tools-dir target/invite-tools
       - name: Relay E2E tests
         run: |
           cargo test -p buzz-test-client --test e2e_persona --test e2e_team_catalog --test e2e_nostr_interop --test e2e_project -- --ignored --nocapture
-          cargo test -p buzz-test-client --test e2e_relay invite -- --ignored --nocapture
           cargo test -p buzz-test-client --test e2e_relay nip43_membership_snapshots_are_rejected -- --ignored --nocapture
         env:
           RELAY_URL: ws://localhost:3000

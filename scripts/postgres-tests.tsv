@@ -547,10 +547,10 @@ buzz-test-client	e2e_relay	test_close_subscription_stops_delivery	crates/buzz-te
 buzz-test-client	e2e_relay	test_connect_and_authenticate	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
 buzz-test-client	e2e_relay	test_eose_sent_for_empty_subscription	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
 buzz-test-client	e2e_relay	test_ephemeral_event_not_stored	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
-buzz-test-client	e2e_relay	test_invite_claim_rejects_invalid_code	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
-buzz-test-client	e2e_relay	test_invite_code_minted_for_one_host_fails_on_another	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
-buzz-test-client	e2e_relay	test_invite_mint_and_claim_admits_new_pubkey	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
-buzz-test-client	e2e_relay	test_invite_mint_requires_owner_or_admin	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_invite_claim_rejects_invalid_code	crates/buzz-test-client/tests/e2e_relay.rs	external	owned PG/Redis/MinIO/relay invite fixture via relay-invite-test-local.py
+buzz-test-client	e2e_relay	test_invite_code_minted_for_one_host_fails_on_another	crates/buzz-test-client/tests/e2e_relay.rs	external	owned PG/Redis/MinIO/relay invite fixture via relay-invite-test-local.py
+buzz-test-client	e2e_relay	test_invite_mint_and_claim_admits_new_pubkey	crates/buzz-test-client/tests/e2e_relay.rs	external	owned PG/Redis/MinIO/relay invite fixture via relay-invite-test-local.py
+buzz-test-client	e2e_relay	test_invite_mint_requires_owner_or_admin	crates/buzz-test-client/tests/e2e_relay.rs	external	owned PG/Redis/MinIO/relay invite fixture via relay-invite-test-local.py
 buzz-test-client	e2e_relay	test_kind0_nip05_sync	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
 buzz-test-client	e2e_relay	test_large_event_frame_below_configured_limit_is_accepted	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
 buzz-test-client	e2e_relay	test_membership_notification_emitted_on_add	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
@@ -573,10 +573,10 @@ buzz-test-client	e2e_relay	test_nip29_put_user_without_role_tag_preserves_role	c
 buzz-test-client	e2e_relay	test_nip29_relay_rejects_last_owner_self_demotion	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
 buzz-test-client	e2e_relay	test_nip29_relay_rejects_role_change_by_unprivileged_actor	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
 buzz-test-client	e2e_relay	test_nip29_standard_client_flow	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
-buzz-test-client	e2e_relay	test_private_channel_admin_can_invite	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_private_channel_admin_can_invite	crates/buzz-test-client/tests/e2e_relay.rs	external	owned PG/Redis/MinIO/relay invite fixture via relay-invite-test-local.py
 buzz-test-client	e2e_relay	test_private_channel_member_cannot_grant_admin	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
-buzz-test-client	e2e_relay	test_private_channel_member_cannot_invite	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
-buzz-test-client	e2e_relay	test_private_channel_non_member_cannot_invite	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_private_channel_member_cannot_invite	crates/buzz-test-client/tests/e2e_relay.rs	external	owned PG/Redis/MinIO/relay invite fixture via relay-invite-test-local.py
+buzz-test-client	e2e_relay	test_private_channel_non_member_cannot_invite	crates/buzz-test-client/tests/e2e_relay.rs	external	owned PG/Redis/MinIO/relay invite fixture via relay-invite-test-local.py
 buzz-test-client	e2e_relay	test_pubkey_mismatch_rejected	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
 buzz-test-client	e2e_relay	test_reply_ingest_pushes_live_thread_summary	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
 buzz-test-client	e2e_relay	test_send_event_and_receive_via_subscription	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
