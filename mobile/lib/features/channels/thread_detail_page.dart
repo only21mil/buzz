@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
-
 import '../../shared/mentions/agent_identity_provider.dart';
 import '../../shared/relay/relay.dart';
 import '../../shared/theme/theme.dart';
@@ -11,8 +10,8 @@ import '../../shared/widgets/frosted_app_bar.dart';
 import '../../shared/widgets/frosted_scaffold.dart';
 import '../../shared/widgets/keyboard_dismiss_on_drag.dart';
 import '../../shared/widgets/message_author_meta.dart';
-import '../profile/user_cache_provider.dart';
-import '../profile/user_profile.dart';
+import '../../shared/profile/user_cache_provider.dart';
+import '../../shared/profile/user_profile.dart';
 import 'channel_link_navigation.dart';
 import 'channel_messages_provider.dart';
 import 'channel_typing_provider.dart';
@@ -35,9 +34,7 @@ import 'small_avatar.dart';
 import 'timeline_message.dart';
 
 /// Full-screen thread detail page.
-///
-/// Shows the thread head message, direct replies, typing indicators scoped to
-/// the thread, and a compose bar for replying.
+/// Shows replies, typing indicators, and the reply composer.
 class ThreadDetailPage extends HookConsumerWidget {
   final TimelineMessage threadHead;
   final List<TimelineMessage> allMessages;
@@ -46,7 +43,6 @@ class ThreadDetailPage extends HookConsumerWidget {
   final bool isMember;
   final bool isArchived;
   final String? initialMessageId;
-
   const ThreadDetailPage({
     super.key,
     required this.threadHead,
@@ -334,6 +330,9 @@ class ThreadDetailPage extends HookConsumerWidget {
 
     // Channel names for message content rendering.
     final channelsAsync = ref.watch(channelsProvider);
+    final channel = channelsAsync.value
+        ?.where((candidate) => candidate.id == channelId)
+        .firstOrNull;
     final channelNamesMap = <String, String>{};
     channelsAsync.whenData((channels) {
       for (final ch in channels) {
@@ -543,6 +542,7 @@ class ThreadDetailPage extends HookConsumerWidget {
                             channelId: channelId,
                             content: content,
                             mentionPubkeys: mentionPubkeys,
+                            channel: channel,
                             parentEventId: threadHead.id,
                             rootEventId: effectiveRootId,
                             mediaTags: mediaTags,

@@ -3,10 +3,12 @@ import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart' show ScrollDirection;
+import 'package:flutter/rendering.dart' show ScrollDirection, SemanticsAction;
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:http/http.dart' as http;
+import 'package:http/testing.dart' as http_testing;
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 import 'package:buzz/features/channels/channel.dart';
@@ -14,6 +16,7 @@ import 'package:buzz/features/channels/channel_detail_page.dart';
 import 'package:buzz/features/channels/channel_management_provider.dart';
 import 'package:buzz/features/channels/channel_messages_provider.dart';
 import 'package:buzz/features/channels/channel_typing_provider.dart';
+import 'package:buzz/features/channels/members_sheet.dart';
 import 'package:buzz/features/channels/date_formatters.dart';
 import 'package:buzz/features/channels/day_divider.dart';
 import 'package:buzz/features/channels/emoji_picker.dart';
@@ -26,13 +29,16 @@ import 'package:buzz/shared/read_state/read_state_provider.dart';
 import 'package:buzz/features/channels/unread_badge/observed_unread_event.dart';
 import 'package:buzz/features/channels/small_avatar.dart';
 import 'package:buzz/features/profile/profile_provider.dart';
-import 'package:buzz/features/profile/user_cache_provider.dart';
-import 'package:buzz/features/profile/user_profile.dart';
+import 'package:buzz/shared/profile/user_cache_provider.dart';
+import 'package:buzz/shared/profile/user_profile.dart';
 import 'package:buzz/features/profile/user_profile_sheet.dart';
 import 'package:buzz/shared/mentions/agent_identity_provider.dart';
 import 'package:buzz/shared/relay/relay.dart';
 import 'package:buzz/shared/theme/theme.dart';
+import 'package:buzz/shared/widgets/app_list_card.dart';
+import 'package:buzz/shared/widgets/avatar_image.dart';
 import 'package:buzz/shared/widgets/frosted_app_bar.dart';
+import 'package:buzz/shared/widgets/masked_avatar_badge.dart';
 import 'package:buzz/shared/widgets/skeleton.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -173,6 +179,7 @@ Widget _buildTestable({
   _FakeChannelsNotifier? channelsNotifier,
   List<NavigatorObserver> navigatorObservers = const [],
   Future<List<ChannelMember>> Function()? loadMembers,
+  List<DirectoryUser>? directoryUsers,
   ChannelActions Function(Ref ref)? createChannelActions,
   ReadStateNotifier? readStateNotifier,
   _FakeMessagesNotifier? messagesNotifier,
@@ -184,6 +191,7 @@ Widget _buildTestable({
   TextScaler textScaler = TextScaler.noScaling,
   bool disableAnimations = false,
   RelaySessionNotifier? relaySessionNotifier,
+  http.Client? mediaClient,
 }) {
   final resolvedChannel = channel ?? _testChannel;
   final fakeChannelsNotifier =
@@ -219,6 +227,9 @@ Widget _buildTestable({
       channelBotPubkeysProvider(
         _channelId,
       ).overrideWith((ref) async => const <String>{}),
+      agentOwnersProvider.overrideWith((ref) async => const <String, String>{}),
+      if (directoryUsers != null)
+        relayDirectoryUsersProvider.overrideWith((ref) async => directoryUsers),
       if (createChannelActions != null)
         channelActionsProvider.overrideWith(createChannelActions),
       if (readStateNotifier != null)
@@ -235,6 +246,12 @@ Widget _buildTestable({
       relayClientProvider.overrideWithValue(
         RelayClient(baseUrl: 'http://localhost:3000'),
       ),
+      if (mediaClient != null) ...[
+        mediaGetAuthServiceProvider.overrideWithValue(
+          MediaGetAuthService(baseUrl: 'https://relay.example', nsec: null),
+        ),
+        mediaHttpClientProvider.overrideWithValue(mediaClient),
+      ],
       if (relaySessionNotifier != null)
         relaySessionProvider.overrideWith(() => relaySessionNotifier),
       // Compose bar drafts persist through SharedPreferences.
@@ -341,6 +358,86 @@ void main() {
   });
 
   group('ChannelDetailPage', () {
+    testWidgets('uses the shared 32px masked presence avatar in DM headers', (
+      tester,
+    ) async {
+      final dmChannel = Channel(
+        id: _channelId,
+        name: 'DM',
+        channelType: 'dm',
+        visibility: 'private',
+        description: 'Direct message',
+        createdBy: 'self',
+        createdAt: DateTime(2025),
+        memberCount: 2,
+        participants: const ['Self', 'Alice'],
+        participantPubkeys: const ['self', 'alice'],
+        isMember: true,
+      );
+
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: const [],
+          channel: dmChannel,
+          users: const {
+            'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+          },
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final avatarFinder = find.byKey(const ValueKey('dm-header-avatar'));
+      final avatar = tester.widget<MaskedAvatarBadge>(avatarFinder);
+      expect(tester.getSize(avatarFinder), const Size.square(32));
+      expect(avatar.geometry, AvatarBadgeMaskGeometry.presenceDot);
+      expect(avatar.badge, isNotNull);
+      expect(
+        find.descendant(of: avatarFinder, matching: find.byType(ClipPath)),
+        findsOneWidget,
+      );
+      final name = tester.widget<Text>(
+        find.byKey(const ValueKey('dm-header-name')),
+      );
+      final presence = tester.widget<Text>(
+        find.byKey(const ValueKey('dm-header-presence')),
+      );
+      expect(name.style?.fontSize, 16);
+      expect(name.style?.fontWeight, FontWeight.w500);
+      expect(presence.style?.fontSize, 14);
+      expect(presence.style?.fontWeight, FontWeight.w400);
+      expect(find.byTooltip('View members'), findsNothing);
+    });
+
+    testWidgets('keeps the Members action for group DMs', (tester) async {
+      final dmChannel = Channel(
+        id: _channelId,
+        name: 'DM',
+        channelType: 'dm',
+        visibility: 'private',
+        description: 'Group direct message',
+        createdBy: 'self',
+        createdAt: DateTime(2025),
+        memberCount: 3,
+        participants: const ['Self', 'Alice', 'Bob'],
+        participantPubkeys: const ['self', 'alice', 'bob'],
+        isMember: true,
+      );
+
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: const [],
+          channel: dmChannel,
+          users: const {
+            'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+            'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
+          },
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byTooltip('View members'), findsOneWidget);
+    });
+
     testWidgets(
       'restores the previous channel replay priority after a nested pop',
       (tester) async {
@@ -710,7 +807,149 @@ void main() {
       );
     });
 
-    testWidgets('members sheet shows roles and manage controls for owners', (
+    testWidgets(
+      'channel details combines people and agents in one member list',
+      (tester) async {
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: const [],
+            members: [
+              ChannelMember(
+                pubkey: 'self',
+                role: 'owner',
+                joinedAt: DateTime(2025),
+                displayName: 'Self',
+              ),
+              ChannelMember(
+                pubkey: 'alice',
+                role: 'member',
+                joinedAt: DateTime(2025),
+                displayName: 'Alice',
+              ),
+              ChannelMember(
+                pubkey: 'agent',
+                role: 'bot',
+                joinedAt: DateTime(2025),
+                displayName: 'Agent',
+              ),
+            ],
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.tap(
+          find.byKey(const ValueKey('channel-header-settings-trigger')),
+        );
+        await tester.pumpAndSettle();
+        expect(find.text('3 members'), findsOneWidget);
+        expect(find.text('You · Owner', findRichText: true), findsOneWidget);
+        expect(find.text('Alice · Member', findRichText: true), findsOneWidget);
+        expect(find.text('Agent · Agent', findRichText: true), findsOneWidget);
+        expect(find.text('Member'), findsNothing);
+        expect(find.text('Owner'), findsNothing);
+        expect(find.text('People · 2'), findsNothing);
+        expect(find.text('Agents · 1'), findsNothing);
+        expect(find.text('PEOPLE — 2'), findsNothing);
+        expect(find.text('BOTS — 1'), findsNothing);
+
+        final aliceRow = find.byKey(
+          const ValueKey('channel-details-member-alice'),
+        );
+        final aliceText = tester.widget<Text>(
+          find.descendant(
+            of: aliceRow,
+            matching: find.byWidgetPredicate(
+              (widget) =>
+                  widget is Text &&
+                  widget.textSpan?.toPlainText() == 'Alice · Member',
+            ),
+          ),
+        );
+        final aliceSpans = (aliceText.textSpan! as TextSpan).children!;
+        expect(
+          aliceSpans.last.style?.fontSize,
+          AppTheme.light().textTheme.bodySmall?.fontSize,
+        );
+        expect(
+          tester
+              .widget<AvatarImage>(
+                find.descendant(
+                  of: aliceRow,
+                  matching: find.byType(AvatarImage),
+                ),
+              )
+              .radius,
+          20,
+        );
+        expect(
+          find.descendant(
+            of: aliceRow,
+            matching: find.byIcon(LucideIcons.chevronRight),
+          ),
+          findsOneWidget,
+        );
+        expect(tester.getSize(aliceRow).height, 40 + (Grid.xxs * 2));
+
+        await tester.tap(aliceRow);
+        await tester.pumpAndSettle();
+        expect(find.byType(UserProfileSheet), findsOneWidget);
+      },
+    );
+
+    testWidgets('hides Add members while the authoritative roster is loading', (
+      tester,
+    ) async {
+      final members = Completer<List<ChannelMember>>();
+      await tester.pumpWidget(
+        _buildTestable(messages: const [], loadMembers: () => members.future),
+      );
+      await tester.pump();
+
+      await tester.tap(
+        find.byKey(const ValueKey('channel-header-settings-trigger')),
+      );
+      await tester.pump(const Duration(milliseconds: 500));
+
+      expect(
+        find.byKey(const ValueKey('channel-details-add-members-row')),
+        findsNothing,
+      );
+
+      members.complete([
+        ChannelMember(pubkey: 'self', role: 'owner', joinedAt: DateTime(2025)),
+      ]);
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('channel-details-add-members-row')),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('hides Add members when the authoritative roster fails', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: const [],
+          loadMembers: () => Future<List<ChannelMember>>.error('failed'),
+        ),
+      );
+      await tester.pump();
+      await tester.pumpAndSettle();
+
+      await tester.tap(
+        find.byKey(const ValueKey('channel-header-settings-trigger')),
+      );
+      await tester.pumpAndSettle();
+
+      expect(
+        find.byKey(const ValueKey('channel-details-add-members-row')),
+        findsNothing,
+      );
+      expect(find.text('Members unavailable'), findsOneWidget);
+    });
+
+    testWidgets('small channel keeps member administration reachable', (
       tester,
     ) async {
       await tester.pumpWidget(
@@ -734,13 +973,416 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      await tester.tap(find.byTooltip('View members'));
+      await tester.tap(
+        find.byKey(const ValueKey('channel-header-settings-trigger')),
+      );
+      await tester.pumpAndSettle();
+      final addRow = find.byKey(
+        const ValueKey('channel-details-add-members-row'),
+      );
+      final memberRow = find.byKey(
+        const ValueKey('channel-details-member-self'),
+      );
+      final seeAllRow = find.byKey(
+        const ValueKey('channel-details-members-row'),
+      );
+      expect(addRow, findsOneWidget);
+      expect(memberRow, findsOneWidget);
+      expect(seeAllRow, findsOneWidget);
+      expect(
+        tester.widget<Text>(find.text('Add members')).style,
+        Theme.of(tester.element(addRow)).textTheme.bodyLarge,
+      );
+      expect(
+        tester.getTopLeft(addRow).dy,
+        lessThan(tester.getTopLeft(memberRow).dy),
+      );
+
+      await tester.ensureVisible(seeAllRow);
+      await tester.pumpAndSettle();
+      await tester.tap(seeAllRow);
+      await tester.pumpAndSettle();
+      expect(find.byType(MembersSheet), findsOneWidget);
+
+      await tester.tap(find.byIcon(LucideIcons.ellipsis));
+      await tester.pumpAndSettle();
+      expect(find.text('Role'), findsOneWidget);
+      expect(find.text('Remove from channel'), findsOneWidget);
+    });
+
+    testWidgets('action tiles expose button and enabled semantics', (
+      tester,
+    ) async {
+      await tester.pumpWidget(_buildTestable(messages: const []));
       await tester.pumpAndSettle();
 
-      expect(find.text('Alice'), findsOneWidget);
-      expect(find.text('Member'), findsOneWidget);
-      expect(find.text('Owner'), findsOneWidget);
+      await tester.tap(
+        find.byKey(const ValueKey('channel-header-settings-trigger')),
+      );
+      await tester.pumpAndSettle();
+
+      final starSemantics = tester.getSemantics(
+        find.byKey(const ValueKey('channel-details-star-action')),
+      );
+      expect(starSemantics.label, 'Star channel');
+      expect(starSemantics.flagsCollection.isButton, isTrue);
+      expect(
+        starSemantics.flagsCollection.isEnabled.toString(),
+        'Tristate.isTrue',
+      );
+      expect(
+        starSemantics.getSemanticsData().hasAction(SemanticsAction.tap),
+        isTrue,
+      );
+
+      final editSemantics = tester.getSemantics(
+        find.byKey(const ValueKey('channel-details-edit-action')),
+      );
+      expect(editSemantics.label, 'Edit');
+      expect(editSemantics.flagsCollection.isButton, isTrue);
+      expect(
+        editSemantics.flagsCollection.isEnabled.toString(),
+        'Tristate.isFalse',
+      );
+      expect(
+        editSemantics.getSemanticsData().hasAction(SemanticsAction.tap),
+        isFalse,
+      );
     });
+
+    testWidgets('action tiles grow together for large text on a narrow page', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(320, 640);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: const [],
+          textScaler: const TextScaler.linear(2),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(
+        find.byKey(const ValueKey('channel-header-settings-trigger')),
+      );
+      await tester.pumpAndSettle();
+
+      final starAction = find.byKey(
+        const ValueKey('channel-details-star-action'),
+      );
+      final muteAction = find.byKey(
+        const ValueKey('channel-details-mute-action'),
+      );
+      final editAction = find.byKey(
+        const ValueKey('channel-details-edit-action'),
+      );
+      expect(find.text('Star channel'), findsOneWidget);
+      expect(find.text('Mute channel'), findsOneWidget);
+      expect(find.text('Edit'), findsOneWidget);
+      expect(tester.getSize(starAction).height, greaterThan(84));
+      expect(
+        tester.getSize(muteAction).height,
+        tester.getSize(starAction).height,
+      );
+      expect(
+        tester.getSize(editAction).height,
+        tester.getSize(starAction).height,
+      );
+      expect(tester.takeException(), isNull);
+    });
+
+    testWidgets('previews five members before an icon-free See all row', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: const [],
+          members: [
+            ChannelMember(
+              pubkey: 'self',
+              role: 'owner',
+              joinedAt: DateTime(2025),
+            ),
+            for (var index = 0; index < 5; index++)
+              ChannelMember(
+                pubkey: 'member-$index',
+                role: 'member',
+                joinedAt: DateTime(2025),
+              ),
+            ChannelMember(
+              pubkey: 'agent',
+              role: 'bot',
+              joinedAt: DateTime(2025),
+            ),
+          ],
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(
+        find.byKey(const ValueKey('channel-header-settings-trigger')),
+      );
+      await tester.pumpAndSettle();
+
+      final previews = find.byWidgetPredicate((widget) {
+        final key = widget.key;
+        return key is ValueKey<String> &&
+            key.value.startsWith('channel-details-member-');
+      });
+      expect(previews, findsNWidgets(5));
+      expect(find.text('See all'), findsOneWidget);
+      final seeAllRow = find.byKey(
+        const ValueKey('channel-details-members-row'),
+      );
+      expect(seeAllRow, findsOneWidget);
+      expect(
+        tester.widget<Text>(find.text('See all')).style,
+        Theme.of(tester.element(seeAllRow)).textTheme.bodyLarge,
+      );
+      expect(
+        find.descendant(of: seeAllRow, matching: find.text('7 members')),
+        findsNothing,
+      );
+      expect(
+        find.descendant(
+          of: seeAllRow,
+          matching: find.byIcon(LucideIcons.users),
+        ),
+        findsNothing,
+      );
+      final firstMemberRow = previews.first;
+      final firstMemberTitle = find.descendant(
+        of: firstMemberRow,
+        matching: find.byWidgetPredicate(
+          (widget) => widget is Text && widget.textSpan != null,
+        ),
+      );
+      expect(
+        tester.getTopLeft(find.text('See all')).dx,
+        closeTo(tester.getTopLeft(firstMemberTitle).dx, 0.1),
+      );
+      expect(tester.getSize(seeAllRow).height, 40 + (Grid.xxs * 2));
+
+      await tester.ensureVisible(seeAllRow);
+      await tester.pumpAndSettle();
+      await tester.tap(seeAllRow);
+      await tester.pumpAndSettle();
+      await tester.drag(
+        find.byKey(const ValueKey('members-sheet-list')),
+        const Offset(0, -500),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('Agent'), findsOneWidget);
+      expect(find.text('Bot'), findsNothing);
+    });
+
+    testWidgets('Add members keeps its close control below the safe top', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(390, 844);
+      tester.view.devicePixelRatio = 1;
+      tester.view.viewPadding = const FakeViewPadding(top: 47, bottom: 34);
+      tester.view.viewInsets = const FakeViewPadding(bottom: 300);
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      addTearDown(tester.view.resetViewPadding);
+      addTearDown(tester.view.resetViewInsets);
+
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: const [],
+          members: [
+            ChannelMember(
+              pubkey: 'self',
+              role: 'owner',
+              joinedAt: DateTime(2025),
+            ),
+          ],
+          directoryUsers: const [
+            DirectoryUser(pubkey: 'alice', displayName: 'Alice'),
+          ],
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(
+        find.byKey(const ValueKey('channel-header-settings-trigger')),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.byKey(const ValueKey('channel-details-add-members-row')),
+      );
+      await tester.pumpAndSettle();
+
+      final sheet = find.byType(BottomSheet).last;
+      final closeButton = find.byTooltip('Close sheet');
+      expect(closeButton, findsOneWidget);
+      expect(tester.getTopLeft(sheet).dy, greaterThanOrEqualTo(47 + Grid.xs));
+      expect(tester.getRect(closeButton).bottom, lessThan(844 - 300));
+    });
+
+    testWidgets('Add members submits selected directory users', (tester) async {
+      List<String>? addedPubkeys;
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: const [],
+          members: [
+            ChannelMember(
+              pubkey: 'self',
+              role: 'owner',
+              joinedAt: DateTime(2025),
+            ),
+          ],
+          directoryUsers: const [
+            DirectoryUser(pubkey: 'alice', displayName: 'Alice'),
+          ],
+          createChannelActions: (ref) => _FakeChannelActions(
+            ref,
+            onAddMembers: (_, pubkeys) async => addedPubkeys = pubkeys,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(
+        find.byKey(const ValueKey('channel-header-settings-trigger')),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.byKey(const ValueKey('channel-details-add-members-row')),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.pump();
+      final unselectedSemantics = tester.getSemantics(
+        find.byKey(const ValueKey('add-channel-member-alice')),
+      );
+      expect(unselectedSemantics.flagsCollection.isButton, isTrue);
+      expect(
+        unselectedSemantics.flagsCollection.isSelected.toString(),
+        'Tristate.isFalse',
+      );
+
+      await tester.tap(find.byKey(const ValueKey('add-channel-member-alice')));
+      await tester.pump();
+      final selectedSemantics = tester.getSemantics(
+        find.byKey(const ValueKey('add-channel-member-alice')),
+      );
+      expect(selectedSemantics.flagsCollection.isButton, isTrue);
+      expect(
+        selectedSemantics.flagsCollection.isSelected.toString(),
+        'Tristate.isTrue',
+      );
+      expect(selectedSemantics.label, 'Alice, selected');
+      await tester.tap(
+        find.byKey(const ValueKey('add-channel-members-submit')),
+      );
+      await tester.pumpAndSettle();
+
+      expect(addedPubkeys, ['alice']);
+      expect(
+        find.byKey(const ValueKey('add-channel-members-search')),
+        findsNothing,
+      );
+    });
+
+    testWidgets(
+      'keeps only rejected members selected after a partial failure',
+      (tester) async {
+        var attempts = 0;
+        final submittedPubkeys = <List<String>>[];
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: const [],
+            members: [
+              ChannelMember(
+                pubkey: 'self',
+                role: 'owner',
+                joinedAt: DateTime(2025),
+              ),
+            ],
+            directoryUsers: const [
+              DirectoryUser(pubkey: 'alice', displayName: 'Alice'),
+              DirectoryUser(pubkey: 'bob', displayName: 'Bob'),
+            ],
+            createChannelActions: (ref) => _FakeChannelActions(
+              ref,
+              onAddMembers: (_, pubkeys) async {
+                submittedPubkeys.add(pubkeys);
+                attempts += 1;
+                if (attempts == 1) {
+                  throw const AddMembersException({'bob': 'rejected'});
+                }
+              },
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.tap(
+          find.byKey(const ValueKey('channel-header-settings-trigger')),
+        );
+        await tester.pumpAndSettle();
+        await tester.tap(
+          find.byKey(const ValueKey('channel-details-add-members-row')),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.tap(
+          find.byKey(const ValueKey('add-channel-member-alice')),
+        );
+        await tester.pump();
+        await tester.tap(find.byKey(const ValueKey('add-channel-member-bob')));
+        await tester.pump();
+        expect(
+          find.byKey(const ValueKey('add-channel-member-selected-alice')),
+          findsOneWidget,
+        );
+        expect(
+          find.byKey(const ValueKey('add-channel-member-selected-bob')),
+          findsOneWidget,
+        );
+        await tester.tap(
+          find.byKey(const ValueKey('add-channel-members-submit')),
+        );
+        await tester.pumpAndSettle();
+
+        expect(attempts, 1);
+        expect(
+          find.byKey(const ValueKey('add-channel-member-selected-alice')),
+          findsNothing,
+        );
+        expect(
+          find.byKey(const ValueKey('add-channel-member-selected-bob')),
+          findsOneWidget,
+        );
+        expect(
+          find.byKey(const ValueKey('add-channel-member-alice')),
+          findsNothing,
+        );
+        // The successful add must not remain selected for a retry.
+        expect(
+          tester
+              .widgetList<InputChip>(find.byType(InputChip))
+              .map((chip) => chip.key)
+              .toList(),
+          [const ValueKey('add-channel-member-selected-bob')],
+        );
+        await tester.tap(
+          find.byKey(const ValueKey('add-channel-members-submit')),
+        );
+        await tester.pumpAndSettle();
+        expect(attempts, 2);
+        expect(submittedPubkeys, [
+          ['alice', 'bob'],
+          ['bob'],
+        ]);
+      },
+    );
 
     testWidgets('hides composer for archived channels', (tester) async {
       final archivedChannel = _testChannel.copyWith(
@@ -835,14 +1477,14 @@ void main() {
       );
       expect(find.text('Message…'), findsNothing);
 
-      await tester.tap(find.byTooltip('Channel actions'));
-      await tester.pumpAndSettle();
-      await tester.drag(
-        find.byType(SingleChildScrollView).last,
-        const Offset(0, -300),
+      await tester.tap(
+        find.byKey(const ValueKey('channel-header-settings-trigger')),
       );
       await tester.pumpAndSettle();
-      await tester.tap(find.text('Manage channel').last);
+      await tester.drag(
+        find.byKey(const ValueKey('channel-details-page-list')),
+        const Offset(0, -300),
+      );
       await tester.pumpAndSettle();
       await tester.tap(find.text('Join channel'));
       await tester.pumpAndSettle();
@@ -852,10 +1494,11 @@ void main() {
         find.text('Join this channel from Manage to participate.'),
         findsNothing,
       );
+
       expect(find.text('Message #general'), findsOneWidget);
     });
 
-    testWidgets('detail-header manage leave closes the detail page', (
+    testWidgets('Leave lives on the detail page instead of Manage', (
       tester,
     ) async {
       await tester.pumpWidget(
@@ -866,14 +1509,24 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      await tester.tap(find.byTooltip('Channel actions'));
+      await tester.tap(
+        find.byKey(const ValueKey('channel-header-settings-trigger')),
+      );
       await tester.pumpAndSettle();
-      await tester.tap(find.text('Manage channel').last);
+      await tester.drag(
+        find.byKey(const ValueKey('channel-details-page-list')),
+        const Offset(0, -300),
+      );
       await tester.pumpAndSettle();
       await tester.tap(find.text('Leave channel').last);
       await tester.pumpAndSettle();
+      await tester.tap(find.text('Leave'));
+      await tester.pumpAndSettle();
 
-      expect(find.byTooltip('Channel actions'), findsNothing);
+      expect(
+        find.byKey(const ValueKey('channel-header-settings-trigger')),
+        findsNothing,
+      );
     });
 
     testWidgets('keeps manage sheet dismissible with a long canvas', (
@@ -887,6 +1540,13 @@ void main() {
       await tester.pumpWidget(
         _buildTestable(
           messages: const [],
+          members: [
+            ChannelMember(
+              pubkey: 'self',
+              role: 'owner',
+              joinedAt: DateTime(2025),
+            ),
+          ],
           canvasContent: List.generate(
             80,
             (index) => 'Canvas line $index',
@@ -895,18 +1555,17 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      await tester.tap(find.byTooltip('Channel actions'));
-      await tester.pumpAndSettle();
-      await tester.drag(
-        find.byType(SingleChildScrollView).last,
-        const Offset(0, -300),
+      await tester.tap(
+        find.byKey(const ValueKey('channel-header-settings-trigger')),
       );
       await tester.pumpAndSettle();
-      await tester.tap(find.text('Manage channel').last);
+      await tester.tap(
+        find.byKey(const ValueKey('channel-details-edit-action')),
+      );
       await tester.pumpAndSettle();
 
       final sheet = find.byType(BottomSheet).last;
-      expect(find.byType(BottomSheet), findsNWidgets(2));
+      expect(find.byType(BottomSheet), findsOneWidget);
       expect(tester.getSize(sheet).height, lessThanOrEqualTo(720));
 
       final sheetTop = tester.getTopLeft(sheet).dy;
@@ -916,7 +1575,88 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      expect(find.text('Manage channel'), findsOneWidget);
+      expect(find.text('Manage channel'), findsNothing);
+    });
+
+    testWidgets('Edit updates name and description without legacy fields', (
+      tester,
+    ) async {
+      String? updatedName;
+      String? updatedDescription;
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: const [],
+          members: [
+            ChannelMember(
+              pubkey: 'self',
+              role: 'owner',
+              joinedAt: DateTime(2025),
+            ),
+          ],
+          createChannelActions: (ref) => _FakeChannelActions(
+            ref,
+            onUpdateChannel: (_, name, description) async {
+              updatedName = name;
+              updatedDescription = description;
+            },
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(
+        find.byKey(const ValueKey('channel-header-settings-trigger')),
+      );
+      await tester.pumpAndSettle();
+      await tester.tap(
+        find.byKey(const ValueKey('channel-details-edit-action')),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('Mute channel'), findsOneWidget);
+      expect(find.text('Leave channel'), findsNothing);
+      expect(find.text('Topic'), findsNothing);
+      expect(find.text('Purpose'), findsNothing);
+      expect(find.text('Canvas'), findsOneWidget);
+
+      final nameField = tester.widget<TextField>(
+        find.byKey(const ValueKey('manage-channel-name')),
+      );
+      final descriptionField = tester.widget<TextField>(
+        find.byKey(const ValueKey('manage-channel-description')),
+      );
+      expect(nameField.decoration?.labelText, isNull);
+      expect(nameField.decoration?.hintText, 'Channel name');
+      expect(nameField.decoration?.border, InputBorder.none);
+      expect(descriptionField.decoration?.labelText, isNull);
+      expect(descriptionField.decoration?.hintText, 'Description');
+      expect(descriptionField.decoration?.border, InputBorder.none);
+      final nameOutline = tester.getRect(
+        find.byKey(const ValueKey('manage-channel-name-outline')),
+      );
+      final descriptionOutline = tester.getRect(
+        find.byKey(const ValueKey('manage-channel-description-outline')),
+      );
+      expect(descriptionOutline.top - nameOutline.bottom, Grid.xs);
+
+      await tester.enterText(
+        find.byKey(const ValueKey('manage-channel-name')),
+        '  #renamed  ',
+      );
+      await tester.enterText(
+        find.byKey(const ValueKey('manage-channel-description')),
+        'A new description',
+      );
+      await tester.pump();
+      await tester.tap(
+        find.byKey(const ValueKey('manage-channel-save-details')),
+      );
+      await tester.pumpAndSettle();
+
+      expect(updatedName, 'renamed');
+      expect(updatedDescription, 'A new description');
+      expect(find.text('renamed'), findsOneWidget);
+      expect(find.text('A new description'), findsOneWidget);
     });
 
     testWidgets('shows empty state when no messages', (tester) async {
@@ -1022,6 +1762,46 @@ void main() {
       await tester.pumpAndSettle();
       expect(
         find.byKey(const ValueKey('channel-jump-to-latest')),
+        findsNothing,
+      );
+    });
+
+    testWidgets('keeps animated message avatars static and transparent', (
+      tester,
+    ) async {
+      const posterUrl = 'https://relay.example/media/alice-poster.png';
+      const animationUrl = 'https://relay.example/media/alice-avatar.png';
+      final profileUrl =
+          '$posterUrl#buzz-anim=${Uri.encodeComponent(animationUrl)}';
+      final mediaClient = http_testing.MockClient(
+        (_) async => http.Response.bytes(_transparentPng, 200),
+      );
+      addTearDown(mediaClient.close);
+
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [
+            _textMsg(id: 'animated-avatar', pubkey: 'alice', content: 'Hello'),
+          ],
+          users: {
+            'alice': UserProfile(
+              pubkey: 'alice',
+              displayName: 'Alice',
+              avatarUrl: profileUrl,
+            ),
+          },
+          mediaClient: mediaClient,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(
+        tester.widget<CircleAvatar>(find.byType(CircleAvatar)).backgroundColor,
+        Colors.transparent,
+      );
+      expect(tester.widget<MediaImage>(find.byType(MediaImage)).url, posterUrl);
+      expect(
+        find.byKey(const ValueKey('progressive-animated-avatar-animation')),
         findsNothing,
       );
     });
@@ -1486,7 +2266,13 @@ void main() {
       final unreadRect = tester.getRect(unreadButton);
       expect(
         unreadRect.top,
-        frostedAppBarHeight(tester.element(unreadButton)) + Grid.xs,
+        frostedAppBarHeight(
+              tester.element(unreadButton),
+              titleContentHeight: tester
+                  .widget<FrostedAppBar>(find.byType(FrostedAppBar).first)
+                  .titleContentHeight,
+            ) +
+            Grid.xs,
       );
       expect(find.text('Latest'), findsNothing);
 
@@ -2704,6 +3490,77 @@ void main() {
       );
     });
 
+    for (final huddleEvent in [
+      (kind: EventKind.huddleStarted, action: 'started a huddle'),
+      (kind: EventKind.huddleEnded, action: 'ended the huddle'),
+    ]) {
+      testWidgets(
+        '${huddleEvent.action} aligns its author and body with a regular message',
+        (tester) async {
+          await tester.pumpWidget(
+            _buildTestable(
+              messages: [
+                _textMsg(
+                  id: 'regular-message',
+                  pubkey: 'alice',
+                  content: 'Regular message',
+                  createdAt: 1000,
+                ),
+                _huddleMsg(
+                  id: 'huddle-message',
+                  kind: huddleEvent.kind,
+                  pubkey: 'bob',
+                  createdAt: 1010,
+                ),
+              ],
+              users: {
+                'alice': const UserProfile(
+                  pubkey: 'alice',
+                  displayName: 'Alice',
+                ),
+                'bob': const UserProfile(pubkey: 'bob', displayName: 'Bob'),
+              },
+            ),
+          );
+          await tester.pumpAndSettle();
+
+          final regularRow = find.byKey(
+            const ValueKey('message-row-regular-message'),
+          );
+          final huddleRow = find.byKey(
+            const ValueKey('system-message-row-huddle-message'),
+          );
+          final regularAvatar = tester.getRect(
+            find
+                .descendant(of: regularRow, matching: find.byType(CircleAvatar))
+                .first,
+          );
+          final huddleAvatar = tester.getRect(
+            find
+                .descendant(of: huddleRow, matching: find.byType(CircleAvatar))
+                .first,
+          );
+          final regularAuthor = tester.getRect(
+            find.byKey(const ValueKey('message-author-regular-message')),
+          );
+          final huddleAuthor = tester.getRect(
+            find.byKey(const ValueKey('system-message-author-bob')),
+          );
+          final regularBody = tester.getRect(findRichText('Regular message'));
+          final huddleBody = tester.getRect(findRichText(huddleEvent.action));
+
+          expect(
+            huddleAuthor.top - huddleAvatar.top,
+            closeTo(regularAuthor.top - regularAvatar.top, 0.01),
+          );
+          expect(
+            huddleBody.top - huddleAuthor.bottom,
+            closeTo(regularBody.top - regularAuthor.bottom, 0.01),
+          );
+        },
+      );
+    }
+
     testWidgets(
       'keeps membership and huddle rows evenly spaced with authored messages',
       (tester) async {
@@ -2887,6 +3744,107 @@ void main() {
       expect(find.text('Copy public key'), findsOneWidget);
       expect(find.byType(UserProfileSheet), findsOneWidget);
     });
+
+    testWidgets(
+      'profile sheet shows the poster before autoplay and restores it on tap',
+      (tester) async {
+        const posterUrl = 'https://relay.example/media/alice-poster.png';
+        const animationUrl = 'https://relay.example/media/alice-avatar.png';
+        final profileUrl =
+            '$posterUrl#buzz-anim=${Uri.encodeComponent(animationUrl)}';
+        final animationResponse = Completer<http.Response>();
+        final mediaClient = http_testing.MockClient(
+          (request) => request.url.toString() == animationUrl
+              ? animationResponse.future
+              : Future.value(http.Response.bytes(_transparentPng, 200)),
+        );
+        addTearDown(mediaClient.close);
+
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: [
+              _huddleMsg(
+                id: 'sys-huddle-animated-avatar',
+                kind: EventKind.huddleStarted,
+                pubkey: 'alice',
+              ),
+            ],
+            users: {
+              'alice': UserProfile(
+                pubkey: 'alice',
+                displayName: 'Alice',
+                avatarUrl: profileUrl,
+              ),
+            },
+            mediaClient: mediaClient,
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.tap(find.byType(CircleAvatar));
+        await tester.pumpAndSettle();
+
+        expect(find.byType(UserProfileSheet), findsOneWidget);
+        expect(
+          find.byKey(const ValueKey('progressive-animated-avatar-poster')),
+          findsOneWidget,
+        );
+        expect(
+          find.byKey(
+            const ValueKey('progressive-animated-avatar-animation-loading'),
+          ),
+          findsOneWidget,
+        );
+
+        animationResponse.complete(http.Response.bytes(_transparentPng, 200));
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 50)),
+        );
+        await tester.pumpAndSettle();
+
+        expect(
+          find.byKey(
+            const ValueKey('progressive-animated-avatar-animation-ready'),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.byKey(const ValueKey('progressive-animated-avatar-poster')),
+          findsNothing,
+        );
+
+        await tester.tap(find.byKey(const ValueKey('selected-profile-avatar')));
+        await tester.pumpAndSettle();
+
+        expect(
+          find.byKey(const ValueKey('progressive-animated-avatar-animation')),
+          findsNothing,
+        );
+        expect(
+          tester
+              .widget<MediaImage>(
+                find.descendant(
+                  of: find.byKey(const ValueKey('selected-profile-avatar')),
+                  matching: find.byType(MediaImage),
+                ),
+              )
+              .url,
+          posterUrl,
+        );
+
+        await tester.tap(find.byKey(const ValueKey('selected-profile-avatar')));
+        await tester.pumpAndSettle();
+
+        expect(
+          find.byKey(const ValueKey('progressive-animated-avatar-animation')),
+          findsOneWidget,
+        );
+        expect(
+          find.byKey(const ValueKey('progressive-animated-avatar-poster')),
+          findsNothing,
+        );
+      },
+    );
 
     testWidgets('opens a profile sheet from a generic system avatar', (
       tester,
@@ -3602,13 +4560,155 @@ void main() {
   });
 
   group('App bar', () {
-    testWidgets('shows channel name with hash icon', (tester) async {
-      await tester.pumpWidget(_buildTestable(messages: []));
+    testWidgets('shows a tappable channel name and collective member count', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [],
+          members: List.generate(
+            5,
+            (index) => ChannelMember(
+              pubkey: 'member-$index',
+              role: 'member',
+              joinedAt: DateTime(2025),
+            ),
+          ),
+        ),
+      );
       await tester.pumpAndSettle();
 
       expect(find.text('general'), findsOneWidget);
+      expect(find.text('5 members'), findsOneWidget);
       // The hash icon appears in the app bar and in the compose bar toolbar.
       expect(find.byIcon(LucideIcons.hash), findsAtLeastNWidgets(1));
+      expect(
+        tester.getSize(find.byKey(const ValueKey('channel-header-avatar'))),
+        const Size.square(40),
+      );
+      expect(
+        tester
+            .widget<Text>(find.byKey(const ValueKey('channel-header-name')))
+            .style
+            ?.fontSize,
+        AppTheme.light().textTheme.titleMedium?.fontSize,
+      );
+      expect(
+        tester
+            .widget<Text>(
+              find.byKey(const ValueKey('channel-header-member-count')),
+            )
+            .style
+            ?.fontSize,
+        AppTheme.light().textTheme.bodySmall?.fontSize,
+      );
+      expect(find.byTooltip('View members'), findsNothing);
+      expect(find.byTooltip('Channel actions'), findsNothing);
+
+      await tester.tap(
+        find.byKey(const ValueKey('channel-header-settings-trigger')),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('Channel settings'), findsNothing);
+      expect(
+        find.byKey(const ValueKey('channel-details-collapsed-title')),
+        findsNothing,
+      );
+      expect(
+        find.byKey(const ValueKey('channel-details-avatar')),
+        findsOneWidget,
+      );
+      expect(
+        find.byKey(const ValueKey('channel-details-name')),
+        findsOneWidget,
+      );
+      expect(find.text('General discussion'), findsOneWidget);
+      expect(find.text('5 members'), findsOneWidget);
+      expect(find.text('Preferences'), findsNothing);
+      expect(find.text('Star channel'), findsOneWidget);
+      expect(find.text('Mute channel'), findsOneWidget);
+      expect(find.text('Edit'), findsOneWidget);
+      expect(find.text('Actions'), findsNothing);
+      expect(find.byTooltip('Back'), findsOneWidget);
+
+      var detailsAppBar = tester.widget<FrostedAppBar>(
+        find.byType(FrostedAppBar).last,
+      );
+      expect(detailsAppBar.frosted, isFalse);
+      expect(detailsAppBar.frostedSurfaceOpacity, 0);
+      expect(detailsAppBar.frostedBlurSigma, 0);
+      expect(detailsAppBar.showBottomDivider, isFalse);
+
+      final descriptionBottom = tester
+          .getRect(find.byKey(const ValueKey('channel-details-description')))
+          .bottom;
+      final firstActionTop = tester
+          .getRect(find.byKey(const ValueKey('channel-details-star-action')))
+          .top;
+      expect(firstActionTop - descriptionBottom, closeTo(Grid.sm, 0.5));
+      expect(
+        tester
+            .getSize(find.byKey(const ValueKey('channel-details-star-action')))
+            .height,
+        68 + (Grid.xxs * 2),
+      );
+
+      final firstActionBottom = tester
+          .getRect(find.byKey(const ValueKey('channel-details-star-action')))
+          .bottom;
+      final membersLabelTop = tester.getRect(find.text('5 members')).top;
+      expect(membersLabelTop - firstActionBottom, closeTo(Grid.sm, 0.5));
+      expect(
+        tester
+            .widget<AppListCard>(
+              find.byKey(const ValueKey('channel-details-members-card')),
+            )
+            .verticalPadding,
+        Grid.twelve,
+      );
+      expect(find.text('Channel'), findsNothing);
+
+      await tester.drag(
+        find.byKey(const ValueKey('channel-details-page-list')),
+        const Offset(0, -300),
+      );
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('channel-details-collapsed-title')),
+        findsOneWidget,
+      );
+      final collapsedTitle = find.byKey(
+        const ValueKey('channel-details-collapsed-title'),
+      );
+      expect(
+        tester.getCenter(collapsedTitle).dx,
+        closeTo(tester.getCenter(find.byType(FrostedAppBar).last).dx, 0.5),
+      );
+      expect(find.text('Channel'), findsNothing);
+      detailsAppBar = tester.widget<FrostedAppBar>(
+        find.byType(FrostedAppBar).last,
+      );
+      expect(detailsAppBar.frosted, isTrue);
+      expect(detailsAppBar.frostedSurfaceOpacity, 0.5);
+      expect(detailsAppBar.frostedBlurSigma, 20);
+      expect(detailsAppBar.showBottomDivider, isTrue);
+      expect(detailsAppBar.bottomDividerOpacity, 0.15);
+      expect(
+        tester
+            .widget<AppListCard>(
+              find.byKey(const ValueKey('channel-details-channel-card')),
+            )
+            .verticalPadding,
+        Grid.twelve,
+      );
+
+      await tester.tap(find.byTooltip('Back'));
+      await tester.pumpAndSettle();
+      expect(
+        find.byKey(const ValueKey('channel-header-settings-trigger')),
+        findsOneWidget,
+      );
     });
 
     testWidgets('shows lock icon for private channel', (tester) async {
@@ -4666,17 +5766,29 @@ class _FakeChannelsNotifier extends ChannelsNotifier {
 
 class _FakeChannelActions extends ChannelActions {
   final Future<void> Function(String channelId)? onJoinChannel;
+  final Future<void> Function(String channelId, List<String> pubkeys)?
+  onAddMembers;
+  final Future<void> Function(
+    String channelId,
+    String? name,
+    String? description,
+  )?
+  onUpdateChannel;
 
-  _FakeChannelActions(Ref ref, {this.onJoinChannel})
-    : super(
-        ref: ref,
-        session: ref.read(relaySessionProvider.notifier),
-        signedEventRelay: SignedEventRelay(
-          session: ref.read(relaySessionProvider.notifier),
-          nsec: null,
-        ),
-        currentPubkey: 'self',
-      );
+  _FakeChannelActions(
+    Ref ref, {
+    this.onJoinChannel,
+    this.onAddMembers,
+    this.onUpdateChannel,
+  }) : super(
+         ref: ref,
+         session: ref.read(relaySessionProvider.notifier),
+         signedEventRelay: SignedEventRelay(
+           session: ref.read(relaySessionProvider.notifier),
+           nsec: null,
+         ),
+         currentPubkey: 'self',
+       );
 
   @override
   Future<void> joinChannel(String channelId) async {
@@ -4684,8 +5796,26 @@ class _FakeChannelActions extends ChannelActions {
   }
 
   @override
+  Future<void> addMembers({
+    required String channelId,
+    required List<String> pubkeys,
+    String role = 'member',
+  }) async {
+    await onAddMembers?.call(channelId, pubkeys);
+  }
+
+  @override
   Future<void> leaveChannel(String channelId) async {
     return;
+  }
+
+  @override
+  Future<void> updateChannel({
+    required String channelId,
+    String? name,
+    String? description,
+  }) async {
+    await onUpdateChannel?.call(channelId, name, description);
   }
 }
 
@@ -4724,6 +5854,10 @@ List<String> _replayedChannelIds(_RecordingRelaySocket socket) => socket
           ((message[2] as Map<String, dynamic>)['#h'] as List).single as String,
     )
     .toList();
+
+final _transparentPng = base64Decode(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+);
 
 class _TestNavigatorObserver extends NavigatorObserver {
   int pushCount = 0;

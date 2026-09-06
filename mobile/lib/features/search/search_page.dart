@@ -9,6 +9,7 @@ import '../../shared/mentions/mention_tags.dart';
 import '../../shared/theme/theme.dart';
 import '../../shared/widgets/avatar_image.dart';
 import '../../shared/widgets/buzz_loading_indicator.dart';
+import '../../shared/widgets/buzz_search_field.dart';
 import '../../shared/widgets/filter_chip_bar.dart';
 import '../../shared/widgets/frosted_app_bar.dart';
 import '../../shared/widgets/frosted_scaffold.dart';
@@ -22,12 +23,10 @@ import '../channels/message_content.dart';
 import '../channels/date_formatters.dart';
 import '../forum/forum_thread_page.dart';
 import '../profile/profile_provider.dart';
-import '../profile/user_cache_provider.dart';
-import '../profile/user_profile.dart';
+import '../../shared/profile/user_cache_provider.dart';
+import '../../shared/profile/user_profile.dart';
 import 'recent_searches_provider.dart';
 import 'search_provider.dart';
-
-part 'search_page/motion_field.dart';
 
 enum _SearchFilter { all, messages, channels, people }
 
@@ -318,14 +317,15 @@ class SearchPage extends HookConsumerWidget {
               // native input connection before the keyboard is shown.
               child: SizedBox(
                 key: const Key('search-field-container'),
-                child: _SearchMotionField(
+                child: BuzzSearchField(
                   controller: textController,
                   focusNode: focusNode,
+                  hintText: 'Search messages, channels, and people',
                   iconColor: searchPrimaryColor,
                   inputColor: searchPrimaryColor,
                   placeholderColor: searchPlaceholderColor,
                   surfaceColor: searchSurfaceColor,
-                  isSearchEditing: isSearchEditing.value,
+                  isEditing: isSearchEditing.value,
                   reduceMotion: reduceMotion,
                   motionDuration: _searchFieldMoveDuration,
                   onTap: activateSearch,
@@ -644,12 +644,10 @@ class _RecentSearches extends StatelessWidget {
 class _ChannelsSection extends StatelessWidget {
   final List<Channel> channels;
   final VoidCallback onResultSelected;
-
   const _ChannelsSection({
     required this.channels,
     required this.onResultSelected,
   });
-
   @override
   Widget build(BuildContext context) {
     return Column(
@@ -670,12 +668,14 @@ class _ChannelsSection extends StatelessWidget {
               key: ValueKey('search-channel-title-${channel.id}'),
               style: contentListTitleTextStyle,
             ),
-            subtitle: Text(
-              '${channel.memberCount} member${channel.memberCount == 1 ? '' : 's'}',
-              style: contentListBodyTextStyle.copyWith(
-                color: context.colors.onSurfaceVariant,
-              ),
-            ),
+            subtitle: channel.isMember
+                ? Text(
+                    '${channel.memberCount} member${channel.memberCount == 1 ? '' : 's'}',
+                    style: contentListBodyTextStyle.copyWith(
+                      color: context.colors.onSurfaceVariant,
+                    ),
+                  )
+                : null,
             trailing: !channel.isMember && !channel.isDm
                 ? Container(
                     padding: const EdgeInsets.symmetric(

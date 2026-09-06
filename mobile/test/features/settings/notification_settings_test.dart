@@ -32,6 +32,7 @@ void main() {
       await tester.pumpWidget(
         WidgetHelpers.testable(
           child: SettingsPage(
+            invitePageBuilder: (_) => const SizedBox.shrink(),
             profileHeader: const SizedBox.shrink(),
             identityRecoveryPageBuilder: (_) => const SizedBox.shrink(),
           ),
@@ -79,6 +80,7 @@ void main() {
       await tester.pumpWidget(
         WidgetHelpers.testable(
           child: SettingsPage(
+            invitePageBuilder: (_) => const SizedBox.shrink(),
             profileHeader: const SizedBox.shrink(),
             identityRecoveryPageBuilder: (_) => const SizedBox.shrink(),
           ),

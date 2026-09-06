@@ -201,6 +201,28 @@ void main() {
   });
 
   group('build channel lifecycle tags', () {
+    test('channel edits match desktop kind 9002 tags', () {
+      expect(
+        buildUpdateChannelTags(
+          channelId: 'channel-id',
+          name: '  ###general  ',
+          description: ' Team updates ',
+        ),
+        [
+          ['h', 'channel-id'],
+          ['name', 'general'],
+          ['about', 'Team updates'],
+        ],
+      );
+    });
+
+    test('channel edits reject a hash-only name', () {
+      expect(
+        () => buildUpdateChannelTags(channelId: 'channel-id', name: ' ### '),
+        throwsArgumentError,
+      );
+    });
+
     test('archive matches kind 9002 tags', () {
       expect(buildSetChannelArchivedTags('channel-id', archived: true), [
         ['h', 'channel-id'],
