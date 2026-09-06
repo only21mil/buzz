@@ -655,6 +655,31 @@ impl Config {
         Self::load_env()
     }
 
+    /// Load fixture configuration without creating the default Git directories.
+    #[cfg(test)]
+    pub(crate) fn from_env_with_test_git_paths(
+        root: &std::path::Path,
+    ) -> Result<Self, ConfigError> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let paths = [
+            ("BUZZ_GIT_REPO_PATH", root.join("repos")),
+            ("BUZZ_GIT_PACK_CACHE_PATH", root.join("pack-cache")),
+        ];
+        let previous = paths.map(|(name, path)| {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, path);
+            (name, previous)
+        });
+        let result = Self::load_env();
+        for (name, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        result
+    }
+
     // Test callers use this only while holding ENV_MUTEX across a complete
     // mutate-load-restore sequence. Production reaches it through from_env.
     fn load_env() -> Result<Self, ConfigError> {

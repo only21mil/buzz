@@ -3054,6 +3054,7 @@ mod tests {
         community: CommunityId,
         host: String,
         owner: nostr::Keys,
+        _git_storage: tempfile::TempDir,
     }
 
     struct AlwaysFreshReplayGuard;
@@ -3127,7 +3128,7 @@ mod tests {
             .await
             .expect("insert owner as channel member");
 
-            let state = Self::make_state(pool, &owner).await;
+            let (state, git_storage) = Self::make_state(pool, &owner).await;
 
             // Seed the exact kind:30617 repository announcement the route test
             // fixture depends on, bound to the test channel (the relay's git
@@ -3142,6 +3143,7 @@ mod tests {
                 community: CommunityId::from_uuid(community_id),
                 host,
                 owner,
+                _git_storage: git_storage,
             }
         }
 
@@ -3426,8 +3428,11 @@ mod tests {
         async fn make_state(
             pool: sqlx::PgPool,
             ci_signer: &nostr::Keys,
-        ) -> std::sync::Arc<AppState> {
-            let mut config = crate::config::Config::from_env().expect("default config loads");
+        ) -> (std::sync::Arc<AppState>, tempfile::TempDir) {
+            let git_storage = tempfile::tempdir().expect("fixture Git storage");
+            let mut config =
+                crate::config::Config::from_env_with_test_git_paths(git_storage.path())
+                    .expect("fixture config loads");
             config.require_relay_membership = false;
             config.ci_status_signer_pubkeys =
                 [ci_signer.public_key().to_hex()].into_iter().collect();
@@ -3468,7 +3473,7 @@ mod tests {
                 media_storage,
             );
             state.nip98_replay = std::sync::Arc::new(AlwaysFreshReplayGuard);
-            std::sync::Arc::new(state)
+            (std::sync::Arc::new(state), git_storage)
         }
     }
 
@@ -4250,6 +4255,13 @@ jobs:
             return;
         }
         let harness = TestHarness::connect().await;
+        let git_root = harness._git_storage.path().to_path_buf();
+        let repo_path = &harness.state.config.git_repo_path;
+        let cache_path = &harness.state.config.git_pack_cache_path;
+        assert!(repo_path.starts_with(&git_root) && repo_path.is_dir());
+        assert!(cache_path.starts_with(&git_root) && cache_path.is_dir());
+        std::fs::write(cache_path.join("cleanup-probe"), b"owned fixture data")
+            .expect("write fixture cleanup probe");
         let body = serde_json::json!({
             "target_repo_a": malformed_repo_a(),
             "requested_tip_oid": "c".repeat(40),
@@ -4261,6 +4273,11 @@ jobs:
             axum::http::StatusCode::BAD_REQUEST,
             "malformed coordinate must be a 400 at the request seam, got {}",
             response.status()
+        );
+        drop(harness);
+        assert!(
+            !git_root.exists(),
+            "fixture Git storage must be removed on drop"
         );
     }
 
