@@ -651,8 +651,10 @@ mod tests {
 
     /// Build a closed-relay (`require_relay_membership = true`) test state with
     /// a fresh community on `host`; returns `None` when Postgres is unavailable.
-    async fn invite_test_state(host: &str) -> Option<Arc<AppState>> {
-        let mut config = crate::config::Config::from_env().ok()?;
+    async fn invite_test_state(host: &str) -> Option<(Arc<AppState>, tempfile::TempDir)> {
+        let git_storage = tempfile::tempdir().ok()?;
+        let mut config =
+            crate::config::Config::from_env_with_test_git_paths(git_storage.path()).ok()?;
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .expect("explicit isolated test database URL required");
@@ -696,7 +698,7 @@ mod tests {
             media_storage,
         );
         state.nip98_replay = Arc::new(AlwaysFreshReplayGuard);
-        Some(Arc::new(state))
+        Some((Arc::new(state), git_storage))
     }
 
     async fn post_json(
@@ -844,7 +846,7 @@ mod tests {
     async fn mint_validates_max_uses_and_ttl_bounds() {
         let host = format!("invites-validation-{}.example", Uuid::new_v4().simple());
         let owner = Keys::generate();
-        let state = invite_test_state(&host)
+        let (state, _git_storage) = invite_test_state(&host)
             .await
             .expect("requires reachable Postgres and relay test state");
         let community = state
@@ -902,7 +904,7 @@ mod tests {
     async fn malformed_and_unknown_v2_codes_are_forbidden_without_v1_fallback() {
         let host = format!("invites-v2-invalid-{}.example", Uuid::new_v4().simple());
         let joiner = Keys::generate();
-        let state = invite_test_state(&host)
+        let (state, _git_storage) = invite_test_state(&host)
             .await
             .expect("requires reachable Postgres and relay test state");
         let unknown = format!("v2.{}", URL_SAFE_NO_PAD.encode([9_u8; 32]));
@@ -942,7 +944,7 @@ mod tests {
         let owner = Keys::generate();
         let first = Keys::generate();
         let second = Keys::generate();
-        let state = invite_test_state(&host)
+        let (state, _git_storage) = invite_test_state(&host)
             .await
             .expect("requires reachable Postgres and relay test state");
         let community = state
@@ -1085,7 +1087,7 @@ mod tests {
         let host = format!("invites-{}.example", Uuid::new_v4().simple());
         let owner = Keys::generate();
         let joiner = Keys::generate();
-        let Some(state) = invite_test_state(&host).await else {
+        let Some((state, _git_storage)) = invite_test_state(&host).await else {
             return;
         };
         let community = state
@@ -1155,7 +1157,7 @@ mod tests {
         let host = format!("invites-policy-{}.example", Uuid::new_v4().simple());
         let owner = Keys::generate();
         let joiner = Keys::generate();
-        let Some(state) = invite_test_state(&host).await else {
+        let Some((state, _git_storage)) = invite_test_state(&host).await else {
             return;
         };
         // Force the join policy on regardless of env.
@@ -1364,7 +1366,7 @@ mod tests {
         let host = format!("invites-{}.example", Uuid::new_v4().simple());
         let member = Keys::generate();
         let outsider = Keys::generate();
-        let Some(state) = invite_test_state(&host).await else {
+        let Some((state, _git_storage)) = invite_test_state(&host).await else {
             return;
         };
         let community = state
@@ -1392,7 +1394,7 @@ mod tests {
     async fn claim_rejects_invalid_code() {
         let host = format!("invites-{}.example", Uuid::new_v4().simple());
         let joiner = Keys::generate();
-        let Some(state) = invite_test_state(&host).await else {
+        let Some((state, _git_storage)) = invite_test_state(&host).await else {
             return;
         };
 
@@ -1426,7 +1428,7 @@ mod tests {
         let host_b = format!("invites-b-{}.example", Uuid::new_v4().simple());
         let owner = Keys::generate();
         let joiner = Keys::generate();
-        let Some(state) = invite_test_state(&host_a).await else {
+        let Some((state, _git_storage)) = invite_test_state(&host_a).await else {
             return;
         };
         state
@@ -1504,7 +1506,7 @@ mod tests {
     async fn claim_rejects_expired_code() {
         let host = format!("invites-{}.example", Uuid::new_v4().simple());
         let joiner = Keys::generate();
-        let state = invite_test_state(&host)
+        let (state, _git_storage) = invite_test_state(&host)
             .await
             .expect("requires reachable Postgres and relay test state");
         let community = state
@@ -1576,7 +1578,7 @@ mod tests {
         let host = format!("invites-{}.example", Uuid::new_v4().simple());
         let owner = Keys::generate();
         let joiner = Keys::generate();
-        let state_arc = invite_test_state(&host)
+        let (state_arc, _git_storage) = invite_test_state(&host)
             .await
             .expect("requires reachable Postgres and relay test state");
         // Swap the always-fresh guard for one that fires the second time the
@@ -1662,7 +1664,7 @@ mod tests {
     async fn claim_rate_limit_fires_on_repeat_pubkey() {
         let host = format!("invites-{}.example", Uuid::new_v4().simple());
         let joiner = Keys::generate();
-        let state_arc = invite_test_state(&host)
+        let (state_arc, _git_storage) = invite_test_state(&host)
             .await
             .expect("requires reachable Postgres and relay test state");
         // Fresh limiter with the production limit so the assertion pins the
@@ -1730,7 +1732,7 @@ mod tests {
     #[ignore = "requires Postgres"]
     async fn join_policy_document_pages_serve_configured_markdown() {
         let host = format!("invites-docs-{}.example", Uuid::new_v4().simple());
-        let Some(state) = invite_test_state(&host).await else {
+        let Some((state, _git_storage)) = invite_test_state(&host).await else {
             return;
         };
 

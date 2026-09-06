@@ -702,8 +702,10 @@ mod tests {
     async fn workspace_profile_test_state(
         host: &str,
         require_relay_membership: bool,
-    ) -> (Arc<AppState>, TenantContext) {
-        let mut config = crate::config::Config::from_env().expect("config from env");
+    ) -> (Arc<AppState>, TenantContext, tempfile::TempDir) {
+        let git_storage = tempfile::tempdir().expect("fixture Git storage");
+        let mut config = crate::config::Config::from_env_with_test_git_paths(git_storage.path())
+            .expect("fixture config loads");
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .expect("explicit isolated test database URL required");
@@ -750,7 +752,7 @@ mod tests {
             Keys::generate(),
             media_storage,
         );
-        (Arc::new(state), tenant)
+        (Arc::new(state), tenant, git_storage)
     }
 
     /// Sign a fresh kind:9033 with `icon` and run it through the real
@@ -786,7 +788,7 @@ mod tests {
     #[ignore = "requires Postgres"]
     async fn open_relay_9033_admits_roleless_only_until_a_steward_exists() {
         let host = format!("icon-gate-open-{}.example", uuid::Uuid::new_v4().simple());
-        let (state, tenant) = workspace_profile_test_state(&host, false).await;
+        let (state, tenant, _git_storage) = workspace_profile_test_state(&host, false).await;
         let roleless = Keys::generate();
         let owner = Keys::generate();
 
@@ -845,7 +847,7 @@ mod tests {
     #[ignore = "requires Postgres"]
     async fn closed_relay_9033_still_requires_admin_or_owner() {
         let host = format!("icon-gate-closed-{}.example", uuid::Uuid::new_v4().simple());
-        let (state, tenant) = workspace_profile_test_state(&host, true).await;
+        let (state, tenant, _git_storage) = workspace_profile_test_state(&host, true).await;
         let roleless = Keys::generate();
         let member = Keys::generate();
         let admin = Keys::generate();

@@ -3665,8 +3665,10 @@ mod tests {
         ));
     }
 
-    async fn discovery_test_state() -> (Arc<AppState>, sqlx::PgPool) {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+    async fn discovery_test_state() -> (Arc<AppState>, sqlx::PgPool, tempfile::TempDir) {
+        let git_storage = tempfile::tempdir().expect("fixture Git storage");
+        let mut config = crate::config::Config::from_env_with_test_git_paths(git_storage.path())
+            .expect("fixture config loads");
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         let pool = sqlx::PgPool::connect(&config.database_url)
@@ -3701,7 +3703,7 @@ mod tests {
             nostr::Keys::generate(),
             media_storage,
         );
-        (Arc::new(state), pool)
+        (Arc::new(state), pool, git_storage)
     }
 
     async fn discovery_head(
@@ -3731,7 +3733,7 @@ mod tests {
         use buzz_core::channel::{ChannelType, ChannelVisibility};
         use buzz_db::CreateCommunityWithOwnerResult;
 
-        let (state, pool) = discovery_test_state().await;
+        let (state, pool, _git_storage) = discovery_test_state().await;
         let owner = nostr::Keys::generate();
         let host = format!("discovery-reconcile-{}.example", Uuid::new_v4().simple());
         let community = match state

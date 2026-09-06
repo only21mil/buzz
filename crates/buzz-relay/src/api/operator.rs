@@ -578,8 +578,12 @@ mod tests {
         format!("Nostr {encoded}")
     }
 
-    async fn operator_test_state(operator_keys: &[Keys]) -> Option<Arc<AppState>> {
-        let mut config = crate::config::Config::from_env().ok()?;
+    async fn operator_test_state(
+        operator_keys: &[Keys],
+    ) -> Option<(Arc<AppState>, tempfile::TempDir)> {
+        let git_storage = tempfile::tempdir().ok()?;
+        let mut config =
+            crate::config::Config::from_env_with_test_git_paths(git_storage.path()).ok()?;
         config.database_url = test_database_url();
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.relay_url = "wss://tenant.example".to_string();
@@ -622,7 +626,7 @@ mod tests {
             media_storage,
         );
         state.nip98_replay = Arc::new(AlwaysFreshReplayGuard);
-        Some(Arc::new(state))
+        Some((Arc::new(state), git_storage))
     }
 
     async fn read_json(response: axum::response::Response) -> Value {
@@ -716,7 +720,7 @@ mod tests {
     async fn non_allowlisted_operator_key_gets_403() {
         let operator = Keys::generate();
         let outsider = Keys::generate();
-        let Some(state) = operator_test_state(&[operator]).await else {
+        let Some((state, _git_storage)) = operator_test_state(&[operator]).await else {
             return;
         };
         let body = format!(
@@ -747,7 +751,9 @@ mod tests {
     #[ignore = "requires Postgres"]
     async fn post_operator_body_requires_payload_tag() {
         let operator = Keys::generate();
-        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
+        let Some((state, _git_storage)) =
+            operator_test_state(std::slice::from_ref(&operator)).await
+        else {
             return;
         };
         let body = format!(
@@ -786,7 +792,9 @@ mod tests {
     #[ignore = "requires Postgres"]
     async fn unmapped_management_host_can_check_availability() {
         let operator = Keys::generate();
-        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
+        let Some((state, _git_storage)) =
+            operator_test_state(std::slice::from_ref(&operator)).await
+        else {
             return;
         };
         let host = format!("community-{}.example", Uuid::new_v4().simple());
@@ -816,7 +824,9 @@ mod tests {
     async fn unmapped_management_host_can_list_owned_communities() {
         let operator = Keys::generate();
         let owner = Keys::generate();
-        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
+        let Some((state, _git_storage)) =
+            operator_test_state(std::slice::from_ref(&operator)).await
+        else {
             return;
         };
         let owner_hex = owner.public_key().to_hex();
@@ -850,7 +860,9 @@ mod tests {
         let operator = Keys::generate();
         let owner = Keys::generate();
         let outsider = Keys::generate();
-        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
+        let Some((state, _git_storage)) =
+            operator_test_state(std::slice::from_ref(&operator)).await
+        else {
             return;
         };
         let host = format!("community-{}.example", Uuid::new_v4().simple());
@@ -940,7 +952,9 @@ mod tests {
     async fn archive_publish_failure_is_retryable_and_preserves_timestamp() {
         let operator = Keys::generate();
         let owner = Keys::generate();
-        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
+        let Some((state, _git_storage)) =
+            operator_test_state(std::slice::from_ref(&operator)).await
+        else {
             return;
         };
         let host = format!("community-{}.example", Uuid::new_v4().simple());
@@ -1052,7 +1066,9 @@ mod tests {
     async fn happy_path_create_returns_created_and_bootstraps_owner() {
         let operator = Keys::generate();
         let owner = Keys::generate();
-        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
+        let Some((state, _git_storage)) =
+            operator_test_state(std::slice::from_ref(&operator)).await
+        else {
             return;
         };
         let host = format!("community-{}.example", Uuid::new_v4().simple());
@@ -1088,7 +1104,9 @@ mod tests {
     async fn fresh_host_at_owner_limit_returns_limit_reached_conflict() {
         let operator = Keys::generate();
         let owner = Keys::generate();
-        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
+        let Some((state, _git_storage)) =
+            operator_test_state(std::slice::from_ref(&operator)).await
+        else {
             return;
         };
 
@@ -1126,7 +1144,9 @@ mod tests {
         let operator = Keys::generate();
         let initial_owner = Keys::generate();
         let new_owner = Keys::generate();
-        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
+        let Some((state, _git_storage)) =
+            operator_test_state(std::slice::from_ref(&operator)).await
+        else {
             return;
         };
 
@@ -1212,7 +1232,9 @@ mod tests {
     async fn transfer_with_invalid_community_id_returns_400() {
         let operator = Keys::generate();
         let new_owner = Keys::generate();
-        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
+        let Some((state, _git_storage)) =
+            operator_test_state(std::slice::from_ref(&operator)).await
+        else {
             return;
         };
         let body = serde_json::json!({
@@ -1238,7 +1260,9 @@ mod tests {
     #[ignore = "requires Postgres"]
     async fn transfer_with_invalid_pubkey_returns_400() {
         let operator = Keys::generate();
-        let Some(state) = operator_test_state(std::slice::from_ref(&operator)).await else {
+        let Some((state, _git_storage)) =
+            operator_test_state(std::slice::from_ref(&operator)).await
+        else {
             return;
         };
         let body = serde_json::json!({

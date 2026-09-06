@@ -1004,8 +1004,10 @@ mod tests {
         assert!(should_stream_as_video(bytes));
     }
 
-    async fn test_state() -> Arc<AppState> {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+    async fn test_state() -> (Arc<AppState>, tempfile::TempDir) {
+        let git_storage = tempfile::tempdir().expect("fixture Git storage");
+        let mut config = crate::config::Config::from_env_with_test_git_paths(git_storage.path())
+            .expect("fixture config loads");
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.media_uploads_per_minute = 1;
@@ -1045,24 +1047,25 @@ mod tests {
             nostr::Keys::generate(),
             media_storage,
         );
-        Arc::new(state)
+        (Arc::new(state), git_storage)
     }
 
     async fn media_get_auth_router() -> axum::Router {
-        let state = test_state().await;
+        let (state, git_storage) = test_state().await;
         axum::Router::new()
             .route(
                 "/media/{sha256_ext}",
                 axum::routing::get(get_blob).head(head_blob),
             )
             .with_state(state)
+            .layer(axum::Extension(Arc::new(git_storage)))
     }
 
     #[tokio::test]
     #[ignore = "requires disposable PostgreSQL fixture"]
     async fn nip_oa_membership_ingress_rejects_invalid_time_and_preserves_direct_members() {
         use crate::api::relay_members::{check_relay_membership, MembershipDecision};
-        let mut state = test_state().await;
+        let (mut state, _git_storage) = test_state().await;
         let config = Arc::make_mut(&mut Arc::get_mut(&mut state).unwrap().config);
         config.require_relay_membership = true;
         config.allow_nip_oa_auth = true;
@@ -1355,7 +1358,7 @@ mod tests {
 
     #[tokio::test]
     async fn upload_rate_limiter_is_scoped_by_community() {
-        let state = test_state().await;
+        let (state, _git_storage) = test_state().await;
         let pubkey = nostr::Keys::generate().public_key();
         let community_a = buzz_core::CommunityId::from_uuid(Uuid::from_u128(0xAAAA));
         let community_b = buzz_core::CommunityId::from_uuid(Uuid::from_u128(0xBBBB));
@@ -1370,7 +1373,7 @@ mod tests {
 
     #[tokio::test]
     async fn upload_concurrency_limit_is_scoped_by_community() {
-        let state = test_state().await;
+        let (state, _git_storage) = test_state().await;
         let pubkey = nostr::Keys::generate().public_key();
         let community_a = buzz_core::CommunityId::from_uuid(Uuid::from_u128(0xAAAA));
         let community_b = buzz_core::CommunityId::from_uuid(Uuid::from_u128(0xBBBB));

@@ -923,8 +923,10 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "{secret}" -hex 2>/dev/nu
 
     // ── hook_policy_check binding gate (requires Postgres) ──────────────
 
-    async fn policy_test_state() -> Arc<AppState> {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+    async fn policy_test_state() -> (Arc<AppState>, tempfile::TempDir) {
+        let git_storage = tempfile::tempdir().expect("fixture Git storage");
+        let mut config = crate::config::Config::from_env_with_test_git_paths(git_storage.path())
+            .expect("fixture config loads");
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
@@ -962,7 +964,7 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "{secret}" -hex 2>/dev/nu
             nostr::Keys::generate(),
             media_storage,
         );
-        Arc::new(state)
+        (Arc::new(state), git_storage)
     }
 
     /// Announce `repo_id` with the given tags, then push to it as its own
@@ -1069,7 +1071,7 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "{secret}" -hex 2>/dev/nu
     async fn hook_allows_active_member_author_on_admin_main() {
         use nostr::{Keys, Tag};
 
-        let state = policy_test_state().await;
+        let (state, _git_storage) = policy_test_state().await;
         let host = format!("policy-{}.example", Uuid::new_v4().simple());
         let community = state
             .db
@@ -1108,7 +1110,7 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "{secret}" -hex 2>/dev/nu
     async fn hook_denies_nonmember_author_before_delegation() {
         use nostr::{Keys, Tag};
 
-        let state = policy_test_state().await;
+        let (state, _git_storage) = policy_test_state().await;
         let host = format!("policy-{}.example", Uuid::new_v4().simple());
         let community = state
             .db
@@ -1143,7 +1145,7 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "{secret}" -hex 2>/dev/nu
     async fn push_gate_denies_owner_without_exact_live_binding() {
         use nostr::{Keys, Tag};
 
-        let state = policy_test_state().await;
+        let (state, _git_storage) = policy_test_state().await;
         let host = format!("policy-{}.example", uuid::Uuid::new_v4().simple());
         let community = state
             .db

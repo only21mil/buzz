@@ -1043,8 +1043,10 @@ mod integration_tests {
     use std::sync::Arc;
 
     /// Real-PG state mirroring `handlers::event::tests::test_state_with_redis_url`.
-    async fn test_state() -> Arc<AppState> {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+    async fn test_state() -> (Arc<AppState>, tempfile::TempDir) {
+        let git_storage = tempfile::tempdir().expect("fixture Git storage");
+        let mut config = crate::config::Config::from_env_with_test_git_paths(git_storage.path())
+            .expect("fixture config loads");
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
@@ -1077,13 +1079,13 @@ mod integration_tests {
             nostr::Keys::generate(),
             media_storage,
         );
-        Arc::new(state)
+        (Arc::new(state), git_storage)
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn workflow_send_message_p_tags_mentioned_member() {
-        let state = test_state().await;
+        let (state, _git_storage) = test_state().await;
 
         let author = nostr::Keys::generate();
         let author_hex = author.public_key().to_hex();
@@ -1188,7 +1190,7 @@ mod integration_tests {
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn pinned_thread_replays_identical_event_after_parent_and_channel_changes() {
-        let state = test_state().await;
+        let (state, _git_storage) = test_state().await;
         let owner = nostr::Keys::generate();
         let owner_hex = owner.public_key().to_hex();
         let host = format!("wf-thread-{}.example", Uuid::new_v4().simple());
@@ -1370,7 +1372,7 @@ mod integration_tests {
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn claimed_effect_recovery_precedes_archived_channel_validation() {
-        let state = test_state().await;
+        let (state, _git_storage) = test_state().await;
         let author = nostr::Keys::generate();
         let author_hex = author.public_key().to_hex();
         let host = format!("wf-recovery-{}.example", Uuid::new_v4().simple());
