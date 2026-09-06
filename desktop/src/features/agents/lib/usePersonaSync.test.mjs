@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test, { mock, beforeEach } from "node:test";
-beforeEach(() => { globalThis.isTauri = true; });
+beforeEach(() => {
+  globalThis.isTauri = true;
+});
 
 import { relayClient } from "@/shared/api/relayClient";
 import {

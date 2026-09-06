@@ -94,6 +94,7 @@ const CAPABILITY_OFF_MUTATIONS: ReadonlyArray<readonly [string, string]> = [
     "managed-agent messaging needs the desktop app",
   ],
   ["set_agent_managed_profiles", "agent settings need the desktop app"],
+  ["set_thread_scoped_acp_sessions", "agent sessions need the desktop app"],
   ["set_global_agent_config", "agent settings need the desktop app"],
   [
     "set_managed_agent_auto_restart",

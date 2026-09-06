@@ -277,6 +277,7 @@
     "set_persona_shared",
     "set_pocket_voice",
     "set_team_shared",
+    "set_thread_scoped_acp_sessions",
     "set_tts_enabled",
     "set_voice_input_mode",
     "sign_project_issue_assignment",
