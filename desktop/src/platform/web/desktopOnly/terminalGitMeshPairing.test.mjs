@@ -14,6 +14,8 @@ import {
 } from "../registry.ts";
 
 const COMMANDS = [
+  { name: "sign_project_issue_assignment", mode: "throw" },
+  { name: "sign_project_issue_unassignment", mode: "throw" },
   { name: "archive_events", mode: "throw" },
   { name: "cancel_pairing", mode: "throw" },
   { name: "clone_project_repository", mode: "throw" },

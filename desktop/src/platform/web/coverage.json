@@ -275,6 +275,8 @@
     "set_team_shared",
     "set_tts_enabled",
     "set_voice_input_mode",
+    "sign_project_issue_assignment",
+    "sign_project_issue_unassignment",
     "sign_project_pull_request_review_request",
     "sign_project_pull_request_status",
     "speak_agent_message",

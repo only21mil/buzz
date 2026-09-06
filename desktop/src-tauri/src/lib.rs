@@ -664,6 +664,8 @@ pub fn run() {
             push_project_local_repository,
             pull_project_local_repository,
             sign_project_pull_request_status,
+            sign_project_issue_assignment,
+            sign_project_issue_unassignment,
             sign_project_pull_request_review_request,
             publish_project_pull_request_merged_status,
             merge_project_pull_request,

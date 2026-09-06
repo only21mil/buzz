@@ -18,6 +18,8 @@ const PAIRING_MUTATIONS: readonly MutationSpec[] = [
 ];
 
 const PROJECT_GIT_MUTATIONS: readonly MutationSpec[] = [
+  ["sign_project_issue_assignment", "project signing needs the desktop app"],
+  ["sign_project_issue_unassignment", "project signing needs the desktop app"],
   ["clone_project_repository", "project repositories need the desktop app"],
   ["create_project_remote_branch", "project git needs the desktop app"],
   ["delete_project_remote_branch", "project git needs the desktop app"],
