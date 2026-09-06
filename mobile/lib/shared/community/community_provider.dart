@@ -231,11 +231,11 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
   final Map<String, Future<void>> _tombstoneAttempts = {};
   final Map<String, Object> _pushLifecycles = {};
 
-  /// Captures consent and identity before asynchronous enrollment starts.
+  /// Captures consent, identity, and policy before asynchronous enrollment starts.
   Object capturePushLifecycle(String id) =>
       _pushLifecycles.putIfAbsent(id, Object.new);
 
-  /// Rejects completions after consent, credentials, removal, or disposal changes.
+  /// Rejects completions after consent, identity, policy, or disposal changes.
   bool isPushLifecycleCurrent(String id, Object lifecycle) =>
       ref.mounted &&
       identical(_pushLifecycles[id], lifecycle) &&
@@ -411,6 +411,9 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
     );
     await storage.save(updated);
     final updatedList = [...current]..[index] = updated;
+    // Install policy and its authority together, after persistence succeeds.
+    // Rotating even on A -> B -> A prevents an old cohort reserving a newer lease.
+    _pushLifecycles[id] = Object();
     state = AsyncData(updatedList);
     await syncCommunitySnapshot(ref, updatedList);
   });

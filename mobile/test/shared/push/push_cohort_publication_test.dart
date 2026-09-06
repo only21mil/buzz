@@ -183,6 +183,125 @@ void main() {
     expect(published, isEmpty);
   });
 
+  for (final policyChange in ['changed', 'ABA', 'unchanged']) {
+    test(
+      '$policyChange policy while descriptor waits preserves newer acceptance',
+      () async {
+        final entered = Completer<void>();
+        final resume = Completer<void>();
+        final publications = <(int, String)>[];
+        final oldDesired = communities.first.pushSubscriptionState.desired;
+        final newDesired = buildDesiredBuzzPushSubscriptions(
+          myPubkey: communities.first.pubkey!,
+          channelIds: const ['123e4567-e89b-42d3-a456-426614174099'],
+          mutedChannelIds: const ['123e4567-e89b-42d3-a456-426614174099'],
+        );
+        Future<BuzzPushEndpointGrant> publishPolicy({bool delay = false}) =>
+            publishBuzzPushCohort(
+              notifier: notifier,
+              communities: [
+                container.read(communityListProvider).requireValue.first,
+              ],
+              enroll: () =>
+                  enrollBuzzPush('wss://a.example', 'https://push.example'),
+              readGrants: readBuzzPushEndpointGrants,
+              descriptorFor: (url) async {
+                if (delay) {
+                  entered.complete();
+                  await resume.future;
+                }
+                return _descriptor(url);
+              },
+              publish: (community, grant, descriptor, generation) async {
+                publications.add((
+                  generation,
+                  buzzPushSubscriptionsFingerprint(
+                    community.pushSubscriptionState.desired,
+                  ),
+                ));
+              },
+            );
+        final pending = publishPolicy(delay: true);
+        await entered.future;
+        await notifier.updateDesiredPushSubscriptions(
+          'a',
+          policyChange == 'unchanged' ? oldDesired : newDesired,
+        );
+        if (policyChange == 'ABA') {
+          await notifier.updateDesiredPushSubscriptions('a', oldDesired);
+        }
+        await publishPolicy();
+        final before = container
+            .read(communityListProvider)
+            .requireValue
+            .first
+            .pushSubscriptionState;
+        expect(before.acceptedGeneration, 1);
+        expect(
+          buzzPushSubscriptionsFingerprint(before.accepted!),
+          buzzPushSubscriptionsFingerprint(before.desired),
+        );
+        resume.complete();
+        await pending;
+        final after = (await storage.loadAll()).first.pushSubscriptionState;
+        final expectedFingerprint = buzzPushSubscriptionsFingerprint(
+          before.desired,
+        );
+        expect(publications, [
+          (1, expectedFingerprint),
+          if (policyChange == 'unchanged') (2, expectedFingerprint),
+        ]);
+        expect(after.generationCursor, policyChange == 'unchanged' ? 2 : 1);
+        expect(after.acceptedGeneration, after.generationCursor);
+        expect(
+          buzzPushSubscriptionsFingerprint(after.accepted!),
+          expectedFingerprint,
+        );
+      },
+    );
+  }
+
+  for (final restorePolicy in [false, true]) {
+    test(
+      'late relay acceptance rejects policy change (ABA: $restorePolicy)',
+      () async {
+        final entered = Completer<void>();
+        final resume = Completer<void>();
+        final pending = publishBuzzPushCohort(
+          notifier: notifier,
+          communities: [communities.first],
+          enroll: () =>
+              enrollBuzzPush('wss://a.example', 'https://push.example'),
+          readGrants: readBuzzPushEndpointGrants,
+          descriptorFor: (url) async => _descriptor(url),
+          publish: (community, grant, descriptor, generation) async {
+            entered.complete();
+            await resume.future;
+          },
+        );
+        await entered.future;
+        await notifier.updateDesiredPushSubscriptions(
+          'a',
+          buildDesiredBuzzPushSubscriptions(
+            myPubkey: communities.first.pubkey!,
+          ),
+        );
+        if (restorePolicy) {
+          await notifier.updateDesiredPushSubscriptions(
+            'a',
+            communities.first.pushSubscriptionState.desired,
+          );
+        }
+        resume.complete();
+        await pending;
+        final after = (await storage.loadAll()).first.pushSubscriptionState;
+        expect(after.generationCursor, 1);
+        expect(after.acceptedGeneration, isNull);
+        expect(after.accepted, isNull);
+      },
+    );
+  }
+
   test(
     'late relay acceptance cannot cross opt-out and re-enable ABA',
     () async {

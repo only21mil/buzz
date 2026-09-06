@@ -284,7 +284,7 @@
     "source_git_blob": "e035752ec3adc3512981fc2255614406d6ca6f6b",
     "source_sha256": "7d5eb5db007cc4ce981f7d94d328fafc94e960214b6aa5041675bc6d7d56bb27",
     "fork_path": "crates/buzz-relay/src/config.rs",
-    "fork_sha256": "fd211ebbc9cd734eeb1ba9c95e01e2d54c2dd7ebe540a66952ed32fde5e81aa4",
+    "fork_sha256": "3159208bf2fa127f6b6985e0f17ef2b73445ada6e2e0ee489973548c12a7e690",
     "disposition": "adapted or already integrated; preserve fork contracts"
   },
   {
@@ -860,7 +860,7 @@
     "source_git_blob": "7788082745ecdef505c2e59bafdc1df41dab6f01",
     "source_sha256": "b15fefa72dc0a78143283c7623578ce3e298aed2f165523d8131cb5ee282f63d",
     "fork_path": "mobile/lib/shared/community/community_provider.dart",
-    "fork_sha256": "7a0956a9f709cd39d14868e41288b1417de2bcb9321602f155351c177e3c659b",
+    "fork_sha256": "100ad213978f051dfb49660c8922a9af1c7ec92b21e93f4a7213edabb4fd7fbb",
     "disposition": "adapted; client lifecycle and shared authority repair preserves fork contracts"
   },
   {
