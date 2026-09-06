@@ -2332,7 +2332,9 @@ async fn tokio_main() -> Result<()> {
                     &ctx,
                     &mut last_activity,
                     observer.as_ref(),
-                ) {
+                )
+                .await
+                {
                     typing_channels.insert(scope, thread_tags);
                 }
             }
@@ -2354,7 +2356,7 @@ async fn tokio_main() -> Result<()> {
                         goose_system_prompt_supported: None,
                         protocol_version,
                     };
-                    pool.return_agent(agent);
+                    pool.return_agent(agent).await;
                     tracing::info!(agent = rr.index, "respawn complete");
                     respawn_collected = true;
                 }
@@ -2374,7 +2376,9 @@ async fn tokio_main() -> Result<()> {
                 &ctx,
                 &mut last_activity,
                 observer.as_ref(),
-            ) {
+            )
+            .await
+            {
                 typing_channels.insert(scope, thread_tags);
             }
         }
@@ -2932,7 +2936,7 @@ async fn tokio_main() -> Result<()> {
                             }
                             if pool_ready {
                                 for (scope, thread_tags) in
-                                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity, observer.as_ref())
+                                    dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity, observer.as_ref()).await
                                 {
                                     typing_channels.insert(scope, thread_tags);
                                 }
@@ -2982,12 +2986,12 @@ async fn tokio_main() -> Result<()> {
                     } else if queue.has_flushable_work() {
                         tracing::debug!("heartbeat_skipped_events");
                         for (scope, thread_tags) in
-                            dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity, observer.as_ref())
+                            dispatch_pending(&mut pool, &mut queue, &ctx, &mut last_activity, observer.as_ref()).await
                         {
                             typing_channels.insert(scope, thread_tags);
                         }
                     } else if pool.any_idle() {
-                        dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight);
+                        dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight).await;
                     } else {
                         tracing::debug!("heartbeat_skipped_busy");
                     }
@@ -3092,7 +3096,9 @@ async fn tokio_main() -> Result<()> {
                     &ctx,
                     &mut last_activity,
                     observer.as_ref(),
-                ) {
+                )
+                .await
+                {
                     typing_channels.insert(scope, thread_tags);
                 }
             }
@@ -3121,7 +3127,9 @@ async fn tokio_main() -> Result<()> {
                     &ctx,
                     &mut last_activity,
                     observer.as_ref(),
-                ) {
+                )
+                .await
+                {
                     typing_channels.insert(scope, thread_tags);
                 }
             }
@@ -3280,7 +3288,9 @@ async fn tokio_main() -> Result<()> {
                     &ctx,
                     &mut last_activity,
                     observer.as_ref(),
-                ) {
+                )
+                .await
+                {
                     typing_channels.insert(scope, thread_tags);
                 }
             }
@@ -3312,7 +3322,9 @@ async fn tokio_main() -> Result<()> {
                             &ctx,
                             &mut last_activity,
                             observer.as_ref(),
-                        ) {
+                        )
+                        .await
+                        {
                             typing_channels.insert(scope, thread_tags);
                         }
                     }
@@ -3694,12 +3706,31 @@ fn try_native_steer(
 // ── dispatch_pending ──────────────────────────────────────────────────────────
 
 /// Flush queued work to available agents.
-fn dispatch_pending(
+async fn dispatch_pending(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
     ctx: &Arc<PromptContext>,
     last_activity: &mut tokio::time::Instant,
     observer: Option<&observer::ObserverHandle>,
+) -> Vec<(scope::SessionScope, ThreadTags)> {
+    dispatch_pending_at(
+        pool,
+        queue,
+        ctx,
+        last_activity,
+        observer,
+        std::time::Instant::now(),
+    )
+    .await
+}
+
+async fn dispatch_pending_at(
+    pool: &mut AgentPool,
+    queue: &mut EventQueue,
+    ctx: &Arc<PromptContext>,
+    last_activity: &mut tokio::time::Instant,
+    observer: Option<&observer::ObserverHandle>,
+    now: std::time::Instant,
 ) -> Vec<(scope::SessionScope, ThreadTags)> {
     // Keyed by the exact session scope, not the channel: two threads dispatching
     // concurrently in one channel get distinct typing entries so completing one
@@ -3712,9 +3743,6 @@ fn dispatch_pending(
     // once the bounded hold expires) reuses that exact session or forks a fresh
     // one instead of starving.
     let mut held: Vec<FlushBatch> = Vec::new();
-    // One clock read for the whole cycle so every batch's bounded-hold window is
-    // measured against the same instant.
-    let now = std::time::Instant::now();
     loop {
         let batch = match queue.flush_next() {
             Some(b) => b,
@@ -3794,7 +3822,7 @@ fn dispatch_pending(
         // thread's provider session so a temporarily busy worker cannot cause
         // another to open a duplicate session for the same thread.
         let affinity_hit = pool.has_session_for(&scope);
-        let mut agent = match pool.try_claim(Some(&scope)) {
+        let mut agent = match pool.try_claim(Some(&scope)).await {
             Some(a) => a,
             None => {
                 let pending = queue.pending_channels();
@@ -4210,7 +4238,7 @@ async fn handle_prompt_result(
                 outcome = outcome_label,
                 "agent_returned"
             );
-            pool.return_agent(result.agent);
+            pool.return_agent(result.agent).await;
         }
         // Fatal outcomes: the agent subprocess is dead or poisoned — respawn it.
         PromptOutcome::AgentExited | PromptOutcome::Timeout(_) => {
@@ -4317,7 +4345,7 @@ async fn handle_prompt_result(
                 pid = harness_pid,
                 "agent_returned (cancelled)"
             );
-            pool.return_agent(result.agent);
+            pool.return_agent(result.agent).await;
         }
         PromptOutcome::Error(ref e) => {
             let is_transport_error = matches!(
@@ -4367,7 +4395,7 @@ async fn handle_prompt_result(
                     "agent_returned (application error — pipe intact)"
                 );
                 emit_turn_error(&e.to_string(), error_code);
-                pool.return_agent(result.agent);
+                pool.return_agent(result.agent).await;
             }
         }
     }
@@ -4525,7 +4553,7 @@ fn drain_ready_join_results(
     LoopAction::Continue
 }
 
-fn dispatch_heartbeat(
+async fn dispatch_heartbeat(
     pool: &mut AgentPool,
     ctx: &Arc<PromptContext>,
     heartbeat_in_flight: &mut bool,
@@ -4533,7 +4561,7 @@ fn dispatch_heartbeat(
     if *heartbeat_in_flight {
         return;
     }
-    let agent = match pool.try_claim(None) {
+    let agent = match pool.try_claim(None).await {
         Some(a) => a,
         None => return,
     };
@@ -5564,8 +5592,8 @@ mod owner_control_command_tests {
             "elapsed window => fork on an idle worker"
         );
         assert!(
-            !pool.held_since_contains(&ta),
-            "fork clears the first-held stamp"
+            pool.held_since_contains(&ta),
+            "fork eligibility retains the stamp until a worker is claimed"
         );
 
         // A conversation scope never holds even with a busy recorded owner —
@@ -5578,11 +5606,7 @@ mod owner_control_command_tests {
             "conversation scope forks a busy owner rather than holding"
         );
 
-        // Re-stamp A's hold so channel invalidation has an entry to prune.
-        assert!(matches!(
-            pool.hold_decision(&ta, now, pool::HOLD_BUSY_OWNER_TIMEOUT),
-            pool::HoldDecision::Hold { .. }
-        ));
+        // The expired hold remains tracked until invalidation prunes it.
         assert!(pool.held_since_contains(&ta));
 
         // Channel-wide session invalidation prunes the owner directory and the

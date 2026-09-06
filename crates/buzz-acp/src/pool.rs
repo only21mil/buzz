@@ -587,10 +587,13 @@ pub struct AgentPool {
     session_owners: HashMap<SessionScope, usize>,
     /// First time each scope was held for a busy owner, so the bounded hold can
     /// expire and fork rather than starve behind an unbounded turn. Derived
-    /// state: cleared on every dispatch/invalidation path, and only ever holds
+    /// state: cleared on successful claim or invalidation, and only ever holds
     /// `Thread` scopes (the sole variant [`hold_decision`](Self::hold_decision)
     /// stamps).
     held_since: HashMap<SessionScope, std::time::Instant>,
+    /// Exact scopes to retire before a worker returns or is reused. Indexed by
+    /// worker so rotation also reaches sessions hidden by a sibling turn.
+    pending_scope_invalidations: HashMap<usize, HashSet<SessionScope>>,
 }
 
 /// Result returned by a completed prompt task.
@@ -976,13 +979,23 @@ impl AgentPool {
             reap_cursor: 0,
             session_owners: HashMap::new(),
             held_since: HashMap::new(),
+            pending_scope_invalidations: HashMap::new(),
         }
     }
 
     /// Record which worker is handling `scope` so a later dispatch can detect a
     /// busy owner and avoid opening a duplicate session on another worker.
     pub fn record_scope_owner(&mut self, scope: SessionScope, agent_index: usize) {
-        self.session_owners.insert(scope, agent_index);
+        self.held_since.remove(&scope);
+        if let Some(previous) = self.session_owners.insert(scope.clone(), agent_index) {
+            // Conversation scopes retain their existing any-worker affinity.
+            if scope.is_thread() && previous != agent_index {
+                self.pending_scope_invalidations
+                    .entry(previous)
+                    .or_default()
+                    .insert(scope);
+            }
+        }
     }
 
     /// True when this scope should be **held** (left queued) rather than
@@ -1029,7 +1042,8 @@ impl AgentPool {
         let first = *self.held_since.entry(scope.clone()).or_insert(now);
         let held_for = now.saturating_duration_since(first);
         if held_for >= timeout {
-            self.held_since.remove(scope);
+            // Keep expiry through pool exhaustion; claiming or invalidation
+            // ends the wait, not merely deciding that a fork is eligible.
             HoldDecision::ForkAfterHold {
                 held_for,
                 owner_index,
@@ -1045,32 +1059,66 @@ impl AgentPool {
     /// Try to claim an idle agent for the given session scope (or heartbeat if
     /// `None`).
     ///
-    /// Pass 1: prefer an agent that already has a session for this exact scope
-    /// (thread affinity — repeated activity in a thread reuses that thread's
-    /// provider session).
+    /// Pass 1: prefer a reusable session for this exact scope. Thread scopes
+    /// reuse only the recorded owner; conversation scopes retain any-worker
+    /// affinity. Retired sessions are closed before the worker is handed out.
     /// Pass 2: any idle agent.
     ///
     /// Returns `None` if all agents are checked out.
-    pub fn try_claim(&mut self, scope: Option<&SessionScope>) -> Option<OwnedAgent> {
-        // Pass 1: prefer agent with existing session for this scope.
-        if let Some(scope) = scope {
-            let idx = self.agents.iter().position(|slot| {
+    pub async fn try_claim(&mut self, scope: Option<&SessionScope>) -> Option<OwnedAgent> {
+        let affinity = scope.and_then(|scope| {
+            self.agents.iter().position(|slot| {
                 slot.as_ref()
-                    .map(|a| a.state.has_reusable_channel_session(scope))
-                    .unwrap_or(false)
-            });
-            if let Some(i) = idx {
-                return self.agents[i].take();
+                    .is_some_and(|agent| self.can_reuse_scope(agent, scope))
+            })
+        });
+        let index = affinity.or_else(|| self.agents.iter().position(Option::is_some))?;
+        let mut agent = self.agents[index].take()?;
+        self.apply_scope_invalidations(&mut agent).await;
+        if let Some(scope) = scope {
+            // A former owner may be the only free worker after another timed
+            // fork. It can accept work, but must start a fresh provider session.
+            if scope.is_thread()
+                && self
+                    .session_owners
+                    .get(scope)
+                    .is_some_and(|owner| *owner != index)
+            {
+                agent
+                    .invalidate_scope(scope, "superseded_scope_owner")
+                    .await;
+            }
+            self.held_since.remove(scope);
+        }
+        Some(agent)
+    }
+
+    fn can_reuse_scope(&self, agent: &OwnedAgent, scope: &SessionScope) -> bool {
+        (!scope.is_thread()
+            || self
+                .session_owners
+                .get(scope)
+                .is_none_or(|owner| *owner == agent.index))
+            && !self
+                .pending_scope_invalidations
+                .get(&agent.index)
+                .is_some_and(|scopes| scopes.contains(scope))
+            && agent.state.has_reusable_channel_session(scope)
+    }
+
+    async fn apply_scope_invalidations(&mut self, agent: &mut OwnedAgent) {
+        if let Some(scopes) = self.pending_scope_invalidations.remove(&agent.index) {
+            for scope in scopes {
+                agent
+                    .invalidate_scope(&scope, "deferred_scope_invalidation")
+                    .await;
             }
         }
-
-        // Pass 2: first idle agent.
-        let idx = self.agents.iter().position(|slot| slot.is_some());
-        idx.map(|i| self.agents[i].take().unwrap())
     }
 
     /// Return an agent to its slot after a task completes.
-    pub fn return_agent(&mut self, agent: OwnedAgent) {
+    pub async fn return_agent(&mut self, mut agent: OwnedAgent) {
+        self.apply_scope_invalidations(&mut agent).await;
         let idx = agent.index;
         if self.agents[idx].is_some() {
             // This is a bug: two tasks returned the same agent index. Log it
@@ -1090,14 +1138,13 @@ impl AgentPool {
         self.agents.iter().any(|slot| slot.is_some())
     }
 
-    /// Whether any idle agent already has a session for `scope`.
+    /// Whether an idle agent has an eligible reusable session for `scope`.
     /// Used to compute `affinity_hit` before calling `try_claim`.
     pub fn has_session_for(&self, scope: &SessionScope) -> bool {
-        self.agents.iter().any(|slot| {
-            slot.as_ref()
-                .map(|a| a.state.has_reusable_channel_session(scope))
-                .unwrap_or(false)
-        })
+        self.agents
+            .iter()
+            .flatten()
+            .any(|agent| self.can_reuse_scope(agent, scope))
     }
 
     /// Count of agents that are alive: idle OR checked out (have a task_map entry).
@@ -1277,7 +1324,8 @@ impl AgentPool {
     /// session, leaving sibling threads in the same channel untouched. Under the
     /// default channel policy the scope is `Conversation(channel_id)` — the sole
     /// scope for the channel — so this matches the channel-wide behavior.
-    /// Returns the number of workers that held a session for the scope.
+    /// Checked-out workers retire this scope on return. Returns the number of
+    /// idle workers whose sessions were invalidated immediately.
     pub async fn invalidate_scope_session(&mut self, scope: &SessionScope) -> usize {
         let mut count = 0;
         for slot in &mut self.agents {
@@ -1286,6 +1334,12 @@ impl AgentPool {
                     count += 1;
                 }
             }
+        }
+        for meta in self.task_map.values() {
+            self.pending_scope_invalidations
+                .entry(meta.agent_index)
+                .or_default()
+                .insert(scope.clone());
         }
         self.session_owners.remove(scope);
         self.held_since.remove(scope);
@@ -6756,6 +6810,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         ));
         let agent = pool
             .try_claim(Some(&conv(channel_id)))
+            .await
             .expect("claim returned agent");
 
         let mut ctx = make_prompt_context_no_owner();
@@ -7451,6 +7506,388 @@ done"#
         agent
     }
 
+    async fn affinity_test_agent(index: usize) -> (OwnedAgent, std::path::PathBuf) {
+        let capture = std::env::temp_dir().join(format!("buzz-affinity-{}.ndjson", Uuid::new_v4()));
+        let script = r#"
+import json, sys
+serial = 0
+for line in sys.stdin:
+    request = json.loads(line)
+    with open(sys.argv[1], 'a') as output:
+        output.write(line)
+    method = request.get('method')
+    result = {}
+    if method == 'session/new':
+        serial += 1
+        result = {'sessionId': 'worker-' + sys.argv[2] + '-' + str(serial)}
+    elif method == 'session/prompt':
+        result = {'stopReason': 'end_turn'}
+    if 'id' in request:
+        print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
+"#;
+        let acp = AcpClient::spawn(
+            "python3",
+            &[
+                "-u".into(),
+                "-c".into(),
+                script.into(),
+                capture.to_string_lossy().into_owned(),
+                index.to_string(),
+            ],
+            &[],
+            false,
+        )
+        .await
+        .unwrap();
+        (
+            OwnedAgent {
+                index,
+                acp,
+                state: SessionState::default(),
+                model_capabilities: None,
+                desired_model: None,
+                model_overridden: false,
+                agent_name: "test".into(),
+                goose_system_prompt_supported: None,
+                protocol_version: 1,
+            },
+            capture,
+        )
+    }
+
+    async fn affinity_context(
+        channel_id: Uuid,
+    ) -> (Arc<PromptContext>, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.rest_client.base_url = format!("http://{}", listener.local_addr().unwrap());
+        ctx.channel_info = ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                crate::relay::ChannelInfo {
+                    name: "affinity-test".into(),
+                    channel_type: "channel".into(),
+                },
+            )]),
+            ctx.rest_client.clone(),
+        );
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0; 16 * 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]").await;
+            }
+        });
+        (Arc::new(ctx), server)
+    }
+
+    fn affinity_enqueue(
+        queue: &mut crate::queue::EventQueue,
+        scope: &SessionScope,
+    ) -> nostr::Event {
+        let event = EventBuilder::new(Kind::Custom(9), "affinity lifecycle turn")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        assert!(queue.push(crate::queue::QueuedEvent {
+            channel_id: scope.channel_id(),
+            scope: scope.clone(),
+            event: event.clone(),
+            received_at: std::time::Instant::now(),
+            prompt_tag: "test".into(),
+        }));
+        event
+    }
+
+    async fn affinity_finish_turn(
+        pool: &mut AgentPool,
+        queue: &mut crate::queue::EventQueue,
+    ) -> usize {
+        let result = tokio::time::timeout(Duration::from_secs(5), pool.result_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        let index = result.agent.index;
+        pool.task_map.retain(|_, meta| meta.agent_index != index);
+        if let PromptSource::Channel(scope) = result.source {
+            queue.mark_complete(scope);
+        }
+        pool.return_agent(result.agent).await;
+        index
+    }
+
+    async fn affinity_turn(pool: &mut AgentPool, scope: &SessionScope) -> usize {
+        let mut queue = crate::queue::EventQueue::new(DedupMode::Queue);
+        affinity_enqueue(&mut queue, scope);
+        let (ctx, server) = affinity_context(scope.channel_id()).await;
+        let dispatched = crate::dispatch_pending(
+            pool,
+            &mut queue,
+            &ctx,
+            &mut tokio::time::Instant::now(),
+            None,
+        )
+        .await;
+        assert_eq!(dispatched.len(), 1);
+        let index = affinity_finish_turn(pool, &mut queue).await;
+        server.abort();
+        index
+    }
+
+    fn affinity_requests(path: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn affinity_expired_dispatch_survives_exhaustion_and_preserves_inbox() {
+        for dedup in [DedupMode::Queue, DedupMode::Drop] {
+            let ch = Uuid::new_v4();
+            let scope = thread_scope(ch, &"a".repeat(64));
+            let sibling = thread_scope(ch, &"b".repeat(64));
+            let (owner, owner_capture) = affinity_test_agent(0).await;
+            let (other, other_capture) = affinity_test_agent(1).await;
+            let mut pool = AgentPool::from_slots(vec![Some(owner), Some(other)]);
+            assert_eq!(affinity_turn(&mut pool, &scope).await, 0);
+            let mut owner = pool.try_claim(Some(&scope)).await.unwrap();
+            let other = pool.try_claim(None).await.unwrap();
+            mark_agent_busy(&mut pool, 0, sibling.clone());
+            mark_agent_busy(&mut pool, 1, thread_scope(Uuid::new_v4(), &"c".repeat(64)));
+            let mut queue = crate::queue::EventQueue::new(dedup);
+            let event = affinity_enqueue(&mut queue, &scope);
+            let dir = std::env::temp_dir().join(format!("buzz-affinity-inbox-{}", Uuid::new_v4()));
+            let mut cursor = crate::InboxCursorStore::load(&dir, "test", 0, 10);
+            assert!(cursor.begin_event(&event));
+            let (ctx, server) = affinity_context(ch).await;
+            let start = std::time::Instant::now();
+            let mut activity = tokio::time::Instant::now();
+            for now in [start, start + HOLD_BUSY_OWNER_TIMEOUT] {
+                assert!(crate::dispatch_pending_at(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut activity,
+                    None,
+                    now
+                )
+                .await
+                .is_empty());
+                assert!(queue.has_flushable_work());
+                let mut restarted = crate::InboxCursorStore::load(&dir, "test", 0, 10);
+                assert!(
+                    restarted.begin_event(&event),
+                    "held or exhausted work must replay"
+                );
+            }
+            pool.task_map.retain(|_, meta| meta.agent_index != 1);
+            pool.return_agent(other).await;
+            let dispatched = crate::dispatch_pending_at(
+                &mut pool,
+                &mut queue,
+                &ctx,
+                &mut activity,
+                None,
+                start + HOLD_BUSY_OWNER_TIMEOUT + Duration::from_millis(1),
+            )
+            .await;
+            assert_eq!(
+                dispatched.len(),
+                1,
+                "new capacity must not restart the ten-second hold"
+            );
+            assert!(!pool.held_since.contains_key(&scope));
+            assert_eq!(affinity_finish_turn(&mut pool, &mut queue).await, 1);
+            let mut restarted = crate::InboxCursorStore::load(&dir, "test", 0, 10);
+            assert!(
+                restarted.begin_event(&event),
+                "dispatch/provider delivery alone never retires inbox work"
+            );
+            server.abort();
+            owner.acp.shutdown().await;
+            pool.agents[1].as_mut().unwrap().acp.shutdown().await;
+            for path in [owner_capture, other_capture] {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn affinity_fork_retires_returned_former_owner_and_keeps_new_history() {
+        let ch = Uuid::new_v4();
+        let scope = thread_scope(ch, &"a".repeat(64));
+        let sibling = thread_scope(ch, &"b".repeat(64));
+        let (owner, capture0) = affinity_test_agent(0).await;
+        let (other, capture1) = affinity_test_agent(1).await;
+        let mut pool = AgentPool::from_slots(vec![Some(owner), Some(other)]);
+        assert_eq!(affinity_turn(&mut pool, &scope).await, 0);
+        assert_eq!(affinity_turn(&mut pool, &sibling).await, 0);
+        let owner = pool.try_claim(Some(&sibling)).await.unwrap();
+        let old_session = owner.state.sessions[&scope].clone();
+        let sibling_session = owner.state.sessions[&sibling].clone();
+        mark_agent_busy(&mut pool, 0, sibling.clone());
+        let start = std::time::Instant::now();
+        let mut queue = crate::queue::EventQueue::new(DedupMode::Queue);
+        affinity_enqueue(&mut queue, &scope);
+        let (ctx, server) = affinity_context(ch).await;
+        let mut activity = tokio::time::Instant::now();
+        assert!(crate::dispatch_pending_at(
+            &mut pool,
+            &mut queue,
+            &ctx,
+            &mut activity,
+            None,
+            start
+        )
+        .await
+        .is_empty());
+        assert_eq!(
+            crate::dispatch_pending_at(
+                &mut pool,
+                &mut queue,
+                &ctx,
+                &mut activity,
+                None,
+                start + HOLD_BUSY_OWNER_TIMEOUT
+            )
+            .await
+            .len(),
+            1
+        );
+        assert_eq!(affinity_finish_turn(&mut pool, &mut queue).await, 1);
+        let new_session = pool.agents[1].as_ref().unwrap().state.sessions[&scope].clone();
+        assert_ne!(old_session, new_session);
+        pool.task_map.retain(|_, meta| meta.agent_index != 0);
+        pool.return_agent(owner).await;
+        let old = pool.agents[0].as_ref().unwrap();
+        assert!(!old.state.has_reusable_channel_session(&scope));
+        assert!(!old.state.deliveries.contains_key(&scope));
+        assert_eq!(old.state.sessions[&sibling], sibling_session);
+        assert!(old.state.deliveries.contains_key(&sibling));
+        assert_eq!(affinity_turn(&mut pool, &scope).await, 1);
+        assert_eq!(
+            pool.agents[1].as_ref().unwrap().state.sessions[&scope],
+            new_session
+        );
+
+        // While the new owner is busy, the former owner must neither count as
+        // an affinity hit nor bypass the bounded hold.
+        let new_owner = pool.try_claim(Some(&scope)).await.unwrap();
+        mark_agent_busy(&mut pool, 1, sibling);
+        assert!(!pool.has_session_for(&scope));
+        assert!(matches!(
+            pool.hold_decision(&scope, start, HOLD_BUSY_OWNER_TIMEOUT),
+            HoldDecision::Hold { owner_index: 1, .. }
+        ));
+        pool.task_map.clear();
+        pool.return_agent(new_owner).await;
+        server.abort();
+        let requests = affinity_requests(&capture0);
+        let retired: Vec<_> = requests
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r["method"].as_str(),
+                    Some("session/close" | "session/delete")
+                )
+            })
+            .collect();
+        assert_eq!(retired.len(), 2);
+        assert!(retired
+            .iter()
+            .all(|r| r["params"]["sessionId"] == old_session));
+        for agent in pool.agents.iter_mut().flatten() {
+            agent.acp.shutdown().await;
+        }
+        for path in [capture0, capture1] {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn affinity_conversation_keeps_existing_any_worker_reuse() {
+        let scope = conv(Uuid::new_v4());
+        let (mut first, _) = affinity_test_agent(0).await;
+        let (mut second, _) = affinity_test_agent(1).await;
+        first
+            .state
+            .sessions
+            .insert(scope.clone(), "first-session".into());
+        second
+            .state
+            .sessions
+            .insert(scope.clone(), "second-session".into());
+        let mut pool = AgentPool::from_slots(vec![Some(first), Some(second)]);
+        pool.record_scope_owner(scope.clone(), 0);
+        pool.record_scope_owner(scope.clone(), 1);
+        assert!(pool.pending_scope_invalidations.is_empty());
+        let mut claimed = pool.try_claim(Some(&scope)).await.unwrap();
+        assert_eq!(claimed.index, 0);
+        assert_eq!(claimed.state.sessions[&scope], "first-session");
+        claimed.acp.shutdown().await;
+        pool.agents[1].as_mut().unwrap().acp.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn affinity_scoped_rotation_retires_live_and_cold_sessions_after_sibling_return() {
+        for cold in [false, true] {
+            let ch = Uuid::new_v4();
+            let scope = thread_scope(ch, &"a".repeat(64));
+            let sibling = thread_scope(ch, &"b".repeat(64));
+            let (agent, capture) = affinity_test_agent(0).await;
+            let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+            affinity_turn(&mut pool, &scope).await;
+            affinity_turn(&mut pool, &sibling).await;
+            let mut agent = pool.try_claim(Some(&sibling)).await.unwrap();
+            let old_session = agent.state.sessions[&scope].clone();
+            let sibling_session = agent.state.sessions[&sibling].clone();
+            if cold {
+                agent.state.sessions.remove(&scope);
+                agent
+                    .state
+                    .cold_sessions
+                    .insert(scope.clone(), old_session.clone());
+            }
+            mark_agent_busy(&mut pool, 0, sibling.clone());
+            assert_eq!(pool.invalidate_scope_session(&scope).await, 0);
+            assert!(!pool.session_owners.contains_key(&scope));
+            pool.task_map.clear();
+            pool.return_agent(agent).await;
+            let returned = pool.agents[0].as_ref().unwrap();
+            assert!(!returned.state.has_reusable_channel_session(&scope));
+            assert!(!returned.state.deliveries.contains_key(&scope));
+            assert_eq!(returned.state.sessions[&sibling], sibling_session);
+            assert!(returned.state.deliveries.contains_key(&sibling));
+            affinity_turn(&mut pool, &scope).await;
+            assert_ne!(
+                pool.agents[0].as_ref().unwrap().state.sessions[&scope],
+                old_session
+            );
+            let requests = affinity_requests(&capture);
+            let retired: Vec<_> = requests
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        r["method"].as_str(),
+                        Some("session/close" | "session/delete")
+                    )
+                })
+                .collect();
+            assert_eq!(retired.len(), 2);
+            assert!(retired
+                .iter()
+                .all(|r| r["params"]["sessionId"] == old_session));
+            pool.agents[0].as_mut().unwrap().acp.shutdown().await;
+            std::fs::remove_file(capture).unwrap();
+        }
+    }
+
     // `hold_decision` is gated on the scope variant (not session policy),
     // short-circuits when an idle worker already holds the session or no busy
     // owner is recorded, and only a busy `Thread` owner holds — for a bounded
@@ -7486,12 +7923,12 @@ done"#
             },
             // An idle worker already holds the thread session — reuse it.
             Row {
-                name: "thread + idle session dispatches",
+                name: "thread + idle former owner holds",
                 is_thread: true,
                 has_session: true,
                 owner_busy: true,
                 elapsed: Duration::ZERO,
-                expect: Expect::Dispatch,
+                expect: Expect::Hold,
             },
             // No busy owner recorded — nothing to wait for.
             Row {
@@ -7562,8 +7999,11 @@ done"#
                 _ => panic!("{}: expected {:?}, got {decision:?}", row.name, row.expect),
             }
 
-            // held_since holds the scope only while a Hold is outstanding.
-            if matches!(decision, HoldDecision::Hold { .. }) {
+            // Eligibility must remain expired until a claim succeeds.
+            if matches!(
+                decision,
+                HoldDecision::Hold { .. } | HoldDecision::ForkAfterHold { .. }
+            ) {
                 assert!(
                     pool.held_since.contains_key(&scope),
                     "{}: hold stamps held_since",
@@ -7572,7 +8012,7 @@ done"#
             } else {
                 assert!(
                     !pool.held_since.contains_key(&scope),
-                    "{}: dispatch/fork clears held_since",
+                    "{}: immediate dispatch clears held_since",
                     row.name
                 );
             }
