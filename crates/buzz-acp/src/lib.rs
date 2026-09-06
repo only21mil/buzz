@@ -1778,7 +1778,7 @@ async fn tokio_main() -> Result<()> {
     let mut inbox_cursor = InboxCursorStore::load(
         &config.state_dir,
         &pubkey_hex,
-        startup_watermark,
+        config::startup_replay_floor(startup_watermark, config.replay_floor_unix),
         config.inbox_reorder_window_secs,
     );
     match inbox_cursor.load_status() {
@@ -1795,8 +1795,16 @@ async fn tokio_main() -> Result<()> {
             "durable inbox cursor is unreadable or corrupt; falling back to startup watermark replay (now - 5s)"
         ),
     }
-    let inbox_catchup_floor =
+    let mut inbox_catchup_floor =
         inbox_cursor.catchup_since(startup_watermark, config.inbox_catchup_max_age_secs);
+    // The durable cursor remains authoritative for retirement/dedup. A pending
+    // publish-first wake may only widen the startup read window, never advance
+    // it or replace the real clock used for durable catch-up age/future clamps.
+    inbox_catchup_floor.since = config::effective_startup_catchup_since(
+        inbox_catchup_floor.since,
+        startup_watermark,
+        config.replay_floor_unix,
+    );
     if let Some(cursor_timestamp) = inbox_catchup_floor.age_truncated_from {
         tracing::warn!(
             cursor_timestamp,
@@ -7272,6 +7280,7 @@ mod build_mcp_servers_tests {
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
             session_policy: scope::SessionPolicy::Channel,
+            replay_floor_unix: None,
             multiple_event_handling: config::MultipleEventHandling::Queue,
             ignore_self: true,
             kinds_override: None,
@@ -7501,6 +7510,7 @@ mod error_outcome_emission_tests {
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
             session_policy: scope::SessionPolicy::Channel,
+            replay_floor_unix: None,
             multiple_event_handling: config::MultipleEventHandling::Queue,
             ignore_self: true,
             kinds_override: None,

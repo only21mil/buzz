@@ -11,6 +11,7 @@ pub(crate) use agent_env::{
 mod backend;
 pub(crate) mod config_bridge;
 pub(crate) mod custom_harnesses;
+pub(crate) mod deferred_start;
 mod discovery;
 pub(crate) mod effective_config;
 mod env_vars;

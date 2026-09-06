@@ -63,6 +63,7 @@ pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
     // desktop/provider-owned bounds while the saved record still promises them.
     "BUZZ_ACP_EXIT_AFTER_INACTIVITY",
     "BUZZ_ACP_SESSION_POLICY",
+    "BUZZ_ACP_REPLAY_FLOOR",
     "BUZZ_ACP_NO_PRESENCE",
     // Readiness handoff: desktop is the ONLY readiness source. A saved or
     // ambient env var must not be able to forge setup mode (NotReady) on a

@@ -399,6 +399,10 @@ pub struct CliArgs {
         value_enum
     )]
     pub session_policy: crate::scope::SessionPolicy,
+    /// Invocation-only replay floor for an accepted publish-first message.
+    /// The consumer clamps this to the fifteen minutes preceding startup.
+    #[arg(long, env = "BUZZ_ACP_REPLAY_FLOOR")]
+    pub replay_floor: Option<u64>,
 
     /// How to handle new @mentions while a turn is already in-flight.
     /// steer (default): cancel+re-prompt, framing the new mention as a message
@@ -583,6 +587,8 @@ pub struct Config {
     pub dedup_mode: DedupMode,
     /// How ACP provider sessions are scoped in channels (channel vs thread).
     pub session_policy: crate::scope::SessionPolicy,
+    /// Invocation-only replay floor, bounded at startup without changing the durable cursor.
+    pub replay_floor_unix: Option<u64>,
     pub multiple_event_handling: MultipleEventHandling,
     pub ignore_self: bool,
     pub kinds_override: Option<Vec<u32>>,
@@ -1193,6 +1199,7 @@ impl Config {
             subscribe_mode: args.subscribe,
             dedup_mode: args.dedup,
             session_policy: args.session_policy,
+            replay_floor_unix: args.replay_floor,
             multiple_event_handling: args.multiple_event_handling,
             ignore_self: !args.no_ignore_self,
             kinds_override: args.kinds,
@@ -1577,6 +1584,7 @@ mod tests {
             subscribe_mode: mode,
             dedup_mode: DedupMode::Queue,
             session_policy: crate::scope::SessionPolicy::Channel,
+            replay_floor_unix: None,
             multiple_event_handling: MultipleEventHandling::Queue,
             ignore_self: true,
             kinds_override: None,
@@ -3170,5 +3178,37 @@ channels = "ALL"
             "Found secret-bearing env args without hide_env_values=true. \
              Add `hide_env_values = true` to each: {violations:?}"
         );
+    }
+}
+
+/// Bound one invocation's replay window without altering the real startup clock.
+pub(crate) fn startup_replay_floor(now: u64, requested: Option<u64>) -> u64 {
+    requested
+        .map(|floor| floor.clamp(now.saturating_sub(15 * 60), now))
+        .unwrap_or(now)
+}
+
+/// A pending wake only widens the durable startup subscription window.
+pub(crate) fn effective_startup_catchup_since(
+    durable_since: u64,
+    now: u64,
+    requested: Option<u64>,
+) -> u64 {
+    match requested {
+        Some(_) => durable_since.min(startup_replay_floor(now, requested)),
+        None => durable_since,
+    }
+}
+
+#[cfg(test)]
+mod replay_floor_tests {
+    use super::startup_replay_floor;
+    #[test]
+    fn replay_floor_is_bounded_and_optional() {
+        assert_eq!(startup_replay_floor(1000, None), 1000);
+        assert_eq!(startup_replay_floor(1000, Some(997)), 997);
+        assert_eq!(startup_replay_floor(1000, Some(0)), 100);
+        assert_eq!(startup_replay_floor(1000, Some(2000)), 1000);
+        assert_eq!(startup_replay_floor(10, Some(0)), 0);
     }
 }

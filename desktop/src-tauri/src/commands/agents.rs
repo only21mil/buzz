@@ -1,3 +1,4 @@
+use crate::managed_agents::deferred_start::{apply_replay_floor_payload, DeferredAgentStart};
 use nostr::{Keys, ToBech32};
 use tauri::{AppHandle, State};
 
@@ -7,12 +8,11 @@ use crate::{
         build_managed_agent_summary, current_instance_id, discover_provider_candidates,
         ensure_persona_is_active, find_managed_agent_mut, load_managed_agents, load_personas,
         load_teams, managed_agent_avatar_url, normalize_agent_args, provider_deploy,
-        resolve_provider_binary, save_managed_agents, start_managed_agent_process,
-        stop_managed_agent_process, stop_managed_agent_workspace_pair,
-        sync_managed_agent_processes, try_regenerate_nest, validate_provider_config, BackendKind,
-        CreateManagedAgentRequest, CreateManagedAgentResponse, ManagedAgentRecord,
-        ManagedAgentSummary, RelayMeshConfig, DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM,
-        DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
+        resolve_provider_binary, save_managed_agents, stop_managed_agent_process,
+        stop_managed_agent_workspace_pair, sync_managed_agent_processes, try_regenerate_nest,
+        validate_provider_config, BackendKind, CreateManagedAgentRequest,
+        CreateManagedAgentResponse, ManagedAgentRecord, ManagedAgentSummary, RelayMeshConfig,
+        DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM, DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
     },
     relay::{relay_ws_url_with_override, sync_managed_agent_profile},
     util::now_iso,
@@ -370,6 +370,7 @@ pub(super) async fn start_local_agent_with_preflight(
     pubkey: &str,
     owner_hex: &str,
     allow_fresh_create_start: bool,
+    start_scope: Option<&DeferredAgentStart>,
 ) -> Result<ManagedAgentSummary, String> {
     let record_snapshot = {
         let _store_guard = state
@@ -439,7 +440,25 @@ pub(super) async fn start_local_agent_with_preflight(
             }
         }
     }
-    start_managed_agent_process(app, record, &mut runtimes, Some(owner_hex))?;
+    if let Some(scope) = start_scope {
+        scope.validate(state)?;
+    }
+    if start_scope.is_some() {
+        crate::managed_agents::start_managed_agent_process_scoped(
+            app,
+            record,
+            &mut runtimes,
+            Some(owner_hex),
+            start_scope,
+        )?;
+    } else {
+        crate::managed_agents::start_managed_agent_process(
+            app,
+            record,
+            &mut runtimes,
+            Some(owner_hex),
+        )?;
+    }
     save_managed_agents(app, &records)?;
     if let Some(saved_record) = records.iter().find(|r| r.pubkey == pubkey) {
         if let Err(e) = retain_managed_agent_pending(app, state, saved_record) {
@@ -460,72 +479,9 @@ pub(super) async fn start_local_agent_with_preflight(
     )
 }
 
-/// Deploy an agent to a provider backend. Resolves the binary, calls deploy via
-/// spawn_blocking, and persists the result (backend_agent_id or last_error).
-///
-/// Idempotency: calling deploy on an already-deployed agent sends the same payload
-/// again. Providers are expected to handle this as an update-in-place or no-op —
-/// the protocol does not include an explicit `undeploy` operation (deferred to v2).
-///
-/// Returns Ok(()) on success, Err(message) on failure. Either way the record is
-/// updated and saved before returning.
-async fn deploy_to_provider(
-    app: &AppHandle,
-    state: &AppState,
-    pubkey: &str,
-    provider_id: &str,
-    config: &serde_json::Value,
-    agent_json: serde_json::Value,
-    cached_binary_path: Option<&str>,
-) -> Result<(), String> {
-    // Resolve via discovered candidates only. Cached path must match BOTH
-    // "is a discovered candidate" AND "belongs to this provider_id". A tampered
-    // record cannot redirect deploys to a different provider's binary.
-    let bin_path = cached_binary_path
-        .map(std::path::PathBuf::from)
-        .filter(|p| p.exists())
-        .map(|p| p.canonicalize().unwrap_or(p))
-        .filter(|canonical| {
-            discover_provider_candidates().iter().any(|(id, cp)| {
-                id == provider_id && cp.canonicalize().ok().as_ref() == Some(canonical)
-            })
-        })
-        .map_or_else(|| resolve_provider_binary(provider_id), Ok)?;
-
-    let config_clone = config.clone();
-    let deploy_result =
-        tokio::task::spawn_blocking(move || provider_deploy(&bin_path, &agent_json, &config_clone))
-            .await
-            .map_err(|e| format!("spawn_blocking failed: {e}"))?;
-
-    // Persist result under lock.
-    let _store_guard = state
-        .managed_agents_store_lock
-        .lock()
-        .map_err(|e| e.to_string())?;
-    let mut records = load_managed_agents(app)?;
-    let rec = records
-        .iter_mut()
-        .find(|r| r.pubkey == pubkey)
-        .ok_or_else(|| format!("agent {pubkey} not found"))?;
-
-    match deploy_result {
-        Ok(backend_agent_id) => {
-            rec.backend_agent_id = Some(backend_agent_id);
-            rec.last_started_at = Some(now_iso());
-            rec.updated_at = now_iso();
-            rec.last_error = None;
-        }
-        Err(ref e) => {
-            rec.last_error = Some(e.clone());
-            rec.updated_at = now_iso();
-            save_managed_agents(app, &records)?;
-            return Err(e.clone());
-        }
-    }
-    save_managed_agents(app, &records)?;
-    Ok(())
-}
+#[path = "agents/provider_deploy.rs"]
+mod provider_deploy;
+use provider_deploy::deploy_to_provider;
 
 // Async so the blocking body (disk reads of agent/persona records, per-agent
 // process-liveness syscalls, and a possible save) runs on Tauri's worker pool
@@ -960,7 +916,8 @@ pub async fn create_managed_agent(
     // ── Phase 3b: local spawn (async preflight outside store lock) ───────────
     let mut spawn_error = None;
     let agent = if input.spawn_after_create && input.backend == BackendKind::Local {
-        match start_local_agent_with_preflight(&app, &state, &pubkey, &owner_hex, true).await {
+        match start_local_agent_with_preflight(&app, &state, &pubkey, &owner_hex, true, None).await
+        {
             Ok(agent) => agent,
             Err(error) => {
                 let _store_guard = state
@@ -1025,7 +982,9 @@ pub async fn create_managed_agent(
                     .ok_or_else(|| "agent disappeared".to_string())?;
                 build_deploy_payload(&app, &state, rec)?
             };
-            match deploy_to_provider(&app, &state, &pubkey, id, config, agent_json, None).await {
+            match deploy_to_provider(&app, &state, &pubkey, id, config, agent_json, None, None)
+                .await
+            {
                 Ok(()) => spawn_error,
                 Err(e) => Some(e),
             }
@@ -1068,12 +1027,21 @@ pub async fn create_managed_agent(
 #[tauri::command]
 pub async fn start_managed_agent(
     pubkey: String,
+    expected_relay_url: Option<String>,
+    expected_signer_pubkey: Option<String>,
+    replay_floor_unix: Option<u64>,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ManagedAgentSummary, String> {
     // Snapshot the workspace owner pubkey for the legacy auth_tag fallback.
     // Read outside the records lock to keep lock ordering simple.
-    let owner_hex = workspace_owner_hex(&state)?;
+    let start_scope = DeferredAgentStart::capture(
+        &state,
+        expected_relay_url.as_deref(),
+        expected_signer_pubkey.as_deref(),
+        replay_floor_unix,
+    )?;
+    let owner_hex = start_scope.signer_pubkey.clone();
     enum StartTarget {
         Local,
         Provider {
@@ -1140,7 +1108,15 @@ pub async fn start_managed_agent(
 
     let result = match target {
         StartTarget::Local => {
-            start_local_agent_with_preflight(&app, &state, &pubkey, &owner_hex, false).await
+            start_local_agent_with_preflight(
+                &app,
+                &state,
+                &pubkey,
+                &owner_hex,
+                false,
+                Some(&start_scope),
+            )
+            .await
         }
         StartTarget::Provider {
             backend: BackendKind::Provider { id, config },
@@ -1155,6 +1131,7 @@ pub async fn start_managed_agent(
                 &config,
                 agent_json,
                 cached_binary_path.as_deref(),
+                Some(&start_scope),
             )
             .await?;
 
@@ -1194,9 +1171,14 @@ pub async fn start_managed_agent(
         tauri::async_runtime::spawn(async move {
             use tauri::Manager;
             let state = reconcile_app.state::<AppState>();
-            if let Err(e) =
-                reconcile_agent_profile(&state, &reconcile_app, &reconcile_pubkey, &reconcile_data)
-                    .await
+            if let Err(e) = profile::reconcile_agent_profile_at(
+                &state,
+                &reconcile_app,
+                &reconcile_pubkey,
+                &reconcile_data,
+                &start_scope.relay_url,
+            )
+            .await
             {
                 eprintln!(
                     "buzz-desktop: profile reconciliation failed for agent {reconcile_pubkey}: {e}"

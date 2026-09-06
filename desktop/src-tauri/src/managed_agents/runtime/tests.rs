@@ -1241,8 +1241,7 @@ fn make_pair_runtime_placeholder() -> crate::managed_agents::ManagedAgentPairRun
     //
     // Absolute `/usr/bin/true` on unix (present on both macOS and Linux):
     // parallel tests holding `lock_path_mutex` swap PATH to a tempdir, and a
-    // bare `true` lookup during that window fails with NotFound (observed
-    // flake). Windows keeps the PATH lookup — no test there swaps PATH.
+    // bare `true` can fail with NotFound. Windows tests do not swap PATH.
     #[cfg(unix)]
     let program = "/usr/bin/true";
     #[cfg(windows)]

@@ -574,7 +574,6 @@ pub fn run() {
                     prev_orphans = new_orphans;
                 }
             });
-
             // Drain events the retention store flagged `pending_sync` (UI
             // create/edit, delete tombstones, launch reconcile) to the relay.
             // One loop is the sole publisher for persona, team, and managed-

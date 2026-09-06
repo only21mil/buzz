@@ -471,6 +471,38 @@ mod tests {
     }
 
     #[test]
+    fn deferred_wake_widens_reads_without_retiring_or_replaying_terminal_ids() {
+        let root = std::env::temp_dir().join(format!("buzz-wake-cursor-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let keys = Keys::generate();
+        let channel = Uuid::new_v4();
+        let terminal = signed_event(&keys, channel, 980, "already completed");
+        let pending = signed_event(&keys, channel, 970, "published before deferred start");
+        let mut cursor = InboxCursorStore::load(&root, &keys.public_key().to_hex(), 900, 10);
+        assert!(cursor.begin_event(&terminal));
+        cursor.mark_processed_at([&terminal], 1000);
+        let disk = std::fs::read(cursor.path()).unwrap();
+        let mut restarted = InboxCursorStore::load(&root, &keys.public_key().to_hex(), 1000, 10);
+        let durable = restarted.catchup_since(1000, 1000).since;
+        assert_eq!(
+            crate::config::effective_startup_catchup_since(durable, 1000, Some(950)),
+            950
+        );
+        assert_eq!(
+            crate::config::effective_startup_catchup_since(800, 1000, Some(950)),
+            800
+        );
+        assert_eq!(
+            crate::config::effective_startup_catchup_since(durable, 1000, None),
+            durable
+        );
+        assert!(!restarted.begin_event(&terminal));
+        assert!(restarted.begin_event(&pending));
+        assert_eq!(std::fs::read(restarted.path()).unwrap(), disk);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn cursor_path_is_scoped_to_the_configured_state_directory() {
         let state_dir = Path::new("/home/buzz-mempool/.local/state/buzz-acp");
         let pubkey = "11".repeat(32);
