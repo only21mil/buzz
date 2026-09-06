@@ -1667,7 +1667,9 @@ impl AcpClient {
                                                     "steer accepted as {STEER_OUTCOME_STARTED_NEW_TURN}: \
                                                      awaited turn had ended — hard deadline not renewed"
                                                 );
-                                                crate::pool::SteerAck::Success
+                                                crate::pool::SteerAck::Success {
+                                                    session_id: session_id.to_owned(),
+                                                }
                                             }
                                             Some(_) => {
                                                 let renew_now = Instant::now();
@@ -1679,7 +1681,9 @@ impl AcpClient {
                                                         "steer success: renewed hard deadline ({max_duration:?} from now)"
                                                     );
                                                 }
-                                                crate::pool::SteerAck::Success
+                                                crate::pool::SteerAck::Success {
+                                                    session_id: session_id.to_owned(),
+                                                }
                                             }
                                             None => {
                                                 // Report the raw string when
@@ -3952,7 +3956,7 @@ mod tests {
             .await
             .expect("ack oneshot must have received a SteerAck");
         match ack {
-            crate::pool::SteerAck::Success => {}
+            crate::pool::SteerAck::Success { .. } => {}
             other => panic!("expected SteerAck::Success, got {other:?}"),
         }
     }
@@ -4013,7 +4017,7 @@ mod tests {
             .await
             .expect("ack oneshot must have received a SteerAck");
         match ack {
-            crate::pool::SteerAck::Success => {}
+            crate::pool::SteerAck::Success { .. } => {}
             other => panic!("expected SteerAck::Success, got {other:?}"),
         }
     }
@@ -4197,7 +4201,7 @@ mod tests {
             "_session/steering must not carry expectedRunId; wrote: {written}"
         );
         assert!(
-            matches!(ack, crate::pool::SteerAck::Success),
+            matches!(ack, crate::pool::SteerAck::Success { .. }),
             "injected outcome must ack Success, got {ack:?}"
         );
     }
@@ -4229,7 +4233,7 @@ mod tests {
         // no `outcome`) — the OutcomeRejected guard applies only to
         // `_session/steering`.
         assert!(
-            matches!(ack, crate::pool::SteerAck::Success),
+            matches!(ack, crate::pool::SteerAck::Success { .. }),
             "goose success result must ack Success, got {ack:?}"
         );
     }
@@ -4334,7 +4338,7 @@ mod tests {
         assert_eq!(result.unwrap()["done"], serde_json::json!(true));
         let ack = ack_rx.await.expect("ack must be received");
         assert!(
-            matches!(ack, crate::pool::SteerAck::Success),
+            matches!(ack, crate::pool::SteerAck::Success { .. }),
             "injected must ack Success, got {ack:?}"
         );
     }
@@ -4391,7 +4395,7 @@ mod tests {
         // rather than released — hence Success, not an Err.
         let ack = ack_rx.await.expect("ack must be received");
         assert!(
-            matches!(ack, crate::pool::SteerAck::Success),
+            matches!(ack, crate::pool::SteerAck::Success { .. }),
             "startedNewTurn is a delivery success, got {ack:?}"
         );
     }
