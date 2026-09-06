@@ -440,7 +440,9 @@ test("does not teleport upward when user abandons fetch by jumping to bottom", a
       break;
     }
     await page.mouse.wheel(0, -2000);
-    await page.waitForTimeout(25);
+    // Separate wheel gestures so the pagination momentum guard can release.
+    // A continuous burst is intentionally stopped at the prefetch boundary.
+    await page.waitForTimeout(120);
   }
   await page.waitForTimeout(150);
 
@@ -1576,7 +1578,9 @@ test("channel intro stays hidden while older history is loading", async ({
       break;
     }
     await page.mouse.wheel(0, -2000);
-    await page.waitForTimeout(25);
+    // Separate wheel gestures so the pagination momentum guard can release.
+    // A continuous burst is intentionally stopped at the prefetch boundary.
+    await page.waitForTimeout(120);
   }
   await page.waitForTimeout(150);
 
