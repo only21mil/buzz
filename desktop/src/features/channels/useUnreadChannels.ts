@@ -1,4 +1,5 @@
 import * as React from "react";
+import { observedUnreadPriority } from "./observedUnreadPriority";
 import {
   EMPTY_SET,
   useLiveChannelUpdates,
@@ -6,7 +7,6 @@ import {
 } from "@/features/channels/useLiveChannelUpdates";
 import {
   countUnreadAppBadgeObservedEvents,
-  countUnreadBadgeObservedEvents,
   countUnreadHighPriorityObservedEvents,
   countUnreadObservedEvents,
   hasUnreadTopLevelObservedEvent,
@@ -28,7 +28,6 @@ import {
 } from "@/features/messages/lib/threading";
 import {
   hasMentionForEvent,
-  isHighPriorityEventForUser,
   shouldNotifyForEvent,
 } from "@/features/notifications/lib/shouldNotify";
 import type { RelayClient } from "@/shared/api/relayClientSession";
@@ -391,13 +390,11 @@ export function useUnreadChannels(
   const handleChannelMessage = React.useCallback(
     (channelId: string, event: RelayEvent) => {
       const channel = channelsRef.current.find((ch) => ch.id === channelId);
-      const isHighPriority =
-        channel?.channelType === "dm" ||
-        (normalizedPubkey !== null &&
-          isHighPriorityEventForUser(event, normalizedPubkey));
-      const isThreadedReply =
-        getThreadReference(event.tags).parentId !== null &&
-        !isBroadcastReply(event.tags);
+      const { isHighPriority, isThreadedReply } = observedUnreadPriority(
+        event,
+        channel?.channelType,
+        normalizedPubkey,
+      );
       const didRecordUnreadEvent = recordUnreadEvent(
         channelId,
         makeObservedUnreadEvent({
@@ -698,16 +695,14 @@ export function useUnreadChannels(
             ) {
               continue;
             }
-            const evtRef = getThreadReference(event.tags);
-            const isThreadedReply =
-              evtRef.parentId !== null && !isBroadcastReply(event.tags);
+            const { isHighPriority, isThreadedReply } = observedUnreadPriority(
+              event,
+              chType,
+              normalizedPubkey,
+            );
             if (event.created_at > maxExternal) {
               maxExternal = event.created_at;
             }
-            const isHighPriority =
-              chType === "dm" ||
-              (normalizedPubkey !== null &&
-                isHighPriorityEventForUser(event, normalizedPubkey));
             unreadEvents.push(
               makeObservedUnreadEvent({
                 id: event.id,
@@ -888,11 +883,7 @@ export function useUnreadChannels(
         ) {
           topLevelUnread.add(channel.id);
         }
-        const badgeCount = countUnreadBadgeObservedEvents(
-          observedEvents,
-          readAtForObservedEvent,
-        );
-        counts.set(channel.id, badgeCount);
+        counts.set(channel.id, unreadCount);
         unreadChannelNotificationCount += countUnreadAppBadgeObservedEvents(
           observedEvents,
           readAtForObservedEvent,
@@ -907,7 +898,7 @@ export function useUnreadChannels(
             readAtForObservedEvent,
           ) > 0
         ) {
-          // Non-DM: high-priority only if at least one mention/broadcast
+          // Non-DM: high-priority only if a mention, broadcast, or relevant reply
           // remains unread in its own channel/thread context.
           highPriority.add(channel.id);
         }
