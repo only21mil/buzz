@@ -1,3 +1,4 @@
+import { isTauri } from "@tauri-apps/api/core";
 import * as React from "react";
 import { Check, ShieldCheck } from "lucide-react";
 import { toast } from "sonner";
@@ -38,7 +39,8 @@ export function ProjectRepositoryManagement({
   const createMutation = useAddProjectRepositoryMutation();
   const attachMutation = useAttachProjectRepositoryMutation();
   const repairMutation = useBindProjectRepositoryChannelMutation();
-  const canEdit = identityPubkey?.toLowerCase() === project.owner.toLowerCase();
+  const canEdit =
+    isTauri() && identityPubkey?.toLowerCase() === project.owner.toLowerCase();
   const accessChannels = React.useMemo(
     () =>
       (channelsQuery.data ?? []).filter(
@@ -60,6 +62,7 @@ export function ProjectRepositoryManagement({
       candidate && accessChannels.some((channel) => channel.id === candidate),
   );
   const canManageAccess =
+    isTauri() &&
     accessChannels.length > 0 &&
     identityPubkey?.toLowerCase() === repository.owner.toLowerCase();
   const attachCandidates = React.useMemo(() => {

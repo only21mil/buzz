@@ -1,3 +1,4 @@
+import { isTauri } from "@tauri-apps/api/core";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import * as React from "react";
 
@@ -712,7 +713,8 @@ export function useProjectRepoDiffQuery(
   const selectedBranch = branchName ?? project?.defaultBranch ?? null;
 
   return useQuery({
-    enabled: Boolean(enabled && project?.cloneUrls[0] && pullRequest),
+    enabled:
+      isTauri() && Boolean(enabled && project?.cloneUrls[0] && pullRequest),
     queryKey: [
       "project",
       project?.id ?? "none",
@@ -722,6 +724,8 @@ export function useProjectRepoDiffQuery(
       pullRequest?.commit ?? "none",
     ],
     queryFn: () => {
+      if (!isTauri())
+        throw new Error("Pull request diffs require the desktop app.");
       if (!project) throw new Error("No project selected.");
       return fetchProjectRepoDiff(project, selectedBranch, pullRequest);
     },
@@ -740,7 +744,7 @@ export function useProjectLocalRepoDiffQuery(
   const selectedBranch = branchName ?? project?.defaultBranch ?? null;
 
   return useQuery({
-    enabled: Boolean(enabled && project),
+    enabled: isTauri() && Boolean(enabled && project),
     queryKey: [
       "project",
       project?.id ?? "none",
@@ -772,7 +776,7 @@ export function useProjectLocalRepoSnapshotQuery(
   const selectedBranch = branchName ?? project?.defaultBranch ?? null;
 
   return useQuery({
-    enabled: Boolean(project),
+    enabled: isTauri() && Boolean(project),
     queryKey: [
       "project",
       project?.id ?? "none",
@@ -791,6 +795,7 @@ export function useProjectLocalRepoSnapshotQuery(
 
 export function useProjectLocalRepositoriesQuery(reposDir?: string | null) {
   return useQuery({
+    enabled: isTauri(),
     queryKey: ["projects", "local-repositories", reposDir ?? "default"],
     queryFn: () => listProjectLocalRepositories({ reposDir }),
     staleTime: 10_000,

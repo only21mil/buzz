@@ -38,6 +38,15 @@ pub fn repo_link(owner: &str, repo_id: &str) -> String {
     format!("buzz://repo?owner={owner}&d={repo_id}")
 }
 
+/// Build a canonical repository commit link. Callers validate the hash first.
+pub fn commit_link(owner: &str, repo_id: &str, commit: &str) -> String {
+    format!(
+        "buzz://repo?owner={}&d={repo_id}&tab=commits&commit={}",
+        owner.to_ascii_lowercase(),
+        commit.to_ascii_lowercase()
+    )
+}
+
 /// Build a `buzz://project` link for a project announcement (kind 30621).
 pub fn project_link(owner: &str, project_id: &str) -> String {
     format!("buzz://project?owner={owner}&d={project_id}")
@@ -80,6 +89,10 @@ mod tests {
         assert_eq!(
             repo_link(owner, dtag),
             golden["links"]["repository"].as_str().unwrap()
+        );
+        assert_eq!(
+            commit_link(owner, dtag, event_id),
+            golden["links"]["commit"].as_str().unwrap()
         );
         assert_eq!(
             project_link(owner, dtag),

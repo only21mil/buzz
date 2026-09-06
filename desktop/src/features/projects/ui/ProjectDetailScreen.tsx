@@ -1,3 +1,4 @@
+import { isTauri } from "@tauri-apps/api/core";
 import { ArrowLeft, ExternalLink, FolderGit2 } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
@@ -152,6 +153,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     });
   const { activeBranch, selectBranch, selectedTag, selectTag } =
     useProjectRepositoryRefSelection({
+      repositoryId: repository?.repoAddress ?? null,
       branchOptions,
       defaultBranch,
       projectAvailable: Boolean(repository),
@@ -365,7 +367,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     const results = await Promise.all([
       repoSnapshotQuery.refetch(),
       repoStateQuery.refetch(),
-      repoSyncStatusQuery.refetch(),
+      ...(isTauri() ? [repoSyncStatusQuery.refetch()] : []),
     ]);
     const error = results.find((result) => result.error)?.error;
     if (error) {
@@ -387,15 +389,17 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     onBranchChange: handleBranchChange,
     onTagChange: handleTagChange,
     onCreateBranch: () => branchActions.setCreateOpen(true),
-    createBranchDisabled: branchActions.createPending || !activeBranchCommit,
+    createBranchDisabled:
+      !isTauri() || branchActions.createPending || !activeBranchCommit,
     createBranchTitle: createBranchReason ?? "Create a remote branch",
     onDeleteBranch: () => branchActions.setDeleteOpen(true),
     deleteBranchDisabled:
-      branchActions.deletePending || Boolean(deleteBranchReason),
+      !isTauri() || branchActions.deletePending || Boolean(deleteBranchReason),
     deleteBranchTitle: deleteBranchReason ?? "Delete this remote branch",
     source: selectedTag ? "remote" : repoSource,
     onSourceChange: setRepoSource,
     localDisabled:
+      !isTauri() ||
       Boolean(selectedTag) ||
       (!repoSyncStatusQuery.data?.localPath &&
         !localRepoSnapshotQuery.data &&
@@ -407,7 +411,10 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
         : "Local missing",
     ...repoRemote.controls,
     onCloneLocal:
-      !selectedTag && repository?.cloneUrls[0] && repoRemote.canCloneLocally
+      isTauri() &&
+      !selectedTag &&
+      repository?.cloneUrls[0] &&
+      repoRemote.canCloneLocally
         ? () => {
             void handleCloneRepo();
           }
@@ -575,7 +582,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       await Promise.all([
         repoSnapshotQuery.refetch(),
         localRepoSnapshotQuery.refetch(),
-        repoSyncStatusQuery.refetch(),
+        ...(isTauri() ? [repoSyncStatusQuery.refetch()] : []),
         repoStateQuery.refetch(),
       ]);
     } catch (error) {
@@ -668,7 +675,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       await Promise.all([
         repoSnapshotQuery.refetch(),
         localRepoSnapshotQuery.refetch(),
-        repoSyncStatusQuery.refetch(),
+        ...(isTauri() ? [repoSyncStatusQuery.refetch()] : []),
         repoStateQuery.refetch(),
       ]);
     } catch (error) {
@@ -942,9 +949,14 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
                 onBranchChange={handleBranchChange}
                 onOpenMergeRecoveryTerminal={handleOpenMergeRecoveryTerminal}
                 onOpenTerminal={() => {
+                  if (!isTauri()) return;
                   void handleOpenTerminal();
                 }}
-                terminalTitle={projectTerminalLabel(hasLocalCheckout)}
+                terminalTitle={
+                  isTauri()
+                    ? projectTerminalLabel(hasLocalCheckout)
+                    : "Terminals require the desktop app"
+                }
                 onSelectedCommitHashChange={handleSelectedCommitHashChange}
                 onSelectedIssueIdChange={handleSelectedIssueIdChange}
                 onSelectedPullRequestIdChange={

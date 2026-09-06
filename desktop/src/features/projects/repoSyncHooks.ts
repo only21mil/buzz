@@ -1,3 +1,4 @@
+import { isTauri } from "@tauri-apps/api/core";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
@@ -28,7 +29,8 @@ export function useProjectRepoSyncStatusQuery(
   const host = useProjectRepoHost(project);
 
   return useQuery({
-    enabled: Boolean(host.kind === "buzz" && project?.cloneUrls[0]),
+    enabled:
+      isTauri() && Boolean(host.kind === "buzz" && project?.cloneUrls[0]),
     queryKey: [
       "project",
       project?.id ?? "none",

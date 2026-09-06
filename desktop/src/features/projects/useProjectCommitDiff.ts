@@ -1,3 +1,4 @@
+import { isTauri } from "@tauri-apps/api/core";
 import { useQuery } from "@tanstack/react-query";
 
 import {
@@ -57,6 +58,10 @@ export function useProjectCommitDiffQuery(
       commitHash ?? "none",
     ],
     queryFn: () => {
+      if (!isTauri())
+        return Promise.reject(
+          new Error("Commit diffs require the desktop app."),
+        );
       if (!project || !commitHash) {
         return Promise.reject(new Error("No commit selected."));
       }

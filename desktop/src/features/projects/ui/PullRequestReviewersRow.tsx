@@ -1,3 +1,4 @@
+import { isTauri } from "@tauri-apps/api/core";
 import { Check, Search, TriangleAlert } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
@@ -182,7 +183,7 @@ export function PullRequestReviewersRow({
           <DialogTrigger asChild>
             <Button
               className="h-6 px-1 text-xs text-muted-foreground hover:text-foreground"
-              disabled={requestReviewMutation.isPending}
+              disabled={!isTauri() || requestReviewMutation.isPending}
               size="xs"
               type="button"
               variant="ghost"
@@ -220,7 +221,7 @@ export function PullRequestReviewersRow({
                     <button
                       className="flex w-full min-w-0 items-center gap-3 rounded-lg px-3 py-2 text-left hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
                       data-testid={`project-reviewer-result-${candidate.pubkey}`}
-                      disabled={requestReviewMutation.isPending}
+                      disabled={!isTauri() || requestReviewMutation.isPending}
                       key={candidate.pubkey}
                       onClick={() => {
                         void handleRequest(candidate.pubkey, label);

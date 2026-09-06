@@ -10,7 +10,64 @@ export type ProjectRepoUnavailableReason =
 
 /** Copy for the `browser` reason, shared by the files, activity and README surfaces. */
 export const BROWSER_REPOSITORY_UNAVAILABLE_MESSAGE =
-  "README, files, and commits aren’t available in the web app yet — branches, issues, and pull requests are. Open this repository in the Buzz desktop app to browse its contents.";
+  "This repository operation is unavailable in the browser. Repository reads are available when the relay supports authenticated snapshots.";
+/** User-facing copy for a classified repository availability failure. */
+export type ProjectRepoUnavailablePresentation = {
+  description: string;
+  title: string;
+};
+
+const PROJECT_REPO_UNAVAILABLE_PRESENTATIONS: Record<
+  ProjectRepoUnavailableReason,
+  ProjectRepoUnavailablePresentation
+> = {
+  browser: {
+    title: "Operation unavailable",
+    description: BROWSER_REPOSITORY_UNAVAILABLE_MESSAGE,
+  },
+  authentication: {
+    description:
+      "Buzz could not authenticate with this repository. Check your access and try again.",
+    title: "Repository access failed",
+  },
+  missing: {
+    description:
+      "The project announcement exists, but its git repository was not found on the Buzz relay.",
+    title: "Repository not initialized",
+  },
+  access: {
+    description:
+      "Repository access is granted through its channel, and you’re not a member. Ask the repository owner for an invite.",
+    title: "Repository access restricted",
+  },
+  unbound: {
+    description:
+      "This repository has no access channel binding, so the relay cannot authorize anyone to read it. The repository owner can bind a channel from the Access menu.",
+    title: "No access channel bound",
+  },
+  network: {
+    description:
+      "The Buzz git service could not be reached. Check your connection and try again.",
+    title: "Couldn’t reach repository",
+  },
+  ref: {
+    description:
+      "The selected branch is advertised by the project but is missing from its git remote.",
+    title: "Branch unavailable",
+  },
+  unknown: {
+    description:
+      "Buzz could not load this repository. Try again or contact the project owner.",
+    title: "Repository unavailable",
+  },
+};
+
+/** Returns consistent, sanitized copy for repository availability UI. */
+export function projectRepoUnavailablePresentation(
+  reason: ProjectRepoUnavailableReason,
+): ProjectRepoUnavailablePresentation {
+  return PROJECT_REPO_UNAVAILABLE_PRESENTATIONS[reason];
+}
 
 export function projectRepoUnavailableReason(
   error: unknown,

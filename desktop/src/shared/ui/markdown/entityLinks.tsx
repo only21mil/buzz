@@ -34,6 +34,9 @@ export function useOpenEntityLink(): (link: ParsedEntityLink) => void {
           : {}),
         ...(link.type === "pr" ? { pullRequestId: link.id } : {}),
         ...(link.type === "issue" ? { issueId: link.id } : {}),
+        ...(link.type === "repo" && link.commitHash
+          ? { commitHash: link.commitHash }
+          : {}),
       });
     },
     [goProject],

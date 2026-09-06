@@ -1,3 +1,4 @@
+import { isTauri } from "@tauri-apps/api/core";
 import { CircleCheck, CircleDot, CircleX, MessageSquare } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
@@ -255,7 +256,7 @@ export function ProjectIssueDetail({
           <div data-testid="project-issue-comment-composer">
             <ForumComposer
               className="border border-border/60 bg-background/45"
-              disabled={commentMutation.isPending}
+              disabled={!isTauri() || commentMutation.isPending}
               isSending={commentMutation.isPending}
               members={members}
               onSubmit={handleCommentSubmit}
