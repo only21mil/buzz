@@ -70,6 +70,18 @@ log() { echo -e "${BLUE}[isolated-relay]${NC} $*"; }
 ok()  { echo -e "${GREEN}[isolated-relay]${NC} $*"; }
 err() { echo -e "${RED}[isolated-relay]${NC} $*" >&2; }
 
+# Refuse an existing relay before starting services or resetting its database.
+if ! command -v lsof >/dev/null 2>&1; then
+  err "lsof is required to check port ${RELAY_MAIN} before changing backing services."
+  exit 1
+fi
+if lsof -nP -iTCP:"${RELAY_MAIN}" -sTCP:LISTEN >/dev/null 2>&1; then
+  err "Port ${RELAY_MAIN} is already in use; refusing to reset an active harness database."
+  err "For a previous harness, run the exact 'Stop relay:' command printed by that launch, then rerun."
+  lsof -nP -iTCP:"${RELAY_MAIN}" -sTCP:LISTEN >&2 || true
+  exit 1
+fi
+
 # ── Backing services (scoped to buzz-harness only) ───────────────────────────
 log "Bringing up backing services (project=${PROJECT})..."
 docker compose -p "${PROJECT}" -f "${COMPOSE_FILE}" up -d
@@ -137,11 +149,6 @@ RELAY_LOG="${RELAY_LOG:-/tmp/dawn-relay-run.log}"
 TMUX_SESSION="${TMUX_SESSION:-dawn-relay}"
 TMUX_SOCKET="${TMUX_SESSION}-$$"
 # A dedicated server inherits the exported identity without putting it in argv.
-if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"${RELAY_MAIN}" -sTCP:LISTEN >/dev/null 2>&1; then
-  err "Port ${RELAY_MAIN} is already in use; refusing to report a stale relay as this harness."
-  lsof -nP -iTCP:"${RELAY_MAIN}" -sTCP:LISTEN >&2 || true
-  exit 1
-fi
 log "Starting relay in tmux session '${TMUX_SESSION}' on :${RELAY_MAIN} (health :${RELAY_HEALTH}, metrics :${RELAY_METRICS})..."
 tmux -L "${TMUX_SOCKET}" new-session -d -s "${TMUX_SESSION}" "cd '${REPO_ROOT}' && env \
   DATABASE_URL=postgres://buzz:buzz_dev@localhost:${PG_PORT}/buzz \
