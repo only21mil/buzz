@@ -73,7 +73,15 @@ test("expands numeric weekday lists and ranges for the weekly picker", () => {
     "5",
   ]);
   assert.deepEqual(scheduleWeekdaysFromCronField("1,3,5"), ["1", "3", "5"]);
-  assert.deepEqual(scheduleWeekdaysFromCronField("MON-FRI"), []);
+  assert.deepEqual(scheduleWeekdaysFromCronField("MON-FRI"), [
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+  ]);
+  assert.deepEqual(scheduleWeekdaysFromCronField("SUN,SAT"), ["1", "7"]);
+  assert.deepEqual(scheduleWeekdaysFromCronField("0"), []);
 });
 
 test("switching schedule modes never emits cron and interval together", () => {

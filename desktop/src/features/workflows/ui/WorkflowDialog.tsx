@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Check, Code, Pencil, X } from "lucide-react";
+import { Check, Code, History, Pencil, X } from "lucide-react";
 import { useBlocker } from "@tanstack/react-router";
 import { stringify as yamlStringify } from "yaml";
 
@@ -31,7 +31,7 @@ import {
   DialogTitle,
 } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
-import { Popover, PopoverContent } from "@/shared/ui/popover";
+import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/popover";
 import { ChannelCombobox } from "./ChannelCombobox";
 import { WorkflowActionsMenu } from "./WorkflowActionsMenu";
 import { WorkflowDetailPanel } from "./WorkflowDetailPanel";
@@ -565,9 +565,6 @@ export function WorkflowDialog({
               {mode === "edit" && workflowSnapshot ? (
                 <>
                   <Popover onOpenChange={setHistoryOpen} open={historyOpen}>
-                    {/* TODO(workflow-run-history-capability): Restore this
-                    icon-only entry point after Desktop gates it on the active
-                    relay's advertised NIP-11 capabilities.
                     <PopoverTrigger asChild>
                       <Button
                         aria-label="Run history"
@@ -579,7 +576,6 @@ export function WorkflowDialog({
                         <History className="h-4 w-4" />
                       </Button>
                     </PopoverTrigger>
-                    */}
                     <PopoverContent
                       align="end"
                       aria-label="Run history"

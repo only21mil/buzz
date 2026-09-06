@@ -52,3 +52,13 @@ test("whole-expression validation requires exactly five fields", () => {
   });
   assert.match(cronExpressionError("not-a-cron"), /Found 1 field/);
 });
+
+test("weekday validation follows cron 0.16 Sunday=1 through Saturday=7", () => {
+  assert.equal(
+    cronExpressionError("0 9 * * 0"),
+    "Weekday must be between 1 and 7.",
+  );
+  for (const day of ["1", "7", "SUN", "SAT"]) {
+    assert.equal(cronExpressionError(`0 9 * * ${day}`), null);
+  }
+});
