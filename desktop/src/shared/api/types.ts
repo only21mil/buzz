@@ -955,25 +955,7 @@ export type ForumThreadResponse = {
   nextCursor: string | null;
 };
 
-/**
- * Forward keyset cursor for the server-side thread read (`get_thread_replies`).
- *
- * The event-id tiebreak is load-bearing: thread replies routinely share a
- * `createdAt` second (bursty threads), so a timestamp-only cursor would skip
- * every tied reply past the page limit. The pair `(createdAt, eventId)` orders
- * replies unambiguously and lets paging resume strictly after the last event.
- */
-export type ThreadCursor = {
-  createdAt: number;
-  eventId: string;
-};
-
-export type ThreadRepliesResponse = {
-  /** The reply subtree (chronological, oldest first), depth >= 1. Excludes the root event (relay keys on `root_event_id`, which a root row lacks); the caller already holds the root. */
-  events: RelayEvent[];
-  /** Present only when a full page was returned — pass back to fetch the next page. */
-  nextCursor: ThreadCursor | null;
-};
+export type { ThreadCursor, ThreadRepliesResponse } from "./threadTypes";
 
 /**
  * Composite backward keyset cursor for channel-timeline paging via the bridge

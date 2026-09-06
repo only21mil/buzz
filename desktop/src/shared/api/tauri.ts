@@ -25,7 +25,6 @@ import type {
   RelayEvent,
   SearchMessagesInput,
   SearchMessagesResponse,
-  SendChannelMessageResult,
   SetCanvasInput,
   SetCanvasResult,
   ThreadCursor,
@@ -43,6 +42,7 @@ import type {
 } from "@/shared/api/types";
 
 export * from "@/shared/api/tauriChannels";
+export { sendChannelMessage } from "@/shared/api/tauriMessages";
 
 type RawPresenceLookup = Record<string, PresenceStatus>;
 
@@ -95,14 +95,6 @@ type RawSearchHit = {
 type RawSearchResponse = {
   hits: RawSearchHit[];
   found: number;
-};
-
-type RawSendChannelMessageResult = {
-  event_id: string;
-  parent_event_id: string | null;
-  root_event_id: string | null;
-  depth: number;
-  created_at: number;
 };
 
 type RawRelayAgent = {
@@ -485,6 +477,7 @@ type RawThreadCursor = {
 };
 
 type RawThreadRepliesResponse = {
+  aux_included?: boolean;
   events: RelayEvent[];
   next_cursor: RawThreadCursor | null;
 };
@@ -532,47 +525,13 @@ export async function getThreadReplies(
 
   return {
     events: response.events,
+    auxIncluded: response.aux_included === true,
     nextCursor: response.next_cursor
       ? {
           createdAt: response.next_cursor.created_at,
           eventId: response.next_cursor.event_id,
         }
       : null,
-  };
-}
-
-export async function sendChannelMessage(
-  channelId: string,
-  content: string,
-  parentEventId?: string | null,
-  mediaTags?: string[][],
-  mentionPubkeys?: string[],
-  kind?: number,
-  emojiTags?: string[][],
-  mentionTags?: string[][],
-  linkPreviewTags?: string[][],
-): Promise<SendChannelMessageResult> {
-  const response = await invokeTauri<RawSendChannelMessageResult>(
-    "send_channel_message",
-    {
-      channelId,
-      content,
-      parentEventId,
-      mediaTags: mediaTags ?? null,
-      emojiTags: emojiTags ?? null,
-      mentionTags: mentionTags ?? null,
-      linkPreviewTags,
-      mentionPubkeys: mentionPubkeys ?? null,
-      kind: kind ?? null,
-    },
-  );
-
-  return {
-    eventId: response.event_id,
-    parentEventId: response.parent_event_id,
-    rootEventId: response.root_event_id,
-    depth: response.depth,
-    createdAt: response.created_at,
   };
 }
 

@@ -133,6 +133,29 @@ export function snapshotContext(
   return relayUrl && signerPubkey ? { relayUrl, signerPubkey } : null;
 }
 
+/** Resolve only a cached parent, using the native resolver's NIP-10 marker order. */
+export function resolveCachedReplyRootId(
+  parentEventId: string,
+  messageCaches: readonly RelayEvent[][],
+): string | null {
+  const validId = /^[0-9a-f]{64}$/i;
+  if (!validId.test(parentEventId)) return null;
+  for (const messages of messageCaches) {
+    const parent = messages.find((event) => event.id === parentEventId);
+    if (!parent) continue;
+    let root: string | undefined;
+    let reply: string | undefined;
+    for (const tag of parent.tags) {
+      if (tag[0] !== "e" || tag.length < 4) continue;
+      if (tag[3] === "root") root = tag[1];
+      if (tag[3] === "reply") reply = tag[1];
+    }
+    const resolved = root ?? reply ?? parentEventId;
+    return validId.test(resolved) ? resolved : null;
+  }
+  return null;
+}
+
 export function createOptimisticMessage(
   channelId: string,
   content: string,
@@ -682,6 +705,17 @@ export function useSendMessageMutation(
           queryClient.getQueryData<RelayEvent[]>(
             channelMessagesKey(effectiveChannel.id),
           ) ?? [];
+        const threadCaches = queryClient
+          .getQueriesData<RelayEvent[]>({
+            queryKey: ["thread-replies", effectiveChannel.id],
+          })
+          .flatMap(([, events]) => (events ? [events] : []));
+        const suppliedRootEventId = parentEventId
+          ? resolveCachedReplyRootId(parentEventId, [
+              cachedMessages,
+              ...threadCaches,
+            ])
+          : null;
         const result = await sendChannelMessage(
           effectiveChannel.id,
           content,
@@ -692,6 +726,7 @@ export function useSendMessageMutation(
           emojiTags,
           mentionTags,
           linkPreviewTags,
+          suppliedRootEventId,
         );
 
         // Build tags matching relay-emitted shape: h, author p, mention ps, reply es, imeta, emoji.
@@ -702,7 +737,7 @@ export function useSendMessageMutation(
               effectiveChannel.id,
               identity.pubkey,
               parentEventId,
-              resolveReplyRootId(parentEventId, cachedMessages),
+              result.rootEventId ?? parentEventId,
               recipientPubkeys,
             )
           : [];

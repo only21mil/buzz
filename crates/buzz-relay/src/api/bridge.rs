@@ -402,6 +402,63 @@ fn extract_page_offset(raw: &Value, limit: Option<i64>) -> Option<i64> {
     page.checked_sub(1)?.checked_mul(per_page)
 }
 
+const THREAD_AUX_MAX_PAGES: usize = 64;
+
+enum ThreadAuxReader<'a> {
+    Database(&'a buzz_db::Db),
+    #[cfg(test)]
+    Fake(&'a mut (dyn FnMut(&buzz_db::EventQuery) -> Vec<buzz_core::StoredEvent> + Send)),
+}
+
+impl ThreadAuxReader<'_> {
+    async fn fetch(
+        &mut self,
+        query: &buzz_db::EventQuery,
+    ) -> buzz_db::Result<Vec<buzz_core::StoredEvent>> {
+        match self {
+            Self::Database(db) => db.query_events_routed("bridge_thread_aux", query).await,
+            #[cfg(test)]
+            Self::Fake(fetch) => Ok(fetch(query)),
+        }
+    }
+}
+
+// A cap or stalled cursor is a failed closure, never a successful truncated
+// response bearing the capability header. Existing channel-window snapshots
+// keep their original transaction-bound reader.
+async fn query_thread_aux_pages(
+    mut query: buzz_db::EventQuery,
+    page_limit: i64,
+    reader: &mut ThreadAuxReader<'_>,
+) -> buzz_db::Result<Vec<buzz_core::StoredEvent>> {
+    query.limit = Some(page_limit);
+    let mut events = Vec::new();
+    for _ in 0..THREAD_AUX_MAX_PAGES {
+        let page = reader.fetch(&query).await?;
+        let next = if page.len() as i64 >= page_limit {
+            page.last().map(|se| (se.event.created_at, se.event.id))
+        } else {
+            None
+        };
+        events.extend(page);
+        let Some((created_at, id)) = next else {
+            return Ok(events);
+        };
+        let next_until = chrono::DateTime::from_timestamp(created_at.as_secs() as i64, 0);
+        let next_id = Some(id.to_bytes().to_vec());
+        if next_until == query.until && next_id == query.before_id {
+            return Err(buzz_db::DbError::InvalidData(
+                "thread aux cursor did not advance".into(),
+            ));
+        }
+        query.until = next_until;
+        query.before_id = next_id;
+    }
+    Err(buzz_db::DbError::InvalidData(
+        "thread aux page limit exceeded".into(),
+    ))
+}
+
 /// Default and maximum row budget for a channel-window request. The budget
 /// counts row events only; summary/bounds overlays and the aux closure never
 /// consume it (docs/bridge-channel-window.md).
@@ -931,7 +988,7 @@ pub async fn query_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     // Row zero: bind this HTTP request to its community from the request host
     // before any tenant-scoped read, identical to the WS door in `router.rs`.
     // An unmapped host or lookup failure fails closed with a generic 404 — never
@@ -979,7 +1036,7 @@ pub async fn query_events(
     )
     .await;
     match &result {
-        Ok(Json(Value::Array(events))) => {
+        Ok((Json(Value::Array(events)), _)) => {
             tracing::info!(
                 pubkey = %pubkey_hex,
                 route = "/query",
@@ -1000,7 +1057,18 @@ pub async fn query_events(
             );
         }
     }
-    result
+    result.map(|(body, aux_included)| thread_aux_query_response(body, aux_included))
+}
+
+fn thread_aux_query_response(body: Json<Value>, aux_included: bool) -> (HeaderMap, Json<Value>) {
+    let mut headers = HeaderMap::new();
+    if aux_included {
+        headers.insert(
+            "x-buzz-thread-aux",
+            axum::http::HeaderValue::from_static("1"),
+        );
+    }
+    (headers, body)
 }
 
 /// Filter execution for [`query_events`], run once NIP-98 auth succeeds.
@@ -1014,7 +1082,7 @@ async fn query_events_authed(
     pubkey: nostr::PublicKey,
     event_id_bytes: [u8; 32],
     signed_auth_created_at: Option<u64>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<(Json<Value>, bool), (StatusCode, Json<Value>)> {
     enforce_http_admission(state, tenant, &pubkey).await?;
     check_nip98_replay(state, tenant, event_id_bytes).await?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
@@ -1083,14 +1151,16 @@ async fn query_events_authed(
             &authed_pubkey_hex,
             &pubkey_bytes,
         )
-        .await;
+        .await
+        .map(|body| (body, false));
     }
 
     if let Some(presence_events) = synthesize_presence(state, tenant, &filters).await {
-        return Ok(Json(Value::Array(presence_events)));
+        return Ok((Json(Value::Array(presence_events)), false));
     }
 
     let mut events: Vec<Value> = Vec::new();
+    let mut thread_aux_included = false;
     let mut handled: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     // Channel-window filters (`top_level: true`) — the GUI read-model surface.
@@ -1250,6 +1320,7 @@ async fn query_events_authed(
             .await
             .map_err(|e| internal_error(&format!("thread query error: {e}")))?;
 
+        let mut thread_row_ids = vec![root_hex.to_string()];
         for reply in thread_replies {
             let se = reply.stored_event;
             if !event_in_accessible_channel(&se, &accessible_channels) {
@@ -1261,9 +1332,48 @@ async fn query_events_authed(
             if !buzz_core::filter::reader_authorized_for_event(&se.event, &authed_pubkey_hex) {
                 continue;
             }
+            thread_row_ids.push(se.event.id.to_hex());
             if let Ok(v) = serde_json::to_value(&se.event) {
                 events.push(v);
             }
+        }
+        if extension_flag(raw, "include_aux") {
+            let mut hop_ids = thread_row_ids;
+            let mut seen = std::collections::HashSet::new();
+            for kinds in [&WINDOW_AUX_KINDS[..], &WINDOW_AUX_DELETE_KINDS[..]] {
+                let mut query = buzz_db::EventQuery::for_community(tenant.community());
+                query.kinds = Some(kinds.iter().map(|kind| *kind as i32).collect());
+                query.e_tags = Some(std::mem::take(&mut hop_ids));
+                let aux = query_thread_aux_pages(
+                    query,
+                    buzz_db::DEFAULT_MAX_PAGE_LIMIT,
+                    &mut ThreadAuxReader::Database(&state.db),
+                )
+                .await
+                .map_err(|e| internal_error(&format!("thread aux query error: {e}")))?;
+                for se in aux {
+                    if !seen.insert(se.event.id)
+                        || !event_in_accessible_channel(&se, &accessible_channels)
+                        || !buzz_core::filter::reader_authorized_for_event(
+                            &se.event,
+                            &authed_pubkey_hex,
+                        )
+                    {
+                        continue;
+                    }
+                    hop_ids.push(se.event.id.to_hex());
+                    events.push(
+                        serde_json::to_value(&se.event)
+                            .map_err(|e| internal_error(&format!("thread aux serialize: {e}")))?,
+                    );
+                }
+                if hop_ids.is_empty() {
+                    break;
+                }
+            }
+            // Native thread reads send one filter. Never infer completeness for
+            // a mixed query where another filter may have taken a different path.
+            thread_aux_included = raw_filters.len() == 1;
         }
         handled.insert(idx);
     }
@@ -1378,7 +1488,7 @@ async fn query_events_authed(
         }
     }
 
-    Ok(Json(Value::Array(events)))
+    Ok((Json(Value::Array(events)), thread_aux_included))
 }
 
 /// Count events via HTTP bridge (NIP-98 auth). Returns `{"count": N}`.
@@ -2624,6 +2734,92 @@ mod tests {
     use super::*;
     use nostr::{Alphabet, EventBuilder, Keys, Kind, SingleLetterTag, Tag};
     use std::sync::Mutex;
+
+    #[test]
+    fn thread_aux_response_proof_is_explicit_and_keeps_the_event_array_shape() {
+        let (legacy_headers, Json(legacy_body)) =
+            thread_aux_query_response(Json(serde_json::json!([])), false);
+        assert!(!legacy_headers.contains_key("x-buzz-thread-aux"));
+        assert_eq!(legacy_body, serde_json::json!([]));
+        let (headers, Json(body)) = thread_aux_query_response(Json(serde_json::json!([])), true);
+        assert_eq!(headers["x-buzz-thread-aux"], "1");
+        assert_eq!(body, legacy_body);
+    }
+
+    fn aux_fixture(keys: &Keys, timestamp: u64, content: &str) -> buzz_core::StoredEvent {
+        buzz_core::StoredEvent::new(
+            EventBuilder::new(Kind::from(7), content)
+                .custom_created_at(nostr::Timestamp::from(timestamp))
+                .sign_with_keys(keys)
+                .expect("event"),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn thread_aux_pages_preserve_dense_second_cursor_and_empty_root_query() {
+        let keys = Keys::generate();
+        let mut rows = vec![
+            aux_fixture(&keys, 40, "a"),
+            aux_fixture(&keys, 40, "b"),
+            aux_fixture(&keys, 30, "c"),
+        ];
+        rows.sort_by(|a, b| {
+            b.event
+                .created_at
+                .cmp(&a.event.created_at)
+                .then(a.event.id.cmp(&b.event.id))
+        });
+        let expected: Vec<_> = rows.iter().map(|row| row.event.id).collect();
+        let mut calls = 0;
+        let mut fetch = |query: &buzz_db::EventQuery| {
+            calls += 1;
+            assert_eq!(query.e_tags, Some(vec!["root".into()]));
+            rows.iter()
+                .filter(|row| match (query.until, query.before_id.as_deref()) {
+                    (Some(until), Some(before)) => {
+                        row.event.created_at.as_secs() < until.timestamp() as u64
+                            || (row.event.created_at.as_secs() == until.timestamp() as u64
+                                && row.event.id.as_bytes().as_slice() > before)
+                    }
+                    _ => true,
+                })
+                .take(query.limit.unwrap() as usize)
+                .cloned()
+                .collect()
+        };
+        let mut query =
+            buzz_db::EventQuery::for_community(fresh_tenant("relay.example").community());
+        query.e_tags = Some(vec!["root".into()]);
+        let result =
+            query_thread_aux_pages(query.clone(), 2, &mut ThreadAuxReader::Fake(&mut fetch))
+                .await
+                .expect("pages");
+        assert_eq!(
+            result.iter().map(|row| row.event.id).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(calls, 2);
+        let mut empty_fetch = |_query: &buzz_db::EventQuery| vec![];
+        assert!(
+            query_thread_aux_pages(query, 2, &mut ThreadAuxReader::Fake(&mut empty_fetch))
+                .await
+                .expect("empty")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_aux_stalled_cursor_fails_instead_of_claiming_complete_hydration() {
+        let row = aux_fixture(&Keys::generate(), 40, "a");
+        let mut fetch = |_query: &buzz_db::EventQuery| vec![row.clone()];
+        let query = buzz_db::EventQuery::for_community(fresh_tenant("relay.example").community());
+        assert!(
+            query_thread_aux_pages(query, 1, &mut ThreadAuxReader::Fake(&mut fetch))
+                .await
+                .is_err()
+        );
+    }
 
     fn redis_pool() -> deadpool_redis::Pool {
         let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());

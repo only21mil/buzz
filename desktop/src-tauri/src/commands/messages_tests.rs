@@ -226,3 +226,39 @@ fn legacy_managed_agent_auth_tag_skips_self_attestation() {
 
     assert_eq!(tag, None);
 }
+
+#[test]
+fn supplied_thread_reference_validates_both_ids_without_parent_lookup() {
+    let root = "a".repeat(64);
+    let parent = "b".repeat(64);
+    let reference = provided_thread_ref(&root, &parent).expect("valid IDs");
+    assert_eq!(reference.root_event_id.to_hex(), root);
+    assert_eq!(reference.parent_event_id.to_hex(), parent);
+    assert!(provided_thread_ref("invalid", &parent).is_err());
+    assert!(provided_thread_ref(&root, "invalid").is_err());
+}
+
+#[test]
+fn thread_cursor_counts_replies_only_even_when_auxiliary_events_finish_the_page() {
+    let keys = Keys::generate();
+    let event = |kind, time| {
+        nostr::EventBuilder::new(nostr::Kind::from(kind), "")
+            .custom_created_at(nostr::Timestamp::from(time))
+            .sign_with_keys(&keys)
+            .expect("event")
+    };
+    let replies = vec![event(9u16, 10u64), event(9u16, 10u64)];
+    let mut page = replies.clone();
+    page.push(event(7u16, 30u64));
+    page.push(event(40003u16, 31u64));
+    page.push(event(5u16, 32u64));
+    let cursor = thread_reply_cursor(&page, 2).expect("full reply page");
+    assert_eq!(cursor.created_at, 10);
+    assert_eq!(cursor.event_id, replies[1].id.to_hex());
+    assert!(thread_reply_cursor(&page[1..], 2).is_none());
+    assert!(thread_reply_cursor(&page[2..], 2).is_none());
+    assert_eq!(
+        build_thread_replies_filter("root", None, 64, 200, None)["include_aux"],
+        true
+    );
+}
