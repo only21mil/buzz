@@ -512,7 +512,7 @@ impl SecretStore {
             Err(ref e) if is_keyring_availability_error(&e.to_string()) => {
                 KeyringProbe::Unreachable
             }
-            Err(_) => KeyringProbe::ReachableButEmpty,
+            Err(_) => KeyringProbe::Unreachable,
         }
     }
 
@@ -530,7 +530,7 @@ impl SecretStore {
                 Err(e) if is_keyring_availability_error(&e.to_string()) => {
                     KeyringProbe::Unreachable
                 }
-                Err(_) => KeyringProbe::ReachableButEmpty,
+                Err(_) => KeyringProbe::Unreachable,
             },
             Err(e) if is_keyring_availability_error(&e.to_string()) => KeyringProbe::Unreachable,
             Err(_) => KeyringProbe::Unreachable,

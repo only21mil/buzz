@@ -8,7 +8,7 @@ use std::{
 };
 
 use nostr::{Keys, ToBech32};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 #[cfg(feature = "mesh-llm")]
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -16,6 +16,10 @@ pub(crate) use crate::identity_storage::{IdentityStorage, RecoveryState, Resolve
 use crate::managed_agents::config_bridge::SessionConfigCache;
 use crate::managed_agents::{ManagedAgentPairRuntime, ManagedAgentRuntimeKey};
 use crate::{channel_member_profiles::ChannelMemberProfileCache, huddle::HuddleState};
+
+#[path = "app_state_startup.rs"]
+mod startup;
+pub use startup::resolve_persisted_identity;
 
 pub struct AppState {
     pub keys: Mutex<Keys>,
@@ -63,8 +67,8 @@ pub struct AppState {
     /// Port of the localhost media streaming proxy (set during setup).
     pub media_proxy_port: AtomicU16,
     /// Set when identity resolution detected a "keyring-locked" state: the
-    /// keyring is unreachable this boot but a migration marker shows the key
-    /// lives there. An ephemeral key is generated so the app can open; all
+    /// keyring is unreachable this boot or macOS did not finish its startup
+    /// access check. The placeholder key lets the app open; all
     /// signing commands check this flag via [`AppState::signing_keys`] and
     /// return `Err` so no events are published under the inaccessible identity.
     /// Mutually exclusive with `identity_lost` (guaranteed by `RecoveryState`
@@ -340,54 +344,6 @@ impl AppState {
     }
 }
 
-/// Resolve the user's identity key from the app data directory and wire
-/// the resulting [`RecoveryState`] into `AppState`.
-///
-/// Priority: `BUZZ_PRIVATE_KEY` env var (already handled in `build_app_state`)
-/// → keyring → `{app_data_dir}/identity.key` file → generate + save.
-///
-/// On success, writes the resolved keys into `state.keys` (with the mutex)
-/// before storing the recovery flags (Release), so any thread that reads
-/// either flag as `false` with Acquire is guaranteed to see the updated keys.
-///
-/// Sets `state.identity_lost` on `RecoveryState::Lost` (keyring empty after
-/// migration — key gone externally) and `state.keyring_locked` on
-/// `RecoveryState::KeyringLocked` (keyring unreachable — key still in keyring
-/// but inaccessible this boot). Both states boot with an ephemeral key; the
-/// frontend shows different recovery screens for each.
-pub fn resolve_persisted_identity(app: &AppHandle, state: &AppState) -> Result<(), String> {
-    // Only skip file-based resolution if the env var was present AND parsed
-    // successfully. A malformed env var should fall through to the persisted
-    // key rather than leaving the app on an ephemeral identity.
-    if identity_from_env().is_some() {
-        return Ok(());
-    }
-
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("app data dir: {e}"))?;
-    std::fs::create_dir_all(&data_dir).map_err(|e| format!("create app data dir: {e}"))?;
-
-    let resolved = load_or_create_identity(&data_dir)?;
-    // Write keys and storage before setting the recovery flags (Release) so
-    // any thread that reads a flag as false with Acquire sees consistent data.
-    {
-        let mut active_keys = state.keys.lock().map_err(|e| e.to_string())?;
-        *active_keys = resolved.keys;
-        state.set_identity_storage(resolved.storage);
-    }
-    state.identity_lost.store(
-        resolved.recovery == RecoveryState::Lost,
-        std::sync::atomic::Ordering::Release,
-    );
-    state.keyring_locked.store(
-        resolved.recovery == RecoveryState::KeyringLocked,
-        std::sync::atomic::Ordering::Release,
-    );
-    Ok(())
-}
-
 #[path = "app_state_keyring.rs"]
 mod keyring_config;
 pub(crate) use keyring_config::keyring_service;
@@ -469,9 +425,18 @@ fn resolve_identity_with_store(
     legacy_path: &std::path::Path,
     data_dir: &std::path::Path,
 ) -> Result<ResolvedIdentity, String> {
+    resolve_identity_from_probe(store, legacy_path, data_dir, store.probe(IDENTITY_KEY_NAME))
+}
+
+fn resolve_identity_from_probe(
+    store: &impl IdentityKeyStore,
+    legacy_path: &std::path::Path,
+    data_dir: &std::path::Path,
+    probe: crate::secret_store::KeyringProbe,
+) -> Result<ResolvedIdentity, String> {
     use crate::secret_store::KeyringProbe;
 
-    match store.probe(IDENTITY_KEY_NAME) {
+    match probe {
         KeyringProbe::Present => {
             if let Some(nsec) = store.load(IDENTITY_KEY_NAME)? {
                 match Keys::parse(nsec.trim()) {
