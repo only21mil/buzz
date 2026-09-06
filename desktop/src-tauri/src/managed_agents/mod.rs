@@ -36,6 +36,7 @@ mod runtime_types;
 pub(crate) mod snapshot_avatar;
 pub(crate) mod spawn_snapshot;
 pub(crate) mod storage;
+pub(crate) mod team_catalog;
 pub(crate) mod team_events;
 mod team_repair;
 mod teams;
@@ -50,7 +51,11 @@ pub(crate) fn lock_path_mutex() -> std::sync::MutexGuard<'static, ()> {
     PATH_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+mod definition_validation;
 pub use backend::*;
+pub(crate) use definition_validation::{
+    validate_agent_definition_text, validate_managed_agent_definition_text, validate_visible_text,
+};
 pub use discovery::*;
 pub use env_vars::*;
 #[cfg(windows)]
@@ -82,6 +87,9 @@ pub use runtime_types::*;
 pub use storage::*;
 pub use teams::*;
 pub use types::*;
+
+#[cfg(test)]
+pub(crate) use teams::delete_catalog_team_at;
 
 /// Returns the Buzz nest directory (`~/.buzz`) if it exists as a real
 /// directory (not a symlink), falling back to the user's home directory.

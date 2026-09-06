@@ -39,6 +39,7 @@ mod relay_admission;
 mod reset;
 mod secret_store;
 mod shutdown;
+mod team_catalog;
 mod templates;
 mod terminal_runtime;
 #[cfg_attr(not(test), allow(dead_code))]
@@ -811,9 +812,12 @@ pub fn run() {
             update_channel_template,
             delete_channel_template,
             duplicate_channel_template,
+            team_catalog::fetch_team_catalog,
             list_teams,
             create_team,
             update_team,
+            set_team_shared,
+            add_team_from_catalog,
             delete_team,
             export_agent_snapshot,
             card_mint_key_status,
