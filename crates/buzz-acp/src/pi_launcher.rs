@@ -333,10 +333,21 @@ mod tests {
         .expect("prepare Pi launcher");
         let prompt_path = prepared.directory.join("SYSTEM.md");
 
-        let status = Command::new(prepared.launcher_path())
-            .args(["--mode", "rpc", "--session", "/tmp/session.jsonl"])
-            .status()
-            .expect("run launcher");
+        // Parallel process fixtures can briefly inherit another thread's open
+        // writer across fork, before CLOEXEC closes it. Retry only ETXTBSY.
+        let mut retries = 0;
+        let status = loop {
+            match Command::new(prepared.launcher_path())
+                .args(["--mode", "rpc", "--session", "/tmp/session.jsonl"])
+                .status()
+            {
+                Err(error) if error.raw_os_error() == Some(26) && retries < 20 => {
+                    retries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => break result.expect("run launcher"),
+            }
+        };
         assert!(status.success());
         assert_eq!(
             fs::read_to_string(&capture_path).expect("read captured args"),
