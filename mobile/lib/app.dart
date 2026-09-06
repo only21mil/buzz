@@ -23,6 +23,8 @@ import 'features/channels/agent_activity/observer_subscription.dart';
 import 'features/channels/deep_link_dispatcher.dart';
 import 'features/profile/user_status_cache_provider.dart';
 import 'features/profile/settings_profile_header.dart';
+import 'features/profile/profile_edit_page.dart';
+import 'features/profile/profile_text_editor.dart';
 import 'features/settings/settings_page.dart';
 import 'shared/auth/auth.dart';
 import 'shared/deeplink/pending_deep_link_provider.dart';
@@ -413,6 +415,10 @@ class App extends HookConsumerWidget {
 
 Widget _buildSettingsPage(BuildContext context) => SettingsPage(
   profileHeader: const SettingsProfileHeader(),
+  profileEditPageBuilder: (_) =>
+      const ProfileEditPage(startInPhotoEditor: true),
+  onEditDisplayName: showProfileDisplayNameEditor,
+  onEditProfileDescription: showProfileDescriptionEditor,
   invitePageBuilder: (_) => const CommunityInvitePage(),
   identityRecoveryPageBuilder: (_) =>
       const PairingPage(addingCommunity: true, identityRecoveryOnly: true),

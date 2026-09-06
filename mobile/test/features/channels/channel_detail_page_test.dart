@@ -4693,7 +4693,7 @@ void main() {
       expect(detailsAppBar.frostedSurfaceOpacity, 0.5);
       expect(detailsAppBar.frostedBlurSigma, 20);
       expect(detailsAppBar.showBottomDivider, isTrue);
-      expect(detailsAppBar.bottomDividerOpacity, 0.15);
+      expect(detailsAppBar.bottomDividerOpacity, 0.07);
       expect(
         tester
             .widget<AppListCard>(

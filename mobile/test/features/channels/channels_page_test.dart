@@ -697,6 +697,8 @@ void main() {
     expect(route, isNot(isA<MaterialPageRoute<void>>()));
     expect(route?.opaque, isFalse);
     expect(route?.allowSnapshotting, isFalse);
+    expect(route?.transitionDuration, const Duration(milliseconds: 150));
+    expect(route?.reverseTransitionDuration, const Duration(milliseconds: 150));
   });
 
   testWidgets('reports monotonic Settings route progress', (tester) async {
@@ -783,7 +785,7 @@ void main() {
     final forwardScaleProgress = (1.04 - forwardScale) / 0.04;
     expect(
       forwardOpacity,
-      closeTo(Curves.easeOutQuad.transform(95 / 220), 0.02),
+      closeTo(Curves.easeOutQuad.transform(95 / 150), 0.02),
     );
     expect(forwardScaleProgress, closeTo(forwardOpacity, 0.001));
     await tester.pumpAndSettle();

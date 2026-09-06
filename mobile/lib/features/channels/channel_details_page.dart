@@ -252,6 +252,7 @@ class ChannelDetailsPage extends HookConsumerWidget {
     return FrostedScaffold(
       backgroundColor: context.colors.surface,
       appBar: FrostedAppBar(
+        centerTitle: true,
         iconColor: context.colors.primary,
         actions: const [SizedBox.square(dimension: 48)],
         frosted: headerFrostProgress.value > 0,
@@ -259,7 +260,7 @@ class ChannelDetailsPage extends HookConsumerWidget {
         frostedBlurSigma:
             _channelDetailsHeaderFrostMaxBlurSigma * headerFrostProgress.value,
         showBottomDivider: headerFrostProgress.value > 0,
-        bottomDividerOpacity: 0.15 * headerFrostProgress.value,
+        bottomDividerOpacity: 0.07 * headerFrostProgress.value,
         title: AnimatedSwitcher(
           duration: reducedMotion
               ? Duration.zero

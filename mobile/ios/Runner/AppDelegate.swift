@@ -10,6 +10,7 @@ import UserNotifications
   private var inlinePhotoPickerSupportChannel: FlutterMethodChannel?
   private var concentricSheetSurfaceChannel: FlutterMethodChannel?
   private var nativeAttachmentPopoverCoordinator: NativeAttachmentPopoverCoordinator?
+  private var nativeProfileTextEditorCoordinator: NativeProfileTextEditorCoordinator?
 
   override func application(
     _ application: UIApplication,
@@ -88,12 +89,56 @@ import UserNotifications
       }
     }
 
+    if let jumpToLatestGlassRegistrar = engineBridge.pluginRegistry.registrar(
+      forPlugin: "BuzzJumpToLatestGlassButton"
+    ) {
+      jumpToLatestGlassRegistrar.register(
+        JumpToLatestGlassButtonFactory(messenger: messenger),
+        withId: "buzz/jump_to_latest_glass"
+      )
+    }
+
+    if let navigationGlassRegistrar = engineBridge.pluginRegistry.registrar(
+      forPlugin: "BuzzNavigationGlassButton"
+    ) {
+      navigationGlassRegistrar.register(
+        NavigationGlassButtonFactory(messenger: messenger),
+        withId: "buzz/navigation_glass"
+      )
+    }
+
+    if let segmentedControlRegistrar = engineBridge.pluginRegistry.registrar(
+      forPlugin: "BuzzNativeSegmentedControl"
+    ) {
+      segmentedControlRegistrar.register(
+        NativeSegmentedControlFactory(messenger: messenger),
+        withId: "buzz/native_segmented_control"
+      )
+    }
+
+    if let skinToneRegistrar = engineBridge.pluginRegistry.registrar(
+      forPlugin: "BuzzNativeSkinToneControl"
+    ) {
+      skinToneRegistrar.register(
+        NativeSkinToneControlFactory(messenger: messenger),
+        withId: "buzz/native_skin_tone_control"
+      )
+    }
+
     let nativeAttachmentRegistrar = engineBridge.pluginRegistry.registrar(
       forPlugin: "BuzzNativeAttachmentPopover"
     )
     nativeAttachmentPopoverCoordinator = NativeAttachmentPopoverCoordinator(
       messenger: messenger,
       parentViewController: nativeAttachmentRegistrar?.viewController
+    )
+
+    let nativeProfileTextEditorRegistrar = engineBridge.pluginRegistry.registrar(
+      forPlugin: "BuzzNativeProfileTextEditor"
+    )
+    nativeProfileTextEditorCoordinator = NativeProfileTextEditorCoordinator(
+      messenger: messenger,
+      parentViewController: nativeProfileTextEditorRegistrar?.viewController
     )
   }
 
