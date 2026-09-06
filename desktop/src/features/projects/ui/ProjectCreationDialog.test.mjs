@@ -104,6 +104,11 @@ test("empty Projects uses the shared creation flow and preserves desktop capabil
         name: "General",
         isMember: true,
       },
+      {
+        id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        name: "Team",
+        isMember: true,
+      },
       { id: "private", name: "Private", isMember: false },
       { id: "dm", name: "Direct", isMember: true, channelType: "dm" },
     ],
@@ -215,11 +220,81 @@ test("empty Projects uses the shared creation flow and preserves desktop capabil
       [...view.getByTestId("create-project-access-channel").options].map(
         (option) => option.value,
       ),
-      ["", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"],
+      [
+        "",
+        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      ],
     );
     fireEvent.change(view.getByTestId("create-project-name"), {
       target: { value: "Discard me" },
     });
+    const draft = {
+      name: "Discard me",
+      description: "Keep this description",
+      "access-channel": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      "clone-url": "https://example.com/project.git",
+      "web-url": "https://example.com/project",
+    };
+    for (const [field, value] of Object.entries(draft)) {
+      fireEvent.change(view.getByTestId(`create-project-${field}`), {
+        target: { value },
+      });
+    }
+    const draftForm = view.getByTestId("create-project-name").form;
+    const assertDraft = () => {
+      assert.ok(
+        view.getByTestId("create-project-name").form === draftForm,
+        "collection transitions must preserve the mounted draft form",
+      );
+      for (const [field, value] of Object.entries(draft)) {
+        assert.equal(view.getByTestId(`create-project-${field}`).value, value);
+      }
+    };
+    const { buildProjectReadModels } = await import("../projectModels.ts");
+    const announcement = (kind, tags, id) => ({
+      kind,
+      tags,
+      id: id.repeat(64),
+      pubkey,
+      created_at: 1,
+      content: "",
+      sig: "0".repeat(128),
+    });
+    const incoming = buildProjectReadModels({
+      projectEvents: [
+        announcement(
+          30621,
+          [
+            ["d", "incoming"],
+            ["a", `30617:${pubkey}:incoming`],
+          ],
+          "1",
+        ),
+      ],
+      repositoryEvents: [announcement(30617, [["d", "incoming"]], "2")],
+      relayOrigin: scope.relayOrigin,
+    });
+    // Real query notifications must not replace the mounted form in any branch.
+    for (const state of [
+      { data: incoming, status: "success", fetchStatus: "idle" },
+      { data: incoming, status: "error", error: new Error("Refresh failed") },
+      { data: [], status: "success" },
+      { data: [], status: "error" },
+      { data: undefined, status: "pending", fetchStatus: "fetching" },
+      { data: undefined, status: "error", fetchStatus: "idle" },
+      { data: incoming, status: "success" },
+      { data: [], status: "success" },
+    ]) {
+      await act(async () => {
+        client
+          .getQueryCache()
+          .find({ queryKey: collectionKey })
+          .setState(state);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      assertDraft();
+    }
     fireEvent.click(view.getByRole("button", { name: "Close" }));
     await waitFor(() =>
       assert.equal(view.queryByTestId("create-project-dialog"), null),
@@ -227,6 +302,13 @@ test("empty Projects uses the shared creation flow and preserves desktop capabil
     assert.equal(writes.length, 0);
     await open();
     assert.equal(view.getByTestId("create-project-name").value, "");
+    assert.equal(view.getByTestId("create-project-description").value, "");
+    assert.equal(view.getByTestId("create-project-clone-url").value, "");
+    assert.equal(view.getByTestId("create-project-web-url").value, "");
+    assert.equal(
+      view.getByTestId("create-project-access-channel").value,
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    );
     fireEvent.change(view.getByTestId("create-project-name"), {
       target: { value: "First project" },
     });
@@ -258,11 +340,39 @@ test("empty Projects uses the shared creation flow and preserves desktop capabil
     );
     fireEvent.click(view.getByRole("button", { name: "Close" }));
     assert.ok(view.getByTestId("create-project-dialog"));
-    // Return the newly published rows when the existing mutation invalidates.
-    relayClient.fetchEvents = async (filter) =>
-      writes.filter((event) => filter.kinds.includes(event.kind));
+    // Hold the settled refresh after confirmed insertion switches to populated.
+    let releaseRefresh;
+    const holdRefresh = new Promise((resolve) => {
+      releaseRefresh = resolve;
+    });
+    relayClient.fetchEvents = async (filter) => {
+      await holdRefresh;
+      return writes.filter((event) => filter.kinds.includes(event.kind));
+    };
+    const submittingForm = view.getByTestId("create-project-name").form;
     await act(async () => {
       release();
+    });
+    await waitFor(() =>
+      assert.equal(client.getQueryData(collectionKey).length, 1),
+    );
+    await waitFor(() =>
+      assert.equal(view.queryByText("No projects yet"), null),
+    );
+    assert.ok(view.getByTestId("create-project-name").form === submittingForm);
+    assert.equal(
+      view.getByTestId("create-project-name").value,
+      "First project",
+    );
+    assert.equal(
+      view.getByTestId("create-project-submit").textContent,
+      "Creating...",
+    );
+    assert.equal(view.getByTestId("create-project-submit").disabled, true);
+    fireEvent.click(view.getByRole("button", { name: "Close" }));
+    assert.ok(view.getByTestId("create-project-dialog"));
+    await act(async () => {
+      releaseRefresh();
     });
     await waitFor(() =>
       assert.equal(view.queryByTestId("create-project-dialog"), null),

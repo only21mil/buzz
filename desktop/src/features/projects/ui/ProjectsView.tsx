@@ -576,24 +576,28 @@ export function ProjectsView() {
   const projectMountCount = useIncrementalMount(visibleProjects.length);
   const repositoryMountCount = useIncrementalMount(visibleRepositories.length);
 
-  const projectCreationDialog = (
-    <ProjectCreationDialog
-      onCreated={() => {
-        // Keep the fork's complete-list landing after either entry point.
-        handleRepositoryScopeChange("all");
-        handleFilterChange("projects");
-      }}
-      onOpenChange={setCreateProjectOpen}
-      open={createProjectOpen}
-    />
+  // Keep the form and mutation mounted at the same position through refreshes.
+  const withProjectCreationDialog = (content: React.ReactNode) => (
+    <>
+      <ProjectCreationDialog
+        onCreated={() => {
+          // Keep the fork's complete-list landing after either entry point.
+          handleRepositoryScopeChange("all");
+          handleFilterChange("projects");
+        }}
+        onOpenChange={setCreateProjectOpen}
+        open={createProjectOpen}
+      />
+      {content}
+    </>
   );
 
   if (projectsQuery.isLoading) {
-    return <ViewLoadingFallback kind="projects" />;
+    return withProjectCreationDialog(<ViewLoadingFallback kind="projects" />);
   }
 
   if (projectsQuery.isError && !projectsQuery.data) {
-    return (
+    return withProjectCreationDialog(
       <div className="flex flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
         <p className="text-sm text-red-400">Failed to load projects</p>
         <Button
@@ -603,14 +607,13 @@ export function ProjectsView() {
         >
           Retry
         </Button>
-      </div>
+      </div>,
     );
   }
 
   if (projects.length === 0) {
-    return (
+    return withProjectCreationDialog(
       <>
-        {projectCreationDialog}
         {projectsQuery.isError ? (
           <div
             role="status"
@@ -627,7 +630,7 @@ export function ProjectsView() {
           </div>
         ) : null}
         <EmptyState onCreateProject={() => setCreateProjectOpen(true)} />
-      </>
+      </>,
     );
   }
 
@@ -822,7 +825,7 @@ export function ProjectsView() {
     </div>
   );
 
-  return (
+  return withProjectCreationDialog(
     <div
       className={cn(
         "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-tl-xl",
@@ -851,7 +854,6 @@ export function ProjectsView() {
       {/* Create button pinned to the pane's top-right corner: it never
           scrolls with the page, it just stays put. */}
       <div className="absolute right-4 top-4 z-40">{createMenu}</div>
-      {projectCreationDialog}
       {createPullRequestOpen ? (
         <CreatePullRequestDialog
           onCreated={async (
@@ -976,6 +978,6 @@ export function ProjectsView() {
           </div>
         </div>
       </div>
-    </div>
+    </div>,
   );
 }
