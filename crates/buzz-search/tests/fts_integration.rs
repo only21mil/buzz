@@ -46,10 +46,10 @@ async fn setup() -> (PgPool, String) {
     admin_pool.close().await;
 
     // Connect with search_path set so the migration's CREATE TABLE lands here.
-    let url_with_search_path = format!("{url}?options=-c%20search_path%3D{schema}");
+    let options = schema_options(&url, &schema);
     let pool = PgPoolOptions::new()
         .max_connections(2)
-        .connect(&url_with_search_path)
+        .connect_with(options)
         .await
         .expect("connect with search_path");
     // Apply the full migration chain in order so the test schema exactly matches
@@ -82,6 +82,37 @@ async fn setup() -> (PgPool, String) {
         .await
         .expect("apply 0014 migration");
     (pool, schema)
+}
+
+fn schema_options(url: &str, schema: &str) -> sqlx::postgres::PgConnectOptions {
+    use std::str::FromStr;
+    sqlx::postgres::PgConnectOptions::from_str(url)
+        .expect("parse test database options")
+        .options([("search_path", schema)])
+}
+
+#[test]
+fn schema_options_preserve_socket_and_existing_connection_settings() {
+    for scheme in ["postgres", "postgresql"] {
+        let options = schema_options(
+            &format!("{scheme}://fixture@buzz-test.invalid/isolated?host=%2Ftmp%2Fowned&application_name=fts&options=-c%20statement_timeout%3D1000"),
+            "fts_fixture",
+        );
+        assert_eq!(
+            options.get_socket().map(|p| p.as_path()),
+            Some(std::path::Path::new("/tmp/owned"))
+        );
+        assert_eq!(options.get_database(), Some("isolated"));
+        assert_eq!(options.get_application_name(), Some("fts"));
+        assert!(options
+            .get_options()
+            .unwrap()
+            .contains("statement_timeout=1000"));
+        assert!(options
+            .get_options()
+            .unwrap()
+            .contains("search_path=fts_fixture"));
+    }
 }
 
 async fn teardown(pool: PgPool, schema: &str) {

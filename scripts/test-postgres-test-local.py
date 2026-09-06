@@ -4,6 +4,8 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+import subprocess
+import sys
 from unittest.mock import patch
 
 
@@ -19,6 +21,49 @@ frozen = load('check-frozen-migrations')
 
 
 class IsolationTests(unittest.TestCase):
+    def test_cluster_is_recreated_per_test_and_removed_on_failure(self):
+        for fail, cleanup_failure in ((False, False), (True, False), (True, True)):
+            with tempfile.TemporaryDirectory(dir='/tmp') as directory:
+                root = Path(directory)
+                binary = root / 'fixture'
+                binary.touch()
+                starts, stops = [], []
+
+                def run(argv, env, **kwargs):
+                    argv = [str(a) for a in argv]
+                    if '--list' in argv:
+                        return subprocess.CompletedProcess(argv, 0, 'first: test\nsecond: test\n')
+                    if argv[0].endswith('/initdb'):
+                        Path(argv[argv.index('-D') + 1]).mkdir()
+                    if argv[-1] == 'start':
+                        starts.append(argv[argv.index('-D') + 1])
+                    if '--exact' in argv and fail:
+                        raise subprocess.CalledProcessError(7, argv)
+                    if argv[0].endswith('/dropdb') and cleanup_failure:
+                        raise subprocess.CalledProcessError(9, argv)
+                    return subprocess.CompletedProcess(argv, 0)
+
+                def stop(argv, **kwargs):
+                    stops.append(str(argv[argv.index('-D') + 1]))
+                    return subprocess.CompletedProcess(argv, 0)
+
+                args = ['runner', '--task-root', directory, '--pg-bin-dir', '/fixture',
+                        '--schema-mode', 'migration', str(binary)]
+                with patch.object(sys, 'argv', args), patch.object(runner.os, 'environ', {}), \
+                     patch.object(runner.os, 'access', return_value=True), \
+                     patch.object(runner.signal, 'signal'), patch.object(runner, 'command', side_effect=run), \
+                     patch.object(runner.subprocess, 'run', side_effect=stop):
+                    if fail:
+                        with self.assertRaises(subprocess.CalledProcessError) as error:
+                            runner.main()
+                        self.assertEqual(error.exception.returncode, 7)
+                    else:
+                        runner.main()
+                self.assertEqual(len(starts), 1 if fail else 2)
+                self.assertEqual(len(set(starts)), len(starts))
+                self.assertEqual(starts, stops)
+                self.assertEqual(list(root.glob('pg-*')), [])
+
     def test_refuses_every_inherited_database_target_without_echoing_it(self):
         for key in runner.TARGET_VARS:
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, '^refusing inherited database URL; unset database target variables$'):
@@ -37,12 +82,15 @@ class IsolationTests(unittest.TestCase):
 
     def test_destructive_legacy_migration_starts_empty(self):
         self.assertEqual(runner.schema_mode('populated_migration_preserves_legacy_approval_and_backfills_resume_state'), 'migration')
-        self.assertEqual(runner.schema_mode('decision_grant_is_atomic_generation_fenced_and_exactly_replayable'), 'desired')
+        with self.assertRaisesRegex(ValueError, 'unknown or ambiguous'):
+            runner.schema_mode('unknown_migration_fixture')
 
     def test_fork_contract_binaries_own_migrations(self):
-        for name in ('ci_grants_contract', 'workflow_approval_contract',
-                     'workflow_enabled_persistence', 'workflow_state_contract'):
-            self.assertEqual(runner.schema_mode('ordinary_test', name + '-1234'), 'migration')
+        from postgres_test_inventory import read_inventory
+        for row in read_inventory():
+            if row['binary'] in ('ci_grants_contract', 'workflow_approval_contract',
+                                 'workflow_enabled_persistence', 'workflow_state_contract'):
+                self.assertEqual(runner.schema_mode(row['test'], row['binary'] + '-1234'), 'migration')
 
     def test_self_migrating_library_fixtures_start_empty(self):
         names = [
@@ -78,7 +126,10 @@ class IsolationTests(unittest.TestCase):
         import shutil
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            shutil.copytree(frozen.ROOT / 'migrations', root / 'migrations')
+            (root / 'migrations').mkdir()
+            for migration in (frozen.ROOT / 'migrations').glob('*.sql'):
+                if int(migration.name.split('_')[0]) <= 35:
+                    shutil.copy(migration, root / 'migrations')
             (root / 'scripts').mkdir()
             shutil.copy(frozen.ROOT / 'scripts/migrations-0001-0035.sha256', root / 'scripts')
             (root / 'migrations/0036_new.sql').write_text('-- new migration\n')

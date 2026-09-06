@@ -513,6 +513,14 @@ if ! run_check \
     exit 1
 fi
 
+# Issue #160: keep native authority/schema Python gates on the candidate receipt.
+if ! run_check "native-ci-python" "bash scripts/test-native-ci-python.sh" bash scripts/test-native-ci-python.sh; then
+    exit 1
+fi
+if ! run_check "postgres-discovery" "bash scripts/test-postgres-test-discovery.sh" bash scripts/test-postgres-test-discovery.sh; then
+    exit 1
+fi
+
 if ((RUN_TESTS != 0)); then
     if ((FULL_CLIPPY != 0)); then
         if ! run_check "rust-tests" "cargo test --workspace" cargo test --workspace; then

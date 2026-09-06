@@ -1,0 +1,600 @@
+package	binary	test	source	mode	reason
+buzz-audit	buzz_audit	service::tests::chain_links_within_one_community	crates/buzz-audit/src/service.rs	desired	desired schema fixture
+buzz-audit	buzz_audit	service::tests::chains_are_independent_per_community	crates/buzz-audit/src/service.rs	desired	desired schema fixture
+buzz-audit	buzz_audit	service::tests::community_chain_starts_at_seq_1_with_null_prev	crates/buzz-audit/src/service.rs	desired	desired schema fixture
+buzz-audit	buzz_audit	service::tests::cross_community_row_does_not_verify	crates/buzz-audit/src/service.rs	desired	desired schema fixture
+buzz-audit	buzz_audit	service::tests::verify_detects_tampering_within_a_community	crates/buzz-audit/src/service.rs	desired	desired schema fixture
+buzz-audit	buzz_audit	service::tests::verify_empty_range_is_false	crates/buzz-audit/src/service.rs	desired	desired schema fixture
+buzz-cli	repos_delete_acceptance	non_owner_delete_is_rejected_and_repository_remains_listed	crates/buzz-cli/tests/repos_delete_acceptance.rs	external	live relay, MinIO and git acceptance
+buzz-cli	repos_delete_acceptance	owner_delete_removes_repository_from_repos_list	crates/buzz-cli/tests/repos_delete_acceptance.rs	external	live relay, MinIO and git acceptance
+buzz-db	buzz_db	admin_moderation::tests::report_detail_has_no_message_for_non_event_target	crates/buzz-db/src/admin_moderation.rs	desired	desired schema fixture
+buzz-db	buzz_db	admin_moderation::tests::report_detail_has_no_message_when_event_row_is_missing	crates/buzz-db/src/admin_moderation.rs	desired	desired schema fixture
+buzz-db	buzz_db	admin_moderation::tests::report_detail_reads_only_the_same_community_target_and_includes_deleted_content	crates/buzz-db/src/admin_moderation.rs	desired	desired schema fixture
+buzz-db	buzz_db	api_token::tests::active_lookup_by_hash_is_scoped_to_community	crates/buzz-db/src/api_token.rs	desired	desired schema fixture
+buzz-db	buzz_db	api_token::tests::lookup_by_hash_is_scoped_to_community	crates/buzz-db/src/api_token.rs	desired	desired schema fixture
+buzz-db	buzz_db	archived_identities::tests::archived_identity_state_is_community_scoped	crates/buzz-db/src/archived_identities.rs	desired	desired schema fixture
+buzz-db	buzz_db	channel::tests::accessible_channel_ids_are_not_truncated_at_one_thousand	crates/buzz-db/src/channel.rs	desired	desired schema fixture
+buzz-db	buzz_db	channel::tests::get_agent_pubkeys_filters_by_agent_type_and_community	crates/buzz-db/src/channel.rs	desired	desired schema fixture
+buzz-db	buzz_db	channel::tests::get_channel_is_scoped_when_channel_uuid_collides_across_communities	crates/buzz-db/src/channel.rs	desired	desired schema fixture
+buzz-db	buzz_db	channel::tests::get_users_bulk_is_scoped_when_pubkey_exists_in_multiple_communities	crates/buzz-db/src/channel.rs	desired	desired schema fixture
+buzz-db	buzz_db	channel::tests::kicked_owner_rejoins_as_member_not_owner	crates/buzz-db/src/channel.rs	desired	desired schema fixture
+buzz-db	buzz_db	channel::tests::membership_writes_serialize_on_the_shared_channel_lock	crates/buzz-db/src/channel.rs	desired	desired schema fixture
+buzz-db	buzz_db	channel::tests::owner_can_still_manage_roles_after_demotion_guard	crates/buzz-db/src/channel.rs	desired	desired schema fixture
+buzz-db	buzz_db	channel::tests::reap_expired_ephemeral_channels_returns_row_community_and_host	crates/buzz-db/src/channel.rs	desired	desired schema fixture
+buzz-db	buzz_db	channel::tests::remove_member_rejects_an_actor_demoted_while_it_waited	crates/buzz-db/src/channel.rs	desired	desired schema fixture
+buzz-db	buzz_db	channel::tests::removed_owner_is_restored_only_by_a_current_owner	crates/buzz-db/src/channel.rs	desired	desired schema fixture
+buzz-db	buzz_db	channel::tests::repro_private_channel_member_can_demote_owner	crates/buzz-db/src/channel.rs	desired	desired schema fixture
+buzz-db	buzz_db	channel::tests::repro_unprivileged_member_can_demote_owner	crates/buzz-db/src/channel.rs	desired	desired schema fixture
+buzz-db	buzz_db	channel::tests::test_agent_owner_can_remove_bot	crates/buzz-db/src/channel.rs	desired	desired schema fixture
+buzz-db	buzz_db	channel::tests::test_random_user_cannot_remove_bot	crates/buzz-db/src/channel.rs	desired	desired schema fixture
+buzz-db	buzz_db	channel::tests::test_unarchive_expired_ephemeral_channel_renews_ttl_deadline	crates/buzz-db/src/channel.rs	desired	desired schema fixture
+buzz-db	buzz_db	channel::tests::unprivileged_member_cannot_demote_a_co_owner	crates/buzz-db/src/channel.rs	desired	desired schema fixture
+buzz-db	buzz_db	ci_grants::tests::expired_grant_is_not_active	crates/buzz-db/src/ci_grants.rs	desired	desired schema fixture
+buzz-db	buzz_db	ci_grants::tests::future_grant_is_not_active	crates/buzz-db/src/ci_grants.rs	desired	desired schema fixture
+buzz-db	buzz_db	ci_grants::tests::grants_are_scoped_per_repo	crates/buzz-db/src/ci_grants.rs	desired	desired schema fixture
+buzz-db	buzz_db	ci_grants::tests::upsert_and_query_active_signers	crates/buzz-db/src/ci_grants.rs	desired	desired schema fixture
+buzz-db	buzz_db	ci_grants::tests::upsert_is_idempotent_and_updates_window	crates/buzz-db/src/ci_grants.rs	desired	desired schema fixture
+buzz-db	buzz_db	event::tests::access_scope_is_applied_before_historical_page_limit	crates/buzz-db/src/event.rs	desired	desired schema fixture
+buzz-db	buzz_db	event::tests::claim_due_reminder_is_won_by_exactly_one_of_two_racing_pods	crates/buzz-db/src/event.rs	desired	desired schema fixture
+buzz-db	buzz_db	event::tests::custom_tag_scope_precedes_limit_and_preserves_tenant_access	crates/buzz-db/src/event.rs	desired	desired schema fixture
+buzz-db	buzz_db	event::tests::event_insert_ttl_trigger_handles_permanent_ephemeral_duplicate_and_activation_race	crates/buzz-db/src/event.rs	desired	desired schema fixture
+buzz-db	buzz_db	event::tests::get_event_by_id_is_scoped_when_event_id_collides_across_communities	crates/buzz-db/src/event.rs	desired	desired schema fixture
+buzz-db	buzz_db	event::tests::permanent_channel_event_commits_do_not_lock_the_channel_row	crates/buzz-db/src/event.rs	desired	desired schema fixture
+buzz-db	buzz_db	event::tests::query_due_reminders_returns_row_community_and_host_per_tenant	crates/buzz-db/src/event.rs	desired	desired schema fixture
+buzz-db	buzz_db	event::tests::reaction_single_tx_cross_community_target_rejected	crates/buzz-db/src/event.rs	desired	desired schema fixture
+buzz-db	buzz_db	event::tests::reaction_single_tx_duplicate_short_circuit_stores_no_event	crates/buzz-db/src/event.rs	desired	desired schema fixture
+buzz-db	buzz_db	event::tests::reaction_single_tx_event_insert_failure_rolls_back_reaction	crates/buzz-db/src/event.rs	desired	desired schema fixture
+buzz-db	buzz_db	event::tests::reaction_single_tx_reactivates_soft_deleted_reaction	crates/buzz-db/src/event.rs	desired	desired schema fixture
+buzz-db	buzz_db	event::tests::reaction_single_tx_stores_wrapped_max_shortcode	crates/buzz-db/src/event.rs	desired	desired schema fixture
+buzz-db	buzz_db	event::tests::release_due_reminder_rolls_back_only_the_matching_stamp	crates/buzz-db/src/event.rs	desired	desired schema fixture
+buzz-db	buzz_db	event::tests::reminder_claim_and_release_are_confined_to_their_community	crates/buzz-db/src/event.rs	desired	desired schema fixture
+buzz-db	buzz_db	feed::tests::query_activity_is_scoped_and_empty_channels_are_global_only	crates/buzz-db/src/feed.rs	desired	desired schema fixture
+buzz-db	buzz_db	feed::tests::query_mentions_is_scoped_across_communities	crates/buzz-db/src/feed.rs	desired	desired schema fixture
+buzz-db	buzz_db	feed::tests::query_needs_action_is_scoped_across_communities	crates/buzz-db/src/feed.rs	desired	desired schema fixture
+buzz-db	buzz_db	git_repo::tests::names_are_scoped_per_community	crates/buzz-db/src/git_repo.rs	desired	desired schema fixture
+buzz-db	buzz_db	git_repo::tests::release_is_owner_scoped_and_frees_the_name	crates/buzz-db/src/git_repo.rs	desired	desired schema fixture
+buzz-db	buzz_db	git_repo::tests::repo_name_owner_reflects_reservation	crates/buzz-db/src/git_repo.rs	desired	desired schema fixture
+buzz-db	buzz_db	git_repo::tests::reserve_classifies_fresh_idempotent_and_collision	crates/buzz-db/src/git_repo.rs	desired	desired schema fixture
+buzz-db	buzz_db	migration::tests::populated_upgrade_preserves_search_policy_except_for_push_leases	crates/buzz-db/src/migration.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	migration::tests::populated_workflow_approval_upgrade_sets_resume_defaults_and_retains_history	crates/buzz-db/src/migration.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	migration::tests::pre_0007_ambiguous_nip_rs_data_blocks_without_mutation_and_allows_retry	crates/buzz-db/src/migration.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	migration::tests::run_migrations_applies_consolidated_initial_schema_on_fresh_database	crates/buzz-db/src/migration.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	moderation::tests::expired_ban_does_not_hide_active_timeout	crates/buzz-db/src/moderation.rs	desired	desired schema fixture
+buzz-db	buzz_db	moderation::tests::report_reingest_returns_same_id_and_preserves_resolution	crates/buzz-db/src/moderation.rs	desired	desired schema fixture
+buzz-db	buzz_db	moderation::tests::resolve_report_returns_false_after_report_is_closed	crates/buzz-db/src/moderation.rs	desired	desired schema fixture
+buzz-db	buzz_db	moderation::tests::restrictions_are_confined_to_their_community	crates/buzz-db/src/moderation.rs	desired	desired schema fixture
+buzz-db	buzz_db	product_feedback::tests::duplicate_event_keeps_first_community_provenance	crates/buzz-db/src/product_feedback.rs	desired	desired schema fixture
+buzz-db	buzz_db	push::tests::acceptance_constraint_failure_rolls_back_source_event	crates/buzz-db/src/push.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	push::tests::batch_claim_is_single_community_and_setwise_ops_honor_the_fence	crates/buzz-db/src/push.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	push::tests::concurrent_enqueue_is_atomic_and_community_scoped	crates/buzz-db/src/push.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	push::tests::delivered_wake_is_retained_while_rematch_is_queued	crates/buzz-db/src/push.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	push::tests::endpoint_invalidation_is_scoped_to_community_and_generation	crates/buzz-db/src/push.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	push::tests::exhausted_match_job_is_reaped_and_cannot_pin_retention	crates/buzz-db/src/push.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	push::tests::gate_orders_lease_activation_after_in_flight_event_and_backfills_it	crates/buzz-db/src/push.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	push::tests::matcher_claim_is_exclusive_across_workers	crates/buzz-db/src/push.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	push::tests::matcher_load_error_preserves_claimed_job_for_recovery	crates/buzz-db/src/push.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	push::tests::matcher_trigger_is_allowlisted_and_deleted_events_are_discarded	crates/buzz-db/src/push.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	push::tests::replacement_and_revoke_are_community_scoped_and_dual_ordered	crates/buzz-db/src/push.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	push::tests::send_revalidation_suppresses_rotated_claim_and_retry_preserves_id	crates/buzz-db/src/push.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	push::tests::setwise_enqueue_maps_outcomes_per_request	crates/buzz-db/src/push.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	push::tests::source_event_collision_is_protocol_outcome_without_event_insert	crates/buzz-db/src/push.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	relay_invite::tests::bounded_claim_exhausts_and_existing_member_retry_does_not_consume	crates/buzz-db/src/relay_invite.rs	desired	desired schema fixture
+buzz-db	buzz_db	relay_invite::tests::concurrent_claims_serialize_the_final_slot	crates/buzz-db/src/relay_invite.rs	desired	desired schema fixture
+buzz-db	buzz_db	relay_invite::tests::expiry_and_tenant_scope_return_typed_failures	crates/buzz-db/src/relay_invite.rs	desired	desired schema fixture
+buzz-db	buzz_db	relay_invite::tests::policy_evidence_failure_rolls_back_membership_and_consumption	crates/buzz-db/src/relay_invite.rs	desired	desired schema fixture
+buzz-db	buzz_db	relay_invite::tests::retention_sweep_deletes_only_invites_older_than_cutoff	crates/buzz-db/src/relay_invite.rs	desired	desired schema fixture
+buzz-db	buzz_db	relay_invite::tests::unlimited_invites_count_each_new_member	crates/buzz-db/src/relay_invite.rs	desired	desired schema fixture
+buzz-db	buzz_db	relay_members::tests::invite_claim_persists_policy_version_and_legacy_claim_does_not	crates/buzz-db/src/relay_members.rs	desired	desired schema fixture
+buzz-db	buzz_db	relay_members::tests::membership_is_confined_to_its_community	crates/buzz-db/src/relay_members.rs	desired	desired schema fixture
+buzz-db	buzz_db	relay_members::tests::owner_bootstrap_is_confined_to_its_community	crates/buzz-db/src/relay_members.rs	desired	desired schema fixture
+buzz-db	buzz_db	relay_members::tests::transfer_ownership_already_owner_is_noop	crates/buzz-db/src/relay_members.rs	desired	desired schema fixture
+buzz-db	buzz_db	relay_members::tests::transfer_ownership_demotes_old_owner_to_member	crates/buzz-db/src/relay_members.rs	desired	desired schema fixture
+buzz-db	buzz_db	relay_members::tests::transfer_ownership_is_community_scoped	crates/buzz-db/src/relay_members.rs	desired	desired schema fixture
+buzz-db	buzz_db	relay_members::tests::transfer_ownership_no_owner_returns_no_owner	crates/buzz-db/src/relay_members.rs	desired	desired schema fixture
+buzz-db	buzz_db	relay_members::tests::transfer_ownership_promotes_existing_member	crates/buzz-db/src/relay_members.rs	desired	desired schema fixture
+buzz-db	buzz_db	relay_members::tests::transfer_ownership_returns_limit_reached_for_maxed_transferee	crates/buzz-db/src/relay_members.rs	desired	desired schema fixture
+buzz-db	buzz_db	relay_members::tests::transfer_ownership_returns_owner_conflict_when_expected_mismatches	crates/buzz-db/src/relay_members.rs	desired	desired schema fixture
+buzz-db	buzz_db	replica_fence::tests::aurora_identity_probe_reports_false_on_plain_postgres	crates/buzz-db/src/replica_fence.rs	desired	desired schema fixture
+buzz-db	buzz_db	replica_fence::tests::probe_commits_tokens_and_sessions_prove_coverage	crates/buzz-db/src/replica_fence.rs	desired	desired schema fixture
+buzz-db	buzz_db	replica_fence::tests::probe_rotates_epoch_on_same_epoch_token_regression	crates/buzz-db/src/replica_fence.rs	desired	desired schema fixture
+buzz-db	buzz_db	replica_fence::tests::sample_writer_fails_closed_when_activity_is_masked	crates/buzz-db/src/replica_fence.rs	desired	desired schema fixture
+buzz-db	buzz_db	replica_fence::tests::sample_writer_sees_open_transactions_and_ignores_idle	crates/buzz-db/src/replica_fence.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::allowlist_is_scoped_to_community	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::armed_pool_rejects_old_channel_inserts_through_public_api	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::channel_cursor_above_fence_stays_on_writer_preventing_middle_hole	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::channel_window_routes_head_to_writer_and_cursor_pages_to_replica	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::communities_of_channels_present_for_existing_absent_for_missing	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::concurrent_same_owner_create_returns_the_winning_row_to_both_callers	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::coordinate_delete_spares_head_newer_than_the_deletion	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::count_events_routed_is_bounded_only	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::create_community_with_owner_enforces_per_owner_limit	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::create_community_with_owner_is_atomic_and_create_only	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::created_at_floor_guard_aborts_old_channel_rows_at_commit	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::database_guard_covers_legacy_writer_and_nip09_deletion	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::duplicate_nip_rs_discriminator_tags_keep_legacy_retention	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::ensure_configured_community_reports_insert_winner	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::fence_probe_refuses_to_start_without_verified_floor_guard	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::floor_guard_blocks_updates_that_move_rows_below_the_fence	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::head_fetch_routes_by_configured_budget	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::is_relay_member_is_bounded_routed_and_fails_closed	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::lazy_reader_pool_still_spawns_fence_probe	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::list_communities_owned_by_returns_only_owner_rows	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::lookup_community_by_host_matches_case_insensitive_host_index	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::mesh_status_replacement_keeps_one_physical_row	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::nip_rs_hard_delete_fence_fails_closed_and_scopes_opt_in_to_transaction	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::nip_rs_replacement_hard_deletes_payload_and_watermark_rejects_replay	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::query_events_routed_defaults_dark_and_routes_covered_when_enabled	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::reactions_are_scoped_to_community	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::read_session_degrades_to_writer_when_replica_connection_dies	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::replacement_after_committed_repo_deletion_survives	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::replica_thread_failure_falls_back_to_writer	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::replica_window_failure_falls_back_to_writer	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::repo_tombstone_shares_target_coordinate_lock_with_replacement	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::repo_tombstone_sql_failure_rolls_back_event_and_coordinate_change	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::repo_tombstone_transaction_rolls_back_and_repairs_replays	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::routed_fallback_spends_one_acquire_budget_when_aurora_cache_is_cold	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::routed_reads_are_confined_to_the_requested_community	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::routed_request_holds_one_snapshot_across_page_and_aux	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::test_usage_metrics_lock_has_single_owner_and_releases_on_drop	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::thread_full_replica_page_above_fence_is_reverified_on_writer	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::thread_replies_cursor_pages_route_to_replica_with_writer_terminal_verification	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	tests::unarchive_community_owned_by_restores_admission_idempotently	crates/buzz-db/src/lib.rs	desired	desired schema fixture
+buzz-db	buzz_db	thread::tests::channel_window_exact_multiple_final_page_reports_exhausted	crates/buzz-db/src/thread.rs	desired	desired schema fixture
+buzz-db	buzz_db	thread::tests::channel_window_joins_thread_summaries_with_participants	crates/buzz-db/src/thread.rs	desired	desired schema fixture
+buzz-db	buzz_db	thread::tests::channel_window_pages_same_second_ties_without_loss	crates/buzz-db/src/thread.rs	desired	desired schema fixture
+buzz-db	buzz_db	thread::tests::channel_window_top_level_predicate	crates/buzz-db/src/thread.rs	desired	desired schema fixture
+buzz-db	buzz_db	thread::tests::get_thread_metadata_by_event_is_scoped_when_event_id_collides_across_communities	crates/buzz-db/src/thread.rs	desired	desired schema fixture
+buzz-db	buzz_db	thread::tests::get_thread_replies_pages_same_second_ties_without_loss	crates/buzz-db/src/thread.rs	desired	desired schema fixture
+buzz-db	buzz_db	thread::tests::get_thread_replies_reaches_nested_depth_two_replies	crates/buzz-db/src/thread.rs	desired	desired schema fixture
+buzz-db	buzz_db	thread::tests::get_thread_replies_reconstructs_stored_events	crates/buzz-db/src/thread.rs	desired	desired schema fixture
+buzz-db	buzz_db	thread::tests::get_thread_replies_skips_unreconstructable_row	crates/buzz-db/src/thread.rs	desired	desired schema fixture
+buzz-db	buzz_db	thread::tests::insert_thread_metadata_nested_reply_creates_root_stub	crates/buzz-db/src/thread.rs	desired	desired schema fixture
+buzz-db	buzz_db	usage::tests::test_active_user_counts_unknown_bucket_for_profileless_poster	crates/buzz-db/src/usage.rs	desired	desired schema fixture
+buzz-db	buzz_db	usage::tests::test_channel_counts_drops_to_zero_after_last_channel_deleted	crates/buzz-db/src/usage.rs	desired	desired schema fixture
+buzz-db	buzz_db	usage::tests::test_channel_counts_scoped_and_excludes_deleted	crates/buzz-db/src/usage.rs	desired	desired schema fixture
+buzz-db	buzz_db	usage::tests::test_community_count_increases	crates/buzz-db/src/usage.rs	desired	desired schema fixture
+buzz-db	buzz_db	usage::tests::test_community_hosts_returns_mapping	crates/buzz-db/src/usage.rs	desired	desired schema fixture
+buzz-db	buzz_db	usage::tests::test_git_repo_counts_scoped_per_community	crates/buzz-db/src/usage.rs	desired	desired schema fixture
+buzz-db	buzz_db	usage::tests::test_user_counts_excludes_deactivated	crates/buzz-db/src/usage.rs	desired	desired schema fixture
+buzz-db	buzz_db	usage::tests::test_user_counts_scoped_per_community	crates/buzz-db/src/usage.rs	desired	desired schema fixture
+buzz-db	buzz_db	usage::tests::test_workflow_counts_excludes_soft_deleted_rows	crates/buzz-db/src/usage.rs	desired	desired schema fixture
+buzz-db	buzz_db	user::tests::test_get_policy_unknown_pubkey	crates/buzz-db/src/user.rs	desired	desired schema fixture
+buzz-db	buzz_db	user::tests::test_owner_only_with_no_owner	crates/buzz-db/src/user.rs	desired	desired schema fixture
+buzz-db	buzz_db	user::tests::test_set_agent_owner_already_owned	crates/buzz-db/src/user.rs	desired	desired schema fixture
+buzz-db	buzz_db	user::tests::test_set_agent_owner_and_get_policy	crates/buzz-db/src/user.rs	desired	desired schema fixture
+buzz-db	buzz_db	user::tests::test_set_agent_owner_nonexistent_agent	crates/buzz-db/src/user.rs	desired	desired schema fixture
+buzz-db	buzz_db	user::tests::test_set_channel_add_policy	crates/buzz-db/src/user.rs	desired	desired schema fixture
+buzz-db	buzz_db	user::tests::test_set_channel_add_policy_nonexistent_user	crates/buzz-db/src/user.rs	desired	desired schema fixture
+buzz-db	buzz_db	user::tests::test_set_channel_add_policy_rejects_invalid	crates/buzz-db/src/user.rs	desired	desired schema fixture
+buzz-db	buzz_db	workflow::tests::approval_is_confined_to_its_community	crates/buzz-db/src/workflow.rs	desired	desired schema fixture
+buzz-db	buzz_db	workflow::tests::attach_links_run_to_claim_and_is_idempotent	crates/buzz-db/src/workflow.rs	desired	desired schema fixture
+buzz-db	buzz_db	workflow::tests::claim_confined_to_its_community	crates/buzz-db/src/workflow.rs	desired	desired schema fixture
+buzz-db	buzz_db	workflow::tests::concurrent_same_window_claims_exactly_one_wins	crates/buzz-db/src/workflow.rs	desired	desired schema fixture
+buzz-db	buzz_db	workflow::tests::disable_for_owner_scopes_to_owner_and_channel	crates/buzz-db/src/workflow.rs	desired	desired schema fixture
+buzz-db	buzz_db	workflow::tests::latest_after_prune_below_interval_breaks_anchor	crates/buzz-db/src/workflow.rs	desired	desired schema fixture
+buzz-db	buzz_db	workflow::tests::owner_delete_is_atomic_and_returns_the_tombstoned_channel	crates/buzz-db/src/workflow.rs	desired	desired schema fixture
+buzz-db	buzz_db	workflow::tests::workflow_delete_is_confined_to_its_community	crates/buzz-db/src/workflow.rs	desired	desired schema fixture
+buzz-db	buzz_db	workflow::tests::workflow_lookup_is_confined_to_its_community	crates/buzz-db/src/workflow.rs	desired	desired schema fixture
+buzz-db	buzz_db	workflow_approval::tests::prior_trace_is_persisted_once_and_replay_does_not_append	crates/buzz-db/src/workflow_approval.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	workflow_run_transition::tests::concurrent_claims_have_one_applied_outcome	crates/buzz-db/src/workflow_run_transition.rs	desired	desired schema fixture
+buzz-db	buzz_db	workflow_run_transition::tests::fenced_failure_cannot_overwrite_a_waiting_gate	crates/buzz-db/src/workflow_run_transition.rs	desired	desired schema fixture
+buzz-db	buzz_db	workflow_run_transition::tests::fenced_failure_closes_the_original_running_generation	crates/buzz-db/src/workflow_run_transition.rs	desired	desired schema fixture
+buzz-db	buzz_db	workflow_run_transition::tests::matching_fence_applies_and_increments_generation	crates/buzz-db/src/workflow_run_transition.rs	desired	desired schema fixture
+buzz-db	buzz_db	workflow_run_transition::tests::stale_fences_conflict_without_mutation	crates/buzz-db/src/workflow_run_transition.rs	desired	desired schema fixture
+buzz-db	buzz_db	workflow_run_transition::tests::tenant_scope_conflicts_even_when_run_ids_match	crates/buzz-db/src/workflow_run_transition.rs	desired	desired schema fixture
+buzz-db	buzz_db	workflow_state::tests::postgres_receipt_replays_before_deriving_a_new_deadline	crates/buzz-db/src/workflow_state.rs	desired	desired schema fixture
+buzz-db	ci_grants_contract	expired_grant_is_not_active	crates/buzz-db/tests/ci_grants_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	ci_grants_contract	future_grant_is_not_active_yet	crates/buzz-db/tests/ci_grants_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	ci_grants_contract	grants_are_scoped_to_the_exact_repo_and_channel	crates/buzz-db/tests/ci_grants_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	ci_grants_contract	malformed_validity_window_is_never_active	crates/buzz-db/tests/ci_grants_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	ci_grants_contract	multiple_active_signers_are_all_returned	crates/buzz-db/tests/ci_grants_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	ci_grants_contract	owner_grant_is_durable_and_visible_to_get_active_ci_signers	crates/buzz-db/tests/ci_grants_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	ci_grants_contract	rejected_non_owner_grant_is_never_visible	crates/buzz-db/tests/ci_grants_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	ci_grants_contract	upsert_is_idempotent_and_updates_window	crates/buzz-db/tests/ci_grants_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	ci_grants_contract	upsert_then_query_returns_the_active_signer	crates/buzz-db/tests/ci_grants_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	ci_grants_contract	validity_window_boundary_is_aware_of_now	crates/buzz-db/tests/ci_grants_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	approval_history_survives_workflow_deletion	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	approval_row_and_request_payload_have_no_raw_token_contract	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	crash_after_claim_before_fire_reuses_identity_and_fires_once	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	crash_after_effect_fired_recovers_without_double_post	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	decision_deny_cancels_without_advancing_the_resume_cursor	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	decision_grant_is_atomic_generation_fenced_and_exactly_replayable	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	decision_rejects_wrong_tenant_removed_member_role_drift_stale_generation_and_expiry	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	exact_pubkey_policy_survives_role_drift_but_not_channel_removal	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	gate_creation_persists_exact_resume_cursor_outputs_and_waiting_trace	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	history_error_code_upgrade_preserves_populated_fork35_evidence	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	history_pages_equal_timestamps_without_cross_tenant_or_workflow_rows	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	history_reads_durable_gate_and_legacy_evidence_without_authority_tokens	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	history_structured_failure_is_atomic_and_generation_fenced	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	identical_gate_replay_reuses_gate_and_outbox_without_mutation	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	membership_changes_and_gate_creation_share_the_channel_lock	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	no_current_policy_match_returns_without_gate_run_or_outbox_writes	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	outbox_deduplicates_replays_and_orders_gate_requests	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	populated_migration_preserves_legacy_approval_and_backfills_resume_state	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	reclaimed_run_skips_fired_steps_and_only_fires_pending_effects	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	replay_rejects_a_mismatched_current_step_without_mutation	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	replay_requires_exact_run_gate_trace_policy_expiry_and_request	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	same_run_step_with_different_payload_conflicts_without_mutation	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	stale_generation_rolls_back_gate_run_and_outbox_writes	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	tenant_and_channel_collisions_fail_closed	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	transaction_abort_after_each_write_leaves_no_partial_state	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_approval_contract	workflow_channel_changes_and_gate_creation_share_the_workflow_row_lock	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_enabled_persistence	workflow_enabled_create_preserves_disabled_state	crates/buzz-db/tests/workflow_enabled_persistence.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_enabled_persistence	workflow_enabled_disabled_insert_is_persisted	crates/buzz-db/tests/workflow_enabled_persistence.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_enabled_persistence	workflow_enabled_updates_transition_and_keep_identity_guards	crates/buzz-db/tests/workflow_enabled_persistence.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_state_contract	concurrent_writers_with_one_expected_revision_have_one_winner	crates/buzz-db/tests/workflow_state_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_state_contract	exact_request_replay_returns_original_receipt_without_mutating_state	crates/buzz-db/tests/workflow_state_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	workflow_state_contract	stale_revision_from_expired_incarnation_conflicts	crates/buzz-db/tests/workflow_state_contract.rs	migration	fixture applies migrations to empty database
+buzz-media	static_creds_minio	static_creds_round_trip_against_minio	crates/buzz-media/tests/static_creds_minio.rs	external	live MinIO object storage
+buzz-pubsub	buzz_pubsub	nip98_replay::tests::above_ceiling_ttl_is_clamped	crates/buzz-pubsub/src/nip98_replay.rs	external	Redis fixture
+buzz-pubsub	buzz_pubsub	nip98_replay::tests::first_claim_succeeds_replay_fails	crates/buzz-pubsub/src/nip98_replay.rs	external	Redis fixture
+buzz-pubsub	buzz_pubsub	nip98_replay::tests::isolation_between_communities	crates/buzz-pubsub/src/nip98_replay.rs	external	Redis fixture
+buzz-pubsub	buzz_pubsub	nip98_replay::tests::sub_floor_ttl_is_lifted_to_default	crates/buzz-pubsub/src/nip98_replay.rs	external	Redis fixture
+buzz-pubsub	buzz_pubsub	presence::tests::test_presence_bulk	crates/buzz-pubsub/src/presence.rs	external	Redis fixture
+buzz-pubsub	buzz_pubsub	presence::tests::test_presence_set_and_get	crates/buzz-pubsub/src/presence.rs	external	Redis fixture
+buzz-pubsub	buzz_pubsub	presence::tests::test_presence_ttl	crates/buzz-pubsub/src/presence.rs	external	Redis fixture
+buzz-pubsub	buzz_pubsub	tests::same_channel_id_in_two_communities_release_one_keeps_other_live	crates/buzz-pubsub/src/lib.rs	external	Redis fixture
+buzz-pubsub	buzz_pubsub	tests::test_cache_invalidation_roundtrip	crates/buzz-pubsub/src/lib.rs	external	Redis fixture
+buzz-pubsub	buzz_pubsub	tests::test_presence_set_and_get	crates/buzz-pubsub/src/lib.rs	external	Redis fixture
+buzz-pubsub	buzz_pubsub	tests::test_publish_and_subscribe_roundtrip	crates/buzz-pubsub/src/lib.rs	external	Redis fixture
+buzz-push-gateway	buzz_push_gateway	postgres::tests::concurrent_admissions_never_over_admit_past_quota_ceiling	crates/buzz-push-gateway/src/postgres.rs	migration	fixture installs its own gateway/FTS schema
+buzz-push-gateway	buzz_push_gateway	postgres::tests::concurrent_same_request_id_admits_exactly_once	crates/buzz-push-gateway/src/postgres.rs	migration	fixture installs its own gateway/FTS schema
+buzz-push-gateway	buzz_push_gateway	postgres::tests::duplicated_retryable_release_does_not_permanently_unfence_request_id	crates/buzz-push-gateway/src/postgres.rs	migration	fixture installs its own gateway/FTS schema
+buzz-push-gateway	buzz_push_gateway	postgres::tests::readiness_requires_migrated_schema_dml_and_no_ddl	crates/buzz-push-gateway/src/postgres.rs	migration	fixture installs its own gateway/FTS schema
+buzz-push-gateway	buzz_push_gateway	postgres::tests::reaper_deletes_active_child_of_retention_eligible_revoked_installation	crates/buzz-push-gateway/src/postgres.rs	migration	fixture installs its own gateway/FTS schema
+buzz-push-gateway	buzz_push_gateway	postgres::tests::retryable_release_frees_request_id_on_real_postgres	crates/buzz-push-gateway/src/postgres.rs	migration	fixture installs its own gateway/FTS schema
+buzz-relay	buzz_relay	api::bridge::tests::nip98_replay_guard_rejects_cross_pod_replay_on_bridge_path	crates/buzz-relay/src/api/bridge.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::bridge::tests::nip98_replay_guard_rejects_same_pod_same_community_replay	crates/buzz-relay/src/api/bridge.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::bridge::tests::submit_event_invalid_json_body_increments_http_transport_counter	crates/buzz-relay/src/api/bridge.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::bridge::tests::submit_event_invalid_json_emits_exactly_one_attribution_line	crates/buzz-relay/src/api/bridge.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::bridge::tests::submit_event_relay_only_kind_emits_exactly_one_attribution_line	crates/buzz-relay/src/api/bridge.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::bridge::tests::submit_event_relay_only_kind_increments_http_transport_counter	crates/buzz-relay/src/api/bridge.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::bridge::workflow_history_tests::workflow_history_privacy_requires_owner_and_active_membership_in_same_community	crates/buzz-relay/src/api/workflow_history_tests.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::ci::tests::route_ci_run_events_pages_by_durable_cursor	crates/buzz-relay/src/api/ci.rs	external	PostgreSQL plus CI evidence storage; existing acceptance scope
+buzz-relay	buzz_relay	api::ci::tests::route_ci_run_events_query_is_exact_and_bounded	crates/buzz-relay/src/api/ci.rs	external	PostgreSQL plus CI evidence storage; existing acceptance scope
+buzz-relay	buzz_relay	api::ci::tests::route_ci_run_reads_fail_closed_for_non_members_and_unknown_runs	crates/buzz-relay/src/api/ci.rs	external	PostgreSQL plus CI evidence storage; existing acceptance scope
+buzz-relay	buzz_relay	api::ci::tests::route_ci_run_request_exports_the_immutable_request	crates/buzz-relay/src/api/ci.rs	external	PostgreSQL plus CI evidence storage; existing acceptance scope
+buzz-relay	buzz_relay	api::ci::tests::route_log_read_uses_tenant_host_not_config_host	crates/buzz-relay/src/api/ci.rs	external	PostgreSQL plus CI evidence storage; existing acceptance scope
+buzz-relay	buzz_relay	api::ci::tests::route_malformed_coordinate_is_400_in_both_domains	crates/buzz-relay/src/api/ci.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	api::ci::tests::route_member_resolvable_repo_returns_deterministic_outcome_no_501	crates/buzz-relay/src/api/ci.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	api::ci::tests::route_non_member_is_403_fail_closed	crates/buzz-relay/src/api/ci.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	api::ci::tests::route_non_member_is_exactly_403	crates/buzz-relay/src/api/ci.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	api::ci::tests::route_rejects_old_501_and_blanket_wf_400_contract	crates/buzz-relay/src/api/ci.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	api::ci::tests::route_unknown_repo_is_404_not_501_not_500	crates/buzz-relay/src/api/ci.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	api::ci::tests::route_unknown_repo_is_exactly_404_not_501	crates/buzz-relay/src/api/ci.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	api::ci::tests::route_unresolvable_tip_is_400_or_404_fail_closed	crates/buzz-relay/src/api/ci.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	api::ci::tests::route_unresolvable_tip_is_400_or_404_not_501	crates/buzz-relay/src/api/ci.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	api::git::policy::tests::hook_allows_active_member_author_on_admin_main	crates/buzz-relay/src/api/git/policy.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::git::policy::tests::hook_denies_nonmember_author_before_delegation	crates/buzz-relay/src/api/git/policy.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::git::policy::tests::push_gate_denies_owner_without_exact_live_binding	crates/buzz-relay/src/api/git/policy.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::git::transport::sec005_read_gate_tests::ban_gate_cascades_to_a_banned_nip_oa_owner	crates/buzz-relay/src/api/git/transport.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::git::transport::sec005_read_gate_tests::ban_gate_denies_banned_member_and_allows_clear_member	crates/buzz-relay/src/api/git/transport.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::git::transport::sec005_read_gate_tests::ban_gate_fails_closed_with_503_when_the_store_is_unreachable	crates/buzz-relay/src/api/git/transport.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::git::transport::sec005_read_gate_tests::read_gate_allows_current_member_denies_removed_and_owner_bypass	crates/buzz-relay/src/api/git/transport.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::git::transport::sec005_read_gate_tests::read_gate_denies_missing_or_malformed_binding_and_absent_repo	crates/buzz-relay/src/api/git/transport.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::git::transport::sec005_read_gate_tests::read_gate_follows_current_announcement_not_stale_registry	crates/buzz-relay/src/api/git/transport.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::git::transport::sec005_read_gate_tests::read_gate_gives_author_of_unbound_repo_remediation_body	crates/buzz-relay/src/api/git/transport.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::invites::tests::bounded_v2_claims_publish_side_effects_only_for_joined	crates/buzz-relay/src/api/invites.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::invites::tests::claim_rate_limit_fires_on_repeat_pubkey	crates/buzz-relay/src/api/invites.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::invites::tests::claim_rejects_expired_code	crates/buzz-relay/src/api/invites.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::invites::tests::claim_rejects_invalid_code	crates/buzz-relay/src/api/invites.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::invites::tests::claim_rejects_replayed_nip98_auth	crates/buzz-relay/src/api/invites.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::invites::tests::code_minted_for_one_community_fails_on_another	crates/buzz-relay/src/api/invites.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::invites::tests::join_policy_document_pages_serve_configured_markdown	crates/buzz-relay/src/api/invites.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::invites::tests::join_policy_gate_end_to_end	crates/buzz-relay/src/api/invites.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::invites::tests::malformed_and_unknown_v2_codes_are_forbidden_without_v1_fallback	crates/buzz-relay/src/api/invites.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::invites::tests::mint_validates_max_uses_and_ttl_bounds	crates/buzz-relay/src/api/invites.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::invites::tests::non_admin_cannot_mint	crates/buzz-relay/src/api/invites.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::invites::tests::owner_mints_and_new_pubkey_claims	crates/buzz-relay/src/api/invites.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::media::tests::nip_oa_membership_ingress_rejects_invalid_time_and_preserves_direct_members	crates/buzz-relay/src/api/media.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::operator::tests::archive_publish_failure_is_retryable_and_preserves_timestamp	crates/buzz-relay/src/api/operator.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::operator::tests::fresh_host_at_owner_limit_returns_limit_reached_conflict	crates/buzz-relay/src/api/operator.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::operator::tests::happy_path_create_returns_created_and_bootstraps_owner	crates/buzz-relay/src/api/operator.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::operator::tests::happy_path_transfer_swaps_owner_and_demotes_old_to_member	crates/buzz-relay/src/api/operator.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::operator::tests::non_allowlisted_operator_key_gets_403	crates/buzz-relay/src/api/operator.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::operator::tests::post_operator_body_requires_payload_tag	crates/buzz-relay/src/api/operator.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::operator::tests::transfer_with_invalid_community_id_returns_400	crates/buzz-relay/src/api/operator.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::operator::tests::transfer_with_invalid_pubkey_returns_400	crates/buzz-relay/src/api/operator.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::operator::tests::unarchive_restores_admission_and_is_idempotent_without_changing_ownership	crates/buzz-relay/src/api/operator.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::operator::tests::unmapped_management_host_can_check_availability	crates/buzz-relay/src/api/operator.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::operator::tests::unmapped_management_host_can_list_owned_communities	crates/buzz-relay/src/api/operator.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	handlers::command_executor::approval_decision_tests::canonical_grant_resumes_persisted_cursor_once_and_completes	crates/buzz-relay/src/handlers/command_executor.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	handlers::command_executor::tests::workflow_persistence_preserves_replays_and_rejects_dominated_cas_updates	crates/buzz-relay/src/handlers/command_executor.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	handlers::relay_admin::tests::closed_relay_9033_still_requires_admin_or_owner	crates/buzz-relay/src/handlers/relay_admin.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	handlers::relay_admin::tests::open_relay_9033_admits_roleless_only_until_a_steward_exists	crates/buzz-relay/src/handlers/relay_admin.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	handlers::side_effects::tests::stale_discovery_member_head_reemits_once_then_is_idempotent	crates/buzz-relay/src/handlers/side_effects.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	workflow_resume::tests::effect_recovery_fires_unfired_claim_once_with_same_identity	crates/buzz-relay/src/workflow_resume.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	workflow_resume::tests::effect_recovery_reclaimed_run_does_not_refire_prior_message	crates/buzz-relay/src/workflow_resume.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	workflow_resume::tests::effect_recovery_skips_fired_message_after_crash_before_finalize	crates/buzz-relay/src/workflow_resume.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	workflow_resume::tests::effect_recovery_uses_pinned_message_when_live_resolution_fails	crates/buzz-relay/src/workflow_resume.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	workflow_resume::tests::inline_driver_and_recovery_sweep_race_on_one_generation_fence	crates/buzz-relay/src/workflow_resume.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	workflow_resume::tests::new_message_claim_uses_authored_text_from_frozen_approval_definition	crates/buzz-relay/src/workflow_resume.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	workflow_resume::tests::recovery_sweep_completes_grant_when_inline_continuation_never_starts	crates/buzz-relay/src/workflow_resume.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	workflow_resume::tests::recovery_sweep_reclaims_expired_running_generation	crates/buzz-relay/src/workflow_resume.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	workflow_resume::tests::replay_reclaims_expired_run_then_conflicts_without_double_execution	crates/buzz-relay/src/workflow_resume.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	workflow_resume::tests::thread_effect_recovery_uses_pinned_ancestry_after_workflow_deletion	crates/buzz-relay/src/workflow_resume.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	workflow_sink::integration_tests::claimed_effect_recovery_precedes_archived_channel_validation	crates/buzz-relay/src/workflow_sink.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	workflow_sink::integration_tests::pinned_thread_replays_identical_event_after_parent_and_channel_changes	crates/buzz-relay/src/workflow_sink.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	workflow_sink::integration_tests::workflow_send_message_p_tags_mentioned_member	crates/buzz-relay/src/workflow_sink.rs	desired	desired schema fixture
+buzz-relay	ci_ingest_storage	a_successful_selected_parent_rejects_rerun_without_storage_side_effects	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
+buzz-relay	ci_ingest_storage	either_terminal_fact_seals_reruns_with_full_transaction_rollback	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
+buzz-relay	ci_ingest_storage	request_and_status_chain_round_trip_into_reducer	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
+buzz-relay	ci_ingest_storage	rerun_final_facts_bind_only_the_final_request_and_selected_graph	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
+buzz-relay	ci_ingest_storage	run_read_exports_bind_membership_channel_and_cursor_bounds	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
+buzz-relay	ci_ingest_storage	stale_fanout_rerun_is_rejected_without_poisoning_selected_graph	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
+buzz-relay	ci_ingest_storage	terminal_run_failure_permits_an_eligible_rerun	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
+buzz-search	fts_integration	author_only_kinds_are_storage_level_unsearchable	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
+buzz-search	fts_integration	channel_less_only_excludes_per_channel_events	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
+buzz-search	fts_integration	channel_scope_restricts_results	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
+buzz-search	fts_integration	deleted_events_are_excluded	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
+buzz-search	fts_integration	empty_query_returns_empty_result_no_roundtrip	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
+buzz-search	fts_integration	enormous_page_number_is_clamped	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
+buzz-search	fts_integration	excluded_kinds_are_storage_level_unsearchable	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
+buzz-search	fts_integration	kind0_search_by_display_name_works_without_flattening	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
+buzz-search	fts_integration	nul_bytes_in_query_are_sanitized	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
+buzz-search	fts_integration	p_gated_persistent_kinds_have_storage_null_tsvector	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
+buzz-search	fts_integration	pagination_works	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
+buzz-search	fts_integration	prefix_mode_handles_tsquery_boundary_punctuation	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
+buzz-search	fts_integration	prefix_mode_matches_final_token_prefix_without_changing_full_text	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
+buzz-search	fts_integration	prefix_mode_preserves_storage_level_privacy_exclusions	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
+buzz-search	fts_integration	search_does_not_return_other_community_events	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
+buzz-search	fts_integration	search_finds_event_in_same_community	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
+buzz-search	fts_integration	since_until_filters	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
+buzz-search	fts_integration	very_long_query_is_bounded_before_pg_parse	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
+buzz-test-client	ci_preflight	preflight_configured_policy_returns_complete_section_2_response	crates/buzz-test-client/tests/ci_preflight.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	ci_preflight	preflight_requires_nip98_auth	crates/buzz-test-client/tests/ci_preflight.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	ci_preflight	preflight_unknown_repo_returns_structured_4xx	crates/buzz-test-client/tests/ci_preflight.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	ci_preflight	preflight_valid_request_fails_closed_without_policy_config	crates/buzz-test-client/tests/ci_preflight.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	conformance_multitenant	api_tokens_nip98_replay::nip98_replay_seenset_is_shared_and_community_scoped	crates/buzz-test-client/tests/conformance_multitenant.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	conformance_multitenant	channelless_global_events_dms::dm_does_not_cross_deliver_between_communities	crates/buzz-test-client/tests/conformance_multitenant.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	conformance_multitenant	channelless_global_events_dms::same_event_id_and_dtag_coexist_across_communities	crates/buzz-test-client/tests/conformance_multitenant.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	conformance_multitenant	channels_membership::same_channel_uuid_in_two_communities_is_isolated	crates/buzz-test-client/tests/conformance_multitenant.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	conformance_multitenant	feed_read_side_isolation::feed_mentions_do_not_cross_communities_over_the_wire	crates/buzz-test-client/tests/conformance_multitenant.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	conformance_multitenant	git_hosting::same_owner_repo_isolated_push_does_not_cross	crates/buzz-test-client/tests/conformance_multitenant.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	conformance_multitenant	media_blossom::media_metadata_boundary_holds_while_blob_bytes_shared	crates/buzz-test-client/tests/conformance_multitenant.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	conformance_multitenant	membership_allowlist::archive_in_a_does_not_affect_b	crates/buzz-test-client/tests/conformance_multitenant.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	conformance_multitenant	mesh_agents_cli::one_key_two_communities_no_bleed	crates/buzz-test-client/tests/conformance_multitenant.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	conformance_multitenant	nip11_relay_info::nip11_is_not_a_cross_community_enumeration_oracle	crates/buzz-test-client/tests/conformance_multitenant.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	conformance_multitenant	pubsub_presence_typing::fanout_and_presence_do_not_cross_communities	crates/buzz-test-client/tests/conformance_multitenant.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	conformance_multitenant	row_zero_host_binding::client_supplied_community_cannot_override_host	crates/buzz-test-client/tests/conformance_multitenant.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	conformance_multitenant	row_zero_host_binding::unmapped_host_fails_closed_generically	crates/buzz-test-client/tests/conformance_multitenant.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	conformance_multitenant	search_fts::search_results_and_deletes_are_community_scoped	crates/buzz-test-client/tests/conformance_multitenant.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	conformance_multitenant	users_profiles_nip05::same_nip05_local_part_on_two_hosts_is_independent	crates/buzz-test-client/tests/conformance_multitenant.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	conformance_multitenant	users_profiles_nip05::same_pubkey_distinct_profiles_in_two_communities	crates/buzz-test-client/tests/conformance_multitenant.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	conformance_multitenant	workflows::approval_token_is_community_confined	crates/buzz-test-client/tests/conformance_multitenant.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	conformance_multitenant	workflows::workflow_trigger_is_community_confined	crates/buzz-test-client/tests/conformance_multitenant.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_author_can_count_own_reminders_http	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_author_can_query_own_reminders_http	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_author_can_subscribe_to_own_reminders_ws	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_fanout_isolation_other_user_does_not_receive_reminder	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_mixed_kind_filter_omits_other_authors_reminders_ws	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_other_user_cannot_count_reminders_http	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_other_user_cannot_query_reminders_http	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_other_user_subscription_closed_for_author_only_kind_ws	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_reminder_accepted_expiration_without_not_before	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_reminder_accepted_missing_not_before	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_reminder_accepted_with_expiration_after_not_before	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_reminder_accepted_with_malformed_expiration	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_reminder_accepted_with_valid_not_before	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_reminder_not_before_max_safe_integer_rejected_too_far_in_future	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_reminder_not_before_zero_accepted	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_reminder_rejected_duplicate_d_tag	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_reminder_rejected_duplicate_not_before	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_reminder_rejected_empty_d_tag	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_reminder_rejected_expiration_before_not_before	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_reminder_rejected_expiration_equal_to_not_before	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_reminder_rejected_malformed_not_before_leading_zero	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_reminder_rejected_malformed_not_before_non_digits	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_reminder_rejected_missing_d_tag	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_reminder_rejected_not_before_above_max_safe_integer	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_reminder_rejected_not_before_too_far_in_future	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_reminder_replacement_semantics	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_scheduler_delivers_due_reminder_to_author_subscription	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_ws_count_returns_zero_for_other_users_reminders	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_event_reminder	test_ws_search_isolation_other_user_cannot_find_reminder	crates/buzz-test-client/tests/e2e_event_reminder.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_git	git_clone_push_fetch_force_roundtrip	crates/buzz-test-client/tests/e2e_git.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_git	git_concurrent_push_one_wins_and_repo_recovers	crates/buzz-test-client/tests/e2e_git.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_human_edit_agent_content	test_agent_can_self_delete_channel	crates/buzz-test-client/tests/e2e_human_edit_agent_content.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_human_edit_agent_content	test_agent_can_self_edit_message	crates/buzz-test-client/tests/e2e_human_edit_agent_content.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_human_edit_agent_content	test_owner_can_archive_agent_channel	crates/buzz-test-client/tests/e2e_human_edit_agent_content.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_human_edit_agent_content	test_owner_can_delete_agent_channel	crates/buzz-test-client/tests/e2e_human_edit_agent_content.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_human_edit_agent_content	test_owner_can_delete_agent_message	crates/buzz-test-client/tests/e2e_human_edit_agent_content.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_human_edit_agent_content	test_owner_can_delete_agent_message_in_private_channel	crates/buzz-test-client/tests/e2e_human_edit_agent_content.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_human_edit_agent_content	test_owner_can_delete_agent_message_kind5	crates/buzz-test-client/tests/e2e_human_edit_agent_content.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_human_edit_agent_content	test_owner_can_delete_private_agent_channel	crates/buzz-test-client/tests/e2e_human_edit_agent_content.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_human_edit_agent_content	test_owner_can_edit_agent_channel_metadata	crates/buzz-test-client/tests/e2e_human_edit_agent_content.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_human_edit_agent_content	test_owner_can_edit_agent_message	crates/buzz-test-client/tests/e2e_human_edit_agent_content.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_human_edit_agent_content	test_owner_can_edit_agent_message_in_private_channel	crates/buzz-test-client/tests/e2e_human_edit_agent_content.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_human_edit_agent_content	test_owner_can_edit_metadata_of_private_agent_channel	crates/buzz-test-client/tests/e2e_human_edit_agent_content.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_human_edit_agent_content	test_removed_author_cannot_delete_own_message_in_private_channel	crates/buzz-test-client/tests/e2e_human_edit_agent_content.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_human_edit_agent_content	test_removed_author_cannot_edit_own_message_in_private_channel	crates/buzz-test-client/tests/e2e_human_edit_agent_content.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_human_edit_agent_content	test_third_party_cannot_delete_agent_channel	crates/buzz-test-client/tests/e2e_human_edit_agent_content.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_human_edit_agent_content	test_third_party_cannot_delete_agent_message	crates/buzz-test-client/tests/e2e_human_edit_agent_content.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_human_edit_agent_content	test_third_party_cannot_delete_agent_message_kind5	crates/buzz-test-client/tests/e2e_human_edit_agent_content.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_human_edit_agent_content	test_third_party_cannot_edit_agent_channel_metadata	crates/buzz-test-client/tests/e2e_human_edit_agent_content.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_human_edit_agent_content	test_third_party_cannot_edit_agent_message	crates/buzz-test-client/tests/e2e_human_edit_agent_content.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_long_form	test_long_form_a_tag_deletion	crates/buzz-test-client/tests/e2e_long_form.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_long_form	test_long_form_accepted	crates/buzz-test-client/tests/e2e_long_form.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_long_form	test_long_form_malformed_e_plus_a_does_not_delete	crates/buzz-test-client/tests/e2e_long_form.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_long_form	test_long_form_nip33_replacement	crates/buzz-test-client/tests/e2e_long_form.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_long_form	test_long_form_retrievable	crates/buzz-test-client/tests/e2e_long_form.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_long_form	test_long_form_set_twice_preserves_published_at	crates/buzz-test-client/tests/e2e_long_form.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_long_form	test_long_form_stale_write_rejected	crates/buzz-test-client/tests/e2e_long_form.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_long_form	test_long_form_stray_h_tag_ignored	crates/buzz-test-client/tests/e2e_long_form.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_managed_agent	test_legacy_fat_agent_event_still_accepted	crates/buzz-test-client/tests/e2e_managed_agent.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_managed_agent	test_managed_agent_nip33_replacement_newer_wins	crates/buzz-test-client/tests/e2e_managed_agent.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_managed_agent	test_managed_agent_publish_and_query	crates/buzz-test-client/tests/e2e_managed_agent.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_managed_agent	test_managed_agent_round_trips_only_projected_fields	crates/buzz-test-client/tests/e2e_managed_agent.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_managed_agent	test_managed_agent_tombstone_deletes_coordinate	crates/buzz-test-client/tests/e2e_managed_agent.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media	test_get_nonexistent_returns_404	crates/buzz-test-client/tests/e2e_media.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media	test_unauthenticated_reads_are_rejected	crates/buzz-test-client/tests/e2e_media.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media	test_upload_and_get	crates/buzz-test-client/tests/e2e_media.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media	test_upload_hash_mismatch_returns_400	crates/buzz-test-client/tests/e2e_media.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media	test_upload_idempotent	crates/buzz-test-client/tests/e2e_media.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media	test_upload_missing_x_sha256_returns_401	crates/buzz-test-client/tests/e2e_media.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media	test_upload_no_auth_returns_401	crates/buzz-test-client/tests/e2e_media.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media	test_upload_real_image	crates/buzz-test-client/tests/e2e_media.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_auth_empty_content	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_auth_expired_token	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_auth_missing_expiration	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_auth_missing_t_tag	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_auth_server_tag_correct	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_auth_server_tag_mismatch	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_auth_wrong_kind	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_concurrent_upload_same_file	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_html_tenant_read_denial	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_legacy_media_route_rejects_non_media	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_legacy_media_route_still_accepts_canonical_media	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_standard_upload_rejects_recognized_audio	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_upload_gif_roundtrip	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_upload_html_served_as_inert_attachment	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_upload_pdf_accepted	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_upload_png_roundtrip	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_upload_random_bytes_accepted	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_upload_svg_accepted_as_text_xml	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_upload_webp_roundtrip	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_upload_zero_bytes_accepted	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_ws_invalid_imeta_external_url	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_ws_invalid_imeta_missing_fields	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_ws_valid_imeta	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_video	test_video_content_type_header_ignored	crates/buzz-test-client/tests/e2e_media_video.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_video	test_video_poster_imeta_accepted_via_ws	crates/buzz-test-client/tests/e2e_media_video.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_video	test_video_poster_imeta_rejects_video_as_poster	crates/buzz-test-client/tests/e2e_media_video.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_video	test_video_range_request_206	crates/buzz-test-client/tests/e2e_media_video.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_video	test_video_range_request_416	crates/buzz-test-client/tests/e2e_media_video.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_video	test_video_upload_and_get	crates/buzz-test-client/tests/e2e_media_video.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_video	test_video_upload_no_auth_returns_401	crates/buzz-test-client/tests/e2e_media_video.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_mesh_llm	live_agent_completes_chat_over_mesh	crates/buzz-test-client/tests/e2e_mesh_llm.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_mesh_llm	live_split_model_completes	crates/buzz-test-client/tests/e2e_mesh_llm.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_mesh_llm	trust_member_reads_mesh_status	crates/buzz-test-client/tests/e2e_mesh_llm.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_mesh_llm	trust_nonmember_read_denied	crates/buzz-test-client/tests/e2e_mesh_llm.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_channel_window_rejects_half_cursor_and_client_overlay_kinds	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_channel_window_rows_overlays_and_exact_multiple_exhaustion	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_dm_discovery_events_emitted	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_empty_kinds_returns_zero_events	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_historical_req_dedup_preserves_or_semantics	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_nip10_root_mismatch_rejected	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_nip10_thread_reply_creates_metadata	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_nip10_thread_reply_not_in_top_level	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_nip10_unknown_parent_rejected	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_nip17_gift_wrap_accepted	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_nip17_gift_wrap_not_searchable	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_nip17_gift_wrap_recipient_receives	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_nip17_gift_wrap_requires_p_filter	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_nip50_search_empty_results	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_nip50_search_mixed_filters_rejected	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_nip50_search_relevance_order	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_nip50_search_returns_results_and_eose	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_nipdv_explicit_kind_query_forbidden_for_third_party	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_nipdv_hide_then_reopen_updates_snapshot	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_nipdv_ids_query_rejects_third_party	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_nipdv_same_second_reopen_supersedes_hide	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_nipdv_search_rejects_third_party	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_nipdv_snapshot_is_private_to_owner	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_nipdv_two_viewers_independent_snapshots	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_nostr_interop	test_nipdv_ws_req_rejects_third_party	crates/buzz-test-client/tests/e2e_nostr_interop.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_behavioral_fields_persona_ingests_and_round_trips	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_accepts_valid_slugs	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_count_excludes_foreign_unshared	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_http_count_cross_author_gate	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_http_query_cross_author_gate	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_http_query_shared_visible_with_newer_private_ahead	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_ids_lookup_unshared_returns_nothing_to_foreign	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_ingest_rejects_three_element_shared_tag	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_ingest_shared_tag_validation	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_live_fanout_shared_gate	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_mixed_kind_filter_does_not_leak	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_multiple_per_author	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_nip33_older_does_not_replace_newer	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_nip33_replacement_newer_wins	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_publish_and_query	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_rejects_d_tag_special_chars	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_rejects_d_tag_starting_with_underscore	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_rejects_d_tag_too_long	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_rejects_d_tag_uppercase	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_rejects_empty_d_tag	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_rejects_missing_d_tag	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_shared_read_gate_foreign_sees_only_shared	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_persona_ws_req_shared_visible_with_newer_private_ahead	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_persona	test_promptless_persona_ingests_and_round_trips	crates/buzz-test-client/tests/e2e_persona.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_project	test_project_malformed_envelope_rejected_by_relay	crates/buzz-test-client/tests/e2e_project.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_project	test_project_publish_and_query_returns_cross_owner_members	crates/buzz-test-client/tests/e2e_project.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_project	test_project_replacement_keeps_only_newest_for_same_author_and_d	crates/buzz-test-client/tests/e2e_project.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_project	test_project_same_d_under_two_authors_are_independent	crates/buzz-test-client/tests/e2e_project.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_project	test_project_tombstone_deletes_coordinate_and_spares_members	crates/buzz-test-client/tests/e2e_project.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_project	test_stale_tombstone_between_versions_leaves_newer_project_live	crates/buzz-test-client/tests/e2e_project.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_auth_event_kind_rejected	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_client_submitted_nip43_membership_snapshots_are_rejected	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_close_subscription_stops_delivery	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_connect_and_authenticate	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_eose_sent_for_empty_subscription	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_ephemeral_event_not_stored	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_invite_claim_rejects_invalid_code	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_invite_code_minted_for_one_host_fails_on_another	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_invite_mint_and_claim_admits_new_pubkey	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_invite_mint_requires_owner_or_admin	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_kind0_nip05_sync	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_large_event_frame_below_configured_limit_is_accepted	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_membership_notification_emitted_on_add	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_membership_notification_emitted_on_remove	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_membership_notification_kind_rejected	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_membership_notification_mixed_filter_rejected	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_membership_notification_multi_p_rejected	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_membership_notification_requires_own_p_filter	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_membership_notification_requires_p_filter	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_membership_notification_wildcard_filter_rejected	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_multiple_concurrent_clients	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_nip11_relay_info	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_nip29_owner_demotion_recovery_paths	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_nip29_put_user_cannot_demote_owner	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_nip29_put_user_default_policy_allows	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_nip29_put_user_nobody_blocks	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_nip29_put_user_owner_only_blocks	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_nip29_put_user_self_add_bypasses_policy	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_nip29_put_user_without_role_tag_preserves_role	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_nip29_relay_rejects_last_owner_self_demotion	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_nip29_relay_rejects_role_change_by_unprivileged_actor	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_nip29_standard_client_flow	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_private_channel_admin_can_invite	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_private_channel_member_cannot_grant_admin	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_private_channel_member_cannot_invite	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_private_channel_non_member_cannot_invite	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_pubkey_mismatch_rejected	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_reply_ingest_pushes_live_thread_summary	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_send_event_and_receive_via_subscription	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_stored_events_returned_before_eose	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_subscription_filters_by_kind	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_subscription_limit_enforced	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_unarchive_emits_member_added_notification	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_relay	test_unauthenticated_rejected	crates/buzz-test-client/tests/e2e_relay.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_team	test_team_nip33_replacement_newer_wins	crates/buzz-test-client/tests/e2e_team.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_team	test_team_publish_and_query	crates/buzz-test-client/tests/e2e_team.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_team	test_team_tombstone_deletes_coordinate	crates/buzz-test-client/tests/e2e_team.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_team_catalog	test_team_catalog_accepts_builtin_colon_d_tag	crates/buzz-test-client/tests/e2e_team_catalog.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_team_catalog	test_team_catalog_count_excludes_foreign_unshared	crates/buzz-test-client/tests/e2e_team_catalog.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_team_catalog	test_team_catalog_foreign_sees_only_shared	crates/buzz-test-client/tests/e2e_team_catalog.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_team_catalog	test_team_catalog_ids_lookup_unshared_returns_nothing_to_foreign	crates/buzz-test-client/tests/e2e_team_catalog.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_team_catalog	test_team_catalog_live_fanout_and_unshare_retracts	crates/buzz-test-client/tests/e2e_team_catalog.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_team_catalog	test_team_catalog_publish_and_query_own_unshared	crates/buzz-test-client/tests/e2e_team_catalog.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_team_catalog	test_team_catalog_rejects_empty_d_tag	crates/buzz-test-client/tests/e2e_team_catalog.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_team_catalog	test_team_catalog_rejects_three_element_shared_tag	crates/buzz-test-client/tests/e2e_team_catalog.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_team_catalog	test_team_catalog_rejects_valueless_plus_valued_d_tags	crates/buzz-test-client/tests/e2e_team_catalog.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_user_status	test_user_status_accepted	crates/buzz-test-client/tests/e2e_user_status.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_user_status	test_user_status_multiple_d_tags_coexist	crates/buzz-test-client/tests/e2e_user_status.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_user_status	test_user_status_nip33_replacement	crates/buzz-test-client/tests/e2e_user_status.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_user_status	test_user_status_retrievable	crates/buzz-test-client/tests/e2e_user_status.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_user_status	test_user_status_stale_write_rejected	crates/buzz-test-client/tests/e2e_user_status.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	nip42_host_binding_live	nip42_cross_host_rejected_a_relay_tag_on_b_connection	crates/buzz-test-client/tests/nip42_host_binding_live.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	nip42_host_binding_live	nip42_cross_host_rejected_b_relay_tag_on_a_connection	crates/buzz-test-client/tests/nip42_host_binding_live.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	nip42_host_binding_live	nip42_matching_host_accepted_a	crates/buzz-test-client/tests/nip42_host_binding_live.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	nip42_host_binding_live	nip42_matching_host_accepted_b	crates/buzz-test-client/tests/nip42_host_binding_live.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	regression_relay_admin_ban_gate	banned_admin_is_refused_but_timed_out_admin_still_administers	crates/buzz-test-client/tests/regression_relay_admin_ban_gate.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-voice	buzz_voice	imported::tests::imports_common_audio_format_fixtures	crates/buzz-voice/src/imported.rs	external	requires BUZZ_VOICE_IMPORT_TEST_DIR with common-format fixtures
+buzz-voice	buzz_voice	pocket::tests::production_api_emits_non_silent_april_int8_pcm	crates/buzz-voice/src/pocket.rs	external	requires BUZZ_POCKET_TEST_MODEL_DIR
+buzz-voice	buzz_voice	pocket_april::tests::gary_provost_long_sentence_respects_bundle_token_limit	crates/buzz-voice/src/pocket_april.rs	external	requires BUZZ_POCKET_TEST_MODEL_DIR
+buzz-voice	buzz_voice	pocket_april::tests::loader_splits_oversized_prompts_at_bundle_token_limit	crates/buzz-voice/src/pocket_april.rs	external	requires BUZZ_POCKET_TEST_MODEL_DIR
+buzz-voice	buzz_voice	pocket_april::tests::tokenizer_matches_sentencepiece_reference_including_unknown_words	crates/buzz-voice/src/pocket_april.rs	external	requires BUZZ_POCKET_TEST_MODEL_DIR
+buzz-voice	pocket_import_audio	objective_import_synthesis_delete_and_mary_fallback	crates/buzz-voice/tests/pocket_import_audio.rs	external	requires BUZZ_POCKET_MODEL_DIR and runs the installed Pocket ONNX model
+buzz-workflow	buzz_workflow	executor::tests::claimed_message_and_reaction_recover_after_workflow_deletion	crates/buzz-workflow/src/executor.rs	desired	desired schema fixture
+buzz-workflow	buzz_workflow	tests::on_event_denies_run_after_owner_removed	crates/buzz-workflow/src/lib.rs	desired	desired schema fixture
+buzz-workflow	buzz_workflow	tests::on_event_denies_webhook_definition_for_plain_member_owner	crates/buzz-workflow/src/lib.rs	desired	desired schema fixture

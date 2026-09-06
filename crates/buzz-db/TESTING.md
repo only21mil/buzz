@@ -2,9 +2,10 @@
 
 Ignored database tests need an explicit run. `scripts/postgres-test-local.py`
 runs each selected Rust libtest case in its own database and removes the whole
-cluster on exit. This adapts per-test isolation from upstream
-`bd73490418266f267d9bb3bdf13e64582adc8e80` without changing CI workflows or their
-required contexts.
+cluster after each case, including failure or interruption. This adapts isolation
+from upstream `bd73490418266f267d9bb3bdf13e64582adc8e80` within the existing
+Backend Integration CI job. Required context names,
+full PR-to-main/manual conditions, and live relay E2E remain unchanged.
 
 Activate Hermit, then compile only the packages needed for your change:
 
@@ -39,15 +40,60 @@ and exports all three test database variables with the same disposable URL.
 Never use an existing relay or live database as a test fixture. Only trusted
 compiled tests are supported; the runner does not sandbox arbitrary binaries.
 
-The fork's `ci_grants_contract`, `workflow_approval_contract`,
-`workflow_enabled_persistence`, and `workflow_state_contract` binaries apply
-migrations themselves, so they start empty. Migration-module tests also start
-empty. Other tests get `schema/schema.sql` in a fresh database. Every test has
-its own database, including tests that drop `public`. For a new self-migrating
-fixture, use `--schema-mode migration`; `--schema-mode desired` explicitly
-selects desired-schema initialization. Use `--repo-root /path/to/worktree` when
-the desired schema belongs to another checkout. Each migration binary embeds
-its own migrations at compile time, so recompile after changing SQL.
+`scripts/postgres-tests.tsv` explicitly records every ignored Rust test under
+`crates/`, its exact compiled name, source, target, schema mode, and fixture
+reason. `desired` applies `schema/schema.sql`; `migration` starts empty for
+fixtures that install their own schema or migrations. `external` records tests
+requiring relay, Redis, object storage or model fixtures; those remain outside
+the PostgreSQL-only runner and keep their existing execution paths.
+
+The four fork database contract binaries, CI ingest storage, ten workflow
+recovery cases, preflight fixtures, command persistence, push and migration
+fixtures are explicitly classified. Auto mode rejects unknown names and
+external cases. An explicit `--schema-mode migration|desired` supports local
+fixture development, but does not admit that fixture to CI.
+
+CI runs:
+
+```sh
+scripts/test-postgres-test-discovery.sh
+scripts/postgres-test-run.sh --task-root /path/to/task --pg-bin-dir /path/to/postgres/bin
+```
+
+The first command checks every source ignore attribute (including bare and
+raw-string annotations). New, removed, renamed or ambiguously classified tests
+fail the guard. To add a test, review its actual setup and add an exact TSV row;
+do not infer mode from a broad test-name prefix. Source-only discovery cannot
+prove a case was compiled. The second command compiles every admitted library
+and integration target, compares each binary's full ignored-test list with the
+manifest, then runs every PostgreSQL-only case. Missing or unknown compiled
+cases fail before any database starts. `--list` performs compilation and this
+reconciliation without starting PostgreSQL. To reuse a current compilation,
+pass `--artifacts /path/to/cargo-output.jsonl [...]`; only test-profile library
+and integration executables are accepted, and every admitted target is required.
+
+Each case uses a fresh cluster and database, sequentially. Role changes, scratch
+databases, destructive schema fixtures and cluster-global locks cannot leak to
+the next test. SQLx receives the socket in the URL; a deliberately invalid TCP
+hostname prevents accidental network fallback. The FTS fixture parses SQLx
+connection options instead of concatenating a second URL query. `--filter name
+--exact` runs exactly one local case. Cleanup preserves a failing test's exit
+status; if shutdown fails, data remains for explicit cleanup with a diagnostic.
+
+Use `--repo-root /path/to/worktree` on the local runner when desired schema
+belongs to another checkout. Migration binaries embed migrations at compile
+time, so recompile after SQL changes. Complete discovery is not a claim that
+all listed tests ran locally: record selected cases and unrun scope separately.
+
+The existing native-CI Python suites now share
+`scripts/test-native-ci-python.sh` between unit tests and pre-freeze. Schema
+validator `check-jsonschema==0.38.0` and the existing clean-host ISO tools are
+still required. This implements the local gate tracked by
+[#160](https://github.com/only21mil/buzz/issues/160), alongside existing
+[retry-policy #157](https://github.com/only21mil/buzz/issues/157) and
+[runner schema drift #149](https://github.com/only21mil/buzz/issues/149).
+No new issue or change to signed events, grants, receipts, promotion or delivery
+authority is introduced.
 
 Run the frozen-prefix check before and after admitting a migration:
 

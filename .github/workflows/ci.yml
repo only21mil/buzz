@@ -56,6 +56,15 @@ jobs:
               - 'scripts/ci-promotion-readiness.py'
               - 'scripts/protected-ci-receipt.py'
               - 'scripts/run-tests.sh'
+              - 'scripts/postgres-test-*.py'
+              - 'scripts/postgres-test-*.sh'
+              - 'scripts/postgres_test_*.py'
+              - 'scripts/postgres-tests.tsv'
+              - 'scripts/test-postgres-test-*.py'
+              - 'scripts/test-postgres-test-*.sh'
+              - 'scripts/check-postgres-test-discovery.py'
+              - 'scripts/test-native-ci-python.sh'
+              - 'scripts/pre-freeze.sh'
               - 'scripts/test-ci-promotion-readiness.py'
               - 'scripts/test-ci-path-filter-contract.sh'
               - 'scripts/test-protected-ci-receipt.py'
@@ -126,6 +135,8 @@ jobs:
         run: node --test scripts/check-file-sizes-core.test.mjs
       - name: Android Google SDK-free guard unit tests
         run: scripts/test-check-android-google-free.sh
+      - name: PostgreSQL discovery contract
+        run: scripts/test-postgres-test-discovery.sh
       - name: CI path filter contract
         run: scripts/test-ci-path-filter-contract.sh
 
@@ -634,7 +645,7 @@ jobs:
   backend-integration:
     name: Backend Integration (relay e2e)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     needs: [changes, desktop-e2e-relay]
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.rust == 'true'
     permissions:
@@ -646,6 +657,18 @@ jobs:
         uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2.79.15
         with:
           tool: cargo-nextest@0.9.136
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - name: Install isolated PostgreSQL tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql postgresql-contrib
+      - name: Isolated PostgreSQL tests
+        run: |
+          task_root=$(mktemp -d /tmp/buzz-pg-ci.XXXXXX)
+          trap 'rmdir "$task_root"' EXIT
+          scripts/postgres-test-run.sh --task-root "$task_root" --pg-bin-dir "$(pg_config --bindir)"
       - name: Start integration services
         run: |
           for attempt in 1 2 3; do
@@ -746,26 +769,6 @@ jobs:
           done
           cat /tmp/buzz-relay.log
           exit 1
-      - name: Invite security tests
-        run: |
-          cargo nextest run \
-            --archive-file target/ci/backend-integration-tests.tar.zst \
-            -E '(package(buzz-db) and test(/relay_invite::tests/)) or (package(buzz-relay) and test(/api::invites::tests/))' \
-            --run-ignored ignored-only
-        env:
-          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
-      - name: Workspace profile (kind:9033) gate tests
-        # Call-site integration for the 9033 authorization gate: open relay
-        # rosterless/steward transitions and the closed-relay admin/owner rule,
-        # against real Postgres. #[ignore]d in the default suite, selected
-        # explicitly here — see handlers::relay_admin::tests.
-        run: |
-          cargo nextest run \
-            --archive-file target/ci/backend-integration-tests.tar.zst \
-            -E 'package(buzz-relay) and test(/handlers::relay_admin::tests/)' \
-            --run-ignored ignored-only
-        env:
-          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
       - name: NIP-ER reminder e2e
         # Feature e2e for NIP-ER (Event Reminders, kind:30300): write-path
         # validation, author-only read filtering, and scheduler delivery against
@@ -778,17 +781,6 @@ jobs:
             --run-ignored ignored-only
         env:
           RELAY_URL: ws://localhost:3000
-      - name: NIP-MP coordinate deletion guard
-        # Verifies the never-delete-newer invariant of soft_delete_by_coordinate:
-        # a stale tombstone (created_at earlier than the live head) spares that
-        # head, and an equal-timestamp tombstone deletes it.
-        run: |
-          cargo nextest run \
-            --archive-file target/ci/backend-integration-tests.tar.zst \
-            -E 'package(buzz-db) and test(coordinate_delete_spares_head_newer_than_the_deletion)' \
-            --run-ignored ignored-only
-        env:
-          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
       - name: Upload relay log
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
