@@ -16,7 +16,7 @@ pub(crate) fn start_managed_agent_process_scoped(
     record: &mut ManagedAgentRecord,
     runtimes: &mut HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
     owner_hex: Option<&str>,
-    scope: Option<&super::deferred_start::DeferredAgentStart>,
+    scope: Option<&super::super::deferred_start::DeferredAgentStart>,
 ) -> Result<(), String> {
     let relay_url = {
         use tauri::Manager;
@@ -41,7 +41,7 @@ pub(crate) fn start_managed_agent_process_scoped(
         }
 
         runtimes.remove(&key);
-        super::remove_agent_runtime_receipt(app, &key);
+        super::super::remove_agent_runtime_receipt(app, &key);
     }
 
     // Scalar PIDs are migration-only and never establish pair liveness.
@@ -56,13 +56,13 @@ pub(crate) fn start_managed_agent_process_scoped(
         scope.and_then(|scope| scope.replay_floor_unix),
     )?;
     let now = now_iso();
-    let receipt = super::ManagedAgentRuntimeReceipt {
+    let receipt = super::super::ManagedAgentRuntimeReceipt {
         key: key.clone(),
         pid: process.child.id(),
         desktop_instance_id: current_instance_id(app),
         started_at: now.clone(),
     };
-    if let Err(error) = super::write_agent_runtime_receipt(app, &receipt) {
+    if let Err(error) = super::super::write_agent_runtime_receipt(app, &receipt) {
         let _ = terminate_process(process.child.id());
         let _ = process.child.wait();
         return Err(error);
@@ -78,9 +78,3 @@ pub(crate) fn start_managed_agent_process_scoped(
     runtimes.insert(key, ManagedAgentPairRuntime::starting(process));
     Ok(())
 }
-
-#[cfg(test)]
-mod test_fixtures;
-
-#[cfg(test)]
-mod tests;

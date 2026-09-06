@@ -925,3 +925,9 @@ fn spawn_agent_child_with_replay_floor(
         start_nonce,
     })
 }
+
+#[cfg(test)]
+mod test_fixtures;
+
+#[cfg(test)]
+mod tests;
