@@ -324,11 +324,13 @@ fn migrate_teams_in_dir_at(
 /// published. This seam catches that drift, over currently-shared heads only —
 /// an unshared head is not discoverable, so nothing is stale to correct.
 ///
-/// Two outcomes, both keeping the published catalog truthful:
+/// Missing members may still be hydrating from the relay, including after a
+/// restart or community switch. Preserve their retained witness until they
+/// arrive; explicit local edits and signed deletions handle member retraction.
 ///
 /// - Still projects, bytes changed → republish a newer shared head.
-/// - Can no longer be projected (a member was deleted, or it outgrew the size
-///   contract) → **purge + tombstone** (I4). An unshared stale body is not a
+/// - Fully resolved but violates the projection contract → **purge + tombstone**
+///   (I4). An unshared stale body is not a
 ///   true retraction — it leaves the coordinate live with no opt-in tag, so
 ///   the team must fully disappear. A typed `team-catalog-auto-retracted`
 ///   notice names the team and reason so the owner knows why the toggle
@@ -466,14 +468,16 @@ fn reconcile_team_catalog_heads_core(
             continue;
         }
 
-        // Reproject from the current on-disk team and members. A failure is
-        // the retraction trigger: purge + tombstone the coordinate and notify
-        // the owner via a typed event. A stale-body "retraction" was rejected
-        // because an unshared-but-retained coordinate leaves the event live on
-        // the relay with no opt-in tag.
-        let rebuilt = resolve_team_members(team, &personas)
-            .and_then(|members| build_team_catalog_event(team, &members, true));
-        let builder = match rebuilt {
+        // An inbound team can be durable before its members arrive. Startup
+        // has no deletion evidence from absence alone, so preserve its witness
+        // just as the inbound refresh does. Later arrivals retry the projection.
+        let Ok(members) = resolve_team_members(team, &personas) else {
+            continue;
+        };
+
+        // With every member present, a projection failure is a retraction
+        // trigger: purge + tombstone the coordinate and notify the owner.
+        let builder = match build_team_catalog_event(team, &members, true) {
             Ok(builder) => builder,
             Err(reason) => {
                 eprintln!(

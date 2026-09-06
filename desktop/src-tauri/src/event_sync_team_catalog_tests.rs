@@ -118,6 +118,13 @@ fn head_is_shared(row: &RetainedEvent) -> bool {
     event_is_shared(&nostr::Event::from_json(&row.raw_event).unwrap())
 }
 
+fn oversized_member(id: &str) -> AgentDefinition {
+    member(
+        id,
+        &"x".repeat(crate::managed_agents::team_catalog::MAX_SYSTEM_PROMPT_BYTES + 1),
+    )
+}
+
 #[test]
 fn test_member_edit_republishes_a_newer_shared_head() {
     let base = tempfile::tempdir().unwrap();
@@ -156,15 +163,35 @@ fn test_unchanged_team_is_left_alone() {
 }
 
 #[test]
-fn test_deleted_member_tombstones_the_coordinate() {
-    // I4: a member disappears making the team unrebuildable. The reconcile
-    // must purge+tombstone the coordinate (not retain a stale-body unshared
-    // head), and the tombstone must be queued for the flush loop.
+fn test_missing_member_preserves_the_witness_across_repeated_reconcile() {
+    // Absence alone cannot distinguish interrupted hydration from deletion.
     let base = tempfile::tempdir().unwrap();
     let keys = nostr::Keys::generate();
     retain_head(base.path(), &keys, &team(), &[member("m1", "Original.")]);
-    // The member is gone, so the team can no longer be projected at all.
+    let before = head(base.path(), &keys).unwrap();
     write_stores(base.path(), &[team()], &[]);
+
+    for _ in 0..2 {
+        assert_eq!(reconcile(base.path(), &keys).unwrap(), 0);
+        assert_eq!(
+            head(base.path(), &keys).unwrap().raw_event,
+            before.raw_event
+        );
+        let conn = open_retention_db(&base.path().join("retention.db")).unwrap();
+        assert!(crate::managed_agents::retention::get_pending_sync(&conn)
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[test]
+fn test_oversized_member_tombstones_the_coordinate() {
+    // I4: a fully resolved team violates the catalog size contract. Purge its
+    // retained head and queue the tombstone for the flush loop.
+    let base = tempfile::tempdir().unwrap();
+    let keys = nostr::Keys::generate();
+    retain_head(base.path(), &keys, &team(), &[member("m1", "Original.")]);
+    write_stores(base.path(), &[team()], &[oversized_member("m1")]);
 
     assert_eq!(reconcile(base.path(), &keys).unwrap(), 1);
 
@@ -190,7 +217,7 @@ fn test_tombstone_is_not_repeated_on_next_boot() {
     let base = tempfile::tempdir().unwrap();
     let keys = nostr::Keys::generate();
     retain_head(base.path(), &keys, &team(), &[member("m1", "Original.")]);
-    write_stores(base.path(), &[team()], &[]);
+    write_stores(base.path(), &[team()], &[oversized_member("m1")]);
     reconcile(base.path(), &keys).unwrap();
 
     assert_eq!(
@@ -204,8 +231,7 @@ fn test_tombstone_is_not_repeated_on_next_boot() {
 fn test_unshared_head_is_never_touched() {
     let base = tempfile::tempdir().unwrap();
     let keys = nostr::Keys::generate();
-    // An unshared head with a member that no longer exists — the retraction
-    // trigger — must still be left alone: it is not discoverable.
+    // An unshared head must still be left alone even when members are missing.
     let event = build_team_catalog_event(&team(), &[member("m1", "Original.")], false)
         .unwrap()
         .sign_with_keys(&keys)
@@ -372,8 +398,12 @@ fn test_two_unrebuildable_teams_are_both_tombstoned_in_one_reconcile() {
     retain_head(base.path(), &keys, &team(), &[member("m1", "Alpha.")]);
     retain_head(base.path(), &keys, &team_b(), &[member("m2", "Beta.")]);
 
-    // Both members vanish — both teams are unrebuildable.
-    write_stores(base.path(), &[team(), team_b()], &[]);
+    // Both members are present but exceed the projection size contract.
+    write_stores(
+        base.path(),
+        &[team(), team_b()],
+        &[oversized_member("m1"), oversized_member("m2")],
+    );
 
     // One reconcile must tombstone both.
     let count = reconcile(base.path(), &keys).unwrap();
@@ -410,11 +440,11 @@ fn test_one_valid_one_unrebuildable_team_both_processed() {
     retain_head(base.path(), &keys, &team(), &[member("m1", "Alpha.")]);
     retain_head(base.path(), &keys, &team_b(), &[member("m2", "Beta.")]);
 
-    // team-alpha's m1 disappears; team-beta's m2 stays but with a new prompt.
+    // team-alpha exceeds the size contract; team-beta has a valid new prompt.
     write_stores(
         base.path(),
         &[team(), team_b()],
-        &[member("m2", "Beta revised.")],
+        &[oversized_member("m1"), member("m2", "Beta revised.")],
     );
 
     let count = reconcile(base.path(), &keys).unwrap();

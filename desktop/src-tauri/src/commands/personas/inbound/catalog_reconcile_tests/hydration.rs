@@ -30,7 +30,7 @@ impl Drop for TestPaths {
     }
 }
 
-fn retained_witness_survives_missing_member(deliver_new_catalog_last: bool) {
+fn retained_witness_survives_missing_member(deliver_new_catalog_last: bool, reactivate: bool) {
     let _guard = crate::managed_agents::lock_path_mutex();
     let temp = tempfile::tempdir().unwrap();
     let _paths = TestPaths::new(temp.path());
@@ -83,6 +83,29 @@ fn retained_witness_survives_missing_member(deliver_new_catalog_last: bool) {
     );
     drop(conn);
 
+    if reactivate {
+        // Startup and community activation use this same reconciliation core.
+        // Reload the durable inbound midpoint before the delayed member arrives.
+        // Repeating it also covers switching away and returning while offline.
+        for _ in 0..2 {
+            assert_eq!(
+                crate::event_sync::reconcile_team_catalog_heads_at_for_test(&base, &keys, &db)
+                    .unwrap(),
+                0,
+                "scope activation must defer an unresolved inbound team"
+            );
+            let conn = open_retention_db(&db).unwrap();
+            assert_eq!(
+                get_retained_event(&conn, KIND_TEAM_CATALOG, &owner, TEAM_ID)
+                    .unwrap()
+                    .unwrap()
+                    .raw_event,
+                witness.as_json()
+            );
+            assert!(get_pending_sync(&conn).unwrap().is_empty());
+        }
+    }
+
     apply(
         build_persona_event(&member("m3", "Three"))
             .unwrap()
@@ -133,10 +156,82 @@ fn retained_witness_survives_missing_member(deliver_new_catalog_last: bool) {
 
 #[test]
 fn returning_device_backfill_keeps_retained_witness_until_members_hydrate() {
-    retained_witness_survives_missing_member(true);
+    retained_witness_survives_missing_member(true, false);
 }
 
 #[test]
 fn live_team_and_persona_updates_wait_for_delayed_new_member() {
-    retained_witness_survives_missing_member(false);
+    retained_witness_survives_missing_member(false, false);
+}
+
+#[test]
+fn interrupted_inbound_hydration_survives_startup_and_scope_reactivation() {
+    retained_witness_survives_missing_member(true, true);
+}
+
+#[test]
+fn signed_member_deletion_retracts_a_team_held_for_hydration() {
+    let _guard = crate::managed_agents::lock_path_mutex();
+    let temp = tempfile::tempdir().unwrap();
+    let _paths = TestPaths::new(temp.path());
+    let keys = nostr::Keys::generate();
+    let owner = keys.public_key().to_hex();
+    let app = mock_app(&keys);
+    let base = crate::managed_agents::managed_agents_base_dir(app.handle()).unwrap();
+    let db = scoped_retention_db_path(&base, RELAY, &owner);
+    let apply = |event: nostr::Event| {
+        reconcile_inbound_persona_event_blocking(
+            event.as_json(),
+            RELAY.into(),
+            app.handle().clone(),
+        )
+        .unwrap();
+    };
+    save_personas(app.handle(), &[member("m1", "One"), member("m2", "Two")]).unwrap();
+    save_teams(app.handle(), &[team()]).unwrap();
+    apply(signed_catalog_head(&keys));
+    let mut updated_team = team();
+    updated_team.persona_ids.push("m3".into());
+    apply(
+        build_team_event(&updated_team)
+            .unwrap()
+            .sign_with_keys(&keys)
+            .unwrap(),
+    );
+    assert_eq!(
+        crate::event_sync::reconcile_team_catalog_heads_at_for_test(&base, &keys, &db).unwrap(),
+        0
+    );
+
+    // A signed deletion is authoritative even while a different member is
+    // missing. It must retract immediately and stay retracted after activation.
+    apply(
+        crate::managed_agents::persona_events::build_persona_delete("m1", &owner)
+            .unwrap()
+            .sign_with_keys(&keys)
+            .unwrap(),
+    );
+    assert!(!load_personas(app.handle())
+        .unwrap()
+        .iter()
+        .any(|p| p.id == "m1"));
+    assert_eq!(
+        crate::event_sync::reconcile_team_catalog_heads_at_for_test(&base, &keys, &db).unwrap(),
+        0
+    );
+    let conn = open_retention_db(&db).unwrap();
+    assert!(
+        get_retained_event(&conn, KIND_TEAM_CATALOG, &owner, TEAM_ID)
+            .unwrap()
+            .is_none()
+    );
+    let pending = get_pending_sync(&conn).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].kind, 5);
+    let deletion = nostr::Event::from_json(&pending[0].raw_event).unwrap();
+    deletion.verify().unwrap();
+    assert_eq!(
+        crate::commands::personas::inbound::parse_deletion_coordinate(&deletion),
+        Some((KIND_TEAM_CATALOG, TEAM_ID.to_string()))
+    );
 }

@@ -168,8 +168,8 @@ pub struct TeamCatalogMember {
 /// Order is load-bearing: it is part of the canonical projection bytes.
 /// An unresolvable id is an error, not a skip — silently publishing a team
 /// with a member missing would present a different team to the community than
-/// the owner sees, and the freshness reconcile treats this failure as grounds
-/// for retraction.
+/// the owner sees. Explicit edits and deletions retract on this error; inbound
+/// and startup reconciliation defer because remote members may still arrive.
 pub fn resolve_team_members(
     team: &TeamRecord,
     personas: &[AgentDefinition],
