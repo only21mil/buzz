@@ -28,6 +28,20 @@ an extracted PostgreSQL server/client directory and a tools directory containing
 tools. Binaries must be compatible with the host. This task used PostgreSQL
 18.6, Valkey 9.0.6 and MinIO RELEASE.2025-09-07T16-13-09Z.
 
+Before initializing PostgreSQL or starting services, the runner lists the test
+binary's ignored tests and requires both exact names:
+`test_upload_html_served_as_inert_attachment` and `test_html_tenant_read_denial`.
+Each execution must then exit successfully and report exactly one passing test.
+A stale binary with a missing selector cannot produce the PASS artifact, even
+though libtest itself exits successfully when an exact selector matches nothing.
+Discovery and execution output remain in `commands.log`, including failures.
+Run the service-free mock regressions with:
+
+```sh
+. ./bin/activate-hermit
+python3 scripts/test-html-relay-test-local.py
+```
+
 Create the namespace with ordinary task ownership inside it. Substitute absolute
 paths and the intended task username; capture the original namespace before
 `unshare`:

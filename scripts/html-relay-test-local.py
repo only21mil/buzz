@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -19,6 +20,45 @@ import tempfile
 import time
 from urllib.parse import urlencode
 from urllib.request import urlopen
+
+
+REQUIRED_TESTS = (
+    'test_upload_html_served_as_inert_attachment',
+    'test_html_tenant_read_denial',
+)
+
+
+def test_output(binary, arguments, env, cwd, transcript):
+    result = subprocess.run([str(binary), *arguments], env=env, cwd=cwd,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    transcript.write(result.stdout)
+    transcript.flush()
+    result.check_returncode()
+    return result.stdout
+
+
+def require_tests(binary, env, cwd, transcript):
+    output = test_output(binary, ['--list', '--ignored', '--format=pretty', '--color=never'],
+                         env, cwd, transcript)
+    inventory = {line.removesuffix(': test') for line in output.splitlines()
+                 if line.endswith(': test')}
+    missing = [name for name in REQUIRED_TESTS if name not in inventory]
+    if missing:
+        raise RuntimeError('test binary missing required ignored tests: ' + ', '.join(missing))
+
+
+def run_test(binary, name, env, cwd, transcript):
+    output = test_output(binary, ['--ignored', '--exact', name, '--nocapture',
+                         '--test-threads=1', '--format=pretty', '--color=never'],
+                         env, cwd, transcript)
+    # Libtest exits successfully for an unmatched --exact selector. Require
+    # its actual one-test summary as well as a successful process exit.
+    summaries = re.findall(r'^test result: .*$', output, re.MULTILINE)
+    if (output.splitlines().count('running 1 test') != 1 or len(summaries) != 1
+            or not re.fullmatch(
+                r'test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; '
+                r'\d+ filtered out; finished in \d+(?:\.\d+)?s', summaries[0])):
+        raise RuntimeError(f'expected exactly one passing test: {name}')
 
 
 def main():
@@ -91,6 +131,7 @@ def main():
             (logs / 'binaries.json').write_text(json.dumps({name: {
                 'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()
             } for name, path in paths.items()}, indent=2) + '\n')
+            require_tests(paths['test'], env, local, transcript)
             command([paths['initdb'], '-D', local / 'pg', '-U', 'buzz_html',
                      '--auth-local=trust', '--auth-host=reject', '--no-locale', '--encoding=UTF8'])
             with (local / 'pg/postgresql.conf').open('a') as config:
@@ -125,8 +166,7 @@ def main():
             wait_http(base + '/health', relay)
             command(['/usr/bin/ip', '-brief', 'address'])
             command(['/usr/bin/ss', '-lntp'])
-            command([paths['test'], '--ignored', '--exact', 'test_upload_html_served_as_inert_attachment',
-                     '--nocapture', '--test-threads=1'], relay_env)
+            run_test(paths['test'], REQUIRED_TESTS[0], relay_env, local, transcript)
             # The supplemental test uses public synthetic key 2, a member of
             # both explicitly seeded communities. Restart with membership on
             # so a tenant denial cannot be mistaken for an auth-only failure.
@@ -147,8 +187,7 @@ SELECT host, role FROM communities JOIN relay_members ON id = community_id ORDER
                               HTML_TEST_OTHER_HOST='html-b.localhost:13000')
             relay = start('relay-membership', [paths['relay']], tenant_env)
             wait_http(base + '/health', relay)
-            command([paths['test'], '--ignored', '--exact', 'test_html_tenant_read_denial',
-                     '--nocapture', '--test-threads=1'], tenant_env)
+            run_test(paths['test'], REQUIRED_TESTS[1], tenant_env, local, transcript)
             command([paths['mc'], '--config-dir', local / 'mc', 'ls', '--recursive', 'fixture/' + bucket], mc_env)
             (logs / 'result.txt').write_text('PASS: HTML relay HTTP acceptance completed.\n')
         finally:
