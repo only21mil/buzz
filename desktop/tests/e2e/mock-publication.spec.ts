@@ -50,3 +50,33 @@ test("default mock Tauri installation binds native publication before signing", 
   expect(publication.expectedScope?.nativeEpoch).toBe(0);
   expect(publication.expectedScope?.relayUrl).toMatch(/^ws:\/\/localhost:\d+$/);
 });
+
+test("mock agent revalidation returns only requested keys with existing policy and membership", async ({
+  page,
+}) => {
+  await installMockBridge(page);
+  await page.goto("/");
+  await expect(page.getByTestId("app-sidebar")).toBeVisible();
+  const evidence = await page.evaluate(async () => {
+    const invoke = window.__BUZZ_E2E_INVOKE_MOCK_COMMAND__;
+    if (!invoke) throw new Error("Mock command bridge is unavailable");
+    const directory = (await invoke("list_relay_agents")) as Array<{
+      pubkey: string;
+      name: string;
+      channel_ids: string[];
+    }>;
+    const alice = directory.find((agent) => agent.name === "alice");
+    if (!alice) throw new Error("Seeded alice is unavailable");
+    const selected = await invoke("revalidate_relay_agents", {
+      pubkeys: [alice.pubkey.toUpperCase(), "unknown-key"],
+      channelId: alice.channel_ids[0],
+    });
+    const excluded = await invoke("revalidate_relay_agents", {
+      pubkeys: [alice.pubkey],
+      channelId: "unjoined-destination",
+    });
+    return { alice, selected, excluded };
+  });
+  expect(evidence.selected).toEqual([evidence.alice]);
+  expect(evidence.excluded).toEqual([]);
+});

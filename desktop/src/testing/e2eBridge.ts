@@ -11906,6 +11906,26 @@ export function maybeInstallE2eTauriMocks() {
         );
       case "list_relay_agents":
         return handleListRelayAgents(activeConfig);
+      case "revalidate_relay_agents": {
+        const { pubkeys, channelId } = payload as {
+          pubkeys: string[];
+          channelId?: string;
+        };
+        const requested = new Set(pubkeys.map(normalizePubkey));
+        // Read the current fixture directory at send time. Preserve its actual
+        // policies and memberships; the requested destination grants neither.
+        return (await handleListRelayAgents(activeConfig)).filter(
+          (agent) =>
+            requested.has(normalizePubkey(agent.pubkey)) &&
+            (!channelId ||
+              agent.channel_ids.includes(channelId) ||
+              mockManagedAgents.some(
+                (managed) => managed.pubkey === agent.pubkey,
+              ) ||
+              mockProfiles.get(agent.pubkey)?.owner_pubkey ===
+                publicationScope.pubkey),
+        );
+      }
       case "list_personas":
         return handleListPersonas();
       case "create_persona":
