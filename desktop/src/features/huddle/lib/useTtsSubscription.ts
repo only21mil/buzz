@@ -2,10 +2,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import * as React from "react";
 
-import {
-  isDocumentVisible,
-  subscribeDocumentVisibility,
-} from "@/shared/lib/useDocumentVisible";
 import { buildHuddleTtsLiveFilter } from "@/shared/api/relayChannelFilters";
 import { relayClient } from "@/shared/api/relayClient";
 import {
@@ -213,29 +209,10 @@ export function useTtsSubscription(
     }
 
     // Initial load + periodic refresh (catches mid-huddle agent additions).
-    // Keep the live subscription installed while hidden, but quiesce its REST
-    // membership backstop and refresh immediately when the window returns.
-    let agentRefreshId: number | null = null;
-    const startAgentRefresh = (refreshNow: boolean) => {
-      if (agentRefreshId !== null) window.clearInterval(agentRefreshId);
-      agentRefreshId = null;
-      if (!isDocumentVisible()) return;
-      if (refreshNow) void loadAgentPubkeys();
-      agentRefreshId = window.setInterval(() => {
-        void loadAgentPubkeys();
-      }, AGENT_PUBKEY_REFRESH_INTERVAL_MS);
-    };
     void loadAgentPubkeys(true);
-    startAgentRefresh(false);
-    const unsubscribeDocumentVisibility = subscribeDocumentVisibility(
-      (visible) => {
-        if (visible) startAgentRefresh(true);
-        else if (agentRefreshId !== null) {
-          window.clearInterval(agentRefreshId);
-          agentRefreshId = null;
-        }
-      },
-    );
+    const agentRefreshId = window.setInterval(() => {
+      void loadAgentPubkeys();
+    }, AGENT_PUBKEY_REFRESH_INTERVAL_MS);
 
     // Install the state listener before requesting a snapshot. If a newer
     // event arrives while IPC is pending, it supersedes the stale snapshot.
@@ -325,8 +302,7 @@ export function useTtsSubscription(
       speakInOrder.setEnabled(false);
       cleanup?.();
       unlistenHuddleState?.();
-      unsubscribeDocumentVisibility();
-      if (agentRefreshId !== null) window.clearInterval(agentRefreshId);
+      window.clearInterval(agentRefreshId);
       if (agentVerificationRetryId !== null) {
         window.clearTimeout(agentVerificationRetryId);
       }

@@ -73,3 +73,27 @@ test("append, duplicate, late and trimmed journals match full transcript replay"
     resetAgentObserverStore();
   }
 });
+
+test("invalid timestamps preserve legacy dedup under non-transitive ordering", () => {
+  resetAgentObserverStore();
+  const accepted = [];
+  const stop = subscribeAgentObserverEventBatches((batch) =>
+    accepted.push(...batch),
+  );
+  try {
+    const invalid = event(2, "invalid");
+    injectObserverEventsForE2E(agent, [
+      invalid,
+      event(2, "2026-01-01"),
+      event(1, "2026-01-02"),
+    ]);
+    const before = getAgentObserverSnapshot(agent).events;
+    injectObserverEventsForE2E(agent, [invalid]);
+    assert.deepEqual(getAgentObserverSnapshot(agent).events, before);
+    assert.equal(accepted.length, 3);
+    assert.deepEqual(getAgentTranscript(agent), buildTranscript(before));
+  } finally {
+    stop();
+    resetAgentObserverStore();
+  }
+});

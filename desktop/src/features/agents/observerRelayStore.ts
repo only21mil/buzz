@@ -53,6 +53,9 @@ const eventBatchListeners = new Set<
   (batch: readonly AgentObserverEventDelta[]) => void
 >();
 const eventsByAgent = new Map<string, ObserverEvent[]>();
+// Invalid timestamps make the legacy timestamp/seq comparator non-transitive.
+// Keep these journals on the full dedup/sort path until the store resets.
+const unorderedTimestampAgents = new Set<string>();
 const transcriptByAgent = new Map<string, TranscriptState>();
 const snapshotByAgent = new Map<string, ObserverSnapshot>();
 
@@ -227,8 +230,16 @@ function observerTag(event: RelayEvent, tagName: string) {
 function appendAgentEvent(agentPubkey: string, event: ObserverEvent): boolean {
   const key = normalizePubkey(agentPubkey);
   const current = eventsByAgent.get(key) ?? [];
+  if (
+    !Number.isFinite(Date.parse(event.timestamp)) ||
+    !Number.isFinite(event.seq)
+  ) {
+    unorderedTimestampAgents.add(key);
+  }
   const tail = current.at(-1);
-  const eventAtEnd = !tail || isObserverEventAfter(event, tail);
+  const eventAtEnd =
+    !unorderedTimestampAgents.has(key) &&
+    (!tail || isObserverEventAfter(event, tail));
   if (
     !eventAtEnd &&
     current.some(
@@ -938,6 +949,7 @@ export function resetAgentObserverStore() {
   startPromise = null;
   eventProcessingQueue = Promise.resolve();
   eventsByAgent.clear();
+  unorderedTimestampAgents.clear();
   transcriptByAgent.clear();
   snapshotByAgent.clear();
   archiveEventsByChannel.clear();
