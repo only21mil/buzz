@@ -577,7 +577,7 @@ export function useMediaUpload({
     if (queueUntilSend) {
       intentRevisionRef.current += 1;
       const epoch = uploadEpochRef.current;
-      openFilePicker({ multiple: true }, (files) => {
+      openFilePicker({ multiple: true, ownershipEpoch: epoch }, (files) => {
         if (isUploadStale(epoch)) return;
         queueFiles(files.filter(shouldQueueFile));
         uploadFiles(files.filter((file) => !shouldQueueFile(file)));

@@ -100,6 +100,47 @@ test("reusing a stable callback does not revive an earlier open handler", async 
   select(node, [file()]);
   assert.equal(count, 1);
 });
+for (const settled of [false, true]) {
+  test(`new ownership epoch retires the old node, settled=${settled}`, async () => {
+    const s = await picker();
+    const calls = [];
+    s.act(() =>
+      s.hook.result.current({ ownershipEpoch: 0 }, () => calls.push("old")),
+    );
+    const oldNode = input();
+    const oldChange = oldNode.onchange;
+    const oldCancel = oldNode.oncancel;
+    if (settled) oldNode.dispatchEvent(new dom.window.Event("cancel"));
+    s.act(() =>
+      s.hook.result.current(
+        { ownershipEpoch: 1, accept: "video/*", multiple: true },
+        () => calls.push("fresh"),
+      ),
+    );
+    const freshNode = input();
+    assert.notEqual(freshNode, oldNode);
+    assert.equal(oldNode.isConnected, false);
+    assert.equal(oldNode.onchange, null);
+    assert.equal(oldNode.oncancel, null);
+    assert.equal(document.querySelectorAll('input[type="file"]').length, 1);
+    assert.equal(freshNode.accept, "video/*");
+    assert.equal(freshNode.multiple, true);
+    select(oldNode, [file()]);
+    oldChange();
+    oldCancel();
+    assert.deepEqual(calls, []);
+    select(freshNode, [file()]);
+    assert.deepEqual(calls, ["fresh"]);
+    s.act(() =>
+      s.hook.result.current({ ownershipEpoch: 1 }, () => calls.push("next")),
+    );
+    assert.equal(input(), freshNode);
+    oldChange();
+    oldCancel();
+    select(freshNode, [file()]);
+    assert.deepEqual(calls, ["fresh", "next"]);
+  });
+}
 test("unmount removes the input and revokes retained handlers and open functions", async () => {
   const s = await picker();
   s.open();
@@ -189,8 +230,14 @@ test("mounted media picker marks open synchronously and routes multi-select to q
   await s.act(async () => s.uploads[0].resolve(descriptor));
   assert.equal(s.media.pendingImeta[0], descriptor);
 });
-for (const boundary of ["reset", "scope restore", "unmount"]) {
-  test(`picker selection after ${boundary} cannot queue or upload into a new composer`, async () => {
+for (const [boundary, staleFirst] of [
+  ["reset", true],
+  ["reset", false],
+  ["scope restore", true],
+  ["scope restore", false],
+  ["unmount", true],
+]) {
+  test(`picker selection after ${boundary} rejects old events, stale first=${staleFirst}`, async () => {
     const s = await media();
     s.act(() => {
       void s.media.handlePaperclip();
@@ -205,20 +252,47 @@ for (const boundary of ["reset", "scope restore", "unmount"]) {
     else
       s.act(() => {
         s.media.setPendingImeta(boundary === "reset" ? [] : [restored]);
-        // Reentry while the original chooser is unsettled must retain its epoch.
+        // A deliberate fresh open must work even if cancellation had no event.
         void s.media.handlePaperclip();
       });
-    s.act(() => select(node, [file(), file("photo.png", "image/png")]));
-    s.act(() => staleChange());
+    const deliverStale = () => {
+      s.act(() => select(node, [file(), file("photo.png", "image/png")]));
+      s.act(() => staleChange());
+    };
+    if (staleFirst) deliverStale();
     assert.equal(s.uploads.length, 0);
     if (boundary !== "unmount") {
       assert.equal(s.media.queuedAttachments.length, 0);
       assert.equal(s.media.pendingImeta.length, boundary === "reset" ? 0 : 1);
+      const freshNode = input();
+      const chosen = file();
+      const photo = file("fresh.png", "image/png");
+      const revision = s.media.getIntentRevision();
       s.act(() => {
-        void s.media.handlePaperclip();
+        select(freshNode, [chosen, photo]);
+        assert.ok(s.media.getIntentRevision() > revision);
       });
-      s.act(() => select(node, [file()]));
       assert.equal(s.media.queuedAttachments.length, 1);
+      assert.equal(s.media.queuedAttachments[0].file, chosen);
+      assert.equal(s.uploads.length, 1);
+      assert.equal(s.uploads[0].selected, photo);
+      if (!staleFirst) {
+        deliverStale();
+        assert.equal(s.media.queuedAttachments.length, 1);
+        assert.equal(s.uploads.length, 1);
+      }
+      assert.notEqual(freshNode, node);
+      assert.equal(node.isConnected, false);
+      const descriptor = {
+        url: "https://media.example/fresh.png",
+        sha256: "1234",
+        type: "image/png",
+        size: 1,
+      };
+      await s.act(async () => s.uploads[0].resolve(descriptor));
+      assert.equal(s.media.pendingImeta.at(-1), descriptor);
+      if (boundary === "scope restore")
+        assert.equal(s.media.pendingImeta[0], restored);
     }
   });
 }
