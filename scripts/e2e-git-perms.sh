@@ -38,6 +38,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
+"${SCRIPT_DIR}/require-relay-key.sh"
+export BUZZ_RELAY_PRIVATE_KEY
+readonly BUZZ_RELAY_PRIVATE_KEY
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 

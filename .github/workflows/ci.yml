@@ -558,6 +558,8 @@ jobs:
       - name: Start relay
         run: |
           chmod +x ./target/ci/buzz-relay
+          # Ephemeral identity belongs only to this isolated test process tree.
+          export BUZZ_RELAY_PRIVATE_KEY="$(openssl rand -hex 32)"
           nohup env \
             DATABASE_URL="postgres://buzz:${BUZZ_TEST_POSTGRES_PASSWORD}@localhost:5432/buzz" \
             REDIS_URL=redis://localhost:6379 \
@@ -718,6 +720,8 @@ jobs:
       - name: Start relay
         run: |
           chmod +x ./target/ci/buzz-relay
+          # Ephemeral identity belongs only to this isolated test process tree.
+          export BUZZ_RELAY_PRIVATE_KEY="$(openssl rand -hex 32)"
           nohup env \
             DATABASE_URL="postgres://buzz:${BUZZ_TEST_POSTGRES_PASSWORD}@localhost:5432/buzz" \
             REDIS_URL=redis://localhost:6379 \
@@ -817,6 +821,7 @@ jobs:
       - name: Start relay
         run: |
           chmod +x ./target/ci/buzz-relay ./target/ci/git-credential-nostr
+          export BUZZ_RELAY_PRIVATE_KEY="$(openssl rand -hex 32)"
           ./scripts/start-relay-for-tests.sh --no-build
       - name: Relay E2E tests
         run: |

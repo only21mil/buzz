@@ -20,6 +20,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+"${SCRIPT_DIR}/require-relay-key.sh"
+export BUZZ_RELAY_PRIVATE_KEY
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -160,7 +162,6 @@ if [[ "${BUZZ_REQUIRE_RELAY_MEMBERSHIP:-}" == "true" ]]; then
   MEMBERSHIP_ENV+=(
     BUZZ_REQUIRE_RELAY_MEMBERSHIP=true
     RELAY_OWNER_PUBKEY="${RELAY_OWNER_PUBKEY:?RELAY_OWNER_PUBKEY required with BUZZ_REQUIRE_RELAY_MEMBERSHIP=true}"
-    BUZZ_RELAY_PRIVATE_KEY="${BUZZ_RELAY_PRIVATE_KEY:?BUZZ_RELAY_PRIVATE_KEY required with BUZZ_REQUIRE_RELAY_MEMBERSHIP=true}"
   )
   log "Membership gating enabled (NIP-43)"
 fi

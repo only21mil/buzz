@@ -1,5 +1,12 @@
 # Testing
 
+Every relay process requires an explicit `BUZZ_RELAY_PRIVATE_KEY`. Local launchers
+consume the stable identity exported by your approved protected environment.
+They never generate it or store it in `.env`. Preserve the same identity across
+restarts. CI creates a separate ephemeral identity for each disposable test relay.
+`./scripts/test-require-relay-key.sh` checks the environment contract without
+starting services or writing key material.
+
 ## Automated Tests
 
 ```bash

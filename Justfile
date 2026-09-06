@@ -42,6 +42,7 @@ bootstrap:
     if [[ ! -f .env ]]; then
         cp .env.example .env
         echo "Created .env from .env.example — review it before running just dev."
+        echo "Relay startup also requires BUZZ_RELAY_PRIVATE_KEY exported from your protected environment."
     fi
 
 # Start Docker services, run migrations, install desktop deps
@@ -417,15 +418,19 @@ desktop-screenshot *ARGS:
 
 # ─── Run ──────────────────────────────────────────────────────────────────────
 
+# Require the stable relay identity before service or migration dependencies.
+_require-relay-key:
+    @./scripts/require-relay-key.sh
+
 # Start the relay server (auto-starts Docker services if needed)
-relay: bootstrap _ensure-migrations
+relay: _require-relay-key bootstrap _ensure-migrations
     #!/usr/bin/env bash
     set -euo pipefail
     export PATH="{{justfile_directory()}}/bin:$PATH"
     cargo run -p buzz-relay
 
 # Start the relay with the built web UI served from it
-relay-web: bootstrap _ensure-migrations
+relay-web: _require-relay-key bootstrap _ensure-migrations
     #!/usr/bin/env bash
     set -euo pipefail
     export PATH="{{justfile_directory()}}/bin:$PATH"
@@ -434,7 +439,7 @@ relay-web: bootstrap _ensure-migrations
     BUZZ_WEB_DIR=./web/dist cargo run -p buzz-relay
 
 # Build and run the private read-only admin dashboard
-admin: bootstrap _ensure-migrations
+admin: _require-relay-key bootstrap _ensure-migrations
     #!/usr/bin/env bash
     set -euo pipefail
     export PATH="{{justfile_directory()}}/bin:$PATH"
@@ -458,12 +463,12 @@ admin-check: fmt-check
     pnpm -C admin-web exec playwright test
 
 # Start the relay server in release mode
-relay-release: _ensure-migrations
+relay-release: _require-relay-key _ensure-migrations
     cargo run -p buzz-relay --release
 
 
 # Run the desktop Tauri app in dev mode with a local relay (ports and identity derived from worktree)
-dev *ARGS: bootstrap _ensure-sidecar-stubs _ensure-migrations
+dev *ARGS: _require-relay-key bootstrap _ensure-sidecar-stubs _ensure-migrations
     #!/usr/bin/env bash
     set -euo pipefail
     export PATH="{{justfile_directory()}}/bin:$PATH"
