@@ -148,6 +148,32 @@ fn resolve_mention_pubkeys(text: &str, members: &[(String, String)]) -> Vec<Stri
     out
 }
 
+/// Append authority only from the two persisted target sets. Legacy claims
+/// have no authored set and retain precisely their historical tag sequence.
+fn append_workflow_authority_tags(
+    tags: &mut Vec<Tag>,
+    author: &str,
+    rendered: &[String],
+    authored: Option<&[String]>,
+) -> Result<(), ActionSinkError> {
+    let Some(authored) = authored else {
+        return Ok(());
+    };
+    tags.push(
+        Tag::parse(["buzz:workflow-owner", author])
+            .map_err(|e| ActionSinkError::EventBuild(e.to_string()))?,
+    );
+    for target in rendered {
+        if authored.contains(target) {
+            tags.push(
+                Tag::parse(["buzz:workflow-mention", target.as_str()])
+                    .map_err(|e| ActionSinkError::EventBuild(e.to_string()))?,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Relay-side action sink — executes workflow side-effects directly.
 ///
 /// Holds a **weak** reference to `AppState` to avoid an `Arc` reference cycle:
@@ -385,15 +411,22 @@ impl ActionSink for RelayActionSink {
 
             // Mention pubkeys were resolved before the claim and are immutable.
             // Retries build the event from this persisted list, never live names.
-            for mentioned in mentioned_pubkeys {
-                if mentioned == author_pubkey_hex {
+            for mentioned in &mentioned_pubkeys {
+                if mentioned == &author_pubkey_hex {
                     continue;
                 }
                 tags.push(
-                    Tag::parse(["p", &mentioned])
+                    Tag::parse(["p", mentioned.as_str()])
                         .map_err(|e| ActionSinkError::EventBuild(format!("mention p tag: {e}")))?,
                 );
             }
+
+            append_workflow_authority_tags(
+                &mut tags,
+                &author_pubkey_hex,
+                &mentioned_pubkeys,
+                options.authored_mentioned_pubkeys.as_deref(),
+            )?;
 
             if let Some(thread) = &options.thread {
                 for tag in &thread.tags {
@@ -908,6 +941,67 @@ mod tests {
     }
 
     #[test]
+    fn workflow_authored_rendered_mentions_get_authority_and_legacy_tags() {
+        let owner = pk('1');
+        let target = pk('2');
+        let injected = pk('3');
+        let members = vec![m("Agent", &target), m("Injected", &injected)];
+        let rendered = resolve_mention_pubkeys("@Agent {{done}} @Injected", &members);
+        let authored = resolve_mention_pubkeys("@Agent {{trigger.text}}", &members);
+        let mut tags = vec![Tag::parse(["p", owner.as_str()]).unwrap()];
+        append_workflow_authority_tags(&mut tags, &owner, &rendered, Some(&authored)).unwrap();
+        assert!(tags
+            .iter()
+            .any(|t| t.as_slice() == ["buzz:workflow-mention", target.as_str()]));
+        assert!(!tags
+            .iter()
+            .any(|t| t.as_slice() == ["buzz:workflow-mention", injected.as_str()]));
+        assert!(tags
+            .iter()
+            .any(|t| t.as_slice() == ["buzz:workflow-owner", owner.as_str()]));
+    }
+
+    #[test]
+    fn trigger_injected_rendered_mention_gets_no_authority() {
+        let owner = pk('1');
+        let target = pk('2');
+        let members = vec![m("Agent", &target)];
+        let rendered = resolve_mention_pubkeys("echo: @Agent do this", &members);
+        let authored = resolve_mention_pubkeys("echo: {{trigger.text}}", &members);
+        let mut tags = vec![Tag::parse(["p", target.as_str()]).unwrap()];
+        append_workflow_authority_tags(&mut tags, &owner, &rendered, Some(&authored)).unwrap();
+        assert!(tags
+            .iter()
+            .all(|t| t.as_slice()[0] != "buzz:workflow-mention"));
+        let mut legacy = tags.clone();
+        append_workflow_authority_tags(&mut legacy, &owner, &rendered, None).unwrap();
+        assert_eq!(
+            legacy, tags,
+            "old claims must not gain even an owner authority tag"
+        );
+    }
+
+    #[test]
+    fn explicit_owner_target_is_required_even_when_owner_is_attributed() {
+        let owner = pk('1');
+        for explicit in [false, true] {
+            let targets = if explicit {
+                vec![owner.clone()]
+            } else {
+                vec![]
+            };
+            let mut tags = vec![Tag::parse(["p", owner.as_str()]).unwrap()];
+            append_workflow_authority_tags(&mut tags, &owner, &targets, Some(&targets)).unwrap();
+            assert_eq!(tags.iter().filter(|t| t.as_slice()[0] == "p").count(), 1);
+            assert_eq!(
+                tags.iter()
+                    .any(|t| t.as_slice()[0] == "buzz:workflow-mention"),
+                explicit
+            );
+        }
+    }
+
+    #[test]
     fn ambiguous_name_wakes_no_one() {
         // Six "Fizz" agents (real team case) with distinct pubkeys → tag none.
         let members = vec![
@@ -1137,6 +1231,7 @@ mod integration_tests {
             .await
             .unwrap();
         let direct = buzz_workflow::MessageEffectOptions {
+            authored_mentioned_pubkeys: None,
             thread: Some(
                 sink.resolve_message_thread(community, &channel.id.to_string(), &root)
                     .await
@@ -1165,6 +1260,7 @@ mod integration_tests {
             .await
             .unwrap();
         let pinned = buzz_workflow::MessageEffectOptions {
+            authored_mentioned_pubkeys: Some(vec![owner_hex.clone()]),
             thread: Some(
                 sink.resolve_message_thread(community, &channel.id.to_string(), &parent)
                     .await
@@ -1195,7 +1291,7 @@ mod integration_tests {
                 &channel.id.to_string(),
                 "nested",
                 &owner_hex,
-                &[],
+                std::slice::from_ref(&owner_hex),
                 &pinned,
             )
             .await
@@ -1207,6 +1303,26 @@ mod integration_tests {
             .await
             .unwrap()
             .unwrap();
+        assert!(first
+            .event
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice() == ["buzz:workflow-owner", owner_hex.as_str()]));
+        assert!(first
+            .event
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice() == ["buzz:workflow-mention", owner_hex.as_str()]));
+        let legacy = state
+            .db
+            .get_event_by_id(community, &hex::decode(&root).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(legacy.event.tags.iter().all(|tag| !matches!(
+            tag.as_slice()[0].as_str(),
+            "buzz:workflow-owner" | "buzz:workflow-mention"
+        )));
         let meta = state
             .db
             .get_thread_metadata_by_event(community, &reply_bytes)
@@ -1236,7 +1352,7 @@ mod integration_tests {
                 &channel.id.to_string(),
                 "nested",
                 &owner_hex,
-                &[],
+                std::slice::from_ref(&owner_hex),
                 &pinned,
             )
             .await

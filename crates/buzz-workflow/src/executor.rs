@@ -936,8 +936,30 @@ async fn dispatch_action_with_generation(
                     } else {
                         None
                     };
+                    // Only the frozen author's step can supply wakeup authority.
+                    // Rendered trigger content must never be reinterpreted as authored.
+                    let authored_text = wf_run
+                        .definition_snapshot
+                        .get("steps")
+                        .and_then(JsonValue::as_array)
+                        .and_then(|steps| {
+                            steps.iter().find(|step| {
+                                step.get("id").and_then(JsonValue::as_str) == Some(step_id)
+                            })
+                        })
+                        .and_then(|step| step.get("text"))
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("");
+                    let authored_mentioned_pubkeys = engine
+                        .action_sink()?
+                        .resolve_message_mentions(community_id, &channel_id, authored_text)
+                        .await
+                        .map_err(WorkflowError::from)?;
                     let candidate_payload = serde_json::to_value(SendMessageEffectPayload {
-                        options: crate::MessageEffectOptions { thread },
+                        options: crate::MessageEffectOptions {
+                            thread,
+                            authored_mentioned_pubkeys: Some(authored_mentioned_pubkeys),
+                        },
                         channel_id,
                         text: text.clone(),
                         author_pubkey: owner_pubkey_hex,

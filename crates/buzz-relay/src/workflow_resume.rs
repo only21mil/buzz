@@ -362,6 +362,7 @@ steps:
     struct RecordingActionSink {
         messages: Mutex<Vec<MessageCall>>,
         resolved_mentions: Mutex<Vec<String>>,
+        mention_inputs: Mutex<Vec<String>>,
         mention_resolution_fails: Mutex<bool>,
         message_options: Mutex<Vec<buzz_workflow::MessageEffectOptions>>,
     }
@@ -394,9 +395,10 @@ steps:
             &self,
             _community_id: CommunityId,
             _channel_id: &str,
-            _text: &str,
+            text: &str,
         ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, ActionSinkError>> + Send + '_>>
         {
+            self.mention_inputs.lock().unwrap().push(text.to_owned());
             if *self
                 .mention_resolution_fails
                 .lock()
@@ -905,6 +907,65 @@ steps:
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn new_message_claim_uses_authored_text_from_frozen_approval_definition() {
+        let yaml = r#"
+name: Frozen authored targets
+trigger:
+  on: webhook
+steps:
+  - id: approve
+    action: request_approval
+    from: owner
+    message: Approve
+  - id: execute
+    action: send_message
+    text: 'authored @Agent: {{trigger.text}}'
+"#;
+        let fixture = recovery_fixture_with_yaml(yaml).await;
+        assert!(matches!(
+            grant(&fixture).await,
+            WorkflowApprovalDecisionOutcome::Applied { .. }
+        ));
+        let run = fixture
+            .db
+            .get_workflow_run(fixture.community_id, fixture.run_id)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE workflows SET definition = $1 WHERE community_id = $2 AND id = $3")
+            .bind(serde_json::json!({"name": "Changed", "trigger": {"on": "webhook"}, "steps": [{"id": "execute", "action": "send_message", "text": "@Injected"}]}))
+            .bind(fixture.community_id.as_uuid()).bind(run.workflow_id).execute(&fixture.pool).await.unwrap();
+        fixture.sink.set_resolved_mentions(vec!["aa".repeat(32)]);
+        let outcome = run_workflow_resume_sweep_once(
+            Arc::clone(&fixture.engine),
+            fixture.db.clone(),
+            Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.claimed, 1);
+        assert_eq!(
+            *fixture.sink.mention_inputs.lock().unwrap(),
+            vec![
+                "authored @Agent: execute exactly once",
+                "authored @Agent: {{trigger.text}}"
+            ]
+        );
+        let options = fixture.sink.message_options.lock().unwrap();
+        assert_eq!(
+            options[0].authored_mentioned_pubkeys,
+            Some(vec!["aa".repeat(32)])
+        );
+        let persisted = fixture
+            .db
+            .get_workflow_run(fixture.community_id, fixture.run_id)
+            .await
+            .unwrap();
+        assert_eq!(persisted.status, RunStatus::Completed);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn effect_recovery_fires_unfired_claim_once_with_same_identity() {
         let yaml = r#"
 name: Unfired effect recovery
@@ -1100,7 +1161,7 @@ steps:
         let effect_payload = serde_json::json!({
             "channel_id": "00000000-0000-0000-0000-000000000001",
             "text": "pinned message",
-            "options": {"thread": {
+            "options": {"authored_mentioned_pubkeys": ["aa".repeat(32)], "thread": {
                 "parent_event_id": vec![1; 32],
                 "parent_event_created_at": "2026-09-06T00:00:00Z",
                 "root_event_id": vec![2; 32],

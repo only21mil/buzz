@@ -48,6 +48,10 @@ pub struct MessageEffectOptions {
     /// Thread ancestry; absent for historical and new top-level messages.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<MessageThread>,
+    /// Targets named in the author's frozen template, before rendering. None
+    /// identifies historical claims that must never gain authority tags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_mentioned_pubkeys: Option<Vec<String>>,
 }
 
 /// Errors from action sink operations.
