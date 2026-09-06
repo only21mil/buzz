@@ -9,6 +9,7 @@ import {
   type MainTimelineEntry,
 } from "@/features/messages/lib/threadPanel";
 import { buildMessageThreadPanelRenderItems } from "@/features/messages/lib/messageThreadPanelRenderItems";
+import { handleTimelineMentionCopy } from "@/features/messages/lib/timelineMentionCopy";
 import type { ImetaMedia } from "@/features/messages/lib/imetaMediaMarkdown";
 import { canManageMessageForCurrentUser } from "@/features/messages/lib/canManageMessage";
 import type { TimelineMessage } from "@/features/messages/types";
@@ -403,6 +404,7 @@ export function MessageThreadPanel({
       data-buzz-conversation-scroll
       data-testid="message-thread-body"
       mode={isHuddleTranscript ? "panel" : undefined}
+      onCopy={handleTimelineMentionCopy}
       onScroll={onScroll}
       tabIndex={-1}
       ref={threadBodyRef}
