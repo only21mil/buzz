@@ -25,6 +25,31 @@ pub struct ActionEffectContext {
     pub claimed_at: DateTime<Utc>,
 }
 
+/// Immutable ancestry resolved before claiming a threaded message effect.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MessageThread {
+    /// Parent event identifier and timestamp, pinned from the same community/channel.
+    pub parent_event_id: Vec<u8>,
+    /// Parent event timestamp used by the thread index.
+    pub parent_event_created_at: DateTime<Utc>,
+    /// Root event identifier.
+    pub root_event_id: Vec<u8>,
+    /// Root event timestamp used by the thread index.
+    pub root_event_created_at: DateTime<Utc>,
+    /// Reply depth fixed at first resolution.
+    pub depth: i32,
+    /// Exact NIP-10 tag order and values used for every replay.
+    pub tags: Vec<Vec<String>>,
+}
+
+/// Optional pinned message inputs. Absent historical values preserve legacy bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MessageEffectOptions {
+    /// Thread ancestry; absent for historical and new top-level messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<MessageThread>,
+}
+
 /// Errors from action sink operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ActionSinkError {
@@ -77,6 +102,49 @@ pub trait ActionSink: Send + Sync {
         _text: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, ActionSinkError>> + Send + '_>> {
         Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// Resolve ancestry once, before the effect claim. Retry uses the persisted value.
+    fn resolve_message_thread(
+        &self,
+        _community_id: CommunityId,
+        _channel_id: &str,
+        _parent_event_id: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<MessageThread, ActionSinkError>> + Send + '_>> {
+        Box::pin(async {
+            Err(ActionSinkError::InvalidInput(
+                "thread replies unsupported by this sink".into(),
+            ))
+        })
+    }
+
+    /// Deliver using pinned optional metadata; legacy sinks support top-level claims.
+    #[allow(clippy::too_many_arguments)]
+    fn send_prepared_message(
+        &self,
+        effect: ActionEffectContext,
+        community_id: CommunityId,
+        channel_id: &str,
+        text: &str,
+        author_pubkey: &str,
+        mentioned_pubkeys: &[String],
+        options: &MessageEffectOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
+        if options.thread.is_some() {
+            return Box::pin(async {
+                Err(ActionSinkError::InvalidInput(
+                    "thread replies unsupported by this sink".into(),
+                ))
+            });
+        }
+        self.send_message(
+            effect,
+            community_id,
+            channel_id,
+            text,
+            author_pubkey,
+            mentioned_pubkeys,
+        )
     }
 
     /// Post a message to a channel on behalf of a workflow owner.

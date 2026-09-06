@@ -262,6 +262,49 @@ impl ActionSink for RelayActionSink {
         })
     }
 
+    fn resolve_message_thread(
+        &self,
+        community_id: CommunityId,
+        channel_id: &str,
+        parent_event_id: &str,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<buzz_workflow::MessageThread, ActionSinkError>> + Send + '_>,
+    > {
+        let channel_id = channel_id.to_owned();
+        let parent_event_id = parent_event_id.to_owned();
+        Box::pin(async move {
+            let state = self
+                .state
+                .upgrade()
+                .ok_or_else(|| ActionSinkError::Database("relay is shutting down".into()))?;
+            let channel = Uuid::parse_str(&channel_id)
+                .map_err(|e| ActionSinkError::InvalidInput(e.to_string()))?;
+            let ancestry = crate::handlers::ingest::resolve_relay_reply_thread_meta(
+                community_id,
+                &parent_event_id,
+                channel,
+                &state,
+            )
+            .await
+            .map_err(ActionSinkError::InvalidInput)?;
+            let root = ancestry.root_hex();
+            let parent = ancestry.parent_hex();
+            let mut tags = Vec::new();
+            if root != parent {
+                tags.push(vec!["e".into(), root, "".into(), "root".into()]);
+            }
+            tags.push(vec!["e".into(), parent, "".into(), "reply".into()]);
+            Ok(buzz_workflow::MessageThread {
+                parent_event_id: ancestry.parent_event_id,
+                parent_event_created_at: ancestry.parent_event_created_at,
+                root_event_id: ancestry.root_event_id,
+                root_event_created_at: ancestry.root_event_created_at,
+                depth: ancestry.depth,
+                tags,
+            })
+        })
+    }
+
     fn send_message(
         &self,
         effect: ActionEffectContext,
@@ -271,6 +314,28 @@ impl ActionSink for RelayActionSink {
         author_pubkey: &str,
         mentioned_pubkeys: &[String],
     ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
+        self.send_prepared_message(
+            effect,
+            community_id,
+            channel_id,
+            text,
+            author_pubkey,
+            mentioned_pubkeys,
+            &Default::default(),
+        )
+    }
+
+    fn send_prepared_message(
+        &self,
+        effect: ActionEffectContext,
+        community_id: CommunityId,
+        channel_id: &str,
+        text: &str,
+        author_pubkey: &str,
+        mentioned_pubkeys: &[String],
+        options: &buzz_workflow::MessageEffectOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
+        let options = options.clone();
         let channel_id = channel_id.to_owned();
         let text = text.to_owned();
         let author_pubkey = author_pubkey.to_owned();
@@ -328,6 +393,14 @@ impl ActionSink for RelayActionSink {
                     Tag::parse(["p", &mentioned])
                         .map_err(|e| ActionSinkError::EventBuild(format!("mention p tag: {e}")))?,
                 );
+            }
+
+            if let Some(thread) = &options.thread {
+                for tag in &thread.tags {
+                    tags.push(
+                        Tag::parse(tag).map_err(|e| ActionSinkError::EventBuild(e.to_string()))?,
+                    );
+                }
             }
 
             let kind = Kind::from(KIND_STREAM_MESSAGE as u16);
@@ -408,11 +481,14 @@ impl ActionSink for RelayActionSink {
                 event_id: &event_id_bytes,
                 event_created_at,
                 channel_id: channel_uuid,
-                parent_event_id: None,
-                parent_event_created_at: None,
-                root_event_id: None,
-                root_event_created_at: None,
-                depth: 0,
+                parent_event_id: options
+                    .thread
+                    .as_ref()
+                    .map(|t| t.parent_event_id.as_slice()),
+                parent_event_created_at: options.thread.as_ref().map(|t| t.parent_event_created_at),
+                root_event_id: options.thread.as_ref().map(|t| t.root_event_id.as_slice()),
+                root_event_created_at: options.thread.as_ref().map(|t| t.root_event_created_at),
+                depth: options.thread.as_ref().map_or(0, |t| t.depth),
                 broadcast: false,
             });
 
@@ -439,6 +515,14 @@ impl ActionSink for RelayActionSink {
                     None,
                 )
                 .await;
+                if let Some(thread) = &options.thread {
+                    crate::handlers::side_effects::emit_live_thread_summary(
+                        &tenant,
+                        &state,
+                        channel_uuid,
+                        thread.root_event_id.clone(),
+                    );
+                }
             }
 
             Ok(event_id_hex)
@@ -1005,6 +1089,166 @@ mod integration_tests {
             p_tag_targets.contains(&agent_hex.as_str()),
             "mentioned member {agent_hex} must be p-tagged so it wakes; got {p_tag_targets:?}"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn pinned_thread_replays_identical_event_after_parent_and_channel_changes() {
+        let state = test_state().await;
+        let owner = nostr::Keys::generate();
+        let owner_hex = owner.public_key().to_hex();
+        let host = format!("wf-thread-{}.example", Uuid::new_v4().simple());
+        let community = match state
+            .db
+            .create_community_with_owner(&host, &owner_hex)
+            .await
+            .unwrap()
+        {
+            CreateCommunityWithOwnerResult::Created(c) => c.id,
+            other => panic!("expected fresh community: {other:?}"),
+        };
+        let channel = state
+            .db
+            .create_channel(
+                community,
+                "thread",
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                None,
+                &owner.public_key().to_bytes(),
+                None,
+            )
+            .await
+            .unwrap();
+        let sink = RelayActionSink::new(&state);
+        let identity = || ActionEffectContext {
+            idempotency_key: Uuid::new_v4(),
+            claimed_at: Utc::now(),
+        };
+        let root = sink
+            .send_message(
+                identity(),
+                community,
+                &channel.id.to_string(),
+                "root",
+                &owner_hex,
+                &[],
+            )
+            .await
+            .unwrap();
+        let direct = buzz_workflow::MessageEffectOptions {
+            thread: Some(
+                sink.resolve_message_thread(community, &channel.id.to_string(), &root)
+                    .await
+                    .unwrap(),
+            ),
+        };
+        assert_eq!(
+            direct.thread.as_ref().unwrap().tags,
+            vec![vec![
+                "e".to_string(),
+                root.clone(),
+                "".into(),
+                "reply".into()
+            ]]
+        );
+        let parent = sink
+            .send_prepared_message(
+                identity(),
+                community,
+                &channel.id.to_string(),
+                "direct",
+                &owner_hex,
+                &[],
+                &direct,
+            )
+            .await
+            .unwrap();
+        let pinned = buzz_workflow::MessageEffectOptions {
+            thread: Some(
+                sink.resolve_message_thread(community, &channel.id.to_string(), &parent)
+                    .await
+                    .unwrap(),
+            ),
+        };
+        let pinned: buzz_workflow::MessageEffectOptions =
+            serde_json::from_value(serde_json::to_value(pinned).unwrap()).unwrap();
+        assert_eq!(pinned.thread.as_ref().unwrap().depth, 2);
+        assert_eq!(pinned.thread.as_ref().unwrap().tags.len(), 2);
+        assert!(sink
+            .resolve_message_thread(community, &Uuid::new_v4().to_string(), &parent)
+            .await
+            .is_err());
+        assert!(sink
+            .resolve_message_thread(community, &channel.id.to_string(), "bad-id")
+            .await
+            .is_err());
+        assert!(sink
+            .resolve_message_thread(community, &channel.id.to_string(), &"f".repeat(64))
+            .await
+            .is_err());
+        let effect = identity();
+        let reply = sink
+            .send_prepared_message(
+                effect,
+                community,
+                &channel.id.to_string(),
+                "nested",
+                &owner_hex,
+                &[],
+                &pinned,
+            )
+            .await
+            .unwrap();
+        let reply_bytes = hex::decode(&reply).unwrap();
+        let first = state
+            .db
+            .get_event_by_id(community, &reply_bytes)
+            .await
+            .unwrap()
+            .unwrap();
+        let meta = state
+            .db
+            .get_thread_metadata_by_event(community, &reply_bytes)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.depth, 2);
+        assert_eq!(meta.root_event_id, Some(hex::decode(&root).unwrap()));
+        assert_eq!(meta.parent_event_id, Some(hex::decode(&parent).unwrap()));
+        let mut tx = state.db.begin_transaction().await.unwrap();
+        sqlx::query("UPDATE events SET deleted_at = NOW() WHERE community_id = $1 AND id = $2")
+            .bind(community.as_uuid())
+            .bind(hex::decode(&parent).unwrap())
+            .execute(tx.as_mut())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        state
+            .db
+            .archive_channel(community, channel.id)
+            .await
+            .unwrap();
+        let replay = sink
+            .send_prepared_message(
+                effect,
+                community,
+                &channel.id.to_string(),
+                "nested",
+                &owner_hex,
+                &[],
+                &pinned,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay, reply);
+        let stored = state
+            .db
+            .get_event_by_id(community, &reply_bytes)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.event, first.event);
     }
 
     #[tokio::test]
