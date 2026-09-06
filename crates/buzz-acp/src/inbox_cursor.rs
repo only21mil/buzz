@@ -422,7 +422,12 @@ pub(crate) async fn fetch_startup_catchup(
             if let Some(group_index) = channel_groups.get(&channel_id) {
                 *group_counts.entry(*group_index).or_default() += 1;
             }
-            events.push(BuzzEvent { channel_id, event });
+            // The caller binds REST catch-up to the connection generation at query start.
+            events.push(BuzzEvent {
+                connection_generation: 0,
+                channel_id,
+                event,
+            });
         }
     }
     events.sort_by(|left, right| {
@@ -550,6 +555,102 @@ mod tests {
             keys,
             auth_tag_json: None,
         }
+    }
+
+    #[tokio::test]
+    async fn workflow_rest_replay_reauthorizes_and_queues_once_per_unfinished_attempt() {
+        use crate::workflow_auth::{
+            tests::{test_relay, workflow},
+            InboundAuthorGate,
+        };
+        use std::sync::{atomic::AtomicU64, Arc};
+        let temp =
+            std::env::temp_dir().join(format!("buzz-acp-workflow-replay-{}", Uuid::new_v4()));
+        let relay_keys = Keys::generate();
+        let agent_keys = Keys::generate();
+        let agent = agent_keys.public_key().to_hex();
+        let owner = Keys::generate().public_key().to_hex();
+        let channel = Uuid::new_v4();
+        let event = workflow(&relay_keys, &owner, &agent, channel, 0).event;
+        let server =
+            test_relay(serde_json::json!({"self": relay_keys.public_key().to_hex()})).await;
+        let cache = crate::OwnerCache::new(Some(owner.clone()));
+        let filters = HashMap::from([(
+            channel,
+            ChannelFilter {
+                kinds: Some(vec![9]),
+                require_mention: true,
+            },
+        )]);
+        let rules = vec![crate::filter::SubscriptionRule {
+            kinds: vec![9],
+            require_mention: true,
+            ..Default::default()
+        }];
+        for attempt in 0..2 {
+            let mut gate =
+                InboundAuthorGate::connect(&server.rest, &agent, Arc::new(AtomicU64::new(0))).await;
+            let mut store = InboxCursorStore::load(&temp, &agent, 0, 10);
+            let rest =
+                mock_query_rest(agent_keys.clone(), vec![event.clone(), event.clone()]).await;
+            let mut caught = fetch_startup_catchup(&rest, &filters, &agent, 0, 10)
+                .await
+                .unwrap();
+            assert_eq!(caught.events.len(), 1);
+            let buzz_event = caught.events.pop_front().unwrap();
+            assert!(store.begin_event(&buzz_event.event));
+            let (decision, effective) = gate
+                .evaluate(
+                    &buzz_event,
+                    &crate::RespondTo::OwnerOnly,
+                    &std::collections::HashSet::new(),
+                    false,
+                    &cache,
+                    &server.rest,
+                )
+                .await;
+            assert!(decision.is_allowed());
+            assert_eq!(effective, owner);
+            let prompt_tag = crate::filter::match_event(&buzz_event.event, channel, &rules, &agent)
+                .await
+                .unwrap();
+            assert!(matches!(
+                crate::mode_gate_signal(
+                    crate::MultipleEventHandling::OwnerInterrupt,
+                    &effective,
+                    cache.get()
+                ),
+                Some(crate::ControlSignal::Interrupt)
+            ));
+            let mut queue = crate::EventQueue::new(crate::DedupMode::Queue);
+            assert!(queue.push(crate::queue::QueuedEvent {
+                channel_id: channel,
+                scope: crate::scope::SessionScope::Conversation {
+                    channel_id: channel
+                },
+                event: buzz_event.event.clone(),
+                received_at: std::time::Instant::now(),
+                prompt_tag: prompt_tag.prompt_tag,
+            }));
+            assert!(
+                !store.begin_event(&event),
+                "overlapping live replay must not enqueue twice"
+            );
+            let batch = queue.flush_next().unwrap();
+            assert_eq!(batch.events.len(), 1);
+            assert_eq!(batch.events[0].event.id, event.id);
+            assert_eq!(
+                batch.events[0].event.pubkey,
+                relay_keys.public_key(),
+                "prompt retains actual signer"
+            );
+            if attempt == 1 {
+                store.mark_processed([&event]);
+            }
+        }
+        let mut completed = InboxCursorStore::load(&temp, &agent, 0, 10);
+        assert!(!completed.begin_event(&event));
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[tokio::test]

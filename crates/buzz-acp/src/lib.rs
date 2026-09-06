@@ -18,6 +18,7 @@ mod scope;
 mod setup_mode;
 mod sibling_auth;
 mod usage;
+mod workflow_auth;
 
 pub use usage::TurnUsage;
 
@@ -1820,6 +1821,13 @@ async fn tokio_main() -> Result<()> {
     .await
     .map_err(|e| anyhow::anyhow!("relay connect error: {e}"))?;
 
+    let mut inbound_author_gate = workflow_auth::InboundAuthorGate::connect(
+        &relay.rest_client(),
+        &pubkey_hex,
+        relay.connection_generation(),
+    )
+    .await;
+
     // Tell the relay background task the durable replay floor so the live
     // subscription overlaps startup catch-up. Missing/corrupt state supplies
     // the legacy startup timestamp here, preserving `now - 5s` behavior.
@@ -1967,6 +1975,9 @@ async fn tokio_main() -> Result<()> {
     // The subsequent REQs deliberately overlap this floor; InboxCursorStore's
     // in-process event-id set suppresses duplicates across the two sources.
     let mut startup_catchup = VecDeque::new();
+    let catchup_generation = relay
+        .connection_generation()
+        .load(std::sync::atomic::Ordering::Acquire);
     if inbox_cursor.has_durable_cursor() && !channel_filters.is_empty() {
         match inbox_cursor::fetch_startup_catchup(
             &relay.rest_client(),
@@ -1992,6 +2003,9 @@ async fn tokio_main() -> Result<()> {
                     "startup inbox catch-up complete"
                 );
                 startup_catchup = batch.events;
+                for event in &mut startup_catchup {
+                    event.connection_generation = catchup_generation;
+                }
             }
             Err(error) => tracing::error!(
                 %error,
@@ -2816,8 +2830,8 @@ async fn tokio_main() -> Result<()> {
                             // it never revokes same-owner team bots.
                             let channel_info =
                                 ctx.channel_info.resolve(buzz_event.channel_id).await;
+                            let effective_author;
                             {
-                                let author = buzz_event.event.pubkey.to_hex();
                                 // DM hardening: resolve channel type (fail-closed
                                 // to DM) so allowlist/anyone modes cannot be
                                 // exercised by non-owner authors inside DMs.
@@ -2830,15 +2844,16 @@ async fn tokio_main() -> Result<()> {
                                     .as_ref()
                                     .map(|info| info.channel_type == "dm")
                                     .unwrap_or(true);
-                                let decision = author_gate_decision(
+                                let (decision, author) = inbound_author_gate.evaluate(
+                                    &buzz_event,
                                     &config.respond_to,
                                     &config.respond_to_allowlist,
-                                    &author,
                                     is_dm,
                                     &owner_cache,
                                     &ctx.rest_client,
                                 )
                                 .await;
+                                effective_author = author;
                                 if let AuthorGateDecision::Drop(reason) = decision {
                                     log_author_gate_drop(
                                         buzz_event.channel_id,
@@ -2879,9 +2894,9 @@ async fn tokio_main() -> Result<()> {
                                 channel_info.as_ref().map(|info| info.channel_type == "dm").unwrap_or(true),
                                 &buzz_event.event,
                             );
-                            // Capture author pubkey before queue.push() moves
-                            // buzz_event.event (needed for mode gate below).
-                            let author_hex = buzz_event.event.pubkey.to_hex();
+                            // Mode policy uses the authorized principal; the
+                            // queued event retains its actual relay signer.
+                            let author_hex = effective_author;
                             let event_id_hex = buzz_event.event.id.to_hex();
                             // Clone for the non-cancelling steer fork, which
                             // needs the event to render the steer body. The

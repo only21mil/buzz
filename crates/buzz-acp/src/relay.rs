@@ -22,6 +22,10 @@
 //! channel. `next_event()` reads from the event receiver.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 /// Default capacity of the event channel from background task to harness.
@@ -262,6 +266,69 @@ fn unix_now_secs() -> u64 {
 }
 
 impl RestClient {
+    /// Fetch the relay's stable signing identity from its NIP-11 document.
+    ///
+    /// Relay-authored workflow attribution is trusted only when the event signer
+    /// matches this key. Missing, malformed, or unavailable identity data fails
+    /// closed by returning an error/`None` to the caller. NIP-11 is standardized
+    /// at the relay root; `/info` remains a compatibility fallback for relays
+    /// that expose the document through Buzz's explicit alias.
+    pub async fn relay_self(&self) -> Result<Option<String>, RelayError> {
+        let mut failures = Vec::new();
+
+        for path in ["/", "/info"] {
+            let url = format!("{}{path}", self.base_url);
+            let response = match self
+                .http
+                .get(&url)
+                .header(reqwest::header::ACCEPT, "application/nostr+json")
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    failures.push(format!("GET {path} failed: {error}"));
+                    continue;
+                }
+            };
+
+            if !response.status().is_success() {
+                failures.push(format!("GET {path} returned HTTP {}", response.status()));
+                continue;
+            }
+
+            let document: serde_json::Value = match response.json().await {
+                Ok(document) => document,
+                Err(error) => {
+                    failures.push(format!("GET {path} returned invalid NIP-11 JSON: {error}"));
+                    continue;
+                }
+            };
+            let Some(relay_self) = document.get("self") else {
+                return Ok(None);
+            };
+            let Some(relay_self) = relay_self.as_str() else {
+                failures.push(format!("GET {path} returned a non-string NIP-11 self key"));
+                continue;
+            };
+            let relay_self = match nostr::PublicKey::from_hex(relay_self) {
+                Ok(pubkey) => pubkey.to_hex(),
+                Err(error) => {
+                    failures.push(format!(
+                        "GET {path} returned an invalid NIP-11 self key: {error}"
+                    ));
+                    continue;
+                }
+            };
+            return Ok(Some(relay_self));
+        }
+
+        Err(RelayError::Http(format!(
+            "failed to fetch a usable NIP-11 document: {}",
+            failures.join("; ")
+        )))
+    }
+
     /// Sign a NIP-98 HTTP Auth event (kind:27235) for the given method/URL/body.
     ///
     /// Returns the `Authorization: Nostr <base64>` header value (without the
@@ -500,6 +567,10 @@ impl RestClient {
 /// Events the harness cares about.
 #[derive(Debug, Clone)]
 pub struct BuzzEvent {
+    /// Which authenticated relay connection delivered this event. Generation 0
+    /// is the initial connection; each successful reconnect increments it
+    /// before any buffered or live event from that connection is forwarded.
+    pub connection_generation: u64,
     /// Which channel this event belongs to.
     pub channel_id: Uuid,
     /// The underlying Nostr event.
@@ -606,6 +677,7 @@ type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 /// A background tokio task owns the WebSocket connection and responds to
 /// Ping frames, preventing disconnection during long agent turns.
 pub struct HarnessRelay {
+    connection_generation: Arc<AtomicU64>,
     /// Receiver for events forwarded by the background task.
     event_rx: mpsc::Receiver<Option<BuzzEvent>>,
     /// Receiver for encrypted observer control events addressed to this agent.
@@ -690,6 +762,8 @@ impl HarnessRelay {
         let bg_relay_url = relay_url.to_string();
         let bg_agent_pubkey_hex = agent_pubkey_hex.to_string();
         let bg_auth_tag = auth_tag.clone();
+        let connection_generation = Arc::new(AtomicU64::new(0));
+        let bg_generation = connection_generation.clone();
 
         let bg_handle = tokio::spawn(async move {
             run_background_task(
@@ -702,11 +776,13 @@ impl HarnessRelay {
                 bg_relay_url,
                 bg_agent_pubkey_hex,
                 bg_auth_tag,
+                bg_generation,
             )
             .await;
         });
 
         Ok(Self {
+            connection_generation,
             event_rx,
             observer_control_rx: Some(observer_control_rx),
             cmd_tx,
@@ -720,6 +796,11 @@ impl HarnessRelay {
             auth_tag,
             bg_handle: Some(bg_handle),
         })
+    }
+
+    /// Shared generation of the current authenticated relay connection.
+    pub(crate) fn connection_generation(&self) -> Arc<AtomicU64> {
+        self.connection_generation.clone()
     }
 
     /// Discover channels the agent is a member of.
@@ -1125,6 +1206,10 @@ struct BgState {
     /// A single failed channel REQ is parked here instead of aborting the whole
     /// reconnect. Drained by the main loop. Flushed on each reconnect attempt.
     resubscribe_retry: HashSet<Uuid>,
+    /// Current authenticated WebSocket generation. Incremented immediately
+    /// after each successful reconnect handshake, before buffered or live
+    /// events from the new connection are forwarded.
+    connection_generation: Arc<AtomicU64>,
     /// Current position in the exponential backoff ladder.
     ///
     /// Persisted across calls to `wait_for_reconnect` so a flapping link stays at
@@ -1156,6 +1241,7 @@ impl BgState {
             observer_in_flight: VecDeque::new(),
             gated_observer_dropped: 0,
             resubscribe_retry: HashSet::new(),
+            connection_generation: Arc::new(AtomicU64::new(0)),
             backoff_step: 0,
         }
     }
@@ -1615,8 +1701,10 @@ async fn run_background_task(
     relay_url: String,
     agent_pubkey_hex: String,
     auth_tag: Option<nostr::Tag>,
+    connection_generation: Arc<AtomicU64>,
 ) {
     let mut state = BgState::new();
+    state.connection_generation = connection_generation;
 
     let handshake_ok = process_handshake_buffer(
         &mut ws,
@@ -2204,6 +2292,9 @@ async fn handle_ws_message(
                         }
                         let ts = event.created_at.as_secs();
                         let buzz_event = BuzzEvent {
+                            connection_generation: state
+                                .connection_generation
+                                .load(Ordering::Acquire),
                             channel_id: channel_uuid,
                             event: *event,
                         };
@@ -2245,6 +2336,9 @@ async fn handle_ws_message(
                         let event_id_hex = event.id.to_hex();
                         if state.record_event(channel_id, &event) {
                             let buzz_event = BuzzEvent {
+                                connection_generation: state
+                                    .connection_generation
+                                    .load(Ordering::Acquire),
                                 channel_id,
                                 event: *event,
                             };
@@ -3028,6 +3122,7 @@ async fn try_autonomous_reconnect(
         match do_connect(relay_url, keys, auth_tag).await {
             Ok((new_ws, handshake_buffer)) => {
                 *ws = new_ws;
+                state.connection_generation.fetch_add(1, Ordering::AcqRel);
                 info!("autonomous reconnect succeeded (attempt {})", attempt + 1);
                 let handshake_ok = process_handshake_buffer(
                     ws,
@@ -3166,6 +3261,7 @@ async fn wait_for_reconnect(
         match do_connect(relay_url, keys, auth_tag).await {
             Ok((new_ws, handshake_buffer)) => {
                 *ws = new_ws;
+                state.connection_generation.fetch_add(1, Ordering::AcqRel);
                 info!("relay reconnected to {relay_url}");
                 let handshake_ok = process_handshake_buffer(
                     ws,
@@ -4099,6 +4195,168 @@ async fn wait_for_any_ok(
 mod tests {
     use super::*;
 
+    async fn nip11_test_client(
+        responses: HashMap<String, (u16, String)>,
+    ) -> (
+        RestClient,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, bool)>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind NIP-11 test server");
+        let base_url = format!(
+            "http://{}",
+            listener.local_addr().expect("test server address")
+        );
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let server_requests = requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0; 8192];
+                let bytes_read = socket.read(&mut request).await.unwrap_or_default();
+                let request = String::from_utf8_lossy(&request[..bytes_read]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                let has_nip11_accept = request
+                    .lines()
+                    .any(|line| line.eq_ignore_ascii_case("accept: application/nostr+json"));
+                server_requests
+                    .lock()
+                    .expect("lock recorded NIP-11 requests")
+                    .push((path.clone(), has_nip11_accept));
+
+                let (status, body) = responses
+                    .get(&path)
+                    .cloned()
+                    .unwrap_or_else(|| (404, "not found".into()));
+                let reason = if status == 200 { "OK" } else { "Not Found" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let client = RestClient {
+            http: reqwest::Client::new(),
+            base_url,
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+        (client, requests, server)
+    }
+
+    #[tokio::test]
+    async fn relay_self_reads_and_normalizes_standard_root_document() {
+        let uppercase = "AB".repeat(32);
+        let responses = HashMap::from([
+            (
+                "/".to_string(),
+                (200, serde_json::json!({ "self": uppercase }).to_string()),
+            ),
+            (
+                "/info".to_string(),
+                (
+                    200,
+                    serde_json::json!({ "self": "cd".repeat(32) }).to_string(),
+                ),
+            ),
+        ]);
+        let (client, requests, server) = nip11_test_client(responses).await;
+
+        assert_eq!(
+            client.relay_self().await.expect("fetch relay self"),
+            Some("ab".repeat(32))
+        );
+        assert_eq!(
+            *requests.lock().expect("lock recorded requests"),
+            vec![("/".to_string(), true)],
+            "the standard root document should be preferred and request NIP-11 JSON"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn relay_self_falls_back_to_info_alias() {
+        let responses = HashMap::from([
+            ("/".to_string(), (404, "not found".into())),
+            (
+                "/info".to_string(),
+                (
+                    200,
+                    serde_json::json!({ "self": "cd".repeat(32) }).to_string(),
+                ),
+            ),
+        ]);
+        let (client, requests, server) = nip11_test_client(responses).await;
+
+        assert_eq!(
+            client.relay_self().await.expect("fetch relay self"),
+            Some("cd".repeat(32))
+        );
+        assert_eq!(
+            *requests.lock().expect("lock recorded requests"),
+            vec![("/".to_string(), true), ("/info".to_string(), true)]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn relay_self_missing_at_root_cannot_be_restored_by_stale_alias() {
+        let responses = HashMap::from([
+            (
+                "/".to_string(),
+                (200, serde_json::json!({"name": "relay"}).to_string()),
+            ),
+            (
+                "/info".to_string(),
+                (
+                    200,
+                    serde_json::json!({"self": "ab".repeat(32)}).to_string(),
+                ),
+            ),
+        ]);
+        let (client, requests, server) = nip11_test_client(responses).await;
+        assert_eq!(client.relay_self().await.unwrap(), None);
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn relay_self_rejects_malformed_identity_at_both_endpoints() {
+        let responses = HashMap::from([
+            (
+                "/".to_string(),
+                (
+                    200,
+                    serde_json::json!({ "self": "not-a-pubkey" }).to_string(),
+                ),
+            ),
+            (
+                "/info".to_string(),
+                (200, serde_json::json!({ "self": 42 }).to_string()),
+            ),
+        ]);
+        let (client, _requests, server) = nip11_test_client(responses).await;
+
+        let error = client
+            .relay_self()
+            .await
+            .expect_err("malformed relay identities must fail closed");
+        assert!(error
+            .to_string()
+            .contains("failed to fetch a usable NIP-11 document"));
+        server.abort();
+    }
+
     #[test]
     fn relay_ws_to_http_plain() {
         assert_eq!(
@@ -4527,6 +4785,7 @@ mod tests {
         let (event_tx, mut event_rx) = mpsc::channel(4);
         let (observer_control_tx, mut observer_control_rx) = mpsc::channel(4);
         let mut state = BgState::new();
+        state.connection_generation.store(7, Ordering::Release);
         let channel_id = Uuid::new_v4();
         let event = make_signed_channel_event(&Keys::generate(), "hello", 2_000);
 
@@ -4544,6 +4803,7 @@ mod tests {
 
         let received = event_rx.try_recv().expect("verified event was forwarded");
         let received = received.expect("event channel should not contain shutdown marker");
+        assert_eq!(received.connection_generation, 7);
         assert_eq!(received.channel_id, channel_id);
         assert_eq!(received.event.id, event.id);
         assert_eq!(state.last_seen.get(&channel_id), Some(&2_000));
