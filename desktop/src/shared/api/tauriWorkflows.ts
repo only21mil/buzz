@@ -15,10 +15,12 @@ import type {
 
 type RawWorkflow = {
   id: string;
+  revision: string;
   name: string;
   owner_pubkey: string;
   channel_id: string | null;
   definition: Record<string, unknown>;
+  yaml_definition?: string;
   status: Workflow["status"];
   created_at: number;
   updated_at: number;
@@ -132,10 +134,12 @@ type RawApprovalActionResponse = {
 function fromRawWorkflow(raw: RawWorkflow): Workflow {
   return {
     id: raw.id,
+    revision: raw.revision,
     name: raw.name,
     ownerPubkey: raw.owner_pubkey,
     channelId: raw.channel_id,
     definition: raw.definition,
+    yamlDefinition: raw.yaml_definition,
     status: raw.status,
     createdAt: raw.created_at,
     updatedAt: raw.updated_at,
@@ -259,10 +263,12 @@ export async function createWorkflow(
 export async function updateWorkflow(
   workflowId: string,
   yamlDefinition: string,
+  expectedRevision: string,
 ): Promise<WorkflowSaveResult> {
   const raw = await invokeTauri<RawWorkflowSaveResponse>("update_workflow", {
     workflowId,
     yamlDefinition,
+    expectedRevision,
   });
   return fromRawWorkflowSave(raw);
 }

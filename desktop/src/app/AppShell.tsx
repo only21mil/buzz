@@ -95,7 +95,7 @@ import { SidebarProvider } from "@/shared/ui/sidebar";
 import { RelayConnectionOverlay } from "@/app/RelayConnectionOverlay";
 import { useSidebarRelayConnectionCard } from "@/features/sidebar/ui/useSidebarRelayConnectionCard";
 import { AppShellTrayMenu } from "@/app/useAppShellTrayMenu";
-import { AppProfilePanelProvider } from "@/app/AppProfilePanelProvider";
+import { AppShellPanelProviders } from "@/app/AppShellPanelProviders";
 import { LazySettingsScreen } from "@/app/LazySettingsScreen";
 const EMPTY_CHANNELS: Channel[] = [];
 export function AppShell() {
@@ -792,7 +792,7 @@ export function AppShell() {
               className="relative z-10 min-h-0 min-w-0 flex-1 flex-col overflow-visible"
               data-testid="app-sidebar-layer"
             >
-              <AppProfilePanelProvider>
+              <AppShellPanelProviders>
                 {!settingsOpen && !isHuddleRoom ? (
                   <AppTopChrome
                     canGoBack={canGoBack}
@@ -989,7 +989,7 @@ export function AppShell() {
                   onOpenChange={setIsSendFeedbackOpen}
                   open={isSendFeedbackOpen}
                 />
-              </AppProfilePanelProvider>
+              </AppShellPanelProviders>
             </SidebarProvider>
           </AppHuddleShell>
         </AppShellProvider>

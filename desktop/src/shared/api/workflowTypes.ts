@@ -2,10 +2,12 @@ export type WorkflowStatus = "active" | "disabled" | "archived";
 
 export type Workflow = {
   id: string;
+  revision: string;
   name: string;
   ownerPubkey: string;
   channelId: string | null;
   definition: Record<string, unknown>;
+  yamlDefinition?: string;
   status: WorkflowStatus;
   createdAt: number;
   updatedAt: number;

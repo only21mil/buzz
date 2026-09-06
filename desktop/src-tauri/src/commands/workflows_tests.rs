@@ -131,6 +131,7 @@ fn workflow_from_event_maps_all_fields() {
     let wf = workflow_from_event(&ev);
 
     assert_eq!(wf.id, WF);
+    assert_eq!(wf.revision, ev.id.to_hex());
     assert_eq!(wf.channel_id.as_deref(), Some(CHAN));
     assert_eq!(wf.owner_pubkey, ev.pubkey.to_hex());
     assert_eq!(wf.name, "Greet on join");
@@ -210,6 +211,7 @@ fn tag_value_reads_d_and_h_and_misses_absent() {
 fn workflow_record_shapes_save_inputs() {
     let wf = workflow_record(
         WF.to_string(),
+        "revision-1".to_string(),
         Some(CHAN.to_string()),
         "deadbeef".to_string(),
         YAML,
@@ -229,6 +231,7 @@ fn workflow_record_shapes_save_inputs() {
 fn save_wire_serializes_flat_with_optional_secret() {
     let workflow = workflow_record(
         WF.to_string(),
+        "revision-1".to_string(),
         Some(CHAN.to_string()),
         "deadbeef".to_string(),
         YAML,
@@ -266,6 +269,7 @@ fn workflow_wire_serializes_with_snake_case_keys() {
     let v = serde_json::to_value(workflow_from_event(&ev)).expect("serialize");
     for key in [
         "id",
+        "revision",
         "name",
         "owner_pubkey",
         "channel_id",
@@ -341,5 +345,29 @@ fn history_cursor_pairs_are_encoded_without_losing_precision() {
     assert_eq!(
         workflow_history_path(id, None, false, None, None).unwrap(),
         workflow_runs_path(id, None)
+    );
+}
+
+#[test]
+fn workflow_channel_filters_keep_exact_batch_boundaries_and_deduplicate() {
+    for count in [128, 129] {
+        let channels: Vec<_> = (0..count)
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect();
+        let filters =
+            workflow_channel_filters(channels.iter().chain(channels.iter()).cloned().collect());
+        assert_eq!(filters.len(), count);
+        for (filter, channel) in filters.iter().zip(channels) {
+            assert_eq!(filter["#h"], serde_json::json!([channel]));
+        }
+    }
+}
+
+#[test]
+fn workflow_wire_keeps_original_yaml_for_lossless_edits() {
+    let yaml = "# do not erase\nname: State\ntrigger: {on: webhook}\nsteps: [{id: read, action: read_state, key: count}]\n";
+    assert_eq!(
+        workflow_from_event(&wf_event(WF, CHAN, yaml)).yaml_definition,
+        yaml
     );
 }
