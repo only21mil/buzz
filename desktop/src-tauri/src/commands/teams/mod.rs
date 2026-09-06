@@ -66,11 +66,10 @@ pub(in crate::commands) fn propagate_membership_best_effort(
     }
 }
 
-/// In-memory core of [`create_team`]: push the built team, persist teams
-/// authoritatively, then propagate its whole roster (no prior members ⇒ the
-/// whole roster is the added delta) to live instances best-effort. Decoupled
-/// from the `AppHandle` shell via injected persistence so the create wiring is
-/// unit-testable. A `persist_teams` error propagates; agent IO is best-effort.
+/// Fixture for full-roster membership propagation with injected persistence.
+/// Production `create_team` persists and publishes through its command path;
+/// these tests exercise the propagation helper, not that command's wiring.
+#[cfg(test)]
 fn commit_team_create(
     teams: &mut Vec<TeamRecord>,
     team: TeamRecord,
