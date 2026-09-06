@@ -7,7 +7,7 @@ import * as scopes from "./publicationScope.ts";
 
 const PUBKEY = "a".repeat(64);
 const RELAY = "wss://relay.example/Team";
-function harness(invokeTauri) {
+function harness(invokeTauri, native = true) {
   scopes.setPublicationScope(PUBKEY, RELAY, true);
   const exports = {};
   runInNewContext(
@@ -30,7 +30,7 @@ function harness(invokeTauri) {
       Error,
       require: (key) =>
         ({
-          "@tauri-apps/api/core": { isTauri: () => true },
+          "@tauri-apps/api/core": { isTauri: () => native },
           "./tauri": { invokeTauri },
           "./publicationScope": scopes,
         })[key],
@@ -85,3 +85,12 @@ for (const snapshot of [
     );
   });
 }
+
+test("browser preparation retains renderer authority without requesting a native epoch", async () => {
+  const prepare = harness(() => {
+    assert.fail("browser must not request native publication authority");
+  }, false);
+  const original = scopes.capturePublicationScope();
+  assert.equal(await prepare(original), original);
+  assert.equal(original.nativeEpoch, undefined);
+});

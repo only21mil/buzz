@@ -216,6 +216,7 @@
     "get_events",
     "get_global_agent_config",
     "get_managed_agent_log",
+    "get_message_publication_scope",
     "get_project_local_repo_diff",
     "get_project_local_repo_snapshot",
     "get_project_repo_diff",

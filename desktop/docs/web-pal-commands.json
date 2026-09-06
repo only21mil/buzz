@@ -1,15 +1,15 @@
 {
   "schemaVersion": 1,
   "renderer": {
-    "commandCount": 307,
-    "invocationCount": 359,
+    "commandCount": 308,
+    "invocationCount": 360,
     "dynamicCallCount": 5,
     "dynamicCalls": [
       "desktop/src/features/huddle/components/AgentVoiceMenu.tsx:67",
       "desktop/src/features/notifications/lib/desktop.ts:137",
       "desktop/src/features/notifications/lib/desktop.ts:178",
       "desktop/src/features/notifications/lib/desktop.ts:238",
-      "desktop/src/shared/api/tauri.ts:304"
+      "desktop/src/shared/api/tauri.ts:305"
     ],
     "commands": [
       {
@@ -31,17 +31,17 @@
       },
       {
         "name": "add_channel_members",
-        "callSites": ["desktop/src/shared/api/tauri.ts:381"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:382"],
         "payloadStyle": "json"
       },
       {
         "name": "add_reaction",
-        "callSites": ["desktop/src/shared/api/tauri.ts:592"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:593"],
         "payloadStyle": "json"
       },
       {
         "name": "add_relay_member",
-        "callSites": ["desktop/src/shared/api/tauri.ts:766"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:768"],
         "payloadStyle": "json"
       },
       {
@@ -88,7 +88,7 @@
       },
       {
         "name": "auto_connect_default_relay_enabled",
-        "callSites": ["desktop/src/shared/api/tauri.ts:363"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:364"],
         "payloadStyle": "json"
       },
       {
@@ -114,7 +114,7 @@
       },
       {
         "name": "cancel_media_fetch",
-        "callSites": ["desktop/src/shared/api/tauriMedia.ts:103"],
+        "callSites": ["desktop/src/shared/api/tauriMedia.ts:100"],
         "payloadStyle": "json"
       },
       {
@@ -124,7 +124,7 @@
       },
       {
         "name": "cancel_pairing",
-        "callSites": ["desktop/src/shared/api/tauri.ts:1083"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:1085"],
         "payloadStyle": "json"
       },
       {
@@ -139,12 +139,12 @@
       },
       {
         "name": "change_channel_member_role",
-        "callSites": ["desktop/src/shared/api/tauri.ts:396"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:397"],
         "payloadStyle": "json"
       },
       {
         "name": "change_relay_member_role",
-        "callSites": ["desktop/src/shared/api/tauri.ts:777"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:779"],
         "payloadStyle": "json"
       },
       {
@@ -200,7 +200,7 @@
       },
       {
         "name": "confirm_pairing_sas",
-        "callSites": ["desktop/src/shared/api/tauri.ts:1079"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:1081"],
         "payloadStyle": "json"
       },
       {
@@ -220,12 +220,12 @@
       },
       {
         "name": "copy_text_to_clipboard",
-        "callSites": ["desktop/src/shared/api/tauriMedia.ts:146"],
+        "callSites": ["desktop/src/shared/api/tauriMedia.ts:150"],
         "payloadStyle": "json"
       },
       {
         "name": "create_auth_event",
-        "callSites": ["desktop/src/shared/api/tauri.ts:616"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:618"],
         "payloadStyle": "json"
       },
       {
@@ -248,7 +248,7 @@
       },
       {
         "name": "create_managed_agent",
-        "callSites": ["desktop/src/shared/api/tauri.ts:792"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:794"],
         "payloadStyle": "json"
       },
       {
@@ -307,17 +307,17 @@
       },
       {
         "name": "delete_custom_harness",
-        "callSites": ["desktop/src/shared/api/tauri.ts:912"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:914"],
         "payloadStyle": "json"
       },
       {
         "name": "delete_managed_agent",
-        "callSites": ["desktop/src/shared/api/tauri.ts:835"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:837"],
         "payloadStyle": "json"
       },
       {
         "name": "delete_message",
-        "callSites": ["desktop/src/shared/api/tauri.ts:584"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:585"],
         "payloadStyle": "json"
       },
       {
@@ -364,7 +364,7 @@
       },
       {
         "name": "discover_acp_providers",
-        "callSites": ["desktop/src/shared/api/tauri.ts:872"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:874"],
         "payloadStyle": "json"
       },
       {
@@ -374,17 +374,17 @@
       },
       {
         "name": "discover_backend_providers",
-        "callSites": ["desktop/src/shared/api/tauri.ts:1053"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:1055"],
         "payloadStyle": "json"
       },
       {
         "name": "discover_git_bash_prerequisite",
-        "callSites": ["desktop/src/shared/api/tauri.ts:857"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:859"],
         "payloadStyle": "json"
       },
       {
         "name": "discover_managed_agent_prereqs",
-        "callSites": ["desktop/src/shared/api/tauri.ts:929"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:931"],
         "payloadStyle": "json"
       },
       {
@@ -409,7 +409,7 @@
       },
       {
         "name": "edit_message",
-        "callSites": ["desktop/src/shared/api/editMessage.ts:12"],
+        "callSites": ["desktop/src/shared/api/editMessage.ts:21"],
         "payloadStyle": "json"
       },
       {
@@ -466,12 +466,12 @@
       },
       {
         "name": "fetch_media_bytes",
-        "callSites": ["desktop/src/shared/api/tauriMedia.ts:180"],
+        "callSites": ["desktop/src/shared/api/tauriMedia.ts:184"],
         "payloadStyle": "json"
       },
       {
         "name": "fetch_snapshot_bytes",
-        "callSites": ["desktop/src/shared/api/tauriMedia.ts:166"],
+        "callSites": ["desktop/src/shared/api/tauriMedia.ts:170"],
         "payloadStyle": "json"
       },
       {
@@ -491,7 +491,7 @@
       },
       {
         "name": "get_agent_config_surface",
-        "callSites": ["desktop/src/shared/api/tauri.ts:954"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:956"],
         "payloadStyle": "json"
       },
       {
@@ -501,7 +501,7 @@
       },
       {
         "name": "get_agent_models",
-        "callSites": ["desktop/src/shared/api/tauri.ts:948"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:950"],
         "payloadStyle": "json"
       },
       {
@@ -511,12 +511,12 @@
       },
       {
         "name": "get_baked_build_env",
-        "callSites": ["desktop/src/shared/api/tauri.ts:1027"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:1029"],
         "payloadStyle": "json"
       },
       {
         "name": "get_baked_build_env_keys",
-        "callSites": ["desktop/src/shared/api/tauri.ts:997"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:999"],
         "payloadStyle": "json"
       },
       {
@@ -537,7 +537,7 @@
       },
       {
         "name": "get_canvas",
-        "callSites": ["desktop/src/shared/api/tauri.ts:408"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:409"],
         "payloadStyle": "json"
       },
       {
@@ -582,7 +582,7 @@
       },
       {
         "name": "get_default_relay_url",
-        "callSites": ["desktop/src/shared/api/tauri.ts:359"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:360"],
         "payloadStyle": "json"
       },
       {
@@ -597,7 +597,7 @@
       },
       {
         "name": "get_feed",
-        "callSites": ["desktop/src/shared/api/tauri.ts:437"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:438"],
         "payloadStyle": "json"
       },
       {
@@ -673,12 +673,17 @@
       },
       {
         "name": "get_managed_agent_log",
-        "callSites": ["desktop/src/shared/api/tauri.ts:842"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:844"],
         "payloadStyle": "json"
       },
       {
         "name": "get_media_proxy_port",
         "callSites": ["desktop/src/shared/lib/mediaUrl.ts:216"],
+        "payloadStyle": "json"
+      },
+      {
+        "name": "get_message_publication_scope",
+        "callSites": ["desktop/src/shared/api/preparePublicationScope.ts:16"],
         "payloadStyle": "json"
       },
       {
@@ -690,7 +695,7 @@
       },
       {
         "name": "get_my_relay_membership",
-        "callSites": ["desktop/src/shared/api/tauri.ts:746"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:748"],
         "payloadStyle": "json"
       },
       {
@@ -720,7 +725,7 @@
       },
       {
         "name": "get_presence",
-        "callSites": ["desktop/src/shared/api/tauri.ts:346"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:347"],
         "payloadStyle": "json"
       },
       {
@@ -756,7 +761,7 @@
       {
         "name": "get_relay_http_url",
         "callSites": [
-          "desktop/src/shared/api/tauri.ts:375",
+          "desktop/src/shared/api/tauri.ts:376",
           "desktop/src/shared/lib/mediaUrl.ts:204"
         ],
         "payloadStyle": "json"
@@ -768,7 +773,7 @@
       },
       {
         "name": "get_relay_ws_url",
-        "callSites": ["desktop/src/shared/api/tauri.ts:371"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:372"],
         "payloadStyle": "json"
       },
       {
@@ -778,12 +783,12 @@
       },
       {
         "name": "get_runtime_file_config",
-        "callSites": ["desktop/src/shared/api/tauri.ts:983"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:985"],
         "payloadStyle": "json"
       },
       {
         "name": "get_thread_replies",
-        "callSites": ["desktop/src/shared/api/tauri.ts:508"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:509"],
         "payloadStyle": "json"
       },
       {
@@ -864,7 +869,7 @@
       },
       {
         "name": "install_acp_runtime",
-        "callSites": ["desktop/src/shared/api/tauri.ts:918"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:920"],
         "payloadStyle": "json"
       },
       {
@@ -874,18 +879,18 @@
       },
       {
         "name": "is_auto_update_supported",
-        "callSites": ["desktop/src/shared/api/tauri.ts:1096"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:1098"],
         "payloadStyle": "json"
       },
       {
         "name": "is_shared_identity",
-        "callSites": ["desktop/src/shared/api/tauri.ts:367"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:368"],
         "payloadStyle": "json"
       },
       {
         "name": "join_channel",
         "callSites": [
-          "desktop/src/shared/api/tauri.ts:400",
+          "desktop/src/shared/api/tauri.ts:401",
           "desktop/src/shared/api/tauriChannels.ts:264"
         ],
         "payloadStyle": "json"
@@ -897,7 +902,7 @@
       },
       {
         "name": "leave_channel",
-        "callSites": ["desktop/src/shared/api/tauri.ts:404"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:405"],
         "payloadStyle": "json"
       },
       {
@@ -946,7 +951,7 @@
         "name": "list_managed_agents",
         "callSites": [
           "desktop/src/features/huddle/components/AddAgentDialog.tsx:52",
-          "desktop/src/shared/api/tauri.ts:787"
+          "desktop/src/shared/api/tauri.ts:789"
         ],
         "payloadStyle": "json"
       },
@@ -962,12 +967,12 @@
       },
       {
         "name": "list_relay_agents",
-        "callSites": ["desktop/src/shared/api/tauri.ts:781"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:783"],
         "payloadStyle": "json"
       },
       {
         "name": "list_relay_members",
-        "callSites": ["desktop/src/shared/api/tauri.ts:740"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:742"],
         "payloadStyle": "json"
       },
       {
@@ -1040,12 +1045,12 @@
       },
       {
         "name": "nip44_decrypt_from_self",
-        "callSites": ["desktop/src/shared/api/tauri.ts:1071"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:1073"],
         "payloadStyle": "json"
       },
       {
         "name": "nip44_encrypt_to_self",
-        "callSites": ["desktop/src/shared/api/tauri.ts:1065"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:1067"],
         "payloadStyle": "json"
       },
       {
@@ -1094,14 +1099,14 @@
       },
       {
         "name": "pick_and_upload_media",
-        "callSites": ["desktop/src/shared/api/tauri.ts:563"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:564"],
         "payloadStyle": "json"
       },
       {
         "name": "plugin:websocket|connect",
         "callSites": [
           "desktop/src/shared/api/readOnlyRelayClient.ts:139",
-          "desktop/src/shared/api/relayClientSession.ts:547"
+          "desktop/src/shared/api/relayClientSession.ts:538"
         ],
         "payloadStyle": "json"
       },
@@ -1109,7 +1114,7 @@
         "name": "plugin:websocket|send",
         "callSites": [
           "desktop/src/shared/api/readOnlyRelayClient.ts:197",
-          "desktop/src/shared/api/relayClientSession.ts:651"
+          "desktop/src/shared/api/relayClientSession.ts:643"
         ],
         "payloadStyle": "json"
       },
@@ -1132,7 +1137,7 @@
       },
       {
         "name": "probe_backend_provider",
-        "callSites": ["desktop/src/shared/api/tauri.ts:1059"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:1061"],
         "payloadStyle": "json"
       },
       {
@@ -1157,7 +1162,7 @@
       },
       {
         "name": "put_agent_session_config",
-        "callSites": ["desktop/src/shared/api/tauri.ts:963"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:965"],
         "payloadStyle": "json"
       },
       {
@@ -1177,7 +1182,7 @@
       },
       {
         "name": "read_clipboard_text",
-        "callSites": ["desktop/src/shared/api/tauriMedia.ts:131"],
+        "callSites": ["desktop/src/shared/api/tauriMedia.ts:135"],
         "payloadStyle": "json"
       },
       {
@@ -1217,7 +1222,7 @@
       },
       {
         "name": "release_media_fetch",
-        "callSites": ["desktop/src/shared/api/tauriMedia.ts:118"],
+        "callSites": ["desktop/src/shared/api/tauriMedia.ts:122"],
         "payloadStyle": "json"
       },
       {
@@ -1230,17 +1235,17 @@
       },
       {
         "name": "remove_channel_member",
-        "callSites": ["desktop/src/shared/api/tauri.ts:388"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:389"],
         "payloadStyle": "json"
       },
       {
         "name": "remove_reaction",
-        "callSites": ["desktop/src/shared/api/tauri.ts:599"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:600"],
         "payloadStyle": "json"
       },
       {
         "name": "remove_relay_member",
-        "callSites": ["desktop/src/shared/api/tauri.ts:770"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:772"],
         "payloadStyle": "json"
       },
       {
@@ -1275,7 +1280,7 @@
       },
       {
         "name": "save_custom_harness",
-        "callSites": ["desktop/src/shared/api/tauri.ts:892"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:894"],
         "payloadStyle": "json"
       },
       {
@@ -1285,7 +1290,7 @@
       },
       {
         "name": "search_messages",
-        "callSites": ["desktop/src/shared/api/tauri.ts:457"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:458"],
         "payloadStyle": "json"
       },
       {
@@ -1295,7 +1300,7 @@
       },
       {
         "name": "send_channel_message",
-        "callSites": ["desktop/src/shared/api/tauriMessages.ts:24"],
+        "callSites": ["desktop/src/shared/api/tauriMessages.ts:33"],
         "payloadStyle": "json"
       },
       {
@@ -1315,7 +1320,7 @@
       },
       {
         "name": "set_canvas",
-        "callSites": ["desktop/src/shared/api/tauri.ts:424"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:425"],
         "payloadStyle": "json"
       },
       {
@@ -1420,7 +1425,7 @@
       },
       {
         "name": "sign_event",
-        "callSites": ["desktop/src/shared/api/tauri.ts:608"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:610"],
         "payloadStyle": "json"
       },
       {
@@ -1496,7 +1501,7 @@
       },
       {
         "name": "start_pairing",
-        "callSites": ["desktop/src/shared/api/tauri.ts:1075"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:1077"],
         "payloadStyle": "json"
       },
       {
@@ -1517,7 +1522,7 @@
         "callSites": [
           "desktop/src/features/agents/hooks.ts:660",
           "desktop/src/features/channels/hooks.ts:538",
-          "desktop/src/features/messages/ui/useMentionSendFlow.ts:513"
+          "desktop/src/features/messages/ui/useMentionSendFlow.ts:519"
         ],
         "payloadStyle": "json"
       },
@@ -1627,7 +1632,7 @@
       },
       {
         "name": "update_managed_agent",
-        "callSites": ["desktop/src/shared/api/tauri.ts:1038"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:1040"],
         "payloadStyle": "json"
       },
       {
@@ -1667,12 +1672,12 @@
       },
       {
         "name": "upload_media",
-        "callSites": ["desktop/src/shared/api/tauri.ts:555"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:556"],
         "payloadStyle": "json"
       },
       {
         "name": "upload_media_bytes",
-        "callSites": ["desktop/src/shared/api/tauri.ts:571"],
+        "callSites": ["desktop/src/shared/api/tauri.ts:572"],
         "payloadStyle": "json"
       },
       {
@@ -1693,7 +1698,7 @@
     ]
   },
   "rust": {
-    "commandCount": 315,
+    "commandCount": 316,
     "commands": [
       "acknowledge_pending_community_deep_link",
       "acknowledge_pending_entity_deep_link",
@@ -1818,6 +1823,7 @@
       "get_liked_notes",
       "get_managed_agent_log",
       "get_media_proxy_port",
+      "get_message_publication_scope",
       "get_model_status",
       "get_my_relay_membership",
       "get_note",

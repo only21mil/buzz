@@ -65,6 +65,13 @@ function registerMutations(
 export function registerRelaySocialConfigCommands(
   _identity: BrowserIdentityManager,
 ): void {
+  // Browser preparation uses its renderer epoch and never requests native authority.
+  // Reject explicit calls rather than returning a fabricated native epoch.
+  registerOffMutation(
+    "get_message_publication_scope",
+    "native publication authority needs the desktop app",
+  );
+
   // Team snapshot mutations require native codecs, files, and local state.
   registerMutations(TEAM_SNAPSHOT_MUTATIONS);
 

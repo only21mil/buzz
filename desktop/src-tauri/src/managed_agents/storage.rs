@@ -5,13 +5,19 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 use crate::app_state::keyring_service;
 use crate::managed_agents::{
     ManagedAgentRecord, ManagedAgentRuntimeKey, ManagedAgentRuntimeReceipt,
 };
 use crate::secret_store::{KeyringProbe, SecretStore};
+
+#[path = "storage_paths.rs"]
+mod paths;
+pub use paths::managed_agents_base_dir;
+use paths::managed_agents_logs_dir;
+pub(crate) use paths::managed_agents_store_path;
 
 /// Keyring key name for an agent's nsec, namespaced from the human identity
 /// key (`"identity"`) which shares the service.
@@ -30,32 +36,6 @@ fn agent_secret_store() -> Option<&'static SecretStore> {
     } else {
         None
     }
-}
-
-pub fn managed_agents_base_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
-    #[cfg(test)]
-    if let Some(probe) = app.try_state::<super::poll_read_probe::PollReadProbe>() {
-        return Ok(probe.directory.path().to_path_buf());
-    }
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("failed to resolve app data dir: {error}"))?
-        .join("agents");
-    fs::create_dir_all(&dir).map_err(|error| format!("failed to create agents dir: {error}"))?;
-    Ok(dir)
-}
-
-pub(crate) fn managed_agents_store_path<R: tauri::Runtime>(
-    app: &AppHandle<R>,
-) -> Result<PathBuf, String> {
-    Ok(managed_agents_base_dir(app)?.join("managed-agents.json"))
-}
-
-fn managed_agents_logs_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
-    let dir = managed_agents_base_dir(app)?.join("logs");
-    fs::create_dir_all(&dir).map_err(|error| format!("failed to create logs dir: {error}"))?;
-    Ok(dir)
 }
 
 /// Install-log path for `runtime_id`, alongside the agent logs.
