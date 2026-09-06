@@ -402,6 +402,12 @@ pub(crate) async fn fetch_startup_catchup(
     let mut events = Vec::new();
     for row in rows {
         let event: Event = serde_json::from_value(row.clone()).map_err(RelayError::Json)?;
+        // REST catch-up must uphold the WebSocket EVENT verification boundary
+        // before channel routing, dedup, durable admission or owner controls.
+        if let Err(error) = buzz_core::verify_event(&event) {
+            tracing::warn!(event_id = %event.id, %error, "invalid inbox catch-up event; skipping");
+            continue;
+        }
         let Some(channel_id) = event.tags.iter().find_map(|tag| {
             let values = tag.as_slice();
             (values.first().map(|value| value.as_str()) == Some("h"))
@@ -544,6 +550,67 @@ mod tests {
             keys,
             auth_tag_json: None,
         }
+    }
+
+    #[tokio::test]
+    async fn forged_rest_events_cannot_poison_admission_controls_or_replay() {
+        let temp = std::env::temp_dir().join(format!("buzz-acp-inbox-{}", Uuid::new_v4()));
+        let keys = Keys::generate();
+        let channel = Uuid::new_v4();
+        let pubkey = keys.public_key().to_hex();
+        let valid = signed_event(&keys, channel, 100, "valid mention");
+        let mut forged_command = valid.clone();
+        forged_command.content = "!shutdown".into();
+        // A matching claimed event ID cannot preempt the later valid event.
+        let mut forged_signature = valid.clone();
+        forged_signature.sig = signed_event(&Keys::generate(), channel, 100, "other").sig;
+        let mut forged_author = valid.clone();
+        forged_author.pubkey = Keys::generate().public_key();
+        let filters = HashMap::from([(
+            channel,
+            ChannelFilter {
+                kinds: Some(vec![1]),
+                require_mention: true,
+            },
+        )]);
+        let mut store = InboxCursorStore::load(&temp, &pubkey, 95, 10);
+        let rest = mock_query_rest(
+            keys.clone(),
+            vec![
+                forged_command,
+                forged_signature,
+                forged_author,
+                valid.clone(),
+            ],
+        )
+        .await;
+        let caught = fetch_startup_catchup(&rest, &filters, &pubkey, 95, 10)
+            .await
+            .unwrap();
+        assert_eq!(caught.events.len(), 1);
+        assert_eq!(caught.events[0].event.content, "valid mention");
+        assert_eq!(caught.events[0].event.id, valid.id);
+        assert!(store.begin_event(&caught.events[0].event));
+        assert!(
+            !store.begin_event(&valid),
+            "live overlap must remain deduplicated"
+        );
+        drop(store);
+        // An unfinished valid event remains eligible after a crash.
+        let mut restarted = InboxCursorStore::load(&temp, &pubkey, 95, 10);
+        let rest = mock_query_rest(keys.clone(), vec![valid.clone()]).await;
+        let caught = fetch_startup_catchup(&rest, &filters, &pubkey, 95, 10)
+            .await
+            .unwrap();
+        assert!(restarted.begin_event(&caught.events[0].event));
+        restarted.mark_processed_at([&caught.events[0].event], 110);
+        drop(restarted);
+        let mut completed = InboxCursorStore::load(&temp, &pubkey, 95, 10);
+        assert!(
+            !completed.begin_event(&valid),
+            "terminal event must survive restart dedup"
+        );
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[tokio::test]
