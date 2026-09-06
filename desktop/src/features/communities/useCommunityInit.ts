@@ -5,10 +5,10 @@ import { isMacPlatform } from "@/shared/lib/platform";
 import { relayClient } from "@/shared/api/relayClient";
 import { resetRateLimitGate } from "@/shared/api/relayRateLimitGate";
 import {
-  applyCommunity,
   autoConnectDefaultRelayEnabled,
   getDefaultRelayUrl,
 } from "@/shared/api/tauri";
+import { applyCommunity } from "@/shared/api/tauri";
 import { getIdentity } from "@/shared/api/tauriIdentity";
 import { clearTrayAgentActivity } from "@/shared/api/trayMenu";
 import { getOverrides } from "@/shared/features";
@@ -237,6 +237,7 @@ export function useCommunityInit(
             undefined,
             activeCommunity.reposDir,
             getOverrides().agentManagedProfiles === true,
+            getOverrides().threadScopedAcpSessions === true,
           );
         });
       } catch (error) {

@@ -1262,6 +1262,7 @@ fn make_pair_runtime_placeholder() -> crate::managed_agents::ManagedAgentPairRun
             &[],
             "wss://relay.example",
             &Default::default(),
+            crate::managed_agents::AcpSessionPolicy::Channel,
         ),
         setup_mode: false,
         adapter_availability: None,

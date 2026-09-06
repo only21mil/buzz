@@ -43,16 +43,17 @@ pub(crate) fn resolve_deploy_model_provider(
 
 /// Serialize the portable launch contract shared with provider-backed agents.
 ///
-/// `descriptor.env` is the authoritative six-layer environment. Policy values
-/// are deliberately separate because providers apply them below that layered
-/// environment, preserving the local spawn's power-user override semantics.
-pub(super) fn build_launch_block(
+/// `descriptor.env` is the authoritative six-layer environment for ordinary
+/// values. Desktop-owned settings are reserved, stripped from that layer, and
+/// emitted through `policy_env` so local and provider launches agree.
+fn build_launch_block_for_policy(
     record: &ManagedAgentRecord,
     descriptor: &crate::managed_agents::readiness::EffectiveHarnessDescriptor,
     teams: &[crate::managed_agents::TeamRecord],
     effective_prompt: Option<&str>,
     effective_model: Option<&str>,
     owner_pubkey: &str,
+    session_policy: crate::managed_agents::AcpSessionPolicy,
 ) -> serde_json::Value {
     use crate::managed_agents::{
         known_acp_runtime, resolve_session_title, DISPLAY_NAME_ENV_VAR, SESSION_TITLE_ENV_VAR,
@@ -78,6 +79,7 @@ pub(super) fn build_launch_block(
         "BUZZ_ACP_AGENTS".into(),
         crate::managed_agents::acp_agents_value(&descriptor.command, record.parallelism),
     );
+    crate::managed_agents::insert_acp_session_policy_env(&mut policy_env, session_policy);
 
     if let Some(value) = effective_prompt {
         policy_env.insert("BUZZ_ACP_SYSTEM_PROMPT".into(), value.to_string());
@@ -104,10 +106,30 @@ pub(super) fn build_launch_block(
     serde_json::json!({
         "command": descriptor.command,
         "args": descriptor.args,
-        "env": descriptor.env,
+        "env": descriptor.env.iter().filter(|(key, _)| !key.eq_ignore_ascii_case(crate::managed_agents::ACP_SESSION_POLICY_ENV_VAR)).collect::<BTreeMap<_, _>>(),
         "policy_env": policy_env,
         "owner_pubkey": owner_pubkey,
     })
+}
+
+#[cfg(test)]
+pub(super) fn build_launch_block(
+    record: &ManagedAgentRecord,
+    descriptor: &crate::managed_agents::readiness::EffectiveHarnessDescriptor,
+    teams: &[crate::managed_agents::TeamRecord],
+    effective_prompt: Option<&str>,
+    effective_model: Option<&str>,
+    owner_pubkey: &str,
+) -> serde_json::Value {
+    build_launch_block_for_policy(
+        record,
+        descriptor,
+        teams,
+        effective_prompt,
+        effective_model,
+        owner_pubkey,
+        crate::managed_agents::AcpSessionPolicy::Channel,
+    )
 }
 
 pub(super) fn ensure_remote_provider_supported(provider: Option<&str>) -> Result<(), String> {
@@ -149,13 +171,14 @@ pub(super) fn build_deploy_payload(
         crate::managed_agents::resolve_effective_harness_descriptor(record, &personas, &global)
             .map_err(|error| crate::managed_agents::user_facing_harness_error(&error))?;
     let owner_pubkey = super::workspace_owner_hex(state)?;
-    let launch = build_launch_block(
+    let launch = build_launch_block_for_policy(
         record,
         &descriptor,
         &teams,
         effective.system_prompt.value.as_deref(),
         effective.model.value.as_deref(),
         &owner_pubkey,
+        crate::managed_agents::acp_session_policy(state),
     );
 
     let effective_parallelism =
@@ -246,6 +269,31 @@ mod tests {
     }
 
     #[test]
+    fn thread_session_policy_cannot_be_overridden_by_provider_descriptor() {
+        let record = record();
+        let descriptor = EffectiveHarnessDescriptor {
+            command: "goose".into(),
+            args: vec![],
+            env: BTreeMap::from([
+                ("BUZZ_ACP_SESSION_POLICY".into(), "channel".into()),
+                ("buzz_acp_session_policy".into(), "channel".into()),
+                ("CUSTOM_VALUE".into(), "kept".into()),
+            ]),
+        };
+        let launch = build_launch_block_for_policy(
+            &record,
+            &descriptor,
+            &[],
+            None,
+            None,
+            "owner",
+            crate::managed_agents::AcpSessionPolicy::Thread,
+        );
+        assert_eq!(launch["policy_env"]["BUZZ_ACP_SESSION_POLICY"], "thread");
+        assert_eq!(launch["env"], serde_json::json!({"CUSTOM_VALUE": "kept"}));
+    }
+
+    #[test]
     fn launch_block_preserves_descriptor_and_spawn_policy() {
         let record = record();
         let descriptor = EffectiveHarnessDescriptor {
@@ -288,6 +336,7 @@ mod tests {
         assert_eq!(launch["policy_env"]["BUZZ_ACP_IDLE_TIMEOUT"], "17");
         assert_eq!(launch["policy_env"]["BUZZ_ACP_MAX_TURN_DURATION"], "23");
         assert_eq!(launch["policy_env"]["BUZZ_ACP_AGENTS"], "4");
+        assert_eq!(launch["policy_env"]["BUZZ_ACP_SESSION_POLICY"], "channel");
         assert_eq!(launch["owner_pubkey"], "owner-hex");
     }
 

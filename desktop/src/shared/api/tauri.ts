@@ -1090,12 +1090,14 @@ export async function applyCommunity(
   nsec?: string,
   reposDir?: string,
   agentManagedProfiles?: boolean,
+  threadScopedAcpSessions?: boolean,
 ): Promise<void> {
   await invokeTauri("apply_workspace", {
     relayUrl,
     nsec: nsec ?? null,
     reposDir: reposDir ?? null,
     agentManagedProfiles: agentManagedProfiles ?? false,
+    threadScopedAcpSessions: threadScopedAcpSessions ?? false,
   });
 }
 
@@ -1117,3 +1119,6 @@ export const setAgentManagedProfiles = (enabled: boolean) =>
 export function isAutoUpdateSupported(): Promise<boolean> {
   return invokeTauri<boolean>("is_auto_update_supported");
 }
+
+export const setThreadScopedAcpSessions = (enabled: boolean) =>
+  invokeTauri("set_thread_scoped_acp_sessions", { enabled });

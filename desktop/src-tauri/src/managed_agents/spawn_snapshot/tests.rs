@@ -12,7 +12,15 @@ fn snapshot(
     workspace_relay: &str,
     global: &GlobalAgentConfig,
 ) -> serde_json::Value {
-    prospective_spawn_config_snapshot(record, personas, teams, workspace_relay, global).canonical()
+    prospective_spawn_config_snapshot(
+        record,
+        personas,
+        teams,
+        workspace_relay,
+        global,
+        super::AcpSessionPolicy::Channel,
+    )
+    .canonical()
 }
 
 fn record() -> ManagedAgentRecord {
