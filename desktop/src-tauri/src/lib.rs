@@ -37,6 +37,7 @@ mod ptt_shortcut;
 mod relay;
 mod relay_admission;
 mod reset;
+mod runtime_init;
 mod secret_store;
 mod shutdown;
 mod team_catalog;
@@ -86,29 +87,7 @@ use tauri_plugin_window_state::StateFlags;
 use tray_menu::show_main_window;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Set mesh-llm's required 8 MiB worker stacks before initializing the Tauri runtime.
-    #[cfg(feature = "mesh-llm")]
-    match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(crate::mesh_llm::MESH_WORKER_STACK_SIZE)
-        .build()
-    {
-        Ok(runtime) => {
-            tauri::async_runtime::set(runtime.handle().clone());
-            // Keep the runtime alive for the process lifetime; dropping it
-            // would shut down the workers Tauri now depends on.
-            std::mem::forget(runtime);
-            eprintln!(
-                "buzz-mesh: installed tokio runtime with {} MiB worker stacks",
-                crate::mesh_llm::MESH_WORKER_STACK_SIZE / (1024 * 1024)
-            );
-        }
-        Err(error) => {
-            // Fall back to Tauri's default runtime: the app still works,
-            // only deep mesh-llm futures are at risk of stack overflow.
-            eprintln!("buzz-mesh: failed to build big-stack tokio runtime, using default: {error}");
-        }
-    }
+    runtime_init::initialize_async_runtime();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             if let Some(w) = app.get_webview_window("main") {
@@ -744,6 +723,9 @@ pub fn run() {
             save_png_data_url,
             download_file,
             fetch_media_bytes,
+            fetch_audio_bytes,
+            cancel_media_fetch,
+            release_media_fetch,
             copy_image_to_clipboard,
             copy_text_to_clipboard,
             read_clipboard_text,

@@ -2,15 +2,15 @@ import { usePreventSleepContext } from "@/features/agents/usePreventSleep";
 import { Switch } from "@/shared/ui/switch";
 import { SettingsOptionGroup, SettingsOptionRow } from "./SettingsOptionGroup";
 import {
-  setPersistentAgentAudienceEnabled,
-  usePersistentAgentAudience,
-} from "@/features/messages/lib/persistentAgentAudience";
+  setKeepMentionedAgentsPinned,
+  useKeepMentionedAgentsPinned,
+} from "@/features/messages/lib/autoPinMentionedAgentsPreference";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
 
 export function PreventSleepSettingsCard() {
   const { enabled, setEnabled, hasRunningAgents, expired, clearExpired } =
     usePreventSleepContext();
-  const persistentAudience = usePersistentAgentAudience(null);
+  const persistentAudience = useKeepMentionedAgentsPinned();
 
   return (
     <section className="min-w-0" data-testid="settings-agents">
@@ -26,7 +26,7 @@ export function PreventSleepSettingsCard() {
               className="text-sm font-medium"
               htmlFor="persistent-agent-audience-switch"
             >
-              Keep addressed agents active
+              Keep mentioned agents pinned
             </label>
             <p className="text-sm font-normal text-muted-foreground">
               Keep agents you address selected for future messages in the same
@@ -34,10 +34,10 @@ export function PreventSleepSettingsCard() {
             </p>
           </div>
           <Switch
-            checked={persistentAudience.enabled}
+            checked={persistentAudience}
             data-testid="persistent-agent-audience-toggle"
             id="persistent-agent-audience-switch"
-            onCheckedChange={setPersistentAgentAudienceEnabled}
+            onCheckedChange={setKeepMentionedAgentsPinned}
           />
         </SettingsOptionRow>
 

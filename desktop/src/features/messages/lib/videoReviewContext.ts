@@ -1,3 +1,5 @@
+import { isVoiceNoteAttachment } from "./audioAttachment";
+import { parseImetaTags } from "@/shared/ui/markdown/parseImeta";
 import type { TimelineMessage } from "@/features/messages/types";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import type { ChannelType } from "@/shared/api/types";
@@ -20,12 +22,10 @@ type ToggleMessageReaction = (
 export function hasVideoAttachment(message: TimelineMessage): boolean {
   if (message.body.includes("![video](")) return true;
 
-  return (
-    message.tags?.some(
-      (tag) =>
-        tag[0] === "imeta" &&
-        tag.some((part) => part.toLowerCase().startsWith("m video/")),
-    ) ?? false
+  return [...parseImetaTags(message.tags ?? []).values()].some(
+    (entry) =>
+      entry.m?.toLowerCase().startsWith("video/") &&
+      !isVoiceNoteAttachment(entry),
   );
 }
 

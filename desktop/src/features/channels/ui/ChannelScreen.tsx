@@ -1,3 +1,4 @@
+import { buildMessageEditTarget } from "@/features/messages/lib/buildMessageEditTarget";
 import * as React from "react";
 import { useAppShell } from "@/app/AppShellContext";
 import { cacheSearchHitEvent } from "@/app/navigation/searchHitEventCache";
@@ -44,7 +45,6 @@ import {
 } from "@/features/messages/hooks";
 import { formatTimelineMessages } from "@/features/messages/lib/formatTimelineMessages";
 import { DeleteMessageConfirmDialog } from "@/features/messages/ui/DeleteMessageConfirmDialog";
-import { imetaMediaFromTags } from "@/features/messages/lib/imetaMediaMarkdown";
 import { getThreadReference } from "@/features/messages/lib/threading";
 import {
   resolveTimelineLoadingLatch,
@@ -877,18 +877,11 @@ export function ChannelScreen({
                   onEntranceMessageComplete={handleWelcomeEntranceComplete}
                   welcomeKickoffStage={welcomeKickoffStage}
                   welcomeKickoffSettingUp={welcomeKickoffSettingUp}
-                  editTarget={
-                    editTargetMessage
-                      ? {
-                          author: editTargetMessage.author,
-                          body: editTargetMessage.body,
-                          id: editTargetMessage.id,
-                          imetaMedia: imetaMediaFromTags(
-                            editTargetMessage.tags,
-                          ),
-                        }
-                      : null
-                  }
+                  editTarget={buildMessageEditTarget(
+                    editTargetMessage,
+                    messageProfiles,
+                    agentPubkeys,
+                  )}
                   followThreadById={followThread}
                   unfollowThreadById={unfollowThread}
                   isFollowingThreadById={isFollowingThread}

@@ -218,6 +218,11 @@ const NOOP_READS: ReadonlyArray<readonly [string, DefaultFactory]> = [
 ];
 
 export function registerAgentsRuntimeBuilderlabCommands(): void {
+  // Authority checks must reject; an empty browser default could drop recipients.
+  registerOffMutation(
+    "revalidate_relay_agents",
+    "agent publication authority needs the desktop app",
+  );
   for (const [command, hint] of CAPABILITY_OFF_MUTATIONS) {
     registerOffMutation(command, hint);
   }

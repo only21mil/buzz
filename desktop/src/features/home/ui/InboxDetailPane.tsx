@@ -1,3 +1,4 @@
+import { buildEditMentionState } from "@/features/messages/lib/draftMentionRefs";
 import {
   AlertCircle,
   ArrowLeft,
@@ -30,17 +31,15 @@ import {
   hasSameMessageAuthor,
   isWithinGroupingWindow,
 } from "@/features/messages/lib/messageGrouping";
-import { orderMentionPubkeysByText } from "@/features/messages/lib/orderMentionPubkeys";
 import { canManageMessageForCurrentUser } from "@/features/messages/lib/canManageMessage";
 import { imetaMediaFromTags } from "@/features/messages/lib/imetaMediaMarkdown";
 import { getThreadReference } from "@/features/messages/lib/threading";
-import { normalizePubkey } from "@/shared/lib/pubkey";
+import { handleTimelineMentionCopy } from "@/features/messages/lib/timelineMentionCopy";
 import { MessageComposer } from "@/features/messages/ui/MessageComposer";
 import { useAnchoredScroll } from "@/features/messages/ui/useAnchoredScroll";
 import { useComposerHeightPadding } from "@/features/messages/ui/useComposerHeightPadding";
 import { UpdateIndicator } from "@/features/settings/UpdateIndicator";
 import type { Channel, UserProfileSummary } from "@/shared/api/types";
-import { resolveMentionProps } from "@/shared/lib/resolveMentionNames";
 import { TopChromeInsetHeader } from "@/shared/layout/TopChromeInsetHeader";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
@@ -196,40 +195,6 @@ function InboxMessageDetailPane({
   // Live arrivals rerun its layout compensation without changing the target.
 
   const selectedMessage = messages.find((message) => message.isSelected);
-  // A latest reply can represent an Inbox conversation. Resolve the actual
-  // root from loaded context or the complete feed group; never treat an
-  // unresolved root/profile lookup as an authoritative empty audience.
-  const contextRoot = messages.find((message) => message.id === conversationId);
-  const feedRoot = item
-    ? [item.item, ...item.groupItems].find(
-        (groupItem) => groupItem.id === conversationId,
-      )
-    : undefined;
-  const rootMessage = contextRoot
-    ? {
-        authorPubkey: contextRoot.authorPubkey,
-        content: contextRoot.content,
-        mentionPubkeysByName: contextRoot.mentionPubkeysByName,
-      }
-    : feedRoot && profiles
-      ? {
-          authorPubkey: feedRoot.pubkey,
-          content: feedRoot.content,
-          mentionPubkeysByName: resolveMentionProps(feedRoot.tags, profiles)
-            .mentionPubkeysByName,
-        }
-      : null;
-  const initialAgentPubkeys = rootMessage
-    ? currentPubkey &&
-      normalizePubkey(rootMessage.authorPubkey) ===
-        normalizePubkey(currentPubkey)
-      ? orderMentionPubkeysByText(
-          rootMessage.content,
-          rootMessage.mentionPubkeysByName,
-          (pubkey) => agentPubkeys?.has(pubkey) === true,
-        )
-      : []
-    : undefined;
   const pendingReplyMessages: InboxDisplayMessage[] = replies.map((reply) => ({
     ...reply,
     depth: reply.depth ?? (selectedMessage?.depth ?? 0) + 1,
@@ -403,6 +368,13 @@ function InboxMessageDetailPane({
     displayMessages.find((message) => message.id === editTargetId) ?? null;
   const composerEditTarget = editTarget
     ? {
+        ...buildEditMentionState(
+          editTarget.content,
+          editTarget.tags,
+          profiles,
+          (pubkey) => agentPubkeys?.has(pubkey) === true,
+        ),
+        isThreadReply: Boolean(editTarget.parentId),
         author: editTarget.authorLabel,
         body: editTarget.content,
         id: editTarget.id,
@@ -586,6 +558,11 @@ function InboxMessageDetailPane({
           aria-busy={isThreadContextLoading}
           className="-mt-13 min-h-0 flex-1 overflow-y-auto overscroll-contain pb-32 pt-13 [overflow-anchor:none]"
           data-testid="home-inbox-detail-scroll"
+          // Selection copy across a rendered mention chip: restores the sigil
+          // and the identity sidecar the browser's default copy would drop.
+          // Covers only the messages — the composer is a sibling overlay, so
+          // its own copy handler is untouched.
+          onCopy={handleTimelineMentionCopy}
           onScroll={onScroll}
           ref={scrollContainerRef}
         >
@@ -654,6 +631,7 @@ function InboxMessageDetailPane({
                   onEdit={canEditMessage ? handleSelectEditTarget : undefined}
                   onSelectReplyTarget={handleSelectReplyTarget}
                   onToggleReaction={onToggleReaction}
+                  profiles={profiles}
                   showUnreadBoundary={hasUnreadBoundary}
                 />
               );
@@ -693,8 +671,9 @@ function InboxMessageDetailPane({
                   ? null
                   : {
                       type: "thread",
-                      threadRootId: item.conversationId,
-                      initialAgentPubkeys,
+                      rootTags: displayMessages.find(
+                        (message) => message.id === conversationId,
+                      )?.tags,
                     }
               }
               channelId={item.item.channelId}

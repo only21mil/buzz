@@ -544,7 +544,8 @@ export function useStartManagedAgentMutation() {
   const queryClient = useQueryClient();
 
   return useMutation({
-    mutationFn: (pubkey: string) => startManagedAgent(pubkey),
+    mutationFn: (input: Parameters<typeof startManagedAgent>[0]) =>
+      startManagedAgent(input),
     onSuccess: (updated) => {
       queryClient.setQueryData<ManagedAgent[]>(
         managedAgentsQueryKey,

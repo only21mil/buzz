@@ -1,3 +1,4 @@
+import { getRecentMentionPubkeys } from "@/features/messages/lib/recentMentionPubkeys";
 import * as React from "react";
 import { Hash, LogIn } from "lucide-react";
 import { AnimatePresence } from "motion/react";
@@ -222,6 +223,10 @@ export const ChannelPane = React.memo(function ChannelPane({
     threadHeadMessage != null &&
     (editTarget.id === threadHeadMessage.id ||
       threadMessages.some((entry) => entry.message.id === editTarget.id));
+  const recentMentionPubkeys = React.useMemo(
+    () => getRecentMentionPubkeys(messages, activeChannel?.channelType),
+    [messages, activeChannel?.channelType],
+  );
   const mainEditTarget = editTarget && !isEditInThread ? editTarget : null;
   const threadEditTarget = editTarget && isEditInThread ? editTarget : null;
   const findLastOwnEditable = React.useCallback(
@@ -333,7 +338,10 @@ export const ChannelPane = React.memo(function ChannelPane({
       onSendMessage,
     ],
   );
+  const [acceptsMainAttachments, setAcceptsMainAttachments] =
+    React.useState(true);
   const canDropInMainColumn =
+    acceptsMainAttachments &&
     hasMainComposerOverlay &&
     !isComposerDisabled &&
     !isMainDeferredEditPending &&
@@ -701,10 +709,12 @@ export const ChannelPane = React.memo(function ChannelPane({
                   layoutMode="dock"
                   disabled={isComposerDisabled}
                   editTarget={mainEditTarget}
+                  recentMentionPubkeys={recentMentionPubkeys}
                   autoSubmitDraftKey={autoSendDraftKey}
                   onAutoSubmitComplete={handleAutoSubmitComplete}
                   isSending={isSending}
                   mediaController={mainComposerMedia}
+                  onAttachmentAcceptanceChange={setAcceptsMainAttachments}
                   onDeferredEditPendingChange={setMainDeferredEditPending}
                   onCancelEdit={onCancelEdit}
                   onEditLastOwnMessage={handleEditLastOwnMainMessage}

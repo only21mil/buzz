@@ -28,11 +28,15 @@ mod link_preview;
 pub(crate) mod media;
 mod media_animated;
 mod media_download;
+mod media_fetch_cancellation;
+mod media_filename;
 mod media_gif;
+mod media_image_fetch;
 mod media_raw;
 mod media_snapshot_png;
 mod media_transcode;
 mod media_upload_progress;
+mod media_voice_note;
 #[cfg(feature = "mesh-llm")]
 pub(crate) mod mesh_llm;
 mod messages;
@@ -90,6 +94,8 @@ pub use legacy_storage::*;
 pub use link_preview::*;
 pub use media::*;
 pub use media_download::*;
+pub use media_fetch_cancellation::{cancel_media_fetch, fetch_audio_bytes, release_media_fetch};
+pub use media_image_fetch::*;
 pub use media_raw::*;
 #[cfg(feature = "mesh-llm")]
 pub use mesh_llm::*;

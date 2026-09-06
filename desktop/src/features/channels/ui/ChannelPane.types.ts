@@ -1,7 +1,7 @@
+import type { MessageComposerEditTarget } from "@/features/messages/ui/MessageComposer.types";
 import type * as React from "react";
 import type { BotActivityAgent } from "@/features/channels/ui/BotActivityBar";
 import type { ChannelAgentSessionAgent } from "@/features/channels/ui/useChannelAgentSessions";
-import type { ImetaMedia } from "@/features/messages/lib/imetaMediaMarkdown";
 import type { MainTimelineEntry } from "@/features/messages/lib/threadPanel";
 import type { ChannelWindowThreadSummary } from "@/features/messages/lib/channelWindowStore";
 import type { TimelineMessage } from "@/features/messages/types";
@@ -37,12 +37,7 @@ export type ChannelPaneProps = {
   channelFind: ReturnType<typeof useChannelFind>;
   channelManagementOpen?: boolean;
   currentPubkey?: string;
-  editTarget?: {
-    author: string;
-    body: string;
-    id: string;
-    imetaMedia?: ImetaMedia[];
-  } | null;
+  editTarget?: MessageComposerEditTarget | null;
   fetchOlder?: () => Promise<void>;
   header?: React.ReactNode;
   hasOlderMessages?: boolean;

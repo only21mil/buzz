@@ -11,6 +11,7 @@ import {
 } from "../registry.ts";
 
 const MUTATIONS = [
+  "revalidate_relay_agents",
   "archive_builderlab_community",
   "bind_builderlab_nostr_identity",
   "cancel_builderlab_login",

@@ -1,3 +1,5 @@
+import { resetAudioMediaLoadScheduler } from "@/features/messages/lib/audioMediaLoadScheduler";
+import { resetPersistentAgentAudienceStore } from "@/features/messages/lib/persistentAgentAudience";
 import { useEffect, useRef, useState } from "react";
 import { isTauri } from "@tauri-apps/api/core";
 import { isMacPlatform } from "@/shared/lib/platform";
@@ -58,6 +60,7 @@ function resetCommunityState({
   resetRateLimitGate();
   clearTimeoutState();
   clearAllDrafts();
+  resetPersistentAgentAudienceStore();
   resetAgentObserverStore();
   resetActiveAgentTurnsStore();
   resetAgentWorkingSignal();
@@ -70,6 +73,7 @@ function resetCommunityState({
   }
   resetSidebarRelayConnectionCardState();
   resetMediaCaches();
+  resetAudioMediaLoadScheduler();
   resetLinkPreviewMetadataCache();
   resetVideoPlayerState();
   resetRenderScopedReactionHydration();
@@ -272,6 +276,7 @@ export function useCommunityInit(
         // leaving that stale value makes authenticated relay media look external
         // and bypass the localhost proxy.
         resetMediaCaches();
+        resetAudioMediaLoadScheduler();
 
         try {
           const identity = await getIdentity();
