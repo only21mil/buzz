@@ -951,11 +951,13 @@ steps:
                 "authored @Agent: {{trigger.text}}"
             ]
         );
-        let options = fixture.sink.message_options.lock().unwrap();
-        assert_eq!(
-            options[0].authored_mentioned_pubkeys,
-            Some(vec!["aa".repeat(32)])
-        );
+        {
+            let options = fixture.sink.message_options.lock().unwrap();
+            assert_eq!(
+                options[0].authored_mentioned_pubkeys,
+                Some(vec!["aa".repeat(32)])
+            );
+        }
         let persisted = fixture
             .db
             .get_workflow_run(fixture.community_id, fixture.run_id)

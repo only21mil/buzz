@@ -55,16 +55,26 @@ buzz-db	buzz_db	git_repo::tests::names_are_scoped_per_community	crates/buzz-db/s
 buzz-db	buzz_db	git_repo::tests::release_is_owner_scoped_and_frees_the_name	crates/buzz-db/src/git_repo.rs	desired	desired schema fixture
 buzz-db	buzz_db	git_repo::tests::repo_name_owner_reflects_reservation	crates/buzz-db/src/git_repo.rs	desired	desired schema fixture
 buzz-db	buzz_db	git_repo::tests::reserve_classifies_fresh_idempotent_and_collision	crates/buzz-db/src/git_repo.rs	desired	desired schema fixture
+buzz-db	buzz_db	migration::tests::desired_schema_push_message_kinds	crates/buzz-db/src/migration.rs	desired	push packet desired-schema message-kind fixture
 buzz-db	buzz_db	migration::tests::populated_upgrade_preserves_search_policy_except_for_push_leases	crates/buzz-db/src/migration.rs	migration	fixture applies migrations to empty database
 buzz-db	buzz_db	migration::tests::populated_workflow_approval_upgrade_sets_resume_defaults_and_retains_history	crates/buzz-db/src/migration.rs	migration	fixture applies migrations to empty database
 buzz-db	buzz_db	migration::tests::pre_0007_ambiguous_nip_rs_data_blocks_without_mutation_and_allows_retry	crates/buzz-db/src/migration.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	migration::tests::push_message_kinds_fresh_install	crates/buzz-db/src/migration.rs	migration	push packet fresh migration fixture
+buzz-db	buzz_db	migration::tests::push_message_kinds_populated_upgrade_preserves_authority	crates/buzz-db/src/migration.rs	migration	push packet populated migration authority-preservation fixture
 buzz-db	buzz_db	migration::tests::run_migrations_applies_consolidated_initial_schema_on_fresh_database	crates/buzz-db/src/migration.rs	migration	fixture applies migrations to empty database
 buzz-db	buzz_db	moderation::tests::expired_ban_does_not_hide_active_timeout	crates/buzz-db/src/moderation.rs	desired	desired schema fixture
 buzz-db	buzz_db	moderation::tests::report_reingest_returns_same_id_and_preserves_resolution	crates/buzz-db/src/moderation.rs	desired	desired schema fixture
 buzz-db	buzz_db	moderation::tests::resolve_report_returns_false_after_report_is_closed	crates/buzz-db/src/moderation.rs	desired	desired schema fixture
 buzz-db	buzz_db	moderation::tests::restrictions_are_confined_to_their_community	crates/buzz-db/src/moderation.rs	desired	desired schema fixture
+buzz-db	buzz_db	observability::tests::postgres_query_cancellation_is_reported_separately	crates/buzz-db/src/observability.rs	desired	database observability packet fixture; explicit schema contract
+buzz-db	buzz_db	observability::tests::production_fork_operations_report_ci_and_workflow_acquisitions	crates/buzz-db/src/observability.rs	desired	database observability packet fixture; explicit schema contract
+buzz-db	buzz_db	observability::tests::readiness_distinguishes_query_error_timeout_and_cancelled_future	crates/buzz-db/src/observability.rs	desired	database observability packet fixture; explicit schema contract
+buzz-db	buzz_db	observability::tests::restricted_telemetry_catalog_failure_does_not_block_serving	crates/buzz-db/src/observability.rs	desired	database observability packet fixture; explicit schema contract
+buzz-db	buzz_db	observability::tests::saturated_acquisition_and_cancellation_drain_bounded_waiters	crates/buzz-db/src/observability.rs	desired	database observability packet fixture; explicit schema contract
+buzz-db	buzz_db	observability::tests::sql_statement_timeout_is_separate_from_acquisition_timeout	crates/buzz-db/src/observability.rs	desired	database observability packet fixture; explicit schema contract
 buzz-db	buzz_db	product_feedback::tests::duplicate_event_keeps_first_community_provenance	crates/buzz-db/src/product_feedback.rs	desired	desired schema fixture
 buzz-db	buzz_db	push::tests::acceptance_constraint_failure_rolls_back_source_event	crates/buzz-db/src/push.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	push::tests::activation_backfill_matches_message_kind_trigger	crates/buzz-db/src/push.rs	migration	push packet fixture applies migrations to empty database
 buzz-db	buzz_db	push::tests::batch_claim_is_single_community_and_setwise_ops_honor_the_fence	crates/buzz-db/src/push.rs	migration	fixture applies migrations to empty database
 buzz-db	buzz_db	push::tests::concurrent_enqueue_is_atomic_and_community_scoped	crates/buzz-db/src/push.rs	migration	fixture applies migrations to empty database
 buzz-db	buzz_db	push::tests::delivered_wake_is_retained_while_rematch_is_queued	crates/buzz-db/src/push.rs	migration	fixture applies migrations to empty database
@@ -99,6 +109,11 @@ buzz-db	buzz_db	replica_fence::tests::probe_commits_tokens_and_sessions_prove_co
 buzz-db	buzz_db	replica_fence::tests::probe_rotates_epoch_on_same_epoch_token_regression	crates/buzz-db/src/replica_fence.rs	desired	desired schema fixture
 buzz-db	buzz_db	replica_fence::tests::sample_writer_fails_closed_when_activity_is_masked	crates/buzz-db/src/replica_fence.rs	desired	desired schema fixture
 buzz-db	buzz_db	replica_fence::tests::sample_writer_sees_open_transactions_and_ignores_idle	crates/buzz-db/src/replica_fence.rs	desired	desired schema fixture
+buzz-db	buzz_db	session_policy::tests::explicit_zero_and_reader_sessions_keep_distinct_policy	crates/buzz-db/src/session_policy.rs	migration	database observability packet fixture; explicit schema contract
+buzz-db	buzz_db	session_policy::tests::idle_transaction_timeout_reaps_only_idle_transaction	crates/buzz-db/src/session_policy.rs	migration	database observability packet fixture; explicit schema contract
+buzz-db	buzz_db	session_policy::tests::migration_wait_and_cancellation_never_return_relaxed_session	crates/buzz-db/src/session_policy.rs	migration	database observability packet fixture; explicit schema contract
+buzz-db	buzz_db	session_policy::tests::writer_policy_bounds_waits_preserves_floor_and_recovers	crates/buzz-db/src/session_policy.rs	migration	database observability packet fixture; explicit schema contract
+buzz-db	buzz_db	session_policy::tests::writer_policy_rejects_non_read_committed_isolation	crates/buzz-db/src/session_policy.rs	migration	database observability packet fixture; explicit schema contract
 buzz-db	buzz_db	tests::allowlist_is_scoped_to_community	crates/buzz-db/src/lib.rs	desired	desired schema fixture
 buzz-db	buzz_db	tests::armed_pool_rejects_old_channel_inserts_through_public_api	crates/buzz-db/src/lib.rs	desired	desired schema fixture
 buzz-db	buzz_db	tests::channel_cursor_above_fence_stays_on_writer_preventing_middle_hole	crates/buzz-db/src/lib.rs	desired	desired schema fixture
@@ -193,6 +208,7 @@ buzz-db	ci_grants_contract	rejected_non_owner_grant_is_never_visible	crates/buzz
 buzz-db	ci_grants_contract	upsert_is_idempotent_and_updates_window	crates/buzz-db/tests/ci_grants_contract.rs	migration	fixture applies migrations to empty database
 buzz-db	ci_grants_contract	upsert_then_query_returns_the_active_signer	crates/buzz-db/tests/ci_grants_contract.rs	migration	fixture applies migrations to empty database
 buzz-db	ci_grants_contract	validity_window_boundary_is_aware_of_now	crates/buzz-db/tests/ci_grants_contract.rs	migration	fixture applies migrations to empty database
+buzz-db	historical_schema_contract	historical_fork_catalog_matches_fresh_migrations	crates/buzz-db/tests/historical_schema_contract.rs	migration	database observability packet fixture; explicit schema contract
 buzz-db	workflow_approval_contract	approval_history_survives_workflow_deletion	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
 buzz-db	workflow_approval_contract	approval_row_and_request_payload_have_no_raw_token_contract	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
 buzz-db	workflow_approval_contract	crash_after_claim_before_fire_reuses_identity_and_fires_once	crates/buzz-db/tests/workflow_approval_contract.rs	migration	fixture applies migrations to empty database
@@ -323,6 +339,7 @@ buzz-relay	ci_ingest_storage	rerun_final_facts_bind_only_the_final_request_and_s
 buzz-relay	ci_ingest_storage	run_read_exports_bind_membership_channel_and_cursor_bounds	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
 buzz-relay	ci_ingest_storage	stale_fanout_rerun_is_rejected_without_poisoning_selected_graph	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
 buzz-relay	ci_ingest_storage	terminal_run_failure_permits_an_eligible_rerun	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
+buzz-relay	huddle_lifecycle	huddle_lifecycle_ingest_postgres_acceptance	crates/buzz-relay/tests/huddle_lifecycle.rs	desired	Huddle lifecycle ingest acceptance requires runner-provided desired schema
 buzz-search	fts_integration	author_only_kinds_are_storage_level_unsearchable	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
 buzz-search	fts_integration	channel_less_only_excludes_per_channel_events	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
 buzz-search	fts_integration	channel_scope_restricts_results	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema

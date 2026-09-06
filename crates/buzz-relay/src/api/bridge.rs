@@ -2770,7 +2770,7 @@ mod tests {
     #[tokio::test]
     async fn thread_aux_pages_preserve_dense_second_cursor_and_empty_root_query() {
         let keys = Keys::generate();
-        let mut rows = vec![
+        let mut rows = [
             aux_fixture(&keys, 40, "a"),
             aux_fixture(&keys, 40, "b"),
             aux_fixture(&keys, 30, "c"),
