@@ -1,3 +1,7 @@
+import {
+  parseProjectChannelRequest,
+  type ProjectChannelRequest,
+} from "@/features/projects/projectChannelRequest";
 import * as React from "react";
 import {
   compareObserverEvents,
@@ -117,6 +121,10 @@ export function getLatestLiveSessionId(
 const controlResultListeners = new Map<
   string,
   Set<(frame: ControlResultFrame) => void>
+>();
+
+const projectChannelRequestListeners = new Set<
+  (agentPubkey: string, request: ProjectChannelRequest) => void
 >();
 
 const agentManagementListeners = new Set<
@@ -411,6 +419,10 @@ function processLiveObserverEvent(
       });
     }
   }
+  const projectRequest = parseProjectChannelRequest(parsed.payload);
+  if (projectRequest)
+    for (const listener of projectChannelRequestListeners)
+      listener(agentPubkey, projectRequest);
   const managementRequest = parseAgentManagementRequest(parsed.payload);
   if (managementRequest) {
     for (const listener of agentManagementListeners) {
@@ -484,6 +496,12 @@ export async function handleRelayObserverEvent(
       const innerEvents = unwrapObserverBatch(parsed);
       const telemetryEvents: ObserverEvent[] = [];
       for (const inner of innerEvents) {
+        const projectRequest = parseProjectChannelRequest(inner.payload);
+        if (projectRequest) {
+          for (const listener of projectChannelRequestListeners)
+            listener(agentPubkey, projectRequest);
+          continue;
+        }
         const managementRequest = parseAgentManagementRequest(inner.payload);
         if (managementRequest) {
           for (const listener of agentManagementListeners) {
@@ -677,6 +695,15 @@ export function subscribeAgentManagementRequests(
   agentManagementListeners.add(listener);
   return () => {
     agentManagementListeners.delete(listener);
+  };
+}
+
+export function subscribeProjectChannelRequests(
+  listener: (agentPubkey: string, request: ProjectChannelRequest) => void,
+) {
+  projectChannelRequestListeners.add(listener);
+  return () => {
+    projectChannelRequestListeners.delete(listener);
   };
 }
 
@@ -930,6 +957,7 @@ export function resetAgentObserverStore() {
   pendingUnknownAgentFrames.length = 0;
   latestLiveSessionByAgentChannel.clear();
   agentManagementListeners.clear();
+  projectChannelRequestListeners.clear();
   onSessionConfigCaptured = null;
   ownerPubkey = null;
   connectionState = "idle";

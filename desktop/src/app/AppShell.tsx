@@ -1,3 +1,4 @@
+import { ProjectChannelRequestDialog } from "@/features/projects/ui/ProjectChannelRequestDialog";
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useLocation } from "@tanstack/react-router";
@@ -957,6 +958,7 @@ export function AppShell() {
                 )}
                 <RequestedAgentCreateDialogs />
                 <AgentManagementDialogs />
+                <ProjectChannelRequestDialog />
                 <AppShellOverlays
                   activeChannel={managedChannel}
                   browseDialogType={browseDialogType}

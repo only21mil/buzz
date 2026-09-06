@@ -9,6 +9,8 @@ mod inbox_cursor;
 mod observer;
 mod pool;
 mod pool_lifecycle;
+mod project_lookup;
+mod prompt_project;
 mod queue;
 mod relay;
 mod scope;
@@ -4189,6 +4191,7 @@ async fn handle_prompt_result(
     let outcome_label = match &result.outcome {
         PromptOutcome::Ok(_) => "ok",
         PromptOutcome::Error(_) => "error",
+        PromptOutcome::ProjectContextIndeterminate(_) => "project_context_indeterminate",
         PromptOutcome::Timeout(TimeoutKind::Idle) => "idle_timeout",
         PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "hard_timeout",
         PromptOutcome::AgentExited => "exited",
@@ -4345,6 +4348,15 @@ async fn handle_prompt_result(
                 pid = harness_pid,
                 "agent_returned (cancelled)"
             );
+            pool.return_agent(result.agent).await;
+        }
+        PromptOutcome::ProjectContextIndeterminate(reason) => {
+            tracing::warn!(
+                agent = agent_index,
+                reason,
+                "project context unavailable; agent remains healthy"
+            );
+            emit_turn_error(&reason, None);
             pool.return_agent(result.agent).await;
         }
         PromptOutcome::Error(ref e) => {

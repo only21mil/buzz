@@ -833,6 +833,7 @@ pub enum TimeoutKind {
 pub enum PromptOutcome {
     Ok(StopReason),
     Error(AcpError),
+    ProjectContextIndeterminate(String),
     AgentExited,
     Timeout(TimeoutKind),
     /// Intentional cancel via `!cancel` command or interrupt mode.
@@ -863,6 +864,7 @@ pub enum PromptOutcome {
 pub struct ChannelInfoResolver {
     cache: std::sync::Arc<std::sync::RwLock<std::collections::HashMap<Uuid, PromptChannelInfo>>>,
     rest_client: RestClient,
+    projects: crate::project_lookup::ProjectResolver,
 }
 
 impl ChannelInfoResolver {
@@ -876,6 +878,7 @@ impl ChannelInfoResolver {
                 (info.channel_type != "unknown").then_some((
                     id,
                     PromptChannelInfo {
+                        project: None,
                         name: info.name,
                         channel_type: info.channel_type,
                     },
@@ -884,6 +887,7 @@ impl ChannelInfoResolver {
             .collect();
         Self {
             cache: std::sync::Arc::new(std::sync::RwLock::new(cache)),
+            projects: crate::project_lookup::ProjectResolver::new(rest_client.clone()),
             rest_client,
         }
     }
@@ -2161,6 +2165,33 @@ pub async fn run_prompt_task(
         .map(|b| b.events.iter().map(|be| be.event.id.to_hex()).collect())
         .unwrap_or_default();
     let _reaction_guard = ReactionGuard::new(ctx.rest_client.clone(), reaction_ids.clone());
+    let resolved_channel_info = match &source {
+        PromptSource::Channel(scope) => {
+            let mut info = ctx.channel_info.resolve(scope.channel_id()).await;
+            if let Some(ref mut metadata) = info {
+                if metadata.channel_type != "dm" {
+                    match ctx.channel_info.projects.resolve(scope.channel_id()).await {
+                        Ok(project) => metadata.project = project,
+                        Err(reason) => {
+                            // No ACP session or provider delivery has occurred. Keep even
+                            // drop-mode batches recoverable under bounded queue retry.
+                            send_prompt_result(
+                                &result_tx,
+                                &turn_id,
+                                agent,
+                                source,
+                                PromptOutcome::ProjectContextIndeterminate(reason),
+                                batch,
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+            info
+        }
+        PromptSource::Heartbeat => None,
+    };
 
     //
     // Core memory is delivered inside the system prompt the harness already
@@ -2708,7 +2739,7 @@ pub async fn run_prompt_task(
     } else if let Some(ref b) = batch {
         // Build prompt from batch with context enrichment.
         // Try startup cache first; lazy-fetch via REST for dynamic channels.
-        let channel_info = ctx.channel_info.resolve(b.channel_id).await;
+        let channel_info = resolved_channel_info.clone();
 
         let conversation_context = if ctx.context_message_limit > 0 {
             fetch_conversation_context(b, &channel_info, &ctx).await
@@ -3331,6 +3362,7 @@ pub(crate) async fn fetch_channel_info(
                 }
                 let channel_type = crate::relay::channel_type_from_tags(tags);
                 Some(PromptChannelInfo {
+                    project: None,
                     name: name.unwrap_or(UNKNOWN_CHANNEL_NAME).to_string(),
                     channel_type,
                 })
@@ -8345,6 +8377,7 @@ for line in sys.stdin:
             PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "Timeout(Hard)",
             PromptOutcome::CancelDrainTimeout(_) => "CancelDrainTimeout",
             PromptOutcome::Error(_) => "Error",
+            PromptOutcome::ProjectContextIndeterminate(_) => "ProjectContextIndeterminate",
             PromptOutcome::Cancelled => "Cancelled",
             PromptOutcome::Ok(_) => "Ok",
         };

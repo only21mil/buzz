@@ -1231,6 +1231,7 @@ pub struct ContextMessage {
 /// Channel metadata for prompt formatting.
 #[derive(Debug, Clone)]
 pub struct PromptChannelInfo {
+    pub project: Option<crate::prompt_project::PromptProjectInfo>,
     pub name: String,
     pub channel_type: String,
 }
@@ -1560,6 +1561,11 @@ fn format_context_hints(
              Channel: {channel_display}\n\
              Thread root: {root}"
         );
+        crate::prompt_project::append_project_context(
+            &mut s,
+            channel_info.and_then(|info| info.project.as_ref()),
+            channel_id,
+        );
         if let Some(ref parent) = thread_tags.parent_event_id {
             if parent != root {
                 s.push_str(&format!("\nParent: {parent}"));
@@ -1581,6 +1587,11 @@ fn format_context_hints(
              Session scope: channel\n\
              Channel: {channel_display}\n\
              Hint: Use `buzz messages get --channel <UUID>` for recent messages if needed."
+        );
+        crate::prompt_project::append_project_context(
+            &mut s,
+            channel_info.and_then(|info| info.project.as_ref()),
+            channel_id,
         );
         if let Some(event_id) = reply_anchor {
             append_new_thread_reply_instruction(&mut s, event_id);
@@ -3765,6 +3776,7 @@ mod tests {
             cancel_reason: None,
         };
         let ci = PromptChannelInfo {
+            project: None,
             name: "engineering".into(),
             channel_type: "stream".into(),
         };
@@ -3797,6 +3809,7 @@ mod tests {
             cancel_reason: None,
         };
         let ci = PromptChannelInfo {
+            project: None,
             name: "DM".into(),
             channel_type: "dm".into(),
         };
@@ -3843,6 +3856,7 @@ mod tests {
                         cancel_reason: None,
                     };
                     let ci = PromptChannelInfo {
+                        project: None,
                         name: "test".into(),
                         channel_type: if is_dm { "dm" } else { "stream" }.into(),
                     };
@@ -4130,6 +4144,7 @@ mod tests {
             cancel_reason: None,
         };
         let ci = PromptChannelInfo {
+            project: None,
             name: "DM".into(),
             channel_type: "dm".into(),
         };
@@ -4389,6 +4404,7 @@ mod tests {
             cancel_reason: None,
         };
         let ci = PromptChannelInfo {
+            project: None,
             name: "DM".into(),
             channel_type: "dm".into(),
         };
@@ -4492,6 +4508,7 @@ mod tests {
             cancel_reason: None,
         };
         let ci = PromptChannelInfo {
+            project: None,
             name: "DM".into(),
             channel_type: "dm".into(),
         };
@@ -4541,6 +4558,7 @@ mod tests {
             cancel_reason: None,
         };
         let ci = PromptChannelInfo {
+            project: None,
             name: "DM".into(),
             channel_type: "dm".into(),
         };
@@ -5102,6 +5120,7 @@ mod tests {
             cancel_reason: None,
         };
         let ci = PromptChannelInfo {
+            project: None,
             name: "DM".into(),
             channel_type: "dm".into(),
         };
@@ -5167,6 +5186,7 @@ mod tests {
             cancel_reason: None,
         };
         let ci = PromptChannelInfo {
+            project: None,
             name: "DM".into(),
             channel_type: "dm".into(),
         };
