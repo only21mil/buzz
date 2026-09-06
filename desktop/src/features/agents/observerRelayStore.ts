@@ -227,7 +227,10 @@ function observerTag(event: RelayEvent, tagName: string) {
 function appendAgentEvent(agentPubkey: string, event: ObserverEvent): boolean {
   const key = normalizePubkey(agentPubkey);
   const current = eventsByAgent.get(key) ?? [];
+  const tail = current.at(-1);
+  const eventAtEnd = !tail || isObserverEventAfter(event, tail);
   if (
+    !eventAtEnd &&
     current.some(
       (existing) =>
         existing.seq === event.seq && existing.timestamp === event.timestamp,
@@ -236,7 +239,11 @@ function appendAgentEvent(agentPubkey: string, event: ObserverEvent): boolean {
     return false;
   }
 
-  const sorted = [...current, event].sort(compareObserverEvents);
+  // Strictly newer events cannot duplicate a retained timestamp/seq.
+  // Replays and out-of-order arrivals retain the full dedup and rebuild path.
+  const sorted = eventAtEnd
+    ? [...current, event]
+    : [...current, event].sort(compareObserverEvents);
   const trimmed = sorted.length > MAX_OBSERVER_EVENTS;
   const final = trimmed
     ? sorted.slice(sorted.length - MAX_OBSERVER_EVENTS)
@@ -246,7 +253,6 @@ function appendAgentEvent(agentPubkey: string, event: ObserverEvent): boolean {
   // Determine whether the new event landed at the end of the sorted array.
   // If it did (common case), we can incrementally process just this event.
   // If not (out-of-order arrival) or if we trimmed, fall back to full rebuild.
-  const eventAtEnd = sorted[sorted.length - 1] === event;
 
   if (eventAtEnd && !trimmed) {
     // Fast path: incremental update
