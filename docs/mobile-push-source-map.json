@@ -284,7 +284,7 @@
     "source_git_blob": "e035752ec3adc3512981fc2255614406d6ca6f6b",
     "source_sha256": "7d5eb5db007cc4ce981f7d94d328fafc94e960214b6aa5041675bc6d7d56bb27",
     "fork_path": "crates/buzz-relay/src/config.rs",
-    "fork_sha256": "3159208bf2fa127f6b6985e0f17ef2b73445ada6e2e0ee489973548c12a7e690",
+    "fork_sha256": "340d3f3eb4fafebbf1d9cb9e0dc5137ac03c31e9d56925003c449b87ef5ab444",
     "disposition": "adapted or already integrated; preserve fork contracts"
   },
   {
