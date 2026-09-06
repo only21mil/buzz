@@ -119,7 +119,7 @@ export function AppSidebar({
   onSelectChannel,
   onOpenSearchResult,
   searchChannels,
-  searchFocusRequest,
+  searchFocusRequests,
   onSelectSettings,
   onSetPresenceStatus,
   onSetUserStatus,
@@ -478,6 +478,9 @@ export function AppSidebar({
         <AppSidebarPinnedHeader
           channelLabels={dmChannelLabels}
           currentPubkey={currentPubkey}
+          currentChannelId={
+            selectedView === "channel" ? selectedChannelId : null
+          }
           onBrowseChannels={onBrowseChannels}
           onCreateAgent={onCreateAgent}
           onCreateChannel={handleOpenCreateChannel}
@@ -485,7 +488,8 @@ export function AppSidebar({
           onOpenSearchResult={onOpenSearchResult}
           onSelectChannel={onSelectChannel}
           searchChannels={searchChannels}
-          searchFocusRequest={searchFocusRequest}
+          searchFocusRequest={searchFocusRequests[0]}
+          scopeSearchFocusRequest={searchFocusRequests[1]}
           suggestionChannels={channels}
         />
 

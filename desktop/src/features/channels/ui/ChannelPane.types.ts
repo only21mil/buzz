@@ -7,7 +7,6 @@ import type { ChannelWindowThreadSummary } from "@/features/messages/lib/channel
 import type { TimelineMessage } from "@/features/messages/types";
 import type { TypingIndicatorEntry } from "@/features/messages/useChannelTyping";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
-import type { useChannelFind } from "@/features/search/useChannelFind";
 import type {
   ProfilePanelTab,
   ProfilePanelView,
@@ -34,7 +33,6 @@ export type ChannelPaneProps = {
    */
   onAutoSendComplete?: (() => void) | null;
   botTypingEntries: TypingIndicatorEntry[];
-  channelFind: ReturnType<typeof useChannelFind>;
   channelManagementOpen?: boolean;
   currentPubkey?: string;
   editTarget?: MessageComposerEditTarget | null;
@@ -159,6 +157,10 @@ export type ChannelPaneProps = {
   threadReplyUnreadCounts?: ReadonlyMap<string, number>;
   threadFirstUnreadReplyId?: string | null;
   targetMessageId: string | null;
+  /** Exact clicked result id, including a reply routed into the thread panel. */
+  targetSearchMessageId?: string | null;
+  /** Search text to highlight within the clicked result. */
+  targetSearchQuery?: string;
   typingPubkeys: string[];
   isFollowingThread?: boolean;
   onFollowThread?: () => void;

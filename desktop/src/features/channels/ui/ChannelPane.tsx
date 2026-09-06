@@ -26,7 +26,6 @@ import {
 import { buildVideoReviewPresentationByMessageId } from "@/features/messages/lib/videoReviewContext";
 import { useComposerHeightPadding } from "@/features/messages/ui/useComposerHeightPadding";
 import { UserProfilePanel } from "@/features/profile/ui/UserProfilePanel";
-import { ChannelFindBar } from "@/features/search/ui/ChannelFindBar";
 import { AgentSessionThreadPanel } from "@/features/channels/ui/AgentSessionThreadPanel";
 import { ChannelManagementAuxiliaryPanel } from "@/features/channels/ui/ChannelManagementAuxiliaryPanel";
 import { RightAuxiliaryPane } from "@/features/channels/ui/RightAuxiliaryPane";
@@ -48,6 +47,7 @@ import {
 import { useWelcomeComposerBanner } from "@/features/channels/ui/useWelcomeComposerBanner";
 import { mentionsKnownAgent } from "@/features/channels/ui/ChannelPane.helpers";
 import { HuddleStartingView, HuddleTranscriptIntro } from "@/features/huddle";
+import { useSearchHighlightProps } from "@/features/channels/ui/useSearchHighlightProps";
 import { useChannelIntro } from "@/features/channels/ui/useChannelIntro";
 import type { ChannelPaneProps } from "@/features/channels/ui/ChannelPane.types";
 import * as agentSessionSelection from "@/features/channels/ui/agentSessionSelection";
@@ -74,7 +74,6 @@ export const ChannelPane = React.memo(function ChannelPane({
   autoSendDraftKey = null,
   onAutoSendComplete = null,
   botTypingEntries,
-  channelFind,
   channelManagementOpen = false,
   currentPubkey,
   editTarget = null,
@@ -149,6 +148,8 @@ export const ChannelPane = React.memo(function ChannelPane({
   profilePanelTab,
   profilePanelView,
   targetMessageId,
+  targetSearchMessageId,
+  targetSearchQuery,
   threadAllMessages,
   threadHeadMessage,
   threadMessages,
@@ -171,6 +172,10 @@ export const ChannelPane = React.memo(function ChannelPane({
     currentPubkey,
   );
   const mainComposerMedia = useMediaUpload({ deferUploadsUntilSend: true });
+  const searchHighlightProps = useSearchHighlightProps(
+    targetSearchMessageId,
+    targetSearchQuery,
+  );
   const [isMainDeferredEditPending, setMainDeferredEditPending] =
     React.useState(false);
   const isNonMemberView =
@@ -189,8 +194,6 @@ export const ChannelPane = React.memo(function ChannelPane({
       channelPaneMountedRef.current = false;
     };
   }, []);
-  // Clear only the auto-send key so thread state survives deferred submission;
-  // older wrappers fall back to goChannel to prevent back-navigation replay.
   const handleAutoSubmitComplete = React.useCallback(() => {
     if (onAutoSendComplete) {
       onAutoSendComplete();
@@ -347,10 +350,6 @@ export const ChannelPane = React.memo(function ChannelPane({
     !isMainDeferredEditPending &&
     !isSinglePanelView;
   const hasTypingActivity = typingPubkeys.length > 0;
-  // Unified working set for the composer bar: observer-derived turns primary,
-  // bot typing fallback (both folded together by agentWorkingSignal). This is
-  // what makes the bar show for an agent whose observer stream is live but
-  // whose typing signal never arrives — and vice versa.
   const composerWorkingBotPubkeys = useChannelWorkingAgentPubkeys(
     activeChannel?.id ?? null,
   );
@@ -562,19 +561,6 @@ export const ChannelPane = React.memo(function ChannelPane({
           }
         >
           {isHuddleTranscript ? null : header}
-          {channelFind.isOpen ? (
-            <div className={cn("absolute inset-x-0 z-40", channelChrome.top)}>
-              <ChannelFindBar
-                matchCount={channelFind.matchCount}
-                matchIndex={channelFind.activeIndex}
-                onClose={channelFind.close}
-                onNext={channelFind.goToNext}
-                onPrevious={channelFind.goToPrevious}
-                onQueryChange={channelFind.setQuery}
-                query={channelFind.query}
-              />
-            </div>
-          ) : null}
           <MessageTimeline
             ref={messageTimelineRef}
             channelId={activeChannel?.id}
@@ -636,9 +622,7 @@ export const ChannelPane = React.memo(function ChannelPane({
             }
             onTargetReached={onTargetReached}
             onToggleReaction={onToggleReaction}
-            searchActiveMessageId={channelFind.activeMatch?.messageId ?? null}
-            searchMatchingMessageIds={channelFind.matchingMessageIds}
-            searchQuery={channelFind.query}
+            {...searchHighlightProps.timeline}
             targetMessageId={targetMessageId}
             splitThreadPanelOpen={
               useSplitAuxiliaryPane &&
@@ -834,6 +818,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                 replyTargetMessage={threadReplyTargetMessage}
                 scrollTargetHighlights={!layoutScrollTargetId}
                 scrollTargetId={layoutScrollTargetId ?? threadScrollTargetId}
+                {...searchHighlightProps.thread}
                 threadHead={threadHeadMessage}
                 videoReviewPresentation={threadVideoReviewPresentation}
                 widthPx={threadPanelWidthPx}
@@ -878,10 +863,6 @@ export const ChannelPane = React.memo(function ChannelPane({
           })()
         ) : activeChannel && selectedAgent ? (
           (() => {
-            // When the panel was opened from a different channel than the
-            // currently active one, re-scope it to the active channel so
-            // that both the content/header AND channel-backed actions (e.g.
-            // Stop current turn) operate on the same channel object.
             const effectiveAgentSessionChannelId =
               openAgentSessionChannelId &&
               activeChannel.id !== openAgentSessionChannelId

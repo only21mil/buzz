@@ -88,14 +88,14 @@ export type AppSidebarProps = {
   onSelectWorkflows: () => void;
   onSelectHome: () => void;
   onSelectChannel: (channelId: string) => void;
-  onOpenSearchResult: (hit: SearchHit) => void;
+  onOpenSearchResult: (hit: SearchHit, query: string) => void;
   /**
    * Full channel set used for global search. Unlike `channels` (which is
    * scoped to the viewer's joined sidebar list), this includes open channels
    * the viewer hasn't joined, so search can surface them.
    */
   searchChannels: Channel[];
-  searchFocusRequest: number;
+  searchFocusRequests: readonly [global: number, channel: number];
   onSelectSettings: (section?: SettingsSection) => void;
   onSetPresenceStatus?: (status: "online" | "away" | "offline") => void;
   onSetUserStatus: (text: string, emoji: string) => void;

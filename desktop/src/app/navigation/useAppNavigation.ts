@@ -6,8 +6,8 @@ import {
   useRouter,
 } from "@tanstack/react-router";
 
-import { cacheSearchHitEvent } from "@/app/navigation/searchHitEventCache";
-import { resolveSearchHitDestination } from "@/app/navigation/resolveSearchHitDestination";
+import type { SearchHighlightNavigation } from "@/app/navigation/searchHighlightNavigation";
+import { openSearchHitWithNavigation } from "@/app/navigation/searchHitNavigation";
 import type { SearchHit } from "@/shared/api/types";
 
 type NavigationBehavior = {
@@ -27,14 +27,23 @@ export function useAppNavigation() {
       next: {
         to: string;
         params?: Record<string, string>;
-        state?: Record<string, unknown>;
+        state?:
+          | Record<string, unknown>
+          | ((
+              previousState: Record<string, unknown>,
+            ) => Record<string, unknown>);
         search?: Record<string, string | undefined>;
       },
       behavior: NavigationBehavior = {},
     ) => {
       const nextLocation = router.buildLocation(next as never);
+      const hasStateUpdate = next.state !== undefined;
 
-      if (location.href === nextLocation.href && !behavior.force) {
+      if (
+        location.href === nextLocation.href &&
+        !behavior.force &&
+        !hasStateUpdate
+      ) {
         return false;
       }
 
@@ -248,6 +257,10 @@ export function useAppNavigation() {
          */
         autoSend?: string;
         messageId?: string;
+        /** Preserve an active search highlight; ordinary navigation clears it. */
+        preserveSearchHighlight?: boolean;
+        searchHighlight?: SearchHighlightNavigation;
+        force?: boolean;
         replace?: boolean;
         /** Open this thread panel directly without waiting for a timeline row. */
         thread?: string;
@@ -273,8 +286,15 @@ export function useAppNavigation() {
             ...(options?.thread ? { thread: options.thread } : {}),
             ...(options?.autoSend ? { autoSend: options.autoSend } : {}),
           },
+          state: options?.preserveSearchHighlight
+            ? undefined
+            : (previousState: Record<string, unknown>) => ({
+                ...previousState,
+                searchHighlight: options?.searchHighlight ?? null,
+              }),
         },
         {
+          force: options?.force,
           replace: options?.replace,
           resetScroll: options?.messageId ? true : undefined,
         },
@@ -300,6 +320,10 @@ export function useAppNavigation() {
       options?: {
         replace?: boolean;
         replyId?: string;
+        /** Preserve an active search highlight; ordinary navigation clears it. */
+        preserveSearchHighlight?: boolean;
+        searchHighlight?: SearchHighlightNavigation;
+        force?: boolean;
       },
     ) =>
       commitNavigation(
@@ -309,9 +333,18 @@ export function useAppNavigation() {
             channelId,
             postId,
           },
-          search: options?.replyId ? { replyId: options.replyId } : {},
+          search: {
+            ...(options?.replyId ? { replyId: options.replyId } : {}),
+          },
+          state: options?.preserveSearchHighlight
+            ? undefined
+            : (previousState: Record<string, unknown>) => ({
+                ...previousState,
+                searchHighlight: options?.searchHighlight ?? null,
+              }),
         },
         {
+          force: options?.force,
           replace: options?.replace,
           resetScroll: false,
         },
@@ -362,25 +395,11 @@ export function useAppNavigation() {
   );
 
   const openSearchHit = React.useCallback(
-    async (hit: SearchHit) => {
-      cacheSearchHitEvent(hit);
-
-      const destination = await resolveSearchHitDestination(hit);
-      if (!destination) {
-        return false;
-      }
-
-      if (destination.kind === "forum-post") {
-        return goForumPost(destination.channelId, destination.postId, {
-          replyId: destination.replyId,
-        });
-      }
-
-      return goChannel(destination.channelId, {
-        messageId: destination.messageId,
-        threadRootId: destination.threadRootId,
-      });
-    },
+    async (
+      hit: SearchHit,
+      behavior?: { force?: boolean; query?: string; signal?: AbortSignal },
+    ) =>
+      openSearchHitWithNavigation(hit, { ...behavior, goChannel, goForumPost }),
     [goChannel, goForumPost],
   );
 

@@ -31,6 +31,8 @@ type ForumViewProps = {
   onTargetReached?: (messageId: string) => void;
   selectedPostId: string | null;
   targetReplyId: string | null;
+  targetSearchMessageId?: string;
+  targetSearchQuery?: string;
 };
 
 function canDelete(postPubkey: string, currentPubkey?: string): boolean {
@@ -48,6 +50,8 @@ export function ForumView({
   onTargetReached,
   selectedPostId,
   targetReplyId,
+  targetSearchMessageId,
+  targetSearchQuery,
 }: ForumViewProps) {
   const [isComposerOpen, setIsComposerOpen] = React.useState(false);
   const postsScrollRef = React.useRef<HTMLDivElement>(null);
@@ -157,6 +161,8 @@ export function ForumView({
         onTargetReached={onTargetReached}
         profiles={profiles}
         targetEventId={targetReplyId}
+        targetSearchMessageId={targetSearchMessageId}
+        targetSearchQuery={targetSearchQuery}
         thread={threadQuery.data}
       />
     );
