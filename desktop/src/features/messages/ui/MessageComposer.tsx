@@ -167,6 +167,7 @@ function MessageComposerImpl({
     onAttachmentAcceptanceChange?.(voiceNote.acceptsAttachment);
   }, [onAttachmentAcceptanceChange, voiceNote.acceptsAttachment]);
   const {
+    getSpoilerRevision,
     handleAttachmentEditSave,
     handleAttachmentRevert,
     handleRemoveAttachment,
@@ -221,6 +222,9 @@ function MessageComposerImpl({
   const captureEditSubmission = useEditSubmissionOwnership(
     editTarget?.id ?? null,
     getComposerRevision,
+    media.getIntentRevision,
+    getSpoilerRevision,
+    runComposerUpdate,
   );
   // biome-ignore lint/correctness/useExhaustiveDependencies: effectiveDraftKey is the sole trigger
   React.useEffect(() => {
@@ -508,7 +512,6 @@ function MessageComposerImpl({
       richText.getPlainTextAndCursor,
     ],
   );
-  // ── Emoji insertion ─────────────────────────────────────────────────
   const insertEmoji = React.useCallback(
     (emoji: string) => {
       if (!richText.editor) return;
@@ -555,16 +558,13 @@ function MessageComposerImpl({
   });
   const submitMessage = React.useCallback(async () => {
     const trimmed = syncComposerContentFromEditor().trim();
-    // Edit mode
     if (editTargetRef.current && onEditSaveRef.current) {
-      // A live recording must be finished or discarded explicitly; never let an
-      // edit save snapshot text while a voice note is mid-capture (the editor's
-      // Enter shortcut bypasses the toolbar's Finish/Discard controls).
+      // Enter must also respect the toolbar's recording and upload gates.
       if (isEditSubmissionLocked || voiceNote.statusRef.current !== "idle") {
         return;
       }
       // Empty edits delete the message through handleEditSave.
-      const isCurrent = captureEditSubmission();
+      const { isCurrent, runUpdate } = captureEditSubmission();
       await submitMessageEdit({
         isCurrent,
         settlePendingMentionBindings: mentions.settlePendingMentionBindings,
@@ -581,7 +581,7 @@ function MessageComposerImpl({
         extractMentionPubkeys: extractMentionPubkeysRef.current,
         save: onEditSaveRef.current,
         clearComposer: () =>
-          runComposerUpdate(() => {
+          runUpdate(() => {
             setComposerContent("");
             richText.clearContent();
             media.setPendingImeta([]);
@@ -593,7 +593,7 @@ function MessageComposerImpl({
             setIsEmojiPickerOpen(false);
           }),
         restoreComposer: (draft) =>
-          runComposerUpdate(() => {
+          runUpdate(() => {
             setComposerContent(draft.content);
             richText.setContent(draft.content);
             media.setPendingImeta(draft.pendingImeta);
@@ -658,7 +658,6 @@ function MessageComposerImpl({
     }
   }, [
     captureEditSubmission,
-    runComposerUpdate,
     channelId,
     channelLinks.clearChannels,
     customEmoji,

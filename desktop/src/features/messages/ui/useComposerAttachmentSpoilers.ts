@@ -20,9 +20,21 @@ export function useComposerAttachmentSpoilers({
   revertAttachment,
   uploadEditedAttachment,
 }: UseComposerAttachmentSpoilersArgs) {
-  const [spoileredAttachmentUrls, setSpoileredAttachmentUrls] = React.useState<
+  const [spoileredAttachmentUrls, setSpoilerState] = React.useState<
     Set<string>
   >(() => new Set());
+  const intentRevisionRef = React.useRef(0);
+  const getSpoilerRevision = React.useCallback(
+    () => intentRevisionRef.current,
+    [],
+  );
+  const setSpoileredAttachmentUrls = React.useCallback(
+    (action: React.SetStateAction<Set<string>>) => {
+      intentRevisionRef.current += 1;
+      setSpoilerState(action);
+    },
+    [],
+  );
   const spoileredAttachmentUrlsRef = React.useRef(spoileredAttachmentUrls);
   spoileredAttachmentUrlsRef.current = spoileredAttachmentUrls;
 
@@ -36,20 +48,23 @@ export function useComposerAttachmentSpoilers({
       });
       removeAttachment(url);
     },
-    [removeAttachment],
+    [removeAttachment, setSpoileredAttachmentUrls],
   );
 
-  const handleToggleAttachmentSpoiler = React.useCallback((url: string) => {
-    setSpoileredAttachmentUrls((current) => {
-      const next = new Set(current);
-      if (next.has(url)) {
-        next.delete(url);
-      } else {
-        next.add(url);
-      }
-      return next;
-    });
-  }, []);
+  const handleToggleAttachmentSpoiler = React.useCallback(
+    (url: string) => {
+      setSpoileredAttachmentUrls((current) => {
+        const next = new Set(current);
+        if (next.has(url)) {
+          next.delete(url);
+        } else {
+          next.add(url);
+        }
+        return next;
+      });
+    },
+    [setSpoileredAttachmentUrls],
+  );
 
   const { handleAttachmentEditSave, handleAttachmentRevert } =
     useAttachmentEditing({
@@ -59,6 +74,7 @@ export function useComposerAttachmentSpoilers({
     });
 
   return {
+    getSpoilerRevision,
     handleAttachmentEditSave,
     handleAttachmentRevert,
     handleRemoveAttachment,

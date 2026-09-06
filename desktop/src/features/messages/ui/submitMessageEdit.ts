@@ -163,6 +163,7 @@ export async function submitMessageEdit({
     setUploadError(error instanceof Error ? error.message : String(error));
     return;
   }
+  if (!isCurrent()) return;
   const hasQueuedAttachments = draft.queuedAttachments.length > 0;
   if (hasQueuedAttachments) setDeferredUploadPending(true);
   clearComposer();

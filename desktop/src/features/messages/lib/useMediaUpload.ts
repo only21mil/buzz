@@ -87,6 +87,15 @@ type UseMediaUploadOptions = {
 export function useMediaUpload({
   deferUploadsUntilSend = false,
 }: UseMediaUploadOptions = {}) {
+  // Synchronous intent changes revoke pending edits before React renders.
+  const intentRevisionRef = React.useRef(0);
+  const getIntentRevision = React.useCallback(
+    () => intentRevisionRef.current,
+    [],
+  );
+  const markIntentChanged = React.useCallback(() => {
+    intentRevisionRef.current += 1;
+  }, []);
   const e2eConfig = (
     window as Window & {
       __BUZZ_E2E__?: { mock?: { deferredComposerUploads?: boolean } };
@@ -249,6 +258,7 @@ export function useMediaUpload({
   const queueFiles = React.useCallback(
     (files: File[]) => {
       if (files.length === 0) return;
+      intentRevisionRef.current += 1;
 
       const attachments = files.map((file) => {
         const id = nextQueuedAttachmentIdRef.current;
@@ -273,6 +283,7 @@ export function useMediaUpload({
   );
 
   const removeQueuedAttachment = React.useCallback((id: number) => {
+    intentRevisionRef.current += 1;
     activeQueuedIdsRef.current.delete(id);
     releaseObjectUrl(
       ownedPreviewUrlsRef.current.get(id),
@@ -285,6 +296,7 @@ export function useMediaUpload({
   }, []);
 
   const clearQueuedAttachments = React.useCallback(() => {
+    intentRevisionRef.current += 1;
     for (const previewUrl of ownedPreviewUrlsRef.current.values()) {
       releaseObjectUrl(previewUrl, releasedPreviewUrlsRef.current);
     }
@@ -308,6 +320,7 @@ export function useMediaUpload({
   );
 
   const toggleQueuedAttachmentSpoiler = React.useCallback((id: number) => {
+    intentRevisionRef.current += 1;
     setQueuedAttachmentsState((current) =>
       current.map((attachment) =>
         attachment.id === id
@@ -341,6 +354,7 @@ export function useMediaUpload({
 
   const reserveUploadingPreview = React.useCallback(
     (file?: File, slotIndex?: number): number => {
+      intentRevisionRef.current += 1;
       const id = nextUploadingPreviewIdRef.current;
       nextUploadingPreviewIdRef.current += 1;
       activeUploadingPreviewIdsRef.current.add(id);
@@ -423,6 +437,7 @@ export function useMediaUpload({
 
   const cancelUpload = React.useCallback(
     (previewId: number) => {
+      intentRevisionRef.current += 1;
       canceledUploadingPreviewIdsRef.current.add(previewId);
       const preview = uploadingPreviewsRef.current.find(
         (candidate) => candidate.id === previewId,
@@ -485,6 +500,7 @@ export function useMediaUpload({
         finishUpload(previewId);
         return;
       }
+      intentRevisionRef.current += 1;
       setImetaSlots((prev) => {
         const next = [...prev];
         next[index] = descriptor;
@@ -507,6 +523,7 @@ export function useMediaUpload({
         finishUpload(previewId);
         return;
       }
+      intentRevisionRef.current += 1;
       nextSlotRef.current += 1;
       setImetaSlots((prev) => [...prev, descriptor]);
       finishUpload(previewId);
@@ -556,12 +573,15 @@ export function useMediaUpload({
 
   const handlePaperclip = React.useCallback(async () => {
     if (queueUntilSend) {
+      intentRevisionRef.current += 1;
+      const epoch = uploadEpochRef.current;
       const input = document.createElement("input");
       input.type = "file";
       input.multiple = true;
       input.addEventListener(
         "change",
         () => {
+          if (isUploadStale(epoch)) return;
           const files = Array.from(input.files ?? []);
           queueFiles(files.filter(shouldQueueFile));
           uploadFiles(files.filter((file) => !shouldQueueFile(file)));
@@ -584,6 +604,7 @@ export function useMediaUpload({
       if (isUploadCanceled(previewId)) return;
       finishUpload(previewId);
       if (isUploadStale(epoch)) return;
+      if (descriptors.length) intentRevisionRef.current += 1;
       for (const descriptor of descriptors) {
         nextSlotRef.current += 1;
         setImetaSlots((prev) => [...prev, descriptor]);
@@ -756,6 +777,7 @@ export function useMediaUpload({
         );
         if (isUploadCanceled(previewId)) return null;
         finishUpload(previewId);
+        intentRevisionRef.current += 1;
         setImetaSlots((prev) =>
           prev.map((d) => (d?.url === oldUrl ? descriptor : d)),
         );
@@ -785,6 +807,7 @@ export function useMediaUpload({
     (url: string): BlobDescriptor | null => {
       const original = originalsByUrlRef.current.get(url);
       if (!original) return null;
+      intentRevisionRef.current += 1;
       setImetaSlots((prev) => prev.map((d) => (d?.url === url ? original : d)));
       setOriginalsByUrl((prev) => {
         const next = new Map(prev);
@@ -797,12 +820,14 @@ export function useMediaUpload({
   );
 
   const removeAttachment = React.useCallback((url: string) => {
+    intentRevisionRef.current += 1;
     setImetaSlots((prev) => prev.map((d) => (d?.url === url ? null : d)));
   }, []);
 
   /** Public setter — replaces all slots (used by MessageComposer to clear/restore). */
   const setPendingImeta = React.useCallback(
     (action: React.SetStateAction<BlobDescriptor[]>) => {
+      intentRevisionRef.current += 1;
       // A wholesale replacement means the composer's contents were swapped out
       // from under any in-flight upload: draft/channel switch, post-send clear,
       // or edit-target restore. Bump the epoch so those uploads discard their
@@ -852,6 +877,8 @@ export function useMediaUpload({
     () => ({
       cancelUpload,
       clearQueuedAttachments,
+      getIntentRevision,
+      markIntentChanged,
       handleDragEnter,
       handleDragLeave,
       handleDragOver,
@@ -882,6 +909,8 @@ export function useMediaUpload({
     [
       cancelUpload,
       clearQueuedAttachments,
+      getIntentRevision,
+      markIntentChanged,
       handleDragEnter,
       handleDragLeave,
       handleDragOver,

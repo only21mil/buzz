@@ -111,7 +111,13 @@ async function setup(stage, { rejectRecipients = false } = {}) {
       });
       return {
         ...draft,
-        capture: useEditSubmissionOwnership(id, draft.getComposerRevision),
+        capture: useEditSubmissionOwnership(
+          id,
+          draft.getComposerRevision,
+          undefined,
+          undefined,
+          draft.runComposerUpdate,
+        ),
       };
     },
     { initialProps: { id: target.current.id, draftKey: key } },

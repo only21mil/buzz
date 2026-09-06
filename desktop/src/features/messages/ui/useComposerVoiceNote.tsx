@@ -92,10 +92,11 @@ export function useComposerVoiceNote({
       toast.error("A voice note must be the only attachment.");
       return;
     }
+    media.markIntentChanged();
     recordingContextRef.current = currentContextRef.current;
     onBeforeStartRef.current();
     void recorder.start();
-  }, [finish, recorder.start]);
+  }, [finish, recorder.start, media.markIntentChanged]);
 
   const cancel = recorder.cancel;
   const attachments = getAttachments();
