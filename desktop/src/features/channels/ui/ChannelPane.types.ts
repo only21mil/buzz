@@ -1,3 +1,5 @@
+import type { PublicationScope } from "@/shared/api/publicationScope";
+import type { MessageComposerProps } from "@/features/messages/ui/MessageComposer.types";
 import type { MessageComposerEditTarget } from "@/features/messages/ui/MessageComposer.types";
 import type * as React from "react";
 import type { BotActivityAgent } from "@/features/channels/ui/BotActivityBar";
@@ -78,11 +80,7 @@ export type ChannelPaneProps = {
   onCloseThread: () => void;
   onDelete?: (message: TimelineMessage) => void;
   onEdit?: (message: TimelineMessage) => void;
-  onEditSave?: (
-    content: string,
-    mediaTags?: string[][],
-    mentionPubkeys?: string[],
-  ) => Promise<void>;
+  onEditSave?: MessageComposerProps["onEditSave"];
   onMarkUnread?: (message: TimelineMessage) => void;
   onMarkRead?: (message: TimelineMessage) => void;
   onExpandThreadReplies: (message: TimelineMessage) => void;
@@ -94,29 +92,16 @@ export type ChannelPaneProps = {
   onOpenThread: (message: TimelineMessage) => void;
   onResetThreadPanelWidth: () => void;
   onSelectThreadReplyTarget: (message: TimelineMessage) => void;
-  onSendMessage: (
-    content: string,
-    mentionPubkeys: string[],
-    mediaTags?: string[][],
-    channelId?: string | null,
-  ) => Promise<void>;
+  onSendMessage: MessageComposerProps["onSend"];
   onSendVideoReviewComment?: (
     message: TimelineMessage,
     content: string,
     mentionPubkeys: string[],
     mediaTags?: string[][],
     parentEventId?: string,
+    publicationScope?: PublicationScope,
   ) => Promise<void>;
-  onSendThreadReply: (
-    content: string,
-    mentionPubkeys: string[],
-    mediaTags?: string[][],
-    channelId?: string | null,
-    threadContext?: {
-      parentEventId: string | null;
-      threadHeadId: string | null;
-    } | null,
-  ) => Promise<void>;
+  onSendThreadReply: MessageComposerProps["onSend"];
   onTargetReached?: (messageId: string) => void;
   onToggleReaction?: (
     message: TimelineMessage,

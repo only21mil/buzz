@@ -1,3 +1,10 @@
+import { preparePublicationScope } from "@/shared/api/preparePublicationScope";
+import {
+  assertPublicationScope,
+  capturePublicationScope,
+  isPublicationScopeCurrent,
+  type PublicationScope,
+} from "@/shared/api/publicationScope";
 import { snapshotUnresolvedEditMentionPubkeys } from "@/features/messages/lib/draftMentionRefs";
 import {
   AgentMentionAuthorizationError,
@@ -30,6 +37,7 @@ type SubmitMessageEditOptions = Omit<
   EditDraft,
   "mentionRefs" | "unresolvedMentionPubkeys"
 > & {
+  publicationScope?: PublicationScope;
   clearComposer: () => void;
   customEmoji: ReadonlyArray<CustomEmoji>;
   extractMentionPubkeys: (
@@ -63,11 +71,13 @@ type SubmitMessageEditOptions = Omit<
     mediaTags?: string[][],
     mentionPubkeys?: string[],
     eventId?: string,
+    publicationScope?: PublicationScope,
   ) => Promise<void>;
   setUploadError: (message: string) => void;
 };
 
 export async function submitMessageEdit({
+  publicationScope = capturePublicationScope(),
   clearComposer,
   content,
   customEmoji,
@@ -89,6 +99,12 @@ export async function submitMessageEdit({
   setUploadError,
   spoileredAttachmentUrls,
 }: SubmitMessageEditOptions): Promise<void> {
+  try {
+    publicationScope = await preparePublicationScope(publicationScope);
+  } catch (error) {
+    setUploadError(error instanceof Error ? error.message : String(error));
+    return;
+  }
   const historicalNames = (editTarget.unresolvedMentionRefs ?? []).map(
     (ref) => ref.displayName,
   );
@@ -110,7 +126,10 @@ export async function submitMessageEdit({
     ),
   };
   const restoreDraft = () => {
-    if (shouldRestoreComposer()) {
+    if (
+      isPublicationScopeCurrent(publicationScope) &&
+      shouldRestoreComposer()
+    ) {
       restoreComposer(draft);
       restoreMentionRefs(draft.mentionRefs);
     }
@@ -149,6 +168,7 @@ export async function submitMessageEdit({
       ]),
     );
     if (signal?.aborted) return;
+    assertPublicationScope(publicationScope);
     const revalidatedMentionPubkeys = await revalidateMentionPubkeys(
       addedMentionPubkeys,
       undefined,
@@ -159,6 +179,7 @@ export async function submitMessageEdit({
       },
     );
     if (signal?.aborted) return;
+    assertPublicationScope(publicationScope);
     const outgoingTags = mergeOutgoingTagsWithReferenceMentions(
       mergeOutgoingTags(
         mediaTags,
@@ -178,6 +199,7 @@ export async function submitMessageEdit({
       outgoingTags,
       revalidatedMentionPubkeys,
       editTargetId,
+      publicationScope,
     );
   };
 

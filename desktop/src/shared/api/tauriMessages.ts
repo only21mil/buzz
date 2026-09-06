@@ -1,3 +1,9 @@
+import { preparePublicationScope } from "./preparePublicationScope";
+import {
+  assertPublicationScope,
+  capturePublicationScope,
+  type PublicationScope,
+} from "./publicationScope";
 import { invokeTauri } from "@/shared/api/tauri";
 import type { SendChannelMessageResult } from "@/shared/api/types";
 
@@ -20,10 +26,14 @@ export async function sendChannelMessage(
   mentionTags?: string[][],
   linkPreviewTags?: string[][],
   rootEventId?: string | null,
+  expectedScope: PublicationScope = capturePublicationScope(),
 ): Promise<SendChannelMessageResult> {
+  expectedScope = await preparePublicationScope(expectedScope);
+  assertPublicationScope(expectedScope);
   const response = await invokeTauri<RawSendChannelMessageResult>(
     "send_channel_message",
     {
+      expectedScope,
       channelId,
       content,
       parentEventId,

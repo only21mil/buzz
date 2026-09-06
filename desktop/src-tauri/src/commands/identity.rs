@@ -104,17 +104,28 @@ pub fn get_media_proxy_port(state: State<'_, AppState>) -> u16 {
         .load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Capture native publication authority before renderer-side async preparation.
+#[tauri::command]
+pub fn get_message_publication_scope(
+    state: State<'_, AppState>,
+) -> Result<crate::relay::PublicationSnapshot, String> {
+    Ok(crate::relay::MessagePublication::capture(&state, None)?.snapshot())
+}
+
 #[tauri::command]
 pub async fn sign_event(
     kind: u16,
     content: String,
     created_at: Option<u64>,
     tags: Vec<Vec<String>>,
+    expected_scope: Option<crate::relay::ExpectedPublicationScope>,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
-    let keys = state.signing_keys()?;
+    let publication = crate::relay::MessagePublication::capture(&state, expected_scope.as_ref())?;
 
     tauri::async_runtime::spawn_blocking(move || {
+        publication.validate()?;
+        let keys = publication.keys;
         let nostr_tags = tags
             .into_iter()
             .map(|tag| Tag::parse(tag).map_err(|error| format!("invalid tag: {error}")))
@@ -419,11 +430,7 @@ pub(crate) fn commit_imported_identity(
     // stores below pair with Acquire loads in get_identity: a reader
     // observing false is guaranteed to see the updated keys.
     let pubkey = keys.public_key();
-    {
-        let mut active_keys = state.keys.lock().map_err(|e| e.to_string())?;
-        *active_keys = keys;
-        state.set_identity_storage(storage);
-    }
+    state.replace_publication_keys(keys, Some(storage))?;
 
     // Clear both recovery flags — an import is valid in either lost or
     // keyring-locked state and resolves both. In the locked case the

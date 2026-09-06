@@ -1,3 +1,4 @@
+import type { MessageComposerProps } from "@/features/messages/ui/MessageComposer.types";
 import * as React from "react";
 import { ArrowDown } from "lucide-react";
 
@@ -69,11 +70,7 @@ type MessageThreadPanelProps = ThreadPanelLayoutProps & {
   onDelete?: (message: TimelineMessage) => void;
   onEdit?: (message: TimelineMessage) => void;
   onEditLastOwnMessage?: () => boolean;
-  onEditSave?: (
-    content: string,
-    mediaTags?: string[][],
-    mentionPubkeys?: string[],
-  ) => Promise<void>;
+  onEditSave?: MessageComposerProps["onEditSave"];
   onMarkUnread?: (message: TimelineMessage) => void;
   onMarkRead?: (message: TimelineMessage) => void;
   onExpandReplies: (message: TimelineMessage) => void;
@@ -83,16 +80,7 @@ type MessageThreadPanelProps = ThreadPanelLayoutProps & {
   searchMessageId?: string | null;
   searchQuery?: string;
   onSelectReplyTarget: (message: TimelineMessage) => void;
-  onSend: (
-    content: string,
-    mentionPubkeys: string[],
-    mediaTags?: string[][],
-    channelId?: string | null,
-    threadContext?: {
-      parentEventId: string | null;
-      threadHeadId: string | null;
-    } | null,
-  ) => Promise<void>;
+  onSend: MessageComposerProps["onSend"];
   onToggleReaction?: (
     message: TimelineMessage,
     emoji: string,

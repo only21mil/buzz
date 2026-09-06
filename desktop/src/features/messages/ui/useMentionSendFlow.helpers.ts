@@ -1,3 +1,4 @@
+import type { PublicationScope } from "@/shared/api/publicationScope";
 import type { MentionRevalidationOptions } from "@/features/messages/lib/agentMentionRevalidation";
 import type { ManagedAgent } from "@/shared/api/types";
 import {
@@ -66,6 +67,7 @@ export type ComposerDraftOwner = {
 };
 
 export type PendingNonMemberMentionSend = {
+  publicationScope: PublicationScope;
   sourceOwner: ComposerDraftOwner;
   composerRevision: number;
   invitationSignal?: AbortSignal;

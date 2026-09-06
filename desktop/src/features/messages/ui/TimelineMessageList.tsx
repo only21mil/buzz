@@ -1,3 +1,4 @@
+import type { PublicationScope } from "@/shared/api/publicationScope";
 import * as React from "react";
 import { VList } from "virtua";
 import type { VListHandle } from "virtua";
@@ -81,6 +82,7 @@ type TimelineMessageListProps = {
     mentionPubkeys: string[],
     mediaTags?: string[][],
     parentEventId?: string,
+    publicationScope?: PublicationScope,
   ) => Promise<void>;
   unfollowThreadById?: (rootId: string) => void;
   onToggleReaction?: (

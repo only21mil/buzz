@@ -1,3 +1,8 @@
+import { preparePublicationScope } from "@/shared/api/preparePublicationScope";
+import {
+  assertPublicationScope,
+  capturePublicationScope,
+} from "@/shared/api/publicationScope";
 import * as React from "react";
 import { EditorContent } from "@tiptap/react";
 import {
@@ -549,6 +554,7 @@ function MessageComposerImpl({
     onToggle: toggleAlwaysAddressAgent,
   });
   const submitMessage = React.useCallback(async () => {
+    let publicationScope = capturePublicationScope();
     const trimmed = syncComposerContentFromEditor().trim();
     // Edit mode
     if (editTargetRef.current && onEditSaveRef.current) {
@@ -560,9 +566,12 @@ function MessageComposerImpl({
       }
       // An edit extracts from the same mention map a pasted identity binds
       // into, so wait on any check still deciding. Bounded internally.
+      publicationScope = await preparePublicationScope(publicationScope);
       await mentions.settlePendingMentionBindings();
+      assertPublicationScope(publicationScope);
       // Empty edits delete the message through handleEditSave.
       await submitMessageEdit({
+        publicationScope,
         content: trimmed,
         editTargetId: editTargetRef.current.id,
         customEmoji,

@@ -1,3 +1,4 @@
+import type { PublicationScope } from "@/shared/api/publicationScope";
 import type * as React from "react";
 import type { CustomEmoji } from "@/shared/lib/remarkCustomEmoji";
 import type { ChannelType } from "@/shared/api/types";
@@ -41,6 +42,7 @@ export type UseMentionSendFlowOptions = {
         threadHeadId: string | null;
       } | null,
       forceRest?: boolean,
+      publicationScope?: PublicationScope,
     ) => Promise<void>
   >;
   richText: Pick<UseRichTextEditorResult, "clearContent" | "setContent">;

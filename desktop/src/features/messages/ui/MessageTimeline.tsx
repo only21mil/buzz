@@ -1,3 +1,4 @@
+import type { PublicationScope } from "@/shared/api/publicationScope";
 import * as React from "react";
 
 import {
@@ -101,6 +102,7 @@ type MessageTimelineProps = {
     mentionPubkeys: string[],
     mediaTags?: string[][],
     parentEventId?: string,
+    publicationScope?: PublicationScope,
   ) => Promise<void>;
   unfollowThreadById?: (rootId: string) => void;
   onToggleReaction?: (

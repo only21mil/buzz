@@ -1,3 +1,5 @@
+import { useVideoComposerSend } from "./useVideoComposerSend";
+import type { PublicationScope } from "@/shared/api/publicationScope";
 import * as React from "react";
 import { createPortal } from "react-dom";
 import {
@@ -86,6 +88,7 @@ export type VideoReviewContext = {
     mediaTags?: string[][],
     /** Reply to this comment instead of the video message itself. */
     parentEventId?: string,
+    publicationScope?: PublicationScope,
   ) => Promise<void>;
   onToggleCommentReaction?: (
     comment: VideoReviewComment,
@@ -1482,6 +1485,7 @@ function VideoReviewDialog({
     async (
       content: string,
       options?: {
+        publicationScope?: PublicationScope;
         mediaTags?: string[][];
         mentionPubkeys?: string[];
         replyTo?: VideoReviewComment | null;
@@ -1527,6 +1531,7 @@ function VideoReviewDialog({
           options?.mentionPubkeys ?? [],
           options?.mediaTags,
           replyTo?.id,
+          options?.publicationScope,
         );
         if (replyTo) {
           setReplyTarget(null);
@@ -1547,20 +1552,10 @@ function VideoReviewDialog({
     [boundSeconds, canPost, readAuthoringSeconds, reviewContext],
   );
 
-  const handleComposerSend = React.useCallback(
-    async (
-      content: string,
-      mentionPubkeys: string[],
-      mediaTags?: string[][],
-    ) => {
-      await postContent(content, {
-        mediaTags,
-        mentionPubkeys,
-        replyTo: replyTargetRef.current?.comment ?? null,
-        stampTimecode: postAtCurrentFrameRef.current,
-      });
-    },
-    [postContent],
+  const handleComposerSend = useVideoComposerSend(
+    postContent,
+    replyTargetRef,
+    postAtCurrentFrameRef,
   );
 
   const focusComposerInput = React.useCallback(() => {

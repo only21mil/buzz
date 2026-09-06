@@ -1,3 +1,4 @@
+import type { PublicationScope } from "@/shared/api/publicationScope";
 import { buildEditMentionState } from "@/features/messages/lib/draftMentionRefs";
 import {
   AlertCircle,
@@ -101,6 +102,7 @@ type InboxDetailPaneProps = {
   onDelete: () => void;
   onEditTargetChange: React.Dispatch<React.SetStateAction<string | null>>;
   onEditSave: (input: {
+    publicationScope?: PublicationScope;
     content: string;
     eventId: string;
     mediaTags?: string[][];
@@ -114,6 +116,7 @@ type InboxDetailPaneProps = {
     threadRootId?: string | null,
   ) => void;
   onSendReply: (input: {
+    publicationScope?: PublicationScope;
     content: string;
     mediaTags?: string[][];
     mentionPubkeys: string[];
@@ -694,7 +697,13 @@ function InboxMessageDetailPane({
               onCancelReply={
                 composerReplyTarget ? () => setReplyTargetId(null) : undefined
               }
-              onEditSave={async (content, mediaTags, mentionPubkeys) => {
+              onEditSave={async (
+                content,
+                mediaTags,
+                mentionPubkeys,
+                capturedEventId,
+                publicationScope,
+              ) => {
                 if (!composerEditTarget) {
                   return;
                 }
@@ -704,19 +713,31 @@ function InboxMessageDetailPane({
                   content.trim().length === 0 &&
                   (mediaTags === undefined || mediaTags.length === 0);
                 if (isEmptyDeletion) {
-                  onRequestEmptyEditDelete(composerEditTarget.id);
+                  onRequestEmptyEditDelete(
+                    capturedEventId ?? composerEditTarget.id,
+                  );
                   return;
                 }
                 await onEditSave({
+                  publicationScope,
                   content,
-                  eventId: composerEditTarget.id,
+                  eventId: capturedEventId ?? composerEditTarget.id,
                   mediaTags,
                   mentionPubkeys,
                 });
                 onEditTargetChange(null);
               }}
-              onSend={(content, mentionPubkeys, mediaTags) =>
+              onSend={(
+                content,
+                mentionPubkeys,
+                mediaTags,
+                _channelId,
+                _threadContext,
+                _forceRest,
+                publicationScope,
+              ) =>
                 onSendReply({
+                  publicationScope,
                   content,
                   mediaTags,
                   mentionPubkeys,

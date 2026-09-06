@@ -1,3 +1,4 @@
+import type { PublicationScope } from "@/shared/api/publicationScope";
 import { isVoiceNoteAttachment } from "./audioAttachment";
 import { parseImetaTags } from "@/shared/ui/markdown/parseImeta";
 import type { TimelineMessage } from "@/features/messages/types";
@@ -11,6 +12,7 @@ type SendVideoReviewComment = (
   mentionPubkeys: string[],
   mediaTags?: string[][],
   parentEventId?: string,
+  publicationScope?: PublicationScope,
 ) => Promise<void>;
 
 type ToggleMessageReaction = (
@@ -153,13 +155,14 @@ export function buildVideoReviewContextForMessage({
     disabled: !onSendVideoReviewComment || message.pending,
     isSending: isSendingVideoReviewComment,
     onSendComment: onSendVideoReviewComment
-      ? (content, mentionPubkeys, mediaTags, parentEventId) =>
+      ? (content, mentionPubkeys, mediaTags, parentEventId, publicationScope) =>
           onSendVideoReviewComment(
             message,
             content,
             mentionPubkeys,
             mediaTags,
             parentEventId,
+            publicationScope,
           )
       : undefined,
     onToggleCommentReaction: onToggleReaction

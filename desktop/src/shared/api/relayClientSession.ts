@@ -1,3 +1,10 @@
+import { sendScopedRelayMessage } from "./relayPublication";
+import {
+  assertPublicationRelay,
+  assertPublicationSigner,
+  capturePublicationScope,
+  type PublicationScope,
+} from "./publicationScope";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import {
   createAuthEvent,
@@ -7,7 +14,6 @@ import {
 } from "@/shared/api/tauri";
 import type { PresenceStatus, RelayEvent } from "@/shared/api/types";
 import {
-  KIND_STREAM_MESSAGE,
   KIND_TYPING_INDICATOR,
   KIND_USER_STATUS,
   CHANNEL_EVENT_KINDS,
@@ -250,27 +256,12 @@ export class RelayClient {
     content: string,
     mentionPubkeys: string[] = [],
     extraTags: string[][] = [],
+    expectedScope: PublicationScope = capturePublicationScope(),
   ) {
-    await this.ensureConnected();
-
-    const tags: string[][] = [["h", channelId]];
-    for (const pubkey of mentionPubkeys) {
-      tags.push(["p", pubkey]);
-    }
-    for (const tag of extraTags) {
-      tags.push(tag);
-    }
-
-    const event = await signRelayEvent({
-      kind: KIND_STREAM_MESSAGE,
-      content: content.trim(),
-      tags,
-    });
-
-    return this.publishEvent(
-      event,
-      "Timed out while sending the message.",
-      "Failed to send the message.",
+    return sendScopedRelayMessage(
+      () => this.ensureConnected(),
+      (...args) => this.publishEvent(...args),
+      { channelId, content, mentionPubkeys, extraTags, expectedScope },
     );
   }
 
@@ -643,7 +634,8 @@ export class RelayClient {
     };
   }
 
-  private async sendRaw(payload: unknown[]) {
+  private async sendRaw(payload: unknown[], expectedScope?: PublicationScope) {
+    if (expectedScope) assertPublicationRelay(expectedScope, this.relayUrl);
     if (this.wsId === null) {
       throw new Error("Relay socket is not connected.");
     }
@@ -705,9 +697,11 @@ export class RelayClient {
     event: RelayEvent,
     timeoutMessage: string,
     sendErrorMessage: string,
+    expectedScope?: PublicationScope,
   ) {
     // Await the gate before sending EVENT; op timeout starts after the wait.
     await waitForRateLimit();
+    if (expectedScope) assertPublicationSigner(expectedScope, event.pubkey);
 
     return new Promise<RelayEvent>((resolve, reject) => {
       const timeout = window.setTimeout(() => {
@@ -722,30 +716,35 @@ export class RelayClient {
         timeout,
       });
 
-      void this.sendRaw(["EVENT", event]).catch(async (error) => {
-        const pendingEvent = this.pendingEvents.get(event.id);
-        this.pendingEvents.delete(event.id);
-        const normalizedError = this.recoverFromSocketFailure(
-          error,
-          sendErrorMessage,
-        );
-
-        try {
-          await this.ensureConnected();
-          if (!pendingEvent) {
-            throw normalizedError;
-          }
-
-          this.pendingEvents.set(event.id, pendingEvent);
-          await this.sendRaw(["EVENT", event]);
-        } catch (retryError) {
-          window.clearTimeout(timeout);
+      void this.sendRaw(["EVENT", event], expectedScope).catch(
+        async (error) => {
+          const pendingEvent = this.pendingEvents.get(event.id);
           this.pendingEvents.delete(event.id);
-          reject(
-            this.recoverFromSocketFailure(retryError, normalizedError.message),
+          const normalizedError = this.recoverFromSocketFailure(
+            error,
+            sendErrorMessage,
           );
-        }
-      });
+
+          try {
+            await this.ensureConnected();
+            if (!pendingEvent) {
+              throw normalizedError;
+            }
+
+            this.pendingEvents.set(event.id, pendingEvent);
+            await this.sendRaw(["EVENT", event], expectedScope);
+          } catch (retryError) {
+            window.clearTimeout(timeout);
+            this.pendingEvents.delete(event.id);
+            reject(
+              this.recoverFromSocketFailure(
+                retryError,
+                normalizedError.message,
+              ),
+            );
+          }
+        },
+      );
     });
   }
 

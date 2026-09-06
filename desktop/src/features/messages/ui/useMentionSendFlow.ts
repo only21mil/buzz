@@ -1,3 +1,8 @@
+import { preparePublicationScope } from "@/shared/api/preparePublicationScope";
+import {
+  capturePublicationScope,
+  isPublicationScopeCurrent,
+} from "@/shared/api/publicationScope";
 import * as React from "react";
 import { claimDraftSend } from "@/features/messages/lib/useDrafts";
 import { toast } from "sonner";
@@ -295,6 +300,7 @@ export function useMentionSendFlow({
       const ownsComposer = () => sourceOwnerRef.current === draft.sourceOwner;
       const sendSignal = draft.preparedLinkPreviews?.signal;
       const isSendCancelled = () =>
+        !isPublicationScopeCurrent(draft.publicationScope) ||
         sendSignal?.aborted === true ||
         draft.invitationSignal?.aborted === true;
       if (isSendCancelled()) return draft.preparedLinkPreviews?.release();
@@ -550,10 +556,7 @@ export function useMentionSendFlow({
           );
           if (!finalOutgoingTags || signal?.aborted || isSendCancelled())
             return restoreComposerAfterFailure();
-          // The pass immediately before signing/publish is always fresh:
-          // mention authorization is re-validated here unconditionally,
-          // whatever did or did not separate it from the admission pass
-          // above (#5681).
+          // Revalidate exact recipients before every publish, including plain sends.
           const revalidatedMentionPubkeys =
             await mentions.revalidateMentionPubkeys(
               mentionPubkeys,
@@ -580,13 +583,10 @@ export function useMentionSendFlow({
             sendChannelId,
             draft.capturedThreadContext,
             draft.preparedLinkPreviews != null,
+            draft.publicationScope,
           );
-          // The relay accepted the publish: flush the queued wakes now,
-          // before the post-send cancellation check — a cancellation racing
-          // a successful publish must not drop the wake for a message that
-          // did land. Fire-and-forget: the send awaits nothing here, and
-          // each wake carries its enqueue-time replay floor so the spawned
-          // harness replays back past this message however late the flush.
+          // Accepted messages must wake their agents even if cancellation races
+          // the acknowledgement. Each detached wake retains its enqueue-time floor.
           for (const wake of agentsToWake) {
             startAgentDetached(wake.agent, wake.replayFloorUnix);
           }
@@ -739,24 +739,24 @@ export function useMentionSendFlow({
       if (isMentionSendPendingRef.current) {
         return;
       }
+      let publicationScope = capturePublicationScope();
       isMentionSendPendingRef.current = true;
       setIsMentionSendPending(true);
       // Bind settlement to this authored visit before reading its recipients.
       claimDraftSend(effectiveDraftKey);
       const composerRevision = getComposerRevision();
       const isSendCancelled = () =>
+        !isPublicationScopeCurrent(publicationScope) ||
         preparedLinkPreviews?.signal.aborted === true;
       let sendPromoted = false;
       if (preparedLinkPreviews) {
         activePreparedLinkPreviews.add(preparedLinkPreviews);
       }
       try {
+        publicationScope = await preparePublicationScope(publicationScope);
         if (isSendCancelled()) return;
-        // Every extraction below reads the mention map, and a pasted identity
-        // can still be verifying — the relay round trip for a non-member is
-        // exactly the case this feature exists for. Sending first would
-        // publish a readable `@Label` with no `p` tag. Bounded inside, so a
-        // lookup that never answers delays the send rather than blocking it.
+        // Settle pasted identities before extraction so readable mentions retain
+        // their exact notification keys. Binding lookups are bounded internally.
         await mentions.settlePendingMentionBindings();
         // Settlement may outlive an edit or A → B → A navigation. In that
         // case the live mention maps no longer belong to this send.
@@ -863,6 +863,7 @@ export function useMentionSendFlow({
           } catch {}
         }
         const pendingDraft: PendingNonMemberMentionSend = {
+          publicationScope,
           sourceOwner,
           composerRevision,
           addressedAgentPubkeys: uniqueNormalizedPubkeys(addressedAgentPubkeys),

@@ -470,3 +470,32 @@ test("still-owned ambiguous history remains reference-only after unrelated text 
     notifying: [],
   });
 });
+
+test("edit waiting for recipient validation cannot publish or recover into a new scope", async () => {
+  const { setPublicationScope } = await import(
+    "../../../shared/api/publicationScope.ts"
+  );
+  setPublicationScope("author", "wss://old.example");
+  let release;
+  const validation = new Promise((resolve) => {
+    release = resolve;
+  });
+  let saves = 0;
+  let restores = 0;
+  const options = baseOptions(async () => {
+    saves += 1;
+  });
+  options.revalidateMentionPubkeys = async () => {
+    await validation;
+    return [];
+  };
+  options.restoreComposer = () => {
+    restores += 1;
+  };
+  const pending = submitMessageEdit(options);
+  setPublicationScope("other", "wss://new.example");
+  release();
+  await pending;
+  assert.equal(saves, 0);
+  assert.equal(restores, 0);
+});

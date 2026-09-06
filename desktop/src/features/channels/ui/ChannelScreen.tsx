@@ -1,3 +1,4 @@
+import type { PublicationScope } from "@/shared/api/publicationScope";
 import { buildMessageEditTarget } from "@/features/messages/lib/buildMessageEditTarget";
 import * as React from "react";
 import { useAppShell } from "@/app/AppShellContext";
@@ -515,8 +516,10 @@ export function ChannelScreen({
       mentionPubkeys: string[],
       mediaTags?: string[][],
       parentEventId?: string,
+      publicationScope?: PublicationScope,
     ) => {
       await sendMessageMutateAsync({
+        publicationScope,
         content,
         mediaTags,
         mentionPubkeys,

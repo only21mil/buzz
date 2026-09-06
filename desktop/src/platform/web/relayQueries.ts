@@ -1,3 +1,4 @@
+import { expectedPublicationScope } from "./publicationScope";
 import { relayClient } from "@/shared/api/relayClient";
 import type { RelayEvent } from "@/shared/api/types";
 import type { BrowserIdentityManager } from "./identity";
@@ -140,12 +141,15 @@ async function publishSignedEvent(
   client: RelayQueryClient,
   request: { kind: number; content: string; tags: string[][] },
   operation: string,
+  expectedScope?: unknown,
 ): Promise<RelayEvent> {
+  const scope = expectedPublicationScope(expectedScope, identity);
   const event = parseSignedEvent(identity.sign(request));
   return client.publishEvent(
     event,
     `Timed out while ${operation}.`,
     `Failed while ${operation}.`,
+    scope,
   );
 }
 
@@ -937,6 +941,7 @@ async function sendChannelMessage(
     client,
     { kind, content, tags },
     "sending the message",
+    input.expectedScope,
   );
   const depth = !parentEventId ? 0 : parentEventId === rootEventId ? 1 : 2;
   return {

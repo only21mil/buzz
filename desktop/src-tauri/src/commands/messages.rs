@@ -467,8 +467,10 @@ pub async fn send_channel_message(
     link_preview_tags: Option<Vec<Vec<String>>>,
     mention_pubkeys: Option<Vec<String>>,
     kind: Option<u32>,
+    expected_scope: Option<crate::relay::ExpectedPublicationScope>,
     state: State<'_, AppState>,
 ) -> Result<SendChannelMessageResponse, String> {
+    let publication = crate::relay::MessagePublication::capture(&state, expected_scope.as_ref())?;
     let channel_uuid = uuid::Uuid::parse_str(&channel_id)
         .map_err(|_| format!("invalid channel UUID: {channel_id}"))?;
     let mentions = mention_pubkeys.unwrap_or_default();
@@ -477,7 +479,7 @@ pub async fn send_channel_message(
     let emoji = emoji_tags.unwrap_or_default();
     let mention_refs_only = mention_tags.unwrap_or_default();
     let link_previews = link_preview_tags.unwrap_or_default();
-    let relay_base = crate::relay::relay_api_base_url_with_override(&state);
+    let relay_base = &publication.api_base_url;
     let kind_num = kind.unwrap_or(buzz_core_pkg::kind::KIND_STREAM_MESSAGE);
 
     if root_event_id.is_some() && parent_event_id.is_none() {
@@ -527,12 +529,12 @@ pub async fn send_channel_message(
                 &emoji,
                 &mention_refs_only,
                 &link_previews,
-                &relay_base,
+                relay_base,
             )?
         }
     };
 
-    let result = submit_event(builder, &state).await?;
+    let result = crate::relay::submit_event_in_scope(builder, &state, publication).await?;
 
     let depth = match (&parent_event_id, &resolved_root) {
         (None, _) => 0,
@@ -862,6 +864,7 @@ pub async fn remove_reaction(
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EditMessageInput {
+    expected_scope: Option<crate::relay::ExpectedPublicationScope>,
     channel_id: String,
     event_id: String,
     content: String,
@@ -882,6 +885,8 @@ pub async fn edit_message(
     input: EditMessageInput,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let publication =
+        crate::relay::MessagePublication::capture(&state, input.expected_scope.as_ref())?;
     let channel_uuid = uuid::Uuid::parse_str(&input.channel_id)
         .map_err(|_| format!("invalid channel UUID: {}", input.channel_id))?;
     let target_eid =
@@ -902,7 +907,7 @@ pub async fn edit_message(
         &mention_refs,
         input.suppress_link_previews,
     )?;
-    submit_event(builder, &state).await?;
+    crate::relay::submit_event_in_scope(builder, &state, publication).await?;
     Ok(())
 }
 

@@ -78,11 +78,7 @@ pub fn resolve_persisted_identity(app: &AppHandle, state: &AppState) -> Result<(
     let resolved = load_or_create_identity(&data_dir)?;
     // Write keys and storage before setting the recovery flags (Release) so
     // any thread that reads a flag as false with Acquire sees consistent data.
-    {
-        let mut active_keys = state.keys.lock().map_err(|e| e.to_string())?;
-        *active_keys = resolved.keys;
-        state.set_identity_storage(resolved.storage);
-    }
+    state.replace_publication_keys(resolved.keys, Some(resolved.storage))?;
     state.identity_lost.store(
         resolved.recovery == RecoveryState::Lost,
         std::sync::atomic::Ordering::Release,

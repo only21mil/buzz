@@ -1,3 +1,4 @@
+import { expectedPublicationScope } from "./publicationScope";
 import { relayClient } from "@/shared/api/relayClient";
 import type { RelayEvent } from "@/shared/api/types";
 import type { BrowserIdentityManager } from "./identity";
@@ -137,12 +138,15 @@ async function publish(
   client: MutationRelayClient,
   request: { kind: number; content: string; tags: string[][] },
   operation: string,
+  expectedScope?: unknown,
 ): Promise<void> {
+  const scope = expectedPublicationScope(expectedScope, identity);
   const signed = parseSignedEvent(identity.sign(request));
   await client.publishEvent(
     signed,
     `Timed out while ${operation}.`,
     `Failed while ${operation}.`,
+    scope,
   );
 }
 
@@ -216,6 +220,7 @@ async function editMessage(
     client,
     { kind: 40003, content, tags },
     "editing the message",
+    input.expectedScope,
   );
 }
 

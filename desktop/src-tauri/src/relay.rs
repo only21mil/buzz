@@ -544,9 +544,12 @@ pub struct AgentProfileInfo {
 
 // ── Signed-event submission ─────────────────────────────────────────────────
 
+mod publication_scope;
+pub use publication_scope::{ExpectedPublicationScope, MessagePublication, PublicationSnapshot};
 mod submit;
 pub use submit::{
-    submit_event, submit_event_at_with_keys, submit_signed_event_at_with_keys, SubmitEventResponse,
+    submit_event, submit_event_at_with_keys, submit_event_in_scope,
+    submit_signed_event_at_with_keys, SubmitEventResponse,
 };
 
 /// Sign an event with explicit keys and POST it to `/events` with NIP-98 auth.

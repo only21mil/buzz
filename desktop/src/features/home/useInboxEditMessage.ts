@@ -1,9 +1,11 @@
+import type { PublicationScope } from "@/shared/api/publicationScope";
 import * as React from "react";
 
 import { useEditMessageMutation } from "@/features/messages/hooks";
 import type { Channel } from "@/shared/api/types";
 
 export type InboxEditMessageInput = {
+  publicationScope?: PublicationScope;
   content: string;
   eventId: string;
   mediaTags?: string[][];
