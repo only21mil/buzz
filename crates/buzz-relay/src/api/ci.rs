@@ -3742,8 +3742,13 @@ jobs:
         let ids: std::collections::HashSet<_> =
             jobs.iter().map(|job| job.job_id.as_str()).collect();
 
-        assert_eq!(jobs.len(), 17);
-        for expected in ["rust-lint", "desktop-smoke-e2e", "desktop-build-macos"] {
+        assert_eq!(jobs.len(), 18);
+        for expected in [
+            "rust-lint",
+            "desktop-smoke-e2e",
+            "desktop-build-macos",
+            "mobile-ios",
+        ] {
             assert!(ids.contains(expected), "missing current job ID {expected}");
         }
     }

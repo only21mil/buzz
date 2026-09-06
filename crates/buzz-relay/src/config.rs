@@ -1331,7 +1331,7 @@ mod tests {
             pub(super) fn load() -> Result<RenamedConfig, super::super::ConfigError> {
                 let comment_like_string = "https://relay.example//Config::load_env()";
                 assert!(comment_like_string.contains("//"));
-                RenamedConfig::load_env()
+                RenamedConfig::from_env()
             }
         }
     }
