@@ -14,7 +14,7 @@ fn parse_events(json: &str) -> Result<Vec<Event>, CliError> {
         .map_err(|error| CliError::Other(format!("failed to parse relay response: {error}")))
 }
 
-async fn fetch_own_repo_announcement(
+pub(crate) async fn fetch_own_repo_announcement(
     client: &BuzzClient,
     repo_id: &str,
 ) -> Result<Option<Event>, CliError> {
@@ -1676,5 +1676,39 @@ mod tests {
                 "unexpected replay acceptance: {raw}"
             );
         }
+    }
+}
+
+/// Build a default project repository with the fork's Buzz-authoritative clone URL policy.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_create_announcement(
+    repo_id: &str,
+    name: Option<&str>,
+    description: Option<&str>,
+    clone_urls: &[String],
+    web_url: Option<&str>,
+    relays: &[String],
+    channel: Option<&str>,
+    owner: &str,
+    relay_url: &str,
+) -> Result<EventBuilder, CliError> {
+    let channel =
+        channel.ok_or_else(|| CliError::Usage("a default repository requires a channel".into()))?;
+    match plan_repo_announcement(
+        None,
+        repo_id,
+        owner,
+        relay_url,
+        name,
+        description,
+        clone_urls,
+        web_url,
+        relays,
+        channel,
+    )? {
+        RepoAnnouncementPlan::Publish { builder, .. } => Ok(builder),
+        RepoAnnouncementPlan::Replay(_) => Err(CliError::Other(
+            "unexpected default repository replay".into(),
+        )),
     }
 }

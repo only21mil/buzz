@@ -1,3 +1,4 @@
+import { findProjectHomeByChannelId } from "@/features/projects/lib/projectHomeChannel";
 import { isTauri } from "@tauri-apps/api/core";
 import { ArrowLeft, ExternalLink, FolderGit2 } from "lucide-react";
 import * as React from "react";
@@ -857,6 +858,14 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       <div className="flex min-h-0 min-w-0 flex-1 flex-row overflow-hidden">
         <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
           <ProjectDetailChrome
+            homeChannelId={
+              findProjectHomeByChannelId(
+                project.projectChannelId,
+                projectsQuery.data ?? [],
+              )?.id === project.id
+                ? project.projectChannelId
+                : null
+            }
             activeTabCrumb={activeTabCrumb}
             activeWorkItemCrumb={activeWorkItemCrumb}
             chromeRef={projectDetailHeaderChromeRef}

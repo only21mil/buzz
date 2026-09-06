@@ -13,6 +13,7 @@ export type ProjectDetailWorkItemCrumb = {
 };
 
 export function ProjectDetailChrome({
+  homeChannelId,
   activeTabCrumb,
   activeWorkItemCrumb,
   chromeRef,
@@ -21,6 +22,7 @@ export function ProjectDetailChrome({
   onGoProjects,
   project,
 }: {
+  homeChannelId: string | null;
   activeTabCrumb: string | null;
   activeWorkItemCrumb: ProjectDetailWorkItemCrumb | null;
   chromeRef: React.Ref<HTMLDivElement>;
@@ -106,15 +108,15 @@ export function ProjectDetailChrome({
             </span>
           )}
         </nav>
-        {project.projectChannelId ? (
+        {homeChannelId ? (
           <Button
             className="h-8 shrink-0 gap-1.5"
-            onClick={() => onGoChannel(project.projectChannelId as string)}
+            onClick={() => onGoChannel(homeChannelId)}
             size="sm"
             variant="outline"
           >
             <MessageSquare className="h-4 w-4" />
-            Open Discussion
+            Open project home
           </Button>
         ) : null}
       </div>

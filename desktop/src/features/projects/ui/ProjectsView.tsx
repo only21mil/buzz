@@ -1,3 +1,5 @@
+import { isTauri } from "@tauri-apps/api/core";
+import { canDeleteProject } from "../projectDeletion";
 import * as React from "react";
 import { toast } from "sonner";
 
@@ -56,7 +58,6 @@ import {
   getProjectUpdatedAt,
   isProjectAccessibleToViewer,
   isProjectMine,
-  isProjectOwnedByCurrentUser,
   isRepositoryAccessibleToViewer,
   projectHasAgent,
   projectOwnerIsUser,
@@ -611,7 +612,11 @@ export function ProjectsView() {
           const repoSnapshot = repoSnapshotsQuery.data?.snapshots?.[project.id];
           return (
             <ProjectGridCard
-              canDelete={isProjectOwnedByCurrentUser(project, currentPubkey)}
+              canDelete={
+                isTauri() &&
+                !project.legacy &&
+                canDeleteProject(project, currentPubkey, profiles)
+              }
               deleteDisabled={deleteProjectMutation.isPending}
               hasLocal={hasLocalCheckout(project, localRepoNames)}
               key={project.id}
@@ -640,7 +645,11 @@ export function ProjectsView() {
           const repoSnapshot = repoSnapshotsQuery.data?.snapshots?.[project.id];
           return (
             <ProjectListRow
-              canDelete={isProjectOwnedByCurrentUser(project, currentPubkey)}
+              canDelete={
+                isTauri() &&
+                !project.legacy &&
+                canDeleteProject(project, currentPubkey, profiles)
+              }
               deleteDisabled={deleteProjectMutation.isPending}
               hasLocal={hasLocalCheckout(project, localRepoNames)}
               key={project.id}

@@ -70,6 +70,8 @@ pub struct EventQuery {
     /// Restrict results to events with an `e` tag referencing any of these event IDs (hex).
     /// Uses JSONB containment (`tags @> ...`) against the `tags` column.
     pub e_tags: Option<Vec<String>>,
+    /// Restrict to a custom tag name/value pair before SQL LIMIT.
+    pub custom_tag: Option<(String, String)>,
     /// Restrict results to events in any of these channels, while retaining
     /// channel-less global events. Applied before SQL `LIMIT` so access-filtered
     /// historical pages have exact exhaustion semantics.
@@ -121,6 +123,7 @@ impl EventQuery {
             authors: None,
             ids: None,
             e_tags: None,
+            custom_tag: None,
             channel_ids: None,
             max_limit: None,
             shared_gated_reader: None,
@@ -519,6 +522,19 @@ pub(crate) async fn query_events_on(
             }
             qb.push(")");
         }
+    }
+
+    if let Some((ref name, ref value)) = q.custom_tag {
+        let containment = serde_json::json!([[name, value]]);
+        qb.push(format!(" AND {col_prefix}tags @> "))
+            .push_bind(containment);
+        // JSONB array containment ignores element positions. Require the tag
+        // name and value at their protocol positions before applying LIMIT.
+        qb.push(format!(" AND EXISTS (SELECT 1 FROM jsonb_array_elements({col_prefix}tags) AS custom_tag WHERE custom_tag->>0 = "))
+            .push_bind(name)
+            .push(" AND custom_tag->>1 = ")
+            .push_bind(value)
+            .push(")");
     }
 
     // Shared-gated visibility pushdown: exclude SHARED_GATED_KINDS events that
@@ -1942,6 +1958,68 @@ mod tests {
             events[1].event.id, older_accessible.id,
             "older accessible row must not be hidden behind newer inaccessible rows"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn custom_tag_scope_precedes_limit_and_preserves_tenant_access() {
+        let pool = setup_pool().await;
+        let community_uuid = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_uuid);
+        let other = CommunityId::from_uuid(make_test_community(&pool).await);
+        let accessible = make_test_channel(&pool, community_uuid, None).await;
+        let inaccessible = make_test_channel(&pool, community_uuid, None).await;
+        let channel = "home' OR TRUE --";
+        let keys = Keys::generate();
+        let event = |tags: Vec<Vec<&str>>, time| {
+            EventBuilder::new(Kind::Custom(39_000), "project scope")
+                .tags(tags.into_iter().map(|tag| Tag::parse(tag).expect("tag")))
+                .custom_created_at(nostr::Timestamp::from(time))
+                .sign_with_keys(&keys)
+                .expect("sign")
+        };
+        for (tags, time) in [
+            (vec![vec!["buzz-channel", "unrelated"]], 1_800_000_005),
+            (vec![vec![channel, "buzz-channel"]], 1_800_000_004),
+            (
+                vec![vec!["buzz-channel", "unrelated", channel]],
+                1_800_000_003,
+            ),
+        ] {
+            insert_event(&pool, community, &event(tags, time), Some(accessible))
+                .await
+                .expect("insert nonmatch");
+        }
+        let matching = |time| event(vec![vec!["buzz-channel", channel]], time);
+        insert_event(&pool, other, &matching(1_800_000_008), None)
+            .await
+            .expect("insert other tenant");
+        insert_event(
+            &pool,
+            community,
+            &matching(1_800_000_007),
+            Some(inaccessible),
+        )
+        .await
+        .expect("insert inaccessible match");
+        let expected = matching(1_800_000_001);
+        insert_event(&pool, community, &expected, Some(accessible))
+            .await
+            .expect("insert accessible match");
+        let rows = query_events(
+            &pool,
+            &EventQuery {
+                kinds: Some(vec![39_000]),
+                custom_tag: Some(("buzz-channel".into(), channel.into())),
+                channel_ids: Some(vec![accessible]),
+                limit: Some(1),
+                ..EventQuery::for_community(community)
+            },
+        )
+        .await
+        .expect("scoped query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event.id, expected.id);
     }
 
     fn make_text_event(content: &str) -> nostr::Event {
