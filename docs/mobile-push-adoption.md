@@ -21,6 +21,24 @@ transport, App Attest verification, challenge quotas and bounded metric labels
 are part of the same packet. Gateway startup and chart rendering reject an App
 Attest app identifier that does not end in the exact configured APNs topic.
 
+## Client lifecycle recovery
+
+Enrollment completion refreshes the NSE snapshot from the current community list
+under the same mutation queue as removal and lease generation reservation.
+Consent and credential lifecycle tokens reject delayed publications and accepted
+responses after removal, opt-out, or replacement, including disable/re-enable and
+remove/re-add cycles. A fresh consent lifecycle also resets bootstrap retry gating.
+
+A gateway delegation remains unique per installation and relay signer. Native
+renewal atomically replaces every cached origin in that cohort, preserving its
+separate relay lease address and metadata authority. Bootstrap republishes every
+enabled, still-authorized captured community in the cohort and retries the whole
+cohort after partial relay failure. Durable pending generations prevent a failed
+renewal save from making an older cached capability reusable on another origin.
+Pending installation requests are recoverable across origins, and completed
+records retain the App Attest key ID bound to their gateway installation handle.
+These identifiers remain native; Flutter's grant projection is unchanged.
+
 ## Existing fork identity
 
 The actual fork iOS default is `com.buzz.buzzMobile`, retained for Release and

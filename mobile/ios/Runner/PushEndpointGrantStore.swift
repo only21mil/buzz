@@ -45,6 +45,10 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
     try replace(all, account: Self.recordsAccount)
   }
 
+  func replaceRecords(_ records: [BuzzPushEndpointGrantRecord]) throws {
+    try replace(records, account: Self.recordsAccount)
+  }
+
   func pendingEnrollment(
     relayOrigin: String,
     appProfile: String
@@ -71,7 +75,7 @@ final class BuzzPushEndpointGrantKeychainStore: BuzzPushEndpointGrantStore {
     try replace(all, account: Self.pendingAccount)
   }
 
-  private func pendingEnrollments() throws -> [BuzzPushPendingEnrollmentRecord] {
+  func pendingEnrollments() throws -> [BuzzPushPendingEnrollmentRecord] {
     var query = baseQuery(account: Self.pendingAccount)
     query[kSecReturnData as String] = true
     query[kSecMatchLimit as String] = kSecMatchLimitOne

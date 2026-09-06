@@ -45,6 +45,41 @@ void main() {
     expect(gate.tryBegin('attempt'), isTrue);
   });
 
+  test(
+    'obsolete ABA completion cannot clear or reschedule a new attempt',
+    () async {
+      final gate = BuzzPushAttemptGate(retryDelay: Duration.zero);
+      addTearDown(gate.dispose);
+      expect(gate.tryBegin('a'), isTrue);
+      final oldOwner = gate.owner;
+      expect(gate.tryBegin('b'), isTrue);
+      expect(gate.tryBegin('a'), isTrue);
+      var retries = 0;
+      gate.failed('a', owner: oldOwner, retry: () => retries++);
+      gate.retryAfter(
+        'a',
+        owner: oldOwner,
+        delay: Duration.zero,
+        retry: () => retries++,
+      );
+      await Future<void>.delayed(Duration.zero);
+      expect(retries, 0);
+      expect(gate.tryBegin('a'), isFalse);
+    },
+  );
+
+  test(
+    'new consent lifecycle starts publication with the same input fingerprint',
+    () {
+      final gate = BuzzPushAttemptGate();
+      addTearDown(gate.dispose);
+      final firstConsent = Object();
+      expect(gate.tryBegin(('a|token', firstConsent)), isTrue);
+      expect(gate.tryBegin(('a|token', firstConsent)), isFalse);
+      expect(gate.tryBegin(('a|token', Object())), isTrue);
+    },
+  );
+
   test('completed bootstrap attempt can run again for later work', () {
     final gate = BuzzPushAttemptGate();
     addTearDown(gate.dispose);

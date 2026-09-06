@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:buzz/shared/community/community.dart';
 import 'package:buzz/shared/deeplink/deep_link.dart';
 import 'package:buzz/shared/push/push_bridge.dart';
 import 'package:buzz/shared/relay/relay_provider.dart';
@@ -196,16 +195,6 @@ void main() {
       final secondGrant = await enrollBuzzPush(
         'wss://relay.example/',
         'https://gateway-two.example/',
-        communitiesForSnapshotRefresh: [
-          Community(
-            id: 'community-id',
-            name: 'Community',
-            relayUrl: 'wss://relay.example/',
-            pubkey: 'd' * 64,
-            pushNotificationsEnabled: true,
-            addedAt: DateTime.fromMillisecondsSinceEpoch(0),
-          ),
-        ],
       );
 
       expect(firstGrant.endpointGrant, 'new-grant');
@@ -225,24 +214,8 @@ void main() {
         'endpointGrants',
         'enrollPush',
         'endpointGrants',
-        'syncPushSnapshot',
       ]);
-      expect(snapshotArguments, [
-        {
-          'section': 'communities',
-          'communities': [
-            {
-              'id': 'community-id',
-              'name': 'Community',
-              'relayUrl': 'wss://relay.example/',
-              'pubkey': 'd' * 64,
-              'policies': <Object?>[],
-            },
-          ],
-          'signingKeys': <String, String>{},
-        },
-      ]);
-      expect(pushEndpointGrants.value.single.endpointGrant, 'new-grant');
+      expect(snapshotArguments, isEmpty);
     },
   );
 

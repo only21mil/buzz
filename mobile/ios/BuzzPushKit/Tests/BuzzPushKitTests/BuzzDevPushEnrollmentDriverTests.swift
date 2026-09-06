@@ -146,6 +146,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
         relayPubkey: Self.relayPubkey,
         relayMetadataPubkey: Self.relayPubkey,
         gatewayInstallationHandle: Self.installationHandle,
+        appAttestKeyId: Self.keyId,
         installationId: Self.installationId,
         endpointGrant: "opaque-grant",
         endpointHash: Self.hex(SHA256.hash(data: Data((1...32).map(UInt8.init)))),
@@ -430,7 +431,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     let provider = BuzzDCAppAttestProvider(service: service, keyIdStore: keyIdStore)
     let clientData = Data("delegation transcript".utf8)
 
-    let assertion = try await provider.assertion(clientData: clientData)
+    let assertion = try await provider.assertion(keyId: nil, clientData: clientData)
 
     XCTAssertEqual(assertion, Data([0x04, 0x05, 0x06]).base64EncodedString())
     XCTAssertEqual(service.assertedKeyIds, [Self.keyId])
@@ -489,7 +490,7 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     )
 
     do {
-      _ = try await provider.assertion(clientData: Data("delegation transcript".utf8))
+      _ = try await provider.assertion(keyId: nil, clientData: Data("delegation transcript".utf8))
       XCTFail("Expected the DeviceCheck error")
     } catch {
       XCTAssertEqual((error as NSError).domain, expected.domain)
@@ -1023,6 +1024,167 @@ final class BuzzDevPushEnrollmentDriverTests: XCTestCase {
     }
   }
 
+  func testSharedRenewalReconcilesEveryOriginAndDoesNotRenewAgain() async throws {
+    try await exerciseSharedRenewal(failSave: false)
+  }
+
+  func testSharedRenewalSaveFailureRetriesFromOtherOriginAtHigherGeneration() async throws {
+    try await exerciseSharedRenewal(failSave: true)
+  }
+
+  private func exerciseSharedRenewal(failSave: Bool) async throws {
+    let token = Data((1...32).map(UInt8.init))
+    let origins = ["wss://relay.example", "wss://second.example"]
+    let records = origins.enumerated().map { index, origin in
+      BuzzPushEndpointGrantRecord(
+        relayOrigin: origin, relayPubkey: Self.relayPubkey,
+        relayMetadataPubkey: Self.relayPubkey,
+        gatewayInstallationHandle: Self.installationHandle,
+        installationId: String(repeating: index == 0 ? "1" : "2", count: 32),
+        endpointGrant: "old-grant", endpointHash: Self.hex(SHA256.hash(data: token)),
+        appProfile: "buzz-ios-dogfood", endpointEpoch: 1, generation: 7,
+        expiresAt: Self.now + 300
+      )
+    }
+    let store = MemoryGrantStore(records: records, grantSaveFailuresRemaining: failSave ? 1 : 0)
+    let driver = try makeDriver(store: store, appAttest: RecordingAppAttest())
+    var generations: [Int] = []
+    URLProtocolStub.handler = { request in
+      if request.httpMethod == "GET" {
+        return Self.response(
+          request, status: 200,
+          json: [
+            "self": Self.relayPubkey,
+            "push": ["keys": [["pubkey": Self.relayPubkey, "current": true]]],
+          ])
+      }
+      if request.url?.path == "/v1/installations/challenges" {
+        return Self.response(
+          request, status: 200,
+          json: [
+            "challenge_id": Self.firstChallengeId, "challenge": Self.challenge,
+            "expires_at": Self.now + 300,
+          ])
+      }
+      XCTAssertEqual(request.url?.path, "/v1/delegations")
+      let generation = try XCTUnwrap(Self.body(request)["generation"] as? Int)
+      generations.append(generation)
+      return Self.response(request, status: 201, json: ["endpoint_grant": "grant-\(generation)"])
+    }
+    if failSave {
+      do {
+        _ = try await driver.enroll(deviceToken: token, relayURL: Self.relayURL)
+        XCTFail("Expected atomic save failure")
+      } catch { XCTAssertEqual((error as NSError).domain, "MemoryGrantStore") }
+      XCTAssertEqual(store.saved, records)
+      XCTAssertEqual(store.pending.first?.delegationGeneration, 8)
+    }
+    let renewed = try await driver.enroll(
+      deviceToken: token, relayURL: URL(string: failSave ? origins[1] : origins[0])!
+    )
+    XCTAssertEqual(renewed.generation, failSave ? 9 : 8)
+    XCTAssertEqual(Set(store.saved.map(\.endpointGrant)), [renewed.endpointGrant])
+    XCTAssertEqual(Set(store.saved.map(\.generation)), [renewed.generation])
+    XCTAssertEqual(Set(store.saved.map(\.installationId)), Set(records.map(\.installationId)))
+    for origin in origins {
+      let reused = try await driver.enroll(deviceToken: token, relayURL: URL(string: origin)!)
+      XCTAssertEqual(reused.endpointGrant, renewed.endpointGrant)
+      XCTAssertEqual(reused.generation, renewed.generation)
+    }
+    XCTAssertEqual(generations, failSave ? [8, 9] : [8])
+  }
+
+  func testCrossOriginRecoversPendingInstallationAfterLostResponse() async throws {
+    try await exerciseCrossOriginRecovery(failure: "installation")
+  }
+
+  func testCrossOriginRecoversPendingInstallationAfterLostDelegation() async throws {
+    try await exerciseCrossOriginRecovery(failure: "delegation")
+  }
+
+  func testCrossOriginRecoversPendingInstallationAfterGrantSaveFailure() async throws {
+    try await exerciseCrossOriginRecovery(failure: "save")
+  }
+
+  private func exerciseCrossOriginRecovery(failure: String) async throws {
+    let token = Data((1...32).map(UInt8.init))
+    let store = MemoryGrantStore(grantSaveFailuresRemaining: failure == "save" ? 1 : 0)
+    let service = RecordingDCAppAttestService()
+    let keys = MemoryAppAttestKeyIdStore()
+    let driver = try makeDriver(
+      store: store,
+      appAttest: BuzzDCAppAttestProvider(
+        service: service, keyIdStore: keys
+      ))
+    var installedKey: String?
+    var installationRequests = 0
+    var delegationRequests = 0
+    URLProtocolStub.handler = { request in
+      if request.httpMethod == "GET" {
+        let signer =
+          request.url?.host == "third.example"
+          ? String(repeating: "b", count: 64) : Self.relayPubkey
+        return Self.response(
+          request, status: 200,
+          json: [
+            "push": ["keys": [["pubkey": signer, "current": true]]]
+          ])
+      }
+      if request.url?.path == "/v1/installations/challenges" {
+        return Self.response(
+          request, status: 200,
+          json: [
+            "challenge_id": Self.firstChallengeId, "challenge": Self.challenge,
+            "expires_at": Self.now + 300,
+          ])
+      }
+      if request.url?.path == "/v1/installations" {
+        installationRequests += 1
+        let key = try XCTUnwrap(Self.body(request)["key_id"] as? String)
+        if let installedKey, installedKey != key {
+          return Self.response(request, status: 409, json: ["error": "endpoint_owned"])
+        }
+        installedKey = key
+        if failure == "installation" && installationRequests == 1 {
+          throw URLError(.networkConnectionLost)
+        }
+        return Self.response(
+          request, status: 201,
+          json: [
+            "installation_handle": Self.installationHandle, "endpoint_epoch": 1,
+            "expires_at": Self.expiresAt,
+          ])
+      }
+      XCTAssertEqual(request.url?.path, "/v1/delegations")
+      delegationRequests += 1
+      XCTAssertEqual(service.assertedKeyIds.last, installedKey)
+      guard service.assertedKeyIds.last == installedKey else {
+        return Self.response(request, status: 401, json: ["error": "wrong_key"])
+      }
+      if failure == "delegation" && delegationRequests == 1 {
+        throw URLError(.networkConnectionLost)
+      }
+      return Self.response(
+        request, status: 201, json: ["endpoint_grant": "grant-\(delegationRequests)"])
+    }
+    do {
+      _ = try await driver.enroll(deviceToken: token, relayURL: Self.relayURL)
+      XCTFail("Expected interrupted first origin enrollment")
+    } catch { /* The durable pending installation must recover on another origin. */  }
+    service.generatedKeyId = Data(repeating: 0xBB, count: 32).base64EncodedString()
+    let second = try await driver.enroll(
+      deviceToken: token, relayURL: URL(string: "wss://second.example")!)
+    let first = try await driver.enroll(deviceToken: token, relayURL: Self.relayURL)
+    XCTAssertEqual(first.endpointGrant, second.endpointGrant)
+    XCTAssertEqual(service.generateKeyCallCount, 1)
+    XCTAssertEqual(installationRequests, failure == "installation" ? 2 : 1)
+    // Even a later global key change must not change the key bound to a handle.
+    try keys.saveKeyId(service.generatedKeyId)
+    _ = try await driver.enroll(deviceToken: token, relayURL: URL(string: "wss://third.example")!)
+    XCTAssertEqual(service.assertedKeyIds.last, installedKey)
+    XCTAssertEqual(service.generateKeyCallCount, 1)
+  }
+
   private func makeDriver(
     store: BuzzPushEndpointGrantStore,
     appAttest: BuzzDevAppAttesting,
@@ -1156,6 +1318,14 @@ private final class MemoryGrantStore: BuzzPushEndpointGrantStore {
     self.grantSaveFailuresRemaining = grantSaveFailuresRemaining
   }
   func records() throws -> [BuzzPushEndpointGrantRecord] { saved }
+  func pendingEnrollments() throws -> [BuzzPushPendingEnrollmentRecord] { pending }
+  func replaceRecords(_ records: [BuzzPushEndpointGrantRecord]) throws {
+    if grantSaveFailuresRemaining > 0 {
+      grantSaveFailuresRemaining -= 1
+      throw NSError(domain: "MemoryGrantStore", code: 1)
+    }
+    saved = records
+  }
   func save(_ record: BuzzPushEndpointGrantRecord) throws {
     if grantSaveFailuresRemaining > 0 {
       grantSaveFailuresRemaining -= 1
@@ -1205,7 +1375,7 @@ private final class RecordingAppAttest: BuzzDevAppAttesting {
     return prepared
   }
 
-  func assertion(clientData: Data) async throws -> String {
+  func assertion(keyId: String?, clientData: Data) async throws -> String {
     self.clientData.append(clientData)
     return BuzzDevPushEnrollmentDriverTests.assertion
   }
@@ -1229,7 +1399,7 @@ private final class MemoryAppAttestKeyIdStore: BuzzAppAttestKeyIdStoring {
 
 private final class RecordingDCAppAttestService: BuzzDCAppAttestServicing {
   let isSupported: Bool
-  let generatedKeyId: String
+  var generatedKeyId: String
   let attestationObject: Data
   let assertionObject: Data
   let error: Error?
