@@ -181,6 +181,15 @@ pub(super) fn prepare_persona_publication_at(
     let mut scoped_persona = persona.clone();
     scoped_persona.shared =
         shared_override.unwrap_or_else(|| retained_persona_is_shared(existing.as_ref()));
+    // Validate the authoritative outgoing share state, including ordinary
+    // edits to an already-shared head, before signing or retaining it. An
+    // explicit unshare must remain possible for an invalid legacy definition.
+    if scoped_persona.shared {
+        crate::managed_agents::validate_agent_definition_text(
+            &scoped_persona.display_name,
+            &scoped_persona.system_prompt,
+        )?;
+    }
     let event = build_persona_event(&scoped_persona)?
         .custom_created_at(monotonic_created_at(
             existing.as_ref().map(|row| row.created_at),
@@ -462,6 +471,59 @@ mod tests {
             .expect_err("sharing must reject an invisible instruction character");
 
         assert!(error.contains("U+200B"));
+        let conn = open_retention_db(&db_path).unwrap();
+        assert!(get_retained_event(
+            &conn,
+            KIND_PERSONA,
+            &keys.public_key().to_hex(),
+            "catalog-reviewer",
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn shared_definition_edit_rejects_invisible_text_without_replacing_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = nostr::Keys::generate();
+        let db_path = dir.path().join("retention.sqlite3");
+        let (_, original, _) =
+            prepare_persona_publication_at(&db_path, &keys, &persona(), Some(true)).unwrap();
+        let mut unsafe_persona = persona();
+        // The local flag is false; the retained scope is the authority.
+        unsafe_persona.display_name = "Catalog\u{200B} Reviewer".to_string();
+
+        let error = prepare_persona_publication_at(&db_path, &keys, &unsafe_persona, None)
+            .expect_err("an ordinary edit must validate the retained shared state");
+        assert!(error.contains("U+200B"));
+        let conn = open_retention_db(&db_path).unwrap();
+        let retained = get_retained_event(
+            &conn,
+            KIND_PERSONA,
+            &keys.public_key().to_hex(),
+            "catalog-reviewer",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(retained.raw_event, original.raw_event);
+    }
+
+    #[test]
+    fn unshare_allows_revoking_an_invisible_legacy_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = nostr::Keys::generate();
+        let db_path = dir.path().join("retention.sqlite3");
+        prepare_persona_publication_at(&db_path, &keys, &persona(), Some(true)).unwrap();
+        let mut unsafe_persona = persona();
+        unsafe_persona.shared = true;
+        unsafe_persona.system_prompt = "Review\u{200B} the catalog.".to_string();
+
+        let (event, retained, unshared) =
+            prepare_persona_publication_at(&db_path, &keys, &unsafe_persona, Some(false))
+                .expect("validation must not prevent revoking catalog visibility");
+        assert!(!buzz_core_pkg::kind::event_is_shared(&event));
+        assert!(!unshared.shared);
+        assert!(retained.pending_sync);
     }
 
     /// Seed a retained 30175 persona head dated `created_at` seconds since
