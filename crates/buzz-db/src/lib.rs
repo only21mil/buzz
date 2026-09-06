@@ -9,6 +9,9 @@
 //! - No FK references to partitioned tables.
 //! - Uses `sqlx::query()` (runtime) not `sqlx::query!()` (compile-time).
 
+#[cfg(test)]
+mod test_connection;
+
 /// Explicit deployment-global admin report reads.
 pub mod admin_moderation;
 /// API token storage and lookup.
@@ -7577,10 +7580,7 @@ mod tests {
             .expect("create scratch db");
         let base = admin_url().await;
         // Swap the database path segment of the admin URL for the scratch name.
-        let scratch_url = {
-            let idx = base.rfind('/').expect("db url has a path segment");
-            format!("{}/{}", &base[..idx], name)
-        };
+        let scratch_url = crate::test_connection::database_url(&base, &name);
         let pool = PgPool::connect(&scratch_url)
             .await
             .expect("connect scratch db");
@@ -8648,10 +8648,7 @@ mod tests {
         let (seed, wname) = create_scratch_db(&admin, "one_budget").await;
         seed.close().await;
         let base = admin_url().await;
-        let scratch_url = {
-            let idx = base.rfind('/').expect("db url has a path segment");
-            format!("{}/{}", &base[..idx], wname)
-        };
+        let scratch_url = crate::test_connection::database_url(&base, &wname);
 
         // `Db::new` so the writer arms the floor guard and the reader is the
         // real lazy `connect_read_pool` pool (min_connections=0, 150ms
@@ -8973,11 +8970,7 @@ mod tests {
         let (seed, wname) = create_scratch_db(&admin, "lazy_w").await;
         seed.close().await;
 
-        let writer_url = {
-            let base = admin_url().await;
-            let idx = base.rfind('/').expect("db url has a path segment");
-            format!("{}/{}", &base[..idx], wname)
-        };
+        let writer_url = crate::test_connection::database_url(&admin_url().await, &wname);
         // `Db::new` (not `from_pools`) so the WRITER pool arms the
         // `buzz.created_at_floor` GUC — `spawn_fence_probe` verifies the
         // floor guard on a writer connection, and `create_scratch_db`'s
@@ -9402,8 +9395,7 @@ mod tests {
 
         // Connect a Db the production way: after_connect arms the guard.
         let base = admin_url().await;
-        let idx = base.rfind('/').expect("db url has a path segment");
-        let scratch_url = format!("{}/{}", &base[..idx], name);
+        let scratch_url = crate::test_connection::database_url(&base, &name);
         let db = Db::new(&DbConfig {
             database_url: scratch_url,
             max_connections: 2,
@@ -9493,9 +9485,8 @@ mod tests {
         replica_pool.close().await;
 
         let base = admin_url().await;
-        let idx = base.rfind('/').expect("db url has a path segment");
-        let writer_url = format!("{}/{}", &base[..idx], wname);
-        let replica_url = format!("{}/{}", &base[..idx], rname);
+        let writer_url = crate::test_connection::database_url(&base, &wname);
+        let replica_url = crate::test_connection::database_url(&base, &rname);
 
         // Healthy schema: verification passes, probe starts. A SEPARATE Db
         // instance, because its background probe legitimately opens its own

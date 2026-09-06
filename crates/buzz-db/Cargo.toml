@@ -26,3 +26,4 @@ metrics     = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 metrics-util = { workspace = true }
+url = { workspace = true }

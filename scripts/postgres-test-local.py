@@ -33,12 +33,14 @@ def database_name(binary, test):
 
 
 def schema_mode(test, binary=None):
-    # These fork integration fixtures call run_migrations themselves.
+    # These integration and library fixtures call run_migrations themselves.
     if binary is not None and any(Path(binary).name.startswith(name + '-') for name in (
             'ci_grants_contract', 'workflow_approval_contract',
             'workflow_enabled_persistence', 'workflow_state_contract')):
         return 'migration'
-    return 'migration' if ('migration_schema_' in test or
+    return 'migration' if (test.startswith('push::tests::') or
+        test == 'workflow_approval::tests::prior_trace_is_persisted_once_and_replay_does_not_append' or
+        'migration_schema_' in test or
         '::migration::' in '::' + test or
         test == 'populated_migration_preserves_legacy_approval_and_backfills_resume_state') else 'desired'
 

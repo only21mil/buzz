@@ -44,6 +44,35 @@ class IsolationTests(unittest.TestCase):
                      'workflow_enabled_persistence', 'workflow_state_contract'):
             self.assertEqual(runner.schema_mode('ordinary_test', name + '-1234'), 'migration')
 
+    def test_self_migrating_library_fixtures_start_empty(self):
+        names = [
+            'workflow_approval::tests::prior_trace_is_persisted_once_and_replay_does_not_append',
+            'push::tests::acceptance_constraint_failure_rolls_back_source_event',
+            'push::tests::source_event_collision_is_protocol_outcome_without_event_insert',
+            'push::tests::replacement_and_revoke_are_community_scoped_and_dual_ordered',
+            'push::tests::concurrent_enqueue_is_atomic_and_community_scoped',
+            'push::tests::setwise_enqueue_maps_outcomes_per_request',
+            'push::tests::send_revalidation_suppresses_rotated_claim_and_retry_preserves_id',
+            'push::tests::endpoint_invalidation_is_scoped_to_community_and_generation',
+            'push::tests::matcher_trigger_is_allowlisted_and_deleted_events_are_discarded',
+            'push::tests::matcher_load_error_preserves_claimed_job_for_recovery',
+            'push::tests::matcher_claim_is_exclusive_across_workers',
+            'push::tests::delivered_wake_is_retained_while_rematch_is_queued',
+            'push::tests::exhausted_match_job_is_reaped_and_cannot_pin_retention',
+            'push::tests::batch_claim_is_single_community_and_setwise_ops_honor_the_fence',
+            'push::tests::gate_orders_lease_activation_after_in_flight_event_and_backfills_it',
+        ]
+        for name in names:
+            with self.subTest(name=name):
+                self.assertEqual(runner.schema_mode(name, 'buzz_db-1234'), 'migration')
+
+    def test_desired_schema_library_fixtures_remain_desired(self):
+        for name in ('tests::test_usage_metrics_lock_has_single_owner_and_releases_on_drop',
+                     'replica_fence::tests::sample_writer_fails_closed_when_activity_is_masked',
+                     'usage::tests::test_community_count_increases'):
+            with self.subTest(name=name):
+                self.assertEqual(runner.schema_mode(name, 'buzz_db-1234'), 'desired')
+
     def test_admission_map_requires_hash_for_new_migration(self):
         import json
         import shutil
