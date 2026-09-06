@@ -4567,8 +4567,8 @@ mod tests {
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
 
     async fn setup_db() -> Db {
-        let database_url =
-            std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into());
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("explicit isolated test database URL required");
         let pool = PgPool::connect(&database_url)
             .await
             .expect("connect to test DB");
@@ -5757,7 +5757,8 @@ mod tests {
         // Postgres advisory locks are per-database; hardcoding the production
         // USAGE_METRICS_LOCK_KEY (0x4255_5A5A_4D45_5452) on the shared test DB
         // races any live buzz-relay on the same database (see #3619).
-        let admin_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into());
+        let admin_url = std::env::var("TEST_DATABASE_URL")
+            .expect("explicit isolated test database URL required");
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .connect(&admin_url)
@@ -6338,7 +6339,7 @@ mod tests {
     // the query instead of trusting the routing code's word for it.
 
     async fn admin_url() -> String {
-        std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into())
+        std::env::var("TEST_DATABASE_URL").expect("explicit isolated test database URL required")
     }
 
     /// Create a fresh scratch database on the same server and run migrations.

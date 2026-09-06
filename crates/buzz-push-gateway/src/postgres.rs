@@ -409,14 +409,12 @@ mod tests {
     use super::*;
     use sqlx::{postgres::PgPoolOptions, AssertSqlSafe};
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
-
     #[tokio::test]
     #[ignore = "requires PostgreSQL with CREATEDB/CREATEROLE"]
     async fn readiness_requires_migrated_schema_dml_and_no_ddl() {
         let admin_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+            .expect("explicit isolated test database URL required");
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .connect(&admin_url)
@@ -504,7 +502,7 @@ mod tests {
     async fn reaper_deletes_active_child_of_retention_eligible_revoked_installation() {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+            .expect("explicit isolated test database URL required");
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect(&database_url)
@@ -595,7 +593,7 @@ mod tests {
     async fn full_schema(max_connections: u32) -> (PgPool, String) {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+            .expect("explicit isolated test database URL required");
         let schema = format!("push_admit_{}", Uuid::new_v4().simple());
         let bootstrap = PgPoolOptions::new()
             .max_connections(1)
@@ -938,7 +936,7 @@ mod tests {
     async fn drop_schema(schema: &str) {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+            .expect("explicit isolated test database URL required");
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect(&database_url)

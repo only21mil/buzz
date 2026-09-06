@@ -785,10 +785,8 @@ pub async fn run_probe(writer: PgPool, fence: Arc<ReplicaFence>) {
 mod tests {
     use super::*;
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
-
     fn test_db_url() -> String {
-        std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into())
+        std::env::var("TEST_DATABASE_URL").expect("explicit isolated test database URL required")
     }
 
     /// A private scratch database with migrations applied: the probe tests

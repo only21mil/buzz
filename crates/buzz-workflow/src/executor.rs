@@ -2640,7 +2640,7 @@ mod tests {
     async fn claimed_message_and_reaction_recover_after_workflow_deletion() {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_owned());
+            .expect("explicit isolated test database URL required");
         let db = buzz_db::Db::new(&buzz_db::DbConfig {
             database_url,
             ..Default::default()

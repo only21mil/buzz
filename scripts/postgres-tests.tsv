@@ -259,12 +259,12 @@ buzz-push-gateway	buzz_push_gateway	postgres::tests::duplicated_retryable_releas
 buzz-push-gateway	buzz_push_gateway	postgres::tests::readiness_requires_migrated_schema_dml_and_no_ddl	crates/buzz-push-gateway/src/postgres.rs	migration	fixture installs its own gateway/FTS schema
 buzz-push-gateway	buzz_push_gateway	postgres::tests::reaper_deletes_active_child_of_retention_eligible_revoked_installation	crates/buzz-push-gateway/src/postgres.rs	migration	fixture installs its own gateway/FTS schema
 buzz-push-gateway	buzz_push_gateway	postgres::tests::retryable_release_frees_request_id_on_real_postgres	crates/buzz-push-gateway/src/postgres.rs	migration	fixture installs its own gateway/FTS schema
-buzz-relay	buzz_relay	api::bridge::tests::nip98_replay_guard_rejects_cross_pod_replay_on_bridge_path	crates/buzz-relay/src/api/bridge.rs	desired	desired schema fixture
-buzz-relay	buzz_relay	api::bridge::tests::nip98_replay_guard_rejects_same_pod_same_community_replay	crates/buzz-relay/src/api/bridge.rs	desired	desired schema fixture
-buzz-relay	buzz_relay	api::bridge::tests::submit_event_invalid_json_body_increments_http_transport_counter	crates/buzz-relay/src/api/bridge.rs	desired	desired schema fixture
-buzz-relay	buzz_relay	api::bridge::tests::submit_event_invalid_json_emits_exactly_one_attribution_line	crates/buzz-relay/src/api/bridge.rs	desired	desired schema fixture
-buzz-relay	buzz_relay	api::bridge::tests::submit_event_relay_only_kind_emits_exactly_one_attribution_line	crates/buzz-relay/src/api/bridge.rs	desired	desired schema fixture
-buzz-relay	buzz_relay	api::bridge::tests::submit_event_relay_only_kind_increments_http_transport_counter	crates/buzz-relay/src/api/bridge.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::bridge::tests::nip98_replay_guard_rejects_cross_pod_replay_on_bridge_path	crates/buzz-relay/src/api/bridge.rs	external	Redis fixture (handler cases also require PostgreSQL)
+buzz-relay	buzz_relay	api::bridge::tests::nip98_replay_guard_rejects_same_pod_same_community_replay	crates/buzz-relay/src/api/bridge.rs	external	Redis fixture (handler cases also require PostgreSQL)
+buzz-relay	buzz_relay	api::bridge::tests::submit_event_invalid_json_body_increments_http_transport_counter	crates/buzz-relay/src/api/bridge.rs	external	Redis fixture (handler cases also require PostgreSQL)
+buzz-relay	buzz_relay	api::bridge::tests::submit_event_invalid_json_emits_exactly_one_attribution_line	crates/buzz-relay/src/api/bridge.rs	external	Redis fixture (handler cases also require PostgreSQL)
+buzz-relay	buzz_relay	api::bridge::tests::submit_event_relay_only_kind_emits_exactly_one_attribution_line	crates/buzz-relay/src/api/bridge.rs	external	Redis fixture (handler cases also require PostgreSQL)
+buzz-relay	buzz_relay	api::bridge::tests::submit_event_relay_only_kind_increments_http_transport_counter	crates/buzz-relay/src/api/bridge.rs	external	Redis fixture (handler cases also require PostgreSQL)
 buzz-relay	buzz_relay	api::bridge::workflow_history_tests::workflow_history_privacy_requires_owner_and_active_membership_in_same_community	crates/buzz-relay/src/api/workflow_history_tests.rs	desired	desired schema fixture
 buzz-relay	buzz_relay	api::ci::tests::route_ci_run_events_pages_by_durable_cursor	crates/buzz-relay/src/api/ci.rs	external	PostgreSQL plus CI evidence storage; existing acceptance scope
 buzz-relay	buzz_relay	api::ci::tests::route_ci_run_events_query_is_exact_and_bounded	crates/buzz-relay/src/api/ci.rs	external	PostgreSQL plus CI evidence storage; existing acceptance scope

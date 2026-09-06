@@ -7,6 +7,7 @@ postgres-test-{run,setup,wrapper}.sh. No existing database is accepted.
 import argparse
 import hashlib
 import os
+import re
 from pathlib import Path
 import shutil
 import signal
@@ -42,7 +43,13 @@ def schema_mode(test, binary=None):
 
 
 def command(argv, env, **kwargs):
-    return subprocess.run([str(arg) for arg in argv], env=env, check=True, **kwargs)
+    try:
+        return subprocess.run([str(arg) for arg in argv], env=env, check=True, **kwargs)
+    except subprocess.CalledProcessError as error:
+        if kwargs.get('capture_output'):
+            print(error.stdout or '', end='', flush=True)
+            print(error.stderr or '', end='', file=sys.stderr, flush=True)
+        raise
 
 
 def discover(binary, env, pattern):
@@ -52,7 +59,13 @@ def discover(binary, env, pattern):
             if line.endswith(': test') and pattern in line[:-6]]
 
 
-def main():
+
+def require_one_test(output, test):
+    summaries = [line for line in output.splitlines() if line.startswith('test result:')]
+    if len(summaries) != 1 or not re.match(r'test result: ok\. 1 passed; 0 failed; 0 ignored;', summaries[0]):
+        raise RuntimeError(f'expected one passing test: {test}')
+
+def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--task-root', type=Path, required=True,
                         help='existing task directory for cluster, socket and logs')
@@ -63,9 +76,28 @@ def main():
     parser.add_argument('--repo-root', type=Path, default=ROOT, help='desired-schema source worktree')
     parser.add_argument('--list', action='store_true', help='inventory without starting PostgreSQL')
     parser.add_argument('binary', type=Path, nargs='+', help='compiled Rust libtest binaries')
-    args = parser.parse_args()
+    return parser, parser.parse_args()
+
+
+def main():
+    from postgres_test_fence import run
+    parser, args = parse_args()
+    clean_environment(os.environ)
+    binaries = [path.resolve(strict=True) for path in args.binary]
+    pg_bin = args.pg_bin_dir
+    if pg_bin is None and not args.list:
+        executable = shutil.which("initdb")
+        if not executable:
+            parser.error("missing initdb; supply --pg-bin-dir")
+        pg_bin = Path(executable).resolve().parent
+    run(args, binaries, pg_bin, ROOT)
+
+
+def inside_main():
+    parser, args = parse_args()
     def mode(test, binary):
-        return schema_mode(test, binary) if args.schema_mode == 'auto' else args.schema_mode
+        classified = classify(test, binary) if args.list else schema_mode(test, binary)  # no external override
+        return classified if args.schema_mode == 'auto' else args.schema_mode
     env = clean_environment(os.environ)
     binaries = [path.resolve(strict=True) for path in args.binary]
     tests = [(binary, test) for binary in binaries
@@ -124,8 +156,11 @@ def main():
                         url = 'postgresql://buzz_test@buzz-test.invalid/' + database + '?' + urlencode({'host': str(socket)})
                         test_env = dict(env, DATABASE_URL=url, TEST_DATABASE_URL=url,
                                         BUZZ_TEST_DATABASE_URL=url, BUZZ_TEST_SCHEMA_MODE=mode(test, binary))
-                        command([binary, '--ignored', '--exact', test, '--nocapture',
-                                 '--test-threads=1'], test_env)
+                        result = command([binary, '--ignored', '--exact', test, '--nocapture',
+                                          '--test-threads=1'], test_env, capture_output=True, text=True)
+                        print(result.stdout, end='', flush=True)
+                        print(result.stderr, end='', file=sys.stderr, flush=True)
+                        require_one_test(result.stdout, test)
                     finally:
                         active_error = sys.exc_info()[1]
                         try:
@@ -148,16 +183,22 @@ def main():
                         print(message, file=sys.stderr)
                     else:
                         safe_to_remove = True
+                        if stopped.returncode and active_error is None:
+                            raise subprocess.CalledProcessError(stopped.returncode, [pg['pg_ctl'], 'stop'])
 
         finally:
             if safe_to_remove:
                 shutil.rmtree(local)
 
 
-if __name__ == '__main__':
+def entry(action=main):
     try:
-        main()
+        action()
     except ValueError as error:
         raise SystemExit(str(error)) from error
     except subprocess.CalledProcessError as error:
         raise SystemExit(error.returncode if error.returncode > 0 else 128 - error.returncode) from error
+
+
+if __name__ == '__main__':
+    entry()

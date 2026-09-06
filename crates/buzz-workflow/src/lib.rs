@@ -2493,11 +2493,7 @@ steps:
     async fn setup_db() -> buzz_db::Db {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            // Local-only test default; this is not a production credential.
-            .unwrap_or_else(|_| {
-                let local_test_database = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
-                local_test_database.to_owned()
-            });
+            .expect("explicit isolated test database URL required");
         buzz_db::Db::new(&buzz_db::DbConfig {
             database_url,
             ..Default::default()

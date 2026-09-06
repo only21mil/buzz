@@ -1604,8 +1604,6 @@ mod tests {
     use super::*;
     use crate::user::ensure_user;
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
-
     struct PostgresGateFixture {
         pool: PgPool,
         community_id: CommunityId,
@@ -1621,7 +1619,7 @@ mod tests {
         async fn new(initial_execution_trace: &Value) -> Self {
             let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
                 .or_else(|_| std::env::var("DATABASE_URL"))
-                .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+                .expect("explicit isolated test database URL required");
             let pool = PgPool::connect(&database_url)
                 .await
                 .expect("connect to test DB");

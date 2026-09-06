@@ -665,7 +665,7 @@ mod tests {
     async fn postgres_receipt_replays_before_deriving_a_new_deadline() {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".into());
+            .expect("explicit isolated test database URL required");
         let pool = PgPool::connect(&database_url)
             .await
             .expect("connect to test DB");

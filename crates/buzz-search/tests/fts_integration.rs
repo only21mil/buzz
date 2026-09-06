@@ -17,7 +17,6 @@ use buzz_search::{ChannelScope, SearchQuery, SearchService};
 use sqlx::{postgres::PgPoolOptions, Executor, PgPool};
 use uuid::Uuid;
 
-const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
 const MIGRATION_0001_SQL: &str = include_str!("../../../migrations/0001_initial_schema.sql");
 const MIGRATION_0002_SQL: &str = include_str!("../../../migrations/0002_git_repo_names.sql");
 const MIGRATION_0003_SQL: &str = include_str!("../../../migrations/0003_community_icon.sql");
@@ -30,7 +29,8 @@ const MIGRATION_0008_SQL: &str =
 const MIGRATION_0014_SQL: &str = include_str!("../../../migrations/0014_push_lease_fts.sql");
 
 async fn setup() -> (PgPool, String) {
-    let url = std::env::var("BUZZ_TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.to_string());
+    let url = std::env::var("BUZZ_TEST_DATABASE_URL")
+        .expect("explicit isolated test database URL required");
     let schema = format!("fts_test_{}", Uuid::new_v4().simple());
     // Connect to the default schema first to create the test schema.
     let admin_pool = PgPoolOptions::new()
@@ -120,7 +120,8 @@ async fn teardown(pool: PgPool, schema: &str) {
     let admin_pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(
-            &std::env::var("BUZZ_TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.to_string()),
+            &std::env::var("BUZZ_TEST_DATABASE_URL")
+                .expect("explicit isolated test database URL required"),
         )
         .await
         .expect("reconnect for drop");

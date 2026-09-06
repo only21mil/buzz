@@ -22,7 +22,7 @@ frozen = load('check-frozen-migrations')
 
 class IsolationTests(unittest.TestCase):
     def test_cluster_is_recreated_per_test_and_removed_on_failure(self):
-        for fail, cleanup_failure in ((False, False), (True, False), (True, True)):
+        for fail, cleanup_failure in ((False, False), (True, False), (True, True), (False, True)):
             with tempfile.TemporaryDirectory(dir='/tmp') as directory:
                 root = Path(directory)
                 binary = root / 'fixture'
@@ -39,9 +39,9 @@ class IsolationTests(unittest.TestCase):
                         starts.append(argv[argv.index('-D') + 1])
                     if '--exact' in argv and fail:
                         raise subprocess.CalledProcessError(7, argv)
-                    if argv[0].endswith('/dropdb') and cleanup_failure:
+                    if argv[0].endswith('/dropdb') and cleanup_failure is True:
                         raise subprocess.CalledProcessError(9, argv)
-                    return subprocess.CompletedProcess(argv, 0)
+                    return subprocess.CompletedProcess(argv, 0, 'test result: ok. 1 passed; 0 failed; 0 ignored;\n', '')
 
                 def stop(argv, **kwargs):
                     stops.append(str(argv[argv.index('-D') + 1]))
@@ -51,18 +51,47 @@ class IsolationTests(unittest.TestCase):
                         '--schema-mode', 'migration', str(binary)]
                 with patch.object(sys, 'argv', args), patch.object(runner.os, 'environ', {}), \
                      patch.object(runner.os, 'access', return_value=True), \
-                     patch.object(runner.signal, 'signal'), patch.object(runner, 'command', side_effect=run), \
+                     patch.object(runner.signal, 'signal'), patch.object(runner, 'classify', return_value='migration'), \
+                     patch.object(runner, 'command', side_effect=run), \
                      patch.object(runner.subprocess, 'run', side_effect=stop):
-                    if fail:
+                    if fail or cleanup_failure:
                         with self.assertRaises(subprocess.CalledProcessError) as error:
-                            runner.main()
-                        self.assertEqual(error.exception.returncode, 7)
+                            runner.inside_main()
+                        self.assertEqual(error.exception.returncode, 7 if fail else 9)
                     else:
-                        runner.main()
-                self.assertEqual(len(starts), 1 if fail else 2)
+                        runner.inside_main()
+                self.assertEqual(len(starts), 1 if fail or cleanup_failure else 2)
                 self.assertEqual(len(set(starts)), len(starts))
                 self.assertEqual(starts, stops)
                 self.assertEqual(list(root.glob('pg-*')), [])
+
+    def test_external_fixture_cannot_be_forced_into_a_schema_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            binary = Path(directory) / 'fixture'; binary.touch()
+            args = ['runner', '--task-root', directory, '--schema-mode', 'desired', str(binary)]
+            with patch.object(sys, 'argv', args), patch.object(runner.os, 'environ', {}), \
+                 patch.object(runner, 'classify', return_value='external'), \
+                 patch.object(runner, 'discover', return_value=['requires_redis']), \
+                 patch.object(runner, 'command') as command:
+                with self.assertRaisesRegex(ValueError, 'external infrastructure'):
+                    runner.inside_main()
+                command.assert_not_called()
+
+    def test_zero_skipped_or_multiple_summaries_cannot_qualify(self):
+        passing = 'test result: ok. 1 passed; 0 failed; 0 ignored;'
+        runner.require_one_test(passing, 'exact_case')
+        for output in ('test result: ok. 0 passed; 0 failed; 0 ignored;',
+                       'test result: ok. 0 passed; 0 failed; 1 ignored;',
+                       passing + '\n' + passing, ''):
+            with self.subTest(output=output), self.assertRaisesRegex(RuntimeError, 'one passing test'):
+                runner.require_one_test(output, 'exact_case')
+
+    def test_inner_entry_preserves_test_exit_status(self):
+        def fail():
+            raise subprocess.CalledProcessError(7, ['fixture'])
+        with self.assertRaises(SystemExit) as error:
+            runner.entry(fail)
+        self.assertEqual(error.exception.code, 7)
 
     def test_refuses_every_inherited_database_target_without_echoing_it(self):
         for key in runner.TARGET_VARS:

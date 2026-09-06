@@ -2914,12 +2914,10 @@ mod sec005_read_gate_tests {
 
     // ── authorize_git_read matrix (requires Postgres) ────────────────────
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
-
     async fn setup_db() -> buzz_db::Db {
         let url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_string());
+            .expect("explicit isolated test database URL required");
         let pool = sqlx::PgPool::connect(&url).await.expect("connect test DB");
         buzz_db::Db::from_pool(pool)
     }
@@ -3353,7 +3351,7 @@ mod sec005_read_gate_tests {
     async fn ban_gate_fails_closed_with_503_when_the_store_is_unreachable() {
         let url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_string());
+            .expect("explicit isolated test database URL required");
         let pool = sqlx::PgPool::connect(&url).await.expect("connect test DB");
         let db = buzz_db::Db::from_pool(pool.clone());
 

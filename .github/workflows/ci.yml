@@ -663,11 +663,12 @@ jobs:
       - name: Install isolated PostgreSQL tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends postgresql postgresql-contrib
+          sudo apt-get install -y --no-install-recommends postgresql postgresql-contrib bubblewrap iproute2 util-linux
       - name: Isolated PostgreSQL tests
         run: |
           task_root=$(mktemp -d /tmp/buzz-pg-ci.XXXXXX)
           trap 'rmdir "$task_root"' EXIT
+          python3 scripts/test-postgres-test-fence.py
           scripts/postgres-test-run.sh --task-root "$task_root" --pg-bin-dir "$(pg_config --bindir)"
       - name: Start integration services
         run: |

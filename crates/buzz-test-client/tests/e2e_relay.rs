@@ -72,8 +72,8 @@ fn nip98_post_header(keys: &Keys, url: &str, body: &str) -> String {
 }
 
 async fn e2e_db_pool() -> sqlx::Pool<sqlx::Postgres> {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
+    let database_url =
+        std::env::var("DATABASE_URL").expect("explicit isolated test database URL required");
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(&database_url)

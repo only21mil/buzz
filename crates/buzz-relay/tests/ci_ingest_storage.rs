@@ -22,7 +22,7 @@ use uuid::Uuid;
 async fn pool() -> PgPool {
     let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
         .or_else(|_| std::env::var("DATABASE_URL"))
-        .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".into());
+        .expect("explicit isolated test database URL required");
     let pool = PgPoolOptions::new()
         .max_connections(4)
         .connect(&database_url)

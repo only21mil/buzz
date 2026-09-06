@@ -62,7 +62,13 @@ def main():
         binaries = artifact_binaries(paths, required)
         selected = []
         for name, binary in sorted(binaries.items()):
-            for test, mode in reconcile(binary, local.discover(binary, env, ''), rows):
+            discovered = subprocess.run(
+                ['python3', str(ROOT / 'scripts/postgres-test-local.py'), '--list',
+                 '--task-root', str(task_root), str(binary)], env=env, text=True,
+                capture_output=True, check=True)
+            names = [line.split('\t')[1] for line in discovered.stdout.splitlines()
+                     if len(line.split('\t')) == 3]
+            for test, mode in reconcile(binary, names, rows):
                 print(f'{name}\t{test}\t{mode}', flush=True)
                 if mode != 'external':
                     selected.append((binary, test))

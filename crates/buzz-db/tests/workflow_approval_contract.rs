@@ -23,7 +23,6 @@ use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
 
-const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
 const PRE_APPROVAL_MIGRATION_VERSION: i64 = 30;
 const DEFINITION_SECRET: &str = "definition-secret-must-not-enter-request-outbox";
 const OUTPUT_SECRET: &str = "raw-step-output-must-not-enter-request-outbox";
@@ -384,7 +383,7 @@ impl Fixture {
 async fn connect_pool() -> PgPool {
     let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
         .or_else(|_| std::env::var("DATABASE_URL"))
-        .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        .expect("explicit isolated test database URL required");
     PgPoolOptions::new()
         .max_connections(8)
         .connect(&database_url)
