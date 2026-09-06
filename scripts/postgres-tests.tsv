@@ -356,6 +356,7 @@ buzz-search	fts_integration	prefix_mode_matches_final_token_prefix_without_chang
 buzz-search	fts_integration	prefix_mode_preserves_storage_level_privacy_exclusions	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
 buzz-search	fts_integration	search_does_not_return_other_community_events	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
 buzz-search	fts_integration	search_finds_event_in_same_community	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
+buzz-search	fts_integration	short_kind0_prefix_prioritizes_exact_lexeme_on_a_noisy_page	crates/buzz-search/tests/fts_integration.rs	migration	scoped search packet fixture installs its own FTS schema
 buzz-search	fts_integration	since_until_filters	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
 buzz-search	fts_integration	very_long_query_is_bounded_before_pg_parse	crates/buzz-search/tests/fts_integration.rs	migration	fixture installs its own gateway/FTS schema
 buzz-test-client	ci_preflight	preflight_configured_policy_returns_complete_section_2_response	crates/buzz-test-client/tests/ci_preflight.rs	external	live relay E2E; retain existing relay workflow selection
