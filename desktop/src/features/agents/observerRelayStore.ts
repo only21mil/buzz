@@ -1,4 +1,12 @@
 import * as React from "react";
+import {
+  compareObserverEvents,
+  isObserverEventAfter,
+} from "./observerEventOrder";
+export {
+  compareObserverEvents,
+  isObserverEventAfter,
+} from "./observerEventOrder";
 
 import { subscribeToAgentObserverFrames } from "@/shared/api/observerRelay";
 import type { RelayEvent, ManagedAgent } from "@/shared/api/types";
@@ -347,42 +355,6 @@ export function getArchivedChannelEvents(
     archiveEventsByChannel.get(archiveChannelKey(agentPubkey, channelId)) ??
     EMPTY_EVENTS
   );
-}
-
-export function compareObserverEvents(
-  left: ObserverEvent,
-  right: ObserverEvent,
-) {
-  const leftTime = Date.parse(left.timestamp);
-  const rightTime = Date.parse(right.timestamp);
-  if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) {
-    const timeDiff = leftTime - rightTime;
-    if (timeDiff !== 0) {
-      return timeDiff;
-    }
-  }
-
-  return left.seq - right.seq;
-}
-
-/**
- * Returns true if `candidate` sorts strictly after `stored` using the same
- * two-key ordering as `compareObserverEvents`: later timestamp wins; equal
- * timestamp falls back to higher seq.  Extracted so latest-live advancement
- * cannot drift from transcript ordering.
- */
-export function isObserverEventAfter(
-  candidate: { timestamp: string; seq: number },
-  stored: { timestamp: string; seq: number },
-): boolean {
-  const candidateTime = Date.parse(candidate.timestamp);
-  const storedTime = Date.parse(stored.timestamp);
-  if (Number.isFinite(candidateTime) && Number.isFinite(storedTime)) {
-    if (candidateTime !== storedTime) {
-      return candidateTime > storedTime;
-    }
-  }
-  return candidate.seq > stored.seq;
 }
 
 // Observer event kind for a batch envelope wrapping multiple events. The ACP
