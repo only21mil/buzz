@@ -12,6 +12,7 @@ import { releaseObjectUrl } from "./objectUrlLifecycle";
 import { isVoiceNoteFile } from "./audioAttachment";
 import { isVideoFile, videoMimeForFile } from "./videoFileType";
 import { captureVideoPosterFrame } from "./videoPosterFrame";
+import { useFilePicker } from "./useFilePicker";
 
 /**
  * First 4 hex chars of the sha256 — used as a short display name.
@@ -87,6 +88,7 @@ type UseMediaUploadOptions = {
 export function useMediaUpload({
   deferUploadsUntilSend = false,
 }: UseMediaUploadOptions = {}) {
+  const openFilePicker = useFilePicker();
   // Synchronous intent changes revoke pending edits before React renders.
   const intentRevisionRef = React.useRef(0);
   const getIntentRevision = React.useCallback(
@@ -575,20 +577,11 @@ export function useMediaUpload({
     if (queueUntilSend) {
       intentRevisionRef.current += 1;
       const epoch = uploadEpochRef.current;
-      const input = document.createElement("input");
-      input.type = "file";
-      input.multiple = true;
-      input.addEventListener(
-        "change",
-        () => {
-          if (isUploadStale(epoch)) return;
-          const files = Array.from(input.files ?? []);
-          queueFiles(files.filter(shouldQueueFile));
-          uploadFiles(files.filter((file) => !shouldQueueFile(file)));
-        },
-        { once: true },
-      );
-      input.click();
+      openFilePicker({ multiple: true }, (files) => {
+        if (isUploadStale(epoch)) return;
+        queueFiles(files.filter(shouldQueueFile));
+        uploadFiles(files.filter((file) => !shouldQueueFile(file)));
+      });
       return;
     }
 
@@ -619,6 +612,7 @@ export function useMediaUpload({
     isUploadCanceled,
     isUploadStale,
     onUploadError,
+    openFilePicker,
     queueFiles,
     reserveUploadingPreview,
     shouldQueueFile,

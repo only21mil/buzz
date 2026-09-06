@@ -336,6 +336,23 @@ const oldUrl = "https://media.example/old.png";
 const queueVideo = (s) =>
   s.media.uploadFile(new File(["video"], "new.mp4", { type: "video/mp4" }));
 const mutations = {
+  picker_open: {
+    initial: "none",
+    change: (s) => s.media.handlePaperclip(),
+  },
+  picker_selection: {
+    initial: "none",
+    change: async (s) => {
+      await s.media.handlePaperclip();
+      const input = document.querySelector('input[type="file"]');
+      assert.ok(input?.isConnected);
+      Object.defineProperty(input, "files", {
+        configurable: true,
+        value: [new File(["video"], "new.mp4", { type: "video/mp4" })],
+      });
+      input.dispatchEvent(new dom.window.Event("change"));
+    },
+  },
   add: { initial: "none", change: queueVideo },
   remove: {
     initial: "uploaded",
