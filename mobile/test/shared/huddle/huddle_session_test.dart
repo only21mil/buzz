@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:typed_data';
 
+import 'package:buzz/shared/audio/microphone_capture.dart';
 import 'package:buzz/shared/huddle/huddle.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
@@ -12,6 +13,63 @@ const _parentChannelId = '11111111-2222-4333-8444-555555555555';
 const _ephemeralChannelId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 
 void main() {
+  test(
+    'Huddle admission waits for voice capture ownership to be released',
+    () async {
+      final media = _FakeMedia();
+      final transport = _FakeTransport();
+      final container = ProviderContainer(
+        overrides: [
+          huddleMediaFactoryProvider.overrideWithValue(() => media),
+          huddleTransportFactoryProvider.overrideWithValue((_) => transport),
+        ],
+      );
+      addTearDown(container.dispose);
+      final microphone = container.read(microphoneCaptureProvider);
+      final releaseVoiceNote = microphone.acquire()!;
+      final controller = container.read(huddleSessionProvider.notifier);
+      await controller.join(_parameters());
+      expect(media.startCalls, 0);
+      expect(
+        container.read(huddleSessionProvider).error,
+        'Finish the voice note before joining a Huddle.',
+      );
+      releaseVoiceNote();
+      await controller.join(_parameters());
+      expect(media.startCalls, 1);
+      expect(microphone.acquire(), isNull);
+      await controller.leave();
+      final release = microphone.acquire();
+      expect(release, isNotNull);
+      release!();
+    },
+  );
+
+  test('capture ownership survives delayed Huddle native disposal', () async {
+    final disposal = Completer<void>();
+    final media = _FakeMedia(disposeGate: disposal.future);
+    final container = ProviderContainer(
+      overrides: [
+        huddleMediaFactoryProvider.overrideWithValue(() => media),
+        huddleTransportFactoryProvider.overrideWithValue(
+          (_) => _FakeTransport(),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+    final controller = container.read(huddleSessionProvider.notifier);
+    final microphone = container.read(microphoneCaptureProvider);
+    await controller.join(_parameters());
+    final leaving = controller.leave();
+    await Future<void>.delayed(Duration.zero);
+    expect(microphone.acquire(), isNull);
+    disposal.complete();
+    await leaving;
+    final release = microphone.acquire();
+    expect(release, isNotNull);
+    release!();
+  });
+
   test('joins unmuted and bridges remote and local Opus frames', () async {
     final media = _FakeMedia();
     final transport = _FakeTransport();

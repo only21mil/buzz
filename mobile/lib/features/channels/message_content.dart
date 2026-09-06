@@ -25,6 +25,7 @@ import '../../shared/emoji/emoji_data_provider.dart';
 import '../../shared/emoji/emoji_only.dart';
 import 'media_viewer_page.dart';
 import 'message_media.dart';
+import 'voice_note_attachment.dart';
 
 part 'message_content/media_carousel.dart';
 part 'message_content/video_preview.dart';
@@ -269,8 +270,15 @@ class MessageContent extends HookConsumerWidget {
         followLinkColor: false,
         codeBuilder: (context, name, code, closed) =>
             _MessageCodeBlock(name: name, code: code),
-        linkBuilder: (context, linkText, url, linkStyle) =>
-            _buildLink(context, ref, linkText, url, linkStyle, style),
+        linkBuilder: (context, linkText, url, linkStyle) => _buildLink(
+          context,
+          ref,
+          linkText,
+          url,
+          imetaByUrl[url],
+          linkStyle,
+          style,
+        ),
         imageBuilder: (context, imageUrl) =>
             _buildMedia(context, imageUrl, imetaByUrl[imageUrl]),
         textAlign: textAlign,
@@ -317,6 +325,17 @@ class MessageContent extends HookConsumerWidget {
 
   Widget _buildMedia(BuildContext context, String imageUrl, ImetaEntry? imeta) {
     final mediaKind = classifyMediaUrl(imageUrl, imeta: imeta);
+    if (mediaKind == MessageMediaKind.audio) {
+      return Padding(
+        padding: const EdgeInsets.only(top: Grid.half),
+        child: VoiceNoteAttachment.remote(
+          url: imageUrl,
+          duration: Duration(
+            milliseconds: ((imeta?.duration ?? 0) * 1000).round(),
+          ),
+        ),
+      );
+    }
     if (mediaKind == MessageMediaKind.video) {
       return _MessageVideoPreview(
         url: imageUrl,
@@ -338,6 +357,7 @@ class MessageContent extends HookConsumerWidget {
     WidgetRef ref,
     InlineSpan linkText,
     String url,
+    ImetaEntry? imeta,
     TextStyle linkStyle,
     TextStyle? fallbackStyle,
   ) {
@@ -350,6 +370,10 @@ class MessageContent extends HookConsumerWidget {
     });
 
     final baseStyle = fallbackStyle ?? linkStyle;
+    if (imeta != null &&
+        classifyMediaUrl(url, imeta: imeta) == MessageMediaKind.audio) {
+      return _buildMedia(context, url, imeta);
+    }
 
     return GestureDetector(
       onTap: () async {

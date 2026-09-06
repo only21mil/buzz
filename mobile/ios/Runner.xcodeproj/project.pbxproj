@@ -29,6 +29,9 @@
 		97C146FC1CF9000F007C117D /* Main.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FA1CF9000F007C117D /* Main.storyboard */; };
 		97C146FE1CF9000F007C117D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FD1CF9000F007C117D /* Assets.xcassets */; };
 		97C147011CF9000F007C117D /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FF1CF9000F007C117D /* LaunchScreen.storyboard */; };
+		4A71C01F2F4100100A17E01 /* VoiceNotePackager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C0202F4100100A17E01 /* VoiceNotePackager.swift */; };
+		4A71C0212F4110100A17E01 /* MP4Canonicalizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C0222F4110100A17E01 /* MP4Canonicalizer.swift */; };
+		4A71C0232F4120100A17E01 /* NativeAttachmentPopoverMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C0242F4120100A17E01 /* NativeAttachmentPopoverMenu.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -91,6 +94,9 @@
 		97C147001CF9000F007C117D /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/LaunchScreen.storyboard; sourceTree = "<group>"; };
 		97C147021CF9000F007C117D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		CD6B899582D0416ADBD8A68F /* Pods_RunnerTests.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_RunnerTests.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		4A71C0202F4100100A17E01 /* VoiceNotePackager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceNotePackager.swift; sourceTree = "<group>"; };
+		4A71C0222F4110100A17E01 /* MP4Canonicalizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MP4Canonicalizer.swift; sourceTree = "<group>"; };
+		4A71C0242F4120100A17E01 /* NativeAttachmentPopoverMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeAttachmentPopoverMenu.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -197,6 +203,9 @@
 				4A71C01C2F40E00100A17E01 /* NativeSkinToneControl.swift */,
 				4A71C0162F40B00100A17E01 /* HuddleMediaPlugin.swift */,
 				4A71C0182F40C00100A17E01 /* HuddleAudioEngine.swift */,
+				4A71C0202F4100100A17E01 /* VoiceNotePackager.swift */,
+				4A71C0222F4110100A17E01 /* MP4Canonicalizer.swift */,
+				4A71C0242F4120100A17E01 /* NativeAttachmentPopoverMenu.swift */,
 				7884E8672EC3CC0400C636F2 /* SceneDelegate.swift */,
 				74858FAD1ED2DC5600515810 /* Runner-Bridging-Header.h */,
 			);
@@ -438,6 +447,9 @@
 				4A71C0152F40B00100A17E01 /* HuddleMediaPlugin.swift in Sources */,
 				4A71C0172F40C00100A17E01 /* HuddleAudioEngine.swift in Sources */,
 				1498D2341E8E89220040F4C2 /* GeneratedPluginRegistrant.m in Sources */,
+				4A71C01F2F4100100A17E01 /* VoiceNotePackager.swift in Sources */,
+				4A71C0212F4110100A17E01 /* MP4Canonicalizer.swift in Sources */,
+				4A71C0232F4120100A17E01 /* NativeAttachmentPopoverMenu.swift in Sources */,
 				7884E8682EC3CC0700C636F2 /* SceneDelegate.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

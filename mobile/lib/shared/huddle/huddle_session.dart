@@ -4,6 +4,7 @@ import 'dart:collection';
 import 'package:flutter/foundation.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
+import '../audio/microphone_capture.dart';
 import 'huddle_auth.dart';
 import 'huddle_media.dart';
 import 'huddle_transport.dart';
@@ -183,6 +184,7 @@ final class HuddleSessionNotifier extends Notifier<HuddleSessionState> {
   StreamSubscription<HuddleRemoteAudioFrame>? _remoteFrameSubscription;
   StreamSubscription<HuddleTransportError>? _transportIssueSubscription;
   StreamSubscription<HuddlePeerEvent>? _peerEventSubscription;
+  void Function()? _releaseMicrophone;
   var _generation = 0;
   var _receivedFrames = 0;
   var _sentFrames = 0;
@@ -225,6 +227,15 @@ final class HuddleSessionNotifier extends Notifier<HuddleSessionState> {
     final generation = ++_generation;
     await _disposeResources();
     if (!_isCurrent(generation)) return;
+    final releaseMicrophone = ref.read(microphoneCaptureProvider).acquire();
+    if (releaseMicrophone == null) {
+      state = state.copyWith(
+        phase: HuddleSessionPhase.failed,
+        error: 'Finish the voice note before joining a Huddle.',
+      );
+      return;
+    }
+    _releaseMicrophone = releaseMicrophone;
     _receivedFrames = 0;
     _sentFrames = 0;
     _reconnectAttempt = 0;
@@ -708,6 +719,8 @@ final class HuddleSessionNotifier extends Notifier<HuddleSessionState> {
     _pendingSpeakerLevels.clear();
     final transport = _transport;
     final media = _media;
+    final releaseMicrophone = _releaseMicrophone;
+    _releaseMicrophone = null;
     _transport = null;
     _media = null;
 
@@ -719,6 +732,7 @@ final class HuddleSessionNotifier extends Notifier<HuddleSessionState> {
     StackTrace? failureStackTrace;
     try {
       await media?.dispose();
+      releaseMicrophone?.call();
     } catch (error, stackTrace) {
       failure = error;
       failureStackTrace = stackTrace;
