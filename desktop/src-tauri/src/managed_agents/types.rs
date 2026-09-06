@@ -196,6 +196,9 @@ impl ManagedAgentRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayAgentInfo {
     pub pubkey: String,
+    /// Owner authenticated by the agent's signed NIP-OA profile and owner policy.
+    #[serde(default)]
+    pub owner_pubkey: Option<String>,
     pub name: String,
     pub agent_type: String,
     pub channels: Vec<String>,

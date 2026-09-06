@@ -65,7 +65,7 @@ type AgentCandidate = {
   name: string;
   /** Managed agents can be auto-started before the prompt is sent. */
   isManaged: boolean;
-  isActive: boolean;
+  isActive: boolean | null;
 };
 
 type ProjectAgentConversation = {
@@ -168,12 +168,16 @@ function useAgentCandidates() {
         pubkey,
         name: agent.name,
         isManaged: false,
-        isActive: agent.status !== "offline",
+        isActive:
+          agent.status === "unknown" ? null : agent.status !== "offline",
       });
     }
 
     return candidates.sort((left, right) => {
-      if (left.isActive !== right.isActive) return left.isActive ? -1 : 1;
+      const rank = (active: boolean | null) =>
+        active === true ? 0 : active === null ? 1 : 2;
+      const activityOrder = rank(left.isActive) - rank(right.isActive);
+      if (activityOrder) return activityOrder;
       if (left.isManaged !== right.isManaged) return left.isManaged ? -1 : 1;
       return left.name.localeCompare(right.name);
     });
@@ -524,14 +528,16 @@ export function ProjectsAgentPromptPage({
                         <span className="min-w-0 truncate">
                           {candidate.name}
                         </span>
-                        <span
-                          className={cn(
-                            "ml-2 h-1.5 w-1.5 shrink-0 rounded-full",
-                            candidate.isActive
-                              ? "bg-emerald-500"
-                              : "bg-muted-foreground/40",
-                          )}
-                        />
+                        {candidate.isActive !== null && (
+                          <span
+                            className={cn(
+                              "ml-2 h-1.5 w-1.5 shrink-0 rounded-full",
+                              candidate.isActive
+                                ? "bg-emerald-500"
+                                : "bg-muted-foreground/40",
+                            )}
+                          />
+                        )}
                       </DropdownMenuRadioItem>
                     ))}
                   </DropdownMenuRadioGroup>

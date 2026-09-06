@@ -269,12 +269,14 @@ export type RelayMember = {
 
 export type RelayAgent = {
   pubkey: string;
+  /** Authenticated owner; absent for legacy runtime-only entries. */
+  ownerPubkey?: string | null;
   name: string;
   agentType: string;
   channels: string[];
   channelIds: string[];
   capabilities: string[];
-  status: "online" | "away" | "offline";
+  status: "online" | "away" | "offline" | "unknown";
   respondTo: RespondToMode | null;
   respondToAllowlist: string[];
 };

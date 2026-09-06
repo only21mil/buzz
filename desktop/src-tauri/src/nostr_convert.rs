@@ -14,6 +14,15 @@ use serde_json::{json, Value};
 
 use crate::models::*;
 
+mod agent_directory;
+pub use agent_directory::{
+    managed_agent_pubkeys_from_events, member_agent_channel_ids_for_viewer,
+    relay_agents_from_directory_events, verified_agent_owners_from_profiles,
+};
+#[cfg(test)]
+use agent_directory::{
+    member_agent_channel_ids_from_events, relay_agents_from_managed_agent_events,
+};
 mod user_search;
 pub use user_search::{
     list_user_search_results, rank_user_search_results, search_users_from_events,
@@ -57,30 +66,47 @@ fn tags_named<'a>(event: &'a Event, name: &'a str) -> impl Iterator<Item = &'a [
 
 /// Return the owner pubkey from a valid NIP-OA owner tag on a kind:0 profile.
 ///
-/// NIP-OA marks an agent identity by having the owner sign an `auth` tag for
-/// the agent pubkey. We verify the tag against the profile event author, not
-/// against the owner, so a forged or stale marker does not turn a person into
-/// an agent in mention search.
+/// NIP-OA requires a valid event and exactly one well-formed `auth` tag whose
+/// owner signature and every condition apply to the event. Time clauses constrain
+/// the profile's `created_at`, not the verifier's clock. Ownership is provenance;
+/// the agent's pubkey remains the author.
 pub(crate) fn profile_valid_oa_owner_pubkey(event: &Event) -> Option<String> {
-    let target_hex = event.pubkey.to_hex();
-    let Ok(target_pubkey) = nostr::PublicKey::from_hex(&target_hex) else {
+    if event.kind != nostr::Kind::Metadata {
         return None;
-    };
-
-    for tag in event.tags.iter() {
-        let slice = tag.as_slice();
-        if slice.first().map(String::as_str) != Some("auth") || slice.len() != 4 {
-            continue;
-        }
-        let Ok(json) = serde_json::to_string(slice) else {
-            continue;
-        };
-        if let Ok(owner_pubkey) = buzz_sdk_pkg::nip_oa::verify_auth_tag(&json, &target_pubkey) {
-            return Some(owner_pubkey.to_hex());
-        }
     }
 
-    None
+    let mut auth_tags = tags_named(event, "auth");
+    let auth_tag = auth_tags.next()?;
+    // Count malformed auth tags too: no first-valid-tag fallback is permitted.
+    if auth_tags.next().is_some() {
+        return None;
+    }
+
+    let json = serde_json::to_string(auth_tag).ok()?;
+    // The structural parser also enforces canonical lowercase key/signature hex.
+    buzz_sdk_pkg::nip_oa::parse_auth_tag(&json).ok()?;
+    event.verify().ok()?;
+    let owner = buzz_sdk_pkg::nip_oa::verify_auth_tag(&json, &event.pubkey).ok()?;
+    let conditions = auth_tag.get(2)?;
+    // Syntax/ranges were checked by the SDK; evaluate every signed clause as-is.
+    let applies = conditions.is_empty()
+        || conditions.split('&').all(|clause| {
+            if let Some(value) = clause.strip_prefix("kind=") {
+                value.parse::<u16>() == Ok(event.kind.as_u16())
+            } else if let Some(value) = clause.strip_prefix("created_at<") {
+                value
+                    .parse::<u64>()
+                    .is_ok_and(|bound| event.created_at.as_secs() < bound)
+            } else if let Some(value) = clause.strip_prefix("created_at>") {
+                value
+                    .parse::<u64>()
+                    .is_ok_and(|bound| event.created_at.as_secs() > bound)
+            } else {
+                false
+            }
+        });
+
+    applies.then(|| owner.to_hex())
 }
 
 pub(crate) fn profile_has_valid_oa_owner(event: &Event) -> bool {
@@ -1009,3 +1035,8 @@ mod tests {
         assert_eq!(timestamp_to_iso(0), "1970-01-01T00:00:00Z");
     }
 }
+
+#[cfg(test)]
+mod agent_directory_tests;
+#[cfg(test)]
+mod oa_profile_tests;

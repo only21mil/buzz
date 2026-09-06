@@ -15,10 +15,8 @@ import {
 } from "./agentSessionSelection";
 import type { PanelValueSetter } from "./useChannelPanelHistoryState";
 
-export type ChannelAgentSessionAgent = Pick<
-  ManagedAgent,
-  "pubkey" | "name" | "status"
-> & {
+export type ChannelAgentSessionAgent = Pick<ManagedAgent, "pubkey" | "name"> & {
+  status: ManagedAgent["status"] | "unknown";
   agentSource: "managed" | "member-agent" | "relay";
   canInterruptTurn: boolean;
   channelIds?: string[];
@@ -47,7 +45,8 @@ type UseChannelAgentSessionsOptions = {
 
 function relayStatusToManagedStatus(
   status: RelayAgent["status"],
-): ManagedAgent["status"] {
+): ChannelAgentSessionAgent["status"] {
+  if (status === "unknown") return "unknown";
   return status === "offline" ? "stopped" : "deployed";
 }
 

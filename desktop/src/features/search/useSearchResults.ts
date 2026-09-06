@@ -364,7 +364,7 @@ export function useSearchResults({
         displayName: agent.name,
         avatarUrl: null,
         nip05Handle: null,
-        ownerPubkey: null,
+        ownerPubkey: agent.ownerPubkey ?? null,
         isAgent: true,
       };
 
