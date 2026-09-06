@@ -1,11 +1,12 @@
+import type { Project } from "./projectModels";
+import type { QueryClient } from "@tanstack/react-query";
+import { projectCollectionMutationOptions } from "./projectCollectionMutation";
+import type { ProjectSnapshotScope } from "./projectSnapshot";
+import { useProjectCollectionScope } from "./useProjectCollectionScope";
 import * as React from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
-import {
-  fetchProjects,
-  type Project,
-  projectsQueryKey,
-} from "@/features/projects/hooks";
+import { fetchProjects } from "@/features/projects/hooks";
 import {
   buildInitialProjectEventTemplates,
   isUnsupportedProjectKindError,
@@ -126,23 +127,39 @@ export function useCreateProjectMutation() {
   const queryClient = useQueryClient();
   const resumableProjectIdsRef = React.useRef(new Set<string>());
 
-  return useMutation({
-    mutationFn: (input: CreateProjectInput) =>
-      createProject(input, resumableProjectIdsRef.current),
-    onSuccess: ({ project }) => {
-      queryClient.setQueryData<Project[]>(projectsQueryKey, (current = []) => [
-        project,
-        ...current.filter(
-          (candidate) =>
-            candidate.id !== project.id &&
-            !(
-              candidate.legacy &&
-              candidate.owner === project.owner &&
-              candidate.dtag === project.dtag
-            ),
-        ),
-      ]);
-      void queryClient.invalidateQueries({ queryKey: projectsQueryKey });
-    },
-  });
+  const scope = useProjectCollectionScope();
+
+  return useMutation(
+    createProjectMutationOptions(
+      queryClient,
+      scope,
+      (input: CreateProjectInput) =>
+        createProject(input, resumableProjectIdsRef.current),
+    ),
+  );
+}
+
+/** Apply confirmed changes and uncertain-write refreshes to the starting scope. */
+export function createProjectMutationOptions(
+  queryClient: QueryClient,
+  scope: ProjectSnapshotScope | null,
+  mutationFn: (input: CreateProjectInput) => Promise<CreateProjectResult>,
+) {
+  return projectCollectionMutationOptions(
+    queryClient,
+    scope,
+    mutationFn,
+    (current, { project }) => [
+      project,
+      ...current.filter(
+        (candidate) =>
+          candidate.id !== project.id &&
+          !(
+            candidate.legacy &&
+            candidate.owner === project.owner &&
+            candidate.dtag === project.dtag
+          ),
+      ),
+    ],
+  );
 }

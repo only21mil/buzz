@@ -6,6 +6,8 @@ import { signRelayEvent } from "@/shared/api/tauri";
 import { getIdentity } from "@/shared/api/tauriIdentity";
 import type { Channel, RelayEvent } from "@/shared/api/types";
 import { fetchProjects } from "./hooks";
+import { eventToExplicitProject, eventToRepository } from "./projectModels";
+import { hasAuthoritativeHomeBinding } from "./lib/projectHomeChannel";
 import { findProjectHomeByChannelId } from "./lib/projectHomeChannel";
 import { buildProjectRelatedChannelPatchTemplate } from "./projectChannelCreation";
 import type { ProjectChannelRequest } from "./projectChannelRequest";
@@ -58,6 +60,31 @@ export async function approveProjectChannel(
     ) {
       throw new Error("The current project head could not be verified.");
     }
+    const liveProject = eventToExplicitProject(head, new Map(), new Map());
+    const authorityChanged = () =>
+      new Error(
+        "Project home authority changed. Refresh before retrying approval.",
+      );
+    if (liveProject?.projectChannelId !== request.request.homeChannelId)
+      throw authorityChanged();
+    // Re-read the repositories that authorized the reviewed home. Enumeration
+    // may predate both the winning project head and a repository replacement.
+    const repositories = [];
+    for (const repository of project.repositories) {
+      if (!liveProject.repositoryAddresses.includes(repository.repoAddress))
+        continue;
+      const [event] = await deps.fetchEvents({
+        kinds: [30617],
+        authors: [repository.owner],
+        "#d": [repository.dtag],
+        limit: 1,
+      });
+      const current = event && eventToRepository(event, origin);
+      if (current?.repoAddress === repository.repoAddress)
+        repositories.push(current);
+    }
+    if (!hasAuthoritativeHomeBinding({ ...liveProject, repositories }))
+      throw authorityChanged();
     return head;
   };
   const head = await readHead();

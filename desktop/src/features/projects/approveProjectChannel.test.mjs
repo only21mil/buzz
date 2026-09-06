@@ -28,7 +28,15 @@ function fixture() {
     dtag: "app",
     projectChannelId: home,
     legacy: false,
-    repositories: [{ owner, channelId: home }],
+    repositoryAddresses: [`30617:${owner}:app`],
+    repositories: [
+      {
+        owner,
+        channelId: home,
+        repoAddress: `30617:${owner}:app`,
+        dtag: "app",
+      },
+    ],
   };
   const calls = { created: 0, published: 0 };
   const deps = {
@@ -36,7 +44,19 @@ function fixture() {
     getIdentity: async () => ({ pubkey: owner }),
     getRelayOrigin: () => "https://relay.example",
     fetchProjects: async () => [project],
-    fetchEvents: async () => [head],
+    fetchEvents: async (filter) =>
+      filter.kinds[0] === 30617
+        ? [
+            {
+              ...head,
+              kind: 30617,
+              tags: [
+                ["d", "app"],
+                ["buzz-channel", home],
+              ],
+            },
+          ]
+        : [head],
     createChannel: async () => {
       calls.created++;
       return channel;
@@ -112,3 +132,129 @@ test("identity rotation before channel creation performs no mutation", async () 
   );
   assert.deepEqual(calls, { created: 0, published: 0 });
 });
+
+for (const change of [
+  "home",
+  "membership",
+  "repository-binding",
+  "repository-authority",
+]) {
+  test(`fresh ${change} change before approval blocks creation and publication`, async () => {
+    const { deps, calls } = fixture();
+    const fetch = deps.fetchEvents;
+    deps.fetchEvents = async (filter) => {
+      const [head] = await fetch(filter);
+      if (filter.kinds[0] === 30621 && change === "home")
+        return [
+          {
+            ...head,
+            tags: head.tags.map((tag) =>
+              tag[0] === "buzz-channel" ? ["buzz-channel", channel.id] : tag,
+            ),
+          },
+        ];
+      if (filter.kinds[0] === 30621 && change === "membership")
+        return [{ ...head, tags: head.tags.filter((tag) => tag[0] !== "a") }];
+      if (filter.kinds[0] === 30617 && change === "repository-binding")
+        return [
+          {
+            ...head,
+            tags: [
+              ["d", "app"],
+              ["buzz-channel", channel.id],
+            ],
+          },
+        ];
+      if (filter.kinds[0] === 30617 && change === "repository-authority")
+        return [{ ...head, pubkey: "b".repeat(64) }];
+      return [head];
+    };
+    await assert.rejects(
+      approveProjectChannel(request, new Map(), deps),
+      /authority changed/,
+    );
+    assert.deepEqual(calls, { created: 0, published: 0 });
+  });
+}
+
+test("authority change after creation retains the channel for a safe retry", async () => {
+  const { deps, calls } = fixture();
+  const resume = new Map();
+  const fetch = deps.fetchEvents;
+  let moved = true;
+  deps.fetchEvents = async (filter) => {
+    const [head] = await fetch(filter);
+    return filter.kinds[0] === 30621 && calls.created && moved
+      ? [
+          {
+            ...head,
+            tags: head.tags.map((tag) =>
+              tag[0] === "buzz-channel" ? ["buzz-channel", channel.id] : tag,
+            ),
+          },
+        ]
+      : [head];
+  };
+  await assert.rejects(
+    approveProjectChannel(request, resume, deps),
+    /authority changed/,
+  );
+  assert.deepEqual(calls, { created: 1, published: 0 });
+  moved = false;
+  assert.equal(await approveProjectChannel(request, resume, deps), channel);
+  assert.deepEqual(calls, { created: 1, published: 1 });
+});
+
+for (const authorized of [true, false]) {
+  test(`fresh repository maintainer authority is ${authorized ? "accepted" : "required"}`, async () => {
+    const { deps, calls, project } = fixture();
+    const repositoryOwner = "b".repeat(64);
+    const repositoryAddress = `30617:${repositoryOwner}:app`;
+    project.repositoryAddresses = [repositoryAddress];
+    project.repositories = [
+      {
+        owner: repositoryOwner,
+        dtag: "app",
+        repoAddress: repositoryAddress,
+        channelId: home,
+        maintainers: [owner],
+      },
+    ];
+    const fetch = deps.fetchEvents;
+    deps.fetchEvents = async (filter) => {
+      const [head] = await fetch(filter);
+      return filter.kinds[0] === 30621
+        ? [
+            {
+              ...head,
+              tags: head.tags.map((tag) =>
+                tag[0] === "a" ? ["a", repositoryAddress] : tag,
+              ),
+            },
+          ]
+        : [
+            {
+              ...head,
+              pubkey: repositoryOwner,
+              tags: [
+                ...head.tags,
+                ...(authorized ? [["maintainers", owner]] : []),
+              ],
+            },
+          ];
+    };
+    if (authorized) {
+      assert.equal(
+        await approveProjectChannel(request, new Map(), deps),
+        channel,
+      );
+      assert.deepEqual(calls, { created: 1, published: 1 });
+    } else {
+      await assert.rejects(
+        approveProjectChannel(request, new Map(), deps),
+        /authority changed/,
+      );
+      assert.deepEqual(calls, { created: 0, published: 0 });
+    }
+  });
+}

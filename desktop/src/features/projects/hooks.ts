@@ -1,3 +1,4 @@
+import { useProjectCollectionScope } from "./useProjectCollectionScope";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { projectCollectionQueryOptions } from "./projectCollectionQuery";
 import { projectDeletionMutationOptions } from "./projectDeletionMutation";
@@ -632,12 +633,7 @@ async function fetchProjectActivitySummaries(
 export const projectsQueryKey = ["projects"] as const;
 
 function useProjectCollectionOptions() {
-  const identity = useIdentityQuery();
-  const relayOrigin = getCachedRelayOrigin();
-  const scope =
-    relayOrigin && identity.data?.pubkey
-      ? { relayOrigin, pubkey: identity.data.pubkey }
-      : null;
+  const scope = useProjectCollectionScope();
   return projectCollectionQueryOptions(scope, {
     hiddenAddresses: new Set(readHiddenProjectCards()),
   });
@@ -957,5 +953,7 @@ export function useProjectActivitySummariesQuery(projects: Project[]) {
 export function useDeleteProjectMutation() {
   const queryClient = useQueryClient();
 
-  return useMutation(projectDeletionMutationOptions(queryClient));
+  return useMutation(
+    projectDeletionMutationOptions(queryClient, useProjectCollectionScope()),
+  );
 }

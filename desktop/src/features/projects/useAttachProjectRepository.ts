@@ -1,10 +1,11 @@
+import type { Project } from "./projectModels";
+import type { QueryClient } from "@tanstack/react-query";
+import { projectCollectionMutationOptions } from "./projectCollectionMutation";
+import type { ProjectSnapshotScope } from "./projectSnapshot";
+import { useProjectCollectionScope } from "./useProjectCollectionScope";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
-import {
-  type Project,
-  projectsQueryKey,
-  type Repository,
-} from "@/features/projects/hooks";
+import type { Repository } from "@/features/projects/hooks";
 import { addRepositoryToProject } from "@/features/projects/projectModels";
 import { buildProjectPatchTemplate } from "@/features/projects/projectRepositoryCreation";
 import { relayClient } from "@/shared/api/relayClient";
@@ -82,21 +83,27 @@ async function attachProjectRepository({
 
 export function useAttachProjectRepositoryMutation() {
   const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: attachProjectRepository,
-    onSuccess: ({ previousProjectId, project }) => {
-      if (previousProjectId !== project.id) {
-        queryClient.removeQueries({
-          exact: true,
-          queryKey: ["project", previousProjectId],
-        });
-      }
-      queryClient.setQueryData<Project[]>(projectsQueryKey, (current = []) =>
-        current.map((candidate) =>
-          candidate.id === previousProjectId ? project : candidate,
-        ),
-      );
-      void queryClient.invalidateQueries({ queryKey: projectsQueryKey });
-    },
-  });
+  return useMutation(
+    attachProjectRepositoryMutationOptions(
+      queryClient,
+      useProjectCollectionScope(),
+    ),
+  );
+}
+
+/** Apply confirmed changes and uncertain-write refreshes to the starting scope. */
+export function attachProjectRepositoryMutationOptions(
+  queryClient: QueryClient,
+  scope: ProjectSnapshotScope | null,
+  mutationFn = attachProjectRepository,
+) {
+  return projectCollectionMutationOptions(
+    queryClient,
+    scope,
+    mutationFn,
+    (current, { previousProjectId, project }) =>
+      current.map((candidate) =>
+        candidate.id === previousProjectId ? project : candidate,
+      ),
+  );
 }
