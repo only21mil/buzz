@@ -303,7 +303,7 @@ Success `200`:
 {"challenge_id":"<uuid>","challenge":"<base64url-no-pad-32-bytes>","expires_at":<unix-seconds>}
 ```
 
-The challenge is single-use. Invalid input is `400 invalid_request`; deployment-global challenge issuance limits return `429 rate_limited`; storage/randomness failure is `503 temporarily_unavailable`.
+The challenge is single-use. Issuance is limited to 600 challenges per deployment in a rolling 60-second window, including consumed or expired challenges issued within that window. Consumption never refunds issuance quota. Invalid input is `400 invalid_request`; deployment-global challenge issuance limits return `429 rate_limited`; storage/randomness failure is `503 temporarily_unavailable`.
 
 ### Installation enrollment
 

@@ -133,3 +133,71 @@ async fn app_store_retirement_preserves_dogfood_authority_byte_for_byte() {
     assert_eq!(counts, (1, 1));
     assert_final_ledger(&pool).await;
 }
+
+#[tokio::test]
+#[ignore = "requires private PostgreSQL migration fixture"]
+async fn challenge_retention_upgrade_preserves_outstanding_issuance() {
+    use crate::authority::{
+        AuthorityError, AuthorityStore, Challenge, CHALLENGE_QUOTA_MAX_REQUESTS,
+    };
+    use crate::postgres::PostgresAuthorityStore;
+    use sha2::{Digest, Sha256};
+    let pool = isolated_pool().await;
+    MIGRATOR.run_to(4, &pool).await.unwrap();
+    let now = chrono::Utc::now().timestamp();
+    let value = [42; 32];
+    let mut ids = Vec::new();
+    for _ in 0..CHALLENGE_QUOTA_MAX_REQUESTS {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO push_gateway_challenges(id,challenge_hash,created_at,expires_at) VALUES($1,$2,to_timestamp($3),to_timestamp($3)+interval '5 minutes')")
+            .bind(id).bind(Sha256::digest(value).to_vec()).bind(now as f64)
+            .execute(&pool).await.unwrap();
+        ids.push(id);
+    }
+    let before: serde_json::Value = sqlx::query_scalar(
+        "SELECT jsonb_agg(to_jsonb(c) ORDER BY id) FROM push_gateway_challenges c",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    MIGRATOR.run(&pool).await.unwrap();
+    let after: serde_json::Value = sqlx::query_scalar(
+        "SELECT jsonb_agg(to_jsonb(c)-'consumed' ORDER BY id) FROM push_gateway_challenges c",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        before, after,
+        "migration preserves outstanding challenge contents"
+    );
+    let store = PostgresAuthorityStore::new(pool.clone());
+    for id in ids {
+        store.consume_challenge(id, value, now).await.unwrap();
+        assert_eq!(
+            store.consume_challenge(id, value, now).await,
+            Err(AuthorityError::Rejected)
+        );
+    }
+    assert_eq!(
+        store
+            .put_challenge(Challenge {
+                id: Uuid::new_v4(),
+                value,
+                created_at: now,
+                expires_at: now + 300,
+            })
+            .await,
+        Err(AuthorityError::RateLimited)
+    );
+    store.reap_expired(now + 61).await.unwrap();
+    let retained: i64 = sqlx::query_scalar("SELECT count(*) FROM push_gateway_challenges")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        retained, 0,
+        "consumed records need not wait for challenge expiry"
+    );
+    assert_final_ledger(&pool).await;
+}

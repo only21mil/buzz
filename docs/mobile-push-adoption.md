@@ -54,6 +54,13 @@ SHA-256/SQLx SHA-384 evidence in `mobile-push-gateway-migrations.json`. They are
 not relay versions or substitutions for relay0038. The source mapping and
 prerequisites are recorded in `mobile-push-migration-map.json`.
 
+Fork gateway0005 adds a consumed marker without changing gateway0001–0004.
+It preserves outstanding challenge contents and retains every issuance in the
+deployment-global 600-per-60-second rolling quota after single-use consumption.
+The reaper removes consumed or expired challenges only after their issuance
+leaves that window. Its bytes and SQLx checksum are admitted in the independent
+gateway ledger. No real database has received these prepared migrations.
+
 Legacy production/sandbox profile labels represented transport environments,
 not proven application identities. **They cannot be mapped safely.** The
 reviewable migration proposal deletes their gateway delegations before their
@@ -61,7 +68,7 @@ installations, and gateway0004 similarly retires dormant App Store authority.
 Existing dogfood authority survives gateway0004 byte-for-byte. Relay0038 retains
 relay leases, event history and queued work while retiring incompatible local
 gateway authority. Old endpoint grants stop working; clients must re-attest and
-publish newly authorized leases. Quota/replay retention policy is unchanged.
+publish newly authorized leases. Delivery quota/replay retention policy is unchanged.
 There is no App Store profile in this MVP.
 
 These SQL artifacts perform destructive retirement when actually applied.
@@ -70,7 +77,7 @@ chart containing them is started against an existing database, obtain rollout
 approval covering the affected registration inventory, retained recovery
 material, retirement/reenrollment plan, downtime and rollback consequences.
 Do not merely change profile strings or reuse old endpoint grants. Relay image
-migration expectations must advance to38, and the independent gateway to4,
+migration expectations must advance to38, and the independent gateway to5,
 only as part of that approved delivery packet.
 
 ## Prepared unsigned iOS CI

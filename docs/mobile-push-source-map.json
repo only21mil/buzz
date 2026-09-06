@@ -122,8 +122,8 @@
     "source_git_blob": "1a7ef4b2a65137b41af555e6999c4867f1b89f2a",
     "source_sha256": "f7adf63e444002681448c8dde7ab28327d199354ac81ba9149c41319baef63e8",
     "fork_path": "crates/buzz-push-gateway/src/authority.rs",
-    "fork_sha256": "f7adf63e444002681448c8dde7ab28327d199354ac81ba9149c41319baef63e8",
-    "disposition": "byte-identical selected source"
+    "fork_sha256": "c610791adc5f2b53a7e56bf7fa5df42e6f051373104ed2c78ce6954ac051ffc5",
+    "disposition": "integrated with fork challenge issuance retention repair"
   },
   {
     "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
@@ -185,8 +185,8 @@
     "source_git_blob": "6cbfb45893d217e8bccdd482058d3b157b236edf",
     "source_sha256": "9a084d3d9f899dce8743b30503e8a3aa82112017d5fdf5a35026605dc771ba01",
     "fork_path": "crates/buzz-push-gateway/src/postgres.rs",
-    "fork_sha256": "189909ea821e346576667a18e5e881bc9d6fc11c3eee7f7369a46fa5cea710bd",
-    "disposition": "byte-identical selected source"
+    "fork_sha256": "ce33bc3700a1c6ddcd8018588879ed0769222d2c6289b447214ebf0223cdf8d1",
+    "disposition": "integrated with fork challenge issuance retention repair"
   },
   {
     "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
@@ -392,8 +392,8 @@
     "source_git_blob": "6575c98bfb3242bb231cc7e706ad958c9db2f751",
     "source_sha256": "843f06e98c2fdf14f5f04c4ea04ce32eacf0990bb68cbd8fea3406a73a4bd910",
     "fork_path": "docs/nips/NIP-PL.md",
-    "fork_sha256": "843f06e98c2fdf14f5f04c4ea04ce32eacf0990bb68cbd8fea3406a73a4bd910",
-    "disposition": "byte-identical selected source"
+    "fork_sha256": "2f240b2a7e87ec753aabdcd329a4d0f2f52456b9dcfaccc6af171327ed0b70a7",
+    "disposition": "integrated with fork challenge issuance retention repair"
   },
   {
     "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
@@ -401,8 +401,8 @@
     "source_git_blob": "e9a9ae16055273c7dd9e43271c18d5de84ff7c6d",
     "source_sha256": "4724be9a9f27bad5ad6c855f92ac4082f09ccac22994347847fc8a59e01a85ad",
     "fork_path": "docs/push-gateway-deployment.md",
-    "fork_sha256": "5bd61378cd6bc8388a5ba29a9b92d93e1a488dd09bf0fcf9539337651a36d192",
-    "disposition": "adapted or already integrated; preserve fork contracts"
+    "fork_sha256": "cc7a935a1079b1ba14c4e283dd166d0282a553dee737c83790e8d8ad8e0584c5",
+    "disposition": "integrated with fork challenge issuance retention repair"
   },
   {
     "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
@@ -1292,8 +1292,8 @@
     "source_git_blob": "c4151a677ce3647abfe55355f44d4b58295e9bf8",
     "source_sha256": "d070d119ccf968346076a3bb82493eddee879a66b6bae8b79d543d08f220f3e3",
     "fork_path": "docs/push-gateway-deployment.md",
-    "fork_sha256": "5bd61378cd6bc8388a5ba29a9b92d93e1a488dd09bf0fcf9539337651a36d192",
-    "disposition": "adapted or already integrated; preserve fork contracts"
+    "fork_sha256": "cc7a935a1079b1ba14c4e283dd166d0282a553dee737c83790e8d8ad8e0584c5",
+    "disposition": "integrated with fork challenge issuance retention repair"
   },
   {
     "source_commit": "42b42447b0dc47c3e1a4d95caab893567dcd1677",

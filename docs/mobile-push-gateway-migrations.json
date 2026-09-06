@@ -59,5 +59,23 @@
       3
     ],
     "rollout_approval_required": true
+  },
+  {
+    "source_commit": null,
+    "source_path": null,
+    "source_git_blob": null,
+    "source_sha256": null,
+    "source_sqlx_sha384": null,
+    "fork_path": "crates/buzz-push-gateway/migrations/0005_consumed_challenge_issuance.sql",
+    "fork_sha256": "0765b81956da7c142e8d2b33ef3e8a032ef35159ff02aa4bf30c934d5d3c6e4a",
+    "disposition": "fork repair; additive consumed marker preserves issuance accounting; rollout approval required before application",
+    "fork_sqlx_sha384": "11c91f0672f5bd2b13738f0ca697b0f021375c3be1b2b1275ab1a3f95069ef4335348c4bb0c3800efc4bcfc9acc399ff",
+    "prerequisite_versions": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "rollout_approval_required": true
   }
 ]

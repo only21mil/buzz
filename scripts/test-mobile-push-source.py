@@ -58,7 +58,7 @@ class PushSourceContracts(unittest.TestCase):
         relay = json.loads(read('docs/mobile-push-migration-map.json'))
         self.assertEqual([Path(row['fork_path']).name[:4] for row in relay], ['0037', '0038'])
         gateway = json.loads(read('docs/mobile-push-gateway-migrations.json'))
-        self.assertEqual([Path(row['fork_path']).name[:4] for row in gateway], ['0001', '0002', '0003', '0004'])
+        self.assertEqual([Path(row['fork_path']).name[:4] for row in gateway], ['0001', '0002', '0003', '0004', '0005'])
         for row in relay + gateway:
             content = (ROOT / row['fork_path']).read_bytes()
             self.assertEqual(hashlib.sha256(content).hexdigest(), row['fork_sha256'])

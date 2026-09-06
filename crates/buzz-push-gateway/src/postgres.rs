@@ -102,6 +102,11 @@ impl AuthorityStore for PostgresAuthorityStore {
                 return Err(AuthorityError::Unavailable);
             }
         }
+        // Table privileges alone do not establish that the quota migration ran.
+        sqlx::query("SELECT consumed FROM push_gateway_challenges LIMIT 0")
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
         let least_privilege: bool = sqlx::query_scalar(
             "SELECT has_database_privilege(current_user, current_database(), 'CONNECT')
                 AND NOT has_database_privilege(current_user, current_database(), 'CREATE')
@@ -155,7 +160,7 @@ impl AuthorityStore for PostgresAuthorityStore {
         now: i64,
     ) -> Result<(), AuthorityError> {
         use sha2::{Digest, Sha256};
-        let result = sqlx::query("DELETE FROM push_gateway_challenges WHERE id=$1 AND challenge_hash=$2 AND expires_at >= $3")
+        let result = sqlx::query("UPDATE push_gateway_challenges SET consumed=true WHERE id=$1 AND challenge_hash=$2 AND expires_at >= $3 AND NOT consumed")
             .bind(id).bind(Sha256::digest(value).to_vec()).bind(at(now)?).execute(&self.pool).await.map_err(db)?;
         if result.rows_affected() != 1 {
             return Err(AuthorityError::Rejected);
@@ -462,8 +467,9 @@ impl AuthorityStore for PostgresAuthorityStore {
 
     async fn reap_expired(&self, now: i64) -> Result<(), AuthorityError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
-        sqlx::query("DELETE FROM push_gateway_challenges WHERE expires_at < $1")
+        sqlx::query("DELETE FROM push_gateway_challenges WHERE (consumed OR expires_at < $1) AND created_at < $2")
             .bind(at(now)?)
+            .bind(at(now.saturating_sub(CHALLENGE_QUOTA_WINDOW_SECONDS))?)
             .execute(&mut *tx)
             .await
             .map_err(db)?;
@@ -623,7 +629,7 @@ mod tests {
             .await
             .expect("select isolated test schema");
         sqlx::raw_sql(
-            "CREATE TABLE push_gateway_challenges (expires_at TIMESTAMPTZ NOT NULL);
+            "CREATE TABLE push_gateway_challenges (expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL, consumed BOOLEAN NOT NULL DEFAULT false);
              CREATE TABLE push_gateway_delivery_auth_replays (expires_at TIMESTAMPTZ NOT NULL);
              CREATE TABLE push_gateway_delivery_request_replays (expires_at TIMESTAMPTZ NOT NULL);
              CREATE TABLE push_gateway_endpoint_quotas (updated_at TIMESTAMPTZ NOT NULL);
@@ -731,7 +737,8 @@ mod tests {
                  id UUID PRIMARY KEY,
                  challenge_hash BYTEA NOT NULL CHECK (length(challenge_hash) = 32),
                  expires_at TIMESTAMPTZ NOT NULL,
-                 created_at TIMESTAMPTZ NOT NULL
+                 created_at TIMESTAMPTZ NOT NULL,
+                 consumed BOOLEAN NOT NULL DEFAULT false
              );
              CREATE TABLE push_gateway_installations (
                  id UUID PRIMARY KEY,
@@ -830,6 +837,93 @@ mod tests {
             "the quota loser receives an explicit rate-limit result"
         );
 
+        pool.close().await;
+        drop_schema(&schema).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn consumed_challenge_quota_survives_restart_concurrency_and_reaping() {
+        use sqlx::postgres::PgPoolOptions;
+        let (pool, schema) = full_schema(4).await;
+        let store = PostgresAuthorityStore::new(pool.clone());
+        let now = Utc::now().timestamp();
+        let challenge = |created_at| Challenge {
+            id: Uuid::new_v4(),
+            value: [42; 32],
+            created_at,
+            expires_at: created_at + 1,
+        };
+        for _ in 0..CHALLENGE_QUOTA_MAX_REQUESTS - 1 {
+            let c = challenge(now);
+            store.put_challenge(c.clone()).await.unwrap();
+            store.consume_challenge(c.id, c.value, now).await.unwrap();
+            assert_eq!(
+                store.consume_challenge(c.id, c.value, now).await,
+                Err(AuthorityError::Rejected)
+            );
+        }
+        // Reopen every connection and store; issuance must live in PostgreSQL.
+        drop(store);
+        let options = pool.connect_options();
+        pool.close().await;
+        let set_path = format!("SET search_path TO {schema}");
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .after_connect(move |conn, _| {
+                let set_path = set_path.clone();
+                Box::pin(async move {
+                    sqlx::query(AssertSqlSafe(set_path)).execute(conn).await?;
+                    Ok(())
+                })
+            })
+            .connect_with((*options).clone())
+            .await
+            .unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let store = PostgresAuthorityStore::new(pool.clone());
+            let c = challenge(now);
+            tasks.spawn(async move {
+                let result = store.put_challenge(c.clone()).await;
+                if result.is_ok() {
+                    store.consume_challenge(c.id, c.value, now).await.unwrap();
+                }
+                result
+            });
+        }
+        let mut admitted = 0;
+        while let Some(result) = tasks.join_next().await {
+            match result.unwrap() {
+                Ok(()) => admitted += 1,
+                Err(error) => assert_eq!(error, AuthorityError::RateLimited),
+            }
+        }
+        assert_eq!(
+            admitted, 1,
+            "consumption cannot release the final global quota slot"
+        );
+        let store = PostgresAuthorityStore::new(pool.clone());
+        assert_eq!(
+            store.put_challenge(challenge(now)).await,
+            Err(AuthorityError::RateLimited)
+        );
+        store.reap_expired(now + 60).await.unwrap();
+        assert_eq!(
+            store.put_challenge(challenge(now + 60)).await,
+            Err(AuthorityError::RateLimited),
+            "expired challenges still count at the window boundary"
+        );
+        store.reap_expired(now + 61).await.unwrap();
+        let retained: i64 = sqlx::query_scalar("SELECT count(*) FROM push_gateway_challenges")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            retained, 0,
+            "consumed issuance records have bounded retention"
+        );
+        store.put_challenge(challenge(now + 61)).await.unwrap();
         pool.close().await;
         drop_schema(&schema).await;
     }

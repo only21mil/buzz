@@ -199,7 +199,8 @@ pub trait AuthorityStore: Send + Sync {
 
 #[derive(Default)]
 struct MemoryState {
-    challenges: HashMap<Uuid, Challenge>,
+    // Keep issuance timestamps after consumption until the quota window elapses.
+    challenges: HashMap<Uuid, (Challenge, bool)>,
     installations: HashMap<Uuid, Installation>,
     token_owners: HashMap<(AppProfile, [u8; 32]), Uuid>,
     delegations: HashMap<(Uuid, String), Delegation>,
@@ -231,15 +232,16 @@ impl AuthorityStore for MemoryAuthorityStore {
             .saturating_sub(CHALLENGE_QUOTA_WINDOW_SECONDS);
         if s.challenges
             .values()
-            .filter(|existing| existing.created_at >= window_start)
+            .filter(|(existing, _)| existing.created_at >= window_start)
             .count()
             >= CHALLENGE_QUOTA_MAX_REQUESTS
         {
             return Err(AuthorityError::RateLimited);
         }
-        if s.challenges.insert(challenge.id, challenge).is_some() {
+        if s.challenges.contains_key(&challenge.id) {
             return Err(AuthorityError::Rejected);
         }
+        s.challenges.insert(challenge.id, (challenge, false));
         Ok(())
     }
 
@@ -250,10 +252,11 @@ impl AuthorityStore for MemoryAuthorityStore {
         now: i64,
     ) -> Result<(), AuthorityError> {
         let mut s = self.0.lock().map_err(|_| AuthorityError::Unavailable)?;
-        let challenge = s.challenges.remove(&id).ok_or(AuthorityError::Rejected)?;
-        if challenge.value != value || challenge.expires_at < now {
+        let (challenge, consumed) = s.challenges.get_mut(&id).ok_or(AuthorityError::Rejected)?;
+        if *consumed || challenge.value != value || challenge.expires_at < now {
             return Err(AuthorityError::Rejected);
         }
+        *consumed = true;
         Ok(())
     }
 
@@ -566,8 +569,10 @@ impl AuthorityStore for MemoryAuthorityStore {
 
     async fn reap_expired(&self, now: i64) -> Result<(), AuthorityError> {
         let mut s = self.0.lock().map_err(|_| AuthorityError::Unavailable)?;
-        s.challenges
-            .retain(|_, challenge| challenge.expires_at >= now);
+        let window_start = now.saturating_sub(CHALLENGE_QUOTA_WINDOW_SECONDS);
+        s.challenges.retain(|_, (challenge, consumed)| {
+            challenge.created_at >= window_start || (!*consumed && challenge.expires_at >= now)
+        });
         s.delivery_auth_replays
             .retain(|_, expires_at| *expires_at >= now);
         s.delivery_request_replays
@@ -690,6 +695,76 @@ mod tests {
             })
             .await
             .expect("quota reopens after the rolling window");
+    }
+
+    #[tokio::test]
+    async fn consumed_challenges_retain_issuance_quota_until_window_expires() {
+        let store = MemoryAuthorityStore::default();
+        let challenge = |created_at| Challenge {
+            id: Uuid::new_v4(),
+            value: [42; 32],
+            created_at,
+            expires_at: created_at + 1,
+        };
+        for _ in 0..CHALLENGE_QUOTA_MAX_REQUESTS {
+            let c = challenge(1_000);
+            store.put_challenge(c.clone()).await.unwrap();
+            store.consume_challenge(c.id, c.value, 1_000).await.unwrap();
+            assert_eq!(
+                store.consume_challenge(c.id, c.value, 1_000).await,
+                Err(AuthorityError::Rejected)
+            );
+        }
+        assert_eq!(
+            store.put_challenge(challenge(1_000)).await,
+            Err(AuthorityError::RateLimited),
+            "consumption must not refund issuance"
+        );
+        store.reap_expired(1_060).await.unwrap();
+        assert_eq!(
+            store.put_challenge(challenge(1_060)).await,
+            Err(AuthorityError::RateLimited),
+            "expiry/reaping must retain the inclusive rolling window"
+        );
+        store.reap_expired(1_061).await.unwrap();
+        assert!(
+            store.0.lock().unwrap().challenges.is_empty(),
+            "retention is bounded"
+        );
+        store.put_challenge(challenge(1_061)).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_issue_and_consume_obeys_global_ceiling() {
+        let store = std::sync::Arc::new(MemoryAuthorityStore::default());
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let store = store.clone();
+            tasks.spawn(async move {
+                let mut admitted = 0;
+                for _ in 0..50 {
+                    let c = Challenge {
+                        id: Uuid::new_v4(),
+                        value: [7; 32],
+                        created_at: 1_000,
+                        expires_at: 1_300,
+                    };
+                    match store.put_challenge(c.clone()).await {
+                        Ok(()) => {
+                            admitted += 1;
+                            store.consume_challenge(c.id, c.value, 1_000).await.unwrap();
+                        }
+                        Err(error) => assert_eq!(error, AuthorityError::RateLimited),
+                    }
+                }
+                admitted
+            });
+        }
+        let mut admitted = 0;
+        while let Some(result) = tasks.join_next().await {
+            admitted += result.unwrap();
+        }
+        assert_eq!(admitted, CHALLENGE_QUOTA_MAX_REQUESTS);
     }
 
     #[tokio::test]
