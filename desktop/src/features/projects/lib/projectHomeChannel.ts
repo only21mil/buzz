@@ -1,3 +1,4 @@
+import { isProjectSnapshotRow } from "../projectSnapshot";
 import { useProjectsQuery } from "@/features/projects/hooks";
 import type { Project } from "@/features/projects/projectModels";
 
@@ -9,6 +10,7 @@ export function findProjectHomeByChannelId(
   if (!channelId) return null;
   const matching = projects.filter(
     (project) =>
+      !isProjectSnapshotRow(project) &&
       !project.legacy &&
       project.projectChannelId === channelId &&
       hasAuthoritativeHomeBinding(project),
@@ -18,8 +20,10 @@ export function findProjectHomeByChannelId(
 
 export type ProjectHomeCandidate = {
   owner: string;
+  repositoryAddresses?: readonly string[];
   projectChannelId: string | null;
   repositories: ReadonlyArray<{
+    repoAddress?: string;
     channelId?: string | null;
     maintainers?: ReadonlyArray<string>;
     owner: string;
@@ -29,12 +33,19 @@ export type ProjectHomeCandidate = {
 export function hasAuthoritativeHomeBinding(
   project: ProjectHomeCandidate,
 ): boolean {
+  if (isProjectSnapshotRow(project)) return false;
   const channelId = project.projectChannelId;
   if (!channelId) return false;
 
   const projectOwner = project.owner.toLowerCase();
   return project.repositories.some((repository) => {
     if (repository.channelId !== channelId) return false;
+    if (
+      project.repositoryAddresses &&
+      (!repository.repoAddress ||
+        !project.repositoryAddresses.includes(repository.repoAddress))
+    )
+      return false;
     if (repository.owner.toLowerCase() === projectOwner) return true;
     return repository.maintainers?.some(
       (maintainer) => maintainer.toLowerCase() === projectOwner,

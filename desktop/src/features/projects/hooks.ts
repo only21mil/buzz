@@ -1,3 +1,5 @@
+import { useIdentityQuery } from "@/shared/api/hooks";
+import { projectCollectionQueryOptions } from "./projectCollectionQuery";
 import { projectDeletionMutationOptions } from "./projectDeletionMutation";
 import { isTauri } from "@tauri-apps/api/core";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -169,13 +171,18 @@ export function eventToProject(
 }
 
 export async function fetchProjects(
-  fetchExhaustively: FetchProjectEventsExhaustively = fetchProjectEventsExhaustively,
+  fetchExhaustively?: FetchProjectEventsExhaustively,
+  signal?: AbortSignal,
 ): Promise<Project[]> {
   // Delegates to `buildProjectsFromFetcher` in `projectEnumeration.ts`, which
   // is the pure, Tauri-free core of this operation. That helper's javadoc
   // explains the fail-closed tombstone contract and the NIP-OA owner-deletion
   // relay-side-suppression decision.
-  return buildProjectsFromFetcher(fetchExhaustively, {
+  const fetcher =
+    fetchExhaustively ??
+    ((kinds, filter) =>
+      fetchProjectEventsExhaustively(kinds, filter, undefined, signal));
+  return buildProjectsFromFetcher(fetcher, {
     relayOrigin: getCachedRelayOrigin(),
     hiddenAddresses: new Set(readHiddenProjectCards()),
   });
@@ -228,6 +235,7 @@ async function fetchRepoState(project: Repository): Promise<RepoState | null> {
 
 async function fetchProjectIssues(
   project: Repository,
+  signal?: AbortSignal,
 ): Promise<ProjectIssue[]> {
   const issuePromise = relayClient.fetchEvents({
     kinds: [KIND_GIT_ISSUE],
@@ -257,7 +265,11 @@ async function fetchProjectIssues(
       // (`#e`) because that is the only tag constraint the relay applies
       // before its SQL LIMIT — see fetchAssignmentOperationEvents.
       issuePromise.then((events) =>
-        fetchAssignmentOperationEvents(events.map((event) => event.id)),
+        fetchAssignmentOperationEvents(
+          events.map((event) => event.id),
+          undefined,
+          signal,
+        ),
       ),
     ]);
 
@@ -619,22 +631,26 @@ async function fetchProjectActivitySummaries(
 
 export const projectsQueryKey = ["projects"] as const;
 
-export function useProjectsQuery() {
-  return useQuery({
-    queryKey: projectsQueryKey,
-    queryFn: () => fetchProjects(),
-    staleTime: 60_000,
+function useProjectCollectionOptions() {
+  const identity = useIdentityQuery();
+  const relayOrigin = getCachedRelayOrigin();
+  const scope =
+    relayOrigin && identity.data?.pubkey
+      ? { relayOrigin, pubkey: identity.data.pubkey }
+      : null;
+  return projectCollectionQueryOptions(scope, {
+    hiddenAddresses: new Set(readHiddenProjectCards()),
   });
 }
-
+export function useProjectsQuery() {
+  return useQuery(useProjectCollectionOptions());
+}
 export function useProjectQuery(projectId: string) {
   return useQuery({
-    queryKey: projectsQueryKey,
-    queryFn: () => fetchProjects(),
-    select: (projects) =>
+    ...useProjectCollectionOptions(),
+    select: (projects: Project[]) =>
       projects.find((project) => projectMatchesRouteId(project, projectId)) ??
       null,
-    staleTime: 60_000,
   });
 }
 
@@ -788,9 +804,9 @@ export function useProjectIssuesQuery(project: Repository | null | undefined) {
   return useQuery({
     enabled: Boolean(project),
     queryKey: ["project", project?.id ?? "none", "issues"],
-    queryFn: () => {
+    queryFn: ({ signal }) => {
       if (!project) throw new Error("No project selected.");
-      return fetchProjectIssues(project);
+      return fetchProjectIssues(project, signal);
     },
     staleTime: 30_000,
   });
@@ -812,10 +828,23 @@ export function useProjectPullRequestsQuery(
 
 /** Loads cross-project issues and pull requests with partial-failure metadata. */
 export function useProjectsWorkItemsQuery(projects: Project[]) {
+  const identity = useIdentityQuery();
   return useQuery({
     enabled: projects.length > 0,
-    queryKey: ["projects", "work-items", projects.map((project) => project.id)],
-    queryFn: () => fetchProjectsWorkItems(projects),
+    queryKey: [
+      "projects",
+      "work-items",
+      getCachedRelayOrigin(),
+      identity.data?.pubkey.toLowerCase() ?? "",
+      projects.map((project) => project.id),
+      projects
+        .flatMap((project) =>
+          project.repositories.map((repo) => repo.repoAddress),
+        )
+        .sort(),
+    ],
+    queryFn: ({ signal }) =>
+      fetchProjectsWorkItems(projects, undefined, signal),
     staleTime: 30_000,
   });
 }

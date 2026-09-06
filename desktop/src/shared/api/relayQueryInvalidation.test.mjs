@@ -58,6 +58,8 @@ test("relay invalidation excludes local Tauri and disk-only query roots", () => 
 test("relay invalidation separates relay project queries from local repo work", () => {
   for (const queryKey of [
     ["projects"],
+    ["projects", "collection", "https://relay.example", "alice"],
+    ["projects", "work-items", "https://relay.example", "alice", []],
     ["project", "project-1"],
     ["project", "project-1", "issues"],
     ["project", "project-1", "pull-requests"],

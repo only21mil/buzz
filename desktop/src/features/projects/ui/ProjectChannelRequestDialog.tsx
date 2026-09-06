@@ -2,7 +2,7 @@ import { isTauri } from "@tauri-apps/api/core";
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { classifyAgentManagementOrigin } from "@/features/agents/agentManagementBuffer";
-import { subscribeProjectChannelRequests } from "@/features/agents/observerRelayStore";
+import { subscribeProjectChannelRequests } from "../projectChannelRequestEvents";
 import { useManagedAgentsQuery } from "@/features/agents/hooks";
 import { useChannelsQuery, channelsQueryKey } from "@/features/channels/hooks";
 import { useIdentityQuery } from "@/shared/api/hooks";

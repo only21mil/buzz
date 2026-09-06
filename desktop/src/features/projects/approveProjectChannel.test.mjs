@@ -99,3 +99,16 @@ test("identity change while signing cannot publish into another identity", async
   );
   assert.equal(calls.published, 0);
 });
+
+test("identity rotation before channel creation performs no mutation", async () => {
+  const { deps, calls } = fixture();
+  let reads = 0;
+  deps.getIdentity = async () => ({
+    pubkey: ++reads === 1 ? owner : "b".repeat(64),
+  });
+  await assert.rejects(
+    approveProjectChannel(request, new Map(), deps),
+    /Identity or relay changed/,
+  );
+  assert.deepEqual(calls, { created: 0, published: 0 });
+});

@@ -1,3 +1,4 @@
+import { useIncrementalMount } from "@/shared/hooks/useIncrementalMount";
 import { isTauri } from "@tauri-apps/api/core";
 import { canDeleteProject } from "../projectDeletion";
 import * as React from "react";
@@ -574,11 +575,14 @@ export function ProjectsView() {
     [deleteProjectMutation],
   );
 
+  const projectMountCount = useIncrementalMount(visibleProjects.length);
+  const repositoryMountCount = useIncrementalMount(visibleRepositories.length);
+
   if (projectsQuery.isLoading) {
     return <ViewLoadingFallback kind="projects" />;
   }
 
-  if (projectsQuery.isError) {
+  if (projectsQuery.isError && !projectsQuery.data) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
         <p className="text-sm text-red-400">Failed to load projects</p>
@@ -607,7 +611,7 @@ export function ProjectsView() {
           filter !== "all" && "xl:grid-cols-3",
         )}
       >
-        {visibleProjects.map((project) => {
+        {visibleProjects.slice(0, projectMountCount).map((project) => {
           const summary = activitySummariesQuery.data?.[project.id];
           const repoSnapshot = repoSnapshotsQuery.data?.snapshots?.[project.id];
           return (
@@ -640,7 +644,7 @@ export function ProjectsView() {
         className="divide-y divide-border/60"
         data-testid="projects-list-container"
       >
-        {visibleProjects.map((project) => {
+        {visibleProjects.slice(0, projectMountCount).map((project) => {
           const summary = activitySummariesQuery.data?.[project.id];
           const repoSnapshot = repoSnapshotsQuery.data?.snapshots?.[project.id];
           return (
@@ -675,37 +679,41 @@ export function ProjectsView() {
       <EmptyFilteredState />
     ) : viewMode === "grid" ? (
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-        {visibleRepositories.map(({ project, repository }) => (
-          <RepositoryGridCard
-            hasLocal={hasLocalRepositoryCheckout(repository, localRepoNames)}
-            key={repository.repoAddress}
-            onOpen={handleOpenRepository}
-            onOpenTerminal={handleOpenRepositoryTerminal}
-            profiles={profiles}
-            project={project}
-            repository={repository}
-            summary={
-              repositoryActivitySummariesQuery.data?.[repository.repoAddress]
-            }
-          />
-        ))}
+        {visibleRepositories
+          .slice(0, repositoryMountCount)
+          .map(({ project, repository }) => (
+            <RepositoryGridCard
+              hasLocal={hasLocalRepositoryCheckout(repository, localRepoNames)}
+              key={repository.repoAddress}
+              onOpen={handleOpenRepository}
+              onOpenTerminal={handleOpenRepositoryTerminal}
+              profiles={profiles}
+              project={project}
+              repository={repository}
+              summary={
+                repositoryActivitySummariesQuery.data?.[repository.repoAddress]
+              }
+            />
+          ))}
       </div>
     ) : (
       <div className="divide-y divide-border/60">
-        {visibleRepositories.map(({ project, repository }) => (
-          <RepositoryListRow
-            hasLocal={hasLocalRepositoryCheckout(repository, localRepoNames)}
-            key={repository.repoAddress}
-            onOpen={handleOpenRepository}
-            onOpenTerminal={handleOpenRepositoryTerminal}
-            profiles={profiles}
-            project={project}
-            repository={repository}
-            summary={
-              repositoryActivitySummariesQuery.data?.[repository.repoAddress]
-            }
-          />
-        ))}
+        {visibleRepositories
+          .slice(0, repositoryMountCount)
+          .map(({ project, repository }) => (
+            <RepositoryListRow
+              hasLocal={hasLocalRepositoryCheckout(repository, localRepoNames)}
+              key={repository.repoAddress}
+              onOpen={handleOpenRepository}
+              onOpenTerminal={handleOpenRepositoryTerminal}
+              profiles={profiles}
+              project={project}
+              repository={repository}
+              summary={
+                repositoryActivitySummariesQuery.data?.[repository.repoAddress]
+              }
+            />
+          ))}
       </div>
     );
 
@@ -791,6 +799,18 @@ export function ProjectsView() {
         topChromeInset.divider,
       )}
     >
+      {projectsQuery.isError ? (
+        <div role="status" className="px-4 py-2 text-sm text-muted-foreground">
+          Project refresh failed. Showing saved rows.{" "}
+          <Button
+            onClick={() => void projectsQuery.refetch()}
+            size="sm"
+            variant="ghost"
+          >
+            Retry
+          </Button>
+        </div>
+      ) : null}
       {/* Scroll indicator painted over the scrollbar gutter; only visible
           while scrolling (native thumb is transparent). */}
       <div

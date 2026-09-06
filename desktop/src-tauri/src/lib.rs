@@ -52,11 +52,7 @@ pub mod webkit_rendering;
 use app_state::{build_app_state, resolve_persisted_identity, AppState};
 use builderlab::*;
 use commands::*;
-use deep_link::{
-    acknowledge_pending_community_deep_link, handle_deep_link_url,
-    take_pending_community_deep_link, PendingCommunityDeepLinks,
-    take_pending_entity_deep_link, acknowledge_pending_entity_deep_link, PendingEntityDeepLinks,
-};
+use deep_link::*;
 use huddle::audio_output::{
     get_audio_output_device, list_audio_output_devices, set_audio_output_device,
 };
@@ -115,7 +111,6 @@ pub fn run() {
     }
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            // Focus the existing window when a duplicate instance launches.
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.set_focus();
             }

@@ -1,4 +1,4 @@
-import { ProjectChannelRequestDialog } from "@/features/projects/ui/ProjectChannelRequestDialog";
+import { OwnerReviewDialogs } from "./OwnerReviewDialogs";
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useLocation } from "@tanstack/react-router";
@@ -45,8 +45,6 @@ import { useManagedAgentRuntimeReconciliation } from "@/features/agents/useManag
 import { useAutoRestartPolicy } from "@/features/agents/lib/useAutoRestartPolicy";
 import { usePersonaSync } from "@/features/agents/lib/usePersonaSync";
 import { useAgentObserverIngestion } from "@/features/agents/useAgentObserverIngestion";
-import { AgentManagementDialogs } from "@/features/agents/ui/AgentManagementDialogs";
-import { RequestedAgentCreateDialogs } from "@/features/agents/ui/RequestedAgentCreateDialogs";
 import {
   usePresenceSession,
   usePresenceSubscription,
@@ -956,9 +954,7 @@ export function AppShell() {
                     ) : null}
                   </div>
                 )}
-                <RequestedAgentCreateDialogs />
-                <AgentManagementDialogs />
-                <ProjectChannelRequestDialog />
+                <OwnerReviewDialogs />
                 <AppShellOverlays
                   activeChannel={managedChannel}
                   browseDialogType={browseDialogType}

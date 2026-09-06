@@ -1,6 +1,7 @@
+import { ProjectLoadState } from "./ProjectLoadState";
 import { findProjectHomeByChannelId } from "@/features/projects/lib/projectHomeChannel";
 import { isTauri } from "@tauri-apps/api/core";
-import { ArrowLeft, ExternalLink, FolderGit2 } from "lucide-react";
+import { ExternalLink, FolderGit2 } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
 
@@ -723,51 +724,13 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   if (projectQuery.isLoading) {
     return <ViewLoadingFallback kind="projects" />;
   }
-  if (projectQuery.isError) {
-    return (
-      <div className="flex flex-1 flex-col items-center justify-center gap-3 px-4 py-16 text-center">
-        <FolderGit2 className="h-10 w-10 text-muted-foreground/40" />
-        <p className="text-sm text-red-400">Failed to load project</p>
-        <div className="flex items-center gap-2">
-          <Button
-            onClick={() => void projectQuery.refetch()}
-            size="sm"
-            variant="outline"
-          >
-            Retry
-          </Button>
-          <Button
-            onClick={() => {
-              void goProjects();
-            }}
-            size="sm"
-            variant="ghost"
-          >
-            <ArrowLeft className="mr-1.5 h-4 w-4" />
-            Back to Projects
-          </Button>
-        </div>
-      </div>
-    );
-  }
   if (!project) {
     return (
-      <div className="flex flex-1 flex-col items-center justify-center gap-3 px-4 py-16 text-center">
-        <FolderGit2 className="h-10 w-10 text-muted-foreground/40" />
-        <p className="text-sm text-muted-foreground">
-          This project could not be found.
-        </p>
-        <Button
-          onClick={() => {
-            void goProjects();
-          }}
-          size="sm"
-          variant="outline"
-        >
-          <ArrowLeft className="mr-1.5 h-4 w-4" />
-          Back to Projects
-        </Button>
-      </div>
+      <ProjectLoadState
+        failed={projectQuery.isError}
+        onRetry={() => void projectQuery.refetch()}
+        onBack={() => void goProjects()}
+      />
     );
   }
   if (!repository) {
@@ -857,6 +820,21 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       />
       <div className="flex min-h-0 min-w-0 flex-1 flex-row overflow-hidden">
         <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+          {projectQuery.isError ? (
+            <p
+              role="status"
+              className="px-4 py-2 text-sm text-muted-foreground"
+            >
+              Project refresh failed. Showing saved details.{" "}
+              <Button
+                onClick={() => void projectQuery.refetch()}
+                variant="ghost"
+                size="sm"
+              >
+                Retry
+              </Button>
+            </p>
+          ) : null}
           <ProjectDetailChrome
             homeChannelId={
               findProjectHomeByChannelId(

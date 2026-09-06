@@ -9,13 +9,10 @@ function withAbsorbedRepository(
   }
   return {
     ...project,
-    primaryRepositoryAddress:
-      project.primaryRepositoryAddress ?? repository.repoAddress,
     repositories: [...project.repositories, repository],
-    repositoryAddresses: [
-      ...project.repositoryAddresses,
-      repository.repoAddress,
-    ],
+    // Presentation grouping never manufactures a signed project membership.
+    // Only a subsequently verified project a-tag can add this address.
+    repositoryAddresses: project.repositoryAddresses,
   };
 }
 

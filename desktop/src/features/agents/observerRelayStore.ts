@@ -1,7 +1,7 @@
 import {
-  parseProjectChannelRequest,
-  type ProjectChannelRequest,
-} from "@/features/projects/projectChannelRequest";
+  dispatchProjectChannelRequest,
+  resetProjectChannelRequests,
+} from "@/features/projects/projectChannelRequestEvents";
 import * as React from "react";
 import {
   compareObserverEvents,
@@ -121,10 +121,6 @@ export function getLatestLiveSessionId(
 const controlResultListeners = new Map<
   string,
   Set<(frame: ControlResultFrame) => void>
->();
-
-const projectChannelRequestListeners = new Set<
-  (agentPubkey: string, request: ProjectChannelRequest) => void
 >();
 
 const agentManagementListeners = new Set<
@@ -419,10 +415,7 @@ function processLiveObserverEvent(
       });
     }
   }
-  const projectRequest = parseProjectChannelRequest(parsed.payload);
-  if (projectRequest)
-    for (const listener of projectChannelRequestListeners)
-      listener(agentPubkey, projectRequest);
+  dispatchProjectChannelRequest(agentPubkey, parsed.payload);
   const managementRequest = parseAgentManagementRequest(parsed.payload);
   if (managementRequest) {
     for (const listener of agentManagementListeners) {
@@ -496,12 +489,7 @@ export async function handleRelayObserverEvent(
       const innerEvents = unwrapObserverBatch(parsed);
       const telemetryEvents: ObserverEvent[] = [];
       for (const inner of innerEvents) {
-        const projectRequest = parseProjectChannelRequest(inner.payload);
-        if (projectRequest) {
-          for (const listener of projectChannelRequestListeners)
-            listener(agentPubkey, projectRequest);
-          continue;
-        }
+        if (dispatchProjectChannelRequest(agentPubkey, inner.payload)) continue;
         const managementRequest = parseAgentManagementRequest(inner.payload);
         if (managementRequest) {
           for (const listener of agentManagementListeners) {
@@ -684,26 +672,13 @@ function dispatchControlResult(agentPubkey: string, payload: unknown) {
   }
 }
 
-/**
- * Subscribe to `control_result` frames for a single agent. Returns an
- * unsubscribe function. Used by the ModelPicker to learn the async outcome of
- * a `switch_model` frame.
- */
+/** Subscribe to owner-review requests from verified observer frames. */
 export function subscribeAgentManagementRequests(
   listener: (agentPubkey: string, request: AgentManagementRequest) => void,
 ) {
   agentManagementListeners.add(listener);
   return () => {
     agentManagementListeners.delete(listener);
-  };
-}
-
-export function subscribeProjectChannelRequests(
-  listener: (agentPubkey: string, request: ProjectChannelRequest) => void,
-) {
-  projectChannelRequestListeners.add(listener);
-  return () => {
-    projectChannelRequestListeners.delete(listener);
   };
 }
 
@@ -957,7 +932,7 @@ export function resetAgentObserverStore() {
   pendingUnknownAgentFrames.length = 0;
   latestLiveSessionByAgentChannel.clear();
   agentManagementListeners.clear();
-  projectChannelRequestListeners.clear();
+  resetProjectChannelRequests();
   onSessionConfigCaptured = null;
   ownerPubkey = null;
   connectionState = "idle";

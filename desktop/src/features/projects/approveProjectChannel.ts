@@ -66,6 +66,14 @@ export async function approveProjectChannel(
   const key = `${identity.pubkey.toLowerCase()}:${request.requestId}`;
   let channel = resume.get(key);
   if (!channel) {
+    if (
+      deps.getRelayOrigin() !== origin ||
+      (await deps.getIdentity()).pubkey.toLowerCase() !==
+        identity.pubkey.toLowerCase()
+    )
+      throw new Error(
+        "Identity or relay changed during approval. Refresh before retrying.",
+      );
     channel = await deps.createChannel({
       name: request.request.name,
       description: request.request.description,

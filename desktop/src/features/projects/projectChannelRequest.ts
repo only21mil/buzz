@@ -31,7 +31,7 @@ export function parseProjectChannelRequest(
   if (
     payload.type !== PROJECT_CHANNEL_REQUEST ||
     payload.action !== "create" ||
-    !isText(payload.requestId) ||
+    !isTextWithin(payload.requestId, 256) ||
     typeof payload.request !== "object" ||
     payload.request === null
   ) {
