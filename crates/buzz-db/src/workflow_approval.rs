@@ -933,6 +933,7 @@ pub async fn decide_workflow_approval_gate(
         UPDATE workflow_runs
         SET status = $1::run_status, generation = generation + 1,
             completed_at = $2, error_message = $3,
+            error_code = CASE WHEN $3::text IS NOT NULL THEN 'approval_denied' ELSE NULL END,
             resume_lease_expires_at = NULL
         WHERE community_id = $4 AND id = $5 AND workflow_id = $6
           AND status = 'waiting_approval' AND generation = $7

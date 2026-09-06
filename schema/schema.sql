@@ -415,6 +415,7 @@ CREATE TABLE workflow_runs (
     started_at          TIMESTAMPTZ,
     resume_lease_expires_at TIMESTAMPTZ,
     completed_at        TIMESTAMPTZ,
+    error_code          TEXT,
     error_message       TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (community_id, id),

@@ -2138,6 +2138,9 @@ const WORKFLOW_RUNS_MAX_LIMIT: u32 = 100;
 /// Optional query controls for workflow run history.
 pub struct WorkflowRunsQuery {
     limit: Option<u32>,
+    page: Option<bool>,
+    before: Option<chrono::DateTime<chrono::Utc>>,
+    before_id: Option<uuid::Uuid>,
 }
 
 fn workflow_runs_limit(requested: Option<u32>) -> i64 {
@@ -2170,6 +2173,7 @@ fn workflow_run_json(run: &buzz_db::workflow::WorkflowRunRecord) -> Value {
         "current_step": run.current_step,
         "execution_trace": redacted_workflow_run_trace(&run.execution_trace),
         "error_message": run.error_message,
+        "error_code": run.error_code,
         "started_at": run.started_at.map(|timestamp| timestamp.timestamp()),
         "completed_at": run.completed_at.map(|timestamp| timestamp.timestamp()),
         "created_at": run.created_at.timestamp(),
@@ -2221,6 +2225,73 @@ pub async fn workflow_runs(
     headers: HeaderMap,
     Query(query): Query<WorkflowRunsQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let tenant = authorize_workflow_history(&state, &headers, &original_uri, workflow_id).await?;
+    let (paged, limit) = workflow_runs_controls(&query)?;
+    let mut runs = state
+        .db
+        .list_workflow_runs_page(
+            tenant.community(),
+            workflow_id,
+            query.before,
+            query.before_id,
+            limit + i64::from(paged),
+        )
+        .await
+        .map_err(|error| internal_error(&format!("list workflow runs: {error}")))?;
+    Ok(Json(workflow_runs_response(
+        &mut runs,
+        limit as usize,
+        paged,
+    )))
+}
+
+fn workflow_runs_controls(
+    query: &WorkflowRunsQuery,
+) -> Result<(bool, i64), (StatusCode, Json<Value>)> {
+    let paged = query.page.unwrap_or(false) || query.before.is_some() || query.before_id.is_some();
+    if query.before.is_some() != query.before_id.is_some() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "before and before_id must be supplied together",
+        ));
+    }
+    let limit = workflow_runs_limit(query.limit);
+    if paged && limit == 0 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "page limit must be positive",
+        ));
+    }
+    Ok((paged, limit))
+}
+
+fn workflow_runs_response(
+    runs: &mut Vec<buzz_db::workflow::WorkflowRunRecord>,
+    limit: usize,
+    paged: bool,
+) -> Value {
+    let has_more = runs.len() > limit;
+    runs.truncate(limit);
+    let next = if has_more {
+        runs.last()
+            .map(|last| serde_json::json!({"before": last.created_at, "before_id": last.id}))
+    } else {
+        None
+    };
+    let rows = runs.iter().map(workflow_run_json).collect::<Vec<_>>();
+    if paged {
+        serde_json::json!({"runs": rows, "next": next})
+    } else {
+        Value::Array(rows)
+    }
+}
+
+async fn authorize_workflow_history(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    original_uri: &axum::http::Uri,
+    workflow_id: uuid::Uuid,
+) -> Result<TenantContext, (StatusCode, Json<Value>)> {
     let raw_host = headers
         .get(axum::http::header::HOST)
         .and_then(|value| value.to_str().ok())
@@ -2237,26 +2308,26 @@ pub async fn workflow_runs(
     let expected_url = nip98_expected_url(
         &state.config.relay_url,
         &tenant,
-        path_with_query(&original_uri),
+        path_with_query(original_uri),
     );
     let VerifiedBridgeAuth {
         pubkey,
         event_id_bytes,
         signed_created_at,
     } = verify_bridge_auth(
-        &headers,
+        headers,
         "GET",
         &expected_url,
         None,
         state.config.require_auth_token,
     )?;
-    enforce_http_admission(&state, &tenant, &pubkey).await?;
-    check_nip98_replay(&state, &tenant, event_id_bytes).await?;
+    enforce_http_admission(state, &tenant, &pubkey).await?;
+    check_nip98_replay(state, &tenant, event_id_bytes).await?;
 
     let authenticated_pubkey = pubkey.to_bytes();
-    let auth_tag = super::relay_members::extract_auth_tag_header(&headers);
+    let auth_tag = super::relay_members::extract_auth_tag_header(headers);
     super::relay_members::enforce_relay_membership(
-        &state,
+        state,
         tenant.community(),
         &authenticated_pubkey,
         auth_tag,
@@ -2264,41 +2335,88 @@ pub async fn workflow_runs(
     )
     .await?;
 
-    let workflow = state
-        .db
-        .get_workflow(tenant.community(), workflow_id)
-        .await
-        .map_err(|error| match error {
-            buzz_db::DbError::NotFound(_) => workflow_not_found(),
-            other => internal_error(&format!("get workflow for run history: {other}")),
-        })?;
+    authorize_workflow_history_rows(
+        &state.db,
+        tenant.community(),
+        &authenticated_pubkey,
+        workflow_id,
+    )
+    .await?;
+    Ok(tenant)
+}
+
+async fn authorize_workflow_history_rows(
+    db: &buzz_db::Db,
+    community_id: buzz_core::CommunityId,
+    authenticated_pubkey: &[u8],
+    workflow_id: uuid::Uuid,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let workflow =
+        db.get_workflow(community_id, workflow_id)
+            .await
+            .map_err(|error| match error {
+                buzz_db::DbError::NotFound(_) => workflow_not_found(),
+                other => internal_error(&format!("get workflow for run history: {other}")),
+            })?;
     let active_channel_member = match workflow.channel_id {
-        Some(channel_id) if workflow.owner_pubkey == authenticated_pubkey => state
-            .db
-            .is_member(tenant.community(), channel_id, &authenticated_pubkey)
+        Some(channel_id) if workflow.owner_pubkey == authenticated_pubkey => db
+            .is_member(community_id, channel_id, authenticated_pubkey)
             .await
             .map_err(|error| {
                 internal_error(&format!("check workflow run history membership: {error}"))
             })?,
         _ => false,
     };
-    if !workflow_runs_access_allowed(&workflow, &authenticated_pubkey, active_channel_member) {
+    if !workflow_runs_access_allowed(&workflow, authenticated_pubkey, active_channel_member) {
         return Err(workflow_not_found());
     }
 
-    let runs = state
-        .db
-        .list_workflow_runs(
-            tenant.community(),
-            workflow_id,
-            workflow_runs_limit(query.limit),
-        )
-        .await
-        .map_err(|error| internal_error(&format!("list workflow runs: {error}")))?;
+    Ok(())
+}
 
-    Ok(Json(Value::Array(
-        runs.iter().map(workflow_run_json).collect(),
-    )))
+/// Read durable approval evidence; display references confer no decision authority.
+pub async fn workflow_run_approvals(
+    State(state): State<Arc<AppState>>,
+    Path((workflow_id, run_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let tenant = authorize_workflow_history(&state, &headers, &original_uri, workflow_id).await?;
+    let run = state
+        .db
+        .get_workflow_run(tenant.community(), run_id)
+        .await
+        .map_err(|error| match error {
+            buzz_db::DbError::NotFound(_) => workflow_not_found(),
+            other => internal_error(&format!("get workflow run for approvals: {other}")),
+        })?;
+    if run.workflow_id != workflow_id {
+        return Err(workflow_not_found());
+    }
+    let approvals = state
+        .db
+        .get_workflow_approval_history(tenant.community(), workflow_id, run_id)
+        .await
+        .map_err(|error| internal_error(&format!("list workflow approvals: {error}")))?;
+    Ok(Json(
+        serde_json::json!({"approvals": approvals.iter().map(workflow_approval_json).collect::<Vec<_>>()}),
+    ))
+}
+
+fn workflow_approval_json(approval: &buzz_db::workflow::WorkflowApprovalHistoryRecord) -> Value {
+    serde_json::json!({
+        "approval_ref": approval.approval_ref,
+        "workflow_id": approval.workflow_id,
+        "run_id": approval.run_id,
+        "step_id": approval.step_id,
+        "step_index": approval.step_index,
+        "approver_spec": approval.approver_spec,
+        "status": approval.status,
+        "approver_pubkey": approval.approver_pubkey,
+        "note": approval.note,
+        "expires_at": approval.expires_at,
+        "created_at": approval.created_at.timestamp(),
+    })
 }
 
 // ── Moderation queue reads (L6 — Quinn) ───────────────────────────────────────
@@ -2529,7 +2647,7 @@ mod tests {
             .to_bytes()
     }
 
-    fn workflow_run_record(
+    pub(super) fn workflow_run_record(
         started_at: Option<chrono::DateTime<chrono::Utc>>,
         completed_at: Option<chrono::DateTime<chrono::Utc>>,
         error_message: Option<&str>,
@@ -2558,6 +2676,7 @@ mod tests {
             trigger_context: None,
             started_at,
             completed_at,
+            error_code: None,
             error_message: error_message.map(str::to_owned),
             created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0)
                 .expect("created timestamp"),
@@ -2595,7 +2714,7 @@ mod tests {
 
         assert_eq!(
             object.len(),
-            9,
+            10,
             "wire response must contain only run fields"
         );
         for key in [
@@ -4274,3 +4393,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "workflow_history_tests.rs"]
+mod workflow_history_tests;

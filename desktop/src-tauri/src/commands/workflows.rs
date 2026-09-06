@@ -207,15 +207,60 @@ pub async fn get_workflow(
 pub async fn get_workflow_runs(
     workflow_id: String,
     limit: Option<u32>,
+    page: Option<bool>,
+    before: Option<String>,
+    before_id: Option<String>,
     state: State<'_, AppState>,
-) -> Result<Vec<Value>, String> {
+) -> Result<Value, String> {
     let workflow_id = uuid::Uuid::parse_str(&workflow_id)
         .map_err(|_| "workflow ID must be a UUID".to_string())?;
-    let path = workflow_runs_path(workflow_id, limit);
-    let url = format!("{}{}", relay_api_base_url_with_override(&state), path);
+    let path = workflow_history_path(
+        workflow_id,
+        limit,
+        page.unwrap_or(false),
+        before.as_deref(),
+        before_id.as_deref(),
+    )?;
+    read_workflow_history(&state, &path).await
+}
 
+fn workflow_history_path(
+    workflow_id: uuid::Uuid,
+    limit: Option<u32>,
+    page: bool,
+    before: Option<&str>,
+    before_id: Option<&str>,
+) -> Result<String, String> {
+    if before.is_some() != before_id.is_some() {
+        return Err("before and before_id must be supplied together".into());
+    }
+    let mut url = reqwest::Url::parse(&format!(
+        "http://localhost{}",
+        workflow_runs_path(workflow_id, limit)
+    ))
+    .map_err(|error| error.to_string())?;
+    if page {
+        url.query_pairs_mut().append_pair("page", "true");
+    }
+    if let (Some(before), Some(before_id)) = (before, before_id) {
+        chrono::DateTime::parse_from_rfc3339(before)
+            .map_err(|_| "invalid history timestamp".to_string())?;
+        uuid::Uuid::parse_str(before_id).map_err(|_| "invalid history run ID".to_string())?;
+        url.query_pairs_mut()
+            .append_pair("before", before)
+            .append_pair("before_id", before_id);
+    }
+    Ok(format!(
+        "{}?{}",
+        url.path(),
+        url.query().unwrap_or_default()
+    ))
+}
+
+async fn read_workflow_history(state: &AppState, path: &str) -> Result<Value, String> {
+    let url = format!("{}{}", relay_api_base_url_with_override(state), path);
     crate::relay_admission::wait_for_rate_limit().await;
-    let auth = build_nip98_auth_header(&Method::GET, &url, &[], &state)?;
+    let auth = build_nip98_auth_header(&Method::GET, &url, &[], state)?;
     let response = state
         .http_client
         .get(&url)
@@ -223,11 +268,9 @@ pub async fn get_workflow_runs(
         .send()
         .await
         .map_err(|error| crate::relay::classify_request_error(&error))?;
-
     if !response.status().is_success() {
         return Err(relay_error_message(response).await);
     }
-
     parse_json_response(response).await
 }
 
@@ -342,15 +385,16 @@ pub async fn trigger_workflow(
 pub async fn get_run_approvals(
     workflow_id: String,
     run_id: String,
-    _state: State<'_, AppState>,
-) -> Result<Vec<Value>, String> {
-    // TODO(workflow-runs): Like runs (see `get_workflow_runs`), reconstructing
-    // approvals into the frontend's `WorkflowApproval` shape from lifecycle
-    // events (46010/46011/46012) is a clearly-scoped follow-up tracked under
-    // TODO(workflow-runs). Return a bare empty array so the frontend's
-    // `getRunApprovals` (`raw.map(fromRawApproval)`) is safe.
-    let _ = (workflow_id, run_id);
-    Ok(Vec::new())
+    state: State<'_, AppState>,
+) -> Result<Value, String> {
+    let workflow_id = uuid::Uuid::parse_str(&workflow_id)
+        .map_err(|_| "workflow ID must be a UUID".to_string())?;
+    let run_id = uuid::Uuid::parse_str(&run_id).map_err(|_| "run ID must be a UUID".to_string())?;
+    read_workflow_history(
+        &state,
+        &format!("/workflows/{workflow_id}/runs/{run_id}/approvals"),
+    )
+    .await
 }
 
 #[tauri::command]

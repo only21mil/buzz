@@ -35,7 +35,7 @@ export function WorkflowDetailPanel({
   const [selectedRunId, setSelectedRunId] = React.useState<string | null>(null);
 
   const workflow = workflowQuery.data;
-  const runs = runsQuery.data ?? [];
+  const runs = runsQuery.data?.pages.flatMap((page) => page.runs) ?? [];
   const approvalsQuery = useRunApprovalsQuery(workflowId, selectedRunId);
   const workflowDescription = workflow
     ? getWorkflowDescription(workflow.definition)
@@ -154,7 +154,26 @@ export function WorkflowDetailPanel({
               <h4 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
                 Run History
               </h4>
-              {runs.length === 0 ? (
+              {runsQuery.isPending ? (
+                <p className="text-sm text-muted-foreground">
+                  Loading run history...
+                </p>
+              ) : null}
+              {runsQuery.isError ? (
+                <p className="text-sm text-destructive" role="alert">
+                  Failed to load run history.{" "}
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void runsQuery.refetch()}
+                  >
+                    Retry
+                  </Button>
+                </p>
+              ) : null}
+              {!runsQuery.isPending &&
+              !runsQuery.isError &&
+              runs.length === 0 ? (
                 <p className="text-sm text-muted-foreground">No runs yet.</p>
               ) : (
                 <div className="space-y-2">
@@ -217,6 +236,11 @@ export function WorkflowDetailPanel({
                                   </span>
                                 ) : null}
                               </div>
+                              {run.errorCode ? (
+                                <p className="mt-2 pl-6 font-mono text-xs text-destructive">
+                                  {run.errorCode}
+                                </p>
+                              ) : null}
                               {run.errorMessage ? (
                                 <p className="mt-2 break-words pl-6 text-xs text-destructive">
                                   {run.errorMessage}
@@ -252,6 +276,19 @@ export function WorkflowDetailPanel({
                   })}
                 </div>
               )}
+              {runsQuery.hasNextPage ? (
+                <Button
+                  className="mt-3"
+                  size="sm"
+                  variant="outline"
+                  disabled={runsQuery.isFetchingNextPage}
+                  onClick={() => void runsQuery.fetchNextPage()}
+                >
+                  {runsQuery.isFetchingNextPage
+                    ? "Loading..."
+                    : "Load older runs"}
+                </Button>
+              ) : null}
             </div>
           </div>
         ) : workflowQuery.isError ? (
@@ -303,6 +340,7 @@ function RunStatusBadge({ status }: { status: string }) {
     pending: "secondary",
     cancelled: "secondary",
     waiting_approval: "warning",
+    resume_pending: "info",
   };
 
   return (

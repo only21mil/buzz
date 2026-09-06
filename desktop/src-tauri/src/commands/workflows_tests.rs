@@ -325,21 +325,21 @@ fn duplicate_trigger_response_keeps_missing_run_id_explicitly_null() {
 }
 
 #[test]
-fn runs_and_approvals_serialize_to_bare_empty_array() {
-    // Regression guard for the crash class this fix closed. The frontend
-    // wrappers `getWorkflowRuns` / `getRunApprovals` do `raw.map(...)`, so the
-    // Rust side MUST return a bare JSON array. A wrapped `{ runs: [...] }` /
-    // `{ approvals: [...] }` shape would make `.map()` throw and crash the
-    // detail panel — the same TypeError class as the original page bug.
-    //
-    // The commands take `State<AppState>`, so we can't invoke them directly in
-    // a unit test; instead we pin the exact value they return (`Vec::new()` of
-    // their `Vec<Value>` element type) and assert its serialized shape.
-    let runs: Vec<Value> = Vec::new();
-    let approvals: Vec<Value> = Vec::new();
-    assert_eq!(serde_json::to_string(&runs).expect("serialize runs"), "[]");
+fn history_cursor_pairs_are_encoded_without_losing_precision() {
+    let id = uuid::Uuid::new_v4();
+    let before = "2026-09-06T10:00:00.123456+00:00";
+    let path =
+        workflow_history_path(id, Some(101), true, Some(before), Some(&id.to_string())).unwrap();
+    let url = reqwest::Url::parse(&format!("http://localhost{path}")).unwrap();
+    let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+    assert_eq!(params["before"], before);
+    assert_eq!(params["before_id"], id.to_string());
+    assert_eq!(params["page"], "true");
+    assert_eq!(params["limit"], "100");
+    assert!(workflow_history_path(id, None, true, Some(before), None).is_err());
+    assert!(workflow_history_path(id, None, true, Some("invalid"), Some(&id.to_string())).is_err());
     assert_eq!(
-        serde_json::to_string(&approvals).expect("serialize approvals"),
-        "[]"
+        workflow_history_path(id, None, false, None, None).unwrap(),
+        workflow_runs_path(id, None)
     );
 }

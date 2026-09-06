@@ -258,6 +258,7 @@ pub async fn complete_running_workflow_run(
             current_step = $1,
             execution_trace = $2,
             error_message = NULL,
+            error_code = NULL,
             completed_at = clock_timestamp(),
             resume_lease_expires_at = NULL,
             generation = generation + 1
@@ -299,6 +300,32 @@ pub async fn fail_running_workflow_run(
     trace: &serde_json::Value,
     error: &str,
 ) -> Result<WorkflowRunTransitionOutcome> {
+    fail_running_workflow_run_with_failure(
+        pool,
+        community_id,
+        id,
+        expected_generation,
+        current_step,
+        trace,
+        crate::workflow::WorkflowRunFailure {
+            code: "workflow_failed",
+            message: error,
+        },
+    )
+    .await
+}
+
+/// Persist structured failure under the running generation fence.
+pub async fn fail_running_workflow_run_with_failure(
+    pool: &PgPool,
+    community_id: CommunityId,
+    id: Uuid,
+    expected_generation: i64,
+    current_step: i32,
+    trace: &serde_json::Value,
+    failure: crate::workflow::WorkflowRunFailure<'_>,
+) -> Result<WorkflowRunTransitionOutcome> {
+    let error = failure.message;
     let row = sqlx::query(
         r#"
         UPDATE workflow_runs
@@ -306,6 +333,7 @@ pub async fn fail_running_workflow_run(
             current_step = $1,
             execution_trace = $2,
             error_message = $3,
+            error_code = $7,
             completed_at = NOW(),
             resume_lease_expires_at = NULL,
             generation = generation + 1
@@ -322,6 +350,7 @@ pub async fn fail_running_workflow_run(
     .bind(community_id.as_uuid())
     .bind(id)
     .bind(expected_generation)
+    .bind(failure.code)
     .fetch_optional(pool)
     .await?;
 

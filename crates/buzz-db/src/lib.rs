@@ -4019,6 +4019,48 @@ impl Db {
         workflow::list_workflow_runs(&self.pool, community_id, workflow_id, limit).await
     }
 
+    /// Read a stable descending page of workflow runs.
+    pub async fn list_workflow_runs_page(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        before: Option<chrono::DateTime<chrono::Utc>>,
+        before_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<workflow::WorkflowRunRecord>> {
+        workflow::list_workflow_runs_page(
+            &self.pool,
+            community_id,
+            workflow_id,
+            before,
+            before_id,
+            limit,
+        )
+        .await
+    }
+
+    /// Update a run with a stable failure code and diagnostic in one write.
+    pub async fn update_workflow_run_with_failure(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        status: workflow::RunStatus,
+        current_step: i32,
+        trace: &serde_json::Value,
+        failure: Option<workflow::WorkflowRunFailure<'_>>,
+    ) -> Result<()> {
+        workflow::update_workflow_run_with_failure(
+            &self.pool,
+            community_id,
+            id,
+            status,
+            current_step,
+            trace,
+            failure,
+        )
+        .await
+    }
+
     /// Update a workflow run's status.
     pub async fn update_workflow_run(
         &self,
@@ -4210,6 +4252,28 @@ impl Db {
         .await
     }
 
+    /// Persist structured failure under the running generation fence.
+    pub async fn fail_running_workflow_run_with_failure(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        expected_generation: i64,
+        current_step: i32,
+        trace: &serde_json::Value,
+        failure: workflow::WorkflowRunFailure<'_>,
+    ) -> Result<WorkflowRunTransitionOutcome> {
+        workflow_run_transition::fail_running_workflow_run_with_failure(
+            &self.pool,
+            community_id,
+            id,
+            expected_generation,
+            current_step,
+            trace,
+            failure,
+        )
+        .await
+    }
+
     /// Mark a running workflow failed only if its generation still matches.
     pub async fn fail_running_workflow_run(
         &self,
@@ -4329,6 +4393,16 @@ impl Db {
         token_hash: &[u8],
     ) -> Result<workflow::ApprovalRecord> {
         workflow::get_approval_by_stored_hash(&self.pool, community_id, token_hash).await
+    }
+
+    /// Read legacy and durable approval evidence without decision credentials.
+    pub async fn get_workflow_approval_history(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<Vec<workflow::WorkflowApprovalHistoryRecord>> {
+        workflow::get_workflow_approval_history(&self.pool, community_id, workflow_id, run_id).await
     }
 
     /// Fetch all approvals for a workflow run.

@@ -563,8 +563,8 @@ mod tests {
 
         assert_eq!(
             migrations.len(),
-            35,
-            "embedded migration matrix must contain the canonical set through 0035_ci_grants"
+            36,
+            "embedded migration matrix must contain the frozen prefix plus admitted tail"
         );
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
@@ -1684,10 +1684,10 @@ mod b1_ci_grants_ordering {
     //! indexes inside the main test module). It asserts the *semantic*
     //! ordering: the workflow snapshot/state/approval/CI-event storage base
     //! (0029-0034) must still occupy versions 29-34, and the CI-signer-grant
-    //! migration must be version 35 at the vector tail and must not have
+    //! migration must remain version 35 in the frozen prefix and must not have
     //! displaced any of 0029-0034.
     //!
-    //! The embedded migrator must contain exactly 35 migrations, with 0035
+    //! The embedded migrator must retain its frozen 35-migration prefix, with 0035
     //! immediately after 0034.
 
     use super::MIGRATOR;
@@ -1697,7 +1697,22 @@ mod b1_ci_grants_ordering {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 35, "0035_ci_grants must be embedded");
+        assert_eq!(
+            migrations
+                .iter()
+                .take(35)
+                .map(|m| m.version)
+                .collect::<Vec<_>>(),
+            (1..=35).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            migrations
+                .iter()
+                .skip(35)
+                .map(|m| (m.version, m.description.as_ref()))
+                .collect::<Vec<_>>(),
+            vec![(36, "workflow run error codes")]
+        );
         let ci_grants = migrations
             .iter()
             .position(|migration| migration.description == "ci grants")
@@ -1730,12 +1745,9 @@ mod b1_ci_grants_ordering {
             "migration 0035 must land immediately after 0034 with no renumbering of 0030-0034"
         );
 
-        // And `ci_grants` must sit at the final vector index (35 in 1-based
+        // And `ci_grants` must stay at its original vector index (35 in 1-based
         // terms, i.e. vector index 34 because 0001 occupies index 0).
-        assert_eq!(
-            ci_grants, 34,
-            "0035_ci_grants must be the last migration (vector index 34)"
-        );
+        assert_eq!(ci_grants, 34, "0035_ci_grants must retain vector index 34");
 
         // Fact-bound: the migration itself must create the grants table with
         // the B1 authorizer's PK and window columns.

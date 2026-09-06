@@ -61,9 +61,21 @@ export function WorkflowRunTrace({
 }: WorkflowRunTraceProps) {
   if (run.executionTrace.length === 0) {
     return (
-      <p className="rounded-xl border border-dashed border-border/70 bg-background/60 px-4 py-6 text-center text-sm text-muted-foreground">
-        No steps recorded yet.
-      </p>
+      <div className="space-y-3">
+        <p className="rounded-xl border border-dashed border-border/70 bg-background/60 px-4 py-6 text-center text-sm text-muted-foreground">
+          {run.status === "pending" ||
+          run.status === "running" ||
+          run.status === "resume_pending"
+            ? "Execution trace is pending."
+            : "No steps recorded."}
+        </p>
+        {approvals.map((approval) => (
+          <WorkflowApprovalCard
+            key={approval.approvalRef}
+            approval={approval}
+          />
+        ))}
+      </div>
     );
   }
 
@@ -71,9 +83,7 @@ export function WorkflowRunTrace({
     <div className="space-y-3" data-testid="workflow-run-trace">
       {run.executionTrace.map((step) => {
         const duration = formatDuration(step.startedAt, step.completedAt);
-        const pendingApproval = approvals.find(
-          (a) => a.stepId === step.stepId && a.status === "pending",
-        );
+        const stepApprovals = approvals.filter((a) => a.stepId === step.stepId);
 
         return (
           <div
@@ -112,12 +122,17 @@ export function WorkflowRunTrace({
                 </pre>
               </div>
             ) : null}
-            {pendingApproval ? (
+            {stepApprovals.length > 0 ? (
               <div className="mt-3">
                 <p className="mb-2 text-2xs font-medium uppercase tracking-[0.16em] text-amber-600">
-                  Pending approval
+                  Approval
                 </p>
-                <WorkflowApprovalCard approval={pendingApproval} />
+                {stepApprovals.map((approval) => (
+                  <WorkflowApprovalCard
+                    key={approval.approvalRef}
+                    approval={approval}
+                  />
+                ))}
               </div>
             ) : null}
           </div>

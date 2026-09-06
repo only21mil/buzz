@@ -401,13 +401,16 @@ impl WorkflowEngine {
                 let trace_json = serde_json::Value::Array(full_trace);
                 if let Err(db_err) = self
                     .db
-                    .update_workflow_run(
+                    .update_workflow_run_with_failure(
                         community_id,
                         run_id,
                         RunStatus::Failed,
                         progress.step_index as i32,
                         &trace_json,
-                        Some(&e.to_string()),
+                        Some(buzz_db::workflow::WorkflowRunFailure {
+                            code: e.code(),
+                            message: &e.to_string(),
+                        }),
                     )
                     .await
                 {
@@ -502,13 +505,16 @@ impl WorkflowEngine {
                 let trace_json = serde_json::Value::Array(full_trace);
                 match self
                     .db
-                    .fail_running_workflow_run(
+                    .fail_running_workflow_run_with_failure(
                         community_id,
                         run_id,
                         claimed_generation,
                         i32::try_from(progress.step_index).unwrap_or(i32::MAX),
                         &trace_json,
-                        &error.to_string(),
+                        buzz_db::workflow::WorkflowRunFailure {
+                            code: error.code(),
+                            message: &error.to_string(),
+                        },
                     )
                     .await
                 {

@@ -1,6 +1,11 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 
-import type { WorkflowRun, WorkflowRunStatus } from "@/shared/api/types";
+import type { WorkflowRunsCursor, WorkflowRunStatus } from "@/shared/api/types";
 import {
   createWorkflow,
   deleteWorkflow,
@@ -8,7 +13,7 @@ import {
   getChannelWorkflows,
   getRunApprovals,
   getWorkflow,
-  getWorkflowRuns,
+  getWorkflowRunsPage,
   grantApproval,
   triggerWorkflow,
   updateWorkflow,
@@ -39,7 +44,8 @@ function isActiveWorkflowRunStatus(status: WorkflowRunStatus) {
   return (
     status === "pending" ||
     status === "running" ||
-    status === "waiting_approval"
+    status === "waiting_approval" ||
+    status === "resume_pending"
   );
 }
 
@@ -65,18 +71,20 @@ export function useWorkflowQuery(workflowId: string | null) {
 }
 
 export function useWorkflowRunsQuery(workflowId: string | null) {
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: workflowRunsQueryKey(workflowId ?? ""),
-    queryFn: ({ queryKey: [, resolvedWorkflowId] }) =>
-      getWorkflowRuns(resolvedWorkflowId),
+    initialPageParam: null as WorkflowRunsCursor | null,
+    queryFn: ({ queryKey: [, resolvedWorkflowId], pageParam }) =>
+      getWorkflowRunsPage(resolvedWorkflowId, pageParam),
+    getNextPageParam: (lastPage) => lastPage.next ?? undefined,
     enabled: workflowId !== null,
     staleTime: 10_000,
-    refetchInterval: (query) => {
-      const runs = query.state.data as WorkflowRun[] | undefined;
-      return runs?.some((run) => isActiveWorkflowRunStatus(run.status))
+    refetchInterval: (query) =>
+      query.state.data?.pages.some((page) =>
+        page.runs.some((run) => isActiveWorkflowRunStatus(run.status)),
+      )
         ? 1_000
-        : false;
-    },
+        : false,
   });
 }
 
