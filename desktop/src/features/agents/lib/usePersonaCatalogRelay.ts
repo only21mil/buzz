@@ -7,6 +7,7 @@ import {
 } from "@/features/agents/lib/personaCatalogRelay";
 import { invalidatePersonaEditCaches } from "@/features/agents/lib/personaEditCaches";
 import { relayClient } from "@/shared/api/relayClient";
+import { useFocusedRefetchInterval } from "@/shared/lib/useDocumentVisible";
 import {
   setPersonaShared,
   updatePersonaAndPublish,
@@ -14,17 +15,24 @@ import {
 import type { AgentPersona, UpdatePersonaInput } from "@/shared/api/types";
 import { KIND_PERSONA } from "@/shared/constants/kinds";
 
+/** Live events and reconnect invalidation keep the cache current between backstops. */
+export const PERSONA_CATALOG_REFETCH_INTERVAL_MS = 20 * 60_000;
+
 export function personaCatalogQueryKey(communityId: string | null) {
   return ["persona-catalog", communityId] as const;
 }
 
 export function usePersonaCatalogQuery(communityId: string | null) {
+  const refetchInterval = useFocusedRefetchInterval(
+    PERSONA_CATALOG_REFETCH_INTERVAL_MS,
+  );
   return useQuery<PersonaCatalogPublication[]>({
     enabled: communityId !== null,
     queryKey: personaCatalogQueryKey(communityId),
     queryFn: fetchPersonaCatalogPublications,
     staleTime: 30_000,
-    refetchInterval: 120_000,
+    refetchInterval,
+    refetchOnWindowFocus: true,
   });
 }
 

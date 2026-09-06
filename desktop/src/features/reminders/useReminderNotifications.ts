@@ -12,6 +12,7 @@ import {
   sendDesktopNotification,
 } from "@/features/notifications/lib/desktop";
 import type { NotificationSettings } from "@/features/notifications/hooks";
+import { startReminderNotificationPoll } from "@/features/reminders/lib/reminderNotificationPoll";
 import {
   formatNotificationTitle,
   resolveNotificationChannelLabel,
@@ -24,7 +25,6 @@ import {
 import { getStorageItem, setStorageItem } from "@/shared/lib/safeStorage";
 
 const WATERMARK_STORAGE_PREFIX = "buzz:lastReminderCheck:";
-const POLL_INTERVAL_MS = 30_000;
 const sessionWatermarks = new Map<string, number>();
 
 function watermarkStorageKey(pubkey: string): string {
@@ -158,8 +158,6 @@ export function useReminderNotifications(
       });
     };
 
-    check();
-    const interval = window.setInterval(check, POLL_INTERVAL_MS);
-    return () => window.clearInterval(interval);
+    return startReminderNotificationPoll(check);
   }, [pubkey, queryClient]);
 }

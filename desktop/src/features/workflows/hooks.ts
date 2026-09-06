@@ -7,6 +7,10 @@ import {
 
 import type { WorkflowRunsCursor, WorkflowRunStatus } from "@/shared/api/types";
 import {
+  useAppFocused,
+  useFocusedRefetchInterval,
+} from "@/shared/lib/useDocumentVisible";
+import {
   createWorkflow,
   deleteWorkflow,
   denyApproval,
@@ -71,6 +75,7 @@ export function useWorkflowQuery(workflowId: string | null) {
 }
 
 export function useWorkflowRunsQuery(workflowId: string | null) {
+  const appFocused = useAppFocused();
   return useInfiniteQuery({
     queryKey: workflowRunsQueryKey(workflowId ?? ""),
     initialPageParam: null as WorkflowRunsCursor | null,
@@ -79,12 +84,15 @@ export function useWorkflowRunsQuery(workflowId: string | null) {
     getNextPageParam: (lastPage) => lastPage.next ?? undefined,
     enabled: workflowId !== null,
     staleTime: 10_000,
-    refetchInterval: (query) =>
-      query.state.data?.pages.some((page) =>
+    refetchInterval: (query) => {
+      if (!appFocused) return false;
+      return query.state.data?.pages.some((page) =>
         page.runs.some((run) => isActiveWorkflowRunStatus(run.status)),
       )
         ? 1_000
-        : false,
+        : false;
+    },
+    refetchOnWindowFocus: true,
   });
 }
 
@@ -92,13 +100,16 @@ export function useRunApprovalsQuery(
   workflowId: string | null,
   runId: string | null,
 ) {
+  const refetchInterval = useFocusedRefetchInterval(10_000);
+
   return useQuery({
     queryKey: runApprovalsQueryKey(workflowId ?? "", runId ?? ""),
     queryFn: ({ queryKey: [, resolvedWorkflowId, resolvedRunId] }) =>
       getRunApprovals(resolvedWorkflowId, resolvedRunId),
     enabled: workflowId !== null && runId !== null,
     staleTime: 10_000,
-    refetchInterval: 10_000,
+    refetchInterval,
+    refetchOnWindowFocus: true,
   });
 }
 

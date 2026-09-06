@@ -24,6 +24,7 @@ import { getStorageItem } from "@/shared/lib/safeStorage";
 
 const CLIENT_ID_KEY_PREFIX = "buzz.nip-rs.client-id";
 const SLOT_ID_KEY_PREFIX = "buzz.nip-rs.slot-id";
+const PUBLISHED_ID_MEMORY = 64;
 const DEBOUNCE_MS = 5_000;
 const sessionPersistedValues = new Map<string, string>();
 
@@ -325,6 +326,7 @@ export class ReadStateManager {
   private contextSourceCreatedAt = new Map<string, number>();
   private pendingSyncedAdvances = new Set<string>();
   private destroyed = false;
+  private recentlyPublishedIds = new Set<string>();
   private parentResolver: ContextParentResolver | null = null;
 
   constructor(pubkey: string, relayClient: RelayClient) {
@@ -489,7 +491,7 @@ export class ReadStateManager {
     >();
 
     for (const event of events) {
-      const parsed = await parseReadStateEvent(event, this.pubkey);
+      const parsed = await this.parseEvent(event);
       if (!parsed) continue;
 
       this.maxFetchedCreatedAt = Math.max(
@@ -525,7 +527,7 @@ export class ReadStateManager {
     // Conflict detection: check if another client_id is squatting on our
     // d-tag coordinate. If so, rotate our slotId to avoid clobbering.
     for (const event of events) {
-      const parsed = await parseReadStateEvent(event, this.pubkey);
+      const parsed = await this.parseEvent(event);
       if (!parsed || parsed.dTag !== `read-state:${this.slotId}`) continue;
       if (parsed.blob.client_id !== this.clientId) {
         this.slotId = generateHex(16);
@@ -580,12 +582,14 @@ export class ReadStateManager {
   private async handleIncomingEvent(event: RelayEvent): Promise<void> {
     if (event.pubkey !== this.pubkey) return;
     if (this.destroyed) return;
+    // Consume live echoes before decrypting. Replays still take the normal path.
+    if (this.recentlyPublishedIds.delete(event.id)) return;
     console.debug(
       `[ReadStateManager] incoming event=${event.id.substring(0, 8)}… created_at=${event.created_at}`,
     );
 
-    const parsed = await parseReadStateEvent(event, this.pubkey);
-    if (!parsed) return;
+    const parsed = await this.parseEvent(event);
+    if (!parsed || this.destroyed) return;
 
     this.maxFetchedCreatedAt = Math.max(
       this.maxFetchedCreatedAt,
@@ -624,6 +628,18 @@ export class ReadStateManager {
       if (blob.client_id !== this.clientId) {
         this.schedulePublish();
       }
+    }
+  }
+
+  private parseEvent(event: RelayEvent) {
+    return parseReadStateEvent(event, this.pubkey);
+  }
+
+  private rememberPublishedId(id: string): void {
+    this.recentlyPublishedIds.add(id);
+    if (this.recentlyPublishedIds.size > PUBLISHED_ID_MEMORY) {
+      const oldest = this.recentlyPublishedIds.values().next().value;
+      if (oldest !== undefined) this.recentlyPublishedIds.delete(oldest);
     }
   }
 
@@ -702,6 +718,8 @@ export class ReadStateManager {
         tags,
       });
 
+      // Relay delivery can precede the publish acknowledgement.
+      this.rememberPublishedId(event.id);
       await this.relayClient.publishEvent(
         event,
         "Timed out publishing read state.",
