@@ -69,6 +69,28 @@ async function getSettledBadgeState(page: import("@playwright/test").Page) {
   return getBadgeState(page);
 }
 
+async function clearSeededUnread(page: import("@playwright/test").Page) {
+  await getSettledBadgeState(page);
+  const seededUnreadIds = await page
+    .getByTestId("app-sidebar")
+    .locator("[data-channel-id].font-bold")
+    .evaluateAll((rows) =>
+      rows.map((row) => {
+        const testId = row.getAttribute("data-testid");
+        if (!testId) throw new Error("Seeded unread row has no test ID");
+        return testId;
+      }),
+    );
+  for (const testId of seededUnreadIds) {
+    await page.getByTestId(testId).click({ button: "right" });
+    await page
+      .getByRole("menuitem", { name: "Mark as read", exact: true })
+      .click();
+  }
+  await expect(page.getByTestId("sidebar-more-unread-above")).toHaveCount(0);
+  await expect(page.getByTestId("sidebar-more-unread-below")).toHaveCount(0);
+}
+
 async function getSidebarHomeBadgeText(page: import("@playwright/test").Page) {
   return page
     .getByTestId("sidebar-home-count")
@@ -269,6 +291,7 @@ test("offscreen unread counts destinations and promotes without incrementing", a
 }) => {
   await page.setViewportSize({ width: 1280, height: 360 });
   await page.goto("/");
+  await clearSeededUnread(page);
   await page.getByTestId("channel-random").click();
   await waitForMockLiveSubscription(page, "random");
   await page.getByTestId("channel-general").click();
@@ -356,6 +379,7 @@ test("offscreen unread DM shows the primary sidebar arrow", async ({
   page,
 }) => {
   await page.goto("/");
+  await clearSeededUnread(page);
   await page.getByTestId("channel-alice-tyler").click();
   await waitForMockLiveSubscription(page, "alice-tyler");
   await page.getByTestId("channel-general").click();
@@ -388,6 +412,7 @@ test("thread-only activity in an offscreen DM stays primary", async ({
   page,
 }) => {
   await page.goto("/");
+  await clearSeededUnread(page);
   await page.getByTestId("channel-alice-tyler").click();
   await waitForMockLiveSubscription(page, "alice-tyler");
   await page.setViewportSize({ width: 1280, height: 360 });
