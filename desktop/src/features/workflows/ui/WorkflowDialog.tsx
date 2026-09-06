@@ -43,7 +43,10 @@ import {
 import { WorkflowWebhookSecretDialog } from "./WorkflowWebhookSecretDialog";
 import { getWorkflowActivationWarning } from "./workflowActivationWarning";
 import { getWorkflowEnabled } from "./workflowDefinition";
-import type { WorkflowEditorPane } from "./workflowEditorPane";
+import {
+  staysInWorkflowEditor,
+  type WorkflowEditorPane,
+} from "./workflowEditorPane";
 import {
   DEFAULT_FORM_STATE,
   formStateToYaml,
@@ -365,19 +368,10 @@ export function WorkflowDialog({
   const navigationBlocker = useBlocker({
     enableBeforeUnload: isDirty || savedWebhookInfo !== null,
     shouldBlockFn: ({ current, next }) => {
-      const currentSearch = current.search as {
-        pane?: unknown;
-        view?: unknown;
-      };
-      const nextSearch = next.search as { pane?: unknown; view?: unknown };
-      const isPaneOnlyNavigation =
-        current.pathname === next.pathname &&
-        currentSearch.view === nextSearch.view &&
-        currentSearch.pane !== nextSearch.pane;
       return (
         (isDirty || savedWebhookInfo !== null) &&
         !allowNavigationRef.current &&
-        !isPaneOnlyNavigation
+        !staysInWorkflowEditor(current, next)
       );
     },
     withResolver: true,

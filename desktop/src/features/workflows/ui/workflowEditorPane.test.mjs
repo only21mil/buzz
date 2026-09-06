@@ -13,9 +13,11 @@ const compiled = ts.transpileModule(source, {
   },
 }).outputText;
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`;
-const { parseWorkflowEditorPane, serializeWorkflowEditorPane } = await import(
-  moduleUrl
-);
+const {
+  parseWorkflowEditorPane,
+  serializeWorkflowEditorPane,
+  staysInWorkflowEditor,
+} = await import(moduleUrl);
 
 test("parses trigger and stable step-id panes", () => {
   assert.deepEqual(parseWorkflowEditorPane("trigger"), { type: "trigger" });
@@ -57,4 +59,33 @@ test("serializes stable step-id panes", () => {
     serializeWorkflowEditorPane({ type: "step", stepId: "bad-id" }),
     undefined,
   );
+});
+
+test("editor navigation allows unchanged and changed panes without dropping other route guards", () => {
+  const current = {
+    pathname: "/workflows/first",
+    search: { view: "edit", pane: "trigger", channel: "general" },
+  };
+  for (const pane of ["trigger", "step:notify", undefined]) {
+    assert.equal(
+      staysInWorkflowEditor(current, {
+        ...current,
+        search: { ...current.search, pane },
+      }),
+      true,
+    );
+  }
+  for (const next of [
+    { ...current, pathname: "/workflows/second" },
+    { ...current, pathname: "/channels/general" },
+    { ...current, search: { ...current.search, view: "duplicate" } },
+    { ...current, search: { pane: "step:notify", channel: "general" } },
+    {
+      ...current,
+      search: { ...current.search, pane: "step:notify", channel: "random" },
+    },
+    { ...current, search: { ...current.search, target: "another" } },
+  ]) {
+    assert.equal(staysInWorkflowEditor(current, next), false);
+  }
 });
