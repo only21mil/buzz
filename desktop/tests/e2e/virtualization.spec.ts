@@ -402,33 +402,130 @@ test.describe("list virtualization", () => {
       // That reader intent retires Virtua's active prepend reconciliation, so
       // later row measurements must not pull the viewport back toward the
       // completed prepend before the next upward load.
-      const exitTracePromise = timeline.evaluate(async (scroller) => {
-        const s = scroller as HTMLElement;
-        const startScrollTop = s.scrollTop;
-        let previousScrollTop = startScrollTop;
-        let maxForwardTravel = 0;
-        let maxRollback = 0;
-        const deadline = performance.now() + 400;
-        while (performance.now() < deadline) {
-          const travel = s.scrollTop - startScrollTop;
-          maxForwardTravel = Math.max(maxForwardTravel, travel);
-          maxRollback = Math.max(maxRollback, previousScrollTop - s.scrollTop);
-          previousScrollTop = s.scrollTop;
-          await new Promise((resolve) => requestAnimationFrame(resolve));
-        }
-        return { maxForwardTravel, maxRollback };
-      });
       const exitBox = await timeline.boundingBox();
       if (!exitBox) throw new Error("timeline has no bounding box");
       await page.mouse.move(
         exitBox.x + exitBox.width / 2,
         exitBox.y + exitBox.height / 2,
       );
+      const exitObserver = await timeline.evaluateHandle((scroller) => {
+        const s = scroller as HTMLElement;
+        const bounds = s.getBoundingClientRect();
+        const anchor = Array.from(
+          s.querySelectorAll<HTMLElement>("[data-message-id]"),
+        ).find((row) => {
+          const top = row.getBoundingClientRect().top;
+          return top >= bounds.top + bounds.height / 2 && top < bounds.bottom;
+        });
+        if (!anchor) throw new Error("no visible exit anchor");
+        const anchorId = anchor.dataset.messageId;
+        const anchorTop = () =>
+          anchor.getBoundingClientRect().top - s.getBoundingClientRect().top;
+        const startAnchorTop = anchorTop();
+        const state = { driverComplete: false };
+        let previousAnchorTop = startAnchorTop;
+        const startScrollTop = s.scrollTop;
+        const startScrollHeight = s.scrollHeight;
+        let previousScrollTop = startScrollTop;
+        let previousScrollHeight = startScrollHeight;
+        let maxForwardTravel = 0;
+        let maxRollback = 0;
+        let maxRawScrollRollback = 0;
+        let wheelCount = 0;
+        let scrolledAfterWheel = false;
+        let stableFrames = 0;
+        const onWheel = () => {
+          wheelCount += 1;
+          scrolledAfterWheel = false;
+          stableFrames = 0;
+        };
+        const onScroll = () => {
+          scrolledAfterWheel = true;
+          stableFrames = 0;
+        };
+        s.addEventListener("wheel", onWheel, { passive: true });
+        s.addEventListener("scroll", onScroll);
+        const result = (async () => {
+          // Fail a stuck driver/scroll; never truncate a successful trace at
+          // a fixed duration. Every sample must retain the original DOM row.
+          const deadline = performance.now() + 10_000;
+          try {
+            while (performance.now() < deadline) {
+              if (
+                !s.contains(anchor) ||
+                anchor.dataset.messageId !== anchorId
+              ) {
+                throw new Error("exit anchor was removed or replaced");
+              }
+              const currentAnchorTop = anchorTop();
+              const currentScrollTop = s.scrollTop;
+              const currentScrollHeight = s.scrollHeight;
+              // Virtua can shrink a spacer and compensate scrollTop by the
+              // same amount without moving the reader. Measure the same
+              // message's viewport displacement, and retain raw diagnostics.
+              maxForwardTravel = Math.max(
+                maxForwardTravel,
+                startAnchorTop - currentAnchorTop,
+              );
+              maxRollback = Math.max(
+                maxRollback,
+                currentAnchorTop - previousAnchorTop,
+              );
+              maxRawScrollRollback = Math.max(
+                maxRawScrollRollback,
+                previousScrollTop - currentScrollTop,
+              );
+              stableFrames =
+                currentAnchorTop === previousAnchorTop &&
+                currentScrollTop === previousScrollTop &&
+                currentScrollHeight === previousScrollHeight
+                  ? stableFrames + 1
+                  : 0;
+              previousAnchorTop = currentAnchorTop;
+              previousScrollTop = currentScrollTop;
+              previousScrollHeight = currentScrollHeight;
+              if (
+                state.driverComplete &&
+                wheelCount === 3 &&
+                scrolledAfterWheel &&
+                stableFrames >= 8
+              ) {
+                return {
+                  maxForwardTravel,
+                  maxRollback,
+                  maxRawScrollRollback,
+                  anchorId,
+                  startScrollTop,
+                  startScrollHeight,
+                  scrollTop: currentScrollTop,
+                  scrollHeight: currentScrollHeight,
+                };
+              }
+              await new Promise((resolve) => requestAnimationFrame(resolve));
+            }
+            throw new Error(
+              `exit scroll did not settle after ${wheelCount} wheels`,
+            );
+          } finally {
+            s.removeEventListener("wheel", onWheel);
+            s.removeEventListener("scroll", onScroll);
+          }
+        })();
+        return { state, result };
+      });
       for (const deltaY of [120, 100, 80]) {
         await page.mouse.wheel(0, deltaY);
         await page.waitForTimeout(12);
       }
-      const exitTrace = await exitTracePromise;
+      await exitObserver.evaluate(({ state }) => {
+        state.driverComplete = true;
+      });
+      const exitTrace = await exitObserver.evaluate(({ result }) => result);
+      await exitObserver.dispose();
+      await test.info().attach(`exit-trace-${pageIndex}`, {
+        body: JSON.stringify(exitTrace),
+        contentType: "application/json",
+      });
       expect(exitTrace.maxForwardTravel).toBeGreaterThan(200);
       expect(exitTrace.maxRollback).toBeLessThan(5);
 
@@ -541,6 +638,7 @@ test.describe("list virtualization", () => {
         }
         await new Promise((resolve) => requestAnimationFrame(resolve));
       }
+      Reflect.deleteProperty(s, "scrollTop");
       s.removeEventListener("wheel", onWheel);
       return {
         commit,
