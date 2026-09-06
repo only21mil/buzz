@@ -134,6 +134,7 @@ export type RawManagedAgent = {
   model: string | null;
   model_source?: ManagedAgent["modelSource"];
   provider: string | null;
+  effort_level?: string | null;
   persona_out_of_date: boolean;
   persona_orphaned: boolean;
   needs_restart: boolean;
@@ -182,6 +183,7 @@ export type RawAcpRuntimeCatalogEntry = {
   model_env_var?: string | null;
   provider_env_var?: string | null;
   thinking_env_var?: string | null;
+  effort_canonical_values?: string[] | null;
   max_tokens_env_var?: string | null;
   context_limit_env_var?: string | null;
   max_rounds_env_var?: string | null;
@@ -652,6 +654,7 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     model: agent.model,
     modelSource: agent.model_source ?? null,
     provider: agent.provider ?? null,
+    effortLevel: agent.effort_level ?? null,
     personaOutOfDate: agent.persona_out_of_date ?? false,
     personaOrphaned: agent.persona_orphaned ?? false,
     needsRestart: agent.needs_restart ?? false,
@@ -691,6 +694,7 @@ export function fromRawAcpRuntimeCatalogEntry(
     modelEnvVar: entry.model_env_var ?? null,
     providerEnvVar: entry.provider_env_var ?? null,
     thinkingEnvVar: entry.thinking_env_var ?? null,
+    effortCanonicalValues: entry.effort_canonical_values ?? null,
     maxTokensEnvVar: entry.max_tokens_env_var ?? null,
     contextLimitEnvVar: entry.context_limit_env_var ?? null,
     maxRoundsEnvVar: entry.max_rounds_env_var ?? null,
@@ -1057,8 +1061,6 @@ export async function probeBackendProvider(
   });
 }
 
-// ── NIP-44 encrypt-to-self ───────────────────────────────────────────────────
-
 export async function nip44EncryptToSelf(plaintext: string): Promise<string> {
   return invokeTauri<string>("nip44_encrypt_to_self", { plaintext });
 }
@@ -1089,9 +1091,7 @@ export {
   validateReposDir,
 } from "./tauriWorkspace";
 
-/** Returns true on macOS, Windows, and Linux AppImage installs.
- *  Returns false on Linux non-AppImage packages (e.g. .deb) where
- *  Tauri's updater cannot swap the binary. */
+/** Whether this install supports Tauri's binary updater. */
 export function isAutoUpdateSupported(): Promise<boolean> {
   return invokeTauri<boolean>("is_auto_update_supported");
 }

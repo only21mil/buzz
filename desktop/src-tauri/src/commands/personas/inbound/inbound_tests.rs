@@ -161,6 +161,7 @@ const AGENT_PUBKEY: &str = "agentpubkeyhex00000000000000000000000000000000000000
 /// event must NEVER be able to overwrite.
 fn local_agent() -> ManagedAgentRecord {
     ManagedAgentRecord {
+        effort_level: None,
         pubkey: AGENT_PUBKEY.to_string(),
         name: "Local Agent".to_string(),
         persona_id: Some("persona-local".to_string()),
@@ -858,6 +859,7 @@ fn retain_managed_agent_pending_surfaces_recovery_mode_error() {
         .store(true, std::sync::atomic::Ordering::Relaxed);
 
     let record = ManagedAgentRecord {
+        effort_level: None,
         pubkey: "a".repeat(64),
         name: "Test".to_string(),
         persona_id: None,

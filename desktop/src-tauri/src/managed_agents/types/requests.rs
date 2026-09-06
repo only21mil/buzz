@@ -199,6 +199,9 @@ pub struct CreateManagedAgentRequest {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateManagedAgentRequest {
+    /// Missing leaves effort unchanged; null clears it; a string sets it atomically with Save.
+    #[serde(default, deserialize_with = "crate::util::double_option")]
+    pub effort_level: Option<Option<String>>,
     pub pubkey: String,
     /// Absent = don't touch. Present = rename the agent.
     #[serde(default)]

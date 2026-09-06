@@ -3,7 +3,6 @@ use crate::managed_agents::{
     DiscoverManagedAgentPrereqsRequest, InstallRuntimeResult, ManagedAgentPrereqsInfo,
     DEFAULT_ACP_COMMAND,
 };
-
 mod post_install_verification;
 mod relay_directory;
 pub use relay_directory::{list_relay_agents, revalidate_relay_agents};
@@ -159,6 +158,7 @@ pub async fn save_custom_harness(
         model_env_var: None,
         provider_env_var: None,
         thinking_env_var: None,
+        effort_canonical_values: None,
         max_tokens_env_var: None,
         context_limit_env_var: None,
         max_rounds_env_var: None,

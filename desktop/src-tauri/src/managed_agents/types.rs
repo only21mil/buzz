@@ -105,6 +105,7 @@ impl AgentDefinition {
     /// event coordinate (`d_tag = slug`) across the fold.
     pub fn into_agent_record(self) -> ManagedAgentRecord {
         ManagedAgentRecord {
+            effort_level: None,
             pubkey: String::new(),
             name: self.display_name.clone(),
             persona_id: None,
@@ -305,6 +306,9 @@ pub struct ManagedAgentRecord {
     /// first load.
     #[serde(default)]
     pub provider: Option<String>,
+    /// Saved thinking effort, projected for the effective harness at process start.
+    #[serde(default)]
+    pub effort_level: Option<String>,
     /// Content hash of the persona at the time this agent was created — the
     /// `persona_content_hash` of the snapshot in `system_prompt` / `model` /
     /// `provider` / `env_vars`. The Agents menu compares it against the linked
@@ -542,6 +546,7 @@ pub struct ManagedAgentSummary {
     /// (definition → global for linked instances; instance → global for
     /// definition-less instances). `None` for an orphaned instance.
     pub provider: Option<String>,
+    pub effort_level: Option<String>,
     /// `true` when the linked persona has been edited since this agent was
     /// created — the running agent uses the older pinned snapshot. The UI
     /// flags it and tells the user to delete + respawn to pick up the edit.
@@ -641,52 +646,8 @@ pub enum HarnessSource {
     Custom,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct AcpRuntimeCatalogEntry {
-    pub id: String,
-    pub label: String,
-    pub avatar_url: String,
-    pub availability: AcpAvailabilityStatus,
-    pub command: Option<String>,
-    pub binary_path: Option<String>,
-    pub default_args: Vec<String>,
-    pub mcp_command: Option<String>,
-    /// Environment variable used to apply the initial model, when supported.
-    pub model_env_var: Option<String>,
-    /// Environment variable used to apply the selected LLM provider, when supported.
-    pub provider_env_var: Option<String>,
-    /// Environment variable used to apply thinking effort, when supported.
-    pub thinking_env_var: Option<String>,
-    pub max_tokens_env_var: Option<String>,
-    pub context_limit_env_var: Option<String>,
-    pub max_rounds_env_var: Option<String>,
-    pub install_hint: String,
-    pub install_instructions_url: String,
-    /// true when at least one automated install step is available
-    pub can_auto_install: bool,
-    /// true when this runtime depends on a separately installed vendor CLI.
-    pub requires_external_cli: bool,
-    pub underlying_cli_path: Option<String>,
-    /// true when an npm adapter step is pending but Node.js / npm is absent.
-    /// The UI hides the Install button and shows a Node.js install callout.
-    pub node_required: bool,
-    /// Login/authentication status for CLI-based runtimes.
-    pub auth_status: AuthStatus,
-    /// Hint for completing authentication, shown when `auth_status` is not `logged_in`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub login_hint: Option<String>,
-    /// Whether this entry came from the compiled-in catalog or a user-supplied
-    /// JSON file in `custom_harnesses/`. The UI uses this to decide editability.
-    pub source: HarnessSource,
-    /// Definition-level env vars for `source: custom` entries; populated from
-    /// `HarnessDefinition.env` so saves don't silently erase existing vars.
-    /// Absent for builtin/preset entries. Skipped when empty in serialization.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub definition_env: BTreeMap<String, String>,
-    /// Spawn-time parallelism cap; absent for uncapped harnesses.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_parallelism: Option<u32>,
-}
+mod runtime_catalog;
+pub use runtime_catalog::AcpRuntimeCatalogEntry;
 
 /// Result of a single install step (CLI or adapter).
 #[derive(Debug, Clone, Serialize)]

@@ -1,7 +1,4 @@
 use crate::managed_agents::deferred_start::{apply_replay_floor_payload, DeferredAgentStart};
-use nostr::{Keys, ToBech32};
-use tauri::{AppHandle, State};
-
 use crate::{
     app_state::AppState,
     managed_agents::{
@@ -17,6 +14,8 @@ use crate::{
     relay::{relay_ws_url_with_override, sync_managed_agent_profile},
     util::now_iso,
 };
+use nostr::{Keys, ToBech32};
+use tauri::{AppHandle, State};
 
 /// Read the owner pubkey for legacy `BUZZ_ACP_AGENT_OWNER` fallback when `auth_tag` is absent.
 pub(super) fn workspace_owner_hex(state: &AppState) -> Result<String, String> {
@@ -807,6 +806,7 @@ pub async fn create_managed_agent(
         )?;
 
         let record = crate::managed_agents::ManagedAgentRecord {
+            effort_level: None,
             pubkey: pubkey.clone(),
             name: name.clone(),
             persona_id: requested_persona_id.clone(),

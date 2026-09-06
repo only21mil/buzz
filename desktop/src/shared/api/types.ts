@@ -309,6 +309,7 @@ export type ManagedAgentBackend =
 import type { RestartDiffEntry } from "./restartDiff";
 export type { JsonValue, RestartChange, RestartDiffEntry } from "./restartDiff";
 export type ManagedAgent = {
+  effortLevel?: string | null;
   pubkey: string;
   name: string;
   personaId: string | null;
@@ -519,6 +520,7 @@ export type AcpRuntimeCatalogEntry = {
   providerEnvVar: string | null;
   /** Environment variable used to apply thinking effort, when supported. */
   thinkingEnvVar: string | null;
+  effortCanonicalValues?: string[] | null;
   maxTokensEnvVar: string | null;
   contextLimitEnvVar: string | null;
   maxRoundsEnvVar: string | null;
@@ -669,17 +671,13 @@ export type NormalizedConfig = {
   systemPrompt: NormalizedField | null;
 };
 
-export type RuntimeConfigSurface = {
-  runtimeId: string | null;
-  runtimeLabel: string | null;
-  isPreSpawn: boolean;
-  normalized: NormalizedConfig;
-  advanced: ConfigField[];
-  extensions: ExtensionEntry[];
-  sources: ConfigSourceReport;
-};
+export type {
+  AcpConfigOptionValue,
+  RuntimeConfigSurface,
+} from "./agentConfigTypes";
 
 export type UpdateManagedAgentInput = {
+  effortLevel?: string | null;
   pubkey: string;
   name?: string;
   model?: string | null;

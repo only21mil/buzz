@@ -2110,6 +2110,7 @@ async fn tokio_main() -> Result<()> {
     }
 
     let ctx = Arc::new(PromptContext {
+        startup_effort: config.startup_effort.clone(),
         mcp_servers: build_mcp_servers(&config),
         initial_message: config.initial_message.clone(),
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),
@@ -7281,6 +7282,7 @@ mod build_mcp_servers_tests {
             dedup_mode: config::DedupMode::Queue,
             session_policy: scope::SessionPolicy::Channel,
             replay_floor_unix: None,
+            startup_effort: None,
             multiple_event_handling: config::MultipleEventHandling::Queue,
             ignore_self: true,
             kinds_override: None,
@@ -7511,6 +7513,7 @@ mod error_outcome_emission_tests {
             dedup_mode: config::DedupMode::Queue,
             session_policy: scope::SessionPolicy::Channel,
             replay_floor_unix: None,
+            startup_effort: None,
             multiple_event_handling: config::MultipleEventHandling::Queue,
             ignore_self: true,
             kinds_override: None,

@@ -403,6 +403,9 @@ pub struct CliArgs {
     /// The consumer clamps this to the fifteen minutes preceding startup.
     #[arg(long, env = "BUZZ_ACP_REPLAY_FLOOR")]
     pub replay_floor: Option<u64>,
+    /// Saved startup preference, validated against each new session’s advertised options.
+    #[arg(long, env = "BUZZ_ACP_EFFORT_LEVEL")]
+    pub effort_level: Option<String>,
 
     /// How to handle new @mentions while a turn is already in-flight.
     /// steer (default): cancel+re-prompt, framing the new mention as a message
@@ -589,6 +592,7 @@ pub struct Config {
     pub session_policy: crate::scope::SessionPolicy,
     /// Invocation-only replay floor, bounded at startup without changing the durable cursor.
     pub replay_floor_unix: Option<u64>,
+    pub startup_effort: Option<String>,
     pub multiple_event_handling: MultipleEventHandling,
     pub ignore_self: bool,
     pub kinds_override: Option<Vec<u32>>,
@@ -1200,6 +1204,7 @@ impl Config {
             dedup_mode: args.dedup,
             session_policy: args.session_policy,
             replay_floor_unix: args.replay_floor,
+            startup_effort: args.effort_level,
             multiple_event_handling: args.multiple_event_handling,
             ignore_self: !args.no_ignore_self,
             kinds_override: args.kinds,
@@ -1585,6 +1590,7 @@ mod tests {
             dedup_mode: DedupMode::Queue,
             session_policy: crate::scope::SessionPolicy::Channel,
             replay_floor_unix: None,
+            startup_effort: None,
             multiple_event_handling: MultipleEventHandling::Queue,
             ignore_self: true,
             kinds_override: None,

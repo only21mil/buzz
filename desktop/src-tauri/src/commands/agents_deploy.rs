@@ -269,6 +269,33 @@ mod tests {
     }
 
     #[test]
+    fn provider_effort_matches_projected_local_descriptor() {
+        let mut record = record();
+        record.team_id = None;
+        record.runtime = Some("goose".into());
+        record.effort_level = Some("xhigh".into());
+        let descriptor = crate::managed_agents::resolve_effective_harness_descriptor(
+            &record,
+            &[],
+            &Default::default(),
+        )
+        .unwrap();
+        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner");
+        assert_eq!(launch["env"]["GOOSE_THINKING_EFFORT"], "max");
+        assert!(launch["env"].get("BUZZ_ACP_EFFORT_LEVEL").is_none());
+        assert!(launch["policy_env"].get("BUZZ_ACP_EFFORT_LEVEL").is_none());
+        record.effort_level = None;
+        let descriptor = crate::managed_agents::resolve_effective_harness_descriptor(
+            &record,
+            &[],
+            &Default::default(),
+        )
+        .unwrap();
+        let launch = build_launch_block(&record, &descriptor, &[], None, None, "owner");
+        assert!(launch["env"].get("GOOSE_THINKING_EFFORT").is_none());
+    }
+
+    #[test]
     fn thread_session_policy_cannot_be_overridden_by_provider_descriptor() {
         let record = record();
         let descriptor = EffectiveHarnessDescriptor {

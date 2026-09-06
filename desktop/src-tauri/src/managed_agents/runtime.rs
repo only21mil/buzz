@@ -315,6 +315,7 @@ pub fn build_managed_agent_summary(
         parallelism: record.parallelism,
         system_prompt: effective_prompt,
         avatar_url: record.avatar_url.clone(),
+        effort_level: record.effort_level.clone(),
         model: effective_model,
         model_source,
         provider: effective_provider,
@@ -818,6 +819,11 @@ fn spawn_agent_child_with_replay_floor(
     // applied. Writing it last lets user-provided values win over every Buzz-set env
     // written above — reserved keys were already stripped from descriptor.env so they
     // cannot clobber BUZZ_PRIVATE_KEY, NOSTR_PRIVATE_KEY, etc.
+    super::config_bridge::effort::prepare_inherited_effort_env(
+        &mut command,
+        runtime_meta,
+        &descriptor.env,
+    );
     for (key, value) in &descriptor.env {
         command.env(key, value);
     }

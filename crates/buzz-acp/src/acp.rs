@@ -773,6 +773,39 @@ impl AcpClient {
         self.send_request("session/set_config_option", params).await
     }
 
+    /// Apply only an option explicitly advertised for this session/model.
+    pub async fn session_set_startup_effort(
+        &mut self,
+        session_id: &str,
+        session: &serde_json::Value,
+        effort: &str,
+    ) -> Result<serde_json::Value, AcpError> {
+        let options = session
+            .get("configOptions")
+            .and_then(serde_json::Value::as_array);
+        let option = options.and_then(|options| {
+            options.iter().find(|entry| {
+                entry.get("category").and_then(serde_json::Value::as_str) == Some("thought_level")
+            })
+        });
+        let config_id =
+            option.and_then(|entry| entry.get("id").and_then(serde_json::Value::as_str));
+        let supported = option
+            .and_then(|entry| entry.get("options").and_then(serde_json::Value::as_array))
+            .is_some_and(|options| {
+                options.iter().any(|entry| {
+                    entry.get("value").and_then(serde_json::Value::as_str) == Some(effort)
+                })
+            });
+        match (config_id.filter(|id| !id.is_empty()), supported) {
+            (Some(id), true) => self.session_set_config_option(session_id, id, effort).await,
+            _ => Err(AcpError::AgentError {
+                code: -32602,
+                message: "saved effort is not advertised for the selected session/model".into(),
+            }),
+        }
+    }
+
     /// Send `session/set_model` (unstable ACP path).
     pub async fn session_set_model(
         &mut self,

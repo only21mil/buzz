@@ -25,6 +25,7 @@ fn snapshot(
 
 fn record() -> ManagedAgentRecord {
     ManagedAgentRecord {
+        effort_level: None,
         pubkey: "p".repeat(64),
         name: "agent".into(),
         persona_id: None,
@@ -836,4 +837,29 @@ fn openclaw_cap_crossing_parallelism_snapshots_differ() {
         snapshot(&at_3, &[], &[], "wss://ws.example", &Default::default()),
         "parallelism 8 (clamps to 5) and 3 (runs as 3) must produce different snapshots"
     );
+}
+
+#[test]
+fn effort_projection_has_one_snapshot_leaf_and_clear_restores_inheritance() {
+    let mut record = record();
+    record.persona_id = None;
+    record.agent_command = "goose".into();
+    record.runtime = Some("goose".into());
+    record.effort_level = Some("xhigh".into());
+    let global = GlobalAgentConfig {
+        env_vars: BTreeMap::from([("GOOSE_THINKING_EFFORT".into(), "low".into())]),
+        ..Default::default()
+    };
+    let selected = snapshot(&record, &[], &[], "wss://relay", &global);
+    assert_eq!(selected["effort_level"], "max");
+    assert!(selected["env"].get("GOOSE_THINKING_EFFORT").is_none());
+    record.effort_level = Some("max".into());
+    assert_eq!(
+        selected,
+        snapshot(&record, &[], &[], "wss://relay", &global)
+    );
+    record.effort_level = None;
+    let inherited = snapshot(&record, &[], &[], "wss://relay", &global);
+    assert_eq!(inherited["effort_level"], "low");
+    assert_ne!(selected, inherited);
 }

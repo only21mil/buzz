@@ -911,6 +911,7 @@ impl ChannelInfoResolver {
 }
 
 pub struct PromptContext {
+    pub startup_effort: Option<String>,
     pub mcp_servers: Vec<McpServer>,
     pub initial_message: Option<String>,
     pub idle_timeout: Duration,
@@ -1669,14 +1670,23 @@ async fn create_session_and_apply_model(
         });
     }
 
+    let mut session_config = resp.raw.clone();
     // Apply desired_model if set, matching against the fresh session/new response.
     // Track whether the switch succeeded so session_config_captured reflects
     // the post-switch state (not the pre-switch desired state).
     let switch_succeeded = if let Some(ref desired) = agent.desired_model {
         match resolve_model_switch_method(&resp.raw, desired) {
             Some(method) => {
-                apply_model_switch(&mut agent.acp, &resp.session_id, desired, &method).await?;
-                true
+                let switched =
+                    apply_model_switch(&mut agent.acp, &resp.session_id, desired, &method).await?;
+                if let Some(ref updated) = switched {
+                    // A model can change effort support. Never trust pre-switch options.
+                    session_config["configOptions"] = updated
+                        .get("configOptions")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                }
+                switched.is_some()
             }
             None => {
                 tracing::warn!(
@@ -1702,6 +1712,27 @@ async fn create_session_and_apply_model(
         false
     };
 
+    if let Some(effort) = ctx.startup_effort.as_deref() {
+        let updated = match agent
+            .acp
+            .session_set_startup_effort(&resp.session_id, &session_config, effort)
+            .await
+        {
+            Ok(updated) => updated,
+            Err(error @ AcpError::AgentError { .. }) => {
+                // This new session has not entered pool state; reject without leaking it.
+                agent
+                    .release_session_best_effort(&resp.session_id, "startup_effort_rejected", true)
+                    .await;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(options) = updated.get("configOptions") {
+            session_config["configOptions"] = options.clone();
+        }
+    }
+
     // Emit session config for desktop consumption (config bridge tier 1b).
     // Emitted AFTER desired_model resolution so the desktop caches the
     // post-switch state. modelOverridden reflects whether the switch actually
@@ -1710,7 +1741,7 @@ async fn create_session_and_apply_model(
     agent.acp.observe(
         "session_config_captured",
         serde_json::json!({
-            "configOptions": resp.raw.get("configOptions").cloned().unwrap_or(serde_json::Value::Null),
+            "configOptions": session_config.get("configOptions").cloned().unwrap_or(serde_json::Value::Null),
             "modes": resp.raw.get("modes").cloned().unwrap_or(serde_json::Value::Null),
             "models": resp.raw.get("models").cloned().unwrap_or(serde_json::Value::Null),
             "modelOverridden": agent.model_overridden && switch_succeeded,
@@ -1772,7 +1803,7 @@ async fn apply_model_switch(
     session_id: &str,
     desired: &str,
     method: &ModelSwitchMethod,
-) -> Result<(), AcpError> {
+) -> Result<Option<serde_json::Value>, AcpError> {
     let method_label = match method {
         ModelSwitchMethod::ConfigOption { config_id, .. } => {
             format!("configOption (configId={config_id})")
@@ -1797,11 +1828,12 @@ async fn apply_model_switch(
     .await;
 
     match result {
-        Ok(Ok(_)) => {
+        Ok(Ok(response)) => {
             tracing::info!(
                 target: "pool::model",
                 "applied model {desired} via {method_label} on session {session_id}"
             );
+            return Ok(Some(response));
         }
         // Transport-class errors may have corrupted the stdio stream — propagate
         // so the caller can respawn the agent instead of reusing a poisoned one.
@@ -1833,7 +1865,7 @@ async fn apply_model_switch(
             return Err(AcpError::Timeout(MODEL_SWITCH_TIMEOUT));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Set the session permission mode via `session/set_config_option`.
@@ -7035,6 +7067,9 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         }
     }
 
+    #[path = "effort_tests.rs"]
+    mod effort_tests;
+
     #[tokio::test]
     async fn session_new_wire_uses_policy_base_and_distinct_thread_titles() {
         let capture =
@@ -9498,6 +9533,7 @@ for line in sys.stdin:
     ) -> PromptContext {
         use crate::relay::RestClient;
         PromptContext {
+            startup_effort: None,
             mcp_servers: vec![],
             initial_message: None,
             idle_timeout: Duration::from_secs(60),
