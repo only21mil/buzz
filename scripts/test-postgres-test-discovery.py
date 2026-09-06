@@ -147,7 +147,9 @@ mod tests {
                             if r['package'] in ('buzz-test-client', 'buzz-pubsub', 'buzz-media', 'buzz-voice')))
         workflow = (inventory.ROOT / '.github/workflows/ci.yml').read_text()
         self.assertIn("-E 'binary(e2e_event_reminder)'", workflow)
-        self.assertIn('scripts/postgres-test-run.sh --task-root', workflow)
+        self.assertIn('bash scripts/postgres-test-ci.sh', workflow)
+        admission = (inventory.ROOT / 'scripts/postgres-test-ci.sh').read_text()
+        self.assertIn('scripts/postgres-test-run.sh --task-root', admission)
         self.assertNotIn('continue-on-error:', workflow.split('  backend-integration:')[1].split('  relay-e2e:')[0])
 
 

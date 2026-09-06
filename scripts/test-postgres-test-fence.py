@@ -78,7 +78,17 @@ class FenceTests(unittest.TestCase):
             # The controlled sentinel parent must allow creation of the child
             # user namespace. Production child fencing keeps both flags.
             args.remove('--disable-userns'); args.remove('--assert-userns-disabled')
-            subprocess.run(args, check=True)
+            # Bubblewrap reports the host PID of its namespace child before
+            # loopback setup. CI can correlate a setup denial to this attempt.
+            with tempfile.TemporaryFile() as info:
+                result = subprocess.run(args[:1] + ['--info-fd', str(info.fileno())] + args[1:],
+                                        pass_fds=(info.fileno(),))
+                info.seek(0)
+                details = info.read()
+                if details:
+                    print('fence-admission=' + json.dumps({
+                        'executable': args[0], 'child_pid': json.loads(details)['child-pid']}), flush=True)
+                result.check_returncode()
 
     def test_host_context_fails_before_execution(self):
         with self.assertRaisesRegex(RuntimeError, 'fresh unprivileged namespaces'):
