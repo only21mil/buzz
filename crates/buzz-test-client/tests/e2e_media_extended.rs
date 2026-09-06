@@ -887,3 +887,86 @@ async fn test_upload_html_served_as_inert_attachment() {
             .is_success());
     }
 }
+
+/// Disposable runner seeds public synthetic key 2 as a member of both hosts
+/// and enables membership enforcement. Hash-scoped Blossom read auth is valid
+/// on both hosts; the expected 404 therefore tests the tenant sidecar boundary.
+#[tokio::test]
+#[ignore = "requires the disposable HTML relay runner and two seeded member contexts"]
+async fn test_html_tenant_read_denial() {
+    let base = std::env::var("RELAY_HTTP_URL").expect("explicit disposable relay URL");
+    let other_host = std::env::var("HTML_TEST_OTHER_HOST").expect("explicit second tenant host");
+    let own_host = reqwest::Url::parse(&base).unwrap().authority().to_string();
+    assert_ne!(own_host, other_host);
+    assert_eq!(
+        std::env::var("BUZZ_REQUIRE_RELAY_MEMBERSHIP").as_deref(),
+        Ok("true")
+    );
+    let keys = Keys::parse(&format!("{:064x}", 2)).unwrap();
+    assert_eq!(
+        keys.public_key().to_hex(),
+        "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+    );
+    let client = http_client();
+    let mut uploads = Vec::new();
+    for host in [&own_host, &other_host] {
+        let html = format!("<!DOCTYPE html><html><script>globalThis.__tenantLeak=true</script><p>{host}-{}</p></html>", Timestamp::now().as_secs()).into_bytes();
+        let hash = hex::encode(Sha256::digest(&html));
+        let uploaded = client
+            .put(format!("{base}/upload"))
+            .header("Host", host)
+            .header(
+                "Authorization",
+                blossom_auth_header(&sign_blossom_auth(&keys, &hash)),
+            )
+            .header("X-SHA-256", &hash)
+            .body(html.clone())
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            uploaded.status().is_success(),
+            "member upload on {host}: {}",
+            uploaded.status()
+        );
+        uploads.push((host, html, hash));
+    }
+    for (owner_host, html, hash) in &uploads {
+        let denied_host = if *owner_host == &own_host {
+            &other_host
+        } else {
+            &own_host
+        };
+        let authorization = blossom_auth_header(&sign_blossom_get_auth(&keys, hash));
+        for suffix in [format!("{hash}.html"), hash.clone()] {
+            for range in [false, true] {
+                let url = format!("{base}/media/{suffix}");
+                let mut allowed = client
+                    .get(&url)
+                    .header("Host", *owner_host)
+                    .header("Authorization", &authorization);
+                let mut denied = client
+                    .get(&url)
+                    .header("Host", denied_host)
+                    .header("Authorization", &authorization);
+                if range {
+                    allowed = allowed.header("Range", "bytes=0-15");
+                    denied = denied.header("Range", "bytes=0-15");
+                }
+                let allowed = allowed.send().await.unwrap();
+                assert_eq!(allowed.status().as_u16(), if range { 206 } else { 200 });
+                let expected = if range { &html[..16] } else { html.as_slice() };
+                assert_eq!(allowed.bytes().await.unwrap().as_ref(), expected);
+                let denied = denied.send().await.unwrap();
+                assert_eq!(
+                    denied.status(),
+                    404,
+                    "valid member auth must reach tenant sidecar denial"
+                );
+                let error = denied.text().await.unwrap();
+                assert_eq!(error, r#"{"error":"not found"}"#);
+                println!("tenant owner={owner_host} denied={denied_host} range={range} suffix={suffix}: allowed exact bytes, denied 404 generic error");
+            }
+        }
+    }
+}
