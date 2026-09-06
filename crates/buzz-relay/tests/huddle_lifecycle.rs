@@ -90,7 +90,29 @@ async fn huddle_lifecycle_ingest_postgres_acceptance() {
     );
     let url = std::env::var("BUZZ_TEST_DATABASE_URL").expect("isolated runner required");
     let pool = PgPool::connect(&url).await.expect("owned database");
-    let mut config = Config::from_env().expect("test config");
+    let git_storage = tempfile::tempdir().expect("fixture Git storage");
+    let git_root = git_storage.path().to_path_buf();
+    // This integration binary has one test. Scope the loader's eager directory
+    // creation before constructing any relay state, then restore its environment.
+    let previous = [
+        ("BUZZ_GIT_REPO_PATH", git_root.join("repos")),
+        ("BUZZ_GIT_PACK_CACHE_PATH", git_root.join("pack-cache")),
+    ]
+    .map(|(name, path)| {
+        let previous = std::env::var_os(name);
+        std::env::set_var(name, path);
+        (name, previous)
+    });
+    let config_result = Config::from_env();
+    for (name, value) in previous {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+    let mut config = config_result.expect("test config");
+    assert!(config.git_repo_path.starts_with(&git_root));
+    assert!(config.git_pack_cache_path.starts_with(&git_root));
     config.database_url = url;
     config.require_relay_membership = false;
     config.require_auth_token = false;
@@ -264,4 +286,6 @@ async fn huddle_lifecycle_ingest_postgres_acceptance() {
     shutdown.drain(std::time::Duration::from_secs(5)).await;
     drop(state);
     pool.close().await;
+    git_storage.close().expect("remove fixture Git storage");
+    assert!(!git_root.exists(), "fixture Git storage must be removed");
 }
