@@ -17,6 +17,65 @@ import 'package:buzz/shared/deeplink/deep_link.dart';
 import '../../shared/community/community_storage_test.dart';
 
 void main() {
+  for (final removeDuringRecovery in [false, true]) {
+    test(
+      'late starter recovery preserves a ${removeDuringRecovery ? 'removed' : 'renamed'} community',
+      () async {
+        final keys = nostr.Keys.generate();
+        final storage = CommunityStorage(secure: FakeSecureStorage());
+        final community = Community(
+          id: 'recovering',
+          name: 'Original',
+          relayUrl: 'wss://relay.example.com',
+          pubkey: keys.public,
+          nsec: keys.nsec,
+          addedAt: DateTime.utc(2026),
+          starterSetupIncomplete: true,
+        );
+        await storage.save(community);
+        final container = ProviderContainer(
+          overrides: [
+            communityStorageProvider.overrideWithValue(storage),
+            inviteJoinRecoveryProvider.overrideWithValue(
+              (_) => _RecordingInviteJoinRecovery(() async {
+                if (removeDuringRecovery) {
+                  await storage.remove(community.id);
+                } else {
+                  await storage.save(community.copyWith(name: 'Renamed'));
+                }
+                return 'welcome-id';
+              }),
+            ),
+          ],
+        );
+        addTearDown(container.dispose);
+        final notifier = container.read(inviteJoinProvider.notifier);
+        await notifier.prepare(
+          const InviteDeepLink(
+            relayUrl: 'wss://relay.example.com',
+            code: 'code',
+          ),
+        );
+        await notifier.startStarterSetupRecovery();
+        final saved = await storage.loadAll();
+        if (removeDuringRecovery) {
+          expect(saved, isEmpty);
+          expect(
+            container.read(inviteJoinProvider).status,
+            InviteJoinStatus.error,
+          );
+        } else {
+          expect(saved.single.name, 'Renamed');
+          expect(saved.single.starterSetupIncomplete, isFalse);
+          expect(
+            container.read(inviteJoinProvider).status,
+            InviteJoinStatus.success,
+          );
+        }
+      },
+    );
+  }
+
   for (final existingRelayUrl in [
     'wss://relay.example.com',
     'https://relay.example.com',

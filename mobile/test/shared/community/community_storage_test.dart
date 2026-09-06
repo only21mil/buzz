@@ -97,6 +97,52 @@ void main() {
   });
 
   group('CommunityStorage', () {
+    test('queues marker updates with renames and removals', () async {
+      final community = Community.create(
+        name: 'Original',
+        relayUrl: 'https://relay.example.com',
+        starterSetupIncomplete: true,
+      );
+      await storage.save(community);
+      final rename = storage.save(community.copyWith(name: 'Renamed'));
+      final marker = storage.updateExisting(
+        community.id,
+        (current) => current.copyWith(starterSetupIncomplete: false),
+      );
+      await Future.wait([rename, marker]);
+      final saved = (await storage.loadAll()).single;
+      expect(saved.name, 'Renamed');
+      expect(saved.starterSetupIncomplete, isFalse);
+
+      final removal = storage.remove(community.id);
+      final lateMarker = storage.updateExisting(
+        community.id,
+        (current) => current.copyWith(starterSetupIncomplete: true),
+      );
+      await expectLater(lateMarker, throwsStateError);
+      await removal;
+      expect(await storage.loadAll(), isEmpty);
+      // A rejected update must not poison later community mutations.
+      await storage.save(community);
+      expect((await storage.loadAll()).single.id, community.id);
+    });
+
+    test('a queued removal wins after a pending marker update', () async {
+      final community = Community.create(
+        name: 'Original',
+        relayUrl: 'https://relay.example.com',
+      );
+      await storage.save(community);
+      await Future.wait([
+        storage.updateExisting(
+          community.id,
+          (current) => current.copyWith(starterSetupIncomplete: false),
+        ),
+        storage.remove(community.id),
+      ]);
+      expect(await storage.loadAll(), isEmpty);
+    });
+
     test('loadAll returns empty list when no data', () async {
       final result = await storage.loadAll();
       expect(result, isEmpty);

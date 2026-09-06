@@ -332,8 +332,18 @@ class InviteJoinNotifier extends Notifier<InviteJoinState> {
     Community community, {
     required bool incomplete,
   }) async {
-    final updated = community.copyWith(starterSetupIncomplete: incomplete);
-    await ref.read(communityStorageProvider).save(updated);
+    await ref.read(communityStorageProvider).updateExisting(community.id, (
+      saved,
+    ) {
+      if (saved.relayUrl != community.relayUrl ||
+          saved.pubkey != community.pubkey ||
+          saved.nsec != community.nsec) {
+        throw StateError('Community changed during invite recovery');
+      }
+      // Preserve edits made while setup was pending and never recreate a
+      // community removed before this queued marker update.
+      return saved.copyWith(starterSetupIncomplete: incomplete);
+    });
     ref.invalidate(communityListProvider);
     ref.invalidate(activeCommunityProvider);
     ref.invalidate(authProvider);
