@@ -176,3 +176,5 @@ fn inbound_catalog_head_retains_arrival_witness_through_the_production_reconcile
         "retaining an inbound catalog head must queue no outbound publication (no ping-pong)"
     );
 }
+
+mod hydration;

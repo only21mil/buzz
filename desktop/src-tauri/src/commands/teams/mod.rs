@@ -214,21 +214,10 @@ pub(crate) fn refresh_team_catalog_heads_for_persona<R: tauri::Runtime>(
     pending::refresh_shared_team_catalog_heads_for_persona(app, state, persona_id);
 }
 
-/// Refresh (or retract) one team's shared 30178 catalog head after an inbound
-/// 30176 team edit landed on this device.
-///
-/// `pub(crate)` so the inbound reconcile can converge the catalog without
-/// reaching into the private `commands::teams` module. Best-effort: failures
-/// are logged, not returned. The idempotency skip inside the refresh makes this
-/// a no-op when the editing device already published the identical head.
-pub(crate) fn refresh_team_catalog_head<R: tauri::Runtime>(
-    app: &AppHandle<R>,
-    state: &AppState,
-    team: &TeamRecord,
-    personas: &[AgentDefinition],
-) {
-    pending::refresh_shared_team_catalog_head_resolving(app, state, team, personas);
-}
+mod inbound;
+pub(crate) use inbound::{
+    refresh_team_catalog_head, refresh_team_catalog_heads_for_inbound_persona,
+};
 
 /// Purge and tombstone a team's 30178 catalog coordinate after an inbound
 /// 30176 team tombstone removed the team on this device.

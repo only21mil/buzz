@@ -213,7 +213,7 @@ fn reconcile_inbound_persona_event_blocking<R: tauri::Runtime>(
                 .map(|record| record.id.clone())
             {
                 drop(personas);
-                super::super::teams::refresh_team_catalog_heads_for_persona(
+                super::super::teams::refresh_team_catalog_heads_for_inbound_persona(
                     &app,
                     &state,
                     &persona_id,
@@ -236,11 +236,9 @@ fn reconcile_inbound_persona_event_blocking<R: tauri::Runtime>(
             if outcome == InboundOutcome::Skipped {
                 return Ok(());
             }
-            // A team edit changes its shared catalog projection. Refresh (or
-            // retract, if a member is now missing) THIS device's retained head
-            // so the community catalog tracks the inbound edit. Idempotent — a
-            // rebuild byte-identical to the retained head does not republish,
-            // so the editing device's own published head causes no churn.
+            // Refresh only after member hydration. A remote team can arrive
+            // before a new member even with a previous witness retained locally;
+            // absence is not evidence of deletion. Member arrivals retry it.
             let teams = load_teams(&app)?;
             let personas = load_personas(&app)?;
             if let Some(team) = teams.iter().find(|record| record.id == team_id) {

@@ -74,7 +74,7 @@ function eventIsNewer(candidate: RelayEvent, current: RelayEvent): boolean {
 }
 
 // The catalog dependency set: the 30178 head and the 30175/30176 coordinates a
-// team-catalog refresh resolves against. Degraded-live drops every live event
+// team-catalog refresh resolves against. Degraded-live holds every live event
 // that could drive (or destructively re-trigger) a catalog refresh against an
 // unhydrated store — see `dispatchLive`. A kind-5 deletion is held whenever ANY
 // parseable `a` tag names a dependency coordinate (`<kind>:<owner>:<d_tag>`):
@@ -146,13 +146,11 @@ export function coalesceManagedAgentBackfill(
  * dominating false tombstone — deleting the owner's valid catalog entry on
  * ordinary first sync.
  *
- * Deferring only the 30178 heads to the end of the batch preserves newest-wins
- * within every other coordinate (order among non-catalog events is untouched)
- * while guaranteeing the constituents are all applied before any catalog
- * refresh could fire. A stable partition keeps relay order within each group.
- * This is only sound over a COMPLETE batch — `startPersonaSync` pages history to
- * exhaustion and buffers concurrent live events so every constituent is present
- * before the partition runs.
+ * The stable partition preserves relay order within each group. It does not
+ * establish member readiness on returning devices with retained witnesses, or
+ * for later live team edits: native inbound refresh also defers unresolved
+ * memberships. The hydration boundary awaits successful native applies before
+ * releasing buffered dependency operations.
  */
 export function orderCatalogHeadsLast(
   events: readonly RelayEvent[],
@@ -289,19 +287,18 @@ export function startPersonaSync(
   // one. One chain per owner/relay subscription makes the newest event the last
   // deployment without serializing unrelated identities or communities.
   let reconcileChain = Promise.resolve();
-  const reconcile = (event: RelayEvent) => {
-    if (event.pubkey !== pubkey) return;
-    reconcileChain = reconcileChain
-      .then(() => {
-        if (!onCancelled())
-          return reconcileInboundPersonaEvent(JSON.stringify(event), relayUrl);
-      })
-      .catch((error) => {
-        console.warn("[usePersonaSync] reconcile failed:", error);
-      });
+  const reconcile = (event: RelayEvent): Promise<void> => {
+    const applied = reconcileChain.then(async () => {
+      if (event.pubkey !== pubkey || onCancelled()) return;
+      await reconcileInboundPersonaEvent(JSON.stringify(event), relayUrl);
+    });
+    // Keep the serializer usable after an error, but return the rejected apply
+    // to its caller. Only that caller can decide whether hydration succeeded.
+    reconcileChain = applied.catch(() => {});
+    return applied;
   };
 
-  // Event ids the backfill already reconciled. The live subscription registers
+  // Event ids the backfill successfully reconciled. The live subscription registers
   // before the backfill queries history, so an event published in that window
   // is delivered live (buffered) AND returned by the backfill. The backend
   // dedupes an equal-id echo, so the duplicate is harmless, but the drain skips
@@ -318,30 +315,42 @@ export function startPersonaSync(
 
   // Dispatch a live (post-boundary or drained-buffer) event. In DEGRADED mode
   // the owner's constituents were never fully hydrated, so the whole catalog
-  // dependency set is dropped: the 30178 head itself, its 30175/30176
+  // dependency set is held: the 30178 head itself, its 30175/30176
   // constituents, and any kind-5 deletion targeting one of those coordinates.
   //
-  // Dropping the 30178 head alone is not enough. The backend's KIND_TEAM /
-  // KIND_PERSONA inbound arms unconditionally call `refresh_team_catalog_head`
-  // after a save (inbound.rs), and live delivery is newest-first — so a 30176
-  // team edit that ADDS a new persona reaches Rust before that persona's 30175.
-  // Against a retained witness the refresh cannot resolve the new member, purges
-  // the valid witness, and queues a dominating false tombstone. Holding the
-  // prior hydration's constituents on disk only proves the OLD revision is
-  // resolvable; it says nothing about a NEW member. A kind-5 deletion of a
-  // dependency is likewise destructive — it intentionally triggers 30178
-  // tombstoning — and cannot safely establish final state on incomplete history.
-  //
-  // 30177 (managed-agent runtime policy) stays live: it drives no catalog
-  // refresh, so it cannot reproduce the purge, and runtime control should keep
-  // working while degraded. Degraded mode is an explicit self-healing abnormal
-  // state — the full backfill retries on the next effect re-run (restart, or an
-  // identity/community switch) — so a degraded device staying stale on
-  // team/persona edits until self-heal is the correct trade against destroying
-  // valid shared state.
+  // Native upserts defer missing members, but signed deletions still retract
+  // immediately. Incomplete history or a failed save therefore keeps the whole
+  // dependency set held. Managed-agent policy can continue independently.
+  // After retry exhaustion, the next effect run refetches history to self-heal.
+  // Serialize retries as well as applies: later dependency operations cannot
+  // overtake a failed save. Managed-agent policy remains live after exhaustion.
+  let liveChain = Promise.resolve();
   const dispatchLive = (event: RelayEvent) => {
-    if (degraded && isCatalogDependencyEvent(event)) return;
-    reconcile(event);
+    liveChain = liveChain.then(async () => {
+      if (onCancelled()) return;
+      if (degraded && isCatalogDependencyEvent(event)) {
+        liveBuffer.push(event);
+        return;
+      }
+      for (let attempt = 0; attempt < BACKFILL_MAX_ATTEMPTS; attempt += 1) {
+        try {
+          await reconcile(event);
+          return;
+        } catch (error) {
+          if (onCancelled()) return;
+          if (attempt < BACKFILL_MAX_ATTEMPTS - 1) {
+            await backfillBackoff(attempt);
+            continue;
+          }
+          console.warn(
+            "[usePersonaSync] live apply failed; holding dependencies:",
+            error,
+          );
+          degraded = true;
+          liveBuffer.push(event);
+        }
+      }
+    });
   };
 
   const liveBuffer: RelayEvent[] = [];
@@ -357,38 +366,44 @@ export function startPersonaSync(
   // Open the hydration boundary and drain buffered live events. Setting
   // `hydrated` and draining are synchronous and uninterrupted, so no live event
   // can slip past the boundary. `degraded` must be set before this runs so the
-  // drain applies the same catalog-drop policy as future live events.
+  // drain applies the same catalog-hold policy as future live events.
   const openBoundaryAndDrain = () => {
     hydrated = true;
-    for (const event of liveBuffer) {
+    const buffered = liveBuffer.splice(0);
+    for (const event of buffered) {
       if (backfillReconciledIds.has(event.id)) continue;
       dispatchLive(event);
     }
-    liveBuffer.length = 0;
   };
 
   // Exhaustive one-shot backfill (closes the fresh-start gap that live-only
   // subscription + reconnect-replay cannot recover). Coalesce managed-agent
   // revisions, defer 30178 catalog heads past their constituents, dispatch the
-  // ordered batch, THEN open the hydration boundary and drain buffered live
-  // events — otherwise a fresh device retracts the owner's valid shared head.
+  // ordered batch successfully, THEN drain buffered live events.
   //
   // A transient fetch failure is retried with bounded backoff; a deterministic
   // `PersonaHistoryDenseBoundaryError` is NOT retried (a dense second cannot
   // clear on retry). When every attempt fails the pipeline transitions to
   // degraded-live rather than leaving the subscription permanently inert:
   // `hydrated` still opens so buffered and future live events keep reconciling,
-  // with catalog heads dropped (see `dispatchLive`).
+  // with catalog dependencies held (see `dispatchLive`).
   const runBackfill = async () => {
+    // Keep the fetched batch across apply retries. A changed relay response
+    // must not erase an event whose native save failed.
+    let history: RelayEvent[] | undefined;
     for (let attempt = 0; attempt < BACKFILL_MAX_ATTEMPTS; attempt += 1) {
       try {
-        const events = await fetchOwnerHistoryToExhaustion(pubkey);
+        history ??= orderCatalogHeadsLast(
+          coalesceManagedAgentBackfill(
+            await fetchOwnerHistoryToExhaustion(pubkey),
+          ),
+        );
         if (onCancelled()) return;
-        for (const event of orderCatalogHeadsLast(
-          coalesceManagedAgentBackfill(events),
-        )) {
+        for (const event of history) {
+          if (backfillReconciledIds.has(event.id)) continue;
+          await reconcile(event);
+          if (onCancelled()) return;
           backfillReconciledIds.add(event.id);
-          reconcile(event);
         }
         openBoundaryAndDrain();
         return;
@@ -408,6 +423,11 @@ export function startPersonaSync(
           error,
         );
         degraded = true;
+        if (history) {
+          liveBuffer.push(
+            ...history.filter((event) => !backfillReconciledIds.has(event.id)),
+          );
+        }
         openBoundaryAndDrain();
         return;
       }
