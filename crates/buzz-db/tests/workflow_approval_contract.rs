@@ -2249,7 +2249,7 @@ async fn history_reads_durable_gate_and_legacy_evidence_without_authority_tokens
     assert_eq!(history[1].status, "pending");
     assert_ne!(history[0].approval_ref, "legacy-raw-token");
     assert_eq!(history[0].approval_ref.len(), 64);
-    decide_gate(
+    let decision = decide_gate(
         &fixture,
         approval_id,
         &fixture.approver,
@@ -2259,6 +2259,10 @@ async fn history_reads_durable_gate_and_legacy_evidence_without_authority_tokens
     )
     .await
     .expect("grant durable gate");
+    assert!(matches!(
+        decision,
+        WorkflowApprovalDecisionOutcome::Applied { .. }
+    ));
     let history = buzz_db::workflow::get_workflow_approval_history(
         &fixture.pool,
         fixture.community_id,
