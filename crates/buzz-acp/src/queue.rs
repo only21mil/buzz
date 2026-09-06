@@ -1464,7 +1464,7 @@ fn resolve_reply_anchor(
     )
 }
 
-/// Format a `[Context]` hints section based on event scope.
+/// Format a `<context>` hints section based on event scope.
 ///
 /// `reply_anchor` is the pre-resolved `--reply-to` target for this turn (see
 /// [`resolve_reply_anchor`]). In the thread/DM branches it threads ordinary
@@ -1517,8 +1517,7 @@ fn format_context_hints(
             "Use `buzz messages get --channel <UUID>` for conversation context."
         };
         let mut s = format!(
-            "[Context]\n\
-             Scope: dm\n\
+            "Scope: dm\n\
              Session scope: dm conversation\n\
              Channel: {channel_display}\n\
              {ctx_hint}"
@@ -1535,7 +1534,7 @@ fn format_context_hints(
                 append_reply_instruction(&mut s, event_id);
             }
         }
-        s
+        crate::prompt_framing::semantic_section("context", &s)
     } else if let Some(root) = scope
         .root_event_id()
         .or(thread_tags.root_event_id.as_deref())
@@ -1555,8 +1554,7 @@ fn format_context_hints(
             "channel"
         };
         let mut s = format!(
-            "[Context]\n\
-             Scope: thread\n\
+            "Scope: thread\n\
              Session scope: {session_scope}\n\
              Channel: {channel_display}\n\
              Thread root: {root}"
@@ -1579,11 +1577,10 @@ fn format_context_hints(
                 append_new_thread_reply_instruction(&mut s, event_id);
             }
         }
-        s
+        crate::prompt_framing::semantic_section("context", &s)
     } else {
         let mut s = format!(
-            "[Context]\n\
-             Scope: channel\n\
+            "Scope: channel\n\
              Session scope: channel\n\
              Channel: {channel_display}\n\
              Hint: Use `buzz messages get --channel <UUID>` for recent messages if needed."
@@ -1596,7 +1593,7 @@ fn format_context_hints(
         if let Some(event_id) = reply_anchor {
             append_new_thread_reply_instruction(&mut s, event_id);
         }
-        s
+        crate::prompt_framing::semantic_section("context", &s)
     }
 }
 
@@ -1685,35 +1682,45 @@ fn format_conversation_context(
     ctx: &ConversationContext,
     profile_lookup: Option<&PromptProfileLookup>,
 ) -> String {
-    let (label, messages, total, truncated) = match ctx {
+    let (tag, messages, total, truncated) = match ctx {
         ConversationContext::Thread {
             messages,
             total,
             truncated,
             ..
-        } => ("Thread Context", messages, total, truncated),
+        } => ("thread-context", messages, total, truncated),
         ConversationContext::Dm {
             messages,
             total,
             truncated,
-        } => ("Conversation Context", messages, total, truncated),
+        } => ("conversation-context", messages, total, truncated),
     };
 
-    let trunc_label = if *truncated { ", truncated" } else { "" };
-    let mut s = format!(
-        "[{label} ({} of {total} messages{trunc_label})]",
-        messages.len()
-    );
+    let mut body = String::new();
     for (i, msg) in messages.iter().enumerate() {
-        s.push_str(&format!(
-            "\n[{}] {} ({}): {}",
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&format!(
+            "[{}] {} ({}): {}",
             i + 1,
             format_prompt_actor(&msg.pubkey, profile_lookup),
             msg.timestamp,
             msg.content,
         ));
     }
-    s
+    let included = messages.len().to_string();
+    let total = total.to_string();
+    let truncated = truncated.to_string();
+    crate::prompt_framing::semantic_section_with_attributes(
+        tag,
+        &[
+            ("included", included.as_str()),
+            ("total", total.as_str()),
+            ("truncated", truncated.as_str()),
+        ],
+        &body,
+    )
 }
 
 /// Arguments for [`format_prompt`] beyond the required [`FlushBatch`].
@@ -1728,15 +1735,15 @@ pub struct FormatPromptArgs<'a> {
     pub profile_lookup: Option<&'a PromptProfileLookup>,
     /// When true, base_prompt and system_prompt are delivered via the system
     /// role (session/new) and omitted from the user message. When false
-    /// (legacy agents), they are injected as `[Base]` and `[System]` sections.
+    /// (legacy agents), they are injected as `<base>` and `<agent-instructions>` sections.
     pub has_system_prompt_support: bool,
     /// Base prompt content for legacy agents (protocol_version < 2).
     pub base_prompt: Option<&'a str>,
     /// System prompt content for legacy agents (protocol_version < 2).
     pub system_prompt: Option<&'a str>,
-    /// Team instructions for legacy agents, rendered after `[System]`.
+    /// Team instructions for legacy agents, rendered after `<agent-instructions>`.
     pub team_instructions: Option<&'a str>,
-    /// Rendered `[Channel Canvas]` metadata section for legacy agents.
+    /// Rendered `<channel-canvas>` metadata section for legacy agents.
     ///
     /// For modern agents (protocol_version >= 2) the section is delivered via
     /// the system role in session/new; omit here to avoid duplication.
@@ -1779,43 +1786,57 @@ impl StandingContext<'_> {
             sections.push(base_section(bp));
         }
         if let Some(sp) = self.system_prompt {
-            sections.push(format!("[System]\n{sp}"));
+            sections.push(crate::prompt_framing::semantic_section(
+                "agent-instructions",
+                sp,
+            ));
         }
         if let Some(team) = self
             .team_instructions
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            sections.push(format!("[Team Instructions]\n{team}"));
+            sections.push(crate::prompt_framing::semantic_section(
+                "team-instructions",
+                team,
+            ));
         }
         if let Some(core) = self.agent_core {
-            sections.push(core.to_string());
+            sections.push(crate::prompt_framing::normalize_semantic_section(
+                "core-memory",
+                "Agent Memory — core",
+                core,
+            ));
         }
         if let Some(canvas) = self.agent_canvas {
-            sections.push(canvas.to_string());
+            sections.push(crate::prompt_framing::normalize_semantic_section(
+                "channel-canvas",
+                "Channel Canvas",
+                canvas,
+            ));
         }
         sections
     }
 }
 
-/// Format the `[Base]` section for the base prompt.
+/// Format the `<base>` section for the base prompt.
 ///
-/// Single source of truth for the `[Base]` framing so the format is defined in
+/// Single source of truth for the `<base>` framing so the format is defined in
 /// exactly one place across all dispatch paths (batch flush, heartbeat,
 /// initial message).
 pub(crate) fn base_section(base_prompt: &str) -> String {
-    format!("[Base]\n{}", base_prompt.trim_end())
+    crate::prompt_framing::semantic_section("base", base_prompt.trim_end())
 }
 
 /// Format a [`FlushBatch`] into the per-section prompt blocks for the agent.
 ///
 /// Produces a stable prompt with these sections (in order):
-/// 0. [`StandingContext`] — `[Base]`, `[System]`, `[Team Instructions]`,
-///    `[Agent Memory — core]`, `[Channel Canvas]`. Legacy agents only, and only
+/// 0. [`StandingContext`] — `<base>`, `<agent-instructions>`, `<team-instructions>`,
+///    `<core-memory>`, `<channel-canvas>`. Legacy agents only, and only
 ///    on the session's first message (see `standing_context_sent`)
-/// 1. `[Context]` — scope, channel name, and contextual hints for the agent
-/// 2. `[Thread Context]` or `[Conversation Context]` — if fetched
-/// 3. `[Event]` / `[Buzz events]` — the triggering event(s)
+/// 1. `<context>` — scope, channel name, and contextual hints for the agent
+/// 2. `<thread-context>` or `<conversation-context>` — if fetched
+/// 3. `<buzz-event>` / `<buzz-events>` — the triggering event(s)
 ///
 /// Each section is returned as its own block rather than one joined string so
 /// the observer frame's size trimmer (`fit_observer_event_to_budget`) elides
@@ -1914,55 +1935,71 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
 
     // 4a. Cancelled events section.
     if has_cancelled {
-        let mut s = framing.prior_header.to_string();
+        let mut body = String::new();
         for (i, be) in batch.cancelled_events.iter().enumerate() {
-            s.push_str(&format!(
-                "\n\n--- Event {} ({}) ---\n{}",
+            if !body.is_empty() {
+                body.push_str("\n\n");
+            }
+            body.push_str(&format!(
+                "--- Event {} ({}) ---\n{}",
                 i + 1,
                 be.prompt_tag,
                 format_event_block(batch.channel_id, args.channel_info, be, args.profile_lookup)
             ));
         }
-        sections.push(s);
+        sections.push(crate::prompt_framing::semantic_section(
+            framing.prior_tag,
+            &body,
+        ));
     }
 
     // 4b. Event block(s).
     let event_section = if batch.events.len() == 1 {
         let be = &batch.events[0];
         if has_cancelled {
-            format!(
-                "{}\n\n--- Event 1 ({}) ---\n{}",
-                framing.new_header_single,
-                be.prompt_tag,
-                format_event_block(batch.channel_id, args.channel_info, be, args.profile_lookup)
+            crate::prompt_framing::semantic_section(
+                framing.new_tag,
+                &format!(
+                    "--- Event 1 ({}) ---\n{}",
+                    be.prompt_tag,
+                    format_event_block(
+                        batch.channel_id,
+                        args.channel_info,
+                        be,
+                        args.profile_lookup
+                    )
+                ),
             )
         } else {
-            format!(
-                "[Buzz event: {}]\n{}",
-                be.prompt_tag,
-                format_event_block(batch.channel_id, args.channel_info, be, args.profile_lookup)
+            crate::prompt_framing::semantic_section_with_attributes(
+                "buzz-event",
+                &[("type", be.prompt_tag.as_str())],
+                &format_event_block(batch.channel_id, args.channel_info, be, args.profile_lookup),
             )
         }
     } else {
-        let header = if has_cancelled {
-            format!(
-                "{} — {} events]",
-                framing.new_header_multi_prefix,
-                batch.events.len()
-            )
-        } else {
-            format!("[Buzz events — {} events]", batch.events.len())
-        };
-        let mut s = header;
+        let mut body = String::new();
         for (i, be) in batch.events.iter().enumerate() {
-            s.push_str(&format!(
-                "\n\n--- Event {} ({}) ---\n{}",
+            if !body.is_empty() {
+                body.push_str("\n\n");
+            }
+            body.push_str(&format!(
+                "--- Event {} ({}) ---\n{}",
                 i + 1,
                 be.prompt_tag,
                 format_event_block(batch.channel_id, args.channel_info, be, args.profile_lookup)
             ));
         }
-        s
+        let count = batch.events.len().to_string();
+        crate::prompt_framing::semantic_section_with_attributes(
+            if has_cancelled {
+                framing.new_tag
+            } else {
+                "buzz-events"
+            },
+            &[("count", count.as_str())],
+            &body,
+        )
     };
     sections.push(event_section);
 
@@ -1980,13 +2017,10 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
 /// arrived while the agent was working, to be woven in without abandoning the
 /// in-progress task.
 struct MergeFraming {
-    /// Header for the prior (cancelled) events section.
-    prior_header: &'static str,
-    /// Header for a single newly-arrived event.
-    new_header_single: &'static str,
-    /// Header prefix for multiple newly-arrived events; ` — N events]` is
-    /// appended (note the unclosed `[`).
-    new_header_multi_prefix: &'static str,
+    /// Tag for the prior (cancelled) events section.
+    prior_tag: &'static str,
+    /// Tag for newly arrived event sections.
+    new_tag: &'static str,
     /// Closing instruction appended after the event block(s).
     closing_note: &'static str,
 }
@@ -2001,17 +2035,15 @@ impl MergeFraming {
                 // terminal and returns nothing — so this section holds the
                 // *original request*, not a transcript. The header must not
                 // overclaim preserved state (per Dawn's framing review).
-                prior_header: "[What you were working on]",
-                new_header_single: "[New message — arrived while you were working]",
-                new_header_multi_prefix: "[New messages — arrived while you were working",
+                prior_tag: "what-you-were-working-on",
+                new_tag: "new-message-arrived-while-you-were-working",
                 closing_note: "Note: A new message arrived while you were working. Continue your \
                      in-progress work and incorporate the new message if it's relevant; if it's \
                      unrelated, you may briefly acknowledge it and carry on.",
             },
             Some(CancelReason::Interrupt) => MergeFraming {
-                prior_header: "[Previous request — interrupted before completion]",
-                new_header_single: "[New request — supersedes previous]",
-                new_header_multi_prefix: "[New request — supersedes previous",
+                prior_tag: "previous-request-interrupted-before-completion",
+                new_tag: "new-request-supersedes-previous",
                 closing_note: "Note: The previous request was interrupted. Please address the new \
                      request.\nIf the new request is unrelated to the previous one, you may \
                      briefly acknowledge the interruption.",
@@ -2024,7 +2056,7 @@ impl MergeFraming {
 /// pulled from the same source-of-truth as the cancel+merge fallback
 /// (`MergeFraming::for_reason(Some(CancelReason::Steer))`).
 ///
-/// Returns `(new_header_single, closing_note)`. Native-steer renders only
+/// Returns `(new_tag, closing_note)`. Native-steer renders only
 /// the new-message header + the single event block + the closing note —
 /// no `prior_header`, no original-request section, because the in-flight
 /// goose turn already has all of that in context. The two paths share
@@ -2033,7 +2065,7 @@ impl MergeFraming {
 /// requirement: native and fallback must not diverge in UX).
 pub(crate) fn native_steer_framing() -> (&'static str, &'static str) {
     let framing = MergeFraming::for_reason(Some(CancelReason::Steer));
-    (framing.new_header_single, framing.closing_note)
+    (framing.new_tag, framing.closing_note)
 }
 
 #[cfg(test)]
@@ -2272,12 +2304,14 @@ mod tests {
 
     #[test]
     fn test_base_section_prepends_header_and_trims_trailing_whitespace() {
-        // Trailing whitespace/newlines are stripped; the [Base] header is
-        // prepended exactly once with a single newline separator.
-        assert_eq!(base_section("hello  \n\n"), "[Base]\nhello");
-        assert_eq!(base_section("hello"), "[Base]\nhello");
+        // Trailing whitespace/newlines are stripped and the boundary is paired.
+        assert_eq!(base_section("hello  \n\n"), "<base>\nhello\n</base>");
+        assert_eq!(base_section("hello"), "<base>\nhello\n</base>");
         // Internal newlines and leading whitespace are preserved verbatim.
-        assert_eq!(base_section("  line1\nline2 "), "[Base]\n  line1\nline2");
+        assert_eq!(
+            base_section("  line1\nline2 "),
+            "<base>\n  line1\nline2\n</base>"
+        );
     }
 
     #[test]
@@ -2462,10 +2496,10 @@ mod tests {
 
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
 
-        // Should contain [Context] section before the event.
-        assert!(prompt.contains("[Context]"));
+        // Should contain the context section before the event.
+        assert!(prompt.contains("<context>"));
         assert!(prompt.contains("Scope: channel"));
-        assert!(prompt.contains("[Buzz event: @mention]\n"));
+        assert!(prompt.contains("<buzz-event type=\"@mention\">\n"));
         assert!(prompt.contains(&format!("Channel: {}", ch)));
         assert!(prompt.contains(&format!("From: {}", npub)));
         assert!(prompt.contains("Content: Hello @agent"));
@@ -2527,11 +2561,11 @@ mod tests {
 
         // Interrupt framing: the new request supersedes the previous one.
         assert!(
-            prompt.contains("supersedes previous"),
+            prompt.contains("<new-request-supersedes-previous>"),
             "interrupt prompt should use supersede framing: {prompt}"
         );
         assert!(
-            prompt.contains("interrupted before completion"),
+            prompt.contains("<previous-request-interrupted-before-completion>"),
             "interrupt prompt should label the prior work as interrupted: {prompt}"
         );
         assert!(
@@ -2599,7 +2633,7 @@ mod tests {
         );
         // The honest prior header (no overclaimed partial-work capture).
         assert!(
-            prompt.contains("[What you were working on]"),
+            prompt.contains("<what-you-were-working-on>"),
             "steer prior header must be the honest variant: {prompt}"
         );
         // Both the original work and the steering message survive the merge.
@@ -2634,7 +2668,7 @@ mod tests {
             cancel_reason: Some(CancelReason::Steer),
         };
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
-        assert!(prompt.contains("New messages — arrived while you were working — 2 events]"));
+        assert!(prompt.contains("<new-message-arrived-while-you-were-working count=\"2\">"));
         assert!(!prompt.contains("supersedes"));
     }
 
@@ -2700,7 +2734,7 @@ mod tests {
             "reply instruction must NOT target the original thread: {prompt}"
         );
         // Steer framing still frames the original as in-progress work to continue.
-        assert!(prompt.contains("[What you were working on]"));
+        assert!(prompt.contains("<what-you-were-working-on>"));
         assert!(prompt.contains("arrived while you were working"));
         assert!(!prompt.contains("supersedes"));
     }
@@ -2866,8 +2900,8 @@ mod tests {
 
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
 
-        assert!(prompt.contains("[Context]"));
-        assert!(prompt.contains("[Buzz events — 3 events]"));
+        assert!(prompt.contains("<context>"));
+        assert!(prompt.contains("<buzz-events count=\"3\">"));
         assert!(prompt.contains("--- Event 1 (tag-a) ---"));
         assert!(prompt.contains("--- Event 2 (tag-b) ---"));
         assert!(prompt.contains("--- Event 3 (tag-c) ---"));
@@ -2896,9 +2930,9 @@ mod tests {
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
         // system_prompt and base_prompt are delivered via session/new system role,
         // so they must NOT appear in the user message.
-        assert!(!prompt.contains("[System]"));
-        assert!(!prompt.contains("[Base]"));
-        assert!(prompt.starts_with("[Context]"));
+        assert!(!prompt.contains("<agent-instructions>"));
+        assert!(!prompt.contains("<base>"));
+        assert!(prompt.starts_with("<context>"));
     }
 
     #[test]
@@ -2916,7 +2950,7 @@ mod tests {
             cancelled_events: vec![],
             cancel_reason: None,
         };
-        let core = "[Agent Memory — core]\nbe helpful";
+        let core = "<core-memory>\nbe helpful\n</core-memory>";
         let prompt = format_prompt(
             &batch,
             &FormatPromptArgs {
@@ -2926,8 +2960,8 @@ mod tests {
         )
         .join("\n\n");
         assert!(
-            prompt.starts_with("[Agent Memory — core]\nbe helpful\n\n[Context]"),
-            "expected core block first, then [Context]; got: {prompt}"
+            prompt.starts_with("<core-memory>\nbe helpful\n</core-memory>\n\n<context>"),
+            "expected core block first, then <context>; got: {prompt}"
         );
     }
 
@@ -2952,17 +2986,17 @@ mod tests {
         let prompt = format_prompt(
             &batch,
             &FormatPromptArgs {
-                agent_core: Some("[Agent Memory — core]\nbe helpful"),
+                agent_core: Some("<core-memory>\nbe helpful\n</core-memory>"),
                 has_system_prompt_support: true,
                 ..Default::default()
             },
         )
         .join("\n\n");
         assert!(
-            !prompt.contains("[Agent Memory — core]"),
+            !prompt.contains("<core-memory>"),
             "modern agents must not get core in the user message; got: {prompt}"
         );
-        assert!(prompt.starts_with("[Context]"));
+        assert!(prompt.starts_with("<context>"));
     }
 
     #[test]
@@ -2980,7 +3014,7 @@ mod tests {
             cancelled_events: vec![],
             cancel_reason: None,
         };
-        let core = "[Agent Memory — core]\nbe helpful";
+        let core = "<core-memory>\nbe helpful\n</core-memory>";
         let prompt = format_prompt(
             &batch,
             &FormatPromptArgs {
@@ -2989,7 +3023,7 @@ mod tests {
             },
         )
         .join("\n\n");
-        assert!(prompt.starts_with("[Agent Memory — core]\nbe helpful\n\n[Context]"));
+        assert!(prompt.starts_with("<core-memory>\nbe helpful\n</core-memory>\n\n<context>"));
     }
 
     #[test]
@@ -3012,9 +3046,9 @@ mod tests {
         // format_prompt no longer accepts or emits base_prompt/system_prompt.
         // They are delivered via session/new system role instead.
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
-        assert!(!prompt.contains("[Base]"));
-        assert!(!prompt.contains("[System]"));
-        assert!(prompt.starts_with("[Context]"));
+        assert!(!prompt.contains("<base>"));
+        assert!(!prompt.contains("<agent-instructions>"));
+        assert!(prompt.starts_with("<context>"));
     }
 
     #[test]
@@ -3034,7 +3068,7 @@ mod tests {
             cancel_reason: None,
         };
 
-        let core = "[Agent Memory — core]\nremember this";
+        let core = "<core-memory>\nremember this\n</core-memory>";
         let prompt = format_prompt(
             &batch,
             &FormatPromptArgs {
@@ -3049,28 +3083,31 @@ mod tests {
 
         // Both sections must be present
         assert!(
-            prompt.contains("[Base]\ntest base prompt"),
-            "missing [Base] section"
+            prompt.contains("<base>\ntest base prompt\n</base>"),
+            "missing <base> section"
         );
         assert!(
-            prompt.contains("[System]\ntest system prompt"),
-            "missing [System] section"
+            prompt.contains("<agent-instructions>\ntest system prompt\n</agent-instructions>"),
+            "missing <agent-instructions> section"
         );
 
-        // [Base] and [System] must appear BEFORE [Agent Memory] and [Context]
-        let base_pos = prompt.find("[Base]").unwrap();
-        let system_pos = prompt.find("[System]").unwrap();
-        let core_pos = prompt.find("[Agent Memory").unwrap();
-        let context_pos = prompt.find("[Context]").unwrap();
+        // <base> and <agent-instructions> must appear BEFORE <core-memory] and <context>
+        let base_pos = prompt.find("<base>").unwrap();
+        let system_pos = prompt.find("<agent-instructions>").unwrap();
+        let core_pos = prompt.find("<core-memory").unwrap();
+        let context_pos = prompt.find("<context>").unwrap();
 
-        assert!(base_pos < system_pos, "[Base] should come before [System]");
+        assert!(
+            base_pos < system_pos,
+            "<base> should come before <agent-instructions>"
+        );
         assert!(
             system_pos < core_pos,
-            "[System] should come before [Agent Memory]"
+            "<agent-instructions> should come before <core-memory]"
         );
         assert!(
             core_pos < context_pos,
-            "[Agent Memory] should come before [Context]"
+            "<core-memory> should come before <context>"
         );
     }
 
@@ -3092,8 +3129,8 @@ mod tests {
             cancelled_events: vec![],
             cancel_reason: None,
         };
-        let canvas = "[Channel Canvas]\ncanvas content";
-        let core = "[Agent Memory — core]\nremember this";
+        let canvas = "<channel-canvas>\ncanvas content\n</channel-canvas>";
+        let core = "<core-memory>\nremember this\n</core-memory>";
         let args = |sent| FormatPromptArgs {
             has_system_prompt_support: false,
             base_prompt: Some("test base prompt"),
@@ -3109,17 +3146,17 @@ mod tests {
         let later = format_prompt(&batch, &args(true)).join("\n\n");
 
         for section in [
-            "[Base]",
-            "[System]",
-            "[Team Instructions]",
-            "[Agent Memory — core]",
-            "[Channel Canvas]",
+            "<base>",
+            "<agent-instructions>",
+            "<team-instructions>",
+            "<core-memory>",
+            "<channel-canvas>",
         ] {
             assert!(first.contains(section), "first message missing {section}");
             assert!(!later.contains(section), "turn 2 repeated {section}");
         }
         // What the turn is actually about survives, and now leads.
-        assert!(later.starts_with("[Context]"), "got: {later}");
+        assert!(later.starts_with("<context>"), "got: {later}");
         assert!(later.contains("hello"));
         assert!(
             later.len() < first.len(),
@@ -3159,14 +3196,14 @@ mod tests {
 
         // Neither section should appear — they are delivered via session/new
         assert!(
-            !prompt.contains("[Base]"),
-            "[Base] should be suppressed for modern agents"
+            !prompt.contains("<base>"),
+            "<base> should be suppressed for modern agents"
         );
         assert!(
-            !prompt.contains("[System]"),
-            "[System] should be suppressed for modern agents"
+            !prompt.contains("<agent-instructions>"),
+            "<agent-instructions> should be suppressed for modern agents"
         );
-        assert!(prompt.starts_with("[Context]"));
+        assert!(prompt.starts_with("<context>"));
     }
 
     #[test]
@@ -3197,7 +3234,7 @@ mod tests {
             truncated: false,
         };
 
-        let core = "[Agent Memory — core]\nbe helpful";
+        let core = "<core-memory>\nbe helpful\n</core-memory>";
         let prompt = format_prompt(
             &batch,
             &FormatPromptArgs {
@@ -3208,26 +3245,24 @@ mod tests {
         )
         .join("\n\n");
 
-        // Verify section ordering: [Agent Memory] < [Context] < [Thread Context]
-        let core_pos = prompt
-            .find("[Agent Memory")
-            .expect("[Agent Memory] missing");
-        let context_pos = prompt.find("[Context]").expect("[Context] missing");
+        // Verify section ordering: core memory < context < thread context.
+        let core_pos = prompt.find("<core-memory>").expect("<core-memory> missing");
+        let context_pos = prompt.find("<context>").expect("<context> missing");
         let thread_pos = prompt
-            .find("[Thread Context")
-            .expect("[Thread Context] missing");
+            .find("<thread-context")
+            .expect("<thread-context> missing");
 
         assert!(
             core_pos < context_pos,
-            "[Agent Memory] must come before [Context]"
+            "<core-memory> must come before <context>"
         );
         assert!(
             context_pos < thread_pos,
-            "[Context] must come before [Thread Context]"
+            "<context> must come before <thread-context>"
         );
-        // No [Base] or [System] in user message
-        assert!(!prompt.contains("[Base]"));
-        assert!(!prompt.contains("[System]"));
+        // No <base> or <agent-instructions> in user message
+        assert!(!prompt.contains("<base>"));
+        assert!(!prompt.contains("<agent-instructions>"));
     }
 
     #[test]
@@ -3994,7 +4029,8 @@ mod tests {
         assert!(complete_prompt.contains("Thread context included below."));
         assert!(!complete_prompt.contains("buzz messages thread"));
         assert!(!complete_prompt.contains("full history"));
-        assert!(complete_prompt.contains("[Thread Context (2 of 2 messages)]"));
+        assert!(complete_prompt
+            .contains("<thread-context included=\"2\" total=\"2\" truncated=\"false\">"));
         assert!(complete_prompt.contains("Let's refactor auth"));
         assert!(complete_prompt.contains(&format!(
             "IMPORTANT: For ordinary replies in this turn, use `--reply-to {root}`"
@@ -4010,7 +4046,8 @@ mod tests {
         )
         .join("\n\n");
         assert!(prompt_with_prior_delivery.contains("buzz messages thread"));
-        assert!(prompt_with_prior_delivery.contains("[Thread Context (2 of 2 messages)]"));
+        assert!(prompt_with_prior_delivery
+            .contains("<thread-context included=\"2\" total=\"2\" truncated=\"false\">"));
         assert!(prompt_with_prior_delivery.contains("Let's refactor auth"));
 
         if let ConversationContext::Thread {
@@ -4028,7 +4065,8 @@ mod tests {
             },
         )
         .join("\n\n");
-        assert!(truncated_prompt.contains("[Thread Context (2 of 5 messages, truncated)]"));
+        assert!(truncated_prompt
+            .contains("<thread-context included=\"2\" total=\"5\" truncated=\"true\">"));
         assert!(truncated_prompt.contains("buzz messages thread"));
         assert!(truncated_prompt.contains("for full history if truncated"));
 
@@ -4051,7 +4089,8 @@ mod tests {
             },
         )
         .join("\n\n");
-        assert!(missing_root_prompt.contains("[Thread Context (2 of 2 messages)]"));
+        assert!(missing_root_prompt
+            .contains("<thread-context included=\"2\" total=\"2\" truncated=\"false\">"));
         assert!(missing_root_prompt.contains("Let's refactor auth"));
         assert!(missing_root_prompt.contains("buzz messages thread"));
     }
@@ -4099,7 +4138,8 @@ mod tests {
             },
         )
         .join("\n\n");
-        assert!(mixed_prompt.contains("[Thread Context (1 of 1 messages)]"));
+        assert!(mixed_prompt
+            .contains("<thread-context included=\"1\" total=\"1\" truncated=\"false\">"));
         assert!(mixed_prompt.contains("thread B root question"));
         assert!(mixed_prompt.contains("older reply in thread A"));
         assert!(mixed_prompt.contains("newer reply in thread B"));
@@ -4123,7 +4163,8 @@ mod tests {
             },
         )
         .join("\n\n");
-        assert!(same_thread_prompt.contains("[Thread Context (1 of 1 messages)]"));
+        assert!(same_thread_prompt
+            .contains("<thread-context included=\"1\" total=\"1\" truncated=\"false\">"));
         assert!(same_thread_prompt.contains("thread B root question"));
         assert!(!same_thread_prompt.contains("buzz messages thread"));
     }
@@ -4172,7 +4213,8 @@ mod tests {
         assert!(prompt.contains("Conversation context included below."));
         assert!(!prompt.contains("buzz messages get"));
         assert!(!prompt.contains("full history"));
-        assert!(prompt.contains("[Conversation Context (1 of 1 messages)]"));
+        assert!(prompt
+            .contains("<conversation-context included=\"1\" total=\"1\" truncated=\"false\">"));
         assert!(prompt.contains("Can you deploy?"));
     }
 
@@ -4446,7 +4488,7 @@ mod tests {
             "DM reply should include thread root"
         );
         // Thread context should be included.
-        assert!(prompt.contains("[Thread Context (1 of 1 messages)]"));
+        assert!(prompt.contains("<thread-context included=\"1\" total=\"1\" truncated=\"false\">"));
         assert!(prompt.contains("Should I deploy?"));
     }
 
@@ -4490,7 +4532,7 @@ mod tests {
         assert!(prompt.contains("Earlier thread context was already delivered in this session"));
         assert!(prompt.contains("buzz messages thread"));
         assert!(!prompt.contains("Thread context included below"));
-        assert!(!prompt.contains("[Thread Context"));
+        assert!(!prompt.contains("<thread-context"));
     }
 
     #[test]
@@ -4539,7 +4581,7 @@ mod tests {
         );
         assert!(prompt.contains("buzz messages get"));
         assert!(!prompt.contains("Conversation context included below"));
-        assert!(!prompt.contains("[Conversation Context"));
+        assert!(!prompt.contains("<conversation-context"));
     }
 
     #[test]
@@ -5663,7 +5705,7 @@ mod tests {
 
     #[test]
     fn test_format_prompt_canvas_injected_for_legacy_agent() {
-        let canvas = "[Channel Canvas]\nCanvas revision (event ID): abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234\nLast modified: 2024-01-15T10:30:00+00:00\nFetch current content with: buzz canvas get --channel 00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae";
+        let canvas = "<channel-canvas>\nCanvas revision (event ID): abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234\nLast modified: 2024-01-15T10:30:00+00:00\nFetch current content with: buzz canvas get --channel 00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae\n</channel-canvas>";
         let ch = Uuid::new_v4();
         let batch = FlushBatch {
             channel_id: ch,
@@ -5686,14 +5728,14 @@ mod tests {
         )
         .join("\n\n");
         assert!(
-            prompt.contains("[Channel Canvas]"),
+            prompt.contains("<channel-canvas>"),
             "legacy agent prompt must include canvas section; got: {prompt}"
         );
     }
 
     #[test]
     fn test_format_prompt_canvas_omitted_for_modern_agent() {
-        let canvas = "[Channel Canvas]\nCanvas revision (event ID): abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234\nLast modified: 2024-01-15T10:30:00+00:00\nFetch current content with: buzz canvas get --channel 00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae";
+        let canvas = "<channel-canvas>\nCanvas revision (event ID): abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234\nLast modified: 2024-01-15T10:30:00+00:00\nFetch current content with: buzz canvas get --channel 00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae\n</channel-canvas>";
         let ch = Uuid::new_v4();
         let batch = FlushBatch {
             channel_id: ch,
@@ -5716,7 +5758,7 @@ mod tests {
         )
         .join("\n\n");
         assert!(
-            !prompt.contains("[Channel Canvas]"),
+            !prompt.contains("<channel-canvas>"),
             "modern agent must not get canvas in user message (it's in systemPrompt); got: {prompt}"
         );
     }
@@ -5737,7 +5779,7 @@ mod tests {
         };
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
         assert!(
-            !prompt.contains("[Channel Canvas]"),
+            !prompt.contains("<channel-canvas>"),
             "no canvas section expected when agent_canvas is None; got: {prompt}"
         );
     }

@@ -216,13 +216,13 @@ done"#
             .as_str()
             .expect("text prompt")
     };
-    assert!(prompt_text(0).contains("[Base]\nstanding-once"));
+    assert!(prompt_text(0).contains("<base>\nstanding-once"));
     assert!(
-        prompt_text(1).contains("[Base]\nstanding-once"),
+        prompt_text(1).contains("<base>\nstanding-once"),
         "retry after channel ACP failure must resend standing context"
     );
     assert!(
-        !prompt_text(2).contains("[Base]\nstanding-once"),
+        !prompt_text(2).contains("<base>\nstanding-once"),
         "turn after channel ACP success must omit standing context"
     );
 }

@@ -83,7 +83,11 @@ impl PiLaunchOverride {
         };
 
         if let Some(prompt) = prompt {
-            write_private_file(&prompt_path, prompt.as_bytes(), false)?;
+            write_private_file(
+                &prompt_path,
+                crate::queue::base_section(prompt).as_bytes(),
+                false,
+            )?;
         }
 
         let script = launcher_script(
@@ -281,28 +285,31 @@ mod tests {
 
     #[test]
     fn pi_adapter_moves_buzz_base_out_of_ordinary_acp_delivery() {
-        let base = crate::scope::SessionPolicy::Thread
-            .append_session_model(include_str!("base_prompt.md"));
-        let (prepared, remaining) = PiLaunchOverride::prepare(
-            "/opt/bin/pi-acp",
-            Some(base.clone()),
-            Path::new("/buzz/.agents/skills"),
-            false,
-        )
-        .expect("prepare");
-        let prepared = prepared.expect("Pi launcher");
-
-        assert!(remaining.is_none());
-        assert_eq!(
-            fs::read_to_string(prepared.directory.join("SYSTEM.md")).expect("read prompt"),
-            base
-        );
-        assert!(base.contains("each thread gets its own"));
-
-        #[cfg(unix)]
-        assert!(fs::read_to_string(prepared.launcher_path())
-            .expect("read launcher")
-            .contains("exec 'pi'"));
+        for policy in [
+            crate::scope::SessionPolicy::Channel,
+            crate::scope::SessionPolicy::Thread,
+        ] {
+            let base = policy.append_session_model(include_str!("base_prompt.md"));
+            let (prepared, remaining) = PiLaunchOverride::prepare(
+                "/opt/bin/pi-acp",
+                Some(base.clone()),
+                Path::new("/buzz/.agents/skills"),
+                false,
+            )
+            .expect("prepare");
+            let prepared = prepared.expect("Pi launcher");
+            assert!(remaining.is_none());
+            let captured =
+                fs::read_to_string(prepared.directory.join("SYSTEM.md")).expect("read prompt");
+            assert_eq!(captured, crate::queue::base_section(&base));
+            assert_eq!(
+                captured.contains("each thread gets its own"),
+                policy == crate::scope::SessionPolicy::Thread
+            );
+            assert!(captured.contains("UUID from `<context>`"));
+            assert!(captured.contains("owner"));
+            assert!(!captured.contains("`[Context]`"));
+        }
     }
 
     #[cfg(unix)]
@@ -359,7 +366,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&prompt_path).expect("read system prompt"),
-            "Buzz base\n\n## Session Model\nThread scoped"
+            "<base>\nBuzz base\n\n## Session Model\nThread scoped\n</base>"
         );
         assert_eq!(
             fs::metadata(&prompt_path)

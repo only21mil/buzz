@@ -11,6 +11,7 @@ mod pi_launcher;
 mod pool;
 mod pool_lifecycle;
 mod project_lookup;
+mod prompt_framing;
 mod prompt_project;
 mod queue;
 mod relay;
@@ -3694,7 +3695,7 @@ fn try_native_steer(
     // channel context and the actor's profile in the original prompt,
     // duplicating it here would defeat the point of non-cancelling
     // steering (which is to inject only what's new).
-    let (header, closing) = queue::native_steer_framing();
+    let (tag, closing) = queue::native_steer_framing();
     let event_id_hex = event.id.to_hex();
     let be = queue::BatchEvent {
         event,
@@ -3702,7 +3703,13 @@ fn try_native_steer(
         received_at: std::time::Instant::now(),
     };
     let event_block = queue::format_event_block(channel_id, None, &be, None);
-    let body = format!("{header}\n\n[Buzz event: {prompt_tag}]\n{event_block}\n\n{closing}");
+    let new_message = prompt_framing::semantic_section(tag, "");
+    let event_section = prompt_framing::semantic_section_with_attributes(
+        "buzz-event",
+        &[("type", prompt_tag.as_str())],
+        &event_block,
+    );
+    let body = format!("{new_message}\n\n{event_section}\n\n{closing}");
 
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<pool::SteerAck>();
     let request = pool::SteerRequest {
@@ -4684,6 +4691,14 @@ mod agent_draft_prompt_tests {
     }
 
     #[test]
+    fn shared_base_prompt_names_current_context_framing() {
+        let prompt = include_str!("base_prompt.md");
+        assert!(prompt.contains("UUID from `<context>`"));
+        assert!(prompt.contains("reply destination supplied in the `<context>` block"));
+        assert!(!prompt.contains("`[Context]`"));
+    }
+
+    #[test]
     fn shared_base_prompt_teaches_real_newlines_for_multiline_messages() {
         let prompt = include_str!("base_prompt.md");
         assert!(prompt.contains("pass real newline bytes through stdin"));
@@ -5309,8 +5324,8 @@ mod heartbeat_base_prompt_tests {
     use super::*;
 
     // Pins the heartbeat dispatch path (dispatch_heartbeat, ~line 2359): a
-    // legacy agent WITH a base_prompt must get [Base] prepended to the
-    // heartbeat user message, composed as `[Base]\n{bp}\n\n{prompt}`. This is
+    // legacy agent WITH a base_prompt must get <base> prepended to the
+    // heartbeat user message. This is
     // the second half of the round-2 regression (the first being initial_message).
 
     fn heartbeat_standing() -> queue::StandingContext<'static> {
@@ -5323,12 +5338,12 @@ mod heartbeat_base_prompt_tests {
     #[test]
     fn test_heartbeat_legacy_agent_gets_base_prepended() {
         // protocol_version 1 + Some(base_prompt): heartbeat prompt is prefixed
-        // with the [Base] section exactly as the legacy session/new path would.
+        // with the <base> section exactly as the legacy session/new path would.
         let prompt = "[System: Heartbeat]\nrun feed get";
         let composed = pool::prepend_standing_for_legacy(1, &heartbeat_standing(), prompt);
         assert_eq!(
             composed,
-            "[Base]\nyou are a helpful agent\n\n[System: Heartbeat]\nrun feed get"
+            "<base>\nyou are a helpful agent\n</base>\n\n[System: Heartbeat]\nrun feed get"
         );
     }
 
@@ -9461,8 +9476,8 @@ mod observer_payload_trim_tests {
     #[test]
     fn test_multi_block_prompt_retains_every_section_header_after_elision() {
         // The real session/prompt fix: format_prompt now emits one block per
-        // section, so the observer payload is params.prompt = [{text: "[Base]…"},
-        // {text: "[Agent Memory — core]…"}, … {text: "[Buzz event: …]…<huge>"}].
+        // section, so the observer payload is params.prompt = [{text: "<base>…"},
+        // {text: "<core-memory>…"}, … {text: "[Buzz event: …]…<huge>"}].
         // An oversized section is its own leaf, so eliding its body keeps the
         // leaf's head-3000 (which begins with the section's [Header] line) — every
         // header survives, so the desktop "Prompt context" panel counts them all.
@@ -9470,12 +9485,15 @@ mod observer_payload_trim_tests {
         // [Buzz event] header fell into the elided middle and the count collapsed
         // to 1).
         let sections = [
-            "[Base]\nyou are a helpful agent".to_string(),
-            "[System]\npersona text".to_string(),
-            "[Agent Memory — core]\nremember this".to_string(),
-            "[Context]\nScope: thread".to_string(),
+            "<base>\nyou are a helpful agent\n</base>".to_string(),
+            "<agent-instructions>\npersona text\n</agent-instructions>".to_string(),
+            "<core-memory>\nremember this\n</core-memory>".to_string(),
+            "<context>\nScope: thread\n</context>".to_string(),
             // The triggering event body, oversized on its own.
-            format!("[Buzz event: @mention]\nContent: {}", "E".repeat(90_000)),
+            format!(
+                "<buzz-event type=\"@mention\">\nContent: {}\n</buzz-event>",
+                "E".repeat(90_000)
+            ),
         ];
         let block_refs: Vec<&str> = sections.iter().map(String::as_str).collect();
         // Mirror the wire shape build_prompt_params produces: each block is its
@@ -9507,11 +9525,11 @@ mod observer_payload_trim_tests {
             .expect("prompt array survives");
         let texts: Vec<&str> = blocks.iter().map(|b| b["text"].as_str().unwrap()).collect();
         for header in [
-            "[Base]",
-            "[System]",
-            "[Agent Memory — core]",
-            "[Context]",
-            "[Buzz event: @mention]",
+            "<base>",
+            "<agent-instructions>",
+            "<core-memory>",
+            "<context>",
+            "<buzz-event type=\"@mention\">",
         ] {
             assert!(
                 texts.iter().any(|t| t.starts_with(header)),
@@ -9521,7 +9539,7 @@ mod observer_payload_trim_tests {
         // The oversized event body was elided in place (header kept, middle cut).
         let event_block = texts
             .iter()
-            .find(|t| t.starts_with("[Buzz event: @mention]"))
+            .find(|t| t.starts_with("<buzz-event type=\"@mention\">"))
             .unwrap();
         assert!(
             event_block.contains("…[elided"),

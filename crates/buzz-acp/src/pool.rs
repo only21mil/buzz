@@ -125,7 +125,7 @@ pub struct SessionState {
     pub turn_counts: HashMap<SessionScope, u32>,
     /// Turn counter for the heartbeat session.
     pub heartbeat_turn_count: u32,
-    /// Whether the live heartbeat session has successfully received `[Base]`.
+    /// Whether the live heartbeat session has successfully received `<base>`.
     pub heartbeat_standing_context_sent: bool,
     /// session scope → rendered NIP-AE core prompt section, populated once at
     /// session creation per Tyler's spec (no mid-session refresh).
@@ -954,7 +954,7 @@ pub struct PromptContext {
     /// Whether NIP-AE agent core memory injection is enabled. When false,
     /// the per-session core engram fetch is skipped and `core_sections`
     /// remains empty for every channel, so `format_prompt` renders no
-    /// `[Agent Memory — core]` section. On by default; disabled via
+    /// `<core-memory>` section. On by default; disabled via
     /// `--no-memory` / `BUZZ_ACP_NO_MEMORY`.
     pub memory_enabled: bool,
     /// Harness identity string for NIP-AM `harness` field. Derived from the
@@ -1595,8 +1595,8 @@ async fn create_session_and_apply_model(
     // single prompt. Standard protocol-v2 agents receive it in `session/new`;
     // Goose receives it through the custom request below. Legacy agents receive
     // the same content as user-message sections via `format_prompt`. Core carries
-    // its own `[Agent Memory — core]` header, and canvas carries its own
-    // `[Channel Canvas]` header; both are appended with a blank-line separator.
+    // its own `<core-memory>` boundary, and canvas carries its own
+    // `<channel-canvas>` boundary; both are appended with a blank-line separator.
     let is_goose = agent.agent_name == "goose";
     let combined_system_prompt = with_canvas(
         with_core(
@@ -1973,12 +1973,12 @@ pub(crate) fn prepend_standing_for_legacy(
 /// header, keeping the base/persona boundary recoverable downstream.
 ///
 /// The header framing matches the legacy per-turn path (`queue::base_section`
-/// for `[Base]`, `[System]\n{...}` for the persona) so the desktop observer can
+/// for `<base>`, `<agent-instructions>\n{...}` for the persona) so the desktop observer can
 /// split the combined value into labeled sub-sections. Each prompt is wrapped
-/// only when present, so a persona-only agent yields `[System]\n{persona}`
-/// rather than an unlabeled blob that would be mislabeled as `[Base]`.
+/// only when present, so a persona-only agent yields `<agent-instructions>\n{persona}`
+/// rather than an unlabeled blob that would be mislabeled as `<base>`.
 ///
-/// Prepends a `[Workspace]` section naming the agent's absolute working
+/// Prepends a `<workspace>` section naming the agent's absolute working
 /// directory. The base prompt describes the workspace layout but never its
 /// absolute root, so without this anchor a model fills the gap by searching
 /// `$HOME` (triggering macOS TCC prompts) or by inventing its own workspace
@@ -1992,51 +1992,62 @@ fn framed_system_prompt(
 ) -> Option<String> {
     let body = match (base_prompt, system_prompt) {
         (Some(bp), Some(sp)) => Some(format!(
-            "{}\n\n[System]\n{sp}",
-            crate::queue::base_section(bp)
+            "{}\n\n{}",
+            crate::queue::base_section(bp),
+            crate::prompt_framing::semantic_section("agent-instructions", sp)
         )),
         (Some(bp), None) => Some(crate::queue::base_section(bp)),
-        (None, Some(sp)) => Some(format!("[System]\n{sp}")),
+        (None, Some(sp)) => Some(crate::prompt_framing::semantic_section(
+            "agent-instructions",
+            sp,
+        )),
         (None, None) => None,
     }?;
     // Anchor the workspace only when a base prompt is present — the workspace
     // section grounds the base prompt's layout description, so it is meaningless
-    // for a persona-only (`[System]`-only) agent that never received that layout.
+    // for a persona-only (`<agent-instructions>`-only) agent that never received that layout.
     match (base_prompt, workspace_section(cwd)) {
         (Some(_), Some(workspace)) => Some(format!("{workspace}\n\n{body}")),
         _ => Some(body),
     }
 }
 
-/// Render the `[Workspace]` grounding section, or `None` when `cwd` is unusable.
+/// Render the `<workspace>` grounding section, or `None` when `cwd` is unusable.
 ///
 /// Skips relative paths and the `/` fallback (`std::env::current_dir()` resolves
 /// to `/` on failure): a `/`-rooted workspace line would actively encourage the
 /// `$HOME`-wide scan this section exists to prevent.
 fn workspace_section(cwd: &str) -> Option<String> {
     if cwd != "/" && cwd.starts_with('/') {
-        Some(format!(
-            "[Workspace]\nYour absolute working directory is `{cwd}`. All workspace \
+        Some(crate::prompt_framing::semantic_section(
+            "workspace",
+            &format!(
+                "Your absolute working directory is `{cwd}`. All workspace \
              files — `AGENTS.md`, `RESEARCH/`, `PLANS/`, `GUIDES/`, `WORK_LOGS/`, \
              `OUTBOX/` — and any repositories you clone (under `{cwd}/REPOS/`) live \
              here. This is where you already are; do not search `$HOME` or other \
              directories for them."
+            ),
         ))
     } else {
         None
     }
 }
 
-/// Append the team-owned instruction section after `[System]` and before core memory.
+/// Append the team-owned instruction section after `<agent-instructions>` and before core memory.
 fn with_team(prompt: Option<String>, instructions: Option<&str>) -> Option<String> {
     let instructions = instructions
         .map(str::trim)
         .filter(|value| !value.is_empty());
     match (prompt, instructions) {
-        (Some(prompt), Some(instructions)) => {
-            Some(format!("{prompt}\n\n[Team Instructions]\n{instructions}"))
-        }
-        (None, Some(instructions)) => Some(format!("[Team Instructions]\n{instructions}")),
+        (Some(prompt), Some(instructions)) => Some(format!(
+            "{prompt}\n\n{}",
+            crate::prompt_framing::semantic_section("team-instructions", instructions)
+        )),
+        (None, Some(instructions)) => Some(crate::prompt_framing::semantic_section(
+            "team-instructions",
+            instructions,
+        )),
         (Some(prompt), None) => Some(prompt),
         (None, None) => None,
     }
@@ -2044,28 +2055,42 @@ fn with_team(prompt: Option<String>, instructions: Option<&str>) -> Option<Strin
 
 /// Append the agent's core memory section onto the framed system prompt.
 ///
-/// Core already carries its own `[Agent Memory — core]` header from
+/// Core already carries its own `<core-memory>` boundary from
 /// `engram_fetch::build_core_section`, so it is joined with a blank-line
 /// separator and never re-labeled. Either side may be absent.
 fn with_core(framed: Option<String>, core: Option<&str>) -> Option<String> {
+    let core = core.map(|core| {
+        crate::prompt_framing::normalize_semantic_section(
+            "core-memory",
+            "Agent Memory — core",
+            core,
+        )
+    });
     match (framed, core) {
         (Some(framed), Some(core)) => Some(format!("{framed}\n\n{core}")),
         (Some(framed), None) => Some(framed),
-        (None, Some(core)) => Some(core.to_string()),
+        (None, Some(core)) => Some(core),
         (None, None) => None,
     }
 }
 
-/// Append the `[Channel Canvas]` metadata section onto the accumulated system prompt.
+/// Append the `<channel-canvas>` metadata section onto the accumulated system prompt.
 ///
-/// The canvas section already carries its `[Channel Canvas]` header (from
+/// The canvas section already carries its `<channel-canvas>` boundary (from
 /// `render_canvas_section`), so it is joined with a blank-line separator.
 /// Either side may be absent.
 fn with_canvas(prompt: Option<String>, canvas: Option<&str>) -> Option<String> {
+    let canvas = canvas.map(|canvas| {
+        crate::prompt_framing::normalize_semantic_section(
+            "channel-canvas",
+            "Channel Canvas",
+            canvas,
+        )
+    });
     match (prompt, canvas) {
         (Some(prompt), Some(canvas)) => Some(format!("{prompt}\n\n{canvas}")),
         (Some(prompt), None) => Some(prompt),
-        (None, Some(canvas)) => Some(canvas.to_string()),
+        (None, Some(canvas)) => Some(canvas),
         (None, None) => None,
     }
 }
@@ -2240,7 +2265,7 @@ pub async fn run_prompt_task(
 
     //
     // Core memory is delivered inside the system prompt the harness already
-    // builds (system role for protocol >= 2, the `[System]` user-message
+    // builds (system role for protocol >= 2, the `<agent-instructions>` user-message
     // section for legacy agents). To put it on the wire at `session/new` for
     // modern agents, the fetch must run *before* the session is created — so
     // we do it here and cache the rendered section in `state.core_sections`.
@@ -2762,7 +2787,7 @@ pub async fn run_prompt_task(
         // Heartbeats create their session before this point, so a Goose method-not-found
         // probe has already selected the correct framing for this process.
         //
-        // Only the first heartbeat of a session carries `[Base]`; later ticks
+        // Only the first heartbeat of a session carries `<base>`; later ticks
         // reuse the same session, so the agent already has it.
         let text = if standing_context_sent {
             text
@@ -3432,7 +3457,7 @@ pub(crate) async fn fetch_channel_info(
 }
 
 /// Fetch the latest canvas event for `channel_id` and return a rendered
-/// `[Channel Canvas]` metadata section, or `None` if absent/blank/error.
+/// `<channel-canvas>` metadata section, or `None` if absent/blank/error.
 ///
 /// Failure modes (all fail open — no crash, no block):
 /// * relay returns no event → `None`
@@ -3495,7 +3520,7 @@ async fn fetch_canvas_section(channel_id: Uuid, rest: &RestClient) -> Option<Str
     canvas_section_from_query_response(events, &channel_id.to_string())
 }
 
-/// Parse a canvas query response array and render a `[Channel Canvas]` section.
+/// Parse a canvas query response array and render a `<channel-canvas>` section.
 ///
 /// Extracted as a pure function so tests can exercise the parsing/validation
 /// logic without async machinery or relay connectivity.
@@ -3612,16 +3637,18 @@ pub(crate) fn canvas_section_from_query_response(
     Some(render_canvas_section(&id, &timestamp, channel_uuid))
 }
 
-/// Render the `[Channel Canvas]` metadata section string.
+/// Render the `<channel-canvas>` metadata section string.
 ///
 /// Pure function — kept separate so unit tests can exercise rendering
 /// without async machinery or relay connectivity.
 pub(crate) fn render_canvas_section(event_id: &str, timestamp: &str, channel_uuid: &str) -> String {
-    format!(
-        "[Channel Canvas]\n\
-         Canvas revision (event ID): {event_id}\n\
-         Last modified: {timestamp}\n\
-         Fetch current content with: buzz canvas get --channel {channel_uuid}"
+    crate::prompt_framing::semantic_section(
+        "channel-canvas",
+        &format!(
+            "Canvas revision (event ID): {event_id}\n\
+             Last modified: {timestamp}\n\
+             Fetch current content with: buzz canvas get --channel {channel_uuid}"
+        ),
     )
 }
 
@@ -5189,7 +5216,7 @@ mod tests {
     }
 
     // These pin the initial_message dispatch path (run_prompt_task, ~line 855):
-    // a legacy agent WITH a base_prompt must get [Base] prepended to the user
+    // a legacy agent WITH a base_prompt must get <base> prepended to the user
     // message. This is the exact regression that shipped in the round-2 bug.
 
     fn base_only(base_prompt: Option<&str>) -> crate::queue::StandingContext<'_> {
@@ -5201,14 +5228,17 @@ mod tests {
 
     #[test]
     fn test_initial_message_legacy_agent_gets_base_prepended() {
-        // protocol_version 1 + Some(base_prompt): [Base] rides along in the
-        // user message, composed as `[Base]\n{bp}\n\n{initial_msg}`.
+        // protocol_version 1 + Some(base_prompt): <base> rides along in the
+        // user message.
         let composed = prepend_standing_for_legacy(
             1,
             &base_only(Some("you are a helpful agent")),
             "hello channel",
         );
-        assert_eq!(composed, "[Base]\nyou are a helpful agent\n\nhello channel");
+        assert_eq!(
+            composed,
+            "<base>\nyou are a helpful agent\n</base>\n\nhello channel"
+        );
     }
 
     #[test]
@@ -5227,9 +5257,9 @@ mod tests {
     fn test_heartbeat_standing_block_is_base_only() {
         // A heartbeat has no channel, so core and canvas are absent by
         // construction — and it has never carried the persona. Pin that the
-        // shared helper does not start handing heartbeats [System].
+        // shared helper does not start handing heartbeats <agent-instructions>.
         let composed = prepend_standing_for_legacy(1, &base_only(Some("be helpful")), "tick");
-        assert_eq!(composed, "[Base]\nbe helpful\n\ntick");
+        assert_eq!(composed, "<base>\nbe helpful\n</base>\n\ntick");
     }
 
     #[test]
@@ -5297,23 +5327,23 @@ mod tests {
             base_prompt: Some("be helpful"),
             system_prompt: Some("you are Eva"),
             team_instructions: Some("ship small"),
-            agent_core: Some("[Agent Memory — core]\nremember this"),
-            agent_canvas: Some("[Channel Canvas]\ncanvas content"),
+            agent_core: Some("<core-memory>\nremember this\n</core-memory>"),
+            agent_canvas: Some("<channel-canvas>\ncanvas content\n</channel-canvas>"),
         }
     }
 
     #[test]
     fn test_initial_message_legacy_agent_gets_whole_standing_block() {
         // The initial message is the legacy agent's first contact, so it must
-        // carry every standing section — not just [Base] and the canvas, which
+        // carry every standing section — not just <base> and the canvas, which
         // left the agent acting on its first turn with no persona and no memory.
         let composed = prepend_standing_for_legacy(1, &full_standing(), "do the thing");
         let positions: Vec<usize> = [
-            "[Base]",
-            "[System]",
-            "[Team Instructions]",
-            "[Agent Memory — core]",
-            "[Channel Canvas]",
+            "<base>",
+            "<agent-instructions>",
+            "<team-instructions>",
+            "<core-memory>",
+            "<channel-canvas>",
             "do the thing",
         ]
         .iter()
@@ -5358,7 +5388,7 @@ mod tests {
     }
 
     // Pin the session/new systemPrompt framing: each present prompt carries its
-    // own header so the desktop observer can split into labeled sub-sections.
+    // own paired tag so the desktop observer can split labeled sub-sections.
 
     #[test]
     fn test_framed_system_prompt_both_present_carries_both_headers() {
@@ -5367,22 +5397,39 @@ mod tests {
         // what pins the framing against a `[Session]` section reappearing here.
         let framed = framed_system_prompt("/", Some("base text"), Some("persona text"))
             .expect("both present yields Some");
-        assert_eq!(framed, "[Base]\nbase text\n\n[System]\npersona text");
+        assert_eq!(
+            framed,
+            "<base>\nbase text\n</base>\n\n<agent-instructions>\npersona text\n</agent-instructions>"
+        );
     }
 
     #[test]
     fn test_framed_system_prompt_base_only_labels_base() {
         let framed = framed_system_prompt("/", Some("base text"), None).expect("base yields Some");
-        assert_eq!(framed, "[Base]\nbase text");
+        assert_eq!(framed, "<base>\nbase text\n</base>");
     }
 
     #[test]
     fn test_framed_system_prompt_persona_only_labels_system() {
         // A bare persona would be mislabeled "Base" downstream — it must carry
-        // its own [System] header even when no base prompt exists.
+        // its own <agent-instructions> header even when no base prompt exists.
         let framed =
             framed_system_prompt("/", None, Some("persona text")).expect("persona yields Some");
-        assert_eq!(framed, "[System]\npersona text");
+        assert_eq!(
+            framed,
+            "<agent-instructions>\npersona text\n</agent-instructions>"
+        );
+    }
+
+    #[test]
+    fn framed_persona_preserves_authored_boundaries_and_whitespace() {
+        let persona = "\n keep </agent-instructions>, <T>, &quot;, & <policy> \n";
+        assert_eq!(
+            framed_system_prompt("/", None, Some(persona)),
+            Some(format!(
+                "<agent-instructions>\n{persona}\n</agent-instructions>"
+            )),
+        );
     }
 
     #[test]
@@ -5395,12 +5442,12 @@ mod tests {
         let framed = framed_system_prompt("/Users/me/.buzz", Some("base text"), None)
             .expect("base yields Some");
         assert!(
-            framed.starts_with("[Workspace]\n"),
+            framed.starts_with("<workspace>\n"),
             "workspace section must lead: {framed}"
         );
         assert!(framed.contains("`/Users/me/.buzz`"));
         assert!(
-            framed.contains("\n\n[Base]\nbase text"),
+            framed.contains("\n\n<base>\nbase text\n</base>"),
             "base must follow the workspace section: {framed}"
         );
     }
@@ -5408,17 +5455,20 @@ mod tests {
     #[test]
     fn test_framed_system_prompt_persona_only_omits_workspace() {
         // The workspace section grounds the base prompt's layout; a persona-only
-        // agent never received that layout, so no [Workspace] anchor is emitted.
+        // agent never received that layout, so no <workspace> anchor is emitted.
         let framed = framed_system_prompt("/Users/me/.buzz", None, Some("persona text"))
             .expect("persona yields Some");
-        assert_eq!(framed, "[System]\npersona text");
+        assert_eq!(
+            framed,
+            "<agent-instructions>\npersona text\n</agent-instructions>"
+        );
     }
 
     #[test]
     fn test_framed_system_prompt_root_cwd_omits_workspace() {
         // The "/" fallback must never be named — it would invite a $HOME scan.
         let framed = framed_system_prompt("/", Some("base text"), None).expect("base yields Some");
-        assert_eq!(framed, "[Base]\nbase text");
+        assert_eq!(framed, "<base>\nbase text\n</base>");
     }
 
     #[test]
@@ -5430,28 +5480,34 @@ mod tests {
     #[test]
     fn test_with_core_appends_below_framed() {
         let framed = with_core(
-            Some("[System]\npersona".to_string()),
-            Some("[Agent Memory — core]\nbe helpful"),
+            Some("<agent-instructions>\npersona\n</agent-instructions>".to_string()),
+            Some("<core-memory>\nbe helpful\n</core-memory>"),
         )
         .expect("both present yields Some");
         assert_eq!(
             framed,
-            "[System]\npersona\n\n[Agent Memory — core]\nbe helpful"
+            "<agent-instructions>\npersona\n</agent-instructions>\n\n<core-memory>\nbe helpful\n</core-memory>"
         );
     }
 
     #[test]
     fn test_with_core_framed_only_passes_through() {
-        let framed = with_core(Some("[System]\npersona".to_string()), None)
-            .expect("framed-only yields Some");
-        assert_eq!(framed, "[System]\npersona");
+        let framed = with_core(
+            Some("<agent-instructions>\npersona\n</agent-instructions>".to_string()),
+            None,
+        )
+        .expect("framed-only yields Some");
+        assert_eq!(
+            framed,
+            "<agent-instructions>\npersona\n</agent-instructions>"
+        );
     }
 
     #[test]
     fn test_with_core_core_only_is_just_core() {
-        let framed = with_core(None, Some("[Agent Memory — core]\nbe helpful"))
+        let framed = with_core(None, Some("<core-memory>\nbe helpful\n</core-memory>"))
             .expect("core-only yields Some");
-        assert_eq!(framed, "[Agent Memory — core]\nbe helpful");
+        assert_eq!(framed, "<core-memory>\nbe helpful\n</core-memory>");
     }
 
     #[test]
@@ -6497,10 +6553,13 @@ done"#
                 .as_str()
                 .expect("text prompt")
         };
-        assert_eq!(prompt_text(0), "[Base]\nstanding-once\n\nheartbeat-1");
+        assert_eq!(
+            prompt_text(0),
+            "<base>\nstanding-once\n</base>\n\nheartbeat-1"
+        );
         assert_eq!(
             prompt_text(1),
-            "[Base]\nstanding-once\n\nheartbeat-2",
+            "<base>\nstanding-once\n</base>\n\nheartbeat-2",
             "retry after ACP failure must resend standing context"
         );
         assert_eq!(
@@ -9583,10 +9642,10 @@ for line in sys.stdin:
         let section = render_canvas_section(id, ts, uuid);
         assert_eq!(
             section,
-            "[Channel Canvas]\n\
+            "<channel-canvas>\n\
              Canvas revision (event ID): a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n\
              Last modified: 2024-01-15T10:30:00+00:00\n\
-             Fetch current content with: buzz canvas get --channel 00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae"
+             Fetch current content with: buzz canvas get --channel 00f1ccaf-1506-4dd7-9a0e-fa67e9e486ae\n</channel-canvas>"
         );
     }
 
@@ -9594,14 +9653,23 @@ for line in sys.stdin:
 
     #[test]
     fn test_with_canvas_appends_to_existing_prompt() {
-        let result = with_canvas(Some("base content".into()), Some("[Channel Canvas]\nstuff"));
-        assert_eq!(result.unwrap(), "base content\n\n[Channel Canvas]\nstuff");
+        let result = with_canvas(
+            Some("base content".into()),
+            Some("<channel-canvas>\nstuff\n</channel-canvas>"),
+        );
+        assert_eq!(
+            result.unwrap(),
+            "base content\n\n<channel-canvas>\nstuff\n</channel-canvas>"
+        );
     }
 
     #[test]
     fn test_with_canvas_returns_canvas_alone_when_no_prompt() {
-        let result = with_canvas(None, Some("[Channel Canvas]\nstuff"));
-        assert_eq!(result.unwrap(), "[Channel Canvas]\nstuff");
+        let result = with_canvas(None, Some("<channel-canvas>\nstuff\n</channel-canvas>"));
+        assert_eq!(
+            result.unwrap(),
+            "<channel-canvas>\nstuff\n</channel-canvas>"
+        );
     }
 
     #[test]
@@ -9624,7 +9692,7 @@ for line in sys.stdin:
         let mut s = SessionState::default();
         s.sessions.insert(conv(ch), "sess".into());
         s.canvas_sections
-            .insert(conv(ch), "[Channel Canvas]\nrev abc".into());
+            .insert(conv(ch), "<channel-canvas>\nrev abc".into());
 
         s.invalidate_channel(&ch);
 
@@ -9698,7 +9766,7 @@ for line in sys.stdin:
         assert!(section.contains(&id), "section must contain the event id");
         assert!(section.contains("buzz canvas get --channel"));
         assert!(section.contains(CHANNEL_UUID));
-        assert!(section.starts_with("[Channel Canvas]"));
+        assert!(section.starts_with("<channel-canvas>"));
         // Timestamp must use Z suffix, not +00:00
         assert!(section.contains('Z'), "timestamp must use Z suffix");
     }
