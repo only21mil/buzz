@@ -23,6 +23,7 @@
 //!    takes `stt_pipeline`/`tts_pipeline` out of the lock, then calls `shutdown()`
 //!    and drops them outside the lock (thread joins can block ~200ms).
 
+mod agent_tts_admission;
 mod agent_tts_publisher;
 mod agent_tts_routing;
 pub mod agent_voice;
@@ -82,7 +83,7 @@ pub use window::{close_huddle_companion, open_huddle_window};
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::atomic::Ordering;
 use tauri::State;
 use uuid::Uuid;
 
@@ -874,7 +875,7 @@ pub async fn speak_agent_message(
         })?;
     }
 
-    let pipeline = {
+    let admission = {
         let hs = state.huddle()?;
         let agent_is_present = hs
             .agent_pubkeys
@@ -888,27 +889,26 @@ pub async fn speak_agent_message(
             );
             return Ok(());
         }
-        hs.tts_pipeline.as_ref().map(Arc::clone)
+        agent_tts_admission::SpeechAdmission::capture(&hs, &speaker_pubkey)
     };
-    let Some(pipeline) = pipeline else {
+    let Some(admission) = admission else {
         eprintln!(
             "buzz-desktop: tts stage=invoke status=failed reason=unavailable route_id={route_id}"
         );
         return Err("Agent text to speech is enabled but its audio pipeline is unavailable".into());
     };
-    match agent_tts_publisher::ensure(&app, &state, &pipeline, &speaker_pubkey).await {
-        Ok(true) => eprintln!(
-            "buzz-desktop: tts broadcast status=ready route_id={route_id}"
-        ),
-        Ok(false) => eprintln!(
-            "buzz-desktop: tts broadcast status=unavailable reason=agent_identity_not_local route_id={route_id}"
-        ),
+    let setup = agent_tts_publisher::ensure(&app, &state, &admission);
+    match admission.finish_setup(&state.huddle_state, setup).await {
+        Ok(false) => return Ok(()),
+        Ok(true) => {}
         Err(error) => eprintln!(
             "buzz-desktop: tts broadcast status=unavailable reason=publisher_setup_failed route_id={route_id} error={error}"
         ),
     }
-    let sender = pipeline.text_sender();
-    let speaker_generation = sender.speaker_generation(&speaker_pubkey);
+    if !admission.is_current(&*state.huddle()?) {
+        return Ok(());
+    }
+    let (sender, speaker_generation) = (admission.sender, admission.speaker_generation);
     enqueue_agent_tts_text(route_id, text, move |route_id, text| {
         sender
             .send(

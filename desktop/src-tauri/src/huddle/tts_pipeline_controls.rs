@@ -5,16 +5,28 @@ impl TtsPipeline {
         self.broadcasters.contains(speaker_pubkey)
     }
 
+    pub(crate) fn speech_is_current(
+        &self,
+        speaker: &str,
+        speaker_generation: u64,
+        voice_generation: u64,
+    ) -> bool {
+        !self.shutdown.load(Ordering::Acquire)
+            && self.voice_generation.load(Ordering::Acquire) == voice_generation
+            && current_speaker_generation(&self.speaker_generations, speaker) == speaker_generation
+    }
+
     pub(crate) fn register_audio_publisher(
         &self,
         speaker_pubkey: &str,
+        speaker_generation: u64,
+        voice_generation: u64,
         publisher: TtsAudioPublisher,
-    ) {
-        self.broadcasters.register(
-            speaker_pubkey,
-            publisher,
-            current_speaker_generation(&self.speaker_generations, speaker_pubkey),
-        );
+    ) -> bool {
+        self.broadcasters
+            .register_if_current(speaker_pubkey, publisher, speaker_generation, || {
+                self.speech_is_current(speaker_pubkey, speaker_generation, voice_generation)
+            })
     }
 
     /// Queue `text` for TTS synthesis and playback.
@@ -117,8 +129,8 @@ impl TtsPipeline {
     /// Signal the worker thread to stop.
     pub fn shutdown(&self) {
         eprintln!("buzz-desktop: tts stage=cancellation reason=shutdown route_id=0");
-        self.broadcasters.shutdown();
         self.shutdown.store(true, Ordering::Release);
+        self.broadcasters.shutdown();
     }
 
     /// Returns `true` if the worker thread has exited (init failure, crash, or normal exit).

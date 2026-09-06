@@ -91,6 +91,10 @@ pub(crate) struct TtsTextSender {
 }
 
 impl TtsTextSender {
+    pub(crate) fn voice_generation(&self) -> u64 {
+        self.generation
+    }
+
     pub(crate) fn send(
         &self,
         route_id: u64,

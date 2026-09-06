@@ -58,6 +58,7 @@ use super::tts_playback::*;
 #[path = "tts_append.rs"]
 mod append;
 use append::*;
+pub(crate) use voice_transition::TtsTextSender;
 use voice_transition::*;
 #[path = "tts_startup.rs"]
 mod startup;
@@ -901,3 +902,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tts_voice_selection_tests.rs"]
 mod voice_selection_tests;
+
+#[cfg(test)]
+#[path = "tts_admission_tests.rs"]
+mod admission_tests;
