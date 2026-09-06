@@ -2,7 +2,9 @@ import 'dart:async';
 
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
+import '../community/community_provider.dart';
 import '../crypto/nip_oa.dart';
+import '../push/push_presentation_cache.dart';
 import '../relay/relay.dart';
 import 'user_profile.dart';
 
@@ -73,6 +75,7 @@ class UserCacheNotifier extends Notifier<Map<String, UserProfile>> {
     _pending.clear();
 
     try {
+      final communityID = ref.read(activeCommunityProvider).value?.id;
       final session = ref.read(relaySessionProvider.notifier);
       final events = await session.fetchHistory(
         NostrFilters.profilesBatch(pubkeys),
@@ -85,6 +88,9 @@ class UserCacheNotifier extends Notifier<Map<String, UserProfile>> {
       }
 
       state = updated;
+      if (communityID != null) {
+        unawaited(cacheBuzzPushProfileEvents(communityID, events));
+      }
     } catch (_) {
       // Silently fail — we'll just show pubkeys.
     }

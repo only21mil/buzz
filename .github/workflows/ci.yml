@@ -116,6 +116,8 @@ jobs:
               - 'scripts/write-android-fork-release-provenance.py'
               - 'scripts/test-android-fork-release-contract.sh'
               - 'scripts/test-mobile-worktree-overrides.sh'
+              - 'scripts/test-mobile-push-source.py'
+              - 'docs/mobile-push-*.json'
               - '.github/workflows/mobile-release-candidate.yml'
               - '.github/workflows/android-fork-release-tag.yml'
               - '.github/workflows/android-fork-release-apk.yml'
@@ -936,6 +938,8 @@ jobs:
         with:
           path: ~/.pub-cache
           key: pub-${{ runner.os }}-${{ hashFiles('mobile/pubspec.lock') }}
+      - name: Mobile push source contracts
+        run: python3 scripts/test-mobile-push-source.py
       - name: File size ratchet
         run: node mobile/scripts/check-file-sizes.mjs
       - name: Format check
@@ -958,6 +962,35 @@ jobs:
           scripts/check-android-google-free.py \
             --apk mobile/build/app/outputs/flutter-apk/app-debug.apk \
             --dependency-manifest mobile/build/app/reports/buzz-runtime-dependencies.tsv
+
+  mobile-ios:
+    name: Mobile iOS Release
+    # Prepared coverage; admission requires a reviewed MBP runner selector.
+    # Never send fork pull requests or unreviewed external source to that host.
+    runs-on: ${{ fromJSON(vars.BUZZ_IOS_CI_RUNNER_LABELS) }}
+    timeout-minutes: 30
+    needs: [changes]
+    if: >-
+      vars.BUZZ_IOS_CI_RUNNER_LABELS != '' &&
+      github.repository == 'only21mil/buzz' &&
+      needs.changes.outputs.mobile == 'true' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.base_ref == 'main'))
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - name: Install Flutter dependencies
+        run: cd mobile && flutter pub get
+      - name: Test standalone push package
+        run: swift test --package-path mobile/ios/BuzzPushKit
+      - name: Build complete unsigned iOS Release
+        run: cd mobile && flutter build ios --release --no-codesign --no-pub
 
   security:
     name: Security

@@ -616,3 +616,10 @@ buzz-voice	pocket_import_audio	objective_import_synthesis_delete_and_mary_fallba
 buzz-workflow	buzz_workflow	executor::tests::claimed_message_and_reaction_recover_after_workflow_deletion	crates/buzz-workflow/src/executor.rs	desired	desired schema fixture
 buzz-workflow	buzz_workflow	tests::on_event_denies_run_after_owner_removed	crates/buzz-workflow/src/lib.rs	desired	desired schema fixture
 buzz-workflow	buzz_workflow	tests::on_event_denies_webhook_definition_for_plain_member_owner	crates/buzz-workflow/src/lib.rs	desired	desired schema fixture
+buzz-push-gateway	buzz_push_gateway	postgres::tests::concurrent_challenge_issuance_obeys_deployment_global_ceiling	crates/buzz-push-gateway/src/postgres.rs	migration	private gateway schema fixture
+buzz-push-gateway	buzz_push_gateway	postgres::tests::delegation_renews_and_expired_enrollment_recovers_token_ownership	crates/buzz-push-gateway/src/postgres.rs	migration	private gateway schema fixture
+buzz-push-gateway	buzz_push_gateway	migration_tests::fresh_gateway_ledger_accepts_only_dogfood	crates/buzz-push-gateway/src/migration_tests.rs	migration	independent gateway ledger and populated retirement fixture
+buzz-push-gateway	buzz_push_gateway	migration_tests::legacy_upgrade_retires_unmappable_authority_preserves_quota	crates/buzz-push-gateway/src/migration_tests.rs	migration	independent gateway ledger and populated retirement fixture
+buzz-push-gateway	buzz_push_gateway	migration_tests::app_store_retirement_preserves_dogfood_authority_byte_for_byte	crates/buzz-push-gateway/src/migration_tests.rs	migration	independent gateway ledger and populated retirement fixture
+buzz-push-gateway	buzz_push_gateway	apns::tests::live_sandbox_probe_reports_literal_status_and_body	crates/buzz-push-gateway/src/apns.rs	external	requires separately approved real APNs credentials and external delivery
+buzz-db	buzz_db	migration::tests::dogfood_profile_upgrade_retires_authority_preserves_lease_and_event_data	crates/buzz-db/src/migration.rs	migration	private populated relay0037 to0038 retirement and retention fixture

@@ -20,7 +20,8 @@ let package = Package(
             dependencies: [
                 "BuzzPushKit",
                 .product(name: "P256K", package: "swift-secp256k1"),
-            ]
+            ],
+            resources: [.copy("Fixtures/app_attest_transcripts.json")]
         ),
     ]
 )

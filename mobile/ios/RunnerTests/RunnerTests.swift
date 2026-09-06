@@ -1,6 +1,7 @@
 import AVFoundation
 import Flutter
 import UIKit
+import UserNotifications
 import XCTest
 
 @testable import Buzz
@@ -80,6 +81,14 @@ class RunnerTests: XCTestCase {
   }
 
 
+
+  func testPushAuthorizationStatusNamesCoverDisplayPermissionStates() {
+    XCTAssertEqual(AppDelegate.pushAuthorizationStatusName(.notDetermined), "notDetermined")
+    XCTAssertEqual(AppDelegate.pushAuthorizationStatusName(.denied), "denied")
+    XCTAssertEqual(AppDelegate.pushAuthorizationStatusName(.authorized), "authorized")
+    XCTAssertEqual(AppDelegate.pushAuthorizationStatusName(.provisional), "provisional")
+    XCTAssertEqual(AppDelegate.pushAuthorizationStatusName(.ephemeral), "ephemeral")
+  }
 
   func testHuddleActiveTalkerSelectorBoundsAndReactivates() {
     var selector = HuddleActiveTalkerSelector(capacity: 15)

@@ -1,57 +1,99 @@
-# Mobile push source boundary
+# iOS push source adoption
 
-The source packet from `c432a111ca9ddd31a85e1312d5995f8b92191b82` is partially
-adopted. It does **not** enable end-to-end iOS remote notifications.
+The selected source from `c432a111ca9ddd31a85e1312d5995f8b92191b82`,
+`42b42447b0dc47c3e1a4d95caab893567dcd1677`, and
+`b270437a62bc1049b27745799dc44268d0c23489` is integrated. This is prepared
+source, not a deployed gateway or an approved iOS build.
 
-The relay now opts into NIP-PL discovery, lease acceptance, matching and delivery
-with `BUZZ_PUSH_ENABLED=true` (default false). Its message kinds are 9, 40002,
-45001 and 45003 across the descriptor, activation backfill and event trigger.
-Existing `buzz-ios-production` / `buzz-ios-sandbox` profile authority and
-notification classes remain unchanged. Queue and gateway timing metrics contain
-bounded outcome labels, not endpoint or event identifiers.
+Runner registers APNs, coordinates App Attest enrollment, stores endpoint grants,
+and shares scoped snapshots with NotificationService through the configured App
+Group and Keychain groups. Flutter bootstrap, community opt-in, subscription
+publication, permission recovery, durable revocation outbox, and community-aware
+notification taps are wired together. The extension verifies relay events before
+presenting cached sender/channel data. Android retains local notifications and its
+existing explicit tap route, native plugins, permissions and Google-free package
+manifest. Huddles and voice-note entrypoints remain present.
 
-`mobile/ios/BuzzPushKit` contains the source's verified notification resolver,
-presentation cache, conversation/navigation values, NIP-98 request signing and
-lease-policy primitives with their source tests. Flutter contains matching
-subscription and community-snapshot primitives. These libraries are not wired
-into Runner or the application bootstrap yet. Android continues to use its
-existing local-notification path. Huddle native plugins, microphone permissions,
-repository browsing, dependency manifests and release workflows are unchanged.
+The relay remains disabled by default (`BUZZ_PUSH_ENABLED=false`). Enabling it
+advertises only `buzz-ios-dogfood`, APNs class `default`, and message kinds
+9, 40002, 45001 and 45003. Gateway profile selection is server-owned. Certificate
+transport, App Attest verification, challenge quotas and bounded metric labels
+are part of the same packet. Gateway startup and chart rendering reject an App
+Attest app identifier that does not end in the exact configured APNs topic.
 
-## Deferred profile and enrollment packet
+## Existing fork identity
 
-The existing gateway has only `0001_push_gateway_authority.sql`. It is
-byte-identical to upstream's prefix and accepts production/sandbox profiles.
-Upstream gateway `0002_application_profiles.sql` deletes those installations
-and their delegations; `0004_dogfood_only_profile.sql` deletes App Store
-registrations. Relay `0043_push_gateway_dogfood_profile.sql` from
-`42b42447b0dc47c3e1a4d95caab893567dcd1677` also deletes legacy authority.
-None of those migrations is admitted. Gateway `0003_challenge_issuance_quota.sql`
-remains with its dependent runtime packet; its source number is not a fork
-reservation. The gateway's SQLx ledger remains separate from the relay ledger.
+The actual fork iOS default is `com.buzz.buzzMobile`, retained for Release and
+Profile. Debug retains `com.buzz.buzzMobile.<worktree>` through the existing
+worktree override script. Android release/profile remains `xyz.block.buzz.mobile`;
+that Android identity is not proof of an iOS provisioning identity.
 
-This holds the dogfood App Attest enrollment driver, certificate/profile gateway
-cutover, mobile enrollment and revocation orchestration, native APNs registration,
-NotificationService target and entitlements, profile/team overrides, and the
-dependent deployment chart corrections. A retention and application-identity
-policy must resolve these together. No legacy profile is silently mapped to
-`buzz-ios-dogfood`, and no source-defined Apple team is installed. Release/profile
-identity remains `xyz.block.buzz.mobile`.
+`BUZZ_DEVELOPMENT_TEAM` remains empty until an approved iOS team is supplied in
+`Flutter/AppOverrides.xcconfig`. That file is still included last. The App Group
+is `group.$(BUNDLE_IDENTIFIER)`, the Keychain suffix is `$(BUNDLE_IDENTIFIER)`,
+and NotificationService is `$(BUNDLE_IDENTIFIER).NotificationService`. Release
+and Profile use production APNs/App Attest; Debug uses development. Custom
+provisioned builds must set the bundle, team, groups and environments consistently
+in their existing override path and configure the gateway for that exact app.
+No source Apple team, actual credential, signing setting outside this source, or
+provisioning profile was installed. The canonical protocol audience and gateway
+URL remain the upstream NIP-PL contract; their suitability and ownership for a
+fork deployment must be settled before enabling push or registering devices.
 
-## Relay migration admission
+## Migration admissions and retirement
 
-- Source: `c432a111ca9ddd31a85e1312d5995f8b92191b82`,
-  `migrations/0040_push_message_kinds.sql`.
-- Source blob: `a76481b15923d0e819f0bf126409aa00588d2915`.
-- Source and adapted SHA-256:
-  `cc094648d73cf34ae6772e15359668e340d995344eb9b99f12cde1235ea60fe8`.
-- Fork target: `migrations/0037_push_message_kinds.sql`, after unchanged 0001–0036.
-- Prerequisites: push leases and endpoint state (0012–0015), queue (0018),
-  shared activation gate (0023), and matching descriptor/backfill kinds.
-- Desired schema: only `enqueue_push_match_job()`'s allowlist changes.
+Relay versions 0001–0035 are frozen; admitted 0036/0037 remain byte-identical.
+Source0040 remains fork0037, which preserves all legacy authority. Source0043 is
+admitted as **0038_push_gateway_dogfood_profile.sql**, byte-identical to the
+selected source. Desired schema changes only the current gateway profile
+constraint for this admission.
 
-The migration preserves existing queued work and all profile authority. Focused
-PostgreSQL tests exercise fresh install, populated upgrade, desired-schema
-behavior and activation backfill. Test databases use private socket-only clusters.
-Production migration, credential changes, signing, app packaging, physical-device
-acceptance, APNs delivery and deployment require their separate authorized work.
+The standalone gateway has its own SQLx ledger. Its 0001 is frozen. Source0002,
+0003 and 0004 are admitted in that ledger with their original bytes and separate
+SHA-256/SQLx SHA-384 evidence in `mobile-push-gateway-migrations.json`. They are
+not relay versions or substitutions for relay0038. The source mapping and
+prerequisites are recorded in `mobile-push-migration-map.json`.
+
+Legacy production/sandbox profile labels represented transport environments,
+not proven application identities. **They cannot be mapped safely.** The
+reviewable migration proposal deletes their gateway delegations before their
+installations, and gateway0004 similarly retires dormant App Store authority.
+Existing dogfood authority survives gateway0004 byte-for-byte. Relay0038 retains
+relay leases, event history and queued work while retiring incompatible local
+gateway authority. Old endpoint grants stop working; clients must re-attest and
+publish newly authorized leases. Quota/replay retention policy is unchanged.
+There is no App Store profile in this MVP.
+
+These SQL artifacts perform destructive retirement when actually applied.
+Their presence in source does not approve applying them. Before a binary or
+chart containing them is started against an existing database, obtain rollout
+approval covering the affected registration inventory, retained recovery
+material, retirement/reenrollment plan, downtime and rollback consequences.
+Do not merely change profile strings or reuse old endpoint grants. Relay image
+migration expectations must advance to38, and the independent gateway to4,
+only as part of that approved delivery packet.
+
+## Prepared unsigned iOS CI
+
+The additional `Mobile iOS Release` job preserves all existing CI job IDs and
+release workflows. It tests BuzzPushKit and runs
+`flutter build ios --release --no-codesign --no-pub`, covering Runner, CocoaPods,
+BuzzPushKit and NotificationService. All extension configurations explicitly
+clear inherited Runner-only linker flags; Runner keeps its plugin flags.
+
+The job is **inactive until runner admission**. An operator must configure
+`BUZZ_IOS_CI_RUNNER_LABELS` as a JSON label array selecting the approved Victor
+MBP runner for this repository. No runner label or registration was invented.
+It accepts mobile changes on trusted same-repository main PRs, pushes, and manual
+CI runs, and excludes external fork PRs. Its token is read-only and checkout
+credentials are not persisted. MBP persistent-runner trust and repository access
+must be reviewed before setting that variable. Existing MBP evidence proves a
+Mason's Budget runner, not an admitted Buzz runner. No workflow was dispatched.
+
+The standalone Swift unit package can be tested on the approved MBP without an
+app build. An actual unsigned iOS Release build, native Runner/extension compiler
+validation, parent/extension provisioning and Communication Notifications
+entitlement verification, physical delivery/tap acceptance, dedicated gateway
+DB roles, verified images, APNs certificate/root configuration and deployment
+remain separately approved acceptance work. Upstream chart registry references
+are source release contracts, not evidence that a fork artifact exists.

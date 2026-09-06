@@ -576,7 +576,7 @@ mod tests {
 
         assert_eq!(
             migrations.len(),
-            37,
+            38,
             "embedded migration matrix must contain the frozen prefix plus admitted tail"
         );
         assert_eq!(migrations[0].version, 1);
@@ -1677,7 +1677,8 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("snapshot existing authority");
-        run_migrations(&pool)
+        MIGRATOR
+            .run_to(37, &pool)
             .await
             .expect("admit only migration 0037");
         let after: serde_json::Value = sqlx::query_scalar(snapshot_sql)
@@ -1704,6 +1705,51 @@ mod tests {
                 .as_ref()
         );
         assert_push_message_kinds(&pool, community).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires private PostgreSQL migration fixture"]
+    async fn dogfood_profile_upgrade_retires_authority_preserves_lease_and_event_data() {
+        // The existing 0037 test proves preservation through that admission.
+        // This fixture explicitly proves the later, separately approved cutover.
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        MIGRATOR.run_to(37, &pool).await.unwrap();
+        let community = seed_push_migration_lease(&pool).await;
+        assert_push_message_kinds(&pool, community).await;
+        sqlx::query("INSERT INTO push_gateway_installations(id,app_attest_key_id,app_attest_public_key,assertion_counter,app_profile,token_ciphertext,token_fingerprint,endpoint_epoch,expires_at) VALUES($1,$2,$3,0,'buzz-ios-sandbox',$4,$5,1,now()+interval '1 day')")
+            .bind(uuid::Uuid::new_v4()).bind(vec![1_u8;32]).bind(vec![2_u8;33]).bind(vec![3_u8;32]).bind(vec![4_u8;32]).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO push_gateway_delegations(id,installation_id,relay_pubkey,endpoint_epoch,generation,not_before,expires_at) SELECT $1,id,$2,1,1,now(),now()+interval '1 hour' FROM push_gateway_installations")
+            .bind(uuid::Uuid::new_v4()).bind(vec![5_u8;32]).execute(&pool).await.unwrap();
+        let snapshot = "SELECT jsonb_build_array((SELECT jsonb_agg(to_jsonb(l) ORDER BY l.installation_id) FROM push_leases l),(SELECT jsonb_agg(to_jsonb(e) ORDER BY e.id) FROM events e),(SELECT jsonb_agg(to_jsonb(q) ORDER BY q.event_id) FROM push_match_queue q))";
+        let before: serde_json::Value =
+            sqlx::query_scalar(snapshot).fetch_one(&pool).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let after: serde_json::Value = sqlx::query_scalar(snapshot).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            before, after,
+            "cutover must retain relay leases, events and queue rows"
+        );
+        let counts: (i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM push_gateway_installations),(SELECT count(*) FROM push_gateway_delegations)").fetch_one(&pool).await.unwrap();
+        assert_eq!(counts, (0, 0));
+        let checksum: Vec<u8> = sqlx::query_scalar(
+            "SELECT checksum FROM _sqlx_migrations WHERE version=38 AND success",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            checksum,
+            MIGRATOR
+                .iter()
+                .find(|m| m.version == 38)
+                .unwrap()
+                .checksum
+                .as_ref()
+        );
+        let constraint: String = sqlx::query_scalar("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='push_gateway_installations'::regclass AND conname='push_gateway_installations_app_profile_check'").fetch_one(&pool).await.unwrap();
+        assert!(constraint.contains("buzz-ios-dogfood"));
+        assert!(!constraint.contains("buzz-ios-sandbox"));
     }
 
     #[tokio::test]
@@ -1864,7 +1910,11 @@ mod b1_ci_grants_ordering {
                 .skip(35)
                 .map(|m| (m.version, m.description.as_ref()))
                 .collect::<Vec<_>>(),
-            vec![(36, "workflow run error codes"), (37, "push message kinds")]
+            vec![
+                (36, "workflow run error codes"),
+                (37, "push message kinds"),
+                (38, "push gateway dogfood profile")
+            ]
         );
         let ci_grants = migrations
             .iter()

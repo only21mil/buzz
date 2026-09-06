@@ -5,6 +5,8 @@ import 'dart:math';
 import 'package:flutter/widgets.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
+import '../../shared/community/community_provider.dart';
+import '../../shared/push/push_presentation_cache.dart';
 import '../../shared/relay/relay.dart';
 import '../../shared/theme/theme_provider.dart';
 import '../../shared/utils/string_utils.dart';
@@ -175,6 +177,7 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
   }) async {
     final myPk = ref.read(myPubkeyProvider);
     if (myPk == null) throw StateError('No signing identity available');
+    final communityID = ref.read(activeCommunityProvider).value?.id;
     _loadThreadInterestStores(myPk);
 
     final session = ref.read(relaySessionProvider.notifier);
@@ -225,11 +228,14 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
       final id = event.getTagValue('d');
       if (id == null) continue;
       final existing = latestMetaPerId[id];
-      if (existing == null || event.createdAt > existing.createdAt) {
+      if (existing == null ||
+          event.createdAt > existing.createdAt ||
+          (event.createdAt == existing.createdAt &&
+              event.id.compareTo(existing.id) < 0)) {
         latestMetaPerId[id] = event;
       }
     }
-    final dedupedMetas = latestMetaPerId.values;
+    final dedupedMetas = latestMetaPerId.values.toList();
 
     // Resolve DM participant display names. Extracted into the part file so
     // `channels_provider.dart` stays under the 1000-line ceiling enforced by
@@ -286,6 +292,12 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
     // Use the membership snapshots already fetched above for both Huddle
     // linkage validation and member-count hydration.
     if (memberEvents.isNotEmpty) _cacheMemberSnapshots(memberEvents);
+    unawaited(
+      cacheBuzzPushChannelEvents(communityID, dedupedMetas, [
+        ...memberships,
+        ...memberEvents,
+      ]),
+    );
     final memberCounts = _memberCountsByChannelId(memberEvents);
     for (var i = 0; i < channels.length; i++) {
       final count = memberCounts[channels[i].id];

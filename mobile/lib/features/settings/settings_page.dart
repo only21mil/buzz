@@ -13,6 +13,7 @@ import '../../shared/auth/auth.dart';
 import '../../shared/clipboard_utils.dart';
 import '../../shared/notifications/notifications.dart';
 import '../../shared/community/community_membership_provider.dart';
+import '../../shared/push/push_bridge.dart';
 import '../../shared/relay/relay.dart';
 import '../../shared/theme/theme.dart';
 import '../../shared/widgets/app_list.dart';
@@ -29,6 +30,7 @@ import 'theme_picker_page.dart';
 part 'settings_page/appearance_section.dart';
 part 'settings_page/community_section.dart';
 part 'settings_page/connection_section.dart';
+part 'settings_page/notifications_section.dart';
 
 Widget _emptyProfileEditPage(BuildContext context) => const SizedBox.shrink();
 
@@ -218,6 +220,8 @@ class SettingsPage extends HookConsumerWidget {
                 const _AppearanceSection(),
                 if (defaultTargetPlatform == TargetPlatform.android)
                   const _NotificationSettingsSection(),
+                if (defaultTargetPlatform == TargetPlatform.iOS)
+                  const _NotificationsSection(),
                 _ConnectionSection(
                   identityRecoveryPageBuilder: identityRecoveryPageBuilder,
                 ),

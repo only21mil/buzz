@@ -206,14 +206,10 @@ fn push_descriptor(
             "pubkey": relay_keypair.public_key().to_hex(),
             "current": true
         }],
-        "app_profiles": [
-            {"id": "buzz-ios-production", "transport": "apns"},
-            {"id": "buzz-ios-sandbox", "transport": "apns"}
-        ],
+        "app_profiles": [{"id": "buzz-ios-dogfood", "transport": "apns"}],
         "push_kinds": crate::handlers::push_lease::PUSH_KINDS,
-        "urgent_kinds": crate::handlers::push_lease::URGENT_KINDS,
         "h_grammar": "uuid-v4-lowercase",
-        "class_support": {"apns": ["silent", "default", "time_sensitive"]},
+        "class_support": {"apns": ["default"]},
         "limitation": {
             "max_lease_ttl": 2592000,
             "max_leases_per_pubkey": 16,
@@ -355,14 +351,11 @@ mod tests {
         assert_eq!(descriptor["origin"], "ws://tenant.example");
         assert_eq!(
             descriptor["app_profiles"],
-            serde_json::json!([
-                {"id": "buzz-ios-production", "transport": "apns"},
-                {"id": "buzz-ios-sandbox", "transport": "apns"}
-            ])
+            serde_json::json!([{"id": "buzz-ios-dogfood", "transport": "apns"}])
         );
         assert_eq!(
             descriptor["class_support"]["apns"],
-            serde_json::json!(["silent", "default", "time_sensitive"])
+            serde_json::json!(["default"])
         );
         assert_eq!(
             descriptor["push_kinds"],
