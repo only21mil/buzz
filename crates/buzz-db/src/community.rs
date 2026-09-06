@@ -91,39 +91,59 @@ impl Db {
         &self,
         normalized_host: &str,
     ) -> Result<Option<CommunityRecord>> {
-        let row = sqlx::query(
-            r#"
+        crate::observability::observe(crate::observability::Operation::Community, async {
+            let row = sqlx::query(
+                r#"
             SELECT id, host
             FROM communities
             WHERE lower(host) = lower($1)
               AND archived_at IS NULL
             "#,
-        )
-        .bind(normalized_host)
-        .fetch_optional(&self.pool)
-        .await?;
+            )
+            .bind(normalized_host)
+            .fetch_optional(
+                &mut *crate::observability::acquire(
+                    &self.pool,
+                    crate::observability::PoolRole::Writer,
+                    crate::observability::Operation::Community,
+                )
+                .await?,
+            )
+            .await?;
 
-        row.map(|row| {
-            let id: Uuid = row.try_get("id")?;
-            let host: String = row.try_get("host")?;
+            row.map(|row| {
+                let id: Uuid = row.try_get("id")?;
+                let host: String = row.try_get("host")?;
 
-            Ok(CommunityRecord {
-                id: CommunityId::from_uuid(id),
-                host,
+                Ok(CommunityRecord {
+                    id: CommunityId::from_uuid(id),
+                    host,
+                })
             })
+            .transpose()
         })
-        .transpose()
+        .await
     }
 
     /// Returns whether a community id still exists in the active lifecycle state.
     pub async fn is_community_active(&self, community_id: CommunityId) -> Result<bool> {
-        let active = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM communities WHERE id = $1 AND archived_at IS NULL)",
-        )
-        .bind(community_id.as_uuid())
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(active)
+        crate::observability::observe(crate::observability::Operation::Community, async {
+            let active = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM communities WHERE id = $1 AND archived_at IS NULL)",
+            )
+            .bind(community_id.as_uuid())
+            .fetch_one(
+                &mut *crate::observability::acquire(
+                    &self.pool,
+                    crate::observability::PoolRole::Writer,
+                    crate::observability::Operation::Community,
+                )
+                .await?,
+            )
+            .await?;
+            Ok(active)
+        })
+        .await
     }
 
     /// Returns a community by host regardless of lifecycle state. Operator-plane only.
@@ -131,17 +151,27 @@ impl Db {
         &self,
         normalized_host: &str,
     ) -> Result<Option<CommunityRecord>> {
-        let row = sqlx::query("SELECT id, host FROM communities WHERE lower(host) = lower($1)")
-            .bind(normalized_host)
-            .fetch_optional(&self.pool)
-            .await?;
-        row.map(|row| {
-            Ok(CommunityRecord {
-                id: CommunityId::from_uuid(row.try_get("id")?),
-                host: row.try_get("host")?,
+        crate::observability::observe(crate::observability::Operation::Community, async {
+            let row = sqlx::query("SELECT id, host FROM communities WHERE lower(host) = lower($1)")
+                .bind(normalized_host)
+                .fetch_optional(
+                    &mut *crate::observability::acquire(
+                        &self.pool,
+                        crate::observability::PoolRole::Writer,
+                        crate::observability::Operation::Community,
+                    )
+                    .await?,
+                )
+                .await?;
+            row.map(|row| {
+                Ok(CommunityRecord {
+                    id: CommunityId::from_uuid(row.try_get("id")?),
+                    host: row.try_get("host")?,
+                })
             })
+            .transpose()
         })
-        .transpose()
+        .await
     }
 
     /// Lists communities where `owner_pubkey` currently holds the `owner` role.
@@ -152,9 +182,10 @@ impl Db {
         &self,
         owner_pubkey: &str,
     ) -> Result<Vec<OwnedCommunityRecord>> {
-        let owner_pubkey = owner_pubkey.to_ascii_lowercase();
-        let rows = sqlx::query(
-            r#"
+        crate::observability::observe(crate::observability::Operation::Community, async {
+            let owner_pubkey = owner_pubkey.to_ascii_lowercase();
+            let rows = sqlx::query(
+                r#"
             SELECT c.id, c.host, c.created_at, c.archived_at
             FROM communities c
             JOIN relay_members rm ON rm.community_id = c.id
@@ -162,25 +193,34 @@ impl Db {
               AND rm.role = 'owner'
             ORDER BY c.created_at ASC, c.host ASC
             "#,
-        )
-        .bind(owner_pubkey)
-        .fetch_all(&self.pool)
-        .await?;
+            )
+            .bind(owner_pubkey)
+            .fetch_all(
+                &mut *crate::observability::acquire(
+                    &self.pool,
+                    crate::observability::PoolRole::Writer,
+                    crate::observability::Operation::Community,
+                )
+                .await?,
+            )
+            .await?;
 
-        rows.into_iter()
-            .map(|row| {
-                let id: Uuid = row.try_get("id")?;
-                let host: String = row.try_get("host")?;
-                let created_at: DateTime<Utc> = row.try_get("created_at")?;
-                let archived_at: Option<DateTime<Utc>> = row.try_get("archived_at")?;
-                Ok(OwnedCommunityRecord {
-                    id: CommunityId::from_uuid(id),
-                    host,
-                    created_at,
-                    archived_at,
+            rows.into_iter()
+                .map(|row| {
+                    let id: Uuid = row.try_get("id")?;
+                    let host: String = row.try_get("host")?;
+                    let created_at: DateTime<Utc> = row.try_get("created_at")?;
+                    let archived_at: Option<DateTime<Utc>> = row.try_get("archived_at")?;
+                    Ok(OwnedCommunityRecord {
+                        id: CommunityId::from_uuid(id),
+                        host,
+                        created_at,
+                        archived_at,
+                    })
                 })
-            })
-            .collect()
+                .collect()
+        })
+        .await
     }
 
     /// Returns the normalized host mapped to a community id, if the community
@@ -194,23 +234,33 @@ impl Db {
     /// community is authoritative; the host is read back for labelling only and
     /// is never used to re-derive the community.
     pub async fn lookup_community_host(&self, community_id: CommunityId) -> Result<Option<String>> {
-        let row = sqlx::query(
-            r#"
+        crate::observability::observe(crate::observability::Operation::Community, async {
+            let row = sqlx::query(
+                r#"
             SELECT host
             FROM communities
             WHERE id = $1
               AND archived_at IS NULL
             "#,
-        )
-        .bind(community_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
+            )
+            .bind(community_id.as_uuid())
+            .fetch_optional(
+                &mut *crate::observability::acquire(
+                    &self.pool,
+                    crate::observability::PoolRole::Writer,
+                    crate::observability::Operation::Community,
+                )
+                .await?,
+            )
+            .await?;
 
-        row.map(|row| {
-            let host: String = row.try_get("host")?;
-            Ok(host)
+            row.map(|row| {
+                let host: String = row.try_get("host")?;
+                Ok(host)
+            })
+            .transpose()
         })
-        .transpose()
+        .await
     }
 
     /// Returns the community's workspace icon (NIP-11 `icon`), if set.
@@ -218,22 +268,32 @@ impl Db {
     /// Set by relay admins/owners via the kind:9033 command; the value is
     /// validated and size-capped at that write path.
     pub async fn get_community_icon(&self, community_id: CommunityId) -> Result<Option<String>> {
-        let row = sqlx::query(
-            r#"
+        crate::observability::observe(crate::observability::Operation::Community, async {
+            let row = sqlx::query(
+                r#"
             SELECT icon
             FROM communities
             WHERE id = $1
             "#,
-        )
-        .bind(community_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
+            )
+            .bind(community_id.as_uuid())
+            .fetch_optional(
+                &mut *crate::observability::acquire(
+                    &self.pool,
+                    crate::observability::PoolRole::Writer,
+                    crate::observability::Operation::Community,
+                )
+                .await?,
+            )
+            .await?;
 
-        Ok(row
-            .map(|row| row.try_get::<Option<String>, _>("icon"))
-            .transpose()?
-            .flatten()
-            .filter(|icon| !icon.is_empty()))
+            Ok(row
+                .map(|row| row.try_get::<Option<String>, _>("icon"))
+                .transpose()?
+                .flatten()
+                .filter(|icon| !icon.is_empty()))
+        })
+        .await
     }
 
     /// Sets or clears (`None`) the community's workspace icon.
@@ -242,18 +302,28 @@ impl Db {
         community_id: CommunityId,
         icon: Option<&str>,
     ) -> Result<()> {
-        sqlx::query(
-            r#"
+        crate::observability::observe(crate::observability::Operation::Community, async {
+            sqlx::query(
+                r#"
             UPDATE communities
             SET icon = $2
             WHERE id = $1
             "#,
-        )
-        .bind(community_id.as_uuid())
-        .bind(icon)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+            )
+            .bind(community_id.as_uuid())
+            .bind(icon)
+            .execute(
+                &mut *crate::observability::acquire(
+                    &self.pool,
+                    crate::observability::PoolRole::Writer,
+                    crate::observability::Operation::Community,
+                )
+                .await?,
+            )
+            .await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Ensure a configured community host exists and return its row.
@@ -265,27 +335,37 @@ impl Db {
         &self,
         normalized_host: &str,
     ) -> Result<EnsuredCommunityRecord> {
-        let row = sqlx::query(
-            r#"
+        crate::observability::observe(crate::observability::Operation::Community, async {
+            let row = sqlx::query(
+                r#"
             INSERT INTO communities (host)
             VALUES ($1)
             ON CONFLICT (lower(host)) DO UPDATE SET host = communities.host
             RETURNING id, host, (xmax = 0) AS created
             "#,
-        )
-        .bind(normalized_host)
-        .fetch_one(&self.pool)
-        .await?;
+            )
+            .bind(normalized_host)
+            .fetch_one(
+                &mut *crate::observability::acquire(
+                    &self.pool,
+                    crate::observability::PoolRole::Writer,
+                    crate::observability::Operation::Community,
+                )
+                .await?,
+            )
+            .await?;
 
-        let id: Uuid = row.try_get("id")?;
-        let host: String = row.try_get("host")?;
-        let created: bool = row.try_get("created")?;
+            let id: Uuid = row.try_get("id")?;
+            let host: String = row.try_get("host")?;
+            let created: bool = row.try_get("created")?;
 
-        Ok(EnsuredCommunityRecord {
-            id: CommunityId::from_uuid(id),
-            host,
-            created,
+            Ok(EnsuredCommunityRecord {
+                id: CommunityId::from_uuid(id),
+                host,
+                created,
+            })
         })
+        .await
     }
 
     /// Atomically creates a community and its initial owner.
@@ -298,8 +378,9 @@ impl Db {
         normalized_host: &str,
         owner_pubkey: &str,
     ) -> Result<CreateCommunityWithOwnerResult> {
+        crate::observability::observe(crate::observability::Operation::Community, async {
         let owner_pubkey = owner_pubkey.to_ascii_lowercase();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::observability::begin(&self.pool, crate::observability::Operation::Community).await?;
 
         // Serialize on the owner pubkey so concurrent creates to the same
         // owner cannot both pass the ownership count check.
@@ -375,6 +456,7 @@ impl Db {
                 host,
             },
         ))
+        }).await
     }
 
     /// Idempotently archives a community when the asserted pubkey is its current owner.
@@ -384,8 +466,9 @@ impl Db {
         owner_pubkey: &str,
         protected_deployment_host: &str,
     ) -> Result<Option<ArchivedCommunityRecord>> {
-        let row = sqlx::query(
-            r#"UPDATE communities c
+        crate::observability::observe(crate::observability::Operation::Community, async {
+            let row = sqlx::query(
+                r#"UPDATE communities c
                SET archived_at = COALESCE(c.archived_at, now())
                FROM relay_members rm
                WHERE lower(c.host) = lower($1)
@@ -394,20 +477,29 @@ impl Db {
                  AND rm.role = 'owner'
                  AND lower(c.host) <> lower($3)
                RETURNING c.id, c.host, c.archived_at"#,
-        )
-        .bind(normalized_host)
-        .bind(owner_pubkey)
-        .bind(protected_deployment_host)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(|row| {
-            Ok(ArchivedCommunityRecord {
-                id: CommunityId::from_uuid(row.try_get("id")?),
-                host: row.try_get("host")?,
-                archived_at: row.try_get("archived_at")?,
+            )
+            .bind(normalized_host)
+            .bind(owner_pubkey)
+            .bind(protected_deployment_host)
+            .fetch_optional(
+                &mut *crate::observability::acquire(
+                    &self.pool,
+                    crate::observability::PoolRole::Writer,
+                    crate::observability::Operation::Community,
+                )
+                .await?,
+            )
+            .await?;
+            row.map(|row| {
+                Ok(ArchivedCommunityRecord {
+                    id: CommunityId::from_uuid(row.try_get("id")?),
+                    host: row.try_get("host")?,
+                    archived_at: row.try_get("archived_at")?,
+                })
             })
+            .transpose()
         })
-        .transpose()
+        .await
     }
 
     /// Idempotently restores a community when the asserted pubkey is its current owner.
@@ -416,8 +508,9 @@ impl Db {
         normalized_host: &str,
         owner_pubkey: &str,
     ) -> Result<Option<UnarchivedCommunityRecord>> {
-        let row = sqlx::query(
-            r#"UPDATE communities c
+        crate::observability::observe(crate::observability::Operation::Community, async {
+            let row = sqlx::query(
+                r#"UPDATE communities c
                SET archived_at = NULL
                FROM relay_members rm
                WHERE lower(c.host) = lower($1)
@@ -425,18 +518,27 @@ impl Db {
                  AND lower(rm.pubkey) = lower($2)
                  AND rm.role = 'owner'
                RETURNING c.id, c.host"#,
-        )
-        .bind(normalized_host)
-        .bind(owner_pubkey)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(|row| {
-            Ok(UnarchivedCommunityRecord {
-                id: CommunityId::from_uuid(row.try_get("id")?),
-                host: row.try_get("host")?,
+            )
+            .bind(normalized_host)
+            .bind(owner_pubkey)
+            .fetch_optional(
+                &mut *crate::observability::acquire(
+                    &self.pool,
+                    crate::observability::PoolRole::Writer,
+                    crate::observability::Operation::Community,
+                )
+                .await?,
+            )
+            .await?;
+            row.map(|row| {
+                Ok(UnarchivedCommunityRecord {
+                    id: CommunityId::from_uuid(row.try_get("id")?),
+                    host: row.try_get("host")?,
+                })
             })
+            .transpose()
         })
-        .transpose()
+        .await
     }
 
     /// Returns the community that owns a channel, if the channel exists.
@@ -444,23 +546,33 @@ impl Db {
     /// Internal relay producers use this to derive tenant context from the row
     /// they are acting on, rather than falling back to an implicit default.
     pub async fn community_of_channel(&self, channel_id: Uuid) -> Result<Option<CommunityId>> {
-        let row = sqlx::query(
-            r#"
+        crate::observability::observe(crate::observability::Operation::Community, async {
+            let row = sqlx::query(
+                r#"
             SELECT community_id
             FROM channels
             WHERE id = $1
               AND deleted_at IS NULL
             "#,
-        )
-        .bind(channel_id)
-        .fetch_optional(&self.pool)
-        .await?;
+            )
+            .bind(channel_id)
+            .fetch_optional(
+                &mut *crate::observability::acquire(
+                    &self.pool,
+                    crate::observability::PoolRole::Writer,
+                    crate::observability::Operation::Community,
+                )
+                .await?,
+            )
+            .await?;
 
-        row.map(|row| {
-            let id: Uuid = row.try_get("community_id")?;
-            Ok(CommunityId::from_uuid(id))
+            row.map(|row| {
+                let id: Uuid = row.try_get("community_id")?;
+                Ok(CommunityId::from_uuid(id))
+            })
+            .transpose()
         })
-        .transpose()
+        .await
     }
 
     /// Batched version of [`Self::community_of_channel`]: given a list of
@@ -485,27 +597,37 @@ impl Db {
         &self,
         channel_ids: &[Uuid],
     ) -> Result<std::collections::HashMap<Uuid, CommunityId>> {
-        if channel_ids.is_empty() {
-            return Ok(std::collections::HashMap::new());
-        }
-        let rows = sqlx::query(
-            r#"
+        crate::observability::observe(crate::observability::Operation::Community, async {
+            if channel_ids.is_empty() {
+                return Ok(std::collections::HashMap::new());
+            }
+            let rows = sqlx::query(
+                r#"
             SELECT id, community_id
             FROM channels
             WHERE id = ANY($1)
               AND deleted_at IS NULL
             "#,
-        )
-        .bind(channel_ids)
-        .fetch_all(&self.pool)
-        .await?;
+            )
+            .bind(channel_ids)
+            .fetch_all(
+                &mut *crate::observability::acquire(
+                    &self.pool,
+                    crate::observability::PoolRole::Writer,
+                    crate::observability::Operation::Community,
+                )
+                .await?,
+            )
+            .await?;
 
-        let mut out = std::collections::HashMap::with_capacity(rows.len());
-        for row in rows {
-            let ch: Uuid = row.try_get("id")?;
-            let cm: Uuid = row.try_get("community_id")?;
-            out.insert(ch, CommunityId::from_uuid(cm));
-        }
-        Ok(out)
+            let mut out = std::collections::HashMap::with_capacity(rows.len());
+            for row in rows {
+                let ch: Uuid = row.try_get("id")?;
+                let cm: Uuid = row.try_get("community_id")?;
+                out.insert(ch, CommunityId::from_uuid(cm));
+            }
+            Ok(out)
+        })
+        .await
     }
 }

@@ -245,7 +245,38 @@ mod tests {
         .unwrap();
         assert_eq!(limits, ("20ms".into(), "20ms".into()));
         db.migrate().await.unwrap();
+        sqlx::query("UPDATE _sqlx_migrations SET checksum = decode('00', 'hex') WHERE version = 1")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        assert!(
+            db.migrate().await.is_err(),
+            "checksum mismatch must fail closed"
+        );
+        let lock: String = sqlx::query_scalar("SHOW lock_timeout")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(lock, "20ms");
         assert!(db.ping().await);
         db.pool.close().await;
+    }
+    #[tokio::test]
+    #[ignore = "requires isolated PostgreSQL"]
+    async fn writer_policy_rejects_non_read_committed_isolation() {
+        let mut connection =
+            sqlx::PgConnection::connect(&std::env::var("BUZZ_TEST_DATABASE_URL").unwrap())
+                .await
+                .unwrap();
+        sqlx::query("SET default_transaction_isolation = 'repeatable read'")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        let error = SessionPolicy::from(&DbConfig::default())
+            .apply(&mut connection)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, sqlx::Error::Protocol(_)));
+        connection.close().await.unwrap();
     }
 }

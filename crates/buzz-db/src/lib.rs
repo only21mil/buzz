@@ -42,6 +42,9 @@ pub mod feed;
 pub mod git_repo;
 /// Embedded database migrations.
 pub mod migration;
+/// Bounded database pressure and readiness observations.
+pub mod observability;
+pub use observability::DbReadinessOutcome;
 /// Community moderation: reports, bans/timeouts, audit actions.
 pub mod moderation;
 /// Monthly table partition management.
@@ -603,6 +606,7 @@ impl Db {
     /// `buzz.created_at_floor` GUC — this is what makes the replica fence
     /// proof hold for every insert path that goes through this pool.
     pub async fn new(config: &DbConfig) -> Result<Self> {
+        observability::describe_metrics();
         let pool = Self::connect_writer_pool(config).await?;
         let read_max_connections = config
             .read_max_connections
@@ -692,7 +696,13 @@ impl Db {
         };
         let aurora_identity = self.reader_aurora_identity.clone();
         tokio::spawn(async move {
-            match read_pool.acquire().await {
+            match observability::acquire(
+                &read_pool,
+                observability::PoolRole::Reader,
+                observability::Operation::History,
+            )
+            .await
+            {
                 Ok(mut conn) => {
                     tracing::info!("read replica reachable at boot");
                     match replica_fence::reader_supports_aurora_identity(&mut conn).await {
@@ -834,7 +844,13 @@ impl Db {
         // `read_pool` separately would spend a second budget whenever the
         // capability is uncached — i.e. after a failed boot ping, which is
         // precisely the reader-unavailable case the bound must hold for.
-        let conn = match read_pool.acquire().await {
+        let conn = match observability::acquire(
+            read_pool,
+            observability::PoolRole::Reader,
+            observability::Operation::History,
+        )
+        .await
+        {
             Ok(conn) => conn,
             Err(sqlx::Error::PoolTimedOut) => {
                 tracing::warn!("reader pool acquire timed out; routing to writer");
@@ -998,7 +1014,12 @@ impl Db {
         &self,
         lock_key: i64,
     ) -> Result<Option<UsageMetricsLeader>> {
-        let mut connection = self.pool.acquire().await?;
+        let mut connection = observability::acquire(
+            &self.pool,
+            observability::PoolRole::Writer,
+            observability::Operation::Maintenance,
+        )
+        .await?;
         let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
             .bind(lock_key)
             .fetch_one(&mut *connection)
@@ -1126,7 +1147,9 @@ impl Db {
     /// Returns a `'static` transaction because `PgPool` is `Arc`-backed internally.
     /// The transaction holds an owned pool handle, not a borrow.
     pub async fn begin_transaction(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
-        self.pool.begin().await.map_err(Into::into)
+        observability::begin(&self.pool, observability::Operation::Other)
+            .await
+            .map_err(Into::into)
     }
 
     /// Inserts an event. Returns `(StoredEvent, was_inserted)` — `false` on duplicate.
@@ -1614,7 +1637,10 @@ impl Db {
         event: &nostr::Event,
         envelope: &buzz_core::ci::ValidatedCiEnvelope,
     ) -> Result<ci::StoreCiEventOutcome> {
-        ci::store_ci_event(&self.pool, community_id, channel_id, event, envelope).await
+        observability::observe(observability::Operation::Ci, async {
+            ci::store_ci_event(&self.pool, community_id, channel_id, event, envelope).await
+        })
+        .await
     }
 
     /// Resolve a CI run's channel only for a current channel member.
@@ -1624,7 +1650,10 @@ impl Db {
         run_id: Uuid,
         pubkey: &[u8],
     ) -> Result<Option<Uuid>> {
-        ci::get_ci_run_member_channel(&self.pool, community_id, run_id, pubkey).await
+        observability::observe(observability::Operation::Ci, async {
+            ci::get_ci_run_member_channel(&self.pool, community_id, run_id, pubkey).await
+        })
+        .await
     }
 
     /// Load the immutable initial request for a member-authorized CI run.
@@ -1634,7 +1663,10 @@ impl Db {
         channel_id: Uuid,
         run_id: Uuid,
     ) -> Result<Option<ci::CiStoredEvent>> {
-        ci::get_ci_run_request(&self.pool, community_id, channel_id, run_id).await
+        observability::observe(observability::Operation::Ci, async {
+            ci::get_ci_run_request(&self.pool, community_id, channel_id, run_id).await
+        })
+        .await
     }
 
     /// List accepted CI events after an exclusive durable per-run cursor.
@@ -1646,14 +1678,17 @@ impl Db {
         after_cursor: i64,
         limit: u32,
     ) -> Result<Vec<ci::CiStoredEvent>> {
-        ci::list_ci_run_events(
-            &self.pool,
-            community_id,
-            channel_id,
-            run_id,
-            after_cursor,
-            limit,
-        )
+        observability::observe(observability::Operation::Ci, async {
+            ci::list_ci_run_events(
+                &self.pool,
+                community_id,
+                channel_id,
+                run_id,
+                after_cursor,
+                limit,
+            )
+            .await
+        })
         .await
     }
 
@@ -1672,16 +1707,19 @@ impl Db {
         valid_until: Option<DateTime<Utc>>,
         granted_by: &str,
     ) -> Result<()> {
-        ci_grants::upsert_ci_grant(
-            &self.pool,
-            community_id,
-            channel_id,
-            target_repo_a,
-            signer_pubkey,
-            valid_from,
-            valid_until,
-            granted_by,
-        )
+        observability::observe(observability::Operation::Ci, async {
+            ci_grants::upsert_ci_grant(
+                &self.pool,
+                community_id,
+                channel_id,
+                target_repo_a,
+                signer_pubkey,
+                valid_from,
+                valid_until,
+                granted_by,
+            )
+            .await
+        })
         .await
     }
 
@@ -1697,8 +1735,17 @@ impl Db {
         target_repo_a: &str,
         now: DateTime<Utc>,
     ) -> Result<Vec<String>> {
-        ci_grants::get_active_ci_signers(&self.pool, community_id, channel_id, target_repo_a, now)
+        observability::observe(observability::Operation::Ci, async {
+            ci_grants::get_active_ci_signers(
+                &self.pool,
+                community_id,
+                channel_id,
+                target_repo_a,
+                now,
+            )
             .await
+        })
+        .await
     }
 
     /// Atomically insert a kind:7 reaction event and its reaction row.
@@ -3018,16 +3065,19 @@ impl Db {
         definition_hash: &[u8],
         enabled: bool,
     ) -> Result<Uuid> {
-        workflow::create_workflow(
-            &self.pool,
-            community_id,
-            channel_id,
-            owner_pubkey,
-            name,
-            definition_json,
-            definition_hash,
-            enabled,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::create_workflow(
+                &self.pool,
+                community_id,
+                channel_id,
+                owner_pubkey,
+                name,
+                definition_json,
+                definition_hash,
+                enabled,
+            )
+            .await
+        })
         .await
     }
 
@@ -3044,17 +3094,20 @@ impl Db {
         definition_hash: &[u8],
         enabled: bool,
     ) -> Result<()> {
-        workflow::upsert_workflow(
-            &self.pool,
-            community_id,
-            id,
-            channel_id,
-            owner_pubkey,
-            name,
-            definition_json,
-            definition_hash,
-            enabled,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::upsert_workflow(
+                &self.pool,
+                community_id,
+                id,
+                channel_id,
+                owner_pubkey,
+                name,
+                definition_json,
+                definition_hash,
+                enabled,
+            )
+            .await
+        })
         .await
     }
 
@@ -3064,7 +3117,10 @@ impl Db {
         community_id: CommunityId,
         id: Uuid,
     ) -> Result<workflow::WorkflowRecord> {
-        workflow::get_workflow(&self.pool, community_id, id).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::get_workflow(&self.pool, community_id, id).await
+        })
+        .await
     }
 
     /// List workflows for a channel.
@@ -3075,7 +3131,11 @@ impl Db {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<Vec<workflow::WorkflowRecord>> {
-        workflow::list_channel_workflows(&self.pool, community_id, channel_id, limit, offset).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::list_channel_workflows(&self.pool, community_id, channel_id, limit, offset)
+                .await
+        })
+        .await
     }
 
     /// List active, enabled workflows for a channel.
@@ -3084,12 +3144,18 @@ impl Db {
         community_id: CommunityId,
         channel_id: Uuid,
     ) -> Result<Vec<workflow::WorkflowRecord>> {
-        workflow::list_enabled_channel_workflows(&self.pool, community_id, channel_id).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::list_enabled_channel_workflows(&self.pool, community_id, channel_id).await
+        })
+        .await
     }
 
     /// List all active, enabled schedule-triggered workflows.
     pub async fn list_all_enabled_workflows(&self) -> Result<Vec<workflow::WorkflowRecord>> {
-        workflow::list_all_enabled_workflows(&self.pool).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::list_all_enabled_workflows(&self.pool).await
+        })
+        .await
     }
 
     /// Claim a scheduled workflow fire for an authoritative schedule instant.
@@ -3106,12 +3172,15 @@ impl Db {
         workflow_id: Uuid,
         scheduled_for: chrono::DateTime<chrono::Utc>,
     ) -> Result<Option<workflow::ScheduledWorkflowFireClaim>> {
-        workflow::claim_scheduled_workflow_fire(
-            &self.pool,
-            community_id,
-            workflow_id,
-            scheduled_for,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::claim_scheduled_workflow_fire(
+                &self.pool,
+                community_id,
+                workflow_id,
+                scheduled_for,
+            )
+            .await
+        })
         .await
     }
 
@@ -3121,7 +3190,10 @@ impl Db {
         community_id: CommunityId,
         workflow_id: Uuid,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
-        workflow::latest_scheduled_workflow_fire(&self.pool, community_id, workflow_id).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::latest_scheduled_workflow_fire(&self.pool, community_id, workflow_id).await
+        })
+        .await
     }
 
     /// Attach the workflow run id created from a won scheduled-fire claim.
@@ -3132,13 +3204,16 @@ impl Db {
         scheduled_for: chrono::DateTime<chrono::Utc>,
         workflow_run_id: Uuid,
     ) -> Result<bool> {
-        workflow::attach_scheduled_workflow_run(
-            &self.pool,
-            community_id,
-            workflow_id,
-            scheduled_for,
-            workflow_run_id,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::attach_scheduled_workflow_run(
+                &self.pool,
+                community_id,
+                workflow_id,
+                scheduled_for,
+                workflow_run_id,
+            )
+            .await
+        })
         .await
     }
 
@@ -3147,7 +3222,10 @@ impl Db {
         &self,
         older_than: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64> {
-        workflow::prune_scheduled_workflow_fires_before(&self.pool, older_than).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::prune_scheduled_workflow_fires_before(&self.pool, older_than).await
+        })
+        .await
     }
 
     /// Update a workflow's name, definition, and hash.
@@ -3159,14 +3237,17 @@ impl Db {
         definition_json: &str,
         definition_hash: &[u8],
     ) -> Result<()> {
-        workflow::update_workflow(
-            &self.pool,
-            community_id,
-            id,
-            name,
-            definition_json,
-            definition_hash,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::update_workflow(
+                &self.pool,
+                community_id,
+                id,
+                name,
+                definition_json,
+                definition_hash,
+            )
+            .await
+        })
         .await
     }
 
@@ -3177,7 +3258,10 @@ impl Db {
         id: Uuid,
         status: workflow::WorkflowStatus,
     ) -> Result<()> {
-        workflow::update_workflow_status(&self.pool, community_id, id, status).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::update_workflow_status(&self.pool, community_id, id, status).await
+        })
+        .await
     }
 
     /// Enable or disable a workflow.
@@ -3187,7 +3271,10 @@ impl Db {
         id: Uuid,
         enabled: bool,
     ) -> Result<()> {
-        workflow::set_workflow_enabled(&self.pool, community_id, id, enabled).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::set_workflow_enabled(&self.pool, community_id, id, enabled).await
+        })
+        .await
     }
 
     /// Disable all of an owner's workflows in a channel (SEC-006, on
@@ -3198,18 +3285,24 @@ impl Db {
         channel_id: Uuid,
         owner_pubkey: &[u8],
     ) -> Result<u64> {
-        workflow::disable_workflows_for_owner_in_channel(
-            &self.pool,
-            community_id,
-            channel_id,
-            owner_pubkey,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::disable_workflows_for_owner_in_channel(
+                &self.pool,
+                community_id,
+                channel_id,
+                owner_pubkey,
+            )
+            .await
+        })
         .await
     }
 
     /// Delete a workflow and all its runs/approvals.
     pub async fn delete_workflow(&self, community_id: CommunityId, id: Uuid) -> Result<()> {
-        workflow::delete_workflow(&self.pool, community_id, id).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::delete_workflow(&self.pool, community_id, id).await
+        })
+        .await
     }
 
     /// Delete a workflow only when it belongs to the provided owner.
@@ -3220,7 +3313,10 @@ impl Db {
         id: Uuid,
         owner_pubkey: &[u8],
     ) -> Result<Option<Uuid>> {
-        workflow::delete_workflow_for_owner(&self.pool, community_id, id, owner_pubkey).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::delete_workflow_for_owner(&self.pool, community_id, id, owner_pubkey).await
+        })
+        .await
     }
 
     /// Find a workflow by owner pubkey and name within a community. Used for
@@ -3231,7 +3327,10 @@ impl Db {
         owner_pubkey: &[u8],
         name: &str,
     ) -> Result<Option<workflow::WorkflowRecord>> {
-        workflow::find_by_owner_and_name(&self.pool, community_id, owner_pubkey, name).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::find_by_owner_and_name(&self.pool, community_id, owner_pubkey, name).await
+        })
+        .await
     }
 
     /// Create a new workflow run.
@@ -3244,15 +3343,18 @@ impl Db {
         definition_snapshot: &serde_json::Value,
         definition_hash: &[u8],
     ) -> Result<Uuid> {
-        workflow::create_workflow_run(
-            &self.pool,
-            community_id,
-            workflow_id,
-            trigger_event_id,
-            trigger_context,
-            definition_snapshot,
-            definition_hash,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::create_workflow_run(
+                &self.pool,
+                community_id,
+                workflow_id,
+                trigger_event_id,
+                trigger_context,
+                definition_snapshot,
+                definition_hash,
+            )
+            .await
+        })
         .await
     }
 
@@ -3262,7 +3364,10 @@ impl Db {
         community_id: CommunityId,
         id: Uuid,
     ) -> Result<workflow::WorkflowRunRecord> {
-        workflow::get_workflow_run(&self.pool, community_id, id).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::get_workflow_run(&self.pool, community_id, id).await
+        })
+        .await
     }
 
     /// List runs for a workflow.
@@ -3272,7 +3377,10 @@ impl Db {
         workflow_id: Uuid,
         limit: i64,
     ) -> Result<Vec<workflow::WorkflowRunRecord>> {
-        workflow::list_workflow_runs(&self.pool, community_id, workflow_id, limit).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::list_workflow_runs(&self.pool, community_id, workflow_id, limit).await
+        })
+        .await
     }
 
     /// Read a stable descending page of workflow runs.
@@ -3284,14 +3392,17 @@ impl Db {
         before_id: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<workflow::WorkflowRunRecord>> {
-        workflow::list_workflow_runs_page(
-            &self.pool,
-            community_id,
-            workflow_id,
-            before,
-            before_id,
-            limit,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::list_workflow_runs_page(
+                &self.pool,
+                community_id,
+                workflow_id,
+                before,
+                before_id,
+                limit,
+            )
+            .await
+        })
         .await
     }
 
@@ -3305,15 +3416,18 @@ impl Db {
         trace: &serde_json::Value,
         failure: Option<workflow::WorkflowRunFailure<'_>>,
     ) -> Result<()> {
-        workflow::update_workflow_run_with_failure(
-            &self.pool,
-            community_id,
-            id,
-            status,
-            current_step,
-            trace,
-            failure,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::update_workflow_run_with_failure(
+                &self.pool,
+                community_id,
+                id,
+                status,
+                current_step,
+                trace,
+                failure,
+            )
+            .await
+        })
         .await
     }
 
@@ -3327,15 +3441,18 @@ impl Db {
         trace: &serde_json::Value,
         error: Option<&str>,
     ) -> Result<()> {
-        workflow::update_workflow_run(
-            &self.pool,
-            community_id,
-            id,
-            status,
-            current_step,
-            trace,
-            error,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::update_workflow_run(
+                &self.pool,
+                community_id,
+                id,
+                status,
+                current_step,
+                trace,
+                error,
+            )
+            .await
+        })
         .await
     }
 
@@ -3352,17 +3469,20 @@ impl Db {
         effect_spec: &serde_json::Value,
         effect_payload: &serde_json::Value,
     ) -> Result<WorkflowEffectClaimOutcome> {
-        workflow_effect::claim_workflow_effect_with_payload(
-            &self.pool,
-            community_id,
-            run_id,
-            expected_generation,
-            step_id,
-            effect_index,
-            effect_kind,
-            effect_spec,
-            effect_payload,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_effect::claim_workflow_effect_with_payload(
+                &self.pool,
+                community_id,
+                run_id,
+                expected_generation,
+                step_id,
+                effect_index,
+                effect_kind,
+                effect_spec,
+                effect_payload,
+            )
+            .await
+        })
         .await
     }
 
@@ -3378,16 +3498,19 @@ impl Db {
         effect_kind: &str,
         effect_spec: &serde_json::Value,
     ) -> Result<Option<WorkflowEffectClaimOutcome>> {
-        workflow_effect::load_workflow_effect_claim(
-            &self.pool,
-            community_id,
-            run_id,
-            expected_generation,
-            step_id,
-            effect_index,
-            effect_kind,
-            effect_spec,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_effect::load_workflow_effect_claim(
+                &self.pool,
+                community_id,
+                run_id,
+                expected_generation,
+                step_id,
+                effect_index,
+                effect_kind,
+                effect_spec,
+            )
+            .await
+        })
         .await
     }
 
@@ -3402,15 +3525,18 @@ impl Db {
         effect_index: i16,
         output: &serde_json::Value,
     ) -> Result<WorkflowEffectMarkOutcome> {
-        workflow_effect::mark_workflow_effect_fired(
-            &self.pool,
-            community_id,
-            run_id,
-            expected_generation,
-            step_id,
-            effect_index,
-            output,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_effect::mark_workflow_effect_fired(
+                &self.pool,
+                community_id,
+                run_id,
+                expected_generation,
+                step_id,
+                effect_index,
+                output,
+            )
+            .await
+        })
         .await
     }
 
@@ -3424,14 +3550,17 @@ impl Db {
         expected_generation: i64,
         next_status: workflow::RunStatus,
     ) -> Result<WorkflowRunTransitionOutcome> {
-        workflow_run_transition::transition_workflow_run(
-            &self.pool,
-            community_id,
-            id,
-            expected_status,
-            expected_generation,
-            next_status,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_run_transition::transition_workflow_run(
+                &self.pool,
+                community_id,
+                id,
+                expected_status,
+                expected_generation,
+                next_status,
+            )
+            .await
+        })
         .await
     }
 
@@ -3442,11 +3571,14 @@ impl Db {
         resume_pending_age_secs: i64,
         limit: i64,
     ) -> Result<Vec<WorkflowResumeCandidate>> {
-        workflow_run_transition::list_recoverable_workflow_resumes(
-            &self.pool,
-            resume_pending_age_secs,
-            limit,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_run_transition::list_recoverable_workflow_resumes(
+                &self.pool,
+                resume_pending_age_secs,
+                limit,
+            )
+            .await
+        })
         .await
     }
 
@@ -3459,14 +3591,17 @@ impl Db {
         expected_generation: i64,
         lease_secs: i64,
     ) -> Result<WorkflowRunTransitionOutcome> {
-        workflow_run_transition::claim_workflow_resume(
-            &self.pool,
-            community_id,
-            id,
-            expected_status,
-            expected_generation,
-            lease_secs,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_run_transition::claim_workflow_resume(
+                &self.pool,
+                community_id,
+                id,
+                expected_status,
+                expected_generation,
+                lease_secs,
+            )
+            .await
+        })
         .await
     }
 
@@ -3478,13 +3613,16 @@ impl Db {
         expected_generation: i64,
         lease_secs: i64,
     ) -> Result<bool> {
-        workflow_run_transition::renew_workflow_resume_lease(
-            &self.pool,
-            community_id,
-            id,
-            expected_generation,
-            lease_secs,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_run_transition::renew_workflow_resume_lease(
+                &self.pool,
+                community_id,
+                id,
+                expected_generation,
+                lease_secs,
+            )
+            .await
+        })
         .await
     }
 
@@ -3497,14 +3635,17 @@ impl Db {
         current_step: i32,
         trace: &serde_json::Value,
     ) -> Result<WorkflowRunTransitionOutcome> {
-        workflow_run_transition::complete_running_workflow_run(
-            &self.pool,
-            community_id,
-            id,
-            expected_generation,
-            current_step,
-            trace,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_run_transition::complete_running_workflow_run(
+                &self.pool,
+                community_id,
+                id,
+                expected_generation,
+                current_step,
+                trace,
+            )
+            .await
+        })
         .await
     }
 
@@ -3518,15 +3659,18 @@ impl Db {
         trace: &serde_json::Value,
         failure: workflow::WorkflowRunFailure<'_>,
     ) -> Result<WorkflowRunTransitionOutcome> {
-        workflow_run_transition::fail_running_workflow_run_with_failure(
-            &self.pool,
-            community_id,
-            id,
-            expected_generation,
-            current_step,
-            trace,
-            failure,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_run_transition::fail_running_workflow_run_with_failure(
+                &self.pool,
+                community_id,
+                id,
+                expected_generation,
+                current_step,
+                trace,
+                failure,
+            )
+            .await
+        })
         .await
     }
 
@@ -3540,15 +3684,18 @@ impl Db {
         trace: &serde_json::Value,
         error: &str,
     ) -> Result<WorkflowRunTransitionOutcome> {
-        workflow_run_transition::fail_running_workflow_run(
-            &self.pool,
-            community_id,
-            id,
-            expected_generation,
-            current_step,
-            trace,
-            error,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_run_transition::fail_running_workflow_run(
+                &self.pool,
+                community_id,
+                id,
+                expected_generation,
+                current_step,
+                trace,
+                error,
+            )
+            .await
+        })
         .await
     }
 
@@ -3559,7 +3706,10 @@ impl Db {
         workflow_id: Uuid,
         key: &str,
     ) -> Result<Option<WorkflowStateEntry>> {
-        workflow_state::read_workflow_state(&self.pool, community_id, workflow_id, key).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_state::read_workflow_state(&self.pool, community_id, workflow_id, key).await
+        })
+        .await
     }
 
     /// Read a live workflow-state value after resolving its workflow from a run.
@@ -3569,12 +3719,18 @@ impl Db {
         run_id: Uuid,
         key: &str,
     ) -> Result<Option<WorkflowStateEntry>> {
-        workflow_state::read_workflow_state_for_run(&self.pool, community_id, run_id, key).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_state::read_workflow_state_for_run(&self.pool, community_id, run_id, key).await
+        })
+        .await
     }
 
     /// Delete at most `limit` expired workflow-state rows.
     pub async fn purge_expired_workflow_state(&self, limit: u32) -> Result<u64> {
-        workflow_state::purge_expired_workflow_state(&self.pool, limit).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_state::purge_expired_workflow_state(&self.pool, limit).await
+        })
+        .await
     }
 
     /// Write state for the workflow that owns a run.
@@ -3589,16 +3745,19 @@ impl Db {
         expires_in_secs: i64,
         expected_revision: Option<&str>,
     ) -> Result<WorkflowStateWriteOutcome> {
-        workflow_state::write_workflow_state(
-            &self.pool,
-            community_id,
-            run_id,
-            step_id,
-            key,
-            value,
-            expires_in_secs,
-            expected_revision,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_state::write_workflow_state(
+                &self.pool,
+                community_id,
+                run_id,
+                step_id,
+                key,
+                value,
+                expires_in_secs,
+                expected_revision,
+            )
+            .await
+        })
         .await
     }
 
@@ -3607,7 +3766,10 @@ impl Db {
         &self,
         params: workflow_approval::CreateWorkflowApprovalGateParams<'_>,
     ) -> Result<WorkflowApprovalGateCreationOutcome> {
-        workflow_approval::create_workflow_approval_gate(&self.pool, params).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_approval::create_workflow_approval_gate(&self.pool, params).await
+        })
+        .await
     }
 
     /// Locate a tenant-bound approval gate without treating its UUID as authority.
@@ -3616,8 +3778,11 @@ impl Db {
         community_id: CommunityId,
         approval_id: Uuid,
     ) -> Result<Option<WorkflowApprovalGateRecord>> {
-        workflow_approval::lookup_workflow_approval_gate(&self.pool, community_id, approval_id)
-            .await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_approval::lookup_workflow_approval_gate(&self.pool, community_id, approval_id)
+                .await
+        })
+        .await
     }
 
     /// Atomically apply or exactly reuse a signed workflow approval decision.
@@ -3625,12 +3790,18 @@ impl Db {
         &self,
         params: workflow_approval::DecideWorkflowApprovalGateParams<'_>,
     ) -> Result<WorkflowApprovalDecisionOutcome> {
-        workflow_approval::decide_workflow_approval_gate(&self.pool, params).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_approval::decide_workflow_approval_gate(&self.pool, params).await
+        })
+        .await
     }
 
     /// Create an approval request.
     pub async fn create_approval(&self, params: workflow::CreateApprovalParams<'_>) -> Result<()> {
-        workflow::create_approval(&self.pool, params).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::create_approval(&self.pool, params).await
+        })
+        .await
     }
 
     /// Fetch an approval by raw token.
@@ -3639,7 +3810,10 @@ impl Db {
         community_id: CommunityId,
         token: &str,
     ) -> Result<workflow::ApprovalRecord> {
-        workflow::get_approval(&self.pool, community_id, token).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::get_approval(&self.pool, community_id, token).await
+        })
+        .await
     }
 
     /// Fetch an approval by its already-hashed token (no re-hashing).
@@ -3648,7 +3822,10 @@ impl Db {
         community_id: CommunityId,
         token_hash: &[u8],
     ) -> Result<workflow::ApprovalRecord> {
-        workflow::get_approval_by_stored_hash(&self.pool, community_id, token_hash).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::get_approval_by_stored_hash(&self.pool, community_id, token_hash).await
+        })
+        .await
     }
 
     /// Read legacy and durable approval evidence without decision credentials.
@@ -3658,7 +3835,11 @@ impl Db {
         workflow_id: Uuid,
         run_id: Uuid,
     ) -> Result<Vec<workflow::WorkflowApprovalHistoryRecord>> {
-        workflow::get_workflow_approval_history(&self.pool, community_id, workflow_id, run_id).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::get_workflow_approval_history(&self.pool, community_id, workflow_id, run_id)
+                .await
+        })
+        .await
     }
 
     /// Fetch all approvals for a workflow run.
@@ -3668,7 +3849,10 @@ impl Db {
         workflow_id: uuid::Uuid,
         run_id: uuid::Uuid,
     ) -> Result<Vec<workflow::ApprovalRecord>> {
-        workflow::get_run_approvals(&self.pool, community_id, workflow_id, run_id).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::get_run_approvals(&self.pool, community_id, workflow_id, run_id).await
+        })
+        .await
     }
 
     /// Update an approval's status.
@@ -3680,14 +3864,17 @@ impl Db {
         approver_pubkey: Option<&[u8]>,
         note: Option<&str>,
     ) -> Result<bool> {
-        workflow::update_approval(
-            &self.pool,
-            community_id,
-            token,
-            status,
-            approver_pubkey,
-            note,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::update_approval(
+                &self.pool,
+                community_id,
+                token,
+                status,
+                approver_pubkey,
+                note,
+            )
+            .await
+        })
         .await
     }
 
@@ -3700,14 +3887,17 @@ impl Db {
         approver_pubkey: Option<&[u8]>,
         note: Option<&str>,
     ) -> Result<bool> {
-        workflow::update_approval_by_stored_hash(
-            &self.pool,
-            community_id,
-            token_hash,
-            status,
-            approver_pubkey,
-            note,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::update_approval_by_stored_hash(
+                &self.pool,
+                community_id,
+                token_hash,
+                status,
+                approver_pubkey,
+                note,
+            )
+            .await
+        })
         .await
     }
 

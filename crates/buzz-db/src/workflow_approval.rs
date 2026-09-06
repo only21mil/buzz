@@ -493,7 +493,8 @@ pub async fn create_workflow_approval_gate(
     let dedupe_key = request_dedupe_key(params.run_id, params.step_index);
     let proposed_approval_id = Uuid::new_v4();
 
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::observability::begin(pool, crate::observability::Operation::Workflow).await?;
     acquire_workflow_approval_channel_lock(&mut tx, params.community_id, params.channel_id).await?;
 
     let run = sqlx::query(
@@ -726,7 +727,14 @@ pub async fn lookup_workflow_approval_gate(
     )
     .bind(community_id.as_uuid())
     .bind(approval_id)
-    .fetch_optional(pool)
+    .fetch_optional(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Workflow,
+        )
+        .await?,
+    )
     .await?;
     row.map(row_to_gate).transpose()
 }
@@ -748,7 +756,8 @@ pub async fn decide_workflow_approval_gate(
         return Ok(WorkflowApprovalDecisionOutcome::Conflict);
     };
 
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::observability::begin(pool, crate::observability::Operation::Workflow).await?;
     acquire_workflow_approval_channel_lock(&mut tx, params.community_id, locator.channel_id)
         .await?;
 

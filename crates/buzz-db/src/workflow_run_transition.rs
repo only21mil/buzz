@@ -93,7 +93,14 @@ pub async fn transition_workflow_run(
     .bind(id)
     .bind(expected_status.to_string())
     .bind(expected_generation)
-    .fetch_optional(pool)
+    .fetch_optional(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Workflow,
+        )
+        .await?,
+    )
     .await?;
 
     match row {
@@ -144,7 +151,14 @@ pub async fn list_recoverable_workflow_resumes(
     )
     .bind(resume_pending_age_secs)
     .bind(limit)
-    .fetch_all(pool)
+    .fetch_all(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Workflow,
+        )
+        .await?,
+    )
     .await?;
 
     rows.into_iter()
@@ -201,7 +215,14 @@ pub async fn claim_workflow_resume(
     .bind(id)
     .bind(expected_status.to_string())
     .bind(expected_generation)
-    .fetch_optional(pool)
+    .fetch_optional(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Workflow,
+        )
+        .await?,
+    )
     .await?;
 
     match row {
@@ -236,7 +257,14 @@ pub async fn renew_workflow_resume_lease(
     .bind(community_id.as_uuid())
     .bind(id)
     .bind(expected_generation)
-    .execute(pool)
+    .execute(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Workflow,
+        )
+        .await?,
+    )
     .await?
     .rows_affected();
     Ok(affected == 1)
@@ -274,7 +302,14 @@ pub async fn complete_running_workflow_run(
     .bind(community_id.as_uuid())
     .bind(id)
     .bind(expected_generation)
-    .fetch_optional(pool)
+    .fetch_optional(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Workflow,
+        )
+        .await?,
+    )
     .await?;
 
     match row {
@@ -351,7 +386,14 @@ pub async fn fail_running_workflow_run_with_failure(
     .bind(id)
     .bind(expected_generation)
     .bind(failure.code)
-    .fetch_optional(pool)
+    .fetch_optional(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Workflow,
+        )
+        .await?,
+    )
     .await?;
 
     match row {

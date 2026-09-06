@@ -89,7 +89,8 @@ pub async fn add_member(
         )));
     }
 
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::observability::begin(pool, crate::observability::Operation::Membership).await?;
 
     // First statement: serialize the whole role-check / owner-count / upsert
     // sequence against concurrent membership writes on this channel.
@@ -272,7 +273,8 @@ pub async fn remove_member(
         crate::user::is_agent_owner(pool, community_id, pubkey, actor_pubkey).await?
     };
 
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::observability::begin(pool, crate::observability::Operation::Membership).await?;
 
     // First statement: serialize the actor-role check, the last-owner count and
     // the UPDATE against concurrent membership writes on this channel (same key
@@ -351,7 +353,7 @@ pub async fn is_member(
     .bind(community_id.as_uuid())
     .bind(channel_id)
     .bind(pubkey)
-    .fetch_one(pool)
+    .fetch_one(&mut *crate::observability::acquire(pool, crate::observability::PoolRole::Writer, crate::observability::Operation::Membership).await?)
     .await?;
     let cnt: i64 = row.try_get("cnt")?;
     Ok(cnt > 0)
@@ -377,7 +379,7 @@ pub async fn membership_pairs(
     .bind(community_id.as_uuid())
     .bind(channel_ids)
     .bind(pubkeys)
-    .fetch_all(pool)
+    .fetch_all(&mut *crate::observability::acquire(pool, crate::observability::PoolRole::Writer, crate::observability::Operation::Membership).await?)
     .await?;
     rows.into_iter()
         .map(|row| Ok((row.try_get("channel_id")?, row.try_get("pubkey")?)))
@@ -404,7 +406,7 @@ pub async fn get_members(
     )
     .bind(community_id.as_uuid())
     .bind(channel_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *crate::observability::acquire(pool, crate::observability::PoolRole::Writer, crate::observability::Operation::Membership).await?)
     .await?;
     rows.into_iter().map(row_to_member_record).collect()
 }
@@ -435,7 +437,7 @@ pub async fn get_members_bulk(
     )
     .bind(community_id.as_uuid())
     .bind(channel_ids)
-    .fetch_all(pool)
+    .fetch_all(&mut *crate::observability::acquire(pool, crate::observability::PoolRole::Writer, crate::observability::Operation::Membership).await?)
     .await?;
     rows.into_iter().map(row_to_member_record).collect()
 }
@@ -463,7 +465,7 @@ pub async fn get_accessible_channel_ids(
     )
     .bind(community_id.as_uuid())
     .bind(pubkey)
-    .fetch_all(pool)
+    .fetch_all(&mut *crate::observability::acquire(pool, crate::observability::PoolRole::Writer, crate::observability::Operation::Membership).await?)
     .await?;
 
     rows.into_iter()
@@ -624,7 +626,16 @@ pub async fn get_accessible_channels(
         query
     };
 
-    let rows = query.fetch_all(pool).await?;
+    let rows = query
+        .fetch_all(
+            &mut *crate::observability::acquire(
+                pool,
+                crate::observability::PoolRole::Writer,
+                crate::observability::Operation::Membership,
+            )
+            .await?,
+        )
+        .await?;
     rows.into_iter()
         .map(|row| {
             let is_member: bool = row.try_get("is_member").unwrap_or(false);
@@ -656,7 +667,7 @@ pub async fn get_bot_members(
         "#,
     )
     .bind(community_id.as_uuid())
-    .fetch_all(pool)
+    .fetch_all(&mut *crate::observability::acquire(pool, crate::observability::PoolRole::Writer, crate::observability::Operation::Membership).await?)
     .await?;
 
     let mut out = Vec::with_capacity(rows.len());
@@ -690,7 +701,14 @@ pub async fn get_agent_pubkeys(pool: &PgPool, community_id: CommunityId) -> Resu
         "#,
     )
     .bind(community_id.as_uuid())
-    .fetch_all(pool)
+    .fetch_all(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Membership,
+        )
+        .await?,
+    )
     .await
     .map_err(Into::into)
 }
@@ -724,7 +742,16 @@ pub async fn get_users_bulk(
         q = q.bind(pk);
     }
 
-    let rows = q.fetch_all(pool).await?;
+    let rows = q
+        .fetch_all(
+            &mut *crate::observability::acquire(
+                pool,
+                crate::observability::PoolRole::Writer,
+                crate::observability::Operation::Membership,
+            )
+            .await?,
+        )
+        .await?;
 
     let mut out = Vec::with_capacity(rows.len());
     for row in rows {
@@ -762,7 +789,7 @@ pub async fn get_member_count(
     )
     .bind(community_id.as_uuid())
     .bind(channel_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *crate::observability::acquire(pool, crate::observability::PoolRole::Writer, crate::observability::Operation::Membership).await?)
     .await?;
     Ok(row.try_get("cnt")?)
 }
@@ -792,7 +819,17 @@ pub async fn get_member_counts_bulk(
     }
     qb.push(") GROUP BY channel_id");
 
-    let rows = qb.build().fetch_all(pool).await?;
+    let rows = qb
+        .build()
+        .fetch_all(
+            &mut *crate::observability::acquire(
+                pool,
+                crate::observability::PoolRole::Writer,
+                crate::observability::Operation::Membership,
+            )
+            .await?,
+        )
+        .await?;
 
     let mut map = std::collections::HashMap::with_capacity(rows.len());
     for row in rows {
@@ -820,7 +857,7 @@ pub async fn get_member_role(
     .bind(community_id.as_uuid())
     .bind(channel_id)
     .bind(pubkey)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *crate::observability::acquire(pool, crate::observability::PoolRole::Writer, crate::observability::Operation::Membership).await?)
     .await?;
     Ok(row.map(|r| r.try_get("role")).transpose()?)
 }
@@ -835,14 +872,17 @@ impl Db {
         role: crate::channel_members::MemberRole,
         invited_by: Option<&[u8]>,
     ) -> Result<crate::channel_members::MemberRecord> {
-        crate::channel_members::add_member(
-            &self.pool,
-            community_id,
-            channel_id,
-            pubkey,
-            role,
-            invited_by,
-        )
+        crate::observability::observe(crate::observability::Operation::Membership, async {
+            crate::channel_members::add_member(
+                &self.pool,
+                community_id,
+                channel_id,
+                pubkey,
+                role,
+                invited_by,
+            )
+            .await
+        })
         .await
     }
 
@@ -854,13 +894,16 @@ impl Db {
         pubkey: &[u8],
         actor_pubkey: &[u8],
     ) -> Result<()> {
-        crate::channel_members::remove_member(
-            &self.pool,
-            community_id,
-            channel_id,
-            pubkey,
-            actor_pubkey,
-        )
+        crate::observability::observe(crate::observability::Operation::Membership, async {
+            crate::channel_members::remove_member(
+                &self.pool,
+                community_id,
+                channel_id,
+                pubkey,
+                actor_pubkey,
+            )
+            .await
+        })
         .await
     }
 
@@ -871,7 +914,10 @@ impl Db {
         channel_id: Uuid,
         pubkey: &[u8],
     ) -> Result<bool> {
-        crate::channel_members::is_member(&self.pool, community_id, channel_id, pubkey).await
+        crate::observability::observe(crate::observability::Operation::Membership, async {
+            crate::channel_members::is_member(&self.pool, community_id, channel_id, pubkey).await
+        })
+        .await
     }
 
     /// Return the active (channel, pubkey) membership pairs among the given
@@ -882,8 +928,11 @@ impl Db {
         channel_ids: &[Uuid],
         pubkeys: &[Vec<u8>],
     ) -> Result<Vec<(Uuid, Vec<u8>)>> {
-        crate::channel_members::membership_pairs(&self.pool, community_id, channel_ids, pubkeys)
-            .await
+        crate::observability::observe(crate::observability::Operation::Membership, async {
+            crate::channel_members::membership_pairs(&self.pool, community_id, channel_ids, pubkeys)
+                .await
+        })
+        .await
     }
 
     /// Returns all active members of a channel.
@@ -892,7 +941,10 @@ impl Db {
         community_id: CommunityId,
         channel_id: Uuid,
     ) -> Result<Vec<crate::channel_members::MemberRecord>> {
-        crate::channel_members::get_members(&self.pool, community_id, channel_id).await
+        crate::observability::observe(crate::observability::Operation::Membership, async {
+            crate::channel_members::get_members(&self.pool, community_id, channel_id).await
+        })
+        .await
     }
 
     /// Returns active members for multiple channels in a single query.
@@ -901,7 +953,10 @@ impl Db {
         community_id: CommunityId,
         channel_ids: &[Uuid],
     ) -> Result<Vec<crate::channel_members::MemberRecord>> {
-        crate::channel_members::get_members_bulk(&self.pool, community_id, channel_ids).await
+        crate::observability::observe(crate::observability::Operation::Membership, async {
+            crate::channel_members::get_members_bulk(&self.pool, community_id, channel_ids).await
+        })
+        .await
     }
 
     /// Get all channel IDs accessible to a pubkey.
@@ -910,7 +965,11 @@ impl Db {
         community_id: CommunityId,
         pubkey: &[u8],
     ) -> Result<Vec<Uuid>> {
-        crate::channel_members::get_accessible_channel_ids(&self.pool, community_id, pubkey).await
+        crate::observability::observe(crate::observability::Operation::Membership, async {
+            crate::channel_members::get_accessible_channel_ids(&self.pool, community_id, pubkey)
+                .await
+        })
+        .await
     }
 
     /// Returns full channel records for all channels a user can access.
@@ -921,13 +980,16 @@ impl Db {
         visibility_filter: Option<&str>,
         member_only: Option<bool>,
     ) -> Result<Vec<crate::channel_members::AccessibleChannel>> {
-        crate::channel_members::get_accessible_channels(
-            &self.pool,
-            community_id,
-            pubkey,
-            visibility_filter,
-            member_only,
-        )
+        crate::observability::observe(crate::observability::Operation::Membership, async {
+            crate::channel_members::get_accessible_channels(
+                &self.pool,
+                community_id,
+                pubkey,
+                visibility_filter,
+                member_only,
+            )
+            .await
+        })
         .await
     }
 
@@ -936,12 +998,18 @@ impl Db {
         &self,
         community_id: CommunityId,
     ) -> Result<Vec<crate::channel_members::BotMemberRecord>> {
-        crate::channel_members::get_bot_members(&self.pool, community_id).await
+        crate::observability::observe(crate::observability::Operation::Membership, async {
+            crate::channel_members::get_bot_members(&self.pool, community_id).await
+        })
+        .await
     }
 
     /// Returns the pubkeys of all agent identities in one community.
     pub async fn get_agent_pubkeys(&self, community_id: CommunityId) -> Result<Vec<Vec<u8>>> {
-        crate::channel_members::get_agent_pubkeys(&self.pool, community_id).await
+        crate::observability::observe(crate::observability::Operation::Membership, async {
+            crate::channel_members::get_agent_pubkeys(&self.pool, community_id).await
+        })
+        .await
     }
 
     /// Bulk-fetch user records by pubkey.
@@ -950,7 +1018,10 @@ impl Db {
         community_id: CommunityId,
         pubkeys: &[Vec<u8>],
     ) -> Result<Vec<crate::channel_members::UserRecord>> {
-        crate::channel_members::get_users_bulk(&self.pool, community_id, pubkeys).await
+        crate::observability::observe(crate::observability::Operation::Membership, async {
+            crate::channel_members::get_users_bulk(&self.pool, community_id, pubkeys).await
+        })
+        .await
     }
 
     /// Returns the count of active members in a channel.
@@ -959,7 +1030,10 @@ impl Db {
         community_id: CommunityId,
         channel_id: Uuid,
     ) -> Result<i64> {
-        crate::channel_members::get_member_count(&self.pool, community_id, channel_id).await
+        crate::observability::observe(crate::observability::Operation::Membership, async {
+            crate::channel_members::get_member_count(&self.pool, community_id, channel_id).await
+        })
+        .await
     }
 
     /// Bulk-fetch member counts for a set of channel IDs.
@@ -968,7 +1042,11 @@ impl Db {
         community_id: CommunityId,
         channel_ids: &[Uuid],
     ) -> Result<std::collections::HashMap<Uuid, i64>> {
-        crate::channel_members::get_member_counts_bulk(&self.pool, community_id, channel_ids).await
+        crate::observability::observe(crate::observability::Operation::Membership, async {
+            crate::channel_members::get_member_counts_bulk(&self.pool, community_id, channel_ids)
+                .await
+        })
+        .await
     }
 
     /// Get the active role of a pubkey in a channel.
@@ -978,6 +1056,10 @@ impl Db {
         channel_id: Uuid,
         pubkey: &[u8],
     ) -> Result<Option<String>> {
-        crate::channel_members::get_member_role(&self.pool, community_id, channel_id, pubkey).await
+        crate::observability::observe(crate::observability::Operation::Membership, async {
+            crate::channel_members::get_member_role(&self.pool, community_id, channel_id, pubkey)
+                .await
+        })
+        .await
     }
 }

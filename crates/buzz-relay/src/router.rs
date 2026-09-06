@@ -408,16 +408,13 @@ async fn readiness_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
             .into_response();
     }
 
-    let check = async {
-        let (pg_ok, redis_ok) = tokio::join!(state.db.ping(), async {
-            state.redis_pool.get().await.is_ok()
-        },);
-        (pg_ok, redis_ok)
-    };
-
-    let (pg_ok, redis_ok) = tokio::time::timeout(Duration::from_secs(2), check)
-        .await
-        .unwrap_or((false, false));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let (postgres, redis_ok) = tokio::join!(state.db.readiness_check(deadline), async {
+        tokio::time::timeout_at(deadline, state.redis_pool.get())
+            .await
+            .is_ok_and(|result| result.is_ok())
+    });
+    let pg_ok = postgres == buzz_db::DbReadinessOutcome::Success;
 
     if pg_ok && redis_ok {
         (StatusCode::OK, Json(json!({"status": "ready"}))).into_response()

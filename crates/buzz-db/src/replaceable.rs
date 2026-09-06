@@ -136,6 +136,7 @@ impl Db {
         event: &nostr::Event,
         channel_id: Option<Uuid>,
     ) -> Result<(StoredEvent, bool)> {
+        crate::observability::observe(crate::observability::Operation::Replacement, async {
         let kind_i32 = buzz_core::kind::event_kind_i32(event);
         let pubkey_bytes = event.pubkey.to_bytes();
         let created_at_secs = event.created_at.as_secs() as i64;
@@ -150,7 +151,7 @@ impl Db {
             channel_id.as_ref().map(|id| id.as_bytes().as_slice()),
         );
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::observability::begin(&self.pool, crate::observability::Operation::Replacement).await?;
 
         // Serialize all writers for the same (kind, pubkey, channel_id) tuple.
         // Advisory lock is transaction-scoped — released on commit/rollback.
@@ -254,6 +255,7 @@ impl Db {
             StoredEvent::with_received_at(event.clone(), received_at, channel_id, true),
             true,
         ))
+        }).await
     }
 
     /// Returns whether the relay-authored NIP-43 snapshot is absent or differs
@@ -267,40 +269,43 @@ impl Db {
         community_id: CommunityId,
         relay_pubkey: &nostr::PublicKey,
     ) -> Result<bool> {
-        let snapshot = self
-            .query_events(&crate::event::EventQuery {
-                kinds: Some(vec![buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST as i32]),
-                pubkey: Some(relay_pubkey.to_bytes().to_vec()),
-                global_only: true,
-                limit: Some(1),
-                ..crate::event::EventQuery::for_community(community_id)
-            })
-            .await?
-            .into_iter()
-            .next();
-        let members = self.list_relay_members(community_id).await?;
+        crate::observability::observe(crate::observability::Operation::Replacement, async {
+            let snapshot = self
+                .query_events(&crate::event::EventQuery {
+                    kinds: Some(vec![buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST as i32]),
+                    pubkey: Some(relay_pubkey.to_bytes().to_vec()),
+                    global_only: true,
+                    limit: Some(1),
+                    ..crate::event::EventQuery::for_community(community_id)
+                })
+                .await?
+                .into_iter()
+                .next();
+            let members = self.list_relay_members(community_id).await?;
 
-        let Some(snapshot) = snapshot else {
-            return Ok(true);
-        };
-        let mut snapshot_members = snapshot
-            .event
-            .tags
-            .iter()
-            .filter_map(|tag| {
-                let parts = tag.as_slice();
-                (parts.first().map(String::as_str) == Some("member") && parts.len() >= 3)
-                    .then(|| (parts[1].to_ascii_lowercase(), parts[2].clone()))
-            })
-            .collect::<Vec<_>>();
-        let mut canonical_members = members
-            .into_iter()
-            .map(|member| (member.pubkey.to_ascii_lowercase(), member.role))
-            .collect::<Vec<_>>();
-        snapshot_members.sort_unstable();
-        canonical_members.sort_unstable();
+            let Some(snapshot) = snapshot else {
+                return Ok(true);
+            };
+            let mut snapshot_members = snapshot
+                .event
+                .tags
+                .iter()
+                .filter_map(|tag| {
+                    let parts = tag.as_slice();
+                    (parts.first().map(String::as_str) == Some("member") && parts.len() >= 3)
+                        .then(|| (parts[1].to_ascii_lowercase(), parts[2].clone()))
+                })
+                .collect::<Vec<_>>();
+            let mut canonical_members = members
+                .into_iter()
+                .map(|member| (member.pubkey.to_ascii_lowercase(), member.role))
+                .collect::<Vec<_>>();
+            snapshot_members.sort_unstable();
+            canonical_members.sort_unstable();
 
-        Ok(snapshot_members != canonical_members)
+            Ok(snapshot_members != canonical_members)
+        })
+        .await
     }
 
     /// Atomically publish a NIP-43 membership snapshot under a single
@@ -317,6 +322,7 @@ impl Db {
         community_id: CommunityId,
         relay_keypair: &nostr::Keys,
     ) -> Result<(StoredEvent, bool, usize)> {
+        crate::observability::observe(crate::observability::Operation::Replacement, async {
         use nostr::{EventBuilder, Kind, Tag};
 
         let kind_i32 = buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST as i32;
@@ -325,7 +331,7 @@ impl Db {
         let lock_key =
             event_replacement_lock_key(community_id, kind_i32, pubkey_bytes.as_slice(), None);
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::observability::begin(&self.pool, crate::observability::Operation::Replacement).await?;
 
         // Acquire the per-community snapshot lock BEFORE reading members.
         // This serializes the entire read-build-write cycle: a concurrent
@@ -429,6 +435,7 @@ impl Db {
             true,
             member_count,
         ))
+        }).await
     }
 
     /// Atomically replace a NIP-33 parameterized replaceable event (kind 30000–39999).
@@ -459,6 +466,7 @@ impl Db {
         d_tag: &str,
         channel_id: Option<Uuid>,
     ) -> Result<(StoredEvent, bool)> {
+        crate::observability::observe(crate::observability::Operation::Replacement, async {
         let kind_i32 = buzz_core::kind::event_kind_i32(event);
         let pubkey_bytes = event.pubkey.to_bytes();
         let created_at_secs = event.created_at.as_secs() as i64;
@@ -472,7 +480,7 @@ impl Db {
             Some(d_tag.as_bytes()),
         );
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::observability::begin(&self.pool, crate::observability::Operation::Replacement).await?;
 
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(lock_key)
@@ -665,6 +673,7 @@ impl Db {
             StoredEvent::with_received_at(event.clone(), received_at, channel_id, true),
             true,
         ))
+        }).await
     }
 
     /// Atomically store a kind-5 tombstone and delete its repository announcement.
@@ -690,6 +699,7 @@ impl Db {
         tombstone: &nostr::Event,
         channel_id: Option<Uuid>,
     ) -> Result<(StoredEvent, RepoDeletionOutcome)> {
+        crate::observability::observe(crate::observability::Operation::Replacement, async {
         const REPO_ANNOUNCEMENT_KIND: i32 = 30_617;
 
         let target = repo_deletion_target(tombstone)?;
@@ -707,7 +717,7 @@ impl Db {
             Some(repo_id.as_bytes()),
         );
 
-        let mut tx = self.pool.begin().await?;
+        let mut tx = crate::observability::begin(&self.pool, crate::observability::Operation::Replacement).await?;
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(lock_key)
             .execute(&mut *tx)
@@ -793,5 +803,6 @@ impl Db {
         }
 
         Ok((stored(tombstone_inserted), RepoDeletionOutcome::Deleted))
+        }).await
     }
 }

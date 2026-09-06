@@ -14,7 +14,13 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 pub async fn run_migrations(pool: &PgPool) -> Result<()> {
     // A migration owns its session. Drop/cancellation closes it, so relaxed
     // budgets and advisory locks can never return to the serving pool.
-    let mut connection = pool.acquire().await?.detach();
+    let mut connection = crate::observability::acquire(
+        pool,
+        crate::observability::PoolRole::Writer,
+        crate::observability::Operation::Maintenance,
+    )
+    .await?
+    .detach();
     sqlx::raw_sql("SET lock_timeout = 0; SET statement_timeout = 0")
         .execute(&mut connection)
         .await?;

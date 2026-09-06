@@ -80,7 +80,14 @@ pub async fn get_ci_run_member_channel(
     .bind(community_id.as_uuid())
     .bind(run_id)
     .bind(pubkey)
-    .fetch_optional(pool)
+    .fetch_optional(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Ci,
+        )
+        .await?,
+    )
     .await
     .map_err(Into::into)
 }
@@ -200,7 +207,7 @@ pub async fn store_ci_event(
         ));
     }
 
-    let mut tx = pool.begin().await?;
+    let mut tx = crate::observability::begin(pool, crate::observability::Operation::Ci).await?;
     let (stored_event, inserted) = event::insert_event_with_thread_metadata_tx(
         &mut tx,
         community_id,
@@ -313,7 +320,14 @@ pub async fn get_ci_run_request(
     .bind(channel_id)
     .bind(run_id)
     .bind(KIND_CI_REQUEST as i32)
-    .fetch_optional(pool)
+    .fetch_optional(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Ci,
+        )
+        .await?,
+    )
     .await?;
     row.map(row_to_ci_stored_event).transpose()
 }
@@ -354,7 +368,14 @@ pub async fn list_ci_run_events(
     .bind(run_id)
     .bind(after_cursor)
     .bind(i64::from(limit.clamp(1, 1_000)))
-    .fetch_all(pool)
+    .fetch_all(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Ci,
+        )
+        .await?,
+    )
     .await?;
     rows.into_iter().map(row_to_ci_stored_event).collect()
 }
@@ -389,7 +410,14 @@ pub async fn load_ci_reducer_events(
     .bind(KIND_CI_REQUEST as i32)
     .bind(KIND_CI_JOB_STATUS as i32)
     .bind(MAX_REDUCER_EVENTS + 1)
-    .fetch_all(pool)
+    .fetch_all(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Ci,
+        )
+        .await?,
+    )
     .await?;
     if rows.len() > MAX_REDUCER_EVENTS as usize {
         return Err(DbError::InvalidData(
