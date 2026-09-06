@@ -2,27 +2,38 @@ import { expect, test, type Page } from "@playwright/test";
 
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge } from "../helpers/bridge";
+import { sentEvents } from "../helpers/mentionClipboard";
 
 const SHOTS = "test-results/persistent-agent-audience";
-const OWNER = "deadbeef".repeat(8);
 const CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
 const AGENT_A = "a".repeat(64);
 const AGENT_B = "b".repeat(64);
 const THREAD_ROOT_ID = "mock-general-welcome";
-const SCOPE = `${OWNER}:${CHANNEL_ID}:thread:${THREAD_ROOT_ID}`;
+const seededAudiences = new WeakMap<Page, string[]>();
 
 async function seedAudience(page: Page, pubkeys: string[], theme = "buzz") {
-  await page.addInitScript(
-    ({ audience, scope, selectedTheme }) => {
-      window.localStorage.setItem("buzz:keep-addressed-agents-active", "1");
-      window.localStorage.setItem(
-        "buzz:persistent-agent-audiences:v2",
-        JSON.stringify({ [scope]: audience }),
-      );
-      window.localStorage.setItem("buzz-theme", selectedTheme);
-    },
-    { audience: pubkeys, scope: SCOPE, selectedTheme: theme },
-  );
+  seededAudiences.set(page, pubkeys);
+  await page.addInitScript((selectedTheme) => {
+    window.localStorage.setItem(
+      "buzz.messages.keepMentionedAgentsPinned",
+      "true",
+    );
+    window.localStorage.setItem("buzz-theme", selectedTheme);
+  }, theme);
+}
+
+async function expectRecipients(
+  page: Page,
+  content: string,
+  pubkeys: string[],
+) {
+  await expect
+    .poll(async () =>
+      (await sentEvents(page, content)).map((event) =>
+        event.tags.filter((tag) => tag[0] === "p").map((tag) => tag[1]),
+      ),
+    )
+    .toEqual([pubkeys]);
 }
 
 async function openGeneral(page: Page) {
@@ -38,6 +49,18 @@ async function openThread(page: Page, threadRootId = THREAD_ROOT_ID) {
     { waitUntil: "domcontentloaded" },
   );
   await expect(page.getByTestId("message-thread-panel")).toBeVisible();
+  // Audience choices are session state. Make the actual pin selections rather
+  // than hydrating the retired durable audience-storage format.
+  const composer = threadComposer(page);
+  const input = composer.getByTestId("message-input");
+  // Each pin prepends its automatic prefix. Select in reverse display order.
+  for (const pubkey of [...(seededAudiences.get(page) ?? [])].reverse()) {
+    const name = pubkey === AGENT_A ? "Morgarita" : "Vogue";
+    await input.pressSequentially(`@${name}`);
+    await composer.getByTestId(`mention-always-address-${pubkey}`).click();
+    await input.press("Escape");
+    await input.press("End");
+  }
 }
 
 async function emitRootMessage(
@@ -97,39 +120,65 @@ async function installAudienceFixtures(
   });
 }
 
-test("first thread open inherits explicitly addressed agents in authored order", async ({
+test("first thread open inherits explicit agent identities in protocol tag order", async ({
   page,
 }) => {
   await page.addInitScript(() => {
-    window.localStorage.setItem("buzz:keep-addressed-agents-active", "1");
+    window.localStorage.setItem(
+      "buzz.messages.keepMentionedAgentsPinned",
+      "true",
+    );
   });
   await installAudienceFixtures(page);
   await openGeneral(page);
   const root = await emitRootMessage(
     page,
     "@Vogue please pair with @Morgarita",
-    // Event tag order deliberately opposes authored mention order.
+    // Protocol recipient order deliberately opposes display-name order.
     [AGENT_A, AGENT_B],
   );
 
   await openThread(page, root.id);
 
   const input = threadComposer(page).getByTestId("message-input");
-  await expect(input).toHaveText("@Vogue @Morgarita ");
+  await expect(input).toHaveText("@Morgarita @Vogue ");
   await expect(input.locator(".agent-mention-highlight")).toHaveCount(2);
-  await expect
-    .poll(() =>
-      page.evaluate(
-        ({ owner, channelId, rootId }) => {
-          const stored = JSON.parse(
-            localStorage.getItem("buzz:persistent-agent-audiences:v2") ?? "{}",
-          );
-          return stored[`${owner}:${channelId}:thread:${rootId}`] ?? null;
-        },
-        { owner: OWNER, channelId: CHANNEL_ID, rootId: root.id },
-      ),
-    )
-    .toEqual([AGENT_B, AGENT_A]);
+  await input.pressSequentially("inherited recipients");
+  await input.press("Enter");
+  await expectRecipients(page, "@Morgarita @Vogue inherited recipients", [
+    AGENT_A,
+    AGENT_B,
+  ]);
+  expect(
+    await page.evaluate(() =>
+      localStorage.getItem("buzz:persistent-agent-audiences:v2"),
+    ),
+  ).toBeNull();
+});
+
+test("thread inheritance stays off until the user enables automatic mentions", async ({
+  page,
+}) => {
+  await installAudienceFixtures(page);
+  await openGeneral(page);
+  const root = await emitRootMessage(page, "@Vogue please reply", [AGENT_B]);
+  await openThread(page, root.id);
+  const composer = threadComposer(page);
+  const input = composer.getByTestId("message-input");
+  await expect(input).toBeEmpty();
+  await input.fill("@");
+  const preference = composer.getByTestId("mention-keep-agents-pinned-toggle");
+  await expect(preference).not.toBeChecked();
+  await preference.click();
+  await expect(preference).toBeChecked();
+  await input.press("Escape");
+  await input.press("End");
+  await input.press("Backspace");
+  await expect(input).toHaveText("@Vogue ");
+  await input.pressSequentially("opted-in reply");
+  await expect(input).toHaveText("@Vogue opted-in reply");
+  await input.press("Enter");
+  await expectRecipients(page, "@Vogue opted-in reply", [AGENT_B]);
 });
 
 test("persistent agents transition atomically before Enter-send resolves", async ({
@@ -240,24 +289,21 @@ test("persistent agents restore through the native inline mention UI", async ({
   await expect(input.locator(".agent-mention-highlight")).toHaveCount(2);
 
   await input.fill("@Morgarita hello");
-  await expect
-    .poll(() =>
-      page.evaluate(
-        ({ scope }) => {
-          const stored = JSON.parse(
-            localStorage.getItem("buzz:persistent-agent-audiences:v2") ?? "{}",
-          );
-          return stored[scope] ?? [];
-        },
-        { scope: SCOPE },
-      ),
-    )
-    .toEqual([AGENT_A]);
 
   await composer.getByTestId("send-message").click();
   await expect(input).toContainText("@Morgarita");
   await expect(input).not.toContainText("@Vogue");
   await expect(input.locator(".agent-mention-highlight")).toHaveCount(1);
+  await expectRecipients(page, "@Morgarita hello", [AGENT_A]);
+  // Explicit pins must not survive a new application session, even though the
+  // user's opt-in preference does. This root has no inherited recipients.
+  await page.reload();
+  await expect(threadComposer(page).getByTestId("message-input")).toBeEmpty();
+  expect(
+    await page.evaluate(() =>
+      localStorage.getItem("buzz:persistent-agent-audiences:v2"),
+    ),
+  ).toBeNull();
 });
 
 for (const theme of ["buzz", "buzz-dark"]) {
@@ -267,6 +313,9 @@ for (const theme of ["buzz", "buzz-dark"]) {
     await openThread(page);
     const overlay = threadComposer(page);
     const composer = overlay.getByTestId("message-composer");
+    await expect(overlay.getByTestId("message-input")).toHaveText(
+      "@Morgarita @Vogue ",
+    );
     await overlay.getByTestId("message-input").focus();
     await waitForAnimations(page);
     await composer.screenshot({
