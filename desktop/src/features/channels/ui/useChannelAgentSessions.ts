@@ -10,6 +10,10 @@ import type {
 import { usePanelReturnTarget } from "@/shared/hooks/usePanelReturnTarget";
 import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
 import {
+  channelAgentMemberPubkeySet,
+  channelMemberPubkeySet,
+} from "@/shared/lib/rosterDerivations";
+import {
   type AgentSessionReturnTarget,
   resolveAgentSessionReturnTarget,
 } from "./agentSessionSelection";
@@ -120,15 +124,14 @@ export function getChannelAgentSessionAgents({
     return [];
   }
 
+  // Identity-cached: the memo recomputes whenever the active channel object
+  // churns (e.g. lastMessageAt updates), and these Sets walked the full
+  // roster each time.
   const memberPubkeys = channelMembers
-    ? new Set(channelMembers.map((member) => normalizePubkey(member.pubkey)))
+    ? channelMemberPubkeySet(channelMembers)
     : null;
   const agentMemberPubkeys = channelMembers
-    ? new Set(
-        channelMembers
-          .filter((member) => member.role === "bot" || member.isAgent)
-          .map((member) => normalizePubkey(member.pubkey)),
-      )
+    ? channelAgentMemberPubkeySet(channelMembers)
     : null;
 
   return agents.filter((agent) => {

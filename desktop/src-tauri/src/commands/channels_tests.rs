@@ -564,3 +564,36 @@ fn starter_match_requires_open_unarchived_stream_by_normalized_name() {
     channel.archived_at = Some("2026-07-16T00:00:00Z".to_string());
     assert!(!is_matching_starter_channel(&channel, spec));
 }
+fn member(pubkey: &str) -> crate::models::ChannelMemberInfo {
+    crate::models::ChannelMemberInfo {
+        pubkey: pubkey.to_string(),
+        role: "member".to_string(),
+        is_agent: false,
+        joined_at: None,
+        display_name: None,
+    }
+}
+
+#[test]
+fn profile_join_pubkeys_caps_in_roster_order() {
+    let members = vec![member(PK_A), member(PK_B), member(PK_C)];
+
+    assert_eq!(
+        profile_join_pubkeys(&members, 2),
+        vec![PK_A.to_string(), PK_B.to_string()]
+    );
+    assert_eq!(profile_join_pubkeys(&members, 3).len(), 3);
+    assert_eq!(profile_join_pubkeys(&members, 10).len(), 3);
+    assert!(profile_join_pubkeys(&[], 10).is_empty());
+}
+
+#[test]
+fn large_roster_profile_join_is_bounded_without_dropping_members() {
+    let members = (0..10_000)
+        .map(|i| member(&format!("{i:064x}")))
+        .collect::<Vec<_>>();
+    let authors = profile_join_pubkeys(&members, MEMBER_PROFILE_JOIN_LIMIT);
+    assert_eq!(authors.len(), 500);
+    assert_eq!(authors[499], members[499].pubkey);
+    assert_eq!(members.len(), 10_000);
+}

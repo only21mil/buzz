@@ -7,6 +7,7 @@ import type {
   ManagedAgent,
   RelayAgent,
 } from "@/shared/api/types";
+import { channelMemberPubkeySet } from "@/shared/lib/rosterDerivations";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
 export function useCandidateProfiles(
@@ -19,8 +20,7 @@ export function useCandidateProfiles(
   memberPubkeys: ReadonlySet<string>;
 } {
   const memberPubkeys = React.useMemo(
-    () =>
-      new Set((members ?? []).map((member) => normalizePubkey(member.pubkey))),
+    () => (members ? channelMemberPubkeySet(members) : new Set<string>()),
     [members],
   );
   const candidatePubkeys = React.useMemo(
