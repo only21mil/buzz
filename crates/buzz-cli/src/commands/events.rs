@@ -36,22 +36,19 @@ struct StatusView {
 }
 
 fn repo_owner(root: &Value) -> Option<String> {
-    root.get("tags")?
+    let tag = root
+        .get("tags")?
         .as_array()?
         .iter()
         .filter_map(Value::as_array)
-        .find_map(|tag| {
-            if tag.first().and_then(Value::as_str) != Some("a") {
-                return None;
-            }
-            let address = tag.get(1)?.as_str()?;
-            let mut parts = address.splitn(3, ':');
-            let _kind = parts.next()?;
-            let owner = parts.next()?;
-            let _identifier = parts.next()?;
-            (owner.len() == 64 && owner.chars().all(|ch| ch.is_ascii_hexdigit()))
-                .then(|| owner.to_ascii_lowercase())
-        })
+        .find(|tag| tag.first().and_then(Value::as_str) == Some("a"))?;
+    let address = tag.get(1)?.as_str()?;
+    let mut parts = address.splitn(3, ':');
+    let _kind = parts.next()?;
+    let owner = parts.next()?;
+    let _identifier = parts.next()?;
+    (owner.len() == 64 && owner.chars().all(|ch| ch.is_ascii_hexdigit()))
+        .then(|| owner.to_ascii_lowercase())
 }
 
 fn annotate_statuses(root: &Value, statuses: Vec<Value>) -> Vec<StatusView> {
@@ -93,9 +90,10 @@ async fn list_statuses(
         )));
     }
 
+    let canonical_root_id = root_id.to_ascii_lowercase();
     let statuses = client
         .query_all_bounded(
-            serde_json::json!({"kinds": STATUS_KINDS, "#e": [root_id]}),
+            serde_json::json!({"kinds": STATUS_KINDS, "#e": [canonical_root_id]}),
             MAX_STATUS_EVENTS,
         )
         .await?;
@@ -202,6 +200,27 @@ mod tests {
         assert_eq!(annotated[2].signer, outsider);
     }
 
+    #[test]
+    fn status_trust_does_not_skip_a_malformed_first_repo_address() {
+        let author = "a".repeat(64);
+        let later_owner = "b".repeat(64);
+        let root = serde_json::json!({
+            "pubkey": author,
+            "tags": [
+                ["a", "30617:invalid:buzz"],
+                ["a", format!("30617:{later_owner}:buzz")]
+            ]
+        });
+        let statuses = vec![serde_json::json!({
+            "id": "1".repeat(64),
+            "pubkey": later_owner
+        })];
+
+        let annotated = annotate_statuses(&root, statuses);
+
+        assert!(!annotated[0].trusted);
+    }
+
     #[tokio::test]
     async fn event_lookup_returns_the_exact_signed_event() {
         let id = "d".repeat(64);
@@ -262,5 +281,31 @@ mod tests {
         let filters = filters.lock().unwrap();
         assert_eq!(filters[1][0]["kinds"], serde_json::json!(STATUS_KINDS));
         assert_eq!(filters[1][0]["#e"], serde_json::json!([root_id]));
+    }
+
+    #[tokio::test]
+    async fn statuses_query_normalizes_an_uppercase_root_id() {
+        let root_id = "d".repeat(64);
+        let root = serde_json::json!({
+            "id": root_id,
+            "pubkey": "a".repeat(64),
+            "kind": 1618,
+            "tags": []
+        });
+        let (url, filters) = query_server(root, Vec::new()).await;
+
+        list_statuses(
+            &test_client(url),
+            &root_id.to_ascii_uppercase(),
+            1618,
+            "pull request",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            filters.lock().unwrap()[1][0]["#e"],
+            serde_json::json!([root_id])
+        );
     }
 }
