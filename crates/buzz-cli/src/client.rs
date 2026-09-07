@@ -2009,14 +2009,16 @@ mod retry_policy_tests {
     /// condition the implementation itself identifies as confirmed-unreceived.
     #[tokio::test]
     async fn exhausted_connect_failures_return_network_retryable() {
-        // Bind a port, capture the address, then drop the listener so every
-        // subsequent connect attempt is refused immediately.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        drop(listener);
+        // Reserve the port for the entire test without listening. A bound
+        // socket refuses connections; a listener would complete TCP handshakes
+        // even without accept(), and dropping it would allow sibling port reuse.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = socket.local_addr().unwrap();
 
         let base = format!("http://{addr}");
-        let client = test_client(&base);
+        let mut client = test_client(&base);
+        client.http = reqwest::Client::builder().no_proxy().build().unwrap();
         let event = make_moderation_event(client.keys(), 9040);
         let err = client.submit_event(event).await.unwrap_err();
         // Must be Network (retryable), not DeliveryUnknown (retryable:false).
@@ -2024,6 +2026,12 @@ mod retry_policy_tests {
             matches!(err, super::super::error::CliError::Network(_)),
             "exhausted connect failures must surface as Network, got {err:?}"
         );
+        assert!(
+            crate::error::is_retryable_error(&err),
+            "exhausted connect failures must remain retryable; got {err:?}"
+        );
+        // Keep the reservation until every retry has completed.
+        drop(socket);
         // Confirm the error description does not suggest ambiguous delivery.
         let description = format!("{err:?}");
         assert!(

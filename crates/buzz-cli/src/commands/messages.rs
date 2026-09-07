@@ -581,6 +581,11 @@ pub async fn cmd_send_message(
     // quoting — the source of countless self-inflicted command-substitution
     // bugs for agent and human users alike.
     p.content = read_or_stdin(&p.content)?;
+    if p.content.trim().is_empty() && p.files.is_empty() {
+        return Err(CliError::Usage(
+            "message content must not be empty: provide --content text, pipe text to stdin, or attach a file".into(),
+        ));
+    }
     validate_content_size(&p.content)?;
     if let Some(ref r) = p.reply_to {
         validate_hex64(r)?;
