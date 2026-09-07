@@ -332,6 +332,26 @@ function imageGalleryItemFromTrigger(
   };
 }
 
+function isRevealedSpoilerFadingIn(element: Element): boolean {
+  if (!element.closest('.buzz-spoiler[data-spoiler][data-revealed="true"]')) {
+    return false;
+  }
+
+  // Gallery membership is captured at open. A revealed image at the first
+  // opacity frame must not stay absent after its reveal transition finishes.
+  return element.getAnimations().some((animation) => {
+    if (
+      !(animation instanceof CSSTransition) ||
+      animation.transitionProperty !== "opacity" ||
+      !(animation.effect instanceof KeyframeEffect)
+    ) {
+      return false;
+    }
+    const finalFrame = animation.effect.getKeyframes().at(-1);
+    return Number(finalFrame?.opacity) > 0;
+  });
+}
+
 function isVisibleImageLightboxTrigger(trigger: HTMLElement): boolean {
   if (isInsideHiddenSpoiler(trigger)) {
     return false;
@@ -347,7 +367,7 @@ function isVisibleImageLightboxTrigger(trigger: HTMLElement): boolean {
     if (
       style.display === "none" ||
       style.visibility === "hidden" ||
-      Number(style.opacity) === 0
+      (Number(style.opacity) === 0 && !isRevealedSpoilerFadingIn(element))
     ) {
       return false;
     }

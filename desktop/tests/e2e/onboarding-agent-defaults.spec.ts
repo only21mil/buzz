@@ -916,9 +916,7 @@ test("concurrent installs each keep their own state — one fails, one succeeds"
     page,
     {
       acpRuntimesCatalog: [claudeNotInstalled, codexNotInstalled],
-      // Claude: long delay then failure with multiline stderr + hint.
-      // Codex: short delay then success.
-      // Per-runtime config lets both be in flight simultaneously.
+      // Controlled time releases Codex success first, then Claude failure.
       installAcpRuntimeByRuntime: {
         claude: {
           delayMs: 600,
@@ -960,8 +958,12 @@ test("concurrent installs each keep their own state — one fails, one succeeds"
     },
     { skipCommunitySeed: true, skipOnboardingSeed: true },
   );
+  await page.clock.install();
   await page.goto("/");
   await navigateToSetupPage(page);
+  const pauseTime = new Date();
+  await page.clock.setFixedTime(pauseTime);
+  await page.clock.pauseAt(pauseTime);
 
   const claudeInstall = page.getByTestId("onboarding-runtime-install-claude");
   const codexInstall = page.getByTestId("onboarding-runtime-install-codex");
@@ -970,11 +972,35 @@ test("concurrent installs each keep their own state — one fails, one succeeds"
   await claudeInstall.click();
   await codexInstall.click();
 
-  // While in flight: both install buttons must be absent (no duplicate clicks).
+  const installCommands = () =>
+    page.evaluate(() =>
+      (
+        window as Window & {
+          __BUZZ_E2E_COMMAND_LOG__?: Array<{
+            command: string;
+            payload?: { runtimeId?: string };
+          }>;
+        }
+      ).__BUZZ_E2E_COMMAND_LOG__
+        ?.filter((entry) => entry.command === "install_acp_runtime")
+        .map((entry) => entry.payload?.runtimeId),
+    );
+  await expect.poll(installCommands).toEqual(["claude", "codex"]);
+
+  // Both commands started, and neither completion timer has been released.
+  // Missing install controls prevent a second install while each is pending.
   await expect(claudeInstall).toHaveCount(0);
   await expect(codexInstall).toHaveCount(0);
 
-  // Codex settles first (shorter delay): success indicator, no error.
+  await expect(page.getByTestId("onboarding-runtime-ready-codex")).toHaveCount(
+    0,
+  );
+  await expect(page.getByTestId("onboarding-runtime-error-claude")).toHaveCount(
+    0,
+  );
+
+  // Release Codex only. Claude must retain its pending state.
+  await page.clock.runFor(250);
   await expect(page.getByTestId("onboarding-runtime-ready-codex")).toBeVisible({
     timeout: 3_000,
   });
@@ -985,7 +1011,12 @@ test("concurrent installs each keep their own state — one fails, one succeeds"
   // Claude still in flight: its install button must still be absent.
   await expect(claudeInstall).toHaveCount(0);
 
-  // Claude settles: failure error visible; codex still shows ready (not reset).
+  await expect(page.getByTestId("onboarding-runtime-error-claude")).toHaveCount(
+    0,
+  );
+
+  // Release Claude's failure, preserving Codex's success.
+  await page.clock.runFor(400);
   const claudeError = page.getByTestId("onboarding-runtime-error-claude");
   await expect(claudeError).toBeVisible({ timeout: 3_000 });
   await expect(
@@ -994,6 +1025,11 @@ test("concurrent installs each keep their own state — one fails, one succeeds"
   await expect(page.getByTestId("onboarding-runtime-error-codex")).toHaveCount(
     0,
   );
+
+  await expect(claudeInstall).toBeVisible();
+  await expect(codexInstall).toHaveCount(0);
+  expect(await installCommands()).toEqual(["claude", "codex"]);
+  await page.clock.resume();
 
   // The error trigger has the full aria-label (label + detail).
   await expect(claudeError).toHaveAttribute("aria-label", /npm ERR!/);

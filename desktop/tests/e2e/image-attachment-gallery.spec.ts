@@ -319,12 +319,50 @@ test("hidden spoiler images are excluded from gallery navigation until revealed"
 
   const spoiler = row.locator(".buzz-spoiler[data-spoiler]").first();
   await expect(spoiler).toHaveAttribute("data-revealed", "false");
+  // Hold the real reveal transition at its initial frame. Opening a different
+  // image must include this revealed image even before its opacity increases.
+  await spoiler.evaluate((element) => {
+    const observer = new MutationObserver(() => {
+      if (element.getAttribute("data-revealed") !== "true") return;
+      for (const animation of element.getAnimations({ subtree: true })) {
+        if (
+          animation instanceof CSSTransition &&
+          animation.transitionProperty === "opacity"
+        ) {
+          animation.pause();
+          animation.currentTime = 0;
+        }
+      }
+      observer.disconnect();
+    });
+    observer.observe(element, {
+      attributes: true,
+      attributeFilter: ["data-revealed"],
+    });
+  });
   await spoiler.click();
   await expect(spoiler).toHaveAttribute("data-revealed", "true");
+  const revealedImage = spoiler.locator(`img[src*="${SPOILER_HIDDEN_SHA}"]`);
+  await expect(revealedImage).toHaveCSS("opacity", "0");
 
   await row.locator(`img[src*="${SPOILER_VISIBLE_SHA}"]`).click();
   await expect(dialog).toBeVisible();
-  await expect(page.getByRole("button", { name: "Next image" })).toBeVisible();
+  await expect(revealedImage).toHaveCSS("opacity", "0");
+  await spoiler.evaluate((element) => {
+    for (const animation of element.getAnimations({ subtree: true })) {
+      if (
+        animation instanceof CSSTransition &&
+        animation.transitionProperty === "opacity"
+      ) {
+        animation.finish();
+      }
+    }
+  });
+  await expect(revealedImage).toHaveCSS("opacity", "1");
+  await page.getByRole("button", { name: "Next image" }).click();
+  await expect(
+    dialog.getByRole("img", { name: "hidden", exact: true }),
+  ).toHaveAttribute("src", new RegExp(SPOILER_HIDDEN_SHA));
 });
 
 test("message images load a thumbnail before requesting the original", async ({
