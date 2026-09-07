@@ -204,6 +204,7 @@ class ReuseTests(unittest.TestCase):
         for job in ("rust-lint", "unit-tests", "desktop-smoke-e2e"):
             block = blocks[job]
             self.assertIn("id: reuse", block)
+            self.assertIn("checks: read", block)
             self.assertIn("if: steps.reuse.outputs.reused != 'true'", block)
             self.assertIn("Retain protected result provenance", block)
             self.assertNotIn("reused", re.search(r"(?m)^    if: (.*)$", block)[1])
