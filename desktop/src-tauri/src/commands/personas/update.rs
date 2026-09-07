@@ -120,10 +120,9 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
 
             super::review_revision::validate_review_revision(
                 input.expected_updated_at.as_deref(),
-                &persona.updated_at,
-                persona.source_team.is_some(),
+                input.expected_content.as_ref(),
                 input.expected_shared,
-                persona.shared,
+                persona,
             )?;
 
             // Track what changed so we can propagate to linked agent records.

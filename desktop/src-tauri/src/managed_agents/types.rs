@@ -918,6 +918,9 @@ pub fn resolve_mint_behavioral_defaults(
 
 mod catalog_source;
 pub use catalog_source::CatalogSource;
+mod review_content;
+pub use review_content::PersonaReviewContent;
+
 mod requests;
 pub use requests::*;
 mod team_catalog_source;
