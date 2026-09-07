@@ -1,4 +1,10 @@
-import { expect, test, type Browser } from "@playwright/test";
+import {
+  expect,
+  test,
+  type Browser,
+  type Page,
+  type Request,
+} from "@playwright/test";
 
 import {
   installRelayBridge,
@@ -8,6 +14,7 @@ import {
 } from "../helpers/bridge";
 import { openSettings } from "../helpers/settings";
 import { assertRelaySeeded } from "../helpers/seed";
+import type { RelayEvent } from "../../src/shared/api/types";
 
 const isCi = Boolean(process.env.CI);
 const relaySeedHookTimeoutMs = isCi ? 90_000 : 30_000;
@@ -175,6 +182,38 @@ async function expectLoggedNotifications(
   await expect.poll(() => getLoggedNotifications(page)).toEqual(expected);
 }
 
+async function expectNativeMentionTarget(
+  page: Page,
+  publication: Request,
+  channelName: string,
+) {
+  const event = publication.postDataJSON() as RelayEvent;
+  expect(event.pubkey).toBe(TEST_IDENTITIES.alice.pubkey);
+  expect(event.tags.filter((tag) => tag[0] === "p")).toEqual([
+    ["p", TEST_IDENTITIES.tyler.pubkey],
+  ]);
+  const channelId = event.tags.find((tag) => tag[0] === "h")?.[1];
+  expect(channelId).toBeTruthy();
+  await expect
+    .poll(() => page.evaluate(() => window.__BUZZ_E2E_NATIVE_NOTIFICATIONS__))
+    .toEqual([
+      {
+        title: `alice mentioned you in #${channelName}`,
+        body: event.content,
+        target: {
+          channelId,
+          channelName,
+          content: event.content,
+          createdAt: event.created_at,
+          eventId: event.id,
+          kind: event.kind,
+          pubkey: event.pubkey,
+          threadRootId: null,
+        },
+      },
+    ]);
+}
+
 test.beforeAll(async () => {
   test.setTimeout(relaySeedHookTimeoutMs);
   await assertRelaySeeded();
@@ -286,6 +325,11 @@ test("live mentions refetch the home feed without waiting for polling", async ({
     await expect(targetPage.getByTestId("chat-title")).toHaveText("general");
 
     const message = `Heads up @tyler live mention ${stamp}`;
+    const publication = senderPage.waitForRequest(
+      (request) =>
+        request.url().endsWith("/events") &&
+        request.postDataJSON()?.content === message,
+    );
     await sendChannelMessage(senderPage, {
       channelName: "general",
       content: message,
@@ -302,6 +346,7 @@ test("live mentions refetch the home feed without waiting for polling", async ({
         title: "alice mentioned you in #general",
       },
     ]);
+    await expectNativeMentionTarget(targetPage, await publication, "general");
 
     // The Inbox feed should have been refetched live (the original purpose
     // of this test). The home badge stays at 0 while the user is actively
@@ -313,8 +358,12 @@ test("live mentions refetch the home feed without waiting for polling", async ({
       .getByRole("button", { name: "Inbox" })
       .click();
     await expect(targetPage.getByTestId("home-inbox-list")).toBeVisible();
-    await expect(targetPage.getByTestId("home-inbox-list")).toContainText(
-      message,
+    const inboxItem = targetPage.getByTestId(/^home-inbox-item-/).filter({
+      hasText: message.replace("@tyler", "tyler"),
+    });
+    await expect(inboxItem).toHaveCount(1);
+    await expect(inboxItem.locator('[data-mention-label="tyler"]')).toHaveText(
+      "tyler",
     );
     await expect(targetPage.getByTestId("sidebar-home-count")).toHaveCount(0);
     await expect.poll(() => getLoggedNotificationCount(targetPage)).toBe(1);
@@ -348,6 +397,11 @@ test("live forum mentions refetch the home feed without waiting for polling", as
     await joinChannel(senderPage, "watercooler");
 
     const message = `Forum ping @tyler ${stamp}`;
+    const publication = senderPage.waitForRequest(
+      (request) =>
+        request.url().endsWith("/events") &&
+        request.postDataJSON()?.content === message,
+    );
     await sendChannelMessage(senderPage, {
       channelName: "watercooler",
       content: message,
@@ -363,6 +417,11 @@ test("live forum mentions refetch the home feed without waiting for polling", as
         title: "alice mentioned you in #watercooler",
       },
     ]);
+    await expectNativeMentionTarget(
+      targetPage,
+      await publication,
+      "watercooler",
+    );
 
     await targetPage
       .getByTestId("app-sidebar")
@@ -370,8 +429,12 @@ test("live forum mentions refetch the home feed without waiting for polling", as
       .click();
     await expect(targetPage.getByTestId("home-inbox-list")).toBeVisible();
     await expect(targetPage.getByTestId("home-inbox-list")).toBeVisible();
-    await expect(targetPage.getByTestId("home-inbox-list")).toContainText(
-      message,
+    const inboxItem = targetPage.getByTestId(/^home-inbox-item-/).filter({
+      hasText: message.replace("@tyler", "tyler"),
+    });
+    await expect(inboxItem).toHaveCount(1);
+    await expect(inboxItem.locator('[data-mention-label="tyler"]')).toHaveText(
+      "tyler",
     );
     await expect(targetPage.getByTestId("sidebar-home-count")).toHaveCount(0);
     await expect.poll(() => getLoggedNotificationCount(targetPage)).toBe(1);

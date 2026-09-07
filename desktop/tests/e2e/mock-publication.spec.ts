@@ -1,5 +1,5 @@
 import { expect, test } from "@playwright/test";
-import { installMockBridge } from "../helpers/bridge";
+import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 
 test("default mock Tauri installation binds native publication before signing", async ({
   page,
@@ -79,4 +79,93 @@ test("mock agent revalidation returns only requested keys with existing policy a
   });
   expect(evidence.selected).toEqual([evidence.alice]);
   expect(evidence.excluded).toEqual([]);
+});
+
+test("native notification capture preserves targets and shares browser click indices", async ({
+  page,
+}) => {
+  await installMockBridge(page);
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+
+  const target = {
+    channelId: "1c7e1c02-87bb-5e88-b2da-5a7a9432d0c9",
+    channelName: "engineering",
+    content: "Native notification body",
+    createdAt: 1_788_700_000,
+    eventId: "native-notification-event",
+    kind: 9,
+    pubkey: TEST_IDENTITIES.bob.pubkey,
+    threadRootId: "native-notification-thread",
+  };
+  const evidence = await page.evaluate(async (target) => {
+    const win = window as Window & {
+      __BUZZ_E2E_CLICK_NOTIFICATION__?: (index: number) => boolean;
+      __BUZZ_E2E_NOTIFICATIONS__?: Array<{
+        title: string;
+        body: string | null;
+      }>;
+    };
+    const invoke = win.__BUZZ_E2E_INVOKE_MOCK_COMMAND__;
+    const click = win.__BUZZ_E2E_CLICK_NOTIFICATION__;
+    if (!invoke || !click)
+      throw new Error("Notification bridge is unavailable");
+    const actions: unknown[] = [];
+    let resolveAction: (target: unknown) => void = () => {};
+    const activation = new Promise((resolve) => {
+      resolveAction = resolve;
+    });
+    window.addEventListener("buzz:desktop-notification-action", (event) => {
+      actions.push((event as CustomEvent).detail);
+      resolveAction((event as CustomEvent).detail);
+    });
+    await invoke("show_native_notification", {
+      title: "Native title",
+      body: target.content,
+      target,
+    });
+    target.content = "Changed after delivery";
+    let browserHandlers = 0;
+    let browserListeners = 0;
+    const browser = new Notification("Browser title", { body: "Browser body" });
+    browser.onclick = () => {
+      browserHandlers += 1;
+    };
+    browser.addEventListener("click", () => {
+      browserListeners += 1;
+    });
+    const browserClicked = click(1);
+    const nativeActionsBeforeClick = actions.length;
+    const nativeClicked = click(0);
+    const activated = await activation;
+    return {
+      native: win.__BUZZ_E2E_NATIVE_NOTIFICATIONS__,
+      all: win.__BUZZ_E2E_NOTIFICATIONS__,
+      browserClicked,
+      nativeClicked,
+      activated,
+      actions,
+      browserHandlers,
+      browserListeners,
+      nativeActionsBeforeClick,
+      invalidIndex: click(-1),
+      absentIndex: click(2),
+    };
+  }, target);
+  expect(evidence).toEqual({
+    native: [{ title: "Native title", body: target.content, target }],
+    all: [
+      { title: "Native title", body: target.content },
+      { title: "Browser title", body: "Browser body" },
+    ],
+    browserClicked: true,
+    nativeClicked: true,
+    activated: target,
+    actions: [target],
+    browserHandlers: 1,
+    browserListeners: 1,
+    nativeActionsBeforeClick: 0,
+    invalidIndex: false,
+    absentIndex: false,
+  });
 });

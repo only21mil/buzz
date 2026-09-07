@@ -1,3 +1,4 @@
+import type { DesktopNotificationTarget } from "@/features/notifications/lib/desktop";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
 import { emit, listen } from "@tauri-apps/api/event";
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
@@ -67,6 +68,12 @@ import {
   isValidLinkPreviewSnapshotCanonicalUrl,
   parseLinkPreviewSnapshots,
 } from "@/shared/lib/linkPreviewSnapshot";
+
+export type MockDesktopNotification = {
+  title: string;
+  body?: string;
+  target: DesktopNotificationTarget | null;
+};
 
 type TestIdentity = {
   privateKey: string;
@@ -1084,6 +1091,11 @@ function updateMockRelayMembershipFromAdminEvent(event: RelayEvent): boolean {
 declare global {
   interface Window {
     __BUZZ_E2E__?: E2eConfig;
+    __BUZZ_E2E_NATIVE_NOTIFICATIONS__?: MockDesktopNotification[];
+    __BUZZ_E2E_RECORD_NATIVE_NOTIFICATION__?: (
+      notification: MockDesktopNotification,
+      activate: () => void,
+    ) => void;
     __BUZZ_E2E_COMMANDS__?: string[];
     __BUZZ_E2E_COMMAND_PAYLOADS__?: Array<{
       command: string;
@@ -12875,6 +12887,18 @@ export function maybeInstallE2eTauriMocks() {
       case "clear_e2e_opened_external_urls":
         openedExternalUrls.length = 0;
         return null;
+      case "show_native_notification": {
+        const notification = structuredClone(
+          payload as MockDesktopNotification,
+        );
+        const record = window.__BUZZ_E2E_RECORD_NATIVE_NOTIFICATION__;
+        if (!record)
+          throw new Error("Notification test capture is unavailable");
+        record(notification, () => {
+          void emit("native-notification-activated", notification.target);
+        });
+        return null;
+      }
       case "plugin:window|show":
       case "plugin:window|unminimize":
       case "plugin:window|set_focus":
