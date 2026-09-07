@@ -1,10 +1,10 @@
+import { checkBrowserUploadSize as checkUploadSize } from "../../shared/lib/browserMediaLimits";
 import { blossomAuthorization } from "./mediaAuth";
 import { serverAuthority } from "./mediaAuthProtocol";
 import { type InvokeBody, type InvokeOptions, register } from "./registry";
 import { emit } from "./shims/event";
 import type { BrowserWorkspace } from "./workspace";
 
-const MAX_BROWSER_UPLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_BROWSER_FETCH_BYTES = 50 * 1024 * 1024;
 const MAX_DESCRIPTOR_BYTES = 64 * 1024;
 const VIDEO_AUTH_LIFETIME_SECONDS = 3600;
@@ -49,12 +49,6 @@ function rawHeader(options: InvokeOptions | undefined, name: string) {
     ([key]) => key.toLowerCase() === name,
   );
   return decodeRawHeader(entry?.[1]);
-}
-
-function checkUploadSize(size: number): void {
-  if (size > MAX_BROWSER_UPLOAD_BYTES) {
-    throw new Error("File is too large. Maximum is 100MB.");
-  }
 }
 
 function uploadInput(body: InvokeBody, options?: InvokeOptions) {
@@ -243,15 +237,20 @@ async function sendUpload(
 async function withUploadController(
   progressId: string | undefined,
   upload: (signal: AbortSignal) => Promise<BlobDescriptor>,
+  callerSignal?: AbortSignal,
 ): Promise<BlobDescriptor> {
+  callerSignal?.throwIfAborted();
   if (progressId && activeUploads.has(progressId)) {
     throw new Error("An upload with this progress ID is already active");
   }
   const controller = new AbortController();
   if (progressId) activeUploads.set(progressId, controller);
+  const onAbort = () => controller.abort();
+  callerSignal?.addEventListener("abort", onAbort, { once: true });
   try {
     return await upload(controller.signal);
   } finally {
+    callerSignal?.removeEventListener("abort", onAbort);
     if (progressId && activeUploads.get(progressId) === controller) {
       activeUploads.delete(progressId);
     }
@@ -264,8 +263,10 @@ export async function uploadBrowserMedia(
   workspace?: BrowserWorkspace,
 ): Promise<BlobDescriptor> {
   const input = uploadInput(body, options);
-  return withUploadController(input.progressId, (signal) =>
-    uploadBytes(input, signal, workspace),
+  return withUploadController(
+    input.progressId,
+    (signal) => uploadBytes(input, signal, workspace),
+    options?.signal,
   );
 }
 

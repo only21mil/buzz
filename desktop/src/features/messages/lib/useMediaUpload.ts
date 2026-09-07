@@ -160,6 +160,31 @@ export function useMediaUpload({
   }, []);
   const activeUploadingPreviewIdsRef = React.useRef(new Set<number>());
   const canceledUploadingPreviewIdsRef = React.useRef(new Set<number>());
+  const fileUploadControllersRef = React.useRef(
+    new Map<number, AbortController>(),
+  );
+  React.useEffect(() => {
+    const controllers = fileUploadControllersRef.current;
+    return () => {
+      for (const controller of controllers.values()) controller.abort();
+    };
+  }, []);
+  const uploadPreviewFile = React.useCallback(
+    async (file: File, previewId: number) => {
+      const controller = new AbortController();
+      fileUploadControllersRef.current.set(previewId, controller);
+      try {
+        return await uploadMediaFile(
+          file,
+          uploadProgressId(previewId),
+          controller.signal,
+        );
+      } finally {
+        fileUploadControllersRef.current.delete(previewId);
+      }
+    },
+    [],
+  );
   /**
    * Incremented whenever the composer's attachment set is replaced wholesale
    * (draft/channel switch, post-send clear, edit restore). Uploads capture the
@@ -430,6 +455,7 @@ export function useMediaUpload({
     activeIds.clear();
     for (const id of retiredIds) {
       canceledUploadingPreviewIdsRef.current.add(id);
+      fileUploadControllersRef.current.get(id)?.abort();
     }
     setUploadingPreviews((prev) =>
       prev.filter((preview) => !retiredIds.has(preview.id)),
@@ -441,6 +467,7 @@ export function useMediaUpload({
     (previewId: number) => {
       intentRevisionRef.current += 1;
       canceledUploadingPreviewIdsRef.current.add(previewId);
+      fileUploadControllersRef.current.get(previewId)?.abort();
       const preview = uploadingPreviewsRef.current.find(
         (candidate) => candidate.id === previewId,
       );
@@ -559,10 +586,7 @@ export function useMediaUpload({
         // Fire-and-forget each upload concurrently — slot preserves order.
         void (async () => {
           try {
-            const descriptor = await uploadMediaFile(
-              file,
-              uploadProgressId(previewId),
-            );
+            const descriptor = await uploadPreviewFile(file, previewId);
             fillSlot(slotIndex, descriptor, previewId, epoch);
           } catch (err) {
             onUploadError(err, previewId);
@@ -570,7 +594,13 @@ export function useMediaUpload({
         })();
       }
     },
-    [fillSlot, onUploadError, reserveSlots, reserveUploadingPreview],
+    [
+      fillSlot,
+      onUploadError,
+      reserveSlots,
+      reserveUploadingPreview,
+      uploadPreviewFile,
+    ],
   );
 
   const handlePaperclip = React.useCallback(async () => {
@@ -719,10 +749,7 @@ export function useMediaUpload({
       setUploadingCount((c) => c + 1);
       const epoch = uploadEpochRef.current;
       try {
-        const descriptor = await uploadMediaFile(
-          file,
-          uploadProgressId(previewId),
-        );
+        const descriptor = await uploadPreviewFile(file, previewId);
         onUploaded(descriptor, previewId, epoch);
       } catch (err) {
         onUploadError(err, previewId);
@@ -734,6 +761,7 @@ export function useMediaUpload({
       queueFiles,
       reserveUploadingPreview,
       shouldQueueFile,
+      uploadPreviewFile,
     ],
   );
 
