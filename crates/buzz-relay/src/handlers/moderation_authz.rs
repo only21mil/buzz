@@ -281,6 +281,30 @@ pub(crate) async fn channel_admin_grant(
     if action == ModerationAction::Kick && target_pubkey.as_deref() == Some(&signer[..]) {
         return Ok(None);
     }
+    // Preserve the existing active-member self-add path without granting
+    // community authority. A different role, inactive membership, or delegated
+    // third-party target must still pass the privileged-target guards below.
+    if action == ModerationAction::ManageMembers
+        && principal_is_admin
+        && target_pubkey.as_deref() == Some(&signer[..])
+        && principal == signer
+    {
+        let current_role = state
+            .db
+            .get_member_role(community, channel_id, &signer)
+            .await?;
+        let requested_role = event
+            .tags
+            .iter()
+            .find(|tag| tag.kind().to_string() == "role")
+            .and_then(|tag| tag.content());
+        if current_role
+            .as_deref()
+            .is_some_and(|current| requested_role.is_none_or(|requested| requested == current))
+        {
+            return Ok(None);
+        }
+    }
     let authority = authorize_moderation_action(
         tenant,
         state,

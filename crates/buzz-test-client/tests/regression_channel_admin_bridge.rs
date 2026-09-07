@@ -100,6 +100,7 @@ async fn community(
 
 fn command(keys: &Keys, kind: u16, channel: Uuid, tags: Vec<Tag>) -> Event {
     EventBuilder::new(Kind::Custom(kind), "")
+        .allow_self_tagging()
         .tags([
             Tag::parse(["h", &channel.to_string()]).unwrap(),
             Tag::parse(["nonce", &Uuid::new_v4().to_string()]).unwrap(),
@@ -526,4 +527,209 @@ async fn community_admin_commands_preserve_tenant_owner_delegation_and_audit_gua
             .await
             .unwrap();
     assert_eq!(foreign_audit, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires disposable Postgres fixture; run against migrations and desired schema"]
+async fn audit_constraint_accepts_current_vocabulary_and_rejects_unknown_actions() {
+    let (state, pool) = fixture().await;
+    let owner = Keys::generate();
+    let tenant = community(&state, &pool, &[(&owner, "owner")]).await;
+    for action in buzz_db::moderation::MODERATION_ACTION_CHECK_VOCAB {
+        sqlx::query("INSERT INTO moderation_actions (community_id, actor_pubkey, action) VALUES ($1, $2, $3)")
+            .bind(tenant.community().as_uuid())
+            .bind(owner.public_key().as_bytes().to_vec())
+            .bind(action)
+            .execute(&pool).await.unwrap();
+    }
+    let error = sqlx::query("INSERT INTO moderation_actions (community_id, actor_pubkey, action) VALUES ($1, $2, 'unknown_action')")
+        .bind(tenant.community().as_uuid())
+        .bind(owner.public_key().as_bytes().to_vec())
+        .execute(&pool).await.unwrap_err();
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("23514")
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires disposable Postgres fixture"]
+async fn community_admin_unchanged_self_add_preserves_roles_and_privileged_target_guards() {
+    let (state, pool) = fixture().await;
+    let owner = Keys::generate();
+    let admin = Keys::generate();
+    let peer = Keys::generate();
+    let member = Keys::generate();
+    let tenant = community(
+        &state,
+        &pool,
+        &[
+            (&owner, "owner"),
+            (&admin, "admin"),
+            (&peer, "admin"),
+            (&member, "member"),
+        ],
+    )
+    .await;
+    for visibility in [ChannelVisibility::Private, ChannelVisibility::Open] {
+        for role in [MemberRole::Member, MemberRole::Admin, MemberRole::Owner] {
+            let channel = state
+                .db
+                .create_channel(
+                    tenant.community(),
+                    "self-add",
+                    ChannelType::Stream,
+                    visibility,
+                    None,
+                    owner.public_key().as_bytes(),
+                    None,
+                )
+                .await
+                .unwrap();
+            for (keys, member_role) in [
+                (&admin, role),
+                (&peer, MemberRole::Member),
+                (&member, MemberRole::Member),
+            ] {
+                state
+                    .db
+                    .add_member(
+                        tenant.community(),
+                        channel.id,
+                        keys.public_key().as_bytes(),
+                        member_role,
+                        Some(owner.public_key().as_bytes()),
+                    )
+                    .await
+                    .unwrap();
+            }
+            // Cover both ingest gates and the direct DB caller that skips them.
+            for requested in [None, Some(role.as_str())] {
+                let mut tags = vec![target(&admin)];
+                if let Some(requested) = requested {
+                    tags.push(Tag::parse(["role", requested]).unwrap());
+                }
+                submit(&state, &tenant, command(&admin, 9000, channel.id, tags))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    state
+                        .db
+                        .get_member_role(
+                            tenant.community(),
+                            channel.id,
+                            admin.public_key().as_bytes()
+                        )
+                        .await
+                        .unwrap()
+                        .as_deref(),
+                    Some(role.as_str())
+                );
+            }
+            let unchanged = state
+                .db
+                .add_member(
+                    tenant.community(),
+                    channel.id,
+                    admin.public_key().as_bytes(),
+                    role,
+                    Some(admin.public_key().as_bytes()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(unchanged.role, role.as_str());
+
+            let changed_role = if role == MemberRole::Member {
+                MemberRole::Admin
+            } else {
+                MemberRole::Member
+            };
+            // Same signer cannot change their role. A fellow admin and the owner
+            // remain protected, including otherwise-idempotent third-party adds.
+            for (target_keys, requested) in [
+                (&admin, changed_role),
+                (&peer, MemberRole::Member),
+                (&owner, MemberRole::Owner),
+                (&member, MemberRole::Owner),
+            ] {
+                assert!(submit(
+                    &state,
+                    &tenant,
+                    command(
+                        &admin,
+                        9000,
+                        channel.id,
+                        vec![
+                            target(target_keys),
+                            Tag::parse(["role", requested.as_str()]).unwrap()
+                        ]
+                    )
+                )
+                .await
+                .is_err());
+                assert!(state
+                    .db
+                    .add_member(
+                        tenant.community(),
+                        channel.id,
+                        target_keys.public_key().as_bytes(),
+                        requested,
+                        Some(admin.public_key().as_bytes())
+                    )
+                    .await
+                    .is_err());
+            }
+            assert_eq!(
+                state
+                    .db
+                    .get_member_role(
+                        tenant.community(),
+                        channel.id,
+                        admin.public_key().as_bytes()
+                    )
+                    .await
+                    .unwrap()
+                    .as_deref(),
+                Some(role.as_str())
+            );
+            // A removed role is history, so it cannot activate the exception.
+            state
+                .db
+                .remove_member(
+                    tenant.community(),
+                    channel.id,
+                    admin.public_key().as_bytes(),
+                    owner.public_key().as_bytes(),
+                )
+                .await
+                .unwrap();
+            assert!(submit(
+                &state,
+                &tenant,
+                command(&admin, 9000, channel.id, vec![target(&admin)])
+            )
+            .await
+            .is_err());
+            assert!(state
+                .db
+                .add_member(
+                    tenant.community(),
+                    channel.id,
+                    admin.public_key().as_bytes(),
+                    role,
+                    Some(admin.public_key().as_bytes())
+                )
+                .await
+                .is_err());
+            assert!(!state
+                .db
+                .is_member(
+                    tenant.community(),
+                    channel.id,
+                    admin.public_key().as_bytes()
+                )
+                .await
+                .unwrap());
+        }
+    }
 }

@@ -93,6 +93,15 @@ async fn community_membership_authority_tx(
     if role.as_deref() == Some("admin") {
         let target_community_role = community_role_tx(tx, community, target).await?;
         let target_channel_role = get_active_role_tx(tx, community, channel_id, target).await?;
+        // An active member retaining their own role needs no community grant.
+        // Keep this check under the membership lock, and never exempt removal,
+        // reactivation, a role change, or a different actor targeting an admin.
+        if actor == target
+            && requested_role
+                .is_some_and(|requested| target_channel_role.as_deref() == Some(requested.as_str()))
+        {
+            return Ok(false);
+        }
         if matches!(
             target_community_role.as_deref(),
             Some("owner") | Some("admin")
