@@ -2982,7 +2982,7 @@ mod tests {
             .expect("failed to spawn test script")
     }
 
-    /// Spawn a probe script whose file name carries a runtime identity (e.g.
+    /// Spawn a probe shell whose file name carries a runtime identity (e.g.
     /// `hermes-acp`) and return the value of `var` as the child observed it.
     /// `<unset>` means the child did not receive the var.
     #[cfg(unix)]
@@ -2991,28 +2991,27 @@ mod tests {
         var: &str,
         extra_env: &[(String, String)],
     ) -> String {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::symlink;
 
         let dir = std::env::temp_dir().join(format!("buzz-acp-env-probe-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create env probe dir");
         let path = dir.join(file_name);
-        std::fs::write(
-            &path,
-            format!("#!/bin/sh\nprintf '%s\\n' \"${{{var}:-<unset>}}\"\n"),
-        )
-        .expect("write env probe script");
-        let mut permissions = std::fs::metadata(&path).expect("stat probe").permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&path, permissions).expect("chmod probe");
+        // Execute a stable shell through the runtime-named path. A freshly
+        // written executable can fail with ETXTBSY if a concurrent fork inherits
+        // its writer before close-on-exec, even after this thread closes it.
+        symlink("/bin/sh", &path).expect("symlink env probe shell");
 
         let mut client = AcpClient::spawn(
             path.to_str().expect("probe path is UTF-8"),
-            &[],
+            &[
+                "-c".into(),
+                format!("printf '%s\\n' \"${{{var}:-<unset>}}\""),
+            ],
             extra_env,
             false,
         )
         .await
-        .expect("spawn env probe script");
+        .expect("spawn env probe shell");
         let observed = client
             .reader
             .next()
