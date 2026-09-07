@@ -791,6 +791,15 @@ pub(crate) fn count_fallback_exceeded(candidate_count: usize) -> bool {
 /// Anything else (multi-#p, #t, search, multi-#h, #d on non-NIP-33)
 /// requires post-filtering and cannot use the fast COUNT path.
 pub fn filter_fully_pushable(filter: &Filter) -> bool {
+    // The converter drops explicit empty author, ID and tag constraints.
+    // They match no events, so COUNT must retain the core matcher.
+    if filter.authors.as_ref().is_some_and(|a| a.is_empty())
+        || filter.ids.as_ref().is_some_and(|ids| ids.is_empty())
+        || filter.generic_tags.values().any(|values| values.is_empty())
+    {
+        return false;
+    }
+
     // Check if filter exclusively targets NIP-33 kinds (needed for #d pushability).
     let is_nip33_only = filter.kinds.as_ref().is_some_and(|ks| {
         !ks.is_empty()
@@ -1780,6 +1789,49 @@ mod tests {
         }
         let absent = filter_to_query_params(&Filter::new(), None, community);
         assert!(absent.a_tags.is_none());
+    }
+
+    #[test]
+    fn coordinate_count_preserves_explicit_empty_constraints() {
+        let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let coordinate = "30617:owner:repo";
+        let keys = nostr::Keys::generate();
+
+        for kind in [1618, 1621] {
+            let event = nostr::EventBuilder::new(nostr::Kind::Custom(kind), "")
+                .tags([nostr::Tag::parse(["a", coordinate]).expect("coordinate tag")])
+                .sign_with_keys(&keys)
+                .expect("sign event");
+            let stored = buzz_core::StoredEvent::new(event, None);
+            let value = serde_json::json!({"kinds": [kind], "#a": [coordinate], "limit": 2});
+            let filter: Filter = serde_json::from_value(value.clone()).expect("coordinate filter");
+            assert!(filter_fully_pushable(&filter));
+            assert!(buzz_core::filter::filters_match(&[filter], &stored));
+
+            for field in ["authors", "ids", "#t", "#h", "#p", "#d", "#e", "#x"] {
+                let mut constrained = value.clone();
+                constrained[field] = serde_json::json!([]);
+                let filter: Filter = serde_json::from_value(constrained).expect("empty constraint");
+                assert_eq!(
+                    serde_json::to_value(&filter).expect("serialize filter")[field],
+                    serde_json::json!([]),
+                    "explicit empty {field} must survive parsing"
+                );
+                let query = filter_to_query_params(&filter, None, community);
+                assert_eq!(query.a_tags, Some(vec![coordinate.to_owned()]));
+                assert_eq!(query.kinds, Some(vec![i32::from(kind)]));
+                assert_eq!(query.community_id, community);
+                assert_eq!(query.limit, Some(2));
+                assert!(
+                    !buzz_core::filter::filters_match(std::slice::from_ref(&filter), &stored),
+                    "empty {field} must reject a coordinate-matching kind {kind} event"
+                );
+                assert!(
+                    !filter_fully_pushable(&filter),
+                    "empty {field} must retain COUNT post-filtering for kind {kind}"
+                );
+            }
+        }
     }
 
     #[test]
