@@ -37,7 +37,6 @@ import {
 } from "@/shared/api/relayChannelFilters";
 import {
   clearClosedRetry,
-  handleRelayClosed,
   handleSubscriptionEose,
   prepareSubscriptionEvent,
 } from "@/shared/api/relayClosedRecovery";
@@ -808,7 +807,7 @@ export class RelayClient {
     }
 
     if (type === "CLOSED" && typeof rest[0] === "string") {
-      handleRelayClosed({
+      this.liveEvents.handleClosed({
         subscriptions: this.subscriptions,
         subId: rest[0],
         message: typeof rest[1] === "string" ? rest[1] : "",

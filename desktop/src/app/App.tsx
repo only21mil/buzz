@@ -65,7 +65,7 @@ import {
   queryCacheScopeKey,
   scopedQueryCache,
 } from "@/shared/api/scopedQueryCache";
-import { applyLiveQueryCache } from "@/shared/api/liveQueryCache";
+import { subscribeLiveQueryCache } from "@/shared/api/liveQueryCacheSubscriptions";
 import { relayClient } from "@/shared/api/relayClient";
 import { isSharedIdentity as isSharedIdentityCmd } from "@/shared/api/tauri";
 import { getProfile } from "@/shared/api/tauriProfiles";
@@ -244,33 +244,9 @@ function CommunityQueryProvider({
 
   useEffect(() => {
     if (!cacheReady) return;
-    let active = true;
-    let dispose: (() => Promise<void>) | undefined;
-    const stop = relayClient.liveEvents.observe((event) => {
-      if (active && scopedQueryCache.isAttached(queryClient))
-        applyLiveQueryCache(queryClient, event, pubkey);
-    });
-    void relayClient
-      .subscribeLive(
-        {
-          kinds: [0, 39000, 39002],
-          limit: 1000,
-          since: Math.floor(Date.now() / 1000),
-        },
-        () => {},
-      )
-      .then((unsubscribe) => {
-        if (active) dispose = unsubscribe;
-        else void unsubscribe().catch(() => {});
-      })
-      .catch((error: unknown) =>
-        console.warn("Live cache metadata unavailable", error),
-      );
-    return () => {
-      active = false;
-      stop();
-      void dispose?.().catch(() => {});
-    };
+    return subscribeLiveQueryCache(queryClient, relayClient, pubkey, () =>
+      scopedQueryCache.isAttached(queryClient),
+    );
   }, [cacheReady, queryClient, pubkey]);
 
   useEffect(() => setAvatarProfileSyncQueryClient(queryClient), [queryClient]);
