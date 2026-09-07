@@ -215,6 +215,18 @@ def acquire_reuse(api, job, head, current_context):
     validate_source(source, job=job, run=run, pr=pr, landed=landed,
                     current_authority=current_authority, current_context=current_context,
                     workflow_hash=hashlib.sha256(Path(WORKFLOW).read_bytes()).hexdigest())
+    # The source job attests command execution. Resolve its claimed Git inputs
+    # independently so a digest-valid artifact cannot merely relabel its tree.
+    source_commit = api.one(PREFIX + f"/git/commits/{source_head}")
+    tested_sha = receipt.sha40(source.get("tested_sha"), "source tested SHA")
+    tested_commit = api.one(PREFIX + f"/git/commits/{tested_sha}")
+    need(source_commit["sha"] == source_head and tested_commit["sha"] == tested_sha,
+         "provider source/tested commit identity mismatch")
+    need(source_commit["tree"]["sha"] == tested_commit["tree"]["sha"] == landed["tree"]["sha"],
+         "provider source/tested tree differs from landed tree")
+    if tested_sha != source_head:
+        need([parent["sha"] for parent in tested_commit["parents"]] == [source["base_sha"], source_head],
+             "tested merge has different ordered parents")
     # Independently verify complete required contexts, including failures and
     # superseded attempts, using the same app-bound rules as delivery receipts.
     checks = receipt.select_checks(api.pages(PREFIX + f"/commits/{source_head}/check-runs?filter=all", "checks"),
@@ -234,6 +246,7 @@ def acquire_reuse(api, job, head, current_context):
     return {"schema_version": 1, "mode": "reused", "repository": REPO, "job": job, "head_sha": head,
             "landed": landed, "pull_request": pr, "source_run": run, "source_job": jobs[0],
             "source_artifact": artifact, "source_proof": source, "protected_checks": checks,
+            "source_commit": source_commit, "tested_commit": tested_commit,
             "authority": current_authority, "context": current_context,
             "canonical_refs": "GitHub main verified; Buzz relay readback remains a delivery gate",
             "review_and_approval": "Independent delivery gates remain required for the exact candidate"}

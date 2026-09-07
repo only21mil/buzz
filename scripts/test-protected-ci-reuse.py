@@ -27,6 +27,8 @@ class FakeAPI:
         self.corrupt_digest = False
         self.archive_extra = False
         self.evidence = []
+        self.source_commit = {"sha": SOURCE, "tree": {"sha": TREE}}
+        self.tested_commit = {"sha": "e" * 40, "tree": {"sha": TREE}, "parents": [{"sha": BASE}, {"sha": SOURCE}]}
 
     def one(self, endpoint):
         suffix = endpoint.removeprefix(reuse.PREFIX)
@@ -34,6 +36,10 @@ class FakeAPI:
             return {"object": {"sha": self.main}}
         if suffix == f"/git/commits/{LANDED}":
             return self.landed
+        if suffix == f"/git/commits/{SOURCE}":
+            return self.source_commit
+        if suffix == f"/git/commits/{'e' * 40}":
+            return self.tested_commit
         if suffix == "/pulls/42":
             return self.pr
         if suffix == "/actions/runs/100":
@@ -110,6 +116,22 @@ class ReuseTests(unittest.TestCase):
     def test_changed_tree(self):
         self.landed["tree"]["sha"] = "f" * 40
         self.refuse()
+
+    def test_digest_valid_artifact_cannot_relabel_provider_source_tree(self):
+        self.api.source_commit["tree"]["sha"] = "f" * 40
+        self.refuse()
+
+    def test_digest_valid_artifact_cannot_relabel_provider_tested_tree(self):
+        self.api.tested_commit["tree"]["sha"] = "f" * 40
+        self.refuse()
+
+    def test_tested_merge_wrong_ordered_parents(self):
+        self.api.tested_commit["parents"].reverse()
+        self.refuse()
+
+    def test_tested_candidate_sha_itself_is_allowed(self):
+        self.source["tested_sha"] = SOURCE
+        self.assertEqual(self.acquire()["mode"], "reused")
 
     def test_reversed_or_added_parent(self):
         self.landed["parents"].reverse()

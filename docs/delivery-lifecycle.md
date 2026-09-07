@@ -122,7 +122,9 @@ artifacts with the landing evidence before their seven-day retention expires.
 - The source artifact was uploaded by that run/attempt after the job's check
   commands succeeded. GitHub's immutable artifact identity and archive digest
   match. A reused proof cannot become a source proof.
-- The tested tree, candidate tree and landed tree agree. The closed internal
+- Live GitHub Git objects independently prove the tested tree, candidate tree
+  and landed tree agree. A synthetic tested merge also needs the exact ordered
+  base/candidate parents. The closed internal
   main PR names that merge, whose ordered parents are the tested base followed
   by the candidate. GitHub main still names the exact landed commit.
 - The source and landed workflow bytes agree, including action pins and check
