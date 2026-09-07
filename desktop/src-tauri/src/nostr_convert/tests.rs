@@ -1,5 +1,5 @@
 use super::*;
-use nostr::{EventBuilder, Keys, Kind, Tag};
+use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 
 /// Build a signed event for testing with the given kind, content, and tags.
 fn ev(kind: u16, content: &str, tags: Vec<Vec<&str>>) -> Event {
@@ -12,6 +12,13 @@ fn ev(kind: u16, content: &str, tags: Vec<Vec<&str>>) -> Event {
         .tags(parsed)
         .sign_with_keys(&keys)
         .expect("sign")
+}
+
+fn agent_profile_event(keys: &Keys, created_at: u64, content: &Value) -> Event {
+    EventBuilder::new(Kind::Custom(10100), content.to_string())
+        .custom_created_at(Timestamp::from(created_at))
+        .sign_with_keys(keys)
+        .expect("sign agent profile")
 }
 
 /// Build a kind:0 profile with a valid NIP-OA auth tag.
@@ -318,10 +325,7 @@ fn agents_handles_invalid_content() {
     let e = ev(10100, "not-json", vec![]);
     let v = agents_from_events(std::slice::from_ref(&e));
     let arr = v.get("agents").and_then(Value::as_array).unwrap();
-    assert_eq!(
-        arr[0].get("pubkey").and_then(Value::as_str).unwrap(),
-        e.pubkey.to_hex()
-    );
+    assert!(arr.is_empty());
 }
 
 #[test]
@@ -344,6 +348,51 @@ fn agents_default_sparse_agent_profiles_for_directory_parse() {
     assert_eq!(parsed[0].capabilities, Vec::<String>::new());
     assert_eq!(parsed[0].status, "offline");
     assert_eq!(parsed[0].respond_to, None);
+}
+
+#[test]
+fn agents_fold_sparse_policy_updates_without_resetting_profile() {
+    let fixture: Value =
+        serde_json::from_str(include_str!("../../../fixtures/agent-profile-fold.json"))
+            .expect("parse shared agent profile fixture");
+    let keys = Keys::generate();
+    let complete = agent_profile_event(&keys, 10, &fixture["complete"]);
+    let sparse = agent_profile_event(&keys, 20, &fixture["sparsePolicyUpdate"]);
+    let replacement = agent_profile_event(&keys, 30, &fixture["replacement"]);
+
+    let after_sparse = agents_from_events(&[complete.clone(), sparse.clone()]);
+    let agents = after_sparse["agents"].as_array().expect("agents array");
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0]["name"], "Scout");
+    assert_eq!(agents[0]["agent_type"], "assistant");
+    assert_eq!(agents[0]["channels"], serde_json::json!(["general"]));
+    assert_eq!(agents[0]["capabilities"], serde_json::json!(["search"]));
+    assert_eq!(agents[0]["status"], "online");
+    assert_eq!(agents[0]["respond_to"], "allowlist");
+    let directory =
+        relay_agents_from_directory_events(&[complete.clone(), sparse.clone()], &[], &[]);
+    assert_eq!(directory.len(), 1);
+    assert_eq!(directory[0].name, "Scout");
+    assert_eq!(directory[0].agent_type, "assistant");
+    assert_eq!(directory[0].status, "online");
+
+    let after_replacement =
+        agents_from_events(&[complete.clone(), sparse.clone(), replacement.clone()]);
+    let agents = after_replacement["agents"]
+        .as_array()
+        .expect("agents array");
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0]["name"], "Builder");
+    assert_eq!(agents[0]["agent_type"], "worker");
+    assert_eq!(agents[0]["channels"], serde_json::json!(["engineering"]));
+    assert_eq!(agents[0]["capabilities"], serde_json::json!(["build"]));
+    assert_eq!(agents[0]["status"], "away");
+    assert_eq!(agents[0]["respond_to"], "anyone");
+    let directory = relay_agents_from_directory_events(&[complete, sparse, replacement], &[], &[]);
+    assert_eq!(directory.len(), 1);
+    assert_eq!(directory[0].name, "Builder");
+    assert_eq!(directory[0].agent_type, "worker");
+    assert_eq!(directory[0].status, "away");
 }
 
 #[test]
