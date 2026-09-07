@@ -267,6 +267,7 @@ export function MembersSidebarMemberCard({
           disabled={disabled}
           managedAgent={managedAgent}
           member={member}
+          memberLabel={memberLabel}
           memberIsBot={memberIsBot}
           moderationState={moderationState}
           onBan={onBan}
@@ -295,6 +296,7 @@ function MemberActionsMenu({
   disabled,
   managedAgent,
   member,
+  memberLabel,
   memberIsBot,
   moderationState,
   onBan,
@@ -315,6 +317,7 @@ function MemberActionsMenu({
   disabled: boolean;
   managedAgent?: ManagedAgent;
   member: ChannelMember;
+  memberLabel: string;
   memberIsBot: boolean;
   moderationState?: MemberModerationState;
   onBan: (member: ChannelMember) => void;
@@ -337,7 +340,8 @@ function MemberActionsMenu({
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
         <button
-          className="invisible relative z-20 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground group-hover/member:visible hover:bg-muted hover:text-foreground data-[state=open]:visible"
+          aria-label={`Actions for ${memberLabel}`}
+          className="relative z-20 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity group-hover/member:opacity-100 focus-visible:opacity-100 hover:bg-muted hover:text-foreground data-[state=open]:opacity-100"
           data-testid={`sidebar-member-menu-${member.pubkey}`}
           type="button"
         >

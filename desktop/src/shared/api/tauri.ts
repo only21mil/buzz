@@ -41,6 +41,7 @@ import type {
   GitBashPrerequisite,
   RuntimeConfigSurface,
 } from "@/shared/api/types";
+import { assertManagedAgentPromptPersisted } from "@/shared/api/agentPromptPersistence";
 
 export * from "@/shared/api/tauriChannels";
 export { sendChannelMessage } from "@/shared/api/tauriMessages";
@@ -1041,8 +1042,10 @@ export async function updateManagedAgent(
     "update_managed_agent",
     { input },
   );
+  const agent = fromRawManagedAgent(response.agent);
+  assertManagedAgentPromptPersisted(input, agent);
   return {
-    agent: fromRawManagedAgent(response.agent),
+    agent,
     profileSyncError: response.profile_sync_error,
   };
 }

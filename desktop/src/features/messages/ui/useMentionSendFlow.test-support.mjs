@@ -174,6 +174,9 @@ export async function setup({ lifecycle = false } = {}) {
     "@/features/messages/lib/agentMentionRevalidation": {
       AgentMentionAuthorizationError: class extends Error {},
     },
+    "@/features/messages/lib/unresolvedMentionFeedback": {
+      unresolvedMentionError: () => null,
+    },
   };
   stubs["./useDetachedAgentStart"] = load("useDetachedAgentStart", stubs);
   stubs["./useEnsureAgentMentionsReady"] = load(
