@@ -215,7 +215,9 @@ function makePinnedCenterNodes() {
       resizeObservers.push(this);
     }
 
-    disconnect() {}
+    disconnect() {
+      this.targets = [];
+    }
 
     observe(target) {
       this.targets ??= [];
@@ -248,13 +250,14 @@ function Harness({ channelId, onTargetSettled, refs }) {
 }
 
 function BottomStateHarness({
+  channelId = "conversation",
   messages,
   onState,
   refs,
   targetMessageId = null,
 }) {
   const anchored = useAnchoredScroll({
-    channelId: "conversation",
+    channelId,
     contentRef: refs.content,
     isLoading: false,
     messages,
@@ -596,4 +599,162 @@ test("mounted virtual target retires bottom intent before direct centering", asy
   );
   assert.equal(bottomWrites.length, 1, "geometry cannot re-pin to bottom");
   await act(async () => root.unmount());
+});
+
+test("late same-channel content mount observes resize and clears the latest pill", async () => {
+  const refs = { container: { current: null }, content: { current: null } };
+  const root = createRoot(document.createElement("div"));
+  const nodes = makePinnedCenterNodes();
+  let state;
+  const render = (messages) =>
+    root.render(
+      React.createElement(BottomStateHarness, {
+        messages,
+        refs,
+        onState: (next) => {
+          state = next;
+        },
+      }),
+    );
+  try {
+    // MessageThreadPanel returns null until its thread head arrives. Its
+    // threadHeadId and hook refs can already exist during that empty commit.
+    await act(async () => render([]));
+    refs.container.current = nodes.container;
+    refs.content.current = nodes.content;
+    await act(async () => render([{ id: "first" }]));
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+    nodes.container.scrollTop = 100;
+    await act(async () => state.onScroll());
+    nodes.container.scrollTop = 100;
+    await act(async () => state.onScroll());
+    await act(async () => render([{ id: "first" }, { id: "second" }]));
+    assert.equal(state.isAtBottom, false);
+    assert.equal(state.newMessageCount, 1);
+
+    // A viewport expansion reaches the floor without a scroll event. Notify
+    // only observers that actually subscribed to the live container.
+    nodes.container.clientHeight = 900;
+    await act(async () => {
+      for (const observer of nodes.resizeObservers) {
+        if (observer.targets?.includes(nodes.container)) observer.callback();
+      }
+    });
+    assert.equal(state.isAtBottom, true);
+    assert.equal(state.newMessageCount, 0);
+  } finally {
+    await act(async () => root.unmount());
+  }
+});
+
+test("replacement scroll nodes preserve history and regain bottom resize following", async () => {
+  const original = makePinnedCenterNodes();
+  const refs = {
+    container: { current: original.container },
+    content: { current: original.content },
+  };
+  const root = createRoot(document.createElement("div"));
+  let state;
+  const first = [{ id: "selected" }];
+  const replies = [...first, { id: "reply" }];
+  const history = [{ id: "older" }, ...replies];
+  const render = (messages, channelId = "conversation") =>
+    root.render(
+      React.createElement(BottomStateHarness, {
+        channelId,
+        messages,
+        refs,
+        onState: (next) => {
+          state = next;
+        },
+      }),
+    );
+  const clampScrollTo = (container) => {
+    container.scrollTo = ({ top }) => {
+      container.scrollTop = Math.max(
+        0,
+        Math.min(top, container.scrollHeight - container.clientHeight),
+      );
+    };
+  };
+  clampScrollTo(original.container);
+  try {
+    await act(async () => render(first));
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+    await act(async () => state.onScroll());
+    original.container.scrollTop = 100;
+    await act(async () => state.onScroll());
+    await act(async () => render(replies));
+    assert.equal(state.newMessageCount, 1);
+
+    // Replace the DOM under the stable refs without changing channel or data.
+    const replacement = makePinnedCenterNodes();
+    clampScrollTo(replacement.container);
+    refs.container.current = replacement.container;
+    refs.content.current = replacement.content;
+    await act(async () => render(replies));
+    const observer = original.resizeObservers[0];
+    assert.deepEqual(observer.targets, [
+      replacement.content,
+      replacement.container,
+    ]);
+    assert.equal(original.resizeObservers.length, 1, "reuse the observer");
+    assert.equal(state.isAtBottom, false);
+    assert.equal(state.newMessageCount, 1);
+
+    // A prepend must retain the visible row offset and not count as unread.
+    replacement.moveSelectedRowBy(120);
+    replacement.container.scrollHeight += 120;
+    await act(async () => render(history));
+    assert.equal(replacement.container.scrollTop, 220);
+    assert.equal(
+      replacement.container.querySelector().getBoundingClientRect().top,
+      200,
+    );
+    assert.equal(state.newMessageCount, 1);
+
+    // Model native scroll anchoring when an image above the reading row grows.
+    replacement.moveSelectedRowBy(80);
+    replacement.container.scrollHeight += 80;
+    replacement.container.scrollTop += 80;
+    await act(async () => observer.callback());
+    assert.equal(replacement.container.scrollTop, 300);
+    assert.equal(
+      replacement.container.querySelector().getBoundingClientRect().top,
+      200,
+    );
+    assert.equal(state.isAtBottom, false);
+    assert.equal(state.newMessageCount, 1);
+
+    await act(async () => state.scrollToBottom());
+    assert.equal(state.isAtBottom, true);
+    assert.equal(state.newMessageCount, 0);
+    replacement.container.scrollHeight += 240;
+    await act(async () => observer.callback());
+    assert.equal(
+      replacement.container.scrollTop,
+      replacement.container.scrollHeight - replacement.container.clientHeight,
+    );
+    replacement.container.scrollHeight += 60;
+    await act(async () => render([...history, { id: "latest" }]));
+    assert.equal(
+      replacement.container.scrollTop,
+      replacement.container.scrollHeight - replacement.container.clientHeight,
+    );
+    assert.equal(state.isAtBottom, true);
+    assert.equal(state.newMessageCount, 0);
+
+    await act(async () => render([{ id: "other" }], "other-channel"));
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+    assert.deepEqual(
+      observer.targets,
+      [],
+      "disconnect the old channel observer",
+    );
+    assert.equal(state.isAtBottom, true);
+    assert.equal(state.newMessageCount, 0);
+  } finally {
+    await act(async () => root.unmount());
+  }
+  assert.deepEqual(original.resizeObservers[0].targets, []);
 });

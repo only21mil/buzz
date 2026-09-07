@@ -209,6 +209,11 @@ export function useAnchoredScroll({
   const isWritingScrollRef = React.useRef(false);
   const programmaticScrollRafRef = React.useRef<number | null>(null);
   const targetSettleRafRef = React.useRef<number | null>(null);
+  const resizeSubscriptionRef = React.useRef<{
+    observer: ResizeObserver;
+    content: HTMLDivElement | null;
+    container: HTMLDivElement | null;
+  } | null>(null);
 
   // Reset everything when the channel changes — the layout effect that runs
   // immediately after this reset is responsible for either jumping to bottom
@@ -784,10 +789,9 @@ export function useAnchoredScroll({
   // mid-history, native scroll anchoring (overflow-anchor) holds the reading
   // row across the reflow, so there's nothing to do.
   // ---------------------------------------------------------------------------
-  // biome-ignore lint/correctness/useExhaustiveDependencies: channelId deliberately re-subscribes after a keyed or conditional scroll-content mount replaces ref.current.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: channelId resets the observer and pending target settlement for each conversation.
   React.useEffect(() => {
-    const content = contentRef.current;
-    if (!content || typeof ResizeObserver === "undefined") return;
+    if (typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(() => {
       const container = scrollContainerRef.current;
       if (!container) return;
@@ -799,11 +803,14 @@ export function useAnchoredScroll({
         container.scrollTo({ top: container.scrollHeight, behavior: "auto" });
       }
     });
-    observer.observe(content);
-    const container = scrollContainerRef.current;
-    if (container && container !== content) observer.observe(container);
+    resizeSubscriptionRef.current = {
+      observer,
+      content: null,
+      container: null,
+    };
     return () => {
       observer.disconnect();
+      resizeSubscriptionRef.current = null;
       if (targetSettleRafRef.current !== null) {
         cancelAnimationFrame(targetSettleRafRef.current);
         targetSettleRafRef.current = null;
@@ -811,11 +818,32 @@ export function useAnchoredScroll({
     };
   }, [
     channelId,
-    contentRef,
     scrollContainerRef,
     settleAtBottomAfterLayout,
     virtualizerOwnsPrependAnchoring,
   ]);
+
+  // Ref objects stay stable when a thread head arrives or a keyed scroll
+  // surface is replaced within the same channel. Check the committed nodes
+  // every render, while keeping subscriptions intact for ordinary updates.
+  React.useEffect(() => {
+    const subscription = resizeSubscriptionRef.current;
+    if (!subscription) return;
+    const content = contentRef.current;
+    const container = scrollContainerRef.current;
+    if (
+      subscription.content === content &&
+      subscription.container === container
+    )
+      return;
+
+    subscription.observer.disconnect();
+    subscription.content = content;
+    subscription.container = container;
+    if (content) subscription.observer.observe(content);
+    if (container && container !== content)
+      subscription.observer.observe(container);
+  });
 
   useVirtualizedViewportResize(
     scrollContainerRef,
