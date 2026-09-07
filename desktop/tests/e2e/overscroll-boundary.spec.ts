@@ -20,8 +20,21 @@ async function dispatchWheelPrevented(
         deltaX,
         deltaY,
       });
-      element.dispatchEvent(event);
-      return event.defaultPrevented;
+      let viewportPrevented: boolean | null = null;
+      const observeViewport = (observed: WheelEvent) => {
+        if (observed === event) viewportPrevented = observed.defaultPrevented;
+      };
+      window.addEventListener("wheel", observeViewport, { capture: true });
+      try {
+        element.dispatchEvent(event);
+      } finally {
+        window.removeEventListener("wheel", observeViewport, { capture: true });
+      }
+      // The viewport listener runs on window in capture phase. A timeline's
+      // own wheel handler may legitimately consume the event after that.
+      if (viewportPrevented === null)
+        throw new Error("Wheel capture was not observed");
+      return viewportPrevented;
     },
     { selector, deltaX: deltas.deltaX ?? 0, deltaY: deltas.deltaY ?? 0 },
   );
@@ -36,7 +49,21 @@ test("locks viewport rubber-band outside conversation scrollers", async ({
 }) => {
   await page.goto("/");
   await page.getByTestId("channel-general").click();
-  await expect(page.getByTestId("message-timeline")).toBeVisible();
+  const timeline = page.getByTestId("message-timeline");
+  await expect(timeline).toBeVisible();
+  // The conversation exemption requires actual overflow, which arrives after
+  // the visible timeline's virtualized rows finish their initial measurement.
+  await expect
+    .poll(() =>
+      timeline.evaluate(
+        (element) =>
+          element.scrollHeight > element.clientHeight + 1 &&
+          ["auto", "scroll", "overlay"].includes(
+            getComputedStyle(element).overflowY,
+          ),
+      ),
+    )
+    .toBe(true);
 
   await expect(
     dispatchWheelPrevented(page, '[data-testid="app-top-chrome"]', {
@@ -84,7 +111,21 @@ test("locks viewport rubber-band outside conversation scrollers", async ({
 test("locks horizontal viewport pan everywhere", async ({ page }) => {
   await page.goto("/");
   await page.getByTestId("channel-general").click();
-  await expect(page.getByTestId("message-timeline")).toBeVisible();
+  const timeline = page.getByTestId("message-timeline");
+  await expect(timeline).toBeVisible();
+  // The conversation exemption requires actual overflow, which arrives after
+  // the visible timeline's virtualized rows finish their initial measurement.
+  await expect
+    .poll(() =>
+      timeline.evaluate(
+        (element) =>
+          element.scrollHeight > element.clientHeight + 1 &&
+          ["auto", "scroll", "overlay"].includes(
+            getComputedStyle(element).overflowY,
+          ),
+      ),
+    )
+    .toBe(true);
 
   for (const deltaX of [-120, 120]) {
     await expect(

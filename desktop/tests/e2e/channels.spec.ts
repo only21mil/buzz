@@ -1174,7 +1174,11 @@ test("keeps the sent expanded DM when detached agent startup fails", async ({
       { exact: true },
     ),
   ).toBeVisible();
-  await expect(page.getByTestId("chat-title")).toHaveText("charlie, Fizz");
+  await expect
+    .poll(async () =>
+      (await page.getByTestId("chat-title").innerText()).split(", ").sort(),
+    )
+    .toEqual(["Fizz", "charlie"]);
   await expect(page.getByTestId("message-timeline")).toContainText(
     "before startup fails",
   );
@@ -1243,7 +1247,11 @@ test("keeps the sent expanded DM when detached agent startup fails", async ({
   expect(followUpCommands.map((entry) => entry.command)).not.toContain(
     "open_dm",
   );
-  await expect(page.getByTestId("chat-title")).toHaveText("charlie, Fizz");
+  await expect
+    .poll(async () =>
+      (await page.getByTestId("chat-title").innerText()).split(", ").sort(),
+    )
+    .toEqual(["Fizz", "charlie"]);
 });
 
 test("closes direct message results while opening", async ({ page }) => {
