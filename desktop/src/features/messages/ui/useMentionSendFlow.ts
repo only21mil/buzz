@@ -769,13 +769,16 @@ export function useMentionSendFlow({
         )
           return;
         const savedMentionRefs = mentions.getDraftMentionRefs(trimmed).slice();
-        const selectedMentionPubkeys = mentions.extractMentionPubkeys(trimmed);
+        const resolvedMentionLabels = new Set<string>();
+        const selectedMentionPubkeys = mentions.extractMentionPubkeys(
+          trimmed,
+          [],
+          (displayName) => resolvedMentionLabels.add(displayName),
+        );
         const selectedPersonas = mentions.extractMentionPersonas(trimmed);
         const unresolvedMentionErrorMessage = unresolvedMentionError(trimmed, [
           ...savedMentionRefs.map((ref) => ref.displayName),
-          ...selectedMentionPubkeys
-            .map(mentions.getMentionDisplayName)
-            .filter((name): name is string => name !== null),
+          ...resolvedMentionLabels,
           ...selectedPersonas.map((target) => target.displayName),
         ]);
         if (unresolvedMentionErrorMessage) {
@@ -945,7 +948,6 @@ export function useMentionSendFlow({
       mentions.isManagedAgentPubkey,
       mentions.memberPubkeys,
       mentions.getDraftMentionRefs,
-      mentions.getMentionDisplayName,
       mentions.settlePendingMentionBindings,
       mentions.registerMentionPubkey,
       onPrepareSendChannel,
