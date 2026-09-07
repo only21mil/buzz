@@ -629,3 +629,5 @@ buzz-relay	buzz_relay	handlers::identity_archive::tests::owner_archive_rejects_s
 buzz-db	schema_partition_contract	desired_schema_attachment_preserves_partition_guards	crates/buzz-db/tests/schema_partition_contract.rs	migration	standalone partition attachment with retained rows and inherited guard enforcement
 buzz-db	schema_partition_contract	populated_migration_attachment_preserves_partition_guards	crates/buzz-db/tests/schema_partition_contract.rs	migration	standalone partition attachment with retained rows and inherited guard enforcement
 buzz-db	buzz_db	event::tests::coordinate_scope_precedes_limit_and_count_preserves_access	crates/buzz-db/src/event.rs	desired	coordinate limit, COUNT, tag AND and tenant access regression
+buzz-db	buzz_db	event::tests::persona_heads_precede_limits_and_count_with_deterministic_ties	crates/buzz-db/src/event.rs	desired	persona latest-head query and COUNT regression
+buzz-db	buzz_db	event::tests::persona_head_selection_preserves_coordinate_and_visibility_boundaries	crates/buzz-db/src/event.rs	desired	persona latest-head query and COUNT regression
