@@ -7,6 +7,7 @@ import { parse as parseYaml } from "yaml";
 
 import type { BrowserIdentityManager } from "../identity";
 import { register } from "../registry";
+import { getWorkflowRuns } from "../relayWorkflowRuns";
 import { BrowserUnavailableError } from "./capabilityOff";
 
 type RelayFilter = {
@@ -560,6 +561,7 @@ export function registerRelayWorkflowsMembersCommands(
     ),
   );
   register("create_workflow", (body) => createWorkflow(body, identity, client));
+  register("get_workflow_runs", getWorkflowRuns);
   register("delete_workflow", async (body) => {
     const workflowId = requiredString(
       objectBody(body, "delete_workflow"),
