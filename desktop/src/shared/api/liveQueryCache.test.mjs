@@ -130,6 +130,8 @@ test("two synthetic clients receive messages, edits, reactions and deletes befor
 test("profile and membership snapshots update hot data without HTTP and older events cannot undo them", () => {
   const client = cache();
   seed(client);
+  client.setQueryData(["channels"], [{ ...channel, visibility: "private" }]);
+  client.setQueryData(["thread-replies", "channel", "root"], [event("reply")]);
   client.setQueryData(["users-batch", peer], { profiles: {}, missing: [peer] });
   client.setQueryData(
     ["channels", "channel", "members"],
@@ -173,7 +175,12 @@ test("profile and membership snapshots update hot data without HTTP and older ev
     client.getQueryData(["channels", "channel", "members"])[0].role,
     "admin",
   );
-  assert.equal(client.getQueryData(["channel-messages", "channel"]), undefined);
+  for (const root of ["channel-messages", "channel-window", "thread-replies"]) {
+    assert.equal(
+      client.getQueryCache().findAll({ queryKey: [root, "channel"] }).length,
+      0,
+    );
+  }
 });
 
 test("a thread reply only updates its own cached thread", () => {
@@ -278,6 +285,7 @@ test("60-second reconnect restores live delivery and fetches only the missed gap
           kinds: [...CHANNEL_EVENT_KINDS],
           "#h": ["channel"],
           limit: 1000,
+          since: 900,
         },
         lastSeenCreatedAt: 1000,
         onEvent: (incoming) => applyLiveQueryCache(client, incoming, self),
@@ -299,12 +307,99 @@ test("60-second reconnect restores live delivery and fetches only the missed gap
     },
   });
   assert.equal(requests[0][2].limit, 0);
-  assert.equal(requests[0][2].since, 1060);
+  assert.equal(requests[0][2].since, 900);
   assert.equal(pages[0].since, 995);
   assert.equal(pages[0].until, 1060);
   assert.ok(
     client
       .getQueryData(["channel-messages", "channel"])
       .some((item) => item.id === "offline"),
+  );
+});
+
+for (const wasMember of [false, true]) {
+  test(`open-channel history remains readable after a roster omits self (wasMember=${wasMember})`, () => {
+    const client = cache();
+    seed(client);
+    client.setQueryData(["channels"], [{ ...channel, isMember: wasMember }]);
+    client.setQueryData(
+      ["thread-replies", "channel", "root"],
+      [event("reply")],
+    );
+    const keys = [
+      ["channel-messages", "channel"],
+      ["channel-window", "channel"],
+      ["thread-replies", "channel", "root"],
+    ];
+    const before = keys.map((key) => client.getQueryData(key));
+    applyLiveQueryCache(
+      client,
+      event("roster", 39002, [
+        ["d", "channel"],
+        ["p", peer],
+      ]),
+      self,
+    );
+    assert.equal(client.getQueryData(["channels"])[0].isMember, false);
+    assert.deepEqual(client.getQueryData(["channels"])[0].memberPubkeys, [
+      peer,
+    ]);
+    keys.forEach((key, index) => {
+      assert.strictEqual(client.getQueryData(key), before[index]);
+    });
+  });
+}
+
+test("paged reconnect accepts a delayed pre-reconnect edit after backfill completes", async () => {
+  const client = cache();
+  seed(client);
+  let liveFilter;
+  const subscription = {
+    mode: "live",
+    filter: {
+      kinds: [...CHANNEL_EVENT_KINDS],
+      "#h": ["channel"],
+      since: 900,
+      limit: 1000,
+    },
+    lastSeenCreatedAt: 1000,
+    onEvent: (incoming) => applyLiveQueryCache(client, incoming, self),
+  };
+  await replayLiveSubscriptions({
+    subscriptions: new Map([["live", subscription]]),
+    now: 1060,
+    sendRaw: async (frame) => {
+      liveFilter = frame[2];
+    },
+    requestHistoryPage: async () => ({ events: [], nextCursor: null }),
+  });
+  const delayed = event(
+    "late-edit",
+    40003,
+    [
+      ["h", "channel"],
+      ["e", "old"],
+    ],
+    "edited",
+    1059,
+  );
+  // Relay live filtering uses created_at, independently of arrival time.
+  if (
+    liveFilter.kinds.includes(delayed.kind) &&
+    liveFilter["#h"].includes("channel") &&
+    (liveFilter.since === undefined || delayed.created_at >= liveFilter.since)
+  ) {
+    subscription.onEvent(delayed);
+  }
+  assert.equal(liveFilter.limit, 0);
+  assert.ok(
+    client
+      .getQueryData(["channel-messages", "channel"])
+      .some((item) => item.id === delayed.id),
+  );
+  assert.ok(
+    flattenChannelWindowEvents(
+      client.getQueryData(["channel-window", "channel"]),
+    ).some((item) => item.id === delayed.id),
   );
 });

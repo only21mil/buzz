@@ -296,7 +296,14 @@ function applyChannelSnapshot(
           })
         : current,
   );
-  if (!pubkeys.includes(self)) {
+  // Open channels remain readable without membership. Only private-channel
+  // removal revokes access to the cached history.
+  if (
+    !pubkeys.includes(self) &&
+    channels.some(
+      (channel) => channel.id === id && channel.visibility === "private",
+    )
+  ) {
     for (const root of [
       "channel-messages",
       "channel-window",
