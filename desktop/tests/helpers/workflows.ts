@@ -36,9 +36,11 @@ export async function addWorkflowMessageStep(page: Page, dialog: Locator) {
   await page
     .getByRole("menuitem", { name: "Send Message", exact: true })
     .click();
-  await dialog
-    .getByLabel("Message text", { exact: true })
-    .fill("Workflow fixture message");
+  // The outgoing trigger inspector has the same label during its exit
+  // animation. Wait for the selected step's textarea before editing it.
+  const message = dialog.locator("textarea#wf-step-0-text");
+  await message.fill("Workflow fixture message");
+  await expect(message).toHaveValue("Workflow fixture message");
 }
 
 export async function createWorkflow(
