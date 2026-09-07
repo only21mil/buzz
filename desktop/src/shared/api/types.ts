@@ -780,6 +780,10 @@ export type CreatePersonaInput = {
 
 export type UpdatePersonaInput = {
   id: string;
+  /** Optional revision bound to an owner-reviewed draft. */
+  expectedUpdatedAt?: string;
+  /** Sharing can change independently of the persona timestamp. */
+  expectedShared?: boolean;
   displayName: string;
   avatarUrl?: string;
   systemPrompt: string;

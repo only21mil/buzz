@@ -93,6 +93,8 @@ export async function createPersona(
 function updatePersonaPayload(input: UpdatePersonaInput) {
   return {
     id: input.id,
+    expectedUpdatedAt: input.expectedUpdatedAt,
+    expectedShared: input.expectedShared,
     displayName: input.displayName,
     avatarUrl: input.avatarUrl,
     systemPrompt: input.systemPrompt,
