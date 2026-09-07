@@ -1,3 +1,4 @@
+import { isTauri } from "@tauri-apps/api/core";
 import { CircleDot, FolderGit2, GitPullRequest, Plus } from "lucide-react";
 import * as React from "react";
 
@@ -47,6 +48,12 @@ export function ProjectsCreateMenu({
     action();
   }
 
+  if (!isTauri())
+    return (
+      <Button disabled title="Project creation requires the desktop app">
+        Create
+      </Button>
+    );
   return (
     <nav
       aria-label="Create project item"

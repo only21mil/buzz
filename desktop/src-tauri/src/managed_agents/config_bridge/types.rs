@@ -168,6 +168,9 @@ pub struct ConfigSourceReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeConfigSurface {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort_config_id: Option<String>,
+    pub effort_options: Vec<AcpConfigOptionValue>,
     pub runtime_id: Option<String>,
     pub runtime_label: Option<String>,
     pub is_pre_spawn: bool,

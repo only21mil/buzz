@@ -55,17 +55,28 @@ async fn enforce_http_admission(
     }
 }
 
+/// Values retained from an already-verified bridge authentication event.
+#[derive(Debug)]
+pub(crate) struct VerifiedBridgeAuth {
+    pub(crate) pubkey: nostr::PublicKey,
+    pub(crate) event_id_bytes: [u8; 32],
+    pub(crate) signed_created_at: Option<u64>,
+}
+
+type BridgeAuthResult = Result<VerifiedBridgeAuth, (StatusCode, Json<Value>)>;
+
 /// Verify bridge auth: NIP-98 (production) or X-Pubkey (dev mode).
 ///
-/// Returns the authenticated public key and an event ID for replay detection.
-/// For X-Pubkey dev mode, the event ID is a zero hash (no replay concern).
+/// Returns the authenticated public key, an event ID for replay detection, and
+/// the verified signed auth timestamp. For X-Pubkey dev mode, the event ID is
+/// a zero hash and the timestamp is absent.
 pub(crate) fn verify_bridge_auth(
     headers: &HeaderMap,
     method: &str,
     url: &str,
     body: Option<&[u8]>,
     require_auth_token: bool,
-) -> Result<(nostr::PublicKey, [u8; 32]), (StatusCode, Json<Value>)> {
+) -> BridgeAuthResult {
     verify_bridge_auth_with_options(headers, method, url, body, require_auth_token, false)
 }
 
@@ -76,7 +87,16 @@ pub(crate) fn verify_bridge_auth_with_options(
     body: Option<&[u8]>,
     require_auth_token: bool,
     require_payload: bool,
-) -> Result<(nostr::PublicKey, [u8; 32]), (StatusCode, Json<Value>)> {
+) -> BridgeAuthResult {
+    // Reject ambiguity before the dev fallback can select another identity.
+    for name in ["authorization", "x-pubkey"] {
+        if headers.get_all(name).iter().count() > 1 {
+            return Err(api_error(
+                StatusCode::UNAUTHORIZED,
+                "duplicate authentication header",
+            ));
+        }
+    }
     // Try NIP-98 first (Authorization: Nostr <base64>)
     if let Some(auth_str) = headers
         .get("authorization")
@@ -111,7 +131,11 @@ pub(crate) fn verify_bridge_auth_with_options(
         let pubkey = buzz_auth::verify_nip98_event(&event_json, url, method, body)
             .map_err(|e| api_error(StatusCode::UNAUTHORIZED, &format!("NIP-98: {e}")))?;
 
-        return Ok((pubkey, event_id_bytes));
+        return Ok(VerifiedBridgeAuth {
+            pubkey,
+            event_id_bytes,
+            signed_created_at: Some(event.created_at.as_secs()),
+        });
     }
 
     // Dev-mode fallback: X-Pubkey header (only when require_auth_token is false)
@@ -120,7 +144,11 @@ pub(crate) fn verify_bridge_auth_with_options(
             let pubkey = nostr::PublicKey::from_hex(hex_val)
                 .map_err(|_| api_error(StatusCode::UNAUTHORIZED, "invalid X-Pubkey hex"))?;
             // Zero event ID — no replay detection needed for dev mode
-            return Ok((pubkey, [0u8; 32]));
+            return Ok(VerifiedBridgeAuth {
+                pubkey,
+                event_id_bytes: [0u8; 32],
+                signed_created_at: None,
+            });
         }
     }
 
@@ -274,6 +302,14 @@ fn extract_before_id(raw: &Value) -> BeforeId {
     }
 }
 
+fn extract_buzz_channel(raw: &Value) -> Option<&str> {
+    raw.get("#buzz-channel")
+        .and_then(Value::as_array)
+        .filter(|values| values.len() == 1)
+        .and_then(|values| values.first())
+        .and_then(Value::as_str)
+}
+
 /// True when the raw filter opts into a bridge extension flag (`top_level`,
 /// `include_summaries`, `include_aux`). Absent or non-boolean = false.
 fn extension_flag(raw: &Value, key: &str) -> bool {
@@ -372,6 +408,63 @@ fn extract_page_offset(raw: &Value, limit: Option<i64>) -> Option<i64> {
         .filter(|value| *value > 1)?;
     let per_page = limit.filter(|l| *l > 0)?;
     page.checked_sub(1)?.checked_mul(per_page)
+}
+
+const THREAD_AUX_MAX_PAGES: usize = 64;
+
+enum ThreadAuxReader<'a> {
+    Database(&'a buzz_db::Db),
+    #[cfg(test)]
+    Fake(&'a mut (dyn FnMut(&buzz_db::EventQuery) -> Vec<buzz_core::StoredEvent> + Send)),
+}
+
+impl ThreadAuxReader<'_> {
+    async fn fetch(
+        &mut self,
+        query: &buzz_db::EventQuery,
+    ) -> buzz_db::Result<Vec<buzz_core::StoredEvent>> {
+        match self {
+            Self::Database(db) => db.query_events_routed("bridge_thread_aux", query).await,
+            #[cfg(test)]
+            Self::Fake(fetch) => Ok(fetch(query)),
+        }
+    }
+}
+
+// A cap or stalled cursor is a failed closure, never a successful truncated
+// response bearing the capability header. Existing channel-window snapshots
+// keep their original transaction-bound reader.
+async fn query_thread_aux_pages(
+    mut query: buzz_db::EventQuery,
+    page_limit: i64,
+    reader: &mut ThreadAuxReader<'_>,
+) -> buzz_db::Result<Vec<buzz_core::StoredEvent>> {
+    query.limit = Some(page_limit);
+    let mut events = Vec::new();
+    for _ in 0..THREAD_AUX_MAX_PAGES {
+        let page = reader.fetch(&query).await?;
+        let next = if page.len() as i64 >= page_limit {
+            page.last().map(|se| (se.event.created_at, se.event.id))
+        } else {
+            None
+        };
+        events.extend(page);
+        let Some((created_at, id)) = next else {
+            return Ok(events);
+        };
+        let next_until = chrono::DateTime::from_timestamp(created_at.as_secs() as i64, 0);
+        let next_id = Some(id.to_bytes().to_vec());
+        if next_until == query.until && next_id == query.before_id {
+            return Err(buzz_db::DbError::InvalidData(
+                "thread aux cursor did not advance".into(),
+            ));
+        }
+        query.until = next_until;
+        query.before_id = next_id;
+    }
+    Err(buzz_db::DbError::InvalidData(
+        "thread aux page limit exceeded".into(),
+    ))
 }
 
 /// Default and maximum row budget for a channel-window request. The budget
@@ -637,7 +730,11 @@ pub async fn submit_event(
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/events");
-    let (pubkey, event_id_bytes) = verify_bridge_auth(
+    let VerifiedBridgeAuth {
+        pubkey,
+        event_id_bytes,
+        signed_created_at,
+    } = verify_bridge_auth(
         &headers,
         "POST",
         &url,
@@ -650,8 +747,16 @@ pub async fn submit_event(
     // runs inside the helper.  The thin wrapper here owns the single terminal
     // attribution line so it fires for every outcome, including admission/
     // replay/membership failures that previously returned before any log fired.
-    let outcome =
-        submit_event_authed(&state, &tenant, &headers, &body, pubkey, event_id_bytes).await;
+    let outcome = submit_event_authed(
+        &state,
+        &tenant,
+        &headers,
+        &body,
+        pubkey,
+        event_id_bytes,
+        signed_created_at,
+    )
+    .await;
 
     match &outcome {
         SubmitOutcome::Ok { accepted, .. } => {
@@ -758,6 +863,7 @@ async fn submit_event_authed(
     body: &[u8],
     pubkey: nostr::PublicKey,
     event_id_bytes: [u8; 32],
+    signed_auth_created_at: Option<u64>,
 ) -> SubmitOutcome {
     // Admission and replay checks fire before body parse — a 429 or replay
     // reject on a malformed body must still be attributed.
@@ -800,18 +906,23 @@ async fn submit_event_authed(
     };
 
     // Enforce relay membership (with NIP-OA fallback via x-auth-tag header).
-    let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
+    let auth_tag = super::relay_members::extract_auth_tag_header(headers);
     let nip_oa_owner = match super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
         &pubkey_bytes,
         auth_tag,
+        signed_auth_created_at,
     )
     .await
     {
         Ok(owner) => owner.or_else(|| {
             if !state.config.require_relay_membership {
-                super::relay_members::extract_nip_oa_owner(&pubkey_bytes, auth_tag)
+                super::relay_members::extract_nip_oa_owner(
+                    &pubkey_bytes,
+                    auth_tag,
+                    signed_auth_created_at,
+                )
             } else {
                 None
             }
@@ -885,7 +996,7 @@ pub async fn query_events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<(HeaderMap, Json<Value>), (StatusCode, Json<Value>)> {
     // Row zero: bind this HTTP request to its community from the request host
     // before any tenant-scoped read, identical to the WS door in `router.rs`.
     // An unmapped host or lookup failure fails closed with a generic 404 — never
@@ -905,7 +1016,11 @@ pub async fn query_events(
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/query");
-    let (pubkey, event_id_bytes) = verify_bridge_auth(
+    let VerifiedBridgeAuth {
+        pubkey,
+        event_id_bytes,
+        signed_created_at,
+    } = verify_bridge_auth(
         &headers,
         "POST",
         &url,
@@ -918,10 +1033,18 @@ pub async fn query_events(
     // helper.  The single terminal attribution line fires here from the Result
     // so every outcome — including admission/replay/membership failures that
     // previously returned before any log — is attributed.
-    let result =
-        query_events_authed(&state, &tenant, &headers, &body, pubkey, event_id_bytes).await;
+    let result = query_events_authed(
+        &state,
+        &tenant,
+        &headers,
+        &body,
+        pubkey,
+        event_id_bytes,
+        signed_created_at,
+    )
+    .await;
     match &result {
-        Ok(Json(Value::Array(events))) => {
+        Ok((Json(Value::Array(events)), _)) => {
             tracing::info!(
                 pubkey = %pubkey_hex,
                 route = "/query",
@@ -942,7 +1065,18 @@ pub async fn query_events(
             );
         }
     }
-    result
+    result.map(|(body, aux_included)| thread_aux_query_response(body, aux_included))
+}
+
+fn thread_aux_query_response(body: Json<Value>, aux_included: bool) -> (HeaderMap, Json<Value>) {
+    let mut headers = HeaderMap::new();
+    if aux_included {
+        headers.insert(
+            "x-buzz-thread-aux",
+            axum::http::HeaderValue::from_static("1"),
+        );
+    }
+    (headers, body)
 }
 
 /// Filter execution for [`query_events`], run once NIP-98 auth succeeds.
@@ -955,17 +1089,19 @@ async fn query_events_authed(
     body: &[u8],
     pubkey: nostr::PublicKey,
     event_id_bytes: [u8; 32],
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    signed_auth_created_at: Option<u64>,
+) -> Result<(Json<Value>, bool), (StatusCode, Json<Value>)> {
     enforce_http_admission(state, tenant, &pubkey).await?;
     check_nip98_replay(state, tenant, event_id_bytes).await?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
-    let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
+    let auth_tag = super::relay_members::extract_auth_tag_header(headers);
     super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
         &pubkey_bytes,
         auth_tag,
+        signed_auth_created_at,
     )
     .await?;
 
@@ -1023,14 +1159,16 @@ async fn query_events_authed(
             &authed_pubkey_hex,
             &pubkey_bytes,
         )
-        .await;
+        .await
+        .map(|body| (body, false));
     }
 
     if let Some(presence_events) = synthesize_presence(state, tenant, &filters).await {
-        return Ok(Json(Value::Array(presence_events)));
+        return Ok((Json(Value::Array(presence_events)), false));
     }
 
     let mut events: Vec<Value> = Vec::new();
+    let mut thread_aux_included = false;
     let mut handled: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
     // Channel-window filters (`top_level: true`) — the GUI read-model surface.
@@ -1190,6 +1328,7 @@ async fn query_events_authed(
             .await
             .map_err(|e| internal_error(&format!("thread query error: {e}")))?;
 
+        let mut thread_row_ids = vec![root_hex.to_string()];
         for reply in thread_replies {
             let se = reply.stored_event;
             if !event_in_accessible_channel(&se, &accessible_channels) {
@@ -1201,9 +1340,48 @@ async fn query_events_authed(
             if !buzz_core::filter::reader_authorized_for_event(&se.event, &authed_pubkey_hex) {
                 continue;
             }
+            thread_row_ids.push(se.event.id.to_hex());
             if let Ok(v) = serde_json::to_value(&se.event) {
                 events.push(v);
             }
+        }
+        if extension_flag(raw, "include_aux") {
+            let mut hop_ids = thread_row_ids;
+            let mut seen = std::collections::HashSet::new();
+            for kinds in [&WINDOW_AUX_KINDS[..], &WINDOW_AUX_DELETE_KINDS[..]] {
+                let mut query = buzz_db::EventQuery::for_community(tenant.community());
+                query.kinds = Some(kinds.iter().map(|kind| *kind as i32).collect());
+                query.e_tags = Some(std::mem::take(&mut hop_ids));
+                let aux = query_thread_aux_pages(
+                    query,
+                    buzz_db::DEFAULT_MAX_PAGE_LIMIT,
+                    &mut ThreadAuxReader::Database(&state.db),
+                )
+                .await
+                .map_err(|e| internal_error(&format!("thread aux query error: {e}")))?;
+                for se in aux {
+                    if !seen.insert(se.event.id)
+                        || !event_in_accessible_channel(&se, &accessible_channels)
+                        || !buzz_core::filter::reader_authorized_for_event(
+                            &se.event,
+                            &authed_pubkey_hex,
+                        )
+                    {
+                        continue;
+                    }
+                    hop_ids.push(se.event.id.to_hex());
+                    events.push(
+                        serde_json::to_value(&se.event)
+                            .map_err(|e| internal_error(&format!("thread aux serialize: {e}")))?,
+                    );
+                }
+                if hop_ids.is_empty() {
+                    break;
+                }
+            }
+            // Native thread reads send one filter. Never infer completeness for
+            // a mixed query where another filter may have taken a different path.
+            thread_aux_included = raw_filters.len() == 1;
         }
         handled.insert(idx);
     }
@@ -1236,6 +1414,9 @@ async fn query_events_authed(
             extract_channel_from_filter(filter),
             &accessible_channels,
         );
+        if let Some(channel) = extract_buzz_channel(raw) {
+            query.custom_tag = Some(("buzz-channel".into(), channel.into()));
+        }
         // Shared-gated visibility pushdown: must mirror WS REQ so that a page of
         // newer private events does not starve older shared ones off the page.
         if crate::handlers::req::filter_can_match_shared_gated_kinds(filter) {
@@ -1318,7 +1499,7 @@ async fn query_events_authed(
         }
     }
 
-    Ok(Json(Value::Array(events)))
+    Ok((Json(Value::Array(events)), thread_aux_included))
 }
 
 /// Count events via HTTP bridge (NIP-98 auth). Returns `{"count": N}`.
@@ -1348,7 +1529,11 @@ pub async fn count_events(
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/count");
-    let (pubkey, event_id_bytes) = verify_bridge_auth(
+    let VerifiedBridgeAuth {
+        pubkey,
+        event_id_bytes,
+        signed_created_at,
+    } = verify_bridge_auth(
         &headers,
         "POST",
         &url,
@@ -1361,8 +1546,16 @@ pub async fn count_events(
     // helper.  The single terminal attribution line fires here from the Result
     // so every outcome — including admission/replay/membership failures that
     // previously returned before any log — is attributed.
-    let result =
-        count_events_authed(&state, &tenant, &headers, &body, pubkey, event_id_bytes).await;
+    let result = count_events_authed(
+        &state,
+        &tenant,
+        &headers,
+        &body,
+        pubkey,
+        event_id_bytes,
+        signed_created_at,
+    )
+    .await;
     match &result {
         Ok(Json(value)) => {
             let count = value.get("count").and_then(Value::as_u64);
@@ -1396,17 +1589,19 @@ async fn count_events_authed(
     body: &[u8],
     pubkey: nostr::PublicKey,
     event_id_bytes: [u8; 32],
+    signed_auth_created_at: Option<u64>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     enforce_http_admission(state, tenant, &pubkey).await?;
     check_nip98_replay(state, tenant, event_id_bytes).await?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
-    let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
+    let auth_tag = super::relay_members::extract_auth_tag_header(headers);
     super::relay_members::enforce_relay_membership(
         state,
         tenant.community(),
         &pubkey_bytes,
         auth_tag,
+        signed_auth_created_at,
     )
     .await?;
 
@@ -2064,6 +2259,9 @@ const WORKFLOW_RUNS_MAX_LIMIT: u32 = 100;
 /// Optional query controls for workflow run history.
 pub struct WorkflowRunsQuery {
     limit: Option<u32>,
+    page: Option<bool>,
+    before: Option<chrono::DateTime<chrono::Utc>>,
+    before_id: Option<uuid::Uuid>,
 }
 
 fn workflow_runs_limit(requested: Option<u32>) -> i64 {
@@ -2096,6 +2294,7 @@ fn workflow_run_json(run: &buzz_db::workflow::WorkflowRunRecord) -> Value {
         "current_step": run.current_step,
         "execution_trace": redacted_workflow_run_trace(&run.execution_trace),
         "error_message": run.error_message,
+        "error_code": run.error_code,
         "started_at": run.started_at.map(|timestamp| timestamp.timestamp()),
         "completed_at": run.completed_at.map(|timestamp| timestamp.timestamp()),
         "created_at": run.created_at.timestamp(),
@@ -2147,6 +2346,73 @@ pub async fn workflow_runs(
     headers: HeaderMap,
     Query(query): Query<WorkflowRunsQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let tenant = authorize_workflow_history(&state, &headers, &original_uri, workflow_id).await?;
+    let (paged, limit) = workflow_runs_controls(&query)?;
+    let mut runs = state
+        .db
+        .list_workflow_runs_page(
+            tenant.community(),
+            workflow_id,
+            query.before,
+            query.before_id,
+            limit + i64::from(paged),
+        )
+        .await
+        .map_err(|error| internal_error(&format!("list workflow runs: {error}")))?;
+    Ok(Json(workflow_runs_response(
+        &mut runs,
+        limit as usize,
+        paged,
+    )))
+}
+
+fn workflow_runs_controls(
+    query: &WorkflowRunsQuery,
+) -> Result<(bool, i64), (StatusCode, Json<Value>)> {
+    let paged = query.page.unwrap_or(false) || query.before.is_some() || query.before_id.is_some();
+    if query.before.is_some() != query.before_id.is_some() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "before and before_id must be supplied together",
+        ));
+    }
+    let limit = workflow_runs_limit(query.limit);
+    if paged && limit == 0 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "page limit must be positive",
+        ));
+    }
+    Ok((paged, limit))
+}
+
+fn workflow_runs_response(
+    runs: &mut Vec<buzz_db::workflow::WorkflowRunRecord>,
+    limit: usize,
+    paged: bool,
+) -> Value {
+    let has_more = runs.len() > limit;
+    runs.truncate(limit);
+    let next = if has_more {
+        runs.last()
+            .map(|last| serde_json::json!({"before": last.created_at, "before_id": last.id}))
+    } else {
+        None
+    };
+    let rows = runs.iter().map(workflow_run_json).collect::<Vec<_>>();
+    if paged {
+        serde_json::json!({"runs": rows, "next": next})
+    } else {
+        Value::Array(rows)
+    }
+}
+
+async fn authorize_workflow_history(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    original_uri: &axum::http::Uri,
+    workflow_id: uuid::Uuid,
+) -> Result<TenantContext, (StatusCode, Json<Value>)> {
     let raw_host = headers
         .get(axum::http::header::HOST)
         .and_then(|value| value.to_str().ok())
@@ -2163,65 +2429,115 @@ pub async fn workflow_runs(
     let expected_url = nip98_expected_url(
         &state.config.relay_url,
         &tenant,
-        path_with_query(&original_uri),
+        path_with_query(original_uri),
     );
-    let (pubkey, event_id_bytes) = verify_bridge_auth(
-        &headers,
+    let VerifiedBridgeAuth {
+        pubkey,
+        event_id_bytes,
+        signed_created_at,
+    } = verify_bridge_auth(
+        headers,
         "GET",
         &expected_url,
         None,
         state.config.require_auth_token,
     )?;
-    enforce_http_admission(&state, &tenant, &pubkey).await?;
-    check_nip98_replay(&state, &tenant, event_id_bytes).await?;
+    enforce_http_admission(state, &tenant, &pubkey).await?;
+    check_nip98_replay(state, &tenant, event_id_bytes).await?;
 
     let authenticated_pubkey = pubkey.to_bytes();
-    let auth_tag = headers
-        .get("x-auth-tag")
-        .and_then(|value| value.to_str().ok());
+    let auth_tag = super::relay_members::extract_auth_tag_header(headers);
     super::relay_members::enforce_relay_membership(
-        &state,
+        state,
         tenant.community(),
         &authenticated_pubkey,
         auth_tag,
+        signed_created_at,
     )
     .await?;
 
-    let workflow = state
-        .db
-        .get_workflow(tenant.community(), workflow_id)
-        .await
-        .map_err(|error| match error {
-            buzz_db::DbError::NotFound(_) => workflow_not_found(),
-            other => internal_error(&format!("get workflow for run history: {other}")),
-        })?;
+    authorize_workflow_history_rows(
+        &state.db,
+        tenant.community(),
+        &authenticated_pubkey,
+        workflow_id,
+    )
+    .await?;
+    Ok(tenant)
+}
+
+async fn authorize_workflow_history_rows(
+    db: &buzz_db::Db,
+    community_id: buzz_core::CommunityId,
+    authenticated_pubkey: &[u8],
+    workflow_id: uuid::Uuid,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let workflow =
+        db.get_workflow(community_id, workflow_id)
+            .await
+            .map_err(|error| match error {
+                buzz_db::DbError::NotFound(_) => workflow_not_found(),
+                other => internal_error(&format!("get workflow for run history: {other}")),
+            })?;
     let active_channel_member = match workflow.channel_id {
-        Some(channel_id) if workflow.owner_pubkey == authenticated_pubkey => state
-            .db
-            .is_member(tenant.community(), channel_id, &authenticated_pubkey)
+        Some(channel_id) if workflow.owner_pubkey == authenticated_pubkey => db
+            .is_member(community_id, channel_id, authenticated_pubkey)
             .await
             .map_err(|error| {
                 internal_error(&format!("check workflow run history membership: {error}"))
             })?,
         _ => false,
     };
-    if !workflow_runs_access_allowed(&workflow, &authenticated_pubkey, active_channel_member) {
+    if !workflow_runs_access_allowed(&workflow, authenticated_pubkey, active_channel_member) {
         return Err(workflow_not_found());
     }
 
-    let runs = state
-        .db
-        .list_workflow_runs(
-            tenant.community(),
-            workflow_id,
-            workflow_runs_limit(query.limit),
-        )
-        .await
-        .map_err(|error| internal_error(&format!("list workflow runs: {error}")))?;
+    Ok(())
+}
 
-    Ok(Json(Value::Array(
-        runs.iter().map(workflow_run_json).collect(),
-    )))
+/// Read durable approval evidence; display references confer no decision authority.
+pub async fn workflow_run_approvals(
+    State(state): State<Arc<AppState>>,
+    Path((workflow_id, run_id)): Path<(uuid::Uuid, uuid::Uuid)>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let tenant = authorize_workflow_history(&state, &headers, &original_uri, workflow_id).await?;
+    let run = state
+        .db
+        .get_workflow_run(tenant.community(), run_id)
+        .await
+        .map_err(|error| match error {
+            buzz_db::DbError::NotFound(_) => workflow_not_found(),
+            other => internal_error(&format!("get workflow run for approvals: {other}")),
+        })?;
+    if run.workflow_id != workflow_id {
+        return Err(workflow_not_found());
+    }
+    let approvals = state
+        .db
+        .get_workflow_approval_history(tenant.community(), workflow_id, run_id)
+        .await
+        .map_err(|error| internal_error(&format!("list workflow approvals: {error}")))?;
+    Ok(Json(
+        serde_json::json!({"approvals": approvals.iter().map(workflow_approval_json).collect::<Vec<_>>()}),
+    ))
+}
+
+fn workflow_approval_json(approval: &buzz_db::workflow::WorkflowApprovalHistoryRecord) -> Value {
+    serde_json::json!({
+        "approval_ref": approval.approval_ref,
+        "workflow_id": approval.workflow_id,
+        "run_id": approval.run_id,
+        "step_id": approval.step_id,
+        "step_index": approval.step_index,
+        "approver_spec": approval.approver_spec,
+        "status": approval.status,
+        "approver_pubkey": approval.approver_pubkey,
+        "note": approval.note,
+        "expires_at": approval.expires_at,
+        "created_at": approval.created_at.timestamp(),
+    })
 }
 
 // ── Moderation queue reads (L6 — Quinn) ───────────────────────────────────────
@@ -2269,8 +2585,11 @@ async fn authorize_moderation_read(
         _ => path.to_string(),
     };
     let url = nip98_expected_url(&state.config.relay_url, &tenant, &path_with_query);
-    let (pubkey, event_id_bytes) =
-        verify_bridge_auth(headers, "GET", &url, None, state.config.require_auth_token)?;
+    let VerifiedBridgeAuth {
+        pubkey,
+        event_id_bytes,
+        ..
+    } = verify_bridge_auth(headers, "GET", &url, None, state.config.require_auth_token)?;
     check_nip98_replay(state, &tenant, event_id_bytes).await?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
@@ -2427,8 +2746,94 @@ mod tests {
     use nostr::{Alphabet, EventBuilder, Keys, Kind, SingleLetterTag, Tag};
     use std::sync::Mutex;
 
+    #[test]
+    fn thread_aux_response_proof_is_explicit_and_keeps_the_event_array_shape() {
+        let (legacy_headers, Json(legacy_body)) =
+            thread_aux_query_response(Json(serde_json::json!([])), false);
+        assert!(!legacy_headers.contains_key("x-buzz-thread-aux"));
+        assert_eq!(legacy_body, serde_json::json!([]));
+        let (headers, Json(body)) = thread_aux_query_response(Json(serde_json::json!([])), true);
+        assert_eq!(headers["x-buzz-thread-aux"], "1");
+        assert_eq!(body, legacy_body);
+    }
+
+    fn aux_fixture(keys: &Keys, timestamp: u64, content: &str) -> buzz_core::StoredEvent {
+        buzz_core::StoredEvent::new(
+            EventBuilder::new(Kind::from(7), content)
+                .custom_created_at(nostr::Timestamp::from(timestamp))
+                .sign_with_keys(keys)
+                .expect("event"),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn thread_aux_pages_preserve_dense_second_cursor_and_empty_root_query() {
+        let keys = Keys::generate();
+        let mut rows = [
+            aux_fixture(&keys, 40, "a"),
+            aux_fixture(&keys, 40, "b"),
+            aux_fixture(&keys, 30, "c"),
+        ];
+        rows.sort_by(|a, b| {
+            b.event
+                .created_at
+                .cmp(&a.event.created_at)
+                .then(a.event.id.cmp(&b.event.id))
+        });
+        let expected: Vec<_> = rows.iter().map(|row| row.event.id).collect();
+        let mut calls = 0;
+        let mut fetch = |query: &buzz_db::EventQuery| {
+            calls += 1;
+            assert_eq!(query.e_tags, Some(vec!["root".into()]));
+            rows.iter()
+                .filter(|row| match (query.until, query.before_id.as_deref()) {
+                    (Some(until), Some(before)) => {
+                        row.event.created_at.as_secs() < until.timestamp() as u64
+                            || (row.event.created_at.as_secs() == until.timestamp() as u64
+                                && row.event.id.as_bytes().as_slice() > before)
+                    }
+                    _ => true,
+                })
+                .take(query.limit.unwrap() as usize)
+                .cloned()
+                .collect()
+        };
+        let mut query =
+            buzz_db::EventQuery::for_community(fresh_tenant("relay.example").community());
+        query.e_tags = Some(vec!["root".into()]);
+        let result =
+            query_thread_aux_pages(query.clone(), 2, &mut ThreadAuxReader::Fake(&mut fetch))
+                .await
+                .expect("pages");
+        assert_eq!(
+            result.iter().map(|row| row.event.id).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(calls, 2);
+        let mut empty_fetch = |_query: &buzz_db::EventQuery| vec![];
+        assert!(
+            query_thread_aux_pages(query, 2, &mut ThreadAuxReader::Fake(&mut empty_fetch))
+                .await
+                .expect("empty")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_aux_stalled_cursor_fails_instead_of_claiming_complete_hydration() {
+        let row = aux_fixture(&Keys::generate(), 40, "a");
+        let mut fetch = |_query: &buzz_db::EventQuery| vec![row.clone()];
+        let query = buzz_db::EventQuery::for_community(fresh_tenant("relay.example").community());
+        assert!(
+            query_thread_aux_pages(query, 1, &mut ThreadAuxReader::Fake(&mut fetch))
+                .await
+                .is_err()
+        );
+    }
+
     fn redis_pool() -> deadpool_redis::Pool {
-        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let url = std::env::var("REDIS_URL").expect("explicit isolated Redis URL required");
         deadpool_redis::Config::from_url(url)
             .create_pool(Some(deadpool_redis::Runtime::Tokio1))
             .expect("create redis pool")
@@ -2449,7 +2854,7 @@ mod tests {
             .to_bytes()
     }
 
-    fn workflow_run_record(
+    pub(super) fn workflow_run_record(
         started_at: Option<chrono::DateTime<chrono::Utc>>,
         completed_at: Option<chrono::DateTime<chrono::Utc>>,
         error_message: Option<&str>,
@@ -2478,6 +2883,7 @@ mod tests {
             trigger_context: None,
             started_at,
             completed_at,
+            error_code: None,
             error_message: error_message.map(str::to_owned),
             created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0)
                 .expect("created timestamp"),
@@ -2515,7 +2921,7 @@ mod tests {
 
         assert_eq!(
             object.len(),
-            9,
+            10,
             "wire response must contain only run fields"
         );
         for key in [
@@ -2905,13 +3311,85 @@ mod tests {
         let tenant_a = fresh_tenant("host-a.example");
         let expected_url = nip98_expected_url(config_relay_url, &tenant_a, "/events");
 
-        let (pubkey, _event_id_bytes) =
-            verify_bridge_auth(&headers, "POST", &expected_url, Some(b""), true)
-                .expect("matching-host NIP-98 event must verify");
+        let VerifiedBridgeAuth {
+            pubkey,
+            signed_created_at,
+            ..
+        } = verify_bridge_auth(&headers, "POST", &expected_url, Some(b""), true)
+            .expect("matching-host NIP-98 event must verify");
         assert_eq!(
             pubkey,
             keys.public_key(),
             "returned pubkey must be the signer's"
+        );
+        assert!(
+            signed_created_at.is_some(),
+            "verified NIP-98 auth must retain its signed timestamp"
+        );
+    }
+
+    #[test]
+    fn nip_oa_bridge_uses_verified_time_and_rejects_duplicate_headers() {
+        use super::super::relay_members::{extract_auth_tag_header, extract_nip_oa_owner};
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let url = "https://relay.example/query";
+        let event_json = build_nip98_event_json(&agent, url, "POST");
+        let event: nostr::Event = serde_json::from_str(&event_json).unwrap();
+        let timestamp = event.created_at.as_secs();
+        for (condition, admitted) in [
+            (format!("created_at<{}", timestamp + 1), true),
+            (format!("created_at<{timestamp}"), false),
+            (format!("created_at>{timestamp}"), false),
+        ] {
+            let tag = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), &condition)
+                .unwrap();
+            let mut headers = nip98_auth_headers(&event_json);
+            headers.insert("x-auth-tag", tag.parse().unwrap());
+            let verified = verify_bridge_auth(&headers, "POST", url, None, true).unwrap();
+            assert_eq!(verified.signed_created_at, Some(timestamp));
+            let owner_at = |headers: &HeaderMap, signed_at| {
+                extract_nip_oa_owner(
+                    verified.pubkey.as_bytes(),
+                    extract_auth_tag_header(headers),
+                    signed_at,
+                )
+            };
+            assert_eq!(
+                owner_at(&headers, verified.signed_created_at).is_some(),
+                admitted
+            );
+            headers.append("x-auth-tag", tag.parse().unwrap());
+            assert_eq!(owner_at(&headers, verified.signed_created_at), None);
+        }
+
+        let mut headers = nip98_auth_headers(&event_json);
+        headers.append("authorization", headers["authorization"].clone());
+        assert_eq!(
+            verify_bridge_auth(&headers, "POST", url, None, false)
+                .unwrap_err()
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-pubkey", agent.public_key().to_hex().parse().unwrap());
+        let verified = verify_bridge_auth(&headers, "POST", url, None, false).unwrap();
+        assert_eq!(verified.signed_created_at, None);
+        let tag = buzz_sdk::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "").unwrap();
+        assert_eq!(
+            extract_nip_oa_owner(
+                verified.pubkey.as_bytes(),
+                Some(&tag),
+                verified.signed_created_at
+            ),
+            None
+        );
+        headers.append("x-pubkey", headers["x-pubkey"].clone());
+        assert_eq!(
+            verify_bridge_auth(&headers, "POST", url, None, false)
+                .unwrap_err()
+                .0,
+            StatusCode::UNAUTHORIZED
         );
     }
 
@@ -2954,7 +3432,7 @@ mod tests {
             Some("limit=20&status=open"),
         );
 
-        let (pubkey, _event_id_bytes) =
+        let VerifiedBridgeAuth { pubkey, .. } =
             verify_bridge_auth(&headers, "GET", &expected_url, None, true)
                 .expect("query-bearing moderation read must verify against the same query");
         assert_eq!(pubkey, keys.public_key());
@@ -3011,7 +3489,7 @@ mod tests {
             Some("limit=20"),
         );
 
-        let (pubkey, _event_id_bytes) =
+        let VerifiedBridgeAuth { pubkey, .. } =
             verify_bridge_auth(&headers, "GET", &expected_url, None, true)
                 .expect("audit query-bearing read must verify");
         assert_eq!(pubkey, keys.public_key());
@@ -3036,7 +3514,7 @@ mod tests {
         );
         assert_eq!(expected_url, "https://host-a.example/moderation/restricted");
 
-        let (pubkey, _event_id_bytes) =
+        let VerifiedBridgeAuth { pubkey, .. } =
             verify_bridge_auth(&headers, "GET", &expected_url, None, true)
                 .expect("query-less restricted read must verify against the bare path");
         assert_eq!(pubkey, keys.public_key());
@@ -3302,6 +3780,22 @@ mod tests {
         assert!(
             search_hit_accepted(&filter, &stored, &[scoped_channel], &reader),
             "channel-scoped hit must be accepted when caller has access to that channel"
+        );
+    }
+
+    #[test]
+    fn extract_buzz_channel_requires_one_string_value() {
+        assert_eq!(
+            extract_buzz_channel(&serde_json::json!({"#buzz-channel": ["channel-a"]})),
+            Some("channel-a")
+        );
+        assert_eq!(
+            extract_buzz_channel(&serde_json::json!({"#buzz-channel": ["channel-a", "channel-b"]})),
+            None
+        );
+        assert_eq!(
+            extract_buzz_channel(&serde_json::json!({"#buzz-channel": [42]})),
+            None
         );
     }
 
@@ -3712,7 +4206,12 @@ mod tests {
         }
     }
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
+    fn test_database_url() -> String {
+        std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("TEST_DATABASE_URL"))
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .expect("explicit isolated test database URL required")
+    }
 
     /// Build an AppState suitable for handler-level bridge tests.
     ///
@@ -3721,20 +4220,20 @@ mod tests {
     ///   OpenRelay without a DB lookup.
     /// - `nip98_replay` replaced with an always-fresh guard → no Redis needed
     ///   for replay detection.
-    /// - Redis pool points at the local dev instance for the admission check.
+    /// - Redis pool requires an explicitly supplied owned fixture for the admission check.
     ///
-    /// Returns `None` when local Postgres is not reachable.
+    /// Returns `None` when an explicitly supplied fixture is not reachable.
     async fn bridge_handler_test_state() -> Option<Arc<crate::state::AppState>> {
         let mut config = crate::config::Config::from_env().ok()?;
-        config.database_url = TEST_DB_URL.to_string();
-        // Use the real local Redis so enforce_http_admission can pass.
+        config.database_url = test_database_url();
+        // The separately owned Redis fixture is needed by enforce_http_admission.
         config.redis_url =
-            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+            std::env::var("REDIS_URL").expect("explicit isolated Redis URL required");
         config.relay_url = "wss://bridge-test.local".to_string();
         config.require_auth_token = false;
         config.require_relay_membership = false;
 
-        let pool = sqlx::PgPool::connect(TEST_DB_URL).await.ok()?;
+        let pool = sqlx::PgPool::connect(&test_database_url()).await.ok()?;
         let db = buzz_db::Db::from_pool(pool.clone());
         let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
             .create_pool(Some(deadpool_redis::Runtime::Tokio1))
@@ -3840,7 +4339,7 @@ mod tests {
             .expect("current_thread runtime");
 
         let Some(state) = rt.block_on(bridge_handler_test_state()) else {
-            panic!("local Postgres not reachable — start Postgres on 127.0.0.1:5432 before running ignored bridge handler tests");
+            panic!("explicit PostgreSQL/Redis fixtures unavailable");
         };
 
         // Provision a fresh community so bind_community succeeds.
@@ -3896,7 +4395,7 @@ mod tests {
             .expect("current_thread runtime");
 
         let Some(state) = rt.block_on(bridge_handler_test_state()) else {
-            panic!("local Postgres not reachable — start Postgres on 127.0.0.1:5432 before running ignored bridge handler tests");
+            panic!("explicit PostgreSQL/Redis fixtures unavailable");
         };
 
         let host = {
@@ -4029,7 +4528,7 @@ mod tests {
 
         let state = rt
             .block_on(bridge_handler_test_state())
-            .expect("local Postgres not reachable — start Postgres on 127.0.0.1:5432 before running ignored bridge handler tests");
+            .expect("explicit PostgreSQL/Redis fixtures unavailable");
 
         let host = {
             let h = format!("bridge-attr-{}.local", uuid::Uuid::new_v4().simple());
@@ -4080,7 +4579,7 @@ mod tests {
 
         let state = rt
             .block_on(bridge_handler_test_state())
-            .expect("local Postgres not reachable — start Postgres on 127.0.0.1:5432 before running ignored bridge handler tests");
+            .expect("explicit PostgreSQL/Redis fixtures unavailable");
 
         let host = {
             let h = format!("bridge-attr-{}.local", uuid::Uuid::new_v4().simple());
@@ -4122,3 +4621,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "workflow_history_tests.rs"]
+mod workflow_history_tests;

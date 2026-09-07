@@ -1,6 +1,5 @@
 import * as React from "react";
 import { AlertTriangle } from "lucide-react";
-
 import {
   depthGuideActionsEqual,
   numberArrayEqual,
@@ -52,7 +51,7 @@ import { MessageAuthorText, MessageHeaderRow } from "./MessageHeader";
 import { MessageTimestamp } from "./MessageTimestamp";
 import { WaveMessageAttachment } from "./WaveMessageAttachment";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
-
+import { useMessageAgentAddressPrefix } from "./MessageAgentAddressPrefix";
 const DiffMessage = React.lazy(() => import("./DiffMessage"));
 const DiffMessageExpanded = React.lazy(() => import("./DiffMessageExpanded"));
 
@@ -217,8 +216,8 @@ export const MessageRow = React.memo(
       [channelId, openReminder],
     );
     const { mentionNames, mentionPubkeysByName } = React.useMemo(
-      () => resolveMentionProps(message.tags, profiles),
-      [profiles, message.tags],
+      () => resolveMentionProps(message.tags, profiles, message.body),
+      [profiles, message.tags, message.body],
     );
     // "Is this pubkey an agent" = the community-scoped baseline every surface
     // shares (managed ∪ relay) plus the pubkey's own profile `isAgent` flag from this surface's lookup. Both are per-pubkey
@@ -254,7 +253,14 @@ export const MessageRow = React.memo(
 
       return Object.keys(values).length > 0 ? values : undefined;
     }, [isKnownAgentPubkey, mentionPubkeysByName]);
-
+    const agentAddressPrefix = useMessageAgentAddressPrefix({
+      profiles,
+      body: message.body,
+      tags: message.tags,
+      mentionNames,
+      mentionPubkeysByName,
+      isKnownAgentPubkey,
+    });
     const imetaByUrl = React.useMemo(
       () => (message.tags ? parseImetaTags(message.tags) : undefined),
       [message.tags],
@@ -360,6 +366,7 @@ export const MessageRow = React.memo(
                   setExpandedDiffId(message.id);
                 }}
                 repoUrl={getTag("repo")}
+                searchQuery={searchQuery}
                 truncated={getTag("truncated") === "true"}
               />
             </React.Suspense>
@@ -381,6 +388,7 @@ export const MessageRow = React.memo(
                 fallbackText={waveMessage.fallbackText}
                 huddleMemberPubkeys={huddleMemberPubkeys}
                 huddleMemberPubkeysPending={huddleMemberPubkeysPending}
+                searchQuery={searchQuery}
               />
             );
           }
@@ -409,6 +417,7 @@ export const MessageRow = React.memo(
               messageId={message.id}
               linkPreviewsSuppressed={linkPreviewsSuppressed}
               linkPreviewTags={message.tags}
+              leadingInlineContent={agentAddressPrefix}
               onRemoveLinkPreviewsForEveryone={removeLinkPreviewsForEveryone}
               customEmoji={customEmoji}
               imetaByUrl={imetaByUrl}
@@ -570,6 +579,7 @@ export const MessageRow = React.memo(
           onRemindLater={handleRemindLater}
           onReply={onReply}
           onUnfollowThread={onUnfollowThread}
+          profiles={profiles}
           reactionErrorMessage={reactionErrorMessage}
           reactions={reactions}
         />

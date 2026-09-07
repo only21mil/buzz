@@ -645,7 +645,7 @@ pub fn upsert_managed_section(file_path: &Path, new_section_content: &str) -> io
     Ok(())
 }
 
-pub fn regenerate_nest_context(app: &AppHandle) -> Result<(), String> {
+pub fn regenerate_nest_context<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let nest = nest_dir().ok_or("cannot resolve home directory for nest")?;
     let agents_md = nest.join("AGENTS.md");
 
@@ -668,7 +668,7 @@ pub fn regenerate_nest_context(app: &AppHandle) -> Result<(), String> {
 ///
 /// All call sites treat regeneration as fire-and-forget — agents run fine with
 /// a stale AGENTS.md, so we warn and continue rather than propagating the error.
-pub fn try_regenerate_nest(app: &AppHandle) {
+pub fn try_regenerate_nest<R: tauri::Runtime>(app: &AppHandle<R>) {
     if let Err(error) = regenerate_nest_context(app) {
         eprintln!("buzz-desktop: nest context regeneration failed: {error}");
     }

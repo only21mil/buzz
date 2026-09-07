@@ -1117,8 +1117,24 @@ test.describe("community rail", () => {
         }),
       );
     }, `community-rail-button-${COMMUNITY_B.id}`);
+    await expect(buttonB).toHaveAttribute("aria-pressed", "true");
+    const announcement = page
+      .getByTestId("community-rail")
+      .locator('[id^="DndLiveRegion-"]');
+    await expect(announcement).toHaveText(
+      `Draggable item ${COMMUNITY_B.id} was moved over droppable area ${COMMUNITY_B.id}.`,
+    );
+    // KeyboardSensor installs its document listener on the next timer task.
+    // Cross that task boundary after observing the real pickup, without
+    // issuing a second activation or retrying a lost movement.
+    await page.evaluate(
+      () => new Promise<void>((resolve) => setTimeout(resolve, 0)),
+    );
     // ArrowUp moves the active item one slot up.
     await page.keyboard.press("ArrowUp");
+    await expect(announcement).toHaveText(
+      `Draggable item ${COMMUNITY_B.id} was moved over droppable area ${COMMUNITY_A.id}.`,
+    );
     // Space drops the item — same synthetic dispatch for consistency.
     await page.evaluate((testId) => {
       const el = document.querySelector(`[data-testid="${testId}"]`);

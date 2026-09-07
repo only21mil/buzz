@@ -2,6 +2,10 @@ use nostr::{Event, EventId, Keys, PublicKey};
 use tauri::{AppHandle, State};
 
 mod forum;
+mod thread_ref;
+#[cfg(test)]
+use thread_ref::provided_thread_ref;
+use thread_ref::{resolve_thread_ref, thread_ref};
 
 use forum::{
     apply_link_preview_suppression, fetch_agent_owner_pubkeys, link_preview_suppression_targets,
@@ -263,19 +267,17 @@ pub async fn get_thread_replies(
         cursor.as_ref(),
     );
 
-    let events = query_relay(&state, &[serde_json::Value::Object(filter)]).await?;
+    let (events, aux_included) = crate::relay::query_relay_with_thread_aux(
+        &state,
+        &crate::relay::relay_api_base_url_with_override(&state),
+        &[serde_json::Value::Object(filter)],
+    )
+    .await?;
 
     // A full page implies there may be more; hand back the last event's
     // composite key as the next cursor (the DB returns replies strictly after
     // it, tiebroken by event_id so same-second replies are not skipped).
-    let next_cursor = if events.len() as u32 >= cap {
-        events.last().map(|ev| crate::models::ThreadCursor {
-            created_at: ev.created_at.as_secs() as i64,
-            event_id: ev.id.to_hex(),
-        })
-    } else {
-        None
-    };
+    let next_cursor = thread_reply_cursor(&events, cap);
 
     let event_values: Vec<serde_json::Value> = events
         .iter()
@@ -285,7 +287,23 @@ pub async fn get_thread_replies(
     Ok(ThreadRepliesResponse {
         events: event_values,
         next_cursor,
+        aux_included,
     })
+}
+
+fn thread_reply_cursor(events: &[Event], cap: u32) -> Option<crate::models::ThreadCursor> {
+    let replies: Vec<_> = events
+        .iter()
+        .filter(|event| TIMELINE_KINDS.contains(&(event.kind.as_u16() as u32)))
+        .collect();
+    if replies.len() as u32 >= cap {
+        replies.last().map(|event| crate::models::ThreadCursor {
+            created_at: event.created_at.as_secs() as i64,
+            event_id: event.id.to_hex(),
+        })
+    } else {
+        None
+    }
 }
 
 /// Build the relay `/query` filter for the server-side thread-subtree read.
@@ -311,6 +329,7 @@ fn build_thread_replies_filter(
     cursor: Option<&crate::models::ThreadCursor>,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut filter = serde_json::Map::new();
+    filter.insert("include_aux".to_string(), serde_json::json!(true));
     filter.insert("#e".to_string(), serde_json::json!([root_event_id]));
     filter.insert("kinds".to_string(), serde_json::json!(TIMELINE_KINDS));
     // depth_limit is what activates the thread-subtree bridge path; the caller
@@ -430,74 +449,10 @@ pub async fn get_channel_messages_before(
     })
 }
 
-#[tauri::command]
-pub async fn get_event(event_id: String, state: State<'_, AppState>) -> Result<String, String> {
-    let events = query_relay(
-        &state,
-        &[serde_json::json!({
-            "ids": [event_id],
-            "kinds": [0, 1, 3, 5, 7, 9, 30078, 40002, 40003, 40008, 40099, 40100, 45001, 45003, buzz_core_pkg::kind::KIND_HUDDLE_STARTED],
-            "limit": 1
-        })],
-    )
-    .await?;
-
-    let ev = events
-        .first()
-        .ok_or_else(|| "event not found".to_string())?;
-    serde_json::to_string(ev).map_err(|e| format!("serialize event: {e}"))
-}
+mod event_batch;
+pub use event_batch::{get_event, get_events};
 
 // ── Writes ──────────────────────────────────────────────────────────────────
-
-/// Fetch a parent event and extract the thread root from its NIP-10 e-tags.
-async fn resolve_thread_ref(
-    parent_event_id: &str,
-    state: &AppState,
-) -> Result<events::ThreadRef, String> {
-    let parent_eid =
-        EventId::from_hex(parent_event_id).map_err(|e| format!("invalid parent event ID: {e}"))?;
-
-    let evs = query_relay(
-        state,
-        &[serde_json::json!({
-            "ids": [parent_event_id],
-            "kinds": [9, 40002, 45001, 45003, buzz_core_pkg::kind::KIND_HUDDLE_STARTED],
-            "limit": 1
-        })],
-    )
-    .await?;
-
-    let parent = evs
-        .first()
-        .ok_or_else(|| "parent event not found".to_string())?;
-
-    // Walk tags looking for NIP-10 root/reply markers.
-    let (mut root, mut reply) = (None, None);
-    for tag in parent.tags.iter() {
-        let s = tag.as_slice();
-        if s.len() >= 4 && s[0] == "e" {
-            match s[3].as_str() {
-                "root" => root = Some(s[1].clone()),
-                "reply" => reply = Some(s[1].clone()),
-                _ => {}
-            }
-        }
-    }
-    let root_hex = root.or(reply);
-
-    let root_eid = match root_hex {
-        Some(hex) if hex != parent_event_id => {
-            EventId::from_hex(&hex).map_err(|e| format!("invalid root event ID: {e}"))?
-        }
-        _ => parent_eid,
-    };
-
-    Ok(events::ThreadRef {
-        root_event_id: root_eid,
-        parent_event_id: parent_eid,
-    })
-}
 
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
@@ -505,14 +460,17 @@ pub async fn send_channel_message(
     channel_id: String,
     content: String,
     parent_event_id: Option<String>,
+    root_event_id: Option<String>,
     media_tags: Option<Vec<Vec<String>>>,
     emoji_tags: Option<Vec<Vec<String>>>,
     mention_tags: Option<Vec<Vec<String>>>,
     link_preview_tags: Option<Vec<Vec<String>>>,
     mention_pubkeys: Option<Vec<String>>,
     kind: Option<u32>,
+    expected_scope: Option<crate::relay::ExpectedPublicationScope>,
     state: State<'_, AppState>,
 ) -> Result<SendChannelMessageResponse, String> {
+    let publication = crate::relay::MessagePublication::capture(&state, expected_scope.as_ref())?;
     let channel_uuid = uuid::Uuid::parse_str(&channel_id)
         .map_err(|_| format!("invalid channel UUID: {channel_id}"))?;
     let mentions = mention_pubkeys.unwrap_or_default();
@@ -521,8 +479,12 @@ pub async fn send_channel_message(
     let emoji = emoji_tags.unwrap_or_default();
     let mention_refs_only = mention_tags.unwrap_or_default();
     let link_previews = link_preview_tags.unwrap_or_default();
-    let relay_base = crate::relay::relay_api_base_url_with_override(&state);
+    let relay_base = &publication.api_base_url;
     let kind_num = kind.unwrap_or(buzz_core_pkg::kind::KIND_STREAM_MESSAGE);
+
+    if root_event_id.is_some() && parent_event_id.is_none() {
+        return Err("root_event_id requires parent_event_id".into());
+    }
 
     let mut resolved_root: Option<String> = None;
 
@@ -538,7 +500,7 @@ pub async fn send_channel_message(
             let parent_id = parent_event_id
                 .as_deref()
                 .ok_or("forum comment requires parent_event_id")?;
-            let thread_ref = resolve_thread_ref(parent_id, &state).await?;
+            let thread_ref = thread_ref(parent_id, root_event_id.as_deref(), &state).await?;
             resolved_root = Some(thread_ref.root_event_id.to_hex());
             events::build_forum_comment(
                 channel_uuid,
@@ -552,7 +514,7 @@ pub async fn send_channel_message(
         _ => {
             let thread_ref = match parent_event_id.as_deref() {
                 Some(pid) => {
-                    let tr = resolve_thread_ref(pid, &state).await?;
+                    let tr = thread_ref(pid, root_event_id.as_deref(), &state).await?;
                     resolved_root = Some(tr.root_event_id.to_hex());
                     Some(tr)
                 }
@@ -567,12 +529,12 @@ pub async fn send_channel_message(
                 &emoji,
                 &mention_refs_only,
                 &link_previews,
-                &relay_base,
+                relay_base,
             )?
         }
     };
 
-    let result = submit_event(builder, &state).await?;
+    let result = crate::relay::submit_event_in_scope(builder, &state, publication).await?;
 
     let depth = match (&parent_event_id, &resolved_root) {
         (None, _) => 0,
@@ -902,6 +864,7 @@ pub async fn remove_reaction(
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EditMessageInput {
+    expected_scope: Option<crate::relay::ExpectedPublicationScope>,
     channel_id: String,
     event_id: String,
     content: String,
@@ -922,6 +885,8 @@ pub async fn edit_message(
     input: EditMessageInput,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let publication =
+        crate::relay::MessagePublication::capture(&state, input.expected_scope.as_ref())?;
     let channel_uuid = uuid::Uuid::parse_str(&input.channel_id)
         .map_err(|_| format!("invalid channel UUID: {}", input.channel_id))?;
     let target_eid =
@@ -942,7 +907,7 @@ pub async fn edit_message(
         &mention_refs,
         input.suppress_link_previews,
     )?;
-    submit_event(builder, &state).await?;
+    crate::relay::submit_event_in_scope(builder, &state, publication).await?;
     Ok(())
 }
 

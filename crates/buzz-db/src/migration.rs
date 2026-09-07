@@ -12,8 +12,21 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
 /// Run all pending Buzz database migrations.
 pub async fn run_migrations(pool: &PgPool) -> Result<()> {
-    reject_legacy_nip_rs_cardinality_ambiguity(pool).await?;
-    MIGRATOR.run(pool).await?;
+    // A migration owns its session. Drop/cancellation closes it, so relaxed
+    // budgets and advisory locks can never return to the serving pool.
+    let mut connection = crate::observability::acquire(
+        pool,
+        crate::observability::PoolRole::Writer,
+        crate::observability::Operation::Maintenance,
+    )
+    .await?
+    .detach();
+    sqlx::raw_sql("SET lock_timeout = 0; SET statement_timeout = 0")
+        .execute(&mut connection)
+        .await?;
+    reject_legacy_nip_rs_cardinality_ambiguity(&mut connection).await?;
+    MIGRATOR.run(&mut connection).await?;
+    sqlx::Connection::close(connection).await?;
     // The replica-fence proof (see `replica_fence`) requires the commit-time
     // `created_at` floor trigger from migration 0021 — correctly shaped — on
     // the `events` parent and every partition. `CREATE TABLE .. PARTITION OF`
@@ -29,17 +42,19 @@ pub async fn run_migrations(pool: &PgPool) -> Result<()> {
 /// enforcement. A populated database still on 0001-0006 must not let 0007
 /// irreversibly purge duplicate-tag history. Fail before sqlx starts its
 /// migration transaction so an operator can inspect and repair those rows.
-async fn reject_legacy_nip_rs_cardinality_ambiguity(pool: &PgPool) -> Result<()> {
+async fn reject_legacy_nip_rs_cardinality_ambiguity(
+    connection: &mut sqlx::PgConnection,
+) -> Result<()> {
     let migrations_table: Option<String> =
         sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations')::text")
-            .fetch_one(pool)
+            .fetch_one(&mut *connection)
             .await?;
     if migrations_table.is_none() {
         return Ok(());
     }
     let applied: Option<i64> =
         sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations WHERE success")
-            .fetch_one(pool)
+            .fetch_one(&mut *connection)
             .await?;
     if applied.is_none_or(|version| version >= 7) {
         return Ok(());
@@ -83,7 +98,7 @@ async fn reject_legacy_nip_rs_cardinality_ambiguity(pool: &PgPool) -> Result<()>
                )\
          )",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *connection)
     .await?;
 
     if ambiguous {
@@ -99,8 +114,6 @@ async fn reject_legacy_nip_rs_cardinality_ambiguity(pool: &PgPool) -> Result<()>
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
-
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum ConstraintKind {
@@ -563,8 +576,8 @@ mod tests {
 
         assert_eq!(
             migrations.len(),
-            35,
-            "embedded migration matrix must contain the canonical set through 0035_ci_grants"
+            38,
+            "embedded migration matrix must contain the frozen prefix plus admitted tail"
         );
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
@@ -1266,7 +1279,7 @@ mod tests {
     async fn connect_test_pool() -> PgPool {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+            .expect("explicit isolated test database URL required");
 
         PgPool::connect(&database_url)
             .await
@@ -1553,6 +1566,192 @@ mod tests {
         assert_eq!(applied_versions(&pool).await.last().copied(), Some(latest));
     }
 
+    async fn assert_push_message_kinds(pool: &PgPool, community: uuid::Uuid) {
+        for kind in [7, 9, 1059, 40002, 40007, 45001, 45003, 46010] {
+            sqlx::query(
+                "INSERT INTO events (community_id,id,pubkey,created_at,kind,tags,content,sig) \
+                 VALUES ($1,$2,$3,now(),$4,'[]','push migration',$5)",
+            )
+            .bind(community)
+            .bind(vec![(kind % 251) as u8; 32])
+            .bind(vec![21_u8; 32])
+            .bind(kind)
+            .bind(vec![22_u8; 64])
+            .execute(pool)
+            .await
+            .expect("insert eligible and excluded events");
+        }
+        let kinds: Vec<i32> = sqlx::query_scalar(
+            "SELECT e.kind FROM push_match_queue q JOIN events e \
+             ON e.community_id=q.community_id AND e.id=q.event_id \
+             WHERE q.community_id=$1 ORDER BY e.kind",
+        )
+        .bind(community)
+        .fetch_all(pool)
+        .await
+        .expect("read matched kinds");
+        assert_eq!(kinds, [9, 40002, 45001, 45003]);
+    }
+
+    async fn seed_push_migration_lease(pool: &PgPool) -> uuid::Uuid {
+        let community = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO communities(id,host) VALUES($1,$2)")
+            .bind(community)
+            .bind(format!("push-migration-{community}.example"))
+            .execute(pool)
+            .await
+            .expect("seed community");
+        sqlx::query(
+            "INSERT INTO push_leases(community_id,author,installation_id,source_event_id,\
+             source_created_at,generation,active,app_profile,endpoint_hash,endpoint_grant,\
+             max_class,subscriptions,expires_at) \
+             VALUES($1,$2,'legacy',$3,1,1,true,'buzz-ios-production',$4,'retained-grant',\
+             'time_sensitive','[]',9223372036854775806)",
+        )
+        .bind(community)
+        .bind(vec![11_u8; 32])
+        .bind(vec![12_u8; 32])
+        .bind(vec![13_u8; 32])
+        .execute(pool)
+        .await
+        .expect("seed legacy lease");
+        community
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres initialized with desired schema"]
+    async fn desired_schema_push_message_kinds() {
+        assert_eq!(
+            std::env::var("BUZZ_TEST_SCHEMA_MODE").as_deref(),
+            Ok("desired")
+        );
+        let pool = connect_test_pool().await;
+        let community = seed_push_migration_lease(&pool).await;
+        assert_push_message_kinds(&pool, community).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn push_message_kinds_fresh_install() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        run_migrations(&pool).await.expect("fresh migrations");
+        let community = seed_push_migration_lease(&pool).await;
+        assert_push_message_kinds(&pool, community).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn push_message_kinds_populated_upgrade_preserves_authority() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        MIGRATOR
+            .run_to(36, &pool)
+            .await
+            .expect("frozen fork prefix");
+        let community = seed_push_migration_lease(&pool).await;
+        let installation = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO push_gateway_installations(id,app_attest_key_id,app_attest_public_key,\
+             assertion_counter,app_profile,token_ciphertext,token_fingerprint,endpoint_epoch,expires_at) \
+             VALUES($1,$2,$3,0,'buzz-ios-sandbox',$4,$5,1,now()+interval '1 day')",
+        )
+        .bind(installation).bind(vec![1_u8; 32]).bind(vec![2_u8; 33])
+        .bind(vec![3_u8; 32]).bind(vec![4_u8; 32])
+        .execute(&pool).await.expect("seed gateway installation");
+        sqlx::query(
+            "INSERT INTO push_gateway_delegations(id,installation_id,relay_pubkey,endpoint_epoch,\
+             generation,not_before,expires_at) VALUES($1,$2,$3,1,1,now(),now()+interval '1 hour')",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(installation)
+        .bind(vec![5_u8; 32])
+        .execute(&pool)
+        .await
+        .expect("seed gateway delegation");
+        let snapshot_sql = "SELECT jsonb_build_array(\
+            (SELECT jsonb_agg(to_jsonb(l)) FROM push_leases l),\
+            (SELECT jsonb_agg(to_jsonb(i)) FROM push_gateway_installations i),\
+            (SELECT jsonb_agg(to_jsonb(d)) FROM push_gateway_delegations d))";
+        let before: serde_json::Value = sqlx::query_scalar(snapshot_sql)
+            .fetch_one(&pool)
+            .await
+            .expect("snapshot existing authority");
+        MIGRATOR
+            .run_to(37, &pool)
+            .await
+            .expect("admit only migration 0037");
+        let after: serde_json::Value = sqlx::query_scalar(snapshot_sql)
+            .fetch_one(&pool)
+            .await
+            .expect("read preserved authority");
+        assert_eq!(
+            before, after,
+            "profile authority and leases must remain byte-equivalent"
+        );
+        let checksum: Vec<u8> = sqlx::query_scalar(
+            "SELECT checksum FROM _sqlx_migrations WHERE version=37 AND success",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("successful adopted migration ledger");
+        assert_eq!(
+            checksum,
+            MIGRATOR
+                .iter()
+                .find(|m| m.version == 37)
+                .unwrap()
+                .checksum
+                .as_ref()
+        );
+        assert_push_message_kinds(&pool, community).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires private PostgreSQL migration fixture"]
+    async fn dogfood_profile_upgrade_retires_authority_preserves_lease_and_event_data() {
+        // The existing 0037 test proves preservation through that admission.
+        // This fixture explicitly proves the later, separately approved cutover.
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        MIGRATOR.run_to(37, &pool).await.unwrap();
+        let community = seed_push_migration_lease(&pool).await;
+        assert_push_message_kinds(&pool, community).await;
+        sqlx::query("INSERT INTO push_gateway_installations(id,app_attest_key_id,app_attest_public_key,assertion_counter,app_profile,token_ciphertext,token_fingerprint,endpoint_epoch,expires_at) VALUES($1,$2,$3,0,'buzz-ios-sandbox',$4,$5,1,now()+interval '1 day')")
+            .bind(uuid::Uuid::new_v4()).bind(vec![1_u8;32]).bind(vec![2_u8;33]).bind(vec![3_u8;32]).bind(vec![4_u8;32]).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO push_gateway_delegations(id,installation_id,relay_pubkey,endpoint_epoch,generation,not_before,expires_at) SELECT $1,id,$2,1,1,now(),now()+interval '1 hour' FROM push_gateway_installations")
+            .bind(uuid::Uuid::new_v4()).bind(vec![5_u8;32]).execute(&pool).await.unwrap();
+        let snapshot = "SELECT jsonb_build_array((SELECT jsonb_agg(to_jsonb(l) ORDER BY l.installation_id) FROM push_leases l),(SELECT jsonb_agg(to_jsonb(e) ORDER BY e.id) FROM events e),(SELECT jsonb_agg(to_jsonb(q) ORDER BY q.event_id) FROM push_match_queue q))";
+        let before: serde_json::Value =
+            sqlx::query_scalar(snapshot).fetch_one(&pool).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let after: serde_json::Value = sqlx::query_scalar(snapshot).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            before, after,
+            "cutover must retain relay leases, events and queue rows"
+        );
+        let counts: (i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM push_gateway_installations),(SELECT count(*) FROM push_gateway_delegations)").fetch_one(&pool).await.unwrap();
+        assert_eq!(counts, (0, 0));
+        let checksum: Vec<u8> = sqlx::query_scalar(
+            "SELECT checksum FROM _sqlx_migrations WHERE version=38 AND success",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            checksum,
+            MIGRATOR
+                .iter()
+                .find(|m| m.version == 38)
+                .unwrap()
+                .checksum
+                .as_ref()
+        );
+        let constraint: String = sqlx::query_scalar("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='push_gateway_installations'::regclass AND conname='push_gateway_installations_app_profile_check'").fetch_one(&pool).await.unwrap();
+        assert!(constraint.contains("buzz-ios-dogfood"));
+        assert!(!constraint.contains("buzz-ios-sandbox"));
+    }
+
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn populated_upgrade_preserves_search_policy_except_for_push_leases() {
@@ -1684,10 +1883,10 @@ mod b1_ci_grants_ordering {
     //! indexes inside the main test module). It asserts the *semantic*
     //! ordering: the workflow snapshot/state/approval/CI-event storage base
     //! (0029-0034) must still occupy versions 29-34, and the CI-signer-grant
-    //! migration must be version 35 at the vector tail and must not have
+    //! migration must remain version 35 in the frozen prefix and must not have
     //! displaced any of 0029-0034.
     //!
-    //! The embedded migrator must contain exactly 35 migrations, with 0035
+    //! The embedded migrator must retain its frozen 35-migration prefix, with 0035
     //! immediately after 0034.
 
     use super::MIGRATOR;
@@ -1697,7 +1896,26 @@ mod b1_ci_grants_ordering {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 35, "0035_ci_grants must be embedded");
+        assert_eq!(
+            migrations
+                .iter()
+                .take(35)
+                .map(|m| m.version)
+                .collect::<Vec<_>>(),
+            (1..=35).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            migrations
+                .iter()
+                .skip(35)
+                .map(|m| (m.version, m.description.as_ref()))
+                .collect::<Vec<_>>(),
+            vec![
+                (36, "workflow run error codes"),
+                (37, "push message kinds"),
+                (38, "push gateway dogfood profile")
+            ]
+        );
         let ci_grants = migrations
             .iter()
             .position(|migration| migration.description == "ci grants")
@@ -1730,12 +1948,9 @@ mod b1_ci_grants_ordering {
             "migration 0035 must land immediately after 0034 with no renumbering of 0030-0034"
         );
 
-        // And `ci_grants` must sit at the final vector index (35 in 1-based
+        // And `ci_grants` must stay at its original vector index (35 in 1-based
         // terms, i.e. vector index 34 because 0001 occupies index 0).
-        assert_eq!(
-            ci_grants, 34,
-            "0035_ci_grants must be the last migration (vector index 34)"
-        );
+        assert_eq!(ci_grants, 34, "0035_ci_grants must retain vector index 34");
 
         // Fact-bound: the migration itself must create the grants table with
         // the B1 authorizer's PK and window columns.

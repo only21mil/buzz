@@ -299,8 +299,8 @@ test("channel and Inbox composers offer the same owned agent member", async ({
   await channelInput.fill("@nad");
   await expect(autocomplete(page)).toBeVisible();
   const channelCandidates = await autocomplete(page)
-    .locator("button")
-    .evaluateAll((buttons) => buttons.map((button) => button.dataset.testid));
+    .locator("[data-mention-suggestion-index]")
+    .evaluateAll((rows) => rows.map((row) => row.getAttribute("data-testid")));
   expect(channelCandidates).toEqual([
     `mention-suggestion-${OWNED_RELAY_AGENT_PUBKEY}`,
   ]);
@@ -358,9 +358,9 @@ test("channel and Inbox composers offer the same owned agent member", async ({
     .poll(() =>
       inboxDetail
         .getByTestId("mention-autocomplete")
-        .locator("button")
-        .evaluateAll((buttons) =>
-          buttons.map((button) => button.dataset.testid),
+        .locator("[data-mention-suggestion-index]")
+        .evaluateAll((rows) =>
+          rows.map((row) => row.getAttribute("data-testid")),
         ),
     )
     .toEqual(channelCandidates);
@@ -574,8 +574,17 @@ test("defers agent mentions until DM members finish loading", async ({
   expect(commandCount(await readCommandLog(page), "add_channel_members")).toBe(
     commandCount(baselineCommands, "add_channel_members"),
   );
-  await expect(input).toBeEmpty();
-  await expect(threadPanel).toContainText("before members resolve");
+  await expect(input).toHaveText("@alice ");
+  await expect(
+    threadPanel.getByTestId(
+      `composer-address-lock-${TEST_IDENTITIES.alice.pubkey}`,
+    ),
+  ).toBeVisible();
+  await expect(
+    threadPanel
+      .getByTestId("message-row")
+      .filter({ hasText: "before members resolve" }),
+  ).toBeVisible();
 });
 
 test("autocomplete filters managed-agent suggestions as user types", async ({
@@ -681,7 +690,7 @@ test("selecting a person mention inserts @Name into input", async ({
 
   await expect(input).toHaveText("Hey @bob ");
   const mentionChip = input.locator(".mention-chip", {
-    hasText: "@bob",
+    hasText: "bob",
   });
   await expect(mentionChip).toBeVisible();
   await expect(mentionChip).not.toHaveClass(/agent-mention-highlight/);
@@ -715,11 +724,11 @@ test("selecting a managed agent mention inserts @Name into input", async ({
   });
   await expect(agentMentionChip).toBeVisible();
   await expect(agentMentionChip).toHaveText("alice");
-  await expect(agentMentionChip).toHaveCSS("display", "inline-flex");
+  await expect(agentMentionChip).toHaveClass(/inline-chip-icon-agent/);
   await expect(agentMentionChip).toHaveCSS("border-top-width", "0px");
 });
 
-test("selecting a persona mention creates a channel agent before sending", async ({
+test("selecting a persona mention creates a channel agent and publishes before waking it", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -760,6 +769,7 @@ test("selecting a persona mention creates a channel agent before sending", async
     baselineCommands,
     "start_managed_agent",
   );
+  const messageContent = await input.textContent();
 
   await page.getByTestId("send-message").click();
   await expect(page.getByRole("alertdialog")).toHaveCount(0);
@@ -779,18 +789,44 @@ test("selecting a persona mention creates a channel agent before sending", async
       commandCount(await readCommandLog(page), "start_managed_agent"),
     )
     .toBeGreaterThan(baselineStartCount);
-  await expect
-    .poll(async () => commandCount(await readCommandLog(page), "sign_event"))
-    .toBeGreaterThan(commandCount(baselineCommands, "sign_event"));
+  const sentMessage = page
+    .getByTestId("message-row")
+    .filter({ hasText: "for a hand" });
+  await expect(sentMessage).toBeVisible();
 
-  const commandsAfterSend = (await readCommandLog(page)).slice(
+  const commandsAfterSend = (await readCommandPayloadLog(page)).slice(
     baselineCommands.length,
   );
-  const startIndex = commandsAfterSend.indexOf("start_managed_agent");
-  const sendIndex = commandsAfterSend.indexOf("sign_event");
+  const startIndex = commandsAfterSend.findIndex(
+    (entry) => entry.command === "start_managed_agent",
+  );
+  // Agent setup also publishes metadata. Match the exact chat event.
+  const sendIndex = commandsAfterSend.findIndex((entry) => {
+    if (entry.command !== "plugin:websocket|send") return false;
+    const payload = entry.payload as { message?: { data?: string } };
+    if (!payload.message?.data) return false;
+    const frame = JSON.parse(payload.message.data) as [
+      string,
+      { kind?: number; content?: string; tags?: string[][] },
+    ];
+    return (
+      frame[0] === "EVENT" &&
+      frame[1].kind === 9 &&
+      frame[1].content === messageContent
+    );
+  });
   expect(startIndex).toBeGreaterThanOrEqual(0);
   expect(sendIndex).toBeGreaterThanOrEqual(0);
-  expect(startIndex).toBeLessThan(sendIndex);
+  const createIndex = commandsAfterSend.findIndex(
+    (entry) => entry.command === "create_managed_agent",
+  );
+  const addIndex = commandsAfterSend.findIndex(
+    (entry) => entry.command === "add_channel_members",
+  );
+  expect(createIndex).toBeGreaterThanOrEqual(0);
+  expect(addIndex).toBeGreaterThan(createIndex);
+  expect(addIndex).toBeLessThan(sendIndex);
+  expect(sendIndex).toBeLessThan(startIndex);
 
   const mentionChip = page
     .getByTestId("message-row")
@@ -798,6 +834,11 @@ test("selecting a persona mention creates a channel agent before sending", async
     .locator("[data-mention].agent-mention-highlight", { hasText: "Fizz" });
   await expect(mentionChip).toBeVisible();
   await expect(mentionChip).toHaveText("Fizz");
+  const agentPubkey = await mentionChip.getAttribute("data-mention-pubkey");
+  expect(agentPubkey).toMatch(/^[a-f0-9]{64}$/);
+  await expect
+    .poll(() => readOutgoingMentionPubkeys(page, messageContent ?? ""))
+    .toEqual([agentPubkey]);
 });
 
 test("selecting a persona mention reuses an existing persona agent", async ({
@@ -1825,7 +1866,7 @@ test("sent non-member person mention uses the normal mention style", async ({
   const mentionChip = page
     .getByTestId("message-row")
     .last()
-    .locator("[data-mention]", { hasText: "@outsider" });
+    .locator("[data-mention]", { hasText: "outsider" });
   await expect(mentionChip).toBeVisible();
   await expect(mentionChip.locator("svg")).toHaveCount(0);
 });
@@ -1852,13 +1893,15 @@ test("sent managed non-member agent mention uses the agent mention style", async
   const dropdown = autocomplete(page);
   await expect(dropdown.getByText("charlie")).toBeVisible();
   await input.press("Enter");
-  await page.keyboard.type(" too");
+  await expect(input).toHaveText("Loop in @charlie ");
+  await page.keyboard.type("too");
+  await expect(input).toHaveText("Loop in @charlie too");
   await page.getByTestId("send-message").click();
 
   const mentionChip = page
     .getByTestId("message-row")
     .last()
-    .locator("[data-mention]", { hasText: "charlie" });
+    .locator(`[data-mention-pubkey="${TEST_IDENTITIES.charlie.pubkey}"]`);
   await expect(mentionChip).toBeVisible();
   await expect(mentionChip).toHaveText("charlie");
   await expect(mentionChip).toHaveClass(/agent-mention-highlight/);
@@ -1965,7 +2008,12 @@ test("mention text is highlighted in sent messages", async ({ page }) => {
     .last()
     .locator("[data-mention].mention-chip", { hasText: "bob" });
   await expect(mentionChip).toBeVisible();
-  await expect(mentionChip.locator(".mention-chip-prefix")).toHaveText("@");
+  await expect(mentionChip).toHaveAttribute(
+    "data-mention-pubkey",
+    TEST_IDENTITIES.bob.pubkey,
+  );
+  await expect(mentionChip).toHaveAttribute("data-mention-kind", "human");
+  await expect(mentionChip).toHaveText("bob");
   await expect(mentionChip.locator("svg")).toHaveCount(0);
 });
 
@@ -2025,8 +2073,8 @@ test("clicking a mention chip in the timeline opens the profile panel", async ({
 
   const mentionChip = page
     .getByTestId("message-row")
-    .filter({ hasText: "Ping @bob about the launch" })
-    .locator("[data-mention]", { hasText: "@bob" });
+    .filter({ hasText: "about the launch" })
+    .locator(`[data-mention-pubkey="${TEST_IDENTITIES.bob.pubkey}"]`);
   await expect(mentionChip).toBeVisible();
   await mentionChip.click();
 
@@ -2053,8 +2101,10 @@ test("mention text matching the kind-0 name alias resolves and opens the profile
 
   const mentionChip = page
     .getByTestId("message-row")
-    .filter({ hasText: "Ask @bobby to review the doc" })
-    .locator("[data-mention]", { hasText: "@bobby" });
+    .filter({ hasText: "to review the doc" })
+    .locator(
+      `[data-mention-pubkey="${TEST_IDENTITIES.bob.pubkey}"][data-mention-label="bobby"]`,
+    );
   await expect(mentionChip).toBeVisible();
   await mentionChip.click();
 
@@ -2079,7 +2129,9 @@ test("clicking a mention chip in a forum post opens the profile panel", async ({
   await page.getByTestId("channel-watercooler").click();
   await expect(page.getByTestId("chat-title")).toHaveText("watercooler");
 
-  const mentionChip = page.locator("[data-mention]", { hasText: "@bob" });
+  const mentionChip = page.locator(
+    `[data-mention-pubkey="${TEST_IDENTITIES.bob.pubkey}"]`,
+  );
   await expect(mentionChip).toBeVisible();
   await mentionChip.click();
 

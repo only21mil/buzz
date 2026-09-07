@@ -129,6 +129,7 @@ pub async fn apply_workspace(
     nsec: Option<String>,
     repos_dir: Option<String>,
     agent_managed_profiles: Option<bool>,
+    thread_scoped_acp_sessions: Option<bool>,
     app: AppHandle,
 ) -> Result<(), String> {
     let restore_app = app.clone();
@@ -164,25 +165,23 @@ pub async fn apply_workspace(
         };
 
         // ── Apply all state changes (nothing below can fail) ──────────────────
-        {
-            let mut override_guard = state.relay_url_override.lock().map_err(|e| e.to_string())?;
-            *override_guard = Some(relay_url);
-        }
-        // Reset the Rust-side admission gate when switching workspace/community,
-        // matching `resetRateLimitGate()` on the TS side (useCommunityInit.ts:38).
+        state.apply_publication_workspace(relay_url, parsed_keys)?;
+        // Match the renderer's admission reset after a community change.
         crate::relay_admission::reset_gate_for_workspace_change();
-
-        if let Some(keys) = parsed_keys {
-            let mut keys_guard = state.keys.lock().map_err(|e| e.to_string())?;
-            *keys_guard = keys;
-        }
 
         // Keep the backend-side reconcile guard aligned with the frontend
         // experiment before launch-time restore can spawn any agents. Missing
         // means the stable behavior: desktop remains authoritative.
         state
-            .managed_agent_profile_reconcile_enabled
+            .managed_agent_profile_reconcile_enabled()
             .store(!agent_managed_profiles.unwrap_or(false), Ordering::Release);
+        // Persisted frontend experiment state must land before launch-time
+        // restore so every restored agent starts with the selected ACP policy.
+        // Missing preserves the stable channel-scoped behavior.
+        state.thread_scoped_acp_sessions_enabled().store(
+            thread_scoped_acp_sessions.unwrap_or(false),
+            Ordering::Release,
+        );
 
         // ── Filesystem side-effect (non-fatal) ────────────────────────────────
         // Persist the *effective* repos_dir (None when the candidate failed

@@ -1,3 +1,4 @@
+import { expectedPublicationScope } from "./publicationScope";
 import { register, type InvokeBody } from "./registry";
 import {
   clearIdentitySecretsForEgressGuard,
@@ -310,7 +311,10 @@ export function registerIdentityCommands(
       stringField(record, "password", false),
     );
   });
-  register("sign_event", (body) => manager.sign(eventRequest(body)));
+  register("sign_event", (body) => {
+    expectedPublicationScope(objectBody(body).expectedScope, manager);
+    return manager.sign(eventRequest(body));
+  });
   register("nip44_encrypt_to_self", (body) =>
     manager.nip44EncryptToSelf(
       stringField(objectBody(body), "plaintext") as string,

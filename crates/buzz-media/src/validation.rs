@@ -62,19 +62,12 @@ pub(crate) fn looks_like_mp4_iso_bmff(bytes: &[u8]) -> bool {
 
 /// MIME types blocked from the generic file-upload path.
 ///
-/// These are the formats a browser (or the desktop webview) will *execute* or
-/// *render as active content* if it ever reaches them with the wrong response
-/// headers. We serve generic files with `Content-Disposition: attachment` +
-/// `X-Content-Type-Options: nosniff` + `CSP: default-src 'none'`, which already
-/// neutralises them — this allowlist-of-denials is defence in depth, so a future
-/// header regression can't turn an uploaded blob into a stored-XSS vector.
-///
-/// HTML, JS, and SVG are the classic stored-XSS carriers. Native executables are
-/// blocked because there's no legitimate reason to host them inline in chat and
-/// they're a malware-distribution risk.
+/// This is defense in depth, not an exhaustive content filter: unrecognized
+/// text (including active web content) can remain opaque. HTML is accepted as
+/// a generic attachment. Authentication, forced download, `nosniff`, CSP, and
+/// client download-only handling are the boundary against in-app execution.
 const BLOCKED_FILE_MIME_TYPES: &[&str] = &[
     // Active web content — stored-XSS vectors.
-    "text/html",
     "application/xhtml+xml",
     "image/svg+xml",
     "application/javascript",
@@ -136,6 +129,7 @@ fn file_mime_to_ext(mime: &str) -> Option<&'static str> {
         "application/json" => "json",
         "text/csv" => "csv",
         "text/plain" => "txt",
+        "text/html" => "html",
         _ => return None,
     };
     Some(ext)
@@ -146,8 +140,8 @@ fn file_mime_to_ext(mime: &str) -> Option<&'static str> {
 /// This is the catch-all path for non-media attachments (documents, archives,
 /// text, data). It enforces three things:
 ///   1. A size cap (`config.max_file_bytes`).
-///   2. A *deny* list — known active-content and executable MIME types are
-///      rejected even though safe headers already neutralise them.
+///   2. A *deny* list — selected active-content and executable MIME types are
+///      rejected as defense in depth.
 ///   3. Magic-byte sniffing where possible.
 ///
 /// Files with no detectable signature (plain text, CSV, source code, JSON —
@@ -282,7 +276,7 @@ pub fn validate_content(bytes: &[u8], config: &MediaConfig) -> Result<String, Me
 /// - Exactly one video track using `avc1` (H.264 only — rejects HEVC, VP9, AV1)
 /// - At most one audio track, using `mp4a` (AAC)
 /// - Duration ≤ 600 seconds (from mvhd timescale, not edit lists)
-/// - Resolution ≤ 3840×2160
+/// - Resolution: short edge ≤ 2160 and long edge ≤ 3840 (portrait or landscape)
 /// - moov atom precedes mdat (fast-start / web-optimised)
 ///
 /// Returns [`VideoMeta`] on success.
@@ -358,10 +352,14 @@ pub fn validate_video_file(path: &Path, config: &MediaConfig) -> Result<VideoMet
                     return Err(MediaError::DurationTooLong);
                 }
 
-                // Resolution check.
+                // Resolution check. Apply the 2160×3840 envelope independent
+                // of orientation so equivalent portrait and landscape videos
+                // receive the same treatment.
                 let width = track.width() as u32;
                 let height = track.height() as u32;
-                if width > 3840 || height > 2160 {
+                let short_edge = width.min(height);
+                let long_edge = width.max(height);
+                if short_edge > 2160 || long_edge > 3840 {
                     return Err(MediaError::ResolutionTooHigh);
                 }
 
@@ -2536,6 +2534,43 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_video_accepts_portrait_resolution() {
+        let mp4_bytes = build_mp4_bytes(true, b"avc1", 1_000, 2160, 3840, false);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &mp4_bytes).unwrap();
+
+        let meta = validate_video_file(tmp.path(), &test_config())
+            .expect("portrait video within the 2160x3840 envelope should be accepted");
+        assert_eq!((meta.width, meta.height), (2160, 3840));
+    }
+
+    #[test]
+    fn test_validate_video_rejects_resolution_above_short_edge_limit() {
+        let mp4_bytes = build_mp4_bytes(true, b"avc1", 1_000, 2161, 3840, false);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &mp4_bytes).unwrap();
+
+        let result = validate_video_file(tmp.path(), &test_config());
+        assert!(
+            matches!(result, Err(MediaError::ResolutionTooHigh)),
+            "expected ResolutionTooHigh, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_video_rejects_resolution_above_long_edge_limit() {
+        let mp4_bytes = build_mp4_bytes(true, b"avc1", 1_000, 2160, 3841, false);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &mp4_bytes).unwrap();
+
+        let result = validate_video_file(tmp.path(), &test_config());
+        assert!(
+            matches!(result, Err(MediaError::ResolutionTooHigh)),
+            "expected ResolutionTooHigh, got {result:?}"
+        );
+    }
+
+    #[test]
     fn test_validate_video_resolution_too_high() {
         let config = test_config();
         let mp4_bytes = build_mp4_too_large();
@@ -2586,15 +2621,50 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_file_html_rejected() {
-        // HTML is a stored-XSS carrier — blocked even though headers neutralise it.
+    fn test_validate_file_html_accepted_as_attachment() {
         let config = test_config();
         let html = b"<!DOCTYPE html><html><body><script>alert(1)</script></body></html>";
-        let result = validate_file_content(html, &config);
-        assert!(
-            matches!(result, Err(MediaError::DisallowedContentType(ref m)) if m == "text/html"),
-            "expected DisallowedContentType(text/html), got {result:?}"
-        );
+        let (mime, ext) = validate_file_content(html, &config).unwrap();
+        assert_eq!((mime.as_str(), ext.as_str()), ("text/html", "html"));
+        assert!(!serve_inline(&mime));
+        assert!(validate_content(html, &config).is_err());
+    }
+
+    #[test]
+    fn test_html_sniffing_variants_remain_generic_downloads() {
+        let mut config = test_config();
+        let fixtures: &[&[u8]] = &[
+            b"<!DOCTYPE html><html><script>alert(1)</script></html>",
+            b"  \n<!DOCTYPE html><html>whitespace</html>",
+            b"\xef\xbb\xbf<!DOCTYPE html><html>BOM</html>",
+            b"<!-- comment --><html>comment</html>",
+            b"<p onclick='alert(1)'>fragment</p>",
+            b"",
+        ];
+        for bytes in fixtures {
+            let (mime, ext) = validate_file_content(bytes, &config).unwrap();
+            assert!(matches!(
+                mime.as_str(),
+                "text/html" | "application/octet-stream"
+            ));
+            assert_eq!(ext, if mime == "text/html" { "html" } else { "bin" });
+            assert!(!serve_inline(&mime));
+            assert!(validate_content(bytes, &config).is_err());
+        }
+        config.max_file_bytes = 10;
+        assert!(matches!(
+            validate_file_content(fixtures[0], &config),
+            Err(MediaError::FileTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_file_executable_still_rejected() {
+        let executable = b"MZ\x90\x00";
+        assert!(matches!(
+            validate_file_content(executable, &test_config()),
+            Err(MediaError::DisallowedContentType(_))
+        ));
     }
 
     #[test]
@@ -2616,5 +2686,6 @@ mod tests {
         assert!(!serve_inline("application/octet-stream"));
         assert!(!serve_inline("audio/mpeg"));
         assert!(!serve_inline("text/plain"));
+        assert!(!serve_inline("text/html"));
     }
 }

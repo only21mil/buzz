@@ -24,6 +24,7 @@ fn local_in_app() -> AgentDefinition {
         source_team: Some("team-1".to_string()),
         source_team_persona_slug: None,
         catalog_source: None,
+        team_catalog_source: None,
         env_vars: BTreeMap::from([("API_KEY".to_string(), "secret".to_string())]),
         respond_to: None,
         respond_to_allowlist: Vec::new(),
@@ -51,6 +52,7 @@ fn inbound_for(d_tag: &str, display_name: &str) -> AgentDefinition {
         source_team: None,
         source_team_persona_slug: Some(d_tag.to_string()),
         catalog_source: None,
+        team_catalog_source: None,
         env_vars: BTreeMap::new(),
         respond_to: None,
         respond_to_allowlist: Vec::new(),
@@ -159,6 +161,7 @@ const AGENT_PUBKEY: &str = "agentpubkeyhex00000000000000000000000000000000000000
 /// event must NEVER be able to overwrite.
 fn local_agent() -> ManagedAgentRecord {
     ManagedAgentRecord {
+        effort_level: None,
         pubkey: AGENT_PUBKEY.to_string(),
         name: "Local Agent".to_string(),
         persona_id: Some("persona-local".to_string()),
@@ -211,6 +214,7 @@ fn local_agent() -> ManagedAgentRecord {
         source_team: None,
         source_team_persona_slug: None,
         catalog_source: None,
+        team_catalog_source: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: Vec::new(),
         definition_parallelism: None,
@@ -395,6 +399,9 @@ fn local_team() -> TeamRecord {
         instructions: None,
         persona_ids: vec!["p-local".to_string()],
         is_builtin: false,
+        shared: false,
+        catalog_source: None,
+
         source_dir: Some(std::path::PathBuf::from("/local/team/dir")),
         is_symlink: true,
         symlink_target: Some("/external".to_string()),
@@ -852,6 +859,7 @@ fn retain_managed_agent_pending_surfaces_recovery_mode_error() {
         .store(true, std::sync::atomic::Ordering::Relaxed);
 
     let record = ManagedAgentRecord {
+        effort_level: None,
         pubkey: "a".repeat(64),
         name: "Test".to_string(),
         persona_id: None,
@@ -901,6 +909,8 @@ fn retain_managed_agent_pending_surfaces_recovery_mode_error() {
         source_team: None,
         source_team_persona_slug: None,
         catalog_source: None,
+
+        team_catalog_source: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: vec![],
         definition_parallelism: None,

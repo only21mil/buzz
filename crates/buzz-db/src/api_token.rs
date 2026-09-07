@@ -344,10 +344,15 @@ mod tests {
     use crate::{ApiTokenRecord, Db};
     use sqlx::PgPool;
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
+    fn test_database_url() -> String {
+        std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("TEST_DATABASE_URL"))
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .expect("explicit isolated test database URL required")
+    }
 
     async fn setup_db() -> Db {
-        let pool = PgPool::connect(TEST_DB_URL)
+        let pool = PgPool::connect(&test_database_url())
             .await
             .expect("connect to test DB");
         Db::from_pool(pool)

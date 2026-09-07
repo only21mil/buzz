@@ -269,12 +269,14 @@ export type RelayMember = {
 
 export type RelayAgent = {
   pubkey: string;
+  /** Authenticated owner; absent for legacy runtime-only entries. */
+  ownerPubkey?: string | null;
   name: string;
   agentType: string;
   channels: string[];
   channelIds: string[];
   capabilities: string[];
-  status: "online" | "away" | "offline";
+  status: "online" | "away" | "offline" | "unknown";
   respondTo: RespondToMode | null;
   respondToAllowlist: string[];
 };
@@ -307,6 +309,7 @@ export type ManagedAgentBackend =
 import type { RestartDiffEntry } from "./restartDiff";
 export type { JsonValue, RestartChange, RestartDiffEntry } from "./restartDiff";
 export type ManagedAgent = {
+  effortLevel?: string | null;
   pubkey: string;
   name: string;
   personaId: string | null;
@@ -517,6 +520,7 @@ export type AcpRuntimeCatalogEntry = {
   providerEnvVar: string | null;
   /** Environment variable used to apply thinking effort, when supported. */
   thinkingEnvVar: string | null;
+  effortCanonicalValues?: string[] | null;
   maxTokensEnvVar: string | null;
   contextLimitEnvVar: string | null;
   maxRoundsEnvVar: string | null;
@@ -667,17 +671,13 @@ export type NormalizedConfig = {
   systemPrompt: NormalizedField | null;
 };
 
-export type RuntimeConfigSurface = {
-  runtimeId: string | null;
-  runtimeLabel: string | null;
-  isPreSpawn: boolean;
-  normalized: NormalizedConfig;
-  advanced: ConfigField[];
-  extensions: ExtensionEntry[];
-  sources: ConfigSourceReport;
-};
+export type {
+  AcpConfigOptionValue,
+  RuntimeConfigSurface,
+} from "./agentConfigTypes";
 
 export type UpdateManagedAgentInput = {
+  effortLevel?: string | null;
   pubkey: string;
   name?: string;
   model?: string | null;
@@ -792,39 +792,13 @@ export type UpdatePersonaInput = {
 };
 
 // ── Team types ────────────────────────────────────────────────────────────────
-export type AgentTeam = {
-  id: string;
-  name: string;
-  description: string | null;
-  instructions: string | null;
-  personaIds: string[];
-  isBuiltin: boolean;
-  /** Absolute path to the team's backing directory (if directory-backed). */
-  sourceDir: string | null;
-  /** Whether sourceDir is a symlink to an external directory. */
-  isSymlink: boolean;
-  /** Resolved symlink target path (for display). Only set when isSymlink is true. */
-  symlinkTarget: string | null;
-  /** Version from the team's plugin.json manifest. */
-  version: string | null;
-  createdAt: string;
-  updatedAt: string;
-};
+export type {
+  AgentTeam,
+  CreateTeamInput,
+  TeamCatalogSourceCoordinate,
+  UpdateTeamInput,
+} from "./teamTypes";
 
-export type CreateTeamInput = {
-  name: string;
-  description?: string;
-  instructions?: string;
-  personaIds: string[];
-};
-
-export type UpdateTeamInput = {
-  id: string;
-  name: string;
-  description?: string;
-  instructions?: string;
-  personaIds: string[];
-};
 // ── Channel Template types ─────────────────────────────────────────────────────
 
 export type TemplateBackend =
@@ -894,6 +868,8 @@ export type {
   WorkflowApprovalStatus,
   WorkflowRun,
   WorkflowRunStatus,
+  WorkflowRunsCursor,
+  WorkflowRunsPage,
   WorkflowSaveResult,
   WorkflowStatus,
   TraceEntry,
@@ -951,25 +927,7 @@ export type ForumThreadResponse = {
   nextCursor: string | null;
 };
 
-/**
- * Forward keyset cursor for the server-side thread read (`get_thread_replies`).
- *
- * The event-id tiebreak is load-bearing: thread replies routinely share a
- * `createdAt` second (bursty threads), so a timestamp-only cursor would skip
- * every tied reply past the page limit. The pair `(createdAt, eventId)` orders
- * replies unambiguously and lets paging resume strictly after the last event.
- */
-export type ThreadCursor = {
-  createdAt: number;
-  eventId: string;
-};
-
-export type ThreadRepliesResponse = {
-  /** The reply subtree (chronological, oldest first), depth >= 1. Excludes the root event (relay keys on `root_event_id`, which a root row lacks); the caller already holds the root. */
-  events: RelayEvent[];
-  /** Present only when a full page was returned — pass back to fetch the next page. */
-  nextCursor: ThreadCursor | null;
-};
+export type { ThreadCursor, ThreadRepliesResponse } from "./threadTypes";
 
 /**
  * Composite backward keyset cursor for channel-timeline paging via the bridge

@@ -142,18 +142,28 @@ function LoadingDots({ label }: { label: string }) {
   );
 }
 
-export function CommunityOnboardingFlow({
-  onCancel,
-  onConnect,
-}: {
+type CommunityOnboardingFlowProps = {
   onCancel: () => void;
   onConnect: () => void;
-}) {
+};
+
+export function CommunityOnboardingFlow(props: CommunityOnboardingFlowProps) {
+  const { transaction } = useCommunityOnboarding();
+  return <CommunityOnboardingTransaction key={transaction?.id} {...props} />;
+}
+
+function CommunityOnboardingTransaction({
+  onCancel,
+  onConnect,
+}: CommunityOnboardingFlowProps) {
   const { transaction, update, clear } = useCommunityOnboarding();
   const queryClient = useQueryClient();
   const systemColorScheme = useSystemColorScheme();
   const [displayName, setDisplayName] = React.useState("");
   const [avatarUrl, setAvatarUrl] = React.useState("");
+  const avatarEditedRef = React.useRef(false);
+  const savedAvatarUrlRef = React.useRef("");
+  const nameEditedRef = React.useRef(false);
   const avatarPresentation = useAvatarPresentation(avatarUrl);
   const [isUploadingAvatar, setIsUploadingAvatar] = React.useState(false);
   const [isAvatarEditorOpen, setIsAvatarEditorOpen] = React.useState(false);
@@ -306,28 +316,27 @@ export function CommunityOnboardingFlow({
     transaction?.stage === "finalizing" ||
     transaction?.stage === "entering";
 
-  // Seed display name and avatar from the relay profile when the profile step
-  // is shown. This covers the case where the skip raced or was bypassed (e.g.,
-  // the user navigated Back). Only seeds fields that are still empty so that
-  // any user edits are preserved.
+  // Hydration supplies the saved baseline, never a new avatar selection.
   React.useEffect(() => {
     if (!isProfileStage) return;
+    let cancelled = false;
     void getProfile()
       .then((profile) => {
-        if (profile.displayName) {
-          setDisplayName((prev) =>
-            prev === "" ? (profile.displayName ?? "") : prev,
-          );
+        if (cancelled) return;
+        savedAvatarUrlRef.current = profile.avatarUrl?.trim() ?? "";
+        if (!nameEditedRef.current) {
+          setDisplayName(profile.displayName ?? "");
         }
-        if (profile.avatarUrl) {
-          setAvatarUrl((prev) =>
-            prev === "" ? (profile.avatarUrl ?? "") : prev,
-          );
+        if (!avatarEditedRef.current) {
+          setAvatarUrl(profile.avatarUrl ?? "");
         }
       })
       .catch(() => {
         // Seeding is best-effort; silently ignore failures.
       });
+    return () => {
+      cancelled = true;
+    };
   }, [isProfileStage]);
 
   React.useLayoutEffect(() => {
@@ -402,13 +411,20 @@ export function CommunityOnboardingFlow({
     try {
       const candidateAvatarUrl = avatarUrl.trim();
       const presentationState = avatarPresentation?.state;
+      const hasAvatarEdit =
+        avatarEditedRef.current &&
+        candidateAvatarUrl !== savedAvatarUrlRef.current;
       const shouldSaveCandidate =
+        hasAvatarEdit &&
         candidateAvatarUrl.length > 0 &&
         presentationState !== "failed" &&
         presentationState !== "pending";
 
       const deferredAvatar =
-        candidateAvatarUrl && presentationState && presentationState !== "ready"
+        hasAvatarEdit &&
+        candidateAvatarUrl &&
+        presentationState &&
+        presentationState !== "ready"
           ? registerAvatarWhenReady({
               avatarUrl: candidateAvatarUrl,
               relayUrl: transaction.relayUrl,
@@ -428,7 +444,7 @@ export function CommunityOnboardingFlow({
         deferredAvatar?.cancel();
         throw error;
       }
-      update({ stage: "team-intro", error: undefined });
+      update({ stage: "team-intro", error: undefined }, transaction.id);
     } catch (error) {
       if (isRelayMembershipDeniedError(error)) {
         try {
@@ -440,7 +456,10 @@ export function CommunityOnboardingFlow({
         setIsMembershipDenied(true);
         return;
       }
-      update({ error: error instanceof Error ? error.message : String(error) });
+      update(
+        { error: error instanceof Error ? error.message : String(error) },
+        transaction.id,
+      );
     } finally {
       setIsPending(false);
     }
@@ -548,7 +567,10 @@ export function CommunityOnboardingFlow({
                       data-testid="community-profile-name-key"
                       disabled={isPending || isUploadingAvatar}
                       id="community-display-name"
-                      onChange={(event) => setDisplayName(event.target.value)}
+                      onChange={(event) => {
+                        nameEditedRef.current = true;
+                        setDisplayName(event.target.value);
+                      }}
                       placeholder="Enter your username here"
                       ref={nameInputRef}
                       spellCheck={false}
@@ -624,7 +646,10 @@ export function CommunityOnboardingFlow({
                       emojiPickerThemeVars={NEUTRAL_EMOJI_PICKER_THEME_VARS}
                       onDone={() => setIsAvatarEditorOpen(false)}
                       onUploadingChange={setIsUploadingAvatar}
-                      onUrlChange={setAvatarUrl}
+                      onUrlChange={(nextAvatarUrl) => {
+                        avatarEditedRef.current = true;
+                        setAvatarUrl(nextAvatarUrl);
+                      }}
                       presentation="onboarding-modal"
                       previewName={displayName.trim() || "Your profile"}
                       testIdPrefix="community-avatar"

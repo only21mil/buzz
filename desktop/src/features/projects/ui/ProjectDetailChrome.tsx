@@ -1,3 +1,4 @@
+import { useChannelsQuery } from "@/features/channels/hooks";
 import { ChevronRight, FolderGit2, MessageSquare } from "lucide-react";
 import type * as React from "react";
 
@@ -13,6 +14,7 @@ export type ProjectDetailWorkItemCrumb = {
 };
 
 export function ProjectDetailChrome({
+  homeChannelId,
   activeTabCrumb,
   activeWorkItemCrumb,
   chromeRef,
@@ -21,6 +23,7 @@ export function ProjectDetailChrome({
   onGoProjects,
   project,
 }: {
+  homeChannelId: string | null;
   activeTabCrumb: string | null;
   activeWorkItemCrumb: ProjectDetailWorkItemCrumb | null;
   chromeRef: React.Ref<HTMLDivElement>;
@@ -29,6 +32,11 @@ export function ProjectDetailChrome({
   onGoProjects: () => void;
   project: Project;
 }) {
+  const channels = useChannelsQuery();
+  const related = (channels.data ?? []).filter(
+    (channel) =>
+      channel.isMember && project.relatedChannelIds?.includes(channel.id),
+  );
   return (
     <div
       className={cn(
@@ -106,17 +114,29 @@ export function ProjectDetailChrome({
             </span>
           )}
         </nav>
-        {project.projectChannelId ? (
-          <Button
-            className="h-8 shrink-0 gap-1.5"
-            onClick={() => onGoChannel(project.projectChannelId as string)}
-            size="sm"
-            variant="outline"
-          >
-            <MessageSquare className="h-4 w-4" />
-            Open Discussion
-          </Button>
-        ) : null}
+        <div className="flex shrink-0 items-center gap-2">
+          {related.map((channel) => (
+            <Button
+              key={channel.id}
+              onClick={() => onGoChannel(channel.id)}
+              size="sm"
+              variant="ghost"
+            >
+              #{channel.name}
+            </Button>
+          ))}
+          {homeChannelId ? (
+            <Button
+              className="h-8 shrink-0 gap-1.5"
+              onClick={() => onGoChannel(homeChannelId)}
+              size="sm"
+              variant="outline"
+            >
+              <MessageSquare className="h-4 w-4" />
+              Open project home
+            </Button>
+          ) : null}
+        </div>
       </div>
     </div>
   );

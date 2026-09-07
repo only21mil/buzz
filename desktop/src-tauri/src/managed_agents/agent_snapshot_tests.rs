@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 /// relevant to snapshot export are filled; the rest use defaults.
 fn minimal_record() -> ManagedAgentRecord {
     ManagedAgentRecord {
+        effort_level: None,
         pubkey: "deadbeef".to_string(),
         name: "Test Agent".to_string(),
         display_name: Some("Test Agent Display".to_string()),
@@ -69,6 +70,7 @@ fn minimal_record() -> ManagedAgentRecord {
         source_team_persona_slug: Some("lep".to_string()), // MUST NOT appear
         definition_respond_to: Some("allowlist".to_string()),
         catalog_source: None,
+        team_catalog_source: None,
         definition_respond_to_allowlist: vec!["abc123def".to_string()],
         definition_parallelism: Some(4),
         relay_mesh: None,

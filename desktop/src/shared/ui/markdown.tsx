@@ -1,3 +1,7 @@
+import { isAudioAttachment } from "@/features/messages/lib/audioAttachment";
+import { renderAudioMessageAttachment } from "@/features/messages/ui/AudioMessageAttachment";
+import { isRelayDownloadable } from "./markdown/mediaEntry";
+import { createMarkdownMention } from "./markdown/MarkdownMention";
 import * as React from "react";
 import { createPortal } from "react-dom";
 import type { Components } from "react-markdown";
@@ -18,7 +22,6 @@ import {
   resolveMessageLinkRenderTarget,
   type ParsedMessageLink,
 } from "@/features/messages/lib/messageLink";
-import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { invokeTauri } from "@/shared/api/tauri";
 import { useChannelNavigation } from "@/shared/context/ChannelNavigationContext";
 import { cn } from "@/shared/lib/cn";
@@ -38,7 +41,6 @@ import {
   INLINE_CODE_CHIP_CLASS,
   MENTION_CHIP_BASE_CLASSES,
   MENTION_CHIP_HOVER_CLASSES,
-  MENTION_CHIP_PREFIX_CLASS,
   MESSAGE_MARKDOWN_CLASS,
 } from "@/shared/ui/mentionChip";
 
@@ -1271,7 +1273,7 @@ function ImageMosaic({ children }: { children: React.ReactNode[] }) {
   );
 }
 
-function createMarkdownComponents(
+export function createMarkdownComponents(
   interactive = true,
   mediaInset = false,
 ): Components {
@@ -1304,6 +1306,16 @@ function createMarkdownComponents(
     }
 
     const label = getReactNodeText(children);
+
+    const audioAttachment = renderAudioMessageAttachment(
+      href ? imetaByUrl?.get(href) : undefined,
+      href,
+      label,
+      href && isRelayDownloadable(href, relayOrigin ?? undefined)
+        ? href
+        : undefined,
+    );
+    if (audioAttachment) return audioAttachment;
 
     // Snapshot attachment (agent or team): classify before generic FileCard.
     // resolveSnapshotCard checks the filename suffix + SHA-256 field.
@@ -1547,7 +1559,8 @@ function createMarkdownComponents(
     ol: ({ children }) => (
       <ol className={cn("list-decimal", listClassName)}>{children}</ol>
     ),
-    p: ({ children }) => {
+    p: function MarkdownParagraph({ children }) {
+      const { imetaByUrl } = useMarkdownRuntime();
       // Detect media-only paragraphs (images + <br> from remarkBreaks).
       // Multi-image: render as a compact, count-aware mosaic. Two images split
       // a row, three form a hero-and-stack triptych, and larger odd counts let
@@ -1561,7 +1574,13 @@ function createMarkdownComponents(
         return <ImageMosaic>{imageChildren}</ImageMosaic>;
       }
 
-      if (hasBlockMedia(childArray)) {
+      const hasAudioAttachment = childArray.some(
+        (child) =>
+          React.isValidElement<{ href?: string }>(child) &&
+          typeof child.props.href === "string" &&
+          isAudioAttachment(imetaByUrl?.get(child.props.href)),
+      );
+      if (hasBlockMedia(childArray) || hasAudioAttachment) {
         return <div>{children}</div>;
       }
 
@@ -1599,59 +1618,7 @@ function createMarkdownComponents(
     ul: ({ children }) => (
       <ul className={cn("list-disc", listClassName)}>{children}</ul>
     ),
-    mention: function MarkdownMention({
-      children,
-    }: {
-      children?: React.ReactNode;
-    }) {
-      const { agentMentionPubkeysByName, mentionPubkeysByName } =
-        useMarkdownRuntime();
-      const mentionText = String(children ?? "");
-      const mentionName = mentionText.replace(/^@/, "").trim().toLowerCase();
-      const pubkey = mentionPubkeysByName?.[mentionName];
-      const isAgentMention =
-        pubkey !== undefined &&
-        agentMentionPubkeysByName?.[mentionName] === pubkey;
-      const mentionLabel = mentionText.replace(/^@/, "");
-      const renderedMentionText = isAgentMention ? (
-        mentionLabel
-      ) : (
-        <>
-          <span className={MENTION_CHIP_PREFIX_CLASS}>@</span>
-          {mentionLabel}
-        </>
-      );
-      // Only chips that actually open a profile get the clickable affordance.
-      // A mention whose pubkey didn't resolve stays a plain chip — a pointer
-      // cursor there promises a click that does nothing.
-      const opensProfile = interactive && pubkey !== undefined;
-      const mentionNode = (
-        <span
-          data-mention=""
-          className={cn(
-            MENTION_CHIP_BASE_CLASSES,
-            opensProfile && "cursor-pointer",
-            opensProfile && MENTION_CHIP_HOVER_CLASSES,
-            isAgentMention && "agent-mention-highlight",
-          )}
-        >
-          {renderedMentionText}
-        </span>
-      );
-
-      return opensProfile ? (
-        <UserProfilePopover
-          botIdenticonValue={mentionLabel}
-          pubkey={pubkey}
-          role={isAgentMention ? "bot" : undefined}
-          triggerElement="span"
-        >
-          {mentionNode}
-        </UserProfilePopover>
-      ) : (
-        mentionNode
-      );
-    },
+    mention: createMarkdownMention(interactive),
     emoji: ({ src, alt }: { src?: string; alt?: string }) => {
       const resolvedSrc = src ? rewriteRelayUrl(src) : src;
       if (!resolvedSrc) {
@@ -1778,6 +1745,7 @@ function MarkdownInner({
   onRemoveLinkPreviewsForEveryone,
   mentionNames,
   mentionPubkeysByName,
+  leadingInlineContent,
   searchQuery,
   snapshotSharedBy,
   videoReviewContext,
@@ -1919,6 +1887,7 @@ function MarkdownInner({
     >
       <MarkdownRuntimeContext.Provider value={runtime}>
         <VideoReviewMarkdownContext.Provider value={videoReviewContext}>
+          {leadingInlineContent}
           {selectProseOrNudge(configNudge, markdownNode)}
           {configNudge !== null ? (
             <AttachmentGroup
@@ -1955,6 +1924,7 @@ export const Markdown = React.memo(
     ) &&
     shallowRecordEqual(prev.mentionPubkeysByName, next.mentionPubkeysByName) &&
     shallowArrayEqual(prev.mentionNames, next.mentionNames) &&
+    prev.leadingInlineContent === next.leadingInlineContent &&
     shallowArrayEqual(prev.channelNames, next.channelNames) &&
     prev.imetaByUrl === next.imetaByUrl &&
     prev.configNudgeAuthorPubkey === next.configNudgeAuthorPubkey &&

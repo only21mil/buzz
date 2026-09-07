@@ -17,11 +17,11 @@ use super::agent_update_rollback::{rollback_failed_agent_update, AgentUpdateRoll
 use crate::{
     app_state::AppState,
     managed_agents::{
-        build_managed_agent_summary, current_instance_id, discovery_env_with_baked_floor,
-        find_managed_agent_mut, known_acp_runtime, load_global_agent_config, load_managed_agents,
-        load_personas, managed_agent_avatar_url, missing_command_message, normalize_agent_args,
-        resolve_command, save_managed_agents, sync_managed_agent_processes, try_regenerate_nest,
-        AgentModelInfo, AgentModelsResponse, UpdateManagedAgentRequest, UpdateManagedAgentResponse,
+        current_instance_id, discovery_env_with_baked_floor, find_managed_agent_mut,
+        known_acp_runtime, load_global_agent_config, load_managed_agents, load_personas,
+        managed_agent_avatar_url, missing_command_message, normalize_agent_args, resolve_command,
+        save_managed_agents, sync_managed_agent_processes, try_regenerate_nest, AgentModelInfo,
+        AgentModelsResponse, UpdateManagedAgentRequest, UpdateManagedAgentResponse,
         DEFAULT_ACP_COMMAND,
     },
     relay::{relay_ws_url_with_override, sync_managed_agent_profile},
@@ -725,18 +725,14 @@ fn apply_model_provider_prompt_update(
     }
 }
 
-/// Update mutable fields on an existing managed agent record.
-///
-/// Does NOT auto-restart the agent. Runtime config changes (system prompt,
-/// parallelism, commands, toolsets) take effect on the next agent spawn.
-/// Name changes are synced to the relay immediately via a kind:0 re-publish.
+/// Save mutable fields atomically. Runtime changes apply on restart;
+/// name changes immediately publish kind:0 to the relay.
 #[tauri::command]
 pub async fn update_managed_agent(
     input: UpdateManagedAgentRequest,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<UpdateManagedAgentResponse, String> {
-    // Phase 1: local save (synchronous, under lock)
     let (summary, sync_params, rollback) = {
         let _store_guard = state
             .managed_agents_store_lock
@@ -785,15 +781,12 @@ pub async fn update_managed_agent(
         if let Some(acp_command) = input.acp_command {
             record.acp_command = acp_command;
         }
-        // Harness edit: the persona's runtime is authoritative, so an explicit
-        // `agent_command_override` is persisted ONLY when the user picks a
-        // command that diverges from the persona, and the empty/whitespace
-        // "Inherit from persona" sentinel clears both the pin and the
-        // materialized record runtime. A name-only edit
-        // (`agent_command == None`) leaves the pin intact. `harness_override`
-        // threads the user's explicit intent — see `apply_agent_command_update`
-        // and `update_time_agent_command_override` for the full resolution
-        // rules.
+        // An explicit inherit transition also drops the instance effort pin.
+        let inherit_effort = record.persona_id.is_some()
+            && input
+                .agent_command
+                .as_deref()
+                .is_some_and(|command| command.trim().is_empty());
         if let Some(agent_command) = input.agent_command {
             let personas = load_personas(&app).unwrap_or_default();
             crate::managed_agents::apply_agent_command_update(
@@ -829,9 +822,14 @@ pub async fn update_managed_agent(
             record.relay_mesh = Some(crate::managed_agents::RelayMeshConfig { model_ref });
         }
 
-        // Inbound author gate: merge patch onto current values, then validate
-        // the merged state. This lets a single update switch to Allowlist AND
-        // supply pubkeys atomically.
+        crate::managed_agents::config_bridge::effort::apply_saved_effort_patch(
+            &app,
+            record,
+            input.effort_level,
+            inherit_effort,
+        )?;
+
+        // Validate the merged gate so mode and allowlist change atomically.
         let prospective_mode = input.respond_to.unwrap_or(record.respond_to);
         let prospective_allowlist = match input.respond_to_allowlist.as_ref() {
             Some(list) => crate::managed_agents::validate_respond_to_allowlist(list)?,
@@ -891,16 +889,7 @@ pub async fn update_managed_agent(
             None
         };
 
-        let summary = {
-            let personas = load_personas(&app).unwrap_or_default();
-            build_managed_agent_summary(
-                &app,
-                record,
-                &runtimes,
-                &personas,
-                &crate::managed_agents::load_global_agent_config(&app).unwrap_or_default(),
-            )?
-        };
+        let summary = super::agents::summarize_from_disk(&app, record, &runtimes)?;
         let rollback = name_changed.then(|| AgentUpdateRollback::new(previous_record, record));
         (summary, sync_params, rollback)
     }; // lock dropped here

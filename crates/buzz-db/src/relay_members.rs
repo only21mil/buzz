@@ -637,12 +637,10 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
-
     async fn setup_pool() -> PgPool {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+            .expect("explicit isolated test database URL required");
         PgPool::connect(&database_url)
             .await
             .expect("connect to test DB")
@@ -998,8 +996,8 @@ mod tests {
         let owner = test_pubkey();
         let transferee = test_pubkey();
 
-        // Give the transferee 3 communities (the max).
-        for _ in 0..3 {
+        // Fill the transferee's effective ownership allowance.
+        for _ in 0..max_communities_per_owner() {
             let c = make_test_community(&pool).await;
             bootstrap_owner(&pool, c, &transferee)
                 .await

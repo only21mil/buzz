@@ -31,7 +31,9 @@ export type ManagedAgentActionResult = {
   noticeMessage?: string;
 };
 
-export function isManagedAgentActive(agent: Pick<ManagedAgent, "status">) {
+export function isManagedAgentActive(agent: {
+  status: ManagedAgent["status"] | "unknown";
+}) {
   return agent.status === "running" || agent.status === "deployed";
 }
 

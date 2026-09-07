@@ -660,3 +660,75 @@ test("a non-media attachment's remove button is named and keyboard-operable", as
   await page.keyboard.press("Enter");
   await expect(composer).not.toContainText("quarterly-report.pdf");
 });
+
+for (const method of ["picker", "drop"] as const) {
+  test(`HTML ${method} sends a named generic card and only invokes file download`, async ({
+    page,
+  }) => {
+    const filename = method === "picker" ? "report.HTML" : "report.htm";
+    const html =
+      "<!DOCTYPE html><script>globalThis.__buzzHtmlExecuted=true</script>";
+    await installMockBridge(page, {
+      deferredComposerUploads: true,
+      uploadDescriptors: [
+        {
+          url: `https://mock.relay/media/${"c".repeat(64)}.html`,
+          sha256: "c".repeat(64),
+          size: html.length,
+          type: "text/html",
+          uploaded: Math.floor(Date.now() / 1000),
+          filename,
+        },
+      ],
+    });
+    await page.goto("/");
+    await page.getByTestId("channel-general").click();
+    if (method === "picker") {
+      const [chooser] = await Promise.all([
+        page.waitForEvent("filechooser"),
+        page.getByRole("button", { name: "Attach file" }).click(),
+      ]);
+      await chooser.setFiles({
+        name: filename,
+        mimeType: "text/html",
+        buffer: Buffer.from(html),
+      });
+    } else {
+      const dataTransfer = await page.evaluateHandle(
+        ({ filename, html }) => {
+          const transfer = new DataTransfer();
+          transfer.items.add(new File([html], filename, { type: "text/html" }));
+          return transfer;
+        },
+        { filename, html },
+      );
+      await page
+        .getByTestId("channel-drop-zone")
+        .dispatchEvent("drop", { dataTransfer });
+    }
+    await expect(page.getByTestId("message-composer")).toContainText(filename);
+    await page.getByTestId("send-message").click();
+    const card = page.getByTestId("file-card").filter({ hasText: filename });
+    await expect(card).toBeVisible();
+    const beforeUrl = page.url();
+    await card.click();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            (window as Window & { __BUZZ_E2E_COMMANDS__?: string[] })
+              .__BUZZ_E2E_COMMANDS__ ?? [],
+        ),
+      )
+      .toContain("download_file");
+    expect(page.url()).toBe(beforeUrl);
+    await expect(page.locator("iframe, webview")).toHaveCount(0);
+    expect(
+      await page.evaluate(
+        () =>
+          (globalThis as typeof globalThis & { __buzzHtmlExecuted?: boolean })
+            .__buzzHtmlExecuted,
+      ),
+    ).toBeUndefined();
+  });
+}

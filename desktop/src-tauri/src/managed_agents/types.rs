@@ -71,6 +71,12 @@ pub struct AgentDefinition {
     /// a new local id, so the only link back to the publication is this pair.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_source: Option<CatalogSource>,
+    /// Provenance of a persona copied out of another owner's shared TEAM
+    /// publication, as opposed to their persona catalog. Distinct from
+    /// `catalog_source` because a 30178 member is not addressable as a 30175
+    /// coordinate — see [`TeamMemberCatalogSource`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_catalog_source: Option<TeamMemberCatalogSource>,
     /// Harness-level configuration passed to the agent subprocess as environment variables.
     /// Opaque to Buzz — keys and values are runtime-specific.
     ///
@@ -99,6 +105,7 @@ impl AgentDefinition {
     /// event coordinate (`d_tag = slug`) across the fold.
     pub fn into_agent_record(self) -> ManagedAgentRecord {
         ManagedAgentRecord {
+            effort_level: None,
             pubkey: String::new(),
             name: self.display_name.clone(),
             persona_id: None,
@@ -149,6 +156,7 @@ impl AgentDefinition {
             source_team: self.source_team,
             source_team_persona_slug: self.source_team_persona_slug,
             catalog_source: self.catalog_source,
+            team_catalog_source: self.team_catalog_source,
             definition_respond_to: self.respond_to,
             definition_respond_to_allowlist: self.respond_to_allowlist,
             definition_parallelism: self.parallelism,
@@ -183,6 +191,7 @@ impl ManagedAgentRecord {
             source_team: self.source_team.clone(),
             source_team_persona_slug: self.source_team_persona_slug.clone(),
             catalog_source: self.catalog_source.clone(),
+            team_catalog_source: self.team_catalog_source.clone(),
             env_vars: self.env_vars.clone(),
             respond_to: self.definition_respond_to.clone(),
             respond_to_allowlist: self.definition_respond_to_allowlist.clone(),
@@ -196,6 +205,9 @@ impl ManagedAgentRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayAgentInfo {
     pub pubkey: String,
+    /// Owner authenticated by the agent's signed NIP-OA profile and owner policy.
+    #[serde(default)]
+    pub owner_pubkey: Option<String>,
     pub name: String,
     pub agent_type: String,
     pub channels: Vec<String>,
@@ -294,6 +306,9 @@ pub struct ManagedAgentRecord {
     /// first load.
     #[serde(default)]
     pub provider: Option<String>,
+    /// Saved thinking effort, projected for the effective harness at process start.
+    #[serde(default)]
+    pub effort_level: Option<String>,
     /// Content hash of the persona at the time this agent was created — the
     /// `persona_content_hash` of the snapshot in `system_prompt` / `model` /
     /// `provider` / `env_vars`. The Agents menu compares it against the linked
@@ -409,6 +424,10 @@ pub struct ManagedAgentRecord {
     /// definition was copied from, when it came from another owner's catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_source: Option<CatalogSource>,
+    /// Absorbed from `AgentDefinition.team_catalog_source` — the team
+    /// publication and member this definition was copied out of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_catalog_source: Option<TeamMemberCatalogSource>,
     /// NIP-AP definition-level behavioral defaults, absorbed from
     /// `AgentDefinition` in WIRE shape (kebab-case string / optional u32),
     /// distinct from the instance-side `respond_to`/`respond_to_allowlist`/
@@ -527,6 +546,7 @@ pub struct ManagedAgentSummary {
     /// (definition → global for linked instances; instance → global for
     /// definition-less instances). `None` for an orphaned instance.
     pub provider: Option<String>,
+    pub effort_level: Option<String>,
     /// `true` when the linked persona has been edited since this agent was
     /// created — the running agent uses the older pinned snapshot. The UI
     /// flags it and tells the user to delete + respawn to pick up the edit.
@@ -626,52 +646,8 @@ pub enum HarnessSource {
     Custom,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct AcpRuntimeCatalogEntry {
-    pub id: String,
-    pub label: String,
-    pub avatar_url: String,
-    pub availability: AcpAvailabilityStatus,
-    pub command: Option<String>,
-    pub binary_path: Option<String>,
-    pub default_args: Vec<String>,
-    pub mcp_command: Option<String>,
-    /// Environment variable used to apply the initial model, when supported.
-    pub model_env_var: Option<String>,
-    /// Environment variable used to apply the selected LLM provider, when supported.
-    pub provider_env_var: Option<String>,
-    /// Environment variable used to apply thinking effort, when supported.
-    pub thinking_env_var: Option<String>,
-    pub max_tokens_env_var: Option<String>,
-    pub context_limit_env_var: Option<String>,
-    pub max_rounds_env_var: Option<String>,
-    pub install_hint: String,
-    pub install_instructions_url: String,
-    /// true when at least one automated install step is available
-    pub can_auto_install: bool,
-    /// true when this runtime depends on a separately installed vendor CLI.
-    pub requires_external_cli: bool,
-    pub underlying_cli_path: Option<String>,
-    /// true when an npm adapter step is pending but Node.js / npm is absent.
-    /// The UI hides the Install button and shows a Node.js install callout.
-    pub node_required: bool,
-    /// Login/authentication status for CLI-based runtimes.
-    pub auth_status: AuthStatus,
-    /// Hint for completing authentication, shown when `auth_status` is not `logged_in`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub login_hint: Option<String>,
-    /// Whether this entry came from the compiled-in catalog or a user-supplied
-    /// JSON file in `custom_harnesses/`. The UI uses this to decide editability.
-    pub source: HarnessSource,
-    /// Definition-level env vars for `source: custom` entries; populated from
-    /// `HarnessDefinition.env` so saves don't silently erase existing vars.
-    /// Absent for builtin/preset entries. Skipped when empty in serialization.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub definition_env: BTreeMap<String, String>,
-    /// Spawn-time parallelism cap; absent for uncapped harnesses.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_parallelism: Option<u32>,
-}
+mod runtime_catalog;
+pub use runtime_catalog::AcpRuntimeCatalogEntry;
 
 /// Result of a single install step (CLI or adapter).
 #[derive(Debug, Clone, Serialize)]
@@ -756,54 +732,6 @@ pub struct AgentModelInfo {
     pub id: String,
     pub name: Option<String>,
     pub description: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TeamRecord {
-    pub id: String,
-    pub name: String,
-    pub description: Option<String>,
-    /// Runtime-layered instructions shared by every member deployment.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
-    pub persona_ids: Vec<String>,
-    #[serde(default)]
-    pub is_builtin: bool,
-    /// Absolute path to the team's backing directory (if directory-backed).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_dir: Option<PathBuf>,
-    /// Whether `source_dir` is a symlink to an external directory.
-    #[serde(default)]
-    pub is_symlink: bool,
-    /// Resolved symlink target path (for display). Only set when `is_symlink` is true.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub symlink_target: Option<String>,
-    /// Version from the team's `plugin.json` manifest.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateTeamRequest {
-    pub name: String,
-    pub description: Option<String>,
-    pub instructions: Option<String>,
-    #[serde(default)]
-    pub persona_ids: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateTeamRequest {
-    pub id: String,
-    pub name: String,
-    pub description: Option<String>,
-    pub instructions: Option<String>,
-    #[serde(default)]
-    pub persona_ids: Vec<String>,
 }
 
 pub const DEFAULT_ACP_COMMAND: &str = "buzz-acp";
@@ -992,6 +920,10 @@ mod catalog_source;
 pub use catalog_source::CatalogSource;
 mod requests;
 pub use requests::*;
+mod team_catalog_source;
+pub use team_catalog_source::{TeamCatalogSource, TeamMemberCatalogSource};
+mod teams;
+pub use teams::{CreateTeamRequest, TeamRecord, UpdateTeamRequest};
 
 #[cfg(test)]
 mod tests;

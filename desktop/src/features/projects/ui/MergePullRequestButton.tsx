@@ -1,3 +1,4 @@
+import { isTauri } from "@tauri-apps/api/core";
 import { AlertTriangle, Copy, GitMerge, SquareTerminal } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
@@ -177,6 +178,12 @@ export function MergePullRequestButton({
     }
   }, [publishMergedMutation, unpublishedStatusEvent]);
 
+  if (!isTauri())
+    return (
+      <Button disabled title="Merging requires the desktop app">
+        Merge unavailable in browser
+      </Button>
+    );
   return (
     <div className="contents">
       <AlertDialog onOpenChange={setConfirmOpen} open={confirmOpen}>

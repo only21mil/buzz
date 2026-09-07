@@ -43,7 +43,8 @@ export function useTrayMenu({
   openCreateChannel: () => void;
 }): void {
   const activeTurns = useActiveAgentTurnsByChannel();
-  const now = useNow(1000);
+  // Native tray menus remain usable while the web document is hidden.
+  const now = useNow(1000, false);
   const managedAgents = useManagedAgentsQuery().data;
   const relayAgents = useRelayAgentsQuery().data;
   const previousActivitiesRef = React.useRef(

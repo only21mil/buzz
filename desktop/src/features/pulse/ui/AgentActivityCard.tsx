@@ -11,7 +11,7 @@ import { truncatePubkey } from "@/shared/lib/pubkey";
 type AgentActivityCardProps = {
   group: AgentNoteGroup;
   profile?: UserProfileSummary | null;
-  agentStatus?: "online" | "away" | "offline";
+  agentStatus?: "online" | "away" | "offline" | "unknown";
 };
 
 function formatRelativeTime(unixSeconds: number): string {
@@ -75,7 +75,9 @@ export function AgentActivityCard({
             <span className="truncate text-sm font-semibold leading-none">
               {displayName}
             </span>
-            {agentStatus ? <StatusDot status={agentStatus} /> : null}
+            {agentStatus && agentStatus !== "unknown" ? (
+              <StatusDot status={agentStatus} />
+            ) : null}
             <span className="shrink-0 text-2xs text-muted-foreground">
               {formatRelativeTime(group.latestAt)}
             </span>

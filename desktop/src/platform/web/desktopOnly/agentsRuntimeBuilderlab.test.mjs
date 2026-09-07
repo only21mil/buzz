@@ -11,6 +11,7 @@ import {
 } from "../registry.ts";
 
 const MUTATIONS = [
+  "revalidate_relay_agents",
   "archive_builderlab_community",
   "bind_builderlab_nostr_identity",
   "cancel_builderlab_login",
@@ -36,6 +37,7 @@ const MUTATIONS = [
   "save_custom_harness",
   "send_managed_agent_channel_message",
   "set_agent_managed_profiles",
+  "set_thread_scoped_acp_sessions",
   "set_global_agent_config",
   "set_managed_agent_auto_restart",
   "set_managed_agent_start_on_app_launch",

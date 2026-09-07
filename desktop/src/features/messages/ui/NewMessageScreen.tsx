@@ -1,3 +1,4 @@
+import type { PublicationScope } from "@/shared/api/publicationScope";
 import * as React from "react";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
@@ -245,6 +246,12 @@ export function NewMessageScreen() {
       mentionPubkeys: string[],
       mediaTags?: string[][],
       targetChannelId?: string | null,
+      _threadContext?: {
+        parentEventId: string | null;
+        threadHeadId: string | null;
+      } | null,
+      _forceRest?: boolean,
+      publicationScope?: PublicationScope,
     ) => {
       const preparedDirectMessage = preparedDirectMessageRef.current;
       const directMessage =
@@ -259,6 +266,7 @@ export function NewMessageScreen() {
 
       try {
         await sendMessageMutation.mutateAsync({
+          publicationScope,
           targetChannel: directMessage,
           content,
           mentionPubkeys,

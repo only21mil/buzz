@@ -3,6 +3,7 @@ import { emit, listen } from "@tauri-apps/api/event";
 import * as React from "react";
 
 import { setupAudioWorklet, type AudioWorkletHandle } from "./lib/audioWorklet";
+import { usePipelineHotstart } from "./lib/usePipelineHotstart";
 import { formatHuddleActionError } from "./lib/huddleError";
 import {
   HUDDLE_AUDIO_COMMAND_EVENT,
@@ -34,7 +35,6 @@ import type { HuddleContextValue } from "./HuddleContext.types";
  *   Active speakers: Tauri "huddle-active-speakers" event (Rust backend emits)
  */
 
-const PIPELINE_HOTSTART_INTERVAL_MS = 15_000;
 const MIC_INITIAL_NOISE_FLOOR = 0.01;
 const MIC_VOICE_GATE_ON_RMS = 0.018;
 const MIC_VOICE_GATE_OFF_RMS = 0.012;
@@ -766,16 +766,7 @@ export function HuddleProvider({
     selfPubkeyRef,
   );
 
-  // Pipeline hot-start — check if voice models finished downloading mid-huddle
-  React.useEffect(() => {
-    if (!ephemeralChannelId) return;
-    const id = window.setInterval(() => {
-      invoke("check_pipeline_hotstart").catch(() => {
-        /* best-effort */
-      });
-    }, PIPELINE_HOTSTART_INTERVAL_MS);
-    return () => window.clearInterval(id);
-  }, [ephemeralChannelId]);
+  usePipelineHotstart(ephemeralChannelId);
 
   // Mic level analyser — drives the voice activity indicator
   React.useEffect(() => {

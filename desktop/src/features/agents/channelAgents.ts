@@ -17,6 +17,8 @@ import {
 import { startManagedAgent } from "@/shared/api/tauriManagedAgents";
 import type {
   AcpRuntime,
+  AgentPersona,
+  CreateManagedAgentInput,
   ChannelRole,
   ManagedAgent,
   ManagedAgentBackend,
@@ -32,6 +34,8 @@ export type AttachManagedAgentToChannelInput = {
   agent: ManagedAgent;
   role?: Exclude<ChannelRole, "owner">;
   ensureRunning?: boolean;
+  /** Queue the start until the caller has published its triggering message. */
+  detachedStart?: (agent: ManagedAgent) => void;
 };
 
 export type AttachManagedAgentToChannelResult = {
@@ -44,6 +48,8 @@ export type EnsureChannelAgentPresetInput = {
   runtime: ChannelAgentRuntime;
   role?: Exclude<ChannelRole, "owner">;
   ensureRunning?: boolean;
+  /** Queue the start until the caller has published its triggering message. */
+  detachedStart?: (agent: ManagedAgent) => void;
 };
 
 export type EnsureChannelAgentPresetResult =
@@ -71,6 +77,8 @@ export type CreateChannelManagedAgentInput = {
   model?: string;
   role?: Exclude<ChannelRole, "owner">;
   ensureRunning?: boolean;
+  /** Queue the start until the caller has published its triggering message. */
+  detachedStart?: (agent: ManagedAgent) => void;
   backend?: ManagedAgentBackend;
   /** Inbound author gate mode. Omitted = server default ("owner-only"). */
   respondTo?: RespondToMode;
@@ -140,15 +148,21 @@ export async function attachManagedAgentToChannel(
     // another community's.
     const isRemote = input.agent.backend.type === "provider";
     if (isRemote && input.agent.status !== "deployed") {
-      agent = await startManagedAgent(input.agent.pubkey);
-      started = true;
+      if (input.detachedStart) input.detachedStart(agent);
+      else {
+        agent = await startManagedAgent(input.agent.pubkey);
+        started = true;
+      }
     } else if (
       !isRemote &&
       input.agent.status !== "running" &&
       input.agent.status !== "deployed"
     ) {
-      agent = await startManagedAgent(input.agent.pubkey);
-      started = true;
+      if (input.detachedStart) input.detachedStart(agent);
+      else {
+        agent = await startManagedAgent(input.agent.pubkey);
+        started = true;
+      }
     }
   }
 
@@ -397,6 +411,7 @@ export async function createChannelManagedAgent(
     agent: provisioned.agent,
     role: input.role ?? "bot",
     ensureRunning: input.ensureRunning ?? true,
+    detachedStart: input.detachedStart,
   });
 
   return {
@@ -442,4 +457,66 @@ export async function createChannelManagedAgents(
   }
 
   return { successes, failures };
+}
+
+export type ApplyReusableAgentAccessPolicyResult = {
+  agent: ManagedAgent;
+  /**
+   * True when reconciling the policy required a relay write. Callers that
+   * sequence authorization around this call — the message-send path revalidates
+   * mention authorization at the publish boundary whenever an awaited relay
+   * round-trip separated it from its earlier pass — depend on this flag rather
+   * than on comparing the returned record's identity against the input, so the
+   * signal survives any future change to whether an update returns a fresh
+   * object.
+   */
+  wrote: boolean;
+};
+
+export async function applyReusableAgentAccessPolicy(
+  agent: ManagedAgent,
+  request: Pick<CreateManagedAgentInput, "respondTo" | "respondToAllowlist">,
+  persona?: Pick<AgentPersona, "respondTo" | "respondToAllowlist">,
+): Promise<ApplyReusableAgentAccessPolicyResult> {
+  const policy = resolveReusableAgentAccessPolicy(request, persona);
+  const matches =
+    agent.respondTo === policy.respondTo &&
+    agent.respondToAllowlist.length === policy.respondToAllowlist.length &&
+    agent.respondToAllowlist.every(
+      (pubkey, index) => pubkey === policy.respondToAllowlist[index],
+    );
+  if (matches) return { agent, wrote: false };
+
+  const { agent: updatedAgent } = await updateManagedAgent({
+    pubkey: agent.pubkey,
+    ...policy,
+  });
+  return { agent: updatedAgent, wrote: true };
+}
+
+export function resolveReusableAgentAccessPolicy(
+  request: Pick<CreateManagedAgentInput, "respondTo" | "respondToAllowlist">,
+  persona?: Pick<AgentPersona, "respondTo" | "respondToAllowlist">,
+) {
+  const requestedAllowlist = request.respondToAllowlist ?? [];
+  if (request.respondTo !== undefined) {
+    return {
+      respondTo: request.respondTo,
+      respondToAllowlist: [...requestedAllowlist],
+    };
+  }
+  if (persona?.respondTo != null) {
+    return {
+      respondTo: persona.respondTo,
+      respondToAllowlist: [
+        ...(requestedAllowlist.length > 0
+          ? requestedAllowlist
+          : persona.respondToAllowlist),
+      ],
+    };
+  }
+  return {
+    respondTo: "owner-only" as const,
+    respondToAllowlist: [...requestedAllowlist],
+  };
 }

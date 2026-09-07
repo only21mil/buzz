@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 
 import { installMockBridge } from "../helpers/bridge";
 import { openSettings } from "../helpers/settings";
+import { createWorkflow } from "../helpers/workflows";
 
 const ENGINEERING_CHANNEL_ID = "1c7e1c02-87bb-5e88-b2da-5a7a9432d0c9";
 const WATERCOLOR_CHANNEL_ID = "a27e1ee9-76a6-5bdf-a5d5-1d85610dad11";
@@ -17,19 +18,6 @@ async function navigateToWorkflows(page: import("@playwright/test").Page) {
   await page.getByTestId("open-workflows-view").click();
   await expect(page).toHaveURL(/#\/workflows$/);
   await expect(page.getByTestId("workflows-view")).toBeVisible();
-}
-
-async function createWorkflow(
-  page: import("@playwright/test").Page,
-  name: string,
-) {
-  await page.getByRole("button", { name: "Create Workflow" }).click();
-  const dialog = page.getByRole("dialog");
-  await expect(dialog).toBeVisible();
-  await dialog.getByLabel("Workflow name").fill(name);
-  await dialog.getByRole("button", { name: "Add step" }).click();
-  await dialog.getByRole("button", { name: "Create" }).click();
-  await expect(dialog).not.toBeVisible();
 }
 
 test("global back and forward move across channel routes", async ({ page }) => {
@@ -105,7 +93,7 @@ test.fixme("direct forum thread links close back to the forum route", async ({
   ).toBeVisible();
 });
 
-test("direct workflow detail links close back to workflows", async ({
+test("direct workflow editor links close back to workflows", async ({
   page,
 }) => {
   const workflowName = `workflow_nav_${Date.now()}`;
@@ -124,8 +112,12 @@ test("direct workflow detail links close back to workflows", async ({
 
   await page.goto(`/#/workflows/${workflowId}`);
 
-  await expect(page.getByTestId("workflow-detail-panel")).toBeVisible();
-  await page.getByRole("button", { name: "Close detail panel" }).click();
+  const editor = page.getByRole("dialog", {
+    name: "Edit workflow",
+    exact: true,
+  });
+  await expect(editor).toContainText(workflowName);
+  await editor.getByRole("button", { name: "Close", exact: true }).click();
 
   await expect(page).toHaveURL(/#\/workflows$/);
   await expect(page.getByTestId("workflows-view")).toBeVisible();

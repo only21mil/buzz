@@ -31,10 +31,28 @@ export async function uploadMediaFile(
   if (signal?.aborted) throw new Error("upload cancelled");
   const bytes = new Uint8Array(await file.arrayBuffer());
   if (signal?.aborted) throw new Error("upload cancelled");
-
-  return invokeTauriRaw<BlobDescriptor>("upload_media_bytes_raw", bytes, {
-    headers,
-  });
+  try {
+    return await invokeTauriRaw<BlobDescriptor>(
+      "upload_media_bytes_raw",
+      bytes,
+      {
+        headers,
+      },
+    );
+  } catch (error) {
+    if (error instanceof Error) throw error;
+    if (typeof error === "string" && error.trim()) throw new Error(error);
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "message" in error &&
+      typeof error.message === "string" &&
+      error.message.trim()
+    ) {
+      throw new Error(error.message);
+    }
+    throw new Error("Media upload failed.");
+  }
 }
 
 /** Stop the native HTTP request associated with a background media upload. */
@@ -60,13 +78,51 @@ export async function pickAndUploadImage(): Promise<BlobDescriptor | null> {
  * proxy needs no special headers. The Rust side enforces the same URL
  * validation and size cap as the download commands.
  */
-export async function fetchMediaBytes(
+export async function fetchAudioBytes(
   url: string,
+  signal?: AbortSignal,
 ): Promise<Uint8Array<ArrayBuffer>> {
+  if (signal?.aborted) {
+    throw new DOMException("Media fetch cancelled", "AbortError");
+  }
+
+  const requestId = signal ? crypto.randomUUID() : undefined;
   // The Rust command replies with `tauri::ipc::Response`, so the bytes
   // arrive as a raw ArrayBuffer rather than a JSON number array.
-  const bytes = await invokeTauri<ArrayBuffer>("fetch_media_bytes", { url });
-  return new Uint8Array(bytes);
+  const request = invokeTauri<ArrayBuffer>("fetch_audio_bytes", {
+    requestId,
+    url,
+  });
+  if (!signal || !requestId) return new Uint8Array(await request);
+
+  let cancellation: Promise<unknown> | undefined;
+  const onAbort = () => {
+    cancellation ??= invokeTauri("cancel_media_fetch", { requestId }).catch(
+      () => undefined,
+    );
+  };
+  signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) onAbort();
+
+  try {
+    // Keep the scheduler slot and the cancel-before-begin token until the
+    // original IPC settles. An abort race must not release native ownership.
+    const bytes = await request;
+    if (signal.aborted)
+      throw new DOMException("Media fetch cancelled", "AbortError");
+    return new Uint8Array(bytes);
+  } catch (error) {
+    if (signal.aborted)
+      throw new DOMException("Media fetch cancelled", "AbortError");
+    throw error;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    // A late cancel acknowledgement can recreate a token after native finish.
+    await cancellation;
+    await invokeTauri("release_media_fetch", { requestId }).catch(
+      () => undefined,
+    );
+  }
 }
 
 /** Read plain text without depending on embedded-webview clipboard grants. */
@@ -118,4 +174,13 @@ export async function fetchSnapshotBytes(args: {
     expectedSize: args.expectedSize,
   });
   return Array.from(new Uint8Array(buffer));
+}
+
+/** Fetch a validated image for the editor without widening its native content policy. */
+export async function fetchMediaBytes(
+  url: string,
+): Promise<Uint8Array<ArrayBuffer>> {
+  return new Uint8Array(
+    await invokeTauri<ArrayBuffer>("fetch_media_bytes", { url }),
+  );
 }

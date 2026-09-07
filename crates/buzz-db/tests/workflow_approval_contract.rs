@@ -23,7 +23,6 @@ use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
 
-const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
 const PRE_APPROVAL_MIGRATION_VERSION: i64 = 30;
 const DEFINITION_SECRET: &str = "definition-secret-must-not-enter-request-outbox";
 const OUTPUT_SECRET: &str = "raw-step-output-must-not-enter-request-outbox";
@@ -384,7 +383,7 @@ impl Fixture {
 async fn connect_pool() -> PgPool {
     let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
         .or_else(|_| std::env::var("DATABASE_URL"))
-        .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+        .expect("explicit isolated test database URL required");
     PgPoolOptions::new()
         .max_connections(8)
         .connect(&database_url)
@@ -2125,4 +2124,360 @@ async fn exact_pubkey_policy_survives_role_drift_but_not_channel_removal() {
         .expect("exact-key decision after channel removal"),
         WorkflowApprovalDecisionOutcome::Unauthorized
     );
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn history_pages_equal_timestamps_without_cross_tenant_or_workflow_rows() {
+    let fixture = Fixture::new().await;
+    let mut ids = vec![fixture.ids.run_id];
+    for _ in 0..4 {
+        ids.push(
+            buzz_db::workflow::create_workflow_run(
+                &fixture.pool,
+                fixture.community_id,
+                fixture.ids.workflow_id,
+                None,
+                None,
+                &json!({}),
+                &fixture.definition_hash,
+            )
+            .await
+            .expect("create history run"),
+        );
+    }
+    let timestamp: DateTime<Utc> = "2026-09-06T10:00:00.123456Z".parse().expect("timestamp");
+    sqlx::query(
+        "UPDATE workflow_runs SET created_at = $1 WHERE community_id = $2 AND workflow_id = $3",
+    )
+    .bind(timestamp)
+    .bind(fixture.ids.community_id)
+    .bind(fixture.ids.workflow_id)
+    .execute(&fixture.pool)
+    .await
+    .expect("tie timestamps");
+    ids.sort_by(|a, b| b.cmp(a));
+    let mut seen = Vec::new();
+    let (mut before, mut before_id) = (None, None);
+    loop {
+        let page = buzz_db::workflow::list_workflow_runs_page(
+            &fixture.pool,
+            fixture.community_id,
+            fixture.ids.workflow_id,
+            before,
+            before_id,
+            2,
+        )
+        .await
+        .expect("page");
+        if page.is_empty() {
+            break;
+        }
+        let last = page.last().expect("nonempty");
+        before = Some(last.created_at);
+        before_id = Some(last.id);
+        seen.extend(page.iter().map(|run| run.id));
+    }
+    assert_eq!(seen, ids);
+    assert!(buzz_db::workflow::list_workflow_runs_page(
+        &fixture.pool,
+        fixture.community_id,
+        fixture.ids.workflow_id,
+        Some(timestamp),
+        None,
+        2
+    )
+    .await
+    .is_err());
+    assert!(buzz_db::workflow::list_workflow_runs(
+        &fixture.pool,
+        CommunityId::from_uuid(Uuid::new_v4()),
+        fixture.ids.workflow_id,
+        20
+    )
+    .await
+    .expect("other tenant")
+    .is_empty());
+    assert!(buzz_db::workflow::list_workflow_runs(
+        &fixture.pool,
+        fixture.community_id,
+        Uuid::new_v4(),
+        20
+    )
+    .await
+    .expect("other workflow")
+    .is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn history_reads_durable_gate_and_legacy_evidence_without_authority_tokens() {
+    let fixture = Fixture::new().await;
+    let spec = fixture.gate_spec();
+    let ObservedCreate::Created { approval_id, .. } = create_gate(&fixture.pool, &spec)
+        .await
+        .expect("create gate")
+    else {
+        panic!("new gate");
+    };
+    buzz_db::workflow::create_approval(
+        &fixture.pool,
+        buzz_db::workflow::CreateApprovalParams {
+            community_id: fixture.community_id,
+            token: "legacy-raw-token",
+            workflow_id: fixture.ids.workflow_id,
+            run_id: fixture.ids.run_id,
+            step_id: "legacy",
+            step_index: 0,
+            approver_spec: "owner",
+            expires_at: Utc::now() + Duration::hours(1),
+        },
+    )
+    .await
+    .expect("legacy evidence");
+    let history = buzz_db::workflow::get_workflow_approval_history(
+        &fixture.pool,
+        fixture.community_id,
+        fixture.ids.workflow_id,
+        fixture.ids.run_id,
+    )
+    .await
+    .expect("history");
+    assert_eq!(history.len(), 2);
+    assert_eq!(history[1].approval_ref, approval_id.to_string());
+    assert_eq!(history[1].status, "pending");
+    assert_ne!(history[0].approval_ref, "legacy-raw-token");
+    assert_eq!(history[0].approval_ref.len(), 64);
+    let decision = decide_gate(
+        &fixture,
+        approval_id,
+        &fixture.approver,
+        "grant",
+        Some("history approval"),
+        0xe1,
+    )
+    .await
+    .expect("grant durable gate");
+    assert!(matches!(
+        decision,
+        WorkflowApprovalDecisionOutcome::Applied { .. }
+    ));
+    let history = buzz_db::workflow::get_workflow_approval_history(
+        &fixture.pool,
+        fixture.community_id,
+        fixture.ids.workflow_id,
+        fixture.ids.run_id,
+    )
+    .await
+    .expect("resolved history");
+    assert_eq!(history[1].status, "granted");
+    assert_eq!(history[1].note.as_deref(), Some("history approval"));
+    assert_eq!(
+        history[1].approver_pubkey,
+        Some(hex::encode(&fixture.approver))
+    );
+    assert_eq!(
+        buzz_db::workflow::get_workflow_run(
+            &fixture.pool,
+            fixture.community_id,
+            fixture.ids.run_id
+        )
+        .await
+        .expect("resume state")
+        .status,
+        buzz_db::workflow::RunStatus::ResumePending
+    );
+    for (community, workflow, run) in [
+        (
+            CommunityId::from_uuid(Uuid::new_v4()),
+            fixture.ids.workflow_id,
+            fixture.ids.run_id,
+        ),
+        (fixture.community_id, Uuid::new_v4(), fixture.ids.run_id),
+        (
+            fixture.community_id,
+            fixture.ids.workflow_id,
+            Uuid::new_v4(),
+        ),
+    ] {
+        assert!(buzz_db::workflow::get_workflow_approval_history(
+            &fixture.pool,
+            community,
+            workflow,
+            run
+        )
+        .await
+        .expect("wrong binding")
+        .is_empty());
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn history_error_code_upgrade_preserves_populated_fork35_evidence() {
+    let pool = connect_pool().await;
+    MIGRATOR.run_to(35, &pool).await.expect("fork35 base");
+    let fixture = Fixture::insert(pool, FixtureIds::random(), 0x71).await;
+    let spec = fixture.gate_spec();
+    create_gate(&fixture.pool, &spec)
+        .await
+        .expect("durable gate at35");
+    buzz_db::workflow::create_approval(
+        &fixture.pool,
+        buzz_db::workflow::CreateApprovalParams {
+            community_id: fixture.community_id,
+            token: "legacy-upgrade",
+            workflow_id: fixture.ids.workflow_id,
+            run_id: fixture.ids.run_id,
+            step_id: "old",
+            step_index: 0,
+            approver_spec: "owner",
+            expires_at: Utc::now() + Duration::hours(1),
+        },
+    )
+    .await
+    .expect("legacy approval");
+    buzz_db::workflow::update_approval(
+        &fixture.pool,
+        fixture.community_id,
+        "legacy-upgrade",
+        buzz_db::workflow::ApprovalStatus::Granted,
+        Some(&fixture.owner),
+        Some("legacy decision retained"),
+    )
+    .await
+    .expect("legacy granted evidence");
+    sqlx::query("INSERT INTO workflow_state (community_id, workflow_id, state_key, value, expires_at) VALUES ($1,$2,'key','state',now()+interval '1 hour')").bind(fixture.ids.community_id).bind(fixture.ids.workflow_id).execute(&fixture.pool).await.expect("state");
+    sqlx::query("INSERT INTO ci_grants (community_id, channel_id, target_repo_a, signer_pubkey, granted_by) VALUES ($1,$2,'repo','signer','owner')").bind(fixture.ids.community_id).bind(fixture.ids.channel_id).execute(&fixture.pool).await.expect("grant");
+    sqlx::query("INSERT INTO workflow_effect_claims (community_id, run_id, step_id, effect_index, effect_kind, effect_spec, effect_payload) VALUES ($1,$2,'notify',0,'send_message','{}','{}')").bind(fixture.ids.community_id).bind(fixture.ids.run_id).execute(&fixture.pool).await.expect("claim");
+    // A failed sibling supplies legacy diagnostic classification without altering the waiting gate.
+    let failed = buzz_db::workflow::create_workflow_run(
+        &fixture.pool,
+        fixture.community_id,
+        fixture.ids.workflow_id,
+        None,
+        None,
+        &json!({}),
+        &fixture.definition_hash,
+    )
+    .await
+    .expect("failed run");
+    sqlx::query("UPDATE workflow_runs SET status='failed', error_message='retained detail' WHERE community_id=$1 AND id=$2").bind(fixture.ids.community_id).bind(failed).execute(&fixture.pool).await.expect("legacy failure");
+    let tables = [
+        "workflow_runs",
+        "workflow_approvals",
+        "workflow_approval_gates",
+        "workflow_approval_outbox",
+        "workflow_state",
+        "workflow_effect_claims",
+        "ci_grants",
+    ];
+    let mut snapshots = Vec::new();
+    for table in tables {
+        let query = history_snapshot_query(table);
+        snapshots.push(
+            sqlx::query_scalar::<_, Value>(query)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("snapshot"),
+        );
+    }
+    buzz_db::migration::run_migrations(&fixture.pool)
+        .await
+        .expect("upgrade36");
+    for (table, snapshot) in tables.into_iter().zip(snapshots) {
+        let query = history_snapshot_query(table);
+        assert_eq!(
+            sqlx::query_scalar::<_, Value>(query)
+                .fetch_one(&fixture.pool)
+                .await
+                .expect("after"),
+            snapshot,
+            "{table} changed"
+        );
+    }
+    let run = buzz_db::workflow::get_workflow_run(&fixture.pool, fixture.community_id, failed)
+        .await
+        .expect("failed");
+    assert_eq!(run.error_code.as_deref(), Some("legacy_unclassified"));
+    assert_eq!(run.error_message.as_deref(), Some("retained detail"));
+    let waiting = buzz_db::workflow::get_workflow_run(
+        &fixture.pool,
+        fixture.community_id,
+        fixture.ids.run_id,
+    )
+    .await
+    .expect("waiting");
+    assert_eq!(waiting.error_code, None);
+    assert_eq!(
+        waiting.status,
+        buzz_db::workflow::RunStatus::WaitingApproval
+    );
+}
+
+fn history_snapshot_query(table: &str) -> &'static str {
+    match table {
+        "workflow_runs" => "SELECT COALESCE(jsonb_agg(row ORDER BY row::text), '[]'::jsonb) FROM (SELECT to_jsonb(t) - 'error_code' AS row FROM workflow_runs t) s",
+        "workflow_approvals" => "SELECT COALESCE(jsonb_agg(row ORDER BY row::text), '[]'::jsonb) FROM (SELECT to_jsonb(t) - 'error_code' AS row FROM workflow_approvals t) s",
+        "workflow_approval_gates" => "SELECT COALESCE(jsonb_agg(row ORDER BY row::text), '[]'::jsonb) FROM (SELECT to_jsonb(t) - 'error_code' AS row FROM workflow_approval_gates t) s",
+        "workflow_approval_outbox" => "SELECT COALESCE(jsonb_agg(row ORDER BY row::text), '[]'::jsonb) FROM (SELECT to_jsonb(t) - 'error_code' AS row FROM workflow_approval_outbox t) s",
+        "workflow_state" => "SELECT COALESCE(jsonb_agg(row ORDER BY row::text), '[]'::jsonb) FROM (SELECT to_jsonb(t) - 'error_code' AS row FROM workflow_state t) s",
+        "workflow_effect_claims" => "SELECT COALESCE(jsonb_agg(row ORDER BY row::text), '[]'::jsonb) FROM (SELECT to_jsonb(t) - 'error_code' AS row FROM workflow_effect_claims t) s",
+        "ci_grants" => "SELECT COALESCE(jsonb_agg(row ORDER BY row::text), '[]'::jsonb) FROM (SELECT to_jsonb(t) - 'error_code' AS row FROM ci_grants t) s",
+        _ => panic!("unexpected snapshot table"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn history_structured_failure_is_atomic_and_generation_fenced() {
+    let fixture = Fixture::new().await;
+    use buzz_db::workflow::WorkflowRunFailure;
+    use buzz_db::workflow_run_transition::fail_running_workflow_run_with_failure;
+    assert!(matches!(
+        fail_running_workflow_run_with_failure(
+            &fixture.pool,
+            fixture.community_id,
+            fixture.ids.run_id,
+            1,
+            2,
+            &json!([]),
+            WorkflowRunFailure {
+                code: "step_timeout",
+                message: "step notify timed out"
+            }
+        )
+        .await
+        .unwrap(),
+        buzz_db::WorkflowRunTransitionOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        fail_running_workflow_run_with_failure(
+            &fixture.pool,
+            fixture.community_id,
+            fixture.ids.run_id,
+            1,
+            9,
+            &json!([]),
+            WorkflowRunFailure {
+                code: "database_error",
+                message: "stale"
+            }
+        )
+        .await
+        .unwrap(),
+        buzz_db::WorkflowRunTransitionOutcome::Conflict
+    ));
+    let run = buzz_db::workflow::get_workflow_run(
+        &fixture.pool,
+        fixture.community_id,
+        fixture.ids.run_id,
+    )
+    .await
+    .unwrap();
+    assert_eq!(run.error_code.as_deref(), Some("step_timeout"));
+    assert_eq!(run.error_message.as_deref(), Some("step notify timed out"));
+    assert_eq!(run.generation, 2);
+    let column: (String,String) = sqlx::query_as("SELECT data_type, is_nullable FROM information_schema.columns WHERE table_schema='public' AND table_name='workflow_runs' AND column_name='error_code'").fetch_one(&fixture.pool).await.unwrap();
+    assert_eq!(column, ("text".into(), "YES".into()));
 }

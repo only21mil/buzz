@@ -535,7 +535,7 @@ class _MessageList extends HookConsumerWidget {
                               : null,
                           channelId: channelId,
                           currentPubkey: currentPubkey,
-                          allMessages: null,
+                          allMessages: allMessages,
                           isMember: isMember,
                           isArchived: isArchived,
                         )

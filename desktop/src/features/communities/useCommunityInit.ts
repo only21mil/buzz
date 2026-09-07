@@ -1,3 +1,6 @@
+import { resetDetachedToastScope } from "@/features/messages/lib/detachedToastScope";
+import { resetAudioMediaLoadScheduler } from "@/features/messages/lib/audioMediaLoadScheduler";
+import { resetPersistentAgentAudienceStore } from "@/features/messages/lib/persistentAgentAudience";
 import { useEffect, useRef, useState } from "react";
 import { isTauri } from "@tauri-apps/api/core";
 import { isMacPlatform } from "@/shared/lib/platform";
@@ -5,10 +8,10 @@ import { isMacPlatform } from "@/shared/lib/platform";
 import { relayClient } from "@/shared/api/relayClient";
 import { resetRateLimitGate } from "@/shared/api/relayRateLimitGate";
 import {
-  applyCommunity,
   autoConnectDefaultRelayEnabled,
   getDefaultRelayUrl,
 } from "@/shared/api/tauri";
+import { applyCommunity } from "@/shared/api/tauri";
 import { getIdentity } from "@/shared/api/tauriIdentity";
 import { clearTrayAgentActivity } from "@/shared/api/trayMenu";
 import { getOverrides } from "@/shared/features";
@@ -54,10 +57,12 @@ function resetCommunityState({
 }: {
   resetAvatarState: boolean;
 }): void {
+  resetDetachedToastScope();
   relayClient.disconnect();
   resetRateLimitGate();
   clearTimeoutState();
   clearAllDrafts();
+  resetPersistentAgentAudienceStore();
   resetAgentObserverStore();
   resetActiveAgentTurnsStore();
   resetAgentWorkingSignal();
@@ -70,6 +75,7 @@ function resetCommunityState({
   }
   resetSidebarRelayConnectionCardState();
   resetMediaCaches();
+  resetAudioMediaLoadScheduler();
   resetLinkPreviewMetadataCache();
   resetVideoPlayerState();
   resetRenderScopedReactionHydration();
@@ -237,6 +243,7 @@ export function useCommunityInit(
             undefined,
             activeCommunity.reposDir,
             getOverrides().agentManagedProfiles === true,
+            getOverrides().threadScopedAcpSessions === true,
           );
         });
       } catch (error) {
@@ -271,6 +278,7 @@ export function useCommunityInit(
         // leaving that stale value makes authenticated relay media look external
         // and bypass the localhost proxy.
         resetMediaCaches();
+        resetAudioMediaLoadScheduler();
 
         try {
           const identity = await getIdentity();

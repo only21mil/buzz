@@ -33,6 +33,10 @@ const CAPABILITY_OFF_MUTATIONS: ReadonlyArray<readonly [string, string]> = [
     "Builderlab communities need the desktop app",
   ],
 
+  ["fetch_team_catalog", "local team storage needs the desktop app"],
+  ["set_team_shared", "local team storage needs the desktop app"],
+  ["add_team_from_catalog", "local team storage needs the desktop app"],
+
   // Persona cards and snapshots.
   ["card_mint_save_openai_key", "persona card keys need the desktop app"],
   [
@@ -49,6 +53,11 @@ const CAPABILITY_OFF_MUTATIONS: ReadonlyArray<readonly [string, string]> = [
   ],
   ["export_agent_snapshot", "agent snapshot exports need the desktop app"],
   ["mint_agent_card", "persona cards need the desktop app"],
+
+  [
+    "revalidate_relay_agents",
+    "relay agent authority revalidation needs the desktop app",
+  ],
 
   // Local ACP runtimes and harnesses.
   ["connect_acp_runtime", "local runtime authentication needs the desktop app"],
@@ -85,6 +94,7 @@ const CAPABILITY_OFF_MUTATIONS: ReadonlyArray<readonly [string, string]> = [
     "managed-agent messaging needs the desktop app",
   ],
   ["set_agent_managed_profiles", "agent settings need the desktop app"],
+  ["set_thread_scoped_acp_sessions", "agent sessions need the desktop app"],
   ["set_global_agent_config", "agent settings need the desktop app"],
   [
     "set_managed_agent_auto_restart",
@@ -209,6 +219,11 @@ const NOOP_READS: ReadonlyArray<readonly [string, DefaultFactory]> = [
 ];
 
 export function registerAgentsRuntimeBuilderlabCommands(): void {
+  // Authority checks must reject; an empty browser default could drop recipients.
+  registerOffMutation(
+    "revalidate_relay_agents",
+    "agent publication authority needs the desktop app",
+  );
   for (const [command, hint] of CAPABILITY_OFF_MUTATIONS) {
     registerOffMutation(command, hint);
   }

@@ -1,3 +1,4 @@
+import { isTauri } from "@tauri-apps/api/core";
 import {
   Check,
   ChevronDown,
@@ -867,7 +868,7 @@ export function ProjectPullRequestDetail({
         <div data-testid="project-pull-request-comment-composer">
           <ForumComposer
             className="border border-border/60 bg-background/45"
-            disabled={commentMutation.isPending}
+            disabled={!isTauri() || commentMutation.isPending}
             isSending={commentMutation.isPending}
             members={members}
             onSecondarySubmit={

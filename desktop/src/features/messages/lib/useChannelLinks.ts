@@ -24,6 +24,10 @@ export function useChannelLinks() {
   );
   const latestValueRef = React.useRef<string>("");
   const latestCursorRef = React.useRef<number>(0);
+  const queryRevisionRef = React.useRef(0);
+  const resolvedRevisionRef = React.useRef(0);
+  // A timer can settle another query before this rendered handler is replaced.
+  const renderedQueryRevision = resolvedRevisionRef.current;
 
   /** Channel names (original casing) for overlay highlighting. */
   const knownChannelNames = React.useMemo<string[]>(
@@ -96,6 +100,10 @@ export function useChannelLinks() {
 
   const updateChannelQuery = React.useCallback(
     (value: string, cursorPosition: number) => {
+      // An old suggestion must lose keyboard authority immediately, including
+      // before React commits and before the replacement query settles.
+      queryRevisionRef.current += 1;
+      setChannelQuery(null);
       // Store latest values so the debounced callback always uses fresh data
       latestValueRef.current = value;
       latestCursorRef.current = cursorPosition;
@@ -106,6 +114,7 @@ export function useChannelLinks() {
 
       debounceTimerRef.current = setTimeout(() => {
         debounceTimerRef.current = null;
+        resolvedRevisionRef.current = queryRevisionRef.current;
         const channel = detectPrefixQuery(
           "#",
           latestValueRef.current,
@@ -125,6 +134,7 @@ export function useChannelLinks() {
   );
 
   const clearChannels = React.useCallback(() => {
+    queryRevisionRef.current += 1;
     if (debounceTimerRef.current !== null) {
       clearTimeout(debounceTimerRef.current);
       debounceTimerRef.current = null;
@@ -137,7 +147,10 @@ export function useChannelLinks() {
     (
       event: React.KeyboardEvent,
     ): { handled: boolean; suggestion?: ChannelSuggestion } => {
-      if (!isChannelOpen) {
+      if (
+        !isChannelOpen ||
+        renderedQueryRevision !== queryRevisionRef.current
+      ) {
         return { handled: false };
       }
 
@@ -180,7 +193,12 @@ export function useChannelLinks() {
 
       return { handled: false };
     },
-    [isChannelOpen, channelSelectedIndex, channelSuggestions],
+    [
+      isChannelOpen,
+      channelSelectedIndex,
+      channelSuggestions,
+      renderedQueryRevision,
+    ],
   );
 
   return {

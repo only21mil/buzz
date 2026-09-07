@@ -42,6 +42,9 @@ pub struct TriggerContext {
     pub emoji: String,
     /// Event ID of the triggering message (hex string).
     pub message_id: String,
+    /// Whether the trigger is itself a threaded reply. Defaults for old snapshots.
+    #[serde(default)]
+    pub is_reply: bool,
     /// Arbitrary webhook body fields (webhook trigger). Top-level fields,
     /// flattened to strings.
     pub webhook_fields: HashMap<String, String>,
@@ -290,6 +293,7 @@ fn apply_filter(value: String, filter: &str) -> Result<String, WorkflowError> {
 /// | `trigger.timestamp`               | `trigger_timestamp`       |
 /// | `trigger.emoji`                   | `trigger_emoji`           |
 /// | `trigger.message_id`              | `trigger_message_id`      |
+/// | `trigger.is_reply`                | `trigger_is_reply` (bool) |
 /// | `steps.STEP_ID.output.FIELD`      | `steps_STEP_ID_output_FIELD` |
 ///
 /// Also registers string helper functions that the `cron` crate's `evalexpr` v11
@@ -415,6 +419,14 @@ pub fn build_eval_context(
             .map_err(|e| WorkflowError::ConditionError(e.to_string()))?;
     }
 
+    // `trigger_is_reply` is boolean (not a string field), so a filter can read
+    // `trigger_is_reply == false` to fire only on top-level messages.
+    ctx.set_value(
+        "trigger_is_reply".into(),
+        Value::Boolean(trigger_ctx.is_reply),
+    )
+    .map_err(|e| WorkflowError::ConditionError(e.to_string()))?;
+
     for (step_id, output) in step_outputs {
         if let JsonValue::Object(map) = output {
             for (field, val) in map {
@@ -518,9 +530,14 @@ pub fn resolve_step_templates(
     };
 
     match &step.action {
-        SendMessage { text, channel } => Ok(SendMessage {
+        SendMessage {
+            text,
+            channel,
+            reply_in_thread,
+        } => Ok(SendMessage {
             text: t(text)?,
             channel: t_opt(channel)?,
+            reply_in_thread: *reply_in_thread,
         }),
         SendDm { to, text } => Ok(SendDm {
             to: t(to)?,
@@ -682,6 +699,8 @@ enum PreparedEffect {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct SendMessageEffectPayload {
+    #[serde(default)]
+    options: crate::MessageEffectOptions,
     channel_id: String,
     text: String,
     author_pubkey: String,
@@ -846,7 +865,11 @@ async fn dispatch_action_with_generation(
     use ActionDef::*;
 
     match action {
-        SendMessage { text, channel } => {
+        SendMessage {
+            text,
+            channel,
+            reply_in_thread,
+        } => {
             let prepared = load_prepared_effect(
                 engine,
                 community_id,
@@ -898,7 +921,45 @@ async fn dispatch_action_with_generation(
                         .resolve_message_mentions(community_id, &channel_id, text)
                         .await
                         .map_err(WorkflowError::from)?;
+                    let thread = if *reply_in_thread {
+                        Some(
+                            engine
+                                .action_sink()?
+                                .resolve_message_thread(
+                                    community_id,
+                                    &channel_id,
+                                    &trigger_ctx.message_id,
+                                )
+                                .await
+                                .map_err(WorkflowError::from)?,
+                        )
+                    } else {
+                        None
+                    };
+                    // Only the frozen author's step can supply wakeup authority.
+                    // Rendered trigger content must never be reinterpreted as authored.
+                    let authored_text = wf_run
+                        .definition_snapshot
+                        .get("steps")
+                        .and_then(JsonValue::as_array)
+                        .and_then(|steps| {
+                            steps.iter().find(|step| {
+                                step.get("id").and_then(JsonValue::as_str) == Some(step_id)
+                            })
+                        })
+                        .and_then(|step| step.get("text"))
+                        .and_then(JsonValue::as_str)
+                        .unwrap_or("");
+                    let authored_mentioned_pubkeys = engine
+                        .action_sink()?
+                        .resolve_message_mentions(community_id, &channel_id, authored_text)
+                        .await
+                        .map_err(WorkflowError::from)?;
                     let candidate_payload = serde_json::to_value(SendMessageEffectPayload {
+                        options: crate::MessageEffectOptions {
+                            thread,
+                            authored_mentioned_pubkeys: Some(authored_mentioned_pubkeys),
+                        },
                         channel_id,
                         text: text.clone(),
                         author_pubkey: owner_pubkey_hex,
@@ -950,7 +1011,7 @@ async fn dispatch_action_with_generation(
 
             let event_id = engine
                 .action_sink()?
-                .send_message(
+                .send_prepared_message(
                     crate::ActionEffectContext {
                         idempotency_key: claim.idempotency_key,
                         claimed_at: claim.claimed_at,
@@ -960,6 +1021,7 @@ async fn dispatch_action_with_generation(
                     &payload.text,
                     &payload.author_pubkey,
                     &payload.mentioned_pubkeys,
+                    &payload.options,
                 )
                 .await
                 .map_err(WorkflowError::from)?;
@@ -2474,6 +2536,7 @@ mod tests {
             timestamp: "1700000000".to_owned(),
             emoji: "fire".to_owned(),
             message_id: "event-id-hex".to_owned(),
+            is_reply: false,
             webhook_fields: HashMap::new(),
             webhook_body: None,
         }
@@ -2559,12 +2622,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn historical_message_claim_decodes_without_changing_its_action_spec() {
+        let legacy = json!({"action": "send_message", "text": "hello", "channel": null});
+        let action: ActionDef = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(action).unwrap(), legacy);
+        let payload: SendMessageEffectPayload = serde_json::from_value(json!({
+            "channel_id": "channel", "text": "hello", "author_pubkey": "owner",
+            "mentioned_pubkeys": [], "idempotency_key": Uuid::nil(),
+        }))
+        .unwrap();
+        assert_eq!(payload.options, Default::default());
+    }
+
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn claimed_message_and_reaction_recover_after_workflow_deletion() {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_owned());
+            .expect("explicit isolated test database URL required");
         let db = buzz_db::Db::new(&buzz_db::DbConfig {
             database_url,
             ..Default::default()
@@ -2597,6 +2673,7 @@ mod tests {
         };
 
         let message_action = ActionDef::SendMessage {
+            reply_in_thread: false,
             text: "committed before marker".to_owned(),
             channel: None,
         };
@@ -2644,6 +2721,7 @@ mod tests {
             "send_message",
             &message_action,
             &serde_json::to_value(SendMessageEffectPayload {
+                options: Default::default(),
                 channel_id: trigger.channel_id.clone(),
                 text: "committed before marker".to_owned(),
                 author_pubkey: owner_hex.clone(),
@@ -2941,6 +3019,56 @@ mod tests {
                 .await
                 .unwrap();
         assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn condition_trigger_is_reply_selects_top_level_only() {
+        // The top-level-only filter from the feature's use case.
+        let mut ctx = make_trigger();
+
+        ctx.is_reply = false;
+        assert!(
+            evaluate_condition("trigger_is_reply == false", &ctx, &HashMap::new())
+                .await
+                .unwrap(),
+            "top-level message should pass the filter"
+        );
+
+        ctx.is_reply = true;
+        assert!(
+            !evaluate_condition("trigger_is_reply == false", &ctx, &HashMap::new())
+                .await
+                .unwrap(),
+            "threaded reply should be filtered out"
+        );
+    }
+
+    #[test]
+    fn resolve_step_templates_carries_reply_in_thread() {
+        let ctx = make_trigger();
+        let step = Step {
+            id: "reply".to_owned(),
+            name: None,
+            if_expr: None,
+            timeout_secs: None,
+            action: ActionDef::SendMessage {
+                text: "hi {{trigger.author}}".to_owned(),
+                channel: None,
+                reply_in_thread: true,
+            },
+        };
+        let resolved = resolve_step_templates(&step, &ctx, &HashMap::new()).unwrap();
+        match resolved {
+            ActionDef::SendMessage {
+                text,
+                reply_in_thread,
+                ..
+            } => {
+                assert_eq!(text, "hi abc123def456");
+                assert!(reply_in_thread, "reply_in_thread must survive resolution");
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
     }
 
     #[tokio::test]

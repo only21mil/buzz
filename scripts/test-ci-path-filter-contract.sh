@@ -37,6 +37,15 @@ for path in \
   'scripts/ci-promotion-readiness.py' \
   'scripts/protected-ci-receipt.py' \
   'scripts/run-tests.sh' \
+  'scripts/postgres-test-*.py' \
+  'scripts/postgres-test-*.sh' \
+  'scripts/postgres_test_*.py' \
+  'scripts/postgres-tests.tsv' \
+  'scripts/test-postgres-test-*.py' \
+  'scripts/test-postgres-test-*.sh' \
+  'scripts/check-postgres-test-discovery.py' \
+  'scripts/test-native-ci-python.sh' \
+  'scripts/pre-freeze.sh' \
   'scripts/test-ci-promotion-readiness.py' \
   scripts/test-ci-path-filter-contract.sh \
   'scripts/test-protected-ci-receipt.py' \

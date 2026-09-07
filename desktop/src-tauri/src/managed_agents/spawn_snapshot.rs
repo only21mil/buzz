@@ -37,7 +37,7 @@ use super::{
     readiness::EffectiveHarnessDescriptor,
     runtime::{resolve_session_title, SESSION_TITLE_ENV_VAR},
     types::{AgentDefinition, ManagedAgentRecord, TeamRecord},
-    GlobalAgentConfig,
+    AcpSessionPolicy, GlobalAgentConfig,
 };
 
 pub(crate) mod diff;
@@ -72,6 +72,7 @@ pub(crate) struct SpawnConfigInputs<'a> {
     pub system_prompt: Option<&'a str>,
     pub model: Option<&'a str>,
     pub provider: Option<&'a str>,
+    pub session_policy: AcpSessionPolicy,
 }
 
 /// The effective spawn configuration of one managed-agent process.
@@ -123,6 +124,8 @@ pub(crate) struct SpawnConfigSnapshot {
     pub idle_timeout_seconds: Option<u64>,
     pub max_turn_duration_seconds: Option<u64>,
     pub parallelism: u32,
+    pub session_policy: String,
+    pub effort_level: Option<String>,
 }
 
 impl SpawnConfigSnapshot {
@@ -136,8 +139,23 @@ impl SpawnConfigSnapshot {
             system_prompt,
             model,
             provider,
+            session_policy,
         } = inputs;
+        let runtime = known_acp_runtime(&descriptor.command);
+        let effort_level = descriptor
+            .env
+            .get(super::config_bridge::effort::effort_dest_key(runtime))
+            .cloned();
+        let mut env = descriptor.env.clone();
+        let effort_keys = super::config_bridge::effort::snapshot_suppress_keys(runtime);
+        env.retain(|key, _| {
+            !effort_keys
+                .iter()
+                .any(|candidate| key.eq_ignore_ascii_case(candidate))
+        });
         Self {
+            effort_level,
+            session_policy: session_policy.as_str().to_string(),
             acp_command: record.acp_command.clone(),
             command: descriptor.command.clone(),
             args: descriptor.args.clone(),
@@ -145,7 +163,7 @@ impl SpawnConfigSnapshot {
                 .and_then(|runtime| runtime.mcp_command)
                 .unwrap_or("")
                 .to_string(),
-            env: descriptor.env.clone(),
+            env,
             relay_url: relay_url.to_string(),
             team_instructions: team_instructions.map(str::to_string),
             system_prompt: system_prompt.map(str::to_string),
@@ -213,6 +231,7 @@ pub(crate) fn prospective_spawn_config_snapshot(
     teams: &[TeamRecord],
     workspace_relay: &str,
     global: &GlobalAgentConfig,
+    session_policy: AcpSessionPolicy,
 ) -> SpawnConfigSnapshot {
     // Prospective re-snapshot: apply the same `apply_persona_snapshot` the
     // start/restore paths run right before spawning, so this describes what a
@@ -262,6 +281,7 @@ pub(crate) fn prospective_spawn_config_snapshot(
         system_prompt: prompt.as_deref(),
         model: model.as_deref(),
         provider: provider.as_deref(),
+        session_policy,
     })
 }
 

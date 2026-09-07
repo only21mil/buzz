@@ -8,10 +8,20 @@ import type {
   ManagedAgentRuntimeStatus,
 } from "@/shared/api/types";
 
-export async function startManagedAgent(pubkey: string): Promise<ManagedAgent> {
-  const response = await invokeTauri<RawManagedAgent>("start_managed_agent", {
-    pubkey,
-  });
+export type StartManagedAgentInput = {
+  pubkey: string;
+  expectedRelayUrl?: string;
+  expectedSignerPubkey?: string;
+  replayFloorUnix?: number;
+};
+
+export async function startManagedAgent(
+  input: string | StartManagedAgentInput,
+): Promise<ManagedAgent> {
+  const response = await invokeTauri<RawManagedAgent>(
+    "start_managed_agent",
+    typeof input === "string" ? { pubkey: input } : input,
+  );
   return fromRawManagedAgent(response);
 }
 

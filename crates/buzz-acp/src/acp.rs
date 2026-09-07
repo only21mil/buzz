@@ -773,6 +773,39 @@ impl AcpClient {
         self.send_request("session/set_config_option", params).await
     }
 
+    /// Apply only an option explicitly advertised for this session/model.
+    pub async fn session_set_startup_effort(
+        &mut self,
+        session_id: &str,
+        session: &serde_json::Value,
+        effort: &str,
+    ) -> Result<serde_json::Value, AcpError> {
+        let options = session
+            .get("configOptions")
+            .and_then(serde_json::Value::as_array);
+        let option = options.and_then(|options| {
+            options.iter().find(|entry| {
+                entry.get("category").and_then(serde_json::Value::as_str) == Some("thought_level")
+            })
+        });
+        let config_id =
+            option.and_then(|entry| entry.get("id").and_then(serde_json::Value::as_str));
+        let supported = option
+            .and_then(|entry| entry.get("options").and_then(serde_json::Value::as_array))
+            .is_some_and(|options| {
+                options.iter().any(|entry| {
+                    entry.get("value").and_then(serde_json::Value::as_str) == Some(effort)
+                })
+            });
+        match (config_id.filter(|id| !id.is_empty()), supported) {
+            (Some(id), true) => self.session_set_config_option(session_id, id, effort).await,
+            _ => Err(AcpError::AgentError {
+                code: -32602,
+                message: "saved effort is not advertised for the selected session/model".into(),
+            }),
+        }
+    }
+
     /// Send `session/set_model` (unstable ACP path).
     pub async fn session_set_model(
         &mut self,
@@ -1667,7 +1700,9 @@ impl AcpClient {
                                                     "steer accepted as {STEER_OUTCOME_STARTED_NEW_TURN}: \
                                                      awaited turn had ended — hard deadline not renewed"
                                                 );
-                                                crate::pool::SteerAck::Success
+                                                crate::pool::SteerAck::Success {
+                                                    session_id: session_id.to_owned(),
+                                                }
                                             }
                                             Some(_) => {
                                                 let renew_now = Instant::now();
@@ -1679,7 +1714,9 @@ impl AcpClient {
                                                         "steer success: renewed hard deadline ({max_duration:?} from now)"
                                                     );
                                                 }
-                                                crate::pool::SteerAck::Success
+                                                crate::pool::SteerAck::Success {
+                                                    session_id: session_id.to_owned(),
+                                                }
                                             }
                                             None => {
                                                 // Report the raw string when
@@ -2945,7 +2982,7 @@ mod tests {
             .expect("failed to spawn test script")
     }
 
-    /// Spawn a probe script whose file name carries a runtime identity (e.g.
+    /// Spawn a probe shell whose file name carries a runtime identity (e.g.
     /// `hermes-acp`) and return the value of `var` as the child observed it.
     /// `<unset>` means the child did not receive the var.
     #[cfg(unix)]
@@ -2954,28 +2991,27 @@ mod tests {
         var: &str,
         extra_env: &[(String, String)],
     ) -> String {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::symlink;
 
         let dir = std::env::temp_dir().join(format!("buzz-acp-env-probe-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("create env probe dir");
         let path = dir.join(file_name);
-        std::fs::write(
-            &path,
-            format!("#!/bin/sh\nprintf '%s\\n' \"${{{var}:-<unset>}}\"\n"),
-        )
-        .expect("write env probe script");
-        let mut permissions = std::fs::metadata(&path).expect("stat probe").permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&path, permissions).expect("chmod probe");
+        // Execute a stable shell through the runtime-named path. A freshly
+        // written executable can fail with ETXTBSY if a concurrent fork inherits
+        // its writer before close-on-exec, even after this thread closes it.
+        symlink("/bin/sh", &path).expect("symlink env probe shell");
 
         let mut client = AcpClient::spawn(
             path.to_str().expect("probe path is UTF-8"),
-            &[],
+            &[
+                "-c".into(),
+                format!("printf '%s\\n' \"${{{var}:-<unset>}}\""),
+            ],
             extra_env,
             false,
         )
         .await
-        .expect("spawn env probe script");
+        .expect("spawn env probe shell");
         let observed = client
             .reader
             .next()
@@ -3952,7 +3988,7 @@ mod tests {
             .await
             .expect("ack oneshot must have received a SteerAck");
         match ack {
-            crate::pool::SteerAck::Success => {}
+            crate::pool::SteerAck::Success { .. } => {}
             other => panic!("expected SteerAck::Success, got {other:?}"),
         }
     }
@@ -4013,7 +4049,7 @@ mod tests {
             .await
             .expect("ack oneshot must have received a SteerAck");
         match ack {
-            crate::pool::SteerAck::Success => {}
+            crate::pool::SteerAck::Success { .. } => {}
             other => panic!("expected SteerAck::Success, got {other:?}"),
         }
     }
@@ -4197,7 +4233,7 @@ mod tests {
             "_session/steering must not carry expectedRunId; wrote: {written}"
         );
         assert!(
-            matches!(ack, crate::pool::SteerAck::Success),
+            matches!(ack, crate::pool::SteerAck::Success { .. }),
             "injected outcome must ack Success, got {ack:?}"
         );
     }
@@ -4229,7 +4265,7 @@ mod tests {
         // no `outcome`) — the OutcomeRejected guard applies only to
         // `_session/steering`.
         assert!(
-            matches!(ack, crate::pool::SteerAck::Success),
+            matches!(ack, crate::pool::SteerAck::Success { .. }),
             "goose success result must ack Success, got {ack:?}"
         );
     }
@@ -4334,7 +4370,7 @@ mod tests {
         assert_eq!(result.unwrap()["done"], serde_json::json!(true));
         let ack = ack_rx.await.expect("ack must be received");
         assert!(
-            matches!(ack, crate::pool::SteerAck::Success),
+            matches!(ack, crate::pool::SteerAck::Success { .. }),
             "injected must ack Success, got {ack:?}"
         );
     }
@@ -4391,7 +4427,7 @@ mod tests {
         // rather than released — hence Success, not an Err.
         let ack = ack_rx.await.expect("ack must be received");
         assert!(
-            matches!(ack, crate::pool::SteerAck::Success),
+            matches!(ack, crate::pool::SteerAck::Success { .. }),
             "startedNewTurn is a delivery success, got {ack:?}"
         );
     }

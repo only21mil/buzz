@@ -2,6 +2,18 @@ import { register } from "../registry";
 import { registerOffMutation } from "./capabilityOff";
 
 export function registerHuddleVoiceTtsCommands(): void {
+  registerOffMutation(
+    "fetch_audio_bytes",
+    "voice note playback needs the desktop app",
+  );
+  registerOffMutation(
+    "cancel_media_fetch",
+    "voice note playback needs the desktop app",
+  );
+  registerOffMutation(
+    "release_media_fetch",
+    "voice note playback needs the desktop app",
+  );
   // Huddle lifecycle and companion-window mutations.
   registerOffMutation(
     "add_agent_to_huddle",

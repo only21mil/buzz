@@ -1,0 +1,81 @@
+[
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/migrations/0001_push_gateway_authority.sql",
+    "source_git_blob": "3fc079a63ec45194602a14b23072115302940b87",
+    "source_sha256": "90e77511f05b11d1893a3c86833f99f2b77c2fcdebb48feb101c4d9032d2ea68",
+    "source_sqlx_sha384": "1f23969e563d726d4a0484a6daab8e50a065f78a678367deaa823bc6022ccce81d3455739bb34f26ea15b8a45dba23eb",
+    "fork_path": "crates/buzz-push-gateway/migrations/0001_push_gateway_authority.sql",
+    "fork_sha256": "90e77511f05b11d1893a3c86833f99f2b77c2fcdebb48feb101c4d9032d2ea68",
+    "disposition": "frozen prefix; byte-identical",
+    "fork_sqlx_sha384": "1f23969e563d726d4a0484a6daab8e50a065f78a678367deaa823bc6022ccce81d3455739bb34f26ea15b8a45dba23eb",
+    "prerequisite_versions": [],
+    "rollout_approval_required": false
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/migrations/0002_application_profiles.sql",
+    "source_git_blob": "45be402dc0779296b02a538748c236f0d0d56c01",
+    "source_sha256": "3f77eb8f02a1c68920b58559697f4914519a1fb2bf8f1d0c5546992e888169e2",
+    "source_sqlx_sha384": "f8c7d63237b324266f5915e5424bf647d4a80681aa5b73e5f4ae312ac95374c514dd29bef878fc77c5527fe3093c1946",
+    "fork_path": "crates/buzz-push-gateway/migrations/0002_application_profiles.sql",
+    "fork_sha256": "3f77eb8f02a1c68920b58559697f4914519a1fb2bf8f1d0c5546992e888169e2",
+    "disposition": "admitted source; byte-identical; rollout approval required before application",
+    "fork_sqlx_sha384": "f8c7d63237b324266f5915e5424bf647d4a80681aa5b73e5f4ae312ac95374c514dd29bef878fc77c5527fe3093c1946",
+    "prerequisite_versions": [
+      1
+    ],
+    "rollout_approval_required": true
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/migrations/0003_challenge_issuance_quota.sql",
+    "source_git_blob": "cc8222f6c6dda5439a7d4d7c67bf4816274ca769",
+    "source_sha256": "2dbd5403c29e57b8a9e2fbeba9a456a73d1cead9acab003e0f7cb5702bea95b7",
+    "source_sqlx_sha384": "a6fb4850d6beac1a93737c6a55363d66facfd470612245690daf33a821be36fa991288c7b8ba330edb540d40c7b2fa9f",
+    "fork_path": "crates/buzz-push-gateway/migrations/0003_challenge_issuance_quota.sql",
+    "fork_sha256": "2dbd5403c29e57b8a9e2fbeba9a456a73d1cead9acab003e0f7cb5702bea95b7",
+    "disposition": "admitted source; byte-identical; rollout approval required before application",
+    "fork_sqlx_sha384": "a6fb4850d6beac1a93737c6a55363d66facfd470612245690daf33a821be36fa991288c7b8ba330edb540d40c7b2fa9f",
+    "prerequisite_versions": [
+      1,
+      2
+    ],
+    "rollout_approval_required": true
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/migrations/0004_dogfood_only_profile.sql",
+    "source_git_blob": "2274219d6ef915bbaf37ec02e0c776577532b305",
+    "source_sha256": "c1f96b868b03cf988f299cd9558c899904b2c1609b27964e6ddfee405a3ee253",
+    "source_sqlx_sha384": "c390174f9cc6903ef4bb254703c81d8703d595d19a007eca2460f1d6eb74ecc75af793b588e75a8fbdfbfd91f72b2ba2",
+    "fork_path": "crates/buzz-push-gateway/migrations/0004_dogfood_only_profile.sql",
+    "fork_sha256": "c1f96b868b03cf988f299cd9558c899904b2c1609b27964e6ddfee405a3ee253",
+    "disposition": "admitted source; byte-identical; rollout approval required before application",
+    "fork_sqlx_sha384": "c390174f9cc6903ef4bb254703c81d8703d595d19a007eca2460f1d6eb74ecc75af793b588e75a8fbdfbfd91f72b2ba2",
+    "prerequisite_versions": [
+      1,
+      2,
+      3
+    ],
+    "rollout_approval_required": true
+  },
+  {
+    "source_commit": null,
+    "source_path": null,
+    "source_git_blob": null,
+    "source_sha256": null,
+    "source_sqlx_sha384": null,
+    "fork_path": "crates/buzz-push-gateway/migrations/0005_consumed_challenge_issuance.sql",
+    "fork_sha256": "0765b81956da7c142e8d2b33ef3e8a032ef35159ff02aa4bf30c934d5d3c6e4a",
+    "disposition": "fork repair; additive consumed marker preserves issuance accounting; rollout approval required before application",
+    "fork_sqlx_sha384": "11c91f0672f5bd2b13738f0ca697b0f021375c3be1b2b1275ab1a3f95069ef4335348c4bb0c3800efc4bcfc9acc399ff",
+    "prerequisite_versions": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "rollout_approval_required": true
+  }
+]

@@ -415,6 +415,7 @@ CREATE TABLE workflow_runs (
     started_at          TIMESTAMPTZ,
     resume_lease_expires_at TIMESTAMPTZ,
     completed_at        TIMESTAMPTZ,
+    error_code          TEXT,
     error_message       TEXT,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (community_id, id),
@@ -1221,7 +1222,7 @@ BEGIN
     -- Keep this allowlist identical to the relay's validated NIP-PL descriptor.
     -- Centralizing it on the events table covers every durable producer,
     -- including internal paths that bypass live dispatch.
-    IF NEW.kind IN (7, 9, 1059, 40007, 46010) THEN
+    IF NEW.kind IN (9, 40002, 45001, 45003) THEN
         PERFORM pg_advisory_xact_lock_shared(
             hashtextextended('buzz_push_gate:' || NEW.community_id::text, 0));
         IF EXISTS (
@@ -1349,7 +1350,7 @@ CREATE TABLE push_gateway_installations (
     app_attest_key_id BYTEA NOT NULL UNIQUE CHECK (octet_length(app_attest_key_id) BETWEEN 1 AND 128),
     app_attest_public_key BYTEA NOT NULL CHECK (octet_length(app_attest_public_key) BETWEEN 33 AND 256),
     assertion_counter BIGINT NOT NULL CHECK (assertion_counter BETWEEN 0 AND 4294967295),
-    app_profile TEXT NOT NULL CHECK (app_profile IN ('buzz-ios-production','buzz-ios-sandbox')),
+    app_profile TEXT NOT NULL CHECK (app_profile = 'buzz-ios-dogfood'),
     token_ciphertext BYTEA NOT NULL CHECK (octet_length(token_ciphertext) BETWEEN 1 AND 2048),
     token_fingerprint BYTEA NOT NULL CHECK (length(token_fingerprint) = 32),
     endpoint_epoch BIGINT NOT NULL CHECK (endpoint_epoch > 0),
@@ -1559,3 +1560,224 @@ CREATE TABLE ci_grants (
 
 CREATE INDEX ci_grants_channel_repo_idx
     ON ci_grants (community_id, channel_id, target_repo_a);
+
+-- Frozen fork retention and product-feedback objects. Keep synchronized with
+-- migrations 0007, 0009-0011, 0017 and 0019; desired schemas contain no backfills.
+
+
+CREATE TABLE parameterized_event_watermarks (
+    community_id  UUID NOT NULL REFERENCES communities(id),
+    kind          INT NOT NULL,
+    pubkey        BYTEA NOT NULL,
+    d_tag         TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL,
+    event_id      BYTEA NOT NULL,
+    PRIMARY KEY (community_id, kind, pubkey, d_tag)
+);
+
+CREATE INDEX idx_event_mentions_community_event
+    ON event_mentions (community_id, event_id);
+
+CREATE FUNCTION guard_nip_rs_hard_delete() RETURNS trigger AS $$
+BEGIN
+    IF current_setting('buzz.nip_rs_hard_delete', true) IS DISTINCT FROM 'on' THEN
+        RAISE EXCEPTION 'NIP-RS hard delete requires corrected writer opt-in'
+            USING ERRCODE = 'check_violation';
+    END IF;
+
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION guard_nip_rs_watermark() RETURNS trigger AS $$
+DECLARE
+    advanced BOOLEAN;
+BEGIN
+    IF NEW.kind = 30078
+       AND NEW.d_tag ~ '^read-state:[0-9a-f]{32}$'
+       AND (
+           SELECT count(*)
+           FROM jsonb_array_elements(CASE WHEN jsonb_typeof(NEW.tags) = 'array' THEN NEW.tags ELSE '[]'::jsonb END) tag
+           WHERE jsonb_typeof(tag) = 'array'
+             AND tag->0 = '"d"'::jsonb
+       ) = 1
+       AND EXISTS (
+           SELECT 1
+           FROM jsonb_array_elements(CASE WHEN jsonb_typeof(NEW.tags) = 'array' THEN NEW.tags ELSE '[]'::jsonb END) tag
+           WHERE jsonb_typeof(tag) = 'array'
+             AND jsonb_array_length(tag) >= 2
+             AND jsonb_typeof(tag->1) = 'string'
+             AND tag->>0 = 'd'
+             AND tag->>1 = NEW.d_tag
+       )
+       AND (
+           SELECT count(*)
+           FROM jsonb_array_elements(CASE WHEN jsonb_typeof(NEW.tags) = 'array' THEN NEW.tags ELSE '[]'::jsonb END) tag
+           WHERE tag = '["t", "read-state"]'::jsonb
+       ) = 1 THEN
+        INSERT INTO parameterized_event_watermarks
+            (community_id, kind, pubkey, d_tag, created_at, event_id)
+        VALUES
+            (NEW.community_id, NEW.kind, NEW.pubkey, NEW.d_tag, NEW.created_at, NEW.id)
+        ON CONFLICT (community_id, kind, pubkey, d_tag) DO UPDATE SET
+            created_at = EXCLUDED.created_at,
+            event_id = EXCLUDED.event_id
+        WHERE EXCLUDED.created_at > parameterized_event_watermarks.created_at
+           OR (EXCLUDED.created_at = parameterized_event_watermarks.created_at
+               AND EXCLUDED.event_id < parameterized_event_watermarks.event_id)
+        RETURNING TRUE INTO advanced;
+
+        IF NOT COALESCE(advanced, FALSE) THEN
+            IF EXISTS (
+                SELECT 1
+                FROM parameterized_event_watermarks
+                WHERE community_id = NEW.community_id
+                  AND kind = NEW.kind
+                  AND pubkey = NEW.pubkey
+                  AND d_tag = NEW.d_tag
+                  AND created_at = NEW.created_at
+                  AND event_id = NEW.id
+            ) THEN
+                RETURN NULL;
+            END IF;
+
+            RAISE EXCEPTION 'stale NIP-RS event rejected by durable watermark'
+                USING ERRCODE = 'check_violation';
+        END IF;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION purge_soft_deleted_nip_rs() RETURNS trigger AS $$
+BEGIN
+    IF OLD.deleted_at IS NULL
+       AND NEW.deleted_at IS NOT NULL
+       AND NEW.kind = 30078
+       AND NEW.d_tag ~ '^read-state:[0-9a-f]{32}$'
+       AND (
+           SELECT count(*)
+           FROM jsonb_array_elements(CASE WHEN jsonb_typeof(NEW.tags) = 'array' THEN NEW.tags ELSE '[]'::jsonb END) tag
+           WHERE jsonb_typeof(tag) = 'array'
+             AND tag->0 = '"d"'::jsonb
+       ) = 1
+       AND EXISTS (
+           SELECT 1
+           FROM jsonb_array_elements(CASE WHEN jsonb_typeof(NEW.tags) = 'array' THEN NEW.tags ELSE '[]'::jsonb END) tag
+           WHERE jsonb_typeof(tag) = 'array'
+             AND jsonb_array_length(tag) >= 2
+             AND jsonb_typeof(tag->1) = 'string'
+             AND tag->>0 = 'd'
+             AND tag->>1 = NEW.d_tag
+       )
+       AND (
+           SELECT count(*)
+           FROM jsonb_array_elements(CASE WHEN jsonb_typeof(NEW.tags) = 'array' THEN NEW.tags ELSE '[]'::jsonb END) tag
+           WHERE tag = '["t", "read-state"]'::jsonb
+       ) = 1 THEN
+        PERFORM set_config('buzz.nip_rs_hard_delete', 'on', true);
+
+        DELETE FROM events
+        WHERE community_id = NEW.community_id
+          AND created_at = NEW.created_at
+          AND id = NEW.id;
+
+        DELETE FROM event_mentions
+        WHERE community_id = NEW.community_id AND event_id = NEW.id;
+    END IF;
+
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION guard_event_mention_live() RETURNS trigger AS $$
+BEGIN
+    IF NEW.event_kind IS DISTINCT FROM 30078 THEN
+        RETURN NEW;
+    END IF;
+
+    PERFORM 1
+    FROM events
+    WHERE community_id = NEW.community_id
+      AND id = NEW.event_id
+      AND created_at = NEW.event_created_at
+      AND deleted_at IS NULL
+    FOR KEY SHARE;
+
+    IF NOT FOUND THEN
+        RETURN NULL;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_events_nip_rs_watermark
+    BEFORE INSERT ON events
+    FOR EACH ROW EXECUTE FUNCTION guard_nip_rs_watermark();
+
+CREATE TRIGGER trg_events_purge_soft_deleted_nip_rs
+    AFTER UPDATE OF deleted_at ON events
+    FOR EACH ROW EXECUTE FUNCTION purge_soft_deleted_nip_rs();
+
+CREATE TRIGGER trg_event_mentions_require_live_event
+    BEFORE INSERT ON event_mentions
+    FOR EACH ROW EXECUTE FUNCTION guard_event_mention_live();
+
+CREATE TRIGGER trg_events_guard_nip_rs_hard_delete
+    BEFORE DELETE ON events
+    FOR EACH ROW
+    WHEN (OLD.kind = 30078 AND OLD.d_tag ~ '^read-state:[0-9a-f]{32}$')
+    EXECUTE FUNCTION guard_nip_rs_hard_delete();
+
+CREATE FUNCTION purge_soft_deleted_buzz_mesh_status() RETURNS trigger AS $$
+BEGIN
+    IF OLD.deleted_at IS NULL
+       AND NEW.deleted_at IS NOT NULL
+       AND NEW.kind = 30003
+       AND NEW.d_tag LIKE 'buzz-mesh-member-status:%'
+       AND NEW.tags @> '[["k", "buzz-mesh-status"]]'::jsonb THEN
+        DELETE FROM events
+        WHERE community_id = NEW.community_id
+          AND created_at = NEW.created_at
+          AND id = NEW.id;
+
+        DELETE FROM event_mentions
+        WHERE community_id = NEW.community_id AND event_id = NEW.id;
+    END IF;
+
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_events_purge_soft_deleted_buzz_mesh_status
+    AFTER UPDATE OF deleted_at ON events
+    FOR EACH ROW EXECUTE FUNCTION purge_soft_deleted_buzz_mesh_status();
+
+
+-- Buzz product feedback is accepted through a dedicated signed event kind and
+-- sidecarred here instead of entering the ordinary events table. Rows remain
+-- attributable to their source community, while deployment operators may
+-- review the table across communities through internal tooling.
+CREATE TABLE product_feedback (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    community_id UUID NOT NULL REFERENCES communities(id),
+    event_id BYTEA NOT NULL CHECK (length(event_id) = 32),
+    submitter_pubkey BYTEA NOT NULL CHECK (length(submitter_pubkey) = 32),
+    category TEXT CHECK (category IN ('bug', 'praise', 'needs-work')),
+    body TEXT NOT NULL CHECK (length(btrim(body)) > 0),
+    tags JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(tags) = 'array'),
+    event_created_at TIMESTAMPTZ NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (event_id)
+);
+
+CREATE INDEX idx_product_feedback_received
+    ON product_feedback (received_at DESC, id);
+CREATE INDEX idx_product_feedback_community_received
+    ON product_feedback (community_id, received_at DESC, id);
+
+INSERT INTO _operator_global_tables (table_name, reason) VALUES
+    ('product_feedback', 'deployment product inbox; community_id is provenance only');
+

@@ -23,6 +23,7 @@ const THROW_COMMANDS = [
   "duplicate_channel_template",
   "encode_team_snapshot_for_send",
   "export_team_snapshot",
+  "get_message_publication_scope",
   "index_observer_channel_id",
   "merge_save_subscription_kinds",
   "preview_team_snapshot_import",

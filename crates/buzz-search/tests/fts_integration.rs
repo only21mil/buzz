@@ -17,7 +17,6 @@ use buzz_search::{ChannelScope, SearchQuery, SearchService};
 use sqlx::{postgres::PgPoolOptions, Executor, PgPool};
 use uuid::Uuid;
 
-const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
 const MIGRATION_0001_SQL: &str = include_str!("../../../migrations/0001_initial_schema.sql");
 const MIGRATION_0002_SQL: &str = include_str!("../../../migrations/0002_git_repo_names.sql");
 const MIGRATION_0003_SQL: &str = include_str!("../../../migrations/0003_community_icon.sql");
@@ -30,7 +29,8 @@ const MIGRATION_0008_SQL: &str =
 const MIGRATION_0014_SQL: &str = include_str!("../../../migrations/0014_push_lease_fts.sql");
 
 async fn setup() -> (PgPool, String) {
-    let url = std::env::var("BUZZ_TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.to_string());
+    let url = std::env::var("BUZZ_TEST_DATABASE_URL")
+        .expect("explicit isolated test database URL required");
     let schema = format!("fts_test_{}", Uuid::new_v4().simple());
     // Connect to the default schema first to create the test schema.
     let admin_pool = PgPoolOptions::new()
@@ -46,10 +46,10 @@ async fn setup() -> (PgPool, String) {
     admin_pool.close().await;
 
     // Connect with search_path set so the migration's CREATE TABLE lands here.
-    let url_with_search_path = format!("{url}?options=-c%20search_path%3D{schema}");
+    let options = schema_options(&url, &schema);
     let pool = PgPoolOptions::new()
         .max_connections(2)
-        .connect(&url_with_search_path)
+        .connect_with(options)
         .await
         .expect("connect with search_path");
     // Apply the full migration chain in order so the test schema exactly matches
@@ -84,12 +84,44 @@ async fn setup() -> (PgPool, String) {
     (pool, schema)
 }
 
+fn schema_options(url: &str, schema: &str) -> sqlx::postgres::PgConnectOptions {
+    use std::str::FromStr;
+    sqlx::postgres::PgConnectOptions::from_str(url)
+        .expect("parse test database options")
+        .options([("search_path", schema)])
+}
+
+#[test]
+fn schema_options_preserve_socket_and_existing_connection_settings() {
+    for scheme in ["postgres", "postgresql"] {
+        let options = schema_options(
+            &format!("{scheme}://fixture@buzz-test.invalid/isolated?host=%2Ftmp%2Fowned&application_name=fts&options=-c%20statement_timeout%3D1000"),
+            "fts_fixture",
+        );
+        assert_eq!(
+            options.get_socket().map(|p| p.as_path()),
+            Some(std::path::Path::new("/tmp/owned"))
+        );
+        assert_eq!(options.get_database(), Some("isolated"));
+        assert_eq!(options.get_application_name(), Some("fts"));
+        assert!(options
+            .get_options()
+            .unwrap()
+            .contains("statement_timeout=1000"));
+        assert!(options
+            .get_options()
+            .unwrap()
+            .contains("search_path=fts_fixture"));
+    }
+}
+
 async fn teardown(pool: PgPool, schema: &str) {
     pool.close().await;
     let admin_pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(
-            &std::env::var("BUZZ_TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.to_string()),
+            &std::env::var("BUZZ_TEST_DATABASE_URL")
+                .expect("explicit isolated test database URL required"),
         )
         .await
         .expect("reconnect for drop");
@@ -299,6 +331,67 @@ async fn kind0_search_by_display_name_works_without_flattening() {
             .unwrap();
         assert_eq!(r.hits.len(), 1, "kind:0 query {q:?} should find Alice");
     }
+
+    teardown(pool, &schema).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn short_kind0_prefix_prioritizes_exact_lexeme_on_a_noisy_page() {
+    let (pool, schema) = setup().await;
+
+    let c = mk_community(&pool, "short-profile-prefix.example").await;
+    let exact_id = rand_bytes32();
+    insert_event(
+        &pool,
+        c,
+        exact_id,
+        rand_bytes32(),
+        0,
+        r#"{"display_name":"jm"}"#,
+        None,
+        1_700_000_000,
+    )
+    .await;
+
+    // These profiles all match jm:* and are newer than the exact name. Without
+    // exact-lexeme priority they consume the entire bounded first page.
+    for (i, display_name) in ["jma", "jmbravo", "jmcharlie", "jmdelta"]
+        .iter()
+        .enumerate()
+    {
+        insert_event(
+            &pool,
+            c,
+            rand_bytes32(),
+            rand_bytes32(),
+            0,
+            &format!(r#"{{"display_name":"{display_name}"}}"#),
+            None,
+            1_700_000_100 + i as i64,
+        )
+        .await;
+    }
+
+    let svc = SearchService::new(pool.clone());
+    let first_page = svc
+        .search(&SearchQuery {
+            community: c,
+            q: "jm".into(),
+            channel_scope: ChannelScope::Any,
+            kinds: Some(vec![0]),
+            authors: None,
+            since: None,
+            until: None,
+            page: 1,
+            per_page: 3,
+            mode: buzz_search::SearchMode::Prefix,
+        })
+        .await
+        .expect("short profile prefix search ok");
+
+    assert_eq!(first_page.hits.len(), 3);
+    assert_eq!(first_page.hits[0].event_id, exact_id);
 
     teardown(pool, &schema).await;
 }

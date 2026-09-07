@@ -435,22 +435,28 @@ mod tests {
         assert!(enforce_request_auth_time_bounds(&auth.to_string(), 200).is_err());
     }
 
-    async fn test_pool() -> Option<sqlx::PgPool> {
-        let url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".into());
-        sqlx::PgPool::connect(&url).await.ok()
+    async fn test_pool() -> sqlx::PgPool {
+        let url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .expect("explicit isolated test database URL required");
+        sqlx::PgPool::connect(&url)
+            .await
+            .expect("connect to isolated test database")
     }
 
-    async fn test_state(pool: sqlx::PgPool) -> Option<Arc<AppState>> {
+    async fn test_state(pool: sqlx::PgPool) -> (Arc<AppState>, tempfile::TempDir) {
         let db = buzz_db::Db::from_pool(pool.clone());
-        let config = crate::config::Config::from_env().ok()?;
+        let git_storage = tempfile::tempdir().expect("fixture Git storage");
+        let mut config = crate::config::Config::from_env_with_test_git_paths(git_storage.path())
+            .expect("fixture config");
+        config.redis_url = "redis://127.0.0.1:1".to_string();
         let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
             .create_pool(Some(deadpool_redis::Runtime::Tokio1))
-            .ok()?;
+            .expect("lazy Redis pool");
         let pubsub = Arc::new(
             buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
                 .await
-                .ok()?,
+                .expect("local pubsub manager"),
         );
         let audit = buzz_audit::AuditService::new(pool.clone());
         let auth = buzz_auth::AuthService::new(config.auth.clone());
@@ -459,7 +465,7 @@ mod tests {
             db.clone(),
             buzz_workflow::WorkflowConfig::default(),
         ));
-        let media_storage = buzz_media::MediaStorage::new(&config.media).ok()?;
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media config");
         let (state, _audit_shutdown) = crate::state::AppState::new(
             config,
             db,
@@ -472,7 +478,7 @@ mod tests {
             Keys::generate(),
             media_storage,
         );
-        Some(Arc::new(state))
+        (Arc::new(state), git_storage)
     }
 
     fn auth_tag(owner_keys: &Keys, target_pubkey: &nostr::PublicKey) -> Tag {
@@ -513,20 +519,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via postgres-test-local.py"]
     async fn owner_archive_rejects_stale_request_after_live_kind0_owner_flip() {
-        let Some(pool) = test_pool().await else {
-            return;
-        };
-        if sqlx::query("SELECT 1 FROM archived_identities LIMIT 1")
+        let pool = test_pool().await;
+        sqlx::query("SELECT 1 FROM archived_identities LIMIT 1")
             .execute(&pool)
             .await
-            .is_err()
-        {
-            return;
-        }
-        let Some(state) = test_state(pool.clone()).await else {
-            return;
-        };
+            .expect("desired schema includes archived identities");
+        let (state, git_storage) = test_state(pool.clone()).await;
         let tenant = seed_test_community(&pool).await;
 
         let owner_keys = Keys::generate();
@@ -576,5 +576,8 @@ mod tests {
             err.contains("live kind:0 no longer attests"),
             "unexpected error: {err}"
         );
+        drop(state);
+        pool.close().await;
+        git_storage.close().expect("remove fixture Git storage");
     }
 }

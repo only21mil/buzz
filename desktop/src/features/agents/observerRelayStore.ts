@@ -1,4 +1,16 @@
+import {
+  dispatchProjectChannelRequest,
+  resetProjectChannelRequests,
+} from "@/features/projects/projectChannelRequestEvents";
 import * as React from "react";
+import {
+  compareObserverEvents,
+  isObserverEventAfter,
+} from "./observerEventOrder";
+export {
+  compareObserverEvents,
+  isObserverEventAfter,
+} from "./observerEventOrder";
 
 import { subscribeToAgentObserverFrames } from "@/shared/api/observerRelay";
 import type { RelayEvent, ManagedAgent } from "@/shared/api/types";
@@ -53,6 +65,9 @@ const eventBatchListeners = new Set<
   (batch: readonly AgentObserverEventDelta[]) => void
 >();
 const eventsByAgent = new Map<string, ObserverEvent[]>();
+// Invalid timestamps make the legacy timestamp/seq comparator non-transitive.
+// Keep these journals on the full dedup/sort path until the store resets.
+const unorderedTimestampAgents = new Set<string>();
 const transcriptByAgent = new Map<string, TranscriptState>();
 const snapshotByAgent = new Map<string, ObserverSnapshot>();
 
@@ -228,6 +243,17 @@ function appendAgentEvent(agentPubkey: string, event: ObserverEvent): boolean {
   const key = normalizePubkey(agentPubkey);
   const current = eventsByAgent.get(key) ?? [];
   if (
+    !Number.isFinite(Date.parse(event.timestamp)) ||
+    !Number.isFinite(event.seq)
+  ) {
+    unorderedTimestampAgents.add(key);
+  }
+  const tail = current.at(-1);
+  const eventAtEnd =
+    !unorderedTimestampAgents.has(key) &&
+    (!tail || isObserverEventAfter(event, tail));
+  if (
+    !eventAtEnd &&
     current.some(
       (existing) =>
         existing.seq === event.seq && existing.timestamp === event.timestamp,
@@ -236,7 +262,11 @@ function appendAgentEvent(agentPubkey: string, event: ObserverEvent): boolean {
     return false;
   }
 
-  const sorted = [...current, event].sort(compareObserverEvents);
+  // Strictly newer events cannot duplicate a retained timestamp/seq.
+  // Replays and out-of-order arrivals retain the full dedup and rebuild path.
+  const sorted = eventAtEnd
+    ? [...current, event]
+    : [...current, event].sort(compareObserverEvents);
   const trimmed = sorted.length > MAX_OBSERVER_EVENTS;
   const final = trimmed
     ? sorted.slice(sorted.length - MAX_OBSERVER_EVENTS)
@@ -246,7 +276,6 @@ function appendAgentEvent(agentPubkey: string, event: ObserverEvent): boolean {
   // Determine whether the new event landed at the end of the sorted array.
   // If it did (common case), we can incrementally process just this event.
   // If not (out-of-order arrival) or if we trimmed, fall back to full rebuild.
-  const eventAtEnd = sorted[sorted.length - 1] === event;
 
   if (eventAtEnd && !trimmed) {
     // Fast path: incremental update
@@ -332,42 +361,6 @@ export function getArchivedChannelEvents(
   );
 }
 
-export function compareObserverEvents(
-  left: ObserverEvent,
-  right: ObserverEvent,
-) {
-  const leftTime = Date.parse(left.timestamp);
-  const rightTime = Date.parse(right.timestamp);
-  if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) {
-    const timeDiff = leftTime - rightTime;
-    if (timeDiff !== 0) {
-      return timeDiff;
-    }
-  }
-
-  return left.seq - right.seq;
-}
-
-/**
- * Returns true if `candidate` sorts strictly after `stored` using the same
- * two-key ordering as `compareObserverEvents`: later timestamp wins; equal
- * timestamp falls back to higher seq.  Extracted so latest-live advancement
- * cannot drift from transcript ordering.
- */
-export function isObserverEventAfter(
-  candidate: { timestamp: string; seq: number },
-  stored: { timestamp: string; seq: number },
-): boolean {
-  const candidateTime = Date.parse(candidate.timestamp);
-  const storedTime = Date.parse(stored.timestamp);
-  if (Number.isFinite(candidateTime) && Number.isFinite(storedTime)) {
-    if (candidateTime !== storedTime) {
-      return candidateTime > storedTime;
-    }
-  }
-  return candidate.seq > stored.seq;
-}
-
 // Observer event kind for a batch envelope wrapping multiple events. The ACP
 // harness publishes one frame per second; everything that accumulated between
 // ticks arrives as `{ kind: "batch", payload: { events: [...] } }` with every
@@ -422,6 +415,7 @@ function processLiveObserverEvent(
       });
     }
   }
+  dispatchProjectChannelRequest(agentPubkey, parsed.payload);
   const managementRequest = parseAgentManagementRequest(parsed.payload);
   if (managementRequest) {
     for (const listener of agentManagementListeners) {
@@ -495,6 +489,7 @@ export async function handleRelayObserverEvent(
       const innerEvents = unwrapObserverBatch(parsed);
       const telemetryEvents: ObserverEvent[] = [];
       for (const inner of innerEvents) {
+        if (dispatchProjectChannelRequest(agentPubkey, inner.payload)) continue;
         const managementRequest = parseAgentManagementRequest(inner.payload);
         if (managementRequest) {
           for (const listener of agentManagementListeners) {
@@ -677,11 +672,7 @@ function dispatchControlResult(agentPubkey: string, payload: unknown) {
   }
 }
 
-/**
- * Subscribe to `control_result` frames for a single agent. Returns an
- * unsubscribe function. Used by the ModelPicker to learn the async outcome of
- * a `switch_model` frame.
- */
+/** Subscribe to owner-review requests from verified observer frames. */
 export function subscribeAgentManagementRequests(
   listener: (agentPubkey: string, request: AgentManagementRequest) => void,
 ) {
@@ -932,6 +923,7 @@ export function resetAgentObserverStore() {
   startPromise = null;
   eventProcessingQueue = Promise.resolve();
   eventsByAgent.clear();
+  unorderedTimestampAgents.clear();
   transcriptByAgent.clear();
   snapshotByAgent.clear();
   archiveEventsByChannel.clear();
@@ -940,6 +932,7 @@ export function resetAgentObserverStore() {
   pendingUnknownAgentFrames.length = 0;
   latestLiveSessionByAgentChannel.clear();
   agentManagementListeners.clear();
+  resetProjectChannelRequests();
   onSessionConfigCaptured = null;
   ownerPubkey = null;
   connectionState = "idle";

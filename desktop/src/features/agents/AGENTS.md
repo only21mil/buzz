@@ -172,6 +172,12 @@ with a TypeScript lookup table or an id comparison in a component.
    locked to owner-only, including provider-backed agents. A provider backend
    does not prove remote execution and must never create a policy carve-out.
 
+12. **Thread-scoped ACP sessions are opt-in and apply at process start.** The
+    persisted desktop experiment defaults to channel scope. Local launches,
+    provider payloads and restart snapshots use the same policy after descriptor
+    overrides. Changing the setting requires restarting running agents. DMs
+    retain conversation scope.
+
 ## The tests that enforce this
 
 - `lib/agentConfigCore.test.mjs` — field model per harness × scope, clearing

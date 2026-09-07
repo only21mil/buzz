@@ -174,20 +174,24 @@ pub fn normalize_global_config_fields(config: &mut GlobalAgentConfig) {
     }
 }
 
-fn global_config_path(app: &AppHandle) -> Result<std::path::PathBuf, String> {
+fn global_config_path<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<std::path::PathBuf, String> {
     Ok(managed_agents_base_dir(app)?.join("global-agent-config.json"))
 }
 
 /// Load the global agent config from disk.
 ///
 /// Returns the default (all-empty) config if the file does not exist yet.
-pub fn load_global_agent_config(app: &AppHandle) -> Result<GlobalAgentConfig, String> {
+pub fn load_global_agent_config<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Result<GlobalAgentConfig, String> {
     let path = global_config_path(app)?;
     if !path.exists() {
         return Ok(GlobalAgentConfig::default());
     }
     let content = std::fs::read_to_string(&path)
         .map_err(|e| format!("failed to read global agent config: {e}"))?;
+    #[cfg(test)]
+    super::poll_read_probe::record_read(app, |probe| &probe.global);
     serde_json::from_str(&content).map_err(|e| format!("failed to parse global agent config: {e}"))
 }
 

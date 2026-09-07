@@ -402,6 +402,12 @@ pub(crate) async fn fetch_startup_catchup(
     let mut events = Vec::new();
     for row in rows {
         let event: Event = serde_json::from_value(row.clone()).map_err(RelayError::Json)?;
+        // REST catch-up must uphold the WebSocket EVENT verification boundary
+        // before channel routing, dedup, durable admission or owner controls.
+        if let Err(error) = buzz_core::verify_event(&event) {
+            tracing::warn!(event_id = %event.id, %error, "invalid inbox catch-up event; skipping");
+            continue;
+        }
         let Some(channel_id) = event.tags.iter().find_map(|tag| {
             let values = tag.as_slice();
             (values.first().map(|value| value.as_str()) == Some("h"))
@@ -416,7 +422,12 @@ pub(crate) async fn fetch_startup_catchup(
             if let Some(group_index) = channel_groups.get(&channel_id) {
                 *group_counts.entry(*group_index).or_default() += 1;
             }
-            events.push(BuzzEvent { channel_id, event });
+            // The caller binds REST catch-up to the connection generation at query start.
+            events.push(BuzzEvent {
+                connection_generation: 0,
+                channel_id,
+                event,
+            });
         }
     }
     events.sort_by(|left, right| {
@@ -457,6 +468,38 @@ mod tests {
             .custom_created_at(Timestamp::from(created_at))
             .sign_with_keys(keys)
             .unwrap()
+    }
+
+    #[test]
+    fn deferred_wake_widens_reads_without_retiring_or_replaying_terminal_ids() {
+        let root = std::env::temp_dir().join(format!("buzz-wake-cursor-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let keys = Keys::generate();
+        let channel = Uuid::new_v4();
+        let terminal = signed_event(&keys, channel, 980, "already completed");
+        let pending = signed_event(&keys, channel, 970, "published before deferred start");
+        let mut cursor = InboxCursorStore::load(&root, &keys.public_key().to_hex(), 900, 10);
+        assert!(cursor.begin_event(&terminal));
+        cursor.mark_processed_at([&terminal], 1000);
+        let disk = std::fs::read(cursor.path()).unwrap();
+        let mut restarted = InboxCursorStore::load(&root, &keys.public_key().to_hex(), 1000, 10);
+        let durable = restarted.catchup_since(1000, 1000).since;
+        assert_eq!(
+            crate::config::effective_startup_catchup_since(durable, 1000, Some(950)),
+            950
+        );
+        assert_eq!(
+            crate::config::effective_startup_catchup_since(800, 1000, Some(950)),
+            800
+        );
+        assert_eq!(
+            crate::config::effective_startup_catchup_since(durable, 1000, None),
+            durable
+        );
+        assert!(!restarted.begin_event(&terminal));
+        assert!(restarted.begin_event(&pending));
+        assert_eq!(std::fs::read(restarted.path()).unwrap(), disk);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -544,6 +587,163 @@ mod tests {
             keys,
             auth_tag_json: None,
         }
+    }
+
+    #[tokio::test]
+    async fn workflow_rest_replay_reauthorizes_and_queues_once_per_unfinished_attempt() {
+        use crate::workflow_auth::{
+            tests::{test_relay, workflow},
+            InboundAuthorGate,
+        };
+        use std::sync::{atomic::AtomicU64, Arc};
+        let temp =
+            std::env::temp_dir().join(format!("buzz-acp-workflow-replay-{}", Uuid::new_v4()));
+        let relay_keys = Keys::generate();
+        let agent_keys = Keys::generate();
+        let agent = agent_keys.public_key().to_hex();
+        let owner = Keys::generate().public_key().to_hex();
+        let channel = Uuid::new_v4();
+        let event = workflow(&relay_keys, &owner, &agent, channel, 0).event;
+        let server =
+            test_relay(serde_json::json!({"self": relay_keys.public_key().to_hex()})).await;
+        let cache = crate::OwnerCache::new(Some(owner.clone()));
+        let filters = HashMap::from([(
+            channel,
+            ChannelFilter {
+                kinds: Some(vec![9]),
+                require_mention: true,
+            },
+        )]);
+        let rules = vec![crate::filter::SubscriptionRule {
+            kinds: vec![9],
+            require_mention: true,
+            ..Default::default()
+        }];
+        for attempt in 0..2 {
+            let mut gate =
+                InboundAuthorGate::connect(&server.rest, &agent, Arc::new(AtomicU64::new(0))).await;
+            let mut store = InboxCursorStore::load(&temp, &agent, 0, 10);
+            let rest =
+                mock_query_rest(agent_keys.clone(), vec![event.clone(), event.clone()]).await;
+            let mut caught = fetch_startup_catchup(&rest, &filters, &agent, 0, 10)
+                .await
+                .unwrap();
+            assert_eq!(caught.events.len(), 1);
+            let buzz_event = caught.events.pop_front().unwrap();
+            assert!(store.begin_event(&buzz_event.event));
+            let (decision, effective) = gate
+                .evaluate(
+                    &buzz_event,
+                    &crate::RespondTo::OwnerOnly,
+                    &std::collections::HashSet::new(),
+                    false,
+                    &cache,
+                    &server.rest,
+                )
+                .await;
+            assert!(decision.is_allowed());
+            assert_eq!(effective, owner);
+            let prompt_tag = crate::filter::match_event(&buzz_event.event, channel, &rules, &agent)
+                .await
+                .unwrap();
+            assert!(matches!(
+                crate::mode_gate_signal(
+                    crate::MultipleEventHandling::OwnerInterrupt,
+                    &effective,
+                    cache.get()
+                ),
+                Some(crate::ControlSignal::Interrupt)
+            ));
+            let mut queue = crate::EventQueue::new(crate::DedupMode::Queue);
+            assert!(queue.push(crate::queue::QueuedEvent {
+                channel_id: channel,
+                scope: crate::scope::SessionScope::Conversation {
+                    channel_id: channel
+                },
+                event: buzz_event.event.clone(),
+                received_at: std::time::Instant::now(),
+                prompt_tag: prompt_tag.prompt_tag,
+            }));
+            assert!(
+                !store.begin_event(&event),
+                "overlapping live replay must not enqueue twice"
+            );
+            let batch = queue.flush_next().unwrap();
+            assert_eq!(batch.events.len(), 1);
+            assert_eq!(batch.events[0].event.id, event.id);
+            assert_eq!(
+                batch.events[0].event.pubkey,
+                relay_keys.public_key(),
+                "prompt retains actual signer"
+            );
+            if attempt == 1 {
+                store.mark_processed([&event]);
+            }
+        }
+        let mut completed = InboxCursorStore::load(&temp, &agent, 0, 10);
+        assert!(!completed.begin_event(&event));
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[tokio::test]
+    async fn forged_rest_events_cannot_poison_admission_controls_or_replay() {
+        let temp = std::env::temp_dir().join(format!("buzz-acp-inbox-{}", Uuid::new_v4()));
+        let keys = Keys::generate();
+        let channel = Uuid::new_v4();
+        let pubkey = keys.public_key().to_hex();
+        let valid = signed_event(&keys, channel, 100, "valid mention");
+        let mut forged_command = valid.clone();
+        forged_command.content = "!shutdown".into();
+        // A matching claimed event ID cannot preempt the later valid event.
+        let mut forged_signature = valid.clone();
+        forged_signature.sig = signed_event(&Keys::generate(), channel, 100, "other").sig;
+        let mut forged_author = valid.clone();
+        forged_author.pubkey = Keys::generate().public_key();
+        let filters = HashMap::from([(
+            channel,
+            ChannelFilter {
+                kinds: Some(vec![1]),
+                require_mention: true,
+            },
+        )]);
+        let mut store = InboxCursorStore::load(&temp, &pubkey, 95, 10);
+        let rest = mock_query_rest(
+            keys.clone(),
+            vec![
+                forged_command,
+                forged_signature,
+                forged_author,
+                valid.clone(),
+            ],
+        )
+        .await;
+        let caught = fetch_startup_catchup(&rest, &filters, &pubkey, 95, 10)
+            .await
+            .unwrap();
+        assert_eq!(caught.events.len(), 1);
+        assert_eq!(caught.events[0].event.content, "valid mention");
+        assert_eq!(caught.events[0].event.id, valid.id);
+        assert!(store.begin_event(&caught.events[0].event));
+        assert!(
+            !store.begin_event(&valid),
+            "live overlap must remain deduplicated"
+        );
+        drop(store);
+        // An unfinished valid event remains eligible after a crash.
+        let mut restarted = InboxCursorStore::load(&temp, &pubkey, 95, 10);
+        let rest = mock_query_rest(keys.clone(), vec![valid.clone()]).await;
+        let caught = fetch_startup_catchup(&rest, &filters, &pubkey, 95, 10)
+            .await
+            .unwrap();
+        assert!(restarted.begin_event(&caught.events[0].event));
+        restarted.mark_processed_at([&caught.events[0].event], 110);
+        drop(restarted);
+        let mut completed = InboxCursorStore::load(&temp, &pubkey, 95, 10);
+        assert!(
+            !completed.begin_event(&valid),
+            "terminal event must survive restart dedup"
+        );
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[tokio::test]

@@ -170,7 +170,14 @@ pub async fn read_workflow_state(
     .bind(community_id.as_uuid())
     .bind(workflow_id)
     .bind(key)
-    .fetch_optional(pool)
+    .fetch_optional(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Workflow,
+        )
+        .await?,
+    )
     .await?
     .map(row_to_entry)
     .transpose()
@@ -195,7 +202,14 @@ pub async fn read_workflow_state_for_run(
     .bind(community_id.as_uuid())
     .bind(run_id)
     .bind(key)
-    .fetch_optional(pool)
+    .fetch_optional(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Workflow,
+        )
+        .await?,
+    )
     .await?
     .ok_or_else(|| DbError::NotFound(format!("workflow_run {run_id}")))?;
     let value: Option<String> = row.try_get("value")?;
@@ -235,7 +249,14 @@ pub async fn purge_expired_workflow_state(pool: &PgPool, limit: u32) -> Result<u
         "#,
     )
     .bind(limit)
-    .execute(pool)
+    .execute(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Workflow,
+        )
+        .await?,
+    )
     .await?
     .rows_affected();
     Ok(deleted)
@@ -275,7 +296,8 @@ pub async fn write_workflow_state(
         expected_revision,
     )?;
 
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::observability::begin(pool, crate::observability::Operation::Workflow).await?;
     let workflow_id: Uuid =
         sqlx::query_scalar("SELECT workflow_id FROM workflow_runs WHERE community_id=$1 AND id=$2")
             .bind(community_id.as_uuid())
@@ -643,7 +665,7 @@ mod tests {
     async fn postgres_receipt_replays_before_deriving_a_new_deadline() {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".into());
+            .expect("explicit isolated test database URL required");
         let pool = PgPool::connect(&database_url)
             .await
             .expect("connect to test DB");

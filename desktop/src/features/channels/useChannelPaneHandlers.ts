@@ -1,3 +1,4 @@
+import type { PublicationScope } from "@/shared/api/publicationScope";
 import * as React from "react";
 
 import type {
@@ -151,6 +152,7 @@ export function useChannelPaneHandlers({
       mediaTags?: string[][],
       mentionPubkeys?: string[],
       capturedEventId?: string,
+      publicationScope?: PublicationScope,
     ) => {
       const eventId = capturedEventId ?? editTargetIdRef.current;
       if (!eventId) {
@@ -174,6 +176,7 @@ export function useChannelPaneHandlers({
       }
 
       await editMessageMutation.mutateAsync({
+        publicationScope,
         eventId,
         content,
         mediaTags,
@@ -276,12 +279,19 @@ export function useChannelPaneHandlers({
       mentionPubkeys: string[],
       mediaTags?: string[][],
       channelId?: string | null,
+      _threadContext?: {
+        parentEventId: string | null;
+        threadHeadId: string | null;
+      } | null,
+      _forceRest?: boolean,
+      publicationScope?: PublicationScope,
     ) => {
       await sendMutateRef.current({
         content,
         mentionPubkeys,
         mediaTags,
         channelId: channelId ?? undefined,
+        publicationScope,
       });
     },
     [],
@@ -297,6 +307,8 @@ export function useChannelPaneHandlers({
         parentEventId: string | null;
         threadHeadId: string | null;
       } | null,
+      _forceRest?: boolean,
+      publicationScope?: PublicationScope,
     ) => {
       // Resolve target using captured submit-time context (race-free) or live
       // refs (legacy path). When threadContext is supplied, no live-ref reads
@@ -329,6 +341,7 @@ export function useChannelPaneHandlers({
         parentEventId,
         mediaTags,
         channelId: channelId ?? undefined,
+        publicationScope,
       });
 
       // Only update thread UI state if the user is still viewing the same

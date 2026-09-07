@@ -228,3 +228,32 @@ test("oversized content and active searches parse fresh without entering the cac
     "non-cacheable parses must not evict an existing cache entry",
   );
 });
+
+test("single-character scoped search stays on lexeme boundaries", () => {
+  const count = getMarkdownNodeCacheSizeForTests();
+  const weight = getMarkdownNodeCacheWeightForTests();
+  const html = renderToStaticMarkup(
+    renderCachedMarkdown({ ...BASE, content: "A plan", searchQuery: "a" }),
+  );
+
+  assert.equal((html.match(/data-search-match="true"/g) ?? []).length, 1);
+  assert.equal(getMarkdownNodeCacheSizeForTests(), count);
+  assert.equal(getMarkdownNodeCacheWeightForTests(), weight);
+});
+
+test("active search queries bypass the cache and highlight every match", () => {
+  clearMarkdownNodeCache();
+  const input = {
+    ...BASE,
+    content: "Bold and bold, but not code `bold`.",
+    searchQuery: "bold",
+  };
+  const first = renderCachedMarkdown(input);
+  const second = renderCachedMarkdown(input);
+  const html = renderToStaticMarkup(first);
+
+  assert.notEqual(first, second);
+  assert.equal((html.match(/data-search-match="true"/g) ?? []).length, 2);
+  assert.match(html, /bg-yellow-300/);
+  assert.match(html, /<code>bold<\/code>/);
+});

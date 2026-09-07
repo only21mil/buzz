@@ -1,3 +1,6 @@
+import { useIncrementalMount } from "@/shared/hooks/useIncrementalMount";
+import { isTauri } from "@tauri-apps/api/core";
+import { canDeleteProject } from "../projectDeletion";
 import * as React from "react";
 import { toast } from "sonner";
 
@@ -15,7 +18,6 @@ import {
   useProjectsWorkItemsQuery,
 } from "@/features/projects/hooks";
 import { useRepositoryActivitySummariesQuery } from "@/features/projects/repositoryActivityHooks";
-import { useCreateProjectMutation } from "@/features/projects/useCreateProject";
 import { selectProjectRepository } from "@/features/projects/projectModels";
 import { useProjectsRepoSnapshotsQuery } from "@/features/projects/useProjectsRepoSnapshots";
 import {
@@ -33,7 +35,7 @@ import {
   ProjectGridCard,
   ProjectListRow,
 } from "@/features/projects/ui/ProjectCards";
-import { CreateProjectDialog } from "@/features/projects/ui/CreateProjectDialog";
+import { ProjectCreationDialog } from "@/features/projects/ui/ProjectCreationDialog";
 import { CreateProjectIssueDialog } from "@/features/projects/ui/CreateProjectIssueDialog";
 import { CreatePullRequestDialog } from "@/features/projects/ui/CreatePullRequestDialog";
 import { ProjectsCreateMenu } from "@/features/projects/ui/ProjectsCreateMenu";
@@ -56,7 +58,6 @@ import {
   getProjectUpdatedAt,
   isProjectAccessibleToViewer,
   isProjectMine,
-  isProjectOwnedByCurrentUser,
   isRepositoryAccessibleToViewer,
   projectHasAgent,
   projectOwnerIsUser,
@@ -196,7 +197,6 @@ export function ProjectsView() {
   const [createIssueOpen, setCreateIssueOpen] = React.useState(false);
   const [createPullRequestOpen, setCreatePullRequestOpen] =
     React.useState(false);
-  const createProjectMutation = useCreateProjectMutation();
   const [storedViewMode, setStoredViewMode] =
     React.useState<ProjectsViewMode | null>(() => readStoredViewMode());
   const [sort, setSort] = React.useState<ProjectsSort>(() => readStoredSort());
@@ -573,12 +573,31 @@ export function ProjectsView() {
     [deleteProjectMutation],
   );
 
+  const projectMountCount = useIncrementalMount(visibleProjects.length);
+  const repositoryMountCount = useIncrementalMount(visibleRepositories.length);
+
+  // Keep the form and mutation mounted at the same position through refreshes.
+  const withProjectCreationDialog = (content: React.ReactNode) => (
+    <>
+      <ProjectCreationDialog
+        onCreated={() => {
+          // Keep the fork's complete-list landing after either entry point.
+          handleRepositoryScopeChange("all");
+          handleFilterChange("projects");
+        }}
+        onOpenChange={setCreateProjectOpen}
+        open={createProjectOpen}
+      />
+      {content}
+    </>
+  );
+
   if (projectsQuery.isLoading) {
-    return <ViewLoadingFallback kind="projects" />;
+    return withProjectCreationDialog(<ViewLoadingFallback kind="projects" />);
   }
 
-  if (projectsQuery.isError) {
-    return (
+  if (projectsQuery.isError && !projectsQuery.data) {
+    return withProjectCreationDialog(
       <div className="flex flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
         <p className="text-sm text-red-400">Failed to load projects</p>
         <Button
@@ -588,12 +607,31 @@ export function ProjectsView() {
         >
           Retry
         </Button>
-      </div>
+      </div>,
     );
   }
 
   if (projects.length === 0) {
-    return <EmptyState />;
+    return withProjectCreationDialog(
+      <>
+        {projectsQuery.isError ? (
+          <div
+            role="status"
+            className="px-4 py-2 text-sm text-muted-foreground"
+          >
+            Project refresh failed. Showing saved rows.{" "}
+            <Button
+              onClick={() => void projectsQuery.refetch()}
+              size="sm"
+              variant="ghost"
+            >
+              Retry
+            </Button>
+          </div>
+        ) : null}
+        <EmptyState onCreateProject={() => setCreateProjectOpen(true)} />
+      </>,
+    );
   }
 
   const projectItems =
@@ -606,12 +644,16 @@ export function ProjectsView() {
           filter !== "all" && "xl:grid-cols-3",
         )}
       >
-        {visibleProjects.map((project) => {
+        {visibleProjects.slice(0, projectMountCount).map((project) => {
           const summary = activitySummariesQuery.data?.[project.id];
           const repoSnapshot = repoSnapshotsQuery.data?.snapshots?.[project.id];
           return (
             <ProjectGridCard
-              canDelete={isProjectOwnedByCurrentUser(project, currentPubkey)}
+              canDelete={
+                isTauri() &&
+                !project.legacy &&
+                canDeleteProject(project, currentPubkey, profiles)
+              }
               deleteDisabled={deleteProjectMutation.isPending}
               hasLocal={hasLocalCheckout(project, localRepoNames)}
               key={project.id}
@@ -635,12 +677,16 @@ export function ProjectsView() {
         className="divide-y divide-border/60"
         data-testid="projects-list-container"
       >
-        {visibleProjects.map((project) => {
+        {visibleProjects.slice(0, projectMountCount).map((project) => {
           const summary = activitySummariesQuery.data?.[project.id];
           const repoSnapshot = repoSnapshotsQuery.data?.snapshots?.[project.id];
           return (
             <ProjectListRow
-              canDelete={isProjectOwnedByCurrentUser(project, currentPubkey)}
+              canDelete={
+                isTauri() &&
+                !project.legacy &&
+                canDeleteProject(project, currentPubkey, profiles)
+              }
               deleteDisabled={deleteProjectMutation.isPending}
               hasLocal={hasLocalCheckout(project, localRepoNames)}
               key={project.id}
@@ -666,37 +712,41 @@ export function ProjectsView() {
       <EmptyFilteredState />
     ) : viewMode === "grid" ? (
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-        {visibleRepositories.map(({ project, repository }) => (
-          <RepositoryGridCard
-            hasLocal={hasLocalRepositoryCheckout(repository, localRepoNames)}
-            key={repository.repoAddress}
-            onOpen={handleOpenRepository}
-            onOpenTerminal={handleOpenRepositoryTerminal}
-            profiles={profiles}
-            project={project}
-            repository={repository}
-            summary={
-              repositoryActivitySummariesQuery.data?.[repository.repoAddress]
-            }
-          />
-        ))}
+        {visibleRepositories
+          .slice(0, repositoryMountCount)
+          .map(({ project, repository }) => (
+            <RepositoryGridCard
+              hasLocal={hasLocalRepositoryCheckout(repository, localRepoNames)}
+              key={repository.repoAddress}
+              onOpen={handleOpenRepository}
+              onOpenTerminal={handleOpenRepositoryTerminal}
+              profiles={profiles}
+              project={project}
+              repository={repository}
+              summary={
+                repositoryActivitySummariesQuery.data?.[repository.repoAddress]
+              }
+            />
+          ))}
       </div>
     ) : (
       <div className="divide-y divide-border/60">
-        {visibleRepositories.map(({ project, repository }) => (
-          <RepositoryListRow
-            hasLocal={hasLocalRepositoryCheckout(repository, localRepoNames)}
-            key={repository.repoAddress}
-            onOpen={handleOpenRepository}
-            onOpenTerminal={handleOpenRepositoryTerminal}
-            profiles={profiles}
-            project={project}
-            repository={repository}
-            summary={
-              repositoryActivitySummariesQuery.data?.[repository.repoAddress]
-            }
-          />
-        ))}
+        {visibleRepositories
+          .slice(0, repositoryMountCount)
+          .map(({ project, repository }) => (
+            <RepositoryListRow
+              hasLocal={hasLocalRepositoryCheckout(repository, localRepoNames)}
+              key={repository.repoAddress}
+              onOpen={handleOpenRepository}
+              onOpenTerminal={handleOpenRepositoryTerminal}
+              profiles={profiles}
+              project={project}
+              repository={repository}
+              summary={
+                repositoryActivitySummariesQuery.data?.[repository.repoAddress]
+              }
+            />
+          ))}
       </div>
     );
 
@@ -775,13 +825,25 @@ export function ProjectsView() {
     </div>
   );
 
-  return (
+  return withProjectCreationDialog(
     <div
       className={cn(
         "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-tl-xl",
         topChromeInset.divider,
       )}
     >
+      {projectsQuery.isError ? (
+        <div role="status" className="px-4 py-2 text-sm text-muted-foreground">
+          Project refresh failed. Showing saved rows.{" "}
+          <Button
+            onClick={() => void projectsQuery.refetch()}
+            size="sm"
+            variant="ghost"
+          >
+            Retry
+          </Button>
+        </div>
+      ) : null}
       {/* Scroll indicator painted over the scrollbar gutter; only visible
           while scrolling (native thumb is transparent). */}
       <div
@@ -792,24 +854,6 @@ export function ProjectsView() {
       {/* Create button pinned to the pane's top-right corner: it never
           scrolls with the page, it just stays put. */}
       <div className="absolute right-4 top-4 z-40">{createMenu}</div>
-      <CreateProjectDialog
-        isCreating={createProjectMutation.isPending}
-        onCreate={async (input) => {
-          const result = await createProjectMutation.mutateAsync(input);
-          if (result.compatibilityWarning) {
-            toast.warning("Created as a standalone project", {
-              description: result.compatibilityWarning,
-            });
-          } else {
-            toast.success(`Project "${result.project.name}" created.`);
-          }
-          // Land on the complete project list after creation.
-          handleRepositoryScopeChange("all");
-          handleFilterChange("projects");
-        }}
-        onOpenChange={setCreateProjectOpen}
-        open={createProjectOpen}
-      />
       {createPullRequestOpen ? (
         <CreatePullRequestDialog
           onCreated={async (
@@ -934,6 +978,6 @@ export function ProjectsView() {
           </div>
         </div>
       </div>
-    </div>
+    </div>,
   );
 }

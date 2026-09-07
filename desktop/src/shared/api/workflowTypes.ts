@@ -2,10 +2,12 @@ export type WorkflowStatus = "active" | "disabled" | "archived";
 
 export type Workflow = {
   id: string;
+  revision: string;
   name: string;
   ownerPubkey: string;
   channelId: string | null;
   definition: Record<string, unknown>;
+  yamlDefinition?: string;
   status: WorkflowStatus;
   createdAt: number;
   updatedAt: number;
@@ -42,6 +44,7 @@ export type WorkflowRun = {
   executionTrace: TraceEntry[];
   startedAt: number | null;
   completedAt: number | null;
+  errorCode?: string | null;
   errorMessage: string | null;
   createdAt: number;
 };
@@ -50,10 +53,12 @@ export type WorkflowApprovalStatus =
   | "pending"
   | "granted"
   | "denied"
-  | "expired";
+  | "expired"
+  | "unsatisfiable";
 
 export type WorkflowApproval = {
-  token: string;
+  /** Display reference only; never a signed decision token. */
+  approvalRef: string;
   workflowId: string;
   runId: string;
   stepId: string;
@@ -78,4 +83,11 @@ export type ApprovalActionResponse = {
   status: string;
   runId: string;
   workflowId: string;
+};
+
+/** Opaque keyset returned by the relay; preserve timestamp precision. */
+export type WorkflowRunsCursor = { before: string; before_id: string };
+export type WorkflowRunsPage = {
+  runs: WorkflowRun[];
+  next: WorkflowRunsCursor | null;
 };

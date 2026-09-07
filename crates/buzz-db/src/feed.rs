@@ -311,12 +311,10 @@ mod tests {
     use nostr::{EventBuilder, Keys, Kind, Tag};
     use uuid::Uuid;
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1 -- local test-only credentials
-
     async fn setup_pool() -> PgPool {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+            .expect("explicit isolated test database URL required");
 
         PgPool::connect(&database_url)
             .await

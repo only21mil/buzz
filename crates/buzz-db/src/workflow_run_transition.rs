@@ -93,7 +93,14 @@ pub async fn transition_workflow_run(
     .bind(id)
     .bind(expected_status.to_string())
     .bind(expected_generation)
-    .fetch_optional(pool)
+    .fetch_optional(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Workflow,
+        )
+        .await?,
+    )
     .await?;
 
     match row {
@@ -144,7 +151,14 @@ pub async fn list_recoverable_workflow_resumes(
     )
     .bind(resume_pending_age_secs)
     .bind(limit)
-    .fetch_all(pool)
+    .fetch_all(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Workflow,
+        )
+        .await?,
+    )
     .await?;
 
     rows.into_iter()
@@ -201,7 +215,14 @@ pub async fn claim_workflow_resume(
     .bind(id)
     .bind(expected_status.to_string())
     .bind(expected_generation)
-    .fetch_optional(pool)
+    .fetch_optional(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Workflow,
+        )
+        .await?,
+    )
     .await?;
 
     match row {
@@ -236,7 +257,14 @@ pub async fn renew_workflow_resume_lease(
     .bind(community_id.as_uuid())
     .bind(id)
     .bind(expected_generation)
-    .execute(pool)
+    .execute(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Workflow,
+        )
+        .await?,
+    )
     .await?
     .rows_affected();
     Ok(affected == 1)
@@ -258,6 +286,7 @@ pub async fn complete_running_workflow_run(
             current_step = $1,
             execution_trace = $2,
             error_message = NULL,
+            error_code = NULL,
             completed_at = clock_timestamp(),
             resume_lease_expires_at = NULL,
             generation = generation + 1
@@ -273,7 +302,14 @@ pub async fn complete_running_workflow_run(
     .bind(community_id.as_uuid())
     .bind(id)
     .bind(expected_generation)
-    .fetch_optional(pool)
+    .fetch_optional(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Workflow,
+        )
+        .await?,
+    )
     .await?;
 
     match row {
@@ -299,6 +335,32 @@ pub async fn fail_running_workflow_run(
     trace: &serde_json::Value,
     error: &str,
 ) -> Result<WorkflowRunTransitionOutcome> {
+    fail_running_workflow_run_with_failure(
+        pool,
+        community_id,
+        id,
+        expected_generation,
+        current_step,
+        trace,
+        crate::workflow::WorkflowRunFailure {
+            code: "workflow_failed",
+            message: error,
+        },
+    )
+    .await
+}
+
+/// Persist structured failure under the running generation fence.
+pub async fn fail_running_workflow_run_with_failure(
+    pool: &PgPool,
+    community_id: CommunityId,
+    id: Uuid,
+    expected_generation: i64,
+    current_step: i32,
+    trace: &serde_json::Value,
+    failure: crate::workflow::WorkflowRunFailure<'_>,
+) -> Result<WorkflowRunTransitionOutcome> {
+    let error = failure.message;
     let row = sqlx::query(
         r#"
         UPDATE workflow_runs
@@ -306,6 +368,7 @@ pub async fn fail_running_workflow_run(
             current_step = $1,
             execution_trace = $2,
             error_message = $3,
+            error_code = $7,
             completed_at = NOW(),
             resume_lease_expires_at = NULL,
             generation = generation + 1
@@ -322,7 +385,15 @@ pub async fn fail_running_workflow_run(
     .bind(community_id.as_uuid())
     .bind(id)
     .bind(expected_generation)
-    .fetch_optional(pool)
+    .bind(failure.code)
+    .fetch_optional(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Workflow,
+        )
+        .await?,
+    )
     .await?;
 
     match row {
@@ -338,12 +409,10 @@ mod tests {
     use super::*;
     use crate::user::ensure_user;
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
-
     async fn setup_pool() -> PgPool {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+            .expect("explicit isolated test database URL required");
 
         PgPool::connect(&database_url)
             .await

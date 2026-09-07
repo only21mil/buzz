@@ -101,11 +101,19 @@ test("a non-empty edit still edits and never deletes", async ({ page }) => {
   const input = page.getByTestId("message-input");
   await expect(input).not.toBeEmpty({ timeout: 5_000 });
   const editedContent = `Edited, not deleted ${Date.now()}`;
-
+  // Loading the original #general can open channel autocomplete. Hold its
+  // debounce clock after it opens, then replace the body and submit before
+  // that old query can settle. Enter must save, never insert stale #general.
+  await expect(
+    page.getByRole("button", { name: "#general stream", exact: true }),
+  ).toBeVisible();
   await input.click();
+  await page.clock.install();
+  await page.clock.pauseAt(new Date());
   await page.keyboard.press("ControlOrMeta+A");
   await page.keyboard.type(editedContent);
   await page.keyboard.press("Enter");
+  await page.clock.runFor(119);
 
   // No delete confirmation, edit mode exits, the row survives with new text.
   await expect(page.getByRole("alertdialog")).toHaveCount(0);

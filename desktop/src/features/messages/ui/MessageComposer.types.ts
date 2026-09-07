@@ -1,15 +1,35 @@
+import type { PublicationScope } from "@/shared/api/publicationScope";
 import type { ReactNode } from "react";
 
+import type { DraftMentionRef } from "@/features/messages/lib/useDrafts";
 import type { ImetaMedia } from "@/features/messages/lib/imetaMediaMarkdown";
 import type { MediaUploadController } from "@/features/messages/lib/useMediaUpload";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import type { ChannelType } from "@/shared/api/types";
 
+export type MessageComposerEditTarget = {
+  author: string;
+  body: string;
+  id: string;
+  isThreadReply?: boolean;
+  /**
+   * NIP-92 imeta attachments on the original event, in tag order. Loaded
+   * into the composer's pending-imeta state on edit-open so the user sees
+   * them as removable thumbnails (just like the send path) and can add
+   * more. The submit path emits a fresh full imeta tag set on the edit
+   * event; the receiver overlays it.
+   */
+  imetaMedia?: ImetaMedia[];
+  mentionRefs?: DraftMentionRef[];
+  unresolvedMentionPubkeys?: string[];
+  /** Historical alias candidates, for retention only; never notifying bindings. */
+  unresolvedMentionRefs?: DraftMentionRef[];
+};
+
 export type MessageComposerProps = {
   audienceContext?: {
+    rootTags?: readonly string[][];
     type: "thread";
-    threadRootId: string;
-    initialAgentPubkeys?: readonly string[];
   } | null;
   channelId?: string | null;
   channelName: string;
@@ -36,21 +56,11 @@ export type MessageComposerProps = {
   autoSubmitDraftKey?: string | null;
   /** Called when the auto-submit fires so the parent can clear the trigger. */
   onAutoSubmitComplete?: () => void;
-  editTarget?: {
-    author: string;
-    body: string;
-    id: string;
-    /**
-     * NIP-92 imeta attachments on the original event, in tag order. Loaded
-     * into the composer's pending-imeta state on edit-open so the user sees
-     * them as removable thumbnails (just like the send path) and can add
-     * more. The submit path emits a fresh full imeta tag set on the edit
-     * event; the receiver overlays it.
-     */
-    imetaMedia?: ImetaMedia[];
-  } | null;
+  editTarget?: MessageComposerEditTarget | null;
   isSending?: boolean;
   mediaController?: MediaUploadController;
+  /** Reports whether a surrounding drop zone may add an attachment. */
+  onAttachmentAcceptanceChange?: (acceptsAttachment: boolean) => void;
   onDeferredEditPendingChange?: (isPending: boolean) => void;
   onCancelEdit?: () => void;
   onCancelReply?: () => void;
@@ -69,6 +79,7 @@ export type MessageComposerProps = {
     mentionPubkeys?: string[],
     /** Target captured when the edit was submitted; avoids a later ref swap. */
     eventId?: string,
+    publicationScope?: PublicationScope,
   ) => Promise<void>;
   /** Captures send context synchronously before awaits can change navigation. */
   onCaptureSendContext?: () => {
@@ -86,9 +97,14 @@ export type MessageComposerProps = {
       parentEventId: string | null;
       threadHeadId: string | null;
     } | null,
+    /** Route through the REST publisher even when best-effort enrichment settled empty. */
+    forceRest?: boolean,
+    publicationScope?: PublicationScope,
   ) => Promise<void>;
   placeholder?: string;
   profiles?: UserProfileLookup;
+  /** Explicit mention pubkeys from the loaded channel window, newest first. */
+  recentMentionPubkeys?: readonly string[];
   replyTarget?: {
     author: string;
     body: string;

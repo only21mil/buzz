@@ -31,10 +31,14 @@ use crate::{
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct WorkflowWire {
     pub id: String,
+    /// Event id of the current kind:30620 revision, used for conflict-protected updates.
+    pub revision: String,
     pub name: String,
     pub owner_pubkey: String,
     pub channel_id: Option<String>,
     pub definition: Value,
+    /// Original YAML, retained for lossless edits of unsupported fields and comments.
+    pub yaml_definition: String,
     pub status: String,
     pub created_at: i64,
     pub updated_at: i64,
@@ -144,42 +148,43 @@ pub async fn get_channel_workflows(
     )
 }
 
-/// Fetch workflows across many channels in a single relay round-trip.
-///
-/// The Workflows overview screen previously issued one `get_channel_workflows`
-/// query per member channel (`Promise.all` fanout in `WorkflowsView`), i.e. N
-/// relay POSTs. A nostr `#h` filter matches ANY of its listed values, so one
-/// query with all channel ids returns the same set. Each `WorkflowWire` carries
-/// its own `channel_id` (from the event's `h` tag), so the frontend can still
-/// group results by channel. Both commands page definitions and tombstones to
-/// exhaustion with the relay's composite cursor.
+/// Fetch definitions with single-channel filters for older relays, paging each
+/// independently in bounded batches. Fold the complete tombstone stream once.
 #[tauri::command]
 pub async fn get_channels_workflows(
     channel_ids: Vec<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<WorkflowWire>, String> {
-    if channel_ids.is_empty() {
+    use futures_util::{StreamExt, TryStreamExt};
+    let filters = workflow_channel_filters(channel_ids);
+    if filters.is_empty() {
         return Ok(Vec::new());
     }
-
-    let events = query_workflow_events(
-        &state,
-        [
-            serde_json::json!({
-                "kinds": [30620],
-                "#h": channel_ids,
-            }),
-            serde_json::json!({ "kinds": [5] }),
-        ],
-    )
-    .await?;
-
+    let state_ref = &*state;
+    let mut events: Vec<nostr::Event> = futures_util::stream::iter(filters)
+        .map(|filter| async move { query_workflow_events(state_ref, [filter]).await })
+        .buffered(128)
+        .try_collect::<Vec<Vec<nostr::Event>>>()
+        .await?
+        .into_iter()
+        .flatten()
+        .collect();
+    events.extend(query_workflow_events(state_ref, [serde_json::json!({"kinds": [5]})]).await?);
     Ok(
         buzz_sdk_pkg::workflow_fold::fold_workflow_definitions(&events)
             .into_iter()
             .map(workflow_from_event)
             .collect(),
     )
+}
+
+fn workflow_channel_filters(channel_ids: Vec<String>) -> Vec<Value> {
+    let mut seen = std::collections::HashSet::new();
+    channel_ids
+        .into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .map(|id| serde_json::json!({"kinds": [30620], "#h": [id]}))
+        .collect()
 }
 
 #[tauri::command]
@@ -207,15 +212,60 @@ pub async fn get_workflow(
 pub async fn get_workflow_runs(
     workflow_id: String,
     limit: Option<u32>,
+    page: Option<bool>,
+    before: Option<String>,
+    before_id: Option<String>,
     state: State<'_, AppState>,
-) -> Result<Vec<Value>, String> {
+) -> Result<Value, String> {
     let workflow_id = uuid::Uuid::parse_str(&workflow_id)
         .map_err(|_| "workflow ID must be a UUID".to_string())?;
-    let path = workflow_runs_path(workflow_id, limit);
-    let url = format!("{}{}", relay_api_base_url_with_override(&state), path);
+    let path = workflow_history_path(
+        workflow_id,
+        limit,
+        page.unwrap_or(false),
+        before.as_deref(),
+        before_id.as_deref(),
+    )?;
+    read_workflow_history(&state, &path).await
+}
 
+fn workflow_history_path(
+    workflow_id: uuid::Uuid,
+    limit: Option<u32>,
+    page: bool,
+    before: Option<&str>,
+    before_id: Option<&str>,
+) -> Result<String, String> {
+    if before.is_some() != before_id.is_some() {
+        return Err("before and before_id must be supplied together".into());
+    }
+    let mut url = reqwest::Url::parse(&format!(
+        "http://localhost{}",
+        workflow_runs_path(workflow_id, limit)
+    ))
+    .map_err(|error| error.to_string())?;
+    if page {
+        url.query_pairs_mut().append_pair("page", "true");
+    }
+    if let (Some(before), Some(before_id)) = (before, before_id) {
+        chrono::DateTime::parse_from_rfc3339(before)
+            .map_err(|_| "invalid history timestamp".to_string())?;
+        uuid::Uuid::parse_str(before_id).map_err(|_| "invalid history run ID".to_string())?;
+        url.query_pairs_mut()
+            .append_pair("before", before)
+            .append_pair("before_id", before_id);
+    }
+    Ok(format!(
+        "{}?{}",
+        url.path(),
+        url.query().unwrap_or_default()
+    ))
+}
+
+async fn read_workflow_history(state: &AppState, path: &str) -> Result<Value, String> {
+    let url = format!("{}{}", relay_api_base_url_with_override(state), path);
     crate::relay_admission::wait_for_rate_limit().await;
-    let auth = build_nip98_auth_header(&Method::GET, &url, &[], &state)?;
+    let auth = build_nip98_auth_header(&Method::GET, &url, &[], state)?;
     let response = state
         .http_client
         .get(&url)
@@ -223,11 +273,9 @@ pub async fn get_workflow_runs(
         .send()
         .await
         .map_err(|error| crate::relay::classify_request_error(&error))?;
-
     if !response.status().is_success() {
         return Err(relay_error_message(response).await);
     }
-
     parse_json_response(response).await
 }
 
@@ -240,7 +288,8 @@ pub async fn create_workflow(
     state: State<'_, AppState>,
 ) -> Result<WorkflowSaveWire, String> {
     let workflow_id = uuid::Uuid::new_v4().to_string();
-    let builder = events::build_workflow_definition(&workflow_id, &channel_id, &yaml_definition)?;
+    let builder =
+        events::build_workflow_definition(&workflow_id, &channel_id, &yaml_definition, None)?;
     let result = submit_event(builder, &state).await?;
 
     // The relay returns `webhook_secret` in the OK response message for
@@ -258,6 +307,7 @@ pub async fn create_workflow(
     let now = now_secs();
     let workflow = workflow_record(
         workflow_id,
+        result.event_id,
         Some(channel_id),
         current_pubkey_hex(&state)?,
         &yaml_definition,
@@ -275,6 +325,7 @@ pub async fn create_workflow(
 pub async fn update_workflow(
     workflow_id: String,
     yaml_definition: String,
+    expected_revision: String,
     state: State<'_, AppState>,
 ) -> Result<WorkflowSaveWire, String> {
     // Find the channel id (and creation time) from the existing workflow event
@@ -293,15 +344,24 @@ pub async fn update_workflow(
     let prior_event = prior
         .first()
         .ok_or_else(|| "workflow not found".to_string())?;
+    if prior_event.id.to_hex() != expected_revision {
+        return Err("workflow changed since it was loaded; refresh and try again".to_string());
+    }
     let channel_id = tag_value(prior_event, "h").ok_or_else(|| "workflow not found".to_string())?;
     let created_at = prior_event.created_at.as_secs() as i64;
 
-    let builder = events::build_workflow_definition(&workflow_id, &channel_id, &yaml_definition)?;
-    submit_event(builder, &state).await?;
+    let builder = events::build_workflow_definition(
+        &workflow_id,
+        &channel_id,
+        &yaml_definition,
+        Some(&expected_revision),
+    )?;
+    let result = submit_event(builder, &state).await?;
 
     let updated_at = now_secs();
     let workflow = workflow_record(
         workflow_id,
+        result.event_id,
         Some(channel_id),
         current_pubkey_hex(&state)?,
         &yaml_definition,
@@ -342,15 +402,16 @@ pub async fn trigger_workflow(
 pub async fn get_run_approvals(
     workflow_id: String,
     run_id: String,
-    _state: State<'_, AppState>,
-) -> Result<Vec<Value>, String> {
-    // TODO(workflow-runs): Like runs (see `get_workflow_runs`), reconstructing
-    // approvals into the frontend's `WorkflowApproval` shape from lifecycle
-    // events (46010/46011/46012) is a clearly-scoped follow-up tracked under
-    // TODO(workflow-runs). Return a bare empty array so the frontend's
-    // `getRunApprovals` (`raw.map(fromRawApproval)`) is safe.
-    let _ = (workflow_id, run_id);
-    Ok(Vec::new())
+    state: State<'_, AppState>,
+) -> Result<Value, String> {
+    let workflow_id = uuid::Uuid::parse_str(&workflow_id)
+        .map_err(|_| "workflow ID must be a UUID".to_string())?;
+    let run_id = uuid::Uuid::parse_str(&run_id).map_err(|_| "run ID must be a UUID".to_string())?;
+    read_workflow_history(
+        &state,
+        &format!("/workflows/{workflow_id}/runs/{run_id}/approvals"),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -445,6 +506,7 @@ fn parse_definition(yaml: &str) -> Value {
 /// (from a relay event) and the write path (from local inputs).
 fn workflow_record(
     id: String,
+    revision: String,
     channel_id: Option<String>,
     owner_pubkey: String,
     yaml_definition: &str,
@@ -461,10 +523,12 @@ fn workflow_record(
 
     WorkflowWire {
         id,
+        revision,
         name,
         owner_pubkey,
         channel_id,
         definition,
+        yaml_definition: yaml_definition.to_owned(),
         status: "active".to_string(),
         created_at,
         updated_at,
@@ -476,7 +540,15 @@ fn workflow_from_event(ev: &nostr::Event) -> WorkflowWire {
     let id = tag_value(ev, "d").unwrap_or_default();
     let channel_id = tag_value(ev, "h");
     let ts = ev.created_at.as_secs() as i64;
-    workflow_record(id, channel_id, ev.pubkey.to_hex(), &ev.content, ts, ts)
+    workflow_record(
+        id,
+        ev.id.to_hex(),
+        channel_id,
+        ev.pubkey.to_hex(),
+        &ev.content,
+        ts,
+        ts,
+    )
 }
 
 #[cfg(test)]

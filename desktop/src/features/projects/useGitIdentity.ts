@@ -1,3 +1,4 @@
+import { isTauri } from "@tauri-apps/api/core";
 import { useQuery } from "@tanstack/react-query";
 
 import { getGitIdentity } from "@/shared/api/projectGit";
@@ -8,6 +9,7 @@ import { getGitIdentity } from "@/shared/api/projectGit";
  */
 export function useGitIdentityQuery() {
   return useQuery({
+    enabled: isTauri(),
     queryKey: ["git-identity"],
     queryFn: getGitIdentity,
     // Git config rarely changes while the app runs.

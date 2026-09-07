@@ -284,6 +284,7 @@ fn persona_with_provider(
         source_team: None,
         source_team_persona_slug: None,
         catalog_source: None,
+        team_catalog_source: None,
         env_vars: std::collections::BTreeMap::new(),
         respond_to: None,
         respond_to_allowlist: Vec::new(),
@@ -414,10 +415,8 @@ fn agent_env_overrides_win_over_persona_env_at_spawn() {
 #[test]
 fn orphaned_agent_refused_at_spawn_boundary() {
     // Persona deleted: `spawn_agent_child` must refuse before any process
-    // side effect, not silently degrade to the record's stale overrides.
-    // `require_resolved` on the shared resolver is the pure predicate
-    // `spawn_agent_child` checks first — this pins the contract without
-    // needing a real `AppHandle`.
+    // side effect. `require_resolved` on the shared resolver is the pure
+    // predicate checked first — pins the contract without a real `AppHandle`.
     let persona = persona_v("p", "prompt", &[("ANTHROPIC_API_KEY", "persona-key")]);
     let mut record = fixture(RespondTo::Anyone, vec![], Some("tag".into()));
     record.env_vars = BTreeMap::from([("EXTRA".to_string(), "agent-value".to_string())]);
@@ -1242,8 +1241,7 @@ fn make_pair_runtime_placeholder() -> crate::managed_agents::ManagedAgentPairRun
     //
     // Absolute `/usr/bin/true` on unix (present on both macOS and Linux):
     // parallel tests holding `lock_path_mutex` swap PATH to a tempdir, and a
-    // bare `true` lookup during that window fails with NotFound (observed
-    // flake). Windows keeps the PATH lookup — no test there swaps PATH.
+    // bare `true` can fail with NotFound. Windows tests do not swap PATH.
     #[cfg(unix)]
     let program = "/usr/bin/true";
     #[cfg(windows)]
@@ -1263,6 +1261,7 @@ fn make_pair_runtime_placeholder() -> crate::managed_agents::ManagedAgentPairRun
             &[],
             "wss://relay.example",
             &Default::default(),
+            crate::managed_agents::AcpSessionPolicy::Channel,
         ),
         setup_mode: false,
         adapter_availability: None,

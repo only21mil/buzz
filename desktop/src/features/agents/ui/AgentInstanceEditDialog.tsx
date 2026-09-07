@@ -64,6 +64,8 @@ import {
   type RuntimeModelProviderSelection,
 } from "./runtimeModelProviderSelection";
 import { AgentCreationPreview } from "./AgentCreationPreview";
+import { useEffortDraft } from "./useEffortDraft";
+import { EffortPickerField } from "./EffortPickerField";
 import { OwnerOnlyAccessField } from "./OwnerOnlyAccessField";
 import type { EnvVarsValue } from "./EnvVarsEditor";
 import { useRequiredCredentialState } from "./useRequiredCredentialState";
@@ -142,6 +144,11 @@ export function AgentInstanceEditDialog({
   const [provider, setProvider] = React.useState(agent.provider ?? "");
   const [isCustomProviderEditing, setIsCustomProviderEditing] =
     React.useState(false);
+  const effortDraft = useEffortDraft(
+    open,
+    agent.pubkey,
+    agent.effortLevel ?? null,
+  );
   const [envVars, setEnvVars] = React.useState<EnvVarsValue>(agent.envVars);
   const [autoRestartOnConfigChange, setAutoRestartOnConfigChange] =
     React.useState(agent.autoRestartOnConfigChange);
@@ -623,14 +630,10 @@ export function AgentInstanceEditDialog({
         .split(",")
         .map((v) => v.trim())
         .filter((v) => v.length > 0);
-      // Model to persist — from the shared inherited-submission snapshot so a
-      // provider-backed inherit-transition carries the persona model (readiness
-      // requires one) and a deliberate local model still wins.
+      // Save the same inherited model snapshot used by the readiness gate.
       const normalizedModel = inheritedSubmission.model;
 
-      // Harness pin resolution — see resolveAgentCommandUpdate for the full
-      // sentinel/pin/no-op contract, including the inherit→pin transition where
-      // the prefilled command equals the original but must still be pinned.
+      // Preserve deliberate pins, including an unchanged prefilled command.
       const agentCommandUpdate = resolveAgentCommandUpdate({
         inheritHarness,
         agentCommand,
@@ -638,26 +641,19 @@ export function AgentInstanceEditDialog({
         agentCommandOverride: agent.agentCommandOverride ?? null,
       });
 
-      // Classify the effective post-submit runtime's provider capability as a
-      // tri-state: "capable" persists the provider, "locked" clears it (only
-      // when we KNOW it's provider-locked, e.g. Claude), "unknown" OMITS it so a
-      // transient/custom state never becomes a destructive write. Resolved
-      // STATICALLY (by id) so a not-yet-loaded catalog can't misclassify a known
-      // runtime as "unknown" — see resolveRuntimeProviderCapability. The runtime
-      // id is the shared prospectiveRuntimeId, so submit and the block-save gate
-      // always agree on which runtime is being saved.
+      // Resolve capability by prospective runtime ID: capable persists,
+      // locked clears, unknown omits. The Save gate uses the same runtime.
       const providerRuntimeCapability = resolveRuntimeProviderCapability(
         prospectiveRuntimeId,
         runtimeSupportsLlmProviderSelection(prospectiveRuntimeId),
       );
 
-      // Provider + env to persist — the shared inherited-submission snapshot
-      // (same values the credential gate validates), so gate ↔ record ↔ spawn
-      // all agree. See resolveInheritedRuntimeSubmission.
+      // Persist the provider/env snapshot validated by the credential gate.
       const normalizedSubmitProvider = inheritedSubmission.provider;
       const submitEnvVars = inheritedSubmission.envVars;
       const input: UpdateManagedAgentInput = {
         pubkey: agent.pubkey,
+        effortLevel: effortDraft.patch,
         name: name.trim() !== agent.name ? name.trim() : undefined,
         // relayUrl deliberately never submitted: the legacy per-record pin is
         // ignored (#2122) and the stored value is preserved as-is.
@@ -666,10 +662,7 @@ export function AgentInstanceEditDialog({
             ? acpCommand.trim()
             : undefined,
         agentCommand: agentCommandUpdate,
-        // A non-inheriting selection is a deliberate pin — signal it so the
-        // backend preserves a Custom/runtime command even when it maps to the
-        // linked persona's own runtime (otherwise it would be dropped back to
-        // inherit). Omitted (falsy) when inheriting or on a name-only edit.
+        // Preserve deliberate pins even when they match the persona runtime.
         harnessOverride:
           agentCommandUpdate != null ? !inheritHarness : undefined,
         agentArgs:
@@ -945,6 +938,13 @@ export function AgentInstanceEditDialog({
               onModeChange={setRespondTo}
             />
             <RunOnSummarySection backend={agent.backend} />
+            <EffortPickerField
+              agent={agent}
+              config={configSurfaceQuery.data}
+              disabled={updateMutation.isPending || runtimeTouched.current}
+              value={effortDraft.value}
+              onChange={effortDraft.onChange}
+            />
 
             {/* Provider (runtime) */}
             <div className="space-y-1.5">

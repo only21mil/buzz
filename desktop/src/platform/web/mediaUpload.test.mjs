@@ -197,3 +197,67 @@ test.afterEach(() => {
 test.after(() => {
   globalThis.window = previousWindow;
 });
+
+for (const [filename, advisoryMime] of [
+  ["report.html", "text/html"],
+  ["report.htm", ""],
+  ["REPORT.HTML", undefined],
+  ["misleading.txt", "text/plain"],
+]) {
+  test(`HTML upload preserves bytes, signed hash and filename: ${filename}`, async () => {
+    installSigner();
+    const bytes = new TextEncoder().encode(
+      "<!DOCTYPE html><script>globalThis.__htmlExecuted=true</script>",
+    );
+    globalThis.fetch = async (url, init) => {
+      assert.equal(String(url), "https://relay.example/upload");
+      assert.deepEqual(
+        new Uint8Array(await new Response(init.body).arrayBuffer()),
+        bytes,
+      );
+      const hash = Buffer.from(
+        await crypto.subtle.digest("SHA-256", bytes),
+      ).toString("hex");
+      assert.equal(init.headers.get("X-SHA-256"), hash);
+      const auth = JSON.parse(
+        Buffer.from(
+          init.headers.get("Authorization").slice(6),
+          "base64url",
+        ).toString(),
+      );
+      assert.ok(auth.tags.some((tag) => tag[0] === "x" && tag[1] === hash));
+      return Response.json({
+        url: `https://relay.example/media/${hash}.html`,
+        sha256: hash,
+        size: bytes.length,
+        type: "text/html",
+        uploaded: 1,
+      });
+    };
+    const headers = {
+      "x-buzz-filename": Buffer.from(filename).toString("base64"),
+    };
+    if (advisoryMime !== undefined)
+      headers["x-buzz-content-type"] =
+        Buffer.from(advisoryMime).toString("base64");
+    const result = await uploadBrowserMedia(bytes, { headers });
+    assert.equal(result.filename, filename);
+    assert.equal(result.type, "text/html");
+    assert.equal(result.size, bytes.length);
+  });
+}
+
+test("browser image editor refuses HTML response bytes", async () => {
+  registerMediaCommands(new BrowserWorkspace());
+  installSigner();
+  globalThis.fetch = async () =>
+    new Response("<!DOCTYPE html><script>alert(1)</script>", {
+      headers: { "Content-Type": "text/html" },
+    });
+  await assert.rejects(
+    dispatch("fetch_media_bytes", {
+      url: `https://relay.example/media/${"a".repeat(64)}.html`,
+    }),
+    /requires image content/,
+  );
+});

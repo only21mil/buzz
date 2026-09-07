@@ -61,7 +61,8 @@ pub async fn load_workflow_effect_claim(
     effect_kind: &str,
     effect_spec: &Value,
 ) -> Result<Option<WorkflowEffectClaimOutcome>> {
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::observability::begin(pool, crate::observability::Operation::Workflow).await?;
     let owned = sqlx::query(
         "SELECT 1 FROM workflow_runs WHERE community_id = $1 AND id = $2 \
          AND status = 'running' AND generation = $3 FOR UPDATE",
@@ -153,7 +154,8 @@ pub async fn claim_workflow_effect_with_payload(
     effect_spec: &Value,
     effect_payload: &Value,
 ) -> Result<WorkflowEffectClaimOutcome> {
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::observability::begin(pool, crate::observability::Operation::Workflow).await?;
     let owned = sqlx::query(
         "SELECT 1 FROM workflow_runs WHERE community_id = $1 AND id = $2 \
          AND status = 'running' AND generation = $3 FOR UPDATE",
@@ -273,7 +275,14 @@ pub async fn mark_workflow_effect_fired(
     .bind(step_id)
     .bind(effect_index)
     .bind(expected_generation)
-    .execute(pool)
+    .execute(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Workflow,
+        )
+        .await?,
+    )
     .await?
     .rows_affected();
 

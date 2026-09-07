@@ -486,6 +486,7 @@ fn sample_persona() -> AgentDefinition {
         source_team: Some("team-1".to_string()),
         source_team_persona_slug: Some("helper".to_string()),
         catalog_source: None,
+        team_catalog_source: None,
         env_vars: [("K".to_string(), "v".to_string())].into_iter().collect(),
         respond_to: None,
         respond_to_allowlist: Vec::new(),
@@ -701,6 +702,7 @@ fn summary_fixture(
     restart_diff: Vec<crate::managed_agents::spawn_snapshot::RestartDiffEntry>,
 ) -> super::ManagedAgentSummary {
     super::ManagedAgentSummary {
+        effort_level: None,
         pubkey: "aa".repeat(32),
         name: "test".into(),
         persona_id: None,

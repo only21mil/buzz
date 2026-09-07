@@ -73,6 +73,18 @@ class ComposeBar extends HookConsumerWidget {
     final uploadProgress = useState(0.0);
     final uploadGeneration = useRef(0);
     final activeUploadCancellation = useRef<UploadCancellationToken?>(null);
+    final voiceNote = _useComposerVoiceNote(
+      context: context,
+      ref: ref,
+      focusNode: focusNode,
+      isComposerExpanded: isComposerExpanded,
+      showFormatting: showFormatting,
+      attachmentSurface: attachmentSurface,
+      uploadError: uploadError,
+      draftRevision: draftRevision,
+      attachments: attachments,
+    );
+    final voiceNoteRef = useRef(voiceNote)..value = voiceNote;
     _useComposeDraftLifecycle(
       ref: ref,
       controller: controller,
@@ -89,6 +101,7 @@ class ComposeBar extends HookConsumerWidget {
       attachmentSurface: attachmentSurface,
       uploadError: uploadError,
       iosAttachmentPopover: iosAttachmentPopover,
+      onDraftIdentityChanged: voiceNote.onDraftIdentityChanged,
     );
     final clipboardHasImage = useState(false);
     final hasAttachments = attachments.value.isNotEmpty;
@@ -125,13 +138,14 @@ class ComposeBar extends HookConsumerWidget {
       final observer = _ComposerKeyboardMetricsObserver(
         view: appView,
         onKeyboardHidden: () {
+          voiceNote.onKeyboardHidden();
           collapseComposer();
           focusNode.unfocus();
         },
       );
       WidgetsBinding.instance.addObserver(observer);
       return () => WidgetsBinding.instance.removeObserver(observer);
-    }, [appView, focusNode]);
+    }, [appView, focusNode, voiceNote.isPreparing]);
     final resolvedHint =
         hintText ??
         (channelName.isNotEmpty ? 'Message #$channelName' : 'Message\u2026');
@@ -560,23 +574,22 @@ class ComposeBar extends HookConsumerWidget {
       }
     }
 
-    void queueAttachment(
-      XFile file,
-      _PendingAttachmentKind kind, {
-      bool deleteAfterUse = false,
-    }) {
-      draftRevision.value += 1;
-      uploadError.value = null;
-      attachments.value = [
-        ...attachments.value,
-        _PendingAttachment(
-          file: file,
-          kind: kind,
-          deleteAfterUse: deleteAfterUse,
-        ),
-      ];
-    }
-
+    final queueAttachment = useCallback(
+      (
+        XFile file,
+        _PendingAttachmentKind kind, {
+        bool deleteAfterUse = false,
+      }) => _queueComposerAttachment(
+        file,
+        kind,
+        voiceNoteRef,
+        attachments,
+        uploadError,
+        draftRevision,
+        deleteAfterUse: deleteAfterUse,
+      ),
+      [voiceNoteRef, draftRevision, uploadError, attachments],
+    );
     Future<void> pickThenQueue({
       required Future<XFile?> Function() pick,
       required _PendingAttachmentKind kind,
@@ -593,20 +606,15 @@ class ComposeBar extends HookConsumerWidget {
       }
     }
 
-    void queueImages(List<XFile> images, {bool deleteAfterUse = false}) {
-      if (images.isEmpty) return;
-      draftRevision.value += 1;
-      uploadError.value = null;
-      attachments.value = [
-        ...attachments.value,
-        for (final image in images)
-          _PendingAttachment(
-            file: image,
-            kind: _PendingAttachmentKind.image,
-            deleteAfterUse: deleteAfterUse,
-          ),
-      ];
-    }
+    bool queueImages(List<XFile> images, {bool deleteAfterUse = false}) =>
+        _queueComposerImages(
+          images,
+          voiceNote,
+          attachments,
+          uploadError,
+          draftRevision,
+          deleteAfterUse,
+        );
 
     Future<void> retainAndQueueImages(List<XFile> images) =>
         _retainAndQueueImages(context, images, queueImages);
@@ -707,23 +715,18 @@ class ComposeBar extends HookConsumerWidget {
       focusNode.requestFocus();
     }
 
-    // ----- Widget tree ----------------------------------------------------
-
     void chooseAttachment(
       Future<void> Function() choose, {
       String? errorMessage,
-    }) {
-      attachmentSurface.value = _AttachmentSurface.closed;
-      unawaited(() async {
-        try {
-          await choose();
-        } catch (error) {
-          if (context.mounted) {
-            uploadError.value = errorMessage ?? _formatUploadError(error);
-          }
-        }
-      }());
-    }
+    }) => _rejectsNonVoiceAttachment(voiceNote, attachments.value, uploadError)
+        ? attachmentSurface.value = _AttachmentSurface.closed
+        : _chooseComposerAttachment(
+            context,
+            attachmentSurface,
+            uploadError,
+            choose,
+            errorMessage: errorMessage,
+          );
 
     void toggleAttachments() {
       attachmentSurface.value = switch (attachmentSurface.value) {
@@ -760,6 +763,7 @@ class ComposeBar extends HookConsumerWidget {
                   kind: _PendingAttachmentKind.video,
                 );
               }),
+              onVoiceNote: voiceNote.start,
               onFiles: () => chooseAttachment(() {
                 final service = ref.read(mediaUploadServiceProvider);
                 return pickThenQueue(
@@ -853,6 +857,7 @@ class ComposeBar extends HookConsumerWidget {
             kind: _PendingAttachmentKind.video,
           );
         }),
+        onVoiceNote: voiceNote.start,
         onFiles: () => chooseAttachment(() {
           final service = ref.read(mediaUploadServiceProvider);
           return pickThenQueue(
@@ -878,10 +883,10 @@ class ComposeBar extends HookConsumerWidget {
 
     // Suggestions and attachments live in the overlay so showing them cannot
     // reflow the composer. Both stay anchored just above the capsule.
-    final composerWidthFactor = 0.85 + 0.15 * composerExpansionProgress;
     final hasPendingUploads = uploadingCount.value > 0;
     return _ComposerDockFrame(
-      widthFactor: composerWidthFactor,
+      expansionAnimation: composerExpansionController,
+      forceFullWidth: _voiceNoteFullWidth(voiceNote, attachments.value),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -905,6 +910,7 @@ class ComposeBar extends HookConsumerWidget {
               attachmentSurface.value = _AttachmentSurface.closed;
             },
             child: _ComposeBarLayout(
+              voiceNoteRecorder: voiceNote.recorder,
               attachments: attachments.value,
               onRemoveAttachment: removeAttachment,
               uploadError: uploadError.value,

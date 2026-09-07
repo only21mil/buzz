@@ -73,11 +73,9 @@ async function seedActiveTurns(
 // opens the profile panel, hovering opens the popover.
 function agentAvatar(page: import("@playwright/test").Page) {
   return page
-    .getByTestId("message-row")
-    .filter({ has: page.locator('[data-testid^="message-avatar-"]') })
-    .last()
-    .getByRole("button")
-    .first();
+    .locator('[data-message-id="mock-agents-charlie"]')
+    .locator("button")
+    .filter({ has: page.locator('[data-testid^="message-avatar-"]') });
 }
 
 test.describe("profile active turn indicator", () => {
@@ -94,6 +92,9 @@ test.describe("profile active turn indicator", () => {
 
     const panel = page.getByTestId("user-profile-panel");
     await expect(panel).toBeVisible();
+    await expect(
+      panel.getByRole("heading", { name: "Charlie", exact: true }),
+    ).toBeVisible();
     const liveActivity = panel.getByTestId(
       `user-profile-live-activity-${AGENT_PUBKEY}`,
     );
@@ -118,6 +119,9 @@ test.describe("profile active turn indicator", () => {
 
     const panel = page.getByTestId("user-profile-panel");
     await expect(panel).toBeVisible();
+    await expect(
+      panel.getByRole("heading", { name: "Charlie", exact: true }),
+    ).toBeVisible();
     const liveActivity = panel.getByTestId(
       `user-profile-live-activity-${AGENT_PUBKEY}`,
     );

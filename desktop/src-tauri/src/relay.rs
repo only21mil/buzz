@@ -317,6 +317,17 @@ pub async fn query_relay_at(
     api_base_url: &str,
     filters: &[serde_json::Value],
 ) -> Result<Vec<nostr::Event>, String> {
+    query_relay_with_thread_aux(state, api_base_url, filters)
+        .await
+        .map(|(events, _)| events)
+}
+
+/// Query while retaining explicit thread-aux capability proof from this response.
+pub async fn query_relay_with_thread_aux(
+    state: &AppState,
+    api_base_url: &str,
+    filters: &[serde_json::Value],
+) -> Result<(Vec<nostr::Event>, bool), String> {
     crate::relay_admission::wait_for_rate_limit().await;
     let url = format!("{}/query", api_base_url);
     let body_bytes =
@@ -337,7 +348,11 @@ pub async fn query_relay_at(
         return Err(relay_error_message(response).await);
     }
 
-    parse_json_response(response).await
+    let aux_included = response
+        .headers()
+        .get("x-buzz-thread-aux")
+        .is_some_and(|value| value == "1");
+    Ok((parse_json_response(response).await?, aux_included))
 }
 
 pub async fn query_relay_at_with_keys(
@@ -529,9 +544,12 @@ pub struct AgentProfileInfo {
 
 // ── Signed-event submission ─────────────────────────────────────────────────
 
+mod publication_scope;
+pub use publication_scope::{ExpectedPublicationScope, MessagePublication, PublicationSnapshot};
 mod submit;
 pub use submit::{
-    submit_event, submit_event_at_with_keys, submit_signed_event_at_with_keys, SubmitEventResponse,
+    submit_event, submit_event_at_with_keys, submit_event_in_scope,
+    submit_signed_event_at_with_keys, SubmitEventResponse,
 };
 
 /// Sign an event with explicit keys and POST it to `/events` with NIP-98 auth.

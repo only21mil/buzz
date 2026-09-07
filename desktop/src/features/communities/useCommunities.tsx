@@ -1,3 +1,4 @@
+import { removeProjectSnapshotForRelay } from "@/features/projects/projectSnapshot";
 import {
   createContext,
   useCallback,
@@ -216,6 +217,8 @@ function useCommunitiesInternal(): UseCommunitiesReturn {
 
   const clearCommunities = useCallback((signerPubkey?: string | null) => {
     const removed = communitiesRef.current;
+    for (const community of removed)
+      removeProjectSnapshotForRelay(community.relayUrl);
     removeMessageSnapshotsForCommunities(
       removed.map((community) => community.relayUrl),
       signerPubkey,
@@ -239,6 +242,7 @@ function useCommunitiesInternal(): UseCommunitiesReturn {
       removeSelfProfileCachesForRelay(removed.relayUrl);
       removeUserLabelCacheForRelay(removed.relayUrl);
       removeChannelSnapshotForRelay(removed.relayUrl);
+      removeProjectSnapshotForRelay(removed.relayUrl);
       removeMessageSnapshotsForIdentity(removed.relayUrl, signerPubkey ?? "");
       clearSavedCommunitySnapshot(id);
       removeCommunityDestination(id);

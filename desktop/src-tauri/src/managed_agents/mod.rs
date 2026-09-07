@@ -11,6 +11,7 @@ pub(crate) use agent_env::{
 mod backend;
 pub(crate) mod config_bridge;
 pub(crate) mod custom_harnesses;
+pub(crate) mod deferred_start;
 mod discovery;
 pub(crate) mod effective_config;
 mod env_vars;
@@ -33,9 +34,11 @@ pub mod retention;
 mod runtime;
 mod runtime_commands;
 mod runtime_types;
+mod session_policy;
 pub(crate) mod snapshot_avatar;
 pub(crate) mod spawn_snapshot;
 pub(crate) mod storage;
+pub(crate) mod team_catalog;
 pub(crate) mod team_events;
 mod team_repair;
 mod teams;
@@ -50,7 +53,11 @@ pub(crate) fn lock_path_mutex() -> std::sync::MutexGuard<'static, ()> {
     PATH_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+mod definition_validation;
 pub use backend::*;
+pub(crate) use definition_validation::{
+    validate_agent_definition_text, validate_managed_agent_definition_text, validate_visible_text,
+};
 pub use discovery::*;
 pub use env_vars::*;
 #[cfg(windows)]
@@ -79,9 +86,16 @@ pub use restore::*;
 pub use runtime::*;
 pub use runtime_commands::*;
 pub use runtime_types::*;
+pub(crate) use session_policy::{
+    acp_session_policy, apply_app_acp_session_policy_env, insert_acp_session_policy_env,
+    AcpSessionPolicy, ManagedAgentExperimentState, ACP_SESSION_POLICY_ENV_VAR,
+};
 pub use storage::*;
 pub use teams::*;
 pub use types::*;
+
+#[cfg(test)]
+pub(crate) use teams::delete_catalog_team_at;
 
 /// Returns the Buzz nest directory (`~/.buzz`) if it exists as a real
 /// directory (not a symlink), falling back to the user's home directory.
@@ -114,3 +128,6 @@ pub fn default_agent_workdir() -> Option<std::path::PathBuf> {
 fn is_real_dir(path: &std::path::Path) -> bool {
     path.symlink_metadata().map(|m| m.is_dir()).unwrap_or(false)
 }
+
+#[cfg(test)]
+pub(crate) mod poll_read_probe;

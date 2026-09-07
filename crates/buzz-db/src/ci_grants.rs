@@ -45,7 +45,7 @@ pub async fn upsert_ci_grant(
     .bind(valid_from)
     .bind(valid_until)
     .bind(granted_by)
-    .execute(pool)
+    .execute(&mut *crate::observability::acquire(pool, crate::observability::PoolRole::Writer, crate::observability::Operation::Ci).await?)
     .await?;
     Ok(())
 }
@@ -73,7 +73,14 @@ pub async fn get_active_ci_signers(
     .bind(channel_id)
     .bind(target_repo_a)
     .bind(now)
-    .fetch_all(pool)
+    .fetch_all(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Ci,
+        )
+        .await?,
+    )
     .await?;
     rows.into_iter()
         .map(|r| {
@@ -88,12 +95,10 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
-
     async fn setup_pool() -> PgPool {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+            .expect("explicit isolated test database URL required");
         PgPool::connect(&database_url)
             .await
             .expect("connect to test DB")

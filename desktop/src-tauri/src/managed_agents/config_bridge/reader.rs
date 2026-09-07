@@ -49,7 +49,13 @@ pub(crate) fn read_config_surface(
             .or_else(|| find_config_option_value(c, "model"))
     });
     let acp_mode = session_cache.and_then(|c| find_config_option_value(c, "mode"));
-    let acp_effort = session_cache.and_then(|c| find_config_option_value(c, "effort"));
+    let acp_effort = session_cache.and_then(|c| {
+        c.config_options
+            .iter()
+            .find(|option| option.category.as_deref() == Some("thought_level"))
+            .and_then(|option| option.current_value.clone())
+            .or_else(|| find_config_option_value(c, "effort"))
+    });
 
     let model_overridden = session_cache.is_some_and(|c| c.model_overridden);
 
@@ -79,7 +85,7 @@ pub(crate) fn read_config_surface(
             record,
             &file_config.thinking_effort,
             &acp_effort,
-            thinking_env_var,
+            runtime_meta,
             is_pre_spawn,
             session_cache,
             tiers,
@@ -181,7 +187,17 @@ pub(crate) fn read_config_surface(
         mcp_config_file_path,
     };
 
+    let effort_option = session_cache.and_then(|cache| {
+        cache
+            .config_options
+            .iter()
+            .find(|option| option.category.as_deref() == Some("thought_level"))
+    });
     RuntimeConfigSurface {
+        effort_config_id: effort_option.map(|option| option.config_id.clone()),
+        effort_options: effort_option
+            .map(|option| option.options.clone())
+            .unwrap_or_default(),
         runtime_id: runtime_meta.map(|m| m.id.to_string()),
         runtime_label: runtime_meta.map(|m| m.label.to_string()),
         is_pre_spawn,
@@ -486,39 +502,46 @@ fn build_thinking_field(
     record: &ManagedAgentRecord,
     file_effort: &Option<String>,
     acp_effort: &Option<String>,
-    thinking_env_var: Option<&str>,
-    is_pre_spawn: bool,
-    session_cache: Option<&SessionConfigCache>,
+    runtime: Option<&KnownAcpRuntime>,
+    _is_pre_spawn: bool,
+    _session_cache: Option<&SessionConfigCache>,
     tiers: &InheritedConfigTiers,
 ) -> Option<NormalizedField> {
-    // Tier ordering: record env > ACP > persona env > global env > definition env > config file.
-    let [rec_env, pers_env, glob_env, def_env] = thinking_env_var
-        .map(|k| {
-            env_candidates(
-                k,
-                &record.env_vars,
-                &tiers.persona_env,
-                &tiers.global_env,
-                &tiers.definition_env,
-            )
-        })
-        .unwrap_or([None, None, None, None]);
-
+    let thinking_env_var = runtime.and_then(|runtime| runtime.thinking_env_var);
+    let normalize = |raw: &str| {
+        super::effort::normalize_effort(
+            runtime.and_then(|r| r.effort_normalization),
+            runtime.and_then(|r| r.effort_accepted_values),
+            raw,
+        )
+    };
+    let tier = |env: &std::collections::BTreeMap<String, String>, legacy: bool| {
+        thinking_env_var
+            .and_then(|key| super::effort::effort_tier_alias(env, key, normalize, legacy))
+    };
+    let acp_effort = acp_effort.as_deref().and_then(normalize);
+    let file_effort = file_effort.as_deref().and_then(normalize);
+    let record_native = tier(&record.env_vars, false);
+    let canonical = record.effort_level.as_deref().and_then(normalize);
+    let record_legacy = thinking_env_var
+        .and_then(|_| super::effort::get_ci(&record.env_vars, super::LEGACY_THINKING_EFFORT_KEY))
+        .and_then(|v| normalize(v));
+    let persona = tier(&tiers.persona_env, true);
+    let global = tier(&tiers.global_env, false);
+    let definition = tier(&tiers.definition_env, false);
     let tiers_list: &[(Option<&str>, ConfigOrigin)] = &[
-        (rec_env, ConfigOrigin::BuzzExplicit),
+        (record_native.as_deref(), ConfigOrigin::BuzzExplicit),
+        (canonical.as_deref(), ConfigOrigin::BuzzExplicit),
+        (record_legacy.as_deref(), ConfigOrigin::BuzzExplicit),
         (acp_effort.as_deref(), ConfigOrigin::AcpConfigOption),
-        (pers_env, ConfigOrigin::PersonaDefault),
-        (glob_env, ConfigOrigin::GlobalDefault),
-        (def_env, ConfigOrigin::HarnessDefault),
+        (persona.as_deref(), ConfigOrigin::PersonaDefault),
+        (global.as_deref(), ConfigOrigin::GlobalDefault),
+        (definition.as_deref(), ConfigOrigin::HarnessDefault),
         (file_effort.as_deref(), ConfigOrigin::ConfigFile),
     ];
     let (value, origin, overridden_value, overridden_origin) = resolve_with_override(tiers_list)?;
 
-    let write_via = if !is_pre_spawn && has_config_option(session_cache, "effort") {
-        ConfigWriteMechanism::AcpSetConfigOption {
-            config_id: "effort".to_string(),
-        }
-    } else if let Some(env_key) = thinking_env_var {
+    let write_via = if let Some(env_key) = thinking_env_var {
         ConfigWriteMechanism::RespawnWithEnvVar {
             env_key: env_key.to_string(),
         }

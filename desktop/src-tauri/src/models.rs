@@ -315,11 +315,14 @@ pub struct ThreadCursor {
 
 /// Response for `get_thread_replies` — the full reply subtree under a root
 /// event, fetched server-side from `thread_metadata` (NOT assembled from the
-/// channel cache). `events` are raw Nostr events in chronological order;
-/// `next_cursor` is the composite `(created_at, event_id)` of the last event
-/// when a full page was returned, for forward keyset paging, else `None`.
+/// channel cache). `events` include auxiliary events when `aux_included` is true.
+/// `next_cursor` counts replies only and uses the last reply composite key
+/// `(created_at, event_id)` when a full reply page was returned.
 #[derive(Serialize, Deserialize)]
 pub struct ThreadRepliesResponse {
+    /// True only when this response proves complete server-side auxiliary hydration.
+    #[serde(default)]
+    pub aux_included: bool,
     pub events: Vec<serde_json::Value>,
     pub next_cursor: Option<ThreadCursor>,
 }

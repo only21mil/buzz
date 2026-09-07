@@ -1,3 +1,4 @@
+import { isTauri } from "@tauri-apps/api/core";
 import {
   Check,
   GitPullRequest,
@@ -194,7 +195,7 @@ export function PullRequestReviewCard({
           {canApprove ? (
             <Button
               className="h-8 gap-1.5 bg-green-600 px-3.5 text-white shadow-sm hover:bg-green-700"
-              disabled={reviewDecisionPending}
+              disabled={!isTauri() || reviewDecisionPending}
               onClick={() => setApproveDialogOpen(true)}
               size="xs"
               type="button"
@@ -213,7 +214,7 @@ export function PullRequestReviewCard({
           {canMarkReady ? (
             <Button
               className="h-8 gap-1.5 px-3"
-              disabled={isUpdatingStatus}
+              disabled={!isTauri() || isUpdatingStatus}
               onClick={() => {
                 void handleStatusChange("open");
               }}
@@ -228,7 +229,7 @@ export function PullRequestReviewCard({
           {canReopen ? (
             <Button
               className="h-8 gap-1.5 px-3"
-              disabled={isUpdatingStatus}
+              disabled={!isTauri() || isUpdatingStatus}
               onClick={() => {
                 void handleStatusChange("open");
               }}
@@ -246,7 +247,7 @@ export function PullRequestReviewCard({
                 <Button
                   aria-label="More pull request actions"
                   className="ml-auto h-8 w-8"
-                  disabled={isUpdatingStatus}
+                  disabled={!isTauri() || isUpdatingStatus}
                   size="icon-xs"
                   type="button"
                   variant="ghost"

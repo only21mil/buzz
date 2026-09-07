@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 use super::agent_env::build_buzz_agent_provider_defaults;
 
@@ -22,10 +22,13 @@ pub(crate) use super::access_policy::{build_respond_to_env_with_policy, RespondT
 
 mod metadata;
 pub(crate) use metadata::{
-    apply_agent_display_env, resolve_session_title, runtime_metadata_env_vars,
-    DISPLAY_NAME_ENV_VAR, SESSION_TITLE_ENV_VAR,
+    apply_agent_display_env, child_rust_log_filter, resolve_session_title,
+    runtime_metadata_env_vars, DISPLAY_NAME_ENV_VAR, SESSION_TITLE_ENV_VAR,
 };
 
+mod start;
+pub use start::start_managed_agent_process;
+pub(crate) use start::start_managed_agent_process_scoped;
 mod stop;
 pub(crate) use stop::managed_agent_runtime_keys;
 pub use stop::{stop_managed_agent_process, stop_managed_agent_workspace_pair};
@@ -102,11 +105,10 @@ fn persona_drift_state(
 /// pin is ignored — see `effective_agent_relay_url`). Returns `None` for
 /// records that cannot form a valid pair key yet (e.g. key-less agents that
 /// mint keys on first start).
-pub(crate) fn workspace_pair_key(
-    app: &AppHandle,
+pub(crate) fn workspace_pair_key<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     record: &ManagedAgentRecord,
 ) -> Option<ManagedAgentRuntimeKey> {
-    use tauri::Manager;
     let state = app.state::<crate::app_state::AppState>();
     resolve_workspace_pair_key(
         &record.pubkey,
@@ -128,11 +130,12 @@ pub(crate) fn resolve_workspace_pair_key(
     ManagedAgentRuntimeKey::new(pubkey.to_string(), &effective_relay).ok()
 }
 
-pub fn build_managed_agent_summary(
-    app: &AppHandle,
+pub fn build_managed_agent_summary<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     record: &ManagedAgentRecord,
     runtimes: &HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
     personas: &[crate::managed_agents::types::AgentDefinition],
+    teams: &[crate::managed_agents::TeamRecord],
     global_config: &crate::managed_agents::GlobalAgentConfig,
 ) -> Result<ManagedAgentSummary, String> {
     use crate::managed_agents::BackendKind;
@@ -195,12 +198,10 @@ pub fn build_managed_agent_summary(
 
     let (persona_out_of_date, persona_orphaned) = persona_drift_state(record, personas);
 
-    let global_for_summary =
-        crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
     let effective_cfg = crate::managed_agents::effective_config::resolve_effective_config(
         record,
         personas,
-        &global_for_summary,
+        global_config,
     );
     let (effective_model, effective_provider, effective_prompt, model_source) = match effective_cfg
     {
@@ -242,16 +243,16 @@ pub fn build_managed_agent_summary(
     // env layering below — the caller loads it once and passes it in, so
     // list-style callers pay one disk read per call rather than one per record.
 
-    // The prospective side is computed only for a tracked pair: it costs a
-    // teams-store read, and an unstamped agent has nothing to compare against.
+    // The prospective side is computed only for a tracked pair: an unstamped
+    // agent has nothing to compare against.
     let tracked_spawn = pair_key.as_ref().zip(pair_runtime).map(|(key, runtime)| {
-        let teams = crate::managed_agents::load_teams(app).unwrap_or_default();
         let current = crate::managed_agents::spawn_snapshot::prospective_spawn_config_snapshot(
             record,
             personas,
-            &teams,
+            teams,
             &key.relay_url,
             global_config,
+            super::acp_session_policy(app.state::<crate::app_state::AppState>().inner()),
         );
         (runtime, current)
     });
@@ -314,6 +315,7 @@ pub fn build_managed_agent_summary(
         parallelism: record.parallelism,
         system_prompt: effective_prompt,
         avatar_url: record.avatar_url.clone(),
+        effort_level: record.effort_level.clone(),
         model: effective_model,
         model_source,
         provider: effective_provider,
@@ -407,6 +409,17 @@ pub fn spawn_agent_child(
     relay_url: &str,
     lazy: bool,
     owner_hex: Option<&str>,
+) -> Result<crate::managed_agents::ManagedAgentProcess, String> {
+    spawn_agent_child_with_replay_floor(app, record, relay_url, lazy, owner_hex, None)
+}
+
+fn spawn_agent_child_with_replay_floor(
+    app: &AppHandle,
+    record: &ManagedAgentRecord,
+    relay_url: &str,
+    lazy: bool,
+    owner_hex: Option<&str>,
+    replay_floor_unix: Option<u64>,
 ) -> Result<crate::managed_agents::ManagedAgentProcess, String> {
     if let Some(error) = spawn_key_refusal(record) {
         return Err(error);
@@ -806,9 +819,16 @@ pub fn spawn_agent_child(
     // applied. Writing it last lets user-provided values win over every Buzz-set env
     // written above — reserved keys were already stripped from descriptor.env so they
     // cannot clobber BUZZ_PRIVATE_KEY, NOSTR_PRIVATE_KEY, etc.
+    super::config_bridge::effort::prepare_inherited_effort_env(
+        &mut command,
+        runtime_meta,
+        &descriptor.env,
+    );
     for (key, value) in &descriptor.env {
         command.env(key, value);
     }
+    let session_policy = super::apply_app_acp_session_policy_env(app, &mut command);
+    super::deferred_start::apply_replay_floor_env(&mut command, replay_floor_unix);
     configure_runtime_cli(&mut command, runtime_meta);
 
     // Buzz shared compute is stored as a native provider; derive the OpenAI-compatible
@@ -844,6 +864,7 @@ pub fn spawn_agent_child(
             system_prompt: effective_prompt.as_deref(),
             model: effective_model.as_deref(),
             provider: effective_provider.as_deref(),
+            session_policy,
         },
     );
 
@@ -909,71 +930,6 @@ pub fn spawn_agent_child(
         adapter_availability: spawned_adapter_availability,
         start_nonce,
     })
-}
-
-fn child_rust_log_filter() -> String {
-    match std::env::var("RUST_LOG") {
-        Ok(existing) if existing.contains("buzz_acp") => existing,
-        Ok(existing) if !existing.trim().is_empty() => format!("{existing},buzz_acp=info"),
-        _ => "buzz_acp=info".to_string(),
-    }
-}
-
-pub fn start_managed_agent_process(
-    app: &AppHandle,
-    record: &mut ManagedAgentRecord,
-    runtimes: &mut HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
-    owner_hex: Option<&str>,
-) -> Result<(), String> {
-    let relay_url = {
-        use tauri::Manager;
-        let state = app.state::<crate::app_state::AppState>();
-        crate::relay::effective_agent_relay_url(
-            &record.relay_url,
-            &crate::relay::relay_ws_url_with_override(&state),
-        )
-    };
-    let key = ManagedAgentRuntimeKey::new(record.pubkey.clone(), &relay_url)?;
-    if let Some(runtime) = runtimes.get_mut(&key) {
-        if runtime
-            .child
-            .try_wait()
-            .map_err(|error| format!("failed to inspect running process: {error}"))?
-            .is_none()
-        {
-            return Ok(());
-        }
-
-        runtimes.remove(&key);
-        super::remove_agent_runtime_receipt(app, &key);
-    }
-
-    // Scalar PIDs are migration-only and never establish pair liveness.
-    record.runtime_pid = None;
-
-    let mut process = spawn_agent_child(app, record, &key.relay_url, false, owner_hex)?;
-    let now = now_iso();
-    let receipt = super::ManagedAgentRuntimeReceipt {
-        key: key.clone(),
-        pid: process.child.id(),
-        desktop_instance_id: current_instance_id(app),
-        started_at: now.clone(),
-    };
-    if let Err(error) = super::write_agent_runtime_receipt(app, &receipt) {
-        let _ = terminate_process(process.child.id());
-        let _ = process.child.wait();
-        return Err(error);
-    }
-
-    record.updated_at = now.clone();
-    record.last_started_at = Some(now);
-    record.last_stopped_at = None;
-    record.last_exit_code = None;
-    record.last_error = None;
-    record.last_error_code = None;
-
-    runtimes.insert(key, ManagedAgentPairRuntime::starting(process));
-    Ok(())
 }
 
 #[cfg(test)]

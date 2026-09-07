@@ -1,4 +1,7 @@
-import { ArrowLeft, ExternalLink, FolderGit2 } from "lucide-react";
+import { ProjectLoadState } from "./ProjectLoadState";
+import { findProjectHomeByChannelId } from "@/features/projects/lib/projectHomeChannel";
+import { isTauri } from "@tauri-apps/api/core";
+import { ExternalLink, FolderGit2 } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
 
@@ -85,6 +88,8 @@ import {
 type ProjectDetailScreenProps = {
   commitHash?: string;
   projectId: string;
+  entityNavigationId?: string;
+  tab?: import("@/shared/lib/entityLink").EntityLinkTab;
   pullRequestId?: string;
   issueId?: string;
   repositoryId?: string;
@@ -150,6 +155,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     });
   const { activeBranch, selectBranch, selectedTag, selectTag } =
     useProjectRepositoryRefSelection({
+      repositoryId: repository?.repoAddress ?? null,
       branchOptions,
       defaultBranch,
       projectAvailable: Boolean(repository),
@@ -161,14 +167,19 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   const [selectedPullRequestId, setSelectedPullRequestId] = React.useState<
     string | null
   >(pullRequestId ?? null);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: repeated entity links must reapply selection.
   React.useEffect(
     () => setSelectedPullRequestId(pullRequestId ?? null),
-    [pullRequestId],
+    [pullRequestId, props.entityNavigationId],
   );
   const [selectedIssueId, setSelectedIssueId] = React.useState<string | null>(
     issueId ?? null,
   );
-  React.useEffect(() => setSelectedIssueId(issueId ?? null), [issueId]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: repeated entity links must reapply selection.
+  React.useEffect(
+    () => setSelectedIssueId(issueId ?? null),
+    [issueId, props.entityNavigationId],
+  );
   const [selectedCommitHash, setSelectedCommitHash] = React.useState<
     string | null
   >(commitHash ?? null);
@@ -358,7 +369,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     const results = await Promise.all([
       repoSnapshotQuery.refetch(),
       repoStateQuery.refetch(),
-      repoSyncStatusQuery.refetch(),
+      ...(isTauri() ? [repoSyncStatusQuery.refetch()] : []),
     ]);
     const error = results.find((result) => result.error)?.error;
     if (error) {
@@ -380,15 +391,17 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     onBranchChange: handleBranchChange,
     onTagChange: handleTagChange,
     onCreateBranch: () => branchActions.setCreateOpen(true),
-    createBranchDisabled: branchActions.createPending || !activeBranchCommit,
+    createBranchDisabled:
+      !isTauri() || branchActions.createPending || !activeBranchCommit,
     createBranchTitle: createBranchReason ?? "Create a remote branch",
     onDeleteBranch: () => branchActions.setDeleteOpen(true),
     deleteBranchDisabled:
-      branchActions.deletePending || Boolean(deleteBranchReason),
+      !isTauri() || branchActions.deletePending || Boolean(deleteBranchReason),
     deleteBranchTitle: deleteBranchReason ?? "Delete this remote branch",
     source: selectedTag ? "remote" : repoSource,
     onSourceChange: setRepoSource,
     localDisabled:
+      !isTauri() ||
       Boolean(selectedTag) ||
       (!repoSyncStatusQuery.data?.localPath &&
         !localRepoSnapshotQuery.data &&
@@ -400,7 +413,10 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
         : "Local missing",
     ...repoRemote.controls,
     onCloneLocal:
-      !selectedTag && repository?.cloneUrls[0] && repoRemote.canCloneLocally
+      isTauri() &&
+      !selectedTag &&
+      repository?.cloneUrls[0] &&
+      repoRemote.canCloneLocally
         ? () => {
             void handleCloneRepo();
           }
@@ -568,7 +584,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       await Promise.all([
         repoSnapshotQuery.refetch(),
         localRepoSnapshotQuery.refetch(),
-        repoSyncStatusQuery.refetch(),
+        ...(isTauri() ? [repoSyncStatusQuery.refetch()] : []),
         repoStateQuery.refetch(),
       ]);
     } catch (error) {
@@ -661,7 +677,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       await Promise.all([
         repoSnapshotQuery.refetch(),
         localRepoSnapshotQuery.refetch(),
-        repoSyncStatusQuery.refetch(),
+        ...(isTauri() ? [repoSyncStatusQuery.refetch()] : []),
         repoStateQuery.refetch(),
       ]);
     } catch (error) {
@@ -708,51 +724,13 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   if (projectQuery.isLoading) {
     return <ViewLoadingFallback kind="projects" />;
   }
-  if (projectQuery.isError) {
-    return (
-      <div className="flex flex-1 flex-col items-center justify-center gap-3 px-4 py-16 text-center">
-        <FolderGit2 className="h-10 w-10 text-muted-foreground/40" />
-        <p className="text-sm text-red-400">Failed to load project</p>
-        <div className="flex items-center gap-2">
-          <Button
-            onClick={() => void projectQuery.refetch()}
-            size="sm"
-            variant="outline"
-          >
-            Retry
-          </Button>
-          <Button
-            onClick={() => {
-              void goProjects();
-            }}
-            size="sm"
-            variant="ghost"
-          >
-            <ArrowLeft className="mr-1.5 h-4 w-4" />
-            Back to Projects
-          </Button>
-        </div>
-      </div>
-    );
-  }
   if (!project) {
     return (
-      <div className="flex flex-1 flex-col items-center justify-center gap-3 px-4 py-16 text-center">
-        <FolderGit2 className="h-10 w-10 text-muted-foreground/40" />
-        <p className="text-sm text-muted-foreground">
-          This project could not be found.
-        </p>
-        <Button
-          onClick={() => {
-            void goProjects();
-          }}
-          size="sm"
-          variant="outline"
-        >
-          <ArrowLeft className="mr-1.5 h-4 w-4" />
-          Back to Projects
-        </Button>
-      </div>
+      <ProjectLoadState
+        failed={projectQuery.isError}
+        onRetry={() => void projectQuery.refetch()}
+        onBack={() => void goProjects()}
+      />
     );
   }
   if (!repository) {
@@ -842,7 +820,30 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       />
       <div className="flex min-h-0 min-w-0 flex-1 flex-row overflow-hidden">
         <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+          {projectQuery.isError ? (
+            <p
+              role="status"
+              className="px-4 py-2 text-sm text-muted-foreground"
+            >
+              Project refresh failed. Showing saved details.{" "}
+              <Button
+                onClick={() => void projectQuery.refetch()}
+                variant="ghost"
+                size="sm"
+              >
+                Retry
+              </Button>
+            </p>
+          ) : null}
           <ProjectDetailChrome
+            homeChannelId={
+              findProjectHomeByChannelId(
+                project.projectChannelId,
+                projectsQuery.data ?? [],
+              )?.id === project.id
+                ? project.projectChannelId
+                : null
+            }
             activeTabCrumb={activeTabCrumb}
             activeWorkItemCrumb={activeWorkItemCrumb}
             chromeRef={projectDetailHeaderChromeRef}
@@ -902,7 +903,8 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
               </section>
 
               <WorkspaceTabs
-                key={`${project.id}:${repository.id}:${tabsResetKey}`}
+                key={`${project.id}:${repository.id}:${tabsResetKey}:${props.entityNavigationId ?? ""}`}
+                initialTab={props.tab === "commits" ? "activity" : props.tab}
                 commitDiff={commitDiffQuery.data}
                 commitDiffError={commitDiffQuery.error}
                 commitDiffLoading={commitDiffQuery.isLoading}
@@ -934,9 +936,14 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
                 onBranchChange={handleBranchChange}
                 onOpenMergeRecoveryTerminal={handleOpenMergeRecoveryTerminal}
                 onOpenTerminal={() => {
+                  if (!isTauri()) return;
                   void handleOpenTerminal();
                 }}
-                terminalTitle={projectTerminalLabel(hasLocalCheckout)}
+                terminalTitle={
+                  isTauri()
+                    ? projectTerminalLabel(hasLocalCheckout)
+                    : "Terminals require the desktop app"
+                }
                 onSelectedCommitHashChange={handleSelectedCommitHashChange}
                 onSelectedIssueIdChange={handleSelectedIssueIdChange}
                 onSelectedPullRequestIdChange={

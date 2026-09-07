@@ -19,10 +19,13 @@ use crate::{channel_member_profiles::ChannelMemberProfileCache, huddle::HuddleSt
 
 #[path = "app_state_startup.rs"]
 mod startup;
-pub use startup::resolve_persisted_identity;
+#[cfg(all(test, unix, not(feature = "system-keyring")))]
+pub(crate) use startup::build_ephemeral_test_app_state;
+pub use startup::{build_app_state, resolve_persisted_identity};
 
 pub struct AppState {
     pub keys: Mutex<Keys>,
+    pub(crate) publication_epoch: Arc<Mutex<u64>>,
     /// Durable backend holding `keys`. Updated after the key write and before
     /// recovery flags are cleared so `get_identity` reports a consistent state.
     pub(crate) identity_storage: AtomicU8,
@@ -43,10 +46,8 @@ pub struct AppState {
     /// restore. `apply_workspace` consumes it after installing the workspace
     /// relay and identity, so agents never start against the fallback relay.
     pub managed_agent_restore_pending: AtomicBool,
-    /// Whether desktop may repair managed-agent kind:0 profiles from its local
-    /// records. Disabled by the agent-managed profiles experiment so an agent's
-    /// own profile updates are not overwritten on start or restore.
-    pub managed_agent_profile_reconcile_enabled: AtomicBool,
+    /// Experiment state applied to managed-agent starts and profile reconciliation.
+    pub managed_agent_experiments: crate::managed_agents::ManagedAgentExperimentState,
     /// Shared shutdown signal checked by launch-time agent restoration.
     pub shutdown_started: AtomicBool,
     /// Serializes every managed-runtime transition that changes the protected
@@ -179,65 +180,6 @@ pub fn build_media_fetch_client() -> reqwest::Result<reqwest::Client> {
         .pool_max_idle_per_host(1)
         .redirect(reqwest::redirect::Policy::none())
         .build()
-}
-
-pub fn build_app_state() -> AppState {
-    // Env var takes precedence (dev/CI). If absent, resolve_persisted_identity()
-    // in setup() will replace the ephemeral placeholder with a persisted key.
-    let (keys, identity_storage) = match identity_from_env() {
-        Some(keys) => {
-            eprintln!(
-                "buzz-desktop: configured identity pubkey {}",
-                keys.public_key().to_hex()
-            );
-            (keys, IdentityStorage::Environment)
-        }
-        None => (Keys::generate(), IdentityStorage::Ephemeral),
-    };
-
-    AppState {
-        keys: Mutex::new(keys),
-        identity_storage: AtomicU8::new(identity_storage as u8),
-        http_client: reqwest::Client::builder()
-            .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
-            .pool_idle_timeout(std::time::Duration::from_secs(10))
-            .pool_max_idle_per_host(1)
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new()),
-        media_fetch_client: build_media_fetch_client().expect(
-            "media_fetch_client must build with redirect::Policy::none(); a \
-             redirect-following fallback would forward the minted media auth \
-             header across origins (redirect-hop SSRF)",
-        ),
-        relay_url_override: Mutex::new(None),
-        managed_agent_restore_pending: AtomicBool::new(false),
-        managed_agent_profile_reconcile_enabled: AtomicBool::new(true),
-        shutdown_started: AtomicBool::new(false),
-        managed_agent_runtime_transition: Mutex::new(()),
-        identity_mutation: Mutex::new(()),
-        managed_agents_store_lock: Mutex::new(()),
-        channel_templates_store_lock: Mutex::new(()),
-        managed_agent_processes: Mutex::new(HashMap::new()),
-        session_config_cache: Mutex::new(HashMap::new()),
-        channel_member_profile_cache: ChannelMemberProfileCache::default(),
-        huddle_state: Mutex::new(HuddleState::default()),
-        huddle_audio: Default::default(),
-        app_handle: Mutex::new(None),
-        media_proxy_port: AtomicU16::new(0),
-        prevent_sleep: Arc::new(Mutex::new(
-            crate::prevent_sleep::PreventSleepState::default(),
-        )),
-        keyring_locked: AtomicBool::new(false),
-        identity_lost: AtomicBool::new(false),
-        reset_failed: AtomicBool::new(false),
-        #[cfg(feature = "mesh-llm")]
-        mesh_llm_runtime: AsyncMutex::new(None),
-        #[cfg(feature = "mesh-llm")]
-        mesh_recovery: crate::mesh_llm::MeshRecoveryState::default(),
-        #[cfg(feature = "mesh-llm")]
-        mesh_coordinator: AsyncMutex::new(None),
-        pending_owned_channels: Mutex::new(std::collections::HashSet::new()),
-    }
 }
 
 impl AppState {

@@ -11,6 +11,9 @@ import {
 } from "../registry.ts";
 
 const THROW_COMMANDS = [
+  "fetch_audio_bytes",
+  "cancel_media_fetch",
+  "release_media_fetch",
   "add_agent_to_huddle",
   "close_huddle_companion",
   "confirm_huddle_active",

@@ -441,6 +441,7 @@ function processEvent(
   return offsetChanged ? "changed" : "processed";
 }
 
+// Native tray consumers remain visible while the document is hidden.
 function ensurePruneInterval() {
   if (pruneInterval) return;
   pruneInterval = setInterval(pruneExpired, PRUNE_INTERVAL_MS);

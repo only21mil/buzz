@@ -231,3 +231,27 @@ test("backup passphrase generation honors bounded word count and separator", asy
   });
   assert.match(passphrase, /^[0-9a-f]{8}(?:-[0-9a-f]{8}){3}$/);
 });
+
+test("sign_event checks the actual signer even before the renderer learns of its replacement", async () => {
+  const { capturePublicationScope, setPublicationScope } = await import(
+    "../../shared/api/publicationScope.ts"
+  );
+  const manager = await BrowserIdentityManager.create(
+    new MemoryIdentityStore(),
+    new DirectNip49Codec(),
+  );
+  setPublicationScope(manager.pubkey(), "wss://relay.example", true);
+  const expectedScope = capturePublicationScope();
+  registerIdentityCommands(manager);
+  const input = {
+    kind: 9,
+    content: "captured",
+    tags: [["h", "channel"]],
+    expectedScope,
+  };
+  const original = JSON.parse(await dispatch("sign_event", input));
+  assert.equal(original.pubkey, expectedScope.pubkey);
+  assert.equal(verifyEvent(original), true);
+  await manager.importIdentity("03".padStart(64, "0"));
+  await assert.rejects(dispatch("sign_event", input), /signer changed/);
+});

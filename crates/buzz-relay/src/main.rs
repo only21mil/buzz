@@ -35,6 +35,16 @@ fn buzz_auto_migrate_enabled(value: Option<&str>) -> bool {
     })
 }
 
+fn relay_keypair_from_config(relay_private_key: Option<&str>) -> anyhow::Result<nostr::Keys> {
+    let hex = relay_private_key.ok_or_else(|| {
+        anyhow::anyhow!(
+            "BUZZ_RELAY_PRIVATE_KEY must be supplied through the approved protected \
+             environment with the existing stable relay identity."
+        )
+    })?;
+    nostr::Keys::parse(hex).map_err(|_| anyhow::anyhow!("invalid BUZZ_RELAY_PRIVATE_KEY"))
+}
+
 /// Controls how many per-community gauge series the usage poller emits.
 ///
 /// Datadog cost is proportional to the number of unique time-series.  With ~25
@@ -143,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
         error!("Invalid configuration: {e}");
         anyhow::anyhow!("Configuration error: {e}")
     })?;
+    let relay_keypair = relay_keypair_from_config(config.relay_private_key.as_deref())?;
     info!(
         bind_addr = %config.bind_addr,
         relay_url = %config.relay_url,
@@ -150,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
         metrics_port = config.metrics_port,
         max_frame_bytes = config.max_frame_bytes,
         audit_enabled = config.audit_enabled,
+        push_enabled = config.push_enabled,
         "Config loaded"
     );
 
@@ -157,6 +169,7 @@ async fn main() -> anyhow::Result<()> {
     let usage_idle_timeout_secs = usage_metrics_idle_timeout_secs(usage_interval_secs);
     relay_metrics::install(config.metrics_port, usage_idle_timeout_secs);
     metrics::gauge!("buzz_audit_enabled").set(if config.audit_enabled { 1.0 } else { 0.0 });
+    metrics::gauge!("buzz_push_enabled").set(if config.push_enabled { 1.0 } else { 0.0 });
     info!(
         port = config.metrics_port,
         idle_timeout_secs = usage_idle_timeout_secs,
@@ -170,7 +183,8 @@ async fn main() -> anyhow::Result<()> {
         max_connections: config.db_pool_size,
         read_max_connections: config.db_read_pool_size,
         ..DbConfig::default()
-    };
+    }
+    .with_session_timeouts_from_env();
     let db = Db::new(&db_config).await.map_err(|e| {
         error!("Failed to connect to Postgres: {e}");
         anyhow::anyhow!("DB connection failed: {e}")
@@ -232,16 +246,6 @@ async fn main() -> anyhow::Result<()> {
         );
         return Err(anyhow::anyhow!(
             "RELAY_OWNER_PUBKEY required when BUZZ_REQUIRE_RELAY_MEMBERSHIP=true"
-        ));
-    }
-
-    // NIP-43: relay membership requires a stable signing key.
-    // Check this before any DB mutations so we fail fast — no point backfilling
-    // or bootstrapping if we'll reject the config anyway.
-    if config.require_relay_membership && config.relay_private_key.is_none() {
-        return Err(anyhow::anyhow!(
-            "BUZZ_RELAY_PRIVATE_KEY is required when BUZZ_REQUIRE_RELAY_MEMBERSHIP=true. \
-             NIP-43 events signed with an ephemeral key become unverifiable after restart."
         ));
     }
 
@@ -347,12 +351,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let audit = if config.audit_enabled {
-        let audit_pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(5)
-            .min_connections(1)
-            .connect(&config.database_url)
-            .await
-            .map_err(|e| anyhow::anyhow!("Audit DB connection failed: {e}"))?;
+        let audit_pool = Db::connect_writer_pool(&DbConfig {
+            max_connections: 5,
+            min_connections: 1,
+            ..db_config.clone()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Audit DB connection failed: {e}"))?;
         info!("Audit service ready");
         Some(AuditService::new(audit_pool))
     } else {
@@ -415,29 +420,6 @@ async fn main() -> anyhow::Result<()> {
 
     let workflow_config = buzz_workflow::WorkflowConfig::default();
     let workflow_engine = Arc::new(WorkflowEngine::new(db.clone(), workflow_config));
-
-    let relay_keypair = if let Some(hex) = &config.relay_private_key {
-        nostr::Keys::parse(hex)
-            .map_err(|e| anyhow::anyhow!("invalid BUZZ_RELAY_PRIVATE_KEY: {e}"))?
-    } else if !config.require_auth_token {
-        // Dev mode: use a deterministic keypair so addressable events (kind:39000/39001/39002)
-        // replace correctly across restarts. Without this, each restart generates a new pubkey
-        // and replace_addressable_event inserts duplicates instead of replacing.
-        const DEV_RELAY_PRIVKEY: &str =
-            "0000000000000000000000000000000000000000000000000000000000000001";
-        let keys = nostr::Keys::parse(DEV_RELAY_PRIVKEY).expect("hardcoded dev key is valid");
-        tracing::warn!(
-            pubkey = %keys.public_key().to_hex(),
-            "Using hardcoded dev relay keypair (BUZZ_REQUIRE_AUTH_TOKEN=false). \
-             Set BUZZ_RELAY_PRIVATE_KEY for production."
-        );
-        keys
-    } else {
-        panic!(
-            "BUZZ_RELAY_PRIVATE_KEY must be set when BUZZ_REQUIRE_AUTH_TOKEN=true. \
-             A stable relay identity is required for production."
-        );
-    };
 
     config
         .media
@@ -749,15 +731,16 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // NIP-PL matcher and worker are enabled as one unit. Lease acceptance is
-    // already disabled without the exact gateway URL, so discovery and runtime
-    // cannot advertise or accumulate work for an undeliverable configuration.
-    if state.config.push_gateway_delivery_url.is_some() {
+    // NIP-PL matcher and worker are enabled as one unit behind the explicit
+    // deployment opt-in. The gateway URL alone never enables push.
+    if state.config.push_enabled {
         tokio::spawn(buzz_relay::push_runtime::run_matcher(Arc::clone(&state)));
         tokio::spawn(buzz_relay::push_runtime::run_delivery_worker(Arc::clone(
             &state,
         )));
         info!("NIP-PL push matcher and delivery worker started");
+    } else {
+        info!("NIP-PL push disabled by BUZZ_PUSH_ENABLED");
     }
 
     // NIP-ER reminder scheduler — polls for due reminders and publishes them
@@ -2029,8 +2012,8 @@ mod tests {
 
     use super::{
         buzz_auto_migrate_enabled, dropped_in_memory_keys, idle_timeout_secs,
-        refresh_legacy_active_gauge_recency, run_periodic_until_cancelled, EmissionScope,
-        InMemoryMetricKey,
+        refresh_legacy_active_gauge_recency, relay_keypair_from_config,
+        run_periodic_until_cancelled, EmissionScope, InMemoryMetricKey,
     };
     use metrics::GaugeFn;
     use metrics_util::{
@@ -2076,6 +2059,33 @@ mod tests {
         assert!(buzz_auto_migrate_enabled(Some(" 1 ")));
         assert!(buzz_auto_migrate_enabled(Some("yes")));
         assert!(buzz_auto_migrate_enabled(Some("on")));
+    }
+
+    #[test]
+    fn configured_relay_identity_is_preserved() {
+        let configured = nostr::Keys::generate();
+        let secret = configured.secret_key().to_secret_hex();
+
+        let selected = relay_keypair_from_config(Some(&secret)).expect("configured key");
+
+        assert_eq!(selected.public_key(), configured.public_key());
+        let restarted = relay_keypair_from_config(Some(&secret)).expect("same configured key");
+        assert_eq!(restarted.public_key(), selected.public_key());
+    }
+
+    #[test]
+    fn invalid_relay_identity_is_rejected_without_echoing_input() {
+        for invalid in ["", "not-a-private-key", "00", &"0".repeat(64)] {
+            let error = relay_keypair_from_config(Some(invalid)).unwrap_err();
+            assert_eq!(error.to_string(), "invalid BUZZ_RELAY_PRIVATE_KEY");
+        }
+    }
+
+    #[test]
+    fn missing_relay_identity_is_rejected() {
+        let result = relay_keypair_from_config(None);
+
+        assert!(result.is_err());
     }
 
     #[test]

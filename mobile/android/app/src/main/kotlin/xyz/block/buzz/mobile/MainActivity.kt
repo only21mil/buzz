@@ -80,10 +80,14 @@ internal object AndroidImageProcessor {
 
 class MainActivity : FlutterActivity() {
     private var mediaUploadChannel: MethodChannel? = null
+    private var huddleMediaPlugin: HuddleMediaPlugin? = null
     private var notificationBridge: AndroidNotificationBridge? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+
+        huddleMediaPlugin?.dispose()
+        huddleMediaPlugin = HuddleMediaPlugin(this, flutterEngine.dartExecutor.binaryMessenger)
 
         notificationBridge?.dispose()
         notificationBridge = AndroidNotificationBridge(
@@ -108,6 +112,9 @@ class MainActivity : FlutterActivity() {
                     }
                     GENERATE_VIDEO_POSTER_METHOD -> {
                         handleGenerateVideoPoster(call.arguments, result)
+                    }
+                    PACKAGE_VOICE_NOTE_FOR_UPLOAD_METHOD -> {
+                        handlePackageVoiceNoteForUpload(call.arguments, result)
                     }
                     REQUIRES_LEGACY_MEDIA_STORAGE_PERMISSION_METHOD -> {
                         result.success(Build.VERSION.SDK_INT <= Build.VERSION_CODES.P)
@@ -135,9 +142,12 @@ class MainActivity : FlutterActivity() {
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         notificationBridge?.handlePermissionResult(requestCode, permissions, grantResults)
+        huddleMediaPlugin?.onRequestPermissionsResult(requestCode, permissions, grantResults)
     }
 
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        huddleMediaPlugin?.dispose()
+        huddleMediaPlugin = null
         notificationBridge?.dispose()
         notificationBridge = null
         super.cleanUpFlutterEngine(flutterEngine)
@@ -361,6 +371,33 @@ class MainActivity : FlutterActivity() {
         }.start()
     }
 
+    private fun handlePackageVoiceNoteForUpload(
+        arguments: Any?,
+        result: MethodChannel.Result,
+    ) {
+        val sourcePath = arguments as? String ?: run {
+            invalidArguments(result, "Expected source file path as String.")
+            return
+        }
+
+        Thread {
+            try {
+                result.success(
+                    AndroidVoiceNotePackager.packageForUpload(
+                        sourcePath = sourcePath,
+                        cacheDirectory = cacheDir,
+                    ),
+                )
+            } catch (error: Exception) {
+                result.error(
+                    "transcode_failed",
+                    "Unable to assemble voice note for upload.",
+                    error.message,
+                )
+            }
+        }.start()
+    }
+
     private fun invalidArguments(
         result: MethodChannel.Result,
         message: String,
@@ -374,6 +411,7 @@ class MainActivity : FlutterActivity() {
         private const val TRANSCODE_IMAGE_TO_JPEG_METHOD = "transcodeImageToJpeg"
         private const val TRANSCODE_VIDEO_TO_MP4_METHOD = "transcodeVideoToMp4"
         private const val GENERATE_VIDEO_POSTER_METHOD = "generateVideoPoster"
+        private const val PACKAGE_VOICE_NOTE_FOR_UPLOAD_METHOD = "packageVoiceNoteForUpload"
         private const val REQUIRES_LEGACY_MEDIA_STORAGE_PERMISSION_METHOD =
             "requiresLegacyMediaStoragePermission"
     }

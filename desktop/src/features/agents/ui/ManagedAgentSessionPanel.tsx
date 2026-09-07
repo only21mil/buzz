@@ -43,7 +43,8 @@ import {
 } from "./agentSessionTranscriptProjection";
 
 type ManagedAgentSessionPanelProps = {
-  agent: Pick<ManagedAgent, "pubkey" | "name" | "status"> & {
+  agent: Pick<ManagedAgent, "pubkey" | "name"> & {
+    status: ManagedAgent["status"] | "unknown";
     avatarUrl?: string | null;
   };
   autoTail?: boolean;

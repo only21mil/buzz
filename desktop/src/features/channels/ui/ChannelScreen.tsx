@@ -1,31 +1,22 @@
+import type { PublicationScope } from "@/shared/api/publicationScope";
+import { buildMessageEditTarget } from "@/features/messages/lib/buildMessageEditTarget";
 import * as React from "react";
 import { useAppShell } from "@/app/AppShellContext";
-import { cacheSearchHitEvent } from "@/app/navigation/searchHitEventCache";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useActiveChannelHeader } from "@/features/channels/useActiveChannelHeader";
 import { useChannelPaneHandlers } from "@/features/channels/useChannelPaneHandlers";
 import { useMessageEventProfilePubkeys } from "@/features/channels/useMessageEventProfilePubkeys";
 import { useMessageOwnerProfiles } from "@/features/channels/useMessageOwnerProfiles";
 import { useThreadTargetSync } from "@/features/channels/useThreadTargetSync";
-import {
-  useChannelMembersQuery,
-  useJoinChannelMutation,
-} from "@/features/channels/hooks";
-import {
-  MSG_PREFIX,
-  THREAD_PREFIX,
-} from "@/features/channels/readState/readStateFormat";
+import * as channelHooks from "@/features/channels/hooks";
+import * as readStateFormat from "@/features/channels/readState/readStateFormat";
 import { ChannelScreenEmptyState } from "@/features/channels/ui/ChannelScreenEmptyState";
 import { ChannelScreenHeader } from "@/features/channels/ui/ChannelScreenHeader";
 import { ChannelPane } from "@/features/channels/ui/ChannelScreenLazyViews";
 import { WelcomeAgentCreateDialog } from "@/features/channels/ui/WelcomeAgentCreateDialog";
 import { ForumChannelContent } from "@/features/channels/ui/ForumChannelContent";
 import { MembersSidebar } from "@/features/channels/ui/MembersSidebar";
-import {
-  useManagedAgentsQuery,
-  usePersonasQuery,
-  useRelayAgentsQuery,
-} from "@/features/agents/hooks";
+import * as agentHooks from "@/features/agents/hooks";
 import { mergeChannelKnownAgentPubkeys } from "@/features/agents/knownAgentPubkeys";
 import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
 import { pickWelcomeGuideAgent } from "@/features/onboarding/welcomeGuide";
@@ -44,7 +35,6 @@ import {
 } from "@/features/messages/hooks";
 import { formatTimelineMessages } from "@/features/messages/lib/formatTimelineMessages";
 import { DeleteMessageConfirmDialog } from "@/features/messages/ui/DeleteMessageConfirmDialog";
-import { imetaMediaFromTags } from "@/features/messages/lib/imetaMediaMarkdown";
 import { getThreadReference } from "@/features/messages/lib/threading";
 import {
   resolveTimelineLoadingLatch,
@@ -57,13 +47,9 @@ import { useChannelTyping } from "@/features/messages/useChannelTyping";
 import type { TimelineMessage } from "@/features/messages/types";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
 import { useRelaySelfQuery } from "@/features/moderation/hooks";
-import type { RelayEvent, RespondToMode, SearchHit } from "@/shared/api/types";
-import { useChannelFind } from "@/features/search/useChannelFind";
+import type { RelayEvent, RespondToMode } from "@/shared/api/types";
 import { ChannelScreenLoadingFallback } from "@/features/channels/ui/ChannelScreenLoadingFallback";
-import {
-  useHuddleChannelMessages,
-  useIsHuddleTranscript,
-} from "@/features/channels/ui/useHuddleChannelMessages";
+import * as huddleMessages from "@/features/channels/ui/useHuddleChannelMessages";
 import { useHuddleReadMarker } from "@/features/channels/ui/useHuddleReadMarker";
 import { useHuddleThreadIsolation } from "@/features/channels/ui/useHuddleThreadIsolation";
 import { AgentSessionProvider } from "@/shared/context/AgentSessionContext";
@@ -97,6 +83,7 @@ export function ChannelScreen({
   targetForumReplyId,
   targetMessageEvents,
   targetMessageId,
+  ...searchTarget
 }: ChannelScreenProps) {
   const { goHome } = useAppNavigation();
   const { activeCommunity } = useCommunities();
@@ -165,7 +152,8 @@ export function ChannelScreen({
   const mainInsetRef = useMainInsetRef();
   const currentPubkey = currentIdentity?.pubkey;
   const activeChannelId = activeChannel?.id ?? null;
-  const isHuddleTranscript = useIsHuddleTranscript(activeChannelId);
+  const isHuddleTranscript =
+    huddleMessages.useIsHuddleTranscript(activeChannelId);
   const relaySelfPubkey = useRelaySelfQuery(activeChannel !== null).data;
   const effectiveOpenThreadHeadId = useHuddleThreadIsolation({
     closeThread: setOpenThreadHeadId,
@@ -224,7 +212,8 @@ export function ChannelScreen({
       return;
     }
     setContextParentResolver((contextId) =>
-      contextId.startsWith(THREAD_PREFIX) || contextId.startsWith(MSG_PREFIX)
+      contextId.startsWith(readStateFormat.THREAD_PREFIX) ||
+      contextId.startsWith(readStateFormat.MSG_PREFIX)
         ? activeChannelId
         : null,
     );
@@ -244,20 +233,16 @@ export function ChannelScreen({
   const toggleReactionMutation = useToggleReactionMutation();
   const deleteMessageMutation = useDeleteMessageMutation(activeChannel);
   const editMessageMutation = useEditMessageMutation(activeChannel);
-  const joinChannelMutation = useJoinChannelMutation(activeChannelId);
-  const [findEvents, setFindEvents] = React.useState<RelayEvent[]>([]);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: intentional
-  React.useEffect(() => {
-    setFindEvents([]);
-  }, [activeChannelId]);
-  const { resolvedMessages, threadSummaries } = useHuddleChannelMessages({
-    activeChannel,
-    findEvents,
-    isHuddleTranscript,
-    messages: messagesQuery.data ?? EMPTY_RELAY_EVENTS,
-    targetMessageEvents,
-    windowStore: windowQuery.data,
-  });
+  const joinChannelMutation =
+    channelHooks.useJoinChannelMutation(activeChannelId);
+  const { resolvedMessages, threadSummaries } =
+    huddleMessages.useHuddleChannelMessages({
+      activeChannel,
+      isHuddleTranscript,
+      messages: messagesQuery.data ?? EMPTY_RELAY_EVENTS,
+      targetMessageEvents,
+      windowStore: windowQuery.data,
+    });
   useHuddleReadMarker({
     activeChannelId,
     activeChannelIsMember: activeChannel?.isMember,
@@ -297,9 +282,11 @@ export function ChannelScreen({
         : [],
     [activeChannel],
   );
-  const channelMembersQuery = useChannelMembersQuery(activeChannel?.id ?? null);
+  const channelMembersQuery = channelHooks.useChannelMembersQuery(
+    activeChannel?.id ?? null,
+  );
   const channelMembers = channelMembersQuery.data;
-  const managedAgentsQuery = useManagedAgentsQuery();
+  const managedAgentsQuery = agentHooks.useManagedAgentsQuery();
   const managedAgents = managedAgentsQuery.data ?? [];
   const welcomeGuideAgent = React.useMemo(
     () => pickWelcomeGuideAgent(managedAgents),
@@ -310,7 +297,7 @@ export function ChannelScreen({
     currentIdentity,
     welcomeGuideAgent,
   });
-  const relayAgentsQuery = useRelayAgentsQuery();
+  const relayAgentsQuery = agentHooks.useRelayAgentsQuery();
   const relayAgents = relayAgentsQuery.data ?? [];
   const knownAgentPubkeys = React.useMemo(
     () =>
@@ -377,7 +364,7 @@ export function ChannelScreen({
     }
     return pubkeys;
   }, [knownAgentPubkeys, messageProfiles, communityAgentPubkeys]);
-  const personasQuery = usePersonasQuery();
+  const personasQuery = agentHooks.usePersonasQuery();
   const { personaLookup, respondToLookup } = React.useMemo(() => {
     const agents = managedAgentsQuery.data ?? [];
     const personaById = new Map(
@@ -420,19 +407,6 @@ export function ChannelScreen({
       resolvedMessages,
     ],
   );
-  const handleFindSearchHit = React.useCallback((hit: SearchHit) => {
-    const event = cacheSearchHitEvent(hit);
-    setFindEvents((currentEvents) =>
-      currentEvents.some((currentEvent) => currentEvent.id === event.id)
-        ? currentEvents
-        : [...currentEvents, event],
-    );
-  }, []);
-  const channelFind = useChannelFind({
-    channelId: activeChannelId,
-    messages: timelineMessages,
-    onSearchHit: handleFindSearchHit,
-  });
   const threadPanelData = useIndependentThreadPanel({
     activeChannel,
     channelEvents: resolvedMessages,
@@ -542,8 +516,10 @@ export function ChannelScreen({
       mentionPubkeys: string[],
       mediaTags?: string[][],
       parentEventId?: string,
+      publicationScope?: PublicationScope,
     ) => {
       await sendMessageMutateAsync({
+        publicationScope,
         content,
         mediaTags,
         mentionPubkeys,
@@ -822,6 +798,7 @@ export function ChannelScreen({
           {activeChannel ? (
             activeChannel.channelType === "forum" ? (
               <ForumChannelContent
+                {...searchTarget}
                 canResetPanelWidth={canResetThreadPanelWidth}
                 channel={activeChannel}
                 currentPubkey={currentPubkey}
@@ -851,6 +828,7 @@ export function ChannelScreen({
                 }
               >
                 <ChannelPane
+                  {...searchTarget}
                   activeChannel={activeChannel}
                   activityAgents={channelAgentSessionAgents}
                   agentPubkeys={agentPubkeys}
@@ -859,7 +837,6 @@ export function ChannelScreen({
                   autoSendDraftKey={autoSendDraftKey}
                   onAutoSendComplete={clearAutoSend}
                   botTypingEntries={botTypingEntries}
-                  channelFind={channelFind}
                   channelManagementOpen={channelManagementOpen}
                   currentPubkey={currentPubkey}
                   canResetThreadPanelWidth={canResetThreadPanelWidth}
@@ -877,18 +854,11 @@ export function ChannelScreen({
                   onEntranceMessageComplete={handleWelcomeEntranceComplete}
                   welcomeKickoffStage={welcomeKickoffStage}
                   welcomeKickoffSettingUp={welcomeKickoffSettingUp}
-                  editTarget={
-                    editTargetMessage
-                      ? {
-                          author: editTargetMessage.author,
-                          body: editTargetMessage.body,
-                          id: editTargetMessage.id,
-                          imetaMedia: imetaMediaFromTags(
-                            editTargetMessage.tags,
-                          ),
-                        }
-                      : null
-                  }
+                  editTarget={buildMessageEditTarget(
+                    editTargetMessage,
+                    messageProfiles,
+                    agentPubkeys,
+                  )}
                   followThreadById={followThread}
                   unfollowThreadById={unfollowThread}
                   isFollowingThreadById={isFollowingThread}

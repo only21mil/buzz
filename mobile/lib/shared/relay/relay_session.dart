@@ -14,9 +14,12 @@ import '../auth/auth.dart';
 import 'nostr_models.dart';
 import 'relay_client.dart';
 import 'relay_closed_policy.dart';
+import 'relay_http_query_client.dart';
 import 'relay_provider.dart';
 import 'relay_rate_limit_gate.dart';
 import 'relay_socket.dart';
+
+part 'relay_session_huddle_lifecycle.dart';
 
 enum SessionStatus { disconnected, connecting, connected, reconnecting }
 
@@ -74,8 +77,7 @@ class _BufferedEvent {
   _BufferedEvent(this.subId, this.event);
 }
 
-/// Manages websocket subscriptions, event batching, reconnection with replay,
-/// and pending event tracking. Equivalent to the desktop's RelayClientSession.
+/// Manages websocket subscriptions, batching, reconnection, and pending events.
 typedef RelaySocketFactory =
     RelaySocket Function({
       required String wsUrl,
@@ -88,19 +90,23 @@ typedef RelaySocketFactory =
 class RelaySessionNotifier extends Notifier<SessionState> {
   RelaySessionNotifier({
     http.Client? httpClient,
+    http.Client Function()? httpClientFactory,
     RelaySocketFactory socketFactory = RelaySocket.new,
     DateTime Function()? now,
     RelayRateLimitGate? rateLimitGate,
     RelayTimerFactory retryTimerFactory = Timer.new,
     Future<void> Function(Duration) replayDelay = Future.delayed,
-  }) : _httpClient = httpClient,
+  }) : _httpQueryClient = RelayHttpQueryClient(
+         client: httpClient,
+         clientFactory: httpClientFactory,
+       ),
        _socketFactory = socketFactory,
        _now = now ?? DateTime.now,
        _rateLimitGate = rateLimitGate ?? RelayRateLimitGate(),
        _retryTimerFactory = retryTimerFactory,
        _replayDelay = replayDelay;
 
-  final http.Client? _httpClient;
+  final RelayHttpQueryClient _httpQueryClient;
   final RelaySocketFactory _socketFactory;
   final DateTime Function() _now;
   final RelayRateLimitGate _rateLimitGate;
@@ -134,6 +140,7 @@ class RelaySessionNotifier extends Notifier<SessionState> {
   bool _hasConnectedOnce = false;
   int _connectionGeneration = 0;
   final Map<Object, String> _visibleChannelsByOwner = {};
+  final Map<Object, Future<void> Function()> _beforePauseCallbacks = {};
   bool _socketConnected = false;
   bool _closedRetryReplayScheduled = false;
 
@@ -168,26 +175,22 @@ class RelaySessionNotifier extends Notifier<SessionState> {
     final bodyBytes = utf8.encode(
       jsonEncode(filters.map((filter) => filter.toJson()).toList()),
     );
-    final client = _httpClient ?? http.Client();
-    final shouldCloseClient = _httpClient == null;
-    final response = await client
-        .post(
-          Uri.parse(url),
-          headers: {
-            'Authorization': buildNip98AuthHeader(
-              method: 'POST',
-              url: url,
-              bodyBytes: bodyBytes,
-              nsec: config.nsec,
-            ),
-            'Content-Type': 'application/json',
-          },
-          body: bodyBytes,
-        )
-        .timeout(timeout)
-        .whenComplete(() {
-          if (shouldCloseClient) client.close();
-        });
+    // Reuse the session transport on success. A timeout rotates immediately
+    // for new queries, then closes the retired client after its peers finish.
+    final response = await _httpQueryClient.post(
+      Uri.parse(url),
+      headers: {
+        'Authorization': buildNip98AuthHeader(
+          method: 'POST',
+          url: url,
+          bodyBytes: bodyBytes,
+          nsec: config.nsec,
+        ),
+        'Content-Type': 'application/json',
+      },
+      body: bodyBytes,
+      timeout: timeout,
+    );
     if (response.statusCode < 200 || response.statusCode >= 300) {
       _activateRateLimitGateFromHttpError(response.body);
       throw RelayException(response.statusCode, response.body);
@@ -395,13 +398,6 @@ class RelaySessionNotifier extends Notifier<SessionState> {
     _reconnectDelayMs = _baseReconnectDelayMs;
     final config = ref.read(relayConfigProvider);
     await _connect(config);
-  }
-
-  /// Called by the app lifecycle provider when the app goes to background.
-  void onAppPaused() {
-    _backgroundedAt = _now();
-    _backgroundGraceTimer?.cancel();
-    _backgroundGraceTimer = Timer(_backgroundGraceDuration, _pauseNow);
   }
 
   void _pauseNow() {
@@ -708,7 +704,7 @@ class RelaySessionNotifier extends Notifier<SessionState> {
       final retrySeconds = parseRateLimitRetrySeconds(message);
       _rateLimitGate.activate(retrySeconds);
       final fallbackMs =
-          (retrySeconds != null && retrySeconds > 0
+          (retrySeconds != null
               ? min(retrySeconds, RelayRateLimitGate.maxRetrySeconds)
               : RelayRateLimitGate.defaultRetrySeconds) *
           1000;
@@ -916,6 +912,7 @@ class RelaySessionNotifier extends Notifier<SessionState> {
 
   void _dispose() {
     _disposed = true;
+    _beforePauseCallbacks.clear();
     _connectionGeneration++;
     _reconnectTimer?.cancel();
     _flushTimer?.cancel();
@@ -936,7 +933,7 @@ class RelaySessionNotifier extends Notifier<SessionState> {
     _recentDeliveryKeys.clear();
     _socket?.dispose();
     _socket = null;
-    _httpClient?.close();
+    _httpQueryClient.close();
   }
 }
 

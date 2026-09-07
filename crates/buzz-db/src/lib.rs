@@ -9,6 +9,9 @@
 //! - No FK references to partitioned tables.
 //! - Uses `sqlx::query()` (runtime) not `sqlx::query!()` (compile-time).
 
+#[cfg(test)]
+mod test_connection;
+
 /// Explicit deployment-global admin report reads.
 pub mod admin_moderation;
 /// API token storage and lookup.
@@ -17,14 +20,20 @@ pub mod api_token;
 pub mod archived_identities;
 /// Channel and membership persistence.
 pub mod channel;
+/// Channel membership reads and serialized role changes.
+pub mod channel_members;
 /// Durable Buzz-native CI ingest index and queries.
 pub mod ci;
 /// CI control-plane signer grants.
 pub mod ci_grants;
+/// Community lifecycle and host-map persistence.
+pub mod community;
 /// Direct message channel persistence.
 pub mod dm;
 /// Database error types.
 pub mod error;
+mod session_policy;
+pub use session_policy::{DEFAULT_IDLE_TXN_TIMEOUT_MS, DEFAULT_LOCK_TIMEOUT_MS};
 /// Event storage and retrieval.
 pub mod event;
 /// Home feed queries.
@@ -33,6 +42,9 @@ pub mod feed;
 pub mod git_repo;
 /// Embedded database migrations.
 pub mod migration;
+/// Bounded database pressure and readiness observations.
+pub mod observability;
+pub use observability::DbReadinessOutcome;
 /// Community moderation: reports, bans/timeouts, audit actions.
 pub mod moderation;
 /// Monthly table partition management.
@@ -47,6 +59,8 @@ pub mod reaction;
 pub mod relay_invite;
 /// Relay-level membership persistence (NIP-43).
 pub mod relay_members;
+/// Replaceable event persistence and coordinate-serialized repository tombstones.
+pub mod replaceable;
 /// Replica freshness fence for keyset-cursor read routing.
 pub mod replica_fence;
 /// Thread metadata persistence.
@@ -89,120 +103,9 @@ use uuid::Uuid;
 
 use buzz_core::{CommunityId, StoredEvent};
 
-/// Result of atomically storing a repository deletion tombstone and applying it
-/// to the current kind-30617 announcement head.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RepoDeletionOutcome {
-    /// A live announcement at or before the tombstone timestamp was deleted.
-    Deleted,
-    /// The tombstone was an exact replay and no live announcement remains.
-    AlreadyAbsent,
-    /// A new tombstone named no live announcement, so the tombstone was rolled back.
-    NotFound,
-    /// The live announcement is newer than the tombstone, so no change was committed.
-    StaleHead,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct RepoDeletionTarget {
-    owner_pubkey: Vec<u8>,
-    repo_id: String,
-}
-
-fn repo_deletion_target(tombstone: &nostr::Event) -> Result<RepoDeletionTarget> {
-    const REPO_ANNOUNCEMENT_KIND: &str = "30617";
-
-    if buzz_core::kind::event_kind_i32(tombstone) != 5 {
-        return Err(DbError::InvalidData(format!(
-            "repository deletion tombstone must be kind 5, got {}",
-            buzz_core::kind::event_kind_i32(tombstone)
-        )));
-    }
-
-    let mut coordinate: Option<&str> = None;
-    for tag in tombstone.tags.iter() {
-        let parts = tag.as_slice();
-        match parts.first().map(String::as_str) {
-            Some("a") => {
-                if coordinate.is_some() || parts.len() != 2 {
-                    return Err(DbError::InvalidData(
-                        "repository deletion tombstone must contain exactly one canonical a tag"
-                            .into(),
-                    ));
-                }
-                coordinate = Some(parts[1].as_str());
-            }
-            Some("e") => {
-                return Err(DbError::InvalidData(
-                    "repository deletion tombstone must not contain e tags".into(),
-                ));
-            }
-            _ => {}
-        }
-    }
-
-    let coordinate = coordinate.ok_or_else(|| {
-        DbError::InvalidData(
-            "repository deletion tombstone must contain exactly one canonical a tag".into(),
-        )
-    })?;
-    let mut parts = coordinate.splitn(3, ':');
-    let (Some(kind), Some(owner_hex), Some(repo_id)) = (parts.next(), parts.next(), parts.next())
-    else {
-        return Err(DbError::InvalidData(
-            "repository deletion target must be 30617:<lowercase-owner-hex>:<repo-id>".into(),
-        ));
-    };
-    if kind != REPO_ANNOUNCEMENT_KIND
-        || owner_hex.len() != 64
-        || owner_hex
-            .bytes()
-            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
-        || repo_id.is_empty()
-        || repo_id.len() > event::D_TAG_MAX_LEN
-    {
-        return Err(DbError::InvalidData(
-            "repository deletion target must be 30617:<lowercase-owner-hex>:<repo-id>".into(),
-        ));
-    }
-    let owner = nostr::PublicKey::from_hex(owner_hex).map_err(|error| {
-        DbError::InvalidData(format!(
-            "repository deletion target contains an invalid owner pubkey: {error}"
-        ))
-    })?;
-
-    Ok(RepoDeletionTarget {
-        owner_pubkey: owner.to_bytes().to_vec(),
-        repo_id: repo_id.to_owned(),
-    })
-}
-
-fn event_replacement_lock_key(
-    community_id: CommunityId,
-    kind: i32,
-    pubkey: &[u8],
-    coordinate: Option<&[u8]>,
-) -> i64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    let kind_bytes = kind.to_le_bytes();
-    for bytes in [
-        community_id.as_uuid().as_bytes().as_slice(),
-        kind_bytes.as_slice(),
-        pubkey,
-    ] {
-        for byte in bytes {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-    }
-    if let Some(coordinate) = coordinate {
-        for byte in coordinate {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-    }
-    hash as i64
-}
+pub use replaceable::RepoDeletionOutcome;
+#[cfg(test)]
+use replaceable::{event_replacement_lock_key, repo_deletion_target};
 
 /// Extract p-tag mentions from an event and insert into the `event_mentions` table.
 ///
@@ -639,6 +542,12 @@ pub struct DbConfig {
     /// than the staleness gate never routes anyway, so a larger budget
     /// would only misrepresent the config.
     pub replica_read_max_age_ms: u64,
+    /// Writer lock wait limit in milliseconds; zero disables it.
+    pub lock_timeout_ms: u64,
+    /// Writer idle transaction lifetime in milliseconds; zero disables it.
+    pub idle_txn_timeout_ms: u64,
+    /// Writer statement limit in milliseconds; zero disables it.
+    pub statement_timeout_ms: u64,
 }
 
 impl Default for DbConfig {
@@ -656,82 +565,18 @@ impl Default for DbConfig {
             max_lifetime_secs: 1800,
             idle_timeout_secs: 600,
             replica_read_max_age_ms: 0,
+            lock_timeout_ms: DEFAULT_LOCK_TIMEOUT_MS,
+            idle_txn_timeout_ms: DEFAULT_IDLE_TXN_TIMEOUT_MS,
+            statement_timeout_ms: 0,
         }
     }
 }
 
-/// Community host-map row returned by [`Db::lookup_community_by_host`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommunityRecord {
-    /// Stable server-resolved community id.
-    pub id: CommunityId,
-    /// Normalized host that maps to this community.
-    pub host: String,
-}
-
-/// Community row returned by idempotent community ensure/create operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EnsuredCommunityRecord {
-    /// Stable server-resolved community id.
-    pub id: CommunityId,
-    /// Normalized host that maps to this community.
-    pub host: String,
-    /// True only when this call inserted the `communities` row.
-    pub created: bool,
-}
-
-/// Community row returned by an atomic create-with-owner operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreatedCommunityRecord {
-    /// Stable server-resolved community id.
-    pub id: CommunityId,
-    /// Normalized host stored for the community.
-    pub host: String,
-}
-
-/// Result of atomically creating a community with its initial owner.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CreateCommunityWithOwnerResult {
-    /// The community was created, or an identical retried create found it.
-    Created(CreatedCommunityRecord),
-    /// The host already belongs to another owner.
-    HostExists,
-    /// The intended owner already owns the maximum number of communities.
-    LimitReached,
-}
-
-/// Community row returned by operator-plane ownership reads.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnedCommunityRecord {
-    /// Stable server-resolved community id.
-    pub id: CommunityId,
-    /// Normalized host that maps to this community.
-    pub host: String,
-    /// When the community row was created.
-    pub created_at: DateTime<Utc>,
-    /// When the community was archived; absent while active.
-    pub archived_at: Option<DateTime<Utc>>,
-}
-
-/// Community row returned by an owner-authorized archive operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ArchivedCommunityRecord {
-    /// Stable server-resolved community id.
-    pub id: CommunityId,
-    /// Reserved canonical host.
-    pub host: String,
-    /// Durable first-archive timestamp.
-    pub archived_at: DateTime<Utc>,
-}
-
-/// Community row returned by an owner-authorized unarchive operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UnarchivedCommunityRecord {
-    /// Stable server-resolved community id.
-    pub id: CommunityId,
-    /// Reserved canonical host restored to active admission.
-    pub host: String,
-}
+pub use community::{
+    ArchivedCommunityRecord, CommunityRecord, CreateCommunityWithOwnerResult,
+    CreatedCommunityRecord, EnsuredCommunityRecord, OwnedCommunityRecord,
+    UnarchivedCommunityRecord,
+};
 
 /// Token summary returned by [`Db::list_active_tokens`].
 #[derive(Debug, Clone)]
@@ -761,7 +606,8 @@ impl Db {
     /// `buzz.created_at_floor` GUC — this is what makes the replica fence
     /// proof hold for every insert path that goes through this pool.
     pub async fn new(config: &DbConfig) -> Result<Self> {
-        let pool = Self::connect_pool(config, &config.database_url, true).await?;
+        observability::describe_metrics();
+        let pool = Self::connect_writer_pool(config).await?;
         let read_max_connections = config
             .read_max_connections
             .unwrap_or(config.max_connections);
@@ -781,32 +627,19 @@ impl Db {
         })
     }
 
-    /// Connect one pool with the sizing knobs from `config`.
-    ///
-    /// `arm_floor_guard` sets the `buzz.created_at_floor` session GUC on
-    /// every connection, arming the deferred commit-time trigger from
-    /// migration 0021. Writer pools must arm it; replica pools are read-only
-    /// so the trigger never fires there.
-    async fn connect_pool(config: &DbConfig, url: &str, arm_floor_guard: bool) -> Result<PgPool> {
-        let mut options = PgPoolOptions::new()
+    /// Connect an additional writer pool using the shared timeout, replica floor,
+    /// and read-committed isolation policy. Audit writers use this constructor too.
+    /// SQLx retains only one after-connect hook; all session policy lives in it.
+    pub async fn connect_writer_pool(config: &DbConfig) -> Result<PgPool> {
+        let policy = session_policy::SessionPolicy::from(config);
+        let options = PgPoolOptions::new()
             .max_connections(config.max_connections)
             .min_connections(config.min_connections)
             .acquire_timeout(Duration::from_secs(config.acquire_timeout_secs))
             .max_lifetime(Duration::from_secs(config.max_lifetime_secs))
-            .idle_timeout(Duration::from_secs(config.idle_timeout_secs));
-        if arm_floor_guard {
-            options = options.after_connect(|conn, _meta| {
-                Box::pin(async move {
-                    // `SET` cannot take bind parameters; `set_config` can.
-                    sqlx::query("SELECT set_config('buzz.created_at_floor', $1, false)")
-                        .bind(replica_fence::CREATED_AT_FLOOR_SECS.to_string())
-                        .execute(conn)
-                        .await?;
-                    Ok(())
-                })
-            });
-        }
-        Ok(options.connect(url).await?)
+            .idle_timeout(Duration::from_secs(config.idle_timeout_secs))
+            .after_connect(move |conn, _meta| Box::pin(policy.apply(conn)));
+        Ok(options.connect(&config.database_url).await?)
     }
 
     /// Reader acquire timeout — deliberately far below the writer's
@@ -831,7 +664,7 @@ impl Db {
     /// the pool back up, which is fine — routed reads re-fill it on demand.
     ///
     /// No floor guard: replica sessions are read-only, the trigger never
-    /// fires there (see [`Db::connect_pool`]).
+    /// fires there (see [`Db::connect_writer_pool`]).
     fn connect_read_pool(config: &DbConfig, url: &str, max_connections: u32) -> Result<PgPool> {
         Ok(PgPoolOptions::new()
             .max_connections(max_connections)
@@ -863,7 +696,13 @@ impl Db {
         };
         let aurora_identity = self.reader_aurora_identity.clone();
         tokio::spawn(async move {
-            match read_pool.acquire().await {
+            match observability::acquire(
+                &read_pool,
+                observability::PoolRole::Reader,
+                observability::Operation::History,
+            )
+            .await
+            {
                 Ok(mut conn) => {
                     tracing::info!("read replica reachable at boot");
                     match replica_fence::reader_supports_aurora_identity(&mut conn).await {
@@ -1005,7 +844,13 @@ impl Db {
         // `read_pool` separately would spend a second budget whenever the
         // capability is uncached — i.e. after a failed boot ping, which is
         // precisely the reader-unavailable case the bound must hold for.
-        let conn = match read_pool.acquire().await {
+        let conn = match observability::acquire(
+            read_pool,
+            observability::PoolRole::Reader,
+            observability::Operation::History,
+        )
+        .await
+        {
             Ok(conn) => conn,
             Err(sqlx::Error::PoolTimedOut) => {
                 tracing::warn!("reader pool acquire timed out; routing to writer");
@@ -1169,7 +1014,12 @@ impl Db {
         &self,
         lock_key: i64,
     ) -> Result<Option<UsageMetricsLeader>> {
-        let mut connection = self.pool.acquire().await?;
+        let mut connection = observability::acquire(
+            &self.pool,
+            observability::PoolRole::Writer,
+            observability::Operation::Maintenance,
+        )
+        .await?;
         let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
             .bind(lock_key)
             .fetch_one(&mut *connection)
@@ -1297,433 +1147,9 @@ impl Db {
     /// Returns a `'static` transaction because `PgPool` is `Arc`-backed internally.
     /// The transaction holds an owned pool handle, not a borrow.
     pub async fn begin_transaction(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
-        self.pool.begin().await.map_err(Into::into)
-    }
-
-    /// Returns the community mapped to a normalized request host, if one exists.
-    ///
-    /// The caller owns host normalization and turns `None` into the fail-closed
-    /// request/connection error. buzz-db only reads the durable host map.
-    pub async fn lookup_community_by_host(
-        &self,
-        normalized_host: &str,
-    ) -> Result<Option<CommunityRecord>> {
-        let row = sqlx::query(
-            r#"
-            SELECT id, host
-            FROM communities
-            WHERE lower(host) = lower($1)
-              AND archived_at IS NULL
-            "#,
-        )
-        .bind(normalized_host)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(|row| {
-            let id: Uuid = row.try_get("id")?;
-            let host: String = row.try_get("host")?;
-
-            Ok(CommunityRecord {
-                id: CommunityId::from_uuid(id),
-                host,
-            })
-        })
-        .transpose()
-    }
-
-    /// Returns whether a community id still exists in the active lifecycle state.
-    pub async fn is_community_active(&self, community_id: CommunityId) -> Result<bool> {
-        let active = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM communities WHERE id = $1 AND archived_at IS NULL)",
-        )
-        .bind(community_id.as_uuid())
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(active)
-    }
-
-    /// Returns a community by host regardless of lifecycle state. Operator-plane only.
-    pub async fn lookup_community_by_host_for_management(
-        &self,
-        normalized_host: &str,
-    ) -> Result<Option<CommunityRecord>> {
-        let row = sqlx::query("SELECT id, host FROM communities WHERE lower(host) = lower($1)")
-            .bind(normalized_host)
-            .fetch_optional(&self.pool)
-            .await?;
-        row.map(|row| {
-            Ok(CommunityRecord {
-                id: CommunityId::from_uuid(row.try_get("id")?),
-                host: row.try_get("host")?,
-            })
-        })
-        .transpose()
-    }
-
-    /// Lists communities where `owner_pubkey` currently holds the `owner` role.
-    ///
-    /// This is an operator-plane helper, not a tenant-scoped data-plane read:
-    /// callers must gate it on deployment-level operator auth before exposing it.
-    pub async fn list_communities_owned_by(
-        &self,
-        owner_pubkey: &str,
-    ) -> Result<Vec<OwnedCommunityRecord>> {
-        let owner_pubkey = owner_pubkey.to_ascii_lowercase();
-        let rows = sqlx::query(
-            r#"
-            SELECT c.id, c.host, c.created_at, c.archived_at
-            FROM communities c
-            JOIN relay_members rm ON rm.community_id = c.id
-            WHERE rm.pubkey = $1
-              AND rm.role = 'owner'
-            ORDER BY c.created_at ASC, c.host ASC
-            "#,
-        )
-        .bind(owner_pubkey)
-        .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter()
-            .map(|row| {
-                let id: Uuid = row.try_get("id")?;
-                let host: String = row.try_get("host")?;
-                let created_at: DateTime<Utc> = row.try_get("created_at")?;
-                let archived_at: Option<DateTime<Utc>> = row.try_get("archived_at")?;
-                Ok(OwnedCommunityRecord {
-                    id: CommunityId::from_uuid(id),
-                    host,
-                    created_at,
-                    archived_at,
-                })
-            })
-            .collect()
-    }
-
-    /// Returns the normalized host mapped to a community id, if the community
-    /// exists.
-    ///
-    /// The reverse of [`lookup_community_by_host`]: used by side-effect
-    /// producers that already hold a server-resolved `CommunityId` (e.g. the
-    /// workflow action sink running a run owned by some community) and need a
-    /// fully-formed [`buzz_core::tenant::TenantContext`] — host included — to
-    /// fan out under *that* community rather than the deployment default. The
-    /// community is authoritative; the host is read back for labelling only and
-    /// is never used to re-derive the community.
-    pub async fn lookup_community_host(&self, community_id: CommunityId) -> Result<Option<String>> {
-        let row = sqlx::query(
-            r#"
-            SELECT host
-            FROM communities
-            WHERE id = $1
-              AND archived_at IS NULL
-            "#,
-        )
-        .bind(community_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(|row| {
-            let host: String = row.try_get("host")?;
-            Ok(host)
-        })
-        .transpose()
-    }
-
-    /// Returns the community's workspace icon (NIP-11 `icon`), if set.
-    ///
-    /// Set by relay admins/owners via the kind:9033 command; the value is
-    /// validated and size-capped at that write path.
-    pub async fn get_community_icon(&self, community_id: CommunityId) -> Result<Option<String>> {
-        let row = sqlx::query(
-            r#"
-            SELECT icon
-            FROM communities
-            WHERE id = $1
-            "#,
-        )
-        .bind(community_id.as_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(row
-            .map(|row| row.try_get::<Option<String>, _>("icon"))
-            .transpose()?
-            .flatten()
-            .filter(|icon| !icon.is_empty()))
-    }
-
-    /// Sets or clears (`None`) the community's workspace icon.
-    pub async fn set_community_icon(
-        &self,
-        community_id: CommunityId,
-        icon: Option<&str>,
-    ) -> Result<()> {
-        sqlx::query(
-            r#"
-            UPDATE communities
-            SET icon = $2
-            WHERE id = $1
-            "#,
-        )
-        .bind(community_id.as_uuid())
-        .bind(icon)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Ensure a configured community host exists and return its row.
-    ///
-    /// This is the startup/config seeding path for N=1 deployments. Migrations
-    /// create the schema only; deployment-specific hosts are not hardcoded into
-    /// schema history.
-    pub async fn ensure_configured_community(
-        &self,
-        normalized_host: &str,
-    ) -> Result<EnsuredCommunityRecord> {
-        let row = sqlx::query(
-            r#"
-            INSERT INTO communities (host)
-            VALUES ($1)
-            ON CONFLICT (lower(host)) DO UPDATE SET host = communities.host
-            RETURNING id, host, (xmax = 0) AS created
-            "#,
-        )
-        .bind(normalized_host)
-        .fetch_one(&self.pool)
-        .await?;
-
-        let id: Uuid = row.try_get("id")?;
-        let host: String = row.try_get("host")?;
-        let created: bool = row.try_get("created")?;
-
-        Ok(EnsuredCommunityRecord {
-            id: CommunityId::from_uuid(id),
-            host,
-            created,
-        })
-    }
-
-    /// Atomically creates a community and its initial owner.
-    ///
-    /// Holds a per-owner advisory lock while enforcing the ownership limit.
-    /// Identical create retries return the original record; host collisions and
-    /// limit failures remain distinguishable to the operator API.
-    pub async fn create_community_with_owner(
-        &self,
-        normalized_host: &str,
-        owner_pubkey: &str,
-    ) -> Result<CreateCommunityWithOwnerResult> {
-        let owner_pubkey = owner_pubkey.to_ascii_lowercase();
-        let mut tx = self.pool.begin().await?;
-
-        // Serialize on the owner pubkey so concurrent creates to the same
-        // owner cannot both pass the ownership count check.
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(relay_members::owner_count_advisory_lock_key(&owner_pubkey))
-            .execute(&mut *tx)
-            .await?;
-
-        let row = sqlx::query(
-            r#"
-            INSERT INTO communities (host)
-            VALUES ($1)
-            ON CONFLICT (lower(host)) DO NOTHING
-            RETURNING id, host
-            "#,
-        )
-        .bind(normalized_host)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let (id, host) = if let Some(row) = row {
-            let id: Uuid = row.try_get("id")?;
-            let host: String = row.try_get("host")?;
-
-            // Enforce the limit before inserting the new owner row.
-            let owned_count: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM relay_members WHERE pubkey = $1 AND role = 'owner'",
-            )
-            .bind(&owner_pubkey)
-            .fetch_one(&mut *tx)
-            .await?;
-
-            if owned_count >= relay_members::max_communities_per_owner() {
-                tx.rollback().await?;
-                return Ok(CreateCommunityWithOwnerResult::LimitReached);
-            }
-
-            sqlx::query(
-                "INSERT INTO relay_members (community_id, pubkey, role, added_by) VALUES ($1, $2, 'owner', NULL)",
-            )
-            .bind(id)
-            .bind(&owner_pubkey)
-            .execute(&mut *tx)
-            .await?;
-            (id, host)
-        } else {
-            let existing = sqlx::query(
-                r#"
-                SELECT c.id, c.host
-                FROM communities c
-                JOIN relay_members rm ON rm.community_id = c.id
-                WHERE lower(c.host) = lower($1)
-                  AND lower(rm.pubkey) = lower($2)
-                  AND rm.role = 'owner'
-                  AND c.archived_at IS NULL
-                "#,
-            )
-            .bind(normalized_host)
-            .bind(&owner_pubkey)
-            .fetch_optional(&mut *tx)
-            .await?;
-            let Some(existing) = existing else {
-                tx.rollback().await?;
-                return Ok(CreateCommunityWithOwnerResult::HostExists);
-            };
-            (existing.try_get("id")?, existing.try_get("host")?)
-        };
-
-        tx.commit().await?;
-        Ok(CreateCommunityWithOwnerResult::Created(
-            CreatedCommunityRecord {
-                id: CommunityId::from_uuid(id),
-                host,
-            },
-        ))
-    }
-
-    /// Idempotently archives a community when the asserted pubkey is its current owner.
-    pub async fn archive_community_owned_by(
-        &self,
-        normalized_host: &str,
-        owner_pubkey: &str,
-        protected_deployment_host: &str,
-    ) -> Result<Option<ArchivedCommunityRecord>> {
-        let row = sqlx::query(
-            r#"UPDATE communities c
-               SET archived_at = COALESCE(c.archived_at, now())
-               FROM relay_members rm
-               WHERE lower(c.host) = lower($1)
-                 AND rm.community_id = c.id
-                 AND lower(rm.pubkey) = lower($2)
-                 AND rm.role = 'owner'
-                 AND lower(c.host) <> lower($3)
-               RETURNING c.id, c.host, c.archived_at"#,
-        )
-        .bind(normalized_host)
-        .bind(owner_pubkey)
-        .bind(protected_deployment_host)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(|row| {
-            Ok(ArchivedCommunityRecord {
-                id: CommunityId::from_uuid(row.try_get("id")?),
-                host: row.try_get("host")?,
-                archived_at: row.try_get("archived_at")?,
-            })
-        })
-        .transpose()
-    }
-
-    /// Idempotently restores a community when the asserted pubkey is its current owner.
-    pub async fn unarchive_community_owned_by(
-        &self,
-        normalized_host: &str,
-        owner_pubkey: &str,
-    ) -> Result<Option<UnarchivedCommunityRecord>> {
-        let row = sqlx::query(
-            r#"UPDATE communities c
-               SET archived_at = NULL
-               FROM relay_members rm
-               WHERE lower(c.host) = lower($1)
-                 AND rm.community_id = c.id
-                 AND lower(rm.pubkey) = lower($2)
-                 AND rm.role = 'owner'
-               RETURNING c.id, c.host"#,
-        )
-        .bind(normalized_host)
-        .bind(owner_pubkey)
-        .fetch_optional(&self.pool)
-        .await?;
-        row.map(|row| {
-            Ok(UnarchivedCommunityRecord {
-                id: CommunityId::from_uuid(row.try_get("id")?),
-                host: row.try_get("host")?,
-            })
-        })
-        .transpose()
-    }
-
-    /// Returns the community that owns a channel, if the channel exists.
-    ///
-    /// Internal relay producers use this to derive tenant context from the row
-    /// they are acting on, rather than falling back to an implicit default.
-    pub async fn community_of_channel(&self, channel_id: Uuid) -> Result<Option<CommunityId>> {
-        let row = sqlx::query(
-            r#"
-            SELECT community_id
-            FROM channels
-            WHERE id = $1
-              AND deleted_at IS NULL
-            "#,
-        )
-        .bind(channel_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        row.map(|row| {
-            let id: Uuid = row.try_get("community_id")?;
-            Ok(CommunityId::from_uuid(id))
-        })
-        .transpose()
-    }
-
-    /// Batched version of [`Self::community_of_channel`]: given a list of
-    /// channel UUIDs, returns a map from channel id → owning community
-    /// for every channel that exists (soft-deletes excluded).
-    ///
-    /// Used by the runtime conformance read-seam emitters in `buzz-relay`:
-    /// after a `query_events`/`get_events_by_ids` returns N rows, the
-    /// emitter collects distinct `channel_id`s, calls this once, then
-    /// projects each row's true community label independently of the
-    /// fetch query's WHERE clause. That independence is what makes the
-    /// `Inv_NonInterference` / `Inv_ReadConfinement` gate non-vacuous —
-    /// a mutation that dropped `community_id = $X` from the fetch query
-    /// would still let this helper return the row's true label, and the
-    /// checker would see the mismatch.
-    ///
-    /// Channels missing from the result map (deleted or never existed)
-    /// are intentionally not present rather than mapped to a default —
-    /// callers MUST treat "channel-id not in map" as a coverage breach,
-    /// never as "use the resolved community".
-    pub async fn communities_of_channels(
-        &self,
-        channel_ids: &[Uuid],
-    ) -> Result<std::collections::HashMap<Uuid, CommunityId>> {
-        if channel_ids.is_empty() {
-            return Ok(std::collections::HashMap::new());
-        }
-        let rows = sqlx::query(
-            r#"
-            SELECT id, community_id
-            FROM channels
-            WHERE id = ANY($1)
-              AND deleted_at IS NULL
-            "#,
-        )
-        .bind(channel_ids)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut out = std::collections::HashMap::with_capacity(rows.len());
-        for row in rows {
-            let ch: Uuid = row.try_get("id")?;
-            let cm: Uuid = row.try_get("community_id")?;
-            out.insert(ch, CommunityId::from_uuid(cm));
-        }
-        Ok(out)
+        observability::begin(&self.pool, observability::Operation::Other)
+            .await
+            .map_err(Into::into)
     }
 
     /// Inserts an event. Returns `(StoredEvent, was_inserted)` — `false` on duplicate.
@@ -2211,7 +1637,10 @@ impl Db {
         event: &nostr::Event,
         envelope: &buzz_core::ci::ValidatedCiEnvelope,
     ) -> Result<ci::StoreCiEventOutcome> {
-        ci::store_ci_event(&self.pool, community_id, channel_id, event, envelope).await
+        observability::observe(observability::Operation::Ci, async {
+            ci::store_ci_event(&self.pool, community_id, channel_id, event, envelope).await
+        })
+        .await
     }
 
     /// Resolve a CI run's channel only for a current channel member.
@@ -2221,7 +1650,10 @@ impl Db {
         run_id: Uuid,
         pubkey: &[u8],
     ) -> Result<Option<Uuid>> {
-        ci::get_ci_run_member_channel(&self.pool, community_id, run_id, pubkey).await
+        observability::observe(observability::Operation::Ci, async {
+            ci::get_ci_run_member_channel(&self.pool, community_id, run_id, pubkey).await
+        })
+        .await
     }
 
     /// Load the immutable initial request for a member-authorized CI run.
@@ -2231,7 +1663,10 @@ impl Db {
         channel_id: Uuid,
         run_id: Uuid,
     ) -> Result<Option<ci::CiStoredEvent>> {
-        ci::get_ci_run_request(&self.pool, community_id, channel_id, run_id).await
+        observability::observe(observability::Operation::Ci, async {
+            ci::get_ci_run_request(&self.pool, community_id, channel_id, run_id).await
+        })
+        .await
     }
 
     /// List accepted CI events after an exclusive durable per-run cursor.
@@ -2243,14 +1678,17 @@ impl Db {
         after_cursor: i64,
         limit: u32,
     ) -> Result<Vec<ci::CiStoredEvent>> {
-        ci::list_ci_run_events(
-            &self.pool,
-            community_id,
-            channel_id,
-            run_id,
-            after_cursor,
-            limit,
-        )
+        observability::observe(observability::Operation::Ci, async {
+            ci::list_ci_run_events(
+                &self.pool,
+                community_id,
+                channel_id,
+                run_id,
+                after_cursor,
+                limit,
+            )
+            .await
+        })
         .await
     }
 
@@ -2269,16 +1707,19 @@ impl Db {
         valid_until: Option<DateTime<Utc>>,
         granted_by: &str,
     ) -> Result<()> {
-        ci_grants::upsert_ci_grant(
-            &self.pool,
-            community_id,
-            channel_id,
-            target_repo_a,
-            signer_pubkey,
-            valid_from,
-            valid_until,
-            granted_by,
-        )
+        observability::observe(observability::Operation::Ci, async {
+            ci_grants::upsert_ci_grant(
+                &self.pool,
+                community_id,
+                channel_id,
+                target_repo_a,
+                signer_pubkey,
+                valid_from,
+                valid_until,
+                granted_by,
+            )
+            .await
+        })
         .await
     }
 
@@ -2294,8 +1735,17 @@ impl Db {
         target_repo_a: &str,
         now: DateTime<Utc>,
     ) -> Result<Vec<String>> {
-        ci_grants::get_active_ci_signers(&self.pool, community_id, channel_id, target_repo_a, now)
+        observability::observe(observability::Operation::Ci, async {
+            ci_grants::get_active_ci_signers(
+                &self.pool,
+                community_id,
+                channel_id,
+                target_repo_a,
+                now,
+            )
             .await
+        })
+        .await
     }
 
     /// Atomically insert a kind:7 reaction event and its reaction row.
@@ -2414,85 +1864,6 @@ impl Db {
         channel::set_canvas(&self.pool, community_id, channel_id, canvas).await
     }
 
-    /// Adds a member to a channel.
-    pub async fn add_member(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-        pubkey: &[u8],
-        role: channel::MemberRole,
-        invited_by: Option<&[u8]>,
-    ) -> Result<channel::MemberRecord> {
-        channel::add_member(
-            &self.pool,
-            community_id,
-            channel_id,
-            pubkey,
-            role,
-            invited_by,
-        )
-        .await
-    }
-
-    /// Removes a member from a channel.
-    pub async fn remove_member(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-        pubkey: &[u8],
-        actor_pubkey: &[u8],
-    ) -> Result<()> {
-        channel::remove_member(&self.pool, community_id, channel_id, pubkey, actor_pubkey).await
-    }
-
-    /// Returns `true` if the pubkey is an active member.
-    pub async fn is_member(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-        pubkey: &[u8],
-    ) -> Result<bool> {
-        channel::is_member(&self.pool, community_id, channel_id, pubkey).await
-    }
-
-    /// Return the active (channel, pubkey) membership pairs among the given
-    /// sets, in one statement.
-    pub async fn membership_pairs(
-        &self,
-        community_id: CommunityId,
-        channel_ids: &[Uuid],
-        pubkeys: &[Vec<u8>],
-    ) -> Result<Vec<(Uuid, Vec<u8>)>> {
-        channel::membership_pairs(&self.pool, community_id, channel_ids, pubkeys).await
-    }
-
-    /// Returns all active members of a channel.
-    pub async fn get_members(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-    ) -> Result<Vec<channel::MemberRecord>> {
-        channel::get_members(&self.pool, community_id, channel_id).await
-    }
-
-    /// Returns active members for multiple channels in a single query.
-    pub async fn get_members_bulk(
-        &self,
-        community_id: CommunityId,
-        channel_ids: &[Uuid],
-    ) -> Result<Vec<channel::MemberRecord>> {
-        channel::get_members_bulk(&self.pool, community_id, channel_ids).await
-    }
-
-    /// Get all channel IDs accessible to a pubkey.
-    pub async fn get_accessible_channel_ids(
-        &self,
-        community_id: CommunityId,
-        pubkey: &[u8],
-    ) -> Result<Vec<Uuid>> {
-        channel::get_accessible_channel_ids(&self.pool, community_id, pubkey).await
-    }
-
     /// Lists channels, optionally filtered by visibility.
     pub async fn list_channels(
         &self,
@@ -2500,46 +1871,6 @@ impl Db {
         visibility: Option<&str>,
     ) -> Result<Vec<channel::ChannelRecord>> {
         channel::list_channels(&self.pool, community_id, visibility).await
-    }
-
-    /// Returns full channel records for all channels a user can access.
-    pub async fn get_accessible_channels(
-        &self,
-        community_id: CommunityId,
-        pubkey: &[u8],
-        visibility_filter: Option<&str>,
-        member_only: Option<bool>,
-    ) -> Result<Vec<channel::AccessibleChannel>> {
-        channel::get_accessible_channels(
-            &self.pool,
-            community_id,
-            pubkey,
-            visibility_filter,
-            member_only,
-        )
-        .await
-    }
-
-    /// Returns all bot-role members with their aggregated channel names in one community.
-    pub async fn get_bot_members(
-        &self,
-        community_id: CommunityId,
-    ) -> Result<Vec<channel::BotMemberRecord>> {
-        channel::get_bot_members(&self.pool, community_id).await
-    }
-
-    /// Returns the pubkeys of all agent identities in one community.
-    pub async fn get_agent_pubkeys(&self, community_id: CommunityId) -> Result<Vec<Vec<u8>>> {
-        channel::get_agent_pubkeys(&self.pool, community_id).await
-    }
-
-    /// Bulk-fetch user records by pubkey.
-    pub async fn get_users_bulk(
-        &self,
-        community_id: CommunityId,
-        pubkeys: &[Vec<u8>],
-    ) -> Result<Vec<channel::UserRecord>> {
-        channel::get_users_bulk(&self.pool, community_id, pubkeys).await
     }
 
     /// Updates a channel's name and/or description.
@@ -2595,34 +1926,6 @@ impl Db {
         channel_id: Uuid,
     ) -> Result<bool> {
         channel::soft_delete_channel(&self.pool, community_id, channel_id).await
-    }
-
-    /// Returns the count of active members in a channel.
-    pub async fn get_member_count(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-    ) -> Result<i64> {
-        channel::get_member_count(&self.pool, community_id, channel_id).await
-    }
-
-    /// Bulk-fetch member counts for a set of channel IDs.
-    pub async fn get_member_counts_bulk(
-        &self,
-        community_id: CommunityId,
-        channel_ids: &[Uuid],
-    ) -> Result<std::collections::HashMap<Uuid, i64>> {
-        channel::get_member_counts_bulk(&self.pool, community_id, channel_ids).await
-    }
-
-    /// Get the active role of a pubkey in a channel.
-    pub async fn get_member_role(
-        &self,
-        community_id: CommunityId,
-        channel_id: Uuid,
-        pubkey: &[u8],
-    ) -> Result<Option<String>> {
-        channel::get_member_role(&self.pool, community_id, channel_id, pubkey).await
     }
 
     /// Archive ephemeral channels whose TTL deadline has passed.
@@ -3762,16 +3065,19 @@ impl Db {
         definition_hash: &[u8],
         enabled: bool,
     ) -> Result<Uuid> {
-        workflow::create_workflow(
-            &self.pool,
-            community_id,
-            channel_id,
-            owner_pubkey,
-            name,
-            definition_json,
-            definition_hash,
-            enabled,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::create_workflow(
+                &self.pool,
+                community_id,
+                channel_id,
+                owner_pubkey,
+                name,
+                definition_json,
+                definition_hash,
+                enabled,
+            )
+            .await
+        })
         .await
     }
 
@@ -3788,17 +3094,20 @@ impl Db {
         definition_hash: &[u8],
         enabled: bool,
     ) -> Result<()> {
-        workflow::upsert_workflow(
-            &self.pool,
-            community_id,
-            id,
-            channel_id,
-            owner_pubkey,
-            name,
-            definition_json,
-            definition_hash,
-            enabled,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::upsert_workflow(
+                &self.pool,
+                community_id,
+                id,
+                channel_id,
+                owner_pubkey,
+                name,
+                definition_json,
+                definition_hash,
+                enabled,
+            )
+            .await
+        })
         .await
     }
 
@@ -3808,7 +3117,10 @@ impl Db {
         community_id: CommunityId,
         id: Uuid,
     ) -> Result<workflow::WorkflowRecord> {
-        workflow::get_workflow(&self.pool, community_id, id).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::get_workflow(&self.pool, community_id, id).await
+        })
+        .await
     }
 
     /// List workflows for a channel.
@@ -3819,7 +3131,11 @@ impl Db {
         limit: Option<i64>,
         offset: Option<i64>,
     ) -> Result<Vec<workflow::WorkflowRecord>> {
-        workflow::list_channel_workflows(&self.pool, community_id, channel_id, limit, offset).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::list_channel_workflows(&self.pool, community_id, channel_id, limit, offset)
+                .await
+        })
+        .await
     }
 
     /// List active, enabled workflows for a channel.
@@ -3828,12 +3144,18 @@ impl Db {
         community_id: CommunityId,
         channel_id: Uuid,
     ) -> Result<Vec<workflow::WorkflowRecord>> {
-        workflow::list_enabled_channel_workflows(&self.pool, community_id, channel_id).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::list_enabled_channel_workflows(&self.pool, community_id, channel_id).await
+        })
+        .await
     }
 
     /// List all active, enabled schedule-triggered workflows.
     pub async fn list_all_enabled_workflows(&self) -> Result<Vec<workflow::WorkflowRecord>> {
-        workflow::list_all_enabled_workflows(&self.pool).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::list_all_enabled_workflows(&self.pool).await
+        })
+        .await
     }
 
     /// Claim a scheduled workflow fire for an authoritative schedule instant.
@@ -3850,12 +3172,15 @@ impl Db {
         workflow_id: Uuid,
         scheduled_for: chrono::DateTime<chrono::Utc>,
     ) -> Result<Option<workflow::ScheduledWorkflowFireClaim>> {
-        workflow::claim_scheduled_workflow_fire(
-            &self.pool,
-            community_id,
-            workflow_id,
-            scheduled_for,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::claim_scheduled_workflow_fire(
+                &self.pool,
+                community_id,
+                workflow_id,
+                scheduled_for,
+            )
+            .await
+        })
         .await
     }
 
@@ -3865,7 +3190,10 @@ impl Db {
         community_id: CommunityId,
         workflow_id: Uuid,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
-        workflow::latest_scheduled_workflow_fire(&self.pool, community_id, workflow_id).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::latest_scheduled_workflow_fire(&self.pool, community_id, workflow_id).await
+        })
+        .await
     }
 
     /// Attach the workflow run id created from a won scheduled-fire claim.
@@ -3876,13 +3204,16 @@ impl Db {
         scheduled_for: chrono::DateTime<chrono::Utc>,
         workflow_run_id: Uuid,
     ) -> Result<bool> {
-        workflow::attach_scheduled_workflow_run(
-            &self.pool,
-            community_id,
-            workflow_id,
-            scheduled_for,
-            workflow_run_id,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::attach_scheduled_workflow_run(
+                &self.pool,
+                community_id,
+                workflow_id,
+                scheduled_for,
+                workflow_run_id,
+            )
+            .await
+        })
         .await
     }
 
@@ -3891,7 +3222,10 @@ impl Db {
         &self,
         older_than: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64> {
-        workflow::prune_scheduled_workflow_fires_before(&self.pool, older_than).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::prune_scheduled_workflow_fires_before(&self.pool, older_than).await
+        })
+        .await
     }
 
     /// Update a workflow's name, definition, and hash.
@@ -3903,14 +3237,17 @@ impl Db {
         definition_json: &str,
         definition_hash: &[u8],
     ) -> Result<()> {
-        workflow::update_workflow(
-            &self.pool,
-            community_id,
-            id,
-            name,
-            definition_json,
-            definition_hash,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::update_workflow(
+                &self.pool,
+                community_id,
+                id,
+                name,
+                definition_json,
+                definition_hash,
+            )
+            .await
+        })
         .await
     }
 
@@ -3921,7 +3258,10 @@ impl Db {
         id: Uuid,
         status: workflow::WorkflowStatus,
     ) -> Result<()> {
-        workflow::update_workflow_status(&self.pool, community_id, id, status).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::update_workflow_status(&self.pool, community_id, id, status).await
+        })
+        .await
     }
 
     /// Enable or disable a workflow.
@@ -3931,7 +3271,10 @@ impl Db {
         id: Uuid,
         enabled: bool,
     ) -> Result<()> {
-        workflow::set_workflow_enabled(&self.pool, community_id, id, enabled).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::set_workflow_enabled(&self.pool, community_id, id, enabled).await
+        })
+        .await
     }
 
     /// Disable all of an owner's workflows in a channel (SEC-006, on
@@ -3942,18 +3285,24 @@ impl Db {
         channel_id: Uuid,
         owner_pubkey: &[u8],
     ) -> Result<u64> {
-        workflow::disable_workflows_for_owner_in_channel(
-            &self.pool,
-            community_id,
-            channel_id,
-            owner_pubkey,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::disable_workflows_for_owner_in_channel(
+                &self.pool,
+                community_id,
+                channel_id,
+                owner_pubkey,
+            )
+            .await
+        })
         .await
     }
 
     /// Delete a workflow and all its runs/approvals.
     pub async fn delete_workflow(&self, community_id: CommunityId, id: Uuid) -> Result<()> {
-        workflow::delete_workflow(&self.pool, community_id, id).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::delete_workflow(&self.pool, community_id, id).await
+        })
+        .await
     }
 
     /// Delete a workflow only when it belongs to the provided owner.
@@ -3964,7 +3313,10 @@ impl Db {
         id: Uuid,
         owner_pubkey: &[u8],
     ) -> Result<Option<Uuid>> {
-        workflow::delete_workflow_for_owner(&self.pool, community_id, id, owner_pubkey).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::delete_workflow_for_owner(&self.pool, community_id, id, owner_pubkey).await
+        })
+        .await
     }
 
     /// Find a workflow by owner pubkey and name within a community. Used for
@@ -3975,7 +3327,10 @@ impl Db {
         owner_pubkey: &[u8],
         name: &str,
     ) -> Result<Option<workflow::WorkflowRecord>> {
-        workflow::find_by_owner_and_name(&self.pool, community_id, owner_pubkey, name).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::find_by_owner_and_name(&self.pool, community_id, owner_pubkey, name).await
+        })
+        .await
     }
 
     /// Create a new workflow run.
@@ -3988,15 +3343,18 @@ impl Db {
         definition_snapshot: &serde_json::Value,
         definition_hash: &[u8],
     ) -> Result<Uuid> {
-        workflow::create_workflow_run(
-            &self.pool,
-            community_id,
-            workflow_id,
-            trigger_event_id,
-            trigger_context,
-            definition_snapshot,
-            definition_hash,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::create_workflow_run(
+                &self.pool,
+                community_id,
+                workflow_id,
+                trigger_event_id,
+                trigger_context,
+                definition_snapshot,
+                definition_hash,
+            )
+            .await
+        })
         .await
     }
 
@@ -4006,7 +3364,10 @@ impl Db {
         community_id: CommunityId,
         id: Uuid,
     ) -> Result<workflow::WorkflowRunRecord> {
-        workflow::get_workflow_run(&self.pool, community_id, id).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::get_workflow_run(&self.pool, community_id, id).await
+        })
+        .await
     }
 
     /// List runs for a workflow.
@@ -4016,7 +3377,58 @@ impl Db {
         workflow_id: Uuid,
         limit: i64,
     ) -> Result<Vec<workflow::WorkflowRunRecord>> {
-        workflow::list_workflow_runs(&self.pool, community_id, workflow_id, limit).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::list_workflow_runs(&self.pool, community_id, workflow_id, limit).await
+        })
+        .await
+    }
+
+    /// Read a stable descending page of workflow runs.
+    pub async fn list_workflow_runs_page(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        before: Option<chrono::DateTime<chrono::Utc>>,
+        before_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<workflow::WorkflowRunRecord>> {
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::list_workflow_runs_page(
+                &self.pool,
+                community_id,
+                workflow_id,
+                before,
+                before_id,
+                limit,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// Update a run with a stable failure code and diagnostic in one write.
+    pub async fn update_workflow_run_with_failure(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        status: workflow::RunStatus,
+        current_step: i32,
+        trace: &serde_json::Value,
+        failure: Option<workflow::WorkflowRunFailure<'_>>,
+    ) -> Result<()> {
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::update_workflow_run_with_failure(
+                &self.pool,
+                community_id,
+                id,
+                status,
+                current_step,
+                trace,
+                failure,
+            )
+            .await
+        })
+        .await
     }
 
     /// Update a workflow run's status.
@@ -4029,15 +3441,18 @@ impl Db {
         trace: &serde_json::Value,
         error: Option<&str>,
     ) -> Result<()> {
-        workflow::update_workflow_run(
-            &self.pool,
-            community_id,
-            id,
-            status,
-            current_step,
-            trace,
-            error,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::update_workflow_run(
+                &self.pool,
+                community_id,
+                id,
+                status,
+                current_step,
+                trace,
+                error,
+            )
+            .await
+        })
         .await
     }
 
@@ -4054,17 +3469,20 @@ impl Db {
         effect_spec: &serde_json::Value,
         effect_payload: &serde_json::Value,
     ) -> Result<WorkflowEffectClaimOutcome> {
-        workflow_effect::claim_workflow_effect_with_payload(
-            &self.pool,
-            community_id,
-            run_id,
-            expected_generation,
-            step_id,
-            effect_index,
-            effect_kind,
-            effect_spec,
-            effect_payload,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_effect::claim_workflow_effect_with_payload(
+                &self.pool,
+                community_id,
+                run_id,
+                expected_generation,
+                step_id,
+                effect_index,
+                effect_kind,
+                effect_spec,
+                effect_payload,
+            )
+            .await
+        })
         .await
     }
 
@@ -4080,16 +3498,19 @@ impl Db {
         effect_kind: &str,
         effect_spec: &serde_json::Value,
     ) -> Result<Option<WorkflowEffectClaimOutcome>> {
-        workflow_effect::load_workflow_effect_claim(
-            &self.pool,
-            community_id,
-            run_id,
-            expected_generation,
-            step_id,
-            effect_index,
-            effect_kind,
-            effect_spec,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_effect::load_workflow_effect_claim(
+                &self.pool,
+                community_id,
+                run_id,
+                expected_generation,
+                step_id,
+                effect_index,
+                effect_kind,
+                effect_spec,
+            )
+            .await
+        })
         .await
     }
 
@@ -4104,15 +3525,18 @@ impl Db {
         effect_index: i16,
         output: &serde_json::Value,
     ) -> Result<WorkflowEffectMarkOutcome> {
-        workflow_effect::mark_workflow_effect_fired(
-            &self.pool,
-            community_id,
-            run_id,
-            expected_generation,
-            step_id,
-            effect_index,
-            output,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_effect::mark_workflow_effect_fired(
+                &self.pool,
+                community_id,
+                run_id,
+                expected_generation,
+                step_id,
+                effect_index,
+                output,
+            )
+            .await
+        })
         .await
     }
 
@@ -4126,14 +3550,17 @@ impl Db {
         expected_generation: i64,
         next_status: workflow::RunStatus,
     ) -> Result<WorkflowRunTransitionOutcome> {
-        workflow_run_transition::transition_workflow_run(
-            &self.pool,
-            community_id,
-            id,
-            expected_status,
-            expected_generation,
-            next_status,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_run_transition::transition_workflow_run(
+                &self.pool,
+                community_id,
+                id,
+                expected_status,
+                expected_generation,
+                next_status,
+            )
+            .await
+        })
         .await
     }
 
@@ -4144,11 +3571,14 @@ impl Db {
         resume_pending_age_secs: i64,
         limit: i64,
     ) -> Result<Vec<WorkflowResumeCandidate>> {
-        workflow_run_transition::list_recoverable_workflow_resumes(
-            &self.pool,
-            resume_pending_age_secs,
-            limit,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_run_transition::list_recoverable_workflow_resumes(
+                &self.pool,
+                resume_pending_age_secs,
+                limit,
+            )
+            .await
+        })
         .await
     }
 
@@ -4161,14 +3591,17 @@ impl Db {
         expected_generation: i64,
         lease_secs: i64,
     ) -> Result<WorkflowRunTransitionOutcome> {
-        workflow_run_transition::claim_workflow_resume(
-            &self.pool,
-            community_id,
-            id,
-            expected_status,
-            expected_generation,
-            lease_secs,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_run_transition::claim_workflow_resume(
+                &self.pool,
+                community_id,
+                id,
+                expected_status,
+                expected_generation,
+                lease_secs,
+            )
+            .await
+        })
         .await
     }
 
@@ -4180,13 +3613,16 @@ impl Db {
         expected_generation: i64,
         lease_secs: i64,
     ) -> Result<bool> {
-        workflow_run_transition::renew_workflow_resume_lease(
-            &self.pool,
-            community_id,
-            id,
-            expected_generation,
-            lease_secs,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_run_transition::renew_workflow_resume_lease(
+                &self.pool,
+                community_id,
+                id,
+                expected_generation,
+                lease_secs,
+            )
+            .await
+        })
         .await
     }
 
@@ -4199,14 +3635,42 @@ impl Db {
         current_step: i32,
         trace: &serde_json::Value,
     ) -> Result<WorkflowRunTransitionOutcome> {
-        workflow_run_transition::complete_running_workflow_run(
-            &self.pool,
-            community_id,
-            id,
-            expected_generation,
-            current_step,
-            trace,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_run_transition::complete_running_workflow_run(
+                &self.pool,
+                community_id,
+                id,
+                expected_generation,
+                current_step,
+                trace,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// Persist structured failure under the running generation fence.
+    pub async fn fail_running_workflow_run_with_failure(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        expected_generation: i64,
+        current_step: i32,
+        trace: &serde_json::Value,
+        failure: workflow::WorkflowRunFailure<'_>,
+    ) -> Result<WorkflowRunTransitionOutcome> {
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_run_transition::fail_running_workflow_run_with_failure(
+                &self.pool,
+                community_id,
+                id,
+                expected_generation,
+                current_step,
+                trace,
+                failure,
+            )
+            .await
+        })
         .await
     }
 
@@ -4220,15 +3684,18 @@ impl Db {
         trace: &serde_json::Value,
         error: &str,
     ) -> Result<WorkflowRunTransitionOutcome> {
-        workflow_run_transition::fail_running_workflow_run(
-            &self.pool,
-            community_id,
-            id,
-            expected_generation,
-            current_step,
-            trace,
-            error,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_run_transition::fail_running_workflow_run(
+                &self.pool,
+                community_id,
+                id,
+                expected_generation,
+                current_step,
+                trace,
+                error,
+            )
+            .await
+        })
         .await
     }
 
@@ -4239,7 +3706,10 @@ impl Db {
         workflow_id: Uuid,
         key: &str,
     ) -> Result<Option<WorkflowStateEntry>> {
-        workflow_state::read_workflow_state(&self.pool, community_id, workflow_id, key).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_state::read_workflow_state(&self.pool, community_id, workflow_id, key).await
+        })
+        .await
     }
 
     /// Read a live workflow-state value after resolving its workflow from a run.
@@ -4249,12 +3719,18 @@ impl Db {
         run_id: Uuid,
         key: &str,
     ) -> Result<Option<WorkflowStateEntry>> {
-        workflow_state::read_workflow_state_for_run(&self.pool, community_id, run_id, key).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_state::read_workflow_state_for_run(&self.pool, community_id, run_id, key).await
+        })
+        .await
     }
 
     /// Delete at most `limit` expired workflow-state rows.
     pub async fn purge_expired_workflow_state(&self, limit: u32) -> Result<u64> {
-        workflow_state::purge_expired_workflow_state(&self.pool, limit).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_state::purge_expired_workflow_state(&self.pool, limit).await
+        })
+        .await
     }
 
     /// Write state for the workflow that owns a run.
@@ -4269,16 +3745,19 @@ impl Db {
         expires_in_secs: i64,
         expected_revision: Option<&str>,
     ) -> Result<WorkflowStateWriteOutcome> {
-        workflow_state::write_workflow_state(
-            &self.pool,
-            community_id,
-            run_id,
-            step_id,
-            key,
-            value,
-            expires_in_secs,
-            expected_revision,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_state::write_workflow_state(
+                &self.pool,
+                community_id,
+                run_id,
+                step_id,
+                key,
+                value,
+                expires_in_secs,
+                expected_revision,
+            )
+            .await
+        })
         .await
     }
 
@@ -4287,7 +3766,10 @@ impl Db {
         &self,
         params: workflow_approval::CreateWorkflowApprovalGateParams<'_>,
     ) -> Result<WorkflowApprovalGateCreationOutcome> {
-        workflow_approval::create_workflow_approval_gate(&self.pool, params).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_approval::create_workflow_approval_gate(&self.pool, params).await
+        })
+        .await
     }
 
     /// Locate a tenant-bound approval gate without treating its UUID as authority.
@@ -4296,8 +3778,11 @@ impl Db {
         community_id: CommunityId,
         approval_id: Uuid,
     ) -> Result<Option<WorkflowApprovalGateRecord>> {
-        workflow_approval::lookup_workflow_approval_gate(&self.pool, community_id, approval_id)
-            .await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_approval::lookup_workflow_approval_gate(&self.pool, community_id, approval_id)
+                .await
+        })
+        .await
     }
 
     /// Atomically apply or exactly reuse a signed workflow approval decision.
@@ -4305,12 +3790,18 @@ impl Db {
         &self,
         params: workflow_approval::DecideWorkflowApprovalGateParams<'_>,
     ) -> Result<WorkflowApprovalDecisionOutcome> {
-        workflow_approval::decide_workflow_approval_gate(&self.pool, params).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow_approval::decide_workflow_approval_gate(&self.pool, params).await
+        })
+        .await
     }
 
     /// Create an approval request.
     pub async fn create_approval(&self, params: workflow::CreateApprovalParams<'_>) -> Result<()> {
-        workflow::create_approval(&self.pool, params).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::create_approval(&self.pool, params).await
+        })
+        .await
     }
 
     /// Fetch an approval by raw token.
@@ -4319,7 +3810,10 @@ impl Db {
         community_id: CommunityId,
         token: &str,
     ) -> Result<workflow::ApprovalRecord> {
-        workflow::get_approval(&self.pool, community_id, token).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::get_approval(&self.pool, community_id, token).await
+        })
+        .await
     }
 
     /// Fetch an approval by its already-hashed token (no re-hashing).
@@ -4328,7 +3822,24 @@ impl Db {
         community_id: CommunityId,
         token_hash: &[u8],
     ) -> Result<workflow::ApprovalRecord> {
-        workflow::get_approval_by_stored_hash(&self.pool, community_id, token_hash).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::get_approval_by_stored_hash(&self.pool, community_id, token_hash).await
+        })
+        .await
+    }
+
+    /// Read legacy and durable approval evidence without decision credentials.
+    pub async fn get_workflow_approval_history(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<Vec<workflow::WorkflowApprovalHistoryRecord>> {
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::get_workflow_approval_history(&self.pool, community_id, workflow_id, run_id)
+                .await
+        })
+        .await
     }
 
     /// Fetch all approvals for a workflow run.
@@ -4338,7 +3849,10 @@ impl Db {
         workflow_id: uuid::Uuid,
         run_id: uuid::Uuid,
     ) -> Result<Vec<workflow::ApprovalRecord>> {
-        workflow::get_run_approvals(&self.pool, community_id, workflow_id, run_id).await
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::get_run_approvals(&self.pool, community_id, workflow_id, run_id).await
+        })
+        .await
     }
 
     /// Update an approval's status.
@@ -4350,14 +3864,17 @@ impl Db {
         approver_pubkey: Option<&[u8]>,
         note: Option<&str>,
     ) -> Result<bool> {
-        workflow::update_approval(
-            &self.pool,
-            community_id,
-            token,
-            status,
-            approver_pubkey,
-            note,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::update_approval(
+                &self.pool,
+                community_id,
+                token,
+                status,
+                approver_pubkey,
+                note,
+            )
+            .await
+        })
         .await
     }
 
@@ -4370,14 +3887,17 @@ impl Db {
         approver_pubkey: Option<&[u8]>,
         note: Option<&str>,
     ) -> Result<bool> {
-        workflow::update_approval_by_stored_hash(
-            &self.pool,
-            community_id,
-            token_hash,
-            status,
-            approver_pubkey,
-            note,
-        )
+        observability::observe(observability::Operation::Workflow, async {
+            workflow::update_approval_by_stored_hash(
+                &self.pool,
+                community_id,
+                token_hash,
+                status,
+                approver_pubkey,
+                note,
+            )
+            .await
+        })
         .await
     }
 
@@ -4954,678 +4474,6 @@ impl Db {
         .await?;
         Ok(result.rows_affected())
     }
-
-    /// Atomically replace a replaceable event: NIP-16 kinds (0, 3, 41, 10000–19999)
-    /// and NIP-29 discovery state (39000–39002, called from side_effects.rs).
-    ///
-    /// Keeps only the event with the highest `created_at` per (kind, pubkey, channel_id).
-    /// Same-second ties are broken by lowest event `id` (NIP-16 deterministic ordering).
-    /// Returns `(event, false)` for stale writes and duplicate IDs — callers should
-    /// skip fan-out/dispatch when `was_inserted` is false.
-    pub async fn replace_addressable_event(
-        &self,
-        community_id: CommunityId,
-        event: &nostr::Event,
-        channel_id: Option<Uuid>,
-    ) -> Result<(StoredEvent, bool)> {
-        let kind_i32 = buzz_core::kind::event_kind_i32(event);
-        let pubkey_bytes = event.pubkey.to_bytes();
-        let created_at_secs = event.created_at.as_secs() as i64;
-        let created_at = chrono::DateTime::from_timestamp(created_at_secs, 0)
-            .ok_or(DbError::InvalidTimestamp(created_at_secs))?;
-
-        // Collisions only cause extra serialization; they cannot change behavior.
-        let lock_key = event_replacement_lock_key(
-            community_id,
-            kind_i32,
-            pubkey_bytes.as_slice(),
-            channel_id.as_ref().map(|id| id.as_bytes().as_slice()),
-        );
-
-        let mut tx = self.pool.begin().await?;
-
-        // Serialize all writers for the same (kind, pubkey, channel_id) tuple.
-        // Advisory lock is transaction-scoped — released on commit/rollback.
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(lock_key)
-            .execute(&mut *tx)
-            .await?;
-
-        // Check for the newest existing event. ORDER BY + LIMIT 1 is defensive against
-        // historical data where prior bugs may have left multiple live rows.
-        let existing: Option<(chrono::DateTime<chrono::Utc>, Vec<u8>)> = sqlx::query_as(
-            "SELECT created_at, id FROM events \
-             WHERE community_id = $1 AND kind = $2 AND pubkey = $3 \
-             AND channel_id IS NOT DISTINCT FROM $4 \
-             AND deleted_at IS NULL \
-             ORDER BY created_at DESC, id ASC LIMIT 1",
-        )
-        .bind(community_id.as_uuid())
-        .bind(kind_i32)
-        .bind(pubkey_bytes.as_slice())
-        .bind(channel_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        // Stale-write protection: reject if incoming is not newer.
-        // NIP-16: created_at is second-resolution. On same-second tie, lowest
-        // event id (lexicographic) wins — deterministic across relays.
-        let incoming_id = event.id.as_bytes().as_slice();
-        if let Some((existing_ts, existing_id)) = existing {
-            let dominated = created_at < existing_ts
-                || (created_at == existing_ts && incoming_id >= existing_id.as_slice());
-            if dominated {
-                tx.rollback().await?;
-                let received_at = chrono::Utc::now();
-                return Ok((
-                    StoredEvent::with_received_at(event.clone(), received_at, channel_id, false),
-                    false,
-                ));
-            }
-        }
-
-        // Soft-delete the old event (if any). IS NOT DISTINCT FROM for NULL safety.
-        sqlx::query(
-            "UPDATE events SET deleted_at = NOW() \
-             WHERE community_id = $1 AND kind = $2 AND pubkey = $3 \
-             AND channel_id IS NOT DISTINCT FROM $4 \
-             AND deleted_at IS NULL",
-        )
-        .bind(community_id.as_uuid())
-        .bind(kind_i32)
-        .bind(pubkey_bytes.as_slice())
-        .bind(channel_id)
-        .execute(&mut *tx)
-        .await?;
-
-        // Insert the new event inside the same transaction.
-        let sig_bytes = event.sig.serialize();
-        let tags_json = serde_json::to_value(&event.tags)?;
-        let received_at = chrono::Utc::now();
-        let d_tag = crate::event::extract_d_tag(event);
-
-        let insert_result = sqlx::query(
-            "INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(community_id.as_uuid())
-        .bind(event.id.as_bytes().as_slice())
-        .bind(pubkey_bytes.as_slice())
-        .bind(created_at)
-        .bind(kind_i32)
-        .bind(&tags_json)
-        .bind(&event.content)
-        .bind(sig_bytes.as_slice())
-        .bind(received_at)
-        .bind(channel_id)
-        .bind(d_tag.as_deref())
-        .execute(&mut *tx)
-        .await?;
-
-        let was_inserted = insert_result.rows_affected() > 0;
-        if !was_inserted {
-            // ON CONFLICT fired — the event ID already exists. Rollback the
-            // soft-delete so we don't lose the previous replaceable event.
-            tx.rollback().await?;
-            return Ok((
-                StoredEvent::with_received_at(event.clone(), received_at, channel_id, false),
-                false,
-            ));
-        }
-
-        tx.commit().await?;
-
-        // Mentions are a denormalized index — safe outside the transaction.
-        // insert_event() normally handles this, but we inlined the INSERT above.
-        if let Err(e) = crate::insert_mentions(&self.pool, community_id, event, channel_id).await {
-            tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
-        }
-
-        Ok((
-            StoredEvent::with_received_at(event.clone(), received_at, channel_id, true),
-            true,
-        ))
-    }
-
-    /// Returns whether the relay-authored NIP-43 snapshot is absent or differs
-    /// from the canonical membership rows for `community_id`.
-    ///
-    /// Snapshot and canonical rows are compared directly rather than by
-    /// timestamp: relay membership events use whole-second Nostr timestamps,
-    /// and multiple mutations within one second must still be repaired.
-    pub async fn nip43_membership_snapshot_needs_reconciliation(
-        &self,
-        community_id: CommunityId,
-        relay_pubkey: &nostr::PublicKey,
-    ) -> Result<bool> {
-        let snapshot = self
-            .query_events(&crate::event::EventQuery {
-                kinds: Some(vec![buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST as i32]),
-                pubkey: Some(relay_pubkey.to_bytes().to_vec()),
-                global_only: true,
-                limit: Some(1),
-                ..crate::event::EventQuery::for_community(community_id)
-            })
-            .await?
-            .into_iter()
-            .next();
-        let members = self.list_relay_members(community_id).await?;
-
-        let Some(snapshot) = snapshot else {
-            return Ok(true);
-        };
-        let mut snapshot_members = snapshot
-            .event
-            .tags
-            .iter()
-            .filter_map(|tag| {
-                let parts = tag.as_slice();
-                (parts.first().map(String::as_str) == Some("member") && parts.len() >= 3)
-                    .then(|| (parts[1].to_ascii_lowercase(), parts[2].clone()))
-            })
-            .collect::<Vec<_>>();
-        let mut canonical_members = members
-            .into_iter()
-            .map(|member| (member.pubkey.to_ascii_lowercase(), member.role))
-            .collect::<Vec<_>>();
-        snapshot_members.sort_unstable();
-        canonical_members.sort_unstable();
-
-        Ok(snapshot_members != canonical_members)
-    }
-
-    /// Atomically publish a NIP-43 membership snapshot under a single
-    /// transaction-scoped advisory lock.
-    ///
-    /// This method acquires the per-community snapshot lock, reads the
-    /// current membership, builds the event, and replaces the prior snapshot
-    /// — all inside one transaction on one database connection. This
-    /// prevents the stale-snapshot race where a concurrent publication reads
-    /// older state and overwrites a newer snapshot by arrival order.
-    ///
-    pub async fn publish_nip43_membership_locked(
-        &self,
-        community_id: CommunityId,
-        relay_keypair: &nostr::Keys,
-    ) -> Result<(StoredEvent, bool, usize)> {
-        use nostr::{EventBuilder, Kind, Tag};
-
-        let kind_i32 = buzz_core::kind::KIND_NIP43_MEMBERSHIP_LIST as i32;
-        let pubkey_bytes = relay_keypair.public_key().to_bytes();
-
-        let lock_key =
-            event_replacement_lock_key(community_id, kind_i32, pubkey_bytes.as_slice(), None);
-
-        let mut tx = self.pool.begin().await?;
-
-        // Acquire the per-community snapshot lock BEFORE reading members.
-        // This serializes the entire read-build-write cycle: a concurrent
-        // publication will block here until our transaction commits, then
-        // read the updated membership state.
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(lock_key)
-            .execute(&mut *tx)
-            .await?;
-
-        // Read current members inside the locked transaction.
-        let rows = sqlx::query(
-            "SELECT pubkey, role FROM relay_members \
-             WHERE community_id = $1 ORDER BY created_at ASC",
-        )
-        .bind(community_id.as_uuid())
-        .fetch_all(&mut *tx)
-        .await?;
-
-        let member_count = rows.len();
-
-        // Build the NIP-43 event from the locked member rows.
-        let mut tags: Vec<Tag> = Vec::with_capacity(member_count + 1);
-        // NIP-70 protected-event marker.
-        tags.push(Tag::parse(["-"]).map_err(|e| {
-            crate::error::DbError::InvalidData(format!("failed to build '-' tag: {e}"))
-        })?);
-        for row in &rows {
-            let pubkey: String = row.try_get("pubkey")?;
-            let role: String = row.try_get("role")?;
-            tags.push(Tag::parse(["member", &pubkey, &role]).map_err(|e| {
-                crate::error::DbError::InvalidData(format!("failed to build member tag: {e}"))
-            })?);
-        }
-
-        let event = EventBuilder::new(Kind::Custom(kind_i32 as u16), "")
-            .tags(tags)
-            .sign_with_keys(relay_keypair)
-            .map_err(|e| {
-                crate::error::DbError::InvalidData(format!("failed to sign kind:13534: {e}"))
-            })?;
-
-        let created_at_secs = event.created_at.as_secs() as i64;
-        let created_at = chrono::DateTime::from_timestamp(created_at_secs, 0)
-            .ok_or(DbError::InvalidTimestamp(created_at_secs))?;
-        let sig_bytes = event.sig.serialize();
-        let tags_json = serde_json::to_value(&event.tags)?;
-        let received_at = chrono::Utc::now();
-        let d_tag = crate::event::extract_d_tag(&event);
-
-        // Soft-delete prior snapshots — unconditional, the relay is authoritative.
-        sqlx::query(
-            "UPDATE events SET deleted_at = NOW() \
-             WHERE community_id = $1 AND kind = $2 AND pubkey = $3 \
-             AND channel_id IS NULL \
-             AND deleted_at IS NULL",
-        )
-        .bind(community_id.as_uuid())
-        .bind(kind_i32)
-        .bind(pubkey_bytes.as_slice())
-        .execute(&mut *tx)
-        .await?;
-
-        let insert_result = sqlx::query(
-            "INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(community_id.as_uuid())
-        .bind(event.id.as_bytes().as_slice())
-        .bind(pubkey_bytes.as_slice())
-        .bind(created_at)
-        .bind(kind_i32)
-        .bind(&tags_json)
-        .bind(&event.content)
-        .bind(sig_bytes.as_slice())
-        .bind(received_at)
-        .bind::<Option<Uuid>>(None)
-        .bind(d_tag.as_deref())
-        .execute(&mut *tx)
-        .await?;
-
-        let was_inserted = insert_result.rows_affected() > 0;
-        if !was_inserted {
-            tx.rollback().await?;
-            return Ok((
-                StoredEvent::with_received_at(event, received_at, None, false),
-                false,
-                member_count,
-            ));
-        }
-
-        tx.commit().await?;
-
-        if let Err(e) = crate::insert_mentions(&self.pool, community_id, &event, None).await {
-            tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
-        }
-
-        Ok((
-            StoredEvent::with_received_at(event, received_at, None, true),
-            true,
-            member_count,
-        ))
-    }
-
-    /// Atomically replace a NIP-33 parameterized replaceable event (kind 30000–39999).
-    ///
-    /// Keeps only the event with the highest `created_at` per `(kind, pubkey, d_tag)`.
-    /// Same-second ties are broken by lowest event `id` (deterministic ordering).
-    /// The entire check → retire old payload → insert runs in a single transaction
-    /// with an advisory lock to prevent concurrent-insert races. NIP-RS read-state
-    /// coordinates hard-delete the superseded payload and preserve a compact
-    /// ordering watermark. Buzz mesh status coordinates also hard-delete their
-    /// superseded heartbeat payload because only the live head has product
-    /// value; other NIP-33 kinds retain soft-deleted history.
-    ///
-    /// **Channel policy:** NIP-33 replacement keys on `(kind, pubkey, d_tag)` globally —
-    /// `channel_id` is NOT part of the replacement key. This matches the Nostr spec:
-    /// an author's parameterized replaceable event is a single global resource identified
-    /// by its d-tag, regardless of which channel it was submitted to. The `channel_id`
-    /// parameter is stored on the new row for query scoping but does not affect replacement.
-    ///
-    /// Note: `replace_addressable_event()` keys on `channel_id` because it serves
-    /// relay-signed NIP-29 group metadata (kind 39000–39002) where the relay is the
-    /// author and channel_id distinguishes groups. User-submitted NIP-33 events use
-    /// this function instead, where the author's pubkey + d-tag is the natural key.
-    pub async fn replace_parameterized_event(
-        &self,
-        community_id: CommunityId,
-        event: &nostr::Event,
-        d_tag: &str,
-        channel_id: Option<Uuid>,
-    ) -> Result<(StoredEvent, bool)> {
-        let kind_i32 = buzz_core::kind::event_kind_i32(event);
-        let pubkey_bytes = event.pubkey.to_bytes();
-        let created_at_secs = event.created_at.as_secs() as i64;
-        let created_at = chrono::DateTime::from_timestamp(created_at_secs, 0)
-            .ok_or(DbError::InvalidTimestamp(created_at_secs))?;
-
-        let lock_key = event_replacement_lock_key(
-            community_id,
-            kind_i32,
-            pubkey_bytes.as_slice(),
-            Some(d_tag.as_bytes()),
-        );
-
-        let mut tx = self.pool.begin().await?;
-
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(lock_key)
-            .execute(&mut *tx)
-            .await?;
-
-        let d_tag_count = event
-            .tags
-            .iter()
-            .filter(|tag| tag.as_slice().first().is_some_and(|part| part == "d"))
-            .count();
-        let has_exact_d_tag = event.tags.iter().any(|tag| {
-            let parts = tag.as_slice();
-            parts.len() >= 2 && parts[0] == "d" && parts[1] == d_tag
-        });
-        let read_state_t_tag_count = event
-            .tags
-            .iter()
-            .filter(|tag| {
-                let parts = tag.as_slice();
-                parts.len() == 2 && parts[0] == "t" && parts[1] == "read-state"
-            })
-            .count();
-        let is_nip_rs = kind_i32 == buzz_core::kind::KIND_READ_STATE as i32
-            && d_tag_count == 1
-            && has_exact_d_tag
-            && d_tag.strip_prefix("read-state:").is_some_and(|slot| {
-                slot.len() == 32
-                    && slot
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            })
-            && read_state_t_tag_count == 1;
-        let is_buzz_mesh_status = kind_i32 == buzz_core::kind::KIND_BOOKMARK_SET as i32
-            && d_tag.starts_with("buzz-mesh-member-status:")
-            && event.tags.iter().any(|tag| {
-                let parts = tag.as_slice();
-                parts.len() == 2 && parts[0] == "k" && parts[1] == "buzz-mesh-status"
-            });
-        let hard_delete_superseded = is_nip_rs || is_buzz_mesh_status;
-
-        // Check the live head and, for NIP-RS, the compact historical ordering
-        // watermark. The watermark remains after a NIP-09 coordinate deletion,
-        // preventing a previously accepted signed blob from being resurrected.
-        let existing: Option<(chrono::DateTime<chrono::Utc>, Vec<u8>)> = sqlx::query_as(
-            "SELECT created_at, id FROM events \
-             WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4 AND deleted_at IS NULL \
-             ORDER BY created_at DESC, id ASC LIMIT 1",
-        )
-        .bind(community_id.as_uuid())
-        .bind(kind_i32)
-        .bind(pubkey_bytes.as_slice())
-        .bind(d_tag)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let watermark: Option<(chrono::DateTime<chrono::Utc>, Vec<u8>)> = if is_nip_rs {
-            sqlx::query_as(
-                "SELECT created_at, event_id FROM parameterized_event_watermarks \
-                 WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4",
-            )
-            .bind(community_id.as_uuid())
-            .bind(kind_i32)
-            .bind(pubkey_bytes.as_slice())
-            .bind(d_tag)
-            .fetch_optional(&mut *tx)
-            .await?
-        } else {
-            None
-        };
-
-        // Stale-write protection: reject if either durable ordering source
-        // dominates the incoming tuple. Equal timestamps use lowest event id.
-        let incoming_id = event.id.as_bytes().as_slice();
-        let dominated =
-            existing
-                .iter()
-                .chain(watermark.iter())
-                .any(|(accepted_ts, accepted_id)| {
-                    created_at < *accepted_ts
-                        || (created_at == *accepted_ts && incoming_id >= accepted_id.as_slice())
-                });
-        if dominated {
-            tx.rollback().await?;
-            let received_at = chrono::Utc::now();
-            return Ok((
-                StoredEvent::with_received_at(event.clone(), received_at, channel_id, false),
-                false,
-            ));
-        }
-
-        if existing.is_some() {
-            if is_nip_rs {
-                // Migration 0011 rejects regex-coordinate hard deletes from
-                // pre-fix writers. Authorize only this corrected NIP-RS delete,
-                // transaction-locally so pooled connections cannot leak it.
-                sqlx::query("SELECT set_config('buzz.nip_rs_hard_delete', 'on', true)")
-                    .execute(&mut *tx)
-                    .await?;
-            }
-            let statement = if hard_delete_superseded {
-                "DELETE FROM events \
-                 WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4 AND deleted_at IS NULL"
-            } else {
-                "UPDATE events SET deleted_at = NOW() \
-                 WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4 AND deleted_at IS NULL"
-            };
-            sqlx::query(statement)
-                .bind(community_id.as_uuid())
-                .bind(kind_i32)
-                .bind(pubkey_bytes.as_slice())
-                .bind(d_tag)
-                .execute(&mut *tx)
-                .await?;
-
-            if hard_delete_superseded {
-                if let Some((_, existing_id)) = &existing {
-                    // Event first, mentions second: migration 0009's live-event
-                    // fence uses this global lock order to avoid deadlocks.
-                    sqlx::query(
-                        "DELETE FROM event_mentions WHERE community_id = $1 AND event_id = $2",
-                    )
-                    .bind(community_id.as_uuid())
-                    .bind(existing_id)
-                    .execute(&mut *tx)
-                    .await?;
-                }
-            }
-        }
-
-        // Insert the new event inside the transaction.
-        let sig_bytes = event.sig.serialize();
-        let tags_json = serde_json::to_value(&event.tags)?;
-        let received_at = chrono::Utc::now();
-
-        let insert_result = sqlx::query(
-            "INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag, not_before) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(community_id.as_uuid())
-        .bind(event.id.as_bytes().as_slice())
-        .bind(pubkey_bytes.as_slice())
-        .bind(created_at)
-        .bind(kind_i32)
-        .bind(&tags_json)
-        .bind(&event.content)
-        .bind(sig_bytes.as_slice())
-        .bind(received_at)
-        .bind(channel_id)
-        .bind(d_tag)
-        .bind(event::extract_not_before(event))
-        .execute(&mut *tx)
-        .await?;
-
-        let was_inserted = insert_result.rows_affected() > 0;
-        if !was_inserted {
-            tx.rollback().await?;
-            return Ok((
-                StoredEvent::with_received_at(event.clone(), received_at, channel_id, false),
-                false,
-            ));
-        }
-
-        if is_nip_rs {
-            sqlx::query(
-                "INSERT INTO parameterized_event_watermarks \
-                     (community_id, kind, pubkey, d_tag, created_at, event_id) \
-                 VALUES ($1, $2, $3, $4, $5, $6) \
-                 ON CONFLICT (community_id, kind, pubkey, d_tag) DO UPDATE SET \
-                     created_at = EXCLUDED.created_at, event_id = EXCLUDED.event_id",
-            )
-            .bind(community_id.as_uuid())
-            .bind(kind_i32)
-            .bind(pubkey_bytes.as_slice())
-            .bind(d_tag)
-            .bind(created_at)
-            .bind(incoming_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        tx.commit().await?;
-
-        // Mentions are a denormalized index — safe outside the transaction.
-        if let Err(e) = crate::insert_mentions(&self.pool, community_id, event, channel_id).await {
-            tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
-        }
-
-        Ok((
-            StoredEvent::with_received_at(event.clone(), received_at, channel_id, true),
-            true,
-        ))
-    }
-
-    /// Atomically store a kind-5 tombstone and delete its repository announcement.
-    ///
-    /// The target is derived from the tombstone's sole canonical `a` tag; callers
-    /// cannot supply a different owner or repository id. Consequently the lock
-    /// key is always `(community, 30617, a-tag owner, repository d-tag)`, never
-    /// `(community, 5, tombstone signer, ...)`.
-    ///
-    /// The transaction takes the exact same advisory lock as
-    /// [`Self::replace_parameterized_event`] for the target kind-30617 coordinate.
-    /// This prevents a replacement and deletion from observing half of each
-    /// other's work. Exact tombstone replays still execute the delete, repairing
-    /// a legacy state where the tombstone committed before its side effect.
-    ///
-    /// A new tombstone is committed only when it deletes a live head. Missing
-    /// targets and heads newer than the tombstone roll the insertion back. An
-    /// exact replay after a successful deletion returns
-    /// [`RepoDeletionOutcome::AlreadyAbsent`].
-    pub async fn store_repo_deletion_tombstone(
-        &self,
-        community_id: CommunityId,
-        tombstone: &nostr::Event,
-        channel_id: Option<Uuid>,
-    ) -> Result<(StoredEvent, RepoDeletionOutcome)> {
-        const REPO_ANNOUNCEMENT_KIND: i32 = 30_617;
-
-        let target = repo_deletion_target(tombstone)?;
-        let owner_pubkey = target.owner_pubkey.as_slice();
-        let repo_id = target.repo_id.as_str();
-        let tombstone_kind = buzz_core::kind::event_kind_i32(tombstone);
-
-        let tombstone_created_at_secs = tombstone.created_at.as_secs() as i64;
-        let tombstone_created_at = chrono::DateTime::from_timestamp(tombstone_created_at_secs, 0)
-            .ok_or(DbError::InvalidTimestamp(tombstone_created_at_secs))?;
-        let lock_key = event_replacement_lock_key(
-            community_id,
-            REPO_ANNOUNCEMENT_KIND,
-            owner_pubkey,
-            Some(repo_id.as_bytes()),
-        );
-
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(lock_key)
-            .execute(&mut *tx)
-            .await?;
-
-        let received_at = chrono::Utc::now();
-        let tags_json = serde_json::to_value(&tombstone.tags)?;
-        let sig_bytes = tombstone.sig.serialize();
-        let insert_result = sqlx::query(
-            "INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag, not_before) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11) \
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(community_id.as_uuid())
-        .bind(tombstone.id.as_bytes().as_slice())
-        .bind(tombstone.pubkey.to_bytes().as_slice())
-        .bind(tombstone_created_at)
-        .bind(tombstone_kind)
-        .bind(&tags_json)
-        .bind(&tombstone.content)
-        .bind(sig_bytes.as_slice())
-        .bind(received_at)
-        .bind(channel_id)
-        .bind(event::extract_not_before(tombstone))
-        .execute(&mut *tx)
-        .await?;
-        let tombstone_inserted = insert_result.rows_affected() > 0;
-
-        let live_head: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
-            "SELECT created_at FROM events \
-             WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4 \
-               AND deleted_at IS NULL \
-             ORDER BY created_at DESC, id ASC LIMIT 1",
-        )
-        .bind(community_id.as_uuid())
-        .bind(REPO_ANNOUNCEMENT_KIND)
-        .bind(owner_pubkey)
-        .bind(repo_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let stored = |was_inserted| {
-            StoredEvent::with_received_at(tombstone.clone(), received_at, channel_id, was_inserted)
-        };
-
-        let Some(head_created_at) = live_head else {
-            tx.rollback().await?;
-            let outcome = if tombstone_inserted {
-                RepoDeletionOutcome::NotFound
-            } else {
-                RepoDeletionOutcome::AlreadyAbsent
-            };
-            return Ok((stored(false), outcome));
-        };
-
-        if head_created_at > tombstone_created_at {
-            tx.rollback().await?;
-            return Ok((stored(false), RepoDeletionOutcome::StaleHead));
-        }
-
-        let delete_result = sqlx::query(
-            "UPDATE events SET deleted_at = NOW() \
-             WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4 \
-               AND deleted_at IS NULL AND created_at <= $5",
-        )
-        .bind(community_id.as_uuid())
-        .bind(REPO_ANNOUNCEMENT_KIND)
-        .bind(owner_pubkey)
-        .bind(repo_id)
-        .bind(tombstone_created_at)
-        .execute(&mut *tx)
-        .await?;
-        debug_assert!(delete_result.rows_affected() > 0);
-
-        tx.commit().await?;
-
-        if tombstone_inserted {
-            if let Err(error) =
-                crate::insert_mentions(&self.pool, community_id, tombstone, channel_id).await
-            {
-                tracing::warn!(event_id = %tombstone.id, "Failed to insert mentions: {error}");
-            }
-        }
-
-        Ok((stored(tombstone_inserted), RepoDeletionOutcome::Deleted))
-    }
 }
 
 /// A full API token record.
@@ -5719,8 +4567,8 @@ mod tests {
     const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
 
     async fn setup_db() -> Db {
-        let database_url =
-            std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into());
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("explicit isolated test database URL required");
         let pool = PgPool::connect(&database_url)
             .await
             .expect("connect to test DB");
@@ -6909,7 +5757,8 @@ mod tests {
         // Postgres advisory locks are per-database; hardcoding the production
         // USAGE_METRICS_LOCK_KEY (0x4255_5A5A_4D45_5452) on the shared test DB
         // races any live buzz-relay on the same database (see #3619).
-        let admin_url = std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into());
+        let admin_url = std::env::var("TEST_DATABASE_URL")
+            .expect("explicit isolated test database URL required");
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .connect(&admin_url)
@@ -7124,8 +5973,8 @@ mod tests {
         let db = setup_db().await;
         let owner = format!("{:064x}", Uuid::new_v4().as_u128());
 
-        // Create 3 communities for this owner (the max).
-        for i in 0..3 {
+        // Fill the configured owner limit, including fork environment overrides.
+        for i in 0..relay_members::max_communities_per_owner() {
             let host = format!("limit-test-{}-{}.example", i, Uuid::new_v4().simple());
             assert!(matches!(
                 db.create_community_with_owner(&host, &owner)
@@ -7490,7 +6339,7 @@ mod tests {
     // the query instead of trusting the routing code's word for it.
 
     async fn admin_url() -> String {
-        std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into())
+        std::env::var("TEST_DATABASE_URL").expect("explicit isolated test database URL required")
     }
 
     /// Create a fresh scratch database on the same server and run migrations.
@@ -7503,10 +6352,7 @@ mod tests {
             .expect("create scratch db");
         let base = admin_url().await;
         // Swap the database path segment of the admin URL for the scratch name.
-        let scratch_url = {
-            let idx = base.rfind('/').expect("db url has a path segment");
-            format!("{}/{}", &base[..idx], name)
-        };
+        let scratch_url = crate::test_connection::database_url(&base, &name);
         let pool = PgPool::connect(&scratch_url)
             .await
             .expect("connect scratch db");
@@ -8574,10 +7420,7 @@ mod tests {
         let (seed, wname) = create_scratch_db(&admin, "one_budget").await;
         seed.close().await;
         let base = admin_url().await;
-        let scratch_url = {
-            let idx = base.rfind('/').expect("db url has a path segment");
-            format!("{}/{}", &base[..idx], wname)
-        };
+        let scratch_url = crate::test_connection::database_url(&base, &wname);
 
         // `Db::new` so the writer arms the floor guard and the reader is the
         // real lazy `connect_read_pool` pool (min_connections=0, 150ms
@@ -8899,11 +7742,7 @@ mod tests {
         let (seed, wname) = create_scratch_db(&admin, "lazy_w").await;
         seed.close().await;
 
-        let writer_url = {
-            let base = admin_url().await;
-            let idx = base.rfind('/').expect("db url has a path segment");
-            format!("{}/{}", &base[..idx], wname)
-        };
+        let writer_url = crate::test_connection::database_url(&admin_url().await, &wname);
         // `Db::new` (not `from_pools`) so the WRITER pool arms the
         // `buzz.created_at_floor` GUC — `spawn_fence_probe` verifies the
         // floor guard on a writer connection, and `create_scratch_db`'s
@@ -9328,8 +8167,7 @@ mod tests {
 
         // Connect a Db the production way: after_connect arms the guard.
         let base = admin_url().await;
-        let idx = base.rfind('/').expect("db url has a path segment");
-        let scratch_url = format!("{}/{}", &base[..idx], name);
+        let scratch_url = crate::test_connection::database_url(&base, &name);
         let db = Db::new(&DbConfig {
             database_url: scratch_url,
             max_connections: 2,
@@ -9419,9 +8257,8 @@ mod tests {
         replica_pool.close().await;
 
         let base = admin_url().await;
-        let idx = base.rfind('/').expect("db url has a path segment");
-        let writer_url = format!("{}/{}", &base[..idx], wname);
-        let replica_url = format!("{}/{}", &base[..idx], rname);
+        let writer_url = crate::test_connection::database_url(&base, &wname);
+        let replica_url = crate::test_connection::database_url(&base, &rname);
 
         // Healthy schema: verification passes, probe starts. A SEPARATE Db
         // instance, because its background probe legitimately opens its own

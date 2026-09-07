@@ -6,11 +6,12 @@ import {
   useRouter,
 } from "@tanstack/react-router";
 
-import { cacheSearchHitEvent } from "@/app/navigation/searchHitEventCache";
-import { resolveSearchHitDestination } from "@/app/navigation/resolveSearchHitDestination";
+import type { SearchHighlightNavigation } from "@/app/navigation/searchHighlightNavigation";
+import { openSearchHitWithNavigation } from "@/app/navigation/searchHitNavigation";
 import type { SearchHit } from "@/shared/api/types";
 
 type NavigationBehavior = {
+  force?: boolean;
   replace?: boolean;
   resetScroll?: boolean;
 };
@@ -26,13 +27,23 @@ export function useAppNavigation() {
       next: {
         to: string;
         params?: Record<string, string>;
+        state?:
+          | Record<string, unknown>
+          | ((
+              previousState: Record<string, unknown>,
+            ) => Record<string, unknown>);
         search?: Record<string, string | undefined>;
       },
       behavior: NavigationBehavior = {},
     ) => {
       const nextLocation = router.buildLocation(next as never);
+      const hasStateUpdate = next.state !== undefined;
 
-      if (location.href === nextLocation.href) {
+      if (
+        location.href === nextLocation.href &&
+        !behavior.force &&
+        !hasStateUpdate
+      ) {
         return false;
       }
 
@@ -110,6 +121,11 @@ export function useAppNavigation() {
         pullRequestId?: string;
         issueId?: string;
         repositoryId?: string;
+        /** Workspace tab requested by a share link (link vocabulary). */
+        tab?: string;
+        /** Unique per entity-link activation so repeating the same link can
+         * re-apply an unchanged tab selection. */
+        entityNavigationId?: string;
       },
     ) =>
       commitNavigation(
@@ -129,9 +145,16 @@ export function useAppNavigation() {
             ...(behavior?.repositoryId
               ? { repositoryId: behavior.repositoryId }
               : {}),
+            ...(behavior?.tab ? { tab: behavior.tab } : {}),
           },
+          state: behavior?.entityNavigationId
+            ? { entityNavigationId: behavior.entityNavigationId }
+            : undefined,
         },
-        behavior,
+        {
+          ...behavior,
+          force: Boolean(behavior?.entityNavigationId),
+        },
       ),
     [commitNavigation],
   );
@@ -155,6 +178,66 @@ export function useAppNavigation() {
           params: {
             workflowId,
           },
+          search: { pane: "trigger" },
+          state: { workflowEditorHasOrigin: true },
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
+  const goNewWorkflow = React.useCallback(
+    (behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/workflows",
+          search: { pane: "trigger", view: "create" },
+          state: { workflowEditorHasOrigin: true },
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
+  const goNewWorkflowForChannel = React.useCallback(
+    (channelId: string, behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/workflows",
+          search: {
+            channel: channelId,
+            pane: "trigger",
+            view: "create",
+          },
+          state: { workflowEditorHasOrigin: true },
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
+  const goEditWorkflow = React.useCallback(
+    (workflowId: string, behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/workflows/$workflowId",
+          params: { workflowId },
+          search: { pane: "trigger", view: "edit" },
+          state: { workflowEditorHasOrigin: true },
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
+  const goDuplicateWorkflow = React.useCallback(
+    (workflowId: string, behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/workflows/$workflowId",
+          params: { workflowId },
+          search: { pane: "trigger", view: "duplicate" },
+          state: { workflowEditorHasOrigin: true },
         },
         behavior,
       ),
@@ -174,6 +257,10 @@ export function useAppNavigation() {
          */
         autoSend?: string;
         messageId?: string;
+        /** Preserve an active search highlight; ordinary navigation clears it. */
+        preserveSearchHighlight?: boolean;
+        searchHighlight?: SearchHighlightNavigation;
+        force?: boolean;
         replace?: boolean;
         /** Open this thread panel directly without waiting for a timeline row. */
         thread?: string;
@@ -199,8 +286,15 @@ export function useAppNavigation() {
             ...(options?.thread ? { thread: options.thread } : {}),
             ...(options?.autoSend ? { autoSend: options.autoSend } : {}),
           },
+          state: options?.preserveSearchHighlight
+            ? undefined
+            : (previousState: Record<string, unknown>) => ({
+                ...previousState,
+                searchHighlight: options?.searchHighlight ?? null,
+              }),
         },
         {
+          force: options?.force,
           replace: options?.replace,
           resetScroll: options?.messageId ? true : undefined,
         },
@@ -226,6 +320,10 @@ export function useAppNavigation() {
       options?: {
         replace?: boolean;
         replyId?: string;
+        /** Preserve an active search highlight; ordinary navigation clears it. */
+        preserveSearchHighlight?: boolean;
+        searchHighlight?: SearchHighlightNavigation;
+        force?: boolean;
       },
     ) =>
       commitNavigation(
@@ -235,9 +333,18 @@ export function useAppNavigation() {
             channelId,
             postId,
           },
-          search: options?.replyId ? { replyId: options.replyId } : {},
+          search: {
+            ...(options?.replyId ? { replyId: options.replyId } : {}),
+          },
+          state: options?.preserveSearchHighlight
+            ? undefined
+            : (previousState: Record<string, unknown>) => ({
+                ...previousState,
+                searchHighlight: options?.searchHighlight ?? null,
+              }),
         },
         {
+          force: options?.force,
           replace: options?.replace,
           resetScroll: false,
         },
@@ -288,25 +395,11 @@ export function useAppNavigation() {
   );
 
   const openSearchHit = React.useCallback(
-    async (hit: SearchHit) => {
-      cacheSearchHitEvent(hit);
-
-      const destination = await resolveSearchHitDestination(hit);
-      if (!destination) {
-        return false;
-      }
-
-      if (destination.kind === "forum-post") {
-        return goForumPost(destination.channelId, destination.postId, {
-          replyId: destination.replyId,
-        });
-      }
-
-      return goChannel(destination.channelId, {
-        messageId: destination.messageId,
-        threadRootId: destination.threadRootId,
-      });
-    },
+    async (
+      hit: SearchHit,
+      behavior?: { force?: boolean; query?: string; signal?: AbortSignal },
+    ) =>
+      openSearchHitWithNavigation(hit, { ...behavior, goChannel, goForumPost }),
     [goChannel, goForumPost],
   );
 
@@ -316,9 +409,13 @@ export function useAppNavigation() {
     closeWorkflowDetail,
     goAgents,
     goChannel,
+    goDuplicateWorkflow,
+    goEditWorkflow,
     goForumPost,
     goHome,
     goNewMessage,
+    goNewWorkflow,
+    goNewWorkflowForChannel,
     goProject,
     goProjects,
     goPulse,

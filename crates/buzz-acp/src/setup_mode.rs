@@ -71,7 +71,6 @@ pub(crate) enum AcpAvailabilityStatus {
 }
 
 use crate::{
-    author_gate_decision,
     config::Config,
     event_mentions_agent, filter, log_author_gate_drop,
     relay::{HarnessRelay, RelayEventPublisher},
@@ -383,6 +382,12 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
 
     let publisher = relay.event_publisher();
     let rest_client = relay.rest_client();
+    let mut inbound_author_gate = crate::workflow_auth::InboundAuthorGate::connect(
+        &rest_client,
+        &pubkey_hex,
+        relay.connection_generation(),
+    )
+    .await;
 
     let channel_info = crate::pool::ChannelInfoResolver::new(channel_info_map, rest_client.clone());
 
@@ -415,55 +420,22 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
             continue;
         }
 
-        // ignore_self: don't react to our own messages.
-        if buzz_event.event.pubkey.to_hex() == pubkey_hex {
-            continue;
-        }
-
-        // Require an explicit @mention of this agent — setup mode must not
-        // nudge on every channel event even if subscribe_mode is "all".
-        if !event_mentions_agent(&buzz_event.event, &pubkey_hex) {
-            continue;
-        }
-
-        // Apply the same author gate as normal mode so the nudge only goes
-        // to authors the real agent would have answered. Same DM hardening:
-        // in DMs only owner/siblings get a nudge (fail-closed on unknown type).
-        let author_hex = buzz_event.event.pubkey.to_hex();
-        let is_dm = crate::is_dm_channel(buzz_event.channel_id, &channel_info).await;
-        let decision = author_gate_decision(
+        let Some(effective_author) = authorize_setup_listener_event(
+            &mut inbound_author_gate,
+            &buzz_event,
+            &pubkey_hex,
             &config.respond_to,
             &config.respond_to_allowlist,
-            &author_hex,
-            is_dm,
             &owner_cache,
+            &channel_info,
             &rest_client,
-        )
-        .await;
-        if let AuthorGateDecision::Drop(reason) = decision {
-            log_author_gate_drop(buzz_event.channel_id, &config.respond_to, is_dm, reason);
-        }
-        let allowed = decision.is_allowed();
-
-        // Apply channel/kind filter rules.
-        let filter_matched = filter::match_event(
-            &buzz_event.event,
-            buzz_event.channel_id,
             &rules,
-            &pubkey_hex,
+            &mut nudged_event_ids,
         )
         .await
-        .is_some();
-
-        // Pure gate: author gate verdict + event-id dedup.
-        if !should_nudge_for_event(
-            buzz_event.event.id,
-            allowed,
-            filter_matched,
-            &mut nudged_event_ids,
-        ) {
+        else {
             continue;
-        }
+        };
 
         // Build and publish the setup nudge.
         if let Err(e) = publish_setup_nudge(
@@ -471,6 +443,7 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
             &config.keys,
             buzz_event.channel_id,
             &buzz_event.event,
+            &effective_author,
             &payload,
         )
         .await
@@ -486,6 +459,69 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
     }
 
     Ok(())
+}
+
+/// Authenticate, filter and deduplicate one setup nudge using the normal author policy.
+#[allow(clippy::too_many_arguments)]
+async fn authorize_setup_listener_event(
+    inbound_author_gate: &mut crate::workflow_auth::InboundAuthorGate,
+    buzz_event: &crate::relay::BuzzEvent,
+    pubkey_hex: &str,
+    respond_to: &crate::config::RespondTo,
+    allowlist: &HashSet<String>,
+    owner_cache: &crate::OwnerCache,
+    channel_info: &crate::pool::ChannelInfoResolver,
+    rest_client: &crate::relay::RestClient,
+    rules: &[filter::SubscriptionRule],
+    nudged_event_ids: &mut HashSet<EventId>,
+) -> Option<String> {
+    // ignore_self: don't react to our own messages.
+    if buzz_event.event.pubkey.to_hex() == pubkey_hex {
+        return None;
+    }
+
+    // Require an explicit @mention of this agent — setup mode must not
+    // nudge on every channel event even if subscribe_mode is "all".
+    if !event_mentions_agent(&buzz_event.event, pubkey_hex) {
+        return None;
+    }
+
+    // Apply the same author gate as normal mode so the nudge only goes
+    // to authors the real agent would have answered. Same DM hardening:
+    // in DMs only owner/siblings get a nudge (fail-closed on unknown type).
+    let is_dm = crate::is_dm_channel(buzz_event.channel_id, channel_info).await;
+    let (decision, effective_author) = inbound_author_gate
+        .evaluate(
+            buzz_event,
+            respond_to,
+            allowlist,
+            is_dm,
+            owner_cache,
+            rest_client,
+        )
+        .await;
+    if let AuthorGateDecision::Drop(reason) = decision {
+        log_author_gate_drop(buzz_event.channel_id, respond_to, is_dm, reason);
+    }
+    let allowed = decision.is_allowed();
+
+    // Apply channel/kind filter rules.
+    let filter_matched =
+        filter::match_event(&buzz_event.event, buzz_event.channel_id, rules, pubkey_hex)
+            .await
+            .is_some();
+
+    // Pure gate: author gate verdict + event-id dedup.
+    if !should_nudge_for_event(
+        buzz_event.event.id,
+        allowed,
+        filter_matched,
+        nudged_event_ids,
+    ) {
+        return None;
+    }
+
+    Some(effective_author)
 }
 
 /// Outcome of the pure per-event gate checks in setup mode.
@@ -602,6 +638,7 @@ async fn publish_setup_nudge(
     keys: &nostr::Keys,
     channel_id: Uuid,
     triggering_event: &nostr::Event,
+    effective_author: &str,
     payload: &SetupPayload,
 ) -> Result<()> {
     use buzz_sdk::ThreadRef;
@@ -626,13 +663,12 @@ async fn publish_setup_nudge(
     };
 
     let body = payload.nudge_body();
-    let author_hex = triggering_event.pubkey.to_hex();
 
     let event_builder = buzz_sdk::build_message(
         channel_id,
         &body,
         thread_ref.as_ref(),
-        &[&author_hex], // p-tag the asker
+        &[effective_author], // p-tag the authorized asker
         false,
         &[],
     )
@@ -655,6 +691,219 @@ async fn publish_setup_nudge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn workflow_setup_boundary_authenticates_filters_deduplicates_and_addresses_owner() {
+        use crate::config::RespondTo;
+        use crate::workflow_auth::{
+            tests::{signed, tags, test_relay, workflow},
+            InboundAuthorGate,
+        };
+        use nostr::{Keys, Kind};
+        use std::sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        };
+        let relay_keys = Keys::generate();
+        let agent_keys = Keys::generate();
+        let agent = agent_keys.public_key().to_hex();
+        let owner = Keys::generate().public_key().to_hex();
+        let external = Keys::generate().public_key().to_hex();
+        let channel = Uuid::new_v4();
+        let server =
+            test_relay(serde_json::json!({"self": relay_keys.public_key().to_hex()})).await;
+        let generation = Arc::new(AtomicU64::new(0));
+        let mut gate = InboundAuthorGate::connect(&server.rest, &agent, generation.clone()).await;
+        let cache = crate::OwnerCache::new(Some(owner.clone()));
+        cache.cache_sibling(relay_keys.public_key().to_hex(), false);
+        cache.cache_sibling(external.clone(), false);
+        let allowlist = HashSet::from([external.clone()]);
+        let rules = vec![mentions_rule(vec![KIND_STREAM_MESSAGE])];
+        let mut nudged = HashSet::new();
+        let channel_info = crate::pool::ChannelInfoResolver::new(
+            std::collections::HashMap::from([(
+                channel,
+                crate::relay::ChannelInfo {
+                    name: "stream".into(),
+                    channel_type: "stream".into(),
+                },
+            )]),
+            server.rest.clone(),
+        );
+        let event = workflow(&relay_keys, &owner, &agent, channel, 0);
+        let mut legacy = event.clone();
+        let mut legacy_tags = tags(&owner, &agent, channel);
+        legacy_tags.retain(|tag| tag[0] != "buzz:workflow-mention");
+        legacy.event = signed(&relay_keys, legacy_tags, Kind::Custom(9));
+        let forged = workflow(&Keys::generate(), &owner, &agent, channel, 0);
+        for candidate in [&legacy, &forged] {
+            assert!(authorize_setup_listener_event(
+                &mut gate,
+                candidate,
+                &agent,
+                &RespondTo::OwnerOnly,
+                &allowlist,
+                &cache,
+                &channel_info,
+                &server.rest,
+                &rules,
+                &mut nudged
+            )
+            .await
+            .is_none());
+        }
+        assert!(nudged.is_empty());
+        assert!(authorize_setup_listener_event(
+            &mut gate,
+            &event,
+            &agent,
+            &RespondTo::Nobody,
+            &allowlist,
+            &cache,
+            &channel_info,
+            &server.rest,
+            &rules,
+            &mut nudged
+        )
+        .await
+        .is_none());
+        let wrong_rules = vec![mentions_rule(vec![1])];
+        assert!(authorize_setup_listener_event(
+            &mut gate,
+            &event,
+            &agent,
+            &RespondTo::OwnerOnly,
+            &allowlist,
+            &cache,
+            &channel_info,
+            &server.rest,
+            &wrong_rules,
+            &mut nudged
+        )
+        .await
+        .is_none());
+        // A buffered event from the old socket cannot acquire the new socket's identity.
+        generation.store(1, Ordering::Release);
+        assert!(authorize_setup_listener_event(
+            &mut gate,
+            &event,
+            &agent,
+            &RespondTo::OwnerOnly,
+            &allowlist,
+            &cache,
+            &channel_info,
+            &server.rest,
+            &rules,
+            &mut nudged
+        )
+        .await
+        .is_none());
+        let mut replay = event.clone();
+        replay.connection_generation = 1;
+        let effective = authorize_setup_listener_event(
+            &mut gate,
+            &replay,
+            &agent,
+            &RespondTo::OwnerOnly,
+            &allowlist,
+            &cache,
+            &channel_info,
+            &server.rest,
+            &rules,
+            &mut nudged,
+        )
+        .await
+        .unwrap();
+        assert_eq!(effective, owner);
+        assert!(authorize_setup_listener_event(
+            &mut gate,
+            &replay,
+            &agent,
+            &RespondTo::OwnerOnly,
+            &allowlist,
+            &cache,
+            &channel_info,
+            &server.rest,
+            &rules,
+            &mut nudged
+        )
+        .await
+        .is_none());
+        let (publisher, mut published) = RelayEventPublisher::test_pair();
+        let payload = SetupPayload {
+            agent_name: "Fixture".into(),
+            agent_pubkey: agent.clone(),
+            requirements: vec![],
+        };
+        publish_setup_nudge(
+            &publisher,
+            &agent_keys,
+            channel,
+            &event.event,
+            &effective,
+            &payload,
+        )
+        .await
+        .unwrap();
+        let nudge = published.recv().await.unwrap();
+        assert!(nudge.verify().is_ok());
+        let recipients: Vec<_> = nudge
+            .tags
+            .iter()
+            .filter(|tag| tag.as_slice()[0] == "p")
+            .map(|tag| tag.as_slice()[1].clone())
+            .collect();
+        assert_eq!(recipients, vec![owner.clone()]);
+        assert_eq!(
+            crate::queue::parse_thread_tags(&nudge).root_event_id,
+            Some(event.event.id.to_hex())
+        );
+        // The same boundary resolves current DM policy; external allowlists do not grant DM access.
+        let dm = Uuid::new_v4();
+        let dm_info = crate::pool::ChannelInfoResolver::new(
+            std::collections::HashMap::from([(
+                dm,
+                crate::relay::ChannelInfo {
+                    name: "dm".into(),
+                    channel_type: "dm".into(),
+                },
+            )]),
+            server.rest.clone(),
+        );
+        let dm_event = workflow(&relay_keys, &external, &agent, dm, 1);
+        assert!(authorize_setup_listener_event(
+            &mut gate,
+            &dm_event,
+            &agent,
+            &RespondTo::Allowlist,
+            &allowlist,
+            &cache,
+            &dm_info,
+            &server.rest,
+            &rules,
+            &mut nudged
+        )
+        .await
+        .is_none());
+        let unknown = crate::pool::ChannelInfoResolver::new(
+            std::collections::HashMap::new(),
+            server.rest.clone(),
+        );
+        assert!(authorize_setup_listener_event(
+            &mut gate,
+            &dm_event,
+            &agent,
+            &RespondTo::Anyone,
+            &allowlist,
+            &cache,
+            &unknown,
+            &server.rest,
+            &rules,
+            &mut nudged
+        )
+        .await
+        .is_none());
+    }
 
     #[test]
     fn setup_payload_from_raw_returns_none_when_absent() {

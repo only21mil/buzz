@@ -50,8 +50,32 @@ class InviteDeepLink extends BuzzDeepLink {
       'InviteDeepLink(relay: $relayUrl, code: $code, policyReceipt: $policyReceipt)';
 }
 
+/// A parsed channel-only deep link.
+///
+/// Canonical form: `buzz://channel/<channel-uuid>`.
+class ChannelDeepLink extends BuzzDeepLink {
+  /// Channel UUID from the sole path segment.
+  final String channelId;
+
+  const ChannelDeepLink({required this.channelId});
+
+  @override
+  bool operator ==(Object other) =>
+      other is ChannelDeepLink && other.channelId == channelId;
+
+  @override
+  int get hashCode => channelId.hashCode;
+
+  @override
+  String toString() => 'ChannelDeepLink(channel: $channelId)';
+}
+
 /// A parsed `buzz://message` deep link.
 class MessageDeepLink extends BuzzDeepLink {
+  /// Local community identifier for notification-originated links.
+  /// Canonical shared links omit this because community IDs are device-local.
+  final String? communityId;
+
   /// Channel UUID from the `channel` query param.
   final String channelId;
 
@@ -62,6 +86,7 @@ class MessageDeepLink extends BuzzDeepLink {
   final String? threadRootId;
 
   const MessageDeepLink({
+    this.communityId,
     required this.channelId,
     required this.messageId,
     this.threadRootId,
@@ -70,16 +95,18 @@ class MessageDeepLink extends BuzzDeepLink {
   @override
   bool operator ==(Object other) =>
       other is MessageDeepLink &&
+      other.communityId == communityId &&
       other.channelId == channelId &&
       other.messageId == messageId &&
       other.threadRootId == threadRootId;
 
   @override
-  int get hashCode => Object.hash(channelId, messageId, threadRootId);
+  int get hashCode =>
+      Object.hash(communityId, channelId, messageId, threadRootId);
 
   @override
   String toString() =>
-      'MessageDeepLink(channel: $channelId, id: $messageId, '
+      'MessageDeepLink(community: $communityId, channel: $channelId, id: $messageId, '
       'thread: $threadRootId)';
 }
 
@@ -113,6 +140,32 @@ String buildMessageLink({
     host: 'message',
     queryParameters: params,
   ).toString();
+}
+
+/// Parse a canonical `buzz://channel/<channel-uuid>` URI.
+///
+/// The channel ID must be the URI's sole non-empty path segment. Query
+/// parameters and fragments are rejected so malformed or ambiguous links never
+/// become navigation targets.
+ChannelDeepLink? parseChannelDeepLink(Uri uri) {
+  if (uri.scheme != 'buzz' || uri.host != 'channel') return null;
+  if (uri.hasQuery ||
+      uri.hasFragment ||
+      uri.userInfo.isNotEmpty ||
+      uri.hasPort) {
+    return null;
+  }
+  if (uri.pathSegments.length != 1 || uri.pathSegments.single.isEmpty) {
+    return null;
+  }
+  final channelId = uri.pathSegments.single;
+  if (!RegExp(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
+    caseSensitive: false,
+  ).hasMatch(channelId)) {
+    return null;
+  }
+  return ChannelDeepLink(channelId: channelId.toLowerCase());
 }
 
 /// Parse a `buzz://message?…` URI into a [MessageDeepLink].
@@ -218,4 +271,6 @@ InviteDeepLink? parseInviteDeepLink(Uri uri) {
 
 /// Parse any supported Buzz deep link.
 BuzzDeepLink? parseBuzzDeepLink(Uri uri) =>
-    parseInviteDeepLink(uri) ?? parseMessageDeepLink(uri);
+    parseInviteDeepLink(uri) ??
+    parseChannelDeepLink(uri) ??
+    parseMessageDeepLink(uri);

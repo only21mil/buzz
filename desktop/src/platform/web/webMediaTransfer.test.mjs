@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { resolveObjectURL } from "node:buffer";
 
 import { finalizeEvent, generateSecretKey } from "nostr-tools/pure";
 
@@ -251,4 +252,86 @@ test.after(() => {
     value: previous.navigator,
   });
   globalThis.window = previous.window;
+});
+
+for (const filename of [
+  "report.html",
+  "report.htm",
+  "REPORT.HTML",
+  "misleading.txt",
+]) {
+  for (const contentType of ["text/html", "application/octet-stream", ""]) {
+    for (const [variant, html] of [
+      [
+        "doctype",
+        "<!DOCTYPE html><html><script>globalThis.__htmlExecuted=true</script></html>",
+      ],
+      ["whitespace", "  \n<!DOCTYPE html><html>whitespace</html>"],
+      ["BOM", "\ufeff<!DOCTYPE html><html>BOM</html>"],
+      [
+        "comment",
+        "<!-- preserved -->\n<html><script>globalThis.__htmlExecuted=true</script></html>",
+      ],
+      ["fragment", "<p onclick='alert(1)'>fragment</p>"],
+      ["empty", ""],
+    ]) {
+      test(`HTML ${variant} ${filename} (${contentType || "missing MIME"}) downloads exact authenticated bytes`, async () => {
+        installSigner();
+        globalThis.fetch = async (_url, init) => {
+          assert.match(init.headers.Authorization, /^Nostr /);
+          assert.equal(init.redirect, "manual");
+          return new Response(new TextEncoder().encode(html), {
+            headers: contentType ? { "Content-Type": contentType } : {},
+          });
+        };
+        assert.equal(
+          await downloadBrowserFile({
+            url: `https://relay.example/media/${"a".repeat(64)}.html`,
+            filename: `../../${filename}`,
+          }),
+          true,
+        );
+        assert.equal(anchors.length, 1);
+        assert.equal(anchors[0].download, filename);
+        assert.match(anchors[0].href, /^blob:/);
+        const blob = resolveObjectURL(anchors[0].href);
+        assert.deepEqual(
+          new Uint8Array(await blob.arrayBuffer()),
+          new TextEncoder().encode(html),
+        );
+        assert.equal(globalThis.__htmlExecuted, undefined);
+        // The fake document permits anchors and canvas only; there is no window.open.
+        // Every object URL must be retired after the explicit download click.
+        timeouts.find((timeout) => timeout.delay === 1_000).callback();
+        assert.equal(resolveObjectURL(anchors[0].href), undefined);
+      });
+    }
+  }
+}
+
+test("HTML is rejected by both browser image actions before rendering", async () => {
+  installSigner();
+  globalThis.fetch = async () =>
+    new Response("<!DOCTYPE html><script>alert(1)</script>", {
+      headers: { "Content-Type": "text/html" },
+    });
+  const body = { url: `https://relay.example/media/${"a".repeat(64)}.html` };
+  await assert.rejects(downloadBrowserImage(body), /not an image/);
+  await assert.rejects(copyBrowserImageToClipboard(body), /not an image/);
+  assert.equal(anchors.length, 0);
+  assert.equal(clipboardWrites.length, 0);
+});
+
+test("rejected HTML download exposes the existing error and creates no Blob download", async () => {
+  installSigner();
+  globalThis.fetch = async () =>
+    new Response("authorization expired", { status: 401 });
+  await assert.rejects(
+    downloadBrowserFile({
+      url: `https://relay.example/media/${"a".repeat(64)}.html`,
+      filename: "report.html",
+    }),
+    /media download failed \(401\): authorization expired/,
+  );
+  assert.equal(anchors.length, 0);
 });

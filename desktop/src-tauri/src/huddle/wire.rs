@@ -7,12 +7,18 @@
 //!
 //! No per-frame metadata; receiver synthesizes sequence/timestamp on arrival.
 //! Kept for backward compatibility — relay still admits v1 clients into
-//! v1-pinned rooms — but new clients always speak v2.
+//! v1-pinned rooms — but new clients speak v2 while deployed relays remain
+//! capped at the released v2 contract.
 //!
-//! ## v2 (this commit)
+//! ## v2 (compatibility contract)
 //!
 //! Client → relay: `<header: [u8; 8]><opus_bytes>`
 //! Relay   → client: `<peer_index: u8><header: [u8; 8]><opus_bytes>`
+//!
+//! Protocol v2 does not carry v3's occupancy epoch in media frames. The
+//! control-plane roster still resets decoder and playout state when an index is
+//! reassigned, but v2 cannot fence a delayed packet from the previous occupant
+//! after that reassignment.
 //!
 //! Header layout (8 bytes, network byte order, big-endian):
 //!
@@ -122,6 +128,19 @@ impl FrameHeader {
     }
 }
 
+/// Parse a complete relay-to-client v2 frame.
+///
+/// The released v2 contract has exactly one relay-authored prefix byte: the
+/// sender's peer index. A non-empty Opus payload must follow the fixed header.
+pub fn parse_relay_frame(bytes: &[u8]) -> Option<(u8, FrameHeader, &[u8])> {
+    let (&peer_index, framed_audio) = bytes.split_first()?;
+    let (header, opus_payload) = FrameHeader::parse(framed_audio)?;
+    if opus_payload.is_empty() {
+        return None;
+    }
+    Some((peer_index, header, opus_payload))
+}
+
 /// Compute a dBov audio level for a normalized f32 PCM frame.
 ///
 /// "dBov" is RMS expressed in dB relative to full scale (where full scale =
@@ -160,6 +179,22 @@ pub fn audio_level_dbov(samples: &[f32]) -> i8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mobile_v2_golden_frame_preserves_the_one_byte_relay_prefix() {
+        let golden = [
+            0x07, 0x12, 0x34, 0x01, 0x02, 0x03, 0x04, 0xd6, 0x01, 0xaa, 0xbb,
+        ];
+        let (peer, header, opus) = parse_relay_frame(&golden).expect("mobile v2 frame");
+        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(peer, 7);
+        assert_eq!(header.seq, 0x1234);
+        assert_eq!(header.ts_48k, 0x01020304);
+        assert_eq!(header.level_dbov, -42);
+        assert!(header.is_dtx());
+        assert_eq!(opus, &[0xaa, 0xbb]);
+        assert_eq!(header.encode(), golden[1..9]);
+    }
 
     #[test]
     fn round_trip_preserves_fields() {
@@ -203,6 +238,41 @@ mod tests {
         buf.extend_from_slice(b"opus-bytes");
         let (_h, tail) = FrameHeader::parse(&buf).expect("parse");
         assert_eq!(tail, b"opus-bytes");
+    }
+
+    #[test]
+    fn relay_frame_uses_the_v2_one_byte_peer_prefix() {
+        let header = FrameHeader {
+            seq: 0x0102,
+            ts_48k: 960,
+            level_dbov: -20,
+            flags: 0,
+        };
+        let mut frame = vec![7];
+        frame.extend_from_slice(&header.encode());
+        frame.extend_from_slice(b"opus");
+
+        let (peer_index, parsed_header, opus_payload) =
+            parse_relay_frame(&frame).expect("valid v2 relay frame");
+        assert_eq!(peer_index, 7);
+        assert_eq!(parsed_header, header);
+        assert_eq!(opus_payload, b"opus");
+    }
+
+    #[test]
+    fn relay_frame_rejects_a_missing_opus_payload() {
+        let mut frame = vec![7];
+        frame.extend_from_slice(
+            &FrameHeader {
+                seq: 1,
+                ts_48k: 960,
+                level_dbov: -20,
+                flags: 0,
+            }
+            .encode(),
+        );
+
+        assert!(parse_relay_frame(&frame).is_none());
     }
 
     /// Bytes in big-endian network order, matching Max's spec. This pins

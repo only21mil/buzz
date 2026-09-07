@@ -40,6 +40,16 @@ test("issue comments use the project activity timeline", async ({ page }) => {
     await expect(page.getByText(comment, { exact: true })).toBeVisible({
       timeout: 10_000,
     });
+    await expect(composer.locator('[contenteditable="true"]')).toBeEmpty();
+    // The timeline confirms delivery. A success toast here covers the next
+    // Send button, and hovering that button pauses the toast's dismissal.
+    // Check immediately so waiting for toast expiry cannot hide the regression.
+    expect(
+      await page
+        .locator('[data-sonner-toast][data-type="success"]')
+        .filter({ hasText: "Comment posted." })
+        .count(),
+    ).toBe(0);
   }
 
   const timelineRows = page.getByTestId("project-issue-comment-timeline-row");

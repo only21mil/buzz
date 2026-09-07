@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use super::overrides::{divergent_agent_command_override, update_time_agent_command_override};
 use super::{
     apply_agent_command_update, classify_runtime, codex_adapter_availability,
@@ -11,6 +9,7 @@ use super::{
     GOOSE_AVATAR_URL,
 };
 use crate::managed_agents::AcpAvailabilityStatus;
+use std::path::PathBuf;
 
 #[test]
 fn resolves_known_avatar_for_bare_command() {
@@ -203,6 +202,7 @@ fn persona_with_runtime(id: &str, runtime: Option<&str>) -> crate::managed_agent
         source_team: None,
         source_team_persona_slug: None,
         catalog_source: None,
+        team_catalog_source: None,
         env_vars: std::collections::BTreeMap::new(),
         respond_to: None,
         respond_to_allowlist: Vec::new(),
@@ -230,6 +230,7 @@ fn record_with(
     override_cmd: Option<&str>,
 ) -> crate::managed_agents::types::ManagedAgentRecord {
     crate::managed_agents::types::ManagedAgentRecord {
+        effort_level: None,
         pubkey: String::new(),
         name: "r".to_string(),
         persona_id: persona_id.map(str::to_string),
@@ -279,6 +280,7 @@ fn record_with(
         source_team: None,
         source_team_persona_slug: None,
         catalog_source: None,
+        team_catalog_source: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: Vec::new(),
         definition_parallelism: None,
@@ -1771,7 +1773,6 @@ fn harness_def(
         install_hint: String::new(),
     }
 }
-
 /// A `save_and_warm` landing mid-discovery (after the scan, before the
 /// publish) must survive discovery's registry publish — through the real
 /// `discover_acp_runtimes_from` path.
@@ -1805,7 +1806,6 @@ fn discovery_publish_path_survives_mid_flight_save() {
          publish clobbers a save that landed mid-discovery"
     );
 }
-
 /// A `delete_and_warm` landing mid-discovery must stay gone after discovery's
 /// publish — a stale snapshot (taken while the file existed) would resurrect it.
 #[test]

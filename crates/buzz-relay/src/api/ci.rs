@@ -244,7 +244,11 @@ pub async fn ci_preflight(
 
     // NIP-98 authentication — same pattern as submit_event in bridge.rs.
     let url = super::bridge::nip98_expected_url(&state.config.relay_url, &tenant, "/ci/preflight");
-    let (pubkey, _event_id_bytes) = super::bridge::verify_bridge_auth(
+    let super::bridge::VerifiedBridgeAuth {
+        pubkey,
+        event_id_bytes: _event_id_bytes,
+        ..
+    } = super::bridge::verify_bridge_auth(
         &headers,
         "POST",
         &url,
@@ -1300,7 +1304,11 @@ pub async fn next_accepted_control(
     let raw_query = raw_query.ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "missing query"))?;
     let path = format!("/ci/control/accepted?{raw_query}");
     let url = super::bridge::nip98_expected_url(&state.config.relay_url, &tenant, &path);
-    let (caller, event_id) = super::bridge::verify_bridge_auth(&headers, "GET", &url, None, true)?;
+    let super::bridge::VerifiedBridgeAuth {
+        pubkey: caller,
+        event_id_bytes: event_id,
+        ..
+    } = super::bridge::verify_bridge_auth(&headers, "GET", &url, None, true)?;
     super::bridge::check_nip98_replay(&state, &tenant, event_id).await?;
 
     let events = state
@@ -1467,7 +1475,11 @@ async fn authenticate_ci_run_read(
         .path_and_query()
         .map_or_else(|| uri.path(), axum::http::uri::PathAndQuery::as_str);
     let url = super::bridge::nip98_expected_url(&state.config.relay_url, &tenant, request_path);
-    let (caller, auth_id) = super::bridge::verify_bridge_auth(headers, "GET", &url, None, true)?;
+    let super::bridge::VerifiedBridgeAuth {
+        pubkey: caller,
+        event_id_bytes: auth_id,
+        ..
+    } = super::bridge::verify_bridge_auth(headers, "GET", &url, None, true)?;
     super::bridge::check_nip98_replay(state, &tenant, auth_id).await?;
     Ok((tenant, caller))
 }
@@ -1630,7 +1642,11 @@ async fn read_ci_log(
     // Authenticate the exact method and URL before any request, repository,
     // event, or object lookup. A valid non-member receives the same 404 as a
     // missing object, so this endpoint is not an existence oracle.
-    let (caller, auth_id) = super::bridge::verify_bridge_auth(&headers, method, &url, None, true)?;
+    let super::bridge::VerifiedBridgeAuth {
+        pubkey: caller,
+        event_id_bytes: auth_id,
+        ..
+    } = super::bridge::verify_bridge_auth(&headers, method, &url, None, true)?;
     super::bridge::check_nip98_replay(&state, &tenant, auth_id).await?;
     validate_log_read_path(&path)?;
 
@@ -2056,7 +2072,11 @@ async fn read_ci_artifact(
 
     // Authenticate before any request, repository, event, or object lookup so
     // absence and membership denial remain indistinguishable to valid callers.
-    let (caller, auth_id) = super::bridge::verify_bridge_auth(&headers, method, &url, None, true)?;
+    let super::bridge::VerifiedBridgeAuth {
+        pubkey: caller,
+        event_id_bytes: auth_id,
+        ..
+    } = super::bridge::verify_bridge_auth(&headers, method, &url, None, true)?;
     super::bridge::check_nip98_replay(&state, &tenant, auth_id).await?;
     validate_artifact_read_path(&path)?;
 
@@ -2262,8 +2282,11 @@ async fn put_ci_evidence(
 
     // Validate signature, method, URL, and payload-tag presence before polling
     // the body stream. The exact digest is verified after the bounded read.
-    let (caller, preauth_id) =
-        super::bridge::verify_bridge_auth_with_options(&headers, "PUT", &url, None, true, true)?;
+    let super::bridge::VerifiedBridgeAuth {
+        pubkey: caller,
+        event_id_bytes: preauth_id,
+        ..
+    } = super::bridge::verify_bridge_auth_with_options(&headers, "PUT", &url, None, true, true)?;
     let request_bytes = hex::decode(&path.request_id)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid request event ID"))?;
     let stored = state
@@ -2320,7 +2343,11 @@ async fn put_ci_evidence(
             "CI evidence length mismatch",
         ));
     }
-    let (_, auth_id) = super::bridge::verify_bridge_auth_with_options(
+    let super::bridge::VerifiedBridgeAuth {
+        pubkey: _,
+        event_id_bytes: auth_id,
+        ..
+    } = super::bridge::verify_bridge_auth_with_options(
         &headers,
         "PUT",
         &url,
@@ -3027,6 +3054,7 @@ mod tests {
         community: CommunityId,
         host: String,
         owner: nostr::Keys,
+        _git_storage: tempfile::TempDir,
     }
 
     struct AlwaysFreshReplayGuard;
@@ -3050,7 +3078,7 @@ mod tests {
         async fn connect() -> TestHarness {
             let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
                 .or_else(|_| std::env::var("DATABASE_URL"))
-                .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_owned());
+                .expect("explicit isolated test database URL required");
             let pool = sqlx::PgPool::connect(&database_url)
                 .await
                 .expect("postgres pool for preflight route test");
@@ -3100,7 +3128,7 @@ mod tests {
             .await
             .expect("insert owner as channel member");
 
-            let state = Self::make_state(pool, &owner).await;
+            let (state, git_storage) = Self::make_state(pool, &owner).await;
 
             // Seed the exact kind:30617 repository announcement the route test
             // fixture depends on, bound to the test channel (the relay's git
@@ -3115,6 +3143,7 @@ mod tests {
                 community: CommunityId::from_uuid(community_id),
                 host,
                 owner,
+                _git_storage: git_storage,
             }
         }
 
@@ -3399,8 +3428,11 @@ mod tests {
         async fn make_state(
             pool: sqlx::PgPool,
             ci_signer: &nostr::Keys,
-        ) -> std::sync::Arc<AppState> {
-            let mut config = crate::config::Config::from_env().expect("default config loads");
+        ) -> (std::sync::Arc<AppState>, tempfile::TempDir) {
+            let git_storage = tempfile::tempdir().expect("fixture Git storage");
+            let mut config =
+                crate::config::Config::from_env_with_test_git_paths(git_storage.path())
+                    .expect("fixture config loads");
             config.require_relay_membership = false;
             config.ci_status_signer_pubkeys =
                 [ci_signer.public_key().to_hex()].into_iter().collect();
@@ -3441,7 +3473,7 @@ mod tests {
                 media_storage,
             );
             state.nip98_replay = std::sync::Arc::new(AlwaysFreshReplayGuard);
-            std::sync::Arc::new(state)
+            (std::sync::Arc::new(state), git_storage)
         }
     }
 
@@ -3710,8 +3742,13 @@ jobs:
         let ids: std::collections::HashSet<_> =
             jobs.iter().map(|job| job.job_id.as_str()).collect();
 
-        assert_eq!(jobs.len(), 17);
-        for expected in ["rust-lint", "desktop-smoke-e2e", "desktop-build-macos"] {
+        assert_eq!(jobs.len(), 18);
+        for expected in [
+            "rust-lint",
+            "desktop-smoke-e2e",
+            "desktop-build-macos",
+            "mobile-ios",
+        ] {
             assert!(ids.contains(expected), "missing current job ID {expected}");
         }
     }
@@ -4223,6 +4260,13 @@ jobs:
             return;
         }
         let harness = TestHarness::connect().await;
+        let git_root = harness._git_storage.path().to_path_buf();
+        let repo_path = &harness.state.config.git_repo_path;
+        let cache_path = &harness.state.config.git_pack_cache_path;
+        assert!(repo_path.starts_with(&git_root) && repo_path.is_dir());
+        assert!(cache_path.starts_with(&git_root) && cache_path.is_dir());
+        std::fs::write(cache_path.join("cleanup-probe"), b"owned fixture data")
+            .expect("write fixture cleanup probe");
         let body = serde_json::json!({
             "target_repo_a": malformed_repo_a(),
             "requested_tip_oid": "c".repeat(40),
@@ -4234,6 +4278,11 @@ jobs:
             axum::http::StatusCode::BAD_REQUEST,
             "malformed coordinate must be a 400 at the request seam, got {}",
             response.status()
+        );
+        drop(harness);
+        assert!(
+            !git_root.exists(),
+            "fixture Git storage must be removed on drop"
         );
     }
 

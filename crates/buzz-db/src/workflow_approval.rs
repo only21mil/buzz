@@ -493,7 +493,8 @@ pub async fn create_workflow_approval_gate(
     let dedupe_key = request_dedupe_key(params.run_id, params.step_index);
     let proposed_approval_id = Uuid::new_v4();
 
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::observability::begin(pool, crate::observability::Operation::Workflow).await?;
     acquire_workflow_approval_channel_lock(&mut tx, params.community_id, params.channel_id).await?;
 
     let run = sqlx::query(
@@ -726,7 +727,14 @@ pub async fn lookup_workflow_approval_gate(
     )
     .bind(community_id.as_uuid())
     .bind(approval_id)
-    .fetch_optional(pool)
+    .fetch_optional(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Workflow,
+        )
+        .await?,
+    )
     .await?;
     row.map(row_to_gate).transpose()
 }
@@ -748,7 +756,8 @@ pub async fn decide_workflow_approval_gate(
         return Ok(WorkflowApprovalDecisionOutcome::Conflict);
     };
 
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::observability::begin(pool, crate::observability::Operation::Workflow).await?;
     acquire_workflow_approval_channel_lock(&mut tx, params.community_id, locator.channel_id)
         .await?;
 
@@ -933,6 +942,7 @@ pub async fn decide_workflow_approval_gate(
         UPDATE workflow_runs
         SET status = $1::run_status, generation = generation + 1,
             completed_at = $2, error_message = $3,
+            error_code = CASE WHEN $3::text IS NOT NULL THEN 'approval_denied' ELSE NULL END,
             resume_lease_expires_at = NULL
         WHERE community_id = $4 AND id = $5 AND workflow_id = $6
           AND status = 'waiting_approval' AND generation = $7
@@ -1594,8 +1604,6 @@ mod tests {
     use super::*;
     use crate::user::ensure_user;
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
-
     struct PostgresGateFixture {
         pool: PgPool,
         community_id: CommunityId,
@@ -1611,7 +1619,7 @@ mod tests {
         async fn new(initial_execution_trace: &Value) -> Self {
             let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
                 .or_else(|_| std::env::var("DATABASE_URL"))
-                .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+                .expect("explicit isolated test database URL required");
             let pool = PgPool::connect(&database_url)
                 .await
                 .expect("connect to test DB");

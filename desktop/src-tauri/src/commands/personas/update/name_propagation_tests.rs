@@ -5,6 +5,7 @@ use super::*;
 
 fn agent(persona_id: &str, name: &str, display_name: Option<&str>) -> ManagedAgentRecord {
     ManagedAgentRecord {
+        effort_level: None,
         pubkey: format!("pubkey-{name}"),
         name: name.to_string(),
         persona_id: Some(persona_id.to_string()),
@@ -54,6 +55,7 @@ fn agent(persona_id: &str, name: &str, display_name: Option<&str>) -> ManagedAge
         source_team: None,
         source_team_persona_slug: None,
         catalog_source: None,
+        team_catalog_source: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: vec![],
         definition_parallelism: None,

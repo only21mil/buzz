@@ -186,8 +186,9 @@ test("failed initial relay dial retries automatically", async ({ page }) => {
               __BUZZ_E2E_GET_RELAY_CONNECTION_STATE__?: () => string;
             }
           ).__BUZZ_E2E_GET_RELAY_CONNECTION_STATE__;
-          if (!getState) throw new Error("Relay state seam is not installed.");
-          return getState();
+          // Navigation may finish before bridge initialization installs the
+          // getter. Keep sampling without stimulating a reconnect ourselves.
+          return getState?.() ?? "bridge-not-ready";
         }),
       { timeout: 10_000 },
     )

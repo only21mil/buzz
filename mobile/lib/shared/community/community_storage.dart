@@ -68,7 +68,18 @@ class CommunityStorage {
     return [];
   }
 
-  Future<void> save(Community community) async {
+  Future<void> _mutationTail = Future.value();
+
+  Future<void> _mutate(Future<void> Function() operation) {
+    final result = _mutationTail.then((_) => operation());
+    _mutationTail = result.then<void>(
+      (_) {},
+      onError: (Object _, StackTrace _) {},
+    );
+    return result;
+  }
+
+  Future<void> save(Community community) => _mutate(() async {
     final all = await loadAll();
     final index = all.indexWhere((w) => w.id == community.id);
     if (index >= 0) {
@@ -77,13 +88,29 @@ class CommunityStorage {
       all.add(community);
     }
     await _saveList(all);
-  }
+  });
 
-  Future<void> remove(String id) async {
+  /// Updates an existing community inside the same queue as saves and removals.
+  /// The synchronous callback sees its latest saved state and may reject a
+  /// changed identity. A missing community is never recreated by this method.
+  Future<void> updateExisting(
+    String id,
+    Community Function(Community current) update,
+  ) => _mutate(() async {
+    final all = await loadAll();
+    final index = all.indexWhere((community) => community.id == id);
+    if (index < 0) throw StateError('Community no longer exists');
+    final updated = update(all[index]);
+    if (updated.id != id) throw StateError('Community identity cannot change');
+    all[index] = updated;
+    await _saveList(all);
+  });
+
+  Future<void> remove(String id) => _mutate(() async {
     final all = await loadAll();
     all.removeWhere((w) => w.id == id);
     await _saveList(all);
-  }
+  });
 
   Future<String?> loadActiveId() async {
     return _secure.read(key: _keyActiveId);

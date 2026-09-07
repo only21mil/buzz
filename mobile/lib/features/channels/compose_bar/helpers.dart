@@ -448,3 +448,22 @@ class _OutgoingMentions {
     }
   }
 }
+
+void _chooseComposerAttachment(
+  BuildContext context,
+  ValueNotifier<_AttachmentSurface> attachmentSurface,
+  ValueNotifier<String?> uploadError,
+  Future<void> Function() choose, {
+  String? errorMessage,
+}) {
+  attachmentSurface.value = _AttachmentSurface.closed;
+  unawaited(() async {
+    try {
+      await choose();
+    } catch (error) {
+      if (context.mounted) {
+        uploadError.value = errorMessage ?? _formatUploadError(error);
+      }
+    }
+  }());
+}

@@ -94,17 +94,17 @@ fn normalize_commit(value: &str) -> Option<String> {
     clean_commit(Some(value.trim().to_ascii_lowercase()))
 }
 
-fn normalize_event_id(value: &str) -> Option<String> {
+pub(crate) fn normalize_event_id(value: &str) -> Option<String> {
     let value = value.trim().to_ascii_lowercase();
     (value.len() == 64 && value.chars().all(|c| c.is_ascii_hexdigit())).then_some(value)
 }
 
-struct ProjectOwnerIdentity {
-    keys: Keys,
-    auth_tag: Option<String>,
+pub(crate) struct ProjectOwnerIdentity {
+    pub(crate) keys: Keys,
+    pub(crate) auth_tag: Option<String>,
 }
 
-fn project_owner_identity(
+pub(crate) fn project_owner_identity(
     app: &AppHandle,
     state: &AppState,
     target_owner: &str,
@@ -143,7 +143,7 @@ fn project_owner_identity(
     })
 }
 
-fn validate_repo_address(repo_address: &str, owner: &str) -> Result<(), String> {
+pub(crate) fn validate_repo_address(repo_address: &str, owner: &str) -> Result<(), String> {
     let prefix = format!("30617:{owner}:");
     if repo_address.strip_prefix(&prefix).is_none_or(str::is_empty) {
         return Err("Repository address does not match the repository owner.".to_string());

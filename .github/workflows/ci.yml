@@ -56,6 +56,15 @@ jobs:
               - 'scripts/ci-promotion-readiness.py'
               - 'scripts/protected-ci-receipt.py'
               - 'scripts/run-tests.sh'
+              - 'scripts/postgres-test-*.py'
+              - 'scripts/postgres-test-*.sh'
+              - 'scripts/postgres_test_*.py'
+              - 'scripts/postgres-tests.tsv'
+              - 'scripts/test-postgres-test-*.py'
+              - 'scripts/test-postgres-test-*.sh'
+              - 'scripts/check-postgres-test-discovery.py'
+              - 'scripts/test-native-ci-python.sh'
+              - 'scripts/pre-freeze.sh'
               - 'scripts/test-ci-promotion-readiness.py'
               - 'scripts/test-ci-path-filter-contract.sh'
               - 'scripts/test-protected-ci-receipt.py'
@@ -107,6 +116,8 @@ jobs:
               - 'scripts/write-android-fork-release-provenance.py'
               - 'scripts/test-android-fork-release-contract.sh'
               - 'scripts/test-mobile-worktree-overrides.sh'
+              - 'scripts/test-mobile-push-source.py'
+              - 'docs/mobile-push-*.json'
               - '.github/workflows/mobile-release-candidate.yml'
               - '.github/workflows/android-fork-release-tag.yml'
               - '.github/workflows/android-fork-release-apk.yml'
@@ -126,6 +137,8 @@ jobs:
         run: node --test scripts/check-file-sizes-core.test.mjs
       - name: Android Google SDK-free guard unit tests
         run: scripts/test-check-android-google-free.sh
+      - name: PostgreSQL discovery contract
+        run: scripts/test-postgres-test-discovery.sh
       - name: CI path filter contract
         run: scripts/test-ci-path-filter-contract.sh
 
@@ -558,6 +571,8 @@ jobs:
       - name: Start relay
         run: |
           chmod +x ./target/ci/buzz-relay
+          # Ephemeral identity belongs only to this isolated test process tree.
+          export BUZZ_RELAY_PRIVATE_KEY="$(openssl rand -hex 32)"
           nohup env \
             DATABASE_URL="postgres://buzz:${BUZZ_TEST_POSTGRES_PASSWORD}@localhost:5432/buzz" \
             REDIS_URL=redis://localhost:6379 \
@@ -632,7 +647,7 @@ jobs:
   backend-integration:
     name: Backend Integration (relay e2e)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     needs: [changes, desktop-e2e-relay]
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.rust == 'true'
     permissions:
@@ -644,6 +659,17 @@ jobs:
         uses: taiki-e/install-action@0fd46367812ee04360509b4169d9f659d6892bb2 # v2.79.15
         with:
           tool: cargo-nextest@0.9.136
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          save-if: ${{ github.event_name != 'pull_request' }}
+      - name: Install isolated PostgreSQL tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql postgresql-contrib bubblewrap iproute2 util-linux apparmor
+      - name: Isolated PostgreSQL tests
+        run: |
+          python3 scripts/test-postgres-test-ci-admission.py
+          bash scripts/postgres-test-ci.sh
       - name: Start integration services
         run: |
           for attempt in 1 2 3; do
@@ -718,6 +744,8 @@ jobs:
       - name: Start relay
         run: |
           chmod +x ./target/ci/buzz-relay
+          # Ephemeral identity belongs only to this isolated test process tree.
+          export BUZZ_RELAY_PRIVATE_KEY="$(openssl rand -hex 32)"
           nohup env \
             DATABASE_URL="postgres://buzz:${BUZZ_TEST_POSTGRES_PASSWORD}@localhost:5432/buzz" \
             REDIS_URL=redis://localhost:6379 \
@@ -742,26 +770,6 @@ jobs:
           done
           cat /tmp/buzz-relay.log
           exit 1
-      - name: Invite security tests
-        run: |
-          cargo nextest run \
-            --archive-file target/ci/backend-integration-tests.tar.zst \
-            -E '(package(buzz-db) and test(/relay_invite::tests/)) or (package(buzz-relay) and test(/api::invites::tests/))' \
-            --run-ignored ignored-only
-        env:
-          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
-      - name: Workspace profile (kind:9033) gate tests
-        # Call-site integration for the 9033 authorization gate: open relay
-        # rosterless/steward transitions and the closed-relay admin/owner rule,
-        # against real Postgres. #[ignore]d in the default suite, selected
-        # explicitly here — see handlers::relay_admin::tests.
-        run: |
-          cargo nextest run \
-            --archive-file target/ci/backend-integration-tests.tar.zst \
-            -E 'package(buzz-relay) and test(/handlers::relay_admin::tests/)' \
-            --run-ignored ignored-only
-        env:
-          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
       - name: NIP-ER reminder e2e
         # Feature e2e for NIP-ER (Event Reminders, kind:30300): write-path
         # validation, author-only read filtering, and scheduler delivery against
@@ -774,17 +782,6 @@ jobs:
             --run-ignored ignored-only
         env:
           RELAY_URL: ws://localhost:3000
-      - name: NIP-MP coordinate deletion guard
-        # Verifies the never-delete-newer invariant of soft_delete_by_coordinate:
-        # a stale tombstone (created_at earlier than the live head) spares that
-        # head, and an equal-timestamp tombstone deletes it.
-        run: |
-          cargo nextest run \
-            --archive-file target/ci/backend-integration-tests.tar.zst \
-            -E 'package(buzz-db) and test(coordinate_delete_spares_head_newer_than_the_deletion)' \
-            --run-ignored ignored-only
-        env:
-          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
       - name: Upload relay log
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -817,11 +814,29 @@ jobs:
       - name: Start relay
         run: |
           chmod +x ./target/ci/buzz-relay ./target/ci/git-credential-nostr
+          export BUZZ_RELAY_PRIVATE_KEY="$(openssl rand -hex 32)"
           ./scripts/start-relay-for-tests.sh --no-build
+      - name: Install isolated invite fixture tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends postgresql postgresql-contrib redis-server bubblewrap iproute2 util-linux apparmor
+      - name: Download pinned invite S3 tools
+        run: |
+          mkdir -p target/invite-tools
+          curl --fail --location --retry 3 --output target/invite-tools/minio https://dl.min.io/server/minio/release/linux-amd64/archive/minio.RELEASE.2025-09-07T16-13-09Z
+          curl --fail --location --retry 3 --output target/invite-tools/mc https://dl.min.io/client/mc/release/linux-amd64/archive/mc.RELEASE.2025-08-13T08-35-41Z
+          sha256sum --check <<'CHECKSUMS'
+          7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f  target/invite-tools/minio
+          01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891  target/invite-tools/mc
+          CHECKSUMS
+          chmod +x target/invite-tools/minio target/invite-tools/mc
+      - name: Isolated relay invite E2E
+        run: bash scripts/postgres-test-ci.sh --relay-invites --relay-binary target/ci/buzz-relay --s3-tools-dir target/invite-tools
+      - name: Isolated HTML tenant read denial
+        run: bash scripts/postgres-test-ci.sh --html-tenants --relay-binary target/ci/buzz-relay --s3-tools-dir target/invite-tools
       - name: Relay E2E tests
         run: |
           cargo test -p buzz-test-client --test e2e_persona --test e2e_team_catalog --test e2e_nostr_interop --test e2e_project -- --ignored --nocapture
-          cargo test -p buzz-test-client --test e2e_relay invite -- --ignored --nocapture
           cargo test -p buzz-test-client --test e2e_relay nip43_membership_snapshots_are_rejected -- --ignored --nocapture
         env:
           RELAY_URL: ws://localhost:3000
@@ -832,10 +847,11 @@ jobs:
         # hash-scoped tokens. They were #[ignore]d and selected by no CI job, so
         # the lane never ran; select it here, where MinIO and the seeded
         # 'localhost:3000' community already exist.
+        # The two-member HTML tenant case runs in its dedicated fenced step above.
         # --no-fail-fast: without it cargo stops after the first failing binary,
         # so one broken case hides every later binary's result.
         run: |
-          cargo test -p buzz-test-client --no-fail-fast --test e2e_media --test e2e_media_extended --test e2e_media_video -- --ignored --nocapture
+          cargo test -p buzz-test-client --no-fail-fast --test e2e_media --test e2e_media_extended --test e2e_media_video -- --ignored --nocapture --skip test_html_tenant_read_denial
         env:
           RELAY_URL: ws://localhost:3000
           RELAY_HTTP_URL: http://localhost:3000
@@ -938,6 +954,8 @@ jobs:
         with:
           path: ~/.pub-cache
           key: pub-${{ runner.os }}-${{ hashFiles('mobile/pubspec.lock') }}
+      - name: Mobile push source contracts
+        run: python3 scripts/test-mobile-push-source.py
       - name: File size ratchet
         run: node mobile/scripts/check-file-sizes.mjs
       - name: Format check
@@ -960,6 +978,35 @@ jobs:
           scripts/check-android-google-free.py \
             --apk mobile/build/app/outputs/flutter-apk/app-debug.apk \
             --dependency-manifest mobile/build/app/reports/buzz-runtime-dependencies.tsv
+
+  mobile-ios:
+    name: Mobile iOS Release
+    # Prepared coverage; admission requires a reviewed MBP runner selector.
+    # Never send fork pull requests or unreviewed external source to that host.
+    runs-on: ${{ fromJSON(vars.BUZZ_IOS_CI_RUNNER_LABELS) }}
+    timeout-minutes: 30
+    needs: [changes]
+    if: >-
+      vars.BUZZ_IOS_CI_RUNNER_LABELS != '' &&
+      github.repository == 'only21mil/buzz' &&
+      needs.changes.outputs.mobile == 'true' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||
+       (github.event_name == 'pull_request' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.base_ref == 'main'))
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
+      - name: Install Flutter dependencies
+        run: cd mobile && flutter pub get
+      - name: Test standalone push package
+        run: swift test --package-path mobile/ios/BuzzPushKit
+      - name: Build complete unsigned iOS Release
+        run: cd mobile && flutter build ios --release --no-codesign --no-pub
 
   security:
     name: Security

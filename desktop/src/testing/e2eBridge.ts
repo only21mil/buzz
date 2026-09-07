@@ -1,9 +1,11 @@
+import type { DesktopNotificationTarget } from "@/features/notifications/lib/desktop";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
 import { emit, listen } from "@tauri-apps/api/event";
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import { decode, npubEncode, nsecEncode } from "nostr-tools/nip19";
 import { finalizeEvent, getPublicKey } from "nostr-tools/pure";
 import { parse as yamlParse } from "yaml";
+import { MockPublicationAuthority } from "./e2eBridgePublicationScope.ts";
 import {
   mergeMockCustomHarnesses,
   handleSaveCustomHarness,
@@ -66,6 +68,12 @@ import {
   isValidLinkPreviewSnapshotCanonicalUrl,
   parseLinkPreviewSnapshots,
 } from "@/shared/lib/linkPreviewSnapshot";
+
+export type MockDesktopNotification = {
+  title: string;
+  body?: string;
+  target: DesktopNotificationTarget | null;
+};
 
 type TestIdentity = {
   privateKey: string;
@@ -1083,6 +1091,11 @@ function updateMockRelayMembershipFromAdminEvent(event: RelayEvent): boolean {
 declare global {
   interface Window {
     __BUZZ_E2E__?: E2eConfig;
+    __BUZZ_E2E_NATIVE_NOTIFICATIONS__?: MockDesktopNotification[];
+    __BUZZ_E2E_RECORD_NATIVE_NOTIFICATION__?: (
+      notification: MockDesktopNotification,
+      activate: () => void,
+    ) => void;
     __BUZZ_E2E_COMMANDS__?: string[];
     __BUZZ_E2E_COMMAND_PAYLOADS__?: Array<{
       command: string;
@@ -3590,6 +3603,7 @@ const mockFeedOverrides: RawHomeFeedResponse["feed"] = {
 };
 
 let installed = false;
+const mockPublicationAuthority = new MockPublicationAuthority();
 let nextSocketId = 1;
 
 function syncMockRelayAgentsFromManagedAgents() {
@@ -3688,6 +3702,7 @@ function importMockIdentity(nsec: string) {
     username,
   };
   writeStoredIdentityOverride(identity);
+  mockPublicationAuthority.update(pubkey, getRelayWsUrl(getConfig()));
   if (!mockProfiles.has(pubkey)) {
     mockProfiles.set(pubkey, {
       pubkey,
@@ -4001,6 +4016,15 @@ function getMockMessageStore(channelId: string): RelayEvent[] {
               kind: 45001,
               tags: [["h", channelId]],
               content: "Release checklist: async feedback thread.",
+              sig: "mocksig".repeat(20).slice(0, 128),
+            },
+            {
+              id: "mock-forum-offsite-thread",
+              pubkey: ALICE_PUBKEY,
+              created_at: Math.floor(Date.now() / 1000) - 85 * 60,
+              kind: 45001,
+              tags: [["h", channelId]],
+              content: "Team offsite planning and travel notes.",
               sig: "mocksig".repeat(20).slice(0, 128),
             },
             {
@@ -9009,6 +9033,11 @@ async function handleSendChannelMessage(
     );
   }
 
+  // Media and thread sends use native IPC instead of the WebSocket mock.
+  // Reject before recording/echoing, matching the same one-shot relay failure.
+  const sendMessageError = config?.mock?.sendMessageErrors?.shift();
+  if (sendMessageError) throw new Error(sendMessageError);
+
   // NIP-92 imeta attachments. The real relay echoes these back on the stored
   // event; mirror that here so attachment renderers (FileCard, images, video)
   // have the imeta tags they key on. `null`/empty → no extra tags.
@@ -10077,9 +10106,8 @@ export function maybeInstallE2eTauriMocks() {
   resetMockPendingCommunityDeepLinks(config);
   initializeMockHuddle(config.mock?.huddle, config);
   mockWebsocketSendMutexWedged = false;
-  if (config.mock?.windowLabel) {
-    (window as Window & { isTauri?: boolean }).isTauri = true;
-  }
+  // The API's isTauri() reads this flag, including for the default main window.
+  (window as Window & { isTauri?: boolean }).isTauri = true;
   mockWindows(config.mock?.windowLabel ?? "main");
   window.__BUZZ_E2E_COMMANDS__ = [];
   window.__BUZZ_E2E_COMMAND_PAYLOADS__ = [];
@@ -10448,6 +10476,10 @@ export function maybeInstallE2eTauriMocks() {
   ): Promise<unknown> => {
     const activeConfig = getConfig();
     const identity = getActiveIdentity(activeConfig);
+    const publicationScope = mockPublicationAuthority.update(
+      identity?.pubkey ?? DEFAULT_MOCK_IDENTITY.pubkey,
+      getRelayWsUrl(activeConfig),
+    );
     window.__BUZZ_E2E_COMMANDS__?.push(command);
     const loggedPayload = (() => {
       if (payload instanceof Uint8Array) {
@@ -11060,6 +11092,8 @@ export function maybeInstallE2eTauriMocks() {
         mockMeshState.nodeMode = null;
         mockMeshState.activeModel = null;
         return meshNodeStatus("off", null);
+      case "get_message_publication_scope":
+        return publicationScope;
       case "get_identity": {
         const isLost =
           !mockIdentityLostCleared && activeConfig?.mock?.identityLost === true;
@@ -11247,10 +11281,20 @@ export function maybeInstallE2eTauriMocks() {
       case "apply_workspace": {
         const applyDelayMs = activeConfig?.mock?.applyCommunityDelayMs ?? 0;
         if (applyDelayMs > 0) {
-          return new Promise((resolve) =>
+          await new Promise((resolve) =>
             window.setTimeout(resolve, applyDelayMs),
           );
         }
+        const relayUrl = (payload as { relayUrl: string }).relayUrl;
+        if (activeConfig) {
+          activeConfig.relayWsUrl = relayUrl;
+          activeConfig.relayHttpUrl = relayUrl.replace(/^ws/, "http");
+        }
+        mockPublicationAuthority.update(
+          getActiveIdentity(activeConfig)?.pubkey ??
+            DEFAULT_MOCK_IDENTITY.pubkey,
+          relayUrl,
+        );
         return;
       }
       case "update_tray_agent_activity":
@@ -11879,6 +11923,26 @@ export function maybeInstallE2eTauriMocks() {
         );
       case "list_relay_agents":
         return handleListRelayAgents(activeConfig);
+      case "revalidate_relay_agents": {
+        const { pubkeys, channelId } = payload as {
+          pubkeys: string[];
+          channelId?: string;
+        };
+        const requested = new Set(pubkeys.map(normalizePubkey));
+        // Read the current fixture directory at send time. Preserve its actual
+        // policies and memberships; the requested destination grants neither.
+        return (await handleListRelayAgents(activeConfig)).filter(
+          (agent) =>
+            requested.has(normalizePubkey(agent.pubkey)) &&
+            (!channelId ||
+              agent.channel_ids.includes(channelId) ||
+              mockManagedAgents.some(
+                (managed) => managed.pubkey === agent.pubkey,
+              ) ||
+              mockProfiles.get(agent.pubkey)?.owner_pubkey ===
+                publicationScope.pubkey),
+        );
+      }
       case "list_personas":
         return handleListPersonas();
       case "create_persona":
@@ -11966,6 +12030,10 @@ export function maybeInstallE2eTauriMocks() {
           payload as Parameters<typeof handleSetPersonaShared>[0],
           activeConfig,
         );
+      case "fetch_team_catalog":
+        // Local team seeds are not community publications. This fixture starts
+        // with no published teams, so the unified chooser can settle empty.
+        return [];
       case "list_teams":
         return handleListTeams();
       case "list_channel_templates":
@@ -12715,6 +12783,10 @@ export function maybeInstallE2eTauriMocks() {
           activeConfig,
         );
       case "sign_event":
+        mockPublicationAuthority.validate(
+          (payload as { expectedScope?: typeof publicationScope })
+            .expectedScope,
+        );
         window.__BUZZ_E2E_SIGNED_EVENTS__?.push({
           content: (payload as { content: string }).content,
           createdAt: (payload as { createdAt?: number }).createdAt,
@@ -12815,6 +12887,18 @@ export function maybeInstallE2eTauriMocks() {
       case "clear_e2e_opened_external_urls":
         openedExternalUrls.length = 0;
         return null;
+      case "show_native_notification": {
+        const notification = structuredClone(
+          payload as MockDesktopNotification,
+        );
+        const record = window.__BUZZ_E2E_RECORD_NATIVE_NOTIFICATION__;
+        if (!record)
+          throw new Error("Notification test capture is unavailable");
+        record(notification, () => {
+          void emit("native-notification-activated", notification.target);
+        });
+        return null;
+      }
       case "plugin:window|show":
       case "plugin:window|unminimize":
       case "plugin:window|set_focus":

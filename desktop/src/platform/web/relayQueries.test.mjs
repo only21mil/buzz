@@ -779,3 +779,46 @@ test("search_messages forwards prefix search and maps raw relay events", async (
     },
   );
 });
+
+test("delayed browser thread lookup cannot sign after an author/community change", async () => {
+  const { capturePublicationScope, setPublicationScope } = await import(
+    "../../shared/api/publicationScope.ts"
+  );
+  setPublicationScope(PUBKEY, "wss://old.example", true);
+  const expectedScope = capturePublicationScope();
+  let release;
+  const lookup = new Promise((resolve) => {
+    release = resolve;
+  });
+  let signs = 0;
+  let sends = 0;
+  const scopedIdentity = {
+    ...identity,
+    identity: () => ({ pubkey: PUBKEY }),
+    sign: (request) => {
+      signs += 1;
+      return identity.sign(request);
+    },
+  };
+  registerRelayQueryCommands(scopedIdentity, {
+    fetchFirstEvent: async () => {
+      await lookup;
+      return event({ id: "2".repeat(64), kind: 9, createdAt: 90 });
+    },
+    publishEvent: async (signed) => {
+      sends += 1;
+      return signed;
+    },
+  });
+  const pending = dispatch("send_channel_message", {
+    expectedScope,
+    channelId: "11111111-1111-4111-8111-111111111111",
+    content: "captured body",
+    parentEventId: "2".repeat(64),
+  });
+  setPublicationScope("b".repeat(64), "wss://other.example");
+  release();
+  await assert.rejects(pending, /identity or community changed/);
+  assert.equal(signs, 0);
+  assert.equal(sends, 0);
+});

@@ -1,17 +1,15 @@
+import type { MessageComposerProps } from "@/features/messages/ui/MessageComposer.types";
 import * as React from "react";
 import { ArrowDown } from "lucide-react";
 
-import { useKnownAgentPubkeys } from "@/features/agents/useKnownAgentPubkeys";
 import { HuddleTranscriptIntro } from "@/features/huddle/components/HuddleTranscriptIntro";
-import { orderMentionPubkeysByText } from "@/features/messages/lib/orderMentionPubkeys";
-import { normalizePubkey } from "@/shared/lib/pubkey";
-import { resolveMentionProps } from "@/shared/lib/resolveMentionNames";
 import {
   buildThreadSummaryFromVisibleEntries,
   hasNestedThreadBranches,
   type MainTimelineEntry,
 } from "@/features/messages/lib/threadPanel";
 import { buildMessageThreadPanelRenderItems } from "@/features/messages/lib/messageThreadPanelRenderItems";
+import { handleTimelineMentionCopy } from "@/features/messages/lib/timelineMentionCopy";
 import type { ImetaMedia } from "@/features/messages/lib/imetaMediaMarkdown";
 import { canManageMessageForCurrentUser } from "@/features/messages/lib/canManageMessage";
 import type { TimelineMessage } from "@/features/messages/types";
@@ -73,28 +71,17 @@ type MessageThreadPanelProps = ThreadPanelLayoutProps & {
   onDelete?: (message: TimelineMessage) => void;
   onEdit?: (message: TimelineMessage) => void;
   onEditLastOwnMessage?: () => boolean;
-  onEditSave?: (
-    content: string,
-    mediaTags?: string[][],
-    mentionPubkeys?: string[],
-  ) => Promise<void>;
+  onEditSave?: MessageComposerProps["onEditSave"];
   onMarkUnread?: (message: TimelineMessage) => void;
   onMarkRead?: (message: TimelineMessage) => void;
   onExpandReplies: (message: TimelineMessage) => void;
   onScrollTargetResolved: () => void;
   onScrollTargetSettled?: (messageId: string) => void;
   scrollTargetHighlights?: boolean;
+  searchMessageId?: string | null;
+  searchQuery?: string;
   onSelectReplyTarget: (message: TimelineMessage) => void;
-  onSend: (
-    content: string,
-    mentionPubkeys: string[],
-    mediaTags?: string[][],
-    channelId?: string | null,
-    threadContext?: {
-      parentEventId: string | null;
-      threadHeadId: string | null;
-    } | null,
-  ) => Promise<void>;
+  onSend: MessageComposerProps["onSend"];
   onToggleReaction?: (
     message: TimelineMessage,
     emoji: string,
@@ -171,6 +158,8 @@ export function MessageThreadPanel({
   replyTargetMessage,
   scrollTargetId,
   scrollTargetHighlights = true,
+  searchMessageId,
+  searchQuery,
   threadHead,
   videoReviewPresentation,
   threadReplies,
@@ -405,30 +394,6 @@ export function MessageThreadPanel({
     settleAtBottomAfterLayout,
   );
 
-  const knownAgentPubkeys = useKnownAgentPubkeys();
-  const initialAgentPubkeys = React.useMemo(() => {
-    if (
-      !threadHead ||
-      !currentPubkey ||
-      normalizePubkey(threadHead.signerPubkey ?? threadHead.pubkey ?? "") !==
-        normalizePubkey(currentPubkey)
-    ) {
-      return [];
-    }
-    const { mentionPubkeysByName } = resolveMentionProps(
-      threadHead.tags,
-      profiles,
-    );
-    if (!mentionPubkeysByName) return [];
-
-    return orderMentionPubkeysByText(
-      threadHead.body,
-      mentionPubkeysByName,
-      (pubkey) =>
-        knownAgentPubkeys.has(pubkey) || profiles?.[pubkey]?.isAgent === true,
-    );
-  }, [currentPubkey, knownAgentPubkeys, profiles, threadHead]);
-
   if (!threadHead) {
     return null;
   }
@@ -439,6 +404,7 @@ export function MessageThreadPanel({
       data-buzz-conversation-scroll
       data-testid="message-thread-body"
       mode={isHuddleTranscript ? "panel" : undefined}
+      onCopy={handleTimelineMentionCopy}
       onScroll={onScroll}
       tabIndex={-1}
       ref={threadBodyRef}
@@ -499,6 +465,9 @@ export function MessageThreadPanel({
                   onUnfollowThread ? (_msg) => onUnfollowThread() : undefined
                 }
                 profiles={profiles}
+                searchQuery={
+                  searchMessageId === threadHead.id ? searchQuery : undefined
+                }
                 showDepthGuides={shouldShowThreadBranchGuides}
                 videoReviewCommentRootId={videoReviewPresentation?.commentRootIdsByMessageId.get(
                   threadHead.id,
@@ -677,6 +646,11 @@ export function MessageThreadPanel({
                         onReply={onSelectReplyTarget}
                         onToggleReaction={onToggleReaction}
                         profiles={profiles}
+                        searchQuery={
+                          searchMessageId === entry.message.id
+                            ? searchQuery
+                            : undefined
+                        }
                         showDepthGuides={shouldShowThreadBranchGuides}
                         videoReviewCommentRootId={videoReviewPresentation?.commentRootIdsByMessageId.get(
                           entry.message.id,
@@ -778,8 +752,7 @@ export function MessageThreadPanel({
             <MessageComposer
               audienceContext={{
                 type: "thread",
-                threadRootId: threadHead.id,
-                initialAgentPubkeys,
+                rootTags: threadHead.tags,
               }}
               channelId={channelId}
               channelName={channelName}

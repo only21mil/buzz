@@ -825,7 +825,7 @@ export async function installBridge(page: Page, options: BridgeOptions) {
         body: string | null;
         title: string;
       }> = [];
-      const notificationInstances: MockNotification[] = [];
+      const notificationClicks: Array<() => void> = [];
 
       class MockNotification extends EventTarget {
         static permission: NotificationPermission = "granted";
@@ -842,7 +842,11 @@ export async function installBridge(page: Page, options: BridgeOptions) {
           super();
           this.title = title;
           this.body = options?.body ?? null;
-          notificationInstances.push(this);
+          notificationClicks.push(() => {
+            const event = new Event("click");
+            this.dispatchEvent(event);
+            this.onclick?.(event);
+          });
           notificationLog.push({
             body: this.body,
             title: this.title,
@@ -883,17 +887,29 @@ export async function installBridge(page: Page, options: BridgeOptions) {
       testWindow.__BUZZ_E2E_APP_BADGE_COUNT__ = 0;
       testWindow.__BUZZ_E2E_APP_BADGE_STATE__ = "none";
       testWindow.__BUZZ_E2E_CLICK_NOTIFICATION__ = (index: number) => {
-        const notification = notificationInstances[index];
-        if (!notification) {
+        const click = notificationClicks[index];
+        if (!click) {
           return false;
         }
 
-        const event = new Event("click");
-        notification.dispatchEvent(event);
-        notification.onclick?.(event);
+        click();
         return true;
       };
       testWindow.__BUZZ_E2E_NOTIFICATIONS__ = notificationLog;
+      testWindow.__BUZZ_E2E_NATIVE_NOTIFICATIONS__ = [];
+      testWindow.__BUZZ_E2E_RECORD_NATIVE_NOTIFICATION__ = (
+        notification,
+        activate,
+      ) => {
+        testWindow.__BUZZ_E2E_NATIVE_NOTIFICATIONS__?.push(
+          structuredClone(notification),
+        );
+        notificationLog.push({
+          title: notification.title,
+          body: notification.body ?? null,
+        });
+        notificationClicks.push(activate);
+      };
     },
     {
       identity,

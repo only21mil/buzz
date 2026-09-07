@@ -387,6 +387,26 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_DEDUP", default_value = "queue", value_enum)]
     pub dedup: DedupMode,
 
+    /// How ACP provider sessions are scoped in channels.
+    /// channel (default): one provider session per channel (legacy behavior).
+    /// thread: each canonical channel thread gets an isolated provider session;
+    /// direct messages stay conversation-scoped either way. Ships as `channel`
+    /// so thread scoping can be canaried and rolled back without code changes.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_SESSION_POLICY",
+        default_value = "channel",
+        value_enum
+    )]
+    pub session_policy: crate::scope::SessionPolicy,
+    /// Invocation-only replay floor for an accepted publish-first message.
+    /// The consumer clamps this to the fifteen minutes preceding startup.
+    #[arg(long, env = "BUZZ_ACP_REPLAY_FLOOR")]
+    pub replay_floor: Option<u64>,
+    /// Saved startup preference, validated against each new session’s advertised options.
+    #[arg(long, env = "BUZZ_ACP_EFFORT_LEVEL")]
+    pub effort_level: Option<String>,
+
     /// How to handle new @mentions while a turn is already in-flight.
     /// steer (default): cancel+re-prompt, framing the new mention as a message
     /// that arrived mid-task — the agent keeps working and weaves it in.
@@ -438,7 +458,7 @@ pub struct CliArgs {
     ///
     /// Memory injection is on by default. When enabled, the harness
     /// fetches the agent's per-session core engram and renders it as an
-    /// `[Agent Memory — core]` prompt section (or renders the onboarding nudge
+    /// `<core-memory>` prompt section (or renders the onboarding nudge
     /// when the relay confirms no core engram exists). The `buzz mem` CLI
     /// and the relay's acceptance of kind:30174 engrams are unaffected — this
     /// flag controls prompt-time injection in the ACP harness only.
@@ -457,8 +477,8 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_NO_MEMORY", conflicts_with = "memory")]
     pub no_memory: bool,
 
-    /// Disable the [Base] platform-context section prepended to every prompt.
-    /// When set, agents receive only the persona [System] prompt with no Buzz orientation.
+    /// Disable the `<base>` platform-context section prepended to every prompt.
+    /// When set, agents receive only the persona `<agent-instructions>` prompt with no Buzz orientation.
     #[arg(long, env = "BUZZ_ACP_NO_BASE_PROMPT")]
     pub no_base_prompt: bool,
 
@@ -519,7 +539,7 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_ALLOWED_RESPOND_TO", value_delimiter = ',')]
     pub allowed_respond_to: Option<Vec<String>>,
 
-    /// Team-owned instructions layered after `[System]` and before agent memory.
+    /// Team-owned instructions layered after `<agent-instructions>` and before agent memory.
     #[arg(long, env = "BUZZ_ACP_TEAM_INSTRUCTIONS")]
     pub team_instructions: Option<String>,
 
@@ -568,6 +588,11 @@ pub struct Config {
     pub initial_message: Option<String>,
     pub subscribe_mode: SubscribeMode,
     pub dedup_mode: DedupMode,
+    /// How ACP provider sessions are scoped in channels (channel vs thread).
+    pub session_policy: crate::scope::SessionPolicy,
+    /// Invocation-only replay floor, bounded at startup without changing the durable cursor.
+    pub replay_floor_unix: Option<u64>,
+    pub startup_effort: Option<String>,
     pub multiple_event_handling: MultipleEventHandling,
     pub ignore_self: bool,
     pub kinds_override: Option<Vec<u32>>,
@@ -589,7 +614,7 @@ pub struct Config {
     pub typing_enabled: bool,
     /// Whether NIP-AE agent core memory injection is enabled. When false,
     /// the harness skips the per-session core engram fetch and renders no
-    /// `[Agent Memory — core]` section. On by default; disabled via the
+    /// `<core-memory>` section. On by default; disabled via the
     /// `--no-memory` / `BUZZ_ACP_NO_MEMORY` opt-out.
     pub memory_enabled: bool,
     /// Desired LLM model ID. Applied after every `session_new_full()`.
@@ -623,7 +648,7 @@ pub struct Config {
     /// Agent owner pubkey (hex). Used for `--respond-to=owner-only` gate.
     /// Replaces the old REST-based owner lookup.
     pub agent_owner: Option<String>,
-    /// Disable the [Base] platform-context section prepended to every prompt.
+    /// Disable the `<base>` platform-context section prepended to every prompt.
     pub no_base_prompt: bool,
     /// Resolved content from `--base-prompt-file`, read and validated in
     /// `from_cli()`. `None` when using the compiled-in default or when
@@ -676,6 +701,35 @@ const SESSION_TITLE_SEPARATOR: &str = " · ";
 /// survives. Returns the bare agent name when there is no channel, the channel
 /// name is blank, or no room is left for it.
 pub(crate) fn compose_session_title(agent: &str, channel_name: Option<&str>) -> String {
+    compose_session_title_with_limit(agent, channel_name, SESSION_TITLE_MAX_CHARS)
+}
+
+/// Append the canonical thread root's first eight characters to a session title.
+/// Reserve suffix space before truncating names so thread identity always survives.
+/// Conversation and heartbeat sessions preserve their existing title behavior.
+pub(crate) fn compose_scoped_session_title(
+    agent: &str,
+    channel_name: Option<&str>,
+    thread_root: Option<&str>,
+) -> String {
+    let Some(root) = thread_root.filter(|root| !root.is_empty()) else {
+        return compose_session_title(agent, channel_name);
+    };
+    let short_root: String = root.chars().take(8).collect();
+    let suffix = format!("{SESSION_TITLE_SEPARATOR}{short_root}");
+    let budget = SESSION_TITLE_MAX_CHARS.saturating_sub(suffix.chars().count());
+    let agent: String = agent.chars().take(budget).collect();
+    format!(
+        "{}{suffix}",
+        compose_session_title_with_limit(agent.trim_end(), channel_name, budget)
+    )
+}
+
+fn compose_session_title_with_limit(
+    agent: &str,
+    channel_name: Option<&str>,
+    max_chars: usize,
+) -> String {
     let Some(channel) = channel_name.and_then(sanitize_session_title) else {
         return agent.to_string();
     };
@@ -683,7 +737,7 @@ pub(crate) fn compose_session_title(agent: &str, channel_name: Option<&str>) -> 
     let reserved = agent.chars().count() + SESSION_TITLE_SEPARATOR.chars().count() + 1;
     let channel: String = channel
         .chars()
-        .take(SESSION_TITLE_MAX_CHARS.saturating_sub(reserved))
+        .take(max_chars.saturating_sub(reserved))
         .collect::<String>()
         .trim_end()
         .to_string();
@@ -1148,6 +1202,9 @@ impl Config {
             initial_message: args.initial_message,
             subscribe_mode: args.subscribe,
             dedup_mode: args.dedup,
+            session_policy: args.session_policy,
+            replay_floor_unix: args.replay_floor,
+            startup_effort: args.effort_level,
             multiple_event_handling: args.multiple_event_handling,
             ignore_self: !args.no_ignore_self,
             kinds_override: args.kinds,
@@ -1203,7 +1260,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} session_idle_ttl={}s max_live_sessions={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} session_idle_ttl={}s max_live_sessions={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1215,6 +1272,7 @@ impl Config {
             self.heartbeat_interval_secs,
             self.subscribe_mode,
             self.dedup_mode,
+            self.session_policy,
             self.multiple_event_handling,
             self.ignore_self,
             self.context_message_limit,
@@ -1530,6 +1588,9 @@ mod tests {
             initial_message: None,
             subscribe_mode: mode,
             dedup_mode: DedupMode::Queue,
+            session_policy: crate::scope::SessionPolicy::Channel,
+            replay_floor_unix: None,
+            startup_effort: None,
             multiple_event_handling: MultipleEventHandling::Queue,
             ignore_self: true,
             kinds_override: None,
@@ -2631,6 +2692,42 @@ channels = "ALL"
         assert!(result.is_empty());
     }
 
+    // ── Session policy parsing + default ──────────────────────────────────────
+
+    #[test]
+    fn test_session_policy_default_is_channel() {
+        // Ships dark: the default must be `channel` so thread scoping is opt-in
+        // and can be rolled back without code changes.
+        let args = CliArgs::parse_from(["buzz-acp", "--private-key", &"0".repeat(64)]);
+        assert_eq!(args.session_policy, crate::scope::SessionPolicy::Channel);
+    }
+
+    #[test]
+    fn test_session_policy_thread_flag_parses() {
+        let args = CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            &"0".repeat(64),
+            "--session-policy",
+            "thread",
+        ]);
+        assert_eq!(args.session_policy, crate::scope::SessionPolicy::Thread);
+    }
+
+    #[test]
+    fn test_session_policy_env_var_parses() {
+        // The env fallback (`BUZZ_ACP_SESSION_POLICY`) must resolve to the same
+        // value as the flag; this is what the managed-agent runtime sets.
+        let args = CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            &"0".repeat(64),
+            "--session-policy=thread",
+        ]);
+        assert_eq!(args.session_policy, crate::scope::SessionPolicy::Thread);
+        assert_eq!(args.session_policy.to_string(), "thread");
+    }
+
     // ── Multiple-event-handling validation + default ──────────────────────────
 
     #[test]
@@ -3029,6 +3126,36 @@ channels = "ALL"
         assert_eq!(compose_session_title(&agent, Some("buzz-dev")), agent);
     }
 
+    #[test]
+    fn scoped_session_title_keeps_short_root_even_when_names_fill_the_cap() {
+        let root = "abcdef01".repeat(8);
+        assert_eq!(
+            compose_scoped_session_title("Fizz", Some("buzz-dev"), Some(&root)),
+            "Fizz · #buzz-dev · abcdef01"
+        );
+        assert_eq!(
+            compose_scoped_session_title("Fizz", None, Some(&root)),
+            "Fizz · abcdef01"
+        );
+        assert_eq!(
+            compose_scoped_session_title("Fizz", Some("buzz-dev"), Some("abc")),
+            "Fizz · #buzz-dev · abc"
+        );
+        for (agent, channel) in [
+            ("🐝".repeat(80), "work".into()),
+            ("Fizz".into(), "🐝".repeat(100)),
+        ] {
+            let title = compose_scoped_session_title(&agent, Some(&channel), Some(&root));
+            assert_eq!(title.chars().count(), SESSION_TITLE_MAX_CHARS);
+            assert!(title.ends_with(" · abcdef01"));
+        }
+        assert_eq!(
+            compose_scoped_session_title("Fizz", Some("buzz-dev"), None),
+            "Fizz · #buzz-dev"
+        );
+        assert_eq!(compose_scoped_session_title("Fizz", None, None), "Fizz");
+    }
+
     /// Every arg whose env var name contains KEY/SECRET/TOKEN/PASSWORD/CRED/AUTH
     /// must set `hide_env_values = true` to prevent credential leakage in --help.
     #[test]
@@ -3057,5 +3184,37 @@ channels = "ALL"
             "Found secret-bearing env args without hide_env_values=true. \
              Add `hide_env_values = true` to each: {violations:?}"
         );
+    }
+}
+
+/// Bound one invocation's replay window without altering the real startup clock.
+pub(crate) fn startup_replay_floor(now: u64, requested: Option<u64>) -> u64 {
+    requested
+        .map(|floor| floor.clamp(now.saturating_sub(15 * 60), now))
+        .unwrap_or(now)
+}
+
+/// A pending wake only widens the durable startup subscription window.
+pub(crate) fn effective_startup_catchup_since(
+    durable_since: u64,
+    now: u64,
+    requested: Option<u64>,
+) -> u64 {
+    match requested {
+        Some(_) => durable_since.min(startup_replay_floor(now, requested)),
+        None => durable_since,
+    }
+}
+
+#[cfg(test)]
+mod replay_floor_tests {
+    use super::startup_replay_floor;
+    #[test]
+    fn replay_floor_is_bounded_and_optional() {
+        assert_eq!(startup_replay_floor(1000, None), 1000);
+        assert_eq!(startup_replay_floor(1000, Some(997)), 997);
+        assert_eq!(startup_replay_floor(1000, Some(0)), 100);
+        assert_eq!(startup_replay_floor(1000, Some(2000)), 1000);
+        assert_eq!(startup_replay_floor(10, Some(0)), 0);
     }
 }

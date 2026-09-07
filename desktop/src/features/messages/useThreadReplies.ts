@@ -75,7 +75,8 @@ async function withThreadAux(
   return sortMessages([...replies, ...structuralAux, ...reactions]);
 }
 
-async function loadThreadReplies(
+/** Load every reply page, retaining legacy aux backfill unless each page proves support. */
+export async function loadThreadReplies(
   queryClient: QueryClient,
   channelId: string,
   rootId: string,
@@ -85,14 +86,18 @@ async function loadThreadReplies(
   const idsAtStart = new Set(cacheAtStart.map((event) => event.id));
   const replies: RelayEvent[] = [];
   let cursor: ThreadCursor | null = null;
+  let allPagesIncludeAux = true;
   for (let page = 0; page < MAX_THREAD_PAGES; page += 1) {
     const response = await getThreadReplies(rootId, channelId, {
       limit: THREAD_PAGE_LIMIT,
       cursor,
     });
     replies.push(...response.events);
+    allPagesIncludeAux &&= response.auxIncluded === true;
     if (!response.nextCursor) {
-      const fetched = await withThreadAux(channelId, rootId, replies);
+      const fetched = allPagesIncludeAux
+        ? replies
+        : await withThreadAux(channelId, rootId, replies);
       const current = queryClient.getQueryData<RelayEvent[]>(queryKey) ?? [];
       const receivedInFlight = current.filter(
         (event) => !idsAtStart.has(event.id),

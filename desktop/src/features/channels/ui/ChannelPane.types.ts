@@ -1,13 +1,14 @@
+import type { PublicationScope } from "@/shared/api/publicationScope";
+import type { MessageComposerProps } from "@/features/messages/ui/MessageComposer.types";
+import type { MessageComposerEditTarget } from "@/features/messages/ui/MessageComposer.types";
 import type * as React from "react";
 import type { BotActivityAgent } from "@/features/channels/ui/BotActivityBar";
 import type { ChannelAgentSessionAgent } from "@/features/channels/ui/useChannelAgentSessions";
-import type { ImetaMedia } from "@/features/messages/lib/imetaMediaMarkdown";
 import type { MainTimelineEntry } from "@/features/messages/lib/threadPanel";
 import type { ChannelWindowThreadSummary } from "@/features/messages/lib/channelWindowStore";
 import type { TimelineMessage } from "@/features/messages/types";
 import type { TypingIndicatorEntry } from "@/features/messages/useChannelTyping";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
-import type { useChannelFind } from "@/features/search/useChannelFind";
 import type {
   ProfilePanelTab,
   ProfilePanelView,
@@ -34,15 +35,9 @@ export type ChannelPaneProps = {
    */
   onAutoSendComplete?: (() => void) | null;
   botTypingEntries: TypingIndicatorEntry[];
-  channelFind: ReturnType<typeof useChannelFind>;
   channelManagementOpen?: boolean;
   currentPubkey?: string;
-  editTarget?: {
-    author: string;
-    body: string;
-    id: string;
-    imetaMedia?: ImetaMedia[];
-  } | null;
+  editTarget?: MessageComposerEditTarget | null;
   fetchOlder?: () => Promise<void>;
   header?: React.ReactNode;
   hasOlderMessages?: boolean;
@@ -85,11 +80,7 @@ export type ChannelPaneProps = {
   onCloseThread: () => void;
   onDelete?: (message: TimelineMessage) => void;
   onEdit?: (message: TimelineMessage) => void;
-  onEditSave?: (
-    content: string,
-    mediaTags?: string[][],
-    mentionPubkeys?: string[],
-  ) => Promise<void>;
+  onEditSave?: MessageComposerProps["onEditSave"];
   onMarkUnread?: (message: TimelineMessage) => void;
   onMarkRead?: (message: TimelineMessage) => void;
   onExpandThreadReplies: (message: TimelineMessage) => void;
@@ -101,29 +92,16 @@ export type ChannelPaneProps = {
   onOpenThread: (message: TimelineMessage) => void;
   onResetThreadPanelWidth: () => void;
   onSelectThreadReplyTarget: (message: TimelineMessage) => void;
-  onSendMessage: (
-    content: string,
-    mentionPubkeys: string[],
-    mediaTags?: string[][],
-    channelId?: string | null,
-  ) => Promise<void>;
+  onSendMessage: MessageComposerProps["onSend"];
   onSendVideoReviewComment?: (
     message: TimelineMessage,
     content: string,
     mentionPubkeys: string[],
     mediaTags?: string[][],
     parentEventId?: string,
+    publicationScope?: PublicationScope,
   ) => Promise<void>;
-  onSendThreadReply: (
-    content: string,
-    mentionPubkeys: string[],
-    mediaTags?: string[][],
-    channelId?: string | null,
-    threadContext?: {
-      parentEventId: string | null;
-      threadHeadId: string | null;
-    } | null,
-  ) => Promise<void>;
+  onSendThreadReply: MessageComposerProps["onSend"];
   onTargetReached?: (messageId: string) => void;
   onToggleReaction?: (
     message: TimelineMessage,
@@ -164,6 +142,10 @@ export type ChannelPaneProps = {
   threadReplyUnreadCounts?: ReadonlyMap<string, number>;
   threadFirstUnreadReplyId?: string | null;
   targetMessageId: string | null;
+  /** Exact clicked result id, including a reply routed into the thread panel. */
+  targetSearchMessageId?: string | null;
+  /** Search text to highlight within the clicked result. */
+  targetSearchQuery?: string;
   typingPubkeys: string[];
   isFollowingThread?: boolean;
   onFollowThread?: () => void;

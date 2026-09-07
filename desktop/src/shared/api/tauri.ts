@@ -1,3 +1,4 @@
+import type { PublicationScope } from "./publicationScope";
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import {
   activateRateLimit,
@@ -25,7 +26,6 @@ import type {
   RelayEvent,
   SearchMessagesInput,
   SearchMessagesResponse,
-  SendChannelMessageResult,
   SetCanvasInput,
   SetCanvasResult,
   ThreadCursor,
@@ -43,6 +43,8 @@ import type {
 } from "@/shared/api/types";
 
 export * from "@/shared/api/tauriChannels";
+export { sendChannelMessage } from "@/shared/api/tauriMessages";
+export { getEventById, getEventsByIds } from "@/shared/api/tauriEvents";
 
 type RawPresenceLookup = Record<string, PresenceStatus>;
 
@@ -97,16 +99,9 @@ type RawSearchResponse = {
   found: number;
 };
 
-type RawSendChannelMessageResult = {
-  event_id: string;
-  parent_event_id: string | null;
-  root_event_id: string | null;
-  depth: number;
-  created_at: number;
-};
-
 type RawRelayAgent = {
   pubkey: string;
+  owner_pubkey?: string | null;
   name: string;
   agent_type: string;
   channels: string[];
@@ -140,6 +135,7 @@ export type RawManagedAgent = {
   model: string | null;
   model_source?: ManagedAgent["modelSource"];
   provider: string | null;
+  effort_level?: string | null;
   persona_out_of_date: boolean;
   persona_orphaned: boolean;
   needs_restart: boolean;
@@ -188,6 +184,7 @@ export type RawAcpRuntimeCatalogEntry = {
   model_env_var?: string | null;
   provider_env_var?: string | null;
   thinking_env_var?: string | null;
+  effort_canonical_values?: string[] | null;
   max_tokens_env_var?: string | null;
   context_limit_env_var?: string | null;
   max_rounds_env_var?: string | null;
@@ -473,17 +470,13 @@ export async function searchMessages(
   };
 }
 
-export async function getEventById(eventId: string): Promise<RelayEvent> {
-  const eventJson = await invokeTauri<string>("get_event", { eventId });
-  return JSON.parse(eventJson) as RelayEvent;
-}
-
 type RawThreadCursor = {
   created_at: number;
   event_id: string;
 };
 
 type RawThreadRepliesResponse = {
+  aux_included?: boolean;
   events: RelayEvent[];
   next_cursor: RawThreadCursor | null;
 };
@@ -531,47 +524,13 @@ export async function getThreadReplies(
 
   return {
     events: response.events,
+    auxIncluded: response.aux_included === true,
     nextCursor: response.next_cursor
       ? {
           createdAt: response.next_cursor.created_at,
           eventId: response.next_cursor.event_id,
         }
       : null,
-  };
-}
-
-export async function sendChannelMessage(
-  channelId: string,
-  content: string,
-  parentEventId?: string | null,
-  mediaTags?: string[][],
-  mentionPubkeys?: string[],
-  kind?: number,
-  emojiTags?: string[][],
-  mentionTags?: string[][],
-  linkPreviewTags?: string[][],
-): Promise<SendChannelMessageResult> {
-  const response = await invokeTauri<RawSendChannelMessageResult>(
-    "send_channel_message",
-    {
-      channelId,
-      content,
-      parentEventId,
-      mediaTags: mediaTags ?? null,
-      emojiTags: emojiTags ?? null,
-      mentionTags: mentionTags ?? null,
-      linkPreviewTags,
-      mentionPubkeys: mentionPubkeys ?? null,
-      kind: kind ?? null,
-    },
-  );
-
-  return {
-    eventId: response.event_id,
-    parentEventId: response.parent_event_id,
-    rootEventId: response.root_event_id,
-    depth: response.depth,
-    createdAt: response.created_at,
   };
 }
 
@@ -642,6 +601,7 @@ export async function removeReaction(
 }
 
 export async function signRelayEvent(input: {
+  expectedScope?: PublicationScope;
   kind: number;
   content: string;
   createdAt?: number;
@@ -662,6 +622,7 @@ export async function createAuthEvent(input: {
 function fromRawRelayAgent(agent: RawRelayAgent): RelayAgent {
   return {
     pubkey: agent.pubkey,
+    ownerPubkey: agent.owner_pubkey ?? null,
     name: agent.name,
     agentType: agent.agent_type,
     channels: agent.channels,
@@ -695,6 +656,7 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     model: agent.model,
     modelSource: agent.model_source ?? null,
     provider: agent.provider ?? null,
+    effortLevel: agent.effort_level ?? null,
     personaOutOfDate: agent.persona_out_of_date ?? false,
     personaOrphaned: agent.persona_orphaned ?? false,
     needsRestart: agent.needs_restart ?? false,
@@ -734,6 +696,7 @@ export function fromRawAcpRuntimeCatalogEntry(
     modelEnvVar: entry.model_env_var ?? null,
     providerEnvVar: entry.provider_env_var ?? null,
     thinkingEnvVar: entry.thinking_env_var ?? null,
+    effortCanonicalValues: entry.effort_canonical_values ?? null,
     maxTokensEnvVar: entry.max_tokens_env_var ?? null,
     contextLimitEnvVar: entry.context_limit_env_var ?? null,
     maxRoundsEnvVar: entry.max_rounds_env_var ?? null,
@@ -1100,8 +1063,6 @@ export async function probeBackendProvider(
   });
 }
 
-// ── NIP-44 encrypt-to-self ───────────────────────────────────────────────────
-
 export async function nip44EncryptToSelf(plaintext: string): Promise<string> {
   return invokeTauri<string>("nip44_encrypt_to_self", { plaintext });
 }
@@ -1124,35 +1085,15 @@ export async function cancelPairing(): Promise<void> {
   await invokeTauri("cancel_pairing");
 }
 
-export async function applyCommunity(
-  relayUrl: string,
-  nsec?: string,
-  reposDir?: string,
-  agentManagedProfiles?: boolean,
-): Promise<void> {
-  await invokeTauri("apply_workspace", {
-    relayUrl,
-    nsec: nsec ?? null,
-    reposDir: reposDir ?? null,
-    agentManagedProfiles: agentManagedProfiles ?? false,
-  });
-}
+export {
+  applyCommunity,
+  setAgentManagedProfiles,
+  setThreadScopedAcpSessions,
+  setPreventSleepActive,
+  validateReposDir,
+} from "./tauriWorkspace";
 
-// Validate a candidate repos dir without mutating the filesystem. Rejects
-// with a human-readable reason; resolves for a valid or empty path.
-export async function validateReposDir(dir: string): Promise<void> {
-  await invokeTauri("validate_repos_dir", { dir });
-}
-
-export const setPreventSleepActive = (active: boolean) =>
-  invokeTauri("set_prevent_sleep_active", { active });
-
-export const setAgentManagedProfiles = (enabled: boolean) =>
-  invokeTauri("set_agent_managed_profiles", { enabled });
-
-/** Returns true on macOS, Windows, and Linux AppImage installs.
- *  Returns false on Linux non-AppImage packages (e.g. .deb) where
- *  Tauri's updater cannot swap the binary. */
+/** Whether this install supports Tauri's binary updater. */
 export function isAutoUpdateSupported(): Promise<boolean> {
   return invokeTauri<boolean>("is_auto_update_supported");
 }

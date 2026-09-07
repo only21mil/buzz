@@ -148,6 +148,32 @@ fn resolve_mention_pubkeys(text: &str, members: &[(String, String)]) -> Vec<Stri
     out
 }
 
+/// Append authority only from the two persisted target sets. Legacy claims
+/// have no authored set and retain precisely their historical tag sequence.
+fn append_workflow_authority_tags(
+    tags: &mut Vec<Tag>,
+    author: &str,
+    rendered: &[String],
+    authored: Option<&[String]>,
+) -> Result<(), ActionSinkError> {
+    let Some(authored) = authored else {
+        return Ok(());
+    };
+    tags.push(
+        Tag::parse(["buzz:workflow-owner", author])
+            .map_err(|e| ActionSinkError::EventBuild(e.to_string()))?,
+    );
+    for target in rendered {
+        if authored.contains(target) {
+            tags.push(
+                Tag::parse(["buzz:workflow-mention", target.as_str()])
+                    .map_err(|e| ActionSinkError::EventBuild(e.to_string()))?,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Relay-side action sink — executes workflow side-effects directly.
 ///
 /// Holds a **weak** reference to `AppState` to avoid an `Arc` reference cycle:
@@ -262,6 +288,49 @@ impl ActionSink for RelayActionSink {
         })
     }
 
+    fn resolve_message_thread(
+        &self,
+        community_id: CommunityId,
+        channel_id: &str,
+        parent_event_id: &str,
+    ) -> Pin<
+        Box<dyn Future<Output = Result<buzz_workflow::MessageThread, ActionSinkError>> + Send + '_>,
+    > {
+        let channel_id = channel_id.to_owned();
+        let parent_event_id = parent_event_id.to_owned();
+        Box::pin(async move {
+            let state = self
+                .state
+                .upgrade()
+                .ok_or_else(|| ActionSinkError::Database("relay is shutting down".into()))?;
+            let channel = Uuid::parse_str(&channel_id)
+                .map_err(|e| ActionSinkError::InvalidInput(e.to_string()))?;
+            let ancestry = crate::handlers::ingest::resolve_relay_reply_thread_meta(
+                community_id,
+                &parent_event_id,
+                channel,
+                &state,
+            )
+            .await
+            .map_err(ActionSinkError::InvalidInput)?;
+            let root = ancestry.root_hex();
+            let parent = ancestry.parent_hex();
+            let mut tags = Vec::new();
+            if root != parent {
+                tags.push(vec!["e".into(), root, "".into(), "root".into()]);
+            }
+            tags.push(vec!["e".into(), parent, "".into(), "reply".into()]);
+            Ok(buzz_workflow::MessageThread {
+                parent_event_id: ancestry.parent_event_id,
+                parent_event_created_at: ancestry.parent_event_created_at,
+                root_event_id: ancestry.root_event_id,
+                root_event_created_at: ancestry.root_event_created_at,
+                depth: ancestry.depth,
+                tags,
+            })
+        })
+    }
+
     fn send_message(
         &self,
         effect: ActionEffectContext,
@@ -271,6 +340,28 @@ impl ActionSink for RelayActionSink {
         author_pubkey: &str,
         mentioned_pubkeys: &[String],
     ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
+        self.send_prepared_message(
+            effect,
+            community_id,
+            channel_id,
+            text,
+            author_pubkey,
+            mentioned_pubkeys,
+            &Default::default(),
+        )
+    }
+
+    fn send_prepared_message(
+        &self,
+        effect: ActionEffectContext,
+        community_id: CommunityId,
+        channel_id: &str,
+        text: &str,
+        author_pubkey: &str,
+        mentioned_pubkeys: &[String],
+        options: &buzz_workflow::MessageEffectOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<String, ActionSinkError>> + Send + '_>> {
+        let options = options.clone();
         let channel_id = channel_id.to_owned();
         let text = text.to_owned();
         let author_pubkey = author_pubkey.to_owned();
@@ -320,14 +411,29 @@ impl ActionSink for RelayActionSink {
 
             // Mention pubkeys were resolved before the claim and are immutable.
             // Retries build the event from this persisted list, never live names.
-            for mentioned in mentioned_pubkeys {
-                if mentioned == author_pubkey_hex {
+            for mentioned in &mentioned_pubkeys {
+                if mentioned == &author_pubkey_hex {
                     continue;
                 }
                 tags.push(
-                    Tag::parse(["p", &mentioned])
+                    Tag::parse(["p", mentioned.as_str()])
                         .map_err(|e| ActionSinkError::EventBuild(format!("mention p tag: {e}")))?,
                 );
+            }
+
+            append_workflow_authority_tags(
+                &mut tags,
+                &author_pubkey_hex,
+                &mentioned_pubkeys,
+                options.authored_mentioned_pubkeys.as_deref(),
+            )?;
+
+            if let Some(thread) = &options.thread {
+                for tag in &thread.tags {
+                    tags.push(
+                        Tag::parse(tag).map_err(|e| ActionSinkError::EventBuild(e.to_string()))?,
+                    );
+                }
             }
 
             let kind = Kind::from(KIND_STREAM_MESSAGE as u16);
@@ -408,11 +514,14 @@ impl ActionSink for RelayActionSink {
                 event_id: &event_id_bytes,
                 event_created_at,
                 channel_id: channel_uuid,
-                parent_event_id: None,
-                parent_event_created_at: None,
-                root_event_id: None,
-                root_event_created_at: None,
-                depth: 0,
+                parent_event_id: options
+                    .thread
+                    .as_ref()
+                    .map(|t| t.parent_event_id.as_slice()),
+                parent_event_created_at: options.thread.as_ref().map(|t| t.parent_event_created_at),
+                root_event_id: options.thread.as_ref().map(|t| t.root_event_id.as_slice()),
+                root_event_created_at: options.thread.as_ref().map(|t| t.root_event_created_at),
+                depth: options.thread.as_ref().map_or(0, |t| t.depth),
                 broadcast: false,
             });
 
@@ -439,6 +548,14 @@ impl ActionSink for RelayActionSink {
                     None,
                 )
                 .await;
+                if let Some(thread) = &options.thread {
+                    crate::handlers::side_effects::emit_live_thread_summary(
+                        &tenant,
+                        &state,
+                        channel_uuid,
+                        thread.root_event_id.clone(),
+                    );
+                }
             }
 
             Ok(event_id_hex)
@@ -824,6 +941,67 @@ mod tests {
     }
 
     #[test]
+    fn workflow_authored_rendered_mentions_get_authority_and_legacy_tags() {
+        let owner = pk('1');
+        let target = pk('2');
+        let injected = pk('3');
+        let members = vec![m("Agent", &target), m("Injected", &injected)];
+        let rendered = resolve_mention_pubkeys("@Agent {{done}} @Injected", &members);
+        let authored = resolve_mention_pubkeys("@Agent {{trigger.text}}", &members);
+        let mut tags = vec![Tag::parse(["p", owner.as_str()]).unwrap()];
+        append_workflow_authority_tags(&mut tags, &owner, &rendered, Some(&authored)).unwrap();
+        assert!(tags
+            .iter()
+            .any(|t| t.as_slice() == ["buzz:workflow-mention", target.as_str()]));
+        assert!(!tags
+            .iter()
+            .any(|t| t.as_slice() == ["buzz:workflow-mention", injected.as_str()]));
+        assert!(tags
+            .iter()
+            .any(|t| t.as_slice() == ["buzz:workflow-owner", owner.as_str()]));
+    }
+
+    #[test]
+    fn trigger_injected_rendered_mention_gets_no_authority() {
+        let owner = pk('1');
+        let target = pk('2');
+        let members = vec![m("Agent", &target)];
+        let rendered = resolve_mention_pubkeys("echo: @Agent do this", &members);
+        let authored = resolve_mention_pubkeys("echo: {{trigger.text}}", &members);
+        let mut tags = vec![Tag::parse(["p", target.as_str()]).unwrap()];
+        append_workflow_authority_tags(&mut tags, &owner, &rendered, Some(&authored)).unwrap();
+        assert!(tags
+            .iter()
+            .all(|t| t.as_slice()[0] != "buzz:workflow-mention"));
+        let mut legacy = tags.clone();
+        append_workflow_authority_tags(&mut legacy, &owner, &rendered, None).unwrap();
+        assert_eq!(
+            legacy, tags,
+            "old claims must not gain even an owner authority tag"
+        );
+    }
+
+    #[test]
+    fn explicit_owner_target_is_required_even_when_owner_is_attributed() {
+        let owner = pk('1');
+        for explicit in [false, true] {
+            let targets = if explicit {
+                vec![owner.clone()]
+            } else {
+                vec![]
+            };
+            let mut tags = vec![Tag::parse(["p", owner.as_str()]).unwrap()];
+            append_workflow_authority_tags(&mut tags, &owner, &targets, Some(&targets)).unwrap();
+            assert_eq!(tags.iter().filter(|t| t.as_slice()[0] == "p").count(), 1);
+            assert_eq!(
+                tags.iter()
+                    .any(|t| t.as_slice()[0] == "buzz:workflow-mention"),
+                explicit
+            );
+        }
+    }
+
+    #[test]
     fn ambiguous_name_wakes_no_one() {
         // Six "Fizz" agents (real team case) with distinct pubkeys → tag none.
         let members = vec![
@@ -865,8 +1043,10 @@ mod integration_tests {
     use std::sync::Arc;
 
     /// Real-PG state mirroring `handlers::event::tests::test_state_with_redis_url`.
-    async fn test_state() -> Arc<AppState> {
-        let mut config = crate::config::Config::from_env().expect("default config loads");
+    async fn test_state() -> (Arc<AppState>, tempfile::TempDir) {
+        let git_storage = tempfile::tempdir().expect("fixture Git storage");
+        let mut config = crate::config::Config::from_env_with_test_git_paths(git_storage.path())
+            .expect("fixture config loads");
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
@@ -899,13 +1079,13 @@ mod integration_tests {
             nostr::Keys::generate(),
             media_storage,
         );
-        Arc::new(state)
+        (Arc::new(state), git_storage)
     }
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn workflow_send_message_p_tags_mentioned_member() {
-        let state = test_state().await;
+        let (state, _git_storage) = test_state().await;
 
         let author = nostr::Keys::generate();
         let author_hex = author.public_key().to_hex();
@@ -1009,8 +1189,190 @@ mod integration_tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn pinned_thread_replays_identical_event_after_parent_and_channel_changes() {
+        let (state, _git_storage) = test_state().await;
+        let owner = nostr::Keys::generate();
+        let owner_hex = owner.public_key().to_hex();
+        let host = format!("wf-thread-{}.example", Uuid::new_v4().simple());
+        let community = match state
+            .db
+            .create_community_with_owner(&host, &owner_hex)
+            .await
+            .unwrap()
+        {
+            CreateCommunityWithOwnerResult::Created(c) => c.id,
+            other => panic!("expected fresh community: {other:?}"),
+        };
+        let channel = state
+            .db
+            .create_channel(
+                community,
+                "thread",
+                ChannelType::Stream,
+                ChannelVisibility::Open,
+                None,
+                &owner.public_key().to_bytes(),
+                None,
+            )
+            .await
+            .unwrap();
+        let sink = RelayActionSink::new(&state);
+        let identity = || ActionEffectContext {
+            idempotency_key: Uuid::new_v4(),
+            claimed_at: Utc::now(),
+        };
+        let root = sink
+            .send_message(
+                identity(),
+                community,
+                &channel.id.to_string(),
+                "root",
+                &owner_hex,
+                &[],
+            )
+            .await
+            .unwrap();
+        let direct = buzz_workflow::MessageEffectOptions {
+            authored_mentioned_pubkeys: None,
+            thread: Some(
+                sink.resolve_message_thread(community, &channel.id.to_string(), &root)
+                    .await
+                    .unwrap(),
+            ),
+        };
+        assert_eq!(
+            direct.thread.as_ref().unwrap().tags,
+            vec![vec![
+                "e".to_string(),
+                root.clone(),
+                "".into(),
+                "reply".into()
+            ]]
+        );
+        let parent = sink
+            .send_prepared_message(
+                identity(),
+                community,
+                &channel.id.to_string(),
+                "direct",
+                &owner_hex,
+                &[],
+                &direct,
+            )
+            .await
+            .unwrap();
+        let pinned = buzz_workflow::MessageEffectOptions {
+            authored_mentioned_pubkeys: Some(vec![owner_hex.clone()]),
+            thread: Some(
+                sink.resolve_message_thread(community, &channel.id.to_string(), &parent)
+                    .await
+                    .unwrap(),
+            ),
+        };
+        let pinned: buzz_workflow::MessageEffectOptions =
+            serde_json::from_value(serde_json::to_value(pinned).unwrap()).unwrap();
+        assert_eq!(pinned.thread.as_ref().unwrap().depth, 2);
+        assert_eq!(pinned.thread.as_ref().unwrap().tags.len(), 2);
+        assert!(sink
+            .resolve_message_thread(community, &Uuid::new_v4().to_string(), &parent)
+            .await
+            .is_err());
+        assert!(sink
+            .resolve_message_thread(community, &channel.id.to_string(), "bad-id")
+            .await
+            .is_err());
+        assert!(sink
+            .resolve_message_thread(community, &channel.id.to_string(), &"f".repeat(64))
+            .await
+            .is_err());
+        let effect = identity();
+        let reply = sink
+            .send_prepared_message(
+                effect,
+                community,
+                &channel.id.to_string(),
+                "nested",
+                &owner_hex,
+                std::slice::from_ref(&owner_hex),
+                &pinned,
+            )
+            .await
+            .unwrap();
+        let reply_bytes = hex::decode(&reply).unwrap();
+        let first = state
+            .db
+            .get_event_by_id(community, &reply_bytes)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first
+            .event
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice() == ["buzz:workflow-owner", owner_hex.as_str()]));
+        assert!(first
+            .event
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice() == ["buzz:workflow-mention", owner_hex.as_str()]));
+        let legacy = state
+            .db
+            .get_event_by_id(community, &hex::decode(&root).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(legacy.event.tags.iter().all(|tag| !matches!(
+            tag.as_slice()[0].as_str(),
+            "buzz:workflow-owner" | "buzz:workflow-mention"
+        )));
+        let meta = state
+            .db
+            .get_thread_metadata_by_event(community, &reply_bytes)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.depth, 2);
+        assert_eq!(meta.root_event_id, Some(hex::decode(&root).unwrap()));
+        assert_eq!(meta.parent_event_id, Some(hex::decode(&parent).unwrap()));
+        let mut tx = state.db.begin_transaction().await.unwrap();
+        sqlx::query("UPDATE events SET deleted_at = NOW() WHERE community_id = $1 AND id = $2")
+            .bind(community.as_uuid())
+            .bind(hex::decode(&parent).unwrap())
+            .execute(tx.as_mut())
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        state
+            .db
+            .archive_channel(community, channel.id)
+            .await
+            .unwrap();
+        let replay = sink
+            .send_prepared_message(
+                effect,
+                community,
+                &channel.id.to_string(),
+                "nested",
+                &owner_hex,
+                std::slice::from_ref(&owner_hex),
+                &pinned,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay, reply);
+        let stored = state
+            .db
+            .get_event_by_id(community, &reply_bytes)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.event, first.event);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn claimed_effect_recovery_precedes_archived_channel_validation() {
-        let state = test_state().await;
+        let (state, _git_storage) = test_state().await;
         let author = nostr::Keys::generate();
         let author_hex = author.public_key().to_hex();
         let host = format!("wf-recovery-{}.example", Uuid::new_v4().simple());

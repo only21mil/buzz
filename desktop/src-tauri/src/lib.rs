@@ -37,8 +37,10 @@ mod ptt_shortcut;
 mod relay;
 mod relay_admission;
 mod reset;
+mod runtime_init;
 mod secret_store;
 mod shutdown;
+mod team_catalog;
 mod templates;
 mod terminal_runtime;
 #[cfg_attr(not(test), allow(dead_code))]
@@ -51,10 +53,7 @@ pub mod webkit_rendering;
 use app_state::{build_app_state, resolve_persisted_identity, AppState};
 use builderlab::*;
 use commands::*;
-use deep_link::{
-    acknowledge_pending_community_deep_link, handle_deep_link_url,
-    take_pending_community_deep_link, PendingCommunityDeepLinks,
-};
+use deep_link::*;
 use huddle::audio_output::{
     get_audio_output_device, list_audio_output_devices, set_audio_output_device,
 };
@@ -88,36 +87,9 @@ use tauri_plugin_window_state::StateFlags;
 use tray_menu::show_main_window;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // mesh-llm's async chains (model download, node start/join) overflow
-    // tokio's default 2 MiB worker stacks — a stack-guard SIGABRT, not a
-    // panic. Upstream mesh-llm and mesh-console both run on 8 MiB worker
-    // stacks for this reason; give Tauri's command runtime the same headroom
-    // before anything else touches tauri::async_runtime.
-    #[cfg(feature = "mesh-llm")]
-    match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(crate::mesh_llm::MESH_WORKER_STACK_SIZE)
-        .build()
-    {
-        Ok(runtime) => {
-            tauri::async_runtime::set(runtime.handle().clone());
-            // Keep the runtime alive for the process lifetime; dropping it
-            // would shut down the workers Tauri now depends on.
-            std::mem::forget(runtime);
-            eprintln!(
-                "buzz-mesh: installed tokio runtime with {} MiB worker stacks",
-                crate::mesh_llm::MESH_WORKER_STACK_SIZE / (1024 * 1024)
-            );
-        }
-        Err(error) => {
-            // Fall back to Tauri's default runtime: the app still works,
-            // only deep mesh-llm futures are at risk of stack overflow.
-            eprintln!("buzz-mesh: failed to build big-stack tokio runtime, using default: {error}");
-        }
-    }
+    runtime_init::initialize_async_runtime();
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            // Focus the existing window when a duplicate instance launches.
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.set_focus();
             }
@@ -307,6 +279,7 @@ pub fn run() {
         .manage(build_app_state())
         .manage(ClipboardState::new())
         .manage(PendingCommunityDeepLinks::default())
+        .manage(PendingEntityDeepLinks::default())
         .manage(BuilderlabSession::default())
         .manage(BuilderlabLogin::default())
         .manage(commands::pairing::PairingHandle::new())
@@ -319,7 +292,6 @@ pub fn run() {
                 macos_notifications::init(&app_handle)?;
             }
 
-            // ── Phase 2: boot-time sentinel wipe ──────────────────────────────
             // Must run before migrations and identity resolution so the wipe
             // completes atomically on crash recovery.
             //
@@ -581,7 +553,6 @@ pub fn run() {
                     prev_orphans = new_orphans;
                 }
             });
-
             // Drain events the retention store flagged `pending_sync` (UI
             // create/edit, delete tombstones, launch reconcile) to the relay.
             // One loop is the sole publisher for persona, team, and managed-
@@ -620,6 +591,8 @@ pub fn run() {
             terminal_runtime::terminal_ack,
             terminal_runtime::terminal_viewport_ready,
             terminal_runtime::terminal_focus,
+            take_pending_entity_deep_link,
+            acknowledge_pending_entity_deep_link,
             take_pending_community_deep_link,
             acknowledge_pending_community_deep_link,
             start_builderlab_login,
@@ -637,6 +610,7 @@ pub fn run() {
             transfer_builderlab_community,
             title_bar_double_click,
             get_identity,
+            get_message_publication_scope,
             get_nsec,
             generate_backup_passphrase,
             create_ncryptsec_backup,
@@ -663,6 +637,8 @@ pub fn run() {
             push_project_local_repository,
             pull_project_local_repository,
             sign_project_pull_request_status,
+            sign_project_issue_assignment,
+            sign_project_issue_unassignment,
             sign_project_pull_request_review_request,
             publish_project_pull_request_merged_status,
             merge_project_pull_request,
@@ -730,6 +706,7 @@ pub fn run() {
             add_reaction,
             remove_reaction,
             get_event,
+            get_events,
             show_native_notification,
             #[cfg(target_os = "macos")]
             macos_notifications::take_pending_activations,
@@ -747,6 +724,9 @@ pub fn run() {
             save_png_data_url,
             download_file,
             fetch_media_bytes,
+            fetch_audio_bytes,
+            cancel_media_fetch,
+            release_media_fetch,
             copy_image_to_clipboard,
             copy_text_to_clipboard,
             read_clipboard_text,
@@ -763,6 +743,7 @@ pub fn run() {
             get_relay_self,
             resolve_oa_owner,
             list_relay_agents,
+            revalidate_relay_agents,
             list_managed_agents,
             list_managed_agent_runtimes,
             start_managed_agent_runtime,
@@ -774,6 +755,7 @@ pub fn run() {
             start_managed_agent,
             stop_managed_agent,
             set_agent_managed_profiles,
+            set_thread_scoped_acp_sessions,
             set_managed_agent_start_on_app_launch,
             set_managed_agent_auto_restart,
             delete_managed_agent,
@@ -810,9 +792,12 @@ pub fn run() {
             update_channel_template,
             delete_channel_template,
             duplicate_channel_template,
+            team_catalog::fetch_team_catalog,
             list_teams,
             create_team,
             update_team,
+            set_team_shared,
+            add_team_from_catalog,
             delete_team,
             export_agent_snapshot,
             card_mint_key_status,

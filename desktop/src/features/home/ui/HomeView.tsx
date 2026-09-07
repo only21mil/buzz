@@ -56,13 +56,13 @@ import {
 import { collectMessageMentionPubkeys } from "@/features/messages/lib/formatTimelineMessages";
 import { formatTime } from "@/features/messages/lib/dateFormatters";
 import { DeleteMessageConfirmDialog } from "@/features/messages/ui/DeleteMessageConfirmDialog";
-import { splitOutgoingTags } from "@/features/messages/lib/imetaMediaMarkdown";
+import { sendInboxReply } from "@/features/home/sendInboxReply";
 import { getThreadReference } from "@/features/messages/lib/threading";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
 import { useRelaySelfQuery } from "@/features/moderation/hooks";
 import { resolveUserLabel } from "@/features/profile/lib/identity";
 import { useRemindLater } from "@/features/reminders/ui/RemindMeLaterProvider";
-import { deleteMessage, sendChannelMessage } from "@/shared/api/tauri";
+import { deleteMessage } from "@/shared/api/tauri";
 import type { HomeFeedResponse } from "@/shared/api/types";
 import { KIND_REACTION } from "@/shared/constants/kinds";
 import { topChromeInset } from "@/shared/layout/chromeLayout";
@@ -835,6 +835,7 @@ export function HomeView({
               onRequestEmptyEditDelete={setEmptyDeleteId}
               onOpenContext={onOpenContext}
               onSendReply={async ({
+                publicationScope,
                 content,
                 mediaTags,
                 mentionPubkeys,
@@ -848,21 +849,14 @@ export function HomeView({
                 const itemToReply = selectedItem;
                 setIsSendingReply(true);
                 try {
-                  const {
-                    mediaTags: imetaTags,
-                    emojiTags,
-                    mentionTags,
-                  } = splitOutgoingTags(mediaTags);
-                  const result = await sendChannelMessage(
+                  const result = await sendInboxReply({
                     channelId,
                     content,
                     parentEventId,
-                    imetaTags,
                     mentionPubkeys,
-                    undefined,
-                    emojiTags,
-                    mentionTags,
-                  );
+                    mediaTags,
+                    publicationScope,
+                  });
                   const authorPubkey = currentPubkey ?? itemToReply.item.pubkey;
                   const reply: InboxReply = {
                     authorLabel: currentPubkey
@@ -887,7 +881,7 @@ export function HomeView({
                     id: result.eventId,
                     parentId: result.parentEventId,
                     rootId: result.rootEventId,
-                    tags: [...imetaTags, ...emojiTags, ...mentionTags],
+                    tags: result.outgoingTags,
                     timeLabel: formatTime(result.createdAt),
                   };
                   setLocalRepliesByItemId((current) => ({

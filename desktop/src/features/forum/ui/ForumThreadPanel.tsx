@@ -1,6 +1,7 @@
 import { ArrowLeft, MessageSquare } from "lucide-react";
 import * as React from "react";
 
+import { handleTimelineMentionCopy } from "@/features/messages/lib/timelineMentionCopy";
 import {
   resolveUserLabel,
   type UserProfileLookup,
@@ -41,6 +42,8 @@ type ForumThreadPanelProps = {
   canDeletePost?: boolean;
   isDeletingPost?: boolean;
   targetEventId?: string | null;
+  targetSearchMessageId?: string;
+  targetSearchQuery?: string;
 };
 
 function canDeleteReply(
@@ -57,12 +60,14 @@ function ReplyRow({
   profiles,
   channelNames,
   onDelete,
+  searchQuery,
 }: {
   reply: ThreadReply;
   currentPubkey?: string;
   profiles?: UserProfileLookup;
   channelNames?: string[];
   onDelete?: (eventId: string) => void;
+  searchQuery?: string;
 }) {
   const replyAuthorLabel = resolveUserLabel({
     pubkey: reply.pubkey,
@@ -76,7 +81,7 @@ function ReplyRow({
   const {
     mentionNames: replyMentionNames,
     mentionPubkeysByName: replyMentionPubkeysByName,
-  } = resolveMentionProps(reply.tags, profiles);
+  } = resolveMentionProps(reply.tags, profiles, reply.content);
 
   return (
     <div
@@ -122,6 +127,7 @@ function ReplyRow({
           imetaByUrl={parseImetaTags(reply.tags)}
           mentionNames={replyMentionNames}
           mentionPubkeysByName={replyMentionPubkeysByName}
+          searchQuery={searchQuery}
         />
       </div>
     </div>
@@ -143,6 +149,8 @@ export function ForumThreadPanel({
   canDeletePost,
   isDeletingPost,
   targetEventId,
+  targetSearchMessageId,
+  targetSearchQuery,
 }: ForumThreadPanelProps) {
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const { channels } = useChannelNavigation();
@@ -195,7 +203,7 @@ export function ForumThreadPanel({
   const {
     mentionNames: postMentionNames,
     mentionPubkeysByName: postMentionPubkeysByName,
-  } = resolveMentionProps(post.tags, profiles);
+  } = resolveMentionProps(post.tags, profiles, post.content);
   const postAuthorLabel = resolveUserLabel({
     pubkey: post.pubkey,
     currentPubkey,
@@ -222,6 +230,7 @@ export function ForumThreadPanel({
       <div
         className="flex-1 overflow-y-auto"
         data-scroll-restoration-id={`forum-thread:${channelId}`}
+        onCopy={handleTimelineMentionCopy}
         ref={scrollRef}
       >
         <div
@@ -268,6 +277,11 @@ export function ForumThreadPanel({
               imetaByUrl={parseImetaTags(post.tags)}
               mentionNames={postMentionNames}
               mentionPubkeysByName={postMentionPubkeysByName}
+              searchQuery={
+                targetSearchMessageId === post.eventId
+                  ? targetSearchQuery
+                  : undefined
+              }
             />
           </div>
         </div>
@@ -286,6 +300,11 @@ export function ForumThreadPanel({
               onDelete={onDeleteReply}
               profiles={profiles}
               reply={reply}
+              searchQuery={
+                targetSearchMessageId === reply.eventId
+                  ? targetSearchQuery
+                  : undefined
+              }
             />
           ))}
 

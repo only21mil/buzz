@@ -12,11 +12,20 @@ fn snapshot(
     workspace_relay: &str,
     global: &GlobalAgentConfig,
 ) -> serde_json::Value {
-    prospective_spawn_config_snapshot(record, personas, teams, workspace_relay, global).canonical()
+    prospective_spawn_config_snapshot(
+        record,
+        personas,
+        teams,
+        workspace_relay,
+        global,
+        super::AcpSessionPolicy::Channel,
+    )
+    .canonical()
 }
 
 fn record() -> ManagedAgentRecord {
     ManagedAgentRecord {
+        effort_level: None,
         pubkey: "p".repeat(64),
         name: "agent".into(),
         persona_id: None,
@@ -66,6 +75,7 @@ fn record() -> ManagedAgentRecord {
         source_team: None,
         source_team_persona_slug: None,
         catalog_source: None,
+        team_catalog_source: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: Vec::new(),
         definition_parallelism: None,
@@ -89,6 +99,7 @@ fn persona(id: &str, runtime: Option<&str>, prompt: &str) -> AgentDefinition {
         source_team: None,
         source_team_persona_slug: None,
         catalog_source: None,
+        team_catalog_source: None,
         env_vars: BTreeMap::new(),
         respond_to: None,
         respond_to_allowlist: Vec::new(),
@@ -826,4 +837,29 @@ fn openclaw_cap_crossing_parallelism_snapshots_differ() {
         snapshot(&at_3, &[], &[], "wss://ws.example", &Default::default()),
         "parallelism 8 (clamps to 5) and 3 (runs as 3) must produce different snapshots"
     );
+}
+
+#[test]
+fn effort_projection_has_one_snapshot_leaf_and_clear_restores_inheritance() {
+    let mut record = record();
+    record.persona_id = None;
+    record.agent_command = "goose".into();
+    record.runtime = Some("goose".into());
+    record.effort_level = Some("xhigh".into());
+    let global = GlobalAgentConfig {
+        env_vars: BTreeMap::from([("GOOSE_THINKING_EFFORT".into(), "low".into())]),
+        ..Default::default()
+    };
+    let selected = snapshot(&record, &[], &[], "wss://relay", &global);
+    assert_eq!(selected["effort_level"], "max");
+    assert!(selected["env"].get("GOOSE_THINKING_EFFORT").is_none());
+    record.effort_level = Some("max".into());
+    assert_eq!(
+        selected,
+        snapshot(&record, &[], &[], "wss://relay", &global)
+    );
+    record.effort_level = None;
+    let inherited = snapshot(&record, &[], &[], "wss://relay", &global);
+    assert_eq!(inherited["effort_level"], "low");
+    assert_ne!(selected, inherited);
 }

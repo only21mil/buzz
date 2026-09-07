@@ -32,19 +32,24 @@ import type {
   SetChannelTopicInput,
   UpdateChannelInput,
 } from "@/shared/api/types";
-import { useIdentityQuery } from "@/shared/api/hooks";
+import { useFocusedRefetchInterval } from "@/shared/lib/useDocumentVisible";
 import { useCommunities } from "@/features/communities/useCommunities";
-import { canAddChannelMembers } from "@/features/channels/lib/channelMemberAdmission";
 import {
   readChannelSnapshot,
   writeChannelSnapshot,
 } from "@/features/channels/channelSnapshot";
+import {
+  CHANNEL_MEMBERS_STALE_TIME_MS,
+  channelMembersQueryKey,
+} from "@/features/channels/rosterFreshness";
 
 export const channelsQueryKey = ["channels"] as const;
+/** Keeps focused polling at the established one-minute cadence. */
+export const CHANNELS_REFETCH_INTERVAL_MS = 60_000;
+/** Suppresses the expensive focus refetch until the channel list is old. */
+export const CHANNELS_FOCUS_STALE_TIME_MS = 5 * 60_000;
 const channelDetailQueryKey = (channelId: string) =>
   ["channels", channelId, "detail"] as const;
-const channelMembersQueryKey = (channelId: string) =>
-  ["channels", channelId, "members"] as const;
 const channelTypeOrder = {
   stream: 0,
   forum: 1,
@@ -193,6 +198,9 @@ function setChannelArchivedState(
 export function useChannelsQuery(options?: { enabled?: boolean }) {
   const { activeCommunity } = useCommunities();
   const relayUrl = activeCommunity?.relayUrl ?? null;
+  const refetchInterval = useFocusedRefetchInterval(
+    CHANNELS_REFETCH_INTERVAL_MS,
+  );
 
   return useQuery({
     enabled: options?.enabled ?? true,
@@ -214,9 +222,9 @@ export function useChannelsQuery(options?: { enabled?: boolean }) {
         }
       : undefined,
     initialDataUpdatedAt: 0,
-    staleTime: 60_000,
-    refetchInterval: 60_000,
-    refetchIntervalInBackground: false,
+    staleTime: CHANNELS_FOCUS_STALE_TIME_MS,
+    refetchInterval,
+    refetchOnWindowFocus: true,
   });
 }
 
@@ -336,7 +344,7 @@ export function useChannelMembersQuery(
 
       return getChannelMembers(channelId);
     },
-    staleTime: 30_000,
+    staleTime: CHANNEL_MEMBERS_STALE_TIME_MS,
   });
 }
 
@@ -500,32 +508,6 @@ export function useDeleteChannelMutation(channelId: string | null) {
         queryClient.invalidateQueries({ queryKey: ["relay-agents"] }),
       ]);
     },
-  });
-}
-
-/**
- * Whether the signed-in identity may add *another* identity to this channel,
- * per {@link canAddChannelMembers}. Both queries are the ones the channel UI
- * already holds, so this shares their cache rather than fetching again.
- */
-export function useCanAddChannelMembers(channelId: string | null) {
-  const channelsQuery = useChannelsQuery();
-  const membersQuery = useChannelMembersQuery(channelId);
-  const identityQuery = useIdentityQuery();
-
-  const channel =
-    channelsQuery.data?.find((candidate) => candidate.id === channelId) ?? null;
-  const selfPubkey = identityQuery.data?.pubkey ?? null;
-  const selfRole = selfPubkey
-    ? (membersQuery.data?.find(
-        (member) => member.pubkey.toLowerCase() === selfPubkey.toLowerCase(),
-      )?.role ?? null)
-    : null;
-
-  return canAddChannelMembers({
-    channelType: channel?.channelType,
-    visibility: channel?.visibility,
-    selfRole,
   });
 }
 

@@ -1,3 +1,5 @@
+import { useFocusedRefetchInterval } from "@/shared/lib/useDocumentVisible";
+import { isTauri } from "@tauri-apps/api/core";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
@@ -23,12 +25,14 @@ export function useProjectRepoSyncStatusQuery(
   branchName?: string | null,
   baseBranch?: string | null,
 ) {
+  const refetchInterval = useFocusedRefetchInterval(60_000);
   const selectedBranch = branchName ?? project?.defaultBranch ?? null;
   const selectedBaseBranch = baseBranch ?? project?.defaultBranch ?? null;
   const host = useProjectRepoHost(project);
 
   return useQuery({
-    enabled: Boolean(host.kind === "buzz" && project?.cloneUrls[0]),
+    enabled:
+      isTauri() && Boolean(host.kind === "buzz" && project?.cloneUrls[0]),
     queryKey: [
       "project",
       project?.id ?? "none",
@@ -48,7 +52,7 @@ export function useProjectRepoSyncStatusQuery(
       });
     },
     staleTime: 10_000,
-    refetchInterval: 60_000,
+    refetchInterval,
     refetchOnWindowFocus: true,
     retry: 1,
   });

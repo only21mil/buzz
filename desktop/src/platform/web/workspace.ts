@@ -79,5 +79,7 @@ export function registerWorkspaceCommands(
     onboardingCompletions: [],
   }));
   register("take_pending_community_deep_link", () => null);
+  register("take_pending_entity_deep_link", () => null);
+  register("acknowledge_pending_entity_deep_link", () => false);
   register("acknowledge_pending_community_deep_link", () => false);
 }

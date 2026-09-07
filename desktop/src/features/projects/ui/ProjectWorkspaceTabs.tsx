@@ -1,3 +1,6 @@
+import { DiscussedInChannels } from "./DiscussionChannels";
+import { repositoryDiscussionQuery } from "../lib/discussionChannels";
+import { isTauri } from "@tauri-apps/api/core";
 import {
   CircleDot,
   GitPullRequest,
@@ -121,6 +124,7 @@ function WorkItemListHeader({
 }
 
 export function WorkspaceTabs({
+  initialTab = "overview",
   commitDiff,
   commitDiffError,
   commitDiffLoading,
@@ -159,6 +163,7 @@ export function WorkspaceTabs({
   terminalTitle,
   viewerGitIdentity,
 }: {
+  initialTab?: string;
   commitDiff: ProjectRepoDiff | null | undefined;
   commitDiffError: unknown;
   commitDiffLoading: boolean;
@@ -253,7 +258,7 @@ export function WorkspaceTabs({
     [pullRequests, selectedCommitHash],
   );
   const isPullRequestSelected = Boolean(selectedPullRequest);
-  const [selectedTab, setSelectedTab] = React.useState("overview");
+  const [selectedTab, setSelectedTab] = React.useState(initialTab);
   const [pullRequestCommentTarget, setPullRequestCommentTarget] =
     React.useState<{
       anchor: ProjectPullRequestCommentAnchor;
@@ -338,6 +343,7 @@ export function WorkspaceTabs({
             <Button
               aria-label="Open terminal"
               className="h-8 w-8 shrink-0 text-muted-foreground hover:text-foreground"
+              disabled={!isTauri()}
               onClick={() => onOpenTerminal()}
               size="icon"
               title={terminalTitle ?? "Open terminal"}
@@ -349,7 +355,7 @@ export function WorkspaceTabs({
           {updatePullRequestAction ? (
             <Button
               className="h-8 shrink-0 gap-1.5"
-              disabled={updatePullRequestAction.pending}
+              disabled={!isTauri() || updatePullRequestAction.pending}
               onClick={updatePullRequestAction.onUpdate}
               size="sm"
               title="Publish the pushed commit to this pull request"
@@ -486,11 +492,16 @@ export function WorkspaceTabs({
       >
         <WorkItemListHeader
           actionDisabled={
+            !isTauri() ||
             !createPullRequestAction ||
             createPullRequestAction.projects.length === 0
           }
           actionLabel="Pull Request"
-          actionTitle="Choose a repository and branches to compare."
+          actionTitle={
+            !isTauri()
+              ? "Pull request creation requires the desktop app"
+              : "Choose a repository and branches to compare."
+          }
           icon={GitPullRequest}
           onAction={() => setCreatePullRequestOpen(true)}
           title="Pull Requests"
@@ -514,7 +525,10 @@ export function WorkspaceTabs({
         value="issues"
       >
         <WorkItemListHeader
-          actionDisabled={createIssueAction.pending}
+          actionDisabled={!isTauri() || createIssueAction.pending}
+          actionTitle={
+            !isTauri() ? "Issue creation requires the desktop app" : undefined
+          }
           actionLabel="Issues"
           icon={CircleDot}
           onAction={() => setCreateIssueOpen(true)}
@@ -528,6 +542,9 @@ export function WorkspaceTabs({
         />
       </TabsContent>
 
+      <TabsContent className="m-0" value="channels">
+        <DiscussedInChannels query={repositoryDiscussionQuery(project)} />
+      </TabsContent>
       <TabsContent className="m-0" value="files">
         {repoSource === "local" && !localSnapshot && !localSnapshotLoading ? (
           <div className="mb-3">

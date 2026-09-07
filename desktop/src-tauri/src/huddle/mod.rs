@@ -23,12 +23,16 @@
 //!    takes `stt_pipeline`/`tts_pipeline` out of the lock, then calls `shutdown()`
 //!    and drops them outside the lock (thread joins can block ~200ms).
 
+mod agent_tts_admission;
+mod agent_tts_publisher;
 mod agent_tts_routing;
 pub mod agent_voice;
 pub mod agents;
 pub mod audio_output;
 mod commands;
+mod human_floor;
 pub mod jitter;
+mod local_barge_in;
 pub mod models;
 pub mod pipeline;
 pub mod playout;
@@ -40,6 +44,7 @@ pub mod state;
 pub mod stt;
 pub mod transcription;
 pub mod tts;
+mod tts_playback;
 pub mod tts_settings;
 mod tts_voice_import;
 mod tts_voice_registry;
@@ -48,23 +53,8 @@ pub mod wire;
 
 // ── Shared utilities ──────────────────────────────────────────────────────────
 
-/// Drain and discard all pending messages until shutdown or disconnect.
-/// Shared by both the STT and TTS worker threads for graceful degradation
-/// when model files are missing or initialization fails.
-pub(super) fn drain_until_shutdown<T>(
-    rx: std::sync::mpsc::Receiver<T>,
-    shutdown: &std::sync::atomic::AtomicBool,
-) {
-    loop {
-        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
-            break;
-        }
-        match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-            Ok(_) => continue,
-            Err(_) => break,
-        }
-    }
-}
+mod worker_shutdown;
+pub(super) use worker_shutdown::drain_until_shutdown;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
@@ -486,7 +476,7 @@ fn teardown_huddle(state: &AppState) -> Result<(), String> {
         // Increment generation first — this immediately invalidates any
         // in-flight transcription task, even before pipelines shut down.
         hs.session_generation.fetch_add(1, Ordering::Release);
-        let stt = hs.stt_pipeline.take();
+        let stt = hs.take_stt_pipeline();
         let tts = hs.tts_pipeline.take();
         let cancel = hs.audio_ws_cancel.take();
         // Cancel the relay token BEFORE dropping the sender. If we drop
@@ -870,7 +860,7 @@ pub async fn speak_agent_message(
         })?;
     }
 
-    let sender = {
+    let admission = {
         let hs = state.huddle()?;
         let agent_is_present = hs
             .agent_pubkeys
@@ -884,20 +874,26 @@ pub async fn speak_agent_message(
             );
             return Ok(());
         }
-        hs.tts_pipeline
-            .as_ref()
-            .map(|pipeline| pipeline.text_sender())
-            .map(|sender| {
-                let speaker_generation = sender.speaker_generation(&speaker_pubkey);
-                (sender, speaker_generation)
-            })
+        agent_tts_admission::SpeechAdmission::capture(&hs, &speaker_pubkey)
     };
-    let Some((sender, speaker_generation)) = sender else {
+    let Some(admission) = admission else {
         eprintln!(
             "buzz-desktop: tts stage=invoke status=failed reason=unavailable route_id={route_id}"
         );
         return Err("Agent text to speech is enabled but its audio pipeline is unavailable".into());
     };
+    let setup = agent_tts_publisher::ensure(&app, &state, &admission);
+    match admission.finish_setup(&state.huddle_state, setup).await {
+        Ok(false) => return Ok(()),
+        Ok(true) => {}
+        Err(error) => eprintln!(
+            "buzz-desktop: tts broadcast status=unavailable reason=publisher_setup_failed route_id={route_id} error={error}"
+        ),
+    }
+    if !admission.is_current(&*state.huddle()?) {
+        return Ok(());
+    }
+    let (sender, speaker_generation) = (admission.sender, admission.speaker_generation);
     enqueue_agent_tts_text(route_id, text, move |route_id, text| {
         sender
             .send(

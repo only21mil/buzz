@@ -8,6 +8,8 @@ const RELAY_WITH_TOKEN: &str = "wss://relay.example/ws?token=SENTINEL";
 /// coverage guard below sees the full serialized key set.
 fn base() -> SpawnConfigSnapshot {
     SpawnConfigSnapshot {
+        session_policy: "channel".into(),
+        effort_level: None,
         acp_command: "buzz-acp".into(),
         command: "goose".into(),
         args: vec!["--mode".into(), "acp".into()],
@@ -70,6 +72,8 @@ fn mutations() -> Vec<Mutation> {
             s.max_turn_duration_seconds = None
         }),
         ("parallelism", |s| s.parallelism = 8),
+        ("effort_level", |s| s.effort_level = Some("high".into())),
+        ("session_policy", |s| s.session_policy = "thread".into()),
     ]
 }
 

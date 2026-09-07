@@ -1,12 +1,26 @@
+import { preparePublicationScope } from "@/shared/api/preparePublicationScope";
+import {
+  assertPublicationScope,
+  capturePublicationScope,
+  isPublicationScopeCurrent,
+  type PublicationScope,
+} from "@/shared/api/publicationScope";
+import { snapshotUnresolvedEditMentionPubkeys } from "@/features/messages/lib/draftMentionRefs";
+import {
+  AgentMentionAuthorizationError,
+  type MentionRevalidationOptions,
+} from "@/features/messages/lib/agentMentionRevalidation";
 import type { QueuedMediaAttachment } from "@/features/messages/lib/backgroundMediaUploadStore";
 import { enqueueBackgroundMediaUpload } from "@/features/messages/lib/backgroundMediaUploadStore";
 import type { DraftMentionRef } from "@/features/messages/lib/useDrafts";
+import type { MessageComposerEditTarget } from "@/features/messages/ui/MessageComposer.types";
 import {
   buildOutgoingMessage,
   type ImetaMedia,
   mergeOutgoingTags,
 } from "@/features/messages/lib/imetaMediaMarkdown";
 import { diffAddedMentionPubkeys } from "@/features/messages/lib/threading";
+import { mergeOutgoingTagsWithReferenceMentions } from "@/features/messages/ui/useMentionSendFlow.helpers";
 import { buildCustomEmojiTags } from "@/shared/lib/customEmojiTags";
 import type { CustomEmoji } from "@/shared/lib/remarkCustomEmoji";
 
@@ -16,18 +30,43 @@ type EditDraft = {
   pendingImeta: ImetaMedia[];
   queuedAttachments: QueuedMediaAttachment[];
   spoileredAttachmentUrls: Set<string>;
+  unresolvedMentionPubkeys: string[];
 };
 
-type SubmitMessageEditOptions = Omit<EditDraft, "mentionRefs"> & {
+type SubmitMessageEditOptions = Omit<
+  EditDraft,
+  "mentionRefs" | "unresolvedMentionPubkeys"
+> & {
+  publicationScope?: PublicationScope;
+  /** A cancelled/replaced edit or newer authored revision revokes this save. */
+  isCurrent?: () => boolean;
+  settlePendingMentionBindings?: () => Promise<void>;
   clearComposer: () => void;
   customEmoji: ReadonlyArray<CustomEmoji>;
-  extractMentionPubkeys: (content: string) => string[];
-  getMentionRefs: (content: string) => DraftMentionRef[];
+  extractMentionPubkeys: (
+    content: string,
+    competingDisplayNames?: readonly string[],
+  ) => string[];
+  getMentionRefs: (
+    content: string,
+    fallbackRefs: readonly DraftMentionRef[],
+    competingDisplayNames?: readonly string[],
+  ) => DraftMentionRef[];
   editTargetId: string;
+  enqueueUpload?: typeof enqueueBackgroundMediaUpload;
+  editTarget: Pick<
+    MessageComposerEditTarget,
+    "mentionRefs" | "unresolvedMentionPubkeys" | "unresolvedMentionRefs"
+  >;
   originalContent: string;
   ownerPubkey: string | null;
   restoreComposer: (draft: EditDraft) => void;
   restoreMentionRefs: (refs: DraftMentionRef[]) => void;
+  revalidateMentionPubkeys: (
+    pubkeys: readonly string[],
+    channelId?: string | null,
+    options?: MentionRevalidationOptions,
+  ) => Promise<string[]>;
   shouldRestoreComposer: () => boolean;
   setDeferredUploadPending: (isPending: boolean) => void;
   save: (
@@ -35,16 +74,21 @@ type SubmitMessageEditOptions = Omit<EditDraft, "mentionRefs"> & {
     mediaTags?: string[][],
     mentionPubkeys?: string[],
     eventId?: string,
+    publicationScope?: PublicationScope,
   ) => Promise<void>;
   setUploadError: (message: string) => void;
 };
 
-/** Clear an edited message immediately, then upload and save captured state. */
 export async function submitMessageEdit({
+  publicationScope = capturePublicationScope(),
+  isCurrent = () => true,
+  settlePendingMentionBindings = async () => {},
   clearComposer,
   content,
   customEmoji,
   editTargetId,
+  enqueueUpload = enqueueBackgroundMediaUpload,
+  editTarget,
   extractMentionPubkeys,
   getMentionRefs,
   originalContent,
@@ -53,30 +97,73 @@ export async function submitMessageEdit({
   queuedAttachments,
   restoreComposer,
   restoreMentionRefs,
+  revalidateMentionPubkeys,
   setDeferredUploadPending,
   shouldRestoreComposer,
   save,
   setUploadError,
   spoileredAttachmentUrls,
 }: SubmitMessageEditOptions): Promise<void> {
+  try {
+    publicationScope = await preparePublicationScope(publicationScope);
+    if (!isCurrent()) return;
+    // Pasted identities must settle before reading the captured edit's refs.
+    await settlePendingMentionBindings();
+    if (!isCurrent()) return;
+    assertPublicationScope(publicationScope);
+  } catch (error) {
+    if (isCurrent())
+      setUploadError(error instanceof Error ? error.message : String(error));
+    return;
+  }
+  const historicalNames = (editTarget.unresolvedMentionRefs ?? []).map(
+    (ref) => ref.displayName,
+  );
   const draft: EditDraft = {
     content,
-    mentionRefs: getMentionRefs(content),
+    mentionRefs: getMentionRefs(
+      content,
+      editTarget.mentionRefs ?? [],
+      historicalNames,
+    ),
     pendingImeta: [...pendingImeta],
     queuedAttachments: [...queuedAttachments],
     spoileredAttachmentUrls: new Set(spoileredAttachmentUrls),
+    unresolvedMentionPubkeys: snapshotUnresolvedEditMentionPubkeys(
+      content,
+      originalContent,
+      editTarget,
+      getMentionRefs,
+    ),
   };
   const restoreDraft = () => {
-    if (shouldRestoreComposer()) {
+    if (
+      isPublicationScopeCurrent(publicationScope) &&
+      isCurrent() &&
+      shouldRestoreComposer()
+    ) {
       restoreComposer(draft);
       restoreMentionRefs(draft.mentionRefs);
     }
   };
-  const addedMentionPubkeys = diffAddedMentionPubkeys(
-    extractMentionPubkeys(originalContent),
-    extractMentionPubkeys(content),
-    ownerPubkey ?? "",
-  );
+  // Current picker bindings must not reinterpret the original body: selecting a
+  // different Scout would otherwise make that new key look already notified.
+  // With unresolved history, conservatively revalidate all current recipients.
+  const originalMentionPubkeys = editTarget.unresolvedMentionPubkeys?.length
+    ? []
+    : (editTarget.mentionRefs ?? []).map((ref) => ref.pubkey);
+  let addedMentionPubkeys: string[];
+  try {
+    addedMentionPubkeys = diffAddedMentionPubkeys(
+      originalMentionPubkeys,
+      extractMentionPubkeys(content, historicalNames),
+      ownerPubkey ?? "",
+    );
+  } catch (error) {
+    setUploadError(error instanceof Error ? error.message : String(error));
+    return;
+  }
+  if (!isCurrent()) return;
   const hasQueuedAttachments = draft.queuedAttachments.length > 0;
   if (hasQueuedAttachments) setDeferredUploadPending(true);
   clearComposer();
@@ -93,30 +180,59 @@ export async function submitMessageEdit({
         ),
       ]),
     );
-    const outgoingTags =
+    if (signal?.aborted || !isCurrent()) return;
+    assertPublicationScope(publicationScope);
+    const revalidatedMentionPubkeys = await revalidateMentionPubkeys(
+      addedMentionPubkeys,
+      undefined,
+      {
+        intendedAgentPubkeys: draft.mentionRefs
+          .filter((ref) => ref.isAgent)
+          .map((ref) => ref.pubkey),
+      },
+    );
+    if (signal?.aborted || !isCurrent()) return;
+    assertPublicationScope(publicationScope);
+    const outgoingTags = mergeOutgoingTagsWithReferenceMentions(
       mergeOutgoingTags(
         mediaTags,
         buildCustomEmojiTags(finalContent, customEmoji),
-      ) ?? [];
-    if (signal?.aborted) return;
-    await save(finalContent, outgoingTags, addedMentionPubkeys, editTargetId);
+      ),
+      [
+        ...draft.mentionRefs.map(({ pubkey }) => pubkey),
+        ...draft.unresolvedMentionPubkeys,
+        // Newly typed recipients are not necessarily selected draft refs. The
+        // authoritative snapshot must include them too, but only after relay
+        // eligibility revalidation, so forwarding cannot resurrect old p-tags.
+        ...revalidatedMentionPubkeys,
+      ],
+    );
+    await save(
+      finalContent,
+      outgoingTags,
+      revalidatedMentionPubkeys,
+      editTargetId,
+      publicationScope,
+    );
   };
 
   if (hasQueuedAttachments) {
-    enqueueBackgroundMediaUpload({
+    enqueueUpload({
       attachments: draft.queuedAttachments,
       onComplete: async (uploaded, signal) => {
         try {
           await finishEdit(uploaded, signal);
-        } catch {
+        } catch (error) {
           restoreDraft();
+          if (isCurrent() && error instanceof AgentMentionAuthorizationError)
+            setUploadError(error.message);
         } finally {
           setDeferredUploadPending(false);
         }
       },
       onError: (error) => {
         restoreDraft();
-        setUploadError(String(error));
+        if (isCurrent()) setUploadError(String(error));
         setDeferredUploadPending(false);
       },
       onCancel: () => {
@@ -129,7 +245,9 @@ export async function submitMessageEdit({
 
   try {
     await finishEdit([]);
-  } catch {
+  } catch (error) {
     restoreDraft();
+    if (isCurrent() && error instanceof AgentMentionAuthorizationError)
+      setUploadError(error.message);
   }
 }

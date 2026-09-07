@@ -10,15 +10,17 @@ import type {
 import { usePanelReturnTarget } from "@/shared/hooks/usePanelReturnTarget";
 import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
 import {
+  channelAgentMemberPubkeySet,
+  channelMemberPubkeySet,
+} from "@/shared/lib/rosterDerivations";
+import {
   type AgentSessionReturnTarget,
   resolveAgentSessionReturnTarget,
 } from "./agentSessionSelection";
 import type { PanelValueSetter } from "./useChannelPanelHistoryState";
 
-export type ChannelAgentSessionAgent = Pick<
-  ManagedAgent,
-  "pubkey" | "name" | "status"
-> & {
+export type ChannelAgentSessionAgent = Pick<ManagedAgent, "pubkey" | "name"> & {
+  status: ManagedAgent["status"] | "unknown";
   agentSource: "managed" | "member-agent" | "relay";
   canInterruptTurn: boolean;
   channelIds?: string[];
@@ -47,7 +49,8 @@ type UseChannelAgentSessionsOptions = {
 
 function relayStatusToManagedStatus(
   status: RelayAgent["status"],
-): ManagedAgent["status"] {
+): ChannelAgentSessionAgent["status"] {
+  if (status === "unknown") return "unknown";
   return status === "offline" ? "stopped" : "deployed";
 }
 
@@ -121,15 +124,14 @@ export function getChannelAgentSessionAgents({
     return [];
   }
 
+  // Identity-cached: the memo recomputes whenever the active channel object
+  // churns (e.g. lastMessageAt updates), and these Sets walked the full
+  // roster each time.
   const memberPubkeys = channelMembers
-    ? new Set(channelMembers.map((member) => normalizePubkey(member.pubkey)))
+    ? channelMemberPubkeySet(channelMembers)
     : null;
   const agentMemberPubkeys = channelMembers
-    ? new Set(
-        channelMembers
-          .filter((member) => member.role === "bot" || member.isAgent)
-          .map((member) => normalizePubkey(member.pubkey)),
-      )
+    ? channelAgentMemberPubkeySet(channelMembers)
     : null;
 
   return agents.filter((agent) => {

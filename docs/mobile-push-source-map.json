@@ -1,0 +1,1334 @@
+[
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": ".env.example",
+    "source_git_blob": "02e907b8cfd6c88483ae7052aa13f49e6f3c4e7f",
+    "source_sha256": "73acb1b5dd01f2dadfb4e9d73f3325ca45c16f34b88a659a056e1fd811adaed3",
+    "fork_path": ".env.example",
+    "fork_sha256": "a26060b7ba5e93644f046c588d72d7a14635a02b1129d0d6684db6bb836c8bb8",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": ".github/workflows/ci.yml",
+    "source_git_blob": "25a59c32432b187ed0cb6d50e94025e91c63e2cc",
+    "source_sha256": "d8b75cb1cb4a73fc565fd39e3682e9c0469cedbd2120fbd553bffb90f9452a7c",
+    "fork_path": ".github/workflows/ci.yml",
+    "fork_sha256": "9c9295c2e33110cd6218e293609788aceba1107d1bd6e5e258b9444ff0bc949f",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": ".intersect/sadscan.yaml",
+    "source_git_blob": "77710ae0d9871365cb6e8328731670c54ce529a7",
+    "source_sha256": "c5c416f78128d64ac0d88b921cd632207906adb88838059808ce569a2829847b",
+    "fork_path": ".intersect/sadscan.yaml",
+    "fork_sha256": "aeb6b31029705f86c60be6083b2cf2f93632ac4a67c8fc8f9be67da6003c2f9e",
+    "disposition": "excluded: independent scan/task runner policy remains fork-owned"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "Cargo.lock",
+    "source_git_blob": "9544a63b8997e449bb8da0e42ad46344af179323",
+    "source_sha256": "5065cb3ccd26fb3e49306dfcdab9e2b3d9ed0aa25df5f39194a84f641c796bfa",
+    "fork_path": "Cargo.lock",
+    "fork_sha256": "ad303e7c3277dfa6f7104a1db34b3a3c9026be80c8ef91153ca6e498a3be99b5",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "Justfile",
+    "source_git_blob": "32d83355e1c5b168b0a467b43dbd36c262a80ee6",
+    "source_sha256": "42228d1dded1a9656208a18a339c52569c8bc7e0e57168c7dcffed98e074d25c",
+    "fork_path": "Justfile",
+    "fork_sha256": "9add74d17d9f9d1e3ebccad100341116378c8eea2d9e2165442b83f74c0c92b7",
+    "disposition": "excluded: independent scan/task runner policy remains fork-owned"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-db/src/runtime/migration.rs",
+    "source_git_blob": "66251563cbdfb2070e7d7a816e0ddc2008f043aa",
+    "source_sha256": "f70fe8a63db8e7b9a4023343b90ce45a28fcc3a41e06f3045fe25e2e0998a370",
+    "fork_path": "crates/buzz-db/src/migration.rs",
+    "fork_sha256": "d6f02f1189ab9acbe4b878b52044dfe42fbe4c8e4502792e09e0571f679cd7a1",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-db/src/store/push.rs",
+    "source_git_blob": "9133b82e7163dde57550956c6553ab5b46b600e8",
+    "source_sha256": "e6d1c18fa3802304b15181bbe5799ca38af99894f90b7999363da9c39121765a",
+    "fork_path": "crates/buzz-db/src/push.rs",
+    "fork_sha256": "802ec6a3f4d4498aa0f107c6b2fac8b8169db6c5efcacac37207eb1395923b67",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/Cargo.toml",
+    "source_git_blob": "06376c02dc51374d22ec4c521fe5e6722eb3e2e1",
+    "source_sha256": "5334ac5aa2ca657ee55fc662baf0fba506fdb9c09c379dcac0017d9adff5b44a",
+    "fork_path": "crates/buzz-push-gateway/Cargo.toml",
+    "fork_sha256": "5334ac5aa2ca657ee55fc662baf0fba506fdb9c09c379dcac0017d9adff5b44a",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/migrations/0002_application_profiles.sql",
+    "source_git_blob": "45be402dc0779296b02a538748c236f0d0d56c01",
+    "source_sha256": "3f77eb8f02a1c68920b58559697f4914519a1fb2bf8f1d0c5546992e888169e2",
+    "fork_path": "crates/buzz-push-gateway/migrations/0002_application_profiles.sql",
+    "fork_sha256": "3f77eb8f02a1c68920b58559697f4914519a1fb2bf8f1d0c5546992e888169e2",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/migrations/0003_challenge_issuance_quota.sql",
+    "source_git_blob": "cc8222f6c6dda5439a7d4d7c67bf4816274ca769",
+    "source_sha256": "2dbd5403c29e57b8a9e2fbeba9a456a73d1cead9acab003e0f7cb5702bea95b7",
+    "fork_path": "crates/buzz-push-gateway/migrations/0003_challenge_issuance_quota.sql",
+    "fork_sha256": "2dbd5403c29e57b8a9e2fbeba9a456a73d1cead9acab003e0f7cb5702bea95b7",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/migrations/0004_dogfood_only_profile.sql",
+    "source_git_blob": "2274219d6ef915bbaf37ec02e0c776577532b305",
+    "source_sha256": "c1f96b868b03cf988f299cd9558c899904b2c1609b27964e6ddfee405a3ee253",
+    "fork_path": "crates/buzz-push-gateway/migrations/0004_dogfood_only_profile.sql",
+    "fork_sha256": "c1f96b868b03cf988f299cd9558c899904b2c1609b27964e6ddfee405a3ee253",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/src/apns.rs",
+    "source_git_blob": "f8f19486c1390255e76b0ccfffa00f8a5f95d9fa",
+    "source_sha256": "3caccfcdc6ca62992a41fcf350a844c38ecf902acb814786d522d4cf21598dba",
+    "fork_path": "crates/buzz-push-gateway/src/apns.rs",
+    "fork_sha256": "3caccfcdc6ca62992a41fcf350a844c38ecf902acb814786d522d4cf21598dba",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/src/app_attest.rs",
+    "source_git_blob": "df655e23d889e81e3310a63b9ec33a109c5276b6",
+    "source_sha256": "50258e1aec62f4b54015bfe129da443575c8337bd8360a7bbb36bde4d8bcb7db",
+    "fork_path": "crates/buzz-push-gateway/src/app_attest.rs",
+    "fork_sha256": "50258e1aec62f4b54015bfe129da443575c8337bd8360a7bbb36bde4d8bcb7db",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/src/authority.rs",
+    "source_git_blob": "1a7ef4b2a65137b41af555e6999c4867f1b89f2a",
+    "source_sha256": "f7adf63e444002681448c8dde7ab28327d199354ac81ba9149c41319baef63e8",
+    "fork_path": "crates/buzz-push-gateway/src/authority.rs",
+    "fork_sha256": "c610791adc5f2b53a7e56bf7fa5df42e6f051373104ed2c78ce6954ac051ffc5",
+    "disposition": "integrated with fork challenge issuance retention repair"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/src/config.rs",
+    "source_git_blob": "f8485a628dea0052ce004d9a36639cb93d47716d",
+    "source_sha256": "289a248cdc61721605fe01aee419440c478e9589b7b06c2709d6311a70abe431",
+    "fork_path": "crates/buzz-push-gateway/src/config.rs",
+    "fork_sha256": "5c397fc546a4ae98596c1e91954bcfd1f9ec8c7b435bfe367c1c6643e26d6291",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/src/grant.rs",
+    "source_git_blob": "8eda1d7ce81ff24d22e8a6b32cf2b525bad3518c",
+    "source_sha256": "6bccf03139d8760e8647bc4a34a3c2c7ebd73bc4969a2734b1e08ed71d508a1f",
+    "fork_path": "crates/buzz-push-gateway/src/grant.rs",
+    "fork_sha256": "6bccf03139d8760e8647bc4a34a3c2c7ebd73bc4969a2734b1e08ed71d508a1f",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/src/http.rs",
+    "source_git_blob": "9a6c66a519a495131320280623d8ecf14232fe13",
+    "source_sha256": "6a7efefba59947288b2181f28b3dbbad26f7f7606f99cf2eaf409b3cd0fbce7f",
+    "fork_path": "crates/buzz-push-gateway/src/http.rs",
+    "fork_sha256": "6a7efefba59947288b2181f28b3dbbad26f7f7606f99cf2eaf409b3cd0fbce7f",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/src/main.rs",
+    "source_git_blob": "db35b25110421fb9be8516c5ec90dafd960ce152",
+    "source_sha256": "1420cd77f9a64f21bb564bde892ba9aaada66140afd980d75b920f93a45be999",
+    "fork_path": "crates/buzz-push-gateway/src/main.rs",
+    "fork_sha256": "1420cd77f9a64f21bb564bde892ba9aaada66140afd980d75b920f93a45be999",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/src/metrics.rs",
+    "source_git_blob": "dfc45f467c05ae09b86c46ef69a4a5e6acdd08f0",
+    "source_sha256": "022ee294bced63c38b6c43b96d7fe74107223a352ce20179e1ad3fce8f76d2f2",
+    "fork_path": "crates/buzz-push-gateway/src/metrics.rs",
+    "fork_sha256": "022ee294bced63c38b6c43b96d7fe74107223a352ce20179e1ad3fce8f76d2f2",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/src/model.rs",
+    "source_git_blob": "390f665d8ab9870822dcd4853ca836695551cb56",
+    "source_sha256": "7768bdbd0e32e72ba831ad8457b3cf57c4a02ad9b9785b596400d412fb711d1e",
+    "fork_path": "crates/buzz-push-gateway/src/model.rs",
+    "fork_sha256": "7768bdbd0e32e72ba831ad8457b3cf57c4a02ad9b9785b596400d412fb711d1e",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/src/postgres.rs",
+    "source_git_blob": "6cbfb45893d217e8bccdd482058d3b157b236edf",
+    "source_sha256": "9a084d3d9f899dce8743b30503e8a3aa82112017d5fdf5a35026605dc771ba01",
+    "fork_path": "crates/buzz-push-gateway/src/postgres.rs",
+    "fork_sha256": "ce33bc3700a1c6ddcd8018588879ed0769222d2c6289b447214ebf0223cdf8d1",
+    "disposition": "integrated with fork challenge issuance retention repair"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/tests/fixtures/apns-test-cert-only.pem",
+    "source_git_blob": "dc7e9923a54f8a8554eb9649c28cad99574a6bb2",
+    "source_sha256": "9da173e2452c003fb5e885852fe96ffebd6af70c0e27b1202ddc9531830512f7",
+    "fork_path": "crates/buzz-push-gateway/tests/fixtures/apns-test-cert-only.pem",
+    "fork_sha256": "9da173e2452c003fb5e885852fe96ffebd6af70c0e27b1202ddc9531830512f7",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/tests/fixtures/apns-test-encrypted-identity.pem",
+    "source_git_blob": "7461fbe111f70e6fd713324ab26fd969433499ae",
+    "source_sha256": "c97f94d5fc2154470aedce4f8ddf7b7d6c93ea5eb2c603f2737ee8cb56d68198",
+    "fork_path": "crates/buzz-push-gateway/tests/fixtures/apns-test-encrypted-identity.pem",
+    "fork_sha256": "c97f94d5fc2154470aedce4f8ddf7b7d6c93ea5eb2c603f2737ee8cb56d68198",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/tests/fixtures/apns-test-identity.pem",
+    "source_git_blob": "f174811712b14f211289ceaba2558571845cdc81",
+    "source_sha256": "b37734dd904ce6265a7697539531564bc74ae41457f8db7bb0bbb39000e5295a",
+    "fork_path": "crates/buzz-push-gateway/tests/fixtures/apns-test-identity.pem",
+    "fork_sha256": "b37734dd904ce6265a7697539531564bc74ae41457f8db7bb0bbb39000e5295a",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/tests/fixtures/apns-test-key-only.pem",
+    "source_git_blob": "7c82d17d61146560face38b99965557ec4236c18",
+    "source_sha256": "962f4c2a74b6a3bccbd8c9929ad052e7c21efbc2a4f201474121a686151ee969",
+    "fork_path": "crates/buzz-push-gateway/tests/fixtures/apns-test-key-only.pem",
+    "fork_sha256": "962f4c2a74b6a3bccbd8c9929ad052e7c21efbc2a4f201474121a686151ee969",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/tests/fixtures/apns-test-mismatched-identity.pem",
+    "source_git_blob": "bed75b120f20f45333e4a5197bc78be05d089431",
+    "source_sha256": "3501c4d6f9ef4192edecc754411c17cd33e61c7e61c56355f2c4e67a47c4c713",
+    "fork_path": "crates/buzz-push-gateway/tests/fixtures/apns-test-mismatched-identity.pem",
+    "fork_sha256": "3501c4d6f9ef4192edecc754411c17cd33e61c7e61c56355f2c4e67a47c4c713",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/tests/fixtures/app-attest-good.json",
+    "source_git_blob": "3bdff5ccdceb1c1d23e6b5e3e90bbebf1667cf73",
+    "source_sha256": "527be3938c23bbaea2b1d4a25da67414c225441e9495a4606432eff8088cabae",
+    "fork_path": "crates/buzz-push-gateway/tests/fixtures/app-attest-good.json",
+    "fork_sha256": "527be3938c23bbaea2b1d4a25da67414c225441e9495a4606432eff8088cabae",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/tests/fixtures/app-attest-wrong-aaguid.json",
+    "source_git_blob": "56d1260bead5372bc9b6df1a9790557afa484fd1",
+    "source_sha256": "4a29fb4016d28e96dec533032bd17aa4185c7a56703ee53badc6195ce9d6c1db",
+    "fork_path": "crates/buzz-push-gateway/tests/fixtures/app-attest-wrong-aaguid.json",
+    "fork_sha256": "4a29fb4016d28e96dec533032bd17aa4185c7a56703ee53badc6195ce9d6c1db",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/tests/fixtures/app-attest-wrong-root.json",
+    "source_git_blob": "7129b63939ecd8795903ceeddabea1df881349f4",
+    "source_sha256": "b3fa10fce327f0a96a9d5b3bc3db1303b9f0c2b434c71f60e7fc56c41ff9310b",
+    "fork_path": "crates/buzz-push-gateway/tests/fixtures/app-attest-wrong-root.json",
+    "fork_sha256": "b3fa10fce327f0a96a9d5b3bc3db1303b9f0c2b434c71f60e7fc56c41ff9310b",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/tests/fixtures/apple-app-attestation-root.pem",
+    "source_git_blob": "4cff2277b518352b70f3e47945ffc1af67bbc09b",
+    "source_sha256": "c778d09ac341f7fd9f8f3b19e2b815af6aed4ad4490e1e92c05cb355212a5013",
+    "fork_path": "crates/buzz-push-gateway/tests/fixtures/apple-app-attestation-root.pem",
+    "fork_sha256": "c778d09ac341f7fd9f8f3b19e2b815af6aed4ad4490e1e92c05cb355212a5013",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-push-gateway/tests/vectors/app_attest_transcripts.json",
+    "source_git_blob": "27b84035d6c271f75f5ed2fa9bf131a04c29ef29",
+    "source_sha256": "6146c80bc543fc9acf39e50a006d141ebf58acfcdf4c99cbb8c9c4c69721e8b6",
+    "fork_path": "crates/buzz-push-gateway/tests/vectors/app_attest_transcripts.json",
+    "fork_sha256": "6146c80bc543fc9acf39e50a006d141ebf58acfcdf4c99cbb8c9c4c69721e8b6",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-relay/src/config.rs",
+    "source_git_blob": "e035752ec3adc3512981fc2255614406d6ca6f6b",
+    "source_sha256": "7d5eb5db007cc4ce981f7d94d328fafc94e960214b6aa5041675bc6d7d56bb27",
+    "fork_path": "crates/buzz-relay/src/config.rs",
+    "fork_sha256": "340d3f3eb4fafebbf1d9cb9e0dc5137ac03c31e9d56925003c449b87ef5ab444",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-relay/src/handlers/push_lease.rs",
+    "source_git_blob": "dd63b438c94f5ca93b8e62b7936216037c2889ee",
+    "source_sha256": "fd9999c512951446789990be46ccb01026eeaf54672e9392aab31f131f9e55e2",
+    "fork_path": "crates/buzz-relay/src/handlers/push_lease.rs",
+    "fork_sha256": "382f98bbcfbf1434f82134f8b56a305bb6cd4b7307f8db8b3f1b85707433004a",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-relay/src/main.rs",
+    "source_git_blob": "d9432589f46f7e4b3926be037807a5cd65379feb",
+    "source_sha256": "6cda190980f5b53db2ea7e047432e835c1d720c82abb7a867695c4e69deacf70",
+    "fork_path": "crates/buzz-relay/src/main.rs",
+    "fork_sha256": "ce43cae010e76091adaa151a6d72b62d9959db88bf0edc73ba2f4486426eefb4",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-relay/src/nip11.rs",
+    "source_git_blob": "e6b18cdd0f8538642aa3dde61a72bc103741ad88",
+    "source_sha256": "7736734a819f5de75d9e43132b9137d2f5f10f496e89425ade4e92ccf8535b33",
+    "fork_path": "crates/buzz-relay/src/nip11.rs",
+    "fork_sha256": "2287f08f73678364c3ec070dd845125c6555ba8c0dd2a3708cfd117bea1adee4",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "crates/buzz-relay/src/push_runtime.rs",
+    "source_git_blob": "246997aac22893bbe29cc6d29b93830eb571346a",
+    "source_sha256": "13613a93986cec94c6c897e56beb47299e5af7794cd67f844b226aecdfa097a3",
+    "fork_path": "crates/buzz-relay/src/push_runtime.rs",
+    "fork_sha256": "f19f0e4e5701ea7e3f27947900a57391844b9b366c3352a0add96322b53634e2",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "deploy/charts/buzz-push-gateway/templates/deployment.yaml",
+    "source_git_blob": "20ce75672704ac797565719d6540554fc697b14e",
+    "source_sha256": "27d260d1cf1e6abbac977c7d74201bee79a76bbfc75de6047d55dc7e5b3485d5",
+    "fork_path": "deploy/charts/buzz-push-gateway/templates/deployment.yaml",
+    "fork_sha256": "7cb8a52a54a1b8839194cd9d082acda60c627d81458663a7adc587f0fe48cc1e",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "deploy/charts/buzz-push-gateway/templates/prometheusrule.yaml",
+    "source_git_blob": "7a718bda718ad2c49976f0aa436212c99c49584c",
+    "source_sha256": "1aef91b5a4412abf9af06a844f8a5c6229d5a2d837807cdf6266a818d86c3e80",
+    "fork_path": "deploy/charts/buzz-push-gateway/templates/prometheusrule.yaml",
+    "fork_sha256": "1aef91b5a4412abf9af06a844f8a5c6229d5a2d837807cdf6266a818d86c3e80",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "deploy/charts/buzz-push-gateway/tests/release-contract.sh",
+    "source_git_blob": "993c4c053699a4acc215b85d6eec66e28a4c5b58",
+    "source_sha256": "2d994cf9cc1a3bd1c9be1f7bbe61df364068f11b9b9b773eb14b5e34452fb724",
+    "fork_path": "deploy/charts/buzz-push-gateway/tests/release-contract.sh",
+    "fork_sha256": "bfaa42dff841934713d16a1e526ca012f4ccdf4e05e9a2b7fffa57599dcf67a2",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "deploy/charts/buzz-push-gateway/tests/render.sh",
+    "source_git_blob": "250955c5fc21d9b513203060522c5f4a71aa4145",
+    "source_sha256": "a2c272ca96feab0ac6692ace241a8fde1be31457a291e8f746bb2867e3ed90ab",
+    "fork_path": "deploy/charts/buzz-push-gateway/tests/render.sh",
+    "fork_sha256": "f4212d37caecbe87fa73eace90c66901ea3be14f78d602e4f95421607620d695",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "deploy/charts/buzz-push-gateway/values-production.yaml",
+    "source_git_blob": "8017f6bacdb004ed05a00fadbc04f6f561921ae8",
+    "source_sha256": "febf78ad7dc302d6c01f4a54c787731027bbf5b0f46dde59892f1bf74efcba47",
+    "fork_path": "deploy/charts/buzz-push-gateway/values-production.yaml",
+    "fork_sha256": "bb22a901200d7ea2867f0eb9c31f729bae37c63be2ea933b82b24f9bdd1448b9",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "deploy/charts/buzz-push-gateway/values.schema.json",
+    "source_git_blob": "29eafa22c8dcdc5536158266c20b0dfbe8420252",
+    "source_sha256": "2d8bb01e40cde0faabd259a653d77a29c9044295a2427fd0b3aff4fe79cb0adb",
+    "fork_path": "deploy/charts/buzz-push-gateway/values.schema.json",
+    "fork_sha256": "85a08228eb6553d9102c4be8a73093704382e6dc286852921bfc4f8c1dd69ff2",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "deploy/charts/buzz-push-gateway/values.yaml",
+    "source_git_blob": "1f1e90cbb08bbbecbb54d4437140098e5bfb8eb9",
+    "source_sha256": "b3f7941ea0e0d2cd0680b70d9fc1ec1d5f3e4404e6fe6247ce69ba4fb441ef9f",
+    "fork_path": "deploy/charts/buzz-push-gateway/values.yaml",
+    "fork_sha256": "c3a49dac1ee53af681bb71ebb09227a6f244941fe3bf4d3bca92bed68f07d6ea",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "docs/nips/NIP-PL.md",
+    "source_git_blob": "6575c98bfb3242bb231cc7e706ad958c9db2f751",
+    "source_sha256": "843f06e98c2fdf14f5f04c4ea04ce32eacf0990bb68cbd8fea3406a73a4bd910",
+    "fork_path": "docs/nips/NIP-PL.md",
+    "fork_sha256": "2f240b2a7e87ec753aabdcd329a4d0f2f52456b9dcfaccc6af171327ed0b70a7",
+    "disposition": "integrated with fork challenge issuance retention repair"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "docs/push-gateway-deployment.md",
+    "source_git_blob": "e9a9ae16055273c7dd9e43271c18d5de84ff7c6d",
+    "source_sha256": "4724be9a9f27bad5ad6c855f92ac4082f09ccac22994347847fc8a59e01a85ad",
+    "fork_path": "docs/push-gateway-deployment.md",
+    "fork_sha256": "cc7a935a1079b1ba14c4e283dd166d0282a553dee737c83790e8d8ad8e0584c5",
+    "disposition": "integrated with fork challenge issuance retention repair"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "migrations/0040_push_message_kinds.sql",
+    "source_git_blob": "a76481b15923d0e819f0bf126409aa00588d2915",
+    "source_sha256": "cc094648d73cf34ae6772e15359668e340d995344eb9b99f12cde1235ea60fe8",
+    "fork_path": "migrations/0037_push_message_kinds.sql",
+    "fork_sha256": "cc094648d73cf34ae6772e15359668e340d995344eb9b99f12cde1235ea60fe8",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/.env.json.example",
+    "source_git_blob": "248ccda1b60288de11dd646b4b4d592091ca6842",
+    "source_sha256": "789e062ab282285a8199f4a7a06864edb7c7a8393364b1223826305462c64614",
+    "fork_path": "mobile/.env.json.example",
+    "fork_sha256": "789e062ab282285a8199f4a7a06864edb7c7a8393364b1223826305462c64614",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/README.md",
+    "source_git_blob": "c108dcece25ccb24133b213ebe534797039fd7d4",
+    "source_sha256": "7fc76655385e08716cee7d8c580e569782d35a06d623ec9874b7ce5d96514371",
+    "fork_path": "mobile/README.md",
+    "fork_sha256": "b6786aa28aa741aa828ca27b0404835ae0bda0f584110da7403edaa78903e3cf",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/.gitignore",
+    "source_git_blob": "0562776fd4e38ab9e55b85810ef4630c2ce86143",
+    "source_sha256": "1958934f1d1879779db2c5ab9c445fbc4fdb9c522eab6d7fdfddbb7cff173207",
+    "fork_path": "mobile/ios/.gitignore",
+    "fork_sha256": "d118ec74df53640d47a1348711b990aa970d603cf16bb1b544c568953b7e2635",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Package.swift",
+    "source_git_blob": "5af3d0a6c46471069e871b30b414f58295b61d6b",
+    "source_sha256": "bfdc3e3ad14be24049376427fb9f6955a52ca619ed2e0aab78477f5edbcb2743",
+    "fork_path": "mobile/ios/BuzzPushKit/Package.swift",
+    "fork_sha256": "bfdc3e3ad14be24049376427fb9f6955a52ca619ed2e0aab78477f5edbcb2743",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Sources/BuzzPushKit/APNsRegistrationBuffer.swift",
+    "source_git_blob": "174fc90bb23726589d5de9084e7dd9c8db40d7ef",
+    "source_sha256": "dce0c513f435912434ae86c21e332c88a586d4fba519ca77ba8371e5146a1d34",
+    "fork_path": "mobile/ios/BuzzPushKit/Sources/BuzzPushKit/APNsRegistrationBuffer.swift",
+    "fork_sha256": "dce0c513f435912434ae86c21e332c88a586d4fba519ca77ba8371e5146a1d34",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Sources/BuzzPushKit/BuzzCommunicationNotification.swift",
+    "source_git_blob": "60f4d9e5110017794088f6bb1e006c1b17e789c5",
+    "source_sha256": "e318b81d4acdf0a6bf6660d3276ae1ca3ff0b561b5bf8ff9f97654d49b011274",
+    "fork_path": "mobile/ios/BuzzPushKit/Sources/BuzzPushKit/BuzzCommunicationNotification.swift",
+    "fork_sha256": "e318b81d4acdf0a6bf6660d3276ae1ca3ff0b561b5bf8ff9f97654d49b011274",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Sources/BuzzPushKit/BuzzDevPushEnrollmentDriver.swift",
+    "source_git_blob": "8003193da390d43dca0c340fd265d9238fa276c4",
+    "source_sha256": "f03954a5f0a207e204edef5980ce7c66561db65cfc86ac4427d49c2c4edf04c7",
+    "fork_path": "mobile/ios/BuzzPushKit/Sources/BuzzPushKit/BuzzDevPushEnrollmentDriver.swift",
+    "fork_sha256": "bdb276e5b8de7f3049e47412786f66991a8511bc460b0795bde688d11150faa5",
+    "disposition": "adapted; client lifecycle and shared authority repair preserves fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Sources/BuzzPushKit/BuzzPushNavigationTarget.swift",
+    "source_git_blob": "9218655021ad61e5073256c6d267dbe2a8451de8",
+    "source_sha256": "f4b885020fc9ec1c583bce4d8bc05cb65912020ef9818089104b4430f974dbc4",
+    "fork_path": "mobile/ios/BuzzPushKit/Sources/BuzzPushKit/BuzzPushNavigationTarget.swift",
+    "fork_sha256": "f4b885020fc9ec1c583bce4d8bc05cb65912020ef9818089104b4430f974dbc4",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Sources/BuzzPushKit/BuzzPushNotificationResolver.swift",
+    "source_git_blob": "47661e813009998aa146b6f424a2c262a70e2b6b",
+    "source_sha256": "9619e028124f78fa14bc44985fa81c644c642a6f3fd2c8f1fd53f760d1c07e4a",
+    "fork_path": "mobile/ios/BuzzPushKit/Sources/BuzzPushKit/BuzzPushNotificationResolver.swift",
+    "fork_sha256": "9619e028124f78fa14bc44985fa81c644c642a6f3fd2c8f1fd53f760d1c07e4a",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Sources/BuzzPushKit/BuzzPushPendingEnrollmentRecord.swift",
+    "source_git_blob": "402f90be30f8404ddfd15107d91b7c5f077c4413",
+    "source_sha256": "a0090c1948b20996119615bcb2e9afb5669e2db92ff3b14a22711465fa723341",
+    "fork_path": "mobile/ios/BuzzPushKit/Sources/BuzzPushKit/BuzzPushPendingEnrollmentRecord.swift",
+    "fork_sha256": "a0090c1948b20996119615bcb2e9afb5669e2db92ff3b14a22711465fa723341",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Sources/BuzzPushKit/BuzzPushPresentationCache.swift",
+    "source_git_blob": "f4a27e8a9f05b0cf3c54af1b02ac5007602b920d",
+    "source_sha256": "3c8f501d03a08830234609b01e1cb28af7ab533b1eed9a1f6a63debfabe82e00",
+    "fork_path": "mobile/ios/BuzzPushKit/Sources/BuzzPushKit/BuzzPushPresentationCache.swift",
+    "fork_sha256": "3c8f501d03a08830234609b01e1cb28af7ab533b1eed9a1f6a63debfabe82e00",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Sources/BuzzPushKit/BuzzPushTranscript.swift",
+    "source_git_blob": "fd0bc34d6969df2a581d0668b965944b26f3dbdd",
+    "source_sha256": "18a03b43d82a4a3993b2b6e1a2458e8ab1233a9a584da5354d3f6db5b9a7cd76",
+    "fork_path": "mobile/ios/BuzzPushKit/Sources/BuzzPushKit/BuzzPushTranscript.swift",
+    "fork_sha256": "18a03b43d82a4a3993b2b6e1a2458e8ab1233a9a584da5354d3f6db5b9a7cd76",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Sources/BuzzPushKit/NostrHTTPAuth.swift",
+    "source_git_blob": "39123704561bc76924a2f9132b2f20b8520231a1",
+    "source_sha256": "6a5c87fad4b003ec600dc2640f730b276dc31b00b2061c4fe14d7e8a963587f3",
+    "fork_path": "mobile/ios/BuzzPushKit/Sources/BuzzPushKit/NostrHTTPAuth.swift",
+    "fork_sha256": "6a5c87fad4b003ec600dc2640f730b276dc31b00b2061c4fe14d7e8a963587f3",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Sources/BuzzPushKit/PushLease.swift",
+    "source_git_blob": "cb7eb791082d90a58a52d5eff17d8f54017cf4bc",
+    "source_sha256": "f30bc73396e5e0cb79df249b33bc3972e360c7099c41dd012e0be455a2e04aba",
+    "fork_path": "mobile/ios/BuzzPushKit/Sources/BuzzPushKit/PushLease.swift",
+    "fork_sha256": "f30bc73396e5e0cb79df249b33bc3972e360c7099c41dd012e0be455a2e04aba",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Tests/BuzzPushKitTests/APNsRegistrationBufferTests.swift",
+    "source_git_blob": "657c925e179bdc01badbfdffd7dce822d30f3f5e",
+    "source_sha256": "05842f906927eb7efa7dddd40a0ce667913771ab7cd62da8916e58ad54076422",
+    "fork_path": "mobile/ios/BuzzPushKit/Tests/BuzzPushKitTests/APNsRegistrationBufferTests.swift",
+    "fork_sha256": "05842f906927eb7efa7dddd40a0ce667913771ab7cd62da8916e58ad54076422",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Tests/BuzzPushKitTests/BuzzDevPushEnrollmentDriverTests.swift",
+    "source_git_blob": "2345bc46c6854e350c2152fe523138fc8afcdc3f",
+    "source_sha256": "2d22a2d75f178f57c2cc6b71a03a7de7ff82f3e037c3fb43015aab42e3053696",
+    "fork_path": "mobile/ios/BuzzPushKit/Tests/BuzzPushKitTests/BuzzDevPushEnrollmentDriverTests.swift",
+    "fork_sha256": "4004ba1c4d116356e5cbca6c6d4af6cfb6bd2e5c6168770730009de8c9fb4f56",
+    "disposition": "adapted; client lifecycle and shared authority repair preserves fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Tests/BuzzPushKitTests/BuzzPushConversationResolverTests.swift",
+    "source_git_blob": "c79147dbea50a40606be1efb234385fd149042bc",
+    "source_sha256": "b4466af6e11758a1223cace5399795820d4baba8d8f33e7277abde504938d3ec",
+    "fork_path": "mobile/ios/BuzzPushKit/Tests/BuzzPushKitTests/BuzzPushConversationResolverTests.swift",
+    "fork_sha256": "b4466af6e11758a1223cace5399795820d4baba8d8f33e7277abde504938d3ec",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Tests/BuzzPushKitTests/BuzzPushNavigationTargetTests.swift",
+    "source_git_blob": "414e9446a2e1bbfecc17f6f74ef0086bf524d555",
+    "source_sha256": "604ccf011006fd56748f50f43d92fbfa5e9c881be2309b8ad7606b0aaada6d1d",
+    "fork_path": "mobile/ios/BuzzPushKit/Tests/BuzzPushKitTests/BuzzPushNavigationTargetTests.swift",
+    "fork_sha256": "604ccf011006fd56748f50f43d92fbfa5e9c881be2309b8ad7606b0aaada6d1d",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Tests/BuzzPushKitTests/BuzzPushNotificationResolverTests.swift",
+    "source_git_blob": "b25e23595f6df1465feda564c1ceb259c75ff24a",
+    "source_sha256": "6eefe7dd3d777fac6a433a041d458c8c0bd565a49098ef3c941a5c76fdb33ff7",
+    "fork_path": "mobile/ios/BuzzPushKit/Tests/BuzzPushKitTests/BuzzPushNotificationResolverTests.swift",
+    "fork_sha256": "6eefe7dd3d777fac6a433a041d458c8c0bd565a49098ef3c941a5c76fdb33ff7",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Tests/BuzzPushKitTests/BuzzPushPresentationCacheTests.swift",
+    "source_git_blob": "ed592c576f6bf4e356605302ffa6abfcf2dc9a1b",
+    "source_sha256": "13adcbd3153993f33729283cf0c1c411c5fff6fb091c697a55ae53281e3ba78d",
+    "fork_path": "mobile/ios/BuzzPushKit/Tests/BuzzPushKitTests/BuzzPushPresentationCacheTests.swift",
+    "fork_sha256": "13adcbd3153993f33729283cf0c1c411c5fff6fb091c697a55ae53281e3ba78d",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Tests/BuzzPushKitTests/BuzzPushTranscriptTests.swift",
+    "source_git_blob": "3cb242bc4cfbddc94ff3606f50e95271908bc66c",
+    "source_sha256": "7a61a58f3b155c717b2f61e7efad4daed00eea761939e2a5b2f4f3df7edc0d03",
+    "fork_path": "mobile/ios/BuzzPushKit/Tests/BuzzPushKitTests/BuzzPushTranscriptTests.swift",
+    "fork_sha256": "7a61a58f3b155c717b2f61e7efad4daed00eea761939e2a5b2f4f3df7edc0d03",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Tests/BuzzPushKitTests/Fixtures",
+    "source_git_blob": "cbfddb7a24670dad07e27af4543b51d8be64eee7",
+    "source_sha256": "e2db6144df72fbb2ef2e60d3964addfe773101d4c27f3168e655a2ce5c2e6374",
+    "fork_path": "mobile/ios/BuzzPushKit/Tests/BuzzPushKitTests/Fixtures",
+    "fork_sha256": "e2db6144df72fbb2ef2e60d3964addfe773101d4c27f3168e655a2ce5c2e6374",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Tests/BuzzPushKitTests/NostrHTTPAuthTests.swift",
+    "source_git_blob": "9cffaa5cd287c7192ae5214a6d7fe5f4039da953",
+    "source_sha256": "cdb66e0d909062129c6fc5cdd44475a1991234a1024498e5f5a08fe7e6b85fa1",
+    "fork_path": "mobile/ios/BuzzPushKit/Tests/BuzzPushKitTests/NostrHTTPAuthTests.swift",
+    "fork_sha256": "cdb66e0d909062129c6fc5cdd44475a1991234a1024498e5f5a08fe7e6b85fa1",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/BuzzPushKit/Tests/BuzzPushKitTests/PushLeaseTests.swift",
+    "source_git_blob": "096737d5359905589b22a40b1d7c2203037a6d20",
+    "source_sha256": "6875162a08259f2a6276f3eaa81db487b4237a876a3deec27c3945c048289cbb",
+    "fork_path": "mobile/ios/BuzzPushKit/Tests/BuzzPushKitTests/PushLeaseTests.swift",
+    "fork_sha256": "6875162a08259f2a6276f3eaa81db487b4237a876a3deec27c3945c048289cbb",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/Flutter/Debug.xcconfig",
+    "source_git_blob": "8660e4e3ed0d62cda13f0e206905811afbefa43b",
+    "source_sha256": "3346538c73353a6e5e9c67247e764974eb3842c6b913a3783a1298d678e537c1",
+    "fork_path": "mobile/ios/Flutter/Debug.xcconfig",
+    "fork_sha256": "6dd426a03885a2addd8dcd843f61490be0eae8a12e40b4b120a3de2b8d916216",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/Flutter/Release.xcconfig",
+    "source_git_blob": "cdacb9e89bca02bf93ae7949146c7857e39baeff",
+    "source_sha256": "a6f283780df6abe521f08fed3c12728a05ecf62fb11c51ccca3dace009be5cf8",
+    "fork_path": "mobile/ios/Flutter/Release.xcconfig",
+    "fork_sha256": "e65b178646a1e5d3132603bc07656534bac57a98f5414909920ad8d66b1f4932",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/NotificationService/Info.plist",
+    "source_git_blob": "e66f3a9505d7ec0efc695ebefb4bb8ee36b895d2",
+    "source_sha256": "ccf416b779210cfa7d62b4ad9e87177e3b2dc03cb8087b1b6fc99bd33c5d2c24",
+    "fork_path": "mobile/ios/NotificationService/Info.plist",
+    "fork_sha256": "ccf416b779210cfa7d62b4ad9e87177e3b2dc03cb8087b1b6fc99bd33c5d2c24",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/NotificationService/NotificationService.entitlements",
+    "source_git_blob": "2187d2c03bdddfecc6b9a375cc0f7fcbccc0203b",
+    "source_sha256": "a5fe4bc4c534863e5fbbd536f6d5494a6e3e99516274159f6dab6af282a7dd2b",
+    "fork_path": "mobile/ios/NotificationService/NotificationService.entitlements",
+    "fork_sha256": "a5fe4bc4c534863e5fbbd536f6d5494a6e3e99516274159f6dab6af282a7dd2b",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/NotificationService/NotificationService.swift",
+    "source_git_blob": "44965720a9f3c43403cacf1f5c479e41489f3793",
+    "source_sha256": "a82fb60e53a2ce1893c9052ef4c5c558a92e45c03131cda7c549b3c8c3471612",
+    "fork_path": "mobile/ios/NotificationService/NotificationService.swift",
+    "fork_sha256": "a82fb60e53a2ce1893c9052ef4c5c558a92e45c03131cda7c549b3c8c3471612",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/Runner.xcodeproj/project.pbxproj",
+    "source_git_blob": "739d87307516cc676a2ac5bce80bf7481af4b36a",
+    "source_sha256": "0d6adddfbaf87429a305c9d652c2052fc74197333a42de34d559f07412c16039",
+    "fork_path": "mobile/ios/Runner.xcodeproj/project.pbxproj",
+    "fork_sha256": "379f2991f0ca43d178e48765bdb896adcf06669c8cea9f24af6f3bcc3986e857",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/Runner.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+    "source_git_blob": "320fe8c569ca4c5a63087f01c2d3fe4d2fecc16f",
+    "source_sha256": "8bf1cbc3e069fb5d985ae96517ebf669005c0d4d975a03790787ba36dad6eadb",
+    "fork_path": "mobile/ios/Runner.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+    "fork_sha256": "8bf1cbc3e069fb5d985ae96517ebf669005c0d4d975a03790787ba36dad6eadb",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/Runner/AppDelegate.swift",
+    "source_git_blob": "a770451b619c83635218ec3bec56fd73a95f1ffe",
+    "source_sha256": "f0cdb47c8bb6f20e71493ea4328cb60a5b7c2aa95e683a9646ef1030dfbd7c5d",
+    "fork_path": "mobile/ios/Runner/AppDelegate.swift",
+    "fork_sha256": "4d409a5acb4ac43d2378a385d9a657c718381f0a2701ebfda8dbdc4eab31ad9d",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/Runner/Info.plist",
+    "source_git_blob": "544f2517bdbb8686e1f8b52bc8a6c695f585cb9b",
+    "source_sha256": "09542c38d151d36176651fe88bced9db7acfc1330d74c5afddfe891e4b629fbb",
+    "fork_path": "mobile/ios/Runner/Info.plist",
+    "fork_sha256": "58e72d525382ea358bdcce3f9d3362afc14ba24a4878dbc4ed4f07be004779e5",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/Runner/PushEndpointGrantStore.swift",
+    "source_git_blob": "ffedbedd19a21815df6648ce949350b7e2bfb000",
+    "source_sha256": "08c575fefd0edee4bf85172b92e24a59237282603dacf7677b361c0c83082e34",
+    "fork_path": "mobile/ios/Runner/PushEndpointGrantStore.swift",
+    "fork_sha256": "67ac0f459fa5cb68f73ab6fb766a715f92a9f272112f0ac26294a85e92cc40f2",
+    "disposition": "adapted; client lifecycle and shared authority repair preserves fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/Runner/PushNativeState.swift",
+    "source_git_blob": "6253f656ce46d8957a4792d01b2d43ac9dbb7211",
+    "source_sha256": "fcb6efad54e536b502db4594fa5103a0f8625be547634b6afdf92631f7374fb3",
+    "fork_path": "mobile/ios/Runner/PushNativeState.swift",
+    "fork_sha256": "fcb6efad54e536b502db4594fa5103a0f8625be547634b6afdf92631f7374fb3",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/Runner/PushSnapshotBridge.swift",
+    "source_git_blob": "5c7bfb5fac0bafa926ae0b658d97280662d10da9",
+    "source_sha256": "3d233d8d1838cfc09c00d5a763a2b039a8725c97e7cf17e4cf20a570d06a9744",
+    "fork_path": "mobile/ios/Runner/PushSnapshotBridge.swift",
+    "fork_sha256": "3d233d8d1838cfc09c00d5a763a2b039a8725c97e7cf17e4cf20a570d06a9744",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/Runner/Runner.entitlements",
+    "source_git_blob": "7fca08a0f350b4308411cd2c7f66a8dcbd14c54d",
+    "source_sha256": "701d3071d82daade83b6847811298d7e44f72742e1520cb1d4abc948b6ca4548",
+    "fork_path": "mobile/ios/Runner/Runner.entitlements",
+    "fork_sha256": "701d3071d82daade83b6847811298d7e44f72742e1520cb1d4abc948b6ca4548",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/RunnerTests/BuzzCommunicationNotificationTests.swift",
+    "source_git_blob": "156aa615210dcb84445340030fb3a2af09730d45",
+    "source_sha256": "b4b820617bed68f6486bb116d96704856961e30fa7ad0e429468f2775d4c06d6",
+    "fork_path": "mobile/ios/RunnerTests/BuzzCommunicationNotificationTests.swift",
+    "fork_sha256": "b4b820617bed68f6486bb116d96704856961e30fa7ad0e429468f2775d4c06d6",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/ios/RunnerTests/RunnerTests.swift",
+    "source_git_blob": "14c35dd21eca1d3954e27a2bdbce85be1f676c5c",
+    "source_sha256": "184d46237b293fe5516d8a6548b675a4c119ea61862f0a9ca640b77fc86cd945",
+    "fork_path": "mobile/ios/RunnerTests/RunnerTests.swift",
+    "fork_sha256": "185ce70c5de57680d4e586707b432249b50f17da970975a453343a684ff9caa2",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/app.dart",
+    "source_git_blob": "66b880679f04f247db4b1ba07fd0664a28e7c43b",
+    "source_sha256": "9b77c46556fa1c4500120128ec81b4af4d90f673db87a7396ace84d283e85123",
+    "fork_path": "mobile/lib/app.dart",
+    "fork_sha256": "ad16781115f95249d5e68792813208ebf097a641e4ca80597137f59c16f2436e",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/features/channels/channel_member_snapshots.dart",
+    "source_git_blob": "33f266ba6b9deaca4936a094ea9713862306518c",
+    "source_sha256": "4ff99f4d1f2d0a5b4d3d7c8bd9850b11558536871b25084c8702115e278e81e7",
+    "fork_path": "mobile/lib/features/channels/channel_member_history.dart",
+    "fork_sha256": "0dcac323c562d58aa53456be2f450ad36e452c511c3b3d7155654f5d31eafa6b",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/features/channels/channels_provider.dart",
+    "source_git_blob": "33bfa210d15e5fbe3eeea07dde94d59ea54ccbba",
+    "source_sha256": "c1063795a69823bf68c171498a09d33ec6026bdbdf781ea772c4d0e6b0ab618b",
+    "fork_path": "mobile/lib/features/channels/channels_provider.dart",
+    "fork_sha256": "1ad71a273ed7fcf88fdc36eb69a9b9b855742f4261632ad9bd791ab4ca6444aa",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/features/channels/deep_link_dispatcher.dart",
+    "source_git_blob": "9d3c0fdc8a4ee2c8d6d64f579a210a1605aab455",
+    "source_sha256": "96fbe291c0fa0bd3f0b333bf5387e808d4460bebd8316b07f3c951f6e4be0887",
+    "fork_path": "mobile/lib/features/channels/deep_link_dispatcher.dart",
+    "fork_sha256": "96fbe291c0fa0bd3f0b333bf5387e808d4460bebd8316b07f3c951f6e4be0887",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/features/settings/settings_page.dart",
+    "source_git_blob": "b5faa970a19f61305e12be28fb8d2ee9de777347",
+    "source_sha256": "986551ec8107748c09c165b70cdf3fc839f2b7c558db6d58cb4ddd9bf415537c",
+    "fork_path": "mobile/lib/features/settings/settings_page.dart",
+    "fork_sha256": "5bf18c467299189ed668450a10be1da8b099faa8be6e3661aff5a15a69a987f2",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/features/settings/settings_page/connection_section.dart",
+    "source_git_blob": "6e7592440a5c8ba1a387699e0487a20ff60e50a0",
+    "source_sha256": "de2e425ac3ad36d091343d05794b8bbfcc629f25df39bb82cc87cff6142fcaf9",
+    "fork_path": "mobile/lib/features/settings/settings_page/connection_section.dart",
+    "fork_sha256": "972c04efe34572b22ae22eaf8b36ebd376e6f04a1b5e14dbd175e079a9e4e95a",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/features/settings/settings_page/notifications_section.dart",
+    "source_git_blob": "8560846b0efa2c10b630f58437cf8b8469d941b3",
+    "source_sha256": "4bb84edbe47aa1e3c6687bee37085536ef035251df4c0385aeb93c6d8cdfd849",
+    "fork_path": "mobile/lib/features/settings/settings_page/notifications_section.dart",
+    "fork_sha256": "4bb84edbe47aa1e3c6687bee37085536ef035251df4c0385aeb93c6d8cdfd849",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/main.dart",
+    "source_git_blob": "8f360a3db914b9bfe8dd6264b6f570de26cc5f3c",
+    "source_sha256": "997a2aee51d2ce9adc1ab452de12fc2c7baa1e69502be5db2f562e3403509a7f",
+    "fork_path": "mobile/lib/main.dart",
+    "fork_sha256": "997a2aee51d2ce9adc1ab452de12fc2c7baa1e69502be5db2f562e3403509a7f",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/shared/auth/auth_provider.dart",
+    "source_git_blob": "9dc17e1e741895a577ad499cb41b462c0d30d484",
+    "source_sha256": "e35f3e2d17496a21003d67b2dbe85fc77b2083770f856cff376966a04933743d",
+    "fork_path": "mobile/lib/shared/auth/auth_provider.dart",
+    "fork_sha256": "e35f3e2d17496a21003d67b2dbe85fc77b2083770f856cff376966a04933743d",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/shared/community/community.dart",
+    "source_git_blob": "86db62bb62744cb54981e95226ce3b7643f29e8c",
+    "source_sha256": "25aa75110f518041c4b0acc1ec77630a69733a43fba0c059315eb8e43f5d4440",
+    "fork_path": "mobile/lib/shared/community/community.dart",
+    "fork_sha256": "9855c79fdda381a7e0b803261d3009549e8739484158e8358b67b9e41deb0ec8",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/shared/community/community_provider.dart",
+    "source_git_blob": "7788082745ecdef505c2e59bafdc1df41dab6f01",
+    "source_sha256": "b15fefa72dc0a78143283c7623578ce3e298aed2f165523d8131cb5ee282f63d",
+    "fork_path": "mobile/lib/shared/community/community_provider.dart",
+    "fork_sha256": "100ad213978f051dfb49660c8922a9af1c7ec92b21e93f4a7213edabb4fd7fbb",
+    "disposition": "adapted; client lifecycle and shared authority repair preserves fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/shared/deeplink/deep_link.dart",
+    "source_git_blob": "c58acefd2189cd9ccb02cee0bb6cc91412cc4ab1",
+    "source_sha256": "70fb0ff321a6ef0e5712cebadea3a94bef00fbc518706e48a1613fbcccaa9871",
+    "fork_path": "mobile/lib/shared/deeplink/deep_link.dart",
+    "fork_sha256": "28d9aab91aea234f21925980cdb03d28a5b94340b4c44e696ab4cd82144b21c2",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/shared/deeplink/pending_deep_link_provider.dart",
+    "source_git_blob": "70f1a6a3b6f05cae00bc512ad56a94cdd2b2b769",
+    "source_sha256": "3a9eeb13c3885c98b935d169bfac0d49d948e547d865046374bd7740b7e6afee",
+    "fork_path": "mobile/lib/shared/deeplink/pending_deep_link_provider.dart",
+    "fork_sha256": "c6c43053ced500d6a6523d76437c2cbb3549dd007da521858e4b9a5ce125a346",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/shared/profile/user_cache_provider.dart",
+    "source_git_blob": "c974b4a055ff108d19241c4379ede2e5d60df99e",
+    "source_sha256": "3b788299e4d2339143cbd938028c8155d32da4eac2234e77e49b671c77410864",
+    "fork_path": "mobile/lib/shared/profile/user_cache_provider.dart",
+    "fork_sha256": "e794b6b4a3aa4c5169d228e5b36d7e5512809c71e7d0c82fb9867ff960dfc363",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/shared/push/dev_push_lease.dart",
+    "source_git_blob": "e7af8dc738aa42982df3989f529be9beba316d2d",
+    "source_sha256": "bbc2665e395b96c8e1872e51a389972b9fad42b4a508240e56bb0fb78614c725",
+    "fork_path": "mobile/lib/shared/push/dev_push_lease.dart",
+    "fork_sha256": "bbc2665e395b96c8e1872e51a389972b9fad42b4a508240e56bb0fb78614c725",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/shared/push/push_bootstrap.dart",
+    "source_git_blob": "0e86745f92dec251f40a827b04d493523c2fe3c1",
+    "source_sha256": "7431c311513012ac1b0e2478da7a86d35fdefc90523b266d159a99af4821e9ae",
+    "fork_path": "mobile/lib/shared/push/push_bootstrap.dart",
+    "fork_sha256": "0276c9390d009a4eef80c681fc3a461512419f0c8fc7dcd77a3c473bf34bf359",
+    "disposition": "adapted; client lifecycle and shared authority repair preserves fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/shared/push/push_bridge.dart",
+    "source_git_blob": "a0c674f14f6631afb7694e9f698c13284f02ac1c",
+    "source_sha256": "0ed8ac574a82352c5ed0433c2a243d2df5161b9e0b543ad73c6f7eef67ba3b5f",
+    "fork_path": "mobile/lib/shared/push/push_bridge.dart",
+    "fork_sha256": "66985300439aeadc36478e0e3165426171f311d9ff5e14e8d0ca921323a444eb",
+    "disposition": "adapted; client lifecycle and shared authority repair preserves fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/shared/push/push_lease_revocation_outbox.dart",
+    "source_git_blob": "3ba44e1757473ff785d059af6866cec50225e3d9",
+    "source_sha256": "998df723b0634ae246e76d02d221d03f3f5525aaac3c429a30da1b46b4b8066a",
+    "fork_path": "mobile/lib/shared/push/push_lease_revocation_outbox.dart",
+    "fork_sha256": "998df723b0634ae246e76d02d221d03f3f5525aaac3c429a30da1b46b4b8066a",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/shared/push/push_presentation_cache.dart",
+    "source_git_blob": "82cc78a89d2c67310749acc59e2b69a93d82bd78",
+    "source_sha256": "bc13c39dcba33c8a1ce4cd9849ce4601f8d7a4b261f9bc3a982e2f294e8d05ad",
+    "fork_path": "mobile/lib/shared/push/push_presentation_cache.dart",
+    "fork_sha256": "bc13c39dcba33c8a1ce4cd9849ce4601f8d7a4b261f9bc3a982e2f294e8d05ad",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/shared/push/push_relay_capability_provider.dart",
+    "source_git_blob": "f2e8eebd8be56139bcd824b5bf0e013bd85be008",
+    "source_sha256": "f40d3ebeded3d94fe7e6beec3d5de923cdf9d925a7f8d836b28f9eaf89a3104c",
+    "fork_path": "mobile/lib/shared/push/push_relay_capability_provider.dart",
+    "fork_sha256": "f40d3ebeded3d94fe7e6beec3d5de923cdf9d925a7f8d836b28f9eaf89a3104c",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/shared/push/push_snapshot.dart",
+    "source_git_blob": "f269d05c0c510190cc79b9f783baf23db7dbdfda",
+    "source_sha256": "53a54a2d0629fc2d1a8797cefbd826ce17ae8ad5d29f037cd433b626e605c862",
+    "fork_path": "mobile/lib/shared/push/push_snapshot.dart",
+    "fork_sha256": "53a54a2d0629fc2d1a8797cefbd826ce17ae8ad5d29f037cd433b626e605c862",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/shared/push/push_subscription.dart",
+    "source_git_blob": "41ef1808feca617505179e52157da5ec60d24820",
+    "source_sha256": "39c122236eb36b94ce8e98224356ac1b32cd11a367e308c3f6663b89efb71a19",
+    "fork_path": "mobile/lib/shared/push/push_subscription.dart",
+    "fork_sha256": "39c122236eb36b94ce8e98224356ac1b32cd11a367e308c3f6663b89efb71a19",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/shared/push/push_subscription_provider.dart",
+    "source_git_blob": "9d24e7cebc9b362eeb2c52a0548734b39de89985",
+    "source_sha256": "3ae2564ad8b7f3d3f7fd7184eb6f87883bee5e8523077862712b2e53c6777c06",
+    "fork_path": "mobile/lib/shared/push/push_subscription_provider.dart",
+    "fork_sha256": "3ae2564ad8b7f3d3f7fd7184eb6f87883bee5e8523077862712b2e53c6777c06",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/shared/relay/media_image.dart",
+    "source_git_blob": "0ab5b5aa2045ca82d28fb28af9056d5aceca092b",
+    "source_sha256": "452c7e3ae672416fa5b4d3ecbe7200c7c9de616153b5b0db066a02a913602623",
+    "fork_path": "mobile/lib/shared/relay/media_image.dart",
+    "fork_sha256": "452c7e3ae672416fa5b4d3ecbe7200c7c9de616153b5b0db066a02a913602623",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/shared/relay/relay_provider.dart",
+    "source_git_blob": "00fcf65b716a51220b74b300b4e0c3471267d9b6",
+    "source_sha256": "c465293e3736fd4ad835a8ea8bd1437c27d4687f5986b804c0ff6e3e1cbacfb3",
+    "fork_path": "mobile/lib/shared/relay/relay_provider.dart",
+    "fork_sha256": "c465293e3736fd4ad835a8ea8bd1437c27d4687f5986b804c0ff6e3e1cbacfb3",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/shared/relay/signed_event_relay.dart",
+    "source_git_blob": "b0106639eb75547fa7d66c8e6c48f04a97e159ce",
+    "source_sha256": "0250fa39bc242ff3b55260dda582acd59be8d1c1169455b3dfee03f297c794b9",
+    "fork_path": "mobile/lib/shared/relay/signed_event_relay.dart",
+    "fork_sha256": "0250fa39bc242ff3b55260dda582acd59be8d1c1169455b3dfee03f297c794b9",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/lib/shared/widgets/avatar_image.dart",
+    "source_git_blob": "b869bf8fbc463b7d38456e47172d9a9c8aa8a0ff",
+    "source_sha256": "911cb83b4acb2170b58a0b2c80fcac675daf6d42e736d7173fb08cd12450005a",
+    "fork_path": "mobile/lib/shared/widgets/avatar_image.dart",
+    "fork_sha256": "911cb83b4acb2170b58a0b2c80fcac675daf6d42e736d7173fb08cd12450005a",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/test/features/channels/deep_link_dispatcher_test.dart",
+    "source_git_blob": "da1746df06c1d477a74e03b289ce972451d37162",
+    "source_sha256": "3ff099906fa09e05671716e945e8b3a9de9a1ae54d84192c6775a28ea8293451",
+    "fork_path": "mobile/test/features/channels/deep_link_dispatcher_test.dart",
+    "fork_sha256": "a32ecbecb98352ec15917e2cca35355abe6a87d39baa8f2a5ddf4ec63b48ef67",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/test/features/settings/settings_page_test.dart",
+    "source_git_blob": "e8f6fb6ade6b23522682a4dcc134d818c0ae9fd1",
+    "source_sha256": "6bdb412a7445f987c40932906907fc6bcbcbe1e9e5aeb42219093371ca37bff4",
+    "fork_path": "mobile/test/features/settings/settings_page_test.dart",
+    "fork_sha256": "5c9426a1375b36f48348033964b956a9d4c9220487613245b1355038dcc45a1e",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/test/shared/auth/auth_provider_test.dart",
+    "source_git_blob": "9dcced5f33343debd85e4b902ce4ec8099ce7188",
+    "source_sha256": "b97bb338de5964303234d2a3d867e6c1f2f8e406254f0153b52cd203b8f3511e",
+    "fork_path": "mobile/test/shared/auth/auth_provider_test.dart",
+    "fork_sha256": "b97bb338de5964303234d2a3d867e6c1f2f8e406254f0153b52cd203b8f3511e",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/test/shared/community/community_provider_test.dart",
+    "source_git_blob": "345226e84d1fdecc661004b911506bd8c4326703",
+    "source_sha256": "0d0665eec9ebd73ef0a6a1c92cd70957a44ae80b8323559f522fe0b7cfd764fd",
+    "fork_path": "mobile/test/shared/community/community_provider_test.dart",
+    "fork_sha256": "0d0665eec9ebd73ef0a6a1c92cd70957a44ae80b8323559f522fe0b7cfd764fd",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/test/shared/community/community_storage_test.dart",
+    "source_git_blob": "486457e6ac5a4113769bb9e7ee4a9ee61aaecfb5",
+    "source_sha256": "d65038311cfa220362f54e48147533fa923b4a5223f41953e9325d58d3cb178d",
+    "fork_path": "mobile/test/shared/community/community_storage_test.dart",
+    "fork_sha256": "e415f78308a21335fa10a552eec94a82be7f79aab7f328c08c7873d7901dbea5",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/test/shared/community/community_test.dart",
+    "source_git_blob": "0d229d23660988d2133ca36300adb38c5da6c587",
+    "source_sha256": "ebb58a19c4849bdc0155794bdf2ab3e38b37bf67398abba4b89b6a42b3e0e834",
+    "fork_path": "mobile/test/shared/community/community_test.dart",
+    "fork_sha256": "499b5e40b48d625068e316d0e37b819713917138d0043586e329ae926615312e",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/test/shared/deeplink/pending_deep_link_provider_test.dart",
+    "source_git_blob": "b13f42df6d232c5a87b1d6e39f524c07487461d0",
+    "source_sha256": "e7f558efbe8531bc9970709a56f54a9963c0aa567a785dba79413ff5e142a34b",
+    "fork_path": "mobile/test/shared/deeplink/pending_deep_link_provider_test.dart",
+    "fork_sha256": "e7f558efbe8531bc9970709a56f54a9963c0aa567a785dba79413ff5e142a34b",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/test/shared/push/dev_push_lease_test.dart",
+    "source_git_blob": "713504c7dacdbdf26dd2af0b8a87d7677edaefc7",
+    "source_sha256": "57fdda432fe7a90fadaf3ad2a370bc05bd8c19d9a8ec3064272cb56a01e5f362",
+    "fork_path": "mobile/test/shared/push/dev_push_lease_test.dart",
+    "fork_sha256": "57fdda432fe7a90fadaf3ad2a370bc05bd8c19d9a8ec3064272cb56a01e5f362",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/test/shared/push/push_bootstrap_test.dart",
+    "source_git_blob": "6380837bf6d2d05613fb24ae9dc397f7f22f4bc6",
+    "source_sha256": "4bd35e09d35e7eeb94092de8ec3f90251883e9558da76159e4c86fb99721e34c",
+    "fork_path": "mobile/test/shared/push/push_bootstrap_test.dart",
+    "fork_sha256": "d76bc667fe853392a11634bdbcfff91b1366f02ab693f2156ce18cbdee605b7b",
+    "disposition": "adapted; client lifecycle and shared authority repair preserves fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/test/shared/push/push_bridge_test.dart",
+    "source_git_blob": "4bff3a2c2c34565c0e01f1f376ce70b494ad96fc",
+    "source_sha256": "bec01c77253d030ea59e0f26ac71852e8b95457cc731f997b0ac5660c04cb04c",
+    "fork_path": "mobile/test/shared/push/push_bridge_test.dart",
+    "fork_sha256": "243c60e5b1e731cd25c677d65c03c2201791d4cfeb8ecfe24092099b35b2b3c4",
+    "disposition": "adapted; client lifecycle and shared authority repair preserves fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/test/shared/push/push_lease_revocation_outbox_test.dart",
+    "source_git_blob": "bfc6dd6bff9d513e54f0fadba49ac1d76ad1d346",
+    "source_sha256": "5320ba01cc787ed2b4a33a0ac8d97723b57e2a0fb1e222dc0176f55ba684f3c0",
+    "fork_path": "mobile/test/shared/push/push_lease_revocation_outbox_test.dart",
+    "fork_sha256": "5320ba01cc787ed2b4a33a0ac8d97723b57e2a0fb1e222dc0176f55ba684f3c0",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/test/shared/push/push_presentation_cache_test.dart",
+    "source_git_blob": "fff3ef72571fab6050e663c6b7f4eb149fe9ca14",
+    "source_sha256": "85a9436f7f24d28cae61be6588f2b85a104e4b8c4822a0f99a6539c52c385086",
+    "fork_path": "mobile/test/shared/push/push_presentation_cache_test.dart",
+    "fork_sha256": "85a9436f7f24d28cae61be6588f2b85a104e4b8c4822a0f99a6539c52c385086",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/test/shared/push/push_relay_capability_provider_test.dart",
+    "source_git_blob": "f6cc5874bac45637a95548a2ff37ceddf66e7447",
+    "source_sha256": "06e6900dd1562eb93de2c76155fc2fd3f3cc786425c7c99bb39749f267abfddd",
+    "fork_path": "mobile/test/shared/push/push_relay_capability_provider_test.dart",
+    "fork_sha256": "06e6900dd1562eb93de2c76155fc2fd3f3cc786425c7c99bb39749f267abfddd",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/test/shared/push/push_snapshot_test.dart",
+    "source_git_blob": "27c2c5ad217a7ffc9a014f2ab547bac8a31f8cb5",
+    "source_sha256": "083ffa11f7b0a8828e6ade2b3fb2efcba643e319b9672a00aaf3210d688d754b",
+    "fork_path": "mobile/test/shared/push/push_snapshot_test.dart",
+    "fork_sha256": "083ffa11f7b0a8828e6ade2b3fb2efcba643e319b9672a00aaf3210d688d754b",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/test/shared/push/push_subscription_provider_test.dart",
+    "source_git_blob": "d75710659482a6ae5dd55b6bf98dca46569ea7d4",
+    "source_sha256": "188571c297abd24f36a141a145e727c9f17ab57649eabeded08391404f197390",
+    "fork_path": "mobile/test/shared/push/push_subscription_provider_test.dart",
+    "fork_sha256": "188571c297abd24f36a141a145e727c9f17ab57649eabeded08391404f197390",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/test/shared/push/push_subscription_test.dart",
+    "source_git_blob": "3ef21938e2a10df8ca9fd4a0dd6161d2e5b7f3d9",
+    "source_sha256": "1468d9c6ac8d5ba1572209705bdc296dfac325ec35d73e837221f6fee197df4e",
+    "fork_path": "mobile/test/shared/push/push_subscription_test.dart",
+    "fork_sha256": "1468d9c6ac8d5ba1572209705bdc296dfac325ec35d73e837221f6fee197df4e",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "mobile/test/shared/widgets/avatar_image_test.dart",
+    "source_git_blob": "821de63a480e6f5f829b889ae740eb2048443f67",
+    "source_sha256": "435696bf551abca4d3f3fddc756ae397cad8ac3838afe73f90056d487deab10b",
+    "fork_path": "mobile/test/shared/widgets/avatar_image_test.dart",
+    "fork_sha256": "435696bf551abca4d3f3fddc756ae397cad8ac3838afe73f90056d487deab10b",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "schema/schema.sql",
+    "source_git_blob": "54566103335a1ca7421adc918b80e789dcf5e76a",
+    "source_sha256": "b49e1b0208aab13bdcda4c6555dad48ee0a8f53c14e3432f3dedf2bcdcbcf4c7",
+    "fork_path": "schema/schema.sql",
+    "fork_sha256": "6a7db65508f4fb9733bf95f1e1d610f0ed67784279790535f4f19611bd77e213",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "scripts/mobile-worktree-clean.sh",
+    "source_git_blob": "644737b7e4489eaf5a8d58ff99ea85896b0fefba",
+    "source_sha256": "fea060ef3a27b9a7a6d1f59b1dd0f4a5eaf610d2cc96996ee140f3a1ffc58190",
+    "fork_path": "scripts/mobile-worktree-clean.sh",
+    "fork_sha256": "2d00909b8e5e7d6964a3f5e90eead5809f27aab7e303826fe64787b0a8fcae69",
+    "disposition": "fork identity preserved; upstream identity changes excluded"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "scripts/mobile-worktree-overrides.sh",
+    "source_git_blob": "e43ef1e27940a2791af5971c789d5c1d5715f610",
+    "source_sha256": "fca7a3b0edaddeededada33a243a89856474c46f018d045d15380975cec2792a",
+    "fork_path": "scripts/mobile-worktree-overrides.sh",
+    "fork_sha256": "4ff090250c67dfbbae5091c15c0bdef4a1bd7b8d5acc8ce788987d6bca177d99",
+    "disposition": "fork identity preserved; upstream identity changes excluded"
+  },
+  {
+    "source_commit": "c432a111ca9ddd31a85e1312d5995f8b92191b82",
+    "source_path": "scripts/test-mobile-worktree-overrides.sh",
+    "source_git_blob": "70637f52259131b838f4214e30621c206f3ce282",
+    "source_sha256": "4440592f2ac287f3e61e8f262ce3b1fac7d0e18d97cca8330f289c07d9fdd00f",
+    "fork_path": "scripts/test-mobile-worktree-overrides.sh",
+    "fork_sha256": "6226ae2f182f0fdb1959670c7d8f16423a6b0aef0e480bf6059f22fc8219d98f",
+    "disposition": "fork identity preserved; upstream identity changes excluded"
+  },
+  {
+    "source_commit": "42b42447b0dc47c3e1a4d95caab893567dcd1677",
+    "source_path": "crates/buzz-db/src/runtime/migration.rs",
+    "source_git_blob": "68071e0ed24d21fe73d8a6d354dc8ddd20b984ce",
+    "source_sha256": "cf183b7f6acda5f063c7fcb52b05f3b1d2fc4ac66a8ebb20502ebdd3ee77cc12",
+    "fork_path": "crates/buzz-db/src/migration.rs",
+    "fork_sha256": "d6f02f1189ab9acbe4b878b52044dfe42fbe4c8e4502792e09e0571f679cd7a1",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "42b42447b0dc47c3e1a4d95caab893567dcd1677",
+    "source_path": "crates/buzz-db/src/runtime/tests.rs",
+    "source_git_blob": "a2938112bc51cc7ce6f3cc3d34501f3039c44b21",
+    "source_sha256": "5863c3f730cca586e400ca9ecfdb0767114a17ec416e36377961f547677100fe",
+    "fork_path": "crates/buzz-db/src/migration.rs",
+    "fork_sha256": "d6f02f1189ab9acbe4b878b52044dfe42fbe4c8e4502792e09e0571f679cd7a1",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "42b42447b0dc47c3e1a4d95caab893567dcd1677",
+    "source_path": "deploy/charts/buzz-push-gateway/Chart.yaml",
+    "source_git_blob": "fe302e58c28faeeddc2641a51a6ca0509c99e3ef",
+    "source_sha256": "0164026689ea9e249f6dbd05c000e838c0cb21855db61df3eba4d00a4fcd8414",
+    "fork_path": "deploy/charts/buzz-push-gateway/Chart.yaml",
+    "fork_sha256": "0164026689ea9e249f6dbd05c000e838c0cb21855db61df3eba4d00a4fcd8414",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "42b42447b0dc47c3e1a4d95caab893567dcd1677",
+    "source_path": "deploy/charts/buzz-push-gateway/templates/deployment.yaml",
+    "source_git_blob": "ecdc97582afd1254c158605f8af22dc0f64e66b3",
+    "source_sha256": "a1df2ba79dcb043e1fec375a1f65f6eabd54642c8fe9d4ab6d738186788a5ca5",
+    "fork_path": "deploy/charts/buzz-push-gateway/templates/deployment.yaml",
+    "fork_sha256": "7cb8a52a54a1b8839194cd9d082acda60c627d81458663a7adc587f0fe48cc1e",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "42b42447b0dc47c3e1a4d95caab893567dcd1677",
+    "source_path": "deploy/charts/buzz-push-gateway/tests/datadog-values.yaml",
+    "source_git_blob": "6a02fdca4c57ebe3d5f7b5abf8c1a21614603816",
+    "source_sha256": "aaf66e55d793ec0ad31116843e5519d4f24a41e70e019de22a788422edd4b67b",
+    "fork_path": "deploy/charts/buzz-push-gateway/tests/datadog-values.yaml",
+    "fork_sha256": "aaf66e55d793ec0ad31116843e5519d4f24a41e70e019de22a788422edd4b67b",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "42b42447b0dc47c3e1a4d95caab893567dcd1677",
+    "source_path": "deploy/charts/buzz-push-gateway/tests/release-contract.sh",
+    "source_git_blob": "eb445687fa95cb11596ef4939f83ec949f292149",
+    "source_sha256": "bfaa42dff841934713d16a1e526ca012f4ccdf4e05e9a2b7fffa57599dcf67a2",
+    "fork_path": "deploy/charts/buzz-push-gateway/tests/release-contract.sh",
+    "fork_sha256": "bfaa42dff841934713d16a1e526ca012f4ccdf4e05e9a2b7fffa57599dcf67a2",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "42b42447b0dc47c3e1a4d95caab893567dcd1677",
+    "source_path": "deploy/charts/buzz-push-gateway/tests/render.sh",
+    "source_git_blob": "97568ba2d0cb625d827289190dee92fdf2d195bd",
+    "source_sha256": "56a19ed70d136a0a34d23c3275508f3285825c94af9a5e696c35fe257199e297",
+    "fork_path": "deploy/charts/buzz-push-gateway/tests/render.sh",
+    "fork_sha256": "f4212d37caecbe87fa73eace90c66901ea3be14f78d602e4f95421607620d695",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "42b42447b0dc47c3e1a4d95caab893567dcd1677",
+    "source_path": "deploy/charts/buzz-push-gateway/values-production.yaml",
+    "source_git_blob": "85dd8af1a8c37efd52212c34af2e889bb59b27e4",
+    "source_sha256": "bb22a901200d7ea2867f0eb9c31f729bae37c63be2ea933b82b24f9bdd1448b9",
+    "fork_path": "deploy/charts/buzz-push-gateway/values-production.yaml",
+    "fork_sha256": "bb22a901200d7ea2867f0eb9c31f729bae37c63be2ea933b82b24f9bdd1448b9",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "42b42447b0dc47c3e1a4d95caab893567dcd1677",
+    "source_path": "deploy/charts/buzz-push-gateway/values.schema.json",
+    "source_git_blob": "1339b777e505fff151b5f300d86963e30744fa5d",
+    "source_sha256": "85a08228eb6553d9102c4be8a73093704382e6dc286852921bfc4f8c1dd69ff2",
+    "fork_path": "deploy/charts/buzz-push-gateway/values.schema.json",
+    "fork_sha256": "85a08228eb6553d9102c4be8a73093704382e6dc286852921bfc4f8c1dd69ff2",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "42b42447b0dc47c3e1a4d95caab893567dcd1677",
+    "source_path": "deploy/charts/buzz-push-gateway/values.yaml",
+    "source_git_blob": "245d1a682ece344a3fc581238d6a2e2cf0f31fb5",
+    "source_sha256": "d74398f4bf0ee5bba54485b2b8bac3b74cf97d2f9b29ea17e0a8bbf9e75bad03",
+    "fork_path": "deploy/charts/buzz-push-gateway/values.yaml",
+    "fork_sha256": "c3a49dac1ee53af681bb71ebb09227a6f244941fe3bf4d3bca92bed68f07d6ea",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "42b42447b0dc47c3e1a4d95caab893567dcd1677",
+    "source_path": "docs/push-gateway-deployment.md",
+    "source_git_blob": "c4151a677ce3647abfe55355f44d4b58295e9bf8",
+    "source_sha256": "d070d119ccf968346076a3bb82493eddee879a66b6bae8b79d543d08f220f3e3",
+    "fork_path": "docs/push-gateway-deployment.md",
+    "fork_sha256": "cc7a935a1079b1ba14c4e283dd166d0282a553dee737c83790e8d8ad8e0584c5",
+    "disposition": "integrated with fork challenge issuance retention repair"
+  },
+  {
+    "source_commit": "42b42447b0dc47c3e1a4d95caab893567dcd1677",
+    "source_path": "migrations/0043_push_gateway_dogfood_profile.sql",
+    "source_git_blob": "5dbed21b193a904c94d6c7861e9bf999758df769",
+    "source_sha256": "c28dd8d54f9c2c17967ab771f24fe7b7dee29168e7891b412ece94388f50b111",
+    "fork_path": "migrations/0038_push_gateway_dogfood_profile.sql",
+    "fork_sha256": "c28dd8d54f9c2c17967ab771f24fe7b7dee29168e7891b412ece94388f50b111",
+    "disposition": "byte-identical selected source"
+  },
+  {
+    "source_commit": "42b42447b0dc47c3e1a4d95caab893567dcd1677",
+    "source_path": "schema/schema.sql",
+    "source_git_blob": "7d18d825a8bfd1d6b263f894b2aa6c7c27842bcb",
+    "source_sha256": "60ff90740a5623a04ba849c095120b57088c0f8cb36d75fccaac2d8bcaf310ea",
+    "fork_path": "schema/schema.sql",
+    "fork_sha256": "6a7db65508f4fb9733bf95f1e1d610f0ed67784279790535f4f19611bd77e213",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "b270437a62bc1049b27745799dc44268d0c23489",
+    "source_path": ".github/workflows/ci.yml",
+    "source_git_blob": "d2331fe81194e58e2775c32dc175c9b4088009ab",
+    "source_sha256": "3e0ebff5efbab0611d32a6be500cf656a6c9fbccf558916545b655d2888abe72",
+    "fork_path": ".github/workflows/ci.yml",
+    "fork_sha256": "9c9295c2e33110cd6218e293609788aceba1107d1bd6e5e258b9444ff0bc949f",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  },
+  {
+    "source_commit": "b270437a62bc1049b27745799dc44268d0c23489",
+    "source_path": "mobile/ios/Runner.xcodeproj/project.pbxproj",
+    "source_git_blob": "3061f92b6a81bfc81a5b4b161ccc5c885c5550df",
+    "source_sha256": "ba55360846abd06a1e8a143f8e4036681e6598860fa0b6ebc4844d311300f0b0",
+    "fork_path": "mobile/ios/Runner.xcodeproj/project.pbxproj",
+    "fork_sha256": "379f2991f0ca43d178e48765bdb896adcf06669c8cea9f24af6f3bcc3986e857",
+    "disposition": "adapted or already integrated; preserve fork contracts"
+  }
+]

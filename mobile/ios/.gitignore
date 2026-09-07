@@ -9,6 +9,7 @@
 .tags*
 **/.vagrant/
 **/DerivedData/
+BuzzPushKit/Package.resolved
 Icon?
 **/Pods/
 **/.symlinks/
@@ -34,3 +35,5 @@ Runner/GeneratedPluginRegistrant.*
 !default.mode2v3
 !default.pbxuser
 !default.perspectivev3
+
+BuzzPushKit/.build/

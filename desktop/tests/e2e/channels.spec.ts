@@ -850,6 +850,12 @@ test("routes an agent mention from an existing DM to the expanded conversation",
   ).toBeVisible();
   await input.press("Enter");
   await page.keyboard.type(" in this DM");
+  // No settlement wait between Enter and typing: assert the literal body and
+  // selected chip before send so a lost separator fails at its source.
+  expect(await input.textContent()).toBe("Ask @Fizz  in this DM");
+  expect(
+    await input.locator(".mention-chip.agent-mention-highlight").textContent(),
+  ).toBe("Fizz");
   const baselineCommands = await readCommandPayloadLog(page);
   await page.getByTestId("send-message").click();
 
@@ -875,6 +881,33 @@ test("routes an agent mention from an existing DM to the expanded conversation",
       }),
     ]),
   );
+  const startAgent = sendCommands.find(
+    (entry) => entry.command === "start_managed_agent",
+  );
+  const fizzPubkey = (startAgent?.payload as { pubkey?: string } | undefined)
+    ?.pubkey;
+  expect(fizzPubkey).toMatch(/^[0-9a-f]{64}$/);
+  const outgoing = sendCommands.flatMap((entry) => {
+    if (entry.command !== "plugin:websocket|send") return [];
+    const data = (entry.payload as { message?: { data?: string } })?.message
+      ?.data;
+    if (!data) return [];
+    const [type, event] = JSON.parse(data) as [
+      string,
+      { content?: string; tags?: string[][] },
+    ];
+    return type === "EVENT" && event.content?.includes(messageTail)
+      ? [event]
+      : [];
+  });
+  expect(outgoing).toHaveLength(1);
+  expect(outgoing[0].content).toBe("Ask @Fizz  in this DM");
+  expect(
+    outgoing[0].tags
+      ?.filter((tag) => tag[0] === "p")
+      .map((tag) => tag[1])
+      .sort(),
+  ).toEqual([TEST_IDENTITIES.alice.pubkey, fizzPubkey].sort());
   expect(sendCommands.map((entry) => entry.command)).toEqual(
     expect.arrayContaining(["open_dm", "start_managed_agent"]),
   );
@@ -1043,7 +1076,9 @@ test("drops an expanded DM after the first message fails", async ({ page }) => {
   await page.keyboard.type(" for a hand");
   await page.getByTestId("send-message").click();
 
-  await expect(page.getByText(sendError)).toBeVisible();
+  await expect(
+    page.getByTestId("new-message-page").getByText(sendError, { exact: true }),
+  ).toBeVisible();
   await expect(input).toContainText("Fizz");
 
   const commandsAfterFailure = await readCommandPayloadLog(page);
@@ -1104,8 +1139,10 @@ test("drops an expanded DM after the first message fails", async ({ page }) => {
   ).toHaveAttribute("data-channel-id", retryChannelId ?? "");
 });
 
-test("drops an expanded DM after agent startup fails", async ({ page }) => {
-  const retryMessage = "Retry after agent startup failed";
+test("keeps the sent expanded DM when detached agent startup fails", async ({
+  page,
+}) => {
+  const followUpMessage = "Follow up after agent startup failed";
   const startError = "Mock agent startup failed.";
   await installMockBridge(page, {
     activePersonaIds: ["builtin:fizz"],
@@ -1132,43 +1169,89 @@ test("drops an expanded DM after agent startup fails", async ({ page }) => {
   await page.getByTestId("send-message").click();
 
   await expect(
-    page.getByText(startError, { exact: false }).first(),
+    page.getByText(
+      `Could not start Fizz — your message was sent, but the agent may not respond. ${startError}`,
+      { exact: true },
+    ),
   ).toBeVisible();
-  await expect(input).toContainText("Fizz");
+  await expect
+    .poll(async () =>
+      (await page.getByTestId("chat-title").innerText()).split(", ").sort(),
+    )
+    .toEqual(["Fizz", "charlie"]);
+  await expect(page.getByTestId("message-timeline")).toContainText(
+    "before startup fails",
+  );
+  await expect(input).toBeEmpty();
 
   const commandsAfterFailure = await readCommandPayloadLog(page);
-  const openDmCallsAfterFailure = commandsAfterFailure.filter(
+  const openDmCalls = commandsAfterFailure.filter(
     (entry) => entry.command === "open_dm",
   );
-  expect(openDmCallsAfterFailure).toHaveLength(2);
-  expect(
-    (openDmCallsAfterFailure.at(-1)?.payload as { pubkeys?: string[] })
-      ?.pubkeys,
-  ).toEqual(expect.arrayContaining([TEST_IDENTITIES.charlie.pubkey]));
-  expect(
-    (openDmCallsAfterFailure.at(-1)?.payload as { pubkeys?: string[] })
-      ?.pubkeys,
-  ).toHaveLength(2);
+  expect(openDmCalls).toHaveLength(2);
+  const recipients = (openDmCalls.at(-1)?.payload as { pubkeys?: string[] })
+    ?.pubkeys;
+  expect(recipients).toEqual(
+    expect.arrayContaining([TEST_IDENTITIES.charlie.pubkey]),
+  );
+  expect(recipients).toHaveLength(2);
+  const starts = commandsAfterFailure.filter(
+    (entry) => entry.command === "start_managed_agent",
+  );
+  expect(starts).toHaveLength(1);
+  const agentPubkey = recipients?.find(
+    (pubkey) => pubkey !== TEST_IDENTITIES.charlie.pubkey,
+  );
+  expect(starts[0].payload).toMatchObject({
+    pubkey: agentPubkey,
+    expectedSignerPubkey: MOCK_IDENTITY_PUBKEY,
+    expectedRelayUrl: (
+      process.env.BUZZ_E2E_RELAY_URL ?? "http://localhost:3000"
+    ).replace(/^http/, "ws"),
+  });
+  const sentIndex = commandsAfterFailure.findIndex((entry) => {
+    if (entry.command !== "plugin:websocket|send") return false;
+    const data = (entry.payload as { message?: { data?: string } })?.message
+      ?.data;
+    if (!data) return false;
+    const frame = JSON.parse(data) as [string, { content?: string }];
+    return (
+      frame[0] === "EVENT" &&
+      frame[1]?.content?.includes("before startup fails")
+    );
+  });
+  expect(sentIndex).toBeGreaterThanOrEqual(0);
+  expect(commandsAfterFailure.indexOf(starts[0])).toBeGreaterThan(sentIndex);
+  const sentChannelId = await readOutgoingChannelId(
+    page,
+    "before startup fails",
+  );
+  expect(sentChannelId).toBeTruthy();
 
-  await input.fill(retryMessage);
-  const retryBaseline = commandsAfterFailure.length;
+  // Dismiss the warning before continuing: it must not trap the composer
+  // behind a toast whose expiry pauses while the pointer is over Send.
+  await page.getByRole("button", { name: "Close toast", exact: true }).click();
+  await expect(page.getByText(startError, { exact: false })).toBeHidden();
+  // A failed wake cannot undo the accepted message or its recipient set.
+  await input.fill(followUpMessage);
   await page.getByTestId("send-message").click();
-
-  await expect(page.getByTestId("chat-title")).toHaveText("charlie");
   await expect(page.getByTestId("message-timeline")).toContainText(
-    retryMessage,
+    followUpMessage,
   );
-
-  const retryCommands = (await readCommandPayloadLog(page)).slice(
-    retryBaseline,
+  expect(await readOutgoingChannelId(page, followUpMessage)).toBe(
+    sentChannelId,
   );
-  const retryOpenDm = retryCommands.find(
-    (entry) => entry.command === "open_dm",
+  const followUpCommands = (await readCommandPayloadLog(page)).slice(
+    commandsAfterFailure.length,
   );
-  expect(
-    (retryOpenDm?.payload as { pubkeys?: string[] } | undefined)?.pubkeys,
-  ).toEqual([TEST_IDENTITIES.charlie.pubkey]);
-  await expect(page.getByTestId("chat-title")).not.toContainText("Fizz");
+  expect(followUpCommands.map((entry) => entry.command)).not.toContain(
+    "open_dm",
+  );
+  await expect
+    .poll(async () =>
+      (await page.getByTestId("chat-title").innerText()).split(", ").sort(),
+    )
+    .toEqual(["Fizz", "charlie"]);
 });
 
 test("closes direct message results while opening", async ({ page }) => {

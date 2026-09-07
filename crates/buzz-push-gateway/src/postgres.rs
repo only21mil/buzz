@@ -63,8 +63,7 @@ fn ts(v: DateTime<Utc>) -> i64 {
 }
 fn profile(v: &str) -> Result<AppProfile, AuthorityError> {
     match v {
-        "buzz-ios-production" => Ok(AppProfile::BuzzIosProduction),
-        "buzz-ios-sandbox" => Ok(AppProfile::BuzzIosSandbox),
+        "buzz-ios-dogfood" => Ok(AppProfile::BuzzIosDogfood),
         _ => Err(AuthorityError::Unavailable),
     }
 }
@@ -103,6 +102,11 @@ impl AuthorityStore for PostgresAuthorityStore {
                 return Err(AuthorityError::Unavailable);
             }
         }
+        // Table privileges alone do not establish that the quota migration ran.
+        sqlx::query("SELECT consumed FROM push_gateway_challenges LIMIT 0")
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
         let least_privilege: bool = sqlx::query_scalar(
             "SELECT has_database_privilege(current_user, current_database(), 'CONNECT')
                 AND NOT has_database_privilege(current_user, current_database(), 'CREATE')
@@ -119,16 +123,35 @@ impl AuthorityStore for PostgresAuthorityStore {
 
     async fn put_challenge(&self, c: Challenge) -> Result<(), AuthorityError> {
         use sha2::{Digest, Sha256};
+        const CHALLENGE_ISSUANCE_LOCK: i64 = 0x4255_5a5a_504c_0001;
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(CHALLENGE_ISSUANCE_LOCK)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
+        let window_start = at(c.created_at.saturating_sub(CHALLENGE_QUOTA_WINDOW_SECONDS))?;
+        let issued: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM push_gateway_challenges WHERE created_at >= $1",
+        )
+        .bind(window_start)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db)?;
+        if issued >= CHALLENGE_QUOTA_MAX_REQUESTS as i64 {
+            return Err(AuthorityError::RateLimited);
+        }
         sqlx::query(
-            "INSERT INTO push_gateway_challenges(id,challenge_hash,expires_at) VALUES($1,$2,$3)",
+            "INSERT INTO push_gateway_challenges(id,challenge_hash,expires_at,created_at) VALUES($1,$2,$3,$4)",
         )
         .bind(c.id)
         .bind(Sha256::digest(c.value).to_vec())
         .bind(at(c.expires_at)?)
-        .execute(&self.pool)
+        .bind(at(c.created_at)?)
+        .execute(&mut *tx)
         .await
         .map_err(db)?;
-        Ok(())
+        tx.commit().await.map_err(db)
     }
     async fn consume_challenge(
         &self,
@@ -137,19 +160,62 @@ impl AuthorityStore for PostgresAuthorityStore {
         now: i64,
     ) -> Result<(), AuthorityError> {
         use sha2::{Digest, Sha256};
-        let result = sqlx::query("DELETE FROM push_gateway_challenges WHERE id=$1 AND challenge_hash=$2 AND expires_at >= $3")
+        let result = sqlx::query("UPDATE push_gateway_challenges SET consumed=true WHERE id=$1 AND challenge_hash=$2 AND expires_at >= $3 AND NOT consumed")
             .bind(id).bind(Sha256::digest(value).to_vec()).bind(at(now)?).execute(&self.pool).await.map_err(db)?;
         if result.rows_affected() != 1 {
             return Err(AuthorityError::Rejected);
         }
         Ok(())
     }
-    async fn create_installation(&self, n: NewInstallation) -> Result<(), AuthorityError> {
+    async fn create_installation(
+        &self,
+        n: NewInstallation,
+        now: i64,
+    ) -> Result<(), AuthorityError> {
+        let mut tx = self.pool.begin().await.map_err(db)?;
+        let now_at = at(now)?;
+        let existing = sqlx::query(
+            "SELECT id,expires_at,revoked_at FROM push_gateway_installations WHERE app_attest_key_id=$1 OR (app_profile=$2 AND token_fingerprint=$3) FOR UPDATE",
+        )
+        .bind(&n.app_attest_key_id)
+        .bind(n.profile.as_str())
+        .bind(n.token_fingerprint.to_vec())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db)?;
+        if existing.iter().any(|row| {
+            let revoked = row.try_get::<Option<DateTime<Utc>>, _>("revoked_at");
+            let expires = row.try_get::<DateTime<Utc>, _>("expires_at");
+            match (revoked, expires) {
+                (Ok(None), Ok(expires_at)) => expires_at >= now_at,
+                (Ok(Some(_)), Ok(_)) => false,
+                _ => true,
+            }
+        }) {
+            return Err(AuthorityError::Rejected);
+        }
+        let replaced = existing
+            .iter()
+            .map(|row| row.try_get::<Uuid, _>("id").map_err(db))
+            .collect::<Result<Vec<_>, _>>()?;
+        if !replaced.is_empty() {
+            sqlx::query("DELETE FROM push_gateway_delegations WHERE installation_id = ANY($1)")
+                .bind(&replaced)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+            sqlx::query("DELETE FROM push_gateway_installations WHERE id = ANY($1)")
+                .bind(&replaced)
+                .execute(&mut *tx)
+                .await
+                .map_err(db)?;
+        }
         let result = sqlx::query("INSERT INTO push_gateway_installations(id,app_attest_key_id,app_attest_public_key,assertion_counter,app_profile,token_ciphertext,token_fingerprint,endpoint_epoch,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING")
-            .bind(n.id).bind(n.app_attest_key_id).bind(n.app_attest_public_key).bind(i64::from(n.assertion_counter)).bind(n.profile.as_str()).bind(n.token_ciphertext).bind(n.token_fingerprint.to_vec()).bind(n.endpoint_epoch).bind(at(n.expires_at)?).execute(&self.pool).await.map_err(db)?;
+            .bind(n.id).bind(n.app_attest_key_id).bind(n.app_attest_public_key).bind(i64::from(n.assertion_counter)).bind(n.profile.as_str()).bind(n.token_ciphertext).bind(n.token_fingerprint.to_vec()).bind(n.endpoint_epoch).bind(at(n.expires_at)?).execute(&mut *tx).await.map_err(db)?;
         if result.rows_affected() != 1 {
             return Err(AuthorityError::Rejected);
         }
+        tx.commit().await.map_err(db)?;
         Ok(())
     }
     async fn installation(&self, id: Uuid, now: i64) -> Result<Installation, AuthorityError> {
@@ -168,6 +234,45 @@ impl AuthorityStore for PostgresAuthorityStore {
             expires_at: ts(r.try_get("expires_at").map_err(db)?),
             revoked: false,
         })
+    }
+    async fn matching_installation(
+        &self,
+        key_id: &[u8],
+        app_profile: AppProfile,
+        token_fingerprint: [u8; 32],
+        endpoint_epoch: i64,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<Option<Installation>, AuthorityError> {
+        let r = sqlx::query("SELECT * FROM push_gateway_installations WHERE app_attest_key_id=$1 AND app_profile=$2 AND token_fingerprint=$3 AND endpoint_epoch=$4 AND expires_at=$5 AND revoked_at IS NULL AND expires_at >= $6")
+            .bind(key_id)
+            .bind(app_profile.as_str())
+            .bind(token_fingerprint.to_vec())
+            .bind(endpoint_epoch)
+            .bind(at(expires_at)?)
+            .bind(at(now)?)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db)?;
+        r.map(|r| {
+            let id = r.try_get("id").map_err(db)?;
+            Ok(Installation {
+                id,
+                app_attest_key_id: r.try_get("app_attest_key_id").map_err(db)?,
+                app_attest_public_key: r.try_get("app_attest_public_key").map_err(db)?,
+                assertion_counter: u32::try_from(
+                    r.try_get::<i64, _>("assertion_counter").map_err(db)?,
+                )
+                .map_err(|_| AuthorityError::Unavailable)?,
+                profile: profile(r.try_get("app_profile").map_err(db)?)?,
+                token_ciphertext: r.try_get("token_ciphertext").map_err(db)?,
+                token_fingerprint: bytes32(r.try_get("token_fingerprint").map_err(db)?)?,
+                endpoint_epoch: r.try_get("endpoint_epoch").map_err(db)?,
+                expires_at: ts(r.try_get("expires_at").map_err(db)?),
+                revoked: false,
+            })
+        })
+        .transpose()
     }
     async fn advance_assertion_counter(
         &self,
@@ -192,7 +297,6 @@ impl AuthorityStore for PostgresAuthorityStore {
             .map_err(db)?
             .is_some()
             || i.try_get::<i64, _>("endpoint_epoch").map_err(db)? != d.endpoint_epoch
-            || at(d.expires_at)? > i.try_get::<DateTime<Utc>, _>("expires_at").map_err(db)?
         {
             return Err(AuthorityError::Rejected);
         }
@@ -202,6 +306,12 @@ impl AuthorityStore for PostgresAuthorityStore {
         if result.rows_affected() != 1 {
             return Err(AuthorityError::Rejected);
         }
+        sqlx::query("UPDATE push_gateway_installations SET expires_at=GREATEST(expires_at,$2),updated_at=now() WHERE id=$1")
+            .bind(d.installation_id)
+            .bind(at(d.expires_at)?)
+            .execute(&mut *tx)
+            .await
+            .map_err(db)?;
         tx.commit().await.map_err(db)?;
         Ok(())
     }
@@ -226,10 +336,10 @@ impl AuthorityStore for PostgresAuthorityStore {
         &self,
         id: Uuid,
         relay: &str,
-        generation: i64,
+        expected_generation: i64,
     ) -> Result<(), AuthorityError> {
         let relay = hex::decode(relay).map_err(|_| AuthorityError::Rejected)?;
-        let result=sqlx::query("UPDATE push_gateway_delegations SET generation=$3,revoked_at=now(),updated_at=now() WHERE installation_id=$1 AND relay_pubkey=$2 AND generation<$3").bind(id).bind(relay).bind(generation).execute(&self.pool).await.map_err(db)?;
+        let result=sqlx::query("UPDATE push_gateway_delegations SET revoked_at=now(),updated_at=now() WHERE installation_id=$1 AND relay_pubkey=$2 AND generation=$3 AND revoked_at IS NULL").bind(id).bind(relay).bind(expected_generation).execute(&self.pool).await.map_err(db)?;
         if result.rows_affected() != 1 {
             return Err(AuthorityError::Rejected);
         }
@@ -357,8 +467,9 @@ impl AuthorityStore for PostgresAuthorityStore {
 
     async fn reap_expired(&self, now: i64) -> Result<(), AuthorityError> {
         let mut tx = self.pool.begin().await.map_err(db)?;
-        sqlx::query("DELETE FROM push_gateway_challenges WHERE expires_at < $1")
+        sqlx::query("DELETE FROM push_gateway_challenges WHERE (consumed OR expires_at < $1) AND created_at < $2")
             .bind(at(now)?)
+            .bind(at(now.saturating_sub(CHALLENGE_QUOTA_WINDOW_SECONDS))?)
             .execute(&mut *tx)
             .await
             .map_err(db)?;
@@ -409,14 +520,12 @@ mod tests {
     use super::*;
     use sqlx::{postgres::PgPoolOptions, AssertSqlSafe};
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
-
     #[tokio::test]
     #[ignore = "requires PostgreSQL with CREATEDB/CREATEROLE"]
     async fn readiness_requires_migrated_schema_dml_and_no_ddl() {
         let admin_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+            .expect("explicit isolated test database URL required");
         let admin = PgPoolOptions::new()
             .max_connections(1)
             .connect(&admin_url)
@@ -504,7 +613,7 @@ mod tests {
     async fn reaper_deletes_active_child_of_retention_eligible_revoked_installation() {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+            .expect("explicit isolated test database URL required");
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect(&database_url)
@@ -520,7 +629,7 @@ mod tests {
             .await
             .expect("select isolated test schema");
         sqlx::raw_sql(
-            "CREATE TABLE push_gateway_challenges (expires_at TIMESTAMPTZ NOT NULL);
+            "CREATE TABLE push_gateway_challenges (expires_at TIMESTAMPTZ NOT NULL, created_at TIMESTAMPTZ NOT NULL, consumed BOOLEAN NOT NULL DEFAULT false);
              CREATE TABLE push_gateway_delivery_auth_replays (expires_at TIMESTAMPTZ NOT NULL);
              CREATE TABLE push_gateway_delivery_request_replays (expires_at TIMESTAMPTZ NOT NULL);
              CREATE TABLE push_gateway_endpoint_quotas (updated_at TIMESTAMPTZ NOT NULL);
@@ -595,7 +704,7 @@ mod tests {
     async fn full_schema(max_connections: u32) -> (PgPool, String) {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+            .expect("explicit isolated test database URL required");
         let schema = format!("push_admit_{}", Uuid::new_v4().simple());
         let bootstrap = PgPoolOptions::new()
             .max_connections(1)
@@ -624,7 +733,14 @@ mod tests {
         // Real DDL from migration 0010 (minus the _operator_global_tables audit
         // insert, which lives outside the isolated schema).
         sqlx::raw_sql(
-            "CREATE TABLE push_gateway_installations (
+            "CREATE TABLE push_gateway_challenges (
+                 id UUID PRIMARY KEY,
+                 challenge_hash BYTEA NOT NULL CHECK (length(challenge_hash) = 32),
+                 expires_at TIMESTAMPTZ NOT NULL,
+                 created_at TIMESTAMPTZ NOT NULL,
+                 consumed BOOLEAN NOT NULL DEFAULT false
+             );
+             CREATE TABLE push_gateway_installations (
                  id UUID PRIMARY KEY,
                  app_attest_key_id BYTEA NOT NULL UNIQUE,
                  app_attest_public_key BYTEA NOT NULL,
@@ -678,12 +794,146 @@ mod tests {
     const RELAY_HEX: &str = "11111111111111111111111111111111111111111111111111111111111111aa";
     const DELEGATION_ID: u128 = 2;
 
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn concurrent_challenge_issuance_obeys_deployment_global_ceiling() {
+        let (pool, schema) = full_schema(4).await;
+        let store = PostgresAuthorityStore::new(pool.clone());
+        let now = Utc::now().timestamp();
+        for offset in 0..CHALLENGE_QUOTA_MAX_REQUESTS - 1 {
+            sqlx::query(
+                "INSERT INTO push_gateway_challenges(id,challenge_hash,expires_at,created_at) VALUES($1,$2,$3,$4)",
+            )
+            .bind(Uuid::from_u128(offset as u128 + 1))
+            .bind(vec![offset as u8; 32])
+            .bind(at(now + 300).expect("valid expiry"))
+            .bind(at(now).expect("valid creation time"))
+            .execute(&pool)
+            .await
+            .expect("seed challenge quota");
+        }
+        let challenge = |id| Challenge {
+            id,
+            value: [0; 32],
+            created_at: now,
+            expires_at: now + 300,
+        };
+        let (first, second) = tokio::join!(
+            store.put_challenge(challenge(Uuid::new_v4())),
+            store.put_challenge(challenge(Uuid::new_v4())),
+        );
+        assert_eq!(
+            [first.is_ok(), second.is_ok()]
+                .into_iter()
+                .filter(|admitted| *admitted)
+                .count(),
+            1,
+            "the cross-connection lock admits only the final quota slot"
+        );
+        assert!(
+            [first, second]
+                .into_iter()
+                .any(|result| result == Err(AuthorityError::RateLimited)),
+            "the quota loser receives an explicit rate-limit result"
+        );
+
+        pool.close().await;
+        drop_schema(&schema).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn consumed_challenge_quota_survives_restart_concurrency_and_reaping() {
+        use sqlx::postgres::PgPoolOptions;
+        let (pool, schema) = full_schema(4).await;
+        let store = PostgresAuthorityStore::new(pool.clone());
+        let now = Utc::now().timestamp();
+        let challenge = |created_at| Challenge {
+            id: Uuid::new_v4(),
+            value: [42; 32],
+            created_at,
+            expires_at: created_at + 1,
+        };
+        for _ in 0..CHALLENGE_QUOTA_MAX_REQUESTS - 1 {
+            let c = challenge(now);
+            store.put_challenge(c.clone()).await.unwrap();
+            store.consume_challenge(c.id, c.value, now).await.unwrap();
+            assert_eq!(
+                store.consume_challenge(c.id, c.value, now).await,
+                Err(AuthorityError::Rejected)
+            );
+        }
+        // Reopen every connection and store; issuance must live in PostgreSQL.
+        drop(store);
+        let options = pool.connect_options();
+        pool.close().await;
+        let set_path = format!("SET search_path TO {schema}");
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .after_connect(move |conn, _| {
+                let set_path = set_path.clone();
+                Box::pin(async move {
+                    sqlx::query(AssertSqlSafe(set_path)).execute(conn).await?;
+                    Ok(())
+                })
+            })
+            .connect_with((*options).clone())
+            .await
+            .unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let store = PostgresAuthorityStore::new(pool.clone());
+            let c = challenge(now);
+            tasks.spawn(async move {
+                let result = store.put_challenge(c.clone()).await;
+                if result.is_ok() {
+                    store.consume_challenge(c.id, c.value, now).await.unwrap();
+                }
+                result
+            });
+        }
+        let mut admitted = 0;
+        while let Some(result) = tasks.join_next().await {
+            match result.unwrap() {
+                Ok(()) => admitted += 1,
+                Err(error) => assert_eq!(error, AuthorityError::RateLimited),
+            }
+        }
+        assert_eq!(
+            admitted, 1,
+            "consumption cannot release the final global quota slot"
+        );
+        let store = PostgresAuthorityStore::new(pool.clone());
+        assert_eq!(
+            store.put_challenge(challenge(now)).await,
+            Err(AuthorityError::RateLimited)
+        );
+        store.reap_expired(now + 60).await.unwrap();
+        assert_eq!(
+            store.put_challenge(challenge(now + 60)).await,
+            Err(AuthorityError::RateLimited),
+            "expired challenges still count at the window boundary"
+        );
+        store.reap_expired(now + 61).await.unwrap();
+        let retained: i64 = sqlx::query_scalar("SELECT count(*) FROM push_gateway_challenges")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            retained, 0,
+            "consumed issuance records have bounded retention"
+        );
+        store.put_challenge(challenge(now + 61)).await.unwrap();
+        pool.close().await;
+        drop_schema(&schema).await;
+    }
+
     // One installation + one live delegation that admits at now=1_000.
     async fn install_authority(pool: &PgPool) {
         let now = Utc::now();
         sqlx::query(
             "INSERT INTO push_gateway_installations(id,app_attest_key_id,app_attest_public_key,assertion_counter,app_profile,token_ciphertext,token_fingerprint,endpoint_epoch,expires_at)
-             VALUES ($1,$2,$3,0,'buzz-ios-production',$4,$5,1,$6)",
+             VALUES ($1,$2,$3,0,'buzz-ios-dogfood',$4,$5,1,$6)",
         )
         .bind(Uuid::from_u128(1))
         .bind(vec![1u8])
@@ -706,6 +956,72 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert delegation");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PostgreSQL"]
+    async fn delegation_renews_and_expired_enrollment_recovers_token_ownership() {
+        let (pool, schema) = full_schema(2).await;
+        let store = PostgresAuthorityStore::new(pool.clone());
+        let now = Utc::now().timestamp();
+        let installation = |id, expires_at| NewInstallation {
+            id,
+            app_attest_key_id: vec![1],
+            app_attest_public_key: vec![2; 33],
+            assertion_counter: 0,
+            profile: AppProfile::BuzzIosDogfood,
+            token_ciphertext: vec![3],
+            token_fingerprint: [4; 32],
+            endpoint_epoch: 1,
+            expires_at,
+        };
+
+        store
+            .create_installation(installation(Uuid::from_u128(1), now + 100), now)
+            .await
+            .expect("create initial installation");
+        store
+            .upsert_delegation(Delegation {
+                id: Uuid::from_u128(2),
+                installation_id: Uuid::from_u128(1),
+                relay_pubkey: RELAY_HEX.to_owned(),
+                endpoint_epoch: 1,
+                generation: 1,
+                not_before: now,
+                expires_at: now + 1_000,
+                revoked: false,
+            })
+            .await
+            .expect("authenticated delegation renews installation");
+        assert!(store
+            .installation(Uuid::from_u128(1), now + 500)
+            .await
+            .is_ok());
+        assert_eq!(
+            store
+                .create_installation(installation(Uuid::from_u128(3), now + 2_000), now + 999,)
+                .await,
+            Err(AuthorityError::Rejected)
+        );
+        store
+            .create_installation(installation(Uuid::from_u128(3), now + 2_000), now + 1_001)
+            .await
+            .expect("expired ownership can be replaced");
+        let old_delegations: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM push_gateway_delegations WHERE installation_id=$1",
+        )
+        .bind(Uuid::from_u128(1))
+        .fetch_one(&pool)
+        .await
+        .expect("count replaced delegations");
+        assert_eq!(old_delegations, 0);
+        assert!(store
+            .installation(Uuid::from_u128(3), now + 1_001)
+            .await
+            .is_ok());
+
+        pool.close().await;
+        drop_schema(&schema).await;
     }
 
     fn admit<'a>(
@@ -938,7 +1254,7 @@ mod tests {
     async fn drop_schema(schema: &str) {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+            .expect("explicit isolated test database URL required");
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect(&database_url)

@@ -5,9 +5,10 @@ import { relayClient } from "@/shared/api/relayClient";
 import {
   KIND_GIT_ISSUE,
   KIND_GIT_PULL_REQUEST,
+  KIND_PROJECT_ANNOUNCEMENT,
 } from "@/shared/constants/kinds";
 
-import { parseEntityLink } from "./entityLink";
+import { isEntityLink, parseEntityLink } from "./entityLink";
 import {
   buzzEntityFallbackTitle,
   type SupportedLinkPreview,
@@ -204,6 +205,31 @@ const entityTitleLoader = createMetadataLoader({
   fetcher: async (href) => {
     const parsed = parseEntityLink(href);
     if (!parsed.ok || parsed.value.type === "repo") return null;
+    if (parsed.value.type === "project") {
+      const { owner, dtag } = parsed.value;
+      const events = await relayClient.fetchEvents({
+        kinds: [KIND_PROJECT_ANNOUNCEMENT],
+        authors: [owner],
+        "#d": [dtag],
+        limit: 1,
+      });
+      const event = events.find(
+        (event) =>
+          event.kind === KIND_PROJECT_ANNOUNCEMENT &&
+          event.pubkey === owner &&
+          event.tags.some((tag) => tag[0] === "d" && tag[1] === dtag),
+      );
+      const title = event?.tags.find((tag) => tag[0] === "name")?.[1];
+      return title
+        ? {
+            title,
+            siteName: "Buzz",
+            description: null,
+            imageDataUrl: null,
+            imageDomain: null,
+          }
+        : null;
+    }
 
     const { id, owner, dtag } = parsed.value;
     const expectedCoordinate = `30617:${owner}:${dtag}`;
@@ -260,9 +286,7 @@ type ResolvedMetadataByHref = Record<
 
 /** Only auto-generated titles may be replaced; explicit markdown labels win. */
 export function shouldResolveTitle(preview: SupportedLinkPreview): boolean {
-  if (preview.kind !== "buzz-pull-request" && preview.kind !== "buzz-issue") {
-    return true;
-  }
+  if (!isEntityLink(preview.href)) return true;
   const parsed = parseEntityLink(preview.href);
   return parsed.ok && preview.title === buzzEntityFallbackTitle(parsed.value);
 }

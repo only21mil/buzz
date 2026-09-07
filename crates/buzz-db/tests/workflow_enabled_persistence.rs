@@ -5,7 +5,6 @@ use buzz_db::{workflow, DbError};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
 
-const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz";
 const DEFINITION: &str = r#"{"trigger":{"on":"message_posted"},"steps":[]}"#;
 
 struct Fixture {
@@ -21,7 +20,7 @@ impl Fixture {
     async fn new() -> Self {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+            .expect("explicit isolated test database URL required");
         let pool = PgPoolOptions::new()
             .max_connections(2)
             .connect(&database_url)

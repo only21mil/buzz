@@ -10,6 +10,7 @@ import {
   setCustomEmoji,
 } from "@/shared/api/customEmoji";
 import { relayClient } from "@/shared/api/relayClient";
+import { useFocusedRefetchInterval } from "@/shared/lib/useDocumentVisible";
 import type { CustomEmoji } from "@/shared/lib/remarkCustomEmoji";
 
 /**
@@ -18,9 +19,12 @@ import type { CustomEmoji } from "@/shared/lib/remarkCustomEmoji";
  * The palette is the client-side UNION of every member's own kind:30030 set, so
  * the query key is stable — not keyed by channel or pubkey. Freshness comes from
  * three layers: a catch-up fetch (the query itself), a live subscription that
- * invalidates on any member's new 30030, and a 2-minute poll backstop in case a
+ * invalidates on any member's new 30030, and a 20-minute poll backstop in case a
  * live event is missed. Mirrors `user-status/hooks.ts`.
  */
+
+/** Live events and reconnect invalidation keep the cache current between backstops. */
+export const CUSTOM_EMOJI_REFETCH_INTERVAL_MS = 20 * 60_000;
 
 export const customEmojiQueryKey = ["custom-emoji"] as const;
 
@@ -28,13 +32,18 @@ export const customEmojiQueryKey = ["custom-emoji"] as const;
 export const ownCustomEmojiQueryKey = ["custom-emoji-own"] as const;
 
 export function useCustomEmojiQuery() {
+  const refetchInterval = useFocusedRefetchInterval(
+    CUSTOM_EMOJI_REFETCH_INTERVAL_MS,
+  );
+
   return useQuery<CustomEmoji[]>({
     queryKey: customEmojiQueryKey,
     queryFn: listCustomEmoji,
     // The palette changes rarely; avoid refetch storms while the picker is open,
-    // but poll every 2 minutes as a backstop for any missed live event.
+    // but poll every 20 minutes as a backstop for any missed live event.
     staleTime: 60_000,
-    refetchInterval: 120_000,
+    refetchInterval,
+    refetchOnWindowFocus: true,
   });
 }
 

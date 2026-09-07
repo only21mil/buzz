@@ -386,7 +386,8 @@ pub async fn verify_floor_guard_behavior(pool: &PgPool) -> crate::Result<()> {
         }
     };
 
-    let mut tx = pool.begin().await?;
+    let mut tx =
+        crate::observability::begin(pool, crate::observability::Operation::Maintenance).await?;
 
     // 1. Pool arming (Perci: assert the effective value, not the intent).
     let armed: String = sqlx::query_scalar("SHOW buzz.created_at_floor")
@@ -543,7 +544,12 @@ pub enum ProbeError {
 /// a single SELECT would not guarantee evaluation order across the
 /// subexpressions, reopening the race this ordering exists to close.
 async fn sample_writer(writer: &PgPool) -> Result<WriterSample, ProbeError> {
-    let mut conn = writer.acquire().await?;
+    let mut conn = crate::observability::acquire(
+        writer,
+        crate::observability::PoolRole::Writer,
+        crate::observability::Operation::Maintenance,
+    )
+    .await?;
 
     // 1. S first.
     let sampled_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
@@ -779,10 +785,8 @@ pub async fn run_probe(writer: PgPool, fence: Arc<ReplicaFence>) {
 mod tests {
     use super::*;
 
-    const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
-
     fn test_db_url() -> String {
-        std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| TEST_DB_URL.into())
+        std::env::var("TEST_DATABASE_URL").expect("explicit isolated test database URL required")
     }
 
     /// A private scratch database with migrations applied: the probe tests
@@ -798,8 +802,8 @@ mod tests {
             .await
             .expect("create scratch db");
         let base = test_db_url();
-        let idx = base.rfind('/').expect("db url has a path segment");
-        let pool = PgPool::connect(&format!("{}/{}", &base[..idx], name))
+        let scratch_url = crate::test_connection::database_url(&base, &name);
+        let pool = PgPool::connect(&scratch_url)
             .await
             .expect("connect scratch db");
         crate::migration::run_migrations(&pool)
@@ -1026,12 +1030,8 @@ mod tests {
         .expect("create unprivileged role");
 
         let base = test_db_url();
-        let unpriv_url = {
-            let rest = base.strip_prefix("postgres://").expect("pg url");
-            let at = rest.rfind('@').expect("credentials in url");
-            format!("postgres://{role}:fence_probe_test@{}", &rest[at + 1..])
-        };
-        let unpriv = PgPool::connect(&unpriv_url).await.expect("connect unpriv");
+        let options = crate::test_connection::role_options(&base, &role, "fence_probe_test");
+        let unpriv = PgPool::connect_with(options).await.expect("connect unpriv");
 
         let err = sample_writer(&unpriv)
             .await

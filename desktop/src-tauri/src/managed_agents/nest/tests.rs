@@ -438,6 +438,8 @@ fn make_persona(id: &str, display_name: &str) -> AgentDefinition {
         source_team: None,
         source_team_persona_slug: None,
         catalog_source: None,
+
+        team_catalog_source: None,
         env_vars: std::collections::BTreeMap::new(),
         respond_to: None,
         respond_to_allowlist: Vec::new(),
@@ -449,6 +451,7 @@ fn make_persona(id: &str, display_name: &str) -> AgentDefinition {
 
 fn make_agent(name: &str, persona_id: Option<&str>) -> ManagedAgentRecord {
     ManagedAgentRecord {
+        effort_level: None,
         pubkey: String::new(),
         name: name.to_string(),
         persona_id: persona_id.map(|s| s.to_string()),
@@ -498,6 +501,8 @@ fn make_agent(name: &str, persona_id: Option<&str>) -> ManagedAgentRecord {
         source_team: None,
         source_team_persona_slug: None,
         catalog_source: None,
+
+        team_catalog_source: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: Vec::new(),
         definition_parallelism: None,
