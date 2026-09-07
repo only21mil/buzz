@@ -299,6 +299,63 @@ class ReceiptTests(unittest.TestCase):
         with self.assertRaises(receipt.GateError):
             receipt.validate_receipt(value, receipt.REPOSITORY, HEAD, "pull-request", now, 600)
 
+    def main_transport(self, commit_sha: str = HEAD):
+        """Exercise GhClient with REST diff pagination and Git Data identity."""
+        authority = FakeClient()
+        authority.base_ref_sha = HEAD
+
+        def runner(command, **kwargs):
+            endpoint = command[-1]
+            headers = ("HTTP/2 200 OK\r\nX-GitHub-Request-Id: id\r\n"
+                       f"Date: {HTTP_DATE}\r\n")
+            if endpoint == f"/repos/{receipt.REPOSITORY}/commits/{HEAD}":
+                next_url = ("https://api.github.com/repositories/1320349503/"
+                            f"commits/{HEAD}?page=2")
+                headers += f'Link: <{next_url}>; rel="next"\r\n'
+                body = {"sha": HEAD, "files": [{"filename": str(i)} for i in range(300)]}
+            elif endpoint == f"/repos/{receipt.REPOSITORY}/git/commits/{HEAD}":
+                body = {"sha": commit_sha, "tree": {"sha": "c" * 40},
+                        "parents": [{"sha": BASE}, {"sha": MOVED}]}
+            elif "/rules/branches/" in endpoint:
+                body = authority.pages(endpoint, "array")
+            elif "/check-runs?" in endpoint:
+                runs = authority.pages(endpoint, "checks")
+                body = {"total_count": len(runs), "check_runs": runs}
+            else:
+                body = authority.serve(endpoint)
+            return subprocess.CompletedProcess(
+                command, 0, (headers + "\r\n" + json.dumps(body)).encode(), b"")
+
+        return receipt.GhClient(receipt.GH_PATH, identity=authority.identity, runner=runner)
+
+    def test_main_git_identity_avoids_paginated_rest_diff_and_reverifies(self) -> None:
+        with mock.patch.dict(os.environ, {"GH_TOKEN": "test"}):
+            with self.assertRaisesRegex(receipt.ProviderError, "resource is not allowlisted"):
+                self.main_transport().one(f"/repos/{receipt.REPOSITORY}/commits/{HEAD}")
+            client = self.main_transport()
+            value = receipt.build_main_receipt(client, HEAD, "main")
+            now = dt.datetime(2026, 9, 1, 12, 5, tzinfo=dt.timezone.utc)
+            receipt.validate_receipt(value, receipt.REPOSITORY, HEAD, "main", now, 600)
+            receipt.reverify_receipt(value, self.main_transport())
+        endpoints = [request["endpoint"] for request in client.requests]
+        self.assertIn(f"/repos/{receipt.REPOSITORY}/git/commits/{HEAD}", endpoints)
+        self.assertNotIn(f"/repos/{receipt.REPOSITORY}/commits/{HEAD}", endpoints)
+
+    def test_main_git_identity_still_rejects_wrong_sha(self) -> None:
+        with mock.patch.dict(os.environ, {"GH_TOKEN": "test"}):
+            with self.assertRaisesRegex(receipt.GateError, "commit identity drift"):
+                receipt.build_main_receipt(self.main_transport(MOVED), HEAD, "main")
+
+    def test_git_commit_endpoint_is_exact_repository_full_sha_and_no_query(self) -> None:
+        endpoint = f"/repos/{receipt.REPOSITORY}/git/commits/{HEAD}"
+        self.assertEqual(receipt.api_endpoint(endpoint), endpoint)
+        for invalid in (endpoint.replace(receipt.REPOSITORY, "other/buzz"),
+                        endpoint[:-1], endpoint + "0", endpoint.replace(HEAD, "main"),
+                        endpoint + "?page=2",
+                        f"/repositories/1320349503/git/commits/{HEAD}"):
+            with self.subTest(endpoint=invalid), self.assertRaises(receipt.ProviderError):
+                receipt.api_endpoint(invalid)
+
     def test_final_authority_reread_rejects_post_snapshot_drift(self) -> None:
         pr_mutations = [
             ("repository default", "mutate_final_repository",
