@@ -228,6 +228,7 @@ def api_endpoint(value: str) -> str:
         rf"^/repos/{re.escape(REPOSITORY)}/pulls/[1-9][0-9]*$",
         rf"^/repos/{re.escape(REPOSITORY)}/git/ref/heads/[A-Za-z0-9._%-]+$",
         rf"^/repos/{re.escape(REPOSITORY)}/commits/[0-9a-f]{{40}}$",
+        rf"^/repos/{re.escape(REPOSITORY)}/git/commits/[0-9a-f]{{40}}$",
         rf"^/repos/{re.escape(REPOSITORY)}/compare/main\.\.\.[0-9a-f]{{40}}$",
         rf"^/repos/{re.escape(REPOSITORY)}/rulesets/[1-9][0-9]*$",
         r"^/orgs/only21mil/rulesets/[1-9][0-9]*$",
@@ -851,7 +852,7 @@ def build_main_receipt(client: GhClient, head: str, branch: str) -> dict[str, An
     refuse(repository.get("default_branch") == branch, "branch is not the repository default branch")
     ref_endpoint = f"/repos/{owner}/{repo}/git/ref/heads/{branch}"
     require_ref(client.one(ref_endpoint), f"refs/heads/{branch}", head)
-    commit = object_(client.one(f"/repos/{owner}/{repo}/commits/{head}"), "commit")
+    commit = object_(client.one(f"/repos/{owner}/{repo}/git/commits/{head}"), "commit")
     refuse(sha40(commit.get("sha"), "commit SHA") == head, "commit identity drift")
     snap_a = snapshot(client, owner, repo, head, branch)
     require_ref(client.one(ref_endpoint), f"refs/heads/{branch}", head)
