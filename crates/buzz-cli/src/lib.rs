@@ -1201,6 +1201,33 @@ pub enum ReposCmd {
         #[arg(long)]
         id: String,
     },
+    /// List hosted branches and their divergence from the default branch.
+    Branches {
+        /// Repository identifier (d-tag).
+        #[arg(long, visible_alias = "repo-id")]
+        id: String,
+        /// Owner pubkey. Defaults to your identity.
+        #[arg(long, visible_alias = "repo-owner")]
+        owner: Option<String>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read issue, PR and merge claims with explicit missing-proof blockers.
+    Reconcile {
+        /// Repository owner pubkey (64-char hex).
+        #[arg(long)]
+        repo_owner: String,
+        /// Repository identifier (d-tag).
+        #[arg(long)]
+        repo_id: String,
+        /// Maximum work items, applied after repository filtering and reduction.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Emit stable JSON (also the default output).
+        #[arg(long)]
+        json: bool,
+    },
     /// Bootstrap an absent Buzz `main` from exact GitHub `main` once.
     ///
     /// This is not an ongoing synchronization direction.
@@ -2595,6 +2622,56 @@ mod tests {
     }
 
     #[test]
+    fn repo_branches_parses_human_and_json_modes() {
+        for (args, expected_json) in [
+            (vec!["buzz", "repos", "branches", "--id", "repo"], false),
+            (
+                vec!["buzz", "repos", "branches", "--id", "repo", "--json"],
+                true,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(args).expect("repos branches should parse");
+            assert!(matches!(
+                cli.command,
+                Cmd::Repos(ReposCmd::Branches { id, json, owner: None }) if id == "repo" && json == expected_json
+            ));
+        }
+    }
+
+    #[test]
+    fn repo_reconcile_parses_coordinate_and_post_filter_limit() {
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "repos",
+            "reconcile",
+            "--repo-owner",
+            "owner",
+            "--repo-id",
+            "repo",
+            "--limit",
+            "0",
+            "--json",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Cmd::Repos(ReposCmd::Reconcile { repo_owner, repo_id, limit: Some(0), json: true }) if repo_owner == "owner" && repo_id == "repo")
+        );
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "repos",
+            "branches",
+            "--repo-owner",
+            "owner",
+            "--repo-id",
+            "repo",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Cmd::Repos(ReposCmd::Branches { owner: Some(owner), id, .. }) if owner == "owner" && id == "repo")
+        );
+    }
+
+    #[test]
     fn command_inventory_is_stable() {
         let expected_groups: Vec<&str> = vec![
             "agents",
@@ -2750,12 +2827,14 @@ mod tests {
             names(&cmd, "repos"),
             vec![
                 "bind",
+                "branches",
                 "create",
                 "get",
                 "import-main",
                 "list",
                 "promote",
                 "protect",
+                "reconcile",
                 "rm",
                 "stage-ci",
                 "status"
