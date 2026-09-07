@@ -115,11 +115,14 @@ artifacts with the landing evidence before their seven-day retention expires.
 
 `scripts/protected-ci-reuse.py` permits reuse only when all of these hold:
 
-- A successful internal pull-request CI run and its exact attempt have a
-  successful job plus every current app-bound protected check. A later failed,
-  pending or cancelled run is never replaced with an earlier success. The
-  source result is at most 24 hours old.
-- The source artifact was uploaded by that run/attempt after the job's check
+- The latest internal pull-request CI run and its latest workflow attempt
+  succeeded, along with every current app-bound protected check. The selected
+  job's latest execution succeeded. A failed-jobs rerun can retain a successful
+  job from an earlier attempt, but a newer failed, pending, cancelled or skipped
+  execution of that job cannot fall back to an older success. The workflow
+  result and the selected job's own completion are at most 24 hours old.
+- The source artifact was uploaded by that run and the selected job's exact
+  attempt after the job's check
   commands succeeded. GitHub's immutable artifact identity and archive digest
   match. A reused proof cannot become a source proof.
 - Live GitHub Git objects independently prove the tested tree, candidate tree

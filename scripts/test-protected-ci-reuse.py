@@ -23,6 +23,9 @@ class FakeAPI:
         self.source, self.run, self.pr, self.landed, self.check = source, run, pr, landed, check
         self.main = LANDED
         self.job_conclusion = "success"
+        self.job_attempt = 1
+        self.job_completed = dt.datetime.now(dt.timezone.utc).isoformat()
+        self.extra_jobs = []
         self.artifacts = True
         self.corrupt_digest = False
         self.archive_extra = False
@@ -70,8 +73,9 @@ class FakeAPI:
                      "digest": "sha256:" + ("0" * 64 if self.corrupt_digest else hashlib.sha256(self.archive()).hexdigest())}] if self.artifacts else []
         if suffix == f"/commits/{SOURCE}/check-runs?filter=all":
             return [self.check]
-        if suffix == "/actions/runs/100/attempts/1/jobs":
-            return [{"id": 80, "name": "Unit Tests", "status": "completed", "conclusion": self.job_conclusion}]
+        if suffix == "/actions/runs/100/jobs?filter=all":
+            return [{"id": 80, "name": "Unit Tests", "status": "completed", "conclusion": self.job_conclusion,
+                     "run_attempt": self.job_attempt, "completed_at": self.job_completed}] + self.extra_jobs
         raise AssertionError(endpoint)
 
 
@@ -191,6 +195,46 @@ class ReuseTests(unittest.TestCase):
         self.refuse()
         self.check["app"]["id"] = 15368
         self.check["check_suite"]["id"] = 99
+        self.refuse()
+
+    def test_partial_rerun_preserves_successful_jobs_original_attempt(self):
+        self.run["run_attempt"] = 2
+        result = self.acquire()
+        self.assertEqual(result["source_run"]["run_attempt"], 2)
+        self.assertEqual(result["source_job"]["run_attempt"], 1)
+        self.assertEqual(result["source_proof"]["run_attempt"], 1)
+
+    def test_newer_failed_job_cannot_use_older_success(self):
+        self.run["run_attempt"] = 2
+        for conclusion in ("failure", "cancelled", "skipped", None):
+            with self.subTest(conclusion=conclusion):
+                self.api.extra_jobs = [{"id": 90, "name": "Unit Tests", "status": "completed",
+                                       "conclusion": conclusion, "run_attempt": 2}]
+                self.refuse()
+
+    def test_newer_success_requires_its_own_artifact(self):
+        self.run["run_attempt"] = 2
+        self.api.job_attempt = 2
+        self.refuse()
+
+    def test_latest_job_attempt_must_be_unambiguous(self):
+        self.api.extra_jobs = [{"id": 90, "name": "Unit Tests", "status": "completed",
+                               "conclusion": "success", "run_attempt": 1}]
+        self.refuse()
+
+    def test_partial_rerun_does_not_refresh_old_successful_job(self):
+        self.run["run_attempt"] = 2
+        self.api.job_completed = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)).isoformat()
+        self.refuse()
+
+    def test_job_attempt_must_be_present_and_positive(self):
+        for attempt in (None, 0, -1, True):
+            with self.subTest(attempt=attempt):
+                self.api.job_attempt = attempt
+                self.refuse()
+
+    def test_job_attempt_cannot_be_ahead_of_workflow(self):
+        self.api.job_attempt = 2
         self.refuse()
 
     def test_changed_run_attempt_cannot_reuse_old_artifact(self):
