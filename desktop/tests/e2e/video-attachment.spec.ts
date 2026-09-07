@@ -797,23 +797,30 @@ test("inline video hover reveals a timeline without a second play control", asyn
   await expect(page.getByTestId("chat-title")).toHaveText("general");
   await waitForMockLiveSubscription(page, "general");
 
-  await emitMockMessage(page, "general", `![video](${VIDEO_URL})`, {
-    extraTags: [
-      [
-        "imeta",
-        `url ${VIDEO_URL}`,
-        "m video/mp4",
-        `x ${VIDEO_SHA}`,
-        "size 987654",
-        "dim 160x80",
-        "duration 12.5",
-        `image ${POSTER_DATA_URL}`,
-        "filename launch-demo.mp4",
+  const emitted = (await emitMockMessage(
+    page,
+    "general",
+    `![video](${VIDEO_URL})`,
+    {
+      extraTags: [
+        [
+          "imeta",
+          `url ${VIDEO_URL}`,
+          "m video/mp4",
+          `x ${VIDEO_SHA}`,
+          "size 987654",
+          "dim 160x80",
+          "duration 12.5",
+          `image ${POSTER_DATA_URL}`,
+          "filename launch-demo.mp4",
+        ],
       ],
-    ],
-  });
+    },
+  )) as { id: string };
 
-  const player = page.getByTestId("video-player").last();
+  const player = page
+    .locator(`[data-message-id="${emitted.id}"]`)
+    .getByTestId("video-player");
   const video = player.locator("video");
   const surface = video.locator("..");
   const centerPlayback = player.getByTestId("video-inline-center-playback");
@@ -841,19 +848,32 @@ test("inline video hover reveals a timeline without a second play control", asyn
     )
     .toBe("50%");
 
-  const restingControlsBox = await controls.boundingBox();
+  // Measure within the same player in one layout snapshot. Timeline anchoring
+  // may move the whole player while hover must not move its controls.
+  const controlsGeometry = () =>
+    surface.evaluate((element) => {
+      const controls = element.querySelector(
+        '[data-testid="video-inline-controls"]',
+      );
+      if (!controls) throw new Error("Inline video controls are missing");
+      const surfaceY = element.getBoundingClientRect().y;
+      const controlsY = controls.getBoundingClientRect().y;
+      return { surfaceY, controlsY, offset: controlsY - surfaceY };
+    });
+  await expect(surface).toBeInViewport();
+  const resting = await controlsGeometry();
   const restingIconTransform = await centerIcon.evaluate(
     (element) => window.getComputedStyle(element).transform,
   );
-  expect(restingControlsBox).not.toBeNull();
   await expect(controls).toHaveCSS("opacity", "0");
   await surface.hover();
   await expect(controls).toHaveCSS("opacity", "1");
-  const hoveredControlsBox = await controls.boundingBox();
-  expect(hoveredControlsBox).not.toBeNull();
-  expect(
-    Math.abs((hoveredControlsBox?.y ?? 0) - (restingControlsBox?.y ?? 0)),
-  ).toBeLessThan(0.5);
+  const hovered = await controlsGeometry();
+  await test.info().attach("inline-controls-geometry", {
+    body: JSON.stringify({ resting, hovered }),
+    contentType: "application/json",
+  });
+  expect(Math.abs(hovered.offset - resting.offset)).toBeLessThan(0.5);
   await expect
     .poll(() =>
       centerIcon.evaluate(
@@ -1448,7 +1468,13 @@ test("playback speed persists across videos and reloads", async ({ page }) => {
     const player = page
       .locator(`[data-message-id="${emitted.id}"]`)
       .getByTestId("video-player");
+    // Playing the first video can freeze the live tail. Release buffered
+    // messages through the reader's action before locating the new player.
+    const latest = page.getByTestId("message-scroll-to-latest");
+    await expect(player.or(latest).first()).toBeVisible();
+    if (await latest.isVisible()) await latest.click();
     await expect(player).toBeVisible();
+    await expect(player).toBeInViewport();
     await player.getByRole("button", { name: "Play video" }).click();
     return player;
   };
