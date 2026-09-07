@@ -72,3 +72,33 @@ test("relay-only nobody remains hidden and archived local identities stay exclud
     [],
   );
 });
+
+test("foreign relay agents retain mentions in owner, admin and guest roles only when channel policy admits the viewer", () => {
+  for (const role of ["owner", "admin", "guest"]) {
+    for (const allowed of [true, false]) {
+      const input = options(false, true);
+      input.members = [{ pubkey: key, role, isAgent: true }];
+      input.relayAgents[0].ownerPubkey = "dd".repeat(32);
+      input.relayAgents[0].respondTo = "allowlist";
+      input.relayAgents[0].respondToAllowlist = allowed ? [owner] : [];
+      const discover = () =>
+        getMentionableAgentPubkeys({
+          currentPubkey: owner,
+          eligibilityScope: { type: "channel", channelId: "channel" },
+          managedAgentPubkeys: input.managedAgentPubkeys,
+          relayAgents: input.relayAgents,
+          sharedChannelIds: new Set(["channel"]),
+        });
+      input.mentionableAgentPubkeys = discover();
+      const candidates = buildMentionCandidates(input);
+      assert.equal(candidates.length, allowed ? 1 : 0);
+      if (allowed) {
+        assert.equal(candidates[0].pubkey, key);
+        assert.equal(candidates[0].role, role);
+      }
+      input.relayAgents[0].channelIds = ["other-channel"];
+      input.mentionableAgentPubkeys = discover();
+      assert.deepEqual(buildMentionCandidates(input), []);
+    }
+  }
+});

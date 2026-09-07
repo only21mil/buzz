@@ -12,6 +12,13 @@ import {
 } from "../../agents/lib/ownedChannelAgents.ts";
 import { canAddChannelMembers } from "../lib/channelMemberAdmission.ts";
 import { normalizePubkey } from "../../../shared/lib/pubkey.ts";
+import { listRelayAgents } from "../../../shared/api/tauri.ts";
+import { registerRelayWorkflowsMembersCommands } from "../../../platform/web/desktopOnly/relayWorkflowsMembers.ts";
+import { directoryFixture } from "../../../platform/web/desktopOnly/relayAgentOwnership.fixtures.mjs";
+import {
+  dispatch,
+  resetRegistryForTests,
+} from "../../../platform/web/registry.ts";
 
 function load(name, stubs) {
   const exports = {};
@@ -140,15 +147,20 @@ test("authorized agent role control dispatches admin; owner, unauthorized and ar
   assert.equal(view.getByTestId(`sidebar-role-admin-${key}`).disabled, true);
 });
 
-function ownedSetup({ failSecond = false } = {}) {
-  const roster = [{ pubkey: owner, role: "owner" }];
+function ownedSetup({
+  failSecond = false,
+  viewer = owner,
+  directoryAgents,
+  fetchDirectory,
+} = {}) {
+  const roster = [{ pubkey: viewer, role: "owner" }];
   const channel = {
     id: "channel",
     channelType: "stream",
     visibility: "private",
     archivedAt: null,
   };
-  const agents = [
+  const agents = directoryAgents ?? [
     { pubkey: key, ownerPubkey: owner, name: "First" },
     { pubkey: other, ownerPubkey: owner, name: "Second" },
   ];
@@ -161,7 +173,12 @@ function ownedSetup({ failSecond = false } = {}) {
   const { AddOwnedChannelAgents } = load("AddOwnedChannelAgents", {
     "@tanstack/react-query": { useQueryClient: () => ({}) },
     "@/features/agents/hooks": {
-      useRelayAgentsQuery: () => query(() => agents),
+      useRelayAgentsQuery: () => ({
+        ...query(() => agents),
+        refetch: async () => ({
+          data: fetchDirectory ? await fetchDirectory() : agents,
+        }),
+      }),
     },
     "@/features/agents/lib/ownedChannelAgents": {
       addOwnedChannelAgents,
@@ -177,7 +194,7 @@ function ownedSetup({ failSecond = false } = {}) {
       useIsArchivedPredicate: () => () => false,
     },
     "@/shared/api/hooks": {
-      useIdentityQuery: () => query(() => ({ pubkey: owner })),
+      useIdentityQuery: () => query(() => ({ pubkey: viewer })),
     },
     "@/shared/api/tauri": {
       addChannelMembers: async (input) => {
@@ -242,7 +259,19 @@ test("selected add excludes unchecked agents and revalidates revoked channel aut
 });
 
 test("browser Add agents keeps relay attachment available while hiding native creation", async () => {
-  const { render } = await import("@testing-library/react");
+  const { render, fireEvent, waitFor } = await import("@testing-library/react");
+  resetRegistryForTests();
+  const fixture = directoryFixture();
+  registerRelayWorkflowsMembersCommands(
+    { pubkey: () => fixture.owner },
+    fixture.client,
+  );
+  window.__TAURI_INTERNALS__ = { invoke: dispatch };
+  const setup = ownedSetup({
+    viewer: fixture.owner,
+    directoryAgents: await listRelayAgents(),
+    fetchDirectory: listRelayAgents,
+  });
   const empty = [];
   const noPersonas = new Set();
   const { AddChannelBotDialog } = load("AddChannelBotDialog", {
@@ -272,8 +301,7 @@ test("browser Add agents keeps relay attachment available while hiding native cr
       useInChannelPersonaIds: () => noPersonas,
     },
     "./AddOwnedChannelAgents": {
-      AddOwnedChannelAgents: () =>
-        React.createElement("div", null, "Existing relay agents"),
+      AddOwnedChannelAgents: setup.AddOwnedChannelAgents,
     },
     "@/platform/web/capabilities": {
       Capability: { ManagedAgents: "managed-agents" },
@@ -300,8 +328,56 @@ test("browser Add agents keeps relay attachment available while hiding native cr
       onCreateAgent() {},
     }),
   );
-  assert.ok(view.getByText("Existing relay agents"));
+  assert.ok(view.getByLabelText("Owned Scout"));
+  assert.equal(view.queryByLabelText("Foreign Scout"), null);
+  assert.equal(view.queryByLabelText("Forged Scout"), null);
   assert.equal(view.queryByText("Native personas"), null);
   assert.equal(view.queryByText(/Install an agent runtime/), null);
   assert.equal(view.queryByRole("button", { name: "Add agent" }), null);
+  const addAll = view.getByRole("button", { name: "Add all my agents (1)" });
+  assert.equal(addAll.disabled, false);
+  fireEvent.click(view.getByLabelText("Owned Scout"));
+  fireEvent.click(view.getByRole("button", { name: "Add selected agents" }));
+  await waitFor(() => assert.ok(view.getByText("Added: Owned Scout.")));
+  assert.deepEqual(
+    setup.calls.map((call) => call.pubkeys[0]),
+    [fixture.owned],
+  );
+  assert.equal(
+    fixture.queries.filter((query) => query.kinds[0] === 10100).length,
+    2,
+  );
+  resetRegistryForTests();
+  delete window.__TAURI_INTERNALS__;
+});
+
+test("browser attachment rechecks signed ownership before adding all owned agents", async () => {
+  const { render, fireEvent, waitFor } = await import("@testing-library/react");
+  resetRegistryForTests();
+  const fixture = directoryFixture();
+  registerRelayWorkflowsMembersCommands(
+    { pubkey: () => fixture.owner },
+    fixture.client,
+  );
+  window.__TAURI_INTERNALS__ = { invoke: dispatch };
+  const setup = ownedSetup({
+    viewer: fixture.owner,
+    directoryAgents: await listRelayAgents(),
+    fetchDirectory: listRelayAgents,
+  });
+  const view = render(
+    React.createElement(setup.AddOwnedChannelAgents, { channelId: "channel" }),
+  );
+  // Revoke the only owned profile after the dialog's initial directory load.
+  fixture.events.splice(
+    fixture.events.findIndex(
+      (event) => event.kind === 0 && event.pubkey === fixture.owned,
+    ),
+    1,
+  );
+  fireEvent.click(view.getByRole("button", { name: "Add all my agents (1)" }));
+  await waitFor(() => assert.ok(view.getByText("No agents were added.")));
+  assert.deepEqual(setup.calls, []);
+  resetRegistryForTests();
+  delete window.__TAURI_INTERNALS__;
 });

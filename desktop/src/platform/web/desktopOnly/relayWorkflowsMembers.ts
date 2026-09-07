@@ -7,6 +7,7 @@ import { parse as parseYaml } from "yaml";
 
 import type { BrowserIdentityManager } from "../identity";
 import { register } from "../registry";
+import { verifiedProfileOwner } from "../relayPeople";
 import { BrowserUnavailableError } from "./capabilityOff";
 
 type RelayFilter = {
@@ -243,7 +244,7 @@ function stringArray(
   return value;
 }
 
-function relayAgentFromEvent(event: RelayEvent) {
+function relayAgentFromEvent(event: RelayEvent, ownerPubkey: string | null) {
   let parsed: unknown;
   try {
     parsed = JSON.parse(event.content);
@@ -265,6 +266,7 @@ function relayAgentFromEvent(event: RelayEvent) {
   }
   return {
     pubkey: event.pubkey,
+    owner_pubkey: ownerPubkey,
     name: typeof record.name === "string" ? record.name : fallbackName,
     agent_type:
       typeof record.agent_type === "string" ? record.agent_type : "agent",
@@ -275,6 +277,38 @@ function relayAgentFromEvent(event: RelayEvent) {
     respond_to: typeof respondTo === "string" ? respondTo : null,
     respond_to_allowlist: stringArray(record, "respond_to_allowlist"),
   };
+}
+
+async function listRelayAgents(client: RelayWorkflowsMembersClient) {
+  const events = (await client.fetchEvents({ kinds: [10100] })).filter(
+    (event) => event.kind === 10100,
+  );
+  const owners = new Map<string, string | null>();
+  const pubkeys = [...new Set(events.map((event) => event.pubkey))];
+  // Bound profile requests, and query each exact author so unrelated profiles
+  // cannot crowd out the ownership evidence for an eligible attachment.
+  for (let offset = 0; offset < pubkeys.length; offset += 8) {
+    await Promise.all(
+      pubkeys.slice(offset, offset + 8).map(async (pubkey) => {
+        const profiles = await client.fetchEvents({
+          kinds: [0],
+          authors: [pubkey],
+          limit: 1,
+        });
+        const latest = profiles
+          .filter((event) => event.kind === 0 && event.pubkey === pubkey)
+          .sort(
+            (a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id),
+          )[0];
+        if (!latest) return;
+        // A newer invalid or revoked profile never revives an old owner.
+        owners.set(pubkey, verifiedProfileOwner(latest));
+      }),
+    );
+  }
+  return events.map((event) =>
+    relayAgentFromEvent(event, owners.get(event.pubkey) ?? null),
+  );
 }
 
 function profileFromEvent(event: RelayEvent) {
@@ -614,13 +648,7 @@ export function registerRelayWorkflowsMembersCommands(
     if (!event) throw new Error("workflow not found");
     return workflowFromEvent(event);
   });
-  register("list_relay_agents", async () =>
-    (
-      await client.fetchEvents({
-        kinds: [10100],
-      })
-    ).map(relayAgentFromEvent),
-  );
+  register("list_relay_agents", () => listRelayAgents(client));
   register("list_relay_members", () => listRelayMembers(client));
   register("remove_relay_member", (body) =>
     publishRelayAdminEvent(body, identity, client, "remove_relay_member", 9031),

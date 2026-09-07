@@ -153,7 +153,7 @@ async fn list_relay_agents_for_selection(
 
     // Membership remains authoritative and visible only to this viewer.
     // Known owned identities can have any membership role; other candidates
-    // must still have explicit bot-role evidence.
+    // must have relay-attested bot identity or legacy bot-role evidence.
     let mut membership_filter = serde_json::json!({
         "kinds": [39002],
         "authors": [&relay_pubkey],

@@ -400,6 +400,7 @@ test("list_relay_agents folds sparse and complete kind:10100 profiles", async ()
   const result = await dispatch("list_relay_agents");
   assert.deepEqual(result[0], {
     pubkey: PUBKEY,
+    owner_pubkey: null,
     name: "Scout",
     agent_type: "assistant",
     channels: ["general"],
@@ -411,6 +412,7 @@ test("list_relay_agents folds sparse and complete kind:10100 profiles", async ()
   });
   assert.deepEqual(result[1], {
     pubkey: TARGET,
+    owner_pubkey: null,
     name: "Builder",
     agent_type: "agent",
     channels: [],
@@ -420,7 +422,11 @@ test("list_relay_agents folds sparse and complete kind:10100 profiles", async ()
     respond_to: null,
     respond_to_allowlist: [],
   });
-  assert.deepEqual(client.calls.fetchEvents, [{ kinds: [10100] }]);
+  assert.deepEqual(client.calls.fetchEvents, [
+    { kinds: [10100] },
+    { kinds: [0], authors: [PUBKEY], limit: 1 },
+    { kinds: [0], authors: [TARGET], limit: 1 },
+  ]);
   assert.equal(getUnregisteredCommandMissCount(), 0);
 });
 
