@@ -636,6 +636,9 @@ pub async fn dispatch(cmd: crate::IssuesCmd, client: &BuzzClient) -> Result<(), 
             )
             .await
         }
+        IssuesCmd::Statuses { issue } => {
+            crate::commands::events::cmd_list_statuses(client, &issue, 1621, "issue").await
+        }
         IssuesCmd::Status {
             issue,
             status,

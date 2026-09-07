@@ -307,7 +307,19 @@ buzz dms add-member --channel "$DM_ID" \
   --pubkey "0000000000000000000000000000000000000000000000000000000000000002" | jq .
 ```
 
-### 6.7 Users & Presence
+### 6.7 Raw events and NIP-34 statuses
+
+```bash
+buzz events get --id "$ISSUE_EVENT_ID" | jq -e \
+  '.id == env.ISSUE_EVENT_ID and (.sig | length == 128)'
+
+buzz issues statuses --issue "$ISSUE_EVENT_ID" | jq .
+buzz pr statuses --pr "$PR_EVENT_ID" | jq .
+# Expected status row:
+# [{"event":{...signed event...},"signer":"<pubkey>","trusted":true}]
+```
+
+### 6.8 Users & Presence
 
 ```bash
 # users get — own profile (0 pubkeys)
@@ -347,7 +359,7 @@ buzz users set-status --clear --text "nope" 2>&1; echo "exit: $?"
 # Expected: exit 1 — clap conflict error
 ```
 
-### 6.8 Channel Members (add/remove require admin:channels)
+### 6.9 Channel Members (add/remove require admin:channels)
 
 ```bash
 # channels add-member
@@ -364,7 +376,7 @@ buzz channels remove-member --channel "$CHANNEL_ID" \
   --pubkey "0000000000000000000000000000000000000000000000000000000000000001" | jq .
 ```
 
-### 6.9 Workflows
+### 6.10 Workflows
 
 ```bash
 # workflows create
@@ -420,7 +432,7 @@ buzz workflows approve --approval "00000000-0000-0000-0000-000000000000" 2>&1 ||
 buzz workflows delete --workflow "$WF_ID" | jq .
 ```
 
-### 6.10 Feed
+### 6.11 Feed
 
 ```bash
 buzz feed get | jq .
@@ -428,7 +440,7 @@ buzz feed get --limit 5 | jq .
 # Expected: [{id,pubkey,kind,content,created_at,tags}] — sig-stripped, sorted newest-first
 ```
 
-### 6.11 Forum & Voting
+### 6.12 Forum & Voting
 
 ```bash
 # Send a forum post (kind 45001) to the forum channel
@@ -444,7 +456,7 @@ buzz messages vote --event "$FORUM_EVENT_ID" --direction up | jq .
 buzz messages vote --event "$FORUM_EVENT_ID" --direction down | jq .
 ```
 
-### 6.12 Notes (NIP-23 long-form, kind:30023)
+### 6.13 Notes (NIP-23 long-form, kind:30023)
 
 Editable team-knowledge notes keyed by `(kind:30023, you, d=slug)`. `set` is an
 idempotent upsert; `rm` is a NIP-09 a-tag deletion. Output is plain text (refs),
