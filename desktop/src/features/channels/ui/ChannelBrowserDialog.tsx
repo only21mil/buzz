@@ -99,6 +99,59 @@ type ChannelBrowserDialogProps = {
   isCreatingChannel?: boolean;
 };
 
+function resolveBrowserChannels(
+  channels: Channel[],
+  channelTypeFilter: ChannelBrowserDialogProps["channelTypeFilter"],
+  activeTab: BrowserTab,
+  sort: ChannelSort,
+  searchQuery: string,
+) {
+  const matchScoreById = new Map<string, number>();
+  if (searchQuery.length > 0) {
+    for (const channel of channels) {
+      const score = scoreChannelMatch(channel, searchQuery);
+      if (score !== null) matchScoreById.set(channel.id, score);
+    }
+  }
+  const matchingChannels = channels.filter(
+    (channel) =>
+      channel.channelType !== "dm" &&
+      (channel.archivedAt
+        ? channel.isMember
+        : channel.visibility === "open" || channel.isMember) &&
+      (!channelTypeFilter || channel.channelType === channelTypeFilter) &&
+      (searchQuery.length === 0 || matchScoreById.has(channel.id)),
+  );
+  const joinedChannels = matchingChannels.filter(
+    (channel) => channel.archivedAt === null && channel.isMember,
+  );
+  const archivedChannels = matchingChannels.filter(
+    (channel) => channel.archivedAt !== null,
+  );
+  const visibleChannels =
+    activeTab === "archived"
+      ? archivedChannels
+      : activeTab === "joined"
+        ? joinedChannels
+        : matchingChannels;
+  const orderedVisibleChannels =
+    sort === "members"
+      ? [...visibleChannels].sort(
+          (a, b) =>
+            b.memberCount - a.memberCount ||
+            a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
+        )
+      : sortChannelsForSidebar(visibleChannels, sort);
+  if (searchQuery.length > 0) {
+    orderedVisibleChannels.sort(
+      (a, b) =>
+        (matchScoreById.get(a.id) ?? Number.POSITIVE_INFINITY) -
+        (matchScoreById.get(b.id) ?? Number.POSITIVE_INFINITY),
+    );
+  }
+  return orderedVisibleChannels;
+}
+
 export function ChannelBrowserDialog({
   channels,
   channelTypeFilter,
@@ -162,79 +215,21 @@ export function ChannelBrowserDialog({
     onCreated: () => onOpenChange(false),
   });
 
-  // Fuzzy match score per channel id for the current query, so both filtering
-  // and relevance-ordering share one source of truth. Empty when no query.
-  const matchScoreById = React.useMemo(() => {
-    const scores = new Map<string, number>();
-    if (deferredQuery.length === 0) return scores;
-    for (const channel of channels) {
-      const score = scoreChannelMatch(channel, deferredQuery);
-      if (score !== null) scores.set(channel.id, score);
-    }
-    return scores;
-  }, [channels, deferredQuery]);
-
-  const matchingChannels = React.useMemo(() => {
-    const filtered = channels.filter(
-      (channel) =>
-        channel.channelType !== "dm" &&
-        (channel.archivedAt
-          ? channel.isMember
-          : channel.visibility === "open" || channel.isMember) &&
-        (channelTypeFilter ? channel.channelType === channelTypeFilter : true),
-    );
-
-    if (deferredQuery.length === 0) {
-      return filtered;
-    }
-
-    return filtered.filter((channel) => matchScoreById.has(channel.id));
-  }, [channels, channelTypeFilter, deferredQuery, matchScoreById]);
-
-  const currentChannels = React.useMemo(
-    () => matchingChannels.filter((channel) => channel.archivedAt === null),
-    [matchingChannels],
+  const resolveChannels = React.useCallback(
+    (searchQuery: string) =>
+      resolveBrowserChannels(
+        channels,
+        channelTypeFilter,
+        activeTab,
+        sort,
+        searchQuery,
+      ),
+    [channels, channelTypeFilter, activeTab, sort],
   );
-
-  const joinedChannels = React.useMemo(
-    () => currentChannels.filter((channel) => channel.isMember),
-    [currentChannels],
+  const orderedVisibleChannels = React.useMemo(
+    () => resolveChannels(deferredQuery),
+    [deferredQuery, resolveChannels],
   );
-
-  const archivedChannels = React.useMemo(
-    () => matchingChannels.filter((channel) => channel.archivedAt !== null),
-    [matchingChannels],
-  );
-
-  const visibleChannels =
-    activeTab === "archived"
-      ? archivedChannels
-      : activeTab === "joined"
-        ? joinedChannels
-        : matchingChannels;
-
-  const isSearching = deferredQuery.length > 0;
-
-  const orderedVisibleChannels = React.useMemo(() => {
-    const sorted =
-      sort === "members"
-        ? [...visibleChannels].sort(
-            (a, b) =>
-              b.memberCount - a.memberCount ||
-              a.name.localeCompare(b.name, undefined, {
-                sensitivity: "base",
-              }),
-          )
-        : sortChannelsForSidebar(visibleChannels, sort);
-
-    if (!isSearching) return sorted;
-
-    return sorted.sort(
-      (a, b) =>
-        (matchScoreById.get(a.id) ?? Number.POSITIVE_INFINITY) -
-        (matchScoreById.get(b.id) ?? Number.POSITIVE_INFINITY),
-    );
-  }, [isSearching, matchScoreById, sort, visibleChannels]);
 
   const selectedSortLabel =
     CHANNEL_SORT_OPTIONS.find((option) => option.value === sort)?.label ??
@@ -386,12 +381,6 @@ export function ChannelBrowserDialog({
     });
   }
 
-  // Map the flat nav index back to a channel, accounting for the create row
-  // occupying index 0 when present.
-  const selectedItem =
-    selectedIndex !== null && !isCreateRowSelected
-      ? orderedVisibleChannels[selectedIndex - channelNavOffset]
-      : undefined;
   const emptyTitle =
     deferredQuery.length > 0
       ? `No ${entityLabel}s match your search`
@@ -461,23 +450,39 @@ export function ChannelBrowserDialog({
                       setSelectedIndex(null);
                     }}
                     onKeyDown={(event) => {
+                      if (
+                        !["ArrowDown", "ArrowUp", "Enter"].includes(
+                          event.key,
+                        ) ||
+                        event.nativeEvent.isComposing
+                      ) {
+                        return;
+                      }
+                      // Rendering may still show the previous query. Resolve actions
+                      // against the live query without waiting for that deferred render.
+                      const actionChannels =
+                        deferredQuery === normalizedQuery
+                          ? orderedVisibleChannels
+                          : resolveChannels(normalizedQuery);
+                      const actionItemCount =
+                        actionChannels.length + channelNavOffset;
                       // Arrow keys traverse the pinned create row (index 0)
                       // and the channel list beneath it, in visual order.
-                      if (event.key === "ArrowDown" && navItemCount > 0) {
+                      if (event.key === "ArrowDown" && actionItemCount > 0) {
                         event.preventDefault();
                         setSelectedIndex((current) =>
                           current === null
                             ? 0
-                            : Math.min(current + 1, navItemCount - 1),
+                            : Math.min(current + 1, actionItemCount - 1),
                         );
                         return;
                       }
 
-                      if (event.key === "ArrowUp" && navItemCount > 0) {
+                      if (event.key === "ArrowUp" && actionItemCount > 0) {
                         event.preventDefault();
                         setSelectedIndex((current) =>
                           current === null
-                            ? navItemCount - 1
+                            ? actionItemCount - 1
                             : Math.max(current - 1, 0),
                         );
                         return;
@@ -491,18 +496,19 @@ export function ChannelBrowserDialog({
                         // actionable item (no channel matches) — Enter creates.
                         if (
                           showCreateRow &&
-                          (isCreateRowSelected ||
-                            orderedVisibleChannels.length === 0)
+                          (isCreateRowSelected || actionChannels.length === 0)
                         ) {
                           event.preventDefault();
                           enterCreateMode(trimmedQuery);
                           return;
                         }
 
-                        if (orderedVisibleChannels.length > 0) {
+                        if (actionChannels.length > 0) {
                           event.preventDefault();
                           handleSelect(
-                            selectedItem ?? orderedVisibleChannels[0],
+                            (selectedIndex !== null
+                              ? actionChannels[selectedIndex - channelNavOffset]
+                              : undefined) ?? actionChannels[0],
                           );
                         }
                       }
