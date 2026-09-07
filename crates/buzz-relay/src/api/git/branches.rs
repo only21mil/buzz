@@ -580,6 +580,12 @@ mod tests {
 
     fn git(dir: &Path, args: &[&str]) {
         let output = StdCommand::new("git")
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
             .current_dir(dir)
             .args(args)
             .env("GIT_AUTHOR_NAME", "Branch Test")
