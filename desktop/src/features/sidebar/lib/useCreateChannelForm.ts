@@ -80,8 +80,13 @@ export function useCreateChannelForm({
     string | null
   >(null);
   const [typePopoverOpen, setTypePopoverOpen] = React.useState(false);
+  const typePopoverOpenRef = React.useRef(typePopoverOpen);
   const nameInputRef = React.useRef<HTMLInputElement>(null);
   const visibilityTouchedRef = React.useRef(false);
+
+  React.useEffect(() => {
+    typePopoverOpenRef.current = typePopoverOpen;
+  }, [typePopoverOpen]);
 
   const templatesQuery = useChannelTemplatesQuery();
   const templates = templatesQuery.data ?? [];
@@ -104,6 +109,8 @@ export function useCreateChannelForm({
 
     // Small delay to let the dialog animation start before focusing.
     const timerId = globalThis.setTimeout(() => {
+      // The type menu is portalled outside the form. Preserve its focus too.
+      if (typePopoverOpenRef.current) return;
       const activeElement = document.activeElement;
       if (
         activeElement instanceof HTMLElement &&
