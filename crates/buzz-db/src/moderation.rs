@@ -100,8 +100,11 @@ pub struct BanRecord {
 }
 
 /// Audit action values accepted by the `moderation_actions.action` CHECK in
-/// migration 0006. Keep this in lockstep with `migrations/0006_moderation.sql`.
+/// migrations 0006 and 0039. Keep this in lockstep with the latest action CHECK.
 pub const MODERATION_ACTION_CHECK_VOCAB: &[&str] = &[
+    "add_member",
+    "edit_metadata",
+    "delete_channel",
     "delete_message",
     "kick",
     "ban",

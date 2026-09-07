@@ -2671,7 +2671,14 @@ async fn ingest_event_inner(
         // member/open gate here lets the owning human act on private agent channels
         // without being a member (OQ1 decision; see validate_edit_ownership /
         // validate_admin_event for per-kind enforcement).
-        let skip_membership = kind_u32 == KIND_NIP29_JOIN_REQUEST
+        let community_member_command =
+            matches!(kind_u32, KIND_NIP29_PUT_USER | KIND_NIP29_REMOVE_USER)
+                && crate::handlers::moderation_authz::channel_admin_grant(tenant, state, &event)
+                    .await
+                    .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?
+                    .is_some();
+        let skip_membership = community_member_command
+            || kind_u32 == KIND_NIP29_JOIN_REQUEST
             || kind_u32 == KIND_NIP29_CREATE_GROUP
             || kind_u32 == KIND_STREAM_MESSAGE_EDIT
             || kind_u32 == KIND_NIP29_EDIT_METADATA
@@ -3459,6 +3466,21 @@ async fn ingest_event_inner(
             accepted: true,
             message: String::new(),
         });
+    }
+
+    // Audit a community-authorized channel command before storage. An audit
+    // failure must reject the write, rather than enter the legacy best-effort
+    // side-effect path and acknowledge an unaudited command.
+    if let Some(grant) =
+        crate::handlers::moderation_authz::channel_admin_grant(tenant, state, &event)
+            .await
+            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?
+    {
+        crate::handlers::moderation_authz::audit_channel_admin_event(tenant, state, &event, &grant)
+            .await
+            .map_err(|e| {
+                IngestError::Internal(format!("error: channel moderation audit failed: {e}"))
+            })?;
     }
 
     let (stored_event, was_inserted) = if let Some(validated) = &validated_ci_event {
