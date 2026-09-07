@@ -101,6 +101,71 @@ the exact landed ref, record the expected first-attempt failure, rerun it once,
 and require the second attempt to pass on the same landed commit. Add the
 ruleset requirement only after that bootstrap evidence is complete.
 
+## Verified protected-result reuse
+
+`CI` still emits every required context on the exact landed commit. For Rust
+Lint, Unit Tests and the four Desktop Smoke E2E shards, it may verify an
+applicable protected result instead of repeating the expensive check commands.
+The job summary states whether work ran fresh or reused a protected result.
+Its immutable `ci-reuse-<attempt>-<job>` artifact retains the full proof.
+`full_exact_head` in the canonical receipt means every required context passed
+for that exact head. It does not claim every underlying command ran again.
+Record the fresh/reused distinction and retain the referenced provenance
+artifacts with the landing evidence before their seven-day retention expires.
+
+`scripts/protected-ci-reuse.py` permits reuse only when all of these hold:
+
+- The latest internal pull-request CI run and its latest workflow attempt
+  succeeded, along with every current app-bound protected check. The selected
+  job's latest execution succeeded. A failed-jobs rerun can retain a successful
+  job from an earlier attempt, but a newer failed, pending, cancelled or skipped
+  execution of that job cannot fall back to an older success. The workflow
+  result and the selected job's own completion are at most 24 hours old.
+- The source artifact was uploaded by that run and the selected job's exact
+  attempt after the job's check
+  commands succeeded. GitHub's immutable artifact identity and archive digest
+  match. A reused proof cannot become a source proof.
+- Live GitHub Git objects independently prove the tested tree, candidate tree
+  and landed tree agree. A synthetic tested merge also needs the exact ordered
+  base/candidate parents. The closed internal
+  main PR names that merge, whose ordered parents are the tested base followed
+  by the candidate. GitHub main still names the exact landed commit.
+- The source and landed workflow bytes agree, including action pins and check
+  commands. Whole-tree equality also binds scripts, toolchain manifests and
+  dependency lockfiles. After normal setup, runner image/version, tool versions
+  and resolved OS/Python packages agree. The optional non-secret repository
+  variable `BUZZ_CI_REUSE_EPOCH` invalidates results when an external relevant
+  input changes. It is not an authorization override.
+- The captured repository, strict app-bound required checks and active ruleset
+  authority agree with live authority, including each public ruleset revision
+  timestamp. GitHub hides bypass actors from read-only workflow tokens; this
+  optimizer never exercises a bypass, and the canonical operator receipt still
+  verifies bypass authority separately. The source run and public authority are
+  read again before returning a reuse decision.
+
+The candidate SHA, synthetic PR merge SHA, landed SHA, event name, workspace
+path and cache-hit state may differ. These are not execution inputs to the
+selected tree-scoped commands. New workflow code can qualify in its reviewed
+candidate CI run and be reused for its identical-tree landing. First-parent
+workflow equality is not a bootstrap requirement. The exact-candidate review,
+merge approval and authoritative Buzz/GitHub ref readbacks remain independent
+delivery gates; a merged GitHub PR alone does not replace them.
+
+Missing or materially different evidence reruns that job's normal checks. In
+particular, old receipts and logs without the resolved dependency/context
+capture are not enough for this adapter. This is a per-job coverage gap, not a
+reason to rerun a proven unrelated job or reinterpret an old receipt's SHA.
+Manual dispatches and pushes outside main execute fresh.
+
+Desktop Release Candidate, relay canary, Security, release/package builds,
+relay-backed integration and deployment checks remain fresh. Their present
+contracts include commit identity, artifacts, live services, mutable advisory
+data or other context that this adapter does not qualify. The relay canary's
+deliberate first-attempt failure and later success remain separate evidence.
+Neither deploy-local nor the desktop publisher needs a receipt schema change:
+they still acquire and live-reverify canonical exact-main protected evidence,
+and retain their source identity, artifact, approval and live-state gates.
+
 ## Deployment preflight
 
 Production deployment is approval-gated. Run it only from a clean checkout of
