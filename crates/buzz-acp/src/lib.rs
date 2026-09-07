@@ -1276,9 +1276,9 @@ fn handle_cancel_turn_control(
 /// post-cancel via `create_session_and_apply_model` (the turn restarts on the
 /// unchanged model + an `unsupported_model` result).
 ///
-/// Idle path: validate against the cached catalog *before* invalidating
-/// (pre-cancel guard), then set `desired_model` + invalidate. The override
-/// takes visible effect on the agent's next turn.
+/// Idle path: a fresh, non-empty cached catalog may reject the pick before
+/// invalidation. Empty or expired catalogs defer validation to the next
+/// `session/new`, which also refreshes the cache.
 async fn handle_switch_model_control(
     payload: &serde_json::Value,
     pool: &mut AgentPool,
@@ -1323,7 +1323,7 @@ async fn handle_switch_model_control(
             "turn_ending"
         }
     } else {
-        // Idle path: validate against the cached catalog before invalidating.
+        // Idle path: only a fresh, non-empty catalog can reject before invalidation.
         match pool.switch_idle_agent_model(channel_id, model_id).await {
             IdleSwitchResult::AmbiguousTarget => "ambiguous_target",
             IdleSwitchResult::Switched => "switched",
@@ -2337,9 +2337,8 @@ async fn tokio_main() -> Result<()> {
             last_maintenance = std::time::Instant::now();
             queue.compact_expired_state();
 
-            // Reap at most one session per maintenance tick. The close RPC has
-            // its own 3s end-to-end deadline, so maintenance never cancels a
-            // request after the adapter may already have applied it.
+            // Release at most one session per maintenance tick. Pending closes
+            // take priority over idle eviction and keep the same RPC deadline.
             let reaped = pool
                 .reap_idle_sessions(
                     Duration::from_secs(config.session_idle_ttl_secs),
@@ -2347,7 +2346,7 @@ async fn tokio_main() -> Result<()> {
                 )
                 .await;
             if reaped > 0 {
-                tracing::info!(reaped, "closed idle or excess ACP sessions");
+                tracing::info!(reaped, "released pending, idle, or excess ACP sessions");
             }
 
             // Slot refill: spawn background tasks for empty slots whose
