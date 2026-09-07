@@ -1,18 +1,28 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import * as React from "react";
+import { renderToString } from "react-dom/server";
+import {
+  Capability,
+  setCapabilityAvailable,
+} from "../../../platform/web/capabilities.ts";
 
 import { AgentDialog } from "./AgentDialog.tsx";
 import { AgentDefinitionDialog } from "./AgentDefinitionDialog.tsx";
 import { AgentInstanceEditDialog } from "./AgentInstanceEditDialog.tsx";
 import { AgentRunLocationProvider } from "./AgentRunLocationContext.tsx";
 
-// ── Phase 1B.3c routing pinning ─────────────────────────────────────────────
-//
-// AgentDialog is the single dialog entry point for every intent. It is
-// hook-free by design, so each union arm can be exercised as a plain function
-// call and the returned element inspected: the arm must route to the form
-// component that owns the intent, and pass-through arms must forward the
-// caller's props byte-for-byte (minus the `mode` discriminant).
+// Render the router inside React so its capability subscription is valid,
+// while inspecting the selected form before any form hooks or effects mount.
+function routeAgentDialog(props) {
+  let element;
+  function Capture() {
+    element = AgentDialog(props);
+    return null;
+  }
+  renderToString(React.createElement(Capture));
+  return element;
+}
 
 const noop = () => {};
 
@@ -31,7 +41,7 @@ test("definition-edit routes to AgentDefinitionDialog with exact pass-through", 
     title: "Edit agent",
   };
 
-  const element = AgentDialog({ mode: "definition-edit", ...props });
+  const element = routeAgentDialog({ mode: "definition-edit", ...props });
 
   assert.equal(element.type, AgentDefinitionDialog);
   assert.deepEqual(element.props, props, "props must pass through unchanged");
@@ -47,7 +57,7 @@ test("instance-edit routes to AgentInstanceEditDialog with its contract props", 
   const onOpenChange = noop;
   const onUpdated = noop;
 
-  const element = AgentDialog({
+  const element = routeAgentDialog({
     mode: "instance-edit",
     agent,
     onOpenChange,
@@ -73,7 +83,7 @@ test("instance-edit routes to AgentInstanceEditDialog with its contract props", 
 
 test("instance-edit publishes the run location resolved from the agent backend", () => {
   const routeWithBackend = (backend) =>
-    AgentDialog({
+    routeAgentDialog({
       mode: "instance-edit",
       agent: { pubkey: "abc", name: "test-agent", backend },
       onOpenChange: noop,
@@ -91,7 +101,7 @@ test("instance-edit publishes the run location resolved from the agent backend",
 });
 
 test("create mode routes to the internal create router, not a form directly", () => {
-  const element = AgentDialog({
+  const element = routeAgentDialog({
     mode: "definition",
     definitionError: null,
     isDefinitionPending: false,
@@ -109,4 +119,32 @@ test("create mode routes to the internal create router, not a form directly", ()
     "definition must route through the internal create router",
   );
   assert.equal(element.type.name, "AgentCreateDialogRouter");
+});
+
+test("unavailable agent create and instance edit show a dismissible desktop notice", () => {
+  setCapabilityAvailable(Capability.ManagedAgents, false);
+  try {
+    const element = routeAgentDialog({
+      mode: "definition",
+      onOpenChange: noop,
+    });
+    assert.equal(element.props.open, true);
+    assert.equal(element.props.onOpenChange, noop);
+    assert.equal(
+      routeAgentDialog({ mode: "instance-edit", open: false }),
+      null,
+    );
+    const edit = routeAgentDialog({
+      mode: "definition-edit",
+      open: true,
+      onOpenChange: noop,
+    });
+    assert.equal(
+      edit.type,
+      AgentDefinitionDialog,
+      "relay-backed definition editing stays reachable",
+    );
+  } finally {
+    setCapabilityAvailable(Capability.ManagedAgents, true);
+  }
 });

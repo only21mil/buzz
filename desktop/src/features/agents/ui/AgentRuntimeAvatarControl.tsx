@@ -1,3 +1,4 @@
+import { Capability, useCapability } from "@/platform/web/capabilities";
 import { CircleAlert } from "lucide-react";
 import { useReducedMotion } from "motion/react";
 
@@ -139,6 +140,7 @@ export function AgentRuntimeAvatarControl({
   onOpenError,
   onStart,
 }: AgentRuntimeAvatarControlProps) {
+  const runtimeAvailable = useCapability(Capability.ManagedAgents);
   const shouldReduceMotion = useReducedMotion();
   const trimmedAvatarUrl = avatarUrl?.trim() || null;
   const isRestartAction = requiresRestart || isRestarting;
@@ -190,16 +192,22 @@ export function AgentRuntimeAvatarControl({
                     : "bg-primary text-primary-foreground hover:bg-primary/90",
               )}
               data-testid={hasError ? errorTestId : startTestId}
-              disabled={isPending}
+              disabled={!runtimeAvailable || isPending}
               onClick={(event) => {
                 event.stopPropagation();
                 if (hasError) {
                   onOpenError?.();
                   return;
                 }
-                onStart();
+                if (runtimeAvailable) onStart();
               }}
-              title={hasError ? errorLabel || errorActionLabel : actionLabel}
+              title={
+                !runtimeAvailable
+                  ? "Open Buzz desktop to run agents"
+                  : hasError
+                    ? errorLabel || errorActionLabel
+                    : actionLabel
+              }
               type="button"
             >
               {isPending ? (

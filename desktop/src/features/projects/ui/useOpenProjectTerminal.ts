@@ -1,3 +1,4 @@
+import { Capability, isCapabilityAvailable } from "@/platform/web/capabilities";
 import { useQueryClient } from "@tanstack/react-query";
 import * as React from "react";
 import { toast } from "sonner";
@@ -23,6 +24,7 @@ export function useOpenProjectTerminal(reposDir?: string | null) {
       project: Repository,
       options: { branch?: string | null; hasLocalCheckout: boolean },
     ) => {
+      if (!isCapabilityAvailable(Capability.Terminal)) return;
       const toastId = options.hasLocalCheckout
         ? undefined
         : toast.loading(`Cloning ${project.name}…`);

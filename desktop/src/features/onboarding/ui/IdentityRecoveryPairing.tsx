@@ -1,3 +1,5 @@
+import { Capability } from "@/platform/web/capabilities";
+import { CapabilityGate } from "@/shared/ui/CapabilityGate";
 import * as React from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -36,7 +38,7 @@ function recoveryErrorMessage(message: string): string {
   return message;
 }
 
-export function IdentityRecoveryPairing({
+function IdentityRecoveryPairingContent({
   onRecovered,
   onStepChange,
 }: {
@@ -274,5 +276,15 @@ export function IdentityRecoveryPairing({
         </p>
       ) : null}
     </div>
+  );
+}
+
+export function IdentityRecoveryPairing(
+  props: React.ComponentProps<typeof IdentityRecoveryPairingContent>,
+) {
+  return (
+    <CapabilityGate capability={Capability.Pairing}>
+      <IdentityRecoveryPairingContent {...props} />
+    </CapabilityGate>
   );
 }

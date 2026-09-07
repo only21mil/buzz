@@ -1,3 +1,5 @@
+import { Capability, useCapability } from "@/platform/web/capabilities";
+import { CapabilityGate } from "@/shared/ui/CapabilityGate";
 import * as React from "react";
 import {
   ArrowUpRight,
@@ -223,6 +225,7 @@ export function ProfileSummaryView({
   unfollowMutation,
   userStatus,
 }: ProfileSummaryViewProps) {
+  const runtimeAvailable = useCapability(Capability.ManagedAgents);
   const activeTurns = useAgentWorking(isBot ? pubkey : null).channels;
 
   const showMemoriesTab = isOwner === true && Boolean(pubkey);
@@ -344,19 +347,19 @@ export function ProfileSummaryView({
 
       {canInstantiateAgent ? (
         <ProfilePersonaPrimaryActions
-          canEditAgent={canEditAgent}
+          canEditAgent={canEditAgent && (!managedAgent || runtimeAvailable)}
           disabled={isAgentActionPending}
-          onCreateCard={onCreateCard}
+          onCreateCard={runtimeAvailable ? onCreateCard : undefined}
           onEditAgent={handleEditAgent}
           onStartAgent={handleInstantiateAgent}
         />
       ) : !isSelf && pubkey ? (
         <ProfilePrimaryActions
-          canEditAgent={canEditAgent}
+          canEditAgent={canEditAgent && (!managedAgent || runtimeAvailable)}
           followMutation={followMutation}
-          onCreateCard={onCreateCard}
+          onCreateCard={runtimeAvailable ? onCreateCard : undefined}
           onEditAgent={handleEditAgent}
-          agentActionDisabled={isAgentActionPending}
+          agentActionDisabled={!runtimeAvailable || isAgentActionPending}
           agentActionLabel={
             isOwner === true && managedAgent
               ? getManagedAgentPrimaryActionLabel(managedAgent)
@@ -424,7 +427,7 @@ export function ProfileSummaryView({
             />
           ) : null}
           {activeTab === "runtime" ? (
-            <>
+            <CapabilityGate capability={Capability.ManagedAgents}>
               <ProfileRuntimeTabContent
                 agentInstruction={agentInstruction}
                 autoRestartEnabled={
@@ -449,7 +452,7 @@ export function ProfileSummaryView({
                   />
                 </div>
               ) : null}
-            </>
+            </CapabilityGate>
           ) : null}
           {activeTab === "channels" ? (
             <ChannelsFocusedView

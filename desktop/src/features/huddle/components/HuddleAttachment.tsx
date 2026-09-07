@@ -1,3 +1,4 @@
+import { Capability, useCapability } from "@/platform/web/capabilities";
 import { useQueryClient } from "@tanstack/react-query";
 import { Headphones, MessageSquareText } from "lucide-react";
 import * as React from "react";
@@ -118,6 +119,7 @@ export function HuddleAttachment({
   className,
   message,
 }: HuddleAttachmentProps) {
+  const huddleAvailable = useCapability(Capability.HuddleAudio);
   const ephemeralChannelId = React.useMemo(
     () => parseEphemeralChannelId(message.body),
     [message.body],
@@ -211,7 +213,8 @@ export function HuddleAttachment({
   const isStaleUnconfirmedHuddle =
     !isCurrentHuddle && isHuddleStartStale(message.createdAt);
   const canJoin = Boolean(
-    channelId &&
+    huddleAvailable &&
+      channelId &&
       ephemeralChannelId &&
       !isEnded &&
       !isCurrentHuddle &&
@@ -220,7 +223,14 @@ export function HuddleAttachment({
   const displayEnded = isEnded || isStaleUnconfirmedHuddle;
 
   async function handleJoin() {
-    if (!channelId || !ephemeralChannelId || isJoining || isStarting) return;
+    if (
+      !huddleAvailable ||
+      !channelId ||
+      !ephemeralChannelId ||
+      isJoining ||
+      isStarting
+    )
+      return;
     setIsJoining(true);
     try {
       await joinHuddle(channelId, ephemeralChannelId, message.id);

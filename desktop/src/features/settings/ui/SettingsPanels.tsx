@@ -1,3 +1,5 @@
+import { Capability } from "@/platform/web/capabilities";
+import { CapabilityGate } from "@/shared/ui/CapabilityGate";
 import { useMemo, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import {
@@ -949,27 +951,41 @@ export function renderSettingsSection(
         />
       );
     case "voice":
-      return <VoiceSettingsCard />;
+      return (
+        <CapabilityGate capability={Capability.HuddleAudio}>
+          <VoiceSettingsCard />
+        </CapabilityGate>
+      );
     case "experimental":
       return <ExperimentalFeaturesCard />;
     case "agents":
       return (
-        <div className="space-y-12">
-          <PreventSleepSettingsCard />
-          <HarnessesSettingsPanel />
-          <AgentDefaultsSettingsCard />
-        </div>
+        <CapabilityGate capability={Capability.ManagedAgents}>
+          <div className="space-y-12">
+            <PreventSleepSettingsCard />
+            <HarnessesSettingsPanel />
+            <AgentDefaultsSettingsCard />
+          </div>
+        </CapabilityGate>
       );
     case "channel-templates":
       return <ChannelTemplatesSettingsCard />;
     case "compute":
-      return <MeshComputeSettingsCard />;
+      return (
+        <CapabilityGate capability={Capability.Mesh}>
+          <MeshComputeSettingsCard />
+        </CapabilityGate>
+      );
     case "appearance":
       return <ThemeSettingsCard />;
     case "shortcuts":
       return <KeyboardShortcutsCard />;
     case "hosted-communities":
-      return <HostedCommunitiesSettingsCard />;
+      return (
+        <CapabilityGate capability={Capability.HostedCommunities}>
+          <HostedCommunitiesSettingsCard />
+        </CapabilityGate>
+      );
     case "community-members":
       return (
         <CommunityMembersSettingsCard currentPubkey={props.currentPubkey} />
@@ -979,9 +995,17 @@ export function renderSettingsSection(
     case "custom-emoji":
       return <CustomEmojiSettingsCard />;
     case "local-archive":
-      return <LocalArchiveSettingsCard />;
+      return (
+        <CapabilityGate capability={Capability.LocalArchive}>
+          <LocalArchiveSettingsCard />
+        </CapabilityGate>
+      );
     case "mobile":
-      return <MobilePairingCard currentPubkey={props.currentPubkey} />;
+      return (
+        <CapabilityGate capability={Capability.Pairing}>
+          <MobilePairingCard currentPubkey={props.currentPubkey} />
+        </CapabilityGate>
+      );
     case "updates":
       return <UpdateChecker />;
     default: {
