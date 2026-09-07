@@ -785,10 +785,10 @@ pub(crate) fn count_fallback_exceeded(candidate_count: usize) -> bool {
 /// an exact count without post-filtering.
 ///
 /// Pushed constraints: kinds, authors (single or multi), ids, since, until,
-/// channel_id (#h single), #p (single), #d (single, NIP-33-only kinds), #e (any),
+/// channel_id (#h single), #p (single), #d (single, NIP-33-only kinds), #e (any), #a (any),
 /// channel_ids (injected by caller).
 ///
-/// Anything else (multi-#p, #t, #a, search, multi-#h, #d on non-NIP-33)
+/// Anything else (multi-#p, #t, search, multi-#h, #d on non-NIP-33)
 /// requires post-filtering and cannot use the fast COUNT path.
 pub fn filter_fully_pushable(filter: &Filter) -> bool {
     // Check if filter exclusively targets NIP-33 kinds (needed for #d pushability).
@@ -824,8 +824,11 @@ pub fn filter_fully_pushable(filter: &Filter) -> bool {
             "e" => {
                 // #e is fully pushed (any count) via JSONB containment.
             }
+            "a" => {
+                // #a is fully pushed (any count) with exact tag positions.
+            }
             _ => {
-                // Any other generic tag (#t, #a, etc.) is not pushed.
+                // Any other generic tag (#t, etc.) is not pushed.
                 if !tag_values.is_empty() {
                     return false;
                 }
@@ -940,6 +943,16 @@ fn filter_to_query_params(
         }
     });
 
+    // Push coordinate values as one OR predicate before ordering and LIMIT.
+    let a_tag_key = nostr::SingleLetterTag::lowercase(nostr::Alphabet::A);
+    let a_tags = filter.generic_tags.get(&a_tag_key).and_then(|values| {
+        if values.is_empty() {
+            None
+        } else {
+            Some(values.iter().map(|value| value.to_string()).collect())
+        }
+    });
+
     // Push single-value #p tag into SQL via event_mentions join.
     // This is critical for gift-wrap (kind:1059) and membership notification
     // queries where >500 events for other recipients would otherwise push
@@ -998,6 +1011,7 @@ fn filter_to_query_params(
         authors,
         ids,
         e_tags,
+        a_tags,
         ..EventQuery::for_community(community)
     }
 }
@@ -1732,6 +1746,40 @@ mod tests {
             ))
             .custom_tags(p_tag, [authed]);
         assert!(p_gated_filters_authorized(&[matching_p], authed));
+    }
+
+    #[test]
+    fn coordinate_filters_push_all_values_without_weakening_other_constraints() {
+        let community = buzz_core::tenant::CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let filter: Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [1618, 1621], "#a": ["30617:owner:quiet", "30617:owner:busy"],
+            "#e": ["thread"], "limit": 2
+        }))
+        .expect("coordinate filter");
+        let q = filter_to_query_params(&filter, None, community);
+        assert_eq!(q.community_id, community);
+        assert_eq!(q.limit, Some(2));
+        let mut coordinates = q.a_tags.expect("coordinate pushdown");
+        coordinates.sort();
+        assert_eq!(coordinates, ["30617:owner:busy", "30617:owner:quiet"]);
+        assert_eq!(q.e_tags, Some(vec!["thread".to_owned()]));
+        assert!(filter_fully_pushable(&filter));
+        for extra in [
+            serde_json::json!({"#t": ["bug"]}),
+            serde_json::json!({"#p": ["alice", "bob"]}),
+            serde_json::json!({"#d": ["slug"]}),
+            serde_json::json!({"search": "issue"}),
+        ] {
+            let mut value = serde_json::to_value(&filter).expect("serialize filter");
+            value
+                .as_object_mut()
+                .expect("filter object")
+                .extend(extra.as_object().expect("extra object").clone());
+            let constrained: Filter = serde_json::from_value(value).expect("constrained filter");
+            assert!(!filter_fully_pushable(&constrained));
+        }
+        let absent = filter_to_query_params(&Filter::new(), None, community);
+        assert!(absent.a_tags.is_none());
     }
 
     #[test]

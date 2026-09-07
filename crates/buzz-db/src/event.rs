@@ -70,6 +70,9 @@ pub struct EventQuery {
     /// Restrict results to events with an `e` tag referencing any of these event IDs (hex).
     /// Uses JSONB containment (`tags @> ...`) against the `tags` column.
     pub e_tags: Option<Vec<String>>,
+    /// Restrict results to events with an `a` tag referencing any of these coordinates.
+    /// Matches the tag name and value at their protocol positions before SQL LIMIT.
+    pub a_tags: Option<Vec<String>>,
     /// Restrict to a custom tag name/value pair before SQL LIMIT.
     pub custom_tag: Option<(String, String)>,
     /// Restrict results to events in any of these channels, while retaining
@@ -123,6 +126,7 @@ impl EventQuery {
             authors: None,
             ids: None,
             e_tags: None,
+            a_tags: None,
             custom_tag: None,
             channel_ids: None,
             max_limit: None,
@@ -467,11 +471,14 @@ pub(crate) async fn query_events_on(
         }
     }
 
+    push_coordinate_filter(&mut qb, col_prefix, &q.a_tags);
+
     // e-tag pushdown via JSONB containment: tags @> '[["e","<hex>"]]'.
     // Multiple e-tags use OR (any match). Served by idx_events_tags_gin
     // (GIN, jsonb_path_ops — migrations/0004): the channel-window aux closure
     // fans this out once per retained row, which made unindexed containment
     // the dominant scroll-back cost (~1.7s/page on staging).
+
     if let Some(ref e_tags) = q.e_tags {
         if !e_tags.is_empty() {
             qb.push(" AND (");
@@ -739,6 +746,8 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
         }
     }
 
+    push_coordinate_filter(&mut qb, col_prefix, &q.a_tags);
+
     if let Some(ref e_tags) = q.e_tags {
         if !e_tags.is_empty() {
             qb.push(" AND (");
@@ -781,6 +790,35 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
     let cnt: i64 = row.try_get("cnt")?;
 
     Ok(cnt)
+}
+
+/// Apply coordinate OR semantics inside the surrounding query's AND constraints.
+fn push_coordinate_filter(
+    qb: &mut QueryBuilder<sqlx::Postgres>,
+    col_prefix: &str,
+    coordinates: &Option<Vec<String>>,
+) {
+    let Some(coordinates) = coordinates else {
+        return;
+    };
+    if coordinates.is_empty() {
+        qb.push(" AND FALSE");
+        return;
+    }
+    qb.push(" AND (");
+    for (index, coordinate) in coordinates.iter().enumerate() {
+        if index > 0 {
+            qb.push(" OR ");
+        }
+        // Containment can use the tags GIN index, but ignores array positions.
+        // The EXISTS check excludes values found in a marker or another tag slot.
+        qb.push(format!("({col_prefix}tags @> "))
+            .push_bind(serde_json::json!([["a", coordinate]]))
+            .push(format!(" AND EXISTS (SELECT 1 FROM jsonb_array_elements({col_prefix}tags) AS coordinate_tag WHERE coordinate_tag->>0 = 'a' AND coordinate_tag->>1 = "))
+            .push_bind(coordinate.clone())
+            .push("))");
+    }
+    qb.push(")");
 }
 
 /// Soft-delete an event by setting `deleted_at = NOW()`.
@@ -1956,6 +1994,201 @@ mod tests {
             events[1].event.id, older_accessible.id,
             "older accessible row must not be hidden behind newer inaccessible rows"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn coordinate_scope_precedes_limit_and_count_preserves_access() {
+        let pool = setup_pool().await;
+        let community_uuid = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_uuid);
+        let other = CommunityId::from_uuid(make_test_community(&pool).await);
+        let accessible = make_test_channel(&pool, community_uuid, None).await;
+        let inaccessible = make_test_channel(&pool, community_uuid, None).await;
+        let keys = Keys::generate();
+        // Include quotes to verify coordinates are bound values, never SQL text.
+        let quiet = "30617:owner:quiet' OR TRUE --";
+        let busy = "30617:owner:busy";
+        let event = |kind, tags: Vec<Vec<&str>>, time| {
+            EventBuilder::new(Kind::Custom(kind), "coordinate fixture")
+                .tags(tags.into_iter().map(|tag| Tag::parse(tag).expect("tag")))
+                .custom_created_at(nostr::Timestamp::from(1_800_000_000 + time))
+                .sign_with_keys(&keys)
+                .expect("sign fixture")
+        };
+        for kind in [1618, 1621] {
+            // The quiet repository sits entirely behind a page of busy events.
+            for (coordinate, start, total) in [(quiet, 0, 3), (busy, 10, 8)] {
+                for offset in 0..total {
+                    let e = event(
+                        kind,
+                        vec![vec!["a", coordinate], vec!["e", "thread"]],
+                        start + offset,
+                    );
+                    insert_event(&pool, community, &e, Some(accessible))
+                        .await
+                        .expect("insert repository event");
+                }
+            }
+            // Newer positional false positives must not spend a page or count.
+            for (offset, tags) in [
+                vec![vec!["a", "other", quiet]],
+                vec![vec![quiet, "a"]],
+                vec![vec!["x", "a", quiet]],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                insert_event(
+                    &pool,
+                    community,
+                    &event(kind, tags, 30 + offset as u64),
+                    Some(accessible),
+                )
+                .await
+                .expect("insert malformed coordinate");
+            }
+            for (tenant, channel, time) in [(other, None, 40), (community, Some(inaccessible), 41)]
+            {
+                insert_event(
+                    &pool,
+                    tenant,
+                    &event(kind, vec![vec!["a", quiet]], time),
+                    channel,
+                )
+                .await
+                .expect("insert inaccessible match");
+            }
+            let deleted = event(kind, vec![vec!["a", quiet]], 42);
+            insert_event(&pool, community, &deleted, None)
+                .await
+                .expect("insert deleted match");
+            soft_delete_event(&pool, community, &deleted.id.to_bytes())
+                .await
+                .expect("delete fixture event");
+            for (coordinate, total) in [(quiet, 3), (busy, 8)] {
+                for limit in [1, 2, 5, 20] {
+                    let q = EventQuery {
+                        kinds: Some(vec![kind as i32]),
+                        a_tags: Some(vec![coordinate.to_owned()]),
+                        channel_ids: Some(vec![accessible]),
+                        limit: Some(limit),
+                        ..EventQuery::for_community(community)
+                    };
+                    let rows = query_events(&pool, &q).await.expect("coordinate page");
+                    assert_eq!(
+                        rows.len() as i64,
+                        limit.min(total),
+                        "kind {kind}, coordinate {coordinate}, limit {limit}"
+                    );
+                    assert!(rows.iter().all(|row| row.event.tags.iter().any(|tag| {
+                        let parts = tag.as_slice();
+                        parts.first().map(String::as_str) == Some("a")
+                            && parts.get(1).map(String::as_str) == Some(coordinate)
+                    })));
+                    assert_eq!(
+                        count_events(&pool, &q).await.expect("coordinate count"),
+                        total
+                    );
+                }
+            }
+            // Both coordinate alternatives match this row, which must occur once.
+            // Trailing relay/marker data is valid; #p also exercises the table alias.
+            let recipient = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let both = event(
+                kind,
+                vec![
+                    vec!["a", quiet, "wss://relay.example"],
+                    vec!["a", busy],
+                    vec!["e", "thread"],
+                    vec!["p", recipient],
+                ],
+                50,
+            );
+            insert_event(&pool, community, &both, Some(accessible))
+                .await
+                .expect("insert multi-coordinate event");
+            crate::insert_mentions(&pool, community, &both, Some(accessible))
+                .await
+                .expect("insert fixture mention");
+            let q = EventQuery {
+                kinds: Some(vec![kind as i32]),
+                a_tags: Some(vec![quiet.to_owned(), busy.to_owned()]),
+                e_tags: Some(vec!["thread".to_owned()]),
+                channel_ids: Some(vec![accessible]),
+                limit: Some(20),
+                ..EventQuery::for_community(community)
+            };
+            assert_eq!(
+                query_events(&pool, &q)
+                    .await
+                    .expect("coordinate OR page")
+                    .len(),
+                12
+            );
+            assert_eq!(
+                count_events(&pool, &q).await.expect("coordinate OR count"),
+                12
+            );
+            let mentioned = EventQuery {
+                p_tag_hex: Some(recipient.to_owned()),
+                ..q.clone()
+            };
+            let mentioned_rows = query_events(&pool, &mentioned)
+                .await
+                .expect("coordinate and mention page");
+            assert_eq!(mentioned_rows.len(), 1);
+            assert_eq!(mentioned_rows[0].event.id, both.id);
+            assert_eq!(
+                count_events(&pool, &mentioned)
+                    .await
+                    .expect("coordinate and mention count"),
+                1
+            );
+            let missing_thread = EventQuery {
+                e_tags: Some(vec!["missing".to_owned()]),
+                ..q.clone()
+            };
+            assert!(query_events(&pool, &missing_thread)
+                .await
+                .expect("tag AND page")
+                .is_empty());
+            assert_eq!(
+                count_events(&pool, &missing_thread)
+                    .await
+                    .expect("tag AND count"),
+                0
+            );
+            let no_access = EventQuery {
+                channel_ids: Some(vec![]),
+                ..q.clone()
+            };
+            assert!(query_events(&pool, &no_access)
+                .await
+                .expect("no access page")
+                .is_empty());
+            assert_eq!(
+                count_events(&pool, &no_access)
+                    .await
+                    .expect("no access count"),
+                0
+            );
+            let empty = EventQuery {
+                a_tags: Some(vec![]),
+                ..q
+            };
+            assert!(query_events(&pool, &empty)
+                .await
+                .expect("empty coordinate page")
+                .is_empty());
+            assert_eq!(
+                count_events(&pool, &empty)
+                    .await
+                    .expect("empty coordinate count"),
+                0
+            );
+        }
+        pool.close().await;
     }
 
     #[tokio::test]
