@@ -466,10 +466,9 @@ pub fn search_response_from_events(events: &[Event]) -> SearchResponse {
 
 /// Convert kind:10100 agent profile events to the agent discovery format.
 ///
-/// Policy-only records are not directory profiles. Ignore them so an old bare
-/// `set-add-policy` event cannot replace real agent metadata with defaults.
-/// If historical duplicate replaceable heads are returned, the newest event
-/// containing an agent name wins for each author.
+/// Policy-only records are not directory profiles. If historical duplicate
+/// replaceable events are returned, choose each author's newest event before
+/// deciding whether its content describes an agent.
 pub(super) fn event_has_agent_identity(event: &Event) -> bool {
     let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&event.content) else {
         return false;
@@ -485,9 +484,6 @@ pub(super) fn event_has_agent_identity(event: &Event) -> bool {
 pub fn agents_from_events(events: &[Event]) -> Value {
     let mut latest: Vec<(usize, &Event)> = Vec::new();
     for (index, event) in events.iter().enumerate() {
-        if !event_has_agent_identity(event) {
-            continue;
-        }
         if let Some((_, previous)) = latest
             .iter_mut()
             .find(|(_, previous)| previous.pubkey == event.pubkey)
@@ -506,6 +502,7 @@ pub fn agents_from_events(events: &[Event]) -> Value {
     let arr: Vec<Value> = latest
         .into_iter()
         .map(|(_, event)| event)
+        .filter(|event| event_has_agent_identity(event))
         .map(|ev| {
             let mut v: Value = serde_json::from_str(&ev.content).unwrap_or_else(|_| json!({}));
             let pubkey = ev.pubkey.to_hex();

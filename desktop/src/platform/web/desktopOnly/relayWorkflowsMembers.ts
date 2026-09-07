@@ -292,12 +292,9 @@ function relayAgentsFromEvents(events: RelayEvent[]) {
     {
       index: number;
       event: RelayEvent;
-      agent: NonNullable<ReturnType<typeof relayAgentFromEvent>>;
     }
   >();
   events.forEach((event, index) => {
-    const agent = relayAgentFromEvent(event);
-    if (!agent) return;
     const previous = latest.get(event.pubkey);
     if (
       !previous ||
@@ -308,13 +305,15 @@ function relayAgentsFromEvents(events: RelayEvent[]) {
       latest.set(event.pubkey, {
         index: previous?.index ?? index,
         event,
-        agent,
       });
     }
   });
   return [...latest.values()]
     .sort((left, right) => left.index - right.index)
-    .map(({ agent }) => agent);
+    .flatMap(({ event }) => {
+      const agent = relayAgentFromEvent(event);
+      return agent ? [agent] : [];
+    });
 }
 
 function profileFromEvent(event: RelayEvent) {

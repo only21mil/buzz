@@ -6,10 +6,7 @@ use nostr::Event;
 
 use crate::managed_agents::{agent_events::managed_agent_content_from_event, RelayAgentInfo};
 
-use super::{
-    agents_from_events, event_has_agent_identity, first_tag_value, profile_valid_oa_owner_pubkey,
-    tags_named,
-};
+use super::{agents_from_events, first_tag_value, profile_valid_oa_owner_pubkey, tags_named};
 
 /// Collect valid agent pubkeys from kind:30177 `d` tags for follow-up relay
 /// queries. Malformed tags are ignored so one hostile event cannot invalidate
@@ -32,9 +29,6 @@ fn event_is_newer(candidate: &Event, previous: &Event) -> bool {
 fn relay_agents_from_legacy_events(events: &[Event]) -> Vec<RelayAgentInfo> {
     let mut latest: HashMap<String, &Event> = HashMap::new();
     for event in events {
-        if !event_has_agent_identity(event) {
-            continue;
-        }
         let pubkey = event.pubkey.to_hex();
         if latest
             .get(&pubkey)

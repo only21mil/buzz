@@ -351,7 +351,7 @@ fn agents_default_sparse_agent_profiles_for_directory_parse() {
 }
 
 #[test]
-fn agents_fold_sparse_policy_updates_without_resetting_profile() {
+fn agents_skip_an_authoritative_sparse_head() {
     let fixture: Value =
         serde_json::from_str(include_str!("../../../fixtures/agent-profile-fold.json"))
             .expect("parse shared agent profile fixture");
@@ -362,19 +362,10 @@ fn agents_fold_sparse_policy_updates_without_resetting_profile() {
 
     let after_sparse = agents_from_events(&[complete.clone(), sparse.clone()]);
     let agents = after_sparse["agents"].as_array().expect("agents array");
-    assert_eq!(agents.len(), 1);
-    assert_eq!(agents[0]["name"], "Scout");
-    assert_eq!(agents[0]["agent_type"], "assistant");
-    assert_eq!(agents[0]["channels"], serde_json::json!(["general"]));
-    assert_eq!(agents[0]["capabilities"], serde_json::json!(["search"]));
-    assert_eq!(agents[0]["status"], "online");
-    assert_eq!(agents[0]["respond_to"], "allowlist");
+    assert!(agents.is_empty());
     let directory =
         relay_agents_from_directory_events(&[complete.clone(), sparse.clone()], &[], &[]);
-    assert_eq!(directory.len(), 1);
-    assert_eq!(directory[0].name, "Scout");
-    assert_eq!(directory[0].agent_type, "assistant");
-    assert_eq!(directory[0].status, "online");
+    assert!(directory.is_empty());
 
     let after_replacement =
         agents_from_events(&[complete.clone(), sparse.clone(), replacement.clone()]);

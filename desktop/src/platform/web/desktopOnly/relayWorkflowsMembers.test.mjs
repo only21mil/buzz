@@ -431,7 +431,7 @@ test("list_relay_agents folds sparse and complete kind:10100 profiles", async ()
   assert.equal(getUnregisteredCommandMissCount(), 0);
 });
 
-test("list_relay_agents preserves a profile across sparse policy updates", async () => {
+test("list_relay_agents skips an authoritative sparse head", async () => {
   const profileEvent = (id, createdAt, content) =>
     event({
       id,
@@ -457,9 +457,7 @@ test("list_relay_agents preserves a profile across sparse policy updates", async
   const client = clientFixture({ events: [complete, sparse] });
   registerRelayWorkflowsMembersCommands(identity, client);
 
-  assert.deepEqual(await dispatch("list_relay_agents"), [
-    { pubkey: PUBKEY, ...AGENT_PROFILE_FOLD_FIXTURE.complete },
-  ]);
+  assert.deepEqual(await dispatch("list_relay_agents"), []);
 
   client.calls.fetchEvents.length = 0;
   client.fetchEvents = async (filter) => {
@@ -469,6 +467,41 @@ test("list_relay_agents preserves a profile across sparse policy updates", async
   assert.deepEqual(await dispatch("list_relay_agents"), [
     { pubkey: PUBKEY, ...AGENT_PROFILE_FOLD_FIXTURE.replacement },
   ]);
+});
+
+test("list_relay_agents parses only the authoritative profile head", async () => {
+  const oldMalformed = event({
+    id: "agent-old-malformed",
+    kind: 10100,
+    createdAt: 10,
+    content: JSON.stringify({ name: "Old", respond_to: 42 }),
+  });
+  const current = event({
+    id: "agent-current",
+    kind: 10100,
+    createdAt: 20,
+    content: JSON.stringify({ name: "New", respond_to: "anyone" }),
+  });
+  const client = clientFixture({ events: [oldMalformed, current] });
+  registerRelayWorkflowsMembersCommands(identity, client);
+
+  const expected = [
+    {
+      pubkey: PUBKEY,
+      name: "New",
+      agent_type: "agent",
+      channels: [],
+      channel_ids: [],
+      capabilities: [],
+      status: "offline",
+      respond_to: "anyone",
+      respond_to_allowlist: [],
+    },
+  ];
+  assert.deepEqual(await dispatch("list_relay_agents"), expected);
+
+  client.fetchEvents = async () => [current, oldMalformed];
+  assert.deepEqual(await dispatch("list_relay_agents"), expected);
 });
 
 test("update_profile_at_relay compare-writes through the explicit relay seam", async () => {
