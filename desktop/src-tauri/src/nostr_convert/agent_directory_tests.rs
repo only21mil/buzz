@@ -40,6 +40,92 @@ fn managed_agent_event(
 }
 
 #[test]
+fn relay_agent_directory_tolerates_malformed_descriptive_arrays() {
+    use crate::managed_agents::{RelayAgentInfo, RespondTo};
+
+    let peer = ev(
+        10100,
+        r#"{"name":"Valid peer","respond_to":"owner-only"}"#,
+        vec![],
+    );
+    for field in ["channels", "channel_ids", "capabilities"] {
+        for (value, expected) in [
+            (
+                json!(["valid", 17, null, {}, [], false, "also-valid"]),
+                vec!["valid", "also-valid"],
+            ),
+            (json!(null), vec![]),
+            (json!("not-an-array"), vec![]),
+            (json!({}), vec![]),
+        ] {
+            let mut content = json!({
+                "name": "Mixed profile",
+                "status": "online",
+                "respond_to": "allowlist",
+                "respond_to_allowlist": ["a".repeat(64)],
+            });
+            content[field] = value;
+            let malformed = ev(10100, &content.to_string(), vec![]);
+            let events = [malformed.clone(), peer.clone()];
+            let converted = agents_from_events(&events);
+            let typed: Vec<RelayAgentInfo> =
+                serde_json::from_value(converted["agents"].clone()).expect("typed directory");
+            assert_eq!(typed.len(), 2, "field: {field}");
+            let mixed = typed
+                .iter()
+                .find(|agent| agent.name == "Mixed profile")
+                .unwrap();
+            let normalized = serde_json::to_value(mixed).unwrap();
+            assert_eq!(normalized[field], json!(expected), "field: {field}");
+            assert_eq!(mixed.respond_to, Some(RespondTo::Allowlist));
+            assert_eq!(mixed.respond_to_allowlist, vec!["a".repeat(64)]);
+
+            let directory = relay_agents_from_directory_events(&events, &[], &[]);
+            assert_eq!(directory.len(), 2, "field: {field}");
+            let mixed = directory
+                .iter()
+                .find(|agent| agent.pubkey == malformed.pubkey.to_hex())
+                .unwrap();
+            assert_eq!(mixed.status, "online");
+            assert!(
+                mixed.channel_ids.is_empty(),
+                "runtime profile cannot grant membership"
+            );
+        }
+    }
+}
+
+#[test]
+fn relay_agent_directory_rejects_malformed_policy_without_losing_valid_peers() {
+    let peer = ev(
+        10100,
+        r#"{"name":"Valid peer","respond_to":"owner-only"}"#,
+        vec![],
+    );
+    for (field, value) in [
+        ("respond_to", json!("unknown-mode")),
+        ("respond_to", json!(17)),
+        ("respond_to_allowlist", json!(["a".repeat(64), 17])),
+        ("respond_to_allowlist", json!("not-an-array")),
+        ("respond_to_allowlist", json!(null)),
+    ] {
+        let mut content = json!({"name": "Malformed policy", "respond_to": "allowlist"});
+        content[field] = value.clone();
+        let malformed = ev(10100, &content.to_string(), vec![]);
+        let converted = agents_from_events(std::slice::from_ref(&malformed));
+        assert_eq!(
+            converted["agents"][0][field], value,
+            "policy must remain strict"
+        );
+        for events in [[malformed.clone(), peer.clone()], [peer.clone(), malformed]] {
+            let directory = relay_agents_from_directory_events(&events, &[], &[]);
+            assert_eq!(directory.len(), 1, "field: {field}, value: {value}");
+            assert_eq!(directory[0].pubkey, peer.pubkey.to_hex());
+        }
+    }
+}
+
+#[test]
 fn managed_agent_directory_accepts_only_the_verified_owner_policy() {
     let agent_keys = Keys::generate();
     let owner_keys = Keys::generate();
