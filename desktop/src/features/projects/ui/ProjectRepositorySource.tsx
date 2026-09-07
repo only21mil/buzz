@@ -14,6 +14,8 @@ import {
   UploadCloud,
 } from "lucide-react";
 
+import { projectBranchLocationLabel } from "@/features/projects/lib/projectBranches";
+
 import { Button } from "@/shared/ui/button";
 import {
   DropdownMenu,
@@ -32,6 +34,9 @@ import { PROJECT_PANEL_ACTION_BUTTON_CLASS } from "./projectPanelStyles";
 export function RepositoryBranchDropdown({
   branch,
   branchOptions,
+  remoteBranches,
+  localBranches,
+  localCheckouts,
   selectedTag,
   tagOptions = [],
   compact,
@@ -46,6 +51,9 @@ export function RepositoryBranchDropdown({
 }: {
   branch: string;
   branchOptions: string[];
+  remoteBranches?: string[];
+  localBranches?: string[];
+  localCheckouts?: Array<{ path: string; branch: string | null }>;
   selectedTag?: string | null;
   tagOptions?: Array<{ name: string; commit: string }>;
   /** Smaller trigger for inline headers. */
@@ -104,6 +112,14 @@ export function RepositoryBranchDropdown({
             <DropdownMenuRadioItem key={option} value={`branch:${option}`}>
               <GitBranch className="mr-1.5 h-3.5 w-3.5 text-muted-foreground" />
               <span className="truncate font-mono">{option}</span>
+              <span className="ml-auto text-xs text-muted-foreground">
+                {projectBranchLocationLabel(
+                  option,
+                  remoteBranches,
+                  localBranches,
+                  localCheckouts,
+                )}
+              </span>
             </DropdownMenuRadioItem>
           ))}
           {tagOptions.length > 0 ? (
@@ -125,6 +141,30 @@ export function RepositoryBranchDropdown({
             </>
           ) : null}
         </DropdownMenuRadioGroup>
+        {localCheckouts && localCheckouts.length > 0 ? (
+          <>
+            <DropdownMenuSeparator />
+            <DropdownMenuLabel>Local checkouts</DropdownMenuLabel>
+            {localCheckouts.map((checkout) => (
+              <DropdownMenuItem
+                key={checkout.path}
+                disabled={!checkout.branch}
+                onSelect={() => {
+                  if (checkout.branch) onBranchChange(checkout.branch);
+                }}
+              >
+                <div className="min-w-0">
+                  <p className="font-mono">
+                    {checkout.branch ?? "Detached HEAD"}
+                  </p>
+                  <p className="break-all text-xs text-muted-foreground">
+                    {checkout.path}
+                  </p>
+                </div>
+              </DropdownMenuItem>
+            ))}
+          </>
+        ) : null}
         {!selectedTag && (onCreateBranch || onDeleteBranch) ? (
           <>
             <DropdownMenuSeparator />
@@ -169,6 +209,9 @@ export function RepositoryBranchDropdown({
 export type RepoSourceHeaderControls = {
   branch: string;
   branchOptions: string[];
+  remoteBranches?: string[];
+  localBranches?: string[];
+  localCheckouts?: Array<{ path: string; branch: string | null }>;
   selectedTag?: string | null;
   tagOptions?: Array<{ name: string; commit: string }>;
   onBranchChange: (branch: string) => void;

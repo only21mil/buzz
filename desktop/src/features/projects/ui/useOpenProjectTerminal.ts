@@ -33,6 +33,29 @@ export function useOpenProjectTerminal(reposDir?: string | null) {
           cloneUrl: project.cloneUrls[0] ?? null,
           defaultBranch: options.branch ?? project.defaultBranch ?? null,
         });
+        if (result.mismatch) {
+          const command = result.worktreeCommand;
+          toast.error("Selected branch needs a worktree", {
+            description: result.mismatch,
+            id: toastId,
+            duration: Number.POSITIVE_INFINITY,
+            action: command
+              ? {
+                  label: "Copy command",
+                  onClick: () => {
+                    void navigator.clipboard.writeText(command).then(
+                      () => toast.success("Worktree command copied."),
+                      () =>
+                        toast.error(
+                          "Couldn’t copy the command. Select it from the message.",
+                        ),
+                    );
+                  },
+                }
+              : undefined,
+          });
+          return;
+        }
         if (result.cloned) {
           toast.success(`Cloned to ${result.path}`, { id: toastId });
           void queryClient.invalidateQueries({

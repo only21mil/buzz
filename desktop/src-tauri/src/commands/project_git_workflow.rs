@@ -8,8 +8,8 @@ use super::project_git_exec::{
     GitAuthConfig,
 };
 use super::project_repo_paths::{
-    canonical_repos_roots, canonicalize_repos_root, default_repos_root_candidates,
-    find_local_repo_dir, local_repo_candidates,
+    canonical_repos_roots, canonicalize_repos_root, checkout_mismatch_message,
+    default_repos_root_candidates, find_local_repo_for_branch, local_repo_candidates,
 };
 use crate::app_state::AppState;
 use crate::managed_agents::{load_managed_agents, spawn_key_refusal};
@@ -347,6 +347,45 @@ fn align_unborn_head_branch(
     .map(|_| ())
 }
 
+pub(crate) fn clone_selected_branch(
+    repo_dir: &std::path::Path,
+    clone_url: &str,
+    branch: Option<&str>,
+    auth: &GitAuthConfig,
+    filter_blobs: bool,
+) -> Result<(), String> {
+    let repo_path = repo_dir
+        .to_str()
+        .ok_or_else(|| "repository path is not UTF-8".to_string())?;
+    let mut clone_args = vec!["clone"];
+    if filter_blobs {
+        clone_args.push("--filter=blob:none");
+    }
+    if let Some(ref branch) = branch {
+        clone_args.extend(["--branch", branch]);
+    }
+    clone_args.extend(["--end-of-options", clone_url, repo_path]);
+    if let Err(error) = run_git(&clone_args, None, auth) {
+        // Only an empty repository can use an unborn selected branch. A missing
+        // branch on a populated remote must not silently clone its default.
+        if branch.is_none()
+            || !run_git(&["ls-remote", "--end-of-options", clone_url], None, auth)?
+                .trim()
+                .is_empty()
+        {
+            return Err(error);
+        }
+        run_git(
+            &["clone", "--end-of-options", clone_url, repo_path],
+            None,
+            auth,
+        )?;
+    }
+    align_unborn_head_branch(repo_dir, branch, auth)?;
+
+    Ok(())
+}
+
 pub(crate) fn clone_project_repository_blocking(
     repos_dir: Option<&str>,
     project_dtag: &str,
@@ -356,7 +395,25 @@ pub(crate) fn clone_project_repository_blocking(
 ) -> Result<ProjectRepoCloneResult, String> {
     validate_local_clone_url(clone_url)?;
     let branch = normalize_branch_option(default_branch);
-    if let Some(repo_dir) = find_local_repo_dir(repos_dir, project_dtag, Some(clone_url))? {
+    if default_branch.is_some() && branch.is_none() {
+        return Err("Invalid selected branch.".to_string());
+    }
+    if let Some(checkout) =
+        find_local_repo_for_branch(repos_dir, project_dtag, Some(clone_url), branch.as_deref())
+            .or_else(|error| {
+                if repos_dir.is_none() {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            })?
+    {
+        if let Some(branch) = branch.as_deref() {
+            if checkout.branch.as_deref() != Some(branch) {
+                return Err(checkout_mismatch_message(&checkout, branch));
+            }
+        }
+        let repo_dir = checkout.path;
         return Ok(ProjectRepoCloneResult {
             path: repo_dir.display().to_string(),
             cloned: false,
@@ -376,26 +433,7 @@ pub(crate) fn clone_project_repository_blocking(
             repo_dir.display()
         ));
     }
-    let repo_path = repo_dir
-        .to_str()
-        .ok_or_else(|| "repository path is not UTF-8".to_string())?;
-
-    let mut clone_args = vec!["clone"];
-    if let Some(ref branch) = branch {
-        clone_args.extend(["--branch", branch.as_str()]);
-    }
-    clone_args.extend(["--end-of-options", clone_url, repo_path]);
-    if let Err(error) = run_git(&clone_args, None, auth) {
-        if branch.is_none() {
-            return Err(error);
-        }
-        run_git(
-            &["clone", "--end-of-options", clone_url, repo_path],
-            None,
-            auth,
-        )?;
-    }
-    align_unborn_head_branch(&repo_dir, branch.as_deref(), auth)?;
+    clone_selected_branch(&repo_dir, clone_url, branch.as_deref(), auth, false)?;
 
     Ok(ProjectRepoCloneResult {
         path: repo_dir.display().to_string(),
@@ -683,11 +721,86 @@ pub async fn merge_project_pull_request(
 mod tests {
     use super::{
         align_unborn_head_branch, build_merged_status_event, build_pull_request_status_event,
-        build_review_request_event, normalize_commit, same_repository,
+        build_review_request_event, clone_selected_branch, normalize_commit, same_repository,
         validate_merge_status_metadata,
     };
     use crate::commands::project_git_exec::{build_test_git_auth_config, run_git};
     use nostr::{Event, JsonUtil, Keys, Timestamp};
+
+    #[test]
+    fn clone_checks_out_selected_branch_and_rejects_missing_branch() {
+        let auth = build_test_git_auth_config().expect("git config");
+        let root = tempfile::tempdir().expect("root");
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        run_git(&["init", "--initial-branch=main"], Some(&source), &auth).unwrap();
+        run_git(
+            &[
+                "-c",
+                "user.name=Buzz Test",
+                "-c",
+                "user.email=buzz-test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+            Some(&source),
+            &auth,
+        )
+        .unwrap();
+        run_git(&["branch", "feature/a"], Some(&source), &auth).unwrap();
+        let target = root.path().join("target");
+        clone_selected_branch(
+            &target,
+            source.to_str().unwrap(),
+            Some("feature/a"),
+            &auth,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            run_git(&["branch", "--show-current"], Some(&target), &auth)
+                .unwrap()
+                .trim(),
+            "feature/a"
+        );
+        let missing = root.path().join("missing");
+        assert!(clone_selected_branch(
+            &missing,
+            source.to_str().unwrap(),
+            Some("feature/missing"),
+            &auth,
+            false,
+        )
+        .is_err());
+        assert!(!missing.join(".git").exists());
+    }
+
+    #[test]
+    fn empty_remote_clone_preserves_selected_unborn_branch() {
+        let auth = build_test_git_auth_config().expect("git config");
+        let root = tempfile::tempdir().expect("root");
+        let source = root.path().join("empty.git");
+        run_git(&["init", "--bare", source.to_str().unwrap()], None, &auth).unwrap();
+        let target = root.path().join("target");
+        clone_selected_branch(
+            &target,
+            source.to_str().unwrap(),
+            Some("feature/a"),
+            &auth,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            run_git(&["branch", "--show-current"], Some(&target), &auth)
+                .unwrap()
+                .trim(),
+            "feature/a"
+        );
+    }
 
     #[test]
     fn empty_clone_uses_requested_default_branch() {

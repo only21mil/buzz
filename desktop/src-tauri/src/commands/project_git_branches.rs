@@ -16,7 +16,7 @@ pub struct ProjectRepoBranchResult {
     pub message: String,
 }
 
-fn normalize_branch(value: &str, label: &str) -> Result<String, String> {
+pub(crate) fn normalize_branch(value: &str, label: &str) -> Result<String, String> {
     let value = value.trim();
     if value.starts_with("refs/") && !value.starts_with("refs/heads/") {
         return Err(format!("Invalid {label} branch."));
