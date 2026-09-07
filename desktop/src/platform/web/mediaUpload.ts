@@ -6,6 +6,7 @@ import type { BrowserWorkspace } from "./workspace";
 
 const MAX_BROWSER_UPLOAD_BYTES = 100 * 1024 * 1024;
 const MAX_BROWSER_FETCH_BYTES = 50 * 1024 * 1024;
+const MAX_DESCRIPTOR_BYTES = 64 * 1024;
 const VIDEO_AUTH_LIFETIME_SECONDS = 3600;
 const DEFAULT_AUTH_LIFETIME_SECONDS = 300;
 const activeUploads = new Map<string, AbortController>();
@@ -50,8 +51,15 @@ function rawHeader(options: InvokeOptions | undefined, name: string) {
   return decodeRawHeader(entry?.[1]);
 }
 
+function checkUploadSize(size: number): void {
+  if (size > MAX_BROWSER_UPLOAD_BYTES) {
+    throw new Error("File is too large. Maximum is 100MB.");
+  }
+}
+
 function uploadInput(body: InvokeBody, options?: InvokeOptions) {
   if (body instanceof Uint8Array) {
+    checkUploadSize(body.byteLength);
     return {
       bytes: Uint8Array.from(body),
       filename: rawHeader(options, "x-buzz-filename"),
@@ -61,6 +69,7 @@ function uploadInput(body: InvokeBody, options?: InvokeOptions) {
     };
   }
   if (body instanceof ArrayBuffer) {
+    checkUploadSize(body.byteLength);
     return {
       bytes: new Uint8Array(body.slice(0)),
       filename: rawHeader(options, "x-buzz-filename"),
@@ -75,6 +84,7 @@ function uploadInput(body: InvokeBody, options?: InvokeOptions) {
   if (!Array.isArray(payload.data)) {
     throw new TypeError("upload_media_bytes requires a data array");
   }
+  checkUploadSize(payload.data.length);
   return {
     bytes: Uint8Array.from(payload.data as number[]),
     filename:
@@ -114,8 +124,45 @@ function uploadTemplate(
   };
 }
 
+async function readBoundedResponse(
+  response: Response,
+  maxBytes: number,
+  limitMessage: string,
+): Promise<Uint8Array<ArrayBuffer>> {
+  const declaredLength = Number(response.headers.get("Content-Length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(limitMessage);
+  }
+  if (!response.body) return new Uint8Array(0);
+  const reader = response.body.getReader();
+  try {
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) throw new Error(limitMessage);
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return bytes;
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+}
+
 async function responseError(response: Response): Promise<Error> {
-  const text = (await response.text().catch(() => "")).slice(0, 512);
+  const text = await readBoundedResponse(response, 512, "response too large")
+    .then((bytes) => new TextDecoder().decode(bytes))
+    .catch(() => "");
   return new Error(
     `media upload failed (${response.status})${text ? `: ${text}` : ""}`,
   );
@@ -193,66 +240,97 @@ async function sendUpload(
   });
 }
 
+async function withUploadController(
+  progressId: string | undefined,
+  upload: (signal: AbortSignal) => Promise<BlobDescriptor>,
+): Promise<BlobDescriptor> {
+  if (progressId && activeUploads.has(progressId)) {
+    throw new Error("An upload with this progress ID is already active");
+  }
+  const controller = new AbortController();
+  if (progressId) activeUploads.set(progressId, controller);
+  try {
+    return await upload(controller.signal);
+  } finally {
+    if (progressId && activeUploads.get(progressId) === controller) {
+      activeUploads.delete(progressId);
+    }
+  }
+}
+
 export async function uploadBrowserMedia(
   body: InvokeBody,
   options?: InvokeOptions,
   workspace?: BrowserWorkspace,
 ): Promise<BlobDescriptor> {
-  const { bytes, filename, mimeType, progressId } = uploadInput(body, options);
-  if (bytes.byteLength > MAX_BROWSER_UPLOAD_BYTES) {
-    throw new Error("File is too large. Maximum is 100MB.");
-  }
+  const input = uploadInput(body, options);
+  return withUploadController(input.progressId, (signal) =>
+    uploadBytes(input, signal, workspace),
+  );
+}
 
+async function uploadBytes(
+  { bytes, filename, mimeType, progressId }: ReturnType<typeof uploadInput>,
+  signal: AbortSignal,
+  workspace?: BrowserWorkspace,
+): Promise<BlobDescriptor> {
+  signal.throwIfAborted();
+  checkUploadSize(bytes.byteLength);
   await emitUploadPhase(progressId, "preparing");
+  signal.throwIfAborted();
   const mediaOrigin = workspace
     ? new URL(workspace.httpUrl()).origin
     : window.location.origin;
   const sha256 = await sha256Hex(bytes);
+  signal.throwIfAborted();
   const authorization = await blossomAuthorization(
     uploadTemplate(sha256, mimeType, mediaOrigin),
   );
+  signal.throwIfAborted();
   const headers = new Headers({
     Authorization: authorization,
     "Content-Type": mimeType,
     "X-SHA-256": sha256,
   });
 
-  const controller = new AbortController();
-  if (progressId) activeUploads.set(progressId, controller);
-  try {
-    await emitUploadPhase(progressId, "uploading");
-    await emitUploadProgress(progressId, 0, bytes.byteLength);
-    let response = await sendUpload(
-      "/upload",
+  await emitUploadPhase(progressId, "uploading");
+  await emitUploadProgress(progressId, 0, bytes.byteLength);
+  signal.throwIfAborted();
+  let response = await sendUpload(
+    "/upload",
+    bytes,
+    headers,
+    signal,
+    mediaOrigin,
+  );
+  if (response.status === 404 || response.status === 405) {
+    await response.body?.cancel().catch(() => {});
+    signal.throwIfAborted();
+    response = await sendUpload(
+      "/media/upload",
       bytes,
       headers,
-      controller.signal,
+      signal,
       mediaOrigin,
     );
-    if (response.status === 404 || response.status === 405) {
-      response = await sendUpload(
-        "/media/upload",
-        bytes,
-        headers,
-        controller.signal,
-        mediaOrigin,
-      );
-    }
-    if (!response.ok) throw await responseError(response);
-    const descriptor = parseDescriptor(
-      await response.json(),
-      sha256,
-      bytes.byteLength,
-      mediaOrigin,
-    );
-    await emitUploadProgress(progressId, bytes.byteLength, bytes.byteLength);
-    await emitUploadPhase(progressId, "finishing");
-    return filename ? { ...descriptor, filename } : descriptor;
-  } finally {
-    if (progressId && activeUploads.get(progressId) === controller) {
-      activeUploads.delete(progressId);
-    }
   }
+  if (!response.ok) throw await responseError(response);
+  const descriptorBytes = await readBoundedResponse(
+    response,
+    MAX_DESCRIPTOR_BYTES,
+    "media upload descriptor exceeds the 64KB limit",
+  );
+  signal.throwIfAborted();
+  const descriptor = parseDescriptor(
+    JSON.parse(new TextDecoder().decode(descriptorBytes)),
+    sha256,
+    bytes.byteLength,
+    mediaOrigin,
+  );
+  await emitUploadProgress(progressId, bytes.byteLength, bytes.byteLength);
+  await emitUploadPhase(progressId, "finishing");
+  signal.throwIfAborted();
+  return filename ? { ...descriptor, filename } : descriptor;
 }
 
 function selectFiles(accept?: string, multiple = false): Promise<File[]> {
@@ -261,14 +339,16 @@ function selectFiles(accept?: string, multiple = false): Promise<File[]> {
     input.type = "file";
     input.multiple = multiple;
     if (accept) input.accept = accept;
-    input.addEventListener(
-      "change",
-      () => {
-        resolve(Array.from(input.files ?? []));
-        input.remove();
-      },
-      { once: true },
-    );
+    const finish = (files: File[]) => {
+      input.removeEventListener("change", onChange);
+      input.removeEventListener("cancel", onCancel);
+      input.remove();
+      resolve(files);
+    };
+    const onChange = () => finish(Array.from(input.files ?? []));
+    const onCancel = () => finish([]);
+    input.addEventListener("change", onChange, { once: true });
+    input.addEventListener("cancel", onCancel, { once: true });
     input.click();
   });
 }
@@ -312,36 +392,26 @@ async function uploadFile(
   requireImage = false,
   workspace?: BrowserWorkspace,
 ): Promise<BlobDescriptor> {
-  const bytes = new Uint8Array(await file.arrayBuffer());
-  const detectedImageMime = sniffImageMime(bytes);
-  if (requireImage && !detectedImageMime) {
-    throw new Error("Selected file is not a supported image");
-  }
-  const options: InvokeOptions = {
-    headers: {
-      "x-buzz-filename": encodeRawHeader(file.name),
-      "x-buzz-content-type": encodeRawHeader(
-        detectedImageMime ?? (file.type || "application/octet-stream"),
-      ),
-    },
-  };
-  if (progressId) {
-    options.headers = {
-      ...options.headers,
-      "x-buzz-progress-id": encodeRawHeader(progressId),
-    };
-  }
-  return uploadBrowserMedia(bytes, options, workspace);
-}
-
-function encodeRawHeader(value: string): string {
-  const bytes = new TextEncoder().encode(value);
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary)
-    .replaceAll("+", "-")
-    .replaceAll("/", "_")
-    .replace(/=+$/, "");
+  checkUploadSize(file.size);
+  return withUploadController(progressId, async (signal) => {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    signal.throwIfAborted();
+    const detectedImageMime = sniffImageMime(bytes);
+    if (requireImage && !detectedImageMime) {
+      throw new Error("Selected file is not a supported image");
+    }
+    return uploadBytes(
+      {
+        bytes,
+        filename: file.name,
+        mimeType:
+          detectedImageMime ?? (file.type || "application/octet-stream"),
+        progressId,
+      },
+      signal,
+      workspace,
+    );
+  });
 }
 
 async function fetchMediaBytes(
@@ -366,36 +436,14 @@ async function fetchMediaBytes(
   if (!response.ok) throw await responseError(response);
   const contentType = response.headers.get("Content-Type")?.split(";", 1)[0];
   if (!contentType?.startsWith("image/")) {
+    await response.body?.cancel().catch(() => {});
     throw new Error("fetch_media_bytes requires image content");
   }
-  const declaredLength = Number(response.headers.get("Content-Length"));
-  if (
-    Number.isFinite(declaredLength) &&
-    declaredLength > MAX_BROWSER_FETCH_BYTES
-  ) {
-    throw new Error("media response exceeds the 50MB limit");
-  }
-  if (!response.body) return new ArrayBuffer(0);
-
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > MAX_BROWSER_FETCH_BYTES) {
-      await reader.cancel();
-      throw new Error("media response exceeds the 50MB limit");
-    }
-    chunks.push(value);
-  }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
+  const bytes = await readBoundedResponse(
+    response,
+    MAX_BROWSER_FETCH_BYTES,
+    "media response exceeds the 50MB limit",
+  );
   return bytes.buffer;
 }
 
