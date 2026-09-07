@@ -10,13 +10,11 @@ name: Sprig
 # musl so the tarball runs on any modern Linux without libc surprises).
 #
 # Triggers:
-#   - push to main     → updates rolling `sprig-latest` release
 #   - tag `sprig-v*`  → versioned release
 #   - workflow_dispatch → manual canary build (no release publish unless asked)
 
 on:
   push:
-    branches: [main]
     tags: ["sprig-v*"]
   workflow_dispatch:
     inputs:
@@ -109,8 +107,7 @@ jobs:
     name: Publish rolling release
     needs: build
     if: |
-      github.event_name == 'push' && github.ref == 'refs/heads/main'
-      || (github.event_name == 'workflow_dispatch' && inputs.publish)
+      github.event_name == 'workflow_dispatch' && inputs.publish
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

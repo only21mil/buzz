@@ -1,6 +1,6 @@
 name: helm chart
 
-# Lints + unit-tests + render-checks the chart on every PR/main push, and
+# Lints + unit-tests + render-checks the chart on matching PRs, and
 # PUBLISHES it to GHCR as an OCI artifact on `chart-v*` tags.
 #
 # Publishing mirrors the relay image (see docker.yml): the chart is versioned
@@ -30,9 +30,8 @@ on:
     # pushes too, so a `chart-v*` tag whose commit didn't touch a chart file
     # would be filtered out and never publish. docker.yml / release.yml / sprig
     # all keep `paths` out of a tag-carrying `push` for exactly this reason —
-    # PR runs stay scoped via `pull_request.paths` below; main pushes lint
-    # unconditionally (cheap), and tag pushes always run so publish can fire.
-    branches: [main]
+    # PR runs stay scoped via `pull_request.paths` below; release tag pushes
+    # always run so publication can proceed after its existing gates.
     tags: ["chart-v[0-9]*"]
   pull_request:
     paths:

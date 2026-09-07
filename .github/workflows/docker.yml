@@ -16,8 +16,6 @@ name: Docker image
 # the relay image version tracks crates/buzz-relay/Cargo.toml, never desktop.
 #
 # Triggers:
-#   - push to main           → :main + :sha-<7>
-#                              + :debug-main + :debug-sha-<7>
 #   - push tags relay-v*.*.* → :{version} + :{major}.{minor} + :{major}
 #                              + matching :debug-* tags
 #                              (+ :latest/:debug-latest for stable releases)
@@ -39,11 +37,10 @@ name: Docker image
 # The :latest tag tracks the latest STABLE relay release: metadata-action's
 # `flavor.latest=auto` (its default) emits :latest only for non-prerelease
 # semver, so relay-v0.3.0-rc.1 publishes :0.3.0-rc.1 without moving :latest,
-# and main pushes (no semver tag) never produce :latest.
+# and manual branch builds (no semver tag) never produce :latest.
 
 on:
   push:
-    branches: [main]
     tags: ["relay-v[0-9]*"]
   workflow_dispatch:
     inputs:
@@ -136,7 +133,7 @@ jobs:
           # behavior is unchanged. Pull requests get nothing (push: false
           # below). :latest is intentionally absent — flavor.latest defaults to
           # `auto`, which adds :latest for stable semver tags only (not
-          # prereleases, not main pushes).
+          # prereleases, not manual branch builds).
           tags: |
             type=ref,event=branch,enable=${{ github.event_name != 'workflow_dispatch' || inputs.version == '' }}
             type=sha,prefix=sha-,format=short,enable=${{ github.event_name != 'workflow_dispatch' || inputs.version == '' }}

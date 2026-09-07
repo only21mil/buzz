@@ -1,7 +1,7 @@
 name: CI
 on:
   push:
-    branches: [main, release]
+    branches: [release]
   pull_request:
   workflow_dispatch:
 
@@ -125,6 +125,8 @@ jobs:
               - '.github/workflows/android-fork-release-tag.yml'
               - '.github/workflows/android-fork-release-apk.yml'
               - '.github/workflows/ci.yml'
+      - name: Landed qualification contract
+        run: python3 scripts/test-protected-ci-landing.py
       - name: Release workflow source contract
         run: scripts/test-release-ref-contract.sh
       - name: Desktop release candidate contract
@@ -146,6 +148,18 @@ jobs:
         run: python3 scripts/test-protected-ci-reuse.py
       - name: CI path filter contract
         run: scripts/test-ci-path-filter-contract.sh
+
+      - name: Capture successful qualification inputs
+        env:
+          QUALIFICATION_JOB: changes
+        run: python3 scripts/protected-ci-landing.py capture --job "$QUALIFICATION_JOB"
+      - name: Retain successful qualification inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: qualification-${{ github.run_attempt }}-changes
+          path: protected-ci-qualification.json
+          if-no-files-found: error
+          retention-days: 7
 
   rust-lint:
     name: Rust Lint
@@ -183,6 +197,18 @@ jobs:
         with:
           name: ci-reuse-${{ github.run_attempt }}-rust-lint
           path: protected-ci-reuse.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Capture successful qualification inputs
+        env:
+          QUALIFICATION_JOB: rust-lint
+        run: python3 scripts/protected-ci-landing.py capture --job "$QUALIFICATION_JOB"
+      - name: Retain successful qualification inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: qualification-${{ github.run_attempt }}-rust-lint
+          path: protected-ci-qualification.json
           if-no-files-found: error
           retention-days: 7
 
@@ -237,6 +263,18 @@ jobs:
         with:
           name: ci-reuse-${{ github.run_attempt }}-unit-tests
           path: protected-ci-reuse.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Capture successful qualification inputs
+        env:
+          QUALIFICATION_JOB: unit-tests
+        run: python3 scripts/protected-ci-landing.py capture --job "$QUALIFICATION_JOB"
+      - name: Retain successful qualification inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: qualification-${{ github.run_attempt }}-unit-tests
+          path: protected-ci-qualification.json
           if-no-files-found: error
           retention-days: 7
 
@@ -332,6 +370,18 @@ jobs:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
 
+      - name: Capture successful qualification inputs
+        env:
+          QUALIFICATION_JOB: desktop-core
+        run: python3 scripts/protected-ci-landing.py capture --job "$QUALIFICATION_JOB"
+      - name: Retain successful qualification inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: qualification-${{ github.run_attempt }}-desktop-core
+          path: protected-ci-qualification.json
+          if-no-files-found: error
+          retention-days: 7
+
   desktop-smoke-e2e:
     name: Desktop Smoke E2E (${{ matrix.shard }})
     runs-on: ubuntu-latest
@@ -412,6 +462,18 @@ jobs:
         with:
           name: ci-reuse-${{ github.run_attempt }}-desktop-smoke-${{ matrix.shard }}
           path: protected-ci-reuse.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Capture successful qualification inputs
+        env:
+          QUALIFICATION_JOB: desktop-smoke-${{ matrix.shard }}
+        run: python3 scripts/protected-ci-landing.py capture --job "$QUALIFICATION_JOB"
+      - name: Retain successful qualification inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: qualification-${{ github.run_attempt }}-desktop-smoke-${{ matrix.shard }}
+          path: protected-ci-qualification.json
           if-no-files-found: error
           retention-days: 7
 
@@ -504,6 +566,18 @@ jobs:
             target/ci/backend-integration-tests.tar.zst
           if-no-files-found: error
           retention-days: 1
+
+      - name: Capture successful qualification inputs
+        env:
+          QUALIFICATION_JOB: desktop-e2e-relay
+        run: python3 scripts/protected-ci-landing.py capture --job "$QUALIFICATION_JOB"
+      - name: Retain successful qualification inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: qualification-${{ github.run_attempt }}-desktop-e2e-relay
+          path: protected-ci-qualification.json
+          if-no-files-found: error
+          retention-days: 7
 
   desktop-e2e-integration-shard:
     name: Desktop E2E Integration (${{ matrix.shard }}/2)
@@ -683,6 +757,18 @@ jobs:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
 
+      - name: Capture successful qualification inputs
+        env:
+          QUALIFICATION_JOB: desktop-integration-${{ matrix.shard }}
+        run: python3 scripts/protected-ci-landing.py capture --job "$QUALIFICATION_JOB"
+      - name: Retain successful qualification inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: qualification-${{ github.run_attempt }}-desktop-integration-${{ matrix.shard }}
+          path: protected-ci-qualification.json
+          if-no-files-found: error
+          retention-days: 7
+
   desktop-e2e-integration:
     name: Desktop E2E Integration
     runs-on: ubuntu-latest
@@ -846,6 +932,18 @@ jobs:
           path: /tmp/buzz-relay.log
           if-no-files-found: ignore
 
+      - name: Capture successful qualification inputs
+        env:
+          QUALIFICATION_JOB: backend-integration
+        run: python3 scripts/protected-ci-landing.py capture --job "$QUALIFICATION_JOB"
+      - name: Retain successful qualification inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: qualification-${{ github.run_attempt }}-backend-integration
+          path: protected-ci-qualification.json
+          if-no-files-found: error
+          retention-days: 7
+
   relay-e2e:
     name: Relay E2E
     runs-on: ubuntu-latest
@@ -919,6 +1017,18 @@ jobs:
           path: /tmp/buzz-relay.log
           if-no-files-found: ignore
 
+      - name: Capture successful qualification inputs
+        env:
+          QUALIFICATION_JOB: relay-e2e
+        run: python3 scripts/protected-ci-landing.py capture --job "$QUALIFICATION_JOB"
+      - name: Retain successful qualification inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: qualification-${{ github.run_attempt }}-relay-e2e
+          path: protected-ci-qualification.json
+          if-no-files-found: error
+          retention-days: 7
+
   web:
     name: Web
     runs-on: ubuntu-latest
@@ -954,6 +1064,18 @@ jobs:
         with:
           path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
           key: pnpm-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+
+      - name: Capture successful qualification inputs
+        env:
+          QUALIFICATION_JOB: web
+        run: python3 scripts/protected-ci-landing.py capture --job "$QUALIFICATION_JOB"
+      - name: Retain successful qualification inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: qualification-${{ github.run_attempt }}-web
+          path: protected-ci-qualification.json
+          if-no-files-found: error
+          retention-days: 7
 
   mobile:
     name: Mobile
@@ -1035,6 +1157,18 @@ jobs:
             --apk mobile/build/app/outputs/flutter-apk/app-debug.apk \
             --dependency-manifest mobile/build/app/reports/buzz-runtime-dependencies.tsv
 
+      - name: Capture successful qualification inputs
+        env:
+          QUALIFICATION_JOB: mobile
+        run: python3 scripts/protected-ci-landing.py capture --job "$QUALIFICATION_JOB"
+      - name: Retain successful qualification inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: qualification-${{ github.run_attempt }}-mobile
+          path: protected-ci-qualification.json
+          if-no-files-found: error
+          retention-days: 7
+
   mobile-ios:
     name: Mobile iOS Release
     # Prepared coverage; admission requires a reviewed MBP runner selector.
@@ -1078,6 +1212,18 @@ jobs:
       - name: Dependency policy
         run: cargo-deny check
 
+      - name: Capture successful qualification inputs
+        env:
+          QUALIFICATION_JOB: security
+        run: python3 scripts/protected-ci-landing.py capture --job "$QUALIFICATION_JOB"
+      - name: Retain successful qualification inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: qualification-${{ github.run_attempt }}-security
+          path: protected-ci-qualification.json
+          if-no-files-found: error
+          retention-days: 7
+
   dead-token-guard:
     name: Dead Token Reference Guard
     runs-on: ubuntu-latest
@@ -1099,12 +1245,24 @@ jobs:
           fi
           echo "No dead token references found."
 
+      - name: Capture successful qualification inputs
+        env:
+          QUALIFICATION_JOB: dead-token-guard
+        run: python3 scripts/protected-ci-landing.py capture --job "$QUALIFICATION_JOB"
+      - name: Retain successful qualification inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: qualification-${{ github.run_attempt }}-dead-token-guard
+          path: protected-ci-qualification.json
+          if-no-files-found: error
+          retention-days: 7
+
   server-cross-compile:
     name: Server Cross-Compile
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [changes]
-    if: github.event_name == 'push' || needs.changes.outputs.rust == 'true'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.rust == 'true'
     permissions:
       contents: read
     strategy:
@@ -1127,8 +1285,8 @@ jobs:
       - name: Build server binaries
         env:
           TARGET: ${{ matrix.target }}
-          # PRs: compile + build-script gate only (no codegen/link). Main: full link gate.
-          CARGO_CMD: ${{ github.event_name == 'pull_request' && 'check' || 'build' }}
+          # Qualify the full link once, before merge.
+          CARGO_CMD: build
         run: |
           cross "$CARGO_CMD" --release --target "$TARGET" \
             -p buzz-relay \
@@ -1137,6 +1295,18 @@ jobs:
             -p buzz-dev-mcp \
             -p git-credential-nostr \
             -p git-sign-nostr
+
+      - name: Capture successful qualification inputs
+        env:
+          QUALIFICATION_JOB: server-${{ matrix.target }}
+        run: python3 scripts/protected-ci-landing.py capture --job "$QUALIFICATION_JOB"
+      - name: Retain successful qualification inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: qualification-${{ github.run_attempt }}-server-${{ matrix.target }}
+          path: protected-ci-qualification.json
+          if-no-files-found: error
+          retention-days: 7
 
   desktop-build-macos:
     name: Desktop Build (macOS)
@@ -1214,3 +1384,14 @@ jobs:
           LLAMA_STAGE_BACKEND: metal
           LLAMA_STAGE_BUILD_DIR: ${{ github.workspace }}/.cache/mesh-llama/build-stage-abi-metal
           SKIPPY_LLAMA_AUTO_BUILD: "0"
+      - name: Capture successful qualification inputs
+        env:
+          QUALIFICATION_JOB: desktop-build-macos
+        run: python3 scripts/protected-ci-landing.py capture --job "$QUALIFICATION_JOB"
+      - name: Retain successful qualification inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: qualification-${{ github.run_attempt }}-desktop-build-macos
+          path: protected-ci-qualification.json
+          if-no-files-found: error
+          retention-days: 7

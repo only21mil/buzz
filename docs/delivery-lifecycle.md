@@ -83,88 +83,115 @@ following before calling the landing complete:
 - authoritative relay default branch at the merge commit;
 - GitHub mirror default branch at the same commit;
 - intended feature-branch retention or deletion; and
-- terminal post-merge CI for the merge commit, including the mandatory
-  `Desktop Release Candidate` check on that exact commit. On `main` that check
-  runs `scripts/desktop_release.py verify-main` for the pushed commit and never
-  passes without validating: either the desktop candidate identity is
-  byte-equal to the first parent and the manifests agree, or the commit is the
-  merge of one internal `version-bump/` pull request and carries that pull
-  request's validated immutable candidate byte-for-byte.
+- the operator's exact landed qualification receipt, including the maintained
+  `desktop_release.py verify-main` identity check on the actual merge commit.
 
-Record the merge commit and any failed, skipped, superseded, or duplicate CI
-runs in the Buzz repository record. Do not describe a history containing a
-failure as uniformly green. State which exact-head run is the promotion gate.
+A merge does not launch CI, a desktop candidate workflow, chart validation,
+image builds or rolling Sprig builds. Protected PRs qualify the full ordinary
+suite once, including both cross-target link builds. Explicit release tags,
+release-PR tagging and authorized manual release actions remain separate.
 
-When initially adding the relay canary as a protected requirement, merge the
-foundation first without that new required context. Dispatch the workflow for
-the exact landed ref, record the expected first-attempt failure, rerun it once,
-and require the second attempt to pass on the same landed commit. Add the
-ruleset requirement only after that bootstrap evidence is complete.
+## Verified landed qualification
 
-## Verified protected-result reuse
+Before merging, retain the canonical version-1 protected pull-request receipt
+and acquire/live-reverify it normally. Every required check remains enforced;
+no ruleset, bypass actor or required context changes for this transition.
+Each successful CI job also uploads an immutable
+`qualification-<job-attempt>-<job>` artifact. The capture runs after all of that
+job's check commands. Missing capture fails the source job. The old six-job
+`ci-reuse` artifacts alone do not cover this complete qualification.
 
-`CI` still emits every required context on the exact landed commit. For Rust
-Lint, Unit Tests and the four Desktop Smoke E2E shards, it may verify an
-applicable protected result instead of repeating the expensive check commands.
-The job summary states whether work ran fresh or reused a protected result.
-Its immutable `ci-reuse-<attempt>-<job>` artifact retains the full proof.
-`full_exact_head` in the canonical receipt means every required context passed
-for that exact head. It does not claim every underlying command ran again.
-Record the fresh/reused distinction and retain the referenced provenance
-artifacts with the landing evidence before their seven-day retention expires.
+Before merging, prove complete source coverage (without inventing a landed
+identity):
 
-`scripts/protected-ci-reuse.py` permits reuse only when all of these hold:
+```bash
+scripts/protected-ci-receipt.py verify-source \
+  --repository only21mil/buzz --head FULL_REVIEWED_CANDIDATE_SHA \
+  --base FULL_REVIEWED_BASE_SHA --receipt "$evidence_dir/protected-ci-pr.json" \
+  --output "$evidence_dir/candidate-qualification.json"
+```
 
-- The latest internal pull-request CI run and its latest workflow attempt
-  succeeded, along with every current app-bound protected check. The selected
-  job's latest execution succeeded. A failed-jobs rerun can retain a successful
-  job from an earlier attempt, but a newer failed, pending, cancelled or skipped
-  execution of that job cannot fall back to an older success. The workflow
-  result and the selected job's own completion are at most 24 hours old.
-- The source artifact was uploaded by that run and the selected job's exact
-  attempt after the job's check
-  commands succeeded. GitHub's immutable artifact identity and archive digest
-  match. A reused proof cannot become a source proof.
-- Live GitHub Git objects independently prove the tested tree, candidate tree
-  and landed tree agree. A synthetic tested merge also needs the exact ordered
-  base/candidate parents. The closed internal
-  main PR names that merge, whose ordered parents are the tested base followed
-  by the candidate. GitHub main still names the exact landed commit.
-- The source and landed workflow bytes agree, including action pins and check
-  commands. Whole-tree equality also binds scripts, toolchain manifests and
-  dependency lockfiles. After normal setup, runner image/version, tool versions
-  and resolved OS/Python packages agree. The optional non-secret repository
-  variable `BUZZ_CI_REUSE_EPOCH` invalidates results when an external relevant
-  input changes. It is not an authorization override.
-- The captured repository, strict app-bound required checks and active ruleset
-  authority agree with live authority, including each public ruleset revision
-  timestamp. GitHub hides bypass actors from read-only workflow tokens; this
-  optimizer never exercises a bypass, and the canonical operator receipt still
-  verifies bypass authority separately. The source run and public authority are
-  read again before returning a reuse decision.
+After merging, use the reviewed checkout's operator verifier:
 
-The candidate SHA, synthetic PR merge SHA, landed SHA, event name, workspace
-path and cache-hit state may differ. These are not execution inputs to the
-selected tree-scoped commands. New workflow code can qualify in its reviewed
-candidate CI run and be reused for its identical-tree landing. First-parent
-workflow equality is not a bootstrap requirement. The exact-candidate review,
-merge approval and authoritative Buzz/GitHub ref readbacks remain independent
-delivery gates; a merged GitHub PR alone does not replace them.
+```bash
+scripts/protected-ci-receipt.py acquire-main \
+  --repository only21mil/buzz --branch main --head FULL_LANDED_SHA \
+  --reuse-source "$evidence_dir/protected-ci-pr.json" \
+  --candidate FULL_REVIEWED_CANDIDATE_SHA --base FULL_REVIEWED_BASE_SHA \
+  --output "$evidence_dir/protected-ci-main.json"
+scripts/protected-ci-receipt.py validate \
+  --receipt "$evidence_dir/protected-ci-main.json" \
+  --repository only21mil/buzz --head FULL_LANDED_SHA \
+  --scope main --max-age-seconds 86400 --reverify
+```
 
-Missing or materially different evidence reruns that job's normal checks. In
-particular, old receipts and logs without the resolved dependency/context
-capture are not enough for this adapter. This is a per-job coverage gap, not a
-reason to rerun a proven unrelated job or reinterpret an old receipt's SHA.
-Manual dispatches and pushes outside main execute fresh.
+The version-2 main receipt keeps the original source receipt bytes unchanged.
+`head_sha` identifies the actual landing, while each `source_check.head_sha`
+continues to identify the tested candidate. It sets `full_exact_head: false`
+and `full_verified_landing: true`, records every source run/job/attempt, and
+records the freshly executed desktop metadata check separately. Version-1
+receipts keep their existing meaning and validation; relabeling one is refused.
+Delivery consumers continue to call the maintained validator with `--reverify`.
+The entrypoint verifies the new helper's exact committed bytes before loading it.
 
-Desktop Release Candidate, relay canary, Security, release/package builds,
-relay-backed integration and deployment checks remain fresh. Their present
-contracts include commit identity, artifacts, live services, mutable advisory
-data or other context that this adapter does not qualify. The relay canary's
-deliberate first-attempt failure and later success remain separate evidence.
-Neither deploy-local nor the desktop publisher needs a receipt schema change:
-they still acquire and live-reverify canonical exact-main protected evidence,
-and retain their source identity, artifact, approval and live-state gates.
+`protected-ci-landing.py` verifies all of the following independently:
+
+- Live GitHub and canonical Buzz main name the actual landed commit. The merged
+  internal PR names the reviewed candidate, and GitHub Git objects prove the
+  exact ordered base/candidate parents and equal candidate/tested/landed trees.
+  The operator supplies the independently reviewed candidate and base; this
+  verifier does not grant review or merge approval.
+- Every current app-bound required source check succeeds under the original
+  strict ruleset and bypass authority. The latest expected workflow run and
+  its latest attempt succeed. Cross-run chronology uses the provider's
+  `run_started_at`, which resets on rerun; an older run ID cannot hide a newer
+  failed attempt. Missing/tied chronology and overlapping attempts are refused.
+  The selected job's latest positive attempt must
+  succeed too; failed, skipped, cancelled, pending, ambiguous or stale work
+  cannot fall back to an earlier pass. A successful job retained by a
+  failed-jobs rerun keeps its own attempt. Source execution and receipts expire
+  after 24 hours.
+- Immutable source artifacts belong to that CI run and each selected job's
+  attempt, and their provider archive digests verify. The provider independently
+  resolves the tested Git objects. Workflow/action pins, verifier policy,
+  toolchain manifests and dependency lockfiles match the landed Git objects.
+  Capture retains actual tool versions, runner image revision, OS package
+  inventory digest, service image IDs and the Android runtime dependency digest.
+- Qualification uses the same immutable source execution snapshot for the
+  landed tree. It does not claim to have rebuilt outputs with the new commit
+  SHA or to have executed on a new runner. Cache writes, checkout paths and the
+  new SHA do not change this source-qualification claim. Commit-stamped
+  binaries, signed packages, deployed services and release outputs require their
+  own actual-source gates. Source snapshots do not assert that later mutable
+  dependency resolution would return identical versions.
+- The live non-secret `BUZZ_CI_REUSE_EPOCH` equals the captured value; change it
+  when an external relevant qualification input is invalidated. The captured
+  RustSec advisory revision must also equal its live authority. A changed
+  advisory database refuses Security reuse. Current checks, jobs, workflow
+  attempts, epoch and main are read again before a receipt can pass.
+- The actual landed desktop identity runs through the existing
+  `desktop_release.py verify-main` gate locally. Unchanged mode checks the first
+  parent's candidate bytes and manifests; release mode validates the immutable
+  candidate from the internal version-bump PR. No build or test suite runs.
+
+The relay canary tests only its workflow attempt. Its candidate attempt-one
+failure and successful attempt two remain separate provider evidence. An
+identical reviewed workflow and successful candidate attempt two satisfy this
+qualification; merging is not a reason to dispatch the canary again.
+
+If a relevant input changes or equivalence is unproven, refuse qualification
+and rerun the affected source job deliberately. A successful retry can provide
+new immutable evidence without rewriting the retained original receipt.
+Rerun the full suite only when the uncertainty covers the suite. No automatic
+fallback launches postmerge CI. Retain the source artifacts before their
+seven-day provider retention expires.
+
+For the first adoption, review this verifier and run the corrected candidate
+CI once to create the complete source artifacts. Acquire the existing protected
+PR receipt before merging. After canonical-first landing and mirror parity,
+run only the operator command above. Historical six-job proofs cannot bootstrap
+missing whole-job coverage, and an old verifier cannot consume a version-2
+receipt. No ruleset relaxation or blanket main run is part of bootstrap.
 
 ## Deployment preflight
 
@@ -177,9 +204,7 @@ mode-`0600` secret file under a mode-`0700` directory, and fresh receipts:
 
 ```bash
 evidence_dir=/absolute/private/evidence-directory
-scripts/protected-ci-receipt.py acquire-main \
-  --repository only21mil/buzz --head FULL_40_CHARACTER_LANDED_COMMIT \
-  --branch main --output "$evidence_dir/protected-ci-main.json"
+# Acquire the verified-landing receipt with --reuse-source as shown above.
 scripts/protected-ci-receipt.py validate \
   --receipt "$evidence_dir/protected-ci-main.json" \
   --repository only21mil/buzz --head FULL_40_CHARACTER_LANDED_COMMIT \
@@ -207,8 +232,8 @@ the deploy re-verifies the protected-CI receipt against GitHub.
 - both receipts are regular, mode-safe, fresh, exact-commit PASS receipts from
   `only21mil/buzz`, and the pre-freeze base is an ancestor;
 - the explicitly supplied protected-CI receipt is canonical `main`-scope
-  evidence for the landed commit, fresh, and a full exact-head protected-CI
-  pass whose retained GitHub bodies reproduce every recorded hash and whose
+  evidence for the landed commit, fresh, with complete verified source qualification
+  or historical exact-head coverage, whose retained bodies reproduce the binding and whose
   binding live GitHub still backs (`validate --reverify` through the pinned
   `gh` with `GH_TOKEN`), with the live `refs/heads/main` head equal to the
   landed commit; the local remote-tracking ref alone does not establish that
