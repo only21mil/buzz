@@ -77,18 +77,73 @@ if scripts/prepare-desktop-release.sh 0.1.0 validate-only >"$tmp/missing-repo.lo
 fi
 [[ "$(git rev-parse HEAD)" == "$base" ]]
 export RELEASE_REPOSITORY=only21mil/buzz
+if scripts/prepare-desktop-release.sh 0.1.0 validate-only >"$tmp/wrong-identity.log" 2>&1; then
+  echo 'fork preparation accepted a noncanonical identity' >&2; exit 1
+fi
+grep -Fq 'GIT_AUTHOR_IDENT must use Victor Vogel' "$tmp/wrong-identity.log"
+[[ "$(git rev-parse HEAD)" == "$base" ]]
+[[ -z "$(git for-each-ref refs/release-preparation/)" ]]
+git config user.name 'Victor Vogel'
+git config user.email '263261067+only21mil@users.noreply.github.com'
+if GIT_COMMITTER_NAME=Wrong scripts/prepare-desktop-release.sh 0.1.0 validate-only >"$tmp/wrong-committer.log" 2>&1; then
+  echo 'fork preparation accepted an overridden committer' >&2; exit 1
+fi
+grep -Fq 'GIT_COMMITTER_IDENT must use Victor Vogel' "$tmp/wrong-committer.log"
+if GIT_AUTHOR_EMAIL=wrong@example.com scripts/prepare-desktop-release.sh 0.1.0 validate-only >"$tmp/wrong-author.log" 2>&1; then
+  echo 'fork preparation accepted an overridden author' >&2; exit 1
+fi
+grep -Fq 'GIT_AUTHOR_IDENT must use Victor Vogel' "$tmp/wrong-author.log"
 git -c tag.gpgSign=false tag desktop-v0.0.1
 if scripts/prepare-desktop-release.sh 0.1.0 validate-only >"$tmp/foreign-tag.log" 2>&1; then
   echo 'accepted an upstream-only desktop tag as fork release history' >&2; exit 1
 fi
 git tag -d desktop-v0.0.1 >/dev/null
 scripts/prepare-desktop-release.sh 0.1.0 validate-only
+victor='Victor Vogel <263261067+only21mil@users.noreply.github.com>'
+wes='Wes <wesbillman@users.noreply.github.com>'
+[[ "$(git show -s --format='%an <%ae>')" == "$victor" ]]
+[[ "$(git show -s --format='%cn <%ce>')" == "$victor" ]]
+git show -s --format='%(trailers:only,unfold)' | grep -Fxq "Signed-off-by: $victor"
 [[ ! -e "$CALL_LOG" ]]
 [[ -z "$(git ls-remote buzz refs/heads/version-bump/0.1.0)" ]]
 grep -Fq 'https://github.com/only21mil/buzz/' CHANGELOG.md
 ! grep -Fq 'https://github.com/block/buzz/' CHANGELOG.md
 [[ "$(git rev-parse refs/remotes/origin/main)" == "$base" ]]
+
+# Rebuild only commit provenance around the exact valid candidate tree. Each
+# refusal must reach the identity check, not fail earlier on release content.
+candidate=$(git rev-parse HEAD)
+tree=$(git rev-parse HEAD^{tree})
+assert_provenance_refused() {
+  local author_name="$1" author_email="$2" message="$3" expected="$4" rejected
+  rejected=$(GIT_AUTHOR_NAME="$author_name" GIT_AUTHOR_EMAIL="$author_email" \
+    git -c commit.gpgSign=false commit-tree "$tree" -p "$base" -m "$message")
+  if scripts/desktop_release.py validate --candidate "$rejected" --version 0.1.0 --repo only21mil/buzz >"$tmp/provenance.log" 2>&1; then
+    echo "accepted invalid fork provenance: $expected" >&2; exit 1
+  fi
+  grep -Fq "$expected" "$tmp/provenance.log"
+}
+automation='Co-authored-by: Release Automation <release-automation@users.noreply.github.com>'
+assert_provenance_refused Wes wesbillman@users.noreply.github.com \
+  "Release"$'\n\n'"Signed-off-by: $wes"$'\n'"$automation" 'unexpected candidate author'
+assert_provenance_refused 'Victor Vogel' '263261067+only21mil@users.noreply.github.com' \
+  "Release"$'\n\n'"Signed-off-by: $wes"$'\n'"$automation" 'candidate is missing Signed-off-by trailer'
+assert_provenance_refused 'Victor Vogel' '263261067+only21mil@users.noreply.github.com' \
+  "Release"$'\n\n'"Signed-off-by: $victor"$'\n\nThis is body text, not a signoff trailer.\n\n'"$automation" \
+  'candidate is missing Signed-off-by trailer'
+assert_provenance_refused 'Victor Vogel' '263261067+only21mil@users.noreply.github.com' \
+  "Release"$'\n\n'"Signed-off-by: $victor" 'candidate is missing automation Co-authored-by trailer'
+[[ "$(git rev-parse HEAD)" == "$candidate" ]]
 scripts/prepare-desktop-release.sh 0.1.0 publish
 grep -Fq 'pr create --repo only21mil/buzz' "$CALL_LOG"
 [[ -z "$(git status --porcelain)" ]]
+# The same generator still emits and validates the upstream release identity.
+RELEASE_REPOSITORY=block/buzz scripts/prepare-desktop-release.sh 0.1.0 validate-only
+[[ "$(git show -s --format='%an <%ae>')" == "$wes" ]]
+git show -s --format='%(trailers:only,unfold)' | grep -Fxq "Signed-off-by: $wes"
+git commit -q --amend --no-edit --author="$victor"
+if scripts/desktop_release.py validate --version 0.1.0 --repo block/buzz >"$tmp/upstream-author.log" 2>&1; then
+  echo 'upstream validator accepted fork author' >&2; exit 1
+fi
+grep -Fq 'unexpected candidate author' "$tmp/upstream-author.log"
 echo 'desktop fork release policy and repository routing passed'

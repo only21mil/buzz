@@ -22,6 +22,15 @@ if [[ -z "$repository" ]]; then
   repository="${repository%.git}"
 fi
 [[ "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "invalid release repository" >&2; exit 1; }
+if [[ "$repository" == only21mil/buzz ]]; then
+  release_author='Victor Vogel <263261067+only21mil@users.noreply.github.com>'
+  for identity in GIT_AUTHOR_IDENT GIT_COMMITTER_IDENT; do
+    [[ "$(git var "$identity")" == "$release_author "* ]] || {
+      echo "$identity must use $release_author for $repository" >&2
+      exit 1
+    }
+  done
+fi
 # Use a dedicated fetched ref; the authoritative relay must not overwrite an
 # unrelated upstream origin/main tracking ref.
 base_ref=refs/release-preparation/main
@@ -64,8 +73,12 @@ chore(release): release Buzz Desktop version $version
 
 Co-authored-by: $agent_name <$agent_email>
 EOF
-git -c user.name='Wes' -c user.email='wesbillman@users.noreply.github.com' \
-  commit -s -F "$msg"
+if [[ "$repository" == only21mil/buzz ]]; then
+  git commit -s -F "$msg"
+else
+  git -c user.name='Wes' -c user.email='wesbillman@users.noreply.github.com' \
+    commit -s -F "$msg"
+fi
 scripts/desktop_release.py validate --candidate HEAD --version "$version" --repo "$repository"
 
 candidate_sha="$(git rev-parse HEAD)"
