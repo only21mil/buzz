@@ -271,8 +271,16 @@ pub(crate) fn worktree_add_command(checkout: &LocalProjectCheckout, branch: &str
     ));
     let repo = quote(&checkout.path.to_string_lossy());
     let destination = quote(&destination.to_string_lossy());
-    // --guess-remote uses an existing local branch or its unique remote-tracking branch.
-    format!("git -C {repo} fetch origin && git -C {repo} worktree add --guess-remote -- {destination} {}", quote(branch))
+    let local_ref = quote(&format!("refs/heads/{branch}"));
+    let remote_ref = quote(&format!("refs/remotes/origin/{branch}"));
+    let refspec = quote(&format!(
+        "+refs/heads/{branch}:refs/remotes/origin/{branch}"
+    ));
+    let branch = quote(branch);
+    // Keep an existing local branch intact, including unpublished commits.
+    // Otherwise fetch the exact ref: a single-branch clone's configured fetch
+    // refspec cannot fetch or guess other remote branches.
+    format!("if git -C {repo} show-ref --verify --quiet {local_ref}; then git -C {repo} worktree add -- {destination} {branch}; else git -C {repo} fetch -- origin {refspec} && git -C {repo} worktree add -b {branch} -- {destination} {remote_ref}; fi")
 }
 
 pub(crate) fn checkout_mismatch_message(checkout: &LocalProjectCheckout, branch: &str) -> String {

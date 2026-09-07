@@ -17,6 +17,9 @@ export function useProjectRepositoryRefSelection(input: {
     null,
   );
   const [selectedTag, setSelectedTag] = React.useState<string | null>(null);
+  const [selectedLocalBranch, setSelectedLocalBranch] = React.useState<
+    string | null
+  >(null);
   const [selectionRepositoryId, setSelectionRepositoryId] = React.useState(
     input.repositoryId,
   );
@@ -26,6 +29,7 @@ export function useProjectRepositoryRefSelection(input: {
     setSelectionRepositoryId(input.repositoryId);
     setSelectedBranch(null);
     setSelectedTag(null);
+    setSelectedLocalBranch(null);
   }
   const staleSelection = selectionRepositoryId !== input.repositoryId;
   const activeBranch =
@@ -39,14 +43,23 @@ export function useProjectRepositoryRefSelection(input: {
       if (input.projectPending) return;
       setSelectedBranch(null);
       setSelectedTag(null);
+      setSelectedLocalBranch(null);
       return;
     }
     setSelectedBranch((currentBranch) => {
-      if (currentBranch && input.branchOptions.includes(currentBranch)) {
+      if (
+        currentBranch &&
+        (input.branchOptions.includes(currentBranch) ||
+          currentBranch === selectedLocalBranch)
+      ) {
         return currentBranch;
       }
       return input.defaultBranch ?? input.branchOptions[0] ?? null;
     });
+    // Once published, a local choice follows normal remote-removal fallback.
+    setSelectedLocalBranch((branch) =>
+      branch && input.branchOptions.includes(branch) ? null : branch,
+    );
     setSelectedTag((currentTag) => {
       if (currentTag && input.tags.some((tag) => tag.name === currentTag)) {
         return currentTag;
@@ -59,12 +72,21 @@ export function useProjectRepositoryRefSelection(input: {
     input.projectAvailable,
     input.projectPending,
     input.tags,
+    selectedLocalBranch,
   ]);
 
-  const selectBranch = React.useCallback((branch: string | null) => {
-    setSelectedBranch(branch);
-    setSelectedTag(null);
-  }, []);
+  const selectBranch = React.useCallback(
+    (branch: string | null) => {
+      setSelectedBranch(branch);
+      setSelectedTag(null);
+      // The menu also offers discovered local branches/worktrees that are
+      // absent from the remote/PR options. Keep that deliberate selection.
+      setSelectedLocalBranch(
+        branch && !input.branchOptions.includes(branch) ? branch : null,
+      );
+    },
+    [input.branchOptions],
+  );
   const selectTag = React.useCallback((tag: string) => {
     setSelectedTag(tag);
   }, []);

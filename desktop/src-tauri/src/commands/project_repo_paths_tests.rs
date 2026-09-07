@@ -198,3 +198,113 @@ fn suggested_command_creates_remote_only_branch_without_switching_existing_check
     assert_eq!(selected.branch.as_deref(), Some("feature/remote"));
     assert_ne!(selected.path, main);
 }
+
+#[test]
+fn suggested_command_fetches_selected_branch_in_single_branch_clones() {
+    for branch in ["feature/remote", "feature/it's;$(false)"] {
+        let root = tempfile::tempdir().unwrap();
+        let source = init(root.path(), "source", "unused");
+        git(&source, &["branch", branch]);
+        let main = root.path().join("single's checkout");
+        git(
+            root.path(),
+            &[
+                "clone",
+                "--single-branch",
+                "--branch",
+                "main",
+                source.to_str().unwrap(),
+                main.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(
+            git(&main, &["config", "remote.origin.fetch"]).trim(),
+            "+refs/heads/main:refs/remotes/origin/main"
+        );
+        std::fs::write(main.join("tracked.txt"), "staged\n").unwrap();
+        git(&main, &["add", "tracked.txt"]);
+        std::fs::write(main.join("tracked.txt"), "unstaged\n").unwrap();
+        std::fs::write(main.join("untracked.txt"), "keep\n").unwrap();
+        let before = git(&main, &["status", "--porcelain=v1"]);
+        let staged = git(&main, &["diff", "--cached"]);
+        let head = git(&main, &["rev-parse", "HEAD"]);
+        let checkout = LocalProjectCheckout {
+            path: main.clone(),
+            branch: Some("main".to_string()),
+        };
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(worktree_add_command(&checkout, branch))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(git(&main, &["status", "--porcelain=v1"]), before);
+        assert_eq!(git(&main, &["diff", "--cached"]), staged);
+        assert_eq!(git(&main, &["rev-parse", "HEAD"]), head);
+        assert_eq!(git(&main, &["branch", "--show-current"]).trim(), "main");
+        assert_eq!(
+            std::fs::read_to_string(main.join("tracked.txt")).unwrap(),
+            "unstaged\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(main.join("untracked.txt")).unwrap(),
+            "keep\n"
+        );
+        let destination =
+            main.with_file_name(format!("single's checkout--{}", branch.replace('/', "-")));
+        assert_eq!(
+            git(&destination, &["branch", "--show-current"]).trim(),
+            branch
+        );
+        assert_eq!(
+            git(&destination, &["rev-parse", "HEAD"]),
+            git(&source, &["rev-parse", branch])
+        );
+        assert_eq!(
+            git(&main, &["config", "remote.origin.fetch"]).trim(),
+            "+refs/heads/main:refs/remotes/origin/main"
+        );
+    }
+}
+
+#[test]
+fn suggested_command_preserves_local_branch_without_fetching_unavailable_origin() {
+    let root = tempfile::tempdir().unwrap();
+    let main = init(
+        root.path(),
+        "main",
+        root.path().join("missing.git").to_str().unwrap(),
+    );
+    git(&main, &["branch", "feature/local"]);
+    let head = git(&main, &["rev-parse", "feature/local"]);
+    let checkout = LocalProjectCheckout {
+        path: main.clone(),
+        branch: Some("main".to_string()),
+    };
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(worktree_add_command(&checkout, "feature/local"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(git(&main, &["rev-parse", "feature/local"]), head);
+    assert_eq!(git(&main, &["branch", "--show-current"]).trim(), "main");
+    assert_eq!(
+        git(
+            &root.path().join("main--feature-local"),
+            &["branch", "--show-current"]
+        )
+        .trim(),
+        "feature/local"
+    );
+}

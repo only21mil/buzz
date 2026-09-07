@@ -291,3 +291,95 @@ test("clone and terminal hooks send selected branch and offer a copyable mismatc
     toast.dismiss();
   }
 });
+
+test("local-only selection survives branch effects and reaches terminal and PR inputs", async () => {
+  const { renderHook } = await import("@testing-library/react");
+  const { mockIPC, clearMocks } = await import("@tauri-apps/api/mocks");
+  const { useOptimisticProjectBranches } = await import(
+    "../useOptimisticProjectBranches.ts"
+  );
+  const { useProjectRepositoryRefSelection } = await import(
+    "../useProjectRepositoryRefSelection.ts"
+  );
+  const { useOpenProjectTerminal } = await import(
+    "./useOpenProjectTerminal.ts"
+  );
+  const { client, project } = fixture();
+  const repository = project.repositories[1];
+  const observedBranches = [{ name: "main", commit: "a".repeat(40) }];
+  client.setQueryData(["project", repository.id, "repo-state"], {
+    branches: observedBranches,
+  });
+  const calls = [];
+  mockIPC((name, input) => {
+    if (name === "get_media_proxy_port") return null;
+    if (name !== "open_project_terminal")
+      throw new Error(`Unexpected native command: ${name}`);
+    calls.push(input);
+    return { path: "/repos/local-worktree", cloned: false };
+  });
+  try {
+    const { result, rerender } = renderHook(
+      () => {
+        const { branchOptions } = useOptimisticProjectBranches({
+          defaultBranch: repository.defaultBranch,
+          observedBranches,
+          projectId: repository.id,
+          referencedBranches: [].map((pr) => pr.branchName ?? null),
+        });
+        const selection = useProjectRepositoryRefSelection({
+          branchOptions,
+          defaultBranch: repository.defaultBranch,
+          repositoryId: repository.repoAddress,
+          projectAvailable: true,
+          projectPending: false,
+          tags: [],
+        });
+        return { ...selection, openTerminal: useOpenProjectTerminal("/repos") };
+      },
+      {
+        wrapper: ({ children }) =>
+          h(BaseQueryClientProvider, { client }, children),
+      },
+    );
+    act(() => result.current.selectBranch("feature/local"));
+    rerender();
+    assert.equal(result.current.activeBranch, "feature/local");
+    await act(async () =>
+      result.current.openTerminal(repository, {
+        branch: result.current.activeBranch,
+        hasLocalCheckout: true,
+      }),
+    );
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].defaultBranch, "feature/local");
+    assert.equal(calls[0].projectDtag, repository.dtag);
+    const view = render(
+      h(
+        QueryClientProvider,
+        { client },
+        h(CreatePullRequestDialog, {
+          initialProjectId: project.id,
+          initialRepositoryId: repository.id,
+          initialSourceBranch: result.current.activeBranch,
+          projects: [project],
+          open: true,
+          onOpenChange() {},
+          onCreated() {},
+        }),
+      ),
+    );
+    assert.equal(
+      view.getByTestId("create-pull-request-compare-branch").value,
+      "feature/local",
+    );
+    assert.equal(
+      view.getByTestId("create-pull-request-base-branch").value,
+      "main",
+    );
+  } finally {
+    cleanup();
+    client.clear();
+    clearMocks();
+  }
+});
