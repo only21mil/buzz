@@ -10,6 +10,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
+  BUZZ_CI_REUSE_EPOCH: ${{ vars.BUZZ_CI_REUSE_EPOCH }}
   CARGO_TERM_COLOR: always
   BUZZ_TEST_POSTGRES_PASSWORD: buzz_dev
   PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.cache/ms-playwright
@@ -55,6 +56,8 @@ jobs:
               - 'docs/delivery-lifecycle.md'
               - 'scripts/ci-promotion-readiness.py'
               - 'scripts/protected-ci-receipt.py'
+              - 'scripts/protected-ci-reuse.py'
+              - 'scripts/test-protected-ci-reuse.py'
               - 'scripts/run-tests.sh'
               - 'scripts/postgres-test-*.py'
               - 'scripts/postgres-test-*.sh'
@@ -139,6 +142,8 @@ jobs:
         run: scripts/test-check-android-google-free.sh
       - name: PostgreSQL discovery contract
         run: scripts/test-postgres-test-discovery.sh
+      - name: Protected CI reuse contract
+        run: python3 scripts/test-protected-ci-reuse.py
       - name: CI path filter contract
         run: scripts/test-ci-path-filter-contract.sh
 
@@ -150,18 +155,35 @@ jobs:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.rust == 'true' || needs.changes.outputs.desktop-rust == 'true'
     permissions:
       contents: read
+      actions: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           save-if: ${{ github.event_name != 'pull_request' }}
+      - name: Verify protected result reuse
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/protected-ci-reuse.py --job "rust-lint"
       - name: Format check
+        if: steps.reuse.outputs.reused != 'true'
         run: just fmt-check
       - name: Desktop Tauri format check
+        if: steps.reuse.outputs.reused != 'true'
         run: just desktop-tauri-fmt-check
       - name: Clippy
+        if: steps.reuse.outputs.reused != 'true'
         run: just clippy
+      - name: Retain protected result provenance
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-reuse-${{ github.run_attempt }}-rust-lint
+          path: protected-ci-reuse.json
+          if-no-files-found: error
+          retention-days: 7
 
   unit-tests:
     name: Unit Tests
@@ -171,6 +193,8 @@ jobs:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.rust == 'true'
     permissions:
       contents: read
+      actions: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
@@ -198,8 +222,21 @@ jobs:
             -o Acquire::https::Timeout=30 \
             -o DPkg::Lock::Timeout=120 \
             xorriso
+      - name: Verify protected result reuse
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/protected-ci-reuse.py --job "unit-tests"
       - name: Unit tests
+        if: steps.reuse.outputs.reused != 'true'
         run: just test-unit
+      - name: Retain protected result provenance
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-reuse-${{ github.run_attempt }}-unit-tests
+          path: protected-ci-reuse.json
+          if-no-files-found: error
+          retention-days: 7
 
   desktop-core:
     name: Desktop Core
@@ -305,6 +342,8 @@ jobs:
         shard: [1, 2, 3, 4]
     permissions:
       contents: read
+      actions: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: cashapp/activate-hermit@cea9af7913204a965fd488637a8d1811bba2e616 # v1
@@ -339,16 +378,23 @@ jobs:
         with:
           path: ${{ env.PLAYWRIGHT_BROWSERS_PATH }}
           key: playwright-${{ runner.os }}-${{ steps.pw-version.outputs.version }}
+      - name: Verify protected result reuse
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/protected-ci-reuse.py --job "desktop-smoke-${{ matrix.shard }}"
       - name: Desktop E2E build
+        if: steps.reuse.outputs.reused != 'true'
         run: pnpm -C desktop build:e2e
       - name: Desktop smoke e2e
+        if: steps.reuse.outputs.reused != 'true'
         run: cd desktop && pnpm exec playwright test --project=smoke --shard=${{ matrix.shard }}/4
       - name: Summarize flaky tests
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.reuse.outputs.reused != 'true' }}
         run: node scripts/summarize-flaky-tests.mjs playwright-report.json "Desktop Smoke E2E (${{ matrix.shard }})"
         working-directory: desktop
       - name: Upload desktop smoke e2e artifacts
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.reuse.outputs.reused != 'true' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: desktop-smoke-e2e-artifacts-${{ matrix.shard }}
@@ -357,6 +403,13 @@ jobs:
             desktop/playwright-report.json
             desktop/test-results
           if-no-files-found: ignore
+          retention-days: 7
+      - name: Retain protected result provenance
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ci-reuse-${{ github.run_attempt }}-desktop-smoke-${{ matrix.shard }}
+          path: protected-ci-reuse.json
+          if-no-files-found: error
           retention-days: 7
 
   desktop:

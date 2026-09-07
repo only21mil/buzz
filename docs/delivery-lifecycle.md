@@ -101,6 +101,63 @@ the exact landed ref, record the expected first-attempt failure, rerun it once,
 and require the second attempt to pass on the same landed commit. Add the
 ruleset requirement only after that bootstrap evidence is complete.
 
+## Verified protected-result reuse
+
+`CI` still emits every required context on the exact landed commit. For Rust
+Lint, Unit Tests and the four Desktop Smoke E2E shards, it may verify an
+applicable protected result instead of repeating the expensive check commands.
+The job summary states whether work ran fresh or reused a protected result.
+Its immutable `ci-reuse-<attempt>-<job>` artifact retains the full proof.
+`full_exact_head` in the canonical receipt means every required context passed
+for that exact head. It does not claim every underlying command ran again.
+Record the fresh/reused distinction and retain the referenced provenance
+artifacts with the landing evidence before their seven-day retention expires.
+
+`scripts/protected-ci-reuse.py` permits reuse only when all of these hold:
+
+- A successful internal pull-request CI run and its exact attempt have a
+  successful job plus every current app-bound protected check. A later failed,
+  pending or cancelled run is never replaced with an earlier success. The
+  source result is at most 24 hours old.
+- The source artifact was uploaded by that run/attempt after the job's check
+  commands succeeded. GitHub's immutable artifact identity and archive digest
+  match. A reused proof cannot become a source proof.
+- The tested tree, candidate tree and landed tree agree. The closed internal
+  main PR names that merge, whose ordered parents are the tested base followed
+  by the candidate. GitHub main still names the exact landed commit.
+- The source and landed workflow bytes agree, including action pins and check
+  commands. Whole-tree equality also binds scripts, toolchain manifests and
+  dependency lockfiles. After normal setup, runner image/version, tool versions
+  and resolved OS/Python packages agree. The optional non-secret repository
+  variable `BUZZ_CI_REUSE_EPOCH` invalidates results when an external relevant
+  input changes. It is not an authorization override.
+- The captured repository, strict app-bound required checks and active ruleset
+  authority agree with live authority. The source run and authority are read
+  again before returning a reuse decision.
+
+The candidate SHA, synthetic PR merge SHA, landed SHA, event name, workspace
+path and cache-hit state may differ. These are not execution inputs to the
+selected tree-scoped commands. New workflow code can qualify in its reviewed
+candidate CI run and be reused for its identical-tree landing. First-parent
+workflow equality is not a bootstrap requirement. The exact-candidate review,
+merge approval and authoritative Buzz/GitHub ref readbacks remain independent
+delivery gates; a merged GitHub PR alone does not replace them.
+
+Missing or materially different evidence reruns that job's normal checks. In
+particular, old receipts and logs without the resolved dependency/context
+capture are not enough for this adapter. This is a per-job coverage gap, not a
+reason to rerun a proven unrelated job or reinterpret an old receipt's SHA.
+Manual dispatches and pushes outside main execute fresh.
+
+Desktop Release Candidate, relay canary, Security, release/package builds,
+relay-backed integration and deployment checks remain fresh. Their present
+contracts include commit identity, artifacts, live services, mutable advisory
+data or other context that this adapter does not qualify. The relay canary's
+deliberate first-attempt failure and later success remain separate evidence.
+Neither deploy-local nor the desktop publisher needs a receipt schema change:
+they still acquire and live-reverify canonical exact-main protected evidence,
+and retain their source identity, artifact, approval and live-state gates.
+
 ## Deployment preflight
 
 Production deployment is approval-gated. Run it only from a clean checkout of

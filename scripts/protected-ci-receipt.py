@@ -14,6 +14,12 @@ contexts, and exact-head check runs, plus the scope authority. A main receipt
 needs the live default-branch head at the receipt head; a pull-request receipt
 needs the live pull request open, non-draft, at the receipt head, based on the
 default branch, with the base unmoved.
+
+full_exact_head describes complete protected check coverage on this head, not
+whether every underlying command ran again. The trusted CI workflow may verify
+protected-result reuse for selected tree-scoped work, with source provenance
+retained in its ci-reuse artifacts. It still emits an exact-head successful
+context; this receipt never relabels a source commit or accepts skipped checks.
 """
 
 from __future__ import annotations
