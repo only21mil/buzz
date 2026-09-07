@@ -460,7 +460,7 @@ buzz-test-client	e2e_media_extended	test_auth_server_tag_correct	crates/buzz-tes
 buzz-test-client	e2e_media_extended	test_auth_server_tag_mismatch	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
 buzz-test-client	e2e_media_extended	test_auth_wrong_kind	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
 buzz-test-client	e2e_media_extended	test_concurrent_upload_same_file	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
-buzz-test-client	e2e_media_extended	test_html_tenant_read_denial	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
+buzz-test-client	e2e_media_extended	test_html_tenant_read_denial	crates/buzz-test-client/tests/e2e_media_extended.rs	external	owned two-member HTML tenant fixture via relay-invite-test-local.py --html-tenants
 buzz-test-client	e2e_media_extended	test_legacy_media_route_rejects_non_media	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
 buzz-test-client	e2e_media_extended	test_legacy_media_route_still_accepts_canonical_media	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection
 buzz-test-client	e2e_media_extended	test_standard_upload_rejects_recognized_audio	crates/buzz-test-client/tests/e2e_media_extended.rs	external	live relay E2E; retain existing relay workflow selection

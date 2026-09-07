@@ -38,5 +38,35 @@ class InviteInventoryTests(unittest.TestCase):
             self.inventory([row['test'] for row in rows], rows)
 
 
+class HtmlTenantInventoryTests(unittest.TestCase):
+    def inventory(self, discovered, rows=None):
+        with patch.dict(runner['local'], discover=lambda *_: discovered):
+            if rows is None:
+                return runner['html_tenant_inventory'](Path('e2e_media_extended'), {})
+            with patch.dict(runner['html_tenant_inventory'].__globals__, read_inventory=lambda: rows):
+                return runner['html_tenant_inventory'](Path('e2e_media_extended'), {})
+
+    def rows(self):
+        return [row for row in runner['read_inventory']() if row['binary'] == 'e2e_media_extended']
+
+    def test_exact_tenant_case_preserves_external_classification(self):
+        rows = self.rows()
+        selected = self.inventory([row['test'] for row in rows])
+        self.assertEqual(selected, ['test_html_tenant_read_denial'])
+        self.assertEqual({row['mode'] for row in rows if row['test'] in selected}, {'external'})
+
+    def test_missing_duplicate_or_unknown_compiled_test_refuses(self):
+        tests = [row['test'] for row in self.rows()]
+        missing = [test for test in tests if test != runner['HTML_TENANT_TEST']]
+        for discovered in (missing, tests + tests[:1], tests + ['test_unknown']):
+            with self.subTest(discovered=discovered), self.assertRaisesRegex(ValueError, 'compiled discovery mismatch'):
+                self.inventory(discovered)
+
+    def test_required_case_cannot_disappear_from_both_inventories(self):
+        rows = [row for row in self.rows() if row['test'] != runner['HTML_TENANT_TEST']]
+        with self.assertRaisesRegex(ValueError, 'HTML tenant test missing'):
+            self.inventory([row['test'] for row in rows], rows)
+
+
 if __name__ == '__main__':
     unittest.main()

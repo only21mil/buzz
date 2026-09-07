@@ -68,3 +68,25 @@ Redis and MinIO, stops PostgreSQL, removes private data, and fails on incomplete
 Fixture logs are printed before removal. Discovery drift fails before any
 service starts. `test-relay-invite-test-local.py` checks that admission behavior
 without starting services.
+
+## HTML tenant read denial
+
+The same owned service runner has a fixed `--html-tenants` mode. CI calls it
+through `bash scripts/postgres-test-ci.sh --html-tenants` with the explicit
+relay binary and S3 tool arguments, under the same hosted admission and
+unchanged PostgreSQL fence as the invite cases. For local use,
+pass `--html-tenants` to `relay-invite-test-local.py` with the explicit binary
+and tool arguments documented above. Its test binary must be the compiled
+`e2e_media_extended` target.
+
+This mode reconciles the complete compiled inventory and runs exactly
+`test_html_tenant_read_denial`. The owned relay first migrates its fresh
+database. The fixture stops it, seeds `localhost:3000` and
+`html-b.localhost:3000` with public synthetic key 2 as a member of both, and
+restarts with membership enforcement enabled. The test receives both explicit
+hosts. Each tenant uploads its own HTML and reads exact full and range bytes;
+valid member auth on the other tenant must receive a generic 404 for both the
+canonical HTML path and bare hash. CI excludes this one test from the generic
+media invocation because the dedicated step supplies its required fixture.
+All other media tests retain their existing selection, and the seven invite
+cases retain their existing runner mode and assertions.

@@ -2,11 +2,12 @@
 # Hosted Ubuntu admission only. Database discovery always follows the kernel gate.
 set -euo pipefail
 
-# Keep the hosted admission and cleanup lifecycle around either fixed runner.
+# Keep the hosted admission and cleanup lifecycle around each fixed runner.
 case "${1:-}" in
   '') runner=postgres ;;
   --relay-invites) runner=invites; shift ;;
-  *) echo 'expected no arguments or --relay-invites [invite runner arguments]' >&2; exit 1 ;;
+  --html-tenants) runner=html; shift ;;
+  *) echo 'expected no arguments, --relay-invites or --html-tenants [runner arguments]' >&2; exit 1 ;;
 esac
 
 if [[ ${GITHUB_ACTIONS:-} != true || ${RUNNER_ENVIRONMENT:-} != github-hosted ]] ||
@@ -58,6 +59,8 @@ fi
 
 if [[ "$runner" == invites ]]; then
   python3 scripts/relay-invite-test-local.py "$@" --task-root "$task_root" --pg-bin-dir "$(pg_config --bindir)"
+elif [[ "$runner" == html ]]; then
+  python3 scripts/relay-invite-test-local.py --html-tenants "$@" --task-root "$task_root" --pg-bin-dir "$(pg_config --bindir)"
 else
   scripts/postgres-test-run.sh --task-root "$task_root" --pg-bin-dir "$(pg_config --bindir)"
 fi

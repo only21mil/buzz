@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the Relay E2E invite selection with owned PostgreSQL, Redis, MinIO and relay."""
+"""Run fixed Relay E2E invite or HTML tenant cases with owned fenced services."""
 import argparse
 import json
 import os
@@ -39,12 +39,24 @@ def invite_inventory(binary, env):
     return selected
 
 
-def inside_main():
+HTML_TENANT_TEST = 'test_html_tenant_read_denial'
+
+
+def html_tenant_inventory(binary, env):
+    tests = local['discover'](binary, env, '')
+    reconcile(binary, tests, read_inventory())
+    if HTML_TENANT_TEST not in tests:
+        raise ValueError('HTML tenant test missing from compiled discovery')
+    return [HTML_TENANT_TEST]
+
+
+def inside_main(html_tenants=False):
     env = dict(os.environ)  # The production fence supplied a fresh allowlist.
     # reqwest requires a root even for these HTTP-only tests. Use the public
     # test certificate; never mount a host trust store or disable TLS checks.
     env['SSL_CERT_FILE'] = '/fixture-ca.pem'
-    tests = invite_inventory(Path('/binaries/e2e_relay'), env)
+    binary = Path('/binaries/e2e_media_extended' if html_tenants else '/binaries/e2e_relay')
+    tests = html_tenant_inventory(binary, env) if html_tenants else invite_inventory(binary, env)
     work = Path(tempfile.mkdtemp(prefix='invite-', dir='/work'))
     processes, handles = [], []
     pg_started = False
@@ -118,16 +130,37 @@ def inside_main():
                          RUST_LOG='buzz_relay=info')
         relay = start('relay', ['/binaries/buzz-relay'], relay_env)
         wait_http('http://127.0.0.1:3000/_readiness')
+        if html_tenants:
+            # Migrations ran in the owned relay. Seed only these two synthetic
+            # communities, then restart with membership enforcement enabled.
+            relay.terminate()
+            relay.wait(timeout=40)
+            processes.remove(relay)
+            seed = work / 'html-tenants.sql'
+            seed.write_text("""
+INSERT INTO communities (host) VALUES ('localhost:3000'), ('html-b.localhost:3000')
+ON CONFLICT DO NOTHING;
+INSERT INTO relay_members (community_id, pubkey, role)
+SELECT id, 'c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5', 'member'
+FROM communities WHERE host IN ('localhost:3000', 'html-b.localhost:3000');
+""")
+            command(['/pg/bin/psql', '-X', '-d', 'buzz_invites', '-v', 'ON_ERROR_STOP=1', '-f', seed])
+            relay_env.update(BUZZ_REQUIRE_RELAY_MEMBERSHIP='true',
+                             RELAY_OWNER_PUBKEY='79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798',
+                             HTML_TEST_OTHER_HOST='html-b.localhost:3000')
+            relay = start('relay-membership', ['/binaries/buzz-relay'], relay_env)
+            wait_http('http://127.0.0.1:3000/_readiness')
         for test in tests:
-            result = command(['/binaries/e2e_relay', '--ignored', '--exact', test,
+            result = command([binary, '--ignored', '--exact', test,
                               '--nocapture', '--test-threads=1'], relay_env,
                              capture_output=True, text=True)
             print(result.stdout, end='', flush=True)
             print(result.stderr, end='', file=sys.stderr, flush=True)
             local['require_one_test'](result.stdout, test)
         if relay.poll() is not None:
-            raise RuntimeError('owned relay exited during invite tests')
-        print('PASS: all seven Relay E2E invite cases executed inside PostgreSQL fence', flush=True)
+            raise RuntimeError('owned relay exited during tests')
+        label = 'HTML tenant read denial' if html_tenants else 'all seven Relay E2E invite cases'
+        print(f'PASS: {label} executed inside PostgreSQL fence', flush=True)
     finally:
         for child in reversed(processes):
             if child.poll() is None:
@@ -154,6 +187,7 @@ def inside_main():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--html-tenants', action='store_true', help='run the exact two-tenant HTML read denial case')
     parser.add_argument('--task-root', type=Path, required=True)
     parser.add_argument('--pg-bin-dir', type=Path, required=True)
     parser.add_argument('--relay-binary', type=Path, required=True)
@@ -162,6 +196,7 @@ def main():
     parser.add_argument('--test-binary', type=Path, help='otherwise compile the CI libtest target')
     args = parser.parse_args()
     env = local['clean_environment'](os.environ)
+    target = 'e2e_media_extended' if args.html_tenants else 'e2e_relay'
     if args.redis_binary is None:
         parser.error('missing redis-server; supply --redis-binary')
     with tempfile.TemporaryDirectory(prefix='relay-invite-fence-', dir=args.task_root.resolve(strict=True)) as temporary:
@@ -169,23 +204,23 @@ def main():
         if test_binary is None:
             artifacts = Path(temporary) / 'artifacts.jsonl'
             with artifacts.open('w') as output:
-                subprocess.run(['cargo', 'test', '-p', 'buzz-test-client', '--test', 'e2e_relay',
+                subprocess.run(['cargo', 'test', '-p', 'buzz-test-client', '--test', target,
                                 '--no-run', '--message-format=json'], cwd=ROOT, env=env, stdout=output, check=True)
             compiled = runpy.run_path(str(ROOT / 'scripts/postgres-test-run.py'))
-            test_binary = compiled['artifact_binaries']([artifacts], {'e2e_relay'})['e2e_relay']
+            test_binary = compiled['artifact_binaries']([artifacts], {target})[target]
         mounts = [(ROOT / 'scripts', '/repo/scripts'),
                   (ROOT / 'crates/buzz-push-gateway/tests/fixtures/apns-test-cert-only.pem', '/fixture-ca.pem'),
                   (args.pg_bin_dir.resolve(strict=True).parent, '/pg'),
                   (args.relay_binary.resolve(strict=True), '/binaries/buzz-relay'),
                   (args.redis_binary.resolve(strict=True), '/binaries/redis-server'),
-                  (test_binary.resolve(strict=True), '/binaries/e2e_relay'),
+                  (test_binary.resolve(strict=True), '/binaries/' + target),
                   ((args.s3_tools_dir / 'minio').resolve(strict=True), '/binaries/minio'),
                   ((args.s3_tools_dir / 'mc').resolve(strict=True), '/binaries/mc')]
         work = Path(temporary) / 'work'
         work.mkdir(mode=0o700)
         code = ('import sys; sys.path.insert(0,"/repo/scripts"); '
                 'from postgres_test_fence import verify; verify(' + repr(fence.namespaces()) + '); '
-                'import runpy; runpy.run_path("/repo/scripts/relay-invite-test-local.py")["inside_main"]()')
+                'import runpy; runpy.run_path("/repo/scripts/relay-invite-test-local.py")["inside_main"](' + repr(args.html_tenants) + ')')
         result = subprocess.run(fence.argv(mounts, work, ['/usr/bin/python3', '-c', code],
                                           fence.etc_files(temporary)), env={'PATH': '/usr/bin:/bin'}, close_fds=True)
         if any(work.iterdir()):

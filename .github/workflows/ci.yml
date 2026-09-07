@@ -832,6 +832,8 @@ jobs:
           chmod +x target/invite-tools/minio target/invite-tools/mc
       - name: Isolated relay invite E2E
         run: bash scripts/postgres-test-ci.sh --relay-invites --relay-binary target/ci/buzz-relay --s3-tools-dir target/invite-tools
+      - name: Isolated HTML tenant read denial
+        run: bash scripts/postgres-test-ci.sh --html-tenants --relay-binary target/ci/buzz-relay --s3-tools-dir target/invite-tools
       - name: Relay E2E tests
         run: |
           cargo test -p buzz-test-client --test e2e_persona --test e2e_team_catalog --test e2e_nostr_interop --test e2e_project -- --ignored --nocapture
@@ -845,10 +847,11 @@ jobs:
         # hash-scoped tokens. They were #[ignore]d and selected by no CI job, so
         # the lane never ran; select it here, where MinIO and the seeded
         # 'localhost:3000' community already exist.
+        # The two-member HTML tenant case runs in its dedicated fenced step above.
         # --no-fail-fast: without it cargo stops after the first failing binary,
         # so one broken case hides every later binary's result.
         run: |
-          cargo test -p buzz-test-client --no-fail-fast --test e2e_media --test e2e_media_extended --test e2e_media_video -- --ignored --nocapture
+          cargo test -p buzz-test-client --no-fail-fast --test e2e_media --test e2e_media_extended --test e2e_media_video -- --ignored --nocapture --skip test_html_tenant_read_denial
         env:
           RELAY_URL: ws://localhost:3000
           RELAY_HTTP_URL: http://localhost:3000
