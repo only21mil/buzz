@@ -439,7 +439,8 @@ test("channel reconnect replay pages the missed window until a short page", asyn
       {
         kinds: filter.kinds,
         "#h": ["channel-1"],
-        limit: 50,
+        since: 2000,
+        limit: 0,
       },
     ],
   ]);

@@ -61,6 +61,12 @@ import { CommunityChangeOverlay } from "@/features/communities/ui/CommunityChang
 import { setAvatarProfileSyncQueryClient } from "@/features/profile/avatarProfileSync";
 import { EncryptedBackupProvider } from "@/features/settings/EncryptedBackupProvider";
 import { createBuzzQueryClient } from "@/shared/api/queryClient";
+import {
+  queryCacheScopeKey,
+  scopedQueryCache,
+} from "@/shared/api/scopedQueryCache";
+import { applyLiveQueryCache } from "@/shared/api/liveQueryCache";
+import { relayClient } from "@/shared/api/relayClient";
 import { isSharedIdentity as isSharedIdentityCmd } from "@/shared/api/tauri";
 import { getProfile } from "@/shared/api/tauriProfiles";
 import {
@@ -210,8 +216,62 @@ function CommunitySwitchGate() {
   );
 }
 
-function CommunityQueryProvider({ children }: { children: ReactNode }) {
+function CommunityQueryProvider({
+  children,
+  relayUrl,
+  pubkey,
+}: {
+  children: ReactNode;
+  relayUrl: string;
+  pubkey: string;
+}) {
   const [queryClient] = useState(createBuzzQueryClient);
+  const [cacheReady, setCacheReady] = useState(false);
+  useEffect(() => {
+    let active = true;
+    const cache = scopedQueryCache.attach(
+      queryClient,
+      queryCacheScopeKey(relayUrl, pubkey),
+    );
+    void cache.ready.then(() => {
+      if (active) setCacheReady(true);
+    });
+    return () => {
+      active = false;
+      cache.stop();
+    };
+  }, [queryClient, relayUrl, pubkey]);
+
+  useEffect(() => {
+    if (!cacheReady) return;
+    let active = true;
+    let dispose: (() => Promise<void>) | undefined;
+    const stop = relayClient.liveEvents.observe((event) => {
+      if (active && scopedQueryCache.isAttached(queryClient))
+        applyLiveQueryCache(queryClient, event, pubkey);
+    });
+    void relayClient
+      .subscribeLive(
+        {
+          kinds: [0, 39000, 39002],
+          limit: 1000,
+          since: Math.floor(Date.now() / 1000),
+        },
+        () => {},
+      )
+      .then((unsubscribe) => {
+        if (active) dispose = unsubscribe;
+        else void unsubscribe().catch(() => {});
+      })
+      .catch((error: unknown) =>
+        console.warn("Live cache metadata unavailable", error),
+      );
+    return () => {
+      active = false;
+      stop();
+      void dispose?.().catch(() => {});
+    };
+  }, [cacheReady, queryClient, pubkey]);
 
   useEffect(() => setAvatarProfileSyncQueryClient(queryClient), [queryClient]);
 
@@ -233,7 +293,9 @@ function CommunityQueryProvider({ children }: { children: ReactNode }) {
   }, [queryClient]);
 
   return (
-    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+    <QueryClientProvider client={queryClient}>
+      {cacheReady ? children : <AppLoadingGate />}
+    </QueryClientProvider>
   );
 }
 
@@ -552,33 +614,38 @@ function CommunityApp({
     }
   }, [communityApplied]);
   if (appContent === null && (!transaction || isEnteringCurtain)) {
-    appContent = communityApplied ? (
-      <CommunityQueryProvider key={communityKey}>
-        <CommunityThemeController />
-        <AppReady
-          isCommunitySwitch={isCommunitySwitch}
-          key={communityKey}
-          isSharedIdentity={sharedIdentity}
-        />
-        {showBootSplashOverlay ? (
-          <div
-            aria-hidden="true"
-            className={cn(
-              "fixed inset-0 z-50 transition-opacity",
-              bootSplashPhase === "fading" ? "opacity-0" : "opacity-100",
-            )}
-            data-testid="boot-splash-overlay"
-            style={{ transitionDuration: `${BOOT_SPLASH_FADE_MS}ms` }}
-          >
-            <AppLoadingGate />
-          </div>
-        ) : null}
-      </CommunityQueryProvider>
-    ) : isCommunitySwitch ? (
-      <CommunitySwitchGate />
-    ) : (
-      <AppLoadingGate />
-    );
+    appContent =
+      communityApplied && currentPubkey && activeCommunity ? (
+        <CommunityQueryProvider
+          key={`${communityKey}:${currentPubkey}`}
+          relayUrl={activeCommunity.relayUrl}
+          pubkey={currentPubkey}
+        >
+          <CommunityThemeController />
+          <AppReady
+            isCommunitySwitch={isCommunitySwitch}
+            key={communityKey}
+            isSharedIdentity={sharedIdentity}
+          />
+          {showBootSplashOverlay ? (
+            <div
+              aria-hidden="true"
+              className={cn(
+                "fixed inset-0 z-50 transition-opacity",
+                bootSplashPhase === "fading" ? "opacity-0" : "opacity-100",
+              )}
+              data-testid="boot-splash-overlay"
+              style={{ transitionDuration: `${BOOT_SPLASH_FADE_MS}ms` }}
+            >
+              <AppLoadingGate />
+            </div>
+          ) : null}
+        </CommunityQueryProvider>
+      ) : isCommunitySwitch ? (
+        <CommunitySwitchGate />
+      ) : (
+        <AppLoadingGate />
+      );
   }
 
   return (

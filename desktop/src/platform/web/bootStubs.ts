@@ -1,3 +1,4 @@
+import { deferredIdentity } from "./deferredIdentity";
 import { relayClient } from "@/shared/api/relayClient";
 import { registerNoopCommands } from "./noops";
 import { registerAgentsRuntimeBuilderlabCommands } from "./desktopOnly/agentsRuntimeBuilderlab";
@@ -21,7 +22,7 @@ import { registerOnboardingCommands } from "./onboarding";
 import { registerRelayCanvasCommands } from "./relayCanvas";
 import { registerRelayDmCommands } from "./relayDms";
 import { registerRelayPeopleCommands } from "./relayPeople";
-import { register } from "./registry";
+import { initializePal, register } from "./registry";
 import { registerRelaySocialCommands } from "./relaySocial";
 import { registerLinkPreviewCommands } from "./webLinkPreview";
 import { registerWebMediaTransferCommands } from "./webMediaTransfer";
@@ -65,12 +66,20 @@ export function registerBootStubs(): void {
   });
 }
 
-export async function installBrowserPal(): Promise<void> {
+export function installBrowserPal(): Promise<void> {
+  const pending = deferredIdentity(BrowserIdentityManager.create());
+  return initializePal(async () => {
+    const workspace = installCommands(pending.identity);
+    await pending.ready;
+    await installMediaAuthServiceWorker(workspace);
+  });
+}
+
+function installCommands(identity: BrowserIdentityManager): BrowserWorkspace {
   registerNoopCommands();
   registerBootStubs();
   registerOnboardingCommands();
   registerWebSocketCommands();
-  const identity = await BrowserIdentityManager.create();
   registerIdentityCommands(identity);
   const workspace = new BrowserWorkspace();
   registerWorkspaceCommands(workspace, identity);
@@ -95,5 +104,5 @@ export async function installBrowserPal(): Promise<void> {
   registerRelayCryptoSocialCommands(identity);
   registerWebMediaTransferCommands(workspace);
   registerLinkPreviewCommands();
-  await installMediaAuthServiceWorker(workspace);
+  return workspace;
 }

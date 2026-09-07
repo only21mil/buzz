@@ -276,8 +276,10 @@ export async function replayLiveSubscriptions({
         sendRaw([
           "REQ",
           subId,
+          // Gap history is paged below. Restore only future live delivery here
+          // so reconnect never downloads the original window a second time.
           shouldPageReplay
-            ? subscription.filter
+            ? { ...subscription.filter, since: now, limit: 0 }
             : buildReconnectReplayFilter(subscription.filter, replaySince),
         ]),
       ),
