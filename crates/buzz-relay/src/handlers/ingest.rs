@@ -1514,18 +1514,16 @@ fn validate_diff_event(event: &Event) -> Result<(), String> {
 /// * exactly one `d` tag with a 64-hex value (`d_tag = lower_hex(HMAC...)`),
 /// * exactly one `p` tag with a 64-hex pubkey (the owner counterparty).
 ///
-/// Content is opaque NIP-44 ciphertext; we do not parse it.
+/// Content is opaque NIP-44 ciphertext; we do not parse it. Ingest also
+/// binds the owner to the author's durable NIP-OA mapping before storage.
 fn validate_engram_envelope(event: &Event) -> Result<(), String> {
     let mut d_tags: Vec<&str> = Vec::new();
     let mut p_tags: Vec<&str> = Vec::new();
     for tag in event.tags.iter() {
         let parts = tag.as_slice();
-        if parts.len() < 2 {
-            continue;
-        }
         match parts[0].as_str() {
-            "d" => d_tags.push(&parts[1]),
-            "p" => p_tags.push(&parts[1]),
+            "d" => d_tags.push(tag.content().unwrap_or("")),
+            "p" => p_tags.push(tag.content().unwrap_or("")),
             _ => {}
         }
     }
@@ -2998,6 +2996,18 @@ async fn ingest_event_inner(
     if kind_u32 == KIND_AGENT_ENGRAM {
         validate_engram_envelope(&event)
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+        if !crate::handlers::req::event_visible_to_reader(
+            state,
+            tenant.community(),
+            &event,
+            event.pubkey.as_bytes(),
+        )
+        .await
+        {
+            return Err(IngestError::AuthFailed(
+                "restricted: agent-engram `p` tag must be the attested owner of this agent".into(),
+            ));
+        }
     }
 
     if kind_u32 == KIND_AGENT_TURN_METRIC {
