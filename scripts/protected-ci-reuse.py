@@ -94,8 +94,23 @@ def authority(api):
     need(repository["full_name"] == REPO and repository["default_branch"] == "main", "repository authority changed")
     rules = api.pages(PREFIX + "/rules/branches/main", "array")
     required, rulesets, strict = receipt.required_checks(rules)
+    active = []
+    for ruleset in rulesets:
+        # This optimization never exercises a merge bypass. GitHub hides bypass
+        # actors from read-only workflow tokens; the canonical operator receipt
+        # still binds those actors independently at delivery. Do not mistake
+        # a missing private field for an empty bypass list or inject admin tokens.
+        need(ruleset["source_type"] == "Repository" and ruleset["source"] == REPO,
+             "source ruleset needs a separately qualified authority adapter")
+        metadata = api.one(PREFIX + f"/rulesets/{ruleset['id']}")
+        need(metadata["id"] == ruleset["id"] and metadata["source_type"] == "Repository"
+             and metadata["source"] == REPO and metadata["enforcement"] == "active"
+             and metadata["target"] == "branch", "ruleset authority changed")
+        need(bool(metadata.get("updated_at")), "ruleset revision timestamp missing")
+        active.append({key: metadata[key] for key in (
+            "id", "source_type", "source", "enforcement", "target", "updated_at", "conditions", "rules")})
     return {"repository_id": repository["id"], "rules": rules, "required_checks": required,
-            "rulesets": receipt.confirm_active_rulesets(api, rulesets), "strict": strict}
+            "rulesets": active, "strict": strict}
 
 
 def context(job):

@@ -132,8 +132,11 @@ artifacts with the landing evidence before their seven-day retention expires.
   variable `BUZZ_CI_REUSE_EPOCH` invalidates results when an external relevant
   input changes. It is not an authorization override.
 - The captured repository, strict app-bound required checks and active ruleset
-  authority agree with live authority. The source run and authority are read
-  again before returning a reuse decision.
+  authority agree with live authority, including each public ruleset revision
+  timestamp. GitHub hides bypass actors from read-only workflow tokens; this
+  optimizer never exercises a bypass, and the canonical operator receipt still
+  verifies bypass authority separately. The source run and public authority are
+  read again before returning a reuse decision.
 
 The candidate SHA, synthetic PR merge SHA, landed SHA, event name, workspace
 path and cache-hit state may differ. These are not execution inputs to the

@@ -198,6 +198,29 @@ class ReuseTests(unittest.TestCase):
         self.api.archive_extra = True
         self.refuse()
 
+    def test_read_only_authority_does_not_require_hidden_bypass_actors(self):
+        rule = {"ruleset_id": 7, "ruleset_source_type": "Repository", "ruleset_source": reuse.REPO,
+                "type": "required_status_checks", "parameters": {"strict_required_status_checks_policy": True,
+                "required_status_checks": [{"context": "Unit Tests", "integration_id": 15368}]}}
+        metadata = {"id": 7, "source_type": "Repository", "source": reuse.REPO, "enforcement": "active",
+                    "target": "branch", "updated_at": "2026-09-07T00:00:00Z", "conditions": {}, "rules": [rule]}
+        class ReadOnlyAPI:
+            def one(self, endpoint):
+                if endpoint == reuse.PREFIX:
+                    return {"id": 1, "full_name": reuse.REPO, "default_branch": "main"}
+                if endpoint == reuse.PREFIX + "/rulesets/7":
+                    return metadata
+                raise AssertionError(endpoint)
+            def pages(self, endpoint, kind):
+                return [rule]
+        original = reuse.authority(ReadOnlyAPI())
+        self.assertNotIn("bypass_actors", original["rulesets"][0])
+        metadata["updated_at"] = "2026-09-07T00:01:00Z"
+        self.assertNotEqual(original, reuse.authority(ReadOnlyAPI()))
+        metadata["enforcement"] = "disabled"
+        with self.assertRaises(reuse.Refusal):
+            reuse.authority(ReadOnlyAPI())
+
     def test_workflow_keeps_exact_main_contexts_and_fresh_sensitive_checks(self):
         workflow = Path(reuse.WORKFLOW).read_text()
         blocks = dict(re.findall(r"(?ms)^  ([a-z0-9-]+):\n(.*?)(?=^  [a-z0-9-]+:|\Z)", workflow))
