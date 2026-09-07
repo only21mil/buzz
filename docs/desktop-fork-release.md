@@ -13,6 +13,12 @@ repository, so an upstream checkout's worktree can contain unrelated desktop
 release history. The preparation script refuses a local desktop tag inventory
 that differs from the selected remote. It never force-replaces release tags.
 
+Fork candidates must use `Victor Vogel
+<263261067+only21mil@users.noreply.github.com>` as their Git author and carry
+his matching `Signed-off-by` trailer. Preparation checks the effective author
+and committer before fetching or changing branches and uses that configured
+identity without overriding it. Upstream candidates retain the Wes identity.
+
 Activate Hermit and use the repository package manager. Set both the
 authoritative remote and the GitHub CI repository explicitly:
 
