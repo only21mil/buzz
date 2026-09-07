@@ -521,3 +521,18 @@ test("coalesceAgentAutocompleteCandidates: leaves non-agents alone", () => {
 
   assert.deepEqual(coalesce([first, second]), [first, second]);
 });
+
+test("shouldHideAgentFromMentions: local custody admits a stopped agent before relay discovery", () => {
+  assert.equal(
+    shouldHideAgentFromMentions({
+      isAgent: true,
+      isMember: false,
+      pubkey: PUB_A.toUpperCase(),
+      respondTo: "nobody",
+      managedAgentPubkeys: new Set([PUB_A]),
+      mentionableAgentPubkeys: new Set(),
+      directoryAgentPubkeys: new Set(),
+    }),
+    false,
+  );
+});
