@@ -1251,6 +1251,26 @@ impl AgentPool {
     pub async fn return_agent(&mut self, mut agent: OwnedAgent) {
         self.apply_scope_invalidations(&mut agent).await;
         let idx = agent.index;
+        // The result loop can immediately dispatch queued work before idle
+        // maintenance runs. Give pending releases one bounded attempt at this
+        // exclusive handoff so a continuously busy worker cannot starve them.
+        if let PendingCloseRetry::Exhausted {
+            session_id,
+            attempts,
+        } = agent.retry_one_pending_close().await
+        {
+            tracing::warn!(
+                agent = idx,
+                session_id,
+                attempts,
+                "pending ACP session close exhausted on return; restarting adapter"
+            );
+            agent.state.invalidate_all();
+            agent.acp.shutdown().await;
+            self.session_owners.retain(|_, owner| *owner != idx);
+            self.pending_scope_invalidations.remove(&idx);
+            return;
+        }
         if self.agents[idx].is_some() {
             // This is a bug: two tasks returned the same agent index. Log it
             // loudly so it shows up in production logs, then overwrite — the
@@ -3503,9 +3523,10 @@ pub async fn run_prompt_task(
         }
         Err(e) => {
             tracing::error!(target: "pool::prompt", "session_prompt error: {e}");
-            // AgentError means the agent caught a problem before mutating
-            // session state (e.g. bad LLM response). The session is healthy —
-            // don't invalidate it. Other errors may have corrupted state.
+            // Preserve sessions for ordinary application errors. The result
+            // handler separately restarts adapters reporting model availability
+            // failures, which may retain stale process-wide provider state.
+            // Other errors may have corrupted session state.
             if !matches!(e, AcpError::AgentError { .. }) {
                 agent
                     .invalidate_source(&source, "session_prompt_error")
@@ -6633,6 +6654,234 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_model_error_recovers_after_provider_returns() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let capture = std::env::temp_dir().join(format!("buzz-model-recovery-{}", Uuid::new_v4()));
+        let recovered = capture.with_extension("recovered");
+        let script = format!(
+            r#"
+            # Model availability is cached once per adapter process. A provider
+            # recovery alone cannot repair this process's negative observation.
+            ready=0
+            [ -f '{}' ] && ready=1
+            count=0
+            while IFS= read -r line; do
+                printf '%s\n' "$line" >> '{}'
+                case "$line" in
+                    *'"method":"initialize"'*) result='{{"protocolVersion":1}}' ;;
+                    *'"method":"session/new"'*) result='{{"sessionId":"fresh-session"}}' ;;
+                    *'"method":"session/prompt"'*)
+                        if [ "$ready" -eq 0 ]; then
+                            printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32000,"message":"There is an issue with the selected model (test-model). It may not exist or you may not have access to it."}}}}\n' "$count"
+                            count=$((count + 1))
+                            continue
+                        fi
+                        result='{{"stopReason":"end_turn"}}' ;;
+                    *) result='{{}}' ;;
+                esac
+                printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$count" "$result"
+                count=$((count + 1))
+            done
+        "#,
+            recovered.display(),
+            capture.display()
+        );
+        let mut config = crate::error_outcome_emission_tests::test_config();
+        config.agent_command = "bash".into();
+        config.agent_args = vec!["-c".into(), script];
+        let (acp, protocol_version, agent_name) = crate::spawn_and_init(
+            &config.agent_command,
+            &config.agent_args,
+            &[],
+            false,
+            0,
+            None,
+        )
+        .await
+        .expect("spawn synthetic stale adapter");
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name,
+            goose_system_prompt_supported: None,
+            protocol_version,
+        };
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        agent
+            .state
+            .sessions
+            .insert(scope.clone(), "stale-session".into());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0; 16 * 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]").await;
+            }
+        });
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.rest_client.base_url = base_url;
+        ctx.channel_info = ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                crate::relay::ChannelInfo {
+                    name: "test-dm".into(),
+                    channel_type: "dm".into(),
+                },
+            )]),
+            ctx.rest_client.clone(),
+        );
+        ctx.dedup_mode = DedupMode::Queue;
+        let ctx = Arc::new(ctx);
+        let batch = |text: &str| FlushBatch {
+            channel_id,
+            scope: scope.clone(),
+            events: vec![crate::queue::BatchEvent {
+                event: EventBuilder::new(Kind::Custom(9), text)
+                    .sign_with_keys(&ctx.agent_keys)
+                    .unwrap(),
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        run_prompt_task(
+            agent,
+            Some(batch("ordinary owner message")),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "failed-turn".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("ordinary prompt result");
+        assert!(
+            matches!(
+                result.outcome,
+                PromptOutcome::Error(AcpError::AgentError { .. })
+            ),
+            "fixture must reach a real session/prompt AgentError"
+        );
+        std::fs::write(&recovered, b"provider recovered").unwrap();
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                scope: Some(scope.clone()),
+                turn_id: "failed-turn".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = crate::queue::EventQueue::new(DedupMode::Queue);
+        let mut circuits = vec![crate::SlotCircuit {
+            crash_times: vec![],
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, mut respawn_rx) = mpsc::channel(1);
+        let mut tasks = tokio::task::JoinSet::new();
+        crate::handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut false,
+            &HashSet::new(),
+            &mut circuits,
+            &respawn_tx,
+            &mut tasks,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            !pool.any_idle(),
+            "model availability error must retire the cached adapter"
+        );
+        assert!(circuits[0].respawn_in_flight);
+        assert_eq!(
+            queue.queued_event_count(channel_id),
+            1,
+            "failed owner message stays queued within its retry budget"
+        );
+        let respawn = tokio::time::timeout(Duration::from_secs(10), respawn_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (acp, protocol_version, agent_name) =
+            respawn.result.expect("replacement adapter initialized");
+        let agent = OwnedAgent {
+            index: respawn.index,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name,
+            goose_system_prompt_supported: None,
+            protocol_version,
+        };
+        pool.return_agent(agent).await;
+        let agent = pool.try_claim(Some(&scope)).await.unwrap();
+        run_prompt_task(
+            agent,
+            Some(batch("next ordinary owner message")),
+            None,
+            Arc::clone(&ctx),
+            result_tx,
+            None,
+            "recovered-turn".into(),
+        )
+        .await;
+        let mut result = result_rx.recv().await.unwrap();
+        assert!(
+            matches!(result.outcome, PromptOutcome::Ok(StopReason::EndTurn)),
+            "next normal message must reach the recovered provider"
+        );
+        result.agent.acp.shutdown().await;
+        while tasks.join_next().await.is_some() {}
+        server.abort();
+        let requests: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let methods: Vec<_> = requests
+            .iter()
+            .filter_map(|v| v["method"].as_str())
+            .collect();
+        assert_eq!(methods.iter().filter(|&&m| m == "initialize").count(), 2);
+        assert_eq!(methods.iter().filter(|&&m| m == "session/new").count(), 1);
+        let prompts: Vec<_> = requests
+            .iter()
+            .filter(|v| v["method"] == "session/prompt")
+            .collect();
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0]["params"]["sessionId"], "stale-session");
+        assert_eq!(prompts[1]["params"]["sessionId"], "fresh-session");
+        std::fs::remove_file(capture).unwrap();
+        std::fs::remove_file(recovered).unwrap();
+    }
+
+    #[tokio::test]
     async fn run_prompt_task_commits_standing_context_only_after_acp_success() {
         let capture = std::env::temp_dir().join(format!(
             "buzz-acp-standing-lifecycle-{}.ndjson",
@@ -9360,6 +9609,63 @@ for line in sys.stdin:
             .iter()
             .all(|request| request["params"]["sessionId"] == "session-needs-retry"));
         let _ = std::fs::remove_file(capture);
+    }
+
+    #[tokio::test]
+    async fn pending_close_progresses_with_continuous_backlog() {
+        let script = r#"
+            for id in 0 1 2 3 4 5; do
+                read _request || exit 1
+                printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"still stuck"}}\n' "$id"
+            done
+            sleep 10
+        "#;
+        let acp = AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+            .await
+            .expect("failed to spawn test agent");
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let mut state = SessionState::default();
+        state
+            .sessions
+            .insert(scope.clone(), "session-never-closes".into());
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state,
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "unknown".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+        assert_eq!(pool.invalidate_scope_session(&scope).await, 1);
+        // Match the result-loop ordering: return, immediately dispatch again,
+        // then maintenance while the worker is checked out. There is always
+        // another queued turn, so the idle maintenance path never gets a slot.
+        let mut backlog = VecDeque::from([1, 2, 3]);
+        let mut agent = pool.try_claim(Some(&scope)).await.expect("first turn");
+        while let Some(turn) = backlog.pop_front() {
+            assert_eq!(pool.reap_idle_sessions(Duration::from_secs(30), 8).await, 0);
+            pool.return_agent(agent).await;
+            let next = pool.try_claim(Some(&scope)).await;
+            if turn == 2 {
+                assert!(
+                    next.is_none(),
+                    "third failed release must retire the busy adapter"
+                );
+                assert!(
+                    !backlog.is_empty(),
+                    "queued work must still exist at retirement"
+                );
+                return;
+            }
+            agent = next.expect("worker remains usable before retry exhaustion");
+        }
+        panic!("pending close never exhausted while backlog stayed ready");
     }
 
     #[tokio::test]

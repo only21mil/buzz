@@ -4000,6 +4000,25 @@ fn is_auth_error(error: &acp::AcpError) -> bool {
     message.contains("Re-authenticate") || message.contains("API Error: 401")
 }
 
+/// Model availability failures can come from a stale provider observation
+/// inside the adapter process. Restart through the existing backoff/circuit
+/// breaker rather than repeatedly returning the same cached adapter to work.
+/// Only structured errors qualify; assistant text is not a recovery signal.
+fn is_model_availability_error(error: &acp::AcpError) -> bool {
+    let acp::AcpError::AgentError { message, .. } = error else {
+        return false;
+    };
+    if is_auth_error(error) {
+        return false;
+    }
+    let message = message.to_ascii_lowercase();
+    message.contains("model_not_found")
+        || message.contains("model not found")
+        || message.contains("no models available")
+        || message.contains("no available models")
+        || (message.contains("issue with the selected model") && message.contains("may not exist"))
+}
+
 /// Spawn a task that posts a user-visible failure notice to the relay.
 ///
 /// Shared by the hard-cap immediate dead-letter path and the retries-exhausted
@@ -4430,14 +4449,16 @@ async fn handle_prompt_result(
                 acp::AcpError::AgentError { code, .. } => Some(*code),
                 _ => None,
             };
-            if is_transport_error {
+            let is_model_error = is_model_availability_error(e);
+            if is_transport_error || is_model_error {
                 tracing::warn!(
                     agent = agent_index,
                     outcome = outcome_label,
                     configured_model = %harness_configured_model,
                     pid = harness_pid,
                     error = %e,
-                    "transport/protocol error — respawning agent"
+                    is_model_error,
+                    "transport/protocol or model availability error — respawning agent"
                 );
                 emit_turn_error(&e.to_string(), error_code);
 
@@ -7504,7 +7525,7 @@ mod error_outcome_emission_tests {
     use nostr::{EventBuilder, Keys, Kind};
     use std::collections::HashSet;
 
-    fn test_config() -> Config {
+    pub(crate) fn test_config() -> Config {
         Config {
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
@@ -9166,6 +9187,37 @@ mod error_outcome_emission_tests {
     }
 
     // ── is_auth_error classification ───────────────────────────────────────
+
+    #[test]
+    fn model_availability_recovery_only_classifies_specific_agent_errors() {
+        for message in [
+            "MODEL_NOT_FOUND: test-model",
+            "Model not found",
+            "No models available",
+            "No available models for provider",
+            "There's an issue with the selected model (test-model). It may not exist or you may not have access to it.",
+        ] {
+            assert!(is_model_availability_error(&AcpError::AgentError { code: -32000, message: message.into() }), "{message}");
+        }
+        for message in [
+            "Usage credits required for 1M context",
+            "Invalid model response",
+            "Tool failed: file not found",
+            "API Error: 401 model_not_found",
+            "Re-authenticate: no models available",
+        ] {
+            assert!(
+                !is_model_availability_error(&AcpError::AgentError {
+                    code: -32000,
+                    message: message.into()
+                }),
+                "{message}"
+            );
+        }
+        assert!(!is_model_availability_error(&AcpError::Protocol(
+            "model_not_found".into()
+        )));
+    }
 
     #[test]
     fn is_auth_error_matches_reauthenticate_message() {
