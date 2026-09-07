@@ -544,23 +544,6 @@ async function invokeMockCommand<T>(
   );
 }
 
-async function seedCurrentAvatar(page: Page, avatarUrl: string) {
-  await page.waitForFunction(() => {
-    const bridgeWindow = window as Window & {
-      __BUZZ_E2E_INVOKE_MOCK_COMMAND__?: unknown;
-      __TAURI_INTERNALS__?: { invoke?: unknown };
-    };
-    return (
-      typeof bridgeWindow.__BUZZ_E2E_INVOKE_MOCK_COMMAND__ === "function" ||
-      typeof bridgeWindow.__TAURI_INTERNALS__?.invoke === "function"
-    );
-  });
-  await invokeMockCommand(page, "update_profile", { avatarUrl });
-  await page.evaluate(() => {
-    window.__BUZZ_E2E_COMMAND_PAYLOADS__ = [];
-  });
-}
-
 async function getWelcomeChannelId(page: Page) {
   const channels = await getMockChannels(page);
   return (
@@ -2204,15 +2187,33 @@ test("name-only community profile save preserves an existing avatar", async ({
   page,
 }) => {
   await seedCommunityProfileStage(page, "txn-avatar-preserve-existing");
-  await installMockBridge(page, undefined, {
-    relayWsUrl: "wss://default.example.com",
-    skipOnboardingSeed: true,
-  });
-  await page.goto("/");
-
   const existingAvatarUrl =
     "https://mock.relay/media/existing-community-avatar.png";
-  await seedCurrentAvatar(page, existingAvatarUrl);
+  await page.route(`${existingAvatarUrl}*`, (route) =>
+    route.fulfill({
+      body: Buffer.from(ONE_PIXEL_PNG_BASE64, "base64"),
+      contentType: "image/png",
+    }),
+  );
+  await installMockBridge(
+    page,
+    {
+      searchProfiles: [
+        {
+          pubkey: BLANK_TYLER_IDENTITY.pubkey,
+          displayName: null,
+          avatarUrl: existingAvatarUrl,
+        },
+      ],
+      profileHasEvent: false,
+    },
+    {
+      relayWsUrl: "wss://default.example.com",
+      skipOnboardingSeed: true,
+    },
+  );
+  await page.goto("/");
+  await expect(page.getByTestId("community-avatar-circle-image")).toBeVisible();
   await page.getByTestId("community-profile-name-key").fill("Tyler");
   await page.getByTestId("community-profile-next").click();
 
@@ -2372,14 +2373,16 @@ test("pending avatar stays navigable, clears failures, and retries", async ({
 test("a pending avatar never becomes durable if propagation fails after onboarding unmounts", async ({
   page,
 }) => {
+  await page.clock.install();
   await seedCommunityProfileStage(page, "txn-avatar-saved-before-failure");
   const uploadedAvatarUrl =
     "https://mock.relay/media/saved-pending-community-avatar.png";
-  let allowAvatarFailure = false;
+  let releaseAvatarFailure!: () => void;
+  const avatarFailure = new Promise<void>((resolve) => {
+    releaseAvatarFailure = resolve;
+  });
   await page.route(`${uploadedAvatarUrl}*`, async (route) => {
-    while (!allowAvatarFailure) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
+    await avatarFailure;
     await route.fulfill({ status: 404 });
   });
   await installMockBridge(
@@ -2413,7 +2416,10 @@ test("a pending avatar never becomes durable if propagation fails after onboardi
   await expect(page.getByTestId("community-onboarding-flow")).toHaveCount(0, {
     timeout: 10_000,
   });
-  allowAvatarFailure = true;
+  releaseAvatarFailure();
+  // Exercise every real verifier backoff without racing their 5.25 s total
+  // against the assertion's 5 s wall-clock timeout.
+  await page.clock.runFor(750 + 1_500 + 3_000);
 
   await expect
     .poll(() =>
@@ -2531,6 +2537,14 @@ test("a failed pending replacement leaves the confirmed avatar untouched", async
   await installMockBridge(
     page,
     {
+      searchProfiles: [
+        {
+          pubkey: BLANK_TYLER_IDENTITY.pubkey,
+          displayName: null,
+          avatarUrl: existingAvatarUrl,
+        },
+      ],
+      profileHasEvent: false,
       uploadDescriptors: [
         {
           filename: "replacement-community-avatar.png",
@@ -2548,7 +2562,6 @@ test("a failed pending replacement leaves the confirmed avatar untouched", async
     },
   );
   await page.goto("/");
-  await seedCurrentAvatar(page, existingAvatarUrl);
 
   await page.getByTestId("community-profile-name-key").fill("Tyler");
   await uploadCommunityAvatar(page, "replacement-community-avatar.png");

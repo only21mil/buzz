@@ -2325,6 +2325,7 @@ test("people sharing stays mounted while a send is pending", async ({
 test("export from share aligns selections and animates memory details", async ({
   page,
 }) => {
+  await page.clock.install();
   await page.emulateMedia({ reducedMotion: "no-preference" });
   await installMockBridge(page, {
     personas: [
@@ -2361,34 +2362,45 @@ test("export from share aligns selections and animates memory details", async ({
     (element) => element.getBoundingClientRect().height,
   );
   await memoryTrigger.click();
+  const pauseTime = new Date();
+  await page.clock.setFixedTime(pauseTime);
+  await page.clock.pauseAt(pauseTime);
+  // Arm the observer before selection. Motion captured the controlled RAF at
+  // application startup, so each runFor frame observes the actual transition.
+  await exportDialog.evaluate((element) => {
+    const testWindow = window as Window & { __exportHeights?: number[] };
+    const samples = [element.getBoundingClientRect().height];
+    testWindow.__exportHeights = samples;
+    const start = performance.now();
+    const sample = (now: number) => {
+      samples.push(element.getBoundingClientRect().height);
+      if (now - start < 280) requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+  });
   await page
     .getByRole("menuitemradio", { name: "Agent + core memory" })
-    .click();
-  const heightSamples = await exportDialog.evaluate(async (element) => {
-    const samples: number[] = [];
-    const start = performance.now();
-
-    await new Promise<void>((resolve) => {
-      const sample = (now: number) => {
-        samples.push(element.getBoundingClientRect().height);
-        if (now - start >= 280) {
-          resolve();
-          return;
-        }
-        requestAnimationFrame(sample);
-      };
-      requestAnimationFrame(sample);
-    });
-
-    return samples;
-  });
+    .press("Enter");
+  await page.clock.runFor(300);
+  const heightSamples = await page.evaluate(
+    () =>
+      (window as Window & { __exportHeights?: number[] }).__exportHeights ?? [],
+  );
 
   await expect(
     exportDialog.getByTestId("agent-snapshot-memory-warning"),
   ).toBeVisible();
   expect(heightSamples.at(-1)).toBeGreaterThan(initialHeight);
   expect(
-    new Set(heightSamples.map((height) => Math.round(height))).size,
+    new Set(
+      heightSamples
+        .map((height) => Math.round(height))
+        .filter(
+          (height) =>
+            height > Math.round(initialHeight) &&
+            height < Math.round(heightSamples.at(-1) ?? 0),
+        ),
+    ).size,
   ).toBeGreaterThan(2);
 });
 
