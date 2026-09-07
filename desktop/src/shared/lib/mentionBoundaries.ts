@@ -143,7 +143,7 @@ function maskMarkdownCode(text: string): string {
 /** Find mention-like sigils outside Markdown code and email addresses. */
 export function getMentionLikeOffsets(text: string): number[] {
   const pattern =
-    /(^|\s|\(|[*_]{1,3}|\|\|)(@[\p{L}\p{N}][\p{L}\p{N}._-]*)(?=[\s,;.!?:)\]}*_]|$)/giu;
+    /(^|\s|\(|[*_]{1,3}|\|\|)(@[\p{L}\p{N}][\p{L}\p{N}._-]*)(?=\|\||[\s,;.!?:)\]}*_]|$)/giu;
   const maskedText = maskMarkdownCode(text);
   const offsets: number[] = [];
   let match = pattern.exec(maskedText);

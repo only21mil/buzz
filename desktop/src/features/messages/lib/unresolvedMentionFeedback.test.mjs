@@ -35,3 +35,7 @@ test("checks every mention when an earlier mention is resolved", () => {
     /not linked to a member/,
   );
 });
+
+test("blocks an unresolved mention inside spoiler markers", () => {
+  assert.match(unresolvedMentionError("||@missing||", []), /not linked/);
+});
