@@ -114,13 +114,17 @@ export function mentionMatchCandidates({
   return candidates;
 }
 
-/** Extract recipients from the same exact occurrences used by draft routing. */
+/**
+ * Extract recipients from the same exact occurrences used by draft routing.
+ * Report each winning keyed label so callers need not reverse-map recipient keys.
+ */
 export function extractMentionPubkeys(options: {
   text: string;
   selectedMentions: ReadonlyMap<string, string>;
   selectedDisplayNames?: Iterable<string>;
   competingDisplayNames?: Iterable<string>;
   memberCandidates: readonly MentionPubkeyCandidate[];
+  onResolvedDisplayName?: (displayName: string) => void;
 }): string[] {
   const { text, selectedMentions, memberCandidates } = options;
   const candidates = mentionMatchCandidates(options);
@@ -137,7 +141,10 @@ export function extractMentionPubkeys(options: {
       );
     }
     for (const match of winners) {
-      if (match.pubkey) winningPubkeys.add(match.pubkey);
+      if (match.pubkey) {
+        winningPubkeys.add(match.pubkey);
+        options.onResolvedDisplayName?.(match.displayName);
+      }
     }
   }
 
