@@ -438,7 +438,7 @@ fn retain_outbox_at(path: &std::path::Path, event: &Event) -> Result<(), CliErro
         options.mode(0o600);
     }
     let mut file = options
-        .open(&path)
+        .open(path)
         .map_err(|e| CliError::Other(e.to_string()))?;
     let bytes = serde_json::to_vec(event).map_err(|e| CliError::Other(e.to_string()))?;
     file.write_all(&bytes)

@@ -296,7 +296,7 @@ async fn collect_branch_page(
                 deadline,
             )
             .await?;
-            (row.behind, row.ahead) = parse_counts(&counts)?;
+            (row.behind, row.ahead) = parse_counts(&counts).map_err(git_error)?;
         }
     }
     Ok((rows, total, snapshot))
@@ -313,20 +313,20 @@ async fn collect_branch_rows(
         .map(|page| page.0)
 }
 
-fn parse_counts(output: &[u8]) -> Result<(u64, u64), Response> {
-    let text = std::str::from_utf8(output)
-        .map_err(|_| git_error("git returned non-UTF-8 ahead/behind counts"))?;
+fn parse_counts(output: &[u8]) -> Result<(u64, u64), &'static str> {
+    let text =
+        std::str::from_utf8(output).map_err(|_| "git returned non-UTF-8 ahead/behind counts")?;
     let mut values = text.split_whitespace();
     let behind = values
         .next()
         .and_then(|value| value.parse().ok())
-        .ok_or_else(|| git_error("git returned malformed ahead/behind counts"))?;
+        .ok_or("git returned malformed ahead/behind counts")?;
     let ahead = values
         .next()
         .and_then(|value| value.parse().ok())
-        .ok_or_else(|| git_error("git returned malformed ahead/behind counts"))?;
+        .ok_or("git returned malformed ahead/behind counts")?;
     if values.next().is_some() {
-        return Err(git_error("git returned malformed ahead/behind counts"));
+        return Err("git returned malformed ahead/behind counts");
     }
     Ok((behind, ahead))
 }

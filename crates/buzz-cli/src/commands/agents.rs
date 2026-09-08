@@ -519,6 +519,34 @@ fn verify_archived_event<'a>(
     Ok(archived)
 }
 
+async fn submit_draft(
+    client: &BuzzClient,
+    built: crate::agent_management::BuiltDraftRequest,
+    retain: bool,
+) -> Result<(), CliError> {
+    let owner = require_owner(client)?;
+    if retain {
+        crate::agent_management::retain_outbox(client.relay_url(), client.keys(), &owner, &built)?;
+    }
+    eprintln!(
+        "Retained draft {}. Retry with: buzz agents draft-retry {}",
+        built.request_id, built.request_id
+    );
+    let response = client.submit_stored_event(built.event).await?;
+    let response: serde_json::Value =
+        serde_json::from_str(&response).map_err(|e| CliError::Other(e.to_string()))?;
+    if !response.to_string().contains("stored: agent-draft-v1") {
+        return Err(CliError::Other(
+            "relay did not confirm durable draft support; retained request may be retried".into(),
+        ));
+    }
+    println!(
+        "{}",
+        json!({"request_id":built.request_id,"action":built.action,"stored":true,"review_eligible":null,"applied":false,"saved":false,"message":"Ciphertext stored for the owner. Desktop checks registered-agent and shared-channel eligibility; receipt does not promise an actionable review."})
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1266,32 +1294,4 @@ mod tests {
         let result = verify_archived_event(&event, &self_hex).expect("should pass");
         assert!(result.is_empty());
     }
-}
-
-async fn submit_draft(
-    client: &BuzzClient,
-    built: crate::agent_management::BuiltDraftRequest,
-    retain: bool,
-) -> Result<(), CliError> {
-    let owner = require_owner(client)?;
-    if retain {
-        crate::agent_management::retain_outbox(client.relay_url(), client.keys(), &owner, &built)?;
-    }
-    eprintln!(
-        "Retained draft {}. Retry with: buzz agents draft-retry {}",
-        built.request_id, built.request_id
-    );
-    let response = client.submit_stored_event(built.event).await?;
-    let response: serde_json::Value =
-        serde_json::from_str(&response).map_err(|e| CliError::Other(e.to_string()))?;
-    if !response.to_string().contains("stored: agent-draft-v1") {
-        return Err(CliError::Other(
-            "relay did not confirm durable draft support; retained request may be retried".into(),
-        ));
-    }
-    println!(
-        "{}",
-        json!({"request_id":built.request_id,"action":built.action,"stored":true,"review_eligible":null,"applied":false,"saved":false,"message":"Ciphertext stored for the owner. Desktop checks registered-agent and shared-channel eligibility; receipt does not promise an actionable review."})
-    );
-    Ok(())
 }

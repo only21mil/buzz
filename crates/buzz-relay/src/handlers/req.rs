@@ -1389,7 +1389,7 @@ mod tests {
         for kind in [14201, 14202] {
             let broad = Filter::new().kind(nostr::Kind::Custom(kind));
             assert!(!p_gated_filters_authorized(
-                &[broad.clone()],
+                std::slice::from_ref(&broad),
                 &owner.public_key().to_hex()
             ));
             assert!(filter_can_match_result_gated_kinds(&broad));
@@ -1399,7 +1399,7 @@ mod tests {
             ));
             let own = broad.clone().pubkey(owner.public_key());
             assert!(p_gated_filters_authorized(
-                &[own.clone()],
+                std::slice::from_ref(&own),
                 &owner.public_key().to_hex()
             ));
             assert!(result_gated_count_safe_for_pushdown(
