@@ -11,7 +11,9 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
+import textwrap
 import unittest
 from unittest import mock
 import zipfile
@@ -71,7 +73,11 @@ class Provider(f.FakeClient):
             context = {"execution": "premerge-source-snapshot", "event": "pull_request", "base_ref": "main", "policy": m.POLICY,
                        "environment": {"RUNNER_OS": "Linux", "RUNNER_ARCH": "X64", "ImageOS": "ubuntu24", "ImageVersion": "20260901.1", "BUZZ_CI_REUSE_EPOCH": ""},
                        "versions": versions}
-            if key in m.SERVICE_JOBS: context["service_images"] = {name: "sha256:" + "f" * 64 for name in ("buzz-postgres", "buzz-redis", "buzz-minio")}
+            if key in {"backend-integration", "relay-e2e", "desktop-integration-1", "desktop-integration-2"}:
+                context["service_images"] = {name: "sha256:" + "f" * 64 for name in ("buzz-postgres", "buzz-redis", "buzz-minio", "buzz-minio-init")}
+            if key.startswith("server-"):
+                context["cross_image"] = {"reference": f"ghcr.io/cross-rs/{key.removeprefix('server-')}@sha256:" + "d" * 64,
+                                          "image_id": "sha256:" + "f" * 64}
             if key == "mobile": context["android_dependencies_sha256"] = "f" * 64
             if key == "security": context["advisory_sha"] = self.advisory
             self.proofs[key] = {"schema_version": 1, "mode": "source", "repository": m.r.REPOSITORY, "job": key,
@@ -196,6 +202,30 @@ class LandingTests(unittest.TestCase):
                 mutate(self.p.proofs["changes"])
                 self.p.pack("changes")
                 with self.assertRaises(m.r.ReceiptError): self.acquire()
+
+    def test_service_and_compiler_image_evidence_is_required(self):
+        def verify(key):
+            job = next(job for job in self.p.jobs[1] if job["name"] == m.JOBS[key])
+            m.verify_source_proof(self.p.proofs[key], key, job, self.p.workflows[m.CI],
+                                  self.p.source, TREE, BINDINGS, "")
+        for key in ("backend-integration", "relay-e2e", "desktop-integration-1", "desktop-integration-2"):
+            for bad in (None, {}, {"buzz-postgres": "sha256:" + "f" * 64},
+                        {name: "latest" for name in ("buzz-postgres", "buzz-redis", "buzz-minio", "buzz-minio-init")},
+                        {name: None for name in ("buzz-postgres", "buzz-redis", "buzz-minio", "buzz-minio-init")},
+                        {name: "sha256:" + "f" * 64 for name in ("buzz-postgres", "buzz-redis", "buzz-minio")}):
+                with self.subTest(job=key, images=bad):
+                    self.p = Provider()
+                    self.p.proofs[key]["context"]["service_images"] = bad
+                    with self.assertRaises(m.r.ReceiptError): verify(key)
+        for key in ("server-x86_64-unknown-linux-musl", "server-aarch64-unknown-linux-musl"):
+            for bad in (None, {}, {"reference": "latest", "image_id": "sha256:" + "f" * 64},
+                        {"reference": "ghcr.io/cross-rs/wrong@sha256:" + "d" * 64, "image_id": "sha256:" + "f" * 64},
+                        {"reference": f"ghcr.io/cross-rs/{key.removeprefix('server-')}@sha256:" + "d" * 64,
+                         "image_id": None}):
+                with self.subTest(job=key, image=bad):
+                    self.p = Provider()
+                    self.p.proofs[key]["context"]["cross_image"] = bad
+                    with self.assertRaises(m.r.ReceiptError): verify(key)
 
     def test_failed_skipped_cancelled_pending_stale_or_ambiguous_latest_job(self):
         for mode in ("failure", "skipped", "cancelled", "pending", "stale", "ambiguous", "wrong source"):
@@ -341,6 +371,140 @@ class LandingTests(unittest.TestCase):
         self.assertEqual(ci.count("Capture successful qualification inputs"), 15)
         self.assertNotIn("  push:", (ROOT / m.DRC).read_text())
         self.assertIn("module.verify_main", (ROOT / "scripts/protected-ci-landing.py").read_text())
+
+
+class BootstrapTests(unittest.TestCase):
+    def test_each_landing_test_job_installs_its_schema_checker_first(self):
+        blocks = dict(re.findall(r"(?ms)^  ([a-z0-9-]+):\n(.*?)(?=^  [a-z0-9-]+:|\Z)", (ROOT / m.CI).read_text()))
+        covered = []
+        for job, block in blocks.items():
+            test = re.search(r"(?m)^        run: python3 scripts/test-protected-ci-landing.py$", block)
+            if test is None: continue
+            covered.append(job)
+            self.assertRegex(block[:test.start()], r"(?m)^        run: python3 -m pip install [^\n]*check-jsonschema==0\.38\.0$", job)
+        self.assertIn("changes", covered)
+
+    def epoch_transport(self, directory, *, status=404, code=1, body=None, admin=True,
+                        repo_status=200, repo_code=0, headers=True, raw_body=None):
+        """Exercise real subprocess exit/stdout handling without a network or token."""
+        root = Path(directory)
+        epoch = m.PREFIX + "/actions/variables/BUZZ_CI_REUSE_EPOCH"
+        body = {"message": "Not Found", "status": "404"} if body is None else body
+        def response(http_status, value):
+            header = (f"X-GitHub-Request-Id: fixture\r\nDate: {f.HTTP_DATE}\r\n" if headers else "")
+            payload = json.dumps(value) if raw_body is None else raw_body
+            return (f"HTTP/2.0 {http_status} fixture\r\n{header}\r\n" + payload).encode()
+        responses = {epoch: [code, response(status, body).decode()],
+                     m.PREFIX: [repo_code, response(repo_status, {"permissions": {"admin": admin}}).decode()]}
+        executable = root / "gh"
+        executable.write_text(f"#!{sys.executable}\n" +
+                              "import json, pathlib, sys\n" +
+                              f"responses = {responses!r}\n" +
+                              "code, output = responses[sys.argv[-1]]\n" +
+                              "pathlib.Path(__file__).with_suffix('.calls').open('a').write(sys.argv[-1] + '\\n')\n" +
+                              "sys.stdout.buffer.write(output.encode())\n" +
+                              "sys.stderr.write('gh: Not Found (HTTP 404)' if code else '')\n" +
+                              "sys.exit(code)\n")
+        executable.chmod(0o700)
+        return m.r.GhClient(str(executable))
+
+    def test_epoch_404_exit_one_requires_independent_admin_authority(self):
+        for admin in (True, False, None, "true"):
+            with self.subTest(admin=admin), tempfile.TemporaryDirectory() as directory, \
+                 mock.patch.dict(os.environ, {"GH_TOKEN": "public-fixture", "XDG_STATE_HOME": directory}, clear=True):
+                client = self.epoch_transport(directory, admin=admin)
+                if admin is True:
+                    self.assertEqual(m.current_epoch(m.Evidence(client)), "")
+                    self.assertEqual([request["status"] for request in client.requests], [404, 200])
+                else:
+                    with self.assertRaises(m.r.GateError): m.current_epoch(m.Evidence(client))
+                self.assertEqual((Path(directory) / "gh.calls").read_text().splitlines(),
+                                 [m.PREFIX + "/actions/variables/BUZZ_CI_REUSE_EPOCH", m.PREFIX])
+
+    def test_epoch_transport_refuses_other_failures_and_malformed_missing_response(self):
+        cases = [{"status": status} for status in (401, 403, 429, 500)]
+        cases += [{"code": 2}, {"code": 4}, {"status": 200}, {"status": 200, "code": 0}, {"headers": False},
+                  {"body": []}, {"body": {"message": "Forbidden"}},
+                  {"body": {"message": "Not Found", "status": "403"}},
+                  {"body": {"message": "Not Found", "value": "hidden"}},
+                  {"repo_status": 404, "repo_code": 1}, {"repo_code": 1}, {"raw_body": "{"}]
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory, \
+                 mock.patch.dict(os.environ, {"GH_TOKEN": "public-fixture", "XDG_STATE_HOME": directory}, clear=True):
+                client = self.epoch_transport(directory, **case)
+                with self.assertRaises(m.r.ProviderError): m.current_epoch(m.Evidence(client))
+
+    def test_present_epoch_uses_successful_transport_without_admin_fallback(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.dict(os.environ, {"GH_TOKEN": "public-fixture", "XDG_STATE_HOME": directory}, clear=True):
+            client = self.epoch_transport(directory, status=200, code=0,
+                                          body={"name": "BUZZ_CI_REUSE_EPOCH", "value": "rotation-2"})
+            self.assertEqual(m.current_epoch(m.Evidence(client)), "rotation-2")
+            self.assertEqual(len(client.requests), 1)
+
+    def capture_environment(self, directory):
+        event = Path(directory) / "event.json"
+        event.write_text(json.dumps({"pull_request": f.pr_value()}))
+        return {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_EVENT_PATH": str(event),
+                "GITHUB_REPOSITORY": m.r.REPOSITORY, "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1",
+                "RUNNER_OS": "Linux", "RUNNER_ARCH": "X64", "ImageOS": "ubuntu24", "ImageVersion": "fixture"}
+
+    def test_relay_capture_resolves_all_four_service_containers(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.dict(os.environ, self.capture_environment(directory), clear=True), \
+             mock.patch.object(m, "command_versions", return_value={}), mock.patch.object(m, "git", return_value=HEAD), \
+             mock.patch.object(m, "bindings", return_value=BINDINGS), \
+             mock.patch.object(m, "run", return_value=("sha256:" + "f" * 64).encode()) as run:
+            captured = m.capture("relay-e2e")
+            names = ("buzz-postgres", "buzz-redis", "buzz-minio", "buzz-minio-init")
+            self.assertEqual(captured["context"].get("service_images"), {name: "sha256:" + "f" * 64 for name in names})
+            self.assertEqual(run.call_args_list, [mock.call(["docker", "inspect", "--format={{.Image}}", name]) for name in names])
+
+    def test_actual_cross_build_step_pins_and_captures_the_compiler_image(self):
+        workflow = (ROOT / m.CI).read_text()
+        block = workflow.split("      - name: Build server binaries\n", 1)[1].split("      - name:", 1)[0]
+        command = textwrap.dedent(block.split("        run: |\n", 1)[1]).strip()
+        for target in ("x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"):
+            for resolution in ("valid", "mutable", "wrong target"):
+                with self.subTest(target=target, resolution=resolution), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    reference = f"ghcr.io/cross-rs/{target}@sha256:" + "d" * 64
+                    resolved = reference if resolution == "valid" else (f"ghcr.io/cross-rs/{target}:0.2.5" if resolution == "mutable" else reference.replace(target, "wrong"))
+                    image_id = "sha256:" + "f" * 64
+                    image_variable = "CROSS_TARGET_" + target.upper().replace("-", "_") + "_IMAGE"
+                    (root / "docker").write_text(f"#!{sys.executable}\n" +
+                        "import sys\n" +
+                        f"expected = {{('pull', 'ghcr.io/cross-rs/{target}:0.2.5'): '', " +
+                        f"('image', 'inspect', '--format', '{{{{index .RepoDigests 0}}}}', 'ghcr.io/cross-rs/{target}:0.2.5'): {resolved!r}, " +
+                        f"('image', 'inspect', '--format={{{{.Id}}}}', {reference!r}): {image_id!r}}}\n" +
+                        "assert tuple(sys.argv[1:]) in expected, sys.argv\n" +
+                        "print(expected[tuple(sys.argv[1:])])\n")
+                    (root / "cross").write_text(f"#!{sys.executable}\n" +
+                        "import os, pathlib, sys\n" +
+                        f"assert os.environ[{image_variable!r}] == {reference!r}\n" +
+                        f"assert sys.argv[1:5] == ['build', '--release', '--target', {target!r}]\n" +
+                        "pathlib.Path(__file__).with_suffix('.called').write_text('linked once')\n")
+                    for name in ("docker", "cross"): (root / name).chmod(0o700)
+                    environment = self.capture_environment(directory)
+                    environment.update(PATH=directory, TARGET=target, CARGO_CMD="build", GITHUB_ENV=str(root / "github-env"))
+                    result = subprocess.run(["/bin/bash", "-e", "-o", "pipefail", "-c", command],
+                                            cwd=root, env=environment, capture_output=True)
+                    if resolution != "valid":
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertFalse((root / "cross.called").exists())
+                        continue
+                    self.assertEqual(result.returncode, 0, result.stderr.decode())
+                    self.assertEqual((root / "cross.called").read_text(), "linked once")
+                    self.assertEqual((root / "github-env").read_text(), f"BUZZ_CROSS_IMAGE={reference}\n")
+                    environment["BUZZ_CROSS_IMAGE"] = reference
+                    with mock.patch.dict(os.environ, environment, clear=True), \
+                         mock.patch.object(m, "command_versions", return_value={}), \
+                         mock.patch.object(m, "git", return_value=HEAD), \
+                         mock.patch.object(m, "bindings", return_value=BINDINGS):
+                        captured = m.capture("server-" + target)
+                        self.assertEqual(captured["context"].get("cross_image"), {"reference": reference, "image_id": image_id})
+                        del os.environ["BUZZ_CROSS_IMAGE"]
+                        with self.assertRaises(m.r.GateError): m.capture("server-" + target)
 
 if __name__ == "__main__":
     unittest.main()

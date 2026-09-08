@@ -427,11 +427,14 @@ class GhClient:
                                     timeout=60)
         except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
             raise ProviderError(f"GitHub GET could not run for {endpoint}") from exc
-        refuse(completed.returncode == 0,
-               f"GitHub GET failed for {endpoint}", ProviderError)
         response = bounded_response(completed.stdout, endpoint)
         status, headers, body = parse_headers(response)
-        missing_epoch = endpoint == f"/repos/{REPOSITORY}/actions/variables/BUZZ_CI_REUSE_EPOCH" and status == 404
+        epoch_endpoint = endpoint == f"/repos/{REPOSITORY}/actions/variables/BUZZ_CI_REUSE_EPOCH"
+        missing_epoch = epoch_endpoint and status == 404
+        # gh exits 1 for an HTTP error. Only the exact epoch 404 is eligible
+        # for the later independent admin-authority check in current_epoch.
+        refuse(completed.returncode == 0 or (completed.returncode == 1 and missing_epoch),
+               f"GitHub GET failed for {endpoint}", ProviderError)
         refuse(status == 200 or missing_epoch, f"GitHub GET returned HTTP {status} for {endpoint}", ProviderError)
         request_id = headers.get("x-github-request-id")
         date = headers.get("date")
@@ -442,6 +445,14 @@ class GhClient:
             require_bounded_json_depth(parsed)
         except (json.JSONDecodeError, UnicodeError, RecursionError) as exc:
             raise ProviderError(f"GitHub returned invalid JSON for {endpoint}") from exc
+        if epoch_endpoint:
+            valid = isinstance(parsed, dict)
+            if missing_epoch:
+                valid = (valid and parsed.get("message") == "Not Found" and
+                         parsed.get("status", "404") == "404" and not {"name", "value"}.intersection(parsed))
+            else:
+                valid = valid and parsed.get("name") == "BUZZ_CI_REUSE_EPOCH" and isinstance(parsed.get("value"), str)
+            refuse(valid, "GitHub returned an invalid epoch response", ProviderError)
         self.requests.append({
             "endpoint": endpoint, "page": page, "status": status,
             "request_id": request_id, "date": date, "etag": headers.get("etag"),

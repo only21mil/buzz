@@ -125,6 +125,8 @@ jobs:
               - '.github/workflows/android-fork-release-tag.yml'
               - '.github/workflows/android-fork-release-apk.yml'
               - '.github/workflows/ci.yml'
+      - name: Install landed-qualification schema validator
+        run: python3 -m pip install --disable-pip-version-check --no-input check-jsonschema==0.38.0
       - name: Landed qualification contract
         run: python3 scripts/test-protected-ci-landing.py
       - name: Release workflow source contract
@@ -1288,6 +1290,16 @@ jobs:
           # Qualify the full link once, before merge.
           CARGO_CMD: build
         run: |
+          # Resolve once, then force cross to use the same immutable image
+          # whose reference and local image ID the qualification captures.
+          image="ghcr.io/cross-rs/${TARGET}:0.2.5"
+          docker pull "$image"
+          resolved=$(docker image inspect --format '{{index .RepoDigests 0}}' "$image")
+          [[ "$resolved" =~ ^ghcr.io/cross-rs/${TARGET}@sha256:[0-9a-f]{64}$ ]]
+          image_variable="CROSS_TARGET_${TARGET^^}_IMAGE"
+          image_variable=${image_variable//-/_}
+          export "$image_variable=$resolved"
+          printf 'BUZZ_CROSS_IMAGE=%s\n' "$resolved" >> "$GITHUB_ENV"
           cross "$CARGO_CMD" --release --target "$TARGET" \
             -p buzz-relay \
             -p buzz-acp \

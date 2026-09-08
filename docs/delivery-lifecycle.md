@@ -157,6 +157,11 @@ The entrypoint verifies the new helper's exact committed bytes before loading it
   toolchain manifests and dependency lockfiles match the landed Git objects.
   Capture retains actual tool versions, runner image revision, OS package
   inventory digest, service image IDs and the Android runtime dependency digest.
+  Relay E2E and both integration lanes retain Postgres, Redis, MinIO and the
+  MinIO setup container image IDs. Each server cross build resolves its compiler
+  image once, forces cross to use that immutable registry digest, and retains
+  both the digest reference and local image ID. Missing image evidence refuses
+  qualification.
 - Qualification uses the same immutable source execution snapshot for the
   landed tree. It does not claim to have rebuilt outputs with the new commit
   SHA or to have executed on a new runner. Cache writes, checkout paths and the
@@ -166,7 +171,10 @@ The entrypoint verifies the new helper's exact committed bytes before loading it
   dependency resolution would return identical versions.
 - The live non-secret `BUZZ_CI_REUSE_EPOCH` equals the captured value; change it
   when an external relevant qualification input is invalidated. The captured
-  RustSec advisory revision must also equal its live authority. A changed
+  value may be empty only when the variable is empty or its exact GitHub 404
+  response is followed by independent repository-admin confirmation. Other
+  HTTP, transport, authentication and malformed-response failures refuse.
+  The captured RustSec advisory revision must also equal its live authority. A changed
   advisory database refuses Security reuse. Current checks, jobs, workflow
   attempts, epoch and main are read again before a receipt can pass.
 - The actual landed desktop identity runs through the existing

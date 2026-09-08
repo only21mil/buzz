@@ -49,7 +49,8 @@ AGGREGATES = {"Desktop", "Desktop E2E Integration"}
 RUST_JOBS = {"rust-lint", "unit-tests", "desktop-core", "desktop-e2e-relay", "backend-integration",
              "relay-e2e", "security", "desktop-build-macos", *[j for j in JOBS if j.startswith("server-")]}
 JS_JOBS = {"desktop-core", "desktop-build-macos", "web", *[j for j in JOBS if j.startswith(("desktop-smoke-", "desktop-integration-"))]}
-SERVICE_JOBS = {"backend-integration", "desktop-integration-1", "desktop-integration-2"}
+SERVICE_JOBS = {"backend-integration", "relay-e2e", "desktop-integration-1", "desktop-integration-2"}
+SERVICE_CONTAINERS = ("buzz-postgres", "buzz-redis", "buzz-minio", "buzz-minio-init")
 
 
 def run(argv, *, cwd=ROOT):
@@ -121,7 +122,13 @@ def capture(job):
                "base_ref": "main", "policy": POLICY}
     if job in SERVICE_JOBS:
         context["service_images"] = {name: run(["docker", "inspect", "--format={{.Image}}", name]).decode().strip()
-                                     for name in ("buzz-postgres", "buzz-redis", "buzz-minio")}
+                                     for name in SERVICE_CONTAINERS}
+    if job.startswith("server-"):
+        reference = os.environ.get("BUZZ_CROSS_IMAGE", "")
+        r.refuse(re.fullmatch(rf"ghcr\.io/cross-rs/{re.escape(job.removeprefix('server-'))}@sha256:[0-9a-f]{{64}}", reference),
+                 "cross compiler image is not pinned to its resolved digest")
+        context["cross_image"] = {"reference": reference,
+                                  "image_id": run(["docker", "image", "inspect", "--format={{.Id}}", reference]).decode().strip()}
     if job == "mobile":
         manifest = ROOT / "mobile/build/app/reports/buzz-runtime-dependencies.tsv"
         context["android_dependencies_sha256"] = digest_bytes(manifest.read_bytes())
@@ -294,8 +301,16 @@ def verify_source_proof(proof, key, job, run, source, target_tree, expected_bind
              "resolved source toolchain evidence missing")
     if key in SERVICE_JOBS:
         images = r.object_(context.get("service_images"), "resolved service images")
-        r.refuse(set(images) == {"buzz-postgres", "buzz-redis", "buzz-minio"} and
-                 all(re.fullmatch(r"sha256:[0-9a-f]{64}", v) for v in images.values()), "service dependency evidence missing")
+        r.refuse(set(images) == set(SERVICE_CONTAINERS) and
+                 all(isinstance(v, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", v) for v in images.values()),
+                 "service dependency evidence missing")
+    if key.startswith("server-"):
+        image = r.object_(context.get("cross_image"), "resolved cross compiler image")
+        reference, image_id = image.get("reference"), image.get("image_id")
+        r.refuse(isinstance(reference, str) and
+                 re.fullmatch(rf"ghcr\.io/cross-rs/{re.escape(key.removeprefix('server-'))}@sha256:[0-9a-f]{{64}}", reference) and
+                 isinstance(image_id, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", image_id),
+                 "cross compiler dependency evidence missing")
     if key == "mobile":
         r.refuse(re.fullmatch(r"[0-9a-f]{64}", context.get("android_dependencies_sha256", "")),
                  "Android dependency evidence missing")
