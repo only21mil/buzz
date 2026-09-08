@@ -33,6 +33,8 @@ pub struct DraftOperation {
     publication: Option<Event>,
     #[serde(default)]
     channel_event: Option<Event>,
+    #[serde(default)]
+    channel_attached: bool,
     publish_shared: bool,
 }
 #[derive(Serialize)]
@@ -116,21 +118,6 @@ fn store_event(scope: &RetentionScope, event: &Event) -> Result<(), String> {
             if route.owner != scope.owner_keys.public_key() {
                 return Err("draft owner mismatch".into());
             }
-            let body: Value =
-                buzz_core_pkg::observer::decrypt_observer_payload(&scope.owner_keys, event)
-                    .map_err(|e| e.to_string())?;
-            if body["version"] != 1
-                || body["payload"]["requestId"] != route.request_id.to_string()
-                || body["channelId"] != route.channel.to_string()
-                || body["payload"]["request"]["channelId"] != route.channel.to_string()
-                || body["payload"]["type"] != "agent_management_request"
-                || !matches!(
-                    body["payload"]["action"].as_str(),
-                    Some("create" | "update")
-                )
-            {
-                return Err("draft encrypted binding mismatch".into());
-            }
             route.owner
         }
         buzz_core_pkg::kind::KIND_AGENT_DRAFT_DECISION => validate_decision(event)?.owner,
@@ -146,6 +133,26 @@ fn store_event(scope: &RetentionScope, event: &Event) -> Result<(), String> {
         )
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+// Retention accepts signed owner-scoped ciphertext even when the private body
+// is unavailable. Only reviewed mutations require a valid decrypted binding.
+fn request_body(scope: &RetentionScope, event: &Event) -> Result<Value, String> {
+    let route = validate_request(event)?;
+    let body: Value = buzz_core_pkg::observer::decrypt_observer_payload(&scope.owner_keys, event)
+        .map_err(|e| e.to_string())?;
+    if body["version"] != 1
+        || body["payload"]["requestId"] != route.request_id.to_string()
+        || body["channelId"] != route.channel.to_string()
+        || body["payload"]["request"]["channelId"] != route.channel.to_string()
+        || body["payload"]["type"] != "agent_management_request"
+        || !matches!(
+            body["payload"]["action"].as_str(),
+            Some("create" | "update")
+        )
+    {
+        return Err("draft encrypted binding mismatch".into());
+    }
+    Ok(body)
 }
 fn terminal_or_claimed(scope: &RetentionScope, id: &str) -> Result<bool, String> {
     let conn = db(scope)?;
@@ -409,14 +416,15 @@ pub fn agent_draft_prepare(
     if action != "reject" {
         validate_registered(&app, &s, &request)?;
     }
-    let body: Value = buzz_core_pkg::observer::decrypt_observer_payload(&s.owner_keys, &request)
-        .map_err(|e| e.to_string())?;
-    let request_action = body["payload"]["action"]
-        .as_str()
-        .ok_or("missing draft action")?;
+    let body = if action == "reject" {
+        Value::Null
+    } else {
+        request_body(&s, &request)?
+    };
+    let request_action = body["payload"]["action"].as_str();
     let mut personas = managed_agents::load_personas(&app)?;
     super::personas::pending::project_active_persona_sharing(&app, &state, &mut personas);
-    let previous = if request_action == "update" && action != "reject" {
+    let previous = if request_action == Some("update") && action != "reject" {
         let target = input["id"]
             .as_str()
             .ok_or("update requires pinned persona ID")?;
@@ -492,6 +500,7 @@ pub fn agent_draft_prepare(
         instance_input,
         publication: None,
         channel_event: None,
+        channel_attached: false,
         publish_shared,
     };
     put_operation(&s, &op)?;
@@ -554,6 +563,7 @@ pub async fn agent_draft_apply(
     }
     let request = stored_request(&s, &request_event_id)?;
     if op.action != "reject" {
+        request_body(&s, &request)?;
         validate_membership(&app, &s, &request).await?;
     }
     scope(&app, &owner, &relay_url)?;
@@ -567,12 +577,11 @@ pub async fn agent_draft_apply(
     // invocation may already have saved this exact local operation.
     {
         let state = app.state::<AppState>();
-        let _epoch = state.publication_epoch.lock().map_err(|e| e.to_string())?;
+        let _epoch = transaction.lock_validated()?;
         let _guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|e| e.to_string())?;
-        transaction.validate()?;
         scope(&app, &owner, &relay_url)?;
         op = read_operation(&s, &request_event_id)?.ok_or("operation missing")?;
         if matches!(op.state.as_str(), "applied" | "rejected" | "uncertain") {
@@ -731,6 +740,96 @@ fn persist_prepared_persona(
     Ok(())
 }
 
+// Only an explicit apply/confirm reaches this path. Once accepted, journal the
+// attachment so later publication/outcome retries cannot re-add a removed member.
+async fn attach_started_instance(
+    app: &AppHandle,
+    owner: &str,
+    relay_url: &str,
+    s: &RetentionScope,
+    transaction: &crate::relay::MessagePublication,
+    op: &mut DraftOperation,
+) -> Result<(), String> {
+    let event = op
+        .channel_event
+        .as_ref()
+        .ok_or("missing channel attachment")?;
+    let stale = event.created_at.as_secs().saturating_add(600) < nostr::Timestamp::now().as_secs();
+    let mut attached = false;
+    if stale {
+        // An interrupted send may have succeeded. Read membership before
+        // renewing the approved event's timestamp; never repeat Create/Start.
+        let route = validate_request(&stored_request(s, &op.request_event_id)?)?;
+        let pubkey = op
+            .instance
+            .as_ref()
+            .and_then(|i| i["pubkey"].as_str())
+            .ok_or("missing started instance")?;
+        let state = app.state::<AppState>();
+        let events = crate::relay::query_relay_at_with_keys(
+            &state,
+            &transaction.api_base_url,
+            &[json!({"kinds":[39002],"#d":[route.channel.to_string()],"limit":1})],
+            &s.owner_keys,
+            None,
+        )
+        .await?;
+        transaction.validate()?;
+        attached = events.first().is_some_and(|members| {
+            members.tags.iter().any(|tag| {
+                tag.as_slice().first().is_some_and(|name| name == "p")
+                    && tag.content() == Some(pubkey)
+            })
+        });
+        if !attached {
+            op.channel_event = Some(
+                nostr::EventBuilder::new(event.kind, &event.content)
+                    .tags(event.tags.clone())
+                    .allow_self_tagging()
+                    .sign_with_keys(&s.owner_keys)
+                    .map_err(|e| e.to_string())?,
+            );
+            let state = app.state::<AppState>();
+            let _epoch = transaction.lock_validated()?;
+            let _guard = state
+                .managed_agents_store_lock
+                .lock()
+                .map_err(|e| e.to_string())?;
+            let mut latest = read_operation(s, &op.request_event_id)?.ok_or("operation missing")?;
+            if latest.channel_attached {
+                *op = latest;
+                return Ok(());
+            }
+            latest.channel_event = op.channel_event.clone();
+            put_operation(s, &latest)?;
+            *op = latest;
+        }
+    }
+    if !attached {
+        send(
+            app,
+            owner,
+            relay_url,
+            s,
+            op.channel_event
+                .as_ref()
+                .ok_or("missing channel attachment")?,
+        )
+        .await?;
+    }
+    let state = app.state::<AppState>();
+    let _epoch = transaction.lock_validated()?;
+    let _guard = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|e| e.to_string())?;
+    let mut latest = read_operation(s, &op.request_event_id)?.ok_or("operation missing")?;
+    latest.channel_attached = true;
+    put_operation(s, &latest)?;
+    *op = latest;
+    Ok(())
+}
+
 async fn finish(
     app: &AppHandle,
     owner: &str,
@@ -739,8 +838,9 @@ async fn finish(
     mut op: DraftOperation,
 ) -> Result<DraftOperation, String> {
     let transaction = crate::relay::MessagePublication::capture(&app.state::<AppState>(), None)?;
-    if let Some(event) = &op.channel_event {
-        if let Err(error) = send(app, owner, relay_url, s, event).await {
+    if op.channel_event.is_some() && !op.channel_attached {
+        let result = attach_started_instance(app, owner, relay_url, s, &transaction, &mut op).await;
+        if let Err(error) = result {
             let state = app.state::<AppState>();
             let _guard = state
                 .managed_agents_store_lock
@@ -756,12 +856,11 @@ async fn finish(
             put_operation(s, &latest)?;
             return Ok(latest);
         }
-        transaction.validate()?;
     }
 
     if op.publication.is_some() {
         let state = app.state::<AppState>();
-        let _epoch = state.publication_epoch.lock().map_err(|e| e.to_string())?;
+        let _epoch = transaction.lock_validated()?;
         let _guard = state
             .managed_agents_store_lock
             .lock()
