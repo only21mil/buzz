@@ -1,3 +1,5 @@
+import { PalReadiness } from "./readiness";
+
 export type InvokeBody =
   | Record<string, unknown>
   | number[]
@@ -17,6 +19,11 @@ export type CommandHandler<T = unknown> = (
 
 const handlers = new Map<string, CommandHandler>();
 let unregisteredCommandMisses = 0;
+let readiness = new PalReadiness();
+
+export function initializePal(initialize: () => Promise<void>): Promise<void> {
+  return readiness.start(initialize);
+}
 
 export class CapabilityUnavailableError extends Error {
   readonly capability: string;
@@ -45,6 +52,7 @@ export async function dispatch<T>(
   body?: InvokeBody,
   options?: InvokeOptions,
 ): Promise<T> {
+  await readiness.wait();
   const handler = handlers.get(command);
   if (!handler) {
     unregisteredCommandMisses += 1;
@@ -59,6 +67,7 @@ export function getUnregisteredCommandMissCount(): number {
 }
 
 export function resetRegistryForTests(): void {
+  readiness = new PalReadiness();
   handlers.clear();
   unregisteredCommandMisses = 0;
 }

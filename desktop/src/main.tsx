@@ -1,4 +1,6 @@
+import { startBrowserShell } from "@/platform/web/startup";
 import React from "react";
+import { flushSync } from "react-dom";
 import ReactDOM from "react-dom/client";
 import { App } from "@/app/App";
 import { RootErrorBoundary } from "@/app/RootErrorBoundary";
@@ -74,8 +76,12 @@ function configureDevE2eBridgeFromUrl() {
   );
 }
 
+const root = ReactDOM.createRoot(
+  document.getElementById("root") as HTMLElement,
+);
+
 function renderApp() {
-  ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+  root.render(
     <React.StrictMode>
       {/* block/buzz#5078 — catch any uncaught render error so a WebKit
           SecurityError from localStorage can't blank the whole window. */}
@@ -127,14 +133,44 @@ async function installBrowserPalIfConfigured() {
   await installBrowserPal();
 }
 
-async function bootstrap() {
+function renderStartupShell(error?: unknown) {
+  flushSync(() =>
+    root.render(
+      <div
+        role={error ? "alert" : "status"}
+        style={{
+          minHeight: "100dvh",
+          background: "#050505",
+          color: "#F5F2EA",
+          display: "grid",
+          placeItems: "center",
+        }}
+      >
+        {error ? "Buzz could not start. Reload to try again." : "Opening Buzz…"}
+      </div>,
+    ),
+  );
+}
+
+async function initializeApp() {
   resetDevWebviewStateFromUrl();
   configureDevE2eBridgeFromUrl();
   recoverLocalStorageQuotaOnStartup();
   await installE2eBridgeIfConfigured();
   await installBrowserPalIfConfigured();
   await migrateLegacyCommunityStorageBeforeRender();
-  renderApp();
 }
 
-void bootstrap();
+async function bootstrap() {
+  if (import.meta.env.MODE === "web") {
+    await startBrowserShell(renderStartupShell, initializeApp, renderApp);
+  } else {
+    await initializeApp();
+    renderApp();
+  }
+}
+
+void bootstrap().catch((error: unknown) => {
+  console.error("Buzz startup failed", error);
+  renderStartupShell(error);
+});
