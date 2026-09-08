@@ -10,7 +10,6 @@ name: Sprig image
 # No QEMU emulation.
 #
 # Triggers:
-#   - push to main (paths-filtered) → :main + :sha-<7>
 #   - tag sprig-v*                  → semver family (shared with sprig.yml's
 #                                     binary release — one tag versions both)
 #   - pull_request (paths-filtered) → build only, no push
@@ -22,17 +21,7 @@ name: Sprig image
 
 on:
   push:
-    branches: [main]
     tags: ["sprig-v[0-9]*"]
-    paths:
-      - "Dockerfile.sprig"
-      - ".dockerignore"
-      - "scripts/sprig-entrypoint.sh"
-      - ".github/workflows/sprig-image.yml"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "crates/**"
   pull_request:
     paths:
       - "Dockerfile.sprig"
@@ -144,7 +133,7 @@ jobs:
           images: ${{ env.IMAGE_NAME }}
           # match=^sprig-v(.*)$ strips the tag prefix for the semver parser,
           # exactly as docker.yml does for relay-v. :latest comes from
-          # flavor.latest=auto — stable semver only, never main pushes.
+          # flavor.latest=auto — stable semver only, never manual branch builds.
           tags: |
             type=ref,event=branch
             type=sha,prefix=sha-,format=short

@@ -2,56 +2,145 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/only21mil/buzz/blob/main/docs/ci/protected-ci-receipt.schema.json",
   "title": "Buzz protected-CI receipt",
-  "type": "object",
-  "additionalProperties": false,
-  "required": [
-    "schema_version",
-    "source",
-    "scope",
-    "repository",
-    "head_sha",
-    "timestamp",
-    "overall",
-    "protected",
-    "full_exact_head",
-    "provider",
-    "pull_request",
-    "protection",
-    "checks"
-  ],
-  "properties": {
-    "schema_version": { "const": 1 },
-    "source": { "const": "protected-ci" },
-    "scope": { "enum": ["pull-request", "main"] },
-    "repository": { "const": "only21mil/buzz" },
-    "head_sha": { "$ref": "#/$defs/sha40" },
-    "timestamp": { "$ref": "#/$defs/timestamp" },
-    "overall": { "const": "PASS" },
-    "protected": { "const": true },
-    "full_exact_head": { "const": true },
-    "provider": { "$ref": "#/$defs/provider" },
-    "pull_request": {
-      "oneOf": [
-        { "$ref": "#/$defs/pull_request" },
-        { "type": "null" }
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "source",
+        "scope",
+        "repository",
+        "head_sha",
+        "timestamp",
+        "overall",
+        "protected",
+        "full_exact_head",
+        "provider",
+        "pull_request",
+        "protection",
+        "checks"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "source": { "const": "protected-ci" },
+        "scope": { "enum": ["pull-request", "main"] },
+        "repository": { "const": "only21mil/buzz" },
+        "head_sha": { "$ref": "#/$defs/sha40" },
+        "timestamp": { "$ref": "#/$defs/timestamp" },
+        "overall": { "const": "PASS" },
+        "protected": { "const": true },
+        "full_exact_head": { "const": true },
+        "provider": { "$ref": "#/$defs/provider" },
+        "pull_request": {
+          "oneOf": [
+            { "$ref": "#/$defs/pull_request" },
+            { "type": "null" }
+          ]
+        },
+        "protection": { "$ref": "#/$defs/protection" },
+        "checks": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/check" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "scope": { "const": "pull-request" } },
+            "required": ["scope"]
+          },
+          "then": { "properties": { "pull_request": { "$ref": "#/$defs/pull_request" } } },
+          "else": { "properties": { "pull_request": { "type": "null" } } }
+        }
       ]
     },
-    "protection": { "$ref": "#/$defs/protection" },
-    "checks": {
-      "type": "array",
-      "minItems": 1,
-      "uniqueItems": true,
-      "items": { "$ref": "#/$defs/check" }
-    }
-  },
-  "allOf": [
     {
-      "if": {
-        "properties": { "scope": { "const": "pull-request" } },
-        "required": ["scope"]
-      },
-      "then": { "properties": { "pull_request": { "$ref": "#/$defs/pull_request" } } },
-      "else": { "properties": { "pull_request": { "type": "null" } } }
+      "description": "All nested authority is replayed and live reverified by protected-ci-receipt.py; JSON Schema alone never qualifies delivery.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "source",
+        "scope",
+        "repository",
+        "head_sha",
+        "timestamp",
+        "overall",
+        "protected",
+        "full_exact_head",
+        "full_verified_landing",
+        "policy",
+        "source_receipt_bytes",
+        "source_receipt_sha256",
+        "provider_client",
+        "evidence",
+        "qualification",
+        "canonical",
+        "landing_checks"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 2
+        },
+        "source": {
+          "const": "protected-ci"
+        },
+        "scope": {
+          "const": "main"
+        },
+        "repository": {
+          "const": "only21mil/buzz"
+        },
+        "head_sha": {
+          "$ref": "#/$defs/sha40"
+        },
+        "timestamp": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "overall": {
+          "const": "PASS"
+        },
+        "protected": {
+          "const": true
+        },
+        "full_exact_head": {
+          "const": false
+        },
+        "full_verified_landing": {
+          "const": true
+        },
+        "policy": {
+          "const": "protected-source-qualification-v1"
+        },
+        "source_receipt_bytes": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_receipt_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "provider_client": {
+          "type": "object"
+        },
+        "evidence": {
+          "type": "object"
+        },
+        "qualification": {
+          "type": "object"
+        },
+        "canonical": {
+          "type": "object"
+        },
+        "landing_checks": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1
+        }
+      }
     }
   ],
   "$defs": {

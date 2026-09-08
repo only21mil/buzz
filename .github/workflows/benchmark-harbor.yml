@@ -1,11 +1,6 @@
 name: Harbor Buzz Orchestra
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "benchmarks/harbor-buzz-orchestra/**"
-      - ".github/workflows/benchmark-harbor.yml"
   pull_request:
     paths:
       - "benchmarks/harbor-buzz-orchestra/**"
