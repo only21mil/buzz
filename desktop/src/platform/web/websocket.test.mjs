@@ -58,6 +58,13 @@ async function install() {
   registerWebSocketCommands();
 }
 
+// dispatch awaits the PAL readiness gate before it reaches a handler, so the
+// fake socket appears one turn after the connect call.
+async function connectedSocket() {
+  await new Promise((resolve) => setImmediate(resolve));
+  return FakeWebSocket.instances[0];
+}
+
 afterEach(async () => {
   try {
     await dispatch("plugin:websocket|disconnect_all");
@@ -81,7 +88,7 @@ test("browser websocket preserves connect, text, send, and local teardown contra
     return id;
   });
 
-  const socket = FakeWebSocket.instances[0];
+  const socket = await connectedSocket();
   assert.equal(socket.url, "wss://relay.example.test");
   assert.equal(socket.binaryType, "arraybuffer");
   await Promise.resolve();
@@ -114,7 +121,7 @@ test("failed connects reject without exposing a socket id", async () => {
     url: "wss://relay.example.test",
     onMessage: new Channel(),
   });
-  const socket = FakeWebSocket.instances[0];
+  const socket = await connectedSocket();
   socket.emit("error");
   await assert.rejects(connect, /WebSocket connection failed/);
   assert.deepEqual(socket.closeCalls, [{ code: 1005, reason: "" }]);
@@ -139,7 +146,7 @@ test("remote terminal events preserve native payloads and remove ownership", asy
     url: "wss://relay.example.test",
     onMessage: new Channel((message) => received.push(message)),
   });
-  const socket = FakeWebSocket.instances[0];
+  const socket = await connectedSocket();
   socket.open();
   const id = await connect;
 
@@ -227,7 +234,7 @@ test("close blocks encrypted key backups in the reason before teardown", async (
     url: "wss://relay.example.test",
     onMessage: new Channel(),
   });
-  const socket = FakeWebSocket.instances[0];
+  const socket = await connectedSocket();
   socket.open();
   const id = await connect;
 

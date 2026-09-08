@@ -3772,7 +3772,9 @@ mod tests {
             .kind(Kind::Custom(30174))
             .author(agent_a.public_key());
 
-        let reader = Keys::generate().public_key().to_hex();
+        // Both envelopes name the same owner, so the owner reader passes the
+        // engram reader gate and only the `authors` filter separates them.
+        let reader = owner.clone();
         assert!(search_hit_accepted(&filter, &env_a, &[], &reader));
         assert!(
             !search_hit_accepted(&filter, &env_b, &[], &reader),
@@ -3795,7 +3797,9 @@ mod tests {
             .kind(Kind::Custom(30174))
             .custom_tags(p_tag, [&owner]);
 
-        let reader = Keys::generate().public_key().to_hex();
+        // The owner passes the engram reader gate, so channel access alone
+        // decides the outcome here.
+        let reader = owner.clone();
         assert!(
             !search_hit_accepted(&filter, &stored, &[], &reader),
             "channel-scoped hit must be rejected when caller has no channel access"
