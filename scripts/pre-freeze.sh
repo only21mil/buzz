@@ -91,7 +91,10 @@ write_receipt() {
         overall="PASS"
     fi
 
-    receipt_tmp="$(mktemp "${TMPDIR:-/tmp}/buzz-pre-freeze-receipt.XXXXXX")" || return 1
+    # Create the temporary receipt beside its destination: os.replace is a
+    # rename, and renaming from $TMPDIR onto another filesystem fails with
+    # EXDEV (issue #143).
+    receipt_tmp="$(mktemp "$REPO_ROOT/.pre-freeze-receipt.XXXXXX")" || return 1
     if ! python3 - "$receipt_tmp" "$RECEIPT_PATH" "$HEAD_SHA" "$BASE_SHA" "$TIMESTAMP" "$RECORDS_FILE" "$overall" <<'PY'
 import json
 import os
