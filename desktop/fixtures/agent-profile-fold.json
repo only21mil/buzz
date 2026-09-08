@@ -1,0 +1,27 @@
+{
+  "complete": {
+    "name": "Scout",
+    "agent_type": "assistant",
+    "channels": ["general"],
+    "channel_ids": ["channel-one"],
+    "capabilities": ["search"],
+    "status": "online",
+    "respond_to": "allowlist",
+    "respond_to_allowlist": [
+      "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    ]
+  },
+  "sparsePolicyUpdate": {
+    "channel_add_policy": "nobody"
+  },
+  "replacement": {
+    "name": "Builder",
+    "agent_type": "worker",
+    "channels": ["engineering"],
+    "channel_ids": ["channel-two"],
+    "capabilities": ["build"],
+    "status": "away",
+    "respond_to": "anyone",
+    "respond_to_allowlist": []
+  }
+}

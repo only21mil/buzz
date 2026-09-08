@@ -250,8 +250,17 @@ function relayAgentFromEvent(event: RelayEvent) {
   } catch {
     parsed = {};
   }
-  const record = asRecord(parsed) ?? {};
+  const record = asRecord(parsed);
+  if (!record) return null;
   const displayName = record.display_name;
+  const name = record.name;
+  if (
+    ![name, displayName].some(
+      (value) => typeof value === "string" && value.trim() !== "",
+    )
+  ) {
+    return null;
+  }
   const fallbackName =
     typeof displayName === "string" && displayName.trim() !== ""
       ? displayName
@@ -265,7 +274,7 @@ function relayAgentFromEvent(event: RelayEvent) {
   }
   return {
     pubkey: event.pubkey,
-    name: typeof record.name === "string" ? record.name : fallbackName,
+    name: typeof name === "string" ? name : fallbackName,
     agent_type:
       typeof record.agent_type === "string" ? record.agent_type : "agent",
     channels: stringArray(record, "channels"),
@@ -275,6 +284,36 @@ function relayAgentFromEvent(event: RelayEvent) {
     respond_to: typeof respondTo === "string" ? respondTo : null,
     respond_to_allowlist: stringArray(record, "respond_to_allowlist"),
   };
+}
+
+function relayAgentsFromEvents(events: RelayEvent[]) {
+  const latest = new Map<
+    string,
+    {
+      index: number;
+      event: RelayEvent;
+    }
+  >();
+  events.forEach((event, index) => {
+    const previous = latest.get(event.pubkey);
+    if (
+      !previous ||
+      event.created_at > previous.event.created_at ||
+      (event.created_at === previous.event.created_at &&
+        event.id < previous.event.id)
+    ) {
+      latest.set(event.pubkey, {
+        index: previous?.index ?? index,
+        event,
+      });
+    }
+  });
+  return [...latest.values()]
+    .sort((left, right) => left.index - right.index)
+    .flatMap(({ event }) => {
+      const agent = relayAgentFromEvent(event);
+      return agent ? [agent] : [];
+    });
 }
 
 function profileFromEvent(event: RelayEvent) {
@@ -615,11 +654,11 @@ export function registerRelayWorkflowsMembersCommands(
     return workflowFromEvent(event);
   });
   register("list_relay_agents", async () =>
-    (
+    relayAgentsFromEvents(
       await client.fetchEvents({
         kinds: [10100],
-      })
-    ).map(relayAgentFromEvent),
+      }),
+    ),
   );
   register("list_relay_members", () => listRelayMembers(client));
   register("remove_relay_member", (body) =>
