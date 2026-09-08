@@ -37,7 +37,7 @@ test("owner review revision reaches the native update command unchanged", async 
     __TAURI_INTERNALS__: {
       invoke: async (command, args) => {
         calls.push({ command, args });
-        return rawPersona();
+        return rawPersona({ system_prompt: args.input.systemPrompt });
       },
     },
   };

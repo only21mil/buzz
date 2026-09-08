@@ -5,7 +5,10 @@ import { toast } from "sonner";
 
 import type { Repository } from "@/features/projects/hooks";
 import { projectCloneErrorPresentation } from "@/features/projects/lib/projectGitError";
-import { openProjectTerminal } from "@/shared/api/projectGit";
+import {
+  openProjectMergeRecoveryTerminal,
+  openProjectTerminal,
+} from "@/shared/api/projectGit";
 
 export function projectTerminalLabel(hasLocalCheckout: boolean) {
   return hasLocalCheckout ? "Open in Terminal" : "Clone & open in Terminal";
@@ -82,5 +85,32 @@ export function useOpenProjectTerminal(reposDir?: string | null) {
       }
     },
     [queryClient, reposDir],
+  );
+}
+
+/** Open merge recovery for the selected repository and workspace directory. */
+export function useOpenProjectMergeRecoveryTerminal(
+  repository: Repository | null | undefined,
+  reposDir?: string | null,
+) {
+  return React.useCallback(
+    async (input: {
+      expectedCommit: string;
+      sourceBranch: string;
+      sourceCloneUrl: string;
+      targetBranch: string;
+    }) => {
+      const targetCloneUrl = repository?.cloneUrls[0];
+      if (!repository || !targetCloneUrl) {
+        throw new Error("No project selected.");
+      }
+      return openProjectMergeRecoveryTerminal({
+        ...input,
+        projectDtag: repository.dtag,
+        reposDir: reposDir,
+        targetCloneUrl,
+      });
+    },
+    [reposDir, repository],
   );
 }

@@ -43,7 +43,6 @@ import {
   profilePanelViewFromSearch,
 } from "@/features/profile/ui/UserProfilePanelUtils";
 import { useIdentityQuery } from "@/shared/api/hooks";
-import { openProjectMergeRecoveryTerminal } from "@/shared/api/projectGit";
 import { useMainInsetRef } from "@/shared/layout/MainInsetContext";
 import { channelContentTopPaddingMeasurement } from "@/shared/layout/chromeLayout";
 import { useMeasuredCssVariable } from "@/shared/layout/useMeasuredCssVariable";
@@ -72,6 +71,7 @@ import { showProjectCloneErrorToast } from "./projectGitErrorToast";
 import {
   projectTerminalLabel,
   useOpenProjectTerminal,
+  useOpenProjectMergeRecoveryTerminal,
 } from "./useOpenProjectTerminal";
 import type { CreateIssueDialogInput } from "./CreateIssueDialog";
 import { ProjectBranchActionDialogs } from "./ProjectBranchActionDialogs";
@@ -80,32 +80,13 @@ import { ProjectRepositoryManagement } from "./ProjectRepositoryManagement";
 import { UnavailableProjectRepositories } from "./UnavailableProjectRepositories";
 import {
   PROJECT_TAB_CRUMB_LABELS,
+  PROJECT_DETAIL_PANEL_SEARCH_KEYS,
+  PROJECT_REPOSITORY_SEARCH_KEYS,
+  type ProjectDetailScreenProps,
   projectPeople,
   pushPullTitle,
   snapshotHasContent,
 } from "./projectDetailHelpers";
-
-type ProjectDetailScreenProps = {
-  commitHash?: string;
-  projectId: string;
-  entityNavigationId?: string;
-  tab?: import("@/shared/lib/entityLink").EntityLinkTab;
-  pullRequestId?: string;
-  issueId?: string;
-  repositoryId?: string;
-};
-
-const PROJECT_DETAIL_PANEL_SEARCH_KEYS = [
-  "profile",
-  "profileTab",
-  "profileView",
-] as const;
-const PROJECT_REPOSITORY_SEARCH_KEYS = [
-  "repositoryId",
-  "issueId",
-  "pullRequestId",
-  "commitHash",
-] as const;
 
 export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   const localGitAvailable = useCapability(Capability.LocalGit);
@@ -723,25 +704,9 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       hasLocalCheckout,
     });
   }, [activeBranch, hasLocalCheckout, openTerminal, repository]);
-  const handleOpenMergeRecoveryTerminal = React.useCallback(
-    async (input: {
-      expectedCommit: string;
-      sourceBranch: string;
-      sourceCloneUrl: string;
-      targetBranch: string;
-    }) => {
-      const targetCloneUrl = repository?.cloneUrls[0];
-      if (!repository || !targetCloneUrl) {
-        throw new Error("No project selected.");
-      }
-      return openProjectMergeRecoveryTerminal({
-        ...input,
-        projectDtag: repository.dtag,
-        reposDir: activeCommunity?.reposDir,
-        targetCloneUrl,
-      });
-    },
-    [activeCommunity?.reposDir, repository],
+  const handleOpenMergeRecoveryTerminal = useOpenProjectMergeRecoveryTerminal(
+    repository,
+    activeCommunity?.reposDir,
   );
 
   if (projectQuery.isLoading) {

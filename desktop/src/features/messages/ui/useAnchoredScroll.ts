@@ -1,3 +1,7 @@
+import {
+  reconnectScrollResizeObserver,
+  type ResizeSubscription,
+} from "./scrollResizeSubscription";
 import * as React from "react";
 
 import { classifyTimelineMessageDelta } from "@/features/messages/lib/timelineSnapshot";
@@ -209,11 +213,7 @@ export function useAnchoredScroll({
   const isWritingScrollRef = React.useRef(false);
   const programmaticScrollRafRef = React.useRef<number | null>(null);
   const targetSettleRafRef = React.useRef<number | null>(null);
-  const resizeSubscriptionRef = React.useRef<{
-    observer: ResizeObserver;
-    content: HTMLDivElement | null;
-    container: HTMLDivElement | null;
-  } | null>(null);
+  const resizeSubscriptionRef = React.useRef<ResizeSubscription | null>(null);
 
   // Reset everything when the channel changes — the layout effect that runs
   // immediately after this reset is responsible for either jumping to bottom
@@ -827,22 +827,11 @@ export function useAnchoredScroll({
   // surface is replaced within the same channel. Check the committed nodes
   // every render, while keeping subscriptions intact for ordinary updates.
   React.useEffect(() => {
-    const subscription = resizeSubscriptionRef.current;
-    if (!subscription) return;
-    const content = contentRef.current;
-    const container = scrollContainerRef.current;
-    if (
-      subscription.content === content &&
-      subscription.container === container
-    )
-      return;
-
-    subscription.observer.disconnect();
-    subscription.content = content;
-    subscription.container = container;
-    if (content) subscription.observer.observe(content);
-    if (container && container !== content)
-      subscription.observer.observe(container);
+    reconnectScrollResizeObserver(
+      resizeSubscriptionRef.current,
+      contentRef.current,
+      scrollContainerRef.current,
+    );
   });
 
   useVirtualizedViewportResize(
