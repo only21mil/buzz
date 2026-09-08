@@ -40,11 +40,18 @@ health_attempts=${BUZZ_DEPLOY_HEALTH_ATTEMPTS:-30}
 health_interval=${BUZZ_DEPLOY_HEALTH_INTERVAL:-2}
 probe_timeout=${BUZZ_DEPLOY_PROBE_TIMEOUT:-5}
 source_ref=${BUZZ_DEPLOY_SOURCE_REF:-refs/remotes/origin/main}
-pre_freeze_receipt=${BUZZ_PRE_FREEZE_RECEIPT:-${repo_root}/pre-freeze-receipt.json}
+# Both receipts are retained evidence under an external evidence root; a
+# repository-root default is intentionally absent because a checkout is never
+# an evidence root (docs/delivery-lifecycle.md, "Retained evidence").
+pre_freeze_receipt=${BUZZ_PRE_FREEZE_RECEIPT-}
 protected_ci_receipt=${BUZZ_PROTECTED_CI_RECEIPT-}
 protected_ci_tool=${repo_root}/scripts/protected-ci-receipt.py
 receipt_max_age=${BUZZ_DEPLOY_RECEIPT_MAX_AGE_SECONDS:-86400}
 prior_migration_override=${BUZZ_PRIOR_MIGRATION_OVERRIDE-}
+if [[ -z ${pre_freeze_receipt} || ${pre_freeze_receipt} != /* ]]; then
+  printf 'REFUSED: BUZZ_PRE_FREEZE_RECEIPT must name an explicit absolute receipt path\n' >&2
+  exit 64
+fi
 if [[ -z ${protected_ci_receipt} || ${protected_ci_receipt} != /* ]]; then
   printf 'REFUSED: BUZZ_PROTECTED_CI_RECEIPT must name an explicit absolute receipt path\n' >&2
   exit 64
@@ -56,40 +63,64 @@ if [[ -z ${GH_TOKEN-} ]]; then
   exit 64
 fi
 
-validate_pre_freeze_receipt() {
-  local receipt_path=$1 receipt_source=pre-freeze
-  [[ -f ${receipt_path} && ! -L ${receipt_path} ]] || {
-    printf 'REFUSED: %s receipt is missing or is not a regular file: %s\n' \
-      "${receipt_source}" "${receipt_path}" >&2
-    return 1
-  }
-  "${python3_bin}" -I - "${receipt_path}" "${commit}" "${receipt_max_age}" <<'PY'
-import datetime
-import json
-import os
-import re
-import stat
+# validate_evidence_parent <path> <description>: the receipt's immediate parent
+# must satisfy the shared evidence-root contract (absolute, canonical,
+# caller-owned mode 0700, outside the checkout) enforced by the commit-bound
+# protected-CI validator, the same helper every other retained-evidence reader uses.
+validate_evidence_parent() {
+  local path=$1 description=$2
+  "${python3_bin}" -I - "${protected_ci_tool}" "${repo_root}" "${path}" "${description}" <<'PY'
+import importlib.util
 import sys
+from pathlib import Path
 
-path, expected_commit, max_age_text = sys.argv[1:]
+sys.dont_write_bytecode = True
+tool_path, repo_root, path, description = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("buzz_protected_ci_receipt", tool_path)
+evidence = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(evidence)
+try:
+    evidence.validate_evidence_root(Path(path).parent, checkout=Path(repo_root))
+except evidence.ReceiptError as error:
+    print(f"REFUSED: {description} parent is not an evidence root: {error}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+validate_pre_freeze_receipt() {
+  local receipt_path=$1
+  "${python3_bin}" -I - "${protected_ci_tool}" "${repo_root}" "${receipt_path}" "${commit}" \
+    "${receipt_max_age}" <<'PY'
+import datetime
+import importlib.util
+import json
+import re
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+tool_path, repo_root, path, expected_commit, max_age_text = sys.argv[1:]
 expected_source = "pre-freeze"
 
 def refuse(message):
     print(f"REFUSED: {expected_source} receipt {message}: {path}", file=sys.stderr)
     raise SystemExit(1)
 
-path_stat = os.stat(path, follow_symlinks=False)
-mode = path_stat.st_mode
-if path_stat.st_uid != os.geteuid():
-    refuse("is not owned by the deployment user")
-if mode & (stat.S_IWGRP | stat.S_IWOTH):
-    refuse("is group- or world-writable")
+spec = importlib.util.spec_from_file_location("buzz_protected_ci_receipt", tool_path)
+evidence = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(evidence)
+try:
+    evidence.validate_evidence_root(Path(path).parent, checkout=Path(repo_root))
+    raw = evidence.safe_read_receipt(Path(path))
+except evidence.ReceiptError as error:
+    refuse(f"is not retained evidence ({error})")
 
 try:
-    with open(path, encoding="utf-8") as receipt_file:
-        receipt = json.load(receipt_file)
-except (OSError, json.JSONDecodeError) as error:
-    refuse(f"is unreadable or invalid JSON ({error})")
+    receipt = json.loads(raw.decode("utf-8"))
+except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+    refuse(f"is not valid JSON ({error})")
+if not isinstance(receipt, dict):
+    refuse("is not a JSON object")
 
 if receipt.get("schema_version") != 1:
     refuse("has unsupported schema_version")
@@ -1298,9 +1329,6 @@ collect_static_preflight_blockers() {
     blockers+=("REFUSED: source ref is unreadable: ${source_ref}")
   fi
   if dirty=$(git -C "${repo_root}" status --porcelain --untracked-files=all 2>/dev/null); then
-    dirty=$(printf '%s\n' "${dirty}" | sed \
-      -e '/^?? pre-freeze-receipt[.]json$/d' \
-      -e '/^?? protected-ci-receipt[.]json$/d')
     [[ -z ${dirty} ]] || blockers+=('REFUSED: source checkout is dirty')
   else
     blockers+=('REFUSED: source checkout status is unreadable')
@@ -1333,9 +1361,9 @@ collect_static_preflight_blockers() {
     capture 'required secret-name validation failed' validate_required_secret_names
   fi
   capture 'pre-freeze receipt parent validation failed' \
-    validate_safe_parent "${pre_freeze_receipt}" '' 'pre-freeze receipt'
+    validate_evidence_parent "${pre_freeze_receipt}" 'pre-freeze receipt'
   capture 'protected-CI receipt parent validation failed' \
-    validate_safe_parent "${protected_ci_receipt}" 700 'protected-CI receipt'
+    validate_evidence_parent "${protected_ci_receipt}" 'protected-CI receipt'
   if [[ ${receipt_max_age} =~ ^[1-9][0-9]*$ ]]; then
     capture 'pre-freeze receipt validation failed' \
       validate_pre_freeze_receipt "${pre_freeze_receipt}"
@@ -1381,7 +1409,7 @@ collect_static_preflight_blockers() {
 
 deployment_preflight() {
   local tool socket_uid socket_group socket_mode available_kb resolved_commit checkout_head
-  local source_head dirty_status filtered_dirty_status status_entry pre_freeze_base
+  local source_head dirty_status pre_freeze_base
   local relay_ids postgres_ids resolved_image container_descriptor image_descriptor image_descriptor_platform
   local image_descriptor_digest prior_required_migration_status=0 db_state expected_override
   local disk_path disk_probe
@@ -1421,15 +1449,7 @@ deployment_preflight() {
     return 1
   }
   dirty_status=$(git -C "${repo_root}" status --porcelain --untracked-files=all)
-  filtered_dirty_status=
-  while IFS= read -r status_entry; do
-    [[ -n ${status_entry} ]] || continue
-    case "${status_entry}" in
-      '?? pre-freeze-receipt.json'|'?? protected-ci-receipt.json') ;;
-      *) filtered_dirty_status+="${status_entry}"$'\n' ;;
-    esac
-  done <<<"${dirty_status}"
-  [[ -z ${filtered_dirty_status} ]] || {
+  [[ -z ${dirty_status} ]] || {
     printf 'REFUSED: source checkout is dirty\n' >&2
     return 1
   }
@@ -1445,8 +1465,8 @@ deployment_preflight() {
     printf 'REFUSED: deployment scripts or Compose inputs differ from the requested commit\n' >&2
     return 1
   }
-  validate_safe_parent "${pre_freeze_receipt}" '' 'pre-freeze receipt'
-  validate_safe_parent "${protected_ci_receipt}" 700 'protected-CI receipt'
+  validate_evidence_parent "${pre_freeze_receipt}" 'pre-freeze receipt'
+  validate_evidence_parent "${protected_ci_receipt}" 'protected-CI receipt'
   pre_freeze_base=$(validate_pre_freeze_receipt "${pre_freeze_receipt}")
   git -C "${repo_root}" cat-file -e "${pre_freeze_base}^{commit}"
   git -C "${repo_root}" merge-base --is-ancestor "${pre_freeze_base}" "${commit}" || {

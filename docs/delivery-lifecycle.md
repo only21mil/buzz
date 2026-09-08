@@ -19,15 +19,48 @@ disagree, stop delivery, fix the disagreement, and re-run the affected gate.
   is incomplete until the authoritative branch and mirror branch resolve to the
   same merge commit and the expected feature ref state is confirmed.
 
+## Retained evidence
+
+Every retained evidence file follows one path contract: the pre-freeze
+receipt, the protected-CI receipts, the promotion evidence bundle, the
+acceptance verdict and records, the collection manifest, and the readiness
+receipt. `scripts/protected-ci-receipt.py` owns the rule in
+`validate_evidence_root`, `safe_read_receipt`, and `safe_publish`;
+`scripts/pre-freeze.sh`, `scripts/ci-promotion-readiness.py`, and
+`deploy/compose/deploy-local.sh` call those helpers and keep no path rules of
+their own.
+
+- The file's immediate parent is an evidence root: an absolute, canonical,
+  non-symlink directory owned by the caller with mode `0700`, outside the
+  checkout. `BUZZ_EVIDENCE_ROOT` names the operator's evidence root and is the
+  default parent for generated receipts; an explicit path is checked against
+  the same rule.
+- The file is a caller-owned regular mode-`0600` file with one link, at most
+  4 MiB. The promotion bundle alone may reach 64 MiB.
+- Publication is create-only. The writer creates a mode-`0600` temporary file
+  beside the destination, so the rename stays on one filesystem, and renames
+  it with `RENAME_NOREPLACE`. An existing file is refused, never replaced;
+  choose a fresh path to run a producer again.
+- No generated receipt sits inside a checkout, and no clean-tree gate exempts
+  a receipt file name.
+
+```bash
+mkdir -m 700 -p "$HOME/work/buzz-evidence"
+export BUZZ_EVIDENCE_ROOT="$HOME/work/buzz-evidence"
+```
+
 ## Freeze and review
 
 1. Resolve the candidate and its base to full commits. Confirm the base is an
    ancestor of the candidate and the candidate worktree is clean.
-2. Run `scripts/pre-freeze.sh` with the intended base. Use `--full` and
-   `--test` when the change or verification tier requires workspace-wide
-   coverage. The script writes `pre-freeze-receipt.json` into the repository
-   root. Move that file into the private mode-`0700` evidence directory at mode
-   `0600` before exporting `BUZZ_PRE_FREEZE_RECEIPT`.
+2. Run `scripts/pre-freeze.sh` with the intended base and `BUZZ_EVIDENCE_ROOT`
+   exported. Use `--full` and `--test` when the change or verification tier
+   requires workspace-wide coverage. The script publishes
+   `$BUZZ_EVIDENCE_ROOT/pre-freeze-receipt-<UTC stamp>.json` (or the
+   `--receipt` path, whose parent must be an evidence root) at mode `0600`,
+   prints `Receipt: <path>`, and writes nothing inside the checkout. Export
+   that path as `BUZZ_PRE_FREEZE_RECEIPT`. A receipt path inside the checkout
+   or an existing file at the destination is refused.
 3. Acquire the pull-request receipt for the exact candidate with
    `scripts/protected-ci-receipt.py acquire`. The receipt is operator-acquired
    evidence: it retains the exact GitHub REST bodies for the repository, the
@@ -36,14 +69,13 @@ disagree, stop delivery, fix the disagreement, and re-run the affected gate.
    those responses, so the receipt is trusted only after `validate --reverify`
    finds the live authority unchanged, including the pull request itself: it
    must still be open, non-draft, at the receipt head, based on `main`, with
-   its base SHA and the live `main` head equal to the recorded base. The output parent
-   must be an absolute, canonical, caller-owned mode-`0700` directory; the tool
-   publishes a new mode-`0600` file and refuses replacement. Validate it with
-   literal scope `pull-request` and `--reverify` before supplying it to the
-   promotion gate:
+   its base SHA and the live `main` head equal to the recorded base. The output
+   parent must be an evidence root; the tool publishes a new mode-`0600` file
+   and refuses replacement. Validate it with literal scope `pull-request` and
+   `--reverify` before supplying it to the promotion gate:
 
    ```bash
-   evidence_dir=/absolute/private/evidence-directory
+   evidence_dir=$BUZZ_EVIDENCE_ROOT
    scripts/protected-ci-receipt.py acquire \
      --repository only21mil/buzz --pull-request PR_NUMBER \
      --head FULL_40_CHARACTER_CANDIDATE --base main \
@@ -211,7 +243,7 @@ The operator supplies a non-secret Compose settings file, the existing
 mode-`0600` secret file under a mode-`0700` directory, and fresh receipts:
 
 ```bash
-evidence_dir=/absolute/private/evidence-directory
+evidence_dir=$BUZZ_EVIDENCE_ROOT
 # Acquire the verified-landing receipt with --reuse-source as shown above.
 scripts/protected-ci-receipt.py validate \
   --receipt "$evidence_dir/protected-ci-main.json" \
@@ -219,7 +251,8 @@ scripts/protected-ci-receipt.py validate \
   --scope main --max-age-seconds 86400 --reverify
 export BUZZ_COMPOSE_ENV_FILE=/absolute/path/to/compose.env
 export BUZZ_SECRET_ENV_FILE="$HOME/.config/sats/secrets.env"
-export BUZZ_PRE_FREEZE_RECEIPT=/absolute/path/to/pre-freeze-receipt.json
+# The path scripts/pre-freeze.sh printed for the landed commit's freeze run.
+export BUZZ_PRE_FREEZE_RECEIPT="$evidence_dir/pre-freeze-receipt-20260908T101112Z.json"
 export BUZZ_PROTECTED_CI_RECEIPT="$evidence_dir/protected-ci-main.json"
 export BUZZ_DEPLOY_SOURCE_REF=refs/remotes/buzz/main
 deploy/compose/deploy-local.sh --check FULL_40_CHARACTER_LANDED_COMMIT
@@ -236,9 +269,12 @@ the deploy re-verifies the protected-CI receipt against GitHub.
 
 - its argument, checkout `HEAD`, and configured source ref resolve to the same
   full commit;
-- the checkout is clean, apart from the two generated receipt files;
-- both receipts are regular, mode-safe, fresh, exact-commit PASS receipts from
-  `only21mil/buzz`, and the pre-freeze base is an ancestor;
+- the checkout is clean; no generated receipt file name is exempt;
+- `BUZZ_PRE_FREEZE_RECEIPT` and `BUZZ_PROTECTED_CI_RECEIPT` are explicit
+  absolute paths, both receipts satisfy the retained-evidence contract (a
+  mode-`0600` file whose parent is an evidence root outside the checkout),
+  both are fresh, exact-commit PASS receipts from `only21mil/buzz`, and the
+  pre-freeze base is an ancestor;
 - the explicitly supplied protected-CI receipt is canonical `main`-scope
   evidence for the landed commit, fresh, with complete verified source qualification
   or historical exact-head coverage, whose retained bodies reproduce the binding and whose
@@ -323,9 +359,9 @@ receipt needs the live `refs/heads/main` head at the receipt head; a
 receipt head, based on `main`, with its base SHA and the live `main` head
 equal to the recorded base. Passing checks on a commit are not enough on
 their own. `deploy-local.sh` always validates with `--reverify`, which is its
-only GitHub contact, and requires an explicit absolute
-`BUZZ_PROTECTED_CI_RECEIPT`; a repository-root default is intentionally absent
-because a normal checkout is not a private mode-`0700` evidence directory.
+only GitHub contact, and requires explicit absolute `BUZZ_PRE_FREEZE_RECEIPT`
+and `BUZZ_PROTECTED_CI_RECEIPT` paths; repository-root defaults are
+intentionally absent because a checkout is never an evidence root.
 Reacquire after a rerun, ruleset change, or landing.
 
 Never use `run-local.sh up` as an upgrade path. The deploy script is the only

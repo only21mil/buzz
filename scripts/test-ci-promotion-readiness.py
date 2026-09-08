@@ -157,6 +157,8 @@ class PromotionReadinessTest(unittest.TestCase):
         self.evidence_dir = self.root / "evidence"
         self.repo.mkdir()
         self.evidence_dir.mkdir(mode=0o700)
+        self.receipt_serial = 0
+        self.receipt_path = self.evidence_dir / "receipt-0.json"
         run(["git", "init", "-q"], self.repo)
         run(["git", "config", "user.name", "Test User"], self.repo)
         run(["git", "config", "user.email", "test@example.invalid"], self.repo)
@@ -675,9 +677,15 @@ class PromotionReadinessTest(unittest.TestCase):
         event["id"] = hashlib.sha256(serialized).hexdigest()
         event["sig"] = schnorr_sign(secret, bytes.fromhex(event["id"]))
 
-    def invoke(self, bundle: dict, *, now: int = NOW) -> subprocess.CompletedProcess[str]:
+    def invoke(
+        self, bundle: dict, *, now: int = NOW, receipt_path: Path | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        """Run the verifier; the receipt is create-only, so each call gets a fresh path."""
         bundle_path = self.evidence_dir / "bundle.json"
-        receipt_path = self.evidence_dir / "receipt.json"
+        self.receipt_serial += 1
+        if receipt_path is None:
+            receipt_path = self.evidence_dir / f"receipt-{self.receipt_serial}.json"
+        self.receipt_path = receipt_path
         write_json(bundle_path, bundle)
         return subprocess.run(
             [sys.executable, str(self.wrapper), str(SCRIPT), str(PROTECTED_TEST_SCRIPT),
@@ -715,13 +723,17 @@ class PromotionReadinessTest(unittest.TestCase):
         self.assert_schema_valid(
             "promotion-evidence.schema.json", self.evidence_dir / "bundle.json"
         )
-        first_bytes = (self.evidence_dir / "receipt.json").read_bytes()
-        self.assert_schema_valid(
-            "promotion-readiness-receipt.schema.json", self.evidence_dir / "receipt.json"
-        )
+        first_path = self.receipt_path
+        first_bytes = first_path.read_bytes()
+        self.assertEqual(first_bytes, first.stdout.encode("utf-8"))
+        self.assertEqual(first_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(first_bytes, READINESS.PROTECTED_CI.canonical_json(json.loads(first_bytes)))
+        self.assert_schema_valid("promotion-readiness-receipt.schema.json", first_path)
+        # Publication is create-only, so determinism is asserted on a fresh path.
         second = self.invoke(self.bundle)
         self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual(first_bytes, (self.evidence_dir / "receipt.json").read_bytes())
+        self.assertNotEqual(self.receipt_path, first_path)
+        self.assertEqual(first_bytes, self.receipt_path.read_bytes())
         receipt = json.loads(first_bytes)
         self.assertEqual(receipt["overall"], "PASS")
         self.assertEqual(receipt["gates"]["threat_model"], {"passed": 17, "total": 17})
@@ -751,7 +763,7 @@ class PromotionReadinessTest(unittest.TestCase):
         result = self.invoke(bundle)
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        receipt = json.loads((self.evidence_dir / "receipt.json").read_text())
+        receipt = json.loads(self.receipt_path.read_text())
         self.assertEqual(
             receipt["evidence"]["collection_manifest_sha256"], digest(sidecar)
         )
@@ -1327,7 +1339,7 @@ class PromotionReadinessTest(unittest.TestCase):
                 self.github_drift = drift
                 self.assert_refused(self.bundle, "re-verification against GitHub failed")
                 self.assertIn(message, self.invoke(self.bundle).stderr)
-                self.assertFalse((self.evidence_dir / "receipt.json").exists())
+                self.assertFalse(self.receipt_path.exists())
 
     def test_forged_receipt_without_live_backing_is_refused(self) -> None:
         self.github_drift = "no_runs"
@@ -1346,7 +1358,7 @@ class PromotionReadinessTest(unittest.TestCase):
                 self.github_drift = drift
                 self.assert_refused(self.bundle, "re-verification against GitHub failed")
                 self.assertIn(message, self.invoke(self.bundle).stderr)
-                self.assertFalse((self.evidence_dir / "receipt.json").exists())
+                self.assertFalse(self.receipt_path.exists())
 
     def test_re_verification_runs_only_after_offline_checks(self) -> None:
         self.github_drift = "no_runs"
@@ -1427,9 +1439,92 @@ class PromotionReadinessTest(unittest.TestCase):
         result = self.invoke(bundle)
         self.assertEqual(result.returncode, 2)
         self.assertNotIn(secret, result.stdout + result.stderr)
-        receipt = self.evidence_dir / "receipt.json"
-        if receipt.exists():
-            self.assertNotIn(secret, receipt.read_text(encoding="utf-8"))
+        if self.receipt_path.exists():
+            self.assertNotIn(secret, self.receipt_path.read_text(encoding="utf-8"))
+
+    def test_receipt_publication_is_create_only(self) -> None:
+        fixed = self.evidence_dir / "fixed-receipt.json"
+        first = self.invoke(self.bundle, receipt_path=fixed)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        first_bytes = fixed.read_bytes()
+        second = self.invoke(self.bundle, receipt_path=fixed)
+        self.assertEqual(second.returncode, 2, second.stdout + second.stderr)
+        self.assertIn("receipt was not published: output already exists", second.stderr)
+        self.assertEqual(fixed.read_bytes(), first_bytes)
+        self.assertEqual(
+            sorted(entry.name for entry in self.evidence_dir.iterdir() if entry.name.startswith(".")),
+            [], "publication left a temporary file behind",
+        )
+
+    def test_receipt_inside_candidate_checkout_is_refused(self) -> None:
+        inside = self.repo / "receipt.json"
+        result = self.invoke(self.bundle, receipt_path=inside)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("evidence root must be outside the checkout", result.stderr)
+        self.assertFalse(inside.exists())
+        self.assertEqual(run(["git", "status", "--porcelain"], self.repo), "")
+
+    def test_receipt_parent_must_be_an_evidence_root(self) -> None:
+        shared = self.root / "shared"
+        shared.mkdir()
+        shared.chmod(0o755)
+        result = self.invoke(self.bundle, receipt_path=shared / "receipt.json")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("caller-owned mode-0700 directory", result.stderr)
+        self.assertFalse((shared / "receipt.json").exists())
+
+    def test_evidence_file_parent_must_be_an_evidence_root(self) -> None:
+        shared = self.root / "shared"
+        shared.mkdir()
+        shared.chmod(0o755)
+        moved = shared / "pre-freeze.json"
+        moved.write_bytes(self.pre_freeze_path.read_bytes())
+        moved.chmod(0o600)
+        bundle = copy.deepcopy(self.bundle)
+        bundle["evidence_files"]["pre_freeze"]["path"] = str(moved)
+        self.assert_refused(bundle, "evidence_files.pre_freeze is not retained evidence")
+        self.assert_refused(bundle, "caller-owned mode-0700 directory")
+
+    def test_evidence_file_inside_candidate_checkout_is_refused(self) -> None:
+        # A directory under the checkout is never an evidence root, even one
+        # with private modes that git status does not report.
+        hidden = self.repo / ".git" / "evidence"
+        hidden.mkdir(mode=0o700)
+        inside = hidden / "pre-freeze.json"
+        inside.write_bytes(self.pre_freeze_path.read_bytes())
+        inside.chmod(0o600)
+        bundle = copy.deepcopy(self.bundle)
+        bundle["evidence_files"]["pre_freeze"]["path"] = str(inside)
+        bundle["evidence_files"]["pre_freeze"]["sha256"] = digest(inside)
+        self.assert_refused(bundle, "evidence root must be outside the checkout")
+
+    def test_bundle_parent_must_be_an_evidence_root(self) -> None:
+        shared = self.root / "shared"
+        shared.mkdir()
+        shared.chmod(0o755)
+        bundle_path = shared / "bundle.json"
+        write_json(bundle_path, self.bundle)
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "--candidate-dir", str(self.repo),
+             "--evidence", str(bundle_path),
+             "--receipt", str(self.evidence_dir / "receipt.json"),
+             "--now", str(NOW)],
+            check=False, capture_output=True, text=True, env=dict(os.environ),
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("promotion evidence is not retained evidence", result.stderr)
+        self.assertFalse((self.evidence_dir / "receipt.json").exists())
+
+    def test_generated_receipt_names_are_no_longer_exempt_from_clean_tree(self) -> None:
+        for name in ("pre-freeze-receipt.json", "protected-ci-receipt.json"):
+            with self.subTest(name=name):
+                stray = self.repo / name
+                stray.write_text("{}\n", encoding="utf-8")
+                try:
+                    self.assert_refused(self.bundle, f"candidate checkout is dirty: ?? {name}")
+                finally:
+                    stray.unlink()
 
 
 if __name__ == "__main__":
