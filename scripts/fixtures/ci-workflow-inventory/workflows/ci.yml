@@ -1,0 +1,40 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [release]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.base_ref == 'main') || needs.changes.outputs.rust == 'true'
+    steps:
+      - run: echo lint
+  smoke:
+    name: Smoke (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [lint]
+    strategy:
+      matrix:
+        shard: [1, 2]
+    steps:
+      - run: echo smoke
+  mac:
+    name: Mac Build
+    runs-on: macos-latest
+    timeout-minutes: 45
+    if: github.repository == 'only21mil/buzz'
+    steps:
+      - run: echo mac
+  ios:
+    name: iOS
+    runs-on: ${{ fromJSON(vars.RUNNER_LABELS) }}
+    if: vars.RUNNER_LABELS != '' && github.repository == 'only21mil/buzz'
+    steps:
+      - run: echo ios
