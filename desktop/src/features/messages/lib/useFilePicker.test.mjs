@@ -191,6 +191,7 @@ async function media() {
     window,
     document,
     URL,
+    AbortController,
     Set,
     Map,
     require: (name) => dependencies[name],

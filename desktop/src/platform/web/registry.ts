@@ -7,6 +7,7 @@ export type InvokeBody =
 
 export type InvokeOptions = {
   headers?: Record<string, string>;
+  signal?: AbortSignal;
 };
 
 export type CommandHandler<T = unknown> = (
