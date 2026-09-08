@@ -67,7 +67,7 @@ import {
   ProfileSummaryView,
 } from "@/features/profile/ui/UserProfilePanelSections";
 import { AgentConfigurationFocusedView } from "@/features/profile/ui/UserProfilePanelAgentDetails";
-import { DurableDraftQueue } from "@/features/agents/ui/DurableDraftQueue";
+import { useProfilePanelView, withDraftQueue } from "./profileDraftQueueBody";
 import { UserProfileAgentSettingsMenuSlot } from "@/features/profile/ui/UserProfileAgentActions";
 import { useProfileAgentDeletion } from "@/features/profile/ui/UserProfilePanelDeletion";
 import { useProfileFieldBuckets } from "@/features/profile/ui/UserProfilePanelFields";
@@ -130,19 +130,7 @@ export function UserProfilePanel({
   const isSplitLayout = layout === "split";
   useEscapeKey(onClose, isOverlay || isSinglePanelView);
 
-  const [internalView, setInternalView] =
-    React.useState<ProfilePanelView>("summary");
-  const view = controlledView ?? internalView;
-  const setView = React.useCallback(
-    (nextView: ProfilePanelView, options?: { replace?: boolean }) => {
-      if (onViewChange) {
-        onViewChange(nextView, options);
-        return;
-      }
-      setInternalView(nextView);
-    },
-    [onViewChange],
-  );
+  const [view, setView] = useProfilePanelView(controlledView, onViewChange);
   const [internalTab, setInternalTab] = React.useState<ProfilePanelTab>("info");
   const tab = controlledTab ?? internalTab;
   const setTab = React.useCallback(
@@ -991,18 +979,12 @@ export function UserProfilePanel({
       onResetWidth={onResetWidth}
       onResizeStart={onResizeStart}
       personaDialogs={personaDialogs}
-      profileBody={
-        <>
-          {isBot ? (
-            <DurableDraftQueue
-              agentPubkey={effectivePubkey ?? undefined}
-              personaId={resolvedPersona?.id}
-              personaName={resolvedPersona?.displayName}
-            />
-          ) : null}
-          {profileBody}
-        </>
-      }
+      profileBody={withDraftQueue(
+        profileBody,
+        isBot,
+        effectivePubkey,
+        resolvedPersona,
+      )}
       splitPaneClamp={splitPaneClamp}
       widthPx={widthPx}
       transparentChrome={transparentChrome}

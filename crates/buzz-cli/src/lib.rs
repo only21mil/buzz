@@ -2958,7 +2958,7 @@ mod tests {
             ("pr", 6),
             ("projects", 8),
             ("reactions", 3),
-            ("repos", 10),
+            ("repos", 12),
             ("social", 7),
             ("upload", 1),
             ("users", 5),
