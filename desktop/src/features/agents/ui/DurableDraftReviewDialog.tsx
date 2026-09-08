@@ -438,7 +438,7 @@ function DraftReview({
             </>
           ) : null}
           <Button
-            disabled={!queue.ready || terminal || pending || !request}
+            disabled={!queue.ready || terminal || pending}
             onClick={() => {
               void run(async () => {
                 assertAvailable(true, true);
