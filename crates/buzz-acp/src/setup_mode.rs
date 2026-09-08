@@ -475,8 +475,8 @@ async fn authorize_setup_listener_event(
     rules: &[filter::SubscriptionRule],
     nudged_event_ids: &mut HashSet<EventId>,
 ) -> Option<String> {
-    // ignore_self: don't react to our own messages.
-    if buzz_event.event.pubkey.to_hex() == pubkey_hex {
+    // Ordinary self replies stay silent; tooling must opt in explicitly.
+    if crate::self_wake::should_ignore_self(buzz_event, pubkey_hex, true) {
         return None;
     }
 
@@ -691,6 +691,71 @@ async fn publish_setup_nudge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn self_wake_setup_boundary_keeps_author_policy_and_suppresses_reply_loops() {
+        use crate::workflow_auth::{tests::test_relay, InboundAuthorGate};
+        use std::sync::{atomic::AtomicU64, Arc};
+        let keys = nostr::Keys::generate();
+        let agent = keys.public_key().to_hex();
+        let owner = nostr::Keys::generate().public_key().to_hex();
+        let channel = Uuid::new_v4();
+        let server = test_relay(serde_json::json!({})).await;
+        let mut gate =
+            InboundAuthorGate::connect(&server.rest, &agent, Arc::new(AtomicU64::new(0))).await;
+        let cache = crate::OwnerCache::new(Some(owner));
+        cache.cache_sibling(agent.clone(), true);
+        let channel_info = crate::pool::ChannelInfoResolver::new(
+            std::collections::HashMap::from([(
+                channel,
+                crate::relay::ChannelInfo {
+                    name: "stream".into(),
+                    channel_type: "stream".into(),
+                },
+            )]),
+            server.rest.clone(),
+        );
+        let build =
+            || buzz_sdk::build_message(channel, "completion", None, &[&agent], false, &[]).unwrap();
+        let event = crate::relay::BuzzEvent {
+            event: build()
+                .tags([nostr::Tag::parse(["wake", "self"]).unwrap()])
+                .sign_with_keys(&keys)
+                .unwrap(),
+            channel_id: channel,
+            connection_generation: 0,
+        };
+        let reply = crate::relay::BuzzEvent {
+            event: build().sign_with_keys(&keys).unwrap(),
+            ..event.clone()
+        };
+        let rules = vec![mentions_rule(vec![KIND_STREAM_MESSAGE])];
+        let mut nudged = HashSet::new();
+        for (candidate, policy, expected) in [
+            (&reply, crate::RespondTo::OwnerOnly, None),
+            (&event, crate::RespondTo::Nobody, None),
+            (&event, crate::RespondTo::OwnerOnly, Some(agent.clone())),
+            (&event, crate::RespondTo::OwnerOnly, None),
+        ] {
+            assert_eq!(
+                authorize_setup_listener_event(
+                    &mut gate,
+                    candidate,
+                    &agent,
+                    &policy,
+                    &HashSet::new(),
+                    &cache,
+                    &channel_info,
+                    &server.rest,
+                    &rules,
+                    &mut nudged,
+                )
+                .await,
+                expected
+            );
+        }
+        assert_eq!(nudged.len(), 1);
+    }
 
     #[tokio::test]
     async fn workflow_setup_boundary_authenticates_filters_deduplicates_and_addresses_owner() {

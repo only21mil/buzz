@@ -16,6 +16,7 @@ mod prompt_project;
 mod queue;
 mod relay;
 mod scope;
+mod self_wake;
 mod setup_mode;
 mod sibling_auth;
 mod usage;
@@ -2681,7 +2682,7 @@ async fn tokio_main() -> Result<()> {
                                 continue;
                             }
 
-                            if config.ignore_self && buzz_event.event.pubkey.to_hex() == pubkey_hex {
+                            if self_wake::should_ignore_self(&buzz_event, &pubkey_hex, config.ignore_self) {
                                 tracing::debug!(channel_id = %buzz_event.channel_id, "dropping self-authored event");
                                 inbox_cursor.mark_processed([&buzz_event.event]);
                                 continue;
