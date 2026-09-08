@@ -192,6 +192,9 @@ enum Cmd {
     /// Manage your custom emoji set (workspace palette is the union of all members' sets)
     #[command(subcommand)]
     Emoji(EmojiCmd),
+    /// Fetch raw signed Nostr events
+    #[command(subcommand)]
+    Events(EventsCmd),
     /// List, open, and manage direct messages
     #[command(subcommand)]
     Dms(DmsCmd),
@@ -827,6 +830,16 @@ pub enum DmsCmd {
         /// DM conversation UUID
         #[arg(long)]
         channel: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum EventsCmd {
+    /// Fetch an event by its 64-character hex ID
+    Get {
+        /// Event ID (64-character hex)
+        #[arg(long)]
+        id: String,
     },
 }
 
@@ -1680,6 +1693,12 @@ pub enum PrCmd {
         #[arg(long)]
         limit: Option<u32>,
     },
+    /// List NIP-34 lifecycle events for a pull request
+    Statuses {
+        /// Pull request root event ID
+        #[arg(long)]
+        pr: String,
+    },
     /// Set status on a PR (open/merged/closed/draft — NIP-34 kind:1630-1633)
     Status {
         /// Pull request event id
@@ -1768,6 +1787,12 @@ pub enum IssuesCmd {
         /// Maximum number of results
         #[arg(long)]
         limit: Option<u32>,
+    },
+    /// List NIP-34 lifecycle events for an issue
+    Statuses {
+        /// Issue root event ID
+        #[arg(long)]
+        issue: String,
     },
     /// Set status on an issue (open/resolved/closed/draft — NIP-34 kind:1630-1633)
     Status {
@@ -2144,6 +2169,9 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Canvas(sub) => commands::channels::dispatch_canvas(sub, &client).await,
         Cmd::Reactions(sub) => commands::reactions::dispatch(sub, &client).await,
         Cmd::Emoji(sub) => commands::emoji::dispatch(sub, &client).await,
+        Cmd::Events(sub) => match sub {
+            EventsCmd::Get { id } => commands::events::cmd_get_event(&client, &id).await,
+        },
         Cmd::Dms(sub) => commands::dms::dispatch(sub, &client).await,
         Cmd::Users(sub) => commands::users::dispatch(sub, &client, &cli.format).await,
         Cmd::Workflows(sub) => commands::workflows::dispatch(sub, &client).await,
@@ -2603,6 +2631,7 @@ mod tests {
             "ci",
             "dms",
             "emoji",
+            "events",
             "feed",
             "issues",
             "media",
@@ -2778,7 +2807,7 @@ mod tests {
         assert_eq!(protect_names, vec!["list", "remove", "set"]);
         assert_eq!(
             names(&cmd, "pr"),
-            vec!["get", "list", "open", "status", "update"]
+            vec!["get", "list", "open", "status", "statuses", "update"]
         );
         assert_eq!(
             names(&cmd, "patches"),
@@ -2799,8 +2828,9 @@ mod tests {
         );
         assert_eq!(
             names(&cmd, "issues"),
-            vec!["assign", "create", "get", "list", "status", "unassign"]
+            vec!["assign", "create", "get", "list", "status", "statuses", "unassign"]
         );
+        assert_eq!(names(&cmd, "events"), vec!["get"]);
         assert_eq!(names(&cmd, "media"), vec!["get"]);
         assert_eq!(names(&cmd, "upload"), vec!["file"]);
         assert_eq!(names(&cmd, "pack"), vec!["inspect", "validate"]);
@@ -2827,13 +2857,14 @@ mod tests {
             ("channels", 16),
             ("dms", 4),
             ("emoji", 5),
+            ("events", 1),
             ("feed", 1),
-            ("issues", 6),
+            ("issues", 7),
             ("media", 1),
             ("messages", 8),
             ("pack", 2),
             ("patches", 4),
-            ("pr", 5),
+            ("pr", 6),
             ("projects", 8),
             ("reactions", 3),
             ("repos", 10),

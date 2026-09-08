@@ -65,6 +65,11 @@ buzz users set-status --clear                 # remove your status
 buzz dms open --pubkey <hex>
 buzz dms list
 
+# Raw signed events and NIP-34 lifecycle history
+buzz events get --id <event-id>
+buzz issues statuses --issue <issue-root-event-id>
+buzz pr statuses --pr <pull-request-root-event-id>
+
 # Workflows
 buzz workflows list --channel <uuid>
 buzz workflows trigger --workflow <uuid>
@@ -102,6 +107,11 @@ buzz repos import-main --id my-repo --commit <exact-40-hex-GitHub-main>
 # Pipe to jq
 buzz channels list | jq '.[].name'
 ```
+
+`events get` prints the stored signed event object and returns exit code 1 when
+the ID is absent. Each `statuses` entry contains the raw signed `event`, an
+explicit `signer`, and `trusted`. A status is trusted when its signer is the
+root author or the owner in the root event's repository `a` tag.
 
 `protect set` replaces every existing rule for the exact ref pattern. Any
 constraint omitted from the command is removed. `protect list` reports malformed

@@ -308,6 +308,9 @@ pub async fn dispatch(cmd: crate::PrCmd, client: &BuzzClient) -> Result<(), CliE
             )
             .await
         }
+        PrCmd::Statuses { pr } => {
+            crate::commands::events::cmd_list_statuses(client, &pr, 1618, "pull request").await
+        }
         PrCmd::Status {
             pr,
             status,
