@@ -81,6 +81,7 @@ async function loadHook(filename, overrides = {}) {
     window,
     document,
     URL,
+    AbortController,
     Set,
     Map,
     require: (name) => dependencies[name],
