@@ -4,6 +4,7 @@ import {
   type InboxFilter,
   type InboxItem,
 } from "@/features/home/lib/inbox";
+import { isInboxListedFeedItem } from "@/features/home/lib/inboxFeedItems";
 import { isProjectInboxItem } from "@/features/home/lib/projectInbox";
 import {
   getChannelIdFromTags,
@@ -16,7 +17,6 @@ import type {
   RelayEvent,
   UserProfileSummary,
 } from "@/shared/api/types";
-import { KIND_REMINDER } from "@/shared/constants/kinds";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { resolveMentionProps } from "@/shared/lib/resolveMentionNames";
 
@@ -26,7 +26,7 @@ function hasThreadReplyTags(tags: string[][]) {
 }
 
 export function filterInboxItems(items: InboxItem[]) {
-  return items.filter((item) => item.item.kind !== KIND_REMINDER);
+  return items.filter((item) => isInboxListedFeedItem(item.item));
 }
 
 export function hasInboxThreadContext(
