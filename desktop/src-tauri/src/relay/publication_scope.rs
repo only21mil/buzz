@@ -1,6 +1,6 @@
 use crate::app_state::AppState;
 use nostr::Keys;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Renderer-captured relay and author required by delayed composer publication.
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -120,10 +120,16 @@ impl MessagePublication {
 
     /// Reject pending preparation/signing/publication after any scope transition.
     pub fn validate(&self) -> Result<(), String> {
-        if *self.owner.lock().map_err(|e| e.to_string())? != self.epoch {
+        self.lock_validated().map(drop)
+    }
+
+    /// Fence local mutations against identity changes without relocking the epoch.
+    pub(crate) fn lock_validated(&self) -> Result<MutexGuard<'_, u64>, String> {
+        let epoch = self.owner.lock().map_err(|e| e.to_string())?;
+        if *epoch != self.epoch {
             return Err("message cancelled because the identity or community changed".into());
         }
-        Ok(())
+        Ok(epoch)
     }
 
     /// Return public scope metadata; signing keys never cross IPC.

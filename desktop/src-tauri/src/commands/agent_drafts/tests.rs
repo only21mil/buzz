@@ -52,6 +52,7 @@ fn fixture() -> (tempfile::TempDir, RetentionScope, Event, DraftOperation) {
         instance_input: None,
         publication: None,
         channel_event: None,
+        channel_attached: false,
         publish_shared: false,
     };
     (dir, scope, request, op)
@@ -174,3 +175,6 @@ fn saved_definition_edit_blocks_recovery_even_with_same_timestamp() {
     )
     .is_err());
 }
+
+#[cfg(all(target_os = "linux", not(feature = "system-keyring")))]
+mod native_commands;
