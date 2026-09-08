@@ -67,6 +67,7 @@ import {
   ProfileSummaryView,
 } from "@/features/profile/ui/UserProfilePanelSections";
 import { AgentConfigurationFocusedView } from "@/features/profile/ui/UserProfilePanelAgentDetails";
+import { DurableDraftQueue } from "@/features/agents/ui/DurableDraftQueue";
 import { UserProfileAgentSettingsMenuSlot } from "@/features/profile/ui/UserProfileAgentActions";
 import { useProfileAgentDeletion } from "@/features/profile/ui/UserProfilePanelDeletion";
 import { useProfileFieldBuckets } from "@/features/profile/ui/UserProfilePanelFields";
@@ -990,7 +991,18 @@ export function UserProfilePanel({
       onResetWidth={onResetWidth}
       onResizeStart={onResizeStart}
       personaDialogs={personaDialogs}
-      profileBody={profileBody}
+      profileBody={
+        <>
+          {isBot ? (
+            <DurableDraftQueue
+              agentPubkey={effectivePubkey ?? undefined}
+              personaId={resolvedPersona?.id}
+              personaName={resolvedPersona?.displayName}
+            />
+          ) : null}
+          {profileBody}
+        </>
+      }
       splitPaneClamp={splitPaneClamp}
       widthPx={widthPx}
       transparentChrome={transparentChrome}

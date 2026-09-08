@@ -265,6 +265,8 @@ impl RespondToArg {
 
 #[derive(Subcommand)]
 pub enum AgentsCmd {
+    /// Retry the exact retained encrypted request after an uncertain delivery.
+    DraftRetry { request_id: String },
     /// Open a prefilled create-agent form in the owner's Buzz Desktop
     DraftCreate {
         /// Current channel UUID; the new agent is added here after save

@@ -8434,3 +8434,5 @@ mod tests {
         drop_scratch_db(&admin, pool, &name).await;
     }
 }
+
+mod agent_drafts;

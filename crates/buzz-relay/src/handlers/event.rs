@@ -130,6 +130,28 @@ pub async fn filter_fanout_by_access(
         })
         .collect();
 
+    // Owner/result privacy applies before every local AND cross-node delivery,
+    // including kindless ID subscriptions. Knowing a ciphertext ID is not authority.
+    let matches =
+        if buzz_core::kind::RESULT_GATED_KINDS.contains(&event_kind_u32(&stored_event.event)) {
+            matches
+                .into_iter()
+                .filter(|(conn_id, _)| {
+                    state
+                        .conn_manager
+                        .pubkey_for_conn(*conn_id)
+                        .is_some_and(|key| {
+                            buzz_core::filter::reader_authorized_for_event(
+                                &stored_event.event,
+                                &hex::encode(key),
+                            )
+                        })
+                })
+                .collect()
+        } else {
+            matches
+        };
+
     // Author-only kinds (NIP-ER reminders) may only ever be delivered to the
     // event's own author. This gate lives here — the chokepoint shared by the
     // ingest fan-out path and the Redis cross-node `subscribe_local` path, the
@@ -458,8 +480,7 @@ async fn dispatch_persistent_event_inner(
     // metrics), live fan-out must reach only the owner — a kindless `ids:[…]`
     // subscription can otherwise match it. Pull paths (HTTP /query, WS historical)
     // are gated separately by reader_authorized_for_event.
-    let owner_only_kind = kind_u32 == buzz_core::kind::KIND_DM_VISIBILITY
-        || kind_u32 == buzz_core::kind::KIND_AGENT_TURN_METRIC;
+    let owner_only_kind = buzz_core::kind::RESULT_GATED_KINDS.contains(&kind_u32);
     let private_event_owner: Option<String> = owner_only_kind
         .then(|| {
             let p = nostr::SingleLetterTag::lowercase(nostr::Alphabet::P);
@@ -1452,6 +1473,22 @@ mod tests {
             filter: Filter,
             pubkey: Option<Vec<u8>>,
         ) -> (Uuid, mpsc::Receiver<Message>) {
+            register_global_sub_in(
+                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                state,
+                sub_id,
+                filter,
+                pubkey,
+            )
+        }
+
+        fn register_global_sub_in(
+            community: buzz_core::tenant::CommunityId,
+            state: &AppState,
+            sub_id: &str,
+            filter: Filter,
+            pubkey: Option<Vec<u8>>,
+        ) -> (Uuid, mpsc::Receiver<Message>) {
             let conn_id = Uuid::new_v4();
             let (tx, rx) = mpsc::channel(10);
             let (ctrl_tx, _ctrl_rx) = mpsc::channel(10);
@@ -1461,7 +1498,7 @@ mod tests {
                 ctrl_tx,
                 None,
                 CancellationToken::new(),
-                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                community,
                 Arc::new(AtomicU8::new(0)),
                 Arc::new(Mutex::new(HashMap::new())),
                 3,
@@ -1469,10 +1506,261 @@ mod tests {
             if let Some(pubkey) = pubkey {
                 state.conn_manager.set_authenticated_pubkey(conn_id, pubkey);
             }
-            state
-                .sub_registry
-                .register(conn_id, sub_id.to_string(), vec![filter], None);
+            state.sub_registry.register_scoped(
+                community,
+                conn_id,
+                sub_id.to_string(),
+                vec![filter],
+                None,
+            );
             (conn_id, rx)
+        }
+
+        #[tokio::test]
+        async fn durable_draft_global_owner_subscription_receives_origin_h_and_remote_privacy_holds(
+        ) {
+            let state = test_state().await;
+            let owner = Keys::generate();
+            let agent = Keys::generate();
+            let stranger = Keys::generate();
+            let channel = Uuid::new_v4().to_string();
+            let request_id = Uuid::new_v4().to_string();
+            let ciphertext = buzz_core::observer::encrypt_observer_payload(
+                &agent,
+                &owner.public_key(),
+                &serde_json::json!({"version":1}),
+            )
+            .unwrap();
+            let request = buzz_sdk::build_agent_draft(
+                &owner.public_key().to_hex(),
+                &agent.public_key().to_hex(),
+                &request_id,
+                &channel,
+                &ciphertext,
+            )
+            .unwrap()
+            .sign_with_keys(&agent)
+            .unwrap();
+            let content = buzz_core::observer::encrypt_observer_payload(
+                &owner,
+                &owner.public_key(),
+                &serde_json::json!({"version":1}),
+            )
+            .unwrap();
+            let outcome = buzz_sdk::build_agent_draft_decision(
+                &owner.public_key().to_hex(),
+                &request.id.to_hex(),
+                &request.id.to_hex(),
+                1,
+                "rejected",
+                &content,
+            )
+            .unwrap()
+            .sign_with_keys(&owner)
+            .unwrap();
+            for event in [request, outcome] {
+                let (_, mut owner_rx) = register_global_sub(
+                    &state,
+                    &Uuid::new_v4().to_string(),
+                    Filter::new()
+                        .kinds([Kind::Custom(14201), Kind::Custom(14202)])
+                        .pubkey(owner.public_key()),
+                    Some(owner.public_key().to_bytes().to_vec()),
+                );
+                let (_, mut stranger_rx) = register_global_sub(
+                    &state,
+                    &Uuid::new_v4().to_string(),
+                    Filter::new().id(event.id),
+                    Some(stranger.public_key().to_bytes().to_vec()),
+                );
+                let (_, mut anonymous_rx) =
+                    register_global_sub(&state, &Uuid::new_v4().to_string(), Filter::new(), None);
+                let stored = buzz_core::StoredEvent::new(event.clone(), None);
+                assert!(!state
+                    .sub_registry
+                    .fan_out_scoped(
+                        buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                        &stored
+                    )
+                    .is_empty());
+                fan_out_pubsub_event(
+                    &state,
+                    buzz_pubsub::ChannelEvent {
+                        community_id: buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                        topic: buzz_pubsub::EventTopic::Global,
+                        event: event.clone(),
+                    },
+                )
+                .await;
+                assert_eq!(
+                    event_from_ws_message(
+                        owner_rx
+                            .try_recv()
+                            .expect("global owner receives encrypted draft/outcome")
+                    )
+                    .id,
+                    event.id
+                );
+                assert!(
+                    stranger_rx.try_recv().is_err(),
+                    "IDs do not disclose remote ciphertext metadata"
+                );
+                assert!(
+                    anonymous_rx.try_recv().is_err(),
+                    "wildcard cannot reveal remote owner event"
+                );
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "requires explicitly fenced disposable PostgreSQL"]
+        async fn durable_draft_ingest_reaches_global_owner_and_cas_checks_live_membership() {
+            use crate::handlers::ingest::{ingest_event, HttpAuthMethod, IngestAuth};
+            let url = std::env::var("BUZZ_TEST_DATABASE_URL").expect("explicit disposable fixture");
+            assert!(url.starts_with("postgresql://buzz_test@buzz-test.invalid/buzz_nt_"));
+            assert!(url.contains("host=%2Fwork%2F"));
+            let pool = sqlx::PgPool::connect(&url).await.unwrap();
+            buzz_db::migration::run_migrations(&pool).await.unwrap();
+            let state = test_state().await;
+            let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::new_v4());
+            let tenant = buzz_core::tenant::TenantContext::resolved(community, "draft-ingest.test");
+            let owner = Keys::generate();
+            let agent = Keys::generate();
+            let stranger = Keys::generate();
+            let channel = Uuid::new_v4();
+            sqlx::query("INSERT INTO communities(id,host) VALUES($1,'draft-ingest.test') ON CONFLICT DO NOTHING").bind(community.as_uuid()).execute(&pool).await.unwrap();
+            for key in [owner.public_key(), agent.public_key()] {
+                sqlx::query("INSERT INTO users(community_id,pubkey) VALUES($1,$2)")
+                    .bind(community.as_uuid())
+                    .bind(key.as_bytes().as_slice())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            sqlx::query(
+                "UPDATE users SET agent_owner_pubkey=$3 WHERE community_id=$1 AND pubkey=$2",
+            )
+            .bind(community.as_uuid())
+            .bind(agent.public_key().as_bytes().as_slice())
+            .bind(owner.public_key().as_bytes().as_slice())
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO channels(community_id,id,name,created_by) VALUES($1,$2,'draft-fixture',$3)").bind(community.as_uuid()).bind(channel).bind(owner.public_key().as_bytes().as_slice()).execute(&pool).await.unwrap();
+            for key in [owner.public_key(), agent.public_key()] {
+                sqlx::query(
+                    "INSERT INTO channel_members(community_id,channel_id,pubkey) VALUES($1,$2,$3)",
+                )
+                .bind(community.as_uuid())
+                .bind(channel)
+                .bind(key.as_bytes().as_slice())
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            let content = buzz_core::observer::encrypt_observer_payload(
+                &agent,
+                &owner.public_key(),
+                &serde_json::json!({"version":1}),
+            )
+            .unwrap();
+            let event = buzz_sdk::build_agent_draft(
+                &owner.public_key().to_hex(),
+                &agent.public_key().to_hex(),
+                &Uuid::new_v4().to_string(),
+                &channel.to_string(),
+                &content,
+            )
+            .unwrap()
+            .sign_with_keys(&agent)
+            .unwrap();
+            let (_, mut owner_rx) = register_global_sub_in(
+                community,
+                &state,
+                "draft-owner",
+                Filter::new()
+                    .kind(Kind::Custom(14201))
+                    .pubkey(owner.public_key()),
+                Some(owner.public_key().to_bytes().to_vec()),
+            );
+            let (_, mut stranger_rx) = register_global_sub_in(
+                community,
+                &state,
+                "draft-outsider",
+                Filter::new().id(event.id),
+                Some(stranger.public_key().to_bytes().to_vec()),
+            );
+            let auth = IngestAuth::Http {
+                pubkey: agent.public_key(),
+                scopes: vec![buzz_auth::Scope::MessagesWrite],
+                auth_method: HttpAuthMethod::Nip98,
+            };
+            assert!(
+                ingest_event(&state, &tenant, event.clone(), auth.clone())
+                    .await
+                    .unwrap()
+                    .accepted
+            );
+            let stored = state
+                .db
+                .get_event_by_id(community, event.id.as_bytes())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored.channel_id, None,
+                "origin h must not route private request to channel subscriber index"
+            );
+            let message = tokio::time::timeout(std::time::Duration::from_secs(10), owner_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(event_from_ws_message(message).id, event.id);
+            assert!(stranger_rx.try_recv().is_err());
+            assert!(
+                ingest_event(&state, &tenant, event.clone(), auth)
+                    .await
+                    .unwrap()
+                    .accepted
+            );
+            let denied = IngestAuth::Http {
+                pubkey: stranger.public_key(),
+                scopes: vec![buzz_auth::Scope::MessagesWrite],
+                auth_method: HttpAuthMethod::Nip98,
+            };
+            assert!(ingest_event(&state, &tenant, event.clone(), denied)
+                .await
+                .is_err());
+            sqlx::query("UPDATE channel_members SET removed_at=now() WHERE community_id=$1 AND channel_id=$2 AND pubkey=$3").bind(community.as_uuid()).bind(channel).bind(agent.public_key().as_bytes().as_slice()).execute(&pool).await.unwrap();
+            let content = buzz_core::observer::encrypt_observer_payload(
+                &owner,
+                &owner.public_key(),
+                &serde_json::json!({"version":1}),
+            )
+            .unwrap();
+            let claim = buzz_sdk::build_agent_draft_decision(
+                &owner.public_key().to_hex(),
+                &event.id.to_hex(),
+                &event.id.to_hex(),
+                1,
+                "applying",
+                &content,
+            )
+            .unwrap()
+            .sign_with_keys(&owner)
+            .unwrap();
+            let owner_auth = IngestAuth::Nip42 {
+                pubkey: owner.public_key(),
+                scopes: vec![buzz_auth::Scope::MessagesWrite],
+                channel_ids: None,
+                conn_id: Uuid::new_v4(),
+            };
+            assert!(
+                ingest_event(&state, &tenant, claim, owner_auth)
+                    .await
+                    .is_err(),
+                "revocation blocks claim before mutation"
+            );
         }
 
         fn register_presence_sub(

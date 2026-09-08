@@ -548,7 +548,7 @@ mod publication_scope;
 pub use publication_scope::{ExpectedPublicationScope, MessagePublication, PublicationSnapshot};
 mod submit;
 pub use submit::{
-    submit_event, submit_event_at_with_keys, submit_event_in_scope,
+    submit_event, submit_event_at_with_keys, submit_event_in_scope, submit_retained_event_in_scope,
     submit_signed_event_at_with_keys, SubmitEventResponse,
 };
 

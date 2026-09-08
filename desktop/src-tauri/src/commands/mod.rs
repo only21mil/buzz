@@ -124,3 +124,6 @@ pub use window_chrome::*;
 pub use window_vibrancy::*;
 pub use workflows::*;
 pub use workspace::*;
+
+mod agent_drafts;
+pub use agent_drafts::*;

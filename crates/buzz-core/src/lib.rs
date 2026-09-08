@@ -81,3 +81,5 @@ pub mod test_helpers {
         StoredEvent::with_received_at(make_event(kind), Utc::now(), channel_id, true)
     }
 }
+
+pub mod agent_drafts;

@@ -46,7 +46,7 @@ import {
   assertAgentManagementUpdateTarget,
 } from "./agentManagementReview";
 
-function updateInputFromRequest(
+export function updateInputFromRequest(
   request: Extract<AgentManagementRequest, { action: "update" }>,
   current: UpdatePersonaInput,
 ): UpdatePersonaInput {
