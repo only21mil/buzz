@@ -127,6 +127,17 @@ jobs:
             !desktop/src-tauri/target/**/release/bundle
           key: ${{ steps.rust_cache_key.outputs.key }}
 
+      # actions/cache archives desktop/src-tauri/target as one directory, so
+      # the `!**/release/bundle` exclusion does not keep installers out of a
+      # saved cache. Remove any restored bundle output so the locate steps only
+      # see this run's artifacts (Buzz issue bf7282bc).
+      - name: Remove stale bundle output from restored cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -d desktop/src-tauri/target ]] || exit 0
+          find desktop/src-tauri/target -type d -path '*/release/bundle' -prune -print -exec rm -rf {} +
+
       - name: Generate non-updating bundle config
         shell: bash
         run: |
