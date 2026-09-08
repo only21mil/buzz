@@ -930,6 +930,11 @@ const _: () = assert!(is_moderation_command_kind(KIND_MODERATION_BAN));
 const _: () = assert!(is_moderation_command_kind(KIND_MODERATION_RESOLVE_REPORT));
 const _: () = assert!(!is_moderation_command_kind(KIND_REPORT));
 
+/// Persistent encrypted owner review request.
+pub const KIND_AGENT_DRAFT: u32 = 14201;
+/// Immutable owner claim/outcome; relay CAS, never timestamp replacement.
+pub const KIND_AGENT_DRAFT_DECISION: u32 = 14202;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1118,8 +1123,3 @@ mod tests {
         assert!(!is_shared_gated_kind(KIND_MANAGED_AGENT));
     }
 }
-
-/// Persistent encrypted owner review request.
-pub const KIND_AGENT_DRAFT: u32 = 14201;
-/// Immutable owner claim/outcome; relay CAS, never timestamp replacement.
-pub const KIND_AGENT_DRAFT_DECISION: u32 = 14202;

@@ -604,6 +604,24 @@ pub struct Listing {
     pub created_at: u64,
 }
 
+/// Return the sole canonical owner tag of an engram envelope.
+///
+/// Missing, valueless, duplicate, or non-canonical owner tags fail closed.
+/// This checks public shape only; the relay must verify the author-owner relation.
+pub fn envelope_owner(event: &nostr::Event) -> Option<&str> {
+    let mut tags = event.tags.iter().filter(|tag| tag.as_slice()[0] == "p");
+    let owner = tags.next()?.content()?;
+    if tags.next().is_some()
+        || owner.len() != 64
+        || !owner
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    Some(owner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1046,22 +1064,4 @@ mod tests {
             vec!["mem/me".to_string()]
         );
     }
-}
-
-/// Return the sole canonical owner tag of an engram envelope.
-///
-/// Missing, valueless, duplicate, or non-canonical owner tags fail closed.
-/// This checks public shape only; the relay must verify the author-owner relation.
-pub fn envelope_owner(event: &nostr::Event) -> Option<&str> {
-    let mut tags = event.tags.iter().filter(|tag| tag.as_slice()[0] == "p");
-    let owner = tags.next()?.content()?;
-    if tags.next().is_some()
-        || owner.len() != 64
-        || !owner
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
-        return None;
-    }
-    Some(owner)
 }
