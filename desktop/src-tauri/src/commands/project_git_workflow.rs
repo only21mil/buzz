@@ -361,7 +361,7 @@ pub(crate) fn clone_selected_branch(
     if filter_blobs {
         clone_args.push("--filter=blob:none");
     }
-    if let Some(ref branch) = branch {
+    if let Some(branch) = branch {
         clone_args.extend(["--branch", branch]);
     }
     clone_args.extend(["--end-of-options", clone_url, repo_path]);

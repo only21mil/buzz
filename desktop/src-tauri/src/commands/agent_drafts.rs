@@ -376,6 +376,7 @@ fn decision(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn agent_draft_prepare(
     owner: String,
     relay_url: String,
