@@ -13,6 +13,8 @@ import { getUsableTeams } from "@/features/agents/lib/teamPersonas";
 import { AddChannelBotPersonasSection } from "@/features/channels/ui/AddChannelBotPersonasSection";
 import { AddChannelBotTeamsSection } from "@/features/channels/ui/AddChannelBotTeamsSection";
 import { useInChannelPersonaIds } from "@/features/channels/ui/useInChannelPersonaIds";
+import { AddOwnedChannelAgents } from "./AddOwnedChannelAgents";
+import { Capability, useCapability } from "@/platform/web/capabilities";
 import type { AcpRuntime } from "@/shared/api/types";
 import { Button } from "@/shared/ui/button";
 import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
@@ -62,6 +64,7 @@ export function AddChannelBotDialog({
   onCreateAgent,
   onOpenChange,
 }: AddChannelBotDialogProps) {
+  const canManageAgents = useCapability(Capability.ManagedAgents);
   const personasQuery = usePersonasQuery();
   const teamsQuery = useTeamsQuery();
   const inChannelPersonaIds = useInChannelPersonaIds(
@@ -135,7 +138,7 @@ export function AddChannelBotDialog({
   }
 
   async function handleSubmit() {
-    if (providers.length === 0 || selectedPersonas.length === 0) return;
+    if (!canManageAgents || !canSubmit) return;
 
     const inputs = selectedPersonas.map((persona) => {
       const resolved = resolvePersonaRuntime(
@@ -190,6 +193,8 @@ export function AddChannelBotDialog({
   }
 
   const canSubmit =
+    canManageAgents &&
+    channelId !== null &&
     providers.length > 0 &&
     selectedPersonas.length > 0 &&
     !providersLoading &&
@@ -218,14 +223,16 @@ export function AddChannelBotDialog({
             >
               Cancel
             </Button>
-            <Button
-              disabled={!canSubmit}
-              onClick={() => void handleSubmit()}
-              size="sm"
-              type="button"
-            >
-              {addButtonLabel}
-            </Button>
+            {canManageAgents ? (
+              <Button
+                disabled={!canSubmit}
+                onClick={() => void handleSubmit()}
+                size="sm"
+                type="button"
+              >
+                {addButtonLabel}
+              </Button>
+            ) : null}
           </>
         }
         footerClassName="justify-end gap-2"
@@ -235,65 +242,79 @@ export function AddChannelBotDialog({
         scrollAreaTestId="add-channel-bot-dialog-scroll-area"
         title="Add agents"
       >
-        <AddChannelBotPersonasSection
-          canToggleSelections={!createBotsMutation.isPending}
-          inChannelPersonaIds={inChannelPersonaIds}
-          isLoading={personasQuery.isLoading}
-          onCreateAgent={handleCreateAgent}
-          onTogglePersona={(personaId) => {
-            setSelectedPersonaIds((current) => toggleValue(current, personaId));
-            setSubmissionNotice(null);
-            setSubmissionError(null);
-          }}
-          personas={personas}
-          selectedPersonaIds={selectedPersonaIds}
-        />
-
-        {teams.length > 0 ? (
-          <AddChannelBotTeamsSection
-            canToggleSelections={!createBotsMutation.isPending}
-            inChannelPersonaIds={inChannelPersonaIds}
-            isLoading={teamsQuery.isLoading}
-            onToggleTeam={handleToggleTeam}
-            personas={personas}
-            selectedPersonaIds={selectedPersonaIds}
-            teams={teams}
+        {channelId ? (
+          <AddOwnedChannelAgents
+            key={channelId}
+            channelId={channelId}
+            disabled={createBotsMutation.isPending}
           />
         ) : null}
+        {canManageAgents ? (
+          <>
+            <AddChannelBotPersonasSection
+              canToggleSelections={!createBotsMutation.isPending}
+              inChannelPersonaIds={inChannelPersonaIds}
+              isLoading={personasQuery.isLoading}
+              onCreateAgent={handleCreateAgent}
+              onTogglePersona={(personaId) => {
+                setSelectedPersonaIds((current) =>
+                  toggleValue(current, personaId),
+                );
+                setSubmissionNotice(null);
+                setSubmissionError(null);
+              }}
+              personas={personas}
+              selectedPersonaIds={selectedPersonaIds}
+            />
 
-        {providers.length === 0 && !providersLoading ? (
-          <div className="flex gap-3 rounded-lg border border-warning/30 bg-warning-bg px-4 py-3">
-            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
-            <p className="text-sm text-warning">
-              Install an agent runtime before adding an agent to this channel.
-            </p>
-          </div>
-        ) : null}
+            {teams.length > 0 ? (
+              <AddChannelBotTeamsSection
+                canToggleSelections={!createBotsMutation.isPending}
+                inChannelPersonaIds={inChannelPersonaIds}
+                isLoading={teamsQuery.isLoading}
+                onToggleTeam={handleToggleTeam}
+                personas={personas}
+                selectedPersonaIds={selectedPersonaIds}
+                teams={teams}
+              />
+            ) : null}
 
-        {providersErrorMessage ? (
-          <p className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
-            {providersErrorMessage}
-          </p>
-        ) : null}
-        {personasQuery.error instanceof Error ? (
-          <p className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
-            {personasQuery.error.message}
-          </p>
-        ) : null}
-        {submissionNotice ? (
-          <p className="rounded-lg bg-muted px-4 py-3 text-sm text-foreground">
-            {submissionNotice}
-          </p>
-        ) : null}
-        {submissionError ? (
-          <p className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
-            {submissionError}
-          </p>
-        ) : null}
-        {createBotsMutation.error instanceof Error ? (
-          <p className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
-            {createBotsMutation.error.message}
-          </p>
+            {providers.length === 0 && !providersLoading ? (
+              <div className="flex gap-3 rounded-lg border border-warning/30 bg-warning-bg px-4 py-3">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+                <p className="text-sm text-warning">
+                  Install an agent runtime before adding an agent to this
+                  channel.
+                </p>
+              </div>
+            ) : null}
+
+            {providersErrorMessage ? (
+              <p className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+                {providersErrorMessage}
+              </p>
+            ) : null}
+            {personasQuery.error instanceof Error ? (
+              <p className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+                {personasQuery.error.message}
+              </p>
+            ) : null}
+            {submissionNotice ? (
+              <p className="rounded-lg bg-muted px-4 py-3 text-sm text-foreground">
+                {submissionNotice}
+              </p>
+            ) : null}
+            {submissionError ? (
+              <p className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+                {submissionError}
+              </p>
+            ) : null}
+            {createBotsMutation.error instanceof Error ? (
+              <p className="rounded-lg border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+                {createBotsMutation.error.message}
+              </p>
+            ) : null}
+          </>
         ) : null}
       </ChooserDialogContent>
     </Dialog>

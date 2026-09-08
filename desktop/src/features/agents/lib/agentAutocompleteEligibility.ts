@@ -196,6 +196,7 @@ export function shouldHideAgentFromMentions({
   currentPubkey,
   respondTo,
   relayAgents,
+  managedAgentPubkeys,
   mentionableAgentPubkeys,
   directoryAgentPubkeys,
 }: {
@@ -206,11 +207,15 @@ export function shouldHideAgentFromMentions({
   currentPubkey?: string | null;
   respondTo?: RelayAgent["respondTo"];
   relayAgents?: readonly Pick<RelayAgent, "pubkey" | "respondTo">[];
+  managedAgentPubkeys?: ReadonlySet<string>;
   mentionableAgentPubkeys: ReadonlySet<string>;
   directoryAgentPubkeys: ReadonlySet<string>;
 }) {
   if (!isAgent) return false;
   const normalized = normalizePubkey(pubkey);
+  // Local custody keeps explicit references available even for stopped agents.
+  // Relay-only identity still follows relay policy below.
+  if (managedAgentPubkeys?.has(normalized)) return false;
   // Invocable => always show.
   if (mentionableAgentPubkeys.has(normalized)) return false;
   const isOwnedByCurrentUser = Boolean(

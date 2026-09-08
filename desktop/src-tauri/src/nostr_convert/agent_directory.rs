@@ -189,7 +189,8 @@ pub fn relay_agents_from_managed_agent_events(
 
 /// Build a pubkey-to-channel-id candidate map from relay-signed membership
 /// events. Known agent identities need not have the cosmetic `bot` role;
-/// otherwise only explicit bot tags seed discovery.
+/// otherwise the relay's independent `bot` identity tags or legacy bot roles
+/// seed discovery. These tags grant no ownership or response permission.
 #[cfg(test)]
 pub fn member_agent_channel_ids_from_events(
     events: &[Event],
@@ -253,6 +254,11 @@ fn membership_channels(
         {
             continue;
         }
+        let relay_agent_pubkeys: std::collections::HashSet<_> = tags_named(event, "bot")
+            .filter_map(|tag| tag.get(1))
+            .filter_map(|key| nostr::PublicKey::from_hex(key).ok())
+            .map(|key| key.to_hex())
+            .collect();
         for tag in tags_named(event, "p") {
             let Some(pubkey) = tag
                 .get(1)
@@ -262,6 +268,7 @@ fn membership_channels(
             };
             let pubkey = pubkey.to_hex();
             if tag.get(3).map(String::as_str) != Some("bot")
+                && !relay_agent_pubkeys.contains(&pubkey)
                 && !known_agent_pubkeys.contains(&pubkey)
             {
                 continue;

@@ -545,3 +545,101 @@ fn membership_is_bound_to_viewer_destination_and_latest_removals() {
     tampered["content"] = json!("tampered");
     assert!(check(&[serde_json::from_value(tampered).unwrap()]).is_empty());
 }
+
+#[test]
+fn relay_bot_identity_preserves_foreign_agent_roles_without_granting_policy() {
+    let relay = Keys::generate();
+    let viewer = Keys::generate().public_key().to_hex();
+    let agent = Keys::generate();
+    let agent_pubkey = agent.public_key().to_hex();
+    let owner = Keys::generate();
+    let attacker = Keys::generate();
+    let auth = buzz_sdk_pkg::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "")
+        .expect("owner attestation");
+    let auth: Vec<String> = serde_json::from_str(&auth).expect("auth values");
+    let profile = EventBuilder::new(Kind::Metadata, "{}")
+        .tags([Tag::parse(auth).expect("auth tag")])
+        .sign_with_keys(&agent)
+        .expect("signed profile");
+    let policy = managed_agent_event(
+        &owner,
+        &agent_pubkey,
+        "Shared",
+        "allowlist",
+        std::slice::from_ref(&viewer),
+    );
+    let forged_policy = managed_agent_event(&attacker, &agent_pubkey, "Forged", "anyone", &[]);
+    let membership = |signer: &Keys, role: &str, timestamp: u64, include_identity: bool| {
+        let mut tags = vec![
+            Tag::parse(["d", "target"]).expect("channel"),
+            Tag::parse(["p", &viewer, "", "member"]).expect("viewer"),
+            Tag::parse(["p", &agent_pubkey, "", role]).expect("agent role"),
+            // A bot marker without a matching member must not create membership.
+            Tag::parse(["bot", &attacker.public_key().to_hex()]).expect("orphan bot"),
+        ];
+        if include_identity {
+            tags.push(Tag::parse(["bot", &agent_pubkey]).expect("bot identity"));
+        }
+        EventBuilder::new(Kind::Custom(39002), "")
+            .tags(tags)
+            .custom_created_at(nostr::Timestamp::from(timestamp))
+            .sign_with_keys(signer)
+            .expect("signed membership")
+    };
+    let discover = |events: &[Event], destination: &str, current_viewer: &str| {
+        member_agent_channel_ids_for_viewer(
+            events,
+            &relay.public_key().to_hex(),
+            &std::collections::HashSet::new(),
+            current_viewer,
+            Some(destination),
+        )
+    };
+    for role in ["owner", "admin", "guest"] {
+        let event = membership(&relay, role, 10, true);
+        let memberships = discover(std::slice::from_ref(&event), "target", &viewer);
+        assert_eq!(memberships.len(), 1);
+        assert_eq!(memberships[&agent_pubkey], vec!["target"]);
+        let mut agents = relay_agents_from_directory_events(
+            &[],
+            &[policy.clone(), forged_policy.clone()],
+            std::slice::from_ref(&profile),
+        );
+        agents.retain(|agent| memberships.contains_key(&agent.pubkey));
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].owner_pubkey, Some(owner.public_key().to_hex()));
+        assert_eq!(
+            agents[0].respond_to,
+            Some(crate::managed_agents::RespondTo::Allowlist)
+        );
+        assert_eq!(agents[0].respond_to_allowlist, vec![viewer.clone()]);
+        assert!(relay_agents_from_directory_events(
+            &[],
+            std::slice::from_ref(&forged_policy),
+            std::slice::from_ref(&profile)
+        )
+        .is_empty());
+        assert!(discover(&[membership(&attacker, role, 10, true)], "target", &viewer).is_empty());
+        assert!(discover(std::slice::from_ref(&event), "other", &viewer).is_empty());
+        assert!(discover(
+            std::slice::from_ref(&event),
+            "target",
+            &attacker.public_key().to_hex()
+        )
+        .is_empty());
+        assert!(discover(
+            &[event.clone(), membership(&relay, role, 11, false)],
+            "target",
+            &viewer
+        )
+        .is_empty());
+        let mut tampered = serde_json::to_value(&event).expect("membership value");
+        tampered["content"] = json!("tampered");
+        assert!(discover(
+            &[serde_json::from_value(tampered).expect("tampered event")],
+            "target",
+            &viewer
+        )
+        .is_empty());
+    }
+}

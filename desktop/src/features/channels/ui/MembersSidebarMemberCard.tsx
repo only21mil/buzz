@@ -94,7 +94,9 @@ const MEMBER_ROW_INSET_DIVIDER_CLASS =
 
 function formatRoleLabel(member: ChannelMember, memberIsBot: boolean) {
   if (memberIsBot) {
-    return "agent";
+    return member.role === "owner" || member.role === "admin"
+      ? `agent · ${member.role}`
+      : "agent";
   }
 
   if (member.role === "owner" || member.role === "admin") {
@@ -154,7 +156,10 @@ export function MembersSidebarMemberCard({
   const canModerateMember =
     canModerate && !memberIsBot && member.role !== "owner";
   const hasActions = memberIsBot
-    ? Boolean(managedAgent) || canRemoveMember || canViewActivity
+    ? Boolean(managedAgent) ||
+      canRemoveMember ||
+      canViewActivity ||
+      canChangeRole
     : canRemoveMember || canChangeRole || canModerateMember;
 
   const memberIdentity = (
@@ -286,7 +291,7 @@ export function MembersSidebarMemberCard({
   );
 }
 
-const PEOPLE_ROLES = ["admin", "member", "guest"] as const;
+const MEMBER_ROLES = ["admin", "member", "guest"] as const;
 
 function MemberActionsMenu({
   canChangeRole,
@@ -331,8 +336,7 @@ function MemberActionsMenu({
   onViewActivity?: (pubkey: string) => void;
   pairAction?: ManagedAgentPairAction;
 }) {
-  const showChangeRole =
-    canChangeRole && !memberIsBot && member.role !== "owner";
+  const showChangeRole = canChangeRole && member.role !== "owner";
   const isBanned = moderationState?.banned ?? false;
   const isTimedOut = moderationState?.timedOut ?? false;
 
@@ -401,18 +405,20 @@ function MemberActionsMenu({
               Change role
             </DropdownMenuSubTrigger>
             <DropdownMenuSubContent>
-              {PEOPLE_ROLES.map((role) => (
-                <DropdownMenuItem
-                  data-testid={`sidebar-role-${role}-${member.pubkey}`}
-                  disabled={disabled || member.role === role}
-                  key={role}
-                  onClick={() => onChangeRole(member, role)}
-                >
-                  {role[0]?.toUpperCase()}
-                  {role.slice(1)}
-                  {member.role === role ? " (current)" : ""}
-                </DropdownMenuItem>
-              ))}
+              {(memberIsBot ? [...MEMBER_ROLES, "bot"] : MEMBER_ROLES).map(
+                (role) => (
+                  <DropdownMenuItem
+                    data-testid={`sidebar-role-${role}-${member.pubkey}`}
+                    disabled={disabled || member.role === role}
+                    key={role}
+                    onClick={() => onChangeRole(member, role)}
+                  >
+                    {role[0]?.toUpperCase()}
+                    {role.slice(1)}
+                    {member.role === role ? " (current)" : ""}
+                  </DropdownMenuItem>
+                ),
+              )}
             </DropdownMenuSubContent>
           </DropdownMenuSub>
         ) : null}

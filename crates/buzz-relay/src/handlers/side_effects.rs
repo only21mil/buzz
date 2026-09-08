@@ -1192,7 +1192,10 @@ fn group_member_tags(
     let mut tags = vec![Tag::parse(["d", group_id])?];
     for member in members {
         let pubkey_hex = hex::encode(&member.pubkey);
-        let role = if agent_pubkeys.contains(&member.pubkey) {
+        // Keep authorization roles intact. Only ordinary agent members use the
+        // legacy bot display role. Attest bot identity separately so discovery
+        // can find agents with elevated or guest roles without changing authority.
+        let role = if member.role == "member" && agent_pubkeys.contains(&member.pubkey) {
             "bot"
         } else {
             &member.role
@@ -1200,6 +1203,9 @@ fn group_member_tags(
         // NIP-29 convention: ["p", pubkey, relay_url, role]. Empty relay_url
         // because the canonical relay is implicit (this event is signed by it).
         tags.push(Tag::parse(["p", &pubkey_hex, "", role])?);
+        if agent_pubkeys.contains(&member.pubkey) {
+            tags.push(Tag::parse(["bot", &pubkey_hex])?);
+        }
     }
     Ok(tags)
 }
@@ -3673,39 +3679,49 @@ mod tests {
     }
 
     #[test]
-    fn discovery_roles_label_agents_as_bots_without_changing_admins() {
+    fn discovery_preserves_agent_authority_and_legacy_bot_members() {
         let channel_id = Uuid::new_v4();
-        let agent_admin = member(channel_id, 1, "admin");
-        let human_admin = member(channel_id, 2, "admin");
-        let human_member = member(channel_id, 3, "member");
-        let members = vec![
-            agent_admin.clone(),
-            human_admin.clone(),
-            human_member.clone(),
-        ];
-        let agent_pubkeys = HashSet::from([agent_admin.pubkey.clone()]);
+        let roles = ["owner", "admin", "member", "guest", "bot"];
+        let members: Vec<_> = roles
+            .iter()
+            .enumerate()
+            .map(|(index, role)| member(channel_id, index as u8 + 1, role))
+            .collect();
+        let agent_pubkeys = members.iter().map(|member| member.pubkey.clone()).collect();
         let group_id = channel_id.to_string();
-
         let member_tags =
             group_member_tags(&group_id, &members, &agent_pubkeys).expect("member tags");
-        assert!(member_tags.contains(
-            &Tag::parse(["p", &hex::encode(&agent_admin.pubkey), "", "bot"])
-                .expect("agent member tag")
-        ));
-        assert!(member_tags.contains(
-            &Tag::parse(["p", &hex::encode(&human_admin.pubkey), "", "admin"])
-                .expect("human admin tag")
-        ));
-        assert!(member_tags.contains(
-            &Tag::parse(["p", &hex::encode(&human_member.pubkey), "", "member"])
-                .expect("human member tag")
-        ));
-
+        assert_eq!(member_tags.len(), members.len() * 2 + 1);
+        for (member, expected) in members
+            .iter()
+            .zip(["owner", "admin", "bot", "guest", "bot"])
+        {
+            assert!(member_tags.contains(
+                &Tag::parse(["p", &hex::encode(&member.pubkey), "", expected])
+                    .expect("agent member tag")
+            ));
+            assert!(member_tags.contains(
+                &Tag::parse(["bot", &hex::encode(&member.pubkey)])
+                    .expect("independent agent identity")
+            ));
+        }
         let admin_tags = group_admin_tags(&group_id, &members).expect("admin tags");
-        assert!(admin_tags.contains(
-            &Tag::parse(["p", &hex::encode(&agent_admin.pubkey), "admin"])
-                .expect("agent admin tag")
-        ));
+        assert_eq!(admin_tags.len(), 3);
+        for member in &members[..2] {
+            assert!(admin_tags.contains(
+                &Tag::parse(["p", &hex::encode(&member.pubkey), &member.role])
+                    .expect("agent authority tag")
+            ));
+        }
+        let human_tags =
+            group_member_tags(&group_id, &members, &HashSet::new()).expect("human tags");
+        assert!(human_tags.iter().all(|tag| tag.as_slice()[0] != "bot"));
+        for member in &members {
+            assert!(human_tags.contains(
+                &Tag::parse(["p", &hex::encode(&member.pubkey), "", &member.role])
+                    .expect("human member tag")
+            ));
+        }
     }
 
     async fn discovery_test_state() -> (Arc<AppState>, sqlx::PgPool, tempfile::TempDir) {
