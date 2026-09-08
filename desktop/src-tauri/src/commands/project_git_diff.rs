@@ -1,7 +1,7 @@
 use super::project_git_exec::{
     build_git_auth_config, clean_branch, run_git, validate_workspace_clone_url, GitAuthConfig,
 };
-use super::project_repo_paths::find_local_repo_dir;
+use super::project_repo_paths::find_local_repo_for_branch;
 use crate::app_state::AppState;
 use serde::Serialize;
 use tauri::State;
@@ -480,9 +480,14 @@ pub async fn get_project_local_repo_diff(
     let target_commit = clean_commit(target_commit);
 
     tauri::async_runtime::spawn_blocking(move || {
-        let Some(repo_dir) =
-            find_local_repo_dir(repos_dir.as_deref(), &project_dtag, clone_url.as_deref())?
-        else {
+        let Some(repo_dir) = find_local_repo_for_branch(
+            repos_dir.as_deref(),
+            &project_dtag,
+            clone_url.as_deref(),
+            branch.as_deref(),
+        )?
+        .filter(|checkout| branch.is_none() || checkout.branch == branch)
+        .map(|checkout| checkout.path) else {
             return Ok(None);
         };
         let range = local_diff_range(

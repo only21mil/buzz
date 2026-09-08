@@ -1638,6 +1638,9 @@ pub enum PrCmd {
         /// Recommended branch name
         #[arg(long)]
         branch_name: Option<String>,
+        /// Base branch to merge into (defaults to the repository default)
+        #[arg(long)]
+        target_branch: Option<String>,
         /// Most recent common ancestor with the target branch
         #[arg(long)]
         merge_base: Option<String>,
@@ -2550,6 +2553,8 @@ mod tests {
             &commit,
             "--clone",
             "https://example.com/repo.git",
+            "--target-branch",
+            "release/v2",
             "--issue",
             &issue_id,
             "--external-id",
@@ -2558,6 +2563,7 @@ mod tests {
         .expect("origin-link flags should parse");
 
         let Cmd::Pr(PrCmd::Open {
+            target_branch,
             issue_id: parsed_issue_id,
             external_id,
             ..
@@ -2565,6 +2571,7 @@ mod tests {
         else {
             panic!("expected pr open");
         };
+        assert_eq!(target_branch.as_deref(), Some("release/v2"));
         assert_eq!(parsed_issue_id.as_deref(), Some(issue_id.as_str()));
         assert_eq!(external_id.as_deref(), Some("github:pull/42"));
     }

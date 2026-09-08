@@ -20,6 +20,8 @@ export type CreatePullRequestDialogInput = CreateProjectWorkItemDialogInput;
 
 export function CreatePullRequestDialog({
   initialProjectId,
+  initialRepositoryId,
+  initialSourceBranch,
   onCreated,
   onOpenChange,
   open,
@@ -27,6 +29,8 @@ export function CreatePullRequestDialog({
   reposDir,
 }: {
   initialProjectId?: string;
+  initialRepositoryId?: string;
+  initialSourceBranch?: string | null;
   onCreated: (
     project: Project,
     repository: Repository,
@@ -46,7 +50,10 @@ export function CreatePullRequestDialog({
   );
   const initialProject =
     projects.find((project) => project.id === initialProjectId) ?? projects[0];
-  const initialRepository = selectProjectRepository(initialProject, null);
+  const initialRepository = selectProjectRepository(
+    initialProject,
+    initialRepositoryId ?? null,
+  );
   const [repositoryId, setRepositoryId] = React.useState(
     initialRepository?.id ?? "",
   );
@@ -66,19 +73,27 @@ export function CreatePullRequestDialog({
   const branchOptions = React.useMemo(() => {
     const names = [
       repository?.defaultBranch,
+      ...(repository?.id === initialRepository?.id && initialSourceBranch
+        ? [initialSourceBranch]
+        : []),
       ...(repoStateQuery.data?.branches.map((branch) => branch.name) ?? []),
       initialSyncQuery.data?.localBranch,
     ].filter((name): name is string => Boolean(name));
     return [...new Set(names)];
   }, [
     initialSyncQuery.data?.localBranch,
+    initialRepository?.id,
+    initialSourceBranch,
+    repository?.id,
     repository?.defaultBranch,
     repoStateQuery.data?.branches,
   ]);
   const [targetBranch, setTargetBranch] = React.useState(
     repository?.defaultBranch ?? "",
   );
-  const [sourceBranch, setSourceBranch] = React.useState("");
+  const [sourceBranch, setSourceBranch] = React.useState(
+    initialSourceBranch ?? "",
+  );
   const sourceSyncQuery = useProjectRepoSyncStatusQuery(
     repository,
     reposDir,
@@ -88,31 +103,23 @@ export function CreatePullRequestDialog({
   const createMutation = useCreateProjectPullRequestMutation(repository);
 
   React.useEffect(() => {
-    if (!open) return;
-    const nextProject =
-      projects.find((candidate) => candidate.id === initialProjectId) ??
-      projects[0];
-    setRepositoryId(selectProjectRepository(nextProject, null)?.id ?? "");
-  }, [initialProjectId, open, projects]);
-
-  React.useEffect(() => {
-    if (!repository) return;
-    setTargetBranch(repository.defaultBranch);
-    setSourceBranch("");
-  }, [repository]);
-
-  React.useEffect(() => {
-    if (
-      sourceBranch &&
-      branchOptions.includes(sourceBranch) &&
-      sourceBranch !== targetBranch
-    ) {
-      return;
+    if (!sourceBranch) {
+      setSourceBranch(
+        branchOptions.find((branch) => branch !== targetBranch) ?? "",
+      );
     }
-    setSourceBranch(
-      branchOptions.find((branch) => branch !== targetBranch) ?? "",
-    );
   }, [branchOptions, sourceBranch, targetBranch]);
+
+  function selectRepository(id: string) {
+    const nextRepository = repositoryOptions.find(
+      (candidate) => candidate.repository.id === id,
+    )?.repository;
+    setRepositoryId(id);
+    setTargetBranch(nextRepository?.defaultBranch ?? "");
+    setSourceBranch(
+      id === initialRepository?.id ? (initialSourceBranch ?? "") : "",
+    );
+  }
 
   const sourceCommit =
     repoStateQuery.data?.branches.find((branch) => branch.name === sourceBranch)
@@ -185,7 +192,7 @@ export function CreatePullRequestDialog({
             className="h-10 w-full rounded-lg border border-input bg-background px-3 text-sm font-normal outline-hidden focus:ring-1 focus:ring-ring"
             data-testid="create-pull-request-repository"
             disabled={createMutation.isPending}
-            onChange={(event) => setRepositoryId(event.target.value)}
+            onChange={(event) => selectRepository(event.target.value)}
             value={repository?.id ?? ""}
           >
             {repositoryOptions.map((candidate) => (

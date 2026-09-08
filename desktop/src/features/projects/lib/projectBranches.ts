@@ -40,7 +40,13 @@ export function projectBranchOptions(
   remoteBranches: string[],
   localBranches: string[] = [],
 ): string[] {
-  return [...new Set([...remoteBranches, ...localBranches].filter(Boolean))];
+  return [
+    ...new Set(
+      [...remoteBranches, ...localBranches]
+        .map(normalizeProjectBranchName)
+        .filter((branch): branch is string => branch !== null),
+    ),
+  ];
 }
 
 export function projectBranchOptionsFromSync(
@@ -49,6 +55,7 @@ export function projectBranchOptionsFromSync(
     localBranch: string | null;
     localBranches: string[];
     localHead: string | null;
+    localCheckouts?: Array<{ branch: string | null }>;
   },
 ): string[] {
   const localBranches =
@@ -56,7 +63,12 @@ export function projectBranchOptionsFromSync(
     (syncStatus?.localHead && syncStatus.localBranch
       ? [syncStatus.localBranch]
       : []);
-  return projectBranchOptions(remoteBranches, localBranches);
+  return projectBranchOptions(remoteBranches, [
+    ...localBranches,
+    ...(syncStatus?.localCheckouts ?? []).flatMap((checkout) =>
+      checkout.branch ? [checkout.branch] : [],
+    ),
+  ]);
 }
 
 export function projectBranchCreationReason(input: {
@@ -116,4 +128,22 @@ export function projectBranchManagementState(input: {
           ? "Close the branch's pull request before deleting it."
           : null;
   return { activeBranchCommit, activeRemoteBranch, deleteBranchReason };
+}
+
+/** Distinguish published refs, local refs, and branches checked out on disk. */
+export function projectBranchLocationLabel(
+  branch: string,
+  remoteBranches: string[] = [],
+  localBranches: string[] = [],
+  checkouts: Array<{ branch: string | null }> = [],
+): string {
+  return [
+    remoteBranches.includes(branch) ? "Remote" : null,
+    localBranches.includes(branch) ? "Local" : null,
+    checkouts.some((checkout) => checkout.branch === branch)
+      ? "Checked out"
+      : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
 }

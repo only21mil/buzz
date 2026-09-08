@@ -583,6 +583,10 @@ export function WorkspaceTabs({
       {createPullRequestAction && createPullRequestOpen ? (
         <CreatePullRequestDialog
           initialProjectId={projectId}
+          initialRepositoryId={project.id}
+          initialSourceBranch={
+            sourceControls?.selectedTag ? null : sourceControls?.branch
+          }
           onCreated={createPullRequestAction.onCreated}
           onOpenChange={setCreatePullRequestOpen}
           open

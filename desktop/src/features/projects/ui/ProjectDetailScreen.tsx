@@ -294,6 +294,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   const cloneRepoMutation = useCloneProjectRepositoryMutation(
     repository,
     activeCommunity?.reposDir,
+    activeBranch,
   );
   const createIssueMutation = useCreateProjectIssueMutation(repository);
   const updatePullRequestMutation = useUpdateProjectPullRequestMutation(
@@ -393,6 +394,9 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   const filesSourceControls: RepoSourceHeaderControls = {
     branch: activeBranch ?? "",
     branchOptions: branchOptionsWithLocal,
+    remoteBranches: managedBranches.map((branch) => branch.name),
+    localBranches: repoSyncStatusQuery.data?.localBranches ?? [],
+    localCheckouts: repoSyncStatusQuery.data?.localCheckouts ?? [],
     selectedTag,
     tagOptions: repoStateQuery.data?.tags ?? [],
     onBranchChange: handleBranchChange,

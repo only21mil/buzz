@@ -710,6 +710,9 @@ export function RepositoryFilesPanel({
           <RepositoryBranchDropdown
             branch={sourceControls.branch}
             branchOptions={sourceControls.branchOptions}
+            remoteBranches={sourceControls.remoteBranches}
+            localBranches={sourceControls.localBranches}
+            localCheckouts={sourceControls.localCheckouts}
             compact
             createBranchDisabled={sourceControls.createBranchDisabled}
             createBranchTitle={sourceControls.createBranchTitle}
@@ -752,6 +755,9 @@ export function RepositoryFilesPanel({
             <RepositoryBranchDropdown
               branch={sourceControls.branch}
               branchOptions={sourceControls.branchOptions}
+              remoteBranches={sourceControls.remoteBranches}
+              localBranches={sourceControls.localBranches}
+              localCheckouts={sourceControls.localCheckouts}
               compact
               createBranchDisabled={sourceControls.createBranchDisabled}
               createBranchTitle={sourceControls.createBranchTitle}

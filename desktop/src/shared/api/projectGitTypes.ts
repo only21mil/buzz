@@ -55,12 +55,14 @@ export type ProjectLocalRepoSnapshot = {
 export type ProjectLocalRepository = {
   name: string;
   path: string;
+  branch: string | null;
 };
 
 export type ProjectRepoSyncStatus = {
   localPath: string | null;
   localBranch: string | null;
   localBranches: string[];
+  localCheckouts?: Array<{ path: string; branch: string | null }>;
   localHead: string | null;
   localShortHead: string | null;
   remoteBranch: string | null;
