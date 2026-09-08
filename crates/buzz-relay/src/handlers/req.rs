@@ -11,6 +11,7 @@ use buzz_core::kind::{
     KIND_DM_VISIBILITY, P_GATED_KINDS, RESULT_GATED_KINDS, SHARED_GATED_KINDS,
 };
 use buzz_core::tenant::TenantContext;
+use buzz_core::CommunityId;
 use buzz_db::EventQuery;
 use buzz_pubsub::EventTopic;
 use hex;
@@ -389,7 +390,14 @@ pub async fn handle_req(
             // Also enforces author-only kinds (30300/30350) and the persona
             // shared-gate (kind:30175 without ["shared","true"]). Single call
             // covers all three gated event classes.
-            if !event_visible_to_reader(&stored.event, &pubkey_bytes) {
+            if !event_visible_to_reader(
+                &state,
+                conn.tenant.community(),
+                &stored.event,
+                &pubkey_bytes,
+            )
+            .await
+            {
                 continue;
             }
 
@@ -722,7 +730,14 @@ async fn handle_search_req(
                     }
                     // Result-level gate: covers author-only, persona shared-gate,
                     // and result-gated kinds in one call.
-                    if !event_visible_to_reader(&stored.event, reader_pubkey_bytes) {
+                    if !event_visible_to_reader(
+                        state,
+                        tenant.community(),
+                        &stored.event,
+                        reader_pubkey_bytes,
+                    )
+                    .await
+                    {
                         continue;
                     }
                     // Dedup AFTER acceptance — an event that fails filter A's constraints
@@ -1104,9 +1119,8 @@ pub(crate) fn p_gated_filters_authorized(filters: &[Filter], authed_pubkey_hex: 
 ///   - `#p` is non-empty and every entry equals the authed pubkey
 ///     (the owner reading engrams addressed to them).
 ///
-/// Filters with explicit `ids` are exempt — knowing the event id already
-/// implies authorization (the engram event id is itself derived from the
-/// signed envelope, which only the agent could have produced).
+/// Filters with explicit `ids` skip this pre-filter check. Every returned
+/// engram still has to pass the per-event attested-owner and recipient gates.
 ///
 /// Mixed-kind filters (e.g. `{kinds:[30174, 9]}`) are evaluated under this
 /// gate when KIND_AGENT_ENGRAM is present; matching events of other kinds in
@@ -1205,6 +1219,15 @@ pub(crate) fn result_gated_count_safe_for_pushdown(
     filter: &Filter,
     authed_pubkey_hex: &str,
 ) -> bool {
+    // Engram visibility also depends on the durable NIP-OA agent-owner
+    // relation, which SQL tag pushdown alone cannot prove.
+    if filter.kinds.as_ref().is_none_or(|kinds| {
+        kinds
+            .iter()
+            .any(|kind| kind.as_u16() as u32 == KIND_AGENT_ENGRAM)
+    }) {
+        return false;
+    }
     let p_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::P);
     filter
         .generic_tags
@@ -1241,7 +1264,17 @@ pub(crate) fn is_author_only_event(event: &nostr::Event, requester_pubkey_bytes:
 /// Call this from every read surface — both WS (REQ/COUNT/fan-out) and HTTP
 /// (NIP-98 `/query`, `/count`, FTS search) — instead of inlining the three
 /// individual predicates at each site.
-pub(crate) fn event_visible_to_reader(event: &nostr::Event, requester_pubkey_bytes: &[u8]) -> bool {
+pub(crate) async fn event_visible_to_reader(
+    state: &AppState,
+    community: CommunityId,
+    event: &nostr::Event,
+    requester_pubkey_bytes: &[u8],
+) -> bool {
+    if event.kind.as_u16() as u32 == KIND_AGENT_ENGRAM
+        && !engram_owner_bound(&state.db, community, event).await
+    {
+        return false;
+    }
     if is_author_only_event(event, requester_pubkey_bytes) {
         return false;
     }
@@ -1253,6 +1286,31 @@ pub(crate) fn event_visible_to_reader(event: &nostr::Event, requester_pubkey_byt
         return false;
     }
     true
+}
+
+/// Verify the durable, tenant-scoped NIP-OA owner before ingest or delivery.
+/// Avoid the observer cache: an absent mapping and every lookup error fail closed.
+pub(crate) async fn engram_owner_bound(
+    db: &buzz_db::Db,
+    community: CommunityId,
+    event: &nostr::Event,
+) -> bool {
+    let Some(owner_hex) = buzz_core::engram::envelope_owner(event) else {
+        return false;
+    };
+    let Ok(owner_bytes) = hex::decode(owner_hex) else {
+        return false;
+    };
+    match db
+        .is_agent_owner(community, event.pubkey.as_bytes(), &owner_bytes)
+        .await
+    {
+        Ok(bound) => bound,
+        Err(error) => {
+            warn!(%error, "engram owner lookup failed, denying access");
+            false
+        }
+    }
 }
 
 /// Pre-filter authorization for filters that exclusively target author-only kinds.
@@ -2086,5 +2144,75 @@ mod tests {
         ));
         // No #p tag — fallback required.
         assert!(!result_gated_count_safe_for_pushdown(&f, &owner));
+    }
+
+    #[test]
+    fn engram_count_never_skips_attested_owner_result_check() {
+        let (owner, _agent, _other) = three_pubkeys();
+        let p_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::P);
+        let f = nostr::Filter::new()
+            .kind(nostr::Kind::Custom(KIND_AGENT_ENGRAM as u16))
+            .custom_tags(p_tag, [owner.clone()]);
+        assert!(!result_gated_count_safe_for_pushdown(&f, &owner));
+    }
+    #[tokio::test]
+    async fn engram_owner_lookup_error_fails_closed() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(50))
+            .connect_lazy("postgres://127.0.0.1:1/engram_fixture")
+            .unwrap();
+        let db = buzz_db::Db::from_pool(pool);
+        let agent = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let event =
+            nostr::EventBuilder::new(nostr::Kind::Custom(KIND_AGENT_ENGRAM as u16), "ciphertext")
+                .tags([nostr::Tag::parse(["p", &owner.public_key().to_hex()]).unwrap()])
+                .sign_with_keys(&agent)
+                .unwrap();
+        assert!(
+            !engram_owner_bound(&db, CommunityId::from_uuid(uuid::Uuid::new_v4()), &event).await
+        );
+    }
+    #[tokio::test]
+    #[ignore = "requires an isolated Postgres fixture in RELAY_AUTH_TEST_DATABASE_URL"]
+    async fn engram_owner_binding_is_tenant_scoped_and_rejects_mismatch() {
+        let url = std::env::var("RELAY_AUTH_TEST_DATABASE_URL").expect("isolated fixture URL");
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let a = CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let b = CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let agent = nostr::Keys::generate();
+        let owner = nostr::Keys::generate();
+        let stranger = nostr::Keys::generate();
+        for community in [a, b] {
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(community.as_uuid())
+                .bind(format!("engram-{}.invalid", community))
+                .execute(&pool)
+                .await
+                .unwrap();
+            for keys in [&agent, &owner, &stranger] {
+                db.ensure_user(community, keys.public_key().as_bytes())
+                    .await
+                    .unwrap();
+            }
+        }
+        let envelope = |recipient: &nostr::Keys| {
+            nostr::EventBuilder::new(nostr::Kind::Custom(KIND_AGENT_ENGRAM as u16), "ciphertext")
+                .tags([nostr::Tag::parse(["p", &recipient.public_key().to_hex()]).unwrap()])
+                .sign_with_keys(&agent)
+                .unwrap()
+        };
+        assert!(!engram_owner_bound(&db, a, &envelope(&owner)).await);
+        db.set_agent_owner(
+            a,
+            agent.public_key().as_bytes(),
+            owner.public_key().as_bytes(),
+        )
+        .await
+        .unwrap();
+        assert!(engram_owner_bound(&db, a, &envelope(&owner)).await);
+        assert!(!engram_owner_bound(&db, a, &envelope(&stranger)).await);
+        assert!(!engram_owner_bound(&db, b, &envelope(&owner)).await);
     }
 }

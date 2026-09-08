@@ -130,6 +130,31 @@ pub async fn filter_fanout_by_access(
         })
         .collect();
 
+    // Include Redis replay and mesh deliveries, which can contain legacy rows
+    // that predate the ingest owner binding. Resolve once per event, then gate
+    // every recipient even for channel-less or known-id subscriptions.
+    let matches = if event_kind_u32(&stored_event.event) == buzz_core::kind::KIND_AGENT_ENGRAM {
+        if !super::req::engram_owner_bound(&state.db, community_id, &stored_event.event).await {
+            return Vec::new();
+        }
+        matches
+            .into_iter()
+            .filter(|(conn_id, _)| {
+                state
+                    .conn_manager
+                    .pubkey_for_conn(*conn_id)
+                    .is_some_and(|pk| {
+                        buzz_core::filter::reader_authorized_for_event(
+                            &stored_event.event,
+                            &hex::encode(pk),
+                        )
+                    })
+            })
+            .collect()
+    } else {
+        matches
+    };
+
     // Author-only kinds (NIP-ER reminders) may only ever be delivered to the
     // event's own author. This gate lives here — the chokepoint shared by the
     // ingest fan-out path and the Redis cross-node `subscribe_local` path, the
