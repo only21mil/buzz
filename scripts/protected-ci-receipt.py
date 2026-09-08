@@ -41,6 +41,7 @@ import sys
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlsplit
 import uuid
+import types
 
 
 REPOSITORY = "only21mil/buzz"
@@ -228,9 +229,13 @@ def api_endpoint(value: str) -> str:
     query = dict(query_items)
     static = {
         "/user",
+        "/repos/RustSec/advisory-db/git/ref/heads/main",
+        f"/repos/{REPOSITORY}/actions/variables/BUZZ_CI_REUSE_EPOCH",
         f"/repos/{REPOSITORY}",
     }
     no_query_patterns = [
+        rf"^/repos/{re.escape(REPOSITORY)}/actions/runs/[1-9][0-9]*$",
+        rf"^/repos/{re.escape(REPOSITORY)}/commits/[0-9a-f]{{40}}/pulls$",
         rf"^/repos/{re.escape(REPOSITORY)}/pulls/[1-9][0-9]*$",
         rf"^/repos/{re.escape(REPOSITORY)}/git/ref/heads/[A-Za-z0-9._%-]+$",
         rf"^/repos/{re.escape(REPOSITORY)}/commits/[0-9a-f]{{40}}$",
@@ -255,6 +260,16 @@ def api_endpoint(value: str) -> str:
         if "page" in query:
             refuse(query["page"].isdigit() and int(query["page"]) >= 2,
                    "pagination page must be at least 2", ProviderError)
+    elif re.fullmatch(rf"/repos/{re.escape(REPOSITORY)}/actions/workflows/(ci|relay_e2e_canary|desktop-release-candidate)\.yml/runs", path):
+        refuse(query.get("per_page") == "100" and SHA40.fullmatch(query.get("head_sha", "")) and
+               query.get("event") in ("pull_request", "workflow_dispatch") and
+               set(query) <= {"per_page", "page", "head_sha", "event"}, "workflow query is not allowlisted", ProviderError)
+    elif re.fullmatch(rf"/repos/{re.escape(REPOSITORY)}/actions/runs/[1-9][0-9]*(?:/attempts/[1-9][0-9]*)?/(jobs|artifacts)", path):
+        allowed = {"per_page", "page", "filter"} if path.endswith("/jobs") else {"per_page", "page"}
+        attempts = "/attempts/" in path
+        refuse(query.get("per_page") == "100" and set(query) <= allowed and
+               (not path.endswith("/jobs") or ("filter" not in query if attempts else query.get("filter") == "all")) and
+               (not attempts or path.endswith("/jobs")), "execution query is not allowlisted", ProviderError)
     else:
         raise ProviderError(f"GitHub API resource is not allowlisted: {path}")
     if parsed.scheme:
@@ -412,11 +427,15 @@ class GhClient:
                                     timeout=60)
         except (OSError, subprocess.SubprocessError, UnicodeError) as exc:
             raise ProviderError(f"GitHub GET could not run for {endpoint}") from exc
-        refuse(completed.returncode == 0,
-               f"GitHub GET failed for {endpoint}", ProviderError)
         response = bounded_response(completed.stdout, endpoint)
         status, headers, body = parse_headers(response)
-        refuse(status == 200, f"GitHub GET returned HTTP {status} for {endpoint}", ProviderError)
+        epoch_endpoint = endpoint == f"/repos/{REPOSITORY}/actions/variables/BUZZ_CI_REUSE_EPOCH"
+        missing_epoch = epoch_endpoint and status == 404
+        # gh exits 1 for an HTTP error. Only the exact epoch 404 is eligible
+        # for the later independent admin-authority check in current_epoch.
+        refuse(completed.returncode == 0 or (completed.returncode == 1 and missing_epoch),
+               f"GitHub GET failed for {endpoint}", ProviderError)
+        refuse(status == 200 or missing_epoch, f"GitHub GET returned HTTP {status} for {endpoint}", ProviderError)
         request_id = headers.get("x-github-request-id")
         date = headers.get("date")
         refuse(bool(request_id), "GitHub response lacks X-GitHub-Request-Id", ProviderError)
@@ -426,6 +445,14 @@ class GhClient:
             require_bounded_json_depth(parsed)
         except (json.JSONDecodeError, UnicodeError, RecursionError) as exc:
             raise ProviderError(f"GitHub returned invalid JSON for {endpoint}") from exc
+        if epoch_endpoint:
+            valid = isinstance(parsed, dict)
+            if missing_epoch:
+                valid = (valid and parsed.get("message") == "Not Found" and
+                         parsed.get("status", "404") == "404" and not {"name", "value"}.intersection(parsed))
+            else:
+                valid = valid and parsed.get("name") == "BUZZ_CI_REUSE_EPOCH" and isinstance(parsed.get("value"), str)
+            refuse(valid, "GitHub returned an invalid epoch response", ProviderError)
         self.requests.append({
             "endpoint": endpoint, "page": page, "status": status,
             "request_id": request_id, "date": date, "etag": headers.get("etag"),
@@ -467,10 +494,12 @@ def assemble_pages(bodies: list[Any], kind: str) -> list[Any]:
             page_total = integer(envelope.get("total_count"), "check-runs total_count")
             total = page_total if total is None else total
             refuse(total == page_total, "check-runs total_count changed during pagination", ProviderError)
-            values = array(envelope.get("check_runs"), "check-runs")
+            key = {"checks": "check_runs", "runs": "workflow_runs", "jobs": "jobs", "artifacts": "artifacts"}.get(kind)
+            refuse(key is not None, "unknown pagination envelope")
+            values = array(envelope.get(key), key)
         records.extend(values)
         refuse(len(records) <= MAX_RECORDS, "GitHub pagination record cap exceeded", ProviderError)
-    if kind == "checks":
+    if kind != "array":
         refuse(total == len(records), "check-runs total_count does not match pages", ProviderError)
         ids = [positive(object_(item, "check run").get("id"), "check run id") for item in records]
         refuse(len(ids) == len(set(ids)), "duplicate check-run id across pages", ProviderError)
@@ -902,9 +931,30 @@ def build_main_receipt(client: GhClient, head: str, branch: str) -> dict[str, An
     }
 
 
+def landing_module(head: str):
+    """Load only module bytes belonging to the requested immutable commit.
+
+    Delivery consumers pin this entrypoint. Verify and execute the same bytes
+    here so adding the helper cannot bypass their source-integrity check.
+    """
+    path = Path(__file__).with_name("protected-ci-landing.py")
+    refuse(path.is_file() and not path.is_symlink(), "landing verifier is not a regular source file")
+    data = path.read_bytes()
+    result = subprocess.run(["git", "show", f"{sha40(head, 'landed head')}:scripts/protected-ci-landing.py"],
+                            cwd=path.parent.parent, capture_output=True, timeout=60, check=False)
+    refuse(result.returncode == 0 and data == result.stdout, "landing verifier differs from immutable source")
+    module = types.ModuleType("protected_ci_landing")
+    module.__file__ = str(path)
+    exec(compile(data, str(path), "exec"), module.__dict__)
+    module.r = types.SimpleNamespace(**globals())
+    return module
+
+
 def validate_receipt(value: Any, repository: str, head: str,
                      scope: str, now: dt.datetime, max_age_seconds: int) -> dict[str, Any]:
     receipt = object_(value, "receipt")
+    if receipt.get("schema_version") == 2:
+        return landing_module(head).validate(receipt, repository, head, scope, now, max_age_seconds)
     top = {"schema_version", "source", "scope", "repository", "head_sha", "timestamp", "overall",
            "protected", "full_exact_head", "provider", "pull_request", "protection", "checks"}
     exact_fields(receipt, top, "receipt")
@@ -1158,6 +1208,9 @@ def reverify_receipt(receipt: dict[str, Any], client: GhClient) -> None:
     request open, non-draft, at the receipt head, based on main, with both the
     pull request's base SHA and the live main head equal to the recorded base.
     """
+    if receipt.get("schema_version") == 2:
+        landing_module(receipt["head_sha"]).reverify(receipt, client)
+        return
     owner, repo = REPOSITORY.split("/")
     head = receipt["head_sha"]
     require_repository(client.one(f"/repos/{owner}/{repo}"),
@@ -1346,6 +1399,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     acquire_main.add_argument("--head", required=True)
     acquire_main.add_argument("--branch", required=True)
     acquire_main.add_argument("--output", required=True, type=Path)
+    acquire_main.add_argument("--reuse-source", type=Path, help="original qualified pull-request receipt; produce verified-landing v2")
+    acquire_main.add_argument("--candidate", help="independently reviewed exact candidate")
+    acquire_main.add_argument("--base", help="independently reviewed exact base")
+    verify_source = subparsers.add_parser("verify-source", help="prove complete candidate qualification before merge")
+    verify_source.add_argument("--repository", required=True)
+    verify_source.add_argument("--head", required=True)
+    verify_source.add_argument("--base", required=True)
+    verify_source.add_argument("--receipt", required=True, type=Path)
+    verify_source.add_argument("--output", required=True, type=Path)
     validate = subparsers.add_parser("validate", help="validate a saved receipt")
     validate.add_argument("--receipt", required=True, type=Path)
     validate.add_argument("--repository", required=True)
@@ -1362,7 +1424,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         refuse(args.repository == REPOSITORY, f"repository must be {REPOSITORY}", ProviderError)
         sha40(args.head, "head")
-        if args.command in ("acquire", "acquire-main"):
+        if args.command == "verify-source":
+            sha40(args.base, "reviewed base")
+            gh, identity = resolve_gh()
+            value = landing_module(args.head).verify_candidate(GhClient(gh, identity), args.head, args.base,
+                                                               safe_read_receipt(args.receipt))
+            safe_publish(args.output, value)
+        elif args.command in ("acquire", "acquire-main"):
             gh, identity = resolve_gh()
             client = GhClient(gh, identity)
             if args.command == "acquire":
@@ -1371,7 +1439,15 @@ def main(argv: list[str] | None = None) -> int:
                 value = build_receipt(client, args.pull_request, args.head, args.base)
             else:
                 refuse(args.branch == "main", "branch must be main")
-                value = build_main_receipt(client, args.head, args.branch)
+                if args.reuse_source:
+                    refuse(args.candidate is not None and args.base is not None, "reuse requires reviewed --candidate and --base")
+                    sha40(args.candidate, "reviewed candidate")
+                    sha40(args.base, "reviewed base")
+                    value = landing_module(args.head).acquire(client, args.head, safe_read_receipt(args.reuse_source),
+                                                             args.candidate, args.base)
+                else:
+                    refuse(args.candidate is None and args.base is None, "candidate/base require --reuse-source")
+                    value = build_main_receipt(client, args.head, args.branch)
             safe_publish(args.output, value)
         else:
             refuse(args.max_age_seconds > 0, "max age must be positive")
