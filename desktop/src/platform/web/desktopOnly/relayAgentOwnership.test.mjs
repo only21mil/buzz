@@ -86,7 +86,12 @@ test("ownership enrichment fails closed for foreign responses, revoked profiles 
         {
           fetchEvents: async (filter) =>
             filter.kinds[0] === 10100
-              ? [signedEvent(key, 10100, { owner_pubkey: viewerPubkey })]
+              ? [
+                  signedEvent(key, 10100, {
+                    name: "Scout",
+                    owner_pubkey: viewerPubkey,
+                  }),
+                ]
               : profiles,
         },
       );
@@ -110,7 +115,9 @@ test("signed owner conditions apply to the profile timestamp, including replacea
     { pubkey: () => viewerPubkey },
     {
       fetchEvents: async (filter) =>
-        filter.kinds[0] === 10100 ? [signedEvent(key, 10100)] : profiles,
+        filter.kinds[0] === 10100
+          ? [signedEvent(key, 10100, { name: "Scout" })]
+          : profiles,
     },
   );
   assert.equal(
@@ -127,4 +134,23 @@ test("signed owner conditions apply to the profile timestamp, including replacea
     (await dispatch("list_relay_agents"))[0].owner_pubkey,
     owned.id < revoked.id ? viewerPubkey : null,
   );
+});
+
+test("a verified owner does not revive an older complete directory profile", async () => {
+  const key = testKey(9);
+  let current = signedEvent(key, 10100, { respond_to: "owner" }, [], 101);
+  const complete = signedEvent(key, 10100, { name: "Scout" }, [], 100);
+  registerRelayWorkflowsMembersCommands(
+    { pubkey: () => viewerPubkey },
+    {
+      fetchEvents: async (filter) =>
+        filter.kinds[0] === 10100 ? [complete, current] : [ownedProfile(key)],
+    },
+  );
+  assert.deepEqual(await dispatch("list_relay_agents"), []);
+  current = signedEvent(key, 10100, { name: "Current Scout" }, [], 102);
+  const agents = await dispatch("list_relay_agents");
+  assert.equal(agents.length, 1);
+  assert.equal(agents[0].name, "Current Scout");
+  assert.equal(agents[0].owner_pubkey, viewerPubkey);
 });

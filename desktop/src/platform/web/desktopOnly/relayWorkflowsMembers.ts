@@ -317,7 +317,10 @@ function relayAgentsFromEvents(
   return [...latest.values()]
     .sort((left, right) => left.index - right.index)
     .flatMap(({ event }) => {
-      const agent = relayAgentFromEvent(event, owners.get(event.pubkey) ?? null);
+      const agent = relayAgentFromEvent(
+        event,
+        owners.get(event.pubkey) ?? null,
+      );
       return agent ? [agent] : [];
     });
 }

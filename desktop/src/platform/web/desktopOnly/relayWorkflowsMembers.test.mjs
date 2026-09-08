@@ -471,7 +471,11 @@ test("list_relay_agents skips an authoritative sparse head", async () => {
     return [complete, sparse, replacement];
   };
   assert.deepEqual(await dispatch("list_relay_agents"), [
-    { pubkey: PUBKEY, ...AGENT_PROFILE_FOLD_FIXTURE.replacement },
+    {
+      pubkey: PUBKEY,
+      owner_pubkey: null,
+      ...AGENT_PROFILE_FOLD_FIXTURE.replacement,
+    },
   ]);
 });
 
@@ -494,6 +498,7 @@ test("list_relay_agents parses only the authoritative profile head", async () =>
   const expected = [
     {
       pubkey: PUBKEY,
+      owner_pubkey: null,
       name: "New",
       agent_type: "agent",
       channels: [],
