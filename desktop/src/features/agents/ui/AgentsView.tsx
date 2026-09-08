@@ -1,3 +1,4 @@
+import { Capability, useCapability } from "@/platform/web/capabilities";
 import { hasLocalTeamStorage } from "../lib/teamStorageCapability";
 import * as React from "react";
 import { EllipsisVertical, OctagonX, Settings2 } from "lucide-react";
@@ -39,6 +40,7 @@ import { PageHeader } from "@/shared/ui/PageHeader";
 import { getInheritedAgentDefaults } from "./bakedEnvHelpers";
 
 export function AgentsView() {
+  const runtimeAvailable = useCapability(Capability.ManagedAgents);
   const { openPersonaProfilePanel, openProfilePanel } = useProfilePanel();
   const { globalConfig } = useGlobalAgentConfig();
   const { data: bakedEnv } = useBakedBuildEnvQuery({ enabled: true });
@@ -52,6 +54,7 @@ export function AgentsView() {
   const [isAiDefaultsOpen, setIsAiDefaultsOpen] = React.useState(false);
 
   function openAiDefaults(trigger: HTMLButtonElement | null) {
+    if (!runtimeAvailable) return;
     aiDefaultsTriggerRef.current = trigger;
     setIsAiDefaultsOpen(true);
   }
@@ -150,6 +153,12 @@ export function AgentsView() {
                 <div className="flex flex-wrap justify-end gap-2 [@container(max-width:40rem)]:hidden">
                   <Button
                     data-testid="agent-defaults-button"
+                    disabled={!runtimeAvailable}
+                    title={
+                      runtimeAvailable
+                        ? undefined
+                        : "Open Buzz desktop to configure agents"
+                    }
                     ref={fullAiDefaultsTriggerRef}
                     onClick={(event) => openAiDefaults(event.currentTarget)}
                     size="sm"
@@ -191,6 +200,12 @@ export function AgentsView() {
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end">
                     <DropdownMenuItem
+                      disabled={!runtimeAvailable}
+                      title={
+                        runtimeAvailable
+                          ? undefined
+                          : "Open Buzz desktop to configure agents"
+                      }
                       onSelect={() => {
                         openAiDefaults(compactActionsTriggerRef.current);
                       }}

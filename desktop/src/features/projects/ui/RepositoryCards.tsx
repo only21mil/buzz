@@ -1,3 +1,4 @@
+import { Capability, useCapability } from "@/platform/web/capabilities";
 import { FolderGit2, GitBranch, Globe, SquareTerminal } from "lucide-react";
 
 import type {
@@ -178,13 +179,18 @@ function RepositoryActionsMenu({
   onOpenTerminal,
   repository,
 }: Pick<RepositoryItemProps, "hasLocal" | "onOpenTerminal" | "repository">) {
+  const terminalAvailable = useCapability(Capability.Terminal);
   return (
     <ProjectListRowMenu label={`More options for ${repository.name}`}>
       <DropdownMenuItem
+        disabled={!terminalAvailable}
+        title={
+          terminalAvailable ? undefined : "Open Buzz desktop to use a terminal"
+        }
         onSelect={(event) => {
           event.preventDefault();
           event.stopPropagation();
-          onOpenTerminal(repository);
+          if (terminalAvailable) onOpenTerminal(repository);
         }}
       >
         <SquareTerminal className="h-4 w-4" />

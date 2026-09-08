@@ -1,3 +1,4 @@
+import { Capability, isCapabilityAvailable } from "@/platform/web/capabilities";
 import * as React from "react";
 
 export type TerminalPanelMode = "closed" | "docked" | "maximized";
@@ -16,6 +17,7 @@ function publish(next: Snapshot) {
 }
 
 export function setTerminalPanelMode(mode: TerminalPanelMode) {
+  if (mode !== "closed" && !isCapabilityAvailable(Capability.Terminal)) return;
   if (snapshot.mode === mode) return;
   publish({ ...snapshot, mode });
 }

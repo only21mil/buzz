@@ -1,3 +1,4 @@
+import { Capability, useCapability } from "@/platform/web/capabilities";
 import * as React from "react";
 import {
   Archive,
@@ -53,11 +54,13 @@ export function UserProfileAgentSettingsMenu({
   onToggleAutoStart?: () => void;
   personaActionKey?: string;
 }) {
+  const runtimeAvailable = useCapability(Capability.ManagedAgents);
   const [archiveConfirmOpen, setArchiveConfirmOpen] = React.useState(false);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = React.useState(false);
   const actionKey = managedAgent?.pubkey ?? "persona-draft";
   const personaKey = personaActionKey ?? actionKey;
   const canToggleAutoStart =
+    runtimeAvailable &&
     managedAgent !== undefined &&
     managedAgent.backend.type === "local" &&
     onToggleAutoStart !== undefined;
@@ -132,7 +135,7 @@ export function UserProfileAgentSettingsMenu({
               Duplicate
             </DropdownMenuItem>
           ) : null}
-          {onExportPersona ? (
+          {runtimeAvailable && onExportPersona ? (
             <DropdownMenuItem
               data-testid={`user-profile-persona-export-${personaKey}`}
               disabled={isPending}

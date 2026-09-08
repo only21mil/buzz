@@ -1,3 +1,4 @@
+import { initializeBrowserCapabilities } from "./capabilities";
 import { relayClient } from "@/shared/api/relayClient";
 import { registerNoopCommands } from "./noops";
 import { registerAgentsRuntimeBuilderlabCommands } from "./desktopOnly/agentsRuntimeBuilderlab";
@@ -66,6 +67,7 @@ export function registerBootStubs(): void {
 }
 
 export async function installBrowserPal(): Promise<void> {
+  initializeBrowserCapabilities();
   registerNoopCommands();
   registerBootStubs();
   registerOnboardingCommands();

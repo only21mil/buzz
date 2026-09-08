@@ -1,3 +1,4 @@
+import { Capability, useCapability } from "@/platform/web/capabilities";
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Activity, Headphones, MessageSquare } from "lucide-react";
@@ -263,12 +264,14 @@ export function UserProfilePopover({
   const selfProfileQuery = useProfileQuery(open && showProfileActions);
   const isCurrentUserOwner = ownsAuthorAgent(profile, currentPubkey);
   const viewerIsOwner = isCurrentUserOwner || isOwner === true;
+  const huddleAvailable = useCapability(Capability.HuddleAudio);
   const showHuddleAction =
-    showHumanProfileActions ||
-    (showProfileActions &&
-      isBotProfile &&
-      viewerIsOwner &&
-      !isAgentClassificationPending);
+    huddleAvailable &&
+    (showHumanProfileActions ||
+      (showProfileActions &&
+        isBotProfile &&
+        viewerIsOwner &&
+        !isAgentClassificationPending));
   const showMessageAction =
     showProfileActions &&
     !isAgentClassificationPending &&

@@ -1,3 +1,4 @@
+import { Capability, useCapability } from "@/platform/web/capabilities";
 import type { LucideIcon } from "lucide-react";
 import {
   MessageSquare,
@@ -138,10 +139,11 @@ export function ProfilePersonaPrimaryActions({
   onEditAgent: () => void;
   onStartAgent: () => void;
 }) {
+  const runtimeAvailable = useCapability(Capability.ManagedAgents);
   return (
     <div className="flex items-center justify-center gap-8">
       <ProfileQuickAction
-        disabled={disabled}
+        disabled={!runtimeAvailable || disabled}
         icon={Play}
         label="Start Agent"
         onClick={onStartAgent}

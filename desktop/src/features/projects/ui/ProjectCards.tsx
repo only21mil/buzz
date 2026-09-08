@@ -1,3 +1,4 @@
+import { Capability, useCapability } from "@/platform/web/capabilities";
 import { isTauri } from "@tauri-apps/api/core";
 import {
   CircleAlert,
@@ -438,16 +439,23 @@ function ProjectActionsMenu({
   onDelete: (project: Project) => Promise<void> | void;
   onOpenTerminal: (project: Project) => Promise<void> | void;
 }) {
+  const terminalAvailable = useCapability(Capability.Terminal);
   const [confirmOpen, setConfirmOpen] = React.useState(false);
 
   return (
     <AlertDialog onOpenChange={setConfirmOpen} open={confirmOpen}>
       <ProjectListRowMenu label={`More options for ${project.name}`}>
         <DropdownMenuItem
+          disabled={!terminalAvailable}
+          title={
+            terminalAvailable
+              ? undefined
+              : "Open Buzz desktop to use a terminal"
+          }
           onSelect={(event) => {
             event.preventDefault();
             event.stopPropagation();
-            void onOpenTerminal(project);
+            if (terminalAvailable) void onOpenTerminal(project);
           }}
         >
           <TerminalSquare className="h-4 w-4" />

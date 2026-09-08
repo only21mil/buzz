@@ -1,3 +1,4 @@
+import { Capability, useCapability } from "@/platform/web/capabilities";
 import { LogIn, SquareTerminal } from "lucide-react";
 import type * as React from "react";
 
@@ -78,21 +79,23 @@ export function ChannelScreenHeader({
     !activeChannel.archivedAt &&
     onJoinChannel;
 
+  const terminalAvailable = useCapability(Capability.Terminal);
   const terminalPanel = useTerminalPanel();
-  const terminalButton = activeChannel ? (
-    <Button
-      aria-label={
-        terminalPanel.mode === "closed" ? "Open Buzz Term" : "Hide Buzz Term"
-      }
-      onClick={toggleTerminalPanel}
-      size="icon"
-      title="Buzz Term (⌘J)"
-      type="button"
-      variant={terminalPanel.mode === "closed" ? "outline" : "secondary"}
-    >
-      <SquareTerminal />
-    </Button>
-  ) : null;
+  const terminalButton =
+    activeChannel && terminalAvailable ? (
+      <Button
+        aria-label={
+          terminalPanel.mode === "closed" ? "Open Buzz Term" : "Hide Buzz Term"
+        }
+        onClick={toggleTerminalPanel}
+        size="icon"
+        title="Buzz Term (⌘J)"
+        type="button"
+        variant={terminalPanel.mode === "closed" ? "outline" : "secondary"}
+      >
+        <SquareTerminal />
+      </Button>
+    ) : null;
   const channelActions = activeChannel ? (
     showJoinButton ? (
       <Button

@@ -1,3 +1,4 @@
+import { Capability, useCapability } from "@/platform/web/capabilities";
 import { listen } from "@tauri-apps/api/event";
 import { Headphones } from "lucide-react";
 import * as React from "react";
@@ -47,6 +48,7 @@ export function HuddleIndicator({
   onStart,
   startDisabled,
 }: HuddleIndicatorProps) {
+  const huddleAvailable = useCapability(Capability.HuddleAudio);
   const { joinHuddle, isStarting } = useHuddle();
   const queryClient = useQueryClient();
   const [activeHuddle, setActiveHuddle] = React.useState<ActiveHuddle | null>(
@@ -211,6 +213,8 @@ export function HuddleIndicator({
       unlisten?.();
     };
   }, []);
+
+  if (!huddleAvailable) return null;
 
   // No active huddle — render the start button (if onStart provided).
   if (!activeHuddle) {

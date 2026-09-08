@@ -1,3 +1,4 @@
+import { Capability, useCapability } from "@/platform/web/capabilities";
 import * as React from "react";
 import { isTauri } from "@tauri-apps/api/core";
 
@@ -89,7 +90,9 @@ export function TerminalBootstrap({
   const closedSessionKeysRef = React.useRef(new Set<string>());
   const [sessions, setSessions] = React.useState<Session[]>([]);
   const [activeKey, setActiveKey] = React.useState<string | null>(null);
-  const [available, setAvailable] = React.useState(() => isTauri());
+  const terminalAvailable = useCapability(Capability.Terminal);
+  const [backendAvailable, setAvailable] = React.useState(() => isTauri());
+  const available = terminalAvailable && backendAvailable;
   const panel = useTerminalPanel();
   const [renderedMode, setRenderedMode] = React.useState<
     "docked" | "maximized"
