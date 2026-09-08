@@ -977,3 +977,5 @@ fn successful_managed_agent_save_protects_new_prompt_against_older_inbound() {
         "an older inbound must not overwrite a newer retained managed-agent edit"
     );
 }
+
+mod review_content;

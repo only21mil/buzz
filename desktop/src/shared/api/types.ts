@@ -1,3 +1,6 @@
+import type { PersonaReviewContent } from "./personaReviewContent";
+export type { PersonaReviewContent } from "./personaReviewContent";
+
 export type ChannelType = "stream" | "forum" | "dm";
 export type ChannelVisibility = "open" | "private";
 export type ChannelRole = "owner" | "admin" | "member" | "guest" | "bot";
@@ -780,6 +783,12 @@ export type CreatePersonaInput = {
 
 export type UpdatePersonaInput = {
   id: string;
+  /** Optional revision bound to an owner-reviewed draft. */
+  expectedUpdatedAt?: string;
+  /** Content must also match because inbound timestamps have second resolution. */
+  expectedContent?: PersonaReviewContent;
+  /** Sharing can change independently of the persona timestamp. */
+  expectedShared?: boolean;
   displayName: string;
   avatarUrl?: string;
   systemPrompt: string;

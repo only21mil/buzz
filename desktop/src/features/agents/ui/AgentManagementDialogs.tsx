@@ -32,6 +32,7 @@ export function AgentManagementDialogs() {
           error={management.editError ? new Error(management.editError) : null}
           initialValues={management.editInitialValues}
           isPending={management.isPending}
+          key={management.request.requestId}
           mode="definition-edit"
           onOpenChange={(open) => {
             if (!open) management.dismiss();

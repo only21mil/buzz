@@ -45,6 +45,12 @@ test("stopped identity option is scoped to owned-agent review dialogs", async ()
     /key=\{management\.request\.requestId\}/,
     "each queued request remounts with fresh dialog state",
   );
+  assert.equal(
+    [...managementDialogs.matchAll(/key=\{management\.request\.requestId\}/g)]
+      .length,
+    2,
+    "create and update dialogs both reset their form for the next queued request",
+  );
   assert.doesNotMatch(requestedDialogs, /offerStoppedCreate/);
 });
 
