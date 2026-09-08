@@ -1,4 +1,4 @@
-import { expect, type Page, test } from "@playwright/test";
+import { expect, type Locator, type Page, test } from "@playwright/test";
 
 import { installMockBridge } from "../helpers/bridge";
 import { expectCornerRadiusPx, expectSmoothCorners } from "../helpers/css";
@@ -1320,6 +1320,38 @@ function emitVideoMessage(
   });
 }
 
+// Buzz issue 812e1460094f19e22650ea34289acea9e45fd33de703640617fdcbb36c33b1aa:
+// the right-click probes located `getByTestId("video-player").last()` and
+// forced a positional right-click on it. A freshly emitted row can still be
+// buffered below the viewport or shifting while the timeline anchors, so
+// `.last()` could resolve to the previous player and the forced click could
+// land on a row that had moved. The menu then never opened, or belonged to the
+// wrong video (an off-relay probe that offered Download). Scope the player to
+// its message id, release the buffered tail, and dispatch the contextmenu
+// event on the surface itself, as the link probe already does.
+async function revealVideoPlayer(page: Page, messageId: string) {
+  const player = page
+    .locator(`[data-message-id="${messageId}"]`)
+    .getByTestId("video-player");
+  const latest = page.getByTestId("message-scroll-to-latest");
+  await expect(player.or(latest).first()).toBeVisible();
+  if (await latest.isVisible()) await latest.click();
+  await expect(player).toBeVisible();
+  await player.scrollIntoViewIfNeeded();
+  await expect(player).toBeInViewport();
+  return player;
+}
+
+async function openVideoContextMenu(player: Locator) {
+  await player
+    .locator("video")
+    .evaluate((element) =>
+      element.dispatchEvent(
+        new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
+      ),
+    );
+}
+
 test("right-click menus expose distinct selectors for links, relay video, and off-relay video", async ({
   page,
 }) => {
@@ -1367,17 +1399,15 @@ test("right-click menus expose distinct selectors for links, relay video, and of
 
   // ── Relay video menu: Download video + Copy link, appearing only once the
   // relay origin resolves (the reactivity fix) ─────────────────────────────
-  await emitVideoMessage(page, {
+  const relayEmitted = (await emitVideoMessage(page, {
     url: MENU_RELAY_VIDEO_URL,
     sha: MENU_RELAY_VIDEO_SHA,
     filename: "relay-clip.mp4",
-  });
-  const relayPlayer = page.getByTestId("video-player").last();
-  await expect(relayPlayer).toBeVisible();
-  // Right-click the player surface. `force` skips the actionability guard: the
-  // Play-button overlay sits above the video, but the contextmenu event still
-  // capture-bubbles to the surface handler that opens the menu.
-  await relayPlayer.click({ button: "right", force: true });
+  })) as { id: string };
+  const relayPlayer = await revealVideoPlayer(page, relayEmitted.id);
+  // The Play-button overlay sits above the video, but the contextmenu event
+  // still capture-bubbles to the surface handler that opens the menu.
+  await openVideoContextMenu(relayPlayer);
 
   const videoMenu = page.locator("[data-video-context-menu]");
   await expect(videoMenu).toBeVisible();
@@ -1413,14 +1443,13 @@ test("right-click menus expose distinct selectors for links, relay video, and of
   await expect(page.locator("[data-video-context-menu]")).toHaveCount(0);
 
   // ── Off-relay video control: renders and offers Copy link, never Download ─
-  await emitVideoMessage(page, {
+  const offRelayEmitted = (await emitVideoMessage(page, {
     url: MENU_OFF_RELAY_VIDEO_URL,
     sha: MENU_OFF_RELAY_VIDEO_SHA,
     filename: "external-clip.mp4",
-  });
-  const offRelayPlayer = page.getByTestId("video-player").last();
-  await expect(offRelayPlayer).toBeVisible();
-  await offRelayPlayer.click({ button: "right", force: true });
+  })) as { id: string };
+  const offRelayPlayer = await revealVideoPlayer(page, offRelayEmitted.id);
+  await openVideoContextMenu(offRelayPlayer);
 
   const offRelayMenu = page.locator("[data-video-context-menu]");
   await expect(offRelayMenu).toBeVisible();
