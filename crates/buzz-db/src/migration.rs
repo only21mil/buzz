@@ -576,42 +576,54 @@ mod tests {
 
         assert_eq!(
             migrations.len(),
-            39,
+            40,
             "embedded migration matrix must contain the frozen prefix plus admitted tail"
         );
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
-        assert!(migrations[0]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE communities"));
+        assert!(
+            migrations[0]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE communities")
+        );
         assert!(migrations[0].sql.as_str().contains("CREATE TABLE channels"));
-        assert!(migrations[0]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE scheduled_workflow_fires"));
-        assert!(migrations[0]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE audit_log"));
-        assert!(migrations[0]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE _operator_global_tables"));
-        assert!(migrations[0]
-            .sql
-            .as_str()
-            .contains("search_tsv  TSVECTOR GENERATED ALWAYS"));
+        assert!(
+            migrations[0]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE scheduled_workflow_fires")
+        );
+        assert!(
+            migrations[0]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE audit_log")
+        );
+        assert!(
+            migrations[0]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE _operator_global_tables")
+        );
+        assert!(
+            migrations[0]
+                .sql
+                .as_str()
+                .contains("search_tsv  TSVECTOR GENERATED ALWAYS")
+        );
 
         // The git repo-name registry is an additive migration, never folded into
         // 0001 — folding it would change 0001's checksum and break brownfield
         // startup (sqlx VersionMismatch). It must live in its own version, and
         // 0001 must not carry it.
         assert_eq!(migrations[1].version, 2);
-        assert!(migrations[1]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE git_repo_names"));
+        assert!(
+            migrations[1]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE git_repo_names")
+        );
         assert!(!migrations[0].sql.as_str().contains("git_repo_names"));
         let desired_schema = include_str!("../../../schema/schema.sql");
         assert!(
@@ -628,18 +640,22 @@ mod tests {
         // Same additive-migration rule for the per-community workspace icon
         // (NIP-11 `icon`): its own version, never folded into 0001.
         assert_eq!(migrations[2].version, 3);
-        assert!(migrations[2]
-            .sql
-            .as_str()
-            .contains("ALTER TABLE communities ADD COLUMN icon"));
+        assert!(
+            migrations[2]
+                .sql
+                .as_str()
+                .contains("ALTER TABLE communities ADD COLUMN icon")
+        );
         assert!(!migrations[0].sql.as_str().contains("icon"));
         // Same additive-migration rule for the e-tag containment GIN index
         // (channel-window aux closure): its own version, never folded into 0001.
         assert_eq!(migrations[3].version, 4);
-        assert!(migrations[3]
-            .sql
-            .as_str()
-            .contains("CREATE INDEX idx_events_tags_gin"));
+        assert!(
+            migrations[3]
+                .sql
+                .as_str()
+                .contains("CREATE INDEX idx_events_tags_gin")
+        );
         assert!(!migrations[0].sql.as_str().contains("idx_events_tags_gin"));
 
         // NIP-AM (kind 44200) FTS exclusion: additive migration, never folded
@@ -654,25 +670,33 @@ mod tests {
         // Community moderation (reports/bans/audit): additive migration, never
         // folded into 0001 — same brownfield checksum rule as above.
         assert_eq!(migrations[5].version, 6);
-        assert!(migrations[5]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE moderation_reports"));
-        assert!(migrations[5]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE community_bans"));
-        assert!(migrations[5]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE moderation_actions"));
+        assert!(
+            migrations[5]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE moderation_reports")
+        );
+        assert!(
+            migrations[5]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE community_bans")
+        );
+        assert!(
+            migrations[5]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE moderation_actions")
+        );
         // 0006 is checksum-frozen. The admitted tail replaces its action CHECK;
         // fresh desired-schema installs must enforce the same effective vocabulary.
         assert_eq!(migrations[38].version, 39);
         let audit_extension = migrations[38].sql.as_str();
         assert!(audit_extension.contains("DROP CONSTRAINT moderation_actions_action_check"));
-        assert!(audit_extension
-            .contains("ADD CONSTRAINT moderation_actions_action_check CHECK (action IN ("));
+        assert!(
+            audit_extension
+                .contains("ADD CONSTRAINT moderation_actions_action_check CHECK (action IN (")
+        );
         let desired_audit = desired_schema
             .split_once("CREATE TABLE moderation_actions (")
             .unwrap()
@@ -706,109 +730,149 @@ mod tests {
         // NIP-RS retention is additive and boot-safe: seed replay watermarks
         // before deleting payload history, without rewriting search storage.
         assert_eq!(migrations[6].version, 7);
-        assert!(migrations[6]
-            .sql
-            .as_str()
-            .contains("LOCK TABLE events IN SHARE ROW EXCLUSIVE MODE"));
-        assert!(migrations[6]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE parameterized_event_watermarks"));
-        assert!(migrations[6]
-            .sql
-            .as_str()
-            .contains("INSERT INTO parameterized_event_watermarks"));
-        assert!(migrations[6]
-            .sql
-            .as_str()
-            .contains("CREATE INDEX idx_event_mentions_community_event"));
-        assert!(migrations[6]
-            .sql
-            .as_str()
-            .contains("NIP-RS retention blocked: deleted event outranks live head"));
-        assert!(migrations[6]
-            .sql
-            .as_str()
-            .contains("DELETE FROM events old"));
-        assert!(!migrations[6]
-            .sql
-            .as_str()
-            .contains("ALTER TABLE events DROP COLUMN search_tsv"));
+        assert!(
+            migrations[6]
+                .sql
+                .as_str()
+                .contains("LOCK TABLE events IN SHARE ROW EXCLUSIVE MODE")
+        );
+        assert!(
+            migrations[6]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE parameterized_event_watermarks")
+        );
+        assert!(
+            migrations[6]
+                .sql
+                .as_str()
+                .contains("INSERT INTO parameterized_event_watermarks")
+        );
+        assert!(
+            migrations[6]
+                .sql
+                .as_str()
+                .contains("CREATE INDEX idx_event_mentions_community_event")
+        );
+        assert!(
+            migrations[6]
+                .sql
+                .as_str()
+                .contains("NIP-RS retention blocked: deleted event outranks live head")
+        );
+        assert!(
+            migrations[6]
+                .sql
+                .as_str()
+                .contains("DELETE FROM events old")
+        );
+        assert!(
+            !migrations[6]
+                .sql
+                .as_str()
+                .contains("ALTER TABLE events DROP COLUMN search_tsv")
+        );
 
         // Fresh installs opt into the positive search allowlist without making
         // populated databases rewrite their events heap during relay startup.
         assert_eq!(migrations[7].version, 8);
-        assert!(migrations[7]
-            .sql
-            .as_str()
-            .contains("IF NOT EXISTS (SELECT 1 FROM events LIMIT 1)"));
-        assert!(migrations[7]
-            .sql
-            .as_str()
-            .contains("CASE WHEN kind IN (0, 9, 40002, 45001, 45003)"));
+        assert!(
+            migrations[7]
+                .sql
+                .as_str()
+                .contains("IF NOT EXISTS (SELECT 1 FROM events LIMIT 1)")
+        );
+        assert!(
+            migrations[7]
+                .sql
+                .as_str()
+                .contains("CASE WHEN kind IN (0, 9, 40002, 45001, 45003)")
+        );
         assert!(migrations[7].sql.as_str().contains("ELSE NULL::tsvector"));
 
         // Mixed-version guards are additive because 0007/0008 may already be
         // recorded by a running relay and their sqlx checksums are immutable.
         assert_eq!(migrations[8].version, 9);
-        assert!(migrations[8]
-            .sql
-            .as_str()
-            .contains("CREATE TRIGGER trg_events_nip_rs_watermark"));
-        assert!(migrations[8]
-            .sql
-            .as_str()
-            .contains("stale NIP-RS event rejected by durable watermark"));
-        assert!(migrations[8]
-            .sql
-            .as_str()
-            .contains("CREATE TRIGGER trg_events_purge_soft_deleted_nip_rs"));
-        assert!(migrations[8]
-            .sql
-            .as_str()
-            .contains("CREATE TRIGGER trg_event_mentions_require_live_event"));
+        assert!(
+            migrations[8]
+                .sql
+                .as_str()
+                .contains("CREATE TRIGGER trg_events_nip_rs_watermark")
+        );
+        assert!(
+            migrations[8]
+                .sql
+                .as_str()
+                .contains("stale NIP-RS event rejected by durable watermark")
+        );
+        assert!(
+            migrations[8]
+                .sql
+                .as_str()
+                .contains("CREATE TRIGGER trg_events_purge_soft_deleted_nip_rs")
+        );
+        assert!(
+            migrations[8]
+                .sql
+                .as_str()
+                .contains("CREATE TRIGGER trg_event_mentions_require_live_event")
+        );
 
         assert_eq!(migrations[9].version, 10);
-        assert!(migrations[9]
-            .sql
-            .as_str()
-            .contains("CREATE OR REPLACE FUNCTION guard_nip_rs_watermark"));
+        assert!(
+            migrations[9]
+                .sql
+                .as_str()
+                .contains("CREATE OR REPLACE FUNCTION guard_nip_rs_watermark")
+        );
         assert!(migrations[9].sql.as_str().contains("RETURN NULL"));
 
         assert_eq!(migrations[10].version, 11);
-        assert!(migrations[10]
-            .sql
-            .as_str()
-            .contains("CREATE OR REPLACE FUNCTION guard_nip_rs_watermark"));
-        assert!(migrations[10]
-            .sql
-            .as_str()
-            .contains("CREATE OR REPLACE FUNCTION purge_soft_deleted_nip_rs"));
+        assert!(
+            migrations[10]
+                .sql
+                .as_str()
+                .contains("CREATE OR REPLACE FUNCTION guard_nip_rs_watermark")
+        );
+        assert!(
+            migrations[10]
+                .sql
+                .as_str()
+                .contains("CREATE OR REPLACE FUNCTION purge_soft_deleted_nip_rs")
+        );
         assert!(migrations[10].sql.as_str().contains("tag->>0 = 'd'"));
         assert!(migrations[10].sql.as_str().contains(") = 1"));
 
         // Push leases and their durable outbox are relay-owned and structurally
         // community-scoped; the public gateway remains stateless.
         assert_eq!(migrations[11].version, 12);
-        assert!(migrations[11]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE push_leases"));
-        assert!(migrations[11]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE push_wake_outbox"));
-        assert!(migrations[11]
-            .sql
-            .as_str()
-            .contains("PRIMARY KEY (community_id, author, installation_id)"));
+        assert!(
+            migrations[11]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE push_leases")
+        );
+        assert!(
+            migrations[11]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE push_wake_outbox")
+        );
+        assert!(
+            migrations[11]
+                .sql
+                .as_str()
+                .contains("PRIMARY KEY (community_id, author, installation_id)")
+        );
         assert!(!migrations[0].sql.as_str().contains("push_leases"));
 
         assert_eq!(migrations[12].version, 13);
-        assert!(migrations[12]
-            .sql
-            .as_str()
-            .contains("ADD COLUMN endpoint_enabled"));
+        assert!(
+            migrations[12]
+                .sql
+                .as_str()
+                .contains("ADD COLUMN endpoint_enabled")
+        );
 
         // Kind 30350 is author-only encrypted data, so its ciphertext is never
         // indexed for NIP-50 search. Preserve the 0001 checksum and extend the
@@ -822,42 +886,56 @@ mod tests {
         // durable: immediate revocation and hostile-relay admission cannot be
         // honestly provided by a stateless gateway.
         assert_eq!(migrations[14].version, 15);
-        assert!(migrations[14]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE push_gateway_installations"));
-        assert!(migrations[14]
-            .sql
-            .as_str()
-            .contains("push_gateway_delegations"));
-        assert!(migrations[14]
-            .sql
-            .as_str()
-            .contains("_operator_global_tables"));
+        assert!(
+            migrations[14]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE push_gateway_installations")
+        );
+        assert!(
+            migrations[14]
+                .sql
+                .as_str()
+                .contains("push_gateway_delegations")
+        );
+        assert!(
+            migrations[14]
+                .sql
+                .as_str()
+                .contains("_operator_global_tables")
+        );
 
         // Community archival and product feedback landed concurrently. Keep
         // both additive migrations in a single, unambiguous sequence.
         assert_eq!(migrations[15].version, 16);
-        assert!(migrations[15]
-            .sql
-            .as_str()
-            .contains("ADD COLUMN archived_at"));
+        assert!(
+            migrations[15]
+                .sql
+                .as_str()
+                .contains("ADD COLUMN archived_at")
+        );
 
         // Product feedback is a deployment-private sidecar; community_id is
         // provenance, not an operator-review authorization boundary.
         assert_eq!(migrations[16].version, 17);
-        assert!(migrations[16]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE product_feedback"));
-        assert!(migrations[16]
-            .sql
-            .as_str()
-            .contains("community_id UUID NOT NULL"));
-        assert!(migrations[16]
-            .sql
-            .as_str()
-            .contains("('product_feedback', 'deployment product inbox"));
+        assert!(
+            migrations[16]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE product_feedback")
+        );
+        assert!(
+            migrations[16]
+                .sql
+                .as_str()
+                .contains("community_id UUID NOT NULL")
+        );
+        assert!(
+            migrations[16]
+                .sql
+                .as_str()
+                .contains("('product_feedback', 'deployment product inbox")
+        );
         assert!(!migrations[0].sql.as_str().contains("product_feedback"));
 
         // Matching is driven from a parent-table trigger so all partition and
@@ -876,31 +954,41 @@ mod tests {
         let mesh_retention = migrations[18].sql.as_str();
         assert!(mesh_retention.contains("buzz-mesh-member-status:%"));
         assert!(mesh_retention.contains("buzz-mesh-status"));
-        assert!(mesh_retention
-            .contains("CREATE TRIGGER trg_events_purge_soft_deleted_buzz_mesh_status"));
-        assert!(!migrations[0]
-            .sql
-            .as_str()
-            .contains("purge_soft_deleted_buzz_mesh_status"));
+        assert!(
+            mesh_retention
+                .contains("CREATE TRIGGER trg_events_purge_soft_deleted_buzz_mesh_status")
+        );
+        assert!(
+            !migrations[0]
+                .sql
+                .as_str()
+                .contains("purge_soft_deleted_buzz_mesh_status")
+        );
 
         // Join policy acceptances landed concurrently with mesh status retention;
         // keep both additive migrations in a single, unambiguous sequence.
         assert_eq!(migrations[19].version, 20);
-        assert!(migrations[19]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE join_policy_acceptances"));
+        assert!(
+            migrations[19]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE join_policy_acceptances")
+        );
 
         // Replica-fence commit-time floor guard on channel-bearing events.
         assert_eq!(migrations[20].version, 21);
-        assert!(migrations[20]
-            .sql
-            .as_str()
-            .contains("events_created_at_floor_guard"));
-        assert!(!migrations[0]
-            .sql
-            .as_str()
-            .contains("join_policy_acceptances"));
+        assert!(
+            migrations[20]
+                .sql
+                .as_str()
+                .contains("events_created_at_floor_guard")
+        );
+        assert!(
+            !migrations[0]
+                .sql
+                .as_str()
+                .contains("join_policy_acceptances")
+        );
 
         // Channel TTL refresh belongs to the event insertion transaction so a
         // concurrent permanent -> ephemeral transition cannot be missed.
@@ -927,16 +1015,20 @@ mod tests {
         // so permanent-channel commits no longer serialize.
         assert_eq!(migrations[23].version, 24);
         let ttl_shared = migrations[23].sql.as_str();
-        assert!(ttl_shared
-            .contains("CREATE OR REPLACE FUNCTION refresh_channel_ttl_after_event_insert"));
+        assert!(
+            ttl_shared
+                .contains("CREATE OR REPLACE FUNCTION refresh_channel_ttl_after_event_insert")
+        );
         assert!(ttl_shared.contains("pg_advisory_xact_lock_shared"));
         assert!(ttl_shared.contains("'buzz_channel_ttl:' || NEW.community_id::text"));
         // The row read must be a bare SELECT (comments describe the removed
         // FOR UPDATE; the executable body must not reintroduce it).
         assert!(ttl_shared.contains("SELECT ttl_seconds INTO channel_ttl"));
-        assert!(!strip_sql_comments(ttl_shared)
-            .to_lowercase()
-            .contains("for update"));
+        assert!(
+            !strip_sql_comments(ttl_shared)
+                .to_lowercase()
+                .contains("for update")
+        );
         assert!(ttl_shared.contains("NEW.kind <> 9007"));
 
         // Use-limited invite links: durable relay_invites table stores only
@@ -945,8 +1037,10 @@ mod tests {
         assert_eq!(migrations[24].version, 25);
         let relay_invites = migrations[24].sql.as_str();
         assert!(relay_invites.contains("CREATE TABLE relay_invites"));
-        assert!(relay_invites
-            .contains("token_hash   BYTEA       NOT NULL CHECK (length(token_hash) = 32)"));
+        assert!(
+            relay_invites
+                .contains("token_hash   BYTEA       NOT NULL CHECK (length(token_hash) = 32)")
+        );
         assert!(relay_invites.contains("PRIMARY KEY (community_id, id)"));
         assert!(relay_invites.contains("UNIQUE (community_id, token_hash)"));
         assert!(
@@ -954,8 +1048,11 @@ mod tests {
         );
         assert!(relay_invites.contains("CHECK (max_uses IS NULL OR use_count <= max_uses)"));
         assert!(relay_invites.contains("role = 'member'"));
-        assert!(relay_invites
-            .contains("CREATE INDEX relay_invites_expires_at_idx ON relay_invites (expires_at)"));
+        assert!(
+            relay_invites.contains(
+                "CREATE INDEX relay_invites_expires_at_idx ON relay_invites (expires_at)"
+            )
+        );
         assert!(!relay_invites.contains("_operator_global_tables"));
 
         let desired_schema = include_str!("../../../schema/schema.sql");
@@ -1056,8 +1153,10 @@ mod tests {
         assert!(approval_foundations.contains("UNIQUE (community_id, run_id, step_index)"));
         assert!(approval_foundations.contains("workflow_approval_gates_workflow_fkey"));
         assert!(approval_foundations.contains("workflow_approval_gates_run_binding_fkey"));
-        assert!(approval_foundations
-            .contains("REFERENCES workflows (community_id, id) ON DELETE NO ACTION"));
+        assert!(
+            approval_foundations
+                .contains("REFERENCES workflows (community_id, id) ON DELETE NO ACTION")
+        );
         assert!(approval_foundations.contains(
             "REFERENCES workflow_runs (community_id, id, workflow_id) ON DELETE NO ACTION"
         ));
@@ -1083,8 +1182,10 @@ mod tests {
         assert_eq!(migrations[33].version, 34);
         let workflow_effect_claims = migrations[33].sql.as_str();
         assert!(workflow_effect_claims.contains("CREATE TABLE workflow_effect_claims"));
-        assert!(workflow_effect_claims
-            .contains("PRIMARY KEY (community_id, run_id, step_id, effect_index)"));
+        assert!(
+            workflow_effect_claims
+                .contains("PRIMARY KEY (community_id, run_id, step_id, effect_index)")
+        );
         assert!(workflow_effect_claims.contains("UNIQUE (community_id, idempotency_key)"));
         assert!(workflow_effect_claims.contains("effect_payload JSONB NOT NULL"));
         assert!(workflow_effect_claims.contains("workflow_effect_claim_identity_immutable"));
@@ -1207,9 +1308,11 @@ mod tests {
 
         let violations = scoped_constraint_violations(sql);
 
-        assert!(violations
-            .iter()
-            .any(|violation| violation.kind == ConstraintKind::PrimaryKey));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.kind == ConstraintKind::PrimaryKey)
+        );
         assert_eq!(
             violations
                 .iter()
@@ -1943,7 +2046,9 @@ mod b1_ci_grants_ordering {
             vec![
                 (36, "workflow run error codes"),
                 (37, "push message kinds"),
-                (38, "push gateway dogfood profile")
+                (38, "push gateway dogfood profile"),
+                (39, "channel admin audit actions"),
+                (40, "agent drafts")
             ]
         );
         let ci_grants = migrations

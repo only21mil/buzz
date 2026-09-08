@@ -7,8 +7,8 @@ use tracing::{debug, warn};
 
 use buzz_core::filter::filters_match;
 use buzz_core::kind::{
-    is_unshared_gated_event, AUTHOR_ONLY_KINDS, KIND_AGENT_ENGRAM, KIND_AGENT_TURN_METRIC,
-    KIND_DM_VISIBILITY, P_GATED_KINDS, RESULT_GATED_KINDS, SHARED_GATED_KINDS,
+    is_unshared_gated_event, AUTHOR_ONLY_KINDS, KIND_AGENT_ENGRAM, P_GATED_KINDS,
+    RESULT_GATED_KINDS, SHARED_GATED_KINDS,
 };
 use buzz_core::tenant::TenantContext;
 use buzz_core::CommunityId;
@@ -1116,7 +1116,7 @@ pub(crate) fn p_gated_filters_authorized(filters: &[Filter], authed_pubkey_hex: 
         let explicitly_no_ids_exemption = filter.kinds.as_ref().is_some_and(|ks| {
             ks.iter().any(|kind| {
                 let k = kind.as_u16() as u32;
-                k == KIND_DM_VISIBILITY || k == KIND_AGENT_TURN_METRIC
+                RESULT_GATED_KINDS.contains(&k)
             })
         });
         if !explicitly_no_ids_exemption && filter.ids.as_ref().is_some_and(|ids| !ids.is_empty()) {
@@ -1381,6 +1381,43 @@ fn topic_for_subscription(channel_id: Option<uuid::Uuid>) -> EventTopic {
 mod tests {
     use super::*;
     use nostr::{Alphabet, Filter, SingleLetterTag};
+
+    #[test]
+    fn durable_draft_count_and_ids_filters_require_owner_result_gates() {
+        let owner = nostr::Keys::generate();
+        let stranger = nostr::Keys::generate();
+        for kind in [14201, 14202] {
+            let broad = Filter::new().kind(nostr::Kind::Custom(kind));
+            assert!(!p_gated_filters_authorized(
+                &[broad.clone()],
+                &owner.public_key().to_hex()
+            ));
+            assert!(filter_can_match_result_gated_kinds(&broad));
+            assert!(!result_gated_count_safe_for_pushdown(
+                &broad,
+                &owner.public_key().to_hex()
+            ));
+            let own = broad.clone().pubkey(owner.public_key());
+            assert!(p_gated_filters_authorized(
+                &[own.clone()],
+                &owner.public_key().to_hex()
+            ));
+            assert!(result_gated_count_safe_for_pushdown(
+                &own,
+                &owner.public_key().to_hex()
+            ));
+            assert!(!p_gated_filters_authorized(
+                &[own],
+                &stranger.public_key().to_hex()
+            ));
+            let ids = Filter::new().id(nostr::EventId::all_zeros());
+            assert!(filter_can_match_result_gated_kinds(&ids));
+            assert!(!result_gated_count_safe_for_pushdown(
+                &ids,
+                &owner.public_key().to_hex()
+            ));
+        }
+    }
 
     #[test]
     fn global_queries_push_access_scope_before_limit() {

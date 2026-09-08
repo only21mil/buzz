@@ -1,5 +1,6 @@
 import { useDetachedToastScope } from "@/features/messages/ui/useDetachedToastScope";
 import { OwnerReviewDialogs } from "./OwnerReviewDialogs";
+import { useDurableDraftBridge } from "@/features/agents/useDurableDraftQueue";
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useLocation } from "@tanstack/react-router";
@@ -187,6 +188,10 @@ export function AppShell() {
     communitiesHook.activeCommunity?.relayUrl,
   );
   usePersonaSync(
+    identityQuery.data?.pubkey,
+    communitiesHook.activeCommunity?.relayUrl,
+  );
+  useDurableDraftBridge(
     identityQuery.data?.pubkey,
     communitiesHook.activeCommunity?.relayUrl,
   );

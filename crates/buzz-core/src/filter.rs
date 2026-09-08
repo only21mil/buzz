@@ -28,7 +28,7 @@ pub fn reader_authorized_for_event(event: &nostr::Event, reader_pubkey_hex: &str
             event.pubkey.to_hex() == reader_pubkey_hex || owner == reader_pubkey_hex
         });
     }
-    if kind != crate::kind::KIND_DM_VISIBILITY && kind != crate::kind::KIND_AGENT_TURN_METRIC {
+    if !crate::kind::RESULT_GATED_KINDS.contains(&kind) {
         return true;
     }
     let p = nostr::SingleLetterTag::lowercase(nostr::Alphabet::P);

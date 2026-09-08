@@ -631,3 +631,11 @@ buzz-db	schema_partition_contract	populated_migration_attachment_preserves_parti
 buzz-db	buzz_db	event::tests::coordinate_scope_precedes_limit_and_count_preserves_access	crates/buzz-db/src/event.rs	desired	coordinate limit, COUNT, tag AND and tenant access regression
 buzz-db	buzz_db	event::tests::persona_heads_precede_limits_and_count_with_deterministic_ties	crates/buzz-db/src/event.rs	desired	persona latest-head query and COUNT regression
 buzz-db	buzz_db	event::tests::persona_head_selection_preserves_coordinate_and_visibility_boundaries	crates/buzz-db/src/event.rs	desired	persona latest-head query and COUNT regression
+buzz-db	agent_drafts_persistence	identical_signed_retry_survives_reconnect_and_uuid_conflict_is_atomic	crates/buzz-db/tests/agent_drafts_persistence.rs	migration	disposable owner-scoped durable draft fixture
+buzz-db	agent_drafts_persistence	concurrent_devices_same_owner_same_clock_have_one_claim_and_no_takeover	crates/buzz-db/tests/agent_drafts_persistence.rs	migration	disposable owner-scoped durable draft fixture
+buzz-db	agent_drafts_persistence	rejected_tombstone_blocks_replay_and_newer_clock_approval	crates/buzz-db/tests/agent_drafts_persistence.rs	migration	disposable owner-scoped durable draft fixture
+buzz-db	agent_drafts_persistence	forged_wrong_owner_wrong_community_and_wrong_request_decisions_never_mutate	crates/buzz-db/tests/agent_drafts_persistence.rs	migration	disposable owner-scoped durable draft fixture
+buzz-db	agent_drafts_persistence	owner_pages_counts_ids_result_gate_and_search_keep_private_history	crates/buzz-db/tests/agent_drafts_persistence.rs	migration	disposable owner-scoped durable draft fixture
+buzz-db	agent_drafts_persistence	event_write_failure_rolls_back_request_identity_and_decision_head	crates/buzz-db/tests/agent_drafts_persistence.rs	migration	disposable owner-scoped durable draft fixture
+buzz-db	agent_drafts_persistence	postgres_process_restart_retains_signed_pending_and_rejected_history	crates/buzz-db/tests/agent_drafts_persistence.rs	external	disposable owner-scoped durable draft fixture
+buzz-relay	buzz_relay	handlers::event::tests::pubsub_fanout::durable_draft_ingest_reaches_global_owner_and_cas_checks_live_membership	crates/buzz-relay/src/handlers/event.rs	migration	disposable signed draft ingest and global fanout fixture

@@ -2,7 +2,7 @@ use crate::managed_agents::{AgentDefinition, PersonaReviewContent};
 
 /// Called after loading the current persona under the store lock and before
 /// changing it. Ordinary edits omit review preconditions and keep their existing path.
-pub(super) fn validate_review_revision(
+pub(in crate::commands) fn validate_review_revision(
     expected_updated_at: Option<&str>,
     expected_content: Option<&PersonaReviewContent>,
     expected_shared: Option<bool>,

@@ -1206,7 +1206,10 @@ impl BuzzClient {
     /// (retryable:false) to prevent an outer re-sign creating a duplicate write.
     /// Content-addressed uploads are exempt: same bytes ⇒ same hash, so outer
     /// re-run is safe regardless of the failure kind.
-    async fn submit_stored_event(&self, event: nostr::Event) -> Result<String, CliError> {
+    pub(crate) async fn submit_stored_event(
+        &self,
+        event: nostr::Event,
+    ) -> Result<String, CliError> {
         let url = format!("{}/events", self.relay_url);
         let body = bytes::Bytes::from(
             serde_json::to_vec(&event)

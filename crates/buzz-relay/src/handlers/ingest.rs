@@ -615,7 +615,7 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
             Ok(Scope::UsersWrite)
         }
         // NIP-AM: agent turn metrics are agent-authored global events (encrypted to owner).
-        KIND_AGENT_TURN_METRIC => Ok(Scope::MessagesWrite),
+        KIND_AGENT_TURN_METRIC | buzz_core::kind::KIND_AGENT_DRAFT | buzz_core::kind::KIND_AGENT_DRAFT_DECISION => Ok(Scope::MessagesWrite),
         // NIP-56 reports are ordinary member writes into the mod-only queue.
         // Ingest persists them to `moderation_reports` and suppresses public
         // storage/fanout; reports are signals, never enforcement triggers.
@@ -2388,7 +2388,12 @@ async fn ingest_event_inner(
     const MAX_TIMESTAMP_DRIFT_SECS: i64 = 900; // ±15 minutes
     let now = chrono::Utc::now().timestamp();
     let event_ts = event.created_at.as_secs() as i64;
-    if (event_ts - now).abs() > MAX_TIMESTAMP_DRIFT_SECS {
+    if (event_ts - now).abs() > MAX_TIMESTAMP_DRIFT_SECS
+        && !matches!(
+            kind_u32,
+            buzz_core::kind::KIND_AGENT_DRAFT | buzz_core::kind::KIND_AGENT_DRAFT_DECISION
+        )
+    {
         return Err(IngestError::Rejected(
             "invalid: event timestamp too far from server time".into(),
         ));
@@ -3052,6 +3057,123 @@ async fn ingest_event_inner(
                     .into(),
             ));
         }
+    }
+
+    if matches!(
+        kind_u32,
+        buzz_core::kind::KIND_AGENT_DRAFT | buzz_core::kind::KIND_AGENT_DRAFT_DECISION
+    ) {
+        if event_ts > now + MAX_TIMESTAMP_DRIFT_SECS {
+            return Err(IngestError::Rejected(
+                "invalid: future draft timestamp".into(),
+            ));
+        }
+        if kind_u32 == buzz_core::kind::KIND_AGENT_DRAFT {
+            let route =
+                buzz_core::agent_drafts::validate_request(&event).map_err(IngestError::Rejected)?;
+            for key in [route.agent, route.owner] {
+                if state
+                    .db
+                    .is_archived(tenant.community(), &key.to_hex())
+                    .await
+                    .map_err(|e| IngestError::Internal(e.to_string()))?
+                {
+                    return Err(IngestError::AuthFailed(
+                        "restricted: draft identity archived".into(),
+                    ));
+                }
+            }
+            let owned = state
+                .db
+                .is_agent_owner(
+                    tenant.community(),
+                    route.agent.as_bytes(),
+                    route.owner.as_bytes(),
+                )
+                .await
+                .map_err(|e| IngestError::Internal(e.to_string()))?;
+            if !owned {
+                return Err(IngestError::AuthFailed(
+                    "restricted: draft agent owner mismatch".into(),
+                ));
+            }
+        } else {
+            let decision = buzz_core::agent_drafts::validate_decision(&event)
+                .map_err(IngestError::Rejected)?;
+            if decision.state == buzz_core::agent_drafts::DecisionState::Applying {
+                let request = state
+                    .db
+                    .get_event_by_id(tenant.community(), decision.request_event.as_bytes())
+                    .await
+                    .map_err(|e| IngestError::Internal(e.to_string()))?
+                    .ok_or_else(|| {
+                        IngestError::AuthFailed("restricted: draft unavailable".into())
+                    })?;
+                let route = buzz_core::agent_drafts::validate_request(&request.event)
+                    .map_err(IngestError::Rejected)?;
+                if route.owner != decision.owner
+                    || !state
+                        .db
+                        .is_agent_owner(
+                            tenant.community(),
+                            route.agent.as_bytes(),
+                            route.owner.as_bytes(),
+                        )
+                        .await
+                        .map_err(|e| IngestError::Internal(e.to_string()))?
+                {
+                    return Err(IngestError::AuthFailed(
+                        "restricted: draft unavailable".into(),
+                    ));
+                }
+                for key in [route.agent, route.owner] {
+                    if state
+                        .db
+                        .is_archived(tenant.community(), &key.to_hex())
+                        .await
+                        .map_err(|e| IngestError::Internal(e.to_string()))?
+                    {
+                        return Err(IngestError::AuthFailed(
+                            "restricted: draft identity archived".into(),
+                        ));
+                    }
+                    if !state
+                        .db
+                        .is_member(tenant.community(), route.channel, key.as_bytes())
+                        .await
+                        .map_err(|e| IngestError::Internal(e.to_string()))?
+                    {
+                        return Err(IngestError::AuthFailed(
+                            "restricted: draft review requires current shared channel membership"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+        }
+        let (stored, inserted) = state
+            .db
+            .store_agent_draft(tenant.community(), &event)
+            .await
+            .map_err(|e| match e {
+                buzz_db::DbError::Conflict(_)
+                | buzz_db::DbError::AccessDenied(_)
+                | buzz_db::DbError::InvalidData(_) => IngestError::Rejected(e.to_string()),
+                _ => IngestError::Internal(e.to_string()),
+            })?;
+        emit_product_feedback_success(tracer, tenant, &event, &auth);
+        if inserted {
+            dispatch_persistent_event(
+                tenant,
+                state,
+                &stored,
+                kind_u32,
+                &auth.pubkey().to_hex(),
+                None,
+            )
+            .await;
+        }
+        return Ok(IngestResult { event_id: event_id_hex, accepted: true, message: "stored: agent-draft-v1; review eligibility is decided by the owner's Desktop; applied=false".into() });
     }
 
     if kind_u32 == KIND_EVENT_REMINDER {

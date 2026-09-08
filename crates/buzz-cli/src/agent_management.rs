@@ -65,6 +65,7 @@ struct ManagementRequest<T> {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ObserverEvent<T> {
+    version: u8,
     seq: u64,
     timestamp: String,
     kind: &'static str,
@@ -109,11 +110,12 @@ fn build<T: Serialize>(
 ) -> Result<BuiltDraftRequest, CliError> {
     let request_id = uuid::Uuid::new_v4().to_string();
     let payload = ObserverEvent {
+        version: 1,
         seq: 0,
         timestamp: chrono::Utc::now().to_rfc3339(),
         kind: request_kind,
         agent_index: None,
-        channel_id: Some(channel_id),
+        channel_id: Some(channel_id.clone()),
         session_id: None,
         turn_id: None,
         payload: ManagementRequest {
@@ -125,15 +127,28 @@ fn build<T: Serialize>(
     };
     let encrypted = encrypt_observer_payload(keys, owner, &payload)
         .map_err(|error| CliError::Other(format!("could not encrypt draft request: {error}")))?;
-    let event = buzz_sdk::build_agent_observer_frame(
-        &owner.to_hex(),
-        &keys.public_key().to_hex(),
-        OBSERVER_FRAME_TELEMETRY,
-        &encrypted,
-    )
-    .map_err(|error| CliError::Other(format!("could not build draft request: {error}")))?
-    .sign_with_keys(keys)
-    .map_err(|error| CliError::Other(format!("could not sign draft request: {error}")))?;
+    let builder = if request_kind == AGENT_REQUEST_KIND {
+        buzz_sdk::build_agent_draft(
+            &owner.to_hex(),
+            &keys.public_key().to_hex(),
+            &request_id,
+            &channel_id,
+            &encrypted,
+        )
+        .map_err(|error| CliError::Other(error.to_string()))
+    } else {
+        buzz_sdk::build_agent_observer_frame(
+            &owner.to_hex(),
+            &keys.public_key().to_hex(),
+            OBSERVER_FRAME_TELEMETRY,
+            &encrypted,
+        )
+        .map_err(|error| CliError::Other(error.to_string()))
+    };
+    let event = builder
+        .map_err(|error| CliError::Other(format!("could not build draft request: {error}")))?
+        .sign_with_keys(keys)
+        .map_err(|error| CliError::Other(format!("could not sign draft request: {error}")))?;
     Ok(BuiltDraftRequest {
         event,
         request_id,
@@ -254,7 +269,7 @@ pub fn build_project_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buzz_core::observer::{decrypt_observer_payload, OBSERVER_AGENT_TAG, OBSERVER_FRAME_TAG};
+    use buzz_core::observer::{decrypt_observer_payload, OBSERVER_AGENT_TAG};
 
     const CHANNEL: &str = "7c07e659-3610-42f4-9a5e-1e9973c09da9";
 
@@ -273,7 +288,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(built.event.kind.as_u16(), 24_200);
+        assert_eq!(built.event.kind.as_u16(), 14_201);
         let tags: Vec<Vec<String>> = built
             .event
             .tags
@@ -286,12 +301,10 @@ mod tests {
         assert!(tags
             .iter()
             .any(|tag| tag == &[OBSERVER_AGENT_TAG, &agent.public_key().to_hex()]));
-        assert!(tags
-            .iter()
-            .any(|tag| tag == &[OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY]));
-        assert!(!tags
-            .iter()
-            .any(|tag| tag.first().map(String::as_str) == Some("h")));
+        assert!(tags.iter().any(|tag| tag == &["h", CHANNEL]));
+        assert!(tags.iter().any(|tag| tag == &["r", &built.request_id]));
+        assert!(tags.iter().any(|tag| tag == &["v", "1"]));
+        buzz_core::agent_drafts::validate_request(&built.event).unwrap();
 
         let payload: serde_json::Value = decrypt_observer_payload(&owner, &built.event).unwrap();
         assert_eq!(payload["kind"], AGENT_REQUEST_KIND);
@@ -369,5 +382,132 @@ mod tests {
             payload["payload"]["request"]["templateName"],
             "Release team"
         );
+    }
+}
+
+fn outbox_path(
+    relay: &str,
+    keys: &Keys,
+    owner: &PublicKey,
+    request_id: &str,
+) -> Result<std::path::PathBuf, CliError> {
+    use sha2::{Digest, Sha256};
+    let id = uuid::Uuid::parse_str(request_id).map_err(|e| CliError::Usage(e.to_string()))?;
+    let scope = format!(
+        "{}:{}:{}",
+        relay.trim_end_matches('/'),
+        keys.public_key().to_hex(),
+        owner.to_hex()
+    );
+    let digest = hex::encode(Sha256::digest(scope.as_bytes()));
+    let root =
+        dirs::data_local_dir().ok_or_else(|| CliError::Other("no local data directory".into()))?;
+    Ok(root
+        .join("buzz/draft-outbox")
+        .join(digest)
+        .join(format!("{id}.json")))
+}
+
+/// Retain only owner-encrypted signed bytes, before any network request.
+pub fn retain_outbox(
+    relay: &str,
+    keys: &Keys,
+    owner: &PublicKey,
+    built: &BuiltDraftRequest,
+) -> Result<(), CliError> {
+    let path = outbox_path(relay, keys, owner, &built.request_id)?;
+    retain_outbox_at(&path, &built.event)
+}
+fn retain_outbox_at(path: &std::path::Path, event: &Event) -> Result<(), CliError> {
+    use std::io::Write;
+    let parent = path
+        .parent()
+        .ok_or_else(|| CliError::Other("invalid outbox path".into()))?;
+    std::fs::create_dir_all(parent).map_err(|e| CliError::Other(e.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| CliError::Other(e.to_string()))?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|e| CliError::Other(e.to_string()))?;
+    let bytes = serde_json::to_vec(event).map_err(|e| CliError::Other(e.to_string()))?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|e| CliError::Other(e.to_string()))?;
+    std::fs::File::open(parent)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| CliError::Other(e.to_string()))?;
+    Ok(())
+}
+
+/// Reload the exact signed ciphertext in the current relay, agent and owner scope.
+pub fn load_outbox(
+    relay: &str,
+    keys: &Keys,
+    owner: &PublicKey,
+    request_id: &str,
+) -> Result<Event, CliError> {
+    let bytes = std::fs::read(outbox_path(relay, keys, owner, request_id)?)
+        .map_err(|e| CliError::Other(e.to_string()))?;
+    let event: Event =
+        serde_json::from_slice(&bytes).map_err(|e| CliError::Other(e.to_string()))?;
+    event.verify().map_err(|e| CliError::Other(e.to_string()))?;
+    let route = buzz_core::agent_drafts::validate_request(&event).map_err(CliError::Other)?;
+    if route.owner != *owner
+        || route.agent != keys.public_key()
+        || route.request_id.to_string() != request_id
+    {
+        return Err(CliError::Other("outbox request scope mismatch".into()));
+    }
+    Ok(event)
+}
+
+#[cfg(test)]
+mod outbox_tests {
+    use super::*;
+    #[test]
+    fn retained_ciphertext_survives_restart_and_retries_are_identical() {
+        let agent = Keys::generate();
+        let owner = Keys::generate();
+        let built = build_create(
+            &agent,
+            &owner.public_key(),
+            CreateAgentDraft {
+                channel_id: uuid::Uuid::new_v4().to_string(),
+                display_name: "Fixture".into(),
+                system_prompt: "synthetic-private-prompt".into(),
+            },
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("buzz-draft-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("request.json");
+        retain_outbox_at(&path, &built.event).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let replay: Event = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(replay, built.event);
+        assert_eq!(serde_json::to_vec(&replay).unwrap(), bytes);
+        assert!(!String::from_utf8(bytes)
+            .unwrap()
+            .contains("synthetic-private-prompt"));
+        assert!(retain_outbox_at(&path, &built.event).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
