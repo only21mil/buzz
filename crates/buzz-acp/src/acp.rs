@@ -743,6 +743,7 @@ impl AcpClient {
         // Explicit invalidation has already discarded the local session even
         // when an adapter rejects or times out this best-effort fallback.
         self.goose_usage.close_session(session_id);
+        self.available_commands.remove(session_id);
         result?;
         tracing::info!(target: "acp::session", "session deleted: {session_id}");
         Ok(())
@@ -954,8 +955,9 @@ impl AcpClient {
     /// `available_commands_update`, in advertised order.
     ///
     /// `None` until the first update for that session arrives (typically
-    /// right after `session/new`), so callers can distinguish "no session
-    /// yet" from "session advertises nothing" (`Some(&[])`). Names keep the
+    /// right after `session/new`, but never for a connector that does not send
+    /// the extension), so `None` means "not advertised yet", not "no session";
+    /// `Some(&[])` means the session advertises nothing. Names keep the
     /// connector's sigil (`/review`, `$deploy`);
     /// [`crate::queue::slash::rewrite_skill`] strips it when matching.
     #[cfg_attr(not(test), allow(dead_code))]

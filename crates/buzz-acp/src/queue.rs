@@ -1325,8 +1325,10 @@ pub(crate) mod slash {
     /// prompting the agent; see [`SkillError::reply_text`].
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum SkillError {
-        /// `/skill` alone but the seat has not advertised its commands yet — no
-        /// session has been created, so there is nothing to list.
+        /// `/skill` alone but no `available_commands_update` has been captured
+        /// for this session: the session may not exist yet, or the connector
+        /// has not sent (or does not implement) the extension. Either way there
+        /// is nothing to list.
         NoSession,
         /// `/skill <name>` where `name` is not in the advertised list.
         Unknown {
@@ -1342,11 +1344,13 @@ pub(crate) mod slash {
         pub fn reply_text(&self) -> String {
             match self {
             Self::NoSession => {
-                "No session yet, so I do not know my skills. Mention me once first, then try `/skill` again."
+                "I do not know my skills for this session yet: the connector has not advertised any commands. Try `/skill` again after my next reply."
                     .to_string()
             }
             Self::Unknown { name, available } => {
-                if available.is_empty() {
+                if name.is_empty() {
+                    "`/skill` needs a skill name after it, for example `/skill review`.".to_string()
+                } else if available.is_empty() {
                     format!("Unknown skill `{name}`; this seat advertises no commands.")
                 } else {
                     format!(
@@ -1376,11 +1380,13 @@ pub(crate) mod slash {
             .unwrap_or(name)
     }
 
-    /// Whether `name` (typed, no sigil) appears in an advertised list.
-    fn advertises(known: &[String], name: &str) -> bool {
+    /// The advertised spelling of `name` (typed, no sigil), matched without
+    /// regard to ASCII case, or `None` when the list does not advertise it.
+    fn advertised<'a>(known: &'a [String], name: &str) -> Option<&'a str> {
         known
             .iter()
-            .any(|k| strip_sigil(k).eq_ignore_ascii_case(strip_sigil(name)))
+            .map(|k| strip_sigil(k))
+            .find(|k| k.eq_ignore_ascii_case(strip_sigil(name)))
     }
 
     /// Rewrite `/skill <name> [args]` into the connector's own skill invocation.
@@ -1392,6 +1398,8 @@ pub(crate) mod slash {
     ///   run. Without a list the command is forwarded blind and the connector
     ///   answers.
     /// * Claude and unknown connectors get `/name args`; Codex gets `$name args`.
+    ///   With a list, `name` is forwarded in the advertised spelling so the
+    ///   connector sees exactly the command it announced.
     ///
     /// `cmd` must already be the `/skill` command with a non-empty first argument;
     /// callers handle the bare `/skill` listing form via [`render_skill_list`]
@@ -1411,14 +1419,13 @@ pub(crate) mod slash {
                 available: known.map(skill_names).unwrap_or_default(),
             });
         }
-        if let Some(list) = known {
-            if !advertises(list, name) {
-                return Err(SkillError::Unknown {
-                    name: name.to_string(),
-                    available: skill_names(list),
-                });
-            }
-        }
+        let name = match known {
+            Some(list) => advertised(list, name).ok_or_else(|| SkillError::Unknown {
+                name: name.to_string(),
+                available: skill_names(list),
+            })?,
+            None => name,
+        };
         let sigil = connector.skill_sigil();
         Ok(if rest.is_empty() {
             format!("{sigil}{name}")
@@ -1436,7 +1443,7 @@ pub(crate) mod slash {
     ///
     /// Lists the advertised names when a list has been captured (or says the
     /// seat advertises none); [`SkillError::NoSession`] when nothing has been
-    /// captured because the session does not exist yet.
+    /// captured for the session yet.
     pub fn render_skill_list(known: Option<&[String]>) -> Result<String, SkillError> {
         let list = known.ok_or(SkillError::NoSession)?;
         if list.is_empty() {
@@ -1499,7 +1506,7 @@ pub(crate) mod slash {
         known: Option<&[String]>,
     ) -> Option<String> {
         let list = known?;
-        if advertises(list, &cmd.name) {
+        if advertised(list, &cmd.name).is_some() {
             return None;
         }
         let names = skill_names(list);
@@ -5977,7 +5984,7 @@ mod tests {
         // Case-insensitive match; the typed spelling is forwarded.
         assert_eq!(
             rewrite_skill(&cmd("skill", "Review"), ConnectorKind::Claude, Some(&list)),
-            Ok("/Review".to_string())
+            Ok("/review".to_string())
         );
         // Unknown connector gets the generic slash form.
         assert_eq!(
@@ -6018,6 +6025,21 @@ mod tests {
                 available: known(&["review", "deploy"]),
             }
         );
+        let empty_name =
+            rewrite_skill(&cmd("skill", "/ args"), ConnectorKind::Claude, Some(&list)).unwrap_err();
+        assert_eq!(
+            empty_name,
+            SkillError::Unknown {
+                name: String::new(),
+                available: known(&["review", "deploy"]),
+            }
+        );
+        assert!(
+            empty_name
+                .reply_text()
+                .starts_with("`/skill` needs a skill name"),
+            "empty name gets a usage reply, not an empty backticked name"
+        );
         assert_eq!(
             err.reply_text(),
             "Unknown skill `nope`; available: `review`, `deploy`"
@@ -6039,8 +6061,8 @@ mod tests {
         assert!(
             SkillError::NoSession
                 .reply_text()
-                .contains("Mention me once first"),
-            "no-session reply tells the user how to create the session"
+                .contains("not advertised any commands"),
+            "no-list reply says the commands are not known yet, not that no session exists"
         );
         let empty: Vec<String> = Vec::new();
         assert_eq!(
