@@ -965,6 +965,17 @@ impl AcpClient {
         self.available_commands.get(session_id).map(Vec::as_slice)
     }
 
+    /// Seed the advertised command list for a session without a live
+    /// `available_commands_update`, so prompt-path tests can exercise the
+    /// `/skill` rewrite.
+    #[cfg(test)]
+    pub(crate) fn set_available_commands_for_test(&mut self, session_id: &str, names: &[&str]) {
+        self.available_commands.insert(
+            session_id.to_string(),
+            names.iter().map(|n| n.to_string()).collect(),
+        );
+    }
+
     /// Whether the agent advertised the [`ACP_STEER_METHOD`] extension at
     /// `initialize` time (`_meta.steering.supported`).
     ///

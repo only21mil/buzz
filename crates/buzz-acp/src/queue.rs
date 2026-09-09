@@ -869,6 +869,35 @@ impl EventQueue {
         ids
     }
 
+    /// Drop every queued, cancelled-carry-over and withheld event for one exact
+    /// scope so the lane does not resume on the next dispatch.
+    ///
+    /// The scope-exact counterpart of [`drain_channel`](Self::drain_channel),
+    /// used by `/stop`: `!cancel` leaves queued batches alone, `/stop` does
+    /// not. Retry state for the scope is cleared too. In-flight markers and
+    /// deadlines are preserved for the same reason as in `drain_channel`.
+    ///
+    /// Returns the ids of the dropped events so the caller can remove the
+    /// reactions added at push time; the count is the dropped-batch number
+    /// the `/stop` acknowledgement reports.
+    pub fn drop_pending_for_scope(&mut self, scope: &SessionScope) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .queues
+            .remove(scope)
+            .map(|q| q.into_iter().map(|e| e.event.id.to_hex()).collect())
+            .unwrap_or_default();
+        if let Some(cancelled) = self.cancelled_batches.remove(scope) {
+            ids.extend(cancelled.into_iter().map(|e| e.event.id.to_hex()));
+        }
+        if let Some(withheld) = self.withheld_native_steer.remove(scope) {
+            ids.extend(withheld.into_iter().map(|e| e.event.id.to_hex()));
+        }
+        self.cancel_reasons.remove(scope);
+        self.retry_after.remove(scope);
+        self.retry_counts.remove(scope);
+        ids
+    }
+
     /// Whether a prompt is currently in-flight for the given scope (or channel,
     /// treated as its conversation scope).
     pub fn is_scope_in_flight<K: IntoScope>(&self, scope: K) -> bool {
@@ -1196,12 +1225,10 @@ pub fn slash_command_for_batch(batch: &FlushBatch, known_names: &[&str]) -> Opti
 ///
 /// Pure functions over the text [`extract_slash_command`] returns and the
 /// per-session command list [`crate::acp::AcpClient::available_commands`]
-/// captures. The prompt path (`pool::run_prompt_task`) does not call them yet:
-/// that wiring lands with the `/stop` PR, which also generalises the harness
-/// reply helper. Until then the module is exercised by its tests only, hence
-/// the `dead_code` allowance outside `cfg(test)`.
+/// captures. The prompt path (`pool::run_prompt_task`) resolves `/skill`
+/// through [`slash::handle_skill`]; the main loop in `lib.rs` consumes
+/// `/stop` before an event is queued.
 pub(crate) mod slash {
-    #![cfg_attr(not(test), allow(dead_code))]
 
     /// A slash command split into its name and argument string.
     ///
@@ -1255,12 +1282,17 @@ pub(crate) mod slash {
     ///
     /// The harness table is deliberately tiny: everything not listed here is
     /// forwarded to the connector unchanged (`/goal`, `/review`, `/compact`,
-    /// connector-native skills). `/stop` and `/plan` are reserved names whose
-    /// harness handling lands in follow-up PRs; until then they pass through.
+    /// connector-native skills). `/plan` is a reserved name whose harness
+    /// handling lands in a follow-up PR; until then it passes through.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum CommandRoute {
         /// `/skill` — the harness rewrites it into the connector's skill invocation.
         Skill,
+        /// `/stop` — consumed by the main loop before the event is queued
+        /// (cancel, drop queued batches, fan out to dispatched siblings). It
+        /// only reaches the prompt path when the author was neither owner nor
+        /// sibling, in which case it is forwarded like any other command.
+        Stop,
         /// Forwarded to the connector as prompt block 0 without rewriting.
         PassThrough,
     }
@@ -1269,7 +1301,8 @@ pub(crate) mod slash {
     ///
     /// Names match case-insensitively. Keep this list in sync with the
     /// "Slash commands" table in `crates/buzz-acp/README.md`.
-    pub const SLASH_COMMAND_TABLE: &[(&str, CommandRoute)] = &[("skill", CommandRoute::Skill)];
+    pub const SLASH_COMMAND_TABLE: &[(&str, CommandRoute)] =
+        &[("skill", CommandRoute::Skill), ("stop", CommandRoute::Stop)];
 
     /// Look up a parsed command in [`SLASH_COMMAND_TABLE`].
     pub fn route_command(cmd: &SlashCommand) -> CommandRoute {
@@ -1326,10 +1359,11 @@ pub(crate) mod slash {
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum SkillError {
         /// `/skill` alone but no `available_commands_update` has been captured
-        /// for this session: the session may not exist yet, or the connector
-        /// has not sent (or does not implement) the extension. Either way there
-        /// is nothing to list.
-        NoSession,
+        /// for this session. The prompt path creates the session before it
+        /// resolves the command, so this never means "no session": the
+        /// connector has not sent the extension yet (a fresh session's first
+        /// update is read during its first turn) or does not implement it.
+        NotAdvertised,
         /// `/skill <name>` where `name` is not in the advertised list.
         Unknown {
             /// The requested skill name, without sigil.
@@ -1343,7 +1377,7 @@ pub(crate) mod slash {
         /// Human-readable reply for the thread.
         pub fn reply_text(&self) -> String {
             match self {
-            Self::NoSession => {
+            Self::NotAdvertised => {
                 "I do not know my skills for this session yet: the connector has not advertised any commands. Try `/skill` again after my next reply."
                     .to_string()
             }
@@ -1442,10 +1476,10 @@ pub(crate) mod slash {
     /// Render the reply for a bare `/skill`.
     ///
     /// Lists the advertised names when a list has been captured (or says the
-    /// seat advertises none); [`SkillError::NoSession`] when nothing has been
+    /// seat advertises none); [`SkillError::NotAdvertised`] when nothing has been
     /// captured for the session yet.
     pub fn render_skill_list(known: Option<&[String]>) -> Result<String, SkillError> {
-        let list = known.ok_or(SkillError::NoSession)?;
+        let list = known.ok_or(SkillError::NotAdvertised)?;
         if list.is_empty() {
             return Ok("This seat advertises no commands.".to_string());
         }
@@ -1501,6 +1535,7 @@ pub(crate) mod slash {
     /// [`route_command`]. Whether a given connector advertises its built-ins
     /// (Claude Code's `/goal`, for example) is a live-check question; apply this
     /// gate only once that is confirmed for the connector in play.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn unsupported_command_reply(
         cmd: &SlashCommand,
         known: Option<&[String]>,
@@ -2591,6 +2626,60 @@ mod tests {
         // The other channel's thread survives.
         let batch = q.flush_next().expect("other channel still has work");
         assert_eq!(batch.channel_id, other);
+    }
+
+    #[test]
+    fn drop_pending_for_scope_counts_only_that_scope() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let target = thread(ch, &"a".repeat(64));
+        let sibling = thread(ch, &"b".repeat(64));
+        q.push(make_scoped(target.clone(), "a1"));
+        q.push(make_scoped(target.clone(), "a2"));
+        q.push(make_scoped(sibling.clone(), "b1"));
+        // A cancelled carry-over for the target scope is dropped as well.
+        let carried = FlushBatch {
+            channel_id: ch,
+            scope: target.clone(),
+            events: vec![BatchEvent {
+                event: make_event("a0"),
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        q.requeue_as_cancelled(carried, CancelReason::Interrupt);
+
+        let dropped = q.drop_pending_for_scope(&target);
+        assert_eq!(dropped.len(), 3, "two queued plus one cancelled carry-over");
+        assert_eq!(q.queued_event_count(&target), 0);
+        assert_eq!(
+            q.queued_event_count(&sibling),
+            1,
+            "sibling thread untouched"
+        );
+        assert!(!q.cancelled_batches.contains_key(&target));
+
+        // Idempotent: a second drop finds nothing.
+        assert!(q.drop_pending_for_scope(&target).is_empty());
+        let batch = q.flush_next().expect("sibling still dispatchable");
+        assert_eq!(batch.scope, sibling);
+    }
+
+    #[test]
+    fn drop_pending_for_scope_keeps_in_flight_marker() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        q.push(make_queued(ch, "first"));
+        let _in_flight = q.flush_next().expect("first flushed");
+        q.push(make_queued(ch, "second"));
+        let dropped = q.drop_pending_for_scope(&conv(ch));
+        assert_eq!(dropped.len(), 1);
+        assert!(
+            q.is_scope_in_flight(conv(ch)),
+            "in-flight marker survives so mark_complete still pairs with the running turn"
+        );
     }
 
     #[test]
@@ -5912,13 +6001,13 @@ mod tests {
     fn test_route_command_table() {
         assert_eq!(route_command(&cmd("skill", "")), CommandRoute::Skill);
         assert_eq!(route_command(&cmd("SKILL", "x")), CommandRoute::Skill);
-        for name in [
-            "goal", "plan", "stop", "review", "compact", "init", "unknown",
-        ] {
+        assert_eq!(route_command(&cmd("stop", "")), CommandRoute::Stop);
+        assert_eq!(route_command(&cmd("Stop", "all")), CommandRoute::Stop);
+        for name in ["goal", "plan", "review", "compact", "init", "unknown"] {
             assert_eq!(
                 route_command(&cmd(name, "")),
                 CommandRoute::PassThrough,
-                "/{name} must pass through in PR1"
+                "/{name} must pass through"
             );
         }
     }
@@ -6057,9 +6146,9 @@ mod tests {
 
     #[test]
     fn test_render_skill_list() {
-        assert_eq!(render_skill_list(None), Err(SkillError::NoSession));
+        assert_eq!(render_skill_list(None), Err(SkillError::NotAdvertised));
         assert!(
-            SkillError::NoSession
+            SkillError::NotAdvertised
                 .reply_text()
                 .contains("not advertised any commands"),
             "no-list reply says the commands are not known yet, not that no session exists"
@@ -6089,7 +6178,7 @@ mod tests {
         );
         assert_eq!(
             handle_skill(&cmd("skill", ""), ConnectorKind::Claude, None),
-            SlashAction::Reply(SkillError::NoSession.reply_text())
+            SlashAction::Reply(SkillError::NotAdvertised.reply_text())
         );
         // Known name → rewritten prompt.
         assert_eq!(

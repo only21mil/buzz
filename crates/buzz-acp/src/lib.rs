@@ -19,6 +19,7 @@ mod scope;
 mod self_wake;
 mod setup_mode;
 mod sibling_auth;
+mod stop_command;
 mod usage;
 mod workflow_auth;
 
@@ -158,7 +159,7 @@ fn resolve_agent_owner(config: &Config) -> Option<String> {
 ///
 /// For unknown authors, queries their kind:0 profile to extract the NIP-OA
 /// auth tag and verify the owner matches. Result is cached.
-async fn is_owner_or_sibling(
+pub(crate) async fn is_owner_or_sibling(
     author: &str,
     owner_cache: &OwnerCache,
     rest_client: &relay::RestClient,
@@ -1783,6 +1784,10 @@ async fn tokio_main() -> Result<()> {
         config::startup_replay_floor(startup_watermark, config.replay_floor_unix),
         config.inbox_reorder_window_secs,
     );
+    // Stop-origin ids this harness already acted on, so a repeated or
+    // cyclic `/stop` fan-out is ignored (see `stop_command`).
+    let mut handled_stop_origins =
+        stop_command::StopOriginSet::new(stop_command::MAX_REMEMBERED_ORIGINS);
     match inbox_cursor.load_status() {
         CursorLoadStatus::Loaded => tracing::info!(
             path = %inbox_cursor.path().display(),
@@ -2876,6 +2881,71 @@ async fn tokio_main() -> Result<()> {
                                 }
                             }
 
+                            // `/stop` and `/stop all`: owner or sibling only. Sits
+                            // after the author gate so drops apply and before
+                            // queue.push so the event is never prompted. Unlike
+                            // `!cancel` the match tolerates leading mentions, so
+                            // the desktop composer's "@Fizz /stop" works. A
+                            // non-owner, non-sibling `/stop` falls through as an
+                            // ordinary prompt, exactly like `!cancel`.
+                            if let Some(stop) = stop_command::parse_stop_command(
+                                &buzz_event.event,
+                                kind_u32,
+                                &pubkey_hex,
+                                &[directory_display_name.as_str()],
+                            ) {
+                                let authorised = stop_command::is_stop_authorised(
+                                    &effective_author,
+                                    &owner_cache,
+                                    &ctx.rest_client,
+                                )
+                                .await;
+                                if authorised {
+                                    if !handled_stop_origins.insert(stop.origin.clone()) {
+                                        tracing::info!(
+                                            channel_id = %buzz_event.channel_id,
+                                            origin = %stop.origin,
+                                            "/stop with an already-handled origin — ignoring"
+                                        );
+                                        inbox_cursor.mark_processed([&buzz_event.event]);
+                                        continue;
+                                    }
+                                    let is_dm = channel_info
+                                        .as_ref()
+                                        .map(|info| info.channel_type == "dm")
+                                        .unwrap_or(true);
+                                    let scope = scope::SessionScope::derive(
+                                        config.session_policy,
+                                        buzz_event.channel_id,
+                                        is_dm,
+                                        &buzz_event.event,
+                                    );
+                                    stop_command::execute_stop(
+                                        stop_command::StopContext {
+                                            request: &stop,
+                                            event: &buzz_event.event,
+                                            channel_id: buzz_event.channel_id,
+                                            scope,
+                                            agent_pubkey_hex: &pubkey_hex,
+                                            max_turn_duration_secs: config.max_turn_duration_secs,
+                                        },
+                                        &mut pool,
+                                        &mut queue,
+                                        &ctx.rest_client,
+                                        &owner_cache,
+                                        observer.as_ref(),
+                                    )
+                                    .await;
+                                    inbox_cursor.mark_processed([&buzz_event.event]);
+                                    continue; // consumed — never queued
+                                }
+                                tracing::debug!(
+                                    channel_id = %buzz_event.channel_id,
+                                    author = %effective_author,
+                                    "/stop from a non-owner, non-sibling author — forwarding as a prompt"
+                                );
+                            }
+
                             let implicitly_addressed = is_implicitly_addressed_dm_message(
                                 &config.subscribe_mode,
                                 kind_u32,
@@ -3535,7 +3605,7 @@ enum LoopAction {
     Exit,
 }
 
-fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
+pub(crate) fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
     event.tags.iter().any(|t| {
         t.as_slice().first().map(|s| s.as_str()) == Some("p")
             && t.as_slice().get(1).map(|s| s.as_str()) == Some(agent_pubkey_hex)
@@ -3943,6 +4013,7 @@ async fn dispatch_pending_at(
                 channel_id: Some(channel_id),
                 scope: Some(scope.clone()),
                 turn_id,
+                started_at: pool::unix_now_secs(),
                 recoverable_batch,
                 control_tx: Some(control_tx),
                 steer_tx,
@@ -4689,6 +4760,7 @@ async fn dispatch_heartbeat(
             channel_id: None,
             scope: None,
             turn_id,
+            started_at: pool::unix_now_secs(),
             recoverable_batch: None,
             control_tx: None,
             steer_tx: None,
@@ -5482,6 +5554,7 @@ mod owner_control_command_tests {
                 channel_id: Some(channel_id),
                 scope: Some(scope::SessionScope::Conversation { channel_id }),
                 turn_id: "test-turn-id".to_string(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: Some(control_tx),
                 steer_tx: None,
@@ -5528,6 +5601,7 @@ mod owner_control_command_tests {
                 channel_id: Some(scope.channel_id()),
                 scope: Some(scope),
                 turn_id: "t".to_string(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: Some(control_tx),
                 steer_tx: None,
@@ -7676,6 +7750,7 @@ mod error_outcome_emission_tests {
                         channel_id: Some(channel_id),
                         scope: Some(batch.scope.clone()),
                         turn_id: format!("turn-{agent_index}"),
+                        started_at: 0,
                         recoverable_batch: Some(batch.clone()),
                         control_tx: None,
                         steer_tx: None,
@@ -7810,6 +7885,7 @@ mod error_outcome_emission_tests {
                 channel_id: Some(channel_id),
                 scope: Some(sibling.clone()),
                 turn_id: "sibling".into(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -7883,6 +7959,7 @@ mod error_outcome_emission_tests {
                 channel_id: Some(channel_id),
                 scope: Some(scope::SessionScope::Conversation { channel_id }),
                 turn_id: "test-turn-id".into(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -7961,6 +8038,7 @@ mod error_outcome_emission_tests {
                 channel_id: Some(channel_id),
                 scope: Some(scope::SessionScope::Conversation { channel_id }),
                 turn_id: "test-turn-id".into(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8086,6 +8164,7 @@ mod error_outcome_emission_tests {
                 channel_id: Some(channel_id),
                 scope: Some(scope::SessionScope::Conversation { channel_id }),
                 turn_id: "test-turn-id".into(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8158,6 +8237,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8240,6 +8320,7 @@ mod error_outcome_emission_tests {
                 channel_id: Some(channel_id),
                 scope: Some(scope::SessionScope::Conversation { channel_id }),
                 turn_id: "panic-turn-id".to_string(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8332,6 +8413,7 @@ mod error_outcome_emission_tests {
                 channel_id: Some(channel_id),
                 scope: Some(scope.clone()),
                 turn_id: "panic-turn-id".to_string(),
+                started_at: 0,
                 recoverable_batch: Some(batch),
                 control_tx: None,
                 steer_tx: None,
@@ -8431,6 +8513,7 @@ mod error_outcome_emission_tests {
                     channel_id: None,
                     scope: None,
                     turn_id: "test-turn-id".to_string(),
+                    started_at: 0,
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
@@ -8530,6 +8613,7 @@ mod error_outcome_emission_tests {
                     channel_id: None,
                     scope: None,
                     turn_id: "test-turn-id".to_string(),
+                    started_at: 0,
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
@@ -8640,6 +8724,7 @@ mod error_outcome_emission_tests {
                     channel_id: None,
                     scope: None,
                     turn_id: "test-turn-id".to_string(),
+                    started_at: 0,
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
@@ -8720,6 +8805,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8819,6 +8905,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8941,6 +9028,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -9085,6 +9173,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -9311,6 +9400,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -9401,6 +9491,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
