@@ -17,25 +17,25 @@ The gate is a new step in the existing pre-receive callback
 refusal is a hook decline, so `finalize_push` publishes nothing (line 1836).
 
 The hook must supply commit facts the relay cannot read, because pushed
-objects sit in git's quarantine. The hook script (`hook.rs`,
-`PRE_RECEIVE_HOOK`) adds, per ref update whose `new_oid` is not zero, five
-fields computed with the inherited quarantine environment:
+objects sit in git's quarantine and `hook_policy_check` receives only JSON
+(`policy.rs` line 204). The hook script (`hook.rs`, `PRE_RECEIVE_HOOK`) adds,
+per ref update whose `new_oid` is not zero, four fields computed with the
+inherited quarantine environment:
 
 - `parents`: ordered parent OIDs of `new_oid` (`git rev-list --parents -n 1`).
-- `tree`: `git rev-parse <new_oid>^{tree}`.
-- `parent_trees`: `git rev-parse <parent>^{tree}` for each parent, in order.
+- `tree`: `git rev-parse <new_oid>^{commit}^{tree}`.
+- `parent_trees`: `git rev-parse <parent>^{tree}` per parent, computed only
+  when `parents.len() <= 2`, else an empty list.
 - `old_in_second_parent`: `git merge-base --is-ancestor <old_oid> <parents[1]>`
   when there are two parents, else false. Exit 128 counts as false.
-- `workflow_blob`: `git rev-parse <old_oid>:<DEFAULT_WORKFLOW_PATH>` (the path
-  preflight resolves, `api/ci.rs` line 115), empty when absent. The gate
-  digests the bytes itself with `git cat-file blob` on the hydrated
-  workspace, since `old_oid` is published and outside quarantine.
 
-`HookRefUpdate` gains the same fields. The HMAC payload (`compute_hmac`,
-`policy.rs` line 142, and its bash mirror) appends
-`len(parents):p1p2...|tree|len(parent_trees):t1t2...|old_in_second_parent|workflow_blob`
-after `is_ancestor` for every ref; the `bash_hmac_matches_rust_hmac` fixtures
-change together. Create and delete send empty values and false.
+Every substitution runs under the script's `set -eo pipefail`, so a missing
+object or a `new_oid` that is a tag rather than a commit declines the push
+before the callback. `HookRefUpdate` gains the same fields. The HMAC payload
+(`compute_hmac`, `policy.rs` line 142, and its bash mirror) appends
+`len(parents):p1p2...|tree|len(parent_trees):t1t2...|old_in_second_parent`
+after `is_ancestor` per ref (`bash_hmac_matches_rust_hmac` fixtures change
+together); create and delete send empty values and false.
 
 ### 1.2 Scope selection
 
@@ -54,15 +54,13 @@ The pinned set lives in the owner-signed announcement, never in the candidate
 tree, because kind-46100 `job_ids` and `workflow_digest` are requester-signed
 (`buzz-core/src/ci.rs` lines 164 to 168) and the reducer reduces over
 `request.job_ids`. `EffectiveRules::for_ref` (`git_perms.rs` line 474) unions
-matching patterns: two values for one ref merge into one requirement per
-workflow with the union of job ids; two workflow ids require both. Job ids
-use the static grammar `^[A-Za-z_][A-Za-z0-9_-]{0,63}$`.
+matching patterns: two values for one ref merge into the union of job ids per
+workflow; two workflow ids require both. Job ids use the static job grammar.
 
 The relay honours the rule only when `BUZZ_MERGE_GATE_MODE` is `shadow` or
 `enforce`; in `off` it is logged as skipped like an unknown rule today
 (`policy.rs` line 320), so the announcement can carry it before the relay
-deploys. The owner declares refs, workflow, and jobs; the operator decides
-whether the relay acts.
+deploys. The owner declares refs, workflow, and jobs; the operator decides.
 
 ### 1.3 Candidate and what the gate requires
 
@@ -80,25 +78,32 @@ For every gated ref update the gate classifies the push:
   `no-delete` and role rules.
 
 Then the gate resolves the run. A new `buzz_db::ci::list_runs_for_tip` uses
-`idx_ci_runs_repo_tip` (`migrations/0032_ci_event_storage.sql`) to return every
-`ci_runs` row for `(community, target_repo_a = 30617:<repo_owner>:<repo_id>,
-tip_oid = candidate, workflow_id = <rule value>)` by `created_at DESC`. The
-latest run decides, as in today's provider chronology rule, and must satisfy:
+`idx_ci_runs_repo_tip` (migration 0032) to return every `ci_runs` row for
+`(community, target_repo_a = 30617:<repo_owner>:<repo_id>, tip_oid =
+candidate, workflow_id = <rule value>)` by `created_at DESC`. The latest run
+decides, as in today's provider chronology rule, and must satisfy:
 
-1. `base_oid` of the run equals `old_oid`, else `base_moved`. Ancestry is
-   proven by the hook facts above; a requester-signed `base_oid` never is.
-2. `ci_runs.workflow_digest` equals the SHA-256 of the workflow blob at
-   `old_oid` named by the hook's `workflow_blob`, else
-   `workflow_digest_mismatch`: a candidate that edits the workflow file, or a
-   run built on another base's bytes, cannot pass. A missing blob at
-   `old_oid` is `gate_misconfigured`.
+1. `base_oid` equals `old_oid`, else `base_moved` (ancestry comes from 1.1).
+2. `ci_runs.workflow_digest` equals the digest of the workflow at `old_oid`:
+   the gate calls `hydrate_for_read` (`hydrate.rs` line 124) on the published
+   state, then the existing `resolve_workflow_at_base(repo_path, old_oid)`
+   (`api/ci.rs` line 766); a missing workflow is `gate_misconfigured`. This
+   is defense in depth only, against a request naming another
+   `workflow_path` or a forged `ci_runs` row: preflight resolves the workflow
+   at the trusted base and the materializer digests it there
+   (`buzz-ci-materializer/src/plan.rs` line 543, `execute.rs` line 192), so
+   with `base_oid == old_oid` a legitimate run always matches. A candidate
+   that edits `ci.yml` lands in one step, tested under the base's workflow,
+   and the edit governs the next candidate.
 3. Its accepted events, read with `list_ci_run_events(after_cursor = 0)` in
    pages until short (the cursor is exclusive), reduce to `Green` under the
    shared reducer with `expected_sha = candidate`; else `check_pending`
    (`Pending`), `check_not_success` (`Red`), or `reducer_disagrees`
    (`InfrastructureFailure`, or a `success` check while the reducer is not
-   green). `load_ci_reducer_events` is not widened; it feeds the relay's own
-   selected-graph reducer.
+   green). `load_ci_reducer_events` is not widened. Only the selected run's
+   events are read and signature-validated, capped at the CLI's 10,000-event
+   window (`dispatch.rs` line 22, longer is `gate_misconfigured`), which
+   keeps one callback inside the hook's `curl --max-time 10` budget.
 4. The reduced green set covers the pinned job ids: each appears in
    `request.job_ids`, is `required: true` in its signed manifest, and is
    terminal-good at its selected attempt; else `required_jobs_missing`, even
@@ -131,15 +136,15 @@ envelope }` exactly as `dispatch::fetch_ci_run_snapshot` does.
 ### 1.4 Refusal the pusher sees
 
 The callback answers 403 with the existing `HookCallbackResponse` shape; the
-hook prints the body to stderr, which git relays over sideband, so the pusher
-sees `remote: error: push denied by policy (HTTP 403)`, the JSON denial, and
-`! [remote rejected] main -> main (pre-receive hook declined)`. Reason
-grammar: `merge gate: <code>: <detail>`, codes `no_check`, `check_pending`,
+hook prints the body to stderr over sideband, so the pusher sees `remote:
+error: push denied by policy (HTTP 403)`, the JSON denial, and `! [remote
+rejected] main -> main (pre-receive hook declined)`. Reason grammar:
+`merge gate: <code>: <detail>`, codes `no_check`, `check_pending`,
 `check_not_success`, `reducer_disagrees`, `base_moved`, `not_descendant`,
 `parent_shape`, `tree_mismatch`, `workflow_digest_mismatch`,
 `required_jobs_missing`, `signer_unauthorized`, `check_expired`,
 `bypass_invalid`, `gate_misconfigured`. Detail names candidate, base, check
-and run ids (12 hex in the message, complete in the log record).
+and run ids, 12 hex in the message and complete in the log.
 
 ### 1.5 Owner override
 
@@ -153,42 +158,43 @@ Owner role; `expires_at - issued_at <= 3600`; `reason` non-empty; the `a` and
 `required_scope_for_kind` maps it to `JobsWrite` like kind 46107. Storage is a
 new table `ci_merge_bypasses` (migration 0042) keyed by `(community,
 event_id)`, indexed on `(community, target_repo_a, ref_name, old_oid,
-new_oid)`; it is not a run event, so migration 0041's `ci_run_events` CHECK
-is untouched. The gate accepts a bypass only when `ref_name`, `old_oid`, and
+new_oid)`, outside migration 0041's `ci_run_events` CHECK. The gate accepts
+a bypass only when `ref_name`, `old_oid`, and
 `new_oid` equal the push exactly, the event is inside its window, and it is
 unconsumed. Consumption happens in `finalize_push` after `cas_publish` returns
 `Won`, never at hook time, so a bypass evaluated in `shadow` or on a push
 that loses the CAS race (409) stays usable until it expires; the consuming
-publish writes the bypass event id into the decision record (1.7) under a
-unique index. Role implies no bypass; the owner signs one exact merge commit.
+publish sets `ci_merge_bypasses.consumed_by` to the decision row id (1.7),
+and a non-null `consumed_by` is what "unconsumed" tests. Role implies no
+bypass; the owner signs one exact merge commit.
 
 ### 1.6 Configuration and failure modes
 
 - `BUZZ_MERGE_GATE_MODE`: `off` (default), `shadow`, `enforce`. Any other
   value fails config load and the relay does not start.
 - `BUZZ_MERGE_GATE_MAX_CHECK_AGE_SECONDS`: default 86400, ceiling 604800.
-- `BUZZ_MERGE_GATE_DECISION_WINDOW_SECONDS`: default 300, the value of
-  `PACK_OPS_TIMEOUT` (`transport.rs` line 45), ceiling 900. See 1.7.
+- `BUZZ_MERGE_GATE_DECISION_WINDOW_SECONDS`: default 300 (`PACK_OPS_TIMEOUT`,
+  `transport.rs` line 45), ceiling 900. See 1.7.
 
 `shadow` evaluates everything, writes the decision record, logs
 `merge_gate decision=<allow|refuse> code=...`, and never refuses. `enforce`
 fails closed: a database error, an empty signer union, a rule naming no
 workflow or job, a callback missing the new fields, or a reducer panic guard
-all answer 403 `gate_misconfigured`.
+answer 403 `gate_misconfigured`.
 
 ### 1.7 Decision record and the finalize fence
 
 Every evaluation inserts one append-only row in a new table
-`git_merge_gate_decisions` (migration 0042): community, repo coordinate, ref,
-old, new, candidate, classification, run id, check event id, signer, code,
-mode, pusher, bypass event id (unique when present), decided_at. In `enforce`
-mode `finalize_push` adds a second fence before `cas_publish`: every gated
-ref that changed in the workspace needs an `allow` row for exactly `(ref,
-old, new, pusher)` with `decided_at` within
+`git_merge_gate_decisions` (migration 0042): id, community, repo coordinate,
+ref, old, new, candidate, classification, run id, check event id, signer,
+code, mode, pusher, bypass event id evaluated, decided_at. Consumption lives
+only on `ci_merge_bypasses.consumed_by` (1.5). In `enforce` mode
+`finalize_push` adds a second fence before `cas_publish`: every gated ref
+that changed in the workspace needs an `allow` row for exactly `(ref, old,
+new, pusher)` with `decided_at` within
 `BUZZ_MERGE_GATE_DECISION_WINDOW_SECONDS` of now (measured from the hook
-decision; the default equals the pack subprocess timeout). Otherwise the push
-is refused 403 `gate_misconfigured`, which closes the case where the hook did
-not run at all.
+decision; the default equals the pack subprocess timeout), else 403
+`gate_misconfigured`. This closes the case where the hook did not run.
 
 ### 1.8 Concurrency, reruns, mirror
 
@@ -196,15 +202,13 @@ Two pushes racing: both hydrate the same parent state and both hooks may
 pass. `cas_publish` lets one win; the loser gets 409 (`transport.rs` line
 1894) and retries with the winner's head as `old_oid`, so the run's
 `base_oid` no longer matches and the gate answers `base_moved`. The loser
-needs a fresh candidate and a new run: strict by design, equal to the
-"require branches to be up to date" rule the ruleset enforces today. Main
-moving between check publication and push takes the same path, because the
-gate compares only against the `old_oid` git reports. Rerun lineage comes
-from the reducer's final-request selection: a running attempt 2 reduces to
-`Pending` and the candidate is refused `check_pending`. Mirror:
-`buzz-github-mirror.timer` (host unit, every two minutes) keeps force-syncing
-all heads and tags; a refused push publishes no pointer, so the mirror sees
-nothing, and the gate reads no GitHub state.
+needs a fresh candidate and a new run, the "require branches to be up to
+date" rule the ruleset enforces today; main moving between check publication
+and push takes the same path. Rerun lineage comes from the reducer's
+final-request selection: a running attempt 2 reduces to `Pending`, refused
+`check_pending`. `buzz-github-mirror.timer` (host unit, every two minutes)
+keeps force-syncing all heads and tags; a refused push publishes no pointer,
+and the gate reads no GitHub state.
 
 ## 2. Buzz-native landing verifier
 
@@ -212,20 +216,17 @@ nothing, and the gate reads no GitHub state.
 
 A Rust subcommand in `crates/buzz-cli/src/commands/ci/landing.rs`, not a
 Python script: the CLI already has NIP-98 signing, `validate_signed_ci_event`,
-the signer set, the reducer, `ls-remote` helpers in `repo_sync.rs`, and GitHub
-reads in `repos/reconcile.rs`. Python would need a second Schnorr verifier and
-a second reducer, and two reducers drift.
+the signer set, the reducer, `ls-remote` helpers, and GitHub reads. Python
+would need a second Schnorr verifier and a second reducer, and reducers drift.
 
 ```text
-buzz ci landing --repo-owner <hex> --repo-id <d-tag> --candidate <oid> --base <oid> \
-  --landed <oid> --checkout <path> --output <absolute receipt path> [--github-mirror owner/repo]
+buzz ci landing --repo-owner <hex> --repo-id <d-tag> --candidate <oid> --base <oid> --landed <oid> --checkout <path> --output <absolute receipt path> [--github-mirror owner/repo]
 ```
 
 ### 2.2 What it proves
 
 1. Relay main: `git ls-remote --refs <relay git url> refs/heads/main` equals
-   `--landed`, read twice with the announcement's hosted refs in between
-   (`reconcile.rs` line 245: hosted refs and git main must agree).
+   `--landed`, read twice around the hosted refs (`reconcile.rs` line 245).
 2. Parents, ancestry, trees: `git -C <checkout> rev-list --parents -n 1
    <landed>` is `[base, candidate]` or, for a fast-forward, `[base]` with
    `landed == candidate`; `git merge-base --is-ancestor <base> <candidate>`
@@ -237,19 +238,18 @@ buzz ci landing --repo-owner <hex> --repo-id <d-tag> --candidate <oid> --base <o
    kind-46108 events with `accepted_at`. The verifier reads the rule from the
    announcement, takes the latest run for that workflow, fetches its history
    from `after=0`, validates every event, reduces with `expected_sha =
-   candidate`, and applies rules 2 to 7 of 1.3 (pinned jobs, digest of `git
-   show <base>:.github/workflows/ci.yml`, `success` check bound to candidate
-   and base, `accepted_at` freshness), following the named run status and
-   terminal fact ids to stored events in the same history.
-4. Signer: `check.relay_signer` is in `BUZZ_CI_STATUS_SIGNERS`; the verifier
-   reads no grants, so a granted key is listed in the environment.
+   candidate`, and applies rules 2 to 7 of 1.3 (digest of `git show
+   <base>:.github/workflows/ci.yml`, pinned jobs, bound `success` check,
+   `accepted_at` freshness), following named fact ids in the same history.
+4. Signer: `check.relay_signer` is in `BUZZ_CI_STATUS_SIGNERS` (grants are
+   not read; list a granted key in the environment).
 5. Gate decision: `GET /ci/merge-gate/decisions?target_repo_a=&ref=refs/heads/main&new_oid=<landed>`
    returns the allow record from 1.7 (Owner or Admin members only). No allow
-   record, or one recorded in `shadow`, is refused unless `--allow-shadow` is
-   passed during the mixed period.
+   record, or a `shadow` one, is refused unless `--allow-shadow` is passed
+   during the mixed period.
 6. GitHub mirror parity, non-gating: `gh api /repos/{mirror}/git/ref/heads/main`
    when `--github-mirror` is set; the receipt records `mirror: {sha, agrees,
-   read_at}` and disagreement is a stderr warning only (the timer lags).
+   read_at}`; disagreement is a stderr warning only (the timer lags).
 7. Desktop identity: verify the checkout's `scripts/desktop_release.py` bytes
    equal `git show <landed>:scripts/desktop_release.py`, run `verify-main
    --commit <landed> --repo only21mil/buzz` as a subprocess, and record it as
@@ -264,20 +264,19 @@ check event id and `accepted_at`, signer, verdict, `retained_events:
 gate decision, mirror, landing checks, timestamp. `validate --offline`
 replays the retained bodies through the reducer and recomputes every hash;
 `--reverify` repeats steps 1, 3, 5 live. Publication copies `safe_publish`
-from `protected-ci-receipt.py` line 1297 (caller-owned 0700 parent,
-`O_CREAT|O_EXCL|O_NOFOLLOW` 0600 temporary, `renameat2(RENAME_NOREPLACE)`,
-existing destination refused, 4 MiB cap); reads follow `safe_read_receipt`.
+from `protected-ci-receipt.py` line 1297 (0700 parent, `O_EXCL` 0600
+temporary, `RENAME_NOREPLACE`, 4 MiB cap); reads follow `safe_read_receipt`.
 
 ### 2.4 What today's verifier proves that this one cannot
 
 - GitHub's independent chronology (`run_started_at`). Replaced by relay
   `watch_cursor` order and the latest-run rule; a mirror has no second clock.
 - The live ruleset, bypass actors, and `BUZZ_CI_REUSE_EPOCH`. Replaced by the
-  owner-signed rule and the relay mode; native runs never reuse results.
+  owner-signed rule and relay mode; native runs never reuse results.
 - Runner image, OS package inventory, service and compiler image ids, and the
   RustSec advisory revision from the `qualification-*` artifacts. The
-  executor captures no such inventory today; that affects reproducibility
-  claims, not merge authority. The receipt records it as not captured.
+  executor captures none of this today; it affects reproducibility claims,
+  not merge authority, and the receipt records it as not captured.
 
 ## 3. Required-check parity
 
@@ -285,9 +284,12 @@ Of the 15 required contexts in `workflow-inventory.required-checks.json`, 11
 have disposition native with one `ci` job each (the 11 ids in the 1.2
 example). The gate needs one kind-46108 for workflow `ci` whose reduced green
 set covers those pinned ids. `scripts/ci-workflow-inventory.py --check` gains
-one assertion: the pinned list in the live announcement equals the native job
-ids of every required native context. That check runs inside candidate CI
-and only catches drift; the owner-signed rule is what the gate trusts.
+one assertion: the pinned list in the live announcement equals the job ids
+present in `ci.yml` at the candidate, all jobs not explicitly marked
+optional, not the GitHub required-checks snapshot, so it keeps working after
+cutover. A change that adds a required job republishes the 30617 rule in the
+same change. The check runs inside candidate CI and only catches drift; the
+owner-signed rule is what the gate trusts.
 
 During the mixed period the gate requires the native set while the GitHub
 ruleset still requires all 15, so `protected-ci-receipt.py acquire-main` and
@@ -297,19 +299,18 @@ accepts the new receipt. The four retained contexts and their exits:
 
 - Detect Changed Paths: native runs every required job without path
   filtering. Exit: gate in `enforce` and one `buzz ci landing` receipt.
-- Desktop Release Candidate: `buzz ci landing` runs `verify-main` itself (2.2
-  step 7). Exit: first receipt with `landing_checks` executed.
+- Desktop Release Candidate: `buzz ci landing` runs `verify-main` itself.
+  Exit: first receipt with `landing_checks` executed.
 - relay_e2e_canary: tests only its own workflow. Exit: native `relay-e2e`
-  pinned and green on three consecutive verified landings; then retire
-  `scripts/test-relay-e2e-canary-contract.sh` or point it at a native request.
+  green on three consecutive verified landings; then retire or repoint
+  `scripts/test-relay-e2e-canary-contract.sh`.
 - Desktop Build (macOS): no native producer. Stays required on GitHub, with
   that one job and today's PR receipt, until #185 or Victor removes it.
 
 ## 4. Cutover sequence
 
 Every step touching relay config, systemd, keys, the announcement, or the
-ruleset waits for Victor's approval. Code lands first through the ordinary
-GitHub-CI PR path, which is still the gate.
+ruleset waits for Victor's approval. Code lands first through GitHub CI.
 
 1. Land the code: gate, rule, hook v2, migration 0042, reducer move, kind
    46109, `buzz ci landing`, routes, tests. Rollback: revert; flag off.
@@ -323,8 +324,7 @@ GitHub-CI PR path, which is still the gate.
    pinned rule on `refs/heads/main`, every other tag byte-for-byte.
    Rollback: republish without the rule.
 5. Shadow observation: three real landings, each with one `decision=allow`
-   row for the landed `(old, new)`; a `refuse` on a landing GitHub accepted
-   is a bug to fix before step 6.
+   row for the landed `(old, new)`; any `refuse` is a bug to fix first.
 6. Enforce (config gate): `BUZZ_MERGE_GATE_MODE=enforce`, restart; the next
    landing runs both verifiers. Rollback: `shadow`, restart.
 7. Ruleset edit one (ruleset gate): drop Detect Changed Paths, Desktop Release
@@ -334,7 +334,7 @@ GitHub-CI PR path, which is still the gate.
    three enforced landings. Rollback: same source.
 9. Desktop Build (macOS): Victor's decision (section 6). Rollback: re-add.
 10. GitHub CI disable (workflow gate): `gh workflow disable` for `ci.yml` and
-    the canary, or edit triggers if the macOS job stays. Rollback: enable.
+    the canary, or edit triggers if macOS stays. Rollback: enable.
 
 ## 5. Test plan
 
@@ -343,21 +343,19 @@ fast-forward, two-parent merge, three parents, wrong first parent,
 `old_in_second_parent` false, tree mismatch; each refusal code from a
 synthetic history built with the reducer's `green_events` fixtures (moved
 with the reducer behind `cfg(test)` helpers), including a green run over a
-subset of the pinned jobs (`required_jobs_missing`), a `workflow_digest`
-matching the candidate tree's workflow but not the blob at `old_oid`
-(`workflow_digest_mismatch`), `accepted_at` one second past the window
-(`check_expired`) while a later `published_at` is ignored, signer not in the
-union, bypass exact-match, expired, reused, and not consumed in `shadow`,
-`shadow` never refusing, `enforce` with an empty union
-(`gate_misconfigured`). `policy.rs`: HMAC v2 tampering of each new field,
-bash parity. `config.rs`: mode parsing, ceilings. `git_perms`: rule parse,
-job grammar, two rules union into one requirement.
+subset of the pinned jobs (`required_jobs_missing`), a `ci_runs` row whose
+`workflow_digest` is not the base workflow's (`workflow_digest_mismatch`),
+`accepted_at` one second past the window (`check_expired`) while a later
+`published_at` is ignored, signer not in the union, bypass exact-match,
+expired, reused, and not consumed in `shadow`, `shadow` never refusing,
+`enforce` with an empty union (`gate_misconfigured`). `policy.rs`: HMAC v2
+tampering of each new field, bash parity. `config.rs`: mode parsing,
+ceilings. `git_perms`: rule parse, job grammar, two rules union.
 
 Database tests (`ci_ingest_storage.rs` style, scratch Postgres):
 `list_runs_for_tip` ordering with a newer red run, `load_ci_check` by id with
-`accepted_at`, decision row uniqueness on bypass id, kind-46109 ingest
-refusing a non-owner and a window over one hour, a bypass left unconsumed
-after a simulated CAS loss.
+`accepted_at`, `consumed_by` set once and only on a CAS win, kind-46109
+ingest refusing a non-owner and a window over one hour.
 
 Git transport integration. No existing test drives the hook:
 `run_test_receive_pack` (`transport.rs` line 2117) runs git without the
@@ -376,24 +374,26 @@ Cases: `ok refs/heads/main` when everything matches; `ng base_moved` after
 advancing main; `ng not_descendant` for a candidate branched from an older
 main whose merge tree equals the candidate; `ng tree_mismatch` for a
 conflict-resolving merge; `ng required_jobs_missing` for a green one-job run;
-`ng workflow_digest_mismatch` for a candidate that edited `ci.yml`; `ng
+`ok` for a candidate that edited `ci.yml` (run digested at the base), then
+the next candidate's preflight resolving the edited workflow; `ng
 check_pending` while attempt 2 runs; allow after a valid bypass and `ng
 bypass_invalid` on reuse; the 409 race with two concurrent pushes; the
 finalize fence refusing a missing or stale decision row.
 
 Verifier tests (`landing.rs` tests and `crates/buzz-cli/tests/ci_contract.rs`):
 the in-process `TcpListener` relay stub from `dispatch.rs` tests (line 508)
-serves `/ci/checks`, run routes, and decisions; a bare temp repository plays
-the relay git remote. Cases: main differs, parents reversed, base not an
+serves the routes; a bare temp repository plays the relay git remote.
+Cases: main differs, parents reversed, base not an
 ancestor of the candidate, tree differs, newer red run, pinned job missing
 from a green run, workflow digest from the candidate tree, `accepted_at`
 expired, signer absent, shadow record without `--allow-shadow`, mirror
 disagreement exits 0, receipt refuses an existing destination and a 0755
 parent, offline validate fails after one retained byte changes, `verify-main`
-stub failure exits 1. `test-ci-workflow-inventory.py` gains the parity check.
+stub failure exits 1. `test-ci-workflow-inventory.py` gains the parity check
+and a post-cutover case: `ci.yml` adding a job without a republished rule
+fails `--check` with no GitHub snapshot present.
 
 ## 6. Open question for Victor
 
 Desktop Build (macOS) has no native producer. Until #185 lands: keep it on
-GitHub with both verifiers, or drop it and prove macOS builds only at release
-time. Step 9 waits on this.
+GitHub with both verifiers, or drop it and prove macOS builds at release only.
