@@ -392,6 +392,242 @@ fn is_implicitly_addressed_dm_message(
         && channel_type == Some("dm")
 }
 
+/// How often the harness retries kind:39000 lookups for channels that were
+/// subscribed before their type could be resolved.
+const DM_RESOLUTION_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Hard bound on one background lookup. Shorter than the retry interval so a
+/// hung REST bridge costs at most one outstanding lookup at a time.
+const DM_RESOLUTION_LOOKUP_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Lookups per channel before the harness stops retrying (about five minutes
+/// at the retry interval). A channel whose metadata never appears, or that
+/// the relay keeps refusing, is dropped with a warning instead of polling
+/// forever; a later membership notification tracks it again.
+const DM_RESOLUTION_MAX_ATTEMPTS: u32 = 30;
+
+/// Retry timer for pending DM resolution. Missed ticks are skipped so a
+/// stalled loop does not fire a burst of lookups when it catches up.
+fn dm_resolution_interval() -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + DM_RESOLUTION_RETRY_INTERVAL,
+        DM_RESOLUTION_RETRY_INTERVAL,
+    );
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
+}
+
+/// True when a `subscribe=mentions` message subscription was pinned to the
+/// relay-side `#p` filter only because the channel's type was unresolved.
+///
+/// A DM whose kind:39000 metadata was missing at discovery (`unknown`) or whose
+/// lazy fetch failed at membership time (`None`) would otherwise stay
+/// mention-gated until restart, and DMs carry no `p` tag. Such channels are
+/// tracked in [`PendingDmResolution`] and re-subscribed once they resolve.
+fn subscription_awaits_channel_type(
+    subscribe_mode: &SubscribeMode,
+    channel_type: Option<&str>,
+    filter: &ChannelFilter,
+) -> bool {
+    let unresolved = channel_type.is_none_or(|t| t == "unknown");
+    let includes_messages = filter
+        .kinds
+        .as_ref()
+        .is_none_or(|kinds| kinds.contains(&KIND_STREAM_MESSAGE));
+    subscribe_mode == &SubscribeMode::Mentions
+        && unresolved
+        && filter.require_mention
+        && includes_messages
+}
+
+/// Startup channels whose subscription was pinned to `#p` only because their
+/// discovery metadata was missing.
+fn unresolved_startup_channels(
+    subscribe_mode: &SubscribeMode,
+    channel_filters: &HashMap<Uuid, ChannelFilter>,
+    channel_info_map: &HashMap<Uuid, relay::ChannelInfo>,
+) -> Vec<Uuid> {
+    let mut channels: Vec<Uuid> = channel_filters
+        .iter()
+        .filter(|(channel_id, filter)| {
+            subscription_awaits_channel_type(
+                subscribe_mode,
+                channel_info_map
+                    .get(channel_id)
+                    .map(|info| info.channel_type.as_str()),
+                filter,
+            )
+        })
+        .map(|(channel_id, _)| *channel_id)
+        .collect();
+    channels.sort();
+    channels
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingDmEntry {
+    replay_floor: u64,
+    attempts: u32,
+}
+
+/// Result of applying one lookup to [`PendingDmResolution`].
+#[derive(Debug, PartialEq, Eq)]
+enum DmLookupOutcome {
+    /// Still unresolved; the channel stays tracked for the next tick.
+    Unresolved { attempts: u32 },
+    /// Retries exhausted; the channel was dropped from the tracker.
+    Exhausted,
+    /// Resolved as a non-DM channel; the explicit-mention REQ stands.
+    NotDm,
+    /// Resolved as a DM; re-subscribe without `#p` from `replay_floor`.
+    Dm { replay_floor: u64 },
+    /// The channel was not tracked (already resolved or removed).
+    Untracked,
+}
+
+/// Channels subscribed while their type was unresolved, with the replay floor
+/// (unix seconds) to use when the subscription is re-issued.
+#[derive(Debug, Default)]
+struct PendingDmResolution {
+    channels: HashMap<Uuid, PendingDmEntry>,
+}
+
+impl PendingDmResolution {
+    fn track(&mut self, channel_id: Uuid, replay_floor: u64) {
+        self.channels.entry(channel_id).or_insert(PendingDmEntry {
+            replay_floor,
+            attempts: 0,
+        });
+    }
+
+    fn remove(&mut self, channel_id: &Uuid) -> Option<u64> {
+        self.channels
+            .remove(channel_id)
+            .map(|entry| entry.replay_floor)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.channels.is_empty()
+    }
+
+    /// Channel to look up next: fewest attempts first, then oldest floor.
+    fn next_lookup(&self) -> Option<Uuid> {
+        self.channels
+            .iter()
+            .min_by_key(|(channel, entry)| (entry.attempts, entry.replay_floor, **channel))
+            .map(|(channel, _)| *channel)
+    }
+
+    /// Record the outcome of a lookup for `channel_id`.
+    fn apply_lookup(&mut self, channel_id: Uuid, channel_type: Option<&str>) -> DmLookupOutcome {
+        let Some(entry) = self.channels.get_mut(&channel_id) else {
+            return DmLookupOutcome::Untracked;
+        };
+        match channel_type {
+            None => {
+                entry.attempts += 1;
+                if entry.attempts >= DM_RESOLUTION_MAX_ATTEMPTS {
+                    self.channels.remove(&channel_id);
+                    DmLookupOutcome::Exhausted
+                } else {
+                    DmLookupOutcome::Unresolved {
+                        attempts: entry.attempts,
+                    }
+                }
+            }
+            Some("dm") => {
+                let replay_floor = entry.replay_floor;
+                self.channels.remove(&channel_id);
+                DmLookupOutcome::Dm { replay_floor }
+            }
+            Some(_) => {
+                self.channels.remove(&channel_id);
+                DmLookupOutcome::NotDm
+            }
+        }
+    }
+}
+
+/// Result channel for the spawned DM lookup task: `(channel_id, channel_type)`.
+type DmLookupSender = mpsc::Sender<(Uuid, Option<String>)>;
+
+/// Reports one DM lookup result to the main loop exactly once.
+///
+/// The main loop marks a lookup in flight when it spawns the task and clears
+/// the mark only when a message arrives. This guard sends on drop, so the
+/// message is sent whether the lookup returns, or panics
+/// and unwinds. A lookup that never reports would otherwise pin the in-flight
+/// flag and stop every later channel from resolving until restart.
+struct DmLookupReport {
+    channel_id: Uuid,
+    channel_type: Option<String>,
+    tx: Option<DmLookupSender>,
+}
+
+impl DmLookupReport {
+    fn new(channel_id: Uuid, tx: DmLookupSender) -> Self {
+        Self {
+            channel_id,
+            channel_type: None,
+            tx: Some(tx),
+        }
+    }
+}
+
+impl Drop for DmLookupReport {
+    fn drop(&mut self) {
+        let Some(tx) = self.tx.take() else {
+            return;
+        };
+        // `try_send` because Drop cannot await. The channel holds several
+        // reports and the main loop allows one lookup in flight, so a full
+        // channel is not expected; a closed one means the loop is gone.
+        if let Err(error) = tx.try_send((self.channel_id, self.channel_type.take())) {
+            tracing::warn!(
+                channel_id = %self.channel_id,
+                %error,
+                "DM lookup result could not be delivered to the main loop"
+            );
+        }
+    }
+}
+
+/// Body of the spawned DM lookup task. The report guard is created before
+/// the lookup runs so the main loop always receives a terminal message.
+async fn run_dm_lookup(resolver: pool::ChannelInfoResolver, channel_id: Uuid, tx: DmLookupSender) {
+    let mut report = DmLookupReport::new(channel_id, tx);
+    report.channel_type = lookup_channel_type(&resolver, channel_id).await;
+}
+
+/// One bounded channel-type lookup for the retry path. Runs on a spawned
+/// task so a hung REST bridge never blocks the main loop.
+async fn lookup_channel_type(
+    channel_info: &pool::ChannelInfoResolver,
+    channel_id: Uuid,
+) -> Option<String> {
+    tokio::time::timeout(
+        DM_RESOLUTION_LOOKUP_TIMEOUT,
+        channel_info.resolve(channel_id),
+    )
+    .await
+    .ok()
+    .flatten()
+    .map(|info| info.channel_type)
+}
+
+/// Subscription filter for a channel that resolved as a DM: the channel's
+/// rule-derived filter with the `#p` requirement dropped. `None` when the
+/// channel is excluded by subscription rules (for example `--channels`).
+fn dm_resubscribe_filter(
+    subscribe_mode: &SubscribeMode,
+    channel_id: Uuid,
+    build_filter: impl Fn(Uuid) -> Option<ChannelFilter>,
+) -> Option<ChannelFilter> {
+    let mut filter = build_filter(channel_id)?;
+    allow_implicit_dm_messages(subscribe_mode, Some("dm"), &mut filter);
+    Some(filter)
+}
+
 /// Query an author's kind:0 profile and check if their NIP-OA auth tag
 /// proves the same owner as us.
 async fn check_sibling_via_profile(
@@ -2025,6 +2261,19 @@ async fn tokio_main() -> Result<()> {
         }
     }
     let mut subscribed_channel_ids = HashSet::with_capacity(channel_filters.len());
+    // Channels subscribed before their kind:39000 metadata resolved. A DM among
+    // them stays mention-gated until the retry tick re-subscribes it.
+    let mut pending_dm = PendingDmResolution::default();
+    let (dm_lookup_tx, mut dm_lookup_rx) = mpsc::channel::<(Uuid, Option<String>)>(4);
+    let mut dm_lookup_in_flight = false;
+    let startup_replay_floor = if inbox_cursor.has_durable_cursor() {
+        inbox_catchup_floor.since
+    } else {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    };
     for (channel_id, filter) in &channel_filters {
         if let Err(e) = relay
             .subscribe_channel_from(
@@ -2042,6 +2291,19 @@ async fn tokio_main() -> Result<()> {
             tracing::info!("subscribed to channel {channel_id}");
         }
     }
+    for channel_id in
+        unresolved_startup_channels(&config.subscribe_mode, &channel_filters, &channel_info_map)
+    {
+        if !subscribed_channel_ids.contains(&channel_id) {
+            continue;
+        }
+        tracing::info!(
+            channel_id = %channel_id,
+            "channel type unresolved at startup — DM subscription retry scheduled"
+        );
+        pending_dm.track(channel_id, startup_replay_floor);
+    }
+    let mut dm_resolution_retry = (!pending_dm.is_empty()).then(dm_resolution_interval);
 
     if let Some((observer, publisher, keys, agent_pubkey, owner_pubkey, owner)) =
         relay_observer_publisher.take()
@@ -2597,24 +2859,41 @@ async fn tokio_main() -> Result<()> {
                                         config::resolve_dynamic_channel_filter(&config, ch, &rules)
                                     {
                                         let channel_info = ctx.channel_info.resolve(ch).await;
+                                        let channel_type = channel_info
+                                            .as_ref()
+                                            .map(|info| info.channel_type.as_str());
                                         allow_implicit_dm_messages(
                                             &config.subscribe_mode,
-                                            channel_info
-                                                .as_ref()
-                                                .map(|info| info.channel_type.as_str()),
+                                            channel_type,
                                             &mut filter,
+                                        );
+                                        let awaits_type = subscription_awaits_channel_type(
+                                            &config.subscribe_mode,
+                                            channel_type,
+                                            &filter,
                                         );
                                         tracing::info!(channel_id = %ch, "membership notification: subscribing to new channel");
                                         if let Err(e) = relay.subscribe_channel_from(ch, filter, Some(ts)).await {
                                             tracing::warn!("failed to subscribe to new channel {ch}: {e}");
                                         } else {
                                             subscribed_channel_ids.insert(ch);
+                                            if awaits_type {
+                                                tracing::warn!(
+                                                    channel_id = %ch,
+                                                    "channel type unresolved at membership time — DM subscription retry scheduled"
+                                                );
+                                                pending_dm.track(ch, ts);
+                                                if dm_resolution_retry.is_none() {
+                                                    dm_resolution_retry = Some(dm_resolution_interval());
+                                                }
+                                            }
                                         }
                                     } else {
                                         tracing::debug!(channel_id = %ch, "membership notification: no matching rules — skipping");
                                     }
                                 } else {
                                     subscribed_channel_ids.remove(&ch);
+                                    pending_dm.remove(&ch);
                                     tracing::info!(channel_id = %ch, "membership notification: unsubscribing from channel");
                                     if let Err(e) = relay.unsubscribe_channel(ch).await {
                                         tracing::warn!("failed to unsubscribe from channel {ch}: {e}");
@@ -3005,6 +3284,77 @@ async fn tokio_main() -> Result<()> {
                                 break;
                             }
                         }
+                    }
+                    None
+                }
+                _ = async {
+                    match dm_resolution_retry.as_mut() {
+                        Some(timer) => timer.tick().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let _ = result_rx;
+                    if pending_dm.is_empty() && !dm_lookup_in_flight {
+                        dm_resolution_retry = None;
+                    } else if !dm_lookup_in_flight {
+                        if let Some(channel_id) = pending_dm.next_lookup() {
+                            // One bounded lookup per tick, off the loop: a hung
+                            // REST bridge costs at most one outstanding lookup.
+                            dm_lookup_in_flight = true;
+                            tokio::spawn(run_dm_lookup(
+                                ctx.channel_info.clone(),
+                                channel_id,
+                                dm_lookup_tx.clone(),
+                            ));
+                        }
+                    }
+                    None
+                }
+                lookup = dm_lookup_rx.recv() => {
+                    let _ = result_rx;
+                    dm_lookup_in_flight = false;
+                    if let Some((channel_id, channel_type)) = lookup {
+                        match pending_dm.apply_lookup(channel_id, channel_type.as_deref()) {
+                            DmLookupOutcome::Dm { replay_floor } => {
+                                match dm_resubscribe_filter(&config.subscribe_mode, channel_id, |id| {
+                                    config::resolve_dynamic_channel_filter(&config, id, &rules)
+                                }) {
+                                    Some(filter) => {
+                                        tracing::info!(
+                                            channel_id = %channel_id,
+                                            replay_floor,
+                                            "channel resolved as DM — re-subscribing without the mention filter; \
+                                             REQ since is the lower of the channel's last seen event and this floor"
+                                        );
+                                        if let Err(e) = relay
+                                            .resubscribe_channel_with_floor(channel_id, filter, replay_floor)
+                                            .await
+                                        {
+                                            tracing::warn!("failed to re-subscribe DM channel {channel_id}: {e}");
+                                            pending_dm.track(channel_id, replay_floor);
+                                        }
+                                    }
+                                    None => tracing::debug!(
+                                        channel_id = %channel_id,
+                                        "channel resolved as DM but is excluded by subscription rules"
+                                    ),
+                                }
+                            }
+                            DmLookupOutcome::Unresolved { attempts } => tracing::debug!(
+                                channel_id = %channel_id,
+                                attempts,
+                                "channel type still unresolved — DM subscription retry deferred"
+                            ),
+                            DmLookupOutcome::Exhausted => tracing::warn!(
+                                channel_id = %channel_id,
+                                attempts = DM_RESOLUTION_MAX_ATTEMPTS,
+                                "channel type never resolved — keeping the explicit-mention subscription"
+                            ),
+                            DmLookupOutcome::NotDm | DmLookupOutcome::Untracked => {}
+                        }
+                    }
+                    if pending_dm.is_empty() {
+                        dm_resolution_retry = None;
                     }
                     None
                 }
@@ -6149,6 +6499,270 @@ mod author_gate_tests {
             is_dm_channel(id, &resolver(startup)).await,
             "missing startup metadata must not be trusted as a stream"
         );
+    }
+
+    fn mention_gated_messages() -> ChannelFilter {
+        ChannelFilter {
+            kinds: Some(vec![KIND_STREAM_MESSAGE, KIND_STREAM_REMINDER]),
+            require_mention: true,
+        }
+    }
+
+    #[test]
+    fn subscription_awaits_channel_type_only_for_unresolved_mention_gated_message_filters() {
+        let mentions = SubscribeMode::Mentions;
+        let filter = mention_gated_messages();
+        assert!(subscription_awaits_channel_type(&mentions, None, &filter));
+        assert!(subscription_awaits_channel_type(
+            &mentions,
+            Some("unknown"),
+            &filter
+        ));
+        for resolved in ["dm", "stream", "forum", "private", "workflow"] {
+            assert!(
+                !subscription_awaits_channel_type(&mentions, Some(resolved), &filter),
+                "{resolved} is resolved and needs no retry"
+            );
+        }
+        assert!(
+            !subscription_awaits_channel_type(&SubscribeMode::All, None, &filter),
+            "only mentions mode pins #p"
+        );
+        let relaxed = ChannelFilter {
+            require_mention: false,
+            ..mention_gated_messages()
+        };
+        assert!(
+            !subscription_awaits_channel_type(&mentions, None, &relaxed),
+            "--no-mention-filter already admits DMs"
+        );
+        let no_messages = ChannelFilter {
+            kinds: Some(vec![KIND_WORKFLOW_APPROVAL_REQUESTED]),
+            require_mention: true,
+        };
+        assert!(
+            !subscription_awaits_channel_type(&mentions, None, &no_messages),
+            "a subscription without kind:9 has no DM to unblock"
+        );
+    }
+
+    #[test]
+    fn startup_tracks_only_channels_with_missing_metadata() {
+        let unknown = Uuid::new_v4();
+        let dm = Uuid::new_v4();
+        let stream = Uuid::new_v4();
+        let undiscovered = Uuid::new_v4();
+        let filters: HashMap<Uuid, ChannelFilter> = [
+            (unknown, mention_gated_messages()),
+            (
+                dm,
+                ChannelFilter {
+                    require_mention: false,
+                    ..mention_gated_messages()
+                },
+            ),
+            (stream, mention_gated_messages()),
+            (undiscovered, mention_gated_messages()),
+        ]
+        .into_iter()
+        .collect();
+        let info = |channel_type: &str| relay::ChannelInfo {
+            name: "x".into(),
+            channel_type: channel_type.into(),
+        };
+        let map: HashMap<Uuid, relay::ChannelInfo> = [
+            (unknown, info("unknown")),
+            (dm, info("dm")),
+            (stream, info("stream")),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut expected = vec![unknown, undiscovered];
+        expected.sort();
+        assert_eq!(
+            unresolved_startup_channels(&SubscribeMode::Mentions, &filters, &map),
+            expected,
+            "missing or unknown metadata is tracked; resolved channels are not"
+        );
+        assert!(
+            unresolved_startup_channels(&SubscribeMode::All, &filters, &map).is_empty(),
+            "subscribe=all never pins #p"
+        );
+    }
+
+    #[test]
+    fn pending_dm_resolution_keeps_first_floor_and_picks_least_tried_channel() {
+        let mut pending = PendingDmResolution::default();
+        let newer = Uuid::new_v4();
+        let older = Uuid::new_v4();
+        pending.track(newer, 200);
+        pending.track(older, 100);
+        pending.track(older, 150);
+        assert_eq!(pending.next_lookup(), Some(older), "oldest floor first");
+        assert_eq!(
+            pending.apply_lookup(older, None),
+            DmLookupOutcome::Unresolved { attempts: 1 }
+        );
+        assert_eq!(
+            pending.next_lookup(),
+            Some(newer),
+            "a channel that was just tried yields to the untried one"
+        );
+        assert_eq!(
+            pending.apply_lookup(older, Some("dm")),
+            DmLookupOutcome::Dm { replay_floor: 100 },
+            "the first tracked floor wins"
+        );
+        assert_eq!(
+            pending.apply_lookup(older, Some("dm")),
+            DmLookupOutcome::Untracked
+        );
+        assert_eq!(
+            pending.apply_lookup(newer, Some("stream")),
+            DmLookupOutcome::NotDm
+        );
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn pending_dm_resolution_gives_up_after_max_attempts() {
+        let mut pending = PendingDmResolution::default();
+        let id = Uuid::new_v4();
+        pending.track(id, 5);
+        for attempt in 1..DM_RESOLUTION_MAX_ATTEMPTS {
+            assert_eq!(
+                pending.apply_lookup(id, None),
+                DmLookupOutcome::Unresolved { attempts: attempt }
+            );
+        }
+        assert_eq!(pending.apply_lookup(id, None), DmLookupOutcome::Exhausted);
+        assert!(pending.is_empty(), "an exhausted channel is dropped");
+        assert_eq!(pending.next_lookup(), None);
+    }
+
+    #[test]
+    fn member_removed_clears_pending_dm_entry() {
+        let mut pending = PendingDmResolution::default();
+        let id = Uuid::new_v4();
+        pending.track(id, 7);
+        assert_eq!(pending.remove(&id), Some(7));
+        assert_eq!(pending.remove(&id), None);
+        assert!(pending.is_empty());
+        assert_eq!(
+            pending.apply_lookup(id, Some("dm")),
+            DmLookupOutcome::Untracked,
+            "a late lookup result for a removed channel is ignored"
+        );
+    }
+
+    #[test]
+    fn dm_resubscribe_filter_drops_mention_requirement_and_honors_rule_exclusions() {
+        let id = Uuid::new_v4();
+        assert_eq!(
+            dm_resubscribe_filter(&SubscribeMode::Mentions, id, |_| Some(
+                mention_gated_messages()
+            )),
+            Some(ChannelFilter {
+                require_mention: false,
+                ..mention_gated_messages()
+            })
+        );
+        assert_eq!(
+            dm_resubscribe_filter(&SubscribeMode::Mentions, id, |_| None),
+            None,
+            "--channels exclusions still apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn dm_lookup_report_sends_on_normal_completion() {
+        let id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let mut report = DmLookupReport::new(id, tx);
+            report.channel_type = Some("dm".to_string());
+        })
+        .await
+        .expect("task completes");
+        assert_eq!(rx.recv().await, Some((id, Some("dm".to_string()))));
+        assert_eq!(
+            rx.recv().await,
+            None,
+            "the sender is released with the report"
+        );
+    }
+
+    #[tokio::test]
+    async fn dm_lookup_report_sends_when_the_lookup_panics() {
+        let id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(4);
+        let joined = tokio::spawn(async move {
+            let _report = DmLookupReport::new(id, tx);
+            panic!("resolver blew up");
+        })
+        .await;
+        assert!(joined.is_err(), "the task panicked");
+        assert_eq!(
+            rx.recv().await,
+            Some((id, None)),
+            "a panicking lookup still reports so in_flight clears"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_dm_lookup_reports_the_resolved_type() {
+        let id = Uuid::new_v4();
+        let response = serde_json::json!([{
+            "tags": [["d", id.to_string()], ["name", "DM"], ["private"], ["hidden"], ["t", "dm"]]
+        }]);
+        let (resolver, _requests, server) = lazy_resolver_with_response(response).await;
+        let (tx, mut rx) = mpsc::channel(4);
+        tokio::spawn(run_dm_lookup(resolver, id, tx))
+            .await
+            .expect("lookup task completes");
+        assert_eq!(rx.recv().await, Some((id, Some("dm".to_string()))));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn lookup_channel_type_resolves_declared_dm() {
+        let id = Uuid::new_v4();
+        let response = serde_json::json!([{
+            "tags": [["d", id.to_string()], ["name", "DM"], ["private"], ["hidden"], ["t", "dm"]]
+        }]);
+        let (resolver, _requests, server) = lazy_resolver_with_response(response).await;
+        assert_eq!(
+            lookup_channel_type(&resolver, id).await.as_deref(),
+            Some("dm")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn lookup_channel_type_resolves_stream() {
+        let id = Uuid::new_v4();
+        let response = serde_json::json!([{
+            "tags": [["d", id.to_string()], ["name", "general"], ["t", "stream"]]
+        }]);
+        let (resolver, _requests, server) = lazy_resolver_with_response(response).await;
+        assert_eq!(
+            lookup_channel_type(&resolver, id).await.as_deref(),
+            Some("stream")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn lookup_channel_type_returns_none_while_metadata_is_unavailable() {
+        let id = Uuid::new_v4();
+        let (resolver, requests, server) = lazy_resolver_with_response(serde_json::json!([])).await;
+        assert_eq!(lookup_channel_type(&resolver, id).await, None);
+        assert!(
+            requests.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "the lookup must query the relay"
+        );
+        server.abort();
     }
 
     async fn lazy_resolver_with_response(
