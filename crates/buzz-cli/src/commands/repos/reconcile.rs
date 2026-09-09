@@ -79,7 +79,9 @@ impl Event {
     /// counts (more than one means none, as in the relay helper) and it must
     /// verify client-side against this event's signer: the relay does not
     /// inspect `auth` tags on status ingest, so an unverified tag proves
-    /// nothing.
+    /// nothing. The delegation's `kind=` and `created_at` clauses are held
+    /// against this event, as the relay's action path does; a scoped or
+    /// expired delegation leaves the event speaking for its signer only.
     fn principal(&self) -> Option<String> {
         let mut tags = self
             .tags
@@ -91,9 +93,14 @@ impl Event {
         }
         let signer = nostr::PublicKey::from_hex(&self.pubkey).ok()?;
         let json = serde_json::to_string(tag).ok()?;
-        buzz_sdk::nip_oa::verify_auth_tag(&json, &signer)
-            .ok()
-            .map(|owner| owner.to_hex())
+        buzz_sdk::nip_oa::verify_auth_tag_for_signed_kind(
+            &json,
+            &signer,
+            self.kind,
+            self.created_at,
+        )
+        .ok()
+        .map(|owner| owner.to_hex())
     }
 
     fn root(&self) -> Option<&str> {
@@ -1471,12 +1478,16 @@ mod tests {
     }
 
     fn auth_tag(principal: &nostr::Keys, agent: &nostr::Keys) -> Vec<String> {
-        let json = buzz_sdk::nip_oa::compute_auth_tag(
-            principal,
-            &agent.public_key(),
-            "created_at<4294967295",
-        )
-        .unwrap();
+        scoped_auth_tag(principal, agent, "created_at<4294967295")
+    }
+
+    fn scoped_auth_tag(
+        principal: &nostr::Keys,
+        agent: &nostr::Keys,
+        conditions: &str,
+    ) -> Vec<String> {
+        let json =
+            buzz_sdk::nip_oa::compute_auth_tag(principal, &agent.public_key(), conditions).unwrap();
         serde_json::from_str(&json).unwrap()
     }
 
@@ -1553,6 +1564,36 @@ mod tests {
         events[1].tags.push(auth_tag(&principal, &agent));
         events.push(merged_status(&principal.public_key().to_hex(), &[]));
         assert_eq!(pr_status(&events), ("open".into(), true));
+    }
+
+    #[test]
+    fn status_authority_holds_delegation_conditions_against_the_status() {
+        let principal = nostr::Keys::generate();
+        let agent = nostr::Keys::generate();
+        // Root signed by the principal; the status (kind 1631 at t=3) is
+        // signed by the agent under a delegation with conditions.
+        let delegated = |conditions: &str| {
+            let mut events = roots();
+            events[1].pubkey = principal.public_key().to_hex();
+            let mut status = merged_status(&agent.public_key().to_hex(), &[]);
+            status
+                .tags
+                .push(scoped_auth_tag(&principal, &agent, conditions));
+            events.push(status);
+            pr_status(&events)
+        };
+
+        // Scoped to another kind: the agent speaks for itself only.
+        assert_eq!(delegated("kind=1"), ("open".into(), true));
+        // Expired before the status was created (strict bound).
+        assert_eq!(delegated("created_at<3"), ("open".into(), true));
+        // Not yet valid at the status time.
+        assert_eq!(delegated("created_at>3"), ("open".into(), true));
+        // Conditions cover the status kind and time window.
+        assert_eq!(
+            delegated("kind=1631&created_at>1&created_at<10"),
+            ("merged_or_resolved".into(), false)
+        );
     }
 
     #[test]
