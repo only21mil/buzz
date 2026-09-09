@@ -1,7 +1,7 @@
 //! Typed, zero-I/O envelopes for Buzz-native CI events.
 
 use crate::kind::{
-    KIND_CI_ARTIFACT_REFERENCE, KIND_CI_EVIDENCE_FINALIZED, KIND_CI_JOB_STATUS,
+    KIND_CI_ARTIFACT_REFERENCE, KIND_CI_CHECK, KIND_CI_EVIDENCE_FINALIZED, KIND_CI_JOB_STATUS,
     KIND_CI_LOG_REFERENCE, KIND_CI_REQUEST, KIND_CI_RUN_STATUS, KIND_CI_TEARDOWN_ATTESTATION,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
@@ -263,6 +263,40 @@ impl CiRequestEnvelope {
             }
         }
         Ok(())
+    }
+}
+
+/// Concurrency group key for a request, shaped like the GitHub `CI`
+/// workflow's `ci-<workflow>-<ref or sha>` group.
+///
+/// A pull-request request (every kind 46100 request carries its PR root event)
+/// is keyed by its source branch, so a newer request for the same branch
+/// supersedes an older one. The `cancel_in_progress` flag says whether an
+/// older non-terminal run in the same group is cancelled when a newer request
+/// arrives; it is set for pull-request refs, matching GitHub's behaviour on
+/// `pull_request` events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiConcurrencyGroup {
+    /// Group key: `ci-<workflow_id>-<source_branch>` for PR refs, else
+    /// `ci-<workflow_id>-<tip_oid>`.
+    pub key: String,
+    /// Whether an older in-flight run in this group is cancelled by a newer one.
+    pub cancel_in_progress: bool,
+}
+
+impl CiConcurrencyGroup {
+    /// Derive the group from a validated request.
+    pub fn of(request: &CiRequestEnvelope) -> Self {
+        let pr_ref = !request.pr_root_event_id.is_empty();
+        let selector = if pr_ref {
+            request.source_branch.as_str()
+        } else {
+            request.tip_oid.as_str()
+        };
+        Self {
+            key: format!("ci-{}-{}", request.workflow_id, selector),
+            cancel_in_progress: pr_ref,
+        }
     }
 }
 
@@ -888,6 +922,129 @@ impl CiTeardownAttestationEnvelope {
     }
 }
 
+/// Terminal check content for kind 46108.
+///
+/// One signed event per run attempt, published by the control plane after the
+/// terminal kind-46101 run status is durable. It carries the conclusion a
+/// merge gate needs, the exact head SHA, the run and attempt identifiers, and
+/// the IDs of the events it summarises. The greatest accepted attempt for a
+/// run decides. It is a summary of already stored facts, never a substitute
+/// for the reducer's evidence checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiCheckEnvelope {
+    /// Always `CI_SCHEMA_VERSION`.
+    pub schema_version: u32,
+    /// Accepted kind 46100 request this attempt executed.
+    pub request_event_id: String,
+    /// Run identifier.
+    pub run_id: String,
+    /// Workflow identifier.
+    pub workflow_id: String,
+    /// Immutable repository coordinate.
+    pub target_repo_a: String,
+    /// Exact head object ID the conclusion is about.
+    pub tip_oid: String,
+    /// Base object ID.
+    pub base_oid: String,
+    /// One-based attempt this check concludes.
+    pub attempt: u32,
+    /// Terminal run state (never `queued` or `running`).
+    pub conclusion: CiRunState,
+    /// Terminal reason copied from the run status, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Event ID of the terminal kind 46101 run status.
+    pub run_status_event_id: String,
+    /// Event ID of the accepted kind 46105 fact, when the run succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_finalized_event_id: Option<String>,
+    /// Event ID of the accepted kind 46106 fact, when the run succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teardown_attestation_event_id: Option<String>,
+    /// Concurrency group key the attempt ran under.
+    pub concurrency_group: String,
+    /// Publication time in Unix seconds.
+    pub published_at: u64,
+    /// Authorized control-plane signer pubkey.
+    pub relay_signer: String,
+}
+
+impl CiCheckEnvelope {
+    /// Validate the context-free terminal check shape.
+    pub fn validate(&self) -> Result<(), CiValidationError> {
+        validate_fact_common(
+            self.schema_version,
+            &self.request_event_id,
+            &self.run_id,
+            &self.workflow_id,
+            &self.target_repo_a,
+            &self.tip_oid,
+            self.attempt,
+            self.published_at,
+            &self.relay_signer,
+        )?;
+        validate_hex(&self.base_oid, self.tip_oid.len(), "invalid check base OID")?;
+        if !self.conclusion.is_terminal() {
+            return Err(CiValidationError("check conclusion must be terminal"));
+        }
+        validate_hex(
+            &self.run_status_event_id,
+            64,
+            "invalid check run status event ID",
+        )?;
+        for id in [
+            self.evidence_finalized_event_id.as_deref(),
+            self.teardown_attestation_event_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            validate_hex(id, 64, "invalid check terminal fact event ID")?;
+        }
+        let both_facts = self.evidence_finalized_event_id.is_some()
+            && self.teardown_attestation_event_id.is_some();
+        if (self.conclusion == CiRunState::Success) != both_facts {
+            return Err(CiValidationError(
+                "check success requires both terminal facts and nothing else may carry them",
+            ));
+        }
+        validate_non_empty(
+            &self.concurrency_group,
+            "concurrency group must be non-empty",
+        )?;
+        if self.reason.as_deref().is_some_and(str::is_empty) {
+            return Err(CiValidationError(
+                "check reason must be non-empty when present",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Bind this check to the request it names.
+    pub fn validate_context(
+        &self,
+        request_event_id: &str,
+        request: &CiRequestEnvelope,
+    ) -> Result<(), CiValidationError> {
+        self.validate()?;
+        request.validate()?;
+        if self.request_event_id != request_event_id
+            || self.run_id != request.run_id
+            || self.workflow_id != request.workflow_id
+            || self.target_repo_a != request.target_repo_a
+            || self.tip_oid != request.tip_oid
+            || self.base_oid != request.base_oid
+            || self.attempt != request.attempt
+            || self.concurrency_group != CiConcurrencyGroup::of(request).key
+        {
+            return Err(CiValidationError(
+                "check provenance does not match accepted request",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A signature-verified, kind-bound CI event envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidatedCiEnvelope {
@@ -905,6 +1062,8 @@ pub enum ValidatedCiEnvelope {
     EvidenceFinalized(CiEvidenceFinalizedEnvelope),
     /// Kind 46106 lease-empty teardown fact.
     TeardownAttestation(CiTeardownAttestationEnvelope),
+    /// Kind 46108 terminal check authored by an authorized control-plane signer.
+    Check(CiCheckEnvelope),
 }
 
 /// Verify a signed CI event, bind its kind to the exact envelope and tags, and enforce signer trust.
@@ -972,6 +1131,13 @@ pub fn validate_signed_ci_event(
             validate_status_signer(&signer, &envelope.relay_signer, authorized_status_signers)?;
             validate_teardown_attestation_tags(&tags, channel_id, &envelope)?;
             Ok(ValidatedCiEnvelope::TeardownAttestation(envelope))
+        }
+        KIND_CI_CHECK => {
+            let envelope: CiCheckEnvelope = serde_json::from_str(&event.content)
+                .map_err(|_| CiValidationError("invalid CI check content"))?;
+            validate_status_signer(&signer, &envelope.relay_signer, authorized_status_signers)?;
+            validate_check_tags(&tags, channel_id, &envelope)?;
+            Ok(ValidatedCiEnvelope::Check(envelope))
         }
         _ => Err(CiValidationError("event kind is not a CI envelope kind")),
     }
@@ -1110,6 +1276,25 @@ pub fn validate_teardown_attestation_tags(
     validate_tags(tags, channel_id, TagFields::teardown_attestation(envelope))
 }
 
+/// Build the required index tags for a kind 46108 terminal check.
+pub fn check_tags(
+    channel_id: &str,
+    envelope: &CiCheckEnvelope,
+) -> Result<Vec<Tag>, CiValidationError> {
+    envelope.validate()?;
+    build_tags(channel_id, TagFields::check(envelope))
+}
+
+/// Validate required index tags against a kind 46108 terminal check.
+pub fn validate_check_tags(
+    tags: &[Tag],
+    channel_id: &str,
+    envelope: &CiCheckEnvelope,
+) -> Result<(), CiValidationError> {
+    envelope.validate()?;
+    validate_tags(tags, channel_id, TagFields::check(envelope))
+}
+
 struct TagFields<'a> {
     target_repo_a: &'a str,
     run_id: &'a str,
@@ -1162,6 +1347,19 @@ impl<'a> TagFields<'a> {
     }
 
     fn teardown_attestation(envelope: &'a CiTeardownAttestationEnvelope) -> Self {
+        Self {
+            target_repo_a: &envelope.target_repo_a,
+            run_id: &envelope.run_id,
+            workflow_id: &envelope.workflow_id,
+            tip_oid: &envelope.tip_oid,
+            attempt: envelope.attempt,
+            job_id: None,
+            request_event_id: Some(&envelope.request_event_id),
+            digest: None,
+        }
+    }
+
+    fn check(envelope: &'a CiCheckEnvelope) -> Self {
         Self {
             target_repo_a: &envelope.target_repo_a,
             run_id: &envelope.run_id,

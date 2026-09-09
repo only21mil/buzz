@@ -579,6 +579,9 @@ pub const KIND_CI_TEARDOWN_ATTESTATION: u32 = 46106;
 /// CI control-plane signer grant (owner/admin upserts an authorized signer
 /// into `ci_grants` for a channel + repository coordinate).
 pub const KIND_CI_GRANT: u32 = 46107;
+/// Signed terminal check for one CI run attempt: the one event a merge gate
+/// reads for the run's conclusion, head SHA, run ID, and attempt.
+pub const KIND_CI_CHECK: u32 = 46108;
 /// Trigger workflow execution.
 pub const KIND_WORKFLOW_TRIGGER: u32 = 46020;
 /// Grant pending approval.
@@ -767,6 +770,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_CI_EVIDENCE_FINALIZED,
     KIND_CI_TEARDOWN_ATTESTATION,
     KIND_CI_GRANT,
+    KIND_CI_CHECK,
     KIND_WORKFLOW_TRIGGER,
     KIND_APPROVAL_GRANT,
     KIND_APPROVAL_DENY,

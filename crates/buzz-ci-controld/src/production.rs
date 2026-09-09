@@ -10,15 +10,15 @@ use std::path::{Component, Path};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use buzz_core::ci::{
-    artifact_reference_tags, evidence_finalized_tags, job_status_tags, log_reference_tags,
-    run_status_tags, teardown_attestation_tags, validate_signed_ci_event,
-    CiArtifactReferenceEnvelope, CiEvidenceFinalizedEnvelope, CiFinalizedJobAttempt, CiJobState,
-    CiJobStatusEnvelope, CiLogReferenceEnvelope, CiRequestEnvelope, CiRunState,
-    CiRunStatusEnvelope, CiSkipPolicy, CiTeardownAttestationEnvelope, ValidatedCiEnvelope,
-    CI_SCHEMA_VERSION,
+    artifact_reference_tags, check_tags, evidence_finalized_tags, job_status_tags,
+    log_reference_tags, run_status_tags, teardown_attestation_tags, validate_signed_ci_event,
+    CiArtifactReferenceEnvelope, CiCheckEnvelope, CiConcurrencyGroup, CiEvidenceFinalizedEnvelope,
+    CiFinalizedJobAttempt, CiJobState, CiJobStatusEnvelope, CiLogReferenceEnvelope,
+    CiRequestEnvelope, CiRequestType, CiRunState, CiRunStatusEnvelope, CiSkipPolicy,
+    CiTeardownAttestationEnvelope, ValidatedCiEnvelope, CI_SCHEMA_VERSION,
 };
 use buzz_core::kind::{
-    KIND_CI_ARTIFACT_REFERENCE, KIND_CI_EVIDENCE_FINALIZED, KIND_CI_JOB_STATUS,
+    KIND_CI_ARTIFACT_REFERENCE, KIND_CI_CHECK, KIND_CI_EVIDENCE_FINALIZED, KIND_CI_JOB_STATUS,
     KIND_CI_LOG_REFERENCE, KIND_CI_RUN_STATUS, KIND_CI_TEARDOWN_ATTESTATION,
 };
 use serde::{Deserialize, Serialize};
@@ -261,10 +261,43 @@ pub trait CiSigner {
 }
 
 /// Runner socket and reconciliation seam.
+/// What the control plane tells a running attempt between broker reads.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WatchDecision {
+    /// Keep reconciling.
+    Continue,
+    /// Stop the job now and record it cancelled with this reason.
+    Cancel(String),
+}
+
+/// Reason prefix recorded on a run superseded by a newer request in its
+/// concurrency group; the superseding request's event ID follows the colon.
+pub const CONCURRENCY_SUPERSEDED_REASON: &str = "concurrency_superseded_by";
+/// Reason recorded on a run whose attempt finished after the run deadline.
+pub const RUN_DEADLINE_REASON: &str = "run_deadline_exceeded";
+/// Reason recorded on a rerun whose lineage does not match the stored parent.
+pub const RERUN_LINEAGE_REASON: &str = "rerun_lineage_mismatch";
+/// How many accepted requests past the head the supersession look-ahead reads.
+const SUPERSESSION_LOOKAHEAD: usize = 8;
+/// How many watch ticks pass between relay probes for a superseding request.
+const SUPERSESSION_PROBE_TICKS: u32 = 5;
+
 pub trait AttemptExecutor {
     type Error;
 
     fn execute(&mut self, request: &AcceptedRequest) -> Result<AttemptCompletion, Self::Error>;
+
+    /// Execute while consulting `watch` between reconciliation reads. An
+    /// executor that cannot stop a running job keeps the default and never
+    /// consults the watch; the runner v2 executor overrides it.
+    fn execute_watched(
+        &mut self,
+        request: &AcceptedRequest,
+        watch: &mut dyn FnMut() -> WatchDecision,
+    ) -> Result<AttemptCompletion, Self::Error> {
+        let _ = watch;
+        self.execute(request)
+    }
 
     /// Whether a validated runner refusal proves this request expired before admission.
     /// Only this request-local terminal condition may advance the relay cursor without
@@ -463,6 +496,17 @@ pub trait ControlStore {
         next: u64,
     ) -> Result<bool, Self::Error>;
     fn load_run(&self, identity: &RunIdentity) -> Result<Option<(u64, RunRecord)>, Self::Error>;
+
+    /// Load every stored record for one `(run_id, attempt)` regardless of
+    /// the request event that created it. Rerun lineage validation reads the
+    /// parent attempt through this seam; a refused rerun leaves its own
+    /// record at the same attempt, so more than one may exist.
+    fn load_run_attempts(
+        &self,
+        run_id: Uuid,
+        attempt: u32,
+    ) -> Result<Vec<(u64, RunRecord)>, Self::Error>;
+
     fn compare_and_swap_run(
         &mut self,
         identity: &RunIdentity,
@@ -1008,7 +1052,16 @@ where
                 return Ok(PollStep::Idle);
             }
         }
-        match self.handle_accepted(&accepted) {
+        let superseder = if terminal_only || expected.is_some() {
+            None
+        } else {
+            self.find_superseder(channel_id, &accepted)?
+        };
+        let handled = match superseder {
+            Some(superseder) => self.handle_superseded(&accepted, &superseder),
+            None => self.handle_accepted(&accepted),
+        };
+        match handled {
             Ok(()) => {}
             Err(ProductionError::DeferredPublication) => return Ok(PollStep::Deferred),
             Err(error) => return Err(error),
@@ -1023,37 +1076,171 @@ where
         Ok(PollStep::Completed)
     }
 
-    fn handle_accepted(&mut self, accepted: &AcceptedRequest) -> Result<(), ProductionError> {
+    /// Look past the channel head for a newer initial request in the head's
+    /// concurrency group. GitHub's `cancel-in-progress` on pull-request refs
+    /// covers queued runs too: a newer push to the same branch makes the
+    /// older run's result moot, so the older head is recorded cancelled
+    /// without running. Bounded to `SUPERSESSION_LOOKAHEAD` reads.
+    fn find_superseder(
+        &mut self,
+        channel_id: &str,
+        head: &AcceptedRequest,
+    ) -> Result<Option<AcceptedRequest>, ProductionError> {
+        let group = CiConcurrencyGroup::of(&head.envelope);
+        if !group.cancel_in_progress {
+            return Ok(None);
+        }
+        let mut cursor = head.watch_cursor;
+        for _ in 0..SUPERSESSION_LOOKAHEAD {
+            let Some(next) = self
+                .relay
+                .next_accepted(channel_id, cursor)
+                .map_err(|_| ProductionError::Relay)?
+            else {
+                return Ok(None);
+            };
+            if next.channel_id != channel_id || next.watch_cursor <= cursor {
+                return Err(ProductionError::Invalid);
+            }
+            if supersedes(&group, head, &next) {
+                return Ok(Some(next));
+            }
+            cursor = next.watch_cursor;
+        }
+        Ok(None)
+    }
+
+    /// Record a queued head cancelled because `superseder` replaced it in its
+    /// concurrency group, and publish its terminal status and check. A head
+    /// that is already terminal only settles its pending publications.
+    fn handle_superseded(
+        &mut self,
+        accepted: &AcceptedRequest,
+        superseder: &AcceptedRequest,
+    ) -> Result<(), ProductionError> {
         let identity = run_identity(accepted)?;
+        let (revision, record) = self.load_or_queue(accepted, &identity)?;
+        if record.state().is_terminal() {
+            return self.settle_terminal(accepted, &identity, revision, record);
+        }
+        if record.state() == RunState::Queued {
+            self.publish_run(accepted, &record, "run:queued")?;
+        }
+        let now = host_now()?
+            .max(record.queued_at())
+            .max(record.started_at().unwrap_or(0));
+        let cancelled = record.transition(
+            RunState::Cancelled,
+            now,
+            Some(format!(
+                "{CONCURRENCY_SUPERSEDED_REASON}:{}",
+                superseder.event_id
+            )),
+        )?;
+        self.finish_terminal(accepted, &identity, revision, cancelled)
+    }
+
+    fn load_or_queue(
+        &mut self,
+        accepted: &AcceptedRequest,
+        identity: &RunIdentity,
+    ) -> Result<(u64, RunRecord), ProductionError> {
         let queued = RunRecord::queued(identity.clone(), accepted.envelope.issued_at)?;
-        let (mut revision, mut record) = match self
+        match self
             .store
-            .load_run(&identity)
+            .load_run(identity)
             .map_err(|_| ProductionError::Store)?
         {
-            Some(existing) => existing,
+            Some(existing) => Ok(existing),
             None => match self
                 .store
-                .compare_and_swap_run(&identity, None, &queued)
+                .compare_and_swap_run(identity, None, &queued)
                 .map_err(|_| ProductionError::Store)?
             {
-                StoreWrite::Written { revision } => (revision, queued),
-                StoreWrite::Conflict { .. } => return Err(ProductionError::PublicationConflict),
+                StoreWrite::Written { revision } => Ok((revision, queued)),
+                StoreWrite::Conflict { .. } => Err(ProductionError::PublicationConflict),
             },
-        };
+        }
+    }
+
+    /// Publish whatever a terminal record still lacks: its terminal run
+    /// status, then its check.
+    fn settle_terminal(
+        &mut self,
+        accepted: &AcceptedRequest,
+        identity: &RunIdentity,
+        mut revision: u64,
+        mut record: RunRecord,
+    ) -> Result<(), ProductionError> {
+        if record.terminal_event_id().is_none() {
+            let terminal_event_id = self.publish_run(accepted, &record, "run:terminal")?;
+            record = record.with_terminal_event(terminal_event_id)?;
+            revision = persist_run(&mut self.store, identity, revision, &record)?;
+        }
+        if record.check_event_id().is_none() {
+            let check_event_id = self.publish_check(accepted, &record)?;
+            let bound = record.with_check_event(check_event_id)?;
+            persist_run(&mut self.store, identity, revision, &bound)?;
+        }
+        Ok(())
+    }
+
+    /// Persist a terminal transition, publish its run status, bind it, then
+    /// publish and bind the one terminal check for the attempt.
+    fn finish_terminal(
+        &mut self,
+        accepted: &AcceptedRequest,
+        identity: &RunIdentity,
+        revision: u64,
+        terminal: RunRecord,
+    ) -> Result<(), ProductionError> {
+        let terminal_revision = persist_run(&mut self.store, identity, revision, &terminal)?;
+        self.settle_terminal(accepted, identity, terminal_revision, terminal)
+    }
+
+    fn handle_accepted(&mut self, accepted: &AcceptedRequest) -> Result<(), ProductionError> {
+        let identity = run_identity(accepted)?;
+        let (mut revision, mut record) = self.load_or_queue(accepted, &identity)?;
         if record.state().is_terminal() {
-            if record.terminal_event_id().is_none() {
-                let terminal_event_id = self.publish_run(accepted, &record, "run:terminal")?;
-                let bound = record.with_terminal_event(terminal_event_id)?;
-                persist_run(&mut self.store, &identity, revision, &bound)?;
-            }
-            return Ok(());
+            return self.settle_terminal(accepted, &identity, revision, record);
         }
 
         if record.state() == RunState::Queued {
             self.publish_run(accepted, &record, "run:queued")?;
         }
-        let completion = match self.executor.execute(accepted) {
+        if accepted.envelope.request_type == CiRequestType::Rerun {
+            if let Err(reason) = validate_rerun_lineage(&self.store, accepted)? {
+                self.publish_terminal_infrastructure_failure(
+                    accepted,
+                    &identity,
+                    revision,
+                    &record,
+                    &format!("{RERUN_LINEAGE_REASON}:{reason}"),
+                )?;
+                return Ok(());
+            }
+        }
+        let completion = {
+            let Self {
+                relay, executor, ..
+            } = self;
+            let group = CiConcurrencyGroup::of(&accepted.envelope);
+            let mut ticks = 0_u32;
+            let mut watch = || {
+                ticks = ticks.wrapping_add(1);
+                if !group.cancel_in_progress || ticks % SUPERSESSION_PROBE_TICKS != 1 {
+                    return WatchDecision::Continue;
+                }
+                match relay.next_accepted(&accepted.channel_id, accepted.watch_cursor) {
+                    Ok(Some(next)) if supersedes(&group, accepted, &next) => WatchDecision::Cancel(
+                        format!("{CONCURRENCY_SUPERSEDED_REASON}:{}", next.event_id),
+                    ),
+                    _ => WatchDecision::Continue,
+                }
+            };
+            executor.execute_watched(accepted, &mut watch)
+        };
+        let completion = match completion {
             Ok(completion) => completion,
             Err(error) => {
                 let expired = self.executor.is_expired_refusal(&error);
@@ -1107,7 +1294,20 @@ where
                 Err(error) => return Err(error),
             };
 
-            let terminal_state = terminal_run_state(&completion.jobs);
+            // The run deadline is the request's signed `timeout_seconds`
+            // measured from the moment it was queued; it bounds the whole
+            // attempt, evidence sealing included, not just the job.
+            let run_deadline_at = record
+                .queued_at()
+                .saturating_add(accepted.envelope.timeout_seconds);
+            let (terminal_state, reason) = if completion.finished_at > run_deadline_at {
+                (RunState::TimedOut, Some(RUN_DEADLINE_REASON.to_owned()))
+            } else {
+                (
+                    terminal_run_state(&completion.jobs),
+                    terminal_reason(&completion.jobs),
+                )
+            };
             if terminal_state == RunState::Success {
                 let evidence = CiEvidenceFinalizedEnvelope {
                     schema_version: CI_SCHEMA_VERSION,
@@ -1140,15 +1340,8 @@ where
                 record = record.with_evidence_finalized(evidence_id)?;
                 record = record.with_teardown_attestation(teardown_id)?;
             }
-            let terminal = record.transition(
-                terminal_state,
-                completion.finished_at,
-                terminal_reason(&completion.jobs),
-            )?;
-            let terminal_revision = persist_run(&mut self.store, &identity, revision, &terminal)?;
-            let terminal_event_id = self.publish_run(accepted, &terminal, "run:terminal")?;
-            let bound = terminal.with_terminal_event(terminal_event_id)?;
-            persist_run(&mut self.store, &identity, terminal_revision, &bound)?;
+            let terminal = record.transition(terminal_state, completion.finished_at, reason)?;
+            self.finish_terminal(accepted, &identity, revision, terminal)?;
         }
         Ok(())
     }
@@ -1161,10 +1354,7 @@ where
         record: &RunRecord,
         reason: &str,
     ) -> Result<(), ProductionError> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| ProductionError::Invalid)?
-            .as_secs()
+        let now = host_now()?
             .max(record.queued_at())
             .max(record.started_at().unwrap_or(0));
         let terminal = record.transition(
@@ -1172,11 +1362,53 @@ where
             now,
             Some(reason.to_owned()),
         )?;
-        let terminal_revision = persist_run(&mut self.store, identity, revision, &terminal)?;
-        let terminal_event_id = self.publish_run(accepted, &terminal, "run:terminal")?;
-        let bound = terminal.with_terminal_event(terminal_event_id)?;
-        persist_run(&mut self.store, identity, terminal_revision, &bound)?;
-        Ok(())
+        self.finish_terminal(accepted, identity, revision, terminal)
+    }
+
+    /// Publish the one kind-46108 terminal check for a terminal attempt. It
+    /// names the terminal run status it summarises and, for a success, both
+    /// terminal facts, so a reader can verify every claim against stored
+    /// events.
+    fn publish_check(
+        &mut self,
+        accepted: &AcceptedRequest,
+        record: &RunRecord,
+    ) -> Result<String, ProductionError> {
+        let run_status_event_id = record
+            .terminal_event_id()
+            .ok_or(ProductionError::Invalid)?
+            .to_owned();
+        let envelope = CiCheckEnvelope {
+            schema_version: CI_SCHEMA_VERSION,
+            request_event_id: accepted.event_id.clone(),
+            run_id: accepted.envelope.run_id.clone(),
+            workflow_id: accepted.envelope.workflow_id.clone(),
+            target_repo_a: accepted.envelope.target_repo_a.clone(),
+            tip_oid: accepted.envelope.tip_oid.clone(),
+            base_oid: accepted.envelope.base_oid.clone(),
+            attempt: accepted.envelope.attempt,
+            conclusion: run_state(record.state()),
+            reason: record.reason().map(str::to_owned),
+            run_status_event_id,
+            evidence_finalized_event_id: record
+                .terminal_facts()
+                .evidence_finalized_event_id()
+                .map(str::to_owned),
+            teardown_attestation_event_id: record
+                .terminal_facts()
+                .teardown_attestation_event_id()
+                .map(str::to_owned),
+            concurrency_group: CiConcurrencyGroup::of(&accepted.envelope).key,
+            published_at: record.finished_at().ok_or(ProductionError::Invalid)?,
+            relay_signer: self.signer.pubkey().to_owned(),
+        };
+        self.publish_envelope(
+            accepted,
+            KIND_CI_CHECK,
+            &envelope,
+            check_tags(&accepted.channel_id, &envelope).map_err(|_| ProductionError::Invalid)?,
+            "run:check",
+        )
     }
 
     fn publish_completion(
@@ -1529,6 +1761,61 @@ where
     }
 }
 
+fn host_now() -> Result<u64, ProductionError> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|_| ProductionError::Invalid)
+}
+
+/// Whether `next` replaces `head` in `group`: a later initial request for a
+/// different run in the same group. A rerun of the same run never supersedes
+/// its own lineage.
+fn supersedes(group: &CiConcurrencyGroup, head: &AcceptedRequest, next: &AcceptedRequest) -> bool {
+    next.watch_cursor > head.watch_cursor
+        && next.envelope.run_id != head.envelope.run_id
+        && next.envelope.request_type == CiRequestType::Run
+        && CiConcurrencyGroup::of(&next.envelope).key == group.key
+}
+
+/// A rerun executes only against the parent attempt controld itself stored:
+/// same run, contiguous attempt, terminal parent, and the same immutable
+/// source and workflow tuple. The relay checks the same lineage; controld
+/// does not trust that check and fails closed on its own record.
+fn validate_rerun_lineage<P: ControlStore>(
+    store: &P,
+    accepted: &AcceptedRequest,
+) -> Result<Result<(), &'static str>, ProductionError> {
+    let request = &accepted.envelope;
+    let run_id = Uuid::parse_str(&request.run_id).map_err(|_| ProductionError::Invalid)?;
+    let Some(parent_attempt) = request.parent_attempt else {
+        return Ok(Err("missing parent attempt"));
+    };
+    if request.parent_run_id.as_deref() != Some(request.run_id.as_str())
+        || request.attempt != parent_attempt.saturating_add(1)
+    {
+        return Ok(Err("attempt does not follow its parent"));
+    }
+    let parents = store
+        .load_run_attempts(run_id, parent_attempt)
+        .map_err(|_| ProductionError::Store)?;
+    if parents.is_empty() {
+        return Ok(Err("parent attempt is not stored"));
+    }
+    let Some((_, parent)) = parents.iter().find(|(_, parent)| {
+        let identity = parent.identity();
+        identity.tip_oid() == request.tip_oid
+            && identity.workflow_id() == request.workflow_id
+            && identity.target_repo_a() == request.target_repo_a
+    }) else {
+        return Ok(Err("immutable coordinates differ from the parent"));
+    };
+    if !parent.state().is_terminal() {
+        return Ok(Err("parent attempt is not terminal"));
+    }
+    Ok(Ok(()))
+}
+
 fn run_identity(accepted: &AcceptedRequest) -> Result<RunIdentity, ProductionError> {
     accepted
         .envelope
@@ -1877,6 +2164,8 @@ mod tests {
     struct MemoryStore {
         cursor: u64,
         run: Option<(u64, RunRecord)>,
+        /// Earlier attempts visible to rerun lineage validation only.
+        lineage: Vec<(u64, RunRecord)>,
         publications: HashMap<String, StoredPublication>,
         deferred: BTreeSet<String>,
     }
@@ -1906,6 +2195,22 @@ mod tests {
             _identity: &RunIdentity,
         ) -> Result<Option<(u64, RunRecord)>, Self::Error> {
             Ok(self.run.clone())
+        }
+
+        fn load_run_attempts(
+            &self,
+            run_id: Uuid,
+            attempt: u32,
+        ) -> Result<Vec<(u64, RunRecord)>, Self::Error> {
+            Ok(self
+                .lineage
+                .iter()
+                .chain(self.run.iter())
+                .filter(|(_, record)| {
+                    record.identity().run_id() == run_id && record.identity().attempt() == attempt
+                })
+                .cloned()
+                .collect())
         }
 
         fn compare_and_swap_run(
@@ -2312,6 +2617,7 @@ mod tests {
         let store = MemoryStore {
             cursor: 0,
             run: Some((1, foreign_terminal.clone())),
+            lineage: Vec::new(),
             publications: HashMap::from([(publication_key.clone(), pending.clone())]),
             deferred: BTreeSet::from([publication_key.clone()]),
         };
@@ -2559,7 +2865,7 @@ mod tests {
         assert_eq!(handler.poll_once(CHANNEL).unwrap(), PollStep::Idle);
         assert_eq!(
             handler.relay.published,
-            vec![46101, 46101, 46102, 46102, 46103, 46102, 46105, 46106, 46101]
+            vec![46101, 46101, 46102, 46102, 46103, 46102, 46105, 46106, 46101, 46108]
         );
         assert_eq!(
             handler
@@ -2660,11 +2966,12 @@ mod tests {
             handler.poll_once(CHANNEL),
             Err(ProductionError::Runner)
         ));
-        assert_eq!(handler.relay.published, vec![46101, 46101]);
+        assert_eq!(handler.relay.published, vec![46101, 46101, 46108]);
         let record = &handler.store.run.as_ref().expect("durable run").1;
         assert_eq!(record.state(), RunState::InfrastructureFailure);
         assert_eq!(record.reason(), Some("runner_or_evidence_provider_failure"));
         assert!(record.terminal_event_id().is_some());
+        assert!(record.check_event_id().is_some());
         assert_eq!(handler.store.cursor, 0);
     }
 
@@ -2690,7 +2997,7 @@ mod tests {
             handler.poll_once(CHANNEL),
             Ok(PollStep::Completed)
         ));
-        assert_eq!(handler.relay.published, vec![46101, 46101]);
+        assert_eq!(handler.relay.published, vec![46101, 46101, 46108]);
         let record = &handler.store.run.as_ref().expect("durable run").1;
         assert_eq!(record.state(), RunState::InfrastructureFailure);
         assert_eq!(record.reason(), Some("request_expired_before_admission"));
@@ -2728,6 +3035,7 @@ mod tests {
             MemoryStore {
                 cursor: 0,
                 run: Some((2, running)),
+                lineage: Vec::new(),
                 publications: HashMap::new(),
                 deferred: BTreeSet::new(),
             },
@@ -2777,6 +3085,7 @@ mod tests {
             MemoryStore {
                 cursor: 0,
                 run: Some((3, terminal)),
+                lineage: Vec::new(),
                 publications: HashMap::new(),
                 deferred: BTreeSet::new(),
             },
@@ -2789,7 +3098,10 @@ mod tests {
                 .expect("reconcile exact terminal without re-execution"),
             PollStep::Completed
         );
-        assert_eq!(handler.relay.published, vec![KIND_CI_RUN_STATUS]);
+        assert_eq!(
+            handler.relay.published,
+            vec![KIND_CI_RUN_STATUS, KIND_CI_CHECK]
+        );
         assert_eq!(handler.store.cursor, 7);
         assert!(handler
             .store
@@ -2991,6 +3303,14 @@ mod tests {
                 identity: &RunIdentity,
             ) -> Result<Option<(u64, RunRecord)>, Self::Error> {
                 self.durable.load_run(identity)
+            }
+
+            fn load_run_attempts(
+                &self,
+                run_id: Uuid,
+                attempt: u32,
+            ) -> Result<Vec<(u64, RunRecord)>, Self::Error> {
+                self.durable.load_run_attempts(run_id, attempt)
             }
 
             fn compare_and_swap_run(
@@ -3329,7 +3649,7 @@ mod tests {
         );
         assert_eq!(
             handler.relay.published,
-            vec!["aa".repeat(32), counted_id(1), counted_id(1)]
+            vec!["aa".repeat(32), counted_id(1), counted_id(1), counted_id(2)]
         );
         assert!(handler
             .store
@@ -3354,7 +3674,7 @@ mod tests {
                 .expect("nothing left"),
             0
         );
-        assert_eq!(handler.relay.published.len(), 3);
+        assert_eq!(handler.relay.published.len(), 4);
     }
 
     #[test]
@@ -3451,7 +3771,10 @@ mod tests {
                 .expect("replay"),
             1
         );
-        assert_eq!(restarted.relay.published, vec![counted_id(1)]);
+        assert_eq!(
+            restarted.relay.published,
+            vec![counted_id(1), counted_id(2)]
+        );
         drop(restarted);
         let settled = DurableControlStore::open(root, uid).expect("reopen settled");
         assert!(settled
@@ -3634,5 +3957,548 @@ mod tests {
         };
         assert!(reader.read(&linked).is_err());
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Spine B4 behaviours: cancellation, deadlines, rerun lineage,
+    /// concurrency groups, and terminal check publication.
+    mod spine_b4 {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use buzz_ci_broker_protocol::CancelReason;
+        use buzz_core::ci::CiCheckEnvelope;
+        use buzz_core::kind::KIND_CI_CHECK;
+
+        use super::*;
+        use crate::production_v2::{compose_runner_v2, AttemptControl};
+        use crate::runner_v2::RunnerV2Client;
+        use crate::test_broker::{
+            bindings, job_metadata, process_group_alive, ProcessBroker, Signer,
+        };
+
+        /// Relay fake with several accepted heads. Heads past `reveal_after`
+        /// stay invisible until `reveal` is set, so a test can make a newer
+        /// request appear only once an older attempt is running.
+        struct HeadRelay {
+            heads: Vec<AcceptedRequest>,
+            reveal_after: u64,
+            reveal: Arc<AtomicBool>,
+            published: Vec<u32>,
+            run_statuses: Vec<CiRunStatusEnvelope>,
+            checks: Vec<CiCheckEnvelope>,
+        }
+
+        impl HeadRelay {
+            fn visible(heads: Vec<AcceptedRequest>) -> Self {
+                Self {
+                    heads,
+                    reveal_after: u64::MAX,
+                    reveal: Arc::new(AtomicBool::new(true)),
+                    published: Vec::new(),
+                    run_statuses: Vec::new(),
+                    checks: Vec::new(),
+                }
+            }
+        }
+
+        impl RelayControl for HeadRelay {
+            type Error = ();
+
+            fn next_accepted(
+                &mut self,
+                _channel_id: &str,
+                after_cursor: u64,
+            ) -> Result<Option<AcceptedRequest>, Self::Error> {
+                let revealed = self.reveal.load(Ordering::SeqCst);
+                Ok(self
+                    .heads
+                    .iter()
+                    .filter(|head| head.watch_cursor > after_cursor)
+                    .filter(|head| revealed || head.watch_cursor <= self.reveal_after)
+                    .min_by_key(|head| head.watch_cursor)
+                    .cloned())
+            }
+
+            fn publish(&mut self, event: &SignedCiEvent) -> Result<String, Self::Error> {
+                if event.kind == KIND_CI_RUN_STATUS {
+                    self.run_statuses
+                        .push(serde_json::from_str(&event.content).expect("run status"));
+                }
+                if event.kind == KIND_CI_CHECK {
+                    self.checks
+                        .push(serde_json::from_str(&event.content).expect("check"));
+                }
+                self.published.push(event.kind);
+                Ok(event.event_id.clone())
+            }
+
+            fn publication_exists(&mut self, _event: &SignedCiEvent) -> Result<bool, Self::Error> {
+                Ok(false)
+            }
+
+            fn put_log(
+                &mut self,
+                accepted: &AcceptedRequest,
+                job: &JobCompletion,
+                _bytes: &[u8],
+            ) -> Result<StoredObject, Self::Error> {
+                Ok(StoredObject {
+                    url: format!(
+                        "https://relay.example/ci/logs/{}/{}/{}/{}/{}",
+                        accepted.event_id,
+                        accepted.envelope.run_id,
+                        job.metadata.job_id,
+                        job.attempt,
+                        job.log.sha256
+                    ),
+                    sha256: job.log.sha256.clone(),
+                    byte_length: job.log.byte_length,
+                })
+            }
+
+            fn put_artifact(
+                &mut self,
+                _accepted: &AcceptedRequest,
+                _job: &JobCompletion,
+                _artifact: &ArtifactCompletion,
+                _bytes: &[u8],
+            ) -> Result<StoredObject, Self::Error> {
+                Err(())
+            }
+        }
+
+        /// Executor that must never run.
+        struct RefusingExecutor;
+
+        impl AttemptExecutor for RefusingExecutor {
+            type Error = ();
+
+            fn execute(
+                &mut self,
+                request: &AcceptedRequest,
+            ) -> Result<AttemptCompletion, Self::Error> {
+                panic!("request {} must not execute", request.event_id);
+            }
+        }
+
+        /// Executor that answers each request with the next queued completion.
+        struct QueuedExecutor(VecDeque<AttemptCompletion>);
+
+        impl AttemptExecutor for QueuedExecutor {
+            type Error = ();
+
+            fn execute(
+                &mut self,
+                _request: &AcceptedRequest,
+            ) -> Result<AttemptCompletion, Self::Error> {
+                self.0.pop_front().ok_or(())
+            }
+        }
+
+        /// A second initial request on `branch` for a different run.
+        fn later_request(cursor: u64, branch: &str) -> AcceptedRequest {
+            let mut later = accepted();
+            later.watch_cursor = cursor;
+            later.event_id = "12".repeat(32);
+            later.envelope.run_id = "123e4567-e89b-12d3-a456-426614174021".into();
+            later.envelope.idempotency_key = "123e4567-e89b-12d3-a456-426614174022".into();
+            later.envelope.source_branch = branch.into();
+            later
+        }
+
+        fn rerun_request(cursor: u64, event_id: &str) -> AcceptedRequest {
+            let mut rerun = accepted();
+            rerun.watch_cursor = cursor;
+            rerun.event_id = event_id.to_owned();
+            rerun.envelope.request_type = CiRequestType::Rerun;
+            rerun.envelope.attempt = 2;
+            rerun.envelope.parent_attempt = Some(1);
+            rerun.envelope.parent_run_id = Some(rerun.envelope.run_id.clone());
+            rerun.envelope.idempotency_key = "123e4567-e89b-12d3-a456-426614174032".into();
+            rerun
+        }
+
+        /// The success completion fixture rebound to `request`.
+        fn completion_for(request: &AcceptedRequest, log: &[u8]) -> AttemptCompletion {
+            let mut completion = completion(log);
+            completion.jobs[0].attempt = request.envelope.attempt;
+            completion.teardown.request_event_id = request.event_id.clone();
+            completion.teardown.run_id = request.envelope.run_id.clone();
+            completion.teardown.attempt = request.envelope.attempt;
+            completion.teardown.leases[0].attempt = request.envelope.attempt;
+            completion
+        }
+
+        fn durable_store() -> (tempfile::TempDir, DurableControlStore) {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let root = fs::canonicalize(directory.path()).expect("root");
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).expect("root mode");
+            let uid = fs::metadata(&root).expect("metadata").uid();
+            let store = DurableControlStore::open(root, uid).expect("store");
+            (directory, store)
+        }
+
+        fn stored_check(store: &MemoryStore, request: &AcceptedRequest) -> CiCheckEnvelope {
+            match store
+                .publications
+                .get(&format!("{}:run:check", request.event_id))
+            {
+                Some(StoredPublication::Accepted { signed, .. }) => {
+                    serde_json::from_str(&signed.content).expect("check content")
+                }
+                other => panic!("check publication missing or pending: {other:?}"),
+            }
+        }
+
+        /// Behaviour (d), running attempt: a newer initial request on the same
+        /// PR branch arrives while the older run executes. The older job's
+        /// process group is killed, the run is recorded cancelled with the
+        /// superseding request named, and its check says so.
+        #[test]
+        fn later_same_group_pr_request_cancels_the_running_attempt() {
+            let reveal = Arc::new(AtomicBool::new(false));
+            let broker = ProcessBroker::default();
+            let hook_flag = Arc::clone(&reveal);
+            broker.0.lock().unwrap().on_admit = Some(Box::new(move || {
+                hook_flag.store(true, Ordering::SeqCst);
+            }));
+            // The broker stamps admission and completion with the live
+            // clock, so the request window must be live too or the run
+            // deadline would already have passed.
+            let now = host_now().unwrap();
+            let mut head = accepted();
+            head.envelope.issued_at = now;
+            head.envelope.expires_at = now + 30;
+            let mut later = later_request(8, "feature");
+            later.envelope.issued_at = now;
+            later.envelope.expires_at = now + 30;
+            let relay = HeadRelay {
+                heads: vec![head.clone(), later.clone()],
+                reveal_after: head.watch_cursor,
+                reveal,
+                published: Vec::new(),
+                run_statuses: Vec::new(),
+                checks: Vec::new(),
+            };
+            let client = RunnerV2Client::new(broker.clone(), 1).unwrap();
+            let mut bindings = bindings();
+            bindings.workflow_id = head.envelope.workflow_id.clone();
+            let (executor, output) = compose_runner_v2(
+                client,
+                Signer,
+                bindings,
+                job_metadata(),
+                SIGNER.into(),
+                Duration::from_millis(20),
+                AttemptControl {
+                    observer: None,
+                    command: None,
+                },
+            )
+            .unwrap();
+            let mut handler = ProductionHandler::new(
+                relay,
+                DeterministicSigner,
+                executor,
+                MemoryStore::default(),
+                output,
+            );
+
+            assert_eq!(handler.poll_once(CHANNEL).unwrap(), PollStep::Completed);
+
+            let group = broker.process_group();
+            assert!(!process_group_alive(group), "the superseded job is gone");
+            assert_eq!(broker.cancels(), vec![CancelReason::UserRequest]);
+            let (_, record) = handler.store.run.clone().expect("run");
+            assert_eq!(record.state(), RunState::Cancelled);
+            assert_eq!(
+                record.reason(),
+                Some(format!("{CONCURRENCY_SUPERSEDED_REASON}:{}", later.event_id).as_str())
+            );
+            assert_eq!(
+                handler.relay.published,
+                vec![46101, 46101, 46102, 46102, 46103, 46102, 46101, 46108]
+            );
+            let check = handler.relay.checks.last().expect("check");
+            assert_eq!(check.conclusion, CiRunState::Cancelled);
+            assert_eq!(check.tip_oid, head.envelope.tip_oid);
+            assert_eq!(check.run_id, head.envelope.run_id);
+            assert_eq!(check.attempt, 1);
+            assert_eq!(check.concurrency_group, "ci-ci-feature");
+            assert_eq!(handler.store.cursor, head.watch_cursor);
+        }
+
+        /// Behaviour (d), queued head: the newer same-branch request is already
+        /// accepted when the older head comes up, so the older head is
+        /// recorded cancelled without ever reaching the executor.
+        #[test]
+        fn queued_pr_head_superseded_by_a_later_same_group_request_never_executes() {
+            let head = accepted();
+            let later = later_request(8, "feature");
+            let mut handler = ProductionHandler::new(
+                HeadRelay::visible(vec![head.clone(), later.clone()]),
+                DeterministicSigner,
+                RefusingExecutor,
+                MemoryStore::default(),
+                MemoryOutput(Vec::new()),
+            );
+
+            assert_eq!(handler.poll_once(CHANNEL).unwrap(), PollStep::Completed);
+
+            assert_eq!(handler.relay.published, vec![46101, 46101, 46108]);
+            let (_, record) = handler.store.run.clone().expect("run");
+            assert_eq!(record.state(), RunState::Cancelled);
+            assert_eq!(record.started_at(), None);
+            assert_eq!(
+                record.reason(),
+                Some(format!("{CONCURRENCY_SUPERSEDED_REASON}:{}", later.event_id).as_str())
+            );
+            assert!(record.terminal_event_id().is_some());
+            assert!(record.check_event_id().is_some());
+            assert_eq!(handler.relay.run_statuses[1].state, CiRunState::Cancelled);
+            assert_eq!(handler.relay.checks[0].conclusion, CiRunState::Cancelled);
+            assert_eq!(handler.store.cursor, head.watch_cursor);
+        }
+
+        /// A newer request on another branch is a different concurrency group
+        /// and leaves the head alone.
+        #[test]
+        fn a_request_on_another_branch_does_not_supersede_the_head() {
+            let log = b"ok\n".to_vec();
+            let head = accepted();
+            let mut handler = ProductionHandler::new(
+                HeadRelay::visible(vec![head.clone(), later_request(8, "other")]),
+                DeterministicSigner,
+                Executor(completion(&log)),
+                MemoryStore::default(),
+                MemoryOutput(log),
+            );
+
+            assert_eq!(handler.poll_once(CHANNEL).unwrap(), PollStep::Completed);
+
+            let (_, record) = handler.store.run.clone().expect("run");
+            assert_eq!(record.state(), RunState::Success);
+            assert_eq!(handler.relay.checks[0].conclusion, CiRunState::Success);
+        }
+
+        /// Behaviour (c): a rerun whose parent attempt controld never stored
+        /// is refused as an infrastructure failure and never executes.
+        #[test]
+        fn rerun_without_a_stored_parent_is_refused_without_execution() {
+            let rerun = rerun_request(8, &"12".repeat(32));
+            let mut handler = ProductionHandler::new(
+                HeadRelay::visible(vec![rerun.clone()]),
+                DeterministicSigner,
+                RefusingExecutor,
+                MemoryStore::default(),
+                MemoryOutput(Vec::new()),
+            );
+
+            assert_eq!(handler.poll_once(CHANNEL).unwrap(), PollStep::Completed);
+
+            assert_eq!(handler.relay.published, vec![46101, 46101, 46108]);
+            let (_, record) = handler.store.run.clone().expect("run");
+            assert_eq!(record.state(), RunState::InfrastructureFailure);
+            assert_eq!(
+                record.reason(),
+                Some(format!("{RERUN_LINEAGE_REASON}:parent attempt is not stored").as_str())
+            );
+            assert_eq!(handler.relay.checks[0].attempt, 2);
+            assert_eq!(
+                handler.relay.checks[0].conclusion,
+                CiRunState::InfrastructureFailure
+            );
+        }
+
+        /// Behaviour (c): a rerun is a new attempt bound to the same source
+        /// commit; the parent attempt's record and events stay untouched, and
+        /// the latest attempt's check carries the run's conclusion. A rerun
+        /// that names a different commit is refused.
+        #[test]
+        fn rerun_executes_against_its_stored_parent_and_leaves_it_immutable() {
+            let log = b"ok\n".to_vec();
+            let (_directory, store) = durable_store();
+            let first = accepted();
+            let mut failed = completion(&log);
+            failed.jobs[0].state = CiJobState::Failure;
+            failed.jobs[0].reason = Some("fixture_failure".into());
+            let rerun = rerun_request(8, &"12".repeat(32));
+            let mut drifted = rerun_request(9, &"13".repeat(32));
+            drifted.envelope.tip_oid = "45".repeat(20);
+            drifted.envelope.idempotency_key = "123e4567-e89b-12d3-a456-426614174033".into();
+            let mut handler = ProductionHandler::new(
+                HeadRelay::visible(vec![first.clone(), rerun.clone(), drifted.clone()]),
+                DeterministicSigner,
+                QueuedExecutor(VecDeque::from([failed, completion_for(&rerun, &log)])),
+                store,
+                MemoryOutput(log),
+            );
+
+            assert_eq!(handler.poll_once(CHANNEL).unwrap(), PollStep::Completed);
+            let run_id = Uuid::parse_str(&first.envelope.run_id).unwrap();
+            let parent_before = handler
+                .store
+                .load_run_attempts(run_id, 1)
+                .unwrap()
+                .pop()
+                .expect("parent attempt");
+            assert_eq!(parent_before.1.state(), RunState::Failure);
+            assert_eq!(handler.relay.checks[0].attempt, 1);
+            assert_eq!(handler.relay.checks[0].conclusion, CiRunState::Failure);
+
+            assert_eq!(handler.poll_once(CHANNEL).unwrap(), PollStep::Completed);
+            let parent_after = handler
+                .store
+                .load_run_attempts(run_id, 1)
+                .unwrap()
+                .pop()
+                .expect("parent attempt");
+            assert_eq!(
+                parent_after, parent_before,
+                "the parent attempt is immutable"
+            );
+            let attempt_two = |store: &DurableControlStore, event_id: &str| {
+                store
+                    .load_run_attempts(run_id, 2)
+                    .unwrap()
+                    .into_iter()
+                    .find(|(_, record)| record.identity().request_event_id() == event_id)
+                    .map(|(_, record)| record)
+                    .expect("stored attempt two")
+            };
+            let second = attempt_two(&handler.store, &rerun.event_id);
+            assert_eq!(second.state(), RunState::Success);
+            assert_eq!(second.identity().tip_oid(), first.envelope.tip_oid);
+            let latest = handler.relay.checks.last().expect("rerun check");
+            assert_eq!(latest.attempt, 2);
+            assert_eq!(latest.conclusion, CiRunState::Success);
+            assert_eq!(latest.request_event_id, rerun.event_id);
+            assert_eq!(latest.tip_oid, first.envelope.tip_oid);
+            assert!(latest.evidence_finalized_event_id.is_some());
+            assert!(latest.teardown_attestation_event_id.is_some());
+
+            assert_eq!(handler.poll_once(CHANNEL).unwrap(), PollStep::Completed);
+            assert!(handler.executor.0.is_empty());
+            assert_eq!(
+                attempt_two(&handler.store, &rerun.event_id),
+                second,
+                "a drifted rerun does not touch the stored attempt"
+            );
+            assert_eq!(
+                attempt_two(&handler.store, &drifted.event_id).state(),
+                RunState::InfrastructureFailure
+            );
+            let refused = handler.relay.checks.last().expect("refusal check");
+            assert_eq!(refused.conclusion, CiRunState::InfrastructureFailure);
+            assert_eq!(
+                refused.reason.as_deref(),
+                Some(
+                    format!("{RERUN_LINEAGE_REASON}:immutable coordinates differ from the parent")
+                        .as_str()
+                )
+            );
+            assert_eq!(handler.store.cursor(CHANNEL).unwrap(), 9);
+        }
+
+        /// Behaviour (b), per run: an attempt whose evidence sealed after the
+        /// request's `timeout_seconds` from queueing is `timed_out`, even when
+        /// the job itself reported success; no terminal facts are published.
+        #[test]
+        fn attempt_finishing_after_the_run_deadline_records_timed_out() {
+            let log = b"ok\n".to_vec();
+            let head = accepted();
+            let mut late = completion(&log);
+            late.finished_at = head.envelope.issued_at + head.envelope.timeout_seconds + 1;
+            late.jobs[0].finished_at = late.finished_at;
+            late.teardown.teardown_at = late.finished_at;
+            let mut handler = ProductionHandler::new(
+                HeadRelay::visible(vec![head.clone()]),
+                DeterministicSigner,
+                Executor(late),
+                MemoryStore::default(),
+                MemoryOutput(log),
+            );
+
+            assert_eq!(handler.poll_once(CHANNEL).unwrap(), PollStep::Completed);
+
+            let (_, record) = handler.store.run.clone().expect("run");
+            assert_eq!(record.state(), RunState::TimedOut);
+            assert_eq!(record.reason(), Some(RUN_DEADLINE_REASON));
+            assert!(!handler
+                .relay
+                .published
+                .contains(&KIND_CI_EVIDENCE_FINALIZED));
+            assert!(!handler
+                .relay
+                .published
+                .contains(&KIND_CI_TEARDOWN_ATTESTATION));
+            assert_eq!(handler.relay.checks[0].conclusion, CiRunState::TimedOut);
+            assert_eq!(
+                handler.relay.checks[0].reason.as_deref(),
+                Some(RUN_DEADLINE_REASON)
+            );
+        }
+
+        /// Behaviour (e): one signed check per terminal attempt, naming the
+        /// exact head SHA, run and attempt, the terminal run status it
+        /// summarises, and both terminal facts for a success. It is bound to
+        /// the durable record and never republished.
+        #[test]
+        fn terminal_check_binds_head_sha_run_attempt_and_terminal_events() {
+            let log = b"ok\n".to_vec();
+            let head = accepted();
+            let mut handler = ProductionHandler::new(
+                HeadRelay::visible(vec![head.clone()]),
+                DeterministicSigner,
+                Executor(completion(&log)),
+                MemoryStore::default(),
+                MemoryOutput(log),
+            );
+
+            assert_eq!(handler.poll_once(CHANNEL).unwrap(), PollStep::Completed);
+            assert_eq!(handler.poll_once(CHANNEL).unwrap(), PollStep::Idle);
+
+            let (_, record) = handler.store.run.clone().expect("run");
+            let check = stored_check(&handler.store, &head);
+            assert_eq!(check, handler.relay.checks[0]);
+            assert_eq!(check.schema_version, CI_SCHEMA_VERSION);
+            assert_eq!(check.request_event_id, head.event_id);
+            assert_eq!(check.run_id, head.envelope.run_id);
+            assert_eq!(check.tip_oid, head.envelope.tip_oid);
+            assert_eq!(check.base_oid, head.envelope.base_oid);
+            assert_eq!(check.attempt, 1);
+            assert_eq!(check.conclusion, CiRunState::Success);
+            assert_eq!(check.reason, None);
+            assert_eq!(
+                Some(check.run_status_event_id.as_str()),
+                record.terminal_event_id()
+            );
+            assert_eq!(
+                check.evidence_finalized_event_id.as_deref(),
+                record.terminal_facts().evidence_finalized_event_id()
+            );
+            assert_eq!(
+                check.teardown_attestation_event_id.as_deref(),
+                record.terminal_facts().teardown_attestation_event_id()
+            );
+            assert_eq!(check.concurrency_group, "ci-ci-feature");
+            assert_eq!(Some(check.published_at), record.finished_at());
+            assert_eq!(check.relay_signer, SIGNER);
+            assert!(check
+                .validate_context(&head.event_id, &head.envelope)
+                .is_ok());
+            assert!(record.check_event_id().is_some());
+            assert_eq!(
+                handler
+                    .relay
+                    .published
+                    .iter()
+                    .filter(|kind| **kind == KIND_CI_CHECK)
+                    .count(),
+                1
+            );
+            assert_eq!(handler.relay.published.last(), Some(&KIND_CI_CHECK));
+        }
     }
 }

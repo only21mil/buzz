@@ -13,15 +13,16 @@
 
 use buzz_core::{
     ci::{
-        artifact_reference_tags, evidence_finalized_tags, job_status_tags, log_reference_tags,
-        request_tags, run_status_tags, teardown_attestation_tags, validate_signed_ci_event,
-        CiArtifactReferenceEnvelope, CiEvidenceFinalizedEnvelope, CiFinalizedJobAttempt,
-        CiJobState, CiJobStatusEnvelope, CiLogReferenceEnvelope, CiRequestEnvelope, CiRequestType,
-        CiRunState, CiRunStatusEnvelope, CiSkipPolicy, CiTeardownAttestationEnvelope,
-        CiTeardownLease, ValidatedCiEnvelope, CI_SCHEMA_VERSION,
+        artifact_reference_tags, check_tags, evidence_finalized_tags, job_status_tags,
+        log_reference_tags, request_tags, run_status_tags, teardown_attestation_tags,
+        validate_signed_ci_event, CiArtifactReferenceEnvelope, CiCheckEnvelope,
+        CiEvidenceFinalizedEnvelope, CiFinalizedJobAttempt, CiJobState, CiJobStatusEnvelope,
+        CiLogReferenceEnvelope, CiRequestEnvelope, CiRequestType, CiRunState, CiRunStatusEnvelope,
+        CiSkipPolicy, CiTeardownAttestationEnvelope, CiTeardownLease, ValidatedCiEnvelope,
+        CI_SCHEMA_VERSION,
     },
     kind::{
-        KIND_CI_ARTIFACT_REFERENCE, KIND_CI_EVIDENCE_FINALIZED, KIND_CI_JOB_STATUS,
+        KIND_CI_ARTIFACT_REFERENCE, KIND_CI_CHECK, KIND_CI_EVIDENCE_FINALIZED, KIND_CI_JOB_STATUS,
         KIND_CI_LOG_REFERENCE, KIND_CI_REQUEST, KIND_CI_RUN_STATUS, KIND_CI_TEARDOWN_ATTESTATION,
     },
 };
@@ -31,14 +32,16 @@ use std::collections::HashSet;
 /// Deterministic channel for every test event.
 const CHANNEL: &str = "46bba699-8251-43c7-943e-66be58376585";
 
-/// Every kind in the 46101-46106 status/control-plane range.
-const STATUS_KINDS: [u32; 6] = [
+/// Every kind in the 46101-46106 status/control-plane range plus the
+/// kind-46108 terminal check, which the same signer set authorizes.
+const STATUS_KINDS: [u32; 7] = [
     KIND_CI_RUN_STATUS,
     KIND_CI_JOB_STATUS,
     KIND_CI_LOG_REFERENCE,
     KIND_CI_ARTIFACT_REFERENCE,
     KIND_CI_EVIDENCE_FINALIZED,
     KIND_CI_TEARDOWN_ATTESTATION,
+    KIND_CI_CHECK,
 ];
 
 fn empty_set() -> HashSet<String> {
@@ -148,6 +151,15 @@ fn signed_status_event(kind: u32, signer: &Keys) -> Event {
                 tags,
             )
         }
+        KIND_CI_CHECK => {
+            let mut envelope = valid_check();
+            envelope.relay_signer = signer.public_key().to_hex();
+            let tags = check_tags(CHANNEL, &envelope).expect("check tags");
+            (
+                serde_json::to_string(&envelope).expect("serialize check"),
+                tags,
+            )
+        }
         other => panic!("unexpected status kind {other}"),
     };
     EventBuilder::new(Kind::Custom(kind as u16), content)
@@ -173,6 +185,27 @@ fn valid_run_status() -> CiRunStatusEnvelope {
         started_at: Some(1_800_000_000),
         finished_at: Some(1_800_000_001),
         job_ids: vec!["rust_lint".into()],
+        relay_signer: String::new(),
+    }
+}
+
+fn valid_check() -> CiCheckEnvelope {
+    CiCheckEnvelope {
+        schema_version: CI_SCHEMA_VERSION,
+        request_event_id: "a".repeat(64),
+        run_id: "018f47a2-4ce1-7c08-b8f3-5b6df7f9dd45".into(),
+        workflow_id: "ci".into(),
+        target_repo_a: format!("30617:{}:buzz", "b".repeat(64)),
+        tip_oid: "c".repeat(40),
+        base_oid: "d".repeat(40),
+        attempt: 1,
+        conclusion: CiRunState::Failure,
+        reason: Some("fixture_failure".into()),
+        run_status_event_id: "e".repeat(64),
+        evidence_finalized_event_id: None,
+        teardown_attestation_event_id: None,
+        concurrency_group: "ci-ci-feature".into(),
+        published_at: 1_800_000_001,
         relay_signer: String::new(),
     }
 }
@@ -344,6 +377,7 @@ fn status_kinds_validate_when_the_exact_signer_is_authorized() {
             ValidatedCiEnvelope::ArtifactReference(_) => 4,
             ValidatedCiEnvelope::EvidenceFinalized(_) => 5,
             ValidatedCiEnvelope::TeardownAttestation(_) => 6,
+            ValidatedCiEnvelope::Check(_) => 7,
         }
     };
 
@@ -355,6 +389,7 @@ fn status_kinds_validate_when_the_exact_signer_is_authorized() {
             KIND_CI_ARTIFACT_REFERENCE => 4,
             KIND_CI_EVIDENCE_FINALIZED => 5,
             KIND_CI_TEARDOWN_ATTESTATION => 6,
+            KIND_CI_CHECK => 7,
             other => panic!("unexpected status kind {other}"),
         }
     };

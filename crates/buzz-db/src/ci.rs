@@ -2,12 +2,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use buzz_core::ci::CiConcurrencyGroup;
 use buzz_core::ci::{
     CiEvidenceFinalizedEnvelope, CiJobState, CiJobStatusEnvelope, CiRequestEnvelope, CiRequestType,
     CiRunState, CiSkipPolicy, CiTeardownAttestationEnvelope, ValidatedCiEnvelope,
 };
 use buzz_core::kind::{
-    KIND_CI_ARTIFACT_REFERENCE, KIND_CI_EVIDENCE_FINALIZED, KIND_CI_JOB_STATUS,
+    KIND_CI_ARTIFACT_REFERENCE, KIND_CI_CHECK, KIND_CI_EVIDENCE_FINALIZED, KIND_CI_JOB_STATUS,
     KIND_CI_LOG_REFERENCE, KIND_CI_REQUEST, KIND_CI_RUN_STATUS, KIND_CI_TEARDOWN_ATTESTATION,
 };
 use buzz_core::{CommunityId, StoredEvent};
@@ -163,6 +164,15 @@ impl Projection {
                 ),
                 ValidatedCiEnvelope::TeardownAttestation(value) => (
                     KIND_CI_TEARDOWN_ATTESTATION,
+                    value.run_id.as_str(),
+                    Some(value.request_event_id.as_str()),
+                    value.attempt,
+                    None,
+                    None,
+                    None,
+                ),
+                ValidatedCiEnvelope::Check(value) => (
+                    KIND_CI_CHECK,
                     value.run_id.as_str(),
                     Some(value.request_event_id.as_str()),
                     value.attempt,
@@ -1317,6 +1327,15 @@ fn coordinates_match(envelope: &ValidatedCiEnvelope, request: &CiRequestEnvelope
                 && value.tip_oid == request.tip_oid
                 && value.base_oid == request.base_oid
                 && value.workflow_digest == request.workflow_digest
+        }
+        ValidatedCiEnvelope::Check(value) => {
+            value.run_id == request.run_id
+                && value.workflow_id == request.workflow_id
+                && value.target_repo_a == request.target_repo_a
+                && value.tip_oid == request.tip_oid
+                && value.base_oid == request.base_oid
+                && value.attempt == request.attempt
+                && value.concurrency_group == CiConcurrencyGroup::of(request).key
         }
     }
 }

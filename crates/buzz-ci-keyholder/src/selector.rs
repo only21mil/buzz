@@ -3,7 +3,7 @@ use crate::{Operation, PublicIdentity};
 /// Fixed credential selected by one signing operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KeySelector {
-    /// Kind 46101 through 46106 event signer.
+    /// Kind 46101 through 46106 and kind 46108 event signer.
     CiEvent,
     /// NIP-98 authorization signer.
     Nip98,

@@ -599,6 +599,14 @@ mod tests {
             Err(())
         }
 
+        fn load_run_attempts(
+            &self,
+            _run_id: uuid::Uuid,
+            _attempt: u32,
+        ) -> Result<Vec<(u64, RunRecord)>, Self::Error> {
+            Err(())
+        }
+
         fn compare_and_swap_run(
             &mut self,
             _identity: &RunIdentity,

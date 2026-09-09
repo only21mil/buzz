@@ -473,6 +473,21 @@ where
         }
     }
 
+    /// Read the broker's current durable view of one validated binding once,
+    /// without waiting. The reconciliation loop in `production_v2` owns the
+    /// deadline, cancellation, and supersession decisions between reads.
+    pub fn poll_attempt(&mut self, bound: BoundAttempt) -> Result<BoundAttempt, RunnerV2Error> {
+        let response = self.exchange(Request::GetAttempt(GetAttemptRequest {
+            attempt_id: bound.response.attempt_id,
+            execution_binding_digest: bound.response.execution_binding_digest,
+        }))?;
+        validate_bound_response(bound.admission, response)?;
+        Ok(BoundAttempt {
+            admission: bound.admission,
+            response,
+        })
+    }
+
     /// Send one exact cancellation request. The service validates the returned
     /// terminal response against the durable admitted binding.
     pub fn cancel(
@@ -542,7 +557,7 @@ pub fn prepare_signed_admission(
     Ok(admission)
 }
 
-fn validate_bound_response(
+pub(crate) fn validate_bound_response(
     admission: AdmitAttemptRequest,
     response: v2::BrokerResponse,
 ) -> Result<(), RunnerV2Error> {

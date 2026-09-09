@@ -10,6 +10,7 @@ use buzz_core::ci::{
     CiEvidenceFinalizedEnvelope, CiFinalizedJobAttempt, CiJobState, CiSkipPolicy,
     CiTeardownAttestationEnvelope, CiTeardownLease, CI_SCHEMA_VERSION,
 };
+use buzz_core::kind::KIND_CI_CHECK;
 use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -203,6 +204,24 @@ impl ControlStore for DurableControlStore {
         })
     }
 
+    fn load_run_attempts(
+        &self,
+        run_id: uuid::Uuid,
+        attempt: u32,
+    ) -> Result<Vec<(u64, RunRecord)>, Self::Error> {
+        self.with_locked(|snapshot| {
+            Ok(snapshot
+                .runs
+                .values()
+                .filter(|stored| {
+                    stored.record.identity().run_id() == run_id
+                        && stored.record.identity().attempt() == attempt
+                })
+                .map(|stored| (stored.revision, stored.record.clone()))
+                .collect())
+        })
+    }
+
     fn compare_and_swap_run(
         &mut self,
         identity: &RunIdentity,
@@ -274,7 +293,7 @@ impl ControlStore for DurableControlStore {
         validate_key(key)?;
         if !is_lower_hex(expected_event_id, 64)
             || !is_lower_hex(&replacement.event_id, 64)
-            || !(46101..=46106).contains(&replacement.kind)
+            || !((46101..=46106).contains(&replacement.kind) || replacement.kind == KIND_CI_CHECK)
         {
             return Err(StoreError::Conflict);
         }
@@ -419,7 +438,7 @@ impl Snapshot {
                 } => (signed, Some(relay_event_id)),
             };
             if !is_lower_hex(&signed.event_id, 64)
-                || !(46101..=46106).contains(&signed.kind)
+                || !((46101..=46106).contains(&signed.kind) || signed.kind == KIND_CI_CHECK)
                 || relay_id.is_some_and(|id| id != &signed.event_id)
             {
                 return Err(StoreError::InvalidSnapshot);
