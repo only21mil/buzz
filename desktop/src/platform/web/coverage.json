@@ -161,6 +161,12 @@
   "capability-off": [
     "add_agent_to_huddle",
     "add_team_from_catalog",
+    "agent_draft_apply",
+    "agent_draft_backfill",
+    "agent_draft_confirm",
+    "agent_draft_prepare",
+    "agent_draft_queue",
+    "agent_draft_receive",
     "archive_builderlab_community",
     "archive_events",
     "bind_builderlab_nostr_identity",

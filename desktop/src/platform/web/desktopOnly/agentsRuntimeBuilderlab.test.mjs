@@ -11,6 +11,10 @@ import {
 } from "../registry.ts";
 
 const MUTATIONS = [
+  "agent_draft_apply",
+  "agent_draft_confirm",
+  "agent_draft_prepare",
+  "agent_draft_receive",
   "revalidate_relay_agents",
   "archive_builderlab_community",
   "bind_builderlab_nostr_identity",
@@ -52,6 +56,8 @@ const MUTATIONS = [
 ];
 
 const READS = [
+  ["agent_draft_backfill", []],
+  ["agent_draft_queue", { events: [], operations: [] }],
   ["card_mint_key_status", "none"],
   ["check_builderlab_community_name", { available: false }],
   ["discover_acp_auth_methods", { methods: [] }],
