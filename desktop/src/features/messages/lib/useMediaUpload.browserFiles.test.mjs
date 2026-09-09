@@ -16,7 +16,6 @@ const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   url: "https://relay.example/app/",
 });
 const previousFetch = globalThis.fetch;
-const cap = 100 * 1024 * 1024;
 const calls = [];
 const requests = [];
 let native = false;
@@ -146,18 +145,35 @@ async function start(result, path, selected) {
 }
 
 for (const path of ["drop", "paste", "editor paste", "deferred paperclip"]) {
-  test(`${path} rejects oversized metadata before reading or invoking`, async () => {
-    const { renderHook } = await import("@testing-library/react");
+  test(`${path} oversized upload surfaces the relay's 413 message`, async () => {
+    const { act, renderHook } = await import("@testing-library/react");
     const { result } = renderHook(() =>
       useMediaUpload({ deferUploadsUntilSend: true }),
     );
-    const selected = file(cap + 1);
+    globalThis.fetch = async (url, init) => {
+      requests.push({ url, init });
+      return Response.json(
+        {
+          error:
+            "file too large: 2147483649 bytes (max 2147483648 bytes, 2048.0 MiB)",
+          size: 2147483649,
+          max_bytes: 2147483648,
+        },
+        { status: 413 },
+      );
+    };
+    const selected = file(2147483649);
     await start(result, path, selected);
-    assert.equal(selected.reads, 0);
-    assert.equal(calls.length, 0);
-    assert.equal(requests.length, 0);
+    await act(async () => {
+      await calls[0].request.catch(() => {});
+    });
+    assert.equal(selected.reads, 1, "no client-side cap refuses the file");
+    assert.equal(requests.length, 1);
     assert.equal(result.current.uploadState.status, "error");
-    assert.match(result.current.uploadState.message, /Maximum is 100MB/);
+    assert.match(
+      result.current.uploadState.message,
+      /File is too large \(2\.0 GiB\)\. This relay accepts up to 2\.0 GiB\./,
+    );
     assert.equal(result.current.isUploading, false);
   });
   test(`${path} cancellation during file read cannot invoke later`, async () => {
@@ -289,17 +305,10 @@ for (const action of ["draft replacement", "unmount"]) {
   });
 }
 
-test("exact browser metadata cap is accepted without a large allocation", async () => {
-  const selected = file(cap);
-  await uploadMediaFile(selected, "boundary");
-  assert.equal(selected.reads, 1);
-  assert.equal(requests.length, 1);
-});
-
-test("native adapter retains raw IPC and does not impose the browser cap", async () => {
+test("native adapter retains raw IPC for any file size", async () => {
   native = true;
   globalThis.isTauri = true;
-  const selected = file(cap + 1);
+  const selected = file(2147483649);
   await uploadMediaFile(selected, "native", new AbortController().signal);
   assert.equal(selected.reads, 1);
   assert.deepEqual([...calls[0].body], [1, 2, 3]);

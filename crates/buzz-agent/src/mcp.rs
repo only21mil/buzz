@@ -958,9 +958,14 @@ const DOWNSCALE_JPEG_QUALITY: u8 = 80;
 /// Stop shrinking once the long edge falls below this many pixels; a smaller
 /// picture tells the model nothing and the elision marker is more honest.
 const DOWNSCALE_MIN_LONG_EDGE: u32 = 64;
-/// Decode guard for tool-result images (pixel dimensions and decode memory).
-const DOWNSCALE_MAX_SIDE: u32 = 16_384;
-const DOWNSCALE_MAX_ALLOC: u64 = 256 * 1024 * 1024;
+/// Decode guard for tool-result images, in pixels. Same number as
+/// `buzz_media::MAX_IMAGE_PIXELS` (100 MP: 8K, triple-5K and panoramas fit);
+/// buzz-agent takes no workspace crates, so the value is repeated here and
+/// must move with it.
+const DOWNSCALE_MAX_PIXELS: u64 = 100_000_000;
+/// Decode memory for a `DOWNSCALE_MAX_PIXELS` image at 16-bit RGBA
+/// (8 bytes per pixel), matching `buzz_media::MAX_IMAGE_DECODE_BYTES`.
+const DOWNSCALE_MAX_ALLOC: u64 = DOWNSCALE_MAX_PIXELS * 8;
 
 /// A tool-result image re-encoded to fit an inline byte budget.
 struct DownscaledImage {
@@ -990,9 +995,10 @@ fn downscale_image_to_budget(data_b64: &str, budget: usize) -> Option<Downscaled
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .ok()?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(DOWNSCALE_MAX_SIDE);
-    limits.max_image_height = Some(DOWNSCALE_MAX_SIDE);
+    // Pixel count is the guard, not a side length: a 100 MP panorama has a
+    // long edge well past any square cap. `decode` reserves the whole output
+    // buffer against `max_alloc`, so the pixel limit holds for every format.
+    let mut limits = image::Limits::no_limits();
     limits.max_alloc = Some(DOWNSCALE_MAX_ALLOC);
     reader.limits(limits);
     let source = reader.decode().ok()?;

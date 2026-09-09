@@ -7,6 +7,7 @@ use image::ImageFormat;
 use crate::config::MediaConfig;
 use crate::error::MediaError;
 use crate::storage::BlobMeta;
+use crate::validation::MAX_IMAGE_DECODE_BYTES;
 
 /// Generate thumbnail and blurhash from image bytes (CPU-bound, sync).
 ///
@@ -23,7 +24,17 @@ pub fn generate_image_metadata_sync(
         return Ok((BlobMeta::default(), None));
     }
 
-    let img = image::load_from_memory(bytes)?;
+    // The pixel gate in `validate_content` already bounds the picture at
+    // `MAX_IMAGE_PIXELS`; decode under the allocation that cap implies rather
+    // than the image crate's default (512 MiB), which would reject a 16-bit
+    // image the gate accepted.
+    let mut limits = image::Limits::no_limits();
+    limits.max_alloc = Some(MAX_IMAGE_DECODE_BYTES);
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| MediaError::Io(e.to_string()))?;
+    reader.limits(limits);
+    let img = reader.decode()?;
     let (w, h) = (img.width(), img.height());
 
     // Thumbnail: 320px max dimension, preserve aspect ratio
