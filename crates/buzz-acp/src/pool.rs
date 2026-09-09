@@ -68,6 +68,10 @@ pub struct TaskMeta {
     pub scope: Option<SessionScope>,
     /// Identifies terminal events when the task panics before returning a result.
     pub turn_id: String,
+    /// Unix seconds at which the turn was dispatched. `/stop` uses it as the
+    /// `since` bound when it looks for siblings this turn dispatched by relay
+    /// message (see [`crate::pool::unix_now_secs`]).
+    pub started_at: u64,
     /// Clone of batch for Queue mode panic recovery.
     pub recoverable_batch: Option<FlushBatch>,
     /// Control signal for the in-flight prompt task.
@@ -187,6 +191,16 @@ pub struct SessionState {
     /// Per-scope successful-delivery state. Created with the ACP session and
     /// cleared atomically with every invalidation path.
     pub deliveries: HashMap<SessionScope, ChannelDeliveryState>,
+    /// `modes.availableModes` ids each live session advertised at
+    /// `session/new`, keyed by session id. `/plan` consults it to decide
+    /// whether the seat has a `plan` mode. Removed with the session.
+    pub session_modes: HashMap<String, Vec<String>>,
+    /// Scopes whose live session was switched to plan mode for a `/plan`
+    /// turn and not yet restored to the configured mode. Normally cleared
+    /// when that turn ends; a turn that ended through a control signal leaves
+    /// the entry so the next prompt for the scope restores the mode first.
+    /// Stripped on session invalidation, since the mode dies with the session.
+    pub plan_mode_sessions: HashSet<SessionScope>,
     /// Invalidated sessions whose adapter-side release has not been confirmed.
     pending_closes: VecDeque<PendingSessionClose>,
 }
@@ -220,9 +234,14 @@ impl SessionState {
         self.canvas_sections.remove(channel_id);
         self.deliveries.remove(channel_id);
         self.last_used.remove(channel_id);
+        self.plan_mode_sessions.remove(channel_id);
         let live = self.sessions.remove(channel_id);
         let cold = self.cold_sessions.remove(channel_id);
-        live.or(cold)
+        let taken = live.or(cold);
+        if let Some(session_id) = taken.as_deref() {
+            self.session_modes.remove(session_id);
+        }
+        taken
     }
 
     fn take_source_session(&mut self, source: &PromptSource) -> Option<String> {
@@ -787,6 +806,63 @@ fn apply_completed_before_control_signal(
         state.take_source_session(source)
     } else {
         None
+    }
+}
+
+/// Current wall-clock time as unix seconds, for [`TaskMeta::started_at`] and
+/// relay `since` filters.
+pub(crate) fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// One in-flight turn a channel-wide control reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalledTurn {
+    pub scope: SessionScope,
+    pub turn_id: String,
+    pub started_at: u64,
+    /// `true` when the signal was delivered; `false` when the turn's control
+    /// oneshot was already consumed by an earlier signal (stop in progress).
+    pub sent: bool,
+}
+
+impl AgentPool {
+    /// Send `signal` to every in-flight prompt task whose turn belongs to
+    /// `channel_id`, across all of its session scopes.
+    ///
+    /// The `/stop all` primitive. Unlike the observer's channel control this
+    /// never refuses an ambiguous channel: stopping every lane in the channel
+    /// is the point. Heartbeat tasks (no scope) and other channels are left
+    /// alone. Returns one entry per matching task, in task-map order, so the
+    /// caller can acknowledge each turn and report those already stopping.
+    pub fn signal_in_flight_tasks_for_channel(
+        &mut self,
+        channel_id: Uuid,
+        signal: ControlSignal,
+    ) -> Vec<SignalledTurn> {
+        let mut signalled = Vec::new();
+        for meta in self.task_map.values_mut() {
+            let Some(scope) = meta.scope.as_ref() else {
+                continue;
+            };
+            if meta.channel_id != Some(channel_id) {
+                continue;
+            }
+            let sent = match meta.control_tx.take() {
+                Some(tx) => tx.send(signal.clone()).is_ok(),
+                None => false,
+            };
+            signalled.push(SignalledTurn {
+                scope: scope.clone(),
+                turn_id: meta.turn_id.clone(),
+                started_at: meta.started_at,
+                sent,
+            });
+        }
+        signalled
     }
 }
 
@@ -1930,6 +2006,13 @@ async fn create_session_and_apply_model(
         }),
     );
 
+    // Remember the modes this session advertised so `/plan` can tell whether
+    // the seat has a plan mode without another round trip.
+    agent
+        .state
+        .session_modes
+        .insert(resp.session_id.clone(), available_mode_ids(&resp.raw));
+
     // Apply permission mode if not the agent's built-in default AND the agent
     // advertises the requested mode in session/new. Agents that don't support
     // the mode (e.g., goose crashes on unrecognized set_config_option values)
@@ -2054,6 +2137,82 @@ async fn apply_model_switch(
 /// Check if the agent's `session/new` response advertises a given mode ID
 /// in `result.modes.availableModes[].id`. Returns `false` if the modes
 /// field is absent or the mode isn't listed.
+/// Which connector family a worker is, for `/skill` rewriting: the
+/// `initialize` name first, the spawned command identity as fallback.
+fn connector_kind_for(
+    agent: &OwnedAgent,
+    ctx: &PromptContext,
+) -> crate::queue::slash::ConnectorKind {
+    use crate::queue::slash::ConnectorKind;
+    match ConnectorKind::detect(&agent.agent_name) {
+        ConnectorKind::Other => ConnectorKind::detect(&ctx.harness_name),
+        kind => kind,
+    }
+}
+
+/// The `modes.availableModes` ids in a `session/new` result, in order.
+fn available_mode_ids(session_new_result: &serde_json::Value) -> Vec<String> {
+    session_new_result
+        .get("modes")
+        .and_then(|m| m.get("availableModes"))
+        .and_then(|a| a.as_array())
+        .map(|modes| {
+            modes
+                .iter()
+                .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Default prompt for a bare `/plan`.
+const PLAN_DEFAULT_PROMPT: &str = "Build a plan for the current thread.";
+
+/// In-thread notice posted when a `/plan` turn starts.
+const PLAN_MODE_NOTICE: &str = "Plan mode on for this turn.";
+
+/// Restore the configured permission mode on a session a `/plan` turn left in
+/// plan mode, and drop the ExitPlanMode hold. Best effort: a transport error
+/// here is logged, since the caller is already ending or has ended the turn.
+///
+/// The restore follows the session-creation rule: the configured mode is
+/// only sent when the session advertised it at `session/new`. A mode the
+/// seat never listed is skipped with a warning instead of a round trip the
+/// connector would refuse (or, for goose, crash on).
+async fn end_plan_turn(
+    agent: &mut OwnedAgent,
+    session_id: &str,
+    scope: &SessionScope,
+    ctx: &PromptContext,
+) {
+    agent.acp.set_plan_hold(session_id, false);
+    agent.state.plan_mode_sessions.remove(scope);
+    let wire = ctx.permission_mode.as_wire_str();
+    let advertised = agent
+        .state
+        .session_modes
+        .get(session_id)
+        .is_some_and(|modes| modes.iter().any(|m| m == wire));
+    if !advertised {
+        tracing::warn!(
+            target: "pool::permission",
+            "configured permission mode {wire:?} is not advertised by session {session_id}; \
+             leaving the mode as the connector set it after the plan turn"
+        );
+        return;
+    }
+    if let Err(error) =
+        apply_permission_mode(&mut agent.acp, session_id, &ctx.permission_mode).await
+    {
+        tracing::warn!(
+            target: "pool::permission",
+            %error,
+            "could not restore permission mode {:?} after plan turn on session {session_id}",
+            ctx.permission_mode.as_wire_str()
+        );
+    }
+}
+
 fn agent_supports_mode(session_new_result: &serde_json::Value, mode_wire: &str) -> bool {
     session_new_result
         .get("modes")
@@ -2778,6 +2937,20 @@ pub async fn run_prompt_task(
     // Backfill liveness's shared session ID so ticks after this point carry
     // it too, matching every other observer frame for this turn.
     liveness_guard.set_session_id(session_id.clone());
+
+    // A previous `/plan` turn that ended through a control signal (cancel,
+    // interrupt, steer) left this session in plan mode; put the configured
+    // mode back before anything else is prompted on it.
+    if let PromptSource::Channel(scope) = &source {
+        if agent.state.plan_mode_sessions.contains(scope) {
+            tracing::info!(
+                target: "pool::permission",
+                scope = %scope.telemetry_label(),
+                "restoring permission mode left over from an interrupted plan turn"
+            );
+            end_plan_turn(&mut agent, &session_id, scope, &ctx).await;
+        }
+    }
     agent.acp.observe(
         "session_resolved",
         serde_json::json!({
@@ -2959,6 +3132,14 @@ pub async fn run_prompt_task(
     // (`prompt[0].text.startsWith("/")`) fires; the wrapped Buzz context
     // follows as a second block.
     let mut slash_command: Option<String> = None;
+    // A harness-owned slash command that answers in-thread instead of
+    // prompting (`/skill` listing or a refused skill name). Posted after the
+    // prompt is assembled, then the turn ends without a `session/prompt`.
+    let mut harness_reply: Option<(String, buzz_sdk::ThreadRef)> = None;
+    // `/plan [text]` on a seat with a plan mode: the text (or the default
+    // prompt) becomes block 0, and the session is switched to plan mode for
+    // this turn before `session/prompt`.
+    let mut plan_request: Option<(String, buzz_sdk::ThreadRef)> = None;
     // Event IDs represented by this prompt. Commit only after ACP reports a
     // successful turn; failed/cancelled prompts must be retryable without loss.
     let mut pending_delivered_event_ids = HashSet::new();
@@ -3031,6 +3212,86 @@ pub async fn run_prompt_task(
             .flatten()
             .collect();
         slash_command = crate::queue::slash_command_for_batch(b, &known_names);
+        if let Some(cmd) = slash_command
+            .as_deref()
+            .and_then(crate::queue::slash::SlashCommand::parse)
+        {
+            use crate::queue::slash::{handle_skill, route_command, CommandRoute, SlashAction};
+            match route_command(&cmd) {
+                CommandRoute::Skill => {
+                    // The session exists by now (created above), so a missing
+                    // list means the connector has not advertised commands
+                    // yet, never that there is no session.
+                    let connector = connector_kind_for(&agent, &ctx);
+                    let known = agent.acp.available_commands(&session_id);
+                    match handle_skill(&cmd, connector, known) {
+                        SlashAction::Prompt(wire) => {
+                            tracing::info!(
+                                target: "pool::prompt",
+                                channel = %b.channel_id,
+                                requested = %cmd.to_wire(),
+                                command = %wire,
+                                ?connector,
+                                "/skill rewritten for connector"
+                            );
+                            slash_command = Some(wire);
+                        }
+                        SlashAction::Reply(text) => {
+                            tracing::info!(
+                                target: "pool::prompt",
+                                channel = %b.channel_id,
+                                requested = %cmd.to_wire(),
+                                "/skill answered by harness; no prompt"
+                            );
+                            let thread_ref = reply_thread_ref(&b.events[0].event);
+                            harness_reply = Some((text, thread_ref));
+                        }
+                    }
+                }
+                CommandRoute::Plan => {
+                    let has_plan_mode = agent
+                        .state
+                        .session_modes
+                        .get(&session_id)
+                        .is_some_and(|modes| modes.iter().any(|m| m == "plan"));
+                    let thread_ref = reply_thread_ref(&b.events[0].event);
+                    if has_plan_mode {
+                        let text = if cmd.args.is_empty() {
+                            PLAN_DEFAULT_PROMPT.to_string()
+                        } else {
+                            cmd.args.clone()
+                        };
+                        tracing::info!(
+                            target: "pool::prompt",
+                            channel = %b.channel_id,
+                            "/plan: switching session to plan mode for this turn"
+                        );
+                        slash_command = None;
+                        plan_request = Some((text, thread_ref));
+                    } else if crate::queue::slash::advertises(
+                        agent.acp.available_commands(&session_id),
+                        "plan",
+                    ) {
+                        // codex-style: the connector owns `/plan`; forward it
+                        // untouched and let it answer (it rejects arguments
+                        // itself).
+                        tracing::info!(
+                            target: "pool::prompt",
+                            channel = %b.channel_id,
+                            "/plan: no plan mode, connector advertises /plan; forwarding"
+                        );
+                    } else {
+                        slash_command = None;
+                        harness_reply = Some((
+                            "This seat has no plan mode and does not advertise `/plan`."
+                                .to_string(),
+                            thread_ref,
+                        ));
+                    }
+                }
+                CommandRoute::Stop | CommandRoute::PassThrough => {}
+            }
+        }
         if let Some(ref cmd) = slash_command {
             tracing::info!(
                 target: "pool::prompt",
@@ -3071,6 +3332,69 @@ pub async fn run_prompt_task(
         return;
     };
 
+    if let Some((text, thread_ref)) = harness_reply {
+        if let Some(channel_id) = observer_channel_id {
+            post_harness_notice(
+                &ctx.rest_client,
+                channel_id,
+                Some(&thread_ref),
+                &text,
+                &[],
+                &[],
+            )
+            .await;
+        }
+        // The events were answered by the harness, not delivered to the
+        // agent, so the delivery ledger is left alone: the next real turn's
+        // context still shows them.
+        send_prompt_result(
+            &result_tx,
+            &turn_id,
+            agent,
+            source,
+            PromptOutcome::Ok(StopReason::EndTurn),
+            None,
+        );
+        return;
+    }
+
+    // Switch the live session to plan mode for this turn. Fatal transport
+    // errors end the turn the same way a failed mode set at session creation
+    // does; application-level refusals were already downgraded to a warning
+    // inside `apply_permission_mode`, and the turn proceeds in the current mode.
+    let mut plan_lead: Option<String> = None;
+    if let (Some((text, thread_ref)), PromptSource::Channel(scope), Some(channel_id)) =
+        (plan_request.take(), &source, observer_channel_id)
+    {
+        if let Err(error) =
+            apply_permission_mode(&mut agent.acp, &session_id, &PermissionMode::Plan).await
+        {
+            agent.state.invalidate_all();
+            send_prompt_result(
+                &result_tx,
+                &turn_id,
+                agent,
+                source,
+                PromptOutcome::Error(error),
+                requeue_batch_if_queue(&ctx, batch),
+            );
+            return;
+        }
+        agent.acp.set_plan_hold(&session_id, true);
+        agent.state.plan_mode_sessions.insert(scope.clone());
+        post_harness_notice(
+            &ctx.rest_client,
+            channel_id,
+            Some(&thread_ref),
+            PLAN_MODE_NOTICE,
+            &[],
+            &[],
+        )
+        .await;
+        plan_lead = Some(text);
+    }
+    let plan_turn = plan_lead.is_some();
+
     // 💬 — fire-and-forget so the prompt fires immediately.
     // The guard's cleanup (spawned on drop) removes 💬 after the turn completes.
     // A brief race where 💬 appears slightly after the agent starts is acceptable.
@@ -3087,8 +3411,9 @@ pub async fn run_prompt_task(
     // own block. Per-section blocks let the observer size trimmer elide a
     // section body in place while every `[Header]` line survives at the head
     // of its own leaf — so the "Prompt context" panel counts every section.
-    let prompt_blocks: Vec<&str> = match slash_command {
-        Some(ref cmd) => std::iter::once(cmd.as_str())
+    let lead_block: Option<&str> = slash_command.as_deref().or(plan_lead.as_deref());
+    let prompt_blocks: Vec<&str> = match lead_block {
+        Some(lead) => std::iter::once(lead)
             .chain(prompt_sections.iter().map(String::as_str))
             .collect(),
         None => prompt_sections.iter().map(String::as_str).collect(),
@@ -3314,6 +3639,30 @@ pub async fn run_prompt_task(
             }
         }
     };
+
+    // A `/plan` turn is over: put the configured mode back while the session
+    // is still usable. Exits and transport failures skip the round trip; the
+    // session is invalidated below and the mode dies with it. An idle or hard
+    // timeout leaves the prompt in flight (`cancel_with_cleanup` below drains
+    // it), so no `session/set_config_option` may be written yet: the flags
+    // stay set and the leftover-restore path at the top of the next prompt
+    // puts the mode back if the session outlives the cleanup.
+    if plan_turn {
+        if let PromptSource::Channel(scope) = &source {
+            match prompt_result {
+                Err(AcpError::IdleTimeout(_)) | Err(AcpError::HardTimeout { .. }) => {}
+                Err(AcpError::AgentExited)
+                | Err(AcpError::Io(_))
+                | Err(AcpError::WriteTimeout(_))
+                | Err(AcpError::Timeout(_))
+                | Err(AcpError::Protocol(_)) => {
+                    agent.acp.set_plan_hold(&session_id, false);
+                    agent.state.plan_mode_sessions.remove(scope);
+                }
+                _ => end_plan_turn(&mut agent, &session_id, scope, &ctx).await,
+            }
+        }
+    }
 
     match prompt_result {
         Ok(stop_reason) => {
@@ -5179,6 +5528,92 @@ pub(crate) async fn reaction_add(rest: &crate::relay::RestClient, event_id: &str
     }
 }
 
+/// Thread reference that continues the thread of `thread_tags`, or `None`
+/// when the triggering event was top level.
+pub(crate) fn thread_ref_for(thread_tags: &ThreadTags) -> Option<buzz_sdk::ThreadRef> {
+    let root = thread_tags.root_event_id.as_deref()?;
+    let root_id = nostr::EventId::from_hex(root).ok()?;
+    let parent_id = thread_tags
+        .parent_event_id
+        .as_deref()
+        .and_then(|p| nostr::EventId::from_hex(p).ok())
+        .unwrap_or(root_id);
+    Some(buzz_sdk::ThreadRef {
+        root_event_id: root_id,
+        parent_event_id: parent_id,
+    })
+}
+
+/// Thread reference for a direct reply to `event`: its thread root when it
+/// has one, otherwise the event itself becomes the root. The parent is always
+/// `event`, so the reply hangs off the message it answers.
+pub(crate) fn reply_thread_ref(event: &nostr::Event) -> buzz_sdk::ThreadRef {
+    let tags = crate::queue::parse_thread_tags(event);
+    let root_event_id = tags
+        .root_event_id
+        .as_deref()
+        .and_then(|root| nostr::EventId::from_hex(root).ok())
+        .unwrap_or(event.id);
+    buzz_sdk::ThreadRef {
+        root_event_id,
+        parent_event_id: event.id,
+    }
+}
+
+/// Best-effort: post a harness-authored kind:9 message signed with the
+/// agent's key. Errors are logged and swallowed — a notice must never take
+/// down the main loop.
+///
+/// `mentions` become `p` tags (they wake the mentioned agents, so pass only
+/// pubkeys that should act on the message); `extra_tags` are appended
+/// verbatim, e.g. `["stop-origin", <id>]` on a `/stop` fan-out. Returns the
+/// posted event id when the relay accepted it.
+pub(crate) async fn post_harness_notice(
+    rest: &crate::relay::RestClient,
+    channel_id: Uuid,
+    thread_ref: Option<&buzz_sdk::ThreadRef>,
+    content: &str,
+    mentions: &[&str],
+    extra_tags: &[Vec<String>],
+) -> Option<String> {
+    let mut builder =
+        match buzz_sdk::build_message(channel_id, content, thread_ref, mentions, false, &[]) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(channel = %channel_id, "harness notice: build failed: {e}");
+                return None;
+            }
+        };
+    for parts in extra_tags {
+        match nostr::Tag::parse(parts.iter().map(String::as_str)) {
+            Ok(tag) => builder = builder.tag(tag),
+            Err(e) => {
+                tracing::warn!(channel = %channel_id, "harness notice: bad tag {parts:?}: {e}");
+                return None;
+            }
+        }
+    }
+    let event = match builder.sign_with_keys(&rest.keys) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(channel = %channel_id, "harness notice: sign failed: {e}");
+            return None;
+        }
+    };
+    let event_id = event.id.to_hex();
+    match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
+        Ok(Ok(_)) => Some(event_id),
+        Ok(Err(e)) => {
+            tracing::warn!(channel = %channel_id, "harness notice failed: {e}");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(channel = %channel_id, "harness notice timed out");
+            None
+        }
+    }
+}
+
 /// Best-effort: post a visible failure notice (kind:9) to a channel after a
 /// batch is dead-lettered. Replies into the thread of `thread_tags` when the
 /// triggering event was threaded. Errors are logged and swallowed — the
@@ -5189,38 +5624,8 @@ pub(crate) async fn post_failure_notice(
     thread_tags: &ThreadTags,
     content: &str,
 ) {
-    let thread_ref = thread_tags.root_event_id.as_deref().and_then(|root| {
-        let root_id = nostr::EventId::from_hex(root).ok()?;
-        let parent_id = thread_tags
-            .parent_event_id
-            .as_deref()
-            .and_then(|p| nostr::EventId::from_hex(p).ok())
-            .unwrap_or(root_id);
-        Some(buzz_sdk::ThreadRef {
-            root_event_id: root_id,
-            parent_event_id: parent_id,
-        })
-    });
-    let builder =
-        match buzz_sdk::build_message(channel_id, content, thread_ref.as_ref(), &[], false, &[]) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(channel = %channel_id, "failure notice: build failed: {e}");
-                return;
-            }
-        };
-    let event = match builder.sign_with_keys(&rest.keys) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!(channel = %channel_id, "failure notice: sign failed: {e}");
-            return;
-        }
-    };
-    match tokio::time::timeout(Duration::from_secs(5), rest.submit_event(&event)).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => tracing::warn!(channel = %channel_id, "failure notice failed: {e}"),
-        Err(_) => tracing::warn!(channel = %channel_id, "failure notice timed out"),
-    }
+    let thread_ref = thread_ref_for(thread_tags);
+    post_harness_notice(rest, channel_id, thread_ref.as_ref(), content, &[], &[]).await;
 }
 
 /// Best-effort: remove a reaction via a signed kind:5 (NIP-09) deletion event.
@@ -6783,6 +7188,7 @@ mod tests {
                 channel_id: Some(channel_id),
                 scope: Some(scope.clone()),
                 turn_id: "failed-turn".into(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -7146,6 +7552,829 @@ done"#
         assert!(!next_wire.contains("merged new-event sentinel"));
         assert!(!next_wire.contains(&carry_over_id));
         assert!(!next_wire.contains(&new_event_id));
+    }
+
+    /// `/skill` in the prompt path: the harness answers in-thread when it has
+    /// nothing to rewrite to, and rewrites block 0 when the seat advertised
+    /// the name. The session exists throughout, so a missing list is "not
+    /// advertised yet", never "no session".
+    #[tokio::test]
+    async fn skill_command_replies_in_thread_or_rewrites_prompt_block_zero() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let channel_id = Uuid::new_v4();
+        let keys = Keys::generate();
+        let make_batch = |content: &str| {
+            let event = EventBuilder::new(Kind::Custom(9), content)
+                .sign_with_keys(&keys)
+                .unwrap();
+            let id = event.id.to_hex();
+            (
+                FlushBatch {
+                    channel_id,
+                    scope: SessionScope::Conversation { channel_id },
+                    events: vec![crate::queue::BatchEvent {
+                        event,
+                        prompt_tag: "test".into(),
+                        received_at: std::time::Instant::now(),
+                    }],
+                    cancelled_events: vec![],
+                    cancel_reason: None,
+                },
+                id,
+            )
+        };
+
+        // REST stub: answers `[]` to everything and records posted kind:9s.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind rest stub");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let posted = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let recorder = Arc::clone(&posted);
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0; 64 * 1024];
+                let n = socket.read(&mut request).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&request[..n]).to_string();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    if head.starts_with("POST /events") {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+                            recorder.lock().unwrap().push(v);
+                        }
+                    }
+                }
+                let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]";
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let capture =
+            std::env::temp_dir().join(format!("buzz-acp-skill-wire-{}.ndjson", Uuid::new_v4()));
+        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{quoted_capture}'
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$count,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+  count=$((count + 1))
+done"#
+        );
+        let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+            .await
+            .expect("spawn wire-capture ACP");
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "legacy-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        agent
+            .state
+            .sessions
+            .insert(conv(channel_id), "live-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(conv(channel_id), ChannelDeliveryState::default());
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.rest_client.base_url = base_url.clone();
+        ctx.channel_info = ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                crate::relay::ChannelInfo {
+                    name: "test-dm".into(),
+                    channel_type: "dm".into(),
+                },
+            )]),
+            RestClient {
+                http: reqwest::Client::new(),
+                base_url,
+                keys: ctx.agent_keys.clone(),
+                auth_tag_json: None,
+            },
+        );
+        let ctx = Arc::new(ctx);
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+
+        // Turn 1: bare /skill, nothing advertised yet → in-thread reply, no prompt.
+        let (batch, skill_event_id) = make_batch("/skill");
+        run_prompt_task(
+            agent,
+            Some(batch),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "skill-list".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("prompt result");
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        agent = result.agent;
+        assert!(
+            !std::path::Path::new(&capture).exists(),
+            "no session/prompt was sent for the listing"
+        );
+        // Reactions and metrics also go through POST /events; only kind:9s
+        // are harness replies.
+        let kind9 = |posted: &Vec<serde_json::Value>| -> Vec<serde_json::Value> {
+            posted.iter().filter(|v| v["kind"] == 9).cloned().collect()
+        };
+        let reply = {
+            let replies = kind9(&posted.lock().unwrap());
+            assert_eq!(replies.len(), 1, "exactly one harness reply");
+            replies[0].clone()
+        };
+        let reply_event: nostr::Event = serde_json::from_value(reply).unwrap();
+        assert_eq!(reply_event.pubkey, ctx.agent_keys.public_key());
+        assert!(
+            reply_event.content.contains("not advertised any commands"),
+            "reply says the list is not known yet: {}",
+            reply_event.content
+        );
+        let thread = crate::queue::parse_thread_tags(&reply_event);
+        assert_eq!(
+            thread.root_event_id.as_deref(),
+            Some(skill_event_id.as_str())
+        );
+        assert!(
+            !reply_event.tags.iter().any(|t| t.as_slice()[0] == "p"),
+            "the reply mentions nobody"
+        );
+
+        // Turn 2: advertised list present → block 0 rewritten to the skill.
+        agent
+            .acp
+            .set_available_commands_for_test("live-session", &["/review", "/commit"]);
+        let (batch, _) = make_batch("/skill Review src/");
+        run_prompt_task(
+            agent,
+            Some(batch),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "skill-run".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("prompt result");
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        agent = result.agent;
+
+        // Turn 3: unknown name → refusal reply, no prompt.
+        let (batch, _) = make_batch("/skill nope");
+        run_prompt_task(
+            agent,
+            Some(batch),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "skill-unknown".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("prompt result");
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        agent = result.agent;
+        agent.acp.shutdown().await;
+        server.abort();
+
+        let requests: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+            .expect("read captured prompts")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("captured prompt JSON"))
+            .collect();
+        std::fs::remove_file(&capture).expect("remove prompt capture");
+        assert_eq!(
+            requests.len(),
+            1,
+            "only the rewritten skill reached the agent"
+        );
+        assert_eq!(requests[0]["method"], "session/prompt");
+        assert_eq!(
+            requests[0]["params"]["prompt"][0]["text"], "/review src/",
+            "advertised spelling, connector sigil, args preserved"
+        );
+        let replies = kind9(&posted.lock().unwrap());
+        assert_eq!(replies.len(), 2, "listing reply plus refusal reply");
+        let refusal: nostr::Event = serde_json::from_value(replies[1].clone()).unwrap();
+        assert_eq!(
+            refusal.content,
+            "Unknown skill `nope`; available: `review`, `commit`"
+        );
+    }
+
+    /// `/plan` in the prompt path: with a `plan` mode the session is switched
+    /// before the prompt, the text becomes block 0, a notice is posted, and
+    /// the configured mode is restored after the turn. Without a plan mode the
+    /// harness answers in-thread, unless the connector advertises `/plan`
+    /// itself, in which case the command passes through untouched.
+    #[tokio::test]
+    async fn plan_command_switches_mode_for_one_turn_or_passes_through() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let channel_id = Uuid::new_v4();
+        let keys = Keys::generate();
+        let make_batch = |content: &str| {
+            let event = EventBuilder::new(Kind::Custom(9), content)
+                .sign_with_keys(&keys)
+                .unwrap();
+            let id = event.id.to_hex();
+            (
+                FlushBatch {
+                    channel_id,
+                    scope: SessionScope::Conversation { channel_id },
+                    events: vec![crate::queue::BatchEvent {
+                        event,
+                        prompt_tag: "test".into(),
+                        received_at: std::time::Instant::now(),
+                    }],
+                    cancelled_events: vec![],
+                    cancel_reason: None,
+                },
+                id,
+            )
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind rest stub");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let posted = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let recorder = Arc::clone(&posted);
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0; 64 * 1024];
+                let n = socket.read(&mut request).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&request[..n]).to_string();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    if head.starts_with("POST /events") {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+                            recorder.lock().unwrap().push(v);
+                        }
+                    }
+                }
+                let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]";
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        let kind9_contents = |posted: &Vec<serde_json::Value>| -> Vec<String> {
+            posted
+                .iter()
+                .filter(|v| v["kind"] == 9)
+                .filter_map(|v| v["content"].as_str().map(str::to_owned))
+                .collect()
+        };
+
+        let capture =
+            std::env::temp_dir().join(format!("buzz-acp-plan-wire-{}.ndjson", Uuid::new_v4()));
+        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{quoted_capture}'
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$count,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+  count=$((count + 1))
+done"#
+        );
+        let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+            .await
+            .expect("spawn wire-capture ACP");
+        let scope = conv(channel_id);
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "legacy-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        agent
+            .state
+            .sessions
+            .insert(scope.clone(), "live-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(scope.clone(), ChannelDeliveryState::default());
+        agent.state.session_modes.insert(
+            "live-session".into(),
+            vec!["default".into(), "acceptEdits".into(), "plan".into()],
+        );
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.permission_mode = PermissionMode::AcceptEdits;
+        ctx.rest_client.base_url = base_url.clone();
+        ctx.channel_info = ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                crate::relay::ChannelInfo {
+                    name: "test-dm".into(),
+                    channel_type: "dm".into(),
+                },
+            )]),
+            RestClient {
+                http: reqwest::Client::new(),
+                base_url,
+                keys: ctx.agent_keys.clone(),
+                auth_tag_json: None,
+            },
+        );
+        let ctx = Arc::new(ctx);
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        let run = |agent: OwnedAgent, batch: FlushBatch, turn: &str| {
+            let ctx = Arc::clone(&ctx);
+            let tx = result_tx.clone();
+            let turn = turn.to_string();
+            async move {
+                run_prompt_task(agent, Some(batch), None, ctx, tx, None, turn).await;
+            }
+        };
+
+        // Turn 1: plan mode available → set plan, prompt with the text, restore.
+        let (batch, plan_event_id) = make_batch("/plan ship the thing");
+        run(agent, batch, "plan-turn").await;
+        let result = result_rx.recv().await.expect("prompt result");
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        agent = result.agent;
+        assert!(
+            !agent.acp.plan_hold("live-session"),
+            "hold released after the turn"
+        );
+        assert!(
+            agent.state.plan_mode_sessions.is_empty(),
+            "restored, nothing left to clean up"
+        );
+        {
+            let notices = kind9_contents(&posted.lock().unwrap());
+            assert_eq!(notices, vec![PLAN_MODE_NOTICE.to_string()]);
+            let notice: nostr::Event =
+                serde_json::from_value(posted.lock().unwrap()[0].clone()).unwrap();
+            assert_eq!(
+                crate::queue::parse_thread_tags(&notice)
+                    .root_event_id
+                    .as_deref(),
+                Some(plan_event_id.as_str()),
+                "notice replies to the /plan"
+            );
+        }
+
+        // Turn 2: no plan mode, nothing advertised → in-thread reply, no prompt.
+        agent
+            .state
+            .session_modes
+            .insert("live-session".into(), vec!["default".into()]);
+        let (batch, _) = make_batch("/plan");
+        run(agent, batch, "plan-unsupported").await;
+        let result = result_rx.recv().await.expect("prompt result");
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        agent = result.agent;
+        assert_eq!(
+            kind9_contents(&posted.lock().unwrap())
+                .last()
+                .map(String::as_str),
+            Some("This seat has no plan mode and does not advertise `/plan`.")
+        );
+
+        // Turn 3: no plan mode but the connector advertises /plan → pass through.
+        agent
+            .acp
+            .set_available_commands_for_test("live-session", &["/plan", "/review"]);
+        let (batch, _) = make_batch("/plan");
+        run(agent, batch, "plan-codex").await;
+        let result = result_rx.recv().await.expect("prompt result");
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        agent = result.agent;
+        agent.acp.shutdown().await;
+        server.abort();
+
+        let requests: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+            .expect("read captured requests")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("captured request JSON"))
+            .collect();
+        std::fs::remove_file(&capture).expect("remove capture");
+        let methods: Vec<&str> = requests
+            .iter()
+            .filter_map(|r| r["method"].as_str())
+            .collect();
+        assert_eq!(
+            methods,
+            vec![
+                "session/set_config_option",
+                "session/prompt",
+                "session/set_config_option",
+                "session/prompt",
+            ],
+            "plan turn: set, prompt, restore; unsupported turn: nothing; codex turn: prompt"
+        );
+        assert_eq!(requests[0]["params"]["configId"], "mode");
+        assert_eq!(requests[0]["params"]["value"], "plan");
+        assert_eq!(
+            requests[1]["params"]["prompt"][0]["text"], "ship the thing",
+            "the plan text leads the prompt"
+        );
+        assert_eq!(requests[2]["params"]["configId"], "mode");
+        assert_eq!(
+            requests[2]["params"]["value"], "acceptEdits",
+            "configured mode restored after the plan turn"
+        );
+        assert_eq!(
+            requests[3]["params"]["prompt"][0]["text"], "/plan",
+            "codex-style seat gets /plan untouched"
+        );
+    }
+
+    /// A plan turn that ended through a control signal leaves the session in
+    /// plan mode; the next prompt on that scope restores the configured mode
+    /// before it is sent, and invalidation strips the flag entirely.
+    #[tokio::test]
+    async fn interrupted_plan_turn_is_restored_before_the_next_prompt() {
+        let channel_id = Uuid::new_v4();
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), "carry on")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let batch = FlushBatch {
+            channel_id,
+            scope: SessionScope::Conversation { channel_id },
+            events: vec![crate::queue::BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let capture =
+            std::env::temp_dir().join(format!("buzz-acp-plan-restore-{}.ndjson", Uuid::new_v4()));
+        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{quoted_capture}'
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$count,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+  count=$((count + 1))
+done"#
+        );
+        let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+            .await
+            .expect("spawn wire-capture ACP");
+        let scope = conv(channel_id);
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "legacy-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        agent
+            .state
+            .sessions
+            .insert(scope.clone(), "live-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(scope.clone(), ChannelDeliveryState::default());
+        agent
+            .state
+            .session_modes
+            .insert("live-session".into(), vec!["default".into(), "plan".into()]);
+        // Leftover from a plan turn that a control signal ended.
+        agent.state.plan_mode_sessions.insert(scope.clone());
+        agent.acp.set_plan_hold("live-session", true);
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.channel_info = ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                crate::relay::ChannelInfo {
+                    name: "test-dm".into(),
+                    channel_type: "dm".into(),
+                },
+            )]),
+            ctx.rest_client.clone(),
+        );
+        let ctx = Arc::new(ctx);
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        run_prompt_task(
+            agent,
+            Some(batch),
+            None,
+            Arc::clone(&ctx),
+            result_tx,
+            None,
+            "after-interrupt".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("prompt result");
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        let mut agent = result.agent;
+        assert!(agent.state.plan_mode_sessions.is_empty());
+        assert!(!agent.acp.plan_hold("live-session"));
+        agent.acp.shutdown().await;
+
+        let requests: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+            .expect("read captured requests")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("captured request JSON"))
+            .collect();
+        std::fs::remove_file(&capture).expect("remove capture");
+        let methods: Vec<&str> = requests
+            .iter()
+            .filter_map(|r| r["method"].as_str())
+            .collect();
+        assert_eq!(methods, vec!["session/set_config_option", "session/prompt"]);
+        assert_eq!(requests[0]["params"]["value"], "default");
+    }
+
+    /// Build a bare agent with one live session that advertised `modes`,
+    /// backed by the bash `script`, for the `/plan` prompt-path tests.
+    async fn plan_test_agent(script: String, scope: &SessionScope, modes: &[&str]) -> OwnedAgent {
+        let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+            .await
+            .expect("spawn wire-capture ACP");
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "legacy-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        agent
+            .state
+            .sessions
+            .insert(scope.clone(), "live-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(scope.clone(), ChannelDeliveryState::default());
+        agent.state.session_modes.insert(
+            "live-session".into(),
+            modes.iter().map(|m| m.to_string()).collect(),
+        );
+        agent
+    }
+
+    fn plan_test_batch(channel_id: Uuid, content: &str) -> FlushBatch {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), content)
+            .sign_with_keys(&keys)
+            .unwrap();
+        FlushBatch {
+            channel_id,
+            scope: SessionScope::Conversation { channel_id },
+            events: vec![crate::queue::BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        }
+    }
+
+    fn plan_test_ctx(channel_id: Uuid, permission_mode: PermissionMode) -> PromptContext {
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.permission_mode = permission_mode;
+        ctx.channel_info = ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                crate::relay::ChannelInfo {
+                    name: "test-dm".into(),
+                    channel_type: "dm".into(),
+                },
+            )]),
+            ctx.rest_client.clone(),
+        );
+        ctx
+    }
+
+    fn captured_requests(capture: &std::path::Path) -> Vec<serde_json::Value> {
+        let requests = std::fs::read_to_string(capture)
+            .expect("read captured requests")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("captured request JSON"))
+            .collect();
+        std::fs::remove_file(capture).expect("remove capture");
+        requests
+    }
+
+    /// A `/plan` turn that ends in an idle timeout must not write
+    /// `session/set_config_option` while the prompt is still in flight: the
+    /// restore would race the late prompt response that `cancel_with_cleanup`
+    /// drains. The flags stay set through the cleanup, and the next prompt on
+    /// the scope restores the configured mode before it is sent.
+    #[tokio::test]
+    async fn plan_turn_ending_in_idle_timeout_restores_mode_after_cleanup() {
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let capture =
+            std::env::temp_dir().join(format!("buzz-acp-plan-idle-{}.ndjson", Uuid::new_v4()));
+        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        // Answers everything at once except the first `session/prompt`, which
+        // stays unanswered until `session/cancel` arrives (the idle timeout
+        // fires first), then completes as `cancelled`. Later prompts end
+        // normally.
+        let script = format!(
+            r#"prompt_id=''
+prompts=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{quoted_capture}'
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"session/prompt"'*)
+      prompts=$((prompts + 1))
+      if [ "$prompts" -eq 1 ]; then
+        prompt_id=$id
+      else
+        printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+      fi
+      ;;
+    *'"method":"session/cancel"'*) printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$prompt_id,\"result\":{{\"stopReason\":\"cancelled\"}}}}" ;;
+    *) printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"stopReason\":\"end_turn\"}}}}" ;;
+  esac
+done"#
+        );
+        let agent = plan_test_agent(script, &scope, &["default", "acceptEdits", "plan"]).await;
+        let mut ctx = plan_test_ctx(channel_id, PermissionMode::AcceptEdits);
+        ctx.idle_timeout = Duration::from_millis(500);
+        let ctx = Arc::new(ctx);
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+
+        run_prompt_task(
+            agent,
+            Some(plan_test_batch(channel_id, "/plan ship the thing")),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "plan-idle".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("prompt result");
+        assert!(
+            matches!(result.outcome, PromptOutcome::Timeout(TimeoutKind::Idle)),
+            "expected idle timeout"
+        );
+        let agent = result.agent;
+        assert!(
+            agent.state.plan_mode_sessions.contains(&scope),
+            "flag survives the cleanup so the next prompt restores the mode"
+        );
+        assert!(agent.acp.plan_hold("live-session"));
+
+        run_prompt_task(
+            agent,
+            Some(plan_test_batch(channel_id, "carry on")),
+            None,
+            Arc::clone(&ctx),
+            result_tx,
+            None,
+            "after-idle".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("prompt result");
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        let mut agent = result.agent;
+        assert!(agent.state.plan_mode_sessions.is_empty());
+        assert!(!agent.acp.plan_hold("live-session"));
+        agent.acp.shutdown().await;
+
+        let requests = captured_requests(&capture);
+        let methods: Vec<&str> = requests
+            .iter()
+            .filter_map(|r| r["method"].as_str())
+            .collect();
+        assert_eq!(
+            methods,
+            vec![
+                "session/set_config_option",
+                "session/prompt",
+                "session/cancel",
+                "session/set_config_option",
+                "session/prompt",
+            ],
+            "no set_config_option between the timed-out prompt and its cancel"
+        );
+        assert_eq!(requests[0]["params"]["value"], "plan");
+        assert_eq!(
+            requests[3]["params"]["value"], "acceptEdits",
+            "configured mode restored before the next prompt"
+        );
+    }
+
+    /// The restore after a `/plan` turn follows the session-creation rule: a
+    /// configured mode the session never advertised is not sent.
+    #[tokio::test]
+    async fn plan_turn_restore_skips_unadvertised_configured_mode() {
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-plan-unadvertised-{}.ndjson",
+            Uuid::new_v4()
+        ));
+        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{quoted_capture}'
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$count,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+  count=$((count + 1))
+done"#
+        );
+        // The seat lists `plan` but not the configured `bypassPermissions`.
+        let agent = plan_test_agent(script, &scope, &["default", "plan"]).await;
+        let ctx = Arc::new(plan_test_ctx(channel_id, PermissionMode::BypassPermissions));
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        run_prompt_task(
+            agent,
+            Some(plan_test_batch(channel_id, "/plan ship the thing")),
+            None,
+            Arc::clone(&ctx),
+            result_tx,
+            None,
+            "plan-unadvertised".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("prompt result");
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        let mut agent = result.agent;
+        assert!(agent.state.plan_mode_sessions.is_empty());
+        assert!(!agent.acp.plan_hold("live-session"));
+        agent.acp.shutdown().await;
+
+        let requests = captured_requests(&capture);
+        let methods: Vec<&str> = requests
+            .iter()
+            .filter_map(|r| r["method"].as_str())
+            .collect();
+        assert_eq!(
+            methods,
+            vec!["session/set_config_option", "session/prompt"],
+            "plan set and prompt only; no restore to an unadvertised mode"
+        );
+        assert_eq!(requests[0]["params"]["value"], "plan");
+    }
+
+    #[test]
+    fn invalidation_strips_plan_flags_and_session_modes() {
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let mut state = SessionState::default();
+        state.sessions.insert(scope.clone(), "s1".into());
+        state
+            .session_modes
+            .insert("s1".into(), vec!["default".into(), "plan".into()]);
+        state.plan_mode_sessions.insert(scope.clone());
+        assert!(state.invalidate_scope(&scope));
+        assert!(state.plan_mode_sessions.is_empty());
+        assert!(!state.session_modes.contains_key("s1"));
     }
 
     #[tokio::test]
@@ -7948,6 +9177,100 @@ done"#
         );
     }
 
+    #[tokio::test]
+    async fn signal_in_flight_tasks_for_channel_reaches_every_lane_in_that_channel_only() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let ch = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let thread_a = SessionScope::Thread {
+            channel_id: ch,
+            root_event_id: "a".repeat(64),
+        };
+        let thread_b = SessionScope::Thread {
+            channel_id: ch,
+            root_event_id: "b".repeat(64),
+        };
+        let elsewhere = SessionScope::Conversation { channel_id: other };
+        let mut receivers = Vec::new();
+        for (index, scope, armed) in [
+            (0, thread_a.clone(), true),
+            (1, thread_b.clone(), false),
+            (2, elsewhere.clone(), true),
+        ] {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let abort = pool.join_set.spawn(async {});
+            pool.task_map_mut().insert(
+                abort.id(),
+                TaskMeta {
+                    agent_index: index,
+                    channel_id: Some(scope.channel_id()),
+                    scope: Some(scope.clone()),
+                    turn_id: format!("turn-{index}"),
+                    started_at: 100 + index as u64,
+                    recoverable_batch: None,
+                    control_tx: armed.then_some(tx),
+                    steer_tx: None,
+                    successful_steer_deliveries: HashSet::new(),
+                },
+            );
+            receivers.push((scope, rx));
+        }
+        // A heartbeat task (no scope) in the same channel is never a target.
+        let hb = pool.join_set.spawn(async {});
+        pool.task_map_mut().insert(
+            hb.id(),
+            TaskMeta {
+                agent_index: 3,
+                channel_id: None,
+                scope: None,
+                turn_id: "hb".into(),
+                started_at: 0,
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+
+        let mut signalled = pool.signal_in_flight_tasks_for_channel(ch, ControlSignal::Cancel);
+        signalled.sort_by(|l, r| l.turn_id.cmp(&r.turn_id));
+        assert_eq!(
+            signalled,
+            vec![
+                SignalledTurn {
+                    scope: thread_a.clone(),
+                    turn_id: "turn-0".into(),
+                    started_at: 100,
+                    sent: true,
+                },
+                SignalledTurn {
+                    scope: thread_b.clone(),
+                    turn_id: "turn-1".into(),
+                    started_at: 101,
+                    sent: false,
+                },
+            ]
+        );
+        for (scope, rx) in receivers {
+            if scope == thread_a {
+                assert_eq!(rx.await.unwrap(), ControlSignal::Cancel);
+            } else if scope == elsewhere {
+                let mut rx = rx;
+                assert!(
+                    matches!(
+                        rx.try_recv(),
+                        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                    ),
+                    "other channel's turn must stay unsignalled"
+                );
+            }
+        }
+        // Second pass: every channel task is already consumed.
+        let again = pool.signal_in_flight_tasks_for_channel(ch, ControlSignal::Cancel);
+        assert!(again.iter().all(|t| !t.sent));
+        assert_eq!(again.len(), 2);
+    }
+
     /// Insert a `task_map` entry so `agent_index` reads as checked-out (busy)
     /// for the busy-owner predicate, mirroring an in-flight prompt task without
     /// spawning a real one. `busy_scope` is the turn the worker is running.
@@ -7960,6 +9283,7 @@ done"#
                 channel_id: Some(busy_scope.channel_id()),
                 scope: Some(busy_scope),
                 turn_id: "t".into(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,

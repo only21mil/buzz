@@ -577,12 +577,22 @@ pub async fn cmd_issue_status(
         applied_as_commits: vec![],
     };
 
-    let builder =
-        with_git_provenance(buzz_sdk::build_git_status(status, &body, &meta).map_err(sdk_err)?)?;
-    let event = client.sign_event(builder)?;
-    let resp = client.submit_event(event).await?;
+    let resp = publish_issue_status(client, status, &body, meta).await?;
     println!("{resp}");
     Ok(())
+}
+
+/// Sign and submit one issue status event; returns the raw relay response.
+pub(crate) async fn publish_issue_status(
+    client: &BuzzClient,
+    status: buzz_sdk::GitStatus,
+    content: &str,
+    meta: GitStatusMeta,
+) -> Result<String, CliError> {
+    let builder =
+        with_git_provenance(buzz_sdk::build_git_status(status, content, &meta).map_err(sdk_err)?)?;
+    let event = client.sign_event(builder)?;
+    client.submit_event(event).await
 }
 
 pub async fn dispatch(cmd: crate::IssuesCmd, client: &BuzzClient) -> Result<(), CliError> {

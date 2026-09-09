@@ -2272,6 +2272,22 @@ mod tests {
                 .map(|(_, revision, run)| (*revision, run.clone())))
         }
 
+        fn load_run_attempts(
+            &self,
+            run_id: uuid::Uuid,
+            attempt: u32,
+        ) -> Result<Vec<(u64, RunRecord)>, Self::Error> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .runs
+                .iter()
+                .filter(|(stored, _, _)| stored.run_id() == run_id && stored.attempt() == attempt)
+                .map(|(_, revision, run)| (*revision, run.clone()))
+                .collect())
+        }
+
         fn compare_and_swap_run(
             &mut self,
             identity: &RunIdentity,

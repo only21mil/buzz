@@ -24,6 +24,11 @@ Repository-wide collision audit at the source baseline found `46100–46104` unu
 46106 KIND_CI_TEARDOWN_ATTESTATION
 ```
 
+Kind `46108 KIND_CI_CHECK`, the signed terminal check for one run attempt, is
+specified in `BUZZ_CI_TERMINAL_CHECK.md` together with cancellation, wall
+deadlines, rerun lineage, and concurrency groups. It follows the 46101 to
+46106 signer and tag rules. Kind 46107 is the owner-signed signer grant.
+
 All seven are stored, signed, channel-scoped regular events. They are append-only facts, not NIP-33 replaceable heads.
 
 ## 2. Encoding and common invariants

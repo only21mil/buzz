@@ -16,6 +16,8 @@ pub mod runner_client;
 pub mod runner_v2;
 pub mod source;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_broker;
 
 pub use acceptance_socket::{
     AcceptanceActorBinding, AcceptanceAuthorityBinding, AcceptanceBinding, ACCEPTANCE_BINDING_PATH,
@@ -352,6 +354,9 @@ pub struct RunRecord {
     reason: Option<String>,
     facts: TerminalFacts,
     terminal_event_id: Option<String>,
+    /// The one stored kind-46108 terminal check bound to this attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    check_event_id: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for RunRecord {
@@ -371,6 +376,8 @@ impl<'de> Deserialize<'de> for RunRecord {
             reason: Option<String>,
             facts: TerminalFacts,
             terminal_event_id: Option<String>,
+            #[serde(default)]
+            check_event_id: Option<String>,
         }
 
         let wire = WireRecord::deserialize(deserializer)?;
@@ -384,6 +391,7 @@ impl<'de> Deserialize<'de> for RunRecord {
             reason: wire.reason,
             facts: wire.facts,
             terminal_event_id: wire.terminal_event_id,
+            check_event_id: wire.check_event_id,
         };
         record.validate_restored().map_err(de::Error::custom)?;
         Ok(record)
@@ -403,6 +411,7 @@ impl RunRecord {
             reason: None,
             facts: TerminalFacts::default(),
             terminal_event_id: None,
+            check_event_id: None,
         })
     }
 
@@ -440,6 +449,10 @@ impl RunRecord {
 
     pub fn terminal_event_id(&self) -> Option<&str> {
         self.terminal_event_id.as_deref()
+    }
+
+    pub fn check_event_id(&self) -> Option<&str> {
+        self.check_event_id.as_deref()
     }
 
     /// Return the next immutable projection for one legal protocol transition.
@@ -505,6 +518,22 @@ impl RunRecord {
         Ok(updated)
     }
 
+    /// Bind the one stored terminal kind-46108 check to its terminal
+    /// projection. The terminal run status must already be bound: the check
+    /// names that event.
+    pub fn with_check_event(&self, event_id: String) -> Result<Self, StateError> {
+        if !self.state.is_terminal() || self.terminal_event_id.is_none() {
+            return Err(StateError::NotTerminal);
+        }
+        if self.check_event_id.is_some() {
+            return Err(StateError::CheckEventAlreadyBound);
+        }
+        require_event_id(&event_id)?;
+        let mut updated = self.clone();
+        updated.check_event_id = Some(event_id);
+        Ok(updated)
+    }
+
     fn with_terminal_fact(
         &self,
         event_id: String,
@@ -551,6 +580,12 @@ impl RunRecord {
         }
         if let Some(event_id) = self.terminal_event_id.as_deref() {
             require_event_id(event_id)?;
+        }
+        if let Some(event_id) = self.check_event_id.as_deref() {
+            require_event_id(event_id)?;
+            if !self.state.is_terminal() || self.terminal_event_id.is_none() {
+                return Err(StateError::InvalidRecord);
+            }
         }
 
         let valid_shape = match self.state {
@@ -627,6 +662,8 @@ pub enum StateError {
     NotTerminal,
     #[error("terminal event is already bound")]
     TerminalEventAlreadyBound,
+    #[error("terminal check event is already bound")]
+    CheckEventAlreadyBound,
 }
 
 /// Result of an optimistic persistence write.

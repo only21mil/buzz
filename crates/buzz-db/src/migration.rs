@@ -576,7 +576,7 @@ mod tests {
 
         assert_eq!(
             migrations.len(),
-            40,
+            41,
             "embedded migration matrix must contain the frozen prefix plus admitted tail"
         );
         assert_eq!(migrations[0].version, 1);
@@ -1945,7 +1945,8 @@ mod b1_ci_grants_ordering {
                 (37, "push message kinds"),
                 (38, "push gateway dogfood profile"),
                 (39, "channel admin audit actions"),
-                (40, "agent drafts")
+                (40, "agent drafts"),
+                (41, "ci check storage")
             ]
         );
         let ci_grants = migrations

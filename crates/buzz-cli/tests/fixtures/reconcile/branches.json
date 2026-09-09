@@ -1,0 +1,153 @@
+{
+ "default_branch": "main",
+ "branch_limit": 200,
+ "branches_total": 16,
+ "next_offset": null,
+ "snapshot": "snap",
+ "branches": [
+  {
+   "name": "main",
+   "tip": "mamamamamamamamamamamamamamamamamamamama",
+   "ahead": 0,
+   "behind": 0,
+   "fully_merged": true,
+   "last_commit_at": 0,
+   "open_pr_event_id": null
+  },
+  {
+   "name": "b1",
+   "tip": "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+   "ahead": 0,
+   "behind": 0,
+   "fully_merged": true,
+   "last_commit_at": 0,
+   "open_pr_event_id": null
+  },
+  {
+   "name": "b2",
+   "tip": "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2",
+   "ahead": 0,
+   "behind": 0,
+   "fully_merged": true,
+   "last_commit_at": 0,
+   "open_pr_event_id": null
+  },
+  {
+   "name": "b3",
+   "tip": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+   "ahead": 0,
+   "behind": 0,
+   "fully_merged": true,
+   "last_commit_at": 0,
+   "open_pr_event_id": null
+  },
+  {
+   "name": "b4",
+   "tip": "c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4c4",
+   "ahead": 0,
+   "behind": 0,
+   "fully_merged": false,
+   "last_commit_at": 0,
+   "open_pr_event_id": null
+  },
+  {
+   "name": "b5",
+   "tip": "c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5",
+   "ahead": 0,
+   "behind": 0,
+   "fully_merged": false,
+   "last_commit_at": 0,
+   "open_pr_event_id": null
+  },
+  {
+   "name": "b6",
+   "tip": "c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6c6",
+   "ahead": 0,
+   "behind": 0,
+   "fully_merged": false,
+   "last_commit_at": 0,
+   "open_pr_event_id": null
+  },
+  {
+   "name": "b7",
+   "tip": "t7t7t7t7t7t7t7t7t7t7t7t7t7t7t7t7t7t7t7t7",
+   "ahead": 0,
+   "behind": 0,
+   "fully_merged": false,
+   "last_commit_at": 0,
+   "open_pr_event_id": null
+  },
+  {
+   "name": "b8",
+   "tip": "c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8c8",
+   "ahead": 0,
+   "behind": 0,
+   "fully_merged": true,
+   "last_commit_at": 0,
+   "open_pr_event_id": null
+  },
+  {
+   "name": "b9",
+   "tip": "c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9c9",
+   "ahead": 0,
+   "behind": 0,
+   "fully_merged": false,
+   "last_commit_at": 0,
+   "open_pr_event_id": null
+  },
+  {
+   "name": "b11",
+   "tip": "c12c12c12c12c12c12c12c12c12c12c12c12c12c",
+   "ahead": 0,
+   "behind": 0,
+   "fully_merged": true,
+   "last_commit_at": 0,
+   "open_pr_event_id": null
+  },
+  {
+   "name": "b17",
+   "tip": "c17c17c17c17c17c17c17c17c17c17c17c17c17c",
+   "ahead": 0,
+   "behind": 0,
+   "fully_merged": true,
+   "last_commit_at": 0,
+   "open_pr_event_id": null
+  },
+  {
+   "name": "b14",
+   "tip": "c14c14c14c14c14c14c14c14c14c14c14c14c14c",
+   "ahead": 0,
+   "behind": 0,
+   "fully_merged": true,
+   "last_commit_at": 0,
+   "open_pr_event_id": null
+  },
+  {
+   "name": "b15",
+   "tip": "c15c15c15c15c15c15c15c15c15c15c15c15c15c",
+   "ahead": 0,
+   "behind": 0,
+   "fully_merged": false,
+   "last_commit_at": 0,
+   "open_pr_event_id": null
+  },
+  {
+   "name": "b16",
+   "tip": "c16c16c16c16c16c16c16c16c16c16c16c16c16c",
+   "ahead": 0,
+   "behind": 0,
+   "fully_merged": true,
+   "last_commit_at": 0,
+   "open_pr_event_id": null
+  },
+  {
+   "name": "b16r",
+   "tip": "c16c16c16c16c16c16c16c16c16c16c16c16c16c",
+   "ahead": 0,
+   "behind": 0,
+   "fully_merged": true,
+   "last_commit_at": 0,
+   "open_pr_event_id": null
+  }
+ ]
+}

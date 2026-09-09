@@ -14,8 +14,8 @@ use buzz_core::kind::{
     event_kind_u32, is_identity_archive_request_kind, is_parameterized_replaceable,
     is_relay_admin_kind, KIND_AGENT_ENGRAM, KIND_AGENT_PROFILE, KIND_AGENT_TURN_METRIC,
     KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_AUTH, KIND_BOOKMARK_LIST, KIND_BOOKMARK_SET,
-    KIND_CANVAS, KIND_CI_ARTIFACT_REFERENCE, KIND_CI_EVIDENCE_FINALIZED, KIND_CI_GRANT,
-    KIND_CI_JOB_STATUS, KIND_CI_LOG_REFERENCE, KIND_CI_REQUEST, KIND_CI_RUN_STATUS,
+    KIND_CANVAS, KIND_CI_ARTIFACT_REFERENCE, KIND_CI_CHECK, KIND_CI_EVIDENCE_FINALIZED,
+    KIND_CI_GRANT, KIND_CI_JOB_STATUS, KIND_CI_LOG_REFERENCE, KIND_CI_REQUEST, KIND_CI_RUN_STATUS,
     KIND_CI_TEARDOWN_ATTESTATION, KIND_CONTACT_LIST, KIND_DELETION, KIND_DM_ADD_MEMBER,
     KIND_DM_HIDE, KIND_DM_OPEN, KIND_EMOJI_LIST, KIND_EMOJI_SET, KIND_EVENT_REMINDER,
     KIND_FOLLOW_SET, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_GIFT_WRAP,
@@ -65,6 +65,7 @@ fn is_ci_event_kind(kind: u32) -> bool {
             | KIND_CI_EVIDENCE_FINALIZED
             | KIND_CI_TEARDOWN_ATTESTATION
             | KIND_CI_GRANT
+            | KIND_CI_CHECK
     )
 }
 
@@ -724,7 +725,8 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_CI_ARTIFACT_REFERENCE
         | KIND_CI_EVIDENCE_FINALIZED
         | KIND_CI_TEARDOWN_ATTESTATION
-        | KIND_CI_GRANT => Ok(Scope::JobsWrite),
+        | KIND_CI_GRANT
+        | KIND_CI_CHECK => Ok(Scope::JobsWrite),
         _ => Err("restricted: unknown event kind"),
     }
 }
@@ -2926,7 +2928,7 @@ async fn ingest_event_inner(
         // 1. Kind 46100 (CI_REQUEST): the actor IS the requester — the signer
         //    set is DEFINED as empty, so validate_signed_ci_event checks the
         //    envelope + tags + actor==signer and never consults the signer set.
-        // 2. Kinds 46101-46106: signers must be authorized. The granted set is
+        // 2. Kinds 46101-46106 and 46108: signers must be authorized. The granted set is
         //    the UNION of canonical's owner-configured static signers
         //    `config.ci_status_signer_pubkeys` AND the active `ci_grants` rows
         //    for (community, channel, target_repo_a) now resolved via
@@ -2940,7 +2942,7 @@ async fn ingest_event_inner(
         let signers: std::collections::HashSet<String> = if kind_u32 == KIND_CI_REQUEST {
             std::collections::HashSet::new()
         } else {
-            // Every 46101-46106 envelope carries the immutable NIP-34 repository
+            // Every 46101-46106 and 46108 envelope carries the immutable NIP-34 repository
             // coordinate `target_repo_a` as a top-level JSON field; it scopes the
             // grant lookup to the exact repository the event is about.
             let parsed: serde_json::Value = serde_json::from_str(&event.content).map_err(|_| {
@@ -4344,6 +4346,7 @@ mod tests {
             KIND_CI_EVIDENCE_FINALIZED,
             KIND_CI_TEARDOWN_ATTESTATION,
             KIND_CI_GRANT,
+            KIND_CI_CHECK,
         ] {
             assert_eq!(
                 required_scope_for_kind(kind, &event).expect("known CI kind"),
@@ -4372,6 +4375,7 @@ mod tests {
             KIND_CI_EVIDENCE_FINALIZED,
             KIND_CI_TEARDOWN_ATTESTATION,
             KIND_CI_GRANT,
+            KIND_CI_CHECK,
         ] {
             assert!(
                 is_ci_event_kind(kind),

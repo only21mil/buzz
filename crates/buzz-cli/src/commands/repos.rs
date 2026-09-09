@@ -907,7 +907,21 @@ pub async fn dispatch(cmd: crate::ReposCmd, client: &BuzzClient) -> Result<(), C
             repo_id,
             limit,
             json: _,
-        } => reconcile::run(client, &repo_owner, &repo_id, limit).await,
+            apply,
+            git_cache,
+        } => {
+            reconcile::run(
+                client,
+                &repo_owner,
+                &repo_id,
+                reconcile::Options {
+                    limit,
+                    apply,
+                    git_cache,
+                },
+            )
+            .await
+        }
         ReposCmd::ImportMain { id, commit } => {
             let announcement = current_repo(client, &id).await?;
             crate::commands::repo_sync::cmd_import_main(client, &announcement, &commit).await

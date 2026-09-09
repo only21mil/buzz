@@ -22,8 +22,15 @@ use crate::{
 
 const CI_EVENT_KIND_MIN: u32 = 46_101;
 const CI_EVENT_KIND_MAX: u32 = 46_106;
+/// Kind 46108 terminal check: signed by the ci-event key like the status
+/// kinds. Kind 46107 between them is the owner-signed grant, never signed here.
+const CI_CHECK_KIND: u32 = 46_108;
 const QUERY_KIND_MIN: u64 = 46_100;
-const QUERY_KIND_MAX: u64 = 46_107;
+const QUERY_KIND_MAX: u64 = 46_108;
+
+const fn signable_ci_kind(kind: u32) -> bool {
+    (kind >= CI_EVENT_KIND_MIN && kind <= CI_EVENT_KIND_MAX) || kind == CI_CHECK_KIND
+}
 const NIP98_EVENT_KIND: u32 = 27_235;
 const NIP98_TIMESTAMP_TOLERANCE_SECONDS: u64 = 60;
 
@@ -651,7 +658,7 @@ impl<B: SigningBackend> KeyholderServer for ProductionKeyholder<B> {
         self.authorize(peer, Operation::SignCiEvent)?;
         let identity =
             self.identity_for_generation(KeySelector::CiEvent, request.expected_generation)?;
-        if !(CI_EVENT_KIND_MIN..=CI_EVENT_KIND_MAX).contains(&request.event_kind) {
+        if !signable_ci_kind(request.event_kind) {
             return Err(ServiceError::PolicyDenied);
         }
         validate_ci_event(
@@ -2276,7 +2283,7 @@ pub(crate) mod tests {
             ),
             (
                 "kind above the CI range",
-                exact_event_filter(&id, CI_EVENT_HEX, "46108", "1"),
+                exact_event_filter(&id, CI_EVENT_HEX, "46109", "1"),
             ),
             (
                 "two kinds",

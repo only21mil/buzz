@@ -10,7 +10,7 @@ pub enum MediaError {
     UnknownContentType,
     #[error("disallowed content type: {0}")]
     DisallowedContentType(String),
-    #[error("file too large: {size} bytes (max {max})")]
+    #[error("file too large: {size} bytes (max {max} bytes, {})", mib(*max))]
     FileTooLarge { size: u64, max: u64 },
     #[error("image dimensions too large")]
     ImageTooLarge,
@@ -96,6 +96,12 @@ impl From<image::ImageError> for MediaError {
     }
 }
 
+/// Render a byte count in MiB with one decimal, for limit messages a person
+/// has to read ("2048.0 MiB" rather than "2147483648").
+fn mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
 impl From<s3::error::S3Error> for MediaError {
     fn from(e: s3::error::S3Error) -> Self {
         Self::StorageError(e.to_string())
@@ -164,13 +170,44 @@ impl IntoResponse for MediaError {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
             }
         };
-        (status, axum::Json(serde_json::json!({"error": msg}))).into_response()
+        let mut body = serde_json::json!({"error": msg});
+        // Size rejections carry the numbers as fields so clients can render
+        // the real limit instead of parsing the message text.
+        if let Self::FileTooLarge { size, max } = &self {
+            body["size"] = serde_json::json!(size);
+            body["max_bytes"] = serde_json::json!(max);
+        }
+        (status, axum::Json(body)).into_response()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn file_too_large_names_the_limit_in_text_and_fields() {
+        let error = MediaError::FileTooLarge {
+            size: 52_428_801,
+            max: 52_428_800,
+        };
+        assert_eq!(
+            error.to_string(),
+            "file too large: 52428801 bytes (max 52428800 bytes, 50.0 MiB)"
+        );
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body["max_bytes"], 52_428_800_u64);
+        assert_eq!(body["size"], 52_428_801_u64);
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("max 52428800 bytes"));
+    }
 
     #[test]
     fn unsupported_media_maps_to_415() {

@@ -772,7 +772,7 @@ where
     ) -> Result<AuthenticatedEventRead, ExportReadError> {
         if !is_lower_hex(event_id, 64)
             || !is_lower_hex(author, 64)
-            || !(46_101..=46_106).contains(&kind)
+            || !((46_101..=46_106).contains(&kind) || kind == buzz_core::kind::KIND_CI_CHECK)
         {
             return Err(ExportReadError::Invalid);
         }

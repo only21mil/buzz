@@ -25,6 +25,9 @@ struct StatusOutput {
     attempt: u32,
     state: red::CiReducedState,
     jobs: Vec<red::CiReducedJob>,
+    /// Signed kind-46108 terminal check for the final request, or `null`
+    /// until the control plane publishes one.
+    check: Option<red::CiReducedCheck>,
 }
 
 pub(super) async fn cmd_status(
@@ -93,6 +96,7 @@ fn status_output(reduction: CiReduction) -> StatusOutput {
         attempt: reduction.attempt,
         state: reduction.state,
         jobs: reduction.jobs,
+        check: reduction.check,
     }
 }
 
@@ -431,6 +435,13 @@ fn build_watch_record(
         ValidatedCiEnvelope::TeardownAttestation(t) => {
             (WatchScope::Teardown, None, None, t.attempt, t.teardown_at)
         }
+        ValidatedCiEnvelope::Check(c) => (
+            WatchScope::Run,
+            None,
+            Some(map_run_state(c.conclusion)),
+            c.attempt,
+            c.published_at,
+        ),
         ValidatedCiEnvelope::Request(request) => (
             WatchScope::Run,
             None,
@@ -503,6 +514,7 @@ mod tests {
             jobs_total: 1,
             required_failing: Vec::new(),
             reason: None,
+            check: None,
         }
     }
 
@@ -516,9 +528,10 @@ mod tests {
                 .expect("status object")
                 .keys()
                 .collect::<Vec<_>>(),
-            vec!["attempt", "jobs", "run_id", "sha", "state"]
+            vec!["attempt", "check", "jobs", "run_id", "sha", "state"]
         );
         assert!(status.get("reduction").is_none());
+        assert!(status.get("check").is_some_and(serde_json::Value::is_null));
 
         let verdict = serde_json::to_value(verdict_output(reduction(red::CiReducedState::Green)))
             .expect("serialize verdict");
