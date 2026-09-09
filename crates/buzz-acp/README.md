@@ -275,6 +275,10 @@ Forum event kinds:
 
 > **Note:** Without `--no-mention-filter` (or `require_mention = false`), the default `subscribe=mentions` mode filters events that don't @mention the agent — forum posts will be invisible.
 
+### DM channels
+
+DMs are ordinary kind:9 messages in a channel whose kind:39000 metadata carries `["t", "dm"]`, and they carry no `p` tag. In `subscribe=mentions` mode the harness therefore drops the relay-side `#p` filter for every channel the relay identifies as a DM, both at startup discovery and when a member-added notification (kind:44100) arrives for a new DM. If that metadata cannot be fetched at subscription time, the channel is subscribed with the mention filter and the harness retries the lookup every 10 seconds; once the channel resolves as a DM it re-issues the subscription without `#p`, replaying from the original subscription floor so DMs posted in the meantime are delivered. Non-DM channels keep the explicit-mention subscription, and the inbound author gate is unchanged: inside a DM only the owner and verified same-owner siblings fire a turn.
+
 ## How It Works
 
 1. **Startup** — Spawns N agent subprocesses (default 1), sends ACP `initialize` to each, connects to the relay with NIP-42 auth.

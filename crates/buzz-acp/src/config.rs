@@ -558,7 +558,7 @@ pub struct CliArgs {
 }
 
 /// Merged NIP-01 subscription filter for a single channel.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelFilter {
     /// Event kinds to subscribe to. None = wildcard (all kinds).
     pub kinds: Option<Vec<u32>>,
