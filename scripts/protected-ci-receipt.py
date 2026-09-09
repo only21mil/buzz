@@ -363,6 +363,13 @@ def validate_evidence_root(path: Path, *, checkout: Path | None = None) -> Path:
     safe_read_receipt re-check the same rule on the directory they open.
     """
     refuse(path.is_absolute(), f"evidence root must be an absolute path: {path}", OutputError)
+    if checkout is not None:
+        # Checked first: a path inside the checkout is wrong whatever its mode,
+        # and the operator needs that reason, not the mode of the checkout.
+        checkout_root = checkout.resolve()
+        located = path.resolve(strict=False)
+        refuse(located != checkout_root and checkout_root not in located.parents,
+               f"evidence root must be outside the checkout {checkout_root}: {path}", OutputError)
     try:
         info = os.lstat(path)
         refuse(not stat.S_ISLNK(info.st_mode), f"evidence root must not be a symlink: {path}",
@@ -373,10 +380,6 @@ def validate_evidence_root(path: Path, *, checkout: Path | None = None) -> Path:
         raise OutputError(f"cannot read evidence root {path}: {exc}") from exc
     refuse(is_private_directory(info),
            f"evidence root must be a caller-owned mode-0700 directory: {path}", OutputError)
-    if checkout is not None:
-        checkout_root = checkout.resolve()
-        refuse(path != checkout_root and checkout_root not in path.parents,
-               f"evidence root must be outside the checkout {checkout_root}: {path}", OutputError)
     return path
 
 

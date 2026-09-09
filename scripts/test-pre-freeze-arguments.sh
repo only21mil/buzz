@@ -15,6 +15,9 @@ fixture="$tmp/repo"
 runtime="$tmp/runtime"
 evidence="$tmp/evidence"
 mkdir -p "$fixture/scripts" "$fixture/bin" "$runtime"
+# A checkout is normally world-readable. Pin it so the in-checkout refusal
+# below reports containment, not the directory mode, under any umask.
+chmod 755 "$fixture"
 mkdir -m 700 "$evidence"
 cp "$subject" "$fixture/scripts/pre-freeze.sh"
 cp "$evidence_tool" "$fixture/scripts/protected-ci-receipt.py"
@@ -44,6 +47,14 @@ status=0
 fail() {
     printf 'FAIL: %s\n' "$*" >&2
     exit 1
+}
+
+# expect_text <file> <text>: the file contains the literal text. A bare
+# grep -q under set -e exits silently; this names the assertion and shows
+# what the subject printed instead.
+expect_text() {
+    local file=$1 text=$2
+    grep -Fq -- "$text" "$file" || fail "expected '$text' in ${file##*/}; got: $(cat "$file")"
 }
 
 # run_subject [--no-root] <arguments...>: run the fixture script with the
@@ -132,74 +143,74 @@ PY
 
 run_subject --no-root --help
 [[ "$status" -eq 0 ]] || fail '--help exit status'
-grep -Fq 'Usage: scripts/pre-freeze.sh' "$output"
-grep -Fq -- '--receipt <path>' "$output"
-grep -Fq 'BUZZ_EVIDENCE_ROOT' "$output"
+expect_text "$output" 'Usage: scripts/pre-freeze.sh'
+expect_text "$output" '--receipt <path>'
+expect_text "$output" 'BUZZ_EVIDENCE_ROOT'
 assert_no_receipt_or_runtime_files
 
 run_subject --no-root -h
 [[ "$status" -eq 0 ]] || fail '-h exit status'
-grep -Fq 'Usage: scripts/pre-freeze.sh' "$output"
+expect_text "$output" 'Usage: scripts/pre-freeze.sh'
 assert_no_receipt_or_runtime_files
 
 run_subject --no-root --unknown
 [[ "$status" -eq 2 ]] || fail '--unknown exit status'
-grep -Fq 'unknown argument: --unknown' "$error"
-grep -Fq 'Usage: scripts/pre-freeze.sh' "$error"
+expect_text "$error" 'unknown argument: --unknown'
+expect_text "$error" 'Usage: scripts/pre-freeze.sh'
 assert_no_receipt_or_runtime_files
 
 run_subject --no-root --base
 [[ "$status" -eq 2 ]] || fail '--base exit status'
-grep -Fq -- '--base requires a ref' "$error"
+expect_text "$error" '--base requires a ref'
 assert_no_receipt_or_runtime_files
 
 run_subject --no-root --base --full
 [[ "$status" -eq 2 ]] || fail '--base --full exit status'
-grep -Fq -- '--base requires a ref' "$error"
+expect_text "$error" '--base requires a ref'
 assert_no_receipt_or_runtime_files
 
 run_subject --no-root --base ''
 [[ "$status" -eq 2 ]] || fail "--base '' exit status"
-grep -Fq -- '--base requires a ref' "$error"
+expect_text "$error" '--base requires a ref'
 assert_no_receipt_or_runtime_files
 
 run_subject --no-root --receipt
 [[ "$status" -eq 2 ]] || fail '--receipt exit status'
-grep -Fq -- '--receipt requires a path' "$error"
+expect_text "$error" '--receipt requires a path'
 assert_no_receipt_or_runtime_files
 
 # --- evidence root contract: refused before any gate runs ---
 
 run_subject --no-root
 [[ "$status" -eq 2 ]] || fail 'missing BUZZ_EVIDENCE_ROOT exit status'
-grep -Fq 'BUZZ_EVIDENCE_ROOT must name the absolute retained-evidence directory' "$error"
+expect_text "$error" 'BUZZ_EVIDENCE_ROOT must name the absolute retained-evidence directory'
 assert_no_receipt_or_runtime_files
 assert_checkout_untouched
 
 run_subject --receipt "$fixture/pre-freeze-receipt.json"
 [[ "$status" -eq 2 ]] || fail 'in-checkout --receipt exit status'
-grep -Fq 'evidence root must be outside the checkout' "$error"
+expect_text "$error" 'evidence root must be outside the checkout'
 [[ ! -e "$fixture/pre-freeze-receipt.json" ]] || fail 'in-checkout receipt was written'
 assert_no_receipt_or_runtime_files
 assert_checkout_untouched
 
 run_subject --receipt relative/receipt.json
 [[ "$status" -eq 2 ]] || fail 'relative --receipt exit status'
-grep -Fq -- '--receipt must be an absolute path' "$error"
+expect_text "$error" '--receipt must be an absolute path'
 assert_no_receipt_or_runtime_files
 
 mkdir "$tmp/shared"
 chmod 755 "$tmp/shared"
 run_subject --receipt "$tmp/shared/receipt.json"
 [[ "$status" -eq 2 ]] || fail 'shared-parent --receipt exit status'
-grep -Fq 'evidence root must be a caller-owned mode-0700 directory' "$error"
+expect_text "$error" 'evidence root must be a caller-owned mode-0700 directory'
 [[ ! -e "$tmp/shared/receipt.json" ]] || fail 'receipt was written under a shared parent'
 assert_no_receipt_or_runtime_files
 
 chmod 755 "$evidence"
 run_subject
 [[ "$status" -eq 2 ]] || fail 'mode-0755 BUZZ_EVIDENCE_ROOT exit status'
-grep -Fq 'evidence root must be a caller-owned mode-0700 directory' "$error"
+expect_text "$error" 'evidence root must be a caller-owned mode-0700 directory'
 chmod 700 "$evidence"
 assert_no_receipt_or_runtime_files
 
@@ -209,7 +220,7 @@ rm -f -- "$output" "$error"
 if (cd "$fixture" && TMPDIR="$runtime" BUZZ_EVIDENCE_ROOT="$BUZZ_EVIDENCE_ROOT_LINK" scripts/pre-freeze.sh) >"$output" 2>"$error"; then
     fail 'symlinked BUZZ_EVIDENCE_ROOT was accepted'
 fi
-grep -Fq 'evidence root must not be a symlink' "$error"
+expect_text "$error" 'evidence root must not be a symlink'
 assert_no_receipt_or_runtime_files
 
 # --- a real gate run: FAIL receipt published under the evidence root ---
@@ -226,7 +237,7 @@ fi
 [[ "$status" -eq 1 ]] || fail "gate run exit status $status: $(cat "$error")"
 receipt=$(receipts_in_evidence)
 [[ -n "$receipt" && "$(printf '%s\n' "$receipt" | wc -l)" -eq 1 ]] || fail 'expected exactly one receipt'
-grep -Fq "Receipt: $receipt (FAIL)" "$output"
+expect_text "$output" "Receipt: $receipt (FAIL)"
 assert_fail_receipt "$receipt"
 assert_checkout_untouched
 assert_evidence_root_clean
@@ -241,8 +252,8 @@ fi
 printf '{}\n' > "$fixture/pre-freeze-receipt.json"
 run_subject --receipt "$evidence/clean-tree.json"
 [[ "$status" -eq 1 ]] || fail 'stray receipt clean-tree exit status'
-grep -Fq 'dirty: ?? pre-freeze-receipt.json' "$error"
-grep -Fq 'worktree must have clean porcelain (except generated build output)' "$error"
+expect_text "$error" 'dirty: ?? pre-freeze-receipt.json'
+expect_text "$error" 'worktree must have clean porcelain (except generated build output)'
 rm -f -- "$fixture/pre-freeze-receipt.json"
 python3 - "$evidence/clean-tree.json" <<'PY'
 import json
@@ -265,7 +276,7 @@ run_subject --receipt "$fixed"
 fixed_sha=$(sha256sum "$fixed" | cut -d' ' -f1)
 run_subject --receipt "$fixed"
 [[ "$status" -eq 2 ]] || fail 'second --receipt run was not refused'
-grep -Fq "receipt already exists: $fixed" "$error"
+expect_text "$error" "receipt already exists: $fixed"
 [[ "$(sha256sum "$fixed" | cut -d' ' -f1)" == "$fixed_sha" ]] || fail 'existing receipt was replaced'
 assert_evidence_root_clean
 
