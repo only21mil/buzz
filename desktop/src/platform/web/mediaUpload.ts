@@ -153,10 +153,49 @@ async function readBoundedResponse(
   }
 }
 
+function formatBinarySize(bytes: number): string {
+  const mib = bytes / (1024 * 1024);
+  if (mib >= 1024) return `${(mib / 1024).toFixed(1)} GiB`;
+  return `${mib.toFixed(1)} MiB`;
+}
+
+/**
+ * Turn the relay's 413 body into a sentence that names the limit that fired.
+ * The relay sends `{ error, size, max_bytes }` for a size rejection; anything
+ * else falls through to the generic upload error.
+ */
+export function uploadSizeLimitMessage(
+  status: number,
+  body: string,
+): string | undefined {
+  if (status !== 413) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+  if (!isRecord(parsed)) return undefined;
+  const max = parsed.max_bytes;
+  if (typeof max !== "number" || !Number.isFinite(max) || max <= 0) {
+    return typeof parsed.error === "string"
+      ? `File is too large. ${parsed.error}`
+      : undefined;
+  }
+  const size = parsed.size;
+  const sizeText =
+    typeof size === "number" && Number.isFinite(size) && size > 0
+      ? ` (${formatBinarySize(size)})`
+      : "";
+  return `File is too large${sizeText}. This relay accepts up to ${formatBinarySize(max)}.`;
+}
+
 async function responseError(response: Response): Promise<Error> {
   const text = await readBoundedResponse(response, 512, "response too large")
     .then((bytes) => new TextDecoder().decode(bytes))
     .catch(() => "");
+  const limit = uploadSizeLimitMessage(response.status, text);
+  if (limit) return new Error(limit);
   return new Error(
     `media upload failed (${response.status})${text ? `: ${text}` : ""}`,
   );

@@ -26,7 +26,8 @@ use crate::state::AppState;
 /// Axum extractor that validates Blossom auth, the BUD-11 hash binding, and
 /// relay membership (NIP-43, when enabled) from headers BEFORE the request
 /// body is read. This prevents unauthenticated clients from forcing the
-/// server to buffer up to 50MB of body data.
+/// server to buffer a body up to the image cap (`BUZZ_MAX_IMAGE_BYTES`,
+/// 2 GiB by default).
 ///
 /// Axum processes `FromRequestParts` extractors before `FromRequest` (body)
 /// extractors, so auth rejection happens before any body buffering.

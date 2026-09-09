@@ -1021,11 +1021,11 @@ impl Config {
             max_image_bytes: std::env::var("BUZZ_MAX_IMAGE_BYTES")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(50 * 1024 * 1024),
+                .unwrap_or(buzz_media::DEFAULT_MAX_IMAGE_BYTES),
             max_gif_bytes: std::env::var("BUZZ_MAX_GIF_BYTES")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(10 * 1024 * 1024),
+                .unwrap_or(buzz_media::DEFAULT_MAX_GIF_BYTES),
             max_video_bytes: std::env::var("BUZZ_MAX_VIDEO_BYTES")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -1446,6 +1446,18 @@ mod tests {
         assert!(config.max_connections > 0);
         assert!(config.send_buffer_size > 0);
         assert_eq!(config.max_frame_bytes, DEFAULT_MAX_FRAME_BYTES);
+        // Storage cap and websocket frame cap are separate numbers: images
+        // reach the relay through Blossom upload, never inline in a frame.
+        assert_eq!(
+            config.media.max_image_bytes,
+            buzz_media::DEFAULT_MAX_IMAGE_BYTES
+        );
+        assert_eq!(
+            config.media.max_gif_bytes,
+            buzz_media::DEFAULT_MAX_GIF_BYTES
+        );
+        assert_eq!(DEFAULT_MAX_FRAME_BYTES, 512 * 1024);
+        assert!(config.media.max_image_bytes > config.max_frame_bytes as u64);
         assert!(config.slow_client_grace_limit > 0);
         assert_eq!(
             config.workflow_resume_sweep_interval,

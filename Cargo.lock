@@ -865,6 +865,7 @@ dependencies = [
  "dirs",
  "getrandom 0.4.3",
  "hex",
+ "image",
  "nix 0.31.3",
  "reqwest 0.13.4",
  "rmcp",

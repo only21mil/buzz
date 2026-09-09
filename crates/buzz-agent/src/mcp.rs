@@ -665,11 +665,26 @@ impl McpRegistry {
                 });
             }
         };
-        let content = tool_result_content(&res.content, budget.total, budget.text);
+        let is_error = res.is_error.unwrap_or(false);
+        let has_image = res
+            .content
+            .iter()
+            .any(|c| matches!(c.raw, rmcp::model::RawContent::Image(_)));
+        let content = if has_image {
+            // An over-budget image gets decoded and resized; keep that off
+            // the async worker.
+            let blocks = res.content;
+            let (total, text) = (budget.total, budget.text);
+            tokio::task::spawn_blocking(move || tool_result_content(&blocks, total, text))
+                .await
+                .map_err(|e| AgentError::Mcp(format!("call {qname}: result assembly: {e}")))?
+        } else {
+            tool_result_content(&res.content, budget.total, budget.text)
+        };
         Ok(ToolResult {
             provider_id: provider_id.to_owned(),
             content,
-            is_error: res.is_error.unwrap_or(false),
+            is_error,
         })
     }
 
@@ -935,6 +950,91 @@ pub(crate) fn truncate_middle(s: &str, max: usize) -> String {
     )
 }
 
+/// MIME type every downscaled tool-result image is delivered as.
+const DOWNSCALED_MIME: &str = "image/jpeg";
+/// JPEG quality for downscaled tool-result images. Screenshots keep their
+/// text legible at this setting; photos lose little.
+const DOWNSCALE_JPEG_QUALITY: u8 = 80;
+/// Stop shrinking once the long edge falls below this many pixels; a smaller
+/// picture tells the model nothing and the elision marker is more honest.
+const DOWNSCALE_MIN_LONG_EDGE: u32 = 64;
+/// Decode guard for tool-result images (pixel dimensions and decode memory).
+const DOWNSCALE_MAX_SIDE: u32 = 16_384;
+const DOWNSCALE_MAX_ALLOC: u64 = 256 * 1024 * 1024;
+
+/// A tool-result image re-encoded to fit an inline byte budget.
+struct DownscaledImage {
+    /// Base64 JPEG bytes, `<= budget` characters.
+    data: String,
+    source_width: u32,
+    source_height: u32,
+    width: u32,
+    height: u32,
+}
+
+/// Shrink a base64 image until its base64 JPEG encoding fits `budget`
+/// characters. Returns `None` when the bytes do not decode as an image, the
+/// decode guard trips, or the picture would have to drop below
+/// [`DOWNSCALE_MIN_LONG_EDGE`] to fit.
+fn downscale_image_to_budget(data_b64: &str, budget: usize) -> Option<DownscaledImage> {
+    use base64::Engine as _;
+    use image::codecs::jpeg::JpegEncoder;
+    use image::GenericImageView as _;
+
+    if budget == 0 {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data_b64.trim())
+        .ok()?;
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(DOWNSCALE_MAX_SIDE);
+    limits.max_image_height = Some(DOWNSCALE_MAX_SIDE);
+    limits.max_alloc = Some(DOWNSCALE_MAX_ALLOC);
+    reader.limits(limits);
+    let source = reader.decode().ok()?;
+    let (source_width, source_height) = source.dimensions();
+    if source_width == 0 || source_height == 0 {
+        return None;
+    }
+
+    let encode = |img: &image::DynamicImage| -> Option<String> {
+        let mut buf = Vec::new();
+        let encoder = JpegEncoder::new_with_quality(&mut buf, DOWNSCALE_JPEG_QUALITY);
+        img.to_rgb8().write_with_encoder(encoder).ok()?;
+        Some(base64::engine::general_purpose::STANDARD.encode(buf))
+    };
+
+    let mut current = source;
+    for _ in 0..12 {
+        let encoded = encode(&current)?;
+        let (width, height) = current.dimensions();
+        if encoded.len() <= budget {
+            return Some(DownscaledImage {
+                data: encoded,
+                source_width,
+                source_height,
+                width,
+                height,
+            });
+        }
+        if width.max(height) <= DOWNSCALE_MIN_LONG_EDGE {
+            return None;
+        }
+        // JPEG size tracks pixel count, so scale both edges by the square
+        // root of the overshoot with a little slack; never grow, always shrink.
+        let ratio = (budget as f64 / encoded.len() as f64).sqrt() * 0.9;
+        let ratio = ratio.clamp(0.1, 0.9);
+        let next_width = ((width as f64) * ratio).round().max(1.0) as u32;
+        let next_height = ((height as f64) * ratio).round().max(1.0) as u32;
+        current = current.thumbnail(next_width, next_height);
+    }
+    None
+}
+
 /// Assemble tool-result content under two budgets: `max_bytes` bounds the
 /// whole result (text + images), `max_text_bytes` bounds the text portion
 /// alone. Images are large by nature and pass through whole or get elided
@@ -990,15 +1090,47 @@ fn tool_result_content(
                         data: i.data.clone(),
                         mime_type: i.mime_type.clone(),
                     });
-                } else {
-                    append(
+                    continue;
+                }
+                // Over budget: the storage cap on originals is 2 GiB, the
+                // inline budget is not. Shrink the picture to fit rather than
+                // dropping it, and say so; the original stays where the tool
+                // read it from.
+                let remaining = max_bytes
+                    .saturating_sub(used)
+                    .saturating_sub(DOWNSCALED_MIME.len())
+                    .saturating_sub(ELISION_MARKER_ALLOWANCE);
+                match downscale_image_to_budget(&i.data, remaining) {
+                    Some(fit) => {
+                        used = used
+                            .saturating_add(fit.data.len())
+                            .saturating_add(DOWNSCALED_MIME.len());
+                        out.push(ToolResultContent::Image {
+                            data: fit.data,
+                            mime_type: DOWNSCALED_MIME.to_string(),
+                        });
+                        append(
+                            &mut text,
+                            &format!(
+                                "[image downscaled: {} {}x{} ({} base64 bytes) exceeded the remaining tool-result budget; delivered as {} {}x{}. The original is unchanged at its source.]",
+                                short(&i.mime_type),
+                                fit.source_width,
+                                fit.source_height,
+                                i.data.len(),
+                                DOWNSCALED_MIME,
+                                fit.width,
+                                fit.height
+                            ),
+                        );
+                    }
+                    None => append(
                         &mut text,
                         &format!(
                             "[image elided: {}, {} base64 bytes exceeds remaining tool-result budget]",
                             short(&i.mime_type),
                             i.data.len()
                         ),
-                    );
+                    ),
                 }
             }
             RawContent::Audio(a) => append(
@@ -1116,8 +1248,82 @@ mod content_tests {
 
     #[test]
     fn tool_result_content_elides_images_over_budget() {
+        // Not decodable as an image: nothing to shrink, so the marker stands.
         let blocks = vec![Content::image("a".repeat(300), "image/png")];
         let out = tool_result_content(&blocks, 256, 256);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], ToolResultContent::Text(t) if t.contains("image elided")));
+    }
+
+    /// Incompressible noise PNG, base64-encoded, so its size is predictable.
+    fn noise_png_base64(width: u32, height: u32) -> String {
+        use base64::Engine as _;
+        let mut img = image::RgbImage::new(width, height);
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for px in img.pixels_mut() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            *px = image::Rgb([
+                (seed & 0xff) as u8,
+                ((seed >> 8) & 0xff) as u8,
+                ((seed >> 16) & 0xff) as u8,
+            ]);
+        }
+        let mut bytes = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn tool_result_content_downscales_a_real_image_over_budget() {
+        let png = noise_png_base64(640, 480);
+        assert!(
+            png.len() > 400 * 1024,
+            "noise png is {} b64 bytes",
+            png.len()
+        );
+        let budget = 96 * 1024;
+        let blocks = vec![
+            Content::text("before"),
+            Content::image(png.clone(), "image/png"),
+        ];
+        let out = tool_result_content(&blocks, budget, budget);
+        assert_eq!(out.len(), 3, "text, downscaled image, note: {out:?}");
+        let ToolResultContent::Image { data, mime_type } = &out[1] else {
+            panic!("expected a downscaled image, got {:?}", out[1]);
+        };
+        assert_eq!(mime_type, "image/jpeg");
+        assert!(data.len() < png.len());
+        let total: usize = out
+            .iter()
+            .map(|c| match c {
+                ToolResultContent::Text(t) => t.len(),
+                ToolResultContent::Image { data, mime_type } => data.len() + mime_type.len(),
+            })
+            .sum();
+        assert!(total <= budget, "assembled {total} > budget {budget}");
+        let ToolResultContent::Text(note) = &out[2] else {
+            panic!("expected the downscale note, got {:?}", out[2]);
+        };
+        assert!(
+            note.contains("image downscaled: image/png 640x480"),
+            "{note}"
+        );
+        assert!(note.contains("delivered as image/jpeg"), "{note}");
+        assert!(note.contains("original is unchanged"), "{note}");
+    }
+
+    #[test]
+    fn tool_result_content_elides_when_no_downscale_fits() {
+        let png = noise_png_base64(64, 64);
+        let blocks = vec![Content::image(png, "image/png")];
+        // Smaller than any JPEG the minimum edge produces.
+        let out = tool_result_content(&blocks, 600, 600);
         assert_eq!(out.len(), 1);
         assert!(matches!(&out[0], ToolResultContent::Text(t) if t.contains("image elided")));
     }

@@ -7,6 +7,7 @@ import {
   registerMediaCommands,
   sniffImageMime,
   uploadBrowserMedia,
+  uploadSizeLimitMessage,
 } from "./mediaUpload.ts";
 import { dispatch, register, resetRegistryForTests } from "./registry.ts";
 import { listen } from "./shims/event.ts";
@@ -110,6 +111,42 @@ test("browser upload falls back only when the standard endpoint is absent", asyn
 
   await uploadBrowserMedia(Uint8Array.from([5, 6, 7]));
   assert.deepEqual(paths, ["/upload", "/media/upload"]);
+});
+
+test("browser upload reports the relay's real limit on a 413", async () => {
+  installSigner();
+  globalThis.fetch = async () =>
+    Response.json(
+      {
+        error: "file too large: 52428801 bytes (max 52428800 bytes, 50.0 MiB)",
+        size: 52428801,
+        max_bytes: 52428800,
+      },
+      { status: 413 },
+    );
+  await assert.rejects(
+    uploadBrowserMedia(Uint8Array.from([5, 6, 7])),
+    /^Error: File is too large \(50\.0 MiB\)\. This relay accepts up to 50\.0 MiB\.$/,
+  );
+});
+
+test("uploadSizeLimitMessage only rewrites structured 413 bodies", () => {
+  assert.equal(
+    uploadSizeLimitMessage(413, JSON.stringify({ max_bytes: 2147483648 })),
+    "File is too large. This relay accepts up to 2.0 GiB.",
+  );
+  assert.equal(
+    uploadSizeLimitMessage(
+      413,
+      JSON.stringify({ error: "image dimensions too large" }),
+    ),
+    "File is too large. image dimensions too large",
+  );
+  assert.equal(uploadSizeLimitMessage(413, "<html>proxy</html>"), undefined);
+  assert.equal(
+    uploadSizeLimitMessage(422, JSON.stringify({ max_bytes: 1 })),
+    undefined,
+  );
 });
 
 test("browser upload rejects a descriptor not bound to the signed bytes", async () => {
