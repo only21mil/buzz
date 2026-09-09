@@ -21,3 +21,5 @@ python3 scripts/test-protected-ci-reuse.py
 bash scripts/test-ci-path-filter-contract.sh
 bash scripts/test-relay-e2e-canary-contract.sh
 python3 scripts/test-populate-ci-promotion-relay-origin.py
+python3 scripts/test-ci-workflow-inventory.py
+python3 scripts/ci-workflow-inventory.py --offline --check

@@ -1,0 +1,9 @@
+{
+  "source": "/repos/only21mil/buzz/rules/branches/main",
+  "repository": "only21mil/buzz",
+  "fetched_at": "2026-09-08T00:00:00+00:00",
+  "checks": [
+    {"context": "Lint", "integration_id": 15368},
+    {"context": "Mac Build", "integration_id": 15368}
+  ]
+}

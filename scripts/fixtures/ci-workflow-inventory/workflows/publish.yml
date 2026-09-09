@@ -1,0 +1,33 @@
+name: Publish
+on:
+  push:
+    tags: ['thing-v[0-9]*']
+  workflow_dispatch:
+    inputs:
+      version:
+        required: true
+permissions: {}
+jobs:
+  image:
+    name: Image (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    if: github.repository == 'block/buzz'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    environment: production
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - run: echo "${{ secrets.GITHUB_TOKEN }}"
+  windows:
+    runs-on: windows-latest
+    if: ${{ false }}
+    steps:
+      - run: echo "${{ secrets.SIGNING_KEY }}"
