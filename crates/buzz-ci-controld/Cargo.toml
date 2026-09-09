@@ -32,7 +32,7 @@ url = { workspace = true }
 uuid = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.31", default-features = false, features = ["fs", "poll", "socket", "user"] }
+nix = { version = "0.31", default-features = false, features = ["fs", "poll", "process", "signal", "socket", "user"] }
 
 [dev-dependencies]
 buzz-ci-acceptance-ctl = { path = "../buzz-ci-acceptance-ctl", features = ["test-support"] }

@@ -1467,7 +1467,8 @@ CREATE TABLE ci_run_events (
     event_id BYTEA NOT NULL CHECK (octet_length(event_id) = 32),
     event_created_at TIMESTAMPTZ NOT NULL,
     request_event_id BYTEA NOT NULL CHECK (octet_length(request_event_id) = 32),
-    event_kind INTEGER NOT NULL CHECK (event_kind BETWEEN 46100 AND 46106),
+    event_kind INTEGER NOT NULL
+        CHECK (event_kind BETWEEN 46100 AND 46106 OR event_kind = 46108),
     attempt INTEGER NOT NULL CHECK (attempt > 0),
     job_id TEXT CHECK (job_id IS NULL OR octet_length(job_id) BETWEEN 1 AND 64),
     status_state TEXT CHECK (status_state IS NULL OR status_state IN (
@@ -1493,7 +1494,7 @@ CREATE TABLE ci_run_events (
             AND sequence IS NOT NULL)
         OR (event_kind IN (46103, 46104) AND job_id IS NOT NULL
             AND status_state IS NULL AND sequence IS NULL)
-        OR (event_kind IN (46105, 46106) AND job_id IS NULL
+        OR (event_kind IN (46105, 46106, 46108) AND job_id IS NULL
             AND status_state IS NULL AND sequence IS NULL)
     )
 );
@@ -1516,6 +1517,9 @@ CREATE UNIQUE INDEX idx_ci_run_events_evidence_finalized
 CREATE UNIQUE INDEX idx_ci_run_events_teardown_attestation
     ON ci_run_events (community_id, run_id)
     WHERE event_kind = 46106;
+CREATE UNIQUE INDEX idx_ci_run_events_check
+    ON ci_run_events (community_id, request_event_id)
+    WHERE event_kind = 46108;
 CREATE INDEX idx_ci_run_events_request
     ON ci_run_events (community_id, request_event_id, watch_cursor);
 

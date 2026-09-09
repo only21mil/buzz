@@ -1127,6 +1127,65 @@ mod tests {
         }
     }
 
+    /// Spine B4 cancellation proof on a real process: the supervised job is
+    /// `sh -c 'sleep 300 & exec sleep 300'` in its own process group, exactly
+    /// as production launches Act. One valid cancel frame must leave the
+    /// whole group answering ESRCH before the executor reports `exited`.
+    #[test]
+    fn cancel_frame_kills_a_real_process_group_before_reporting_exited() {
+        let fixture = ordinary_fixture();
+        let binding = fixture
+            .plan
+            .binding
+            .clone()
+            .validate_phase1(&fixture.plan.validation.context())
+            .unwrap();
+        let descriptor = launch_descriptor(&fixture, &binding);
+        let (mut service, mut peer) = UnixStream::pair().unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 300 & exec sleep 300"])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let group = Pid::from_raw(child.id() as i32);
+        let descriptor_for_service = descriptor.clone();
+        let worker = thread::spawn(move || {
+            let result = supervise_launched_child(
+                &mut service,
+                &descriptor_for_service,
+                &mut child,
+                &mut SystemProcessGroup,
+                Instant::now() + Duration::from_secs(60),
+                CleanupPolicy {
+                    term_grace: Duration::from_millis(200),
+                    kill_grace: Duration::from_secs(2),
+                    poll_interval: Duration::from_millis(5),
+                },
+            );
+            (result, child.try_wait().ok().flatten().is_some())
+        });
+        let _: ExecutorResponse = read_frame(&mut peer, EXECUTOR_RESPONSE_KIND).unwrap();
+        assert_eq!(kill(Pid::from_raw(-group.as_raw()), None), Ok(()));
+        let cancel = CancelRequest {
+            request_id: descriptor.request_id,
+            identity_digest: descriptor.identity_digest().unwrap(),
+        };
+        write_frame(&mut peer, EXECUTOR_CANCEL_KIND, &cancel).unwrap();
+        let exited: ExecutorResponse = read_frame(&mut peer, EXECUTOR_RESPONSE_KIND).unwrap();
+        assert_eq!(exited.status, "exited");
+        assert_eq!(
+            kill(Pid::from_raw(-group.as_raw()), None),
+            Err(Errno::ESRCH),
+            "every process in the job group is gone when exited is reported"
+        );
+        let (result, reaped) = worker.join().unwrap();
+        assert_eq!(result, Ok(()));
+        assert!(reaped, "the child was reaped, not left as a zombie");
+    }
+
     #[test]
     fn unprovable_kill_fails_the_service_closed() {
         let fixture = ordinary_fixture();

@@ -5,10 +5,10 @@ use std::sync::{mpsc::Receiver, mpsc::Sender, Arc, Mutex};
 use std::time::Duration;
 
 use buzz_ci_broker_protocol::v2::{
-    self, AttemptEvidenceCoordinates, DescribeAttemptEvidenceRequest, EvidenceDescriptor,
-    EvidenceKind, ReadAttemptEvidenceRequest, WireText64,
+    self, AttemptEvidenceCoordinates, CancelAttemptRequest, DescribeAttemptEvidenceRequest,
+    EvidenceDescriptor, EvidenceKind, ReadAttemptEvidenceRequest, WireText64,
 };
-use buzz_ci_broker_protocol::{Conclusion, ResponseCode};
+use buzz_ci_broker_protocol::{BrokerState, CancelReason, Conclusion, ResponseCode};
 use buzz_core::ci::{
     CiJobState, CiTeardownAttestationEnvelope, CiTeardownLease, CI_SCHEMA_VERSION,
 };
@@ -18,17 +18,40 @@ use thiserror::Error;
 
 use crate::production::{
     AcceptedRequest, ArtifactCompletion, AttemptCompletion, AttemptExecutor, EvidenceReader,
-    JobCompletion, JobMetadata, OutputDescriptor,
+    JobCompletion, JobMetadata, OutputDescriptor, WatchDecision,
 };
 use crate::runner_v2::{
-    live_bound_now, prepare_signed_admission, AdmissionSigner, BoundAttempt, RunnerV2Client,
-    RunnerV2Error, RunnerV2Transport, StaticAdmissionBindings, TerminalAttempt,
+    live_bound_now, prepare_signed_admission, validate_bound_response, AdmissionSigner,
+    BoundAttempt, RunnerV2Client, RunnerV2Error, RunnerV2Transport, StaticAdmissionBindings,
+    TerminalAttempt,
 };
 
 const MAX_EVIDENCE_ITEM_BYTES: u32 = 16 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES: u32 = 32 * 1024;
 const DESCRIPTOR_SET_DOMAIN: &[u8] = b"buzz-ci-execd:evidence-descriptor-set:v2\0";
 const ARTIFACT_RECEIPT_SET_DOMAIN: &[u8] = b"buzz-ci-execd:artifact-receipt-set:v1\0";
+const CANCEL_DIGEST_DOMAIN: &[u8] = b"buzz-ci-controld:attempt-cancel:v1\0";
+/// How long past the attempt's wall deadline controld keeps reconciling for
+/// execd's own terminal record before the attempt is an infrastructure
+/// failure. execd judges the same deadline and stops the job itself; the
+/// grace covers clock skew between the two judgements.
+const DEADLINE_GRACE: Duration = Duration::from_secs(10);
+
+/// Why controld stopped reconciling an attempt as still running.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StopCause {
+    /// execd reported the terminal state on its own.
+    Natural,
+    /// A cancel command or a supersession decision stopped the job.
+    Cancelled { reason: String },
+    /// The wall-clock deadline passed while the job was still running.
+    Deadline,
+}
+
+/// Reason string recorded on a job stopped by its wall deadline.
+pub const WALL_DEADLINE_REASON: &str = "wall_deadline_exceeded";
+/// Reason string recorded on a job stopped by an operator cancel command.
+pub const USER_CANCEL_REASON: &str = "cancelled_by_request";
 
 /// Sanitized bridge failure. No output bytes or provider details are exposed.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -70,7 +93,11 @@ pub struct VerifiedArtifactEvidence {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttemptCommand {
+    /// Release the acceptance gate and let the attempt run to terminal.
     Continue,
+    /// Stop the running job: controld sends one exact broker cancellation and
+    /// reconciles the binding to its cancelled terminal state.
+    Cancel,
 }
 
 /// Optional acceptance-only observation and release channels. Production
@@ -151,6 +178,14 @@ where
     type Error = ProductionV2Error;
 
     fn execute(&mut self, accepted: &AcceptedRequest) -> Result<AttemptCompletion, Self::Error> {
+        self.execute_watched(accepted, &mut || WatchDecision::Continue)
+    }
+
+    fn execute_watched(
+        &mut self,
+        accepted: &AcceptedRequest,
+        watch: &mut dyn FnMut() -> WatchDecision,
+    ) -> Result<AttemptCompletion, Self::Error> {
         let admission = prepare_signed_admission(accepted, &self.bindings, &mut self.signer)
             .map_err(|_| ProductionV2Error::Runner)?;
         let mut session = self.session.lock().map_err(|_| ProductionV2Error::Runner)?;
@@ -163,15 +198,13 @@ where
             .client
             .admit(admission)
             .map_err(|_| ProductionV2Error::Runner)?;
-        if bound.response.broker_state != buzz_ci_broker_protocol::BrokerState::Terminal {
+        let mut pending = None;
+        if bound.response.broker_state != BrokerState::Terminal {
             self.observe(AttemptObservation::Active(bound))?;
             let deadline_at = bound.deadline_at().map_err(|_| ProductionV2Error::Runner)?;
-            self.await_command(deadline_at)?;
+            pending = self.await_command(deadline_at)?;
         }
-        let terminal = session
-            .client
-            .wait_terminal(bound, self.poll_interval)
-            .map_err(|_| ProductionV2Error::Runner)?;
+        let (terminal, cause) = self.reconcile(&mut session.client, bound, pending, watch)?;
         self.observe(AttemptObservation::Terminal(terminal))?;
         let coordinates = terminal
             .evidence_coordinates(accepted, &self.job.job_id)
@@ -266,7 +299,20 @@ where
             byte_length: output.len() as u64,
         };
         cache_verified(&mut session.verified, output_digest, output)?;
-        let state = job_state(terminal.response.conclusion)?;
+        let (state, reason) = match &cause {
+            StopCause::Natural => (
+                job_state(terminal.response.conclusion)?,
+                terminal_reason(terminal.response.conclusion),
+            ),
+            StopCause::Cancelled { reason } => {
+                job_state(terminal.response.conclusion)?;
+                (CiJobState::Cancelled, Some(reason.clone()))
+            }
+            StopCause::Deadline => {
+                job_state(terminal.response.conclusion)?;
+                (CiJobState::TimedOut, Some(WALL_DEADLINE_REASON.to_owned()))
+            }
+        };
         let lease_id = hex::encode(teardown_descriptor.teardown_lease_id);
         let teardown = CiTeardownAttestationEnvelope {
             schema_version: CI_SCHEMA_VERSION,
@@ -292,7 +338,7 @@ where
                 metadata: self.job.clone(),
                 attempt: accepted.envelope.attempt,
                 state,
-                reason: terminal_reason(terminal.response.conclusion),
+                reason,
                 started_at: terminal.response.accepted_at,
                 finished_at: terminal.response.updated_at,
                 log: output_descriptor,
@@ -362,9 +408,9 @@ impl<T, S> RunnerV2AttemptExecutor<T, S> {
     /// its deadline (admission time plus the bounded window) passes. The
     /// deadline is a live bound on the host clock (`live_bound_now`), never
     /// the package-bound window.
-    fn await_command(&self, deadline_at: u64) -> Result<(), ProductionV2Error> {
+    fn await_command(&self, deadline_at: u64) -> Result<Option<StopCause>, ProductionV2Error> {
         let Some(receiver) = &self.control.command else {
-            return Ok(());
+            return Ok(None);
         };
         let now = live_bound_now().map_err(|_| ProductionV2Error::Runner)?;
         let timeout = deadline_at
@@ -373,9 +419,137 @@ impl<T, S> RunnerV2AttemptExecutor<T, S> {
             .map(Duration::from_secs)
             .ok_or(ProductionV2Error::Runner)?;
         match receiver.recv_timeout(timeout) {
-            Ok(AttemptCommand::Continue) => Ok(()),
+            Ok(AttemptCommand::Continue) => Ok(None),
+            Ok(AttemptCommand::Cancel) => Ok(Some(StopCause::Cancelled {
+                reason: USER_CANCEL_REASON.to_owned(),
+            })),
             Err(_) => Err(ProductionV2Error::Runner),
         }
+    }
+
+    /// Reconcile one admitted binding to its terminal state.
+    ///
+    /// Between broker reads the loop takes exactly one stop decision, in this
+    /// order: a queued `AttemptCommand::Cancel`, the caller's watch (which
+    /// carries supersession by a newer same-group request), then the wall
+    /// deadline. A decision sends one broker cancellation and the loop keeps
+    /// reading until execd records the terminal binding, so a stop is proven
+    /// by the runner's terminal state and never by a local flag. Past the
+    /// deadline plus grace with no terminal state the attempt is an
+    /// infrastructure failure.
+    fn reconcile<U: RunnerV2Transport>(
+        &self,
+        client: &mut RunnerV2Client<U>,
+        bound: BoundAttempt,
+        pending: Option<StopCause>,
+        watch: &mut dyn FnMut() -> WatchDecision,
+    ) -> Result<(TerminalAttempt, StopCause), ProductionV2Error> {
+        let deadline_at = bound.deadline_at().map_err(|_| ProductionV2Error::Runner)?;
+        let grace_at = deadline_at.saturating_add(DEADLINE_GRACE.as_secs());
+        let mut current = bound;
+        let mut stop: Option<StopCause> = None;
+        let mut pending = pending;
+        loop {
+            if current.response.broker_state == BrokerState::Terminal {
+                return Ok((
+                    TerminalAttempt {
+                        admission: current.admission,
+                        response: current.response,
+                    },
+                    stop.unwrap_or(StopCause::Natural),
+                ));
+            }
+            let now = live_bound_now().map_err(|_| ProductionV2Error::Runner)?;
+            if stop.is_none() {
+                let decision = pending
+                    .take()
+                    .or_else(|| self.stop_decision(now, deadline_at, watch));
+                if let Some(cause) = decision {
+                    let reason = match cause {
+                        StopCause::Deadline => CancelReason::SignedPolicy,
+                        _ => CancelReason::UserRequest,
+                    };
+                    if let Some(response) = self.send_cancel(client, current, reason)? {
+                        current.response = response;
+                    }
+                    stop = Some(cause);
+                    continue;
+                }
+            }
+            if now >= grace_at {
+                return Err(ProductionV2Error::Runner);
+            }
+            let remaining = Duration::from_secs(grace_at - now);
+            std::thread::sleep(self.poll_interval.min(remaining));
+            current = client
+                .poll_attempt(current)
+                .map_err(|_| ProductionV2Error::Runner)?;
+        }
+    }
+
+    fn stop_decision(
+        &self,
+        now: u64,
+        deadline_at: u64,
+        watch: &mut dyn FnMut() -> WatchDecision,
+    ) -> Option<StopCause> {
+        if let Some(receiver) = &self.control.command {
+            if let Ok(AttemptCommand::Cancel) = receiver.try_recv() {
+                return Some(StopCause::Cancelled {
+                    reason: USER_CANCEL_REASON.to_owned(),
+                });
+            }
+        }
+        if let WatchDecision::Cancel(reason) = watch() {
+            return Some(StopCause::Cancelled { reason });
+        }
+        if now >= deadline_at {
+            return Some(StopCause::Deadline);
+        }
+        None
+    }
+
+    /// Send one exact cancellation. A terminal answer (`Ok` or `Existing`)
+    /// is validated against the admitted binding and adopted; a refusal such
+    /// as `NotFound` when execd is already expiring the lease itself leaves
+    /// the loop reading for execd's own terminal record.
+    fn send_cancel<U: RunnerV2Transport>(
+        &self,
+        client: &mut RunnerV2Client<U>,
+        active: BoundAttempt,
+        reason: CancelReason,
+    ) -> Result<Option<v2::BrokerResponse>, ProductionV2Error> {
+        let mut cancel = CancelAttemptRequest {
+            attempt_id: active.response.attempt_id,
+            execution_binding_digest: active.response.execution_binding_digest,
+            actor_pubkey: active.admission.actor_pubkey,
+            cancel_digest: [0; 32],
+            issued_at: active.admission.issued_at,
+            expires_at: active.admission.expires_at,
+            expected_generation: active.response.generation,
+            reason,
+        };
+        cancel.cancel_digest = Sha256::new()
+            .chain_update(CANCEL_DIGEST_DOMAIN)
+            .chain_update(cancel.attempt_id)
+            .chain_update(cancel.execution_binding_digest)
+            .chain_update((reason as u16).to_be_bytes())
+            .finalize()
+            .into();
+        let response = client
+            .cancel(cancel)
+            .map_err(|_| ProductionV2Error::Runner)?;
+        if !matches!(response.code, ResponseCode::Ok | ResponseCode::Existing) {
+            return Ok(None);
+        }
+        validate_bound_response(active.admission, response)
+            .map_err(|_| ProductionV2Error::Runner)?;
+        if response.attempt_id != active.response.attempt_id
+            || response.execution_binding_digest != active.response.execution_binding_digest
+        {
+            return Err(ProductionV2Error::Runner);
+        }
+        Ok(Some(response))
     }
 }
 
@@ -897,5 +1071,162 @@ mod tests {
             validate_description(cancelled, foreign).map(|_| ()),
             Err(ProductionV2Error::Evidence)
         );
+    }
+
+    mod process_tests {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        use buzz_ci_broker_protocol::CancelReason;
+        use buzz_core::ci::CiJobState;
+
+        use super::super::*;
+        use crate::test_broker::{
+            accepted, bindings, job_metadata, process_group_alive, ProcessBroker, Signer,
+        };
+
+        const RELAY_SIGNER: &str =
+            "7777777777777777777777777777777777777777777777777777777777777777";
+
+        fn executor(
+            broker: &ProcessBroker,
+            control: AttemptControl,
+        ) -> RunnerV2AttemptExecutor<ProcessBroker, Signer> {
+            let client = RunnerV2Client::new(broker.clone(), 1).unwrap();
+            let (executor, _) = compose_runner_v2(
+                client,
+                Signer,
+                bindings(),
+                job_metadata(),
+                RELAY_SIGNER.into(),
+                Duration::from_millis(50),
+                control,
+            )
+            .unwrap();
+            executor
+        }
+
+        fn wait_until(predicate: impl Fn() -> bool, what: &str) {
+            for _ in 0..600 {
+                if predicate() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("timed out waiting for {what}");
+        }
+
+        /// Behaviour (a): a cancel command stops the running job and the
+        /// attempt records a cancelled terminal state. The job is a real
+        /// process group; the assertion is the kernel's ESRCH, not a flag.
+        #[test]
+        fn cancel_command_kills_the_running_job_process_group_and_records_cancelled() {
+            let broker = ProcessBroker::default();
+            let (observer, observations) = mpsc::channel();
+            let (commands, command_receiver) = mpsc::channel();
+            let mut executor = executor(
+                &broker,
+                AttemptControl {
+                    observer: Some(observer),
+                    command: Some(command_receiver),
+                },
+            );
+            let request = accepted(0x11, 0x21, 7, "feature", 30);
+            let worker = thread::spawn(move || executor.execute(&request));
+
+            let observed = observations
+                .recv_timeout(Duration::from_secs(5))
+                .expect("active observation");
+            assert!(matches!(observed, AttemptObservation::Active(_)));
+            let group = broker.process_group();
+            assert!(process_group_alive(group), "the job runs before cancel");
+            commands.send(AttemptCommand::Continue).unwrap();
+            thread::sleep(Duration::from_millis(120));
+            assert!(
+                process_group_alive(group),
+                "the job keeps running until cancelled"
+            );
+
+            commands.send(AttemptCommand::Cancel).unwrap();
+            let completion = worker.join().unwrap().expect("cancelled completion");
+
+            assert!(!process_group_alive(group), "the job process group is gone");
+            assert_eq!(broker.cancels(), vec![CancelReason::UserRequest]);
+            assert_eq!(completion.jobs[0].state, CiJobState::Cancelled);
+            assert_eq!(
+                completion.jobs[0].reason.as_deref(),
+                Some(USER_CANCEL_REASON)
+            );
+            assert!(completion.jobs[0].finished_at >= completion.jobs[0].started_at);
+            assert!(matches!(
+                observations.recv_timeout(Duration::from_secs(1)),
+                Ok(AttemptObservation::Terminal(terminal))
+                    if terminal.response.conclusion == Conclusion::Cancelled
+            ));
+        }
+
+        /// Behaviour (b): the per-job wall deadline stops a job that would
+        /// run for ever and records `timed_out`, not an infrastructure
+        /// failure. The broker here never expires the lease itself, the
+        /// worst case for controld.
+        #[test]
+        fn wall_deadline_stops_the_job_and_records_timed_out() {
+            let broker = ProcessBroker::default();
+            let mut executor = executor(
+                &broker,
+                AttemptControl {
+                    observer: None,
+                    command: None,
+                },
+            );
+            let request = accepted(0x12, 0x22, 7, "feature", 1);
+            let started = std::time::Instant::now();
+            let completion = executor.execute(&request).expect("timed out completion");
+
+            let group = broker.process_group();
+            assert!(!process_group_alive(group), "the job process group is gone");
+            assert!(started.elapsed() < DEADLINE_GRACE);
+            assert_eq!(broker.cancels(), vec![CancelReason::SignedPolicy]);
+            assert_eq!(completion.jobs[0].state, CiJobState::TimedOut);
+            assert_eq!(
+                completion.jobs[0].reason.as_deref(),
+                Some(WALL_DEADLINE_REASON)
+            );
+        }
+
+        /// The watch seam stops a job the same way a command does; the
+        /// production handler uses it for concurrency supersession.
+        #[test]
+        fn watch_cancel_stops_the_job_with_the_given_reason() {
+            let broker = ProcessBroker::default();
+            let mut executor = executor(
+                &broker,
+                AttemptControl {
+                    observer: None,
+                    command: None,
+                },
+            );
+            let request = accepted(0x13, 0x23, 7, "feature", 30);
+            let probe = broker.clone();
+            let mut ticks = 0;
+            let completion = executor
+                .execute_watched(&request, &mut || {
+                    ticks += 1;
+                    if ticks >= 3 && probe.is_active() {
+                        WatchDecision::Cancel("superseded".into())
+                    } else {
+                        WatchDecision::Continue
+                    }
+                })
+                .expect("cancelled completion");
+            assert!(!process_group_alive(broker.process_group()));
+            assert_eq!(completion.jobs[0].state, CiJobState::Cancelled);
+            assert_eq!(completion.jobs[0].reason.as_deref(), Some("superseded"));
+            wait_until(
+                || !process_group_alive(broker.process_group()),
+                "group exit",
+            );
+        }
     }
 }

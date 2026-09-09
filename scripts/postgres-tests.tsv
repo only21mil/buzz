@@ -332,7 +332,10 @@ buzz-relay	buzz_relay	workflow_resume::tests::thread_effect_recovery_uses_pinned
 buzz-relay	buzz_relay	workflow_sink::integration_tests::claimed_effect_recovery_precedes_archived_channel_validation	crates/buzz-relay/src/workflow_sink.rs	desired	desired schema fixture
 buzz-relay	buzz_relay	workflow_sink::integration_tests::pinned_thread_replays_identical_event_after_parent_and_channel_changes	crates/buzz-relay/src/workflow_sink.rs	desired	desired schema fixture
 buzz-relay	buzz_relay	workflow_sink::integration_tests::workflow_send_message_p_tags_mentioned_member	crates/buzz-relay/src/workflow_sink.rs	desired	desired schema fixture
+buzz-relay	ci_ingest_storage	a_second_check_for_the_same_request_is_refused_unless_identical	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
 buzz-relay	ci_ingest_storage	a_successful_selected_parent_rejects_rerun_without_storage_side_effects	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
+buzz-relay	ci_ingest_storage	check_conclusion_and_reason_must_agree_with_the_stored_terminal_run_status	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
+buzz-relay	ci_ingest_storage	check_references_must_resolve_to_stored_events_of_the_same_request	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
 buzz-relay	ci_ingest_storage	either_terminal_fact_seals_reruns_with_full_transaction_rollback	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
 buzz-relay	ci_ingest_storage	request_and_status_chain_round_trip_into_reducer	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
 buzz-relay	ci_ingest_storage	rerun_final_facts_bind_only_the_final_request_and_selected_graph	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database

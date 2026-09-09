@@ -4,7 +4,7 @@ use buzz_core::{
         request_tags, run_status_tags, teardown_attestation_tags, validate_artifact_reference_tags,
         validate_evidence_finalized_tags, validate_job_status_tags, validate_log_reference_tags,
         validate_request_tags, validate_run_status_tags, validate_signed_ci_event,
-        validate_teardown_attestation_tags, CiArtifactReferenceEnvelope,
+        validate_teardown_attestation_tags, CiArtifactReferenceEnvelope, CiConcurrencyGroup,
         CiEvidenceFinalizedEnvelope, CiFinalizedJobAttempt, CiJobState, CiJobStatusEnvelope,
         CiLogReferenceEnvelope, CiRequestEnvelope, CiRequestType, CiRunState, CiRunStatusEnvelope,
         CiSkipPolicy, CiTeardownAttestationEnvelope, CiTeardownLease, ValidatedCiEnvelope,
@@ -241,6 +241,39 @@ fn closed_states_use_the_frozen_wire_names() {
         "\"allow\""
     );
     assert!(serde_json::from_str::<CiSkipPolicy>("\"unknown\"").is_err());
+}
+
+#[test]
+fn concurrency_group_is_per_pull_request_and_repository_not_per_branch_name() {
+    let request = valid_run_request();
+    let group = CiConcurrencyGroup::of(&request);
+    assert!(group.cancel_in_progress);
+    assert_eq!(
+        group.key,
+        format!(
+            "ci-{}-{}-{}-{}",
+            request.workflow_id,
+            request.target_repo_a,
+            request.pr_root_event_id,
+            request.source_branch
+        )
+    );
+
+    // A newer request for the same pull request shares the group.
+    let mut same_pr = request.clone();
+    same_pr.run_id = "018f47a2-4ce1-7c08-b8f3-5b6df7f9dd46".into();
+    same_pr.tip_oid = "f".repeat(40);
+    assert_eq!(CiConcurrencyGroup::of(&same_pr).key, group.key);
+
+    // Another pull request pushing the same branch name is a different group,
+    // as is the same branch name in another repository on the channel.
+    let mut other_pr = request.clone();
+    other_pr.pr_root_event_id = "9".repeat(64);
+    other_pr.trigger_event_id = "9".repeat(64);
+    assert_ne!(CiConcurrencyGroup::of(&other_pr).key, group.key);
+    let mut other_repo = request.clone();
+    other_repo.target_repo_a = format!("30617:{}:fork", "2".repeat(64));
+    assert_ne!(CiConcurrencyGroup::of(&other_repo).key, group.key);
 }
 
 #[test]

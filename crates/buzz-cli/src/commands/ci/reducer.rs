@@ -6,9 +6,9 @@
 //! terminal-success rule is defined by relay acceptance order.
 
 use buzz_core::ci::{
-    CiArtifactReferenceEnvelope, CiEvidenceFinalizedEnvelope, CiJobState, CiJobStatusEnvelope,
-    CiLogReferenceEnvelope, CiRequestEnvelope, CiRequestType, CiRunState, CiRunStatusEnvelope,
-    CiSkipPolicy, CiTeardownAttestationEnvelope, ValidatedCiEnvelope,
+    CiArtifactReferenceEnvelope, CiCheckEnvelope, CiEvidenceFinalizedEnvelope, CiJobState,
+    CiJobStatusEnvelope, CiLogReferenceEnvelope, CiRequestEnvelope, CiRequestType, CiRunState,
+    CiRunStatusEnvelope, CiSkipPolicy, CiTeardownAttestationEnvelope, ValidatedCiEnvelope,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -52,6 +52,22 @@ pub struct CiReducedJob {
     pub attempt: u32,
 }
 
+/// The kind-46108 terminal check published for the run's final request.
+///
+/// It is reported, never trusted on its own: the reducer requires it to name
+/// the terminal run status it summarises and to agree with that status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CiReducedCheck {
+    pub event_id: String,
+    pub attempt: u32,
+    pub conclusion: CiRunState,
+    pub sha: String,
+    pub run_status_event_id: String,
+    pub published_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// Deterministic state returned by the reducer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CiReduction {
@@ -65,6 +81,8 @@ pub struct CiReduction {
     pub required_failing: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Terminal check for the final request, once one is accepted.
+    pub check: Option<CiReducedCheck>,
 }
 
 /// A refusal that is separate from the reduced run state.
@@ -154,6 +172,7 @@ fn reduce_checked(
         HashMap::new();
     let mut evidence_facts: Vec<(&AcceptedCiEnvelope, &CiEvidenceFinalizedEnvelope)> = Vec::new();
     let mut teardown_facts: Vec<(&AcceptedCiEnvelope, &CiTeardownAttestationEnvelope)> = Vec::new();
+    let mut checks: Vec<(&AcceptedCiEnvelope, &CiCheckEnvelope)> = Vec::new();
     let mut seen_ids: HashMap<&str, &AcceptedCiEnvelope> = HashMap::new();
     let mut seen_cursors: HashMap<u64, &str> = HashMap::new();
 
@@ -322,6 +341,16 @@ fn reduce_checked(
                     return Err("teardown immutable coordinates differ from the request".into());
                 }
                 teardown_facts.push((event, fact));
+            }
+            ValidatedCiEnvelope::Check(check) => {
+                check
+                    .validate()
+                    .map_err(|error| format!("invalid terminal check: {error}"))?;
+                let bound = bound_request(&requests, event, &check.request_event_id)?;
+                check
+                    .validate_context(&check.request_event_id, bound)
+                    .map_err(|error| format!("terminal check provenance mismatch: {error}"))?;
+                checks.push((event, check));
             }
         }
     }
@@ -495,6 +524,7 @@ fn reduce_checked(
         .1;
     let current_run = latest_runs.get(final_request_id).copied();
     let current_terminal = current_run.is_some_and(|(_, run)| run.state.is_terminal());
+    let selected_check = select_check(&checks, final_request_id, current_run)?;
 
     let mut jobs = Vec::with_capacity(request.job_ids.len());
     let mut jobs_terminal = 0;
@@ -530,6 +560,7 @@ fn reduce_checked(
         jobs_total: request.job_ids.len(),
         required_failing: required_failing.clone(),
         reason,
+        check: selected_check.clone(),
     };
 
     if let Some((_, run)) = current_run {
@@ -703,6 +734,60 @@ fn reduce_checked(
     }
 
     Ok(base(CiReducedState::Green, None))
+}
+
+/// Select the terminal check for the final request. The latest attempt
+/// decides: checks for earlier requests are history, not verdict. A check
+/// must name the accepted terminal run status it summarises, follow it in
+/// acceptance order, and carry the same conclusion; two different checks for
+/// one request are equivocation.
+fn select_check(
+    checks: &[(&AcceptedCiEnvelope, &CiCheckEnvelope)],
+    final_request_id: &str,
+    current_run: Option<RunEvent<'_>>,
+) -> Result<Option<CiReducedCheck>, String> {
+    let mut selected: Option<(&AcceptedCiEnvelope, &CiCheckEnvelope)> = None;
+    for (event, check) in checks {
+        if check.request_event_id != final_request_id {
+            continue;
+        }
+        if let Some((previous, _)) = selected {
+            if previous.event_id != event.event_id {
+                return Err(format!(
+                    "terminal checks {} and {} both claim request {final_request_id}",
+                    previous.event_id, event.event_id
+                ));
+            }
+        }
+        selected = Some((event, check));
+    }
+    let Some((event, check)) = selected else {
+        return Ok(None);
+    };
+    let Some((run_event, run)) = current_run else {
+        return Err(format!(
+            "terminal check {} precedes any run status for its request",
+            event.event_id
+        ));
+    };
+    if check.run_status_event_id != run_event.event_id
+        || check.conclusion != run.state
+        || event.watch_cursor <= run_event.watch_cursor
+    {
+        return Err(format!(
+            "terminal check {} contradicts run status {}",
+            event.event_id, run_event.event_id
+        ));
+    }
+    Ok(Some(CiReducedCheck {
+        event_id: event.event_id.clone(),
+        attempt: check.attempt,
+        conclusion: check.conclusion,
+        sha: check.tip_oid.clone(),
+        run_status_event_id: check.run_status_event_id.clone(),
+        published_at: check.published_at,
+        reason: check.reason.clone(),
+    }))
 }
 
 fn bound_request<'a>(
@@ -1125,6 +1210,7 @@ fn infrastructure_reduction(
             ValidatedCiEnvelope::JobStatus(status) => Some(status.attempt),
             ValidatedCiEnvelope::EvidenceFinalized(fact) => Some(fact.attempt),
             ValidatedCiEnvelope::TeardownAttestation(fact) => Some(fact.attempt),
+            ValidatedCiEnvelope::Check(check) => Some(check.attempt),
             _ => None,
         })
         .max()
@@ -1151,6 +1237,7 @@ fn infrastructure_reduction(
         jobs_total: request.job_ids.len(),
         required_failing: Vec::new(),
         reason: Some(reason),
+        check: None,
     }
 }
 
@@ -1511,6 +1598,88 @@ mod tests {
         for (index, event) in events.iter_mut().enumerate() {
             event.watch_cursor = index as u64 + 1;
         }
+    }
+
+    /// A check for the final request, naming the accepted terminal run
+    /// status and agreeing with it, is reported next to the verdict.
+    fn check_for(events: &[AcceptedCiEnvelope], conclusion: CiRunState) -> CiCheckEnvelope {
+        let find = |predicate: &dyn Fn(&ValidatedCiEnvelope) -> bool| {
+            events
+                .iter()
+                .rev()
+                .find(|event| predicate(&event.envelope))
+                .map(|event| event.event_id.clone())
+                .expect("fixture event")
+        };
+        let request = request();
+        let success = conclusion == CiRunState::Success;
+        CiCheckEnvelope {
+            schema_version: CI_SCHEMA_VERSION,
+            request_event_id: id(REQUEST_ID),
+            run_id: request.run_id.clone(),
+            workflow_id: request.workflow_id.clone(),
+            target_repo_a: request.target_repo_a.clone(),
+            tip_oid: request.tip_oid.clone(),
+            base_oid: request.base_oid.clone(),
+            attempt: 1,
+            conclusion,
+            reason: None,
+            run_status_event_id: find(
+                &|envelope| matches!(envelope, ValidatedCiEnvelope::RunStatus(status) if status.state.is_terminal()),
+            ),
+            evidence_finalized_event_id: success.then(|| {
+                find(&|envelope| matches!(envelope, ValidatedCiEnvelope::EvidenceFinalized(_)))
+            }),
+            teardown_attestation_event_id: success.then(|| {
+                find(&|envelope| matches!(envelope, ValidatedCiEnvelope::TeardownAttestation(_)))
+            }),
+            concurrency_group: buzz_core::ci::CiConcurrencyGroup::of(&request).key,
+            published_at: 32,
+            relay_signer: "d".repeat(64),
+        }
+    }
+
+    #[test]
+    fn terminal_check_for_the_final_request_is_reported_with_the_verdict() {
+        let mut events = green_events(1, CiJobState::Success, CiSkipPolicy::Forbid);
+        let check = check_for(&events, CiRunState::Success);
+        let cursor = events.len() as u64 + 1;
+        events.push(accepted(
+            900,
+            cursor,
+            ValidatedCiEnvelope::Check(check.clone()),
+        ));
+
+        let result = reduce(&events);
+        assert_eq!(result.state, CiReducedState::Green, "{result:?}");
+        let reported = result.check.expect("check reported");
+        assert_eq!(reported.event_id, id(900));
+        assert_eq!(reported.attempt, 1);
+        assert_eq!(reported.conclusion, CiRunState::Success);
+        assert_eq!(reported.sha, request().tip_oid);
+        assert_eq!(reported.run_status_event_id, check.run_status_event_id);
+        assert_eq!(reported.published_at, 32);
+
+        let without = reduce(&events[..events.len() - 1]);
+        assert_eq!(without.state, CiReducedState::Green);
+        assert_eq!(without.check, None);
+    }
+
+    #[test]
+    fn terminal_check_contradicting_the_run_status_is_infrastructure_failure() {
+        let mut events = green_events(1, CiJobState::Success, CiSkipPolicy::Forbid);
+        let mut check = check_for(&events, CiRunState::Failure);
+        check.reason = Some("forged".into());
+        let cursor = events.len() as u64 + 1;
+        events.push(accepted(901, cursor, ValidatedCiEnvelope::Check(check)));
+
+        let result = reduce(&events);
+        assert_eq!(result.state, CiReducedState::InfrastructureFailure);
+        assert!(result
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("contradicts run status")));
+        assert_eq!(result.check, None);
     }
 
     #[test]
