@@ -191,9 +191,15 @@ The entrypoint verifies the new helper's exact committed bytes before loading it
   accepts exactly one whose job is a completed success of the same run and
   head with identical `started_at`/`completed_at`; that `n` is recorded as
   `executed_attempt` beside the selected job. A timestamp match against an
-  unsuccessful origin, no match, or two matches refuses. Because a failed
-  execution is always re-executed by the next rerun and gets new timestamps,
-  the selected success can only mirror the last execution of that job.
+  unsuccessful origin, no match, or two matches refuses. Only a success can
+  be retained this way: a retained copy of a failed execution carries
+  `conclusion: failure` and `selected_job` refuses it before any artifact is
+  read, and a re-executed job gets new timestamps and its own artifact. In
+  the receipt, `checks[].source_job_attempt` records the listing attempt of
+  the selected entry, while `jobs[].executed_attempt` records the attempt
+  that executed the job; readers wanting the execution consult `jobs[]`.
+  `protected-ci-reuse.py` applies the same rule to its `ci-reuse-<n>-<job>`
+  artifacts and records `executed_attempt` in its reuse proof.
   Source execution and receipts expire after 24 hours.
 - Immutable source artifacts belong to that CI run and each selected job's
   executed attempt, and their provider archive digests verify. The provider independently

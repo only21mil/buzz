@@ -24,8 +24,10 @@ class FakeAPI:
         self.main = LANDED
         self.job_conclusion = "success"
         self.job_attempt = 1
+        self.job_started = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5)).isoformat()
         self.job_completed = dt.datetime.now(dt.timezone.utc).isoformat()
         self.extra_jobs = []
+        self.extra_artifacts = []
         self.artifacts = True
         self.corrupt_digest = False
         self.archive_extra = False
@@ -49,6 +51,11 @@ class FakeAPI:
             return self.run
         raise AssertionError(endpoint)
 
+    def jobs(self):
+        return [{"id": 80, "name": "Unit Tests", "status": "completed", "conclusion": self.job_conclusion,
+                 "run_id": 100, "head_sha": SOURCE, "run_attempt": self.job_attempt,
+                 "started_at": self.job_started, "completed_at": self.job_completed}] + self.extra_jobs
+
     def archive(self):
         output = io.BytesIO()
         with zipfile.ZipFile(output, "w") as bundle:
@@ -60,6 +67,8 @@ class FakeAPI:
     def raw(self, endpoint):
         if endpoint == reuse.PREFIX + "/actions/artifacts/500/zip":
             return self.archive()
+        if any(endpoint == reuse.PREFIX + f"/actions/artifacts/{item['id']}/zip" for item in self.extra_artifacts):
+            return self.archive()
         raise AssertionError(endpoint)
 
     def pages(self, endpoint, kind):
@@ -69,13 +78,16 @@ class FakeAPI:
         if suffix == f"/actions/workflows/ci.yml/runs?head_sha={SOURCE}&event=pull_request":
             return [self.run]
         if suffix == "/actions/runs/100/artifacts":
-            return [{"id": 500, "name": "ci-reuse-1-unit-tests", "expired": False,
-                     "digest": "sha256:" + ("0" * 64 if self.corrupt_digest else hashlib.sha256(self.archive()).hexdigest())}] if self.artifacts else []
+            return ([{"id": 500, "name": "ci-reuse-1-unit-tests", "expired": False,
+                     "digest": "sha256:" + ("0" * 64 if self.corrupt_digest else hashlib.sha256(self.archive()).hexdigest())}] if self.artifacts else []) + [
+                        {**item, "expired": False, "digest": "sha256:" + hashlib.sha256(self.archive()).hexdigest()} for item in self.extra_artifacts]
         if suffix == f"/commits/{SOURCE}/check-runs?filter=all":
             return [self.check]
         if suffix == "/actions/runs/100/jobs?filter=all":
-            return [{"id": 80, "name": "Unit Tests", "status": "completed", "conclusion": self.job_conclusion,
-                     "run_attempt": self.job_attempt, "completed_at": self.job_completed}] + self.extra_jobs
+            return self.jobs()
+        match = re.fullmatch(r"/actions/runs/100/attempts/([0-9]+)/jobs", suffix)
+        if match:
+            return [job for job in self.jobs() if job.get("run_attempt") == int(match[1])]
         raise AssertionError(endpoint)
 
 
@@ -203,6 +215,63 @@ class ReuseTests(unittest.TestCase):
         self.assertEqual(result["source_run"]["run_attempt"], 2)
         self.assertEqual(result["source_job"]["run_attempt"], 1)
         self.assertEqual(result["source_proof"]["run_attempt"], 1)
+
+    def retain(self, attempt, *, started=None, completed=None, **origin_overrides):
+        """Copy the job into a later attempt's listing the way a failed-jobs rerun does."""
+        self.run["run_attempt"] = max(self.run["run_attempt"], attempt)
+        copied = {"id": 80 + attempt, "name": "Unit Tests", "status": "completed", "conclusion": "success",
+                  "run_id": 100, "head_sha": SOURCE, "run_attempt": attempt,
+                  "started_at": started or self.api.job_started, "completed_at": completed or self.api.job_completed}
+        self.api.extra_jobs.append(copied)
+        return copied
+
+    def test_retained_job_reuses_the_attempt_that_executed_it(self):
+        copied = self.retain(2)
+        result = self.acquire()
+        self.assertEqual(result["source_run"]["run_attempt"], 2)
+        self.assertEqual(result["source_job"]["id"], copied["id"])
+        self.assertEqual(result["source_job"]["run_attempt"], 2)
+        self.assertEqual(result["executed_attempt"], 1)
+        self.assertEqual(result["source_artifact"]["name"], "ci-reuse-1-unit-tests")
+        self.assertEqual(result["source_proof"]["run_attempt"], 1)
+
+    def test_retained_job_whose_origin_did_not_succeed_is_refused(self):
+        for conclusion in ("failure", "skipped", "cancelled", None):
+            with self.subTest(conclusion=conclusion):
+                self.setUp()
+                self.retain(2)
+                self.api.job_conclusion = conclusion
+                with self.assertRaisesRegex(reuse.Refusal, "mirrors an unsuccessful attempt 1"):
+                    self.acquire()
+
+    def test_retained_job_must_mirror_its_origin_timestamps(self):
+        for field in ("started", "completed"):
+            with self.subTest(field=field):
+                self.setUp()
+                self.retain(2, **{field: (dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=1)).isoformat()})
+                with self.assertRaisesRegex(reuse.Refusal, "proof missing or ambiguous"):
+                    self.acquire()
+
+    def test_retained_job_with_two_matching_earlier_proofs_is_refused(self):
+        self.retain(2)
+        self.retain(3)
+        self.api.extra_artifacts = [{"id": 501, "name": "ci-reuse-2-unit-tests"}]
+        with self.assertRaisesRegex(reuse.Refusal, "proof missing or ambiguous"):
+            self.acquire()
+
+    def test_fresh_job_binds_its_own_attempt_without_attempt_lookups(self):
+        result = self.acquire()
+        self.assertEqual((result["source_job"]["run_attempt"], result["executed_attempt"]), (1, 1))
+        self.setUp()
+        self.run["run_attempt"] = 2
+        self.api.job_attempt = 2
+        self.source["run_attempt"] = 2
+        self.api.extra_artifacts = [{"id": 501, "name": "ci-reuse-2-unit-tests"}]
+        pages = self.api.pages
+        with patch.object(self.api, "pages", side_effect=lambda endpoint, kind: (self.assertNotIn("/attempts/", endpoint), pages(endpoint, kind))[1]):
+            result = self.acquire()
+        self.assertEqual((result["source_job"]["run_attempt"], result["executed_attempt"]), (2, 2))
+        self.assertEqual(result["source_artifact"]["id"], 501)
 
     def test_newer_failed_job_cannot_use_older_success(self):
         self.run["run_attempt"] = 2

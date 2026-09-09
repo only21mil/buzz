@@ -15,6 +15,10 @@ if [[ $# -eq 0 ]]; then
 fi
 
 attempts="${APT_RETRY_ATTEMPTS:-3}"
+if [[ ! "$attempts" =~ ^[1-9][0-9]*$ ]]; then
+    echo "APT_RETRY_ATTEMPTS must be a positive integer, got '${attempts}'" >&2
+    exit 2
+fi
 apt_options=(
     -o Acquire::Retries=3
     -o Acquire::http::Timeout=30
