@@ -60,16 +60,39 @@ async function chooseLargeVideo(page: Page) {
   });
 }
 
+function timelineDistanceFromBottom(page: Page) {
+  return page
+    .getByTestId("message-timeline")
+    .evaluate(
+      (element) =>
+        element.scrollHeight - element.clientHeight - element.scrollTop,
+    );
+}
+
+// Wait for the timeline to finish pinning to its newest row. Scrolling away
+// before that lands lets the pin re-run under the wheel and snap the viewport
+// back to the tail.
+async function waitForTimelineSettledAtBottom(page: Page) {
+  await expect
+    .poll(() => timelineDistanceFromBottom(page), { timeout: 10_000 })
+    .toBeLessThanOrEqual(1);
+  await expect(page.getByTestId("message-scroll-to-latest")).toHaveCount(0);
+}
+
 async function scrollTimelineAwayFromBottom(page: Page) {
   const timeline = page.getByTestId("message-timeline");
   await timeline.hover();
   for (let attempt = 0; attempt < 8; attempt += 1) {
     await page.mouse.wheel(0, -800);
-    const distanceFromBottom = await timeline.evaluate(
-      (element) =>
-        element.scrollHeight - element.clientHeight - element.scrollTop,
-    );
-    if (distanceFromBottom > 160) return;
+    if ((await timelineDistanceFromBottom(page)) > 160) {
+      // Buzz issue d1b52a88e3a974da111463185d86172a9aba266e8a7dac6a761e3b5fd8ea0046:
+      // a timeline still settling at its tail re-pinned right after the wheel,
+      // so "Jump to latest" passed `toBeVisible` and vanished before
+      // `boundingBox` ran. Return only once the departure holds.
+      await page.waitForTimeout(150);
+      if ((await timelineDistanceFromBottom(page)) > 160) return;
+      continue;
+    }
     await page.waitForTimeout(25);
   }
   throw new Error("timeline did not move away from the visual tail");
@@ -373,6 +396,7 @@ test("upload progress floats above the dock and lifts Jump to latest", async ({
 
   const timeline = page.getByTestId("message-timeline");
   await expect(timeline.locator("[data-message-id]").first()).toBeVisible();
+  await waitForTimelineSettledAtBottom(page);
   await scrollTimelineAwayFromBottom(page);
   const jumpToLatest = page.getByTestId("message-scroll-to-latest");
   await expect(jumpToLatest).toBeVisible();
