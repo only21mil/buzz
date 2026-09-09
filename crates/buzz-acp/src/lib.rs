@@ -548,6 +548,57 @@ impl PendingDmResolution {
     }
 }
 
+/// Result channel for the spawned DM lookup task: `(channel_id, channel_type)`.
+type DmLookupSender = mpsc::Sender<(Uuid, Option<String>)>;
+
+/// Reports one DM lookup result to the main loop exactly once.
+///
+/// The main loop marks a lookup in flight when it spawns the task and clears
+/// the mark only when a message arrives. This guard sends on drop, so the
+/// message is sent whether the lookup returns, or panics
+/// and unwinds. A lookup that never reports would otherwise pin the in-flight
+/// flag and stop every later channel from resolving until restart.
+struct DmLookupReport {
+    channel_id: Uuid,
+    channel_type: Option<String>,
+    tx: Option<DmLookupSender>,
+}
+
+impl DmLookupReport {
+    fn new(channel_id: Uuid, tx: DmLookupSender) -> Self {
+        Self {
+            channel_id,
+            channel_type: None,
+            tx: Some(tx),
+        }
+    }
+}
+
+impl Drop for DmLookupReport {
+    fn drop(&mut self) {
+        let Some(tx) = self.tx.take() else {
+            return;
+        };
+        // `try_send` because Drop cannot await. The channel holds several
+        // reports and the main loop allows one lookup in flight, so a full
+        // channel is not expected; a closed one means the loop is gone.
+        if let Err(error) = tx.try_send((self.channel_id, self.channel_type.take())) {
+            tracing::warn!(
+                channel_id = %self.channel_id,
+                %error,
+                "DM lookup result could not be delivered to the main loop"
+            );
+        }
+    }
+}
+
+/// Body of the spawned DM lookup task. The report guard is created before
+/// the lookup runs so the main loop always receives a terminal message.
+async fn run_dm_lookup(resolver: pool::ChannelInfoResolver, channel_id: Uuid, tx: DmLookupSender) {
+    let mut report = DmLookupReport::new(channel_id, tx);
+    report.channel_type = lookup_channel_type(&resolver, channel_id).await;
+}
+
 /// One bounded channel-type lookup for the retry path. Runs on a spawned
 /// task so a hung REST bridge never blocks the main loop.
 async fn lookup_channel_type(
@@ -2213,7 +2264,7 @@ async fn tokio_main() -> Result<()> {
     // Channels subscribed before their kind:39000 metadata resolved. A DM among
     // them stays mention-gated until the retry tick re-subscribes it.
     let mut pending_dm = PendingDmResolution::default();
-    let (dm_lookup_tx, mut dm_lookup_rx) = tokio::sync::mpsc::channel::<(Uuid, Option<String>)>(4);
+    let (dm_lookup_tx, mut dm_lookup_rx) = mpsc::channel::<(Uuid, Option<String>)>(4);
     let mut dm_lookup_in_flight = false;
     let startup_replay_floor = if inbox_cursor.has_durable_cursor() {
         inbox_catchup_floor.since
@@ -3250,12 +3301,11 @@ async fn tokio_main() -> Result<()> {
                             // One bounded lookup per tick, off the loop: a hung
                             // REST bridge costs at most one outstanding lookup.
                             dm_lookup_in_flight = true;
-                            let resolver = ctx.channel_info.clone();
-                            let tx = dm_lookup_tx.clone();
-                            tokio::spawn(async move {
-                                let channel_type = lookup_channel_type(&resolver, channel_id).await;
-                                let _ = tx.send((channel_id, channel_type)).await;
-                            });
+                            tokio::spawn(run_dm_lookup(
+                                ctx.channel_info.clone(),
+                                channel_id,
+                                dm_lookup_tx.clone(),
+                            ));
                         }
                     }
                     None
@@ -6623,6 +6673,56 @@ mod author_gate_tests {
             None,
             "--channels exclusions still apply"
         );
+    }
+
+    #[tokio::test]
+    async fn dm_lookup_report_sends_on_normal_completion() {
+        let id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            let mut report = DmLookupReport::new(id, tx);
+            report.channel_type = Some("dm".to_string());
+        })
+        .await
+        .expect("task completes");
+        assert_eq!(rx.recv().await, Some((id, Some("dm".to_string()))));
+        assert_eq!(
+            rx.recv().await,
+            None,
+            "the sender is released with the report"
+        );
+    }
+
+    #[tokio::test]
+    async fn dm_lookup_report_sends_when_the_lookup_panics() {
+        let id = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(4);
+        let joined = tokio::spawn(async move {
+            let _report = DmLookupReport::new(id, tx);
+            panic!("resolver blew up");
+        })
+        .await;
+        assert!(joined.is_err(), "the task panicked");
+        assert_eq!(
+            rx.recv().await,
+            Some((id, None)),
+            "a panicking lookup still reports so in_flight clears"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_dm_lookup_reports_the_resolved_type() {
+        let id = Uuid::new_v4();
+        let response = serde_json::json!([{
+            "tags": [["d", id.to_string()], ["name", "DM"], ["private"], ["hidden"], ["t", "dm"]]
+        }]);
+        let (resolver, _requests, server) = lazy_resolver_with_response(response).await;
+        let (tx, mut rx) = mpsc::channel(4);
+        tokio::spawn(run_dm_lookup(resolver, id, tx))
+            .await
+            .expect("lookup task completes");
+        assert_eq!(rx.recv().await, Some((id, Some("dm".to_string()))));
+        server.abort();
     }
 
     #[tokio::test]

@@ -1203,6 +1203,13 @@ struct BgState {
     /// Startup-era channels use the startup watermark; dynamic channels use
     /// the membership notification timestamp that caused the subscription.
     subscribe_since: HashMap<Uuid, u64>,
+    /// Replay floor owed to a channel by a pending [`RelayCommand::Resubscribe`].
+    ///
+    /// Set by `clamp_replay_floor` and consumed when the next REQ for the
+    /// channel is confirmed sent. `record_event` raises `last_seen` while the
+    /// old REQ stays live (a rate-gated or failed resubscribe), so
+    /// `channel_since` takes the lower of its usual answer and this floor.
+    pending_replay_floor: HashMap<Uuid, u64>,
     /// Relay rate-limit gate deadline.
     ///
     /// While `Some(deadline)` and `Instant::now() < deadline`, outbound
@@ -1268,6 +1275,7 @@ impl BgState {
             proactive_resubscribe_needed: false,
             startup_watermark: None,
             subscribe_since: HashMap::new(),
+            pending_replay_floor: HashMap::new(),
             rate_limit_gate: None,
             rate_limited_pending: HashMap::new(),
             membership_resub_needed: false,
@@ -1307,10 +1315,14 @@ impl BgState {
     /// the replay window covers both successfully processed events and any
     /// that were dropped due to queue pressure. Falls back to the per-channel
     /// `subscribe_since` (set at first subscribe) or `startup_watermark`.
+    ///
+    /// A `pending_replay_floor` recorded by an unsent resubscribe always wins
+    /// when lower, so events that reached the old REQ after the floor was set
+    /// cannot move the window past tag-less DMs the new REQ must replay.
     fn channel_since(&self, channel_id: &Uuid) -> Option<u64> {
         let last_seen = self.last_seen.get(channel_id).copied();
         let dropped = self.channel_dropped_since.get(channel_id).copied();
-        match (last_seen, dropped) {
+        let since = match (last_seen, dropped) {
             (Some(l), Some(d)) => Some(l.min(d)),
             (Some(l), None) => Some(l),
             (None, Some(d)) => Some(d),
@@ -1319,6 +1331,11 @@ impl BgState {
                 .get(channel_id)
                 .copied()
                 .or(self.startup_watermark),
+        };
+        match (since, self.pending_replay_floor.get(channel_id).copied()) {
+            (Some(s), Some(floor)) => Some(s.min(floor)),
+            (None, Some(floor)) => Some(floor),
+            (since, None) => since,
         }
     }
 
@@ -1326,8 +1343,10 @@ impl BgState {
     /// on reconnect) starts no later than `replay_floor`.
     ///
     /// `subscribe_since` is lowered or seeded; `last_seen` is lowered only when
-    /// present. Events replayed a second time are suppressed by the inbox
-    /// cursor's processed-id set in the main loop.
+    /// present. The floor is also kept in `pending_replay_floor` until a REQ
+    /// for the channel is sent, because events still arriving on the old REQ
+    /// raise `last_seen` again in the meantime. Events replayed a second time
+    /// are suppressed by the inbox cursor's processed-id set in the main loop.
     fn clamp_replay_floor(&mut self, channel_id: Uuid, replay_floor: u64) {
         self.subscribe_since
             .entry(channel_id)
@@ -1336,6 +1355,10 @@ impl BgState {
         if let Some(seen) = self.last_seen.get_mut(&channel_id) {
             *seen = (*seen).min(replay_floor);
         }
+        self.pending_replay_floor
+            .entry(channel_id)
+            .and_modify(|floor| *floor = (*floor).min(replay_floor))
+            .or_insert(replay_floor);
     }
 
     /// Clear all per-channel state for a channel that is being unsubscribed.
@@ -1344,6 +1367,7 @@ impl BgState {
     fn clear_channel_state(&mut self, channel_id: &Uuid) {
         self.last_seen.remove(channel_id);
         self.subscribe_since.remove(channel_id);
+        self.pending_replay_floor.remove(channel_id);
         self.channel_dropped_since.remove(channel_id);
         self.active_filters.remove(channel_id);
         self.rate_limited_pending.remove(channel_id);
@@ -1656,11 +1680,7 @@ async fn execute_connected_command(
             }
 
             state.clamp_replay_floor(channel_id, replay_floor);
-            let since = state
-                .last_seen
-                .get(&channel_id)
-                .copied()
-                .or_else(|| state.subscribe_since.get(&channel_id).copied());
+            let since = state.channel_since(&channel_id);
             let sent =
                 send_subscribe(ws, state, channel_id, agent_pubkey_hex, since, &filter).await;
             if sent {
@@ -1668,6 +1688,7 @@ async fn execute_connected_command(
                     .active_subscriptions
                     .insert(channel_id, channel_sub_id(channel_id));
                 state.active_filters.insert(channel_id, filter);
+                state.pending_replay_floor.remove(&channel_id);
                 state.rate_limited_pending.remove(&channel_id);
                 state.resubscribe_retry.remove(&channel_id);
                 true
@@ -2846,6 +2867,7 @@ async fn resubscribe_after_reconnect(
                 send_subscribe(ws, state, channel_id, agent_pubkey_hex, since, &filter).await;
             if this_sent {
                 state.channel_dropped_since.remove(&channel_id);
+                state.pending_replay_floor.remove(&channel_id);
                 // Shutdown-aware pacing sleep before any next replay/deferred REQ.
                 if !pacing_sleep(cmd_rx, &mut deferred_commands, REQ_PACING_INTERVAL).await {
                     return ResubscribeResult::Shutdown;
@@ -3017,6 +3039,7 @@ async fn drain_rate_limited_pending(
         if sent {
             state.rate_limited_pending.remove(&channel_id);
             state.channel_dropped_since.remove(&channel_id);
+            state.pending_replay_floor.remove(&channel_id);
             sent_count += 1;
             // Pacing is enforced by the main-loop timer; no inline sleep here.
         } else {
@@ -3074,6 +3097,7 @@ async fn drain_resubscribe_retry(
         if sent {
             state.resubscribe_retry.remove(&channel_id);
             state.channel_dropped_since.remove(&channel_id);
+            state.pending_replay_floor.remove(&channel_id);
             sent_count += 1;
             // Pacing is enforced by the main-loop timer; no inline sleep here.
         } else {
@@ -4918,6 +4942,87 @@ mod tests {
         assert!(
             !state.active_filters[&channel_id].require_mention,
             "state keeps the relaxed filter for reconnects"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_gated_resubscribe_keeps_floor_after_mention_raises_last_seen() {
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+        let channel_id = Uuid::new_v4();
+        let agent = "ab".repeat(32);
+        let floor = 1_787_279_643u64;
+
+        // Mention-gated REQ is live; its wire frame is consumed and ignored.
+        assert!(
+            execute_connected_command(
+                &mut ws,
+                &mut state,
+                &agent,
+                RelayCommand::Subscribe {
+                    channel_id,
+                    filter: ChannelFilter {
+                        kinds: Some(vec![9]),
+                        require_mention: true,
+                    },
+                    replay_since: Some(floor),
+                },
+            )
+            .await
+        );
+        let first = next_test_frame(&mut server).await;
+        assert_eq!(first[2]["#p"], json!([agent]));
+
+        // Rate gate armed: the resubscribe is parked and the old #p REQ stays live.
+        state.rate_limit_gate = Some(tokio::time::Instant::now() + Duration::from_millis(100));
+        assert!(
+            execute_connected_command(
+                &mut ws,
+                &mut state,
+                &agent,
+                RelayCommand::Resubscribe {
+                    channel_id,
+                    filter: ChannelFilter {
+                        kinds: Some(vec![9]),
+                        require_mention: false,
+                    },
+                    replay_floor: floor,
+                },
+            )
+            .await
+        );
+        assert!(state.rate_limited_pending.contains_key(&channel_id));
+        assert!(
+            timeout(Duration::from_millis(50), server.next())
+                .await
+                .is_err(),
+            "no REQ while the gate is armed"
+        );
+
+        // A mention on the old REQ, well past the skew buffer, raises last_seen.
+        let keys = Keys::generate();
+        let mention = make_signed_channel_event(&keys, "@agent", floor + 600);
+        assert!(state.record_event(channel_id, &mention));
+        assert_eq!(state.last_seen.get(&channel_id), Some(&(floor + 600)));
+
+        // Gate clears; the drain sends the parked REQ.
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert_eq!(
+            drain_rate_limited_pending(&mut ws, &mut state, &agent, 1).await,
+            1
+        );
+        let drained = next_test_frame(&mut server).await;
+        assert_eq!(drained[0], "REQ");
+        assert_eq!(drained[1], channel_sub_id(channel_id));
+        assert!(drained[2].get("#p").is_none(), "drained REQ drops #p");
+        let since = drained[2]["since"].as_u64().expect("since on the wire");
+        assert!(
+            since <= floor,
+            "drained since {since} must not skip DMs from the floor {floor}"
+        );
+        assert!(
+            !state.pending_replay_floor.contains_key(&channel_id),
+            "the floor is consumed by the sent REQ"
         );
     }
 
