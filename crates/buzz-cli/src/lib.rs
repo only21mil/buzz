@@ -1245,6 +1245,14 @@ pub enum ReposCmd {
         /// Emit stable JSON (also the default output).
         #[arg(long)]
         json: bool,
+        /// Write stale PR merged and issue resolved statuses for items whose
+        /// merge is proven on both main refs. Default is a dry run.
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+        /// Absolute bare git object cache reused across runs. Defaults to
+        /// ~/work/.buzz-reconcile/<owner>-<repo>.git.
+        #[arg(long)]
+        git_cache: Option<String>,
     },
     /// Bootstrap an absent Buzz `main` from exact GitHub `main` once.
     ///
@@ -2694,7 +2702,23 @@ mod tests {
         ])
         .unwrap();
         assert!(
-            matches!(cli.command, Cmd::Repos(ReposCmd::Reconcile { repo_owner, repo_id, limit: Some(0), json: true }) if repo_owner == "owner" && repo_id == "repo")
+            matches!(cli.command, Cmd::Repos(ReposCmd::Reconcile { repo_owner, repo_id, limit: Some(0), json: true, apply: false, git_cache: None }) if repo_owner == "owner" && repo_id == "repo")
+        );
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "repos",
+            "reconcile",
+            "--repo-owner",
+            "owner",
+            "--repo-id",
+            "repo",
+            "--apply",
+            "--git-cache",
+            "/tmp/cache.git",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Cmd::Repos(ReposCmd::Reconcile { apply: true, git_cache: Some(cache), .. }) if cache == "/tmp/cache.git")
         );
         let cli = Cli::try_parse_from([
             "buzz",

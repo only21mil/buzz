@@ -16,10 +16,10 @@ use tempfile::TempDir;
 use crate::client::BuzzClient;
 use crate::error::CliError;
 
-const MAIN_REF: &str = "refs/heads/main";
+pub(crate) const MAIN_REF: &str = "refs/heads/main";
 const BUZZ_TRACKING_REF: &str = "refs/remotes/buzz/main";
 const BUZZ_SOURCE_TRACKING_REF: &str = "refs/remotes/buzz/source";
-const GITHUB_ACTIONS_APP_ID: u64 = 15_368;
+pub(crate) const GITHUB_ACTIONS_APP_ID: u64 = 15_368;
 #[cfg(unix)]
 const GITHUB_ASKPASS: &str = r#"#!/bin/sh
 case "$1" in
@@ -45,29 +45,29 @@ struct RepoRemotes {
 }
 
 #[derive(Debug, Clone)]
-struct GitHubRepo {
-    clone_url: String,
-    owner: String,
-    repo: String,
+pub(crate) struct GitHubRepo {
+    pub(crate) clone_url: String,
+    pub(crate) owner: String,
+    pub(crate) repo: String,
 }
 
 #[derive(Clone)]
-struct GitAuth {
+pub(crate) struct GitAuth {
     private_key: String,
     auth_tag: Option<String>,
 }
 
 #[derive(Clone)]
-struct GitHubAuth {
+pub(crate) struct GitHubAuth {
     variable: &'static str,
-    token: String,
+    pub(crate) token: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RemoteState {
-    main: Option<String>,
-    head: Option<String>,
-    head_target: Option<String>,
+pub(crate) struct RemoteState {
+    pub(crate) main: Option<String>,
+    pub(crate) head: Option<String>,
+    pub(crate) head_target: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -130,22 +130,22 @@ struct PromoteRequest<'a> {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct CheckRunsResponse {
-    check_runs: Vec<CheckRun>,
+pub(crate) struct CheckRunsResponse {
+    pub(crate) check_runs: Vec<CheckRun>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-struct CheckRun {
-    name: String,
-    status: String,
-    conclusion: Option<String>,
-    head_sha: String,
-    app: CheckApp,
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub(crate) struct CheckRun {
+    pub(crate) name: String,
+    pub(crate) status: String,
+    pub(crate) conclusion: Option<String>,
+    pub(crate) head_sha: String,
+    pub(crate) app: CheckApp,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-struct CheckApp {
-    id: u64,
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub(crate) struct CheckApp {
+    pub(crate) id: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,7 +154,7 @@ enum PromoteStart {
     ResumeAfterBuzzAdvance,
 }
 
-fn exact_oid(value: &str, flag: &str) -> Result<String, CliError> {
+pub(crate) fn exact_oid(value: &str, flag: &str) -> Result<String, CliError> {
     if value.len() != 40 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(CliError::Usage(format!(
             "{flag} must be an exact 40-hex commit"
@@ -181,7 +181,7 @@ fn exact_tag_values<'a>(event: &'a Event, name: &str) -> Result<Option<Vec<&'a s
     ))
 }
 
-fn github_repo(value: &str) -> Result<GitHubRepo, CliError> {
+pub(crate) fn github_repo(value: &str) -> Result<GitHubRepo, CliError> {
     let url = url::Url::parse(value)
         .map_err(|_| CliError::Usage("GitHub clone URL must be a valid HTTPS URL".into()))?;
     let parts = url
@@ -270,7 +270,18 @@ fn expected_ref(value: &str, flag: &str) -> Result<Option<String>, CliError> {
     }
 }
 
-fn github_auth_from_env() -> Result<GitHubAuth, CliError> {
+impl GitHubAuth {
+    /// Placeholder for runs without a mirror token; GitHub remotes then fail
+    /// authentication instead of being tried anonymously.
+    pub(crate) fn absent() -> Self {
+        Self {
+            variable: "GH_TOKEN",
+            token: String::new(),
+        }
+    }
+}
+
+pub(crate) fn github_auth_from_env() -> Result<GitHubAuth, CliError> {
     for variable in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Some(token) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
             let token = token
@@ -353,7 +364,7 @@ fn derive_remotes(client: &BuzzClient, announcement: &Event) -> Result<RepoRemot
     })
 }
 
-struct GitRepo {
+pub(crate) struct GitRepo {
     _temp: TempDir,
     git_dir: std::path::PathBuf,
     buzz_auth: GitAuth,
@@ -362,7 +373,7 @@ struct GitRepo {
 }
 
 #[derive(Clone, Copy)]
-enum RemoteAuth {
+pub(crate) enum RemoteAuth {
     None,
     Buzz,
     GitHub,
@@ -391,17 +402,55 @@ fn write_github_askpass(path: &std::path::Path) -> Result<(), CliError> {
 }
 
 impl GitRepo {
-    fn new(buzz_auth: GitAuth, github_auth: GitHubAuth) -> Result<Self, CliError> {
+    pub(crate) fn work_root() -> Result<std::path::PathBuf, CliError> {
         let work_root = dirs::home_dir()
             .ok_or_else(|| CliError::Other("home directory is unavailable".into()))?
             .join("work");
         std::fs::create_dir_all(&work_root)
             .map_err(|_| CliError::Other("failed to prepare the private sync workspace".into()))?;
-        let temp = tempfile::Builder::new()
+        Ok(work_root)
+    }
+
+    fn private_temp() -> Result<TempDir, CliError> {
+        tempfile::Builder::new()
             .prefix("buzz-repo-sync-")
-            .tempdir_in(work_root)
-            .map_err(|_| CliError::Other("failed to create private temporary repository".into()))?;
+            .tempdir_in(Self::work_root()?)
+            .map_err(|_| CliError::Other("failed to create private temporary repository".into()))
+    }
+
+    pub(crate) fn new(buzz_auth: GitAuth, github_auth: GitHubAuth) -> Result<Self, CliError> {
+        let temp = Self::private_temp()?;
         let git_dir = temp.path().join("repo.git");
+        Self::open(temp, git_dir, buzz_auth, github_auth)
+    }
+
+    /// Reuse a caller-owned bare object store across runs. Refs are still
+    /// fetched fresh; only objects persist, so repeated ancestry reads do not
+    /// re-download the full history.
+    pub(crate) fn persistent(
+        git_dir: std::path::PathBuf,
+        buzz_auth: GitAuth,
+        github_auth: GitHubAuth,
+    ) -> Result<Self, CliError> {
+        if !git_dir.is_absolute() {
+            return Err(CliError::Usage(
+                "git cache directory must be an absolute path".into(),
+            ));
+        }
+        if let Some(parent) = git_dir.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|_| CliError::Other("failed to prepare the git cache".into()))?;
+        }
+        let temp = Self::private_temp()?;
+        Self::open(temp, git_dir, buzz_auth, github_auth)
+    }
+
+    fn open(
+        temp: TempDir,
+        git_dir: std::path::PathBuf,
+        buzz_auth: GitAuth,
+        github_auth: GitHubAuth,
+    ) -> Result<Self, CliError> {
         let askpass = temp.path().join("github-askpass");
         write_github_askpass(&askpass)?;
         let repo = Self {
@@ -411,11 +460,13 @@ impl GitRepo {
             github_auth,
             askpass,
         };
-        repo.run(
-            RemoteAuth::None,
-            "initialize temporary repository",
-            ["init", "--bare"],
-        )?;
+        if !repo.git_dir.join("HEAD").is_file() {
+            repo.run(
+                RemoteAuth::None,
+                "initialize temporary repository",
+                ["init", "--bare"],
+            )?;
+        }
         Ok(repo)
     }
 
@@ -484,7 +535,7 @@ impl GitRepo {
         self.output(auth, operation, args).map(|_| ())
     }
 
-    fn ls_remote(
+    pub(crate) fn ls_remote(
         &self,
         url: &str,
         auth: RemoteAuth,
@@ -500,7 +551,39 @@ impl GitRepo {
         parse_remote_state(stdout)
     }
 
-    fn remote_ref(
+    /// Every `refs/heads/*` on the remote as branch name -> exact commit.
+    pub(crate) fn heads(
+        &self,
+        url: &str,
+        auth: RemoteAuth,
+        remote: &str,
+    ) -> Result<std::collections::BTreeMap<String, String>, CliError> {
+        let output = self.output(
+            auth,
+            &format!("read {remote} heads"),
+            ["ls-remote", "--refs", url, "refs/heads/*"],
+        )?;
+        let stdout = std::str::from_utf8(&output.stdout)
+            .map_err(|_| CliError::Other(format!("{remote} returned invalid ref data")))?;
+        let mut heads = std::collections::BTreeMap::new();
+        for line in stdout.lines() {
+            let (oid, name) = line
+                .split_once('\t')
+                .ok_or_else(|| CliError::Other("git returned malformed ref data".into()))?;
+            let Some(branch) = name.strip_prefix("refs/heads/") else {
+                continue;
+            };
+            if heads
+                .insert(branch.to_owned(), exact_oid(oid, "remote head")?)
+                .is_some()
+            {
+                return Err(CliError::Other("git returned duplicate remote refs".into()));
+            }
+        }
+        Ok(heads)
+    }
+
+    pub(crate) fn remote_ref(
         &self,
         url: &str,
         auth: RemoteAuth,
@@ -534,7 +617,7 @@ impl GitRepo {
         self.remote_ref(url, RemoteAuth::GitHub, "GitHub", MAIN_REF)
     }
 
-    fn fetch_ref(
+    pub(crate) fn fetch_ref(
         &self,
         url: &str,
         auth: RemoteAuth,
@@ -569,7 +652,7 @@ impl GitRepo {
         )
     }
 
-    fn rev_parse(&self, reference: &str) -> Result<String, CliError> {
+    pub(crate) fn rev_parse(&self, reference: &str) -> Result<String, CliError> {
         let output = self.output(
             RemoteAuth::None,
             "resolve commit",
@@ -581,7 +664,7 @@ impl GitRepo {
         exact_oid(value, "resolved ref")
     }
 
-    fn is_ancestor(&self, older: &str, newer: &str) -> Result<bool, CliError> {
+    pub(crate) fn is_ancestor(&self, older: &str, newer: &str) -> Result<bool, CliError> {
         let output = self
             .command(RemoteAuth::None)
             .args(["merge-base", "--is-ancestor", older, newer])
@@ -591,6 +674,66 @@ impl GitRepo {
             Some(0) => Ok(true),
             Some(1) => Ok(false),
             _ => Err(CliError::Other("git ancestry proof failed".into())),
+        }
+    }
+
+    /// True when the exact commit object is present locally.
+    pub(crate) fn has_commit(&self, commit: &str) -> Result<bool, CliError> {
+        let output = self
+            .command(RemoteAuth::None)
+            .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
+            .output()
+            .map_err(|_| CliError::Other("failed to run git for commit lookup".into()))?;
+        Ok(output.status.success())
+    }
+
+    /// Exact commits on `tip`'s first-parent chain, newest first.
+    pub(crate) fn first_parent_chain(&self, tip: &str) -> Result<Vec<String>, CliError> {
+        let output = self.output(
+            RemoteAuth::None,
+            "list first-parent chain",
+            ["rev-list", "--first-parent", tip],
+        )?;
+        let stdout = std::str::from_utf8(&output.stdout)
+            .map_err(|_| CliError::Other("git returned invalid commit data".into()))?;
+        stdout
+            .lines()
+            .map(|line| exact_oid(line, "first-parent commit"))
+            .collect()
+    }
+
+    /// The commit on `tip`'s first-parent chain that brought `commit` in:
+    /// `commit` itself after a fast-forward, otherwise the oldest first-parent
+    /// descendant. `None` when `commit` is not an ancestor of `tip`.
+    pub(crate) fn landing_commit(
+        &self,
+        commit: &str,
+        tip: &str,
+        first_parent: &[String],
+    ) -> Result<Option<String>, CliError> {
+        if first_parent.iter().any(|entry| entry == commit) {
+            return Ok(Some(commit.to_owned()));
+        }
+        if !self.has_commit(commit)? || !self.is_ancestor(commit, tip)? {
+            return Ok(None);
+        }
+        let range = format!("{commit}..{tip}");
+        let output = self.output(
+            RemoteAuth::None,
+            "search landing commit",
+            [
+                "rev-list",
+                "--first-parent",
+                "--ancestry-path",
+                "--reverse",
+                range.as_str(),
+            ],
+        )?;
+        let stdout = std::str::from_utf8(&output.stdout)
+            .map_err(|_| CliError::Other("git returned invalid commit data".into()))?;
+        match stdout.lines().next() {
+            Some(line) => exact_oid(line, "landing commit").map(Some),
+            None => Ok(None),
         }
     }
 
@@ -683,7 +826,7 @@ fn require_exact_head(state: &RemoteState, commit: &str) -> Result<(), CliError>
     Ok(())
 }
 
-fn auth_from_client(client: &BuzzClient) -> GitAuth {
+pub(crate) fn auth_from_client(client: &BuzzClient) -> GitAuth {
     GitAuth {
         private_key: client.keys().secret_key().to_secret_hex(),
         auth_tag: client.auth_tag_json().map(str::to_owned),
@@ -866,7 +1009,52 @@ fn evaluate_required_checks(
     Ok(())
 }
 
-async fn github_check_runs(
+/// One authenticated GitHub REST read with only rejections mapped: 401 and
+/// 403 are auth errors, every other status is returned for the caller to
+/// interpret. The token never appears in messages.
+pub(crate) async fn github_get_status(
+    client: &reqwest::Client,
+    auth: &GitHubAuth,
+    url: String,
+    what: &str,
+) -> Result<reqwest::Response, CliError> {
+    let response = client
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header(reqwest::header::USER_AGENT, "buzz-cli-repo-sync")
+        .bearer_auth(&auth.token)
+        .send()
+        .await?;
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(CliError::Auth(format!(
+            "GitHub {what} request was rejected (HTTP {})",
+            status.as_u16()
+        )));
+    }
+    Ok(response)
+}
+
+/// One authenticated GitHub REST read that must succeed.
+pub(crate) async fn github_get(
+    client: &reqwest::Client,
+    auth: &GitHubAuth,
+    url: String,
+    what: &str,
+) -> Result<reqwest::Response, CliError> {
+    let response = github_get_status(client, auth, url, what).await?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(CliError::Other(format!(
+            "GitHub {what} request failed (HTTP {})",
+            status.as_u16()
+        )));
+    }
+    Ok(response)
+}
+
+pub(crate) async fn github_check_runs(
     github: &GitHubRepo,
     auth: &GitHubAuth,
     commit: &str,
@@ -878,27 +1066,7 @@ async fn github_check_runs(
             "https://api.github.com/repos/{}/{}/commits/{commit}/check-runs?per_page=100&page={page}",
             github.owner, github.repo
         );
-        let response = client
-            .get(url)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .header(reqwest::header::USER_AGENT, "buzz-cli-repo-sync")
-            .bearer_auth(&auth.token)
-            .send()
-            .await?;
-        let status = response.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(CliError::Auth(format!(
-                "GitHub checks request was rejected (HTTP {})",
-                status.as_u16()
-            )));
-        }
-        if !status.is_success() {
-            return Err(CliError::Other(format!(
-                "GitHub checks request failed (HTTP {})",
-                status.as_u16()
-            )));
-        }
+        let response = github_get(&client, auth, url, "checks").await?;
         let page: CheckRunsResponse = response.json().await?;
         let count = page.check_runs.len();
         all.extend(page.check_runs);
