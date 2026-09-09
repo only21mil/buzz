@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.dev/schemas/native-ci/apple-release-request-v1.json",
+  "title": "Buzz Apple release request profile v1",
+  "description": "The `apple_release` object carried inside a kind-46100 CI request. It names an Apple build, sign, notarize, or TestFlight outcome by public identifiers only. Credentials are referenced by keyholder name and never appear in the request. The relay validator in crates/buzz-relay/src/api/ci/apple_release.rs adds the checks this schema cannot express: tip-OID equality, secret-material scan, executor capability, and requester scope. See docs/ci/apple-release-request.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "target",
+    "executor_class",
+    "source_commit",
+    "version",
+    "bundle_identifiers",
+    "team_id",
+    "signing_identity_ref",
+    "architectures",
+    "approval_event_id",
+    "artifact_retention_days"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "target": { "enum": ["macos-notarized", "ios-testflight"] },
+    "executor_class": { "const": "apple-mbp" },
+    "source_commit": { "$ref": "#/$defs/sha1" },
+    "controller_commit": { "$ref": "#/$defs/sha1" },
+    "version": { "$ref": "#/$defs/marketingVersion" },
+    "build_number": { "$ref": "#/$defs/buildNumber" },
+    "bundle_identifiers": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/bundleIdentifier" }
+    },
+    "team_id": { "$ref": "#/$defs/teamId" },
+    "signing_identity_ref": { "$ref": "#/$defs/credentialRef" },
+    "signing_certificate_sha256": { "$ref": "#/$defs/sha256" },
+    "architectures": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2,
+      "uniqueItems": true,
+      "items": { "enum": ["arm64", "x86_64"] }
+    },
+    "notarization": { "$ref": "#/$defs/notarization" },
+    "testflight": { "$ref": "#/$defs/testflight" },
+    "approval_event_id": { "$ref": "#/$defs/eventId" },
+    "artifact_retention_days": { "type": "integer", "minimum": 1, "maximum": 90 }
+  },
+  "oneOf": [
+    {
+      "properties": { "target": { "const": "macos-notarized" } },
+      "required": ["notarization"],
+      "not": { "required": ["testflight"] }
+    },
+    {
+      "properties": {
+        "target": { "const": "ios-testflight" },
+        "architectures": { "const": ["arm64"] }
+      },
+      "required": ["testflight", "build_number"],
+      "not": { "required": ["notarization"] }
+    }
+  ],
+  "$defs": {
+    "sha1": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "sha256": { "type": "string", "pattern": "^(?!0{64}$)[0-9a-f]{64}$" },
+    "eventId": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "marketingVersion": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+    },
+    "buildNumber": { "type": "string", "pattern": "^[1-9][0-9]{0,9}$" },
+    "bundleIdentifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+){1,}$",
+      "maxLength": 155
+    },
+    "teamId": { "type": "string", "pattern": "^[A-Z0-9]{10}$" },
+    "credentialRef": {
+      "description": "Name of an entry in the executor keyholder. Never the credential itself.",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"
+    },
+    "notarization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["credential_ref", "staple", "wait_timeout_seconds"],
+      "properties": {
+        "credential_ref": { "$ref": "#/$defs/credentialRef" },
+        "staple": { "type": "boolean" },
+        "wait_timeout_seconds": { "type": "integer", "minimum": 60, "maximum": 7200 }
+      }
+    },
+    "testflight": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asc_app_id", "credential_ref", "wait_for_processing_seconds"],
+      "properties": {
+        "asc_app_id": { "type": "string", "pattern": "^[1-9][0-9]{0,19}$" },
+        "credential_ref": { "$ref": "#/$defs/credentialRef" },
+        "beta_group_refs": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/credentialRef" }
+        },
+        "what_to_test": { "type": "string", "minLength": 1, "maxLength": 4000 },
+        "wait_for_processing_seconds": { "type": "integer", "minimum": 60, "maximum": 7200 }
+      }
+    }
+  }
+}

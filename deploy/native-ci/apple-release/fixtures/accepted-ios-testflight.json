@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "target": "ios-testflight",
+  "executor_class": "apple-mbp",
+  "source_commit": "038e8ae4f33387f2b5a299c1af54b1a4404c5f94",
+  "version": "0.5.9",
+  "build_number": "1",
+  "bundle_identifiers": ["com.sats21m.buzz", "com.sats21m.buzz.NotificationService"],
+  "team_id": "384ZGKG4GB",
+  "signing_identity_ref": "apple-distribution",
+  "architectures": ["arm64"],
+  "testflight": {
+    "asc_app_id": "6809565361",
+    "credential_ref": "asc-api-buzz",
+    "beta_group_refs": ["internal"],
+    "what_to_test": "Buzz 0.5.9 build 1 from exact source 038e8ae4.",
+    "wait_for_processing_seconds": 1800
+  },
+  "approval_event_id": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+  "artifact_retention_days": 14
+}

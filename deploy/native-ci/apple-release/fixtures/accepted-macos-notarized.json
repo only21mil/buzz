@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "target": "macos-notarized",
+  "executor_class": "apple-mbp",
+  "source_commit": "d9abae67a7d9dfab3d693e968477561456694898",
+  "controller_commit": "3db2d0fad3f996bdb8ac2f6edc09204930d338e7",
+  "version": "0.5.20",
+  "bundle_identifiers": ["xyz.block.buzz.app"],
+  "team_id": "384ZGKG4GB",
+  "signing_identity_ref": "developer-id-application",
+  "signing_certificate_sha256": "12b8d023db5e81dde29d53557e031803df5ee39067578d2b3996168bdb6c0805",
+  "architectures": ["arm64", "x86_64"],
+  "notarization": {
+    "credential_ref": "notarytool-buzz",
+    "staple": true,
+    "wait_timeout_seconds": 1800
+  },
+  "approval_event_id": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+  "artifact_retention_days": 30
+}

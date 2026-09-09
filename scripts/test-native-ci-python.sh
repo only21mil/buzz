@@ -7,6 +7,7 @@ for suite in \
   deploy/native-ci/activation/render_inputs/tests \
   deploy/native-ci/activation/tests \
   deploy/native-ci/activation/tests/clean_host_e2e \
+  deploy/native-ci/apple-release/tests \
   deploy/native-ci/controld/tests \
   deploy/native-ci/execd/tests \
   deploy/native-ci/keyholder/tests \
