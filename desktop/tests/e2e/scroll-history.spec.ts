@@ -228,8 +228,33 @@ test("preserves user scroll while older channel history loads", async ({
       container.dispatchEvent(new Event("scroll", { bubbles: true }));
     });
 
-  let deepest = (await oldestRenderedIndex()) ?? Number.POSITIVE_INFINITY;
-  for (let pageIndex = 0; pageIndex < 10 && deepest >= 400; pageIndex += 1) {
+  // Buzz issue 812e1460094f19e22650ea34289acea9e45fd33de703640617fdcbb36c33b1aa:
+  // each climb step used to accept the first smaller index it saw and the
+  // walk was capped at ten steps. Under load the virtualizer mounts a landed
+  // page over several frames, so a step could observe a handful of rows and
+  // ten such steps stalled at index 506. Read each page only once its oldest
+  // index holds across two samples, and bound the walk by time, not steps.
+  const settledOldestIndex = async (fallback: number) => {
+    let previous: number | null = null;
+    await expect
+      .poll(
+        async () => {
+          const current = (await oldestRenderedIndex()) ?? fallback;
+          const settled = current === previous;
+          previous = current;
+          return settled;
+        },
+        { intervals: [100], timeout: 5_000 },
+      )
+      .toBe(true);
+    return previous ?? fallback;
+  };
+  const climbDeadline = Date.now() + 30_000;
+  let deepest = await settledOldestIndex(Number.POSITIVE_INFINITY);
+  while (deepest >= 400) {
+    expect(Date.now(), "phase 1 climb exceeded its 30s budget").toBeLessThan(
+      climbDeadline,
+    );
     const previousDeepest = deepest;
     await scrollToTop();
     await expect
@@ -237,7 +262,7 @@ test("preserves user scroll while older channel history loads", async ({
         timeout: 5_000,
       })
       .toBeLessThan(previousDeepest);
-    deepest = (await oldestRenderedIndex()) ?? previousDeepest;
+    deepest = await settledOldestIndex(previousDeepest);
   }
   expect(deepest).toBeLessThan(400);
 
@@ -1374,6 +1399,13 @@ test("fast middle-page scroll settles with continuous mounted coverage", async (
   // A day heading can produce a small legitimate gap between message rows;
   // the stale-range failure leaves a viewport-scale hole. Check repeatedly
   // while idle so a transient good frame cannot mask a stuck blank range.
+  //
+  // Buzz issue 812e1460094f19e22650ea34289acea9e45fd33de703640617fdcbb36c33b1aa:
+  // under runner load the virtualizer could still be mounting the final range
+  // 250ms after the last scroll event, so the first sample read a 198px gap on
+  // a timeline that settled a few frames later. A stuck blank range never
+  // settles, so wait for coverage first, then require it to hold while idle.
+  await expect.poll(viewportCoverage, { timeout: 10_000 }).toBeLessThan(100);
   for (let sample = 0; sample < 5; sample += 1) {
     expect(await viewportCoverage()).toBeLessThan(100);
     await page.waitForTimeout(100);

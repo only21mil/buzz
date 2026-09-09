@@ -69,7 +69,10 @@ use instance_reaper::{buffer_contains_identifier, is_desktop_binary};
 mod lifecycle;
 #[cfg(test)]
 use lifecycle::kill_stale_tracked_processes_with;
+#[cfg(test)]
+pub(crate) use lifecycle::sync_managed_agent_processes_with;
 pub use lifecycle::{kill_stale_tracked_processes, sync_managed_agent_processes};
+pub(crate) use lifecycle::{tracked_runtime_pid, tracked_runtime_pids};
 
 /// Classify an agent's persona against the live catalog for the Agents-menu
 /// drift indicator. Returns `(out_of_date, orphaned)`.
@@ -170,14 +173,20 @@ pub fn build_managed_agent_summary<R: tauri::Runtime>(
         };
         (status, None, String::new())
     } else {
-        let persisted_pid = record.runtime_pid.filter(|pid| process_is_running(*pid));
         if let Some(runtime) = pair_runtime {
             (
                 "running".to_string(),
                 Some(runtime.child.id()),
                 runtime.log_path.display().to_string(),
             )
-        } else if let Some(pid) = persisted_pid {
+        } else if let Some(pid) = record
+            .runtime_pid
+            // A record with a tracked pair elsewhere names that pair's PID;
+            // it must still read as stopped in this community. Only a record
+            // with no pair anywhere falls back to the persisted scalar PID.
+            .filter(|_| tracked_runtime_pids(runtimes, &record.pubkey).is_empty())
+            .filter(|pid| process_is_running(*pid))
+        {
             (
                 "running".to_string(),
                 Some(pid),
@@ -937,3 +946,6 @@ mod test_fixtures;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod runtime_pid_tests;

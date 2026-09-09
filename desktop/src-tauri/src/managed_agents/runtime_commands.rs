@@ -296,7 +296,7 @@ fn start_pair(
         let _ = process.child.wait();
         return Err(error);
     }
-    record.runtime_pid = None;
+    record.runtime_pid = Some(receipt.pid);
     record.updated_at = now.clone();
     record.last_started_at = Some(now);
     record.last_stopped_at = None;
@@ -366,7 +366,8 @@ pub fn stop_managed_agent_runtime(
     }
     super::remove_agent_runtime_receipt(&app, &key);
     state.clear_agent_session_cache(&key);
-    record.runtime_pid = None;
+    // Another community's pair may still run for this record; keep naming it.
+    record.runtime_pid = super::runtime::tracked_runtime_pid(&runtimes, record);
     record.updated_at = crate::util::now_iso();
     record.last_stopped_at = Some(record.updated_at.clone());
     let status = status_for(&app, record, &key, None, None);

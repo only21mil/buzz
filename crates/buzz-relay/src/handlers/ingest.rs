@@ -2955,10 +2955,39 @@ async fn ingest_event_inner(
             signers
         };
 
-        Some(
+        let validated =
             buzz_core::ci::validate_signed_ci_event(&event, &ch_id.to_string(), &signers)
-                .map_err(|error| IngestError::Rejected(error.to_string()))?,
-        )
+                .map_err(|error| IngestError::Rejected(error.to_string()))?;
+
+        // Apple release profile (docs/ci/apple-release-request.md). A kind
+        // 46100 request that carries `apple_release` is admitted only when
+        // the profile validates against the frozen v1 shape, pins the
+        // envelope tip, names credentials by keyholder reference only, the
+        // requester holds jobs:write, and the operator has advertised an
+        // executor capability set covering the target. Nothing here
+        // schedules, signs, or contacts App Store Connect.
+        if let buzz_core::ci::ValidatedCiEnvelope::Request(request) = &validated {
+            let content: serde_json::Value =
+                serde_json::from_str(&event.content).map_err(|_| {
+                    IngestError::Rejected("invalid: CI request content is not valid JSON".into())
+                })?;
+            if let Some(profile) = crate::api::ci::apple_release::apple_release_profile(&content) {
+                crate::api::ci::apple_release::validate_apple_release_request(
+                    request,
+                    profile,
+                    auth.scopes(),
+                    &state.config.ci.apple_executor_capabilities,
+                )
+                .map_err(|refusal| match refusal.reason {
+                    crate::api::ci::apple_release::AppleReleaseRefusalReason::UnauthorizedRequester => {
+                        IngestError::AuthFailed(format!("restricted: {refusal}"))
+                    }
+                    _ => IngestError::Rejected(format!("invalid: {refusal}")),
+                })?;
+            }
+        }
+
+        Some(validated)
     } else {
         None
     };

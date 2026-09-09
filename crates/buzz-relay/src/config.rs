@@ -59,6 +59,13 @@ pub struct CiConfig {
     /// `None` keeps preflight fail-closed. The policy is present only when all
     /// five `BUZZ_CI_*` policy variables pass validation together.
     pub policy: Option<CiPolicyConfig>,
+    /// Executor capabilities the operator advertises for Apple release
+    /// requests (`BUZZ_CI_APPLE_EXECUTOR_CAPABILITIES`, comma-separated).
+    ///
+    /// Empty by default, so every `apple_release` request is refused with
+    /// `missing_capability` until an Apple executor is registered. Only the
+    /// names in `api::ci::apple_release::KNOWN_CAPABILITIES` are accepted.
+    pub apple_executor_capabilities: std::collections::HashSet<String>,
 }
 
 /// Validated CI request and acknowledgement bounds advertised by preflight.
@@ -404,6 +411,42 @@ fn parse_pubkey_set_env(name: &str) -> Result<std::collections::HashSet<String>,
                 )));
             }
             Ok(entry)
+        })
+        .collect()
+}
+
+const CI_APPLE_EXECUTOR_CAPABILITIES_ENV: &str = "BUZZ_CI_APPLE_EXECUTOR_CAPABILITIES";
+
+fn apple_executor_capabilities_from_env() -> Result<std::collections::HashSet<String>, ConfigError>
+{
+    let raw = match std::env::var(CI_APPLE_EXECUTOR_CAPABILITIES_ENV) {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => return Ok(std::collections::HashSet::new()),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(ConfigError::InvalidValue(format!(
+                "{CI_APPLE_EXECUTOR_CAPABILITIES_ENV} must be valid Unicode"
+            )))
+        }
+    };
+    parse_apple_executor_capabilities(&raw)
+}
+
+/// Parse a comma-separated capability list. Unknown names fail closed so a
+/// typo never advertises less than the operator believes.
+fn parse_apple_executor_capabilities(
+    raw: &str,
+) -> Result<std::collections::HashSet<String>, ConfigError> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            if crate::api::ci::apple_release::KNOWN_CAPABILITIES.contains(&entry) {
+                Ok(entry.to_owned())
+            } else {
+                Err(ConfigError::InvalidValue(format!(
+                    "{CI_APPLE_EXECUTOR_CAPABILITIES_ENV} entry is not a known Apple executor capability: {entry:?}"
+                )))
+            }
         })
         .collect()
 }
@@ -915,6 +958,7 @@ impl Config {
         let ci_status_signer_pubkeys = parse_pubkey_set_env("BUZZ_CI_STATUS_SIGNER_PUBKEYS")?;
         let ci = CiConfig {
             policy: ci_policy_config_from_env()?,
+            apple_executor_capabilities: apple_executor_capabilities_from_env()?,
         };
 
         let auth = buzz_auth::AuthConfig {
@@ -1429,6 +1473,10 @@ mod tests {
             "CI status signer authority should default empty"
         );
         assert!(
+            config.ci.apple_executor_capabilities.is_empty(),
+            "Apple executor capabilities should default empty"
+        );
+        assert!(
             config.ci.policy.is_none(),
             "CI preflight policy should default absent"
         );
@@ -1877,6 +1925,24 @@ mod tests {
 
     fn ci_policy_values(values: [&str; 5]) -> [Option<String>; 5] {
         values.map(|value| Some(value.to_string()))
+    }
+
+    #[test]
+    fn apple_executor_capabilities_parse_known_names_only() {
+        let parsed = parse_apple_executor_capabilities(
+            " apple-build, apple-codesign ,apple-notarize,apple-testflight-upload, ",
+        )
+        .expect("known names parse");
+        assert_eq!(parsed.len(), 4);
+        assert!(parse_apple_executor_capabilities("")
+            .expect("empty")
+            .is_empty());
+        let error = parse_apple_executor_capabilities("apple-build,apple-sign")
+            .expect_err("unknown name fails closed");
+        assert!(
+            matches!(error, ConfigError::InvalidValue(ref message) if message.contains("apple-sign")),
+            "{error:?}"
+        );
     }
 
     #[test]

@@ -107,6 +107,7 @@ case "${args}" in
   *" ls-tree -r --name-only "*) printf 'migrations/0031_workflow_approval_foundations.sql\n' ;;
   *" status --porcelain "*)
     [[ ${TEST_DIRTY_CHECKOUT} == 1 ]] && printf ' M deploy/compose/deploy-local.sh\n'
+    [[ ${TEST_DIRTY_CHECKOUT} == 2 ]] && printf '?? pre-freeze-receipt.json\n'
     exit 0
     ;;
   *" worktree add --detach "*)
@@ -490,6 +491,7 @@ run_case() {
   local initial_db=28 prior_required_migration=28
   local checkout_head=${test_commit} source_head=${test_commit} dirty_checkout=0
   local pre_freeze_head=${test_commit} protected_ci_head=${test_commit}
+  local pre_freeze_receipt_path=${case_dir}/pre-freeze-receipt.json
   local receipt_timestamp prior_migration_override='' docker_default_platform=''
   local deploy_log_root=${case_dir}/logs deploy_build_root=${case_dir}/build
   local run_local_override=${compose_dir}/run-local.sh deploy_source_ref=refs/remotes/origin/main
@@ -519,6 +521,7 @@ run_case() {
     stale_checkout|check_stale_checkout) checkout_head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
     stale_source|check_stale_source) source_head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
     dirty_checkout|check_dirty_checkout) dirty_checkout=1 ;;
+    check_stray_receipt_dirty) dirty_checkout=2 ;;
     check_raw_source_ref) deploy_source_ref=${test_commit} ;;
     check_runner_override) run_local_override=${case_dir}/bin/run-local-sentinel ;;
     check_docker_host) docker_host=tcp://127.0.0.1:2375 ;;
@@ -535,6 +538,8 @@ run_case() {
     check_root_symlink) deploy_build_root=${case_dir}/check-build ;;
     check_root_unsafe_parent) deploy_build_root=${case_dir}/unsafe/new ;;
     short_receipt) pre_freeze_head=aaaaaaaaaaaa ;;
+    check_pre_freeze_in_checkout) pre_freeze_receipt_path=${case_dir}/repo/pre-freeze-receipt.json ;;
+    check_pre_freeze_shared_parent) pre_freeze_receipt_path=${case_dir}/shared/pre-freeze-receipt.json ;;
     mismatched_receipt|check_bad_receipt) protected_ci_head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
     prior_override_required) prior_required_migration=invalid ;;
     prior_override_success)
@@ -577,7 +582,14 @@ sock = socket.socket(socket.AF_UNIX)
 sock.bind(sys.argv[1])
 sock.close()
 PY
-  cat >"${case_dir}/pre-freeze-receipt.json" <<JSON
+  # Retained evidence: the receipt is mode 0600 under a caller-owned mode-0700
+  # parent outside the checkout unless the scenario breaks one of those rules.
+  mkdir -p "$(dirname "${pre_freeze_receipt_path}")"
+  case "${scenario}" in
+    check_pre_freeze_in_checkout) chmod 700 "${case_dir}/repo" ;;
+    check_pre_freeze_shared_parent) chmod 755 "${case_dir}/shared" ;;
+  esac
+  cat >"${pre_freeze_receipt_path}" <<JSON
 {
   "schema_version": 1,
   "source": "pre-freeze",
@@ -589,6 +601,8 @@ PY
   "checks": [{"name": "targeted", "status": "PASS"}]
 }
 JSON
+  chmod 600 "${pre_freeze_receipt_path}"
+  [[ ${scenario} != check_pre_freeze_world_readable ]] || chmod 644 "${pre_freeze_receipt_path}"
   python3 - "${compose_dir}/../../scripts/test-protected-ci-receipt.py" \
     "${case_dir}/protected-ci-receipt.json" "${protected_ci_head}" \
     "${receipt_timestamp}" "${scenario}" <<'PY'
@@ -616,6 +630,8 @@ PY
   # deploy-local.sh runs the validator from the checkout root. The fake repo
   # carries a stub that runs the real validator with the pinned GitHub client
   # replaced by the hermetic FakeClient, so `--reverify` never reaches the network.
+  # deploy-local.sh also imports the validator for the shared evidence-root
+  # helpers, so the stub re-exports them and runs main only as a script.
   mkdir -p "${case_dir}/repo/scripts"
   cat >"${case_dir}/repo/scripts/protected-ci-receipt.py" <<'STUB'
 #!/usr/bin/env python3
@@ -629,6 +645,9 @@ spec = importlib.util.spec_from_file_location(
 fixture = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fixture)
 receipt = fixture.receipt
+ReceiptError = receipt.ReceiptError
+validate_evidence_root = receipt.validate_evidence_root
+safe_read_receipt = receipt.safe_read_receipt
 drift = {
     "reverify_forged_receipt": "no_runs",
     "reverify_check_drift": "check_failure",
@@ -646,11 +665,12 @@ def fake_client(gh, identity=None, runner=None):
     return client
 
 
-with open(os.environ["TEST_COMMAND_LOG"], "a", encoding="utf-8") as log:
-    log.write("protected-ci-receipt " + " ".join(sys.argv[1:]) + "\n")
 receipt.resolve_gh = lambda: (receipt.GH_PATH, fixture.FakeClient().identity)
 receipt.GhClient = fake_client
-sys.exit(receipt.main(sys.argv[1:]))
+if __name__ == "__main__":
+    with open(os.environ["TEST_COMMAND_LOG"], "a", encoding="utf-8") as log:
+        log.write("protected-ci-receipt " + " ".join(sys.argv[1:]) + "\n")
+    sys.exit(receipt.main(sys.argv[1:]))
 STUB
   chmod 700 "${case_dir}/repo/scripts/protected-ci-receipt.py"
   if [[ ${scenario} == legacy_protected_receipt ]]; then
@@ -749,7 +769,7 @@ ENV
       BUZZ_DEPLOY_SOURCE_REF="${deploy_source_ref}" \
       BUZZ_SECRET_ENV_FILE="${case_dir}/secrets.env" \
       BUZZ_DOCKER_SOCKET="${case_dir}/docker.sock" \
-      BUZZ_PRE_FREEZE_RECEIPT="${case_dir}/pre-freeze-receipt.json" \
+      BUZZ_PRE_FREEZE_RECEIPT="${pre_freeze_receipt_path}" \
       BUZZ_PROTECTED_CI_RECEIPT="${case_dir}/protected-ci-receipt.json" \
       BUZZ_PRIOR_MIGRATION_OVERRIDE="${prior_migration_override}" \
       DOCKER_HOST="${docker_host}" \
@@ -905,7 +925,8 @@ assert_contains "${scratch}/check-invalid-sha.output" \
   'commit must be exactly 40 lowercase hexadecimal characters'
 
 set +e
-env -u BUZZ_PROTECTED_CI_RECEIPT BUZZ_COMPOSE_ENV_FILE=/nonexistent/compose.env \
+env -u BUZZ_PROTECTED_CI_RECEIPT BUZZ_PRE_FREEZE_RECEIPT=/nonexistent/pre-freeze-receipt.json \
+  BUZZ_COMPOSE_ENV_FILE=/nonexistent/compose.env \
   "${deploy_script}" --check "${test_commit}" \
   >"${scratch}/check-missing-protected-receipt.output" 2>&1
 missing_receipt_rc=$?
@@ -915,7 +936,31 @@ assert_contains "${scratch}/check-missing-protected-receipt.output" \
   'BUZZ_PROTECTED_CI_RECEIPT must name an explicit absolute receipt path'
 
 set +e
+env -u BUZZ_PRE_FREEZE_RECEIPT BUZZ_PROTECTED_CI_RECEIPT=/nonexistent/protected-ci-receipt.json \
+  BUZZ_COMPOSE_ENV_FILE=/nonexistent/compose.env \
+  "${deploy_script}" --check "${test_commit}" \
+  >"${scratch}/check-missing-pre-freeze-receipt.output" 2>&1
+missing_pre_freeze_rc=$?
+set -e
+[[ ${missing_pre_freeze_rc} -ne 0 ]] || fail 'check mode accepted a missing pre-freeze receipt path'
+assert_contains "${scratch}/check-missing-pre-freeze-receipt.output" \
+  'BUZZ_PRE_FREEZE_RECEIPT must name an explicit absolute receipt path'
+
+set +e
+env BUZZ_PRE_FREEZE_RECEIPT=relative/pre-freeze-receipt.json \
+  BUZZ_PROTECTED_CI_RECEIPT=/nonexistent/protected-ci-receipt.json \
+  BUZZ_COMPOSE_ENV_FILE=/nonexistent/compose.env \
+  "${deploy_script}" --check "${test_commit}" \
+  >"${scratch}/check-relative-pre-freeze-receipt.output" 2>&1
+relative_pre_freeze_rc=$?
+set -e
+[[ ${relative_pre_freeze_rc} -ne 0 ]] || fail 'check mode accepted a relative pre-freeze receipt path'
+assert_contains "${scratch}/check-relative-pre-freeze-receipt.output" \
+  'BUZZ_PRE_FREEZE_RECEIPT must name an explicit absolute receipt path'
+
+set +e
 env -u GH_TOKEN BUZZ_PROTECTED_CI_RECEIPT=/nonexistent/protected-ci-receipt.json \
+  BUZZ_PRE_FREEZE_RECEIPT=/nonexistent/pre-freeze-receipt.json \
   BUZZ_COMPOSE_ENV_FILE=/nonexistent/compose.env \
   "${deploy_script}" --check "${test_commit}" \
   >"${scratch}/check-missing-gh-token.output" 2>&1
@@ -986,7 +1031,9 @@ for check_early_failure in check_stale_checkout check_stale_source \
   check_dirty_checkout check_raw_source_ref check_runner_override check_bad_receipt \
   check_bad_owner check_bad_mode check_symlink check_missing_secret check_docker_host \
   check_docker_context check_root_slash check_root_relative check_root_noncanonical \
-  check_root_overlap check_root_repo check_root_symlink check_root_unsafe_parent; do
+  check_root_overlap check_root_repo check_root_symlink check_root_unsafe_parent \
+  check_pre_freeze_in_checkout check_pre_freeze_shared_parent check_pre_freeze_world_readable \
+  check_stray_receipt_dirty; do
   run_case "${check_early_failure}" failure check
   assert_not_contains "${scratch}/${check_early_failure}/commands.log" '^docker '
   assert_not_contains "${scratch}/${check_early_failure}/commands.log" '^fs '
@@ -998,6 +1045,14 @@ for check_early_failure in check_stale_checkout check_stale_source \
   fi
 done
 assert_contains "${scratch}/check_bad_owner/output" 'Compose environment file must be owned'
+assert_contains "${scratch}/check_pre_freeze_in_checkout/output" \
+  'pre-freeze receipt parent is not an evidence root: evidence root must be outside the checkout'
+assert_contains "${scratch}/check_pre_freeze_shared_parent/output" \
+  'pre-freeze receipt parent is not an evidence root: evidence root must be a caller-owned mode-0700 directory'
+assert_contains "${scratch}/check_pre_freeze_world_readable/output" \
+  'pre-freeze receipt is not retained evidence .*caller-owned, mode 0600'
+# No generated receipt name is exempt from the clean-checkout requirement.
+assert_contains "${scratch}/check_stray_receipt_dirty/output" 'source checkout is dirty'
 assert_contains "${scratch}/check_bad_mode/output" 'Compose environment file must have mode 640'
 assert_contains "${scratch}/check_symlink/output" 'Compose environment file is missing, is not a regular file, or is a symlink'
 assert_contains "${scratch}/check_missing_secret/output" 'required secret name is missing: BUZZ_RELAY_OWNER_PUBKEY'

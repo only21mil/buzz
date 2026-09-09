@@ -2,12 +2,19 @@
 
 # Run the local gates that must be green before a Buzz candidate is frozen.
 # The command list intentionally follows .github/workflows/ci.yml and Justfile.
+#
+# The receipt is retained evidence: it is published under the external
+# evidence root (BUZZ_EVIDENCE_ROOT or an explicit --receipt parent) through
+# the same create-only helper protected-ci-receipt.py uses, never inside the
+# checkout.
 
 set -u -o pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
-RECEIPT_PATH="$REPO_ROOT/pre-freeze-receipt.json"
+EVIDENCE_TOOL="$SCRIPT_DIR/protected-ci-receipt.py"
+RECEIPT_INPUT=""
+RECEIPT_PATH=""
 RECORDS_FILE=""
 DIFF_PATHS_FILE=""
 
@@ -15,6 +22,7 @@ HEAD_SHA=""
 BASE_SHA=""
 BASE_INPUT=""
 TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+RECEIPT_STAMP="${TIMESTAMP//[-:]/}"
 OVERALL_FAILED=0
 FULL_CLIPPY=0
 RUN_TESTS=0
@@ -82,25 +90,60 @@ run_check() {
     return 0
 }
 
+# Resolve the receipt destination before any gate runs, so a missing or unsafe
+# evidence root fails immediately and no work is wasted. The receipt is
+# create-only: an existing file at the destination is refused, not replaced.
+resolve_receipt_path() {
+    python3 - "$EVIDENCE_TOOL" "$REPO_ROOT" "$RECEIPT_INPUT" "$RECEIPT_STAMP" <<'PY'
+import importlib.util
+import os
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+tool_path, repo_root, receipt_input, stamp = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("buzz_protected_ci_receipt", tool_path)
+evidence = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(evidence)
+try:
+    if receipt_input:
+        receipt = Path(receipt_input)
+        evidence.refuse(receipt.is_absolute(), f"--receipt must be an absolute path: {receipt}",
+                        evidence.OutputError)
+        evidence.validate_evidence_root(receipt.parent, checkout=Path(repo_root))
+    else:
+        root = evidence.evidence_root_from_environment(checkout=Path(repo_root))
+        receipt = root / f"pre-freeze-receipt-{stamp}.json"
+    evidence.refuse(not os.path.lexists(receipt), f"receipt already exists: {receipt}",
+                    evidence.OutputError)
+except evidence.ReceiptError as error:
+    print(f"pre-freeze receipt: {error}", file=sys.stderr)
+    raise SystemExit(1)
+print(receipt)
+PY
+}
+
 write_receipt() {
     local process_status="$1"
     local overall="FAIL"
-    local receipt_tmp
 
     if ((process_status == 0 && OVERALL_FAILED == 0)); then
         overall="PASS"
     fi
 
-    # Create the temporary receipt beside its destination: os.replace is a
-    # rename, and renaming from $TMPDIR onto another filesystem fails with
-    # EXDEV (issue #143).
-    receipt_tmp="$(mktemp "$REPO_ROOT/.pre-freeze-receipt.XXXXXX")" || return 1
-    if ! python3 - "$receipt_tmp" "$RECEIPT_PATH" "$HEAD_SHA" "$BASE_SHA" "$TIMESTAMP" "$RECORDS_FILE" "$overall" <<'PY'
-import json
-import os
+    # protected-ci-receipt.py publishes the receipt: mode-0600 temporary file
+    # beside the destination (one filesystem, so no EXDEV; issue #143), then a
+    # create-only rename into the validated evidence root.
+    if ! python3 - "$EVIDENCE_TOOL" "$RECEIPT_PATH" "$HEAD_SHA" "$BASE_SHA" "$TIMESTAMP" "$RECORDS_FILE" "$overall" <<'PY'
+import importlib.util
 import sys
+from pathlib import Path
 
-tmp_path, output_path, head_sha, base_sha, timestamp, records_path, overall = sys.argv[1:]
+sys.dont_write_bytecode = True
+tool_path, output_path, head_sha, base_sha, timestamp, records_path, overall = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("buzz_protected_ci_receipt", tool_path)
+evidence = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(evidence)
 checks = []
 with open(records_path, encoding="utf-8") as records:
     for line in records:
@@ -126,16 +169,16 @@ receipt = {
     "checks": checks,
     "overall": overall,
 }
-with open(tmp_path, "w", encoding="utf-8") as output:
-    json.dump(receipt, output, indent=2, sort_keys=True)
-    output.write("\n")
-os.replace(tmp_path, output_path)
+try:
+    evidence.safe_publish(Path(output_path), receipt)
+except evidence.ReceiptError as error:
+    print(f"pre-freeze receipt: {error}", file=sys.stderr)
+    raise SystemExit(1)
 PY
     then
-        rm -f -- "$receipt_tmp"
+        printf 'pre-freeze receipt was not written: %s\n' "$RECEIPT_PATH" >&2
         return 1
     fi
-    rm -f -- "$receipt_tmp"
     printf '\nReceipt: %s (%s)\n' "$RECEIPT_PATH" "$overall"
     return 0
 }
@@ -151,12 +194,18 @@ finish() {
 
 usage() {
     cat <<'USAGE'
-Usage: scripts/pre-freeze.sh [--base <ref>] [--full] [--test]
+Usage: scripts/pre-freeze.sh [--base <ref>] [--full] [--test] [--receipt <path>]
 
-  --base <ref>  Compare against this commit/ref. Defaults to merge-base with
-                refs/remotes/buzz/main.
-  --full        Run workspace-wide clippy (and workspace-wide tests with --test).
-  --test        Run cargo test for the touched workspace crates.
+  --base <ref>     Compare against this commit/ref. Defaults to merge-base with
+                   refs/remotes/buzz/main.
+  --full           Run workspace-wide clippy (and workspace-wide tests with --test).
+  --test           Run cargo test for the touched workspace crates.
+  --receipt <path> Absolute receipt path whose parent is an evidence root.
+                   Defaults to $BUZZ_EVIDENCE_ROOT/pre-freeze-receipt-<UTC stamp>.json.
+
+The receipt is retained evidence. Its parent must be an absolute, canonical,
+caller-owned mode-0700 directory outside the checkout; the file is published
+at mode 0600 and is never replaced. Set BUZZ_EVIDENCE_ROOT to that directory.
 USAGE
 }
 
@@ -178,6 +227,14 @@ while (($# > 0)); do
             RUN_TESTS=1
             shift
             ;;
+        --receipt)
+            if (($# < 2)) || [[ -z "$2" || "$2" == -* ]]; then
+                printf '%s\n' '--receipt requires a path' >&2
+                exit 2
+            fi
+            RECEIPT_INPUT="$2"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -189,6 +246,10 @@ while (($# > 0)); do
             ;;
     esac
 done
+
+if ! RECEIPT_PATH="$(resolve_receipt_path)"; then
+    exit 2
+fi
 
 if ! RECORDS_FILE="$(mktemp "${TMPDIR:-/tmp}/buzz-pre-freeze-records.XXXXXX")"; then
     printf '%s\n' 'could not create pre-freeze records file' >&2
@@ -231,7 +292,6 @@ fi
 
 is_generated_untracked_path() {
     case "$1" in
-        pre-freeze-receipt.json|\
         target|target/*|\
         dist|dist/*|\
         build|build/*|\
@@ -279,7 +339,7 @@ check_clean_tree() {
     done < "$status_file"
     rm -f -- "$status_file"
     if ((dirty != 0)); then
-        printf '%s\n' 'worktree must have clean porcelain (except generated build output and pre-freeze-receipt.json)' >&2
+        printf '%s\n' 'worktree must have clean porcelain (except generated build output)' >&2
         return 1
     fi
     return 0
@@ -287,7 +347,7 @@ check_clean_tree() {
 
 if ! run_check \
     "clean-tree" \
-    "git status --porcelain=v1 --untracked-files=all -z (build directories and pre-freeze-receipt.json excepted)" \
+    "git status --porcelain=v1 --untracked-files=all -z (build directories excepted)" \
     check_clean_tree; then
     exit 1
 fi
