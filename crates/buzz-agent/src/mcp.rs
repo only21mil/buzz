@@ -967,6 +967,11 @@ const DOWNSCALE_MAX_PIXELS: u64 = 100_000_000;
 /// (8 bytes per pixel), matching `buzz_media::MAX_IMAGE_DECODE_BYTES`.
 const DOWNSCALE_MAX_ALLOC: u64 = DOWNSCALE_MAX_PIXELS * 8;
 
+/// Whether a declared geometry is over [`DOWNSCALE_MAX_PIXELS`].
+fn exceeds_downscale_pixel_cap(width: u32, height: u32) -> bool {
+    u64::from(width) * u64::from(height) > DOWNSCALE_MAX_PIXELS
+}
+
 /// A tool-result image re-encoded to fit an inline byte budget.
 struct DownscaledImage {
     /// Base64 JPEG bytes, `<= budget` characters.
@@ -984,7 +989,7 @@ struct DownscaledImage {
 fn downscale_image_to_budget(data_b64: &str, budget: usize) -> Option<DownscaledImage> {
     use base64::Engine as _;
     use image::codecs::jpeg::JpegEncoder;
-    use image::GenericImageView as _;
+    use image::{GenericImageView as _, ImageDecoder as _};
 
     if budget == 0 {
         return None;
@@ -996,16 +1001,22 @@ fn downscale_image_to_budget(data_b64: &str, budget: usize) -> Option<Downscaled
         .with_guessed_format()
         .ok()?;
     // Pixel count is the guard, not a side length: a 100 MP panorama has a
-    // long edge well past any square cap. `decode` reserves the whole output
-    // buffer against `max_alloc`, so the pixel limit holds for every format.
+    // long edge well past any square cap. `max_alloc` bounds bytes, not
+    // pixels (a 28000x28000 Luma8 declares 784 MP in 784 MB), so the
+    // dimensions are checked from the header before any output buffer exists.
     let mut limits = image::Limits::no_limits();
     limits.max_alloc = Some(DOWNSCALE_MAX_ALLOC);
     reader.limits(limits);
-    let source = reader.decode().ok()?;
-    let (source_width, source_height) = source.dimensions();
-    if source_width == 0 || source_height == 0 {
+    let decoder = reader.into_decoder().ok()?;
+    let (source_width, source_height) = decoder.dimensions();
+    if source_width == 0
+        || source_height == 0
+        || exceeds_downscale_pixel_cap(source_width, source_height)
+        || decoder.total_bytes() > DOWNSCALE_MAX_ALLOC
+    {
         return None;
     }
+    let source = image::DynamicImage::from_decoder(decoder).ok()?;
 
     let encode = |img: &image::DynamicImage| -> Option<String> {
         let mut buf = Vec::new();
@@ -1322,6 +1333,127 @@ mod content_tests {
         );
         assert!(note.contains("delivered as image/jpeg"), "{note}");
         assert!(note.contains("original is unchanged"), "{note}");
+    }
+
+    /// The pixel cap must not drift from the relay's. buzz-agent takes no
+    /// workspace crates, so the source of truth is read as text and checked
+    /// at compile time of the test build.
+    const BUZZ_MEDIA_VALIDATION_SOURCE: &str = include_str!("../../buzz-media/src/validation.rs");
+
+    const fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        if needle.len() > haystack.len() {
+            return false;
+        }
+        let mut start = 0;
+        while start + needle.len() <= haystack.len() {
+            let mut i = 0;
+            while i < needle.len() && haystack[start + i] == needle[i] {
+                i += 1;
+            }
+            if i == needle.len() {
+                return true;
+            }
+            start += 1;
+        }
+        false
+    }
+
+    const _: () = assert!(
+        contains(
+            BUZZ_MEDIA_VALIDATION_SOURCE.as_bytes(),
+            b"pub const MAX_IMAGE_PIXELS: u64 = 100_000_000;"
+        ),
+        "buzz_media::MAX_IMAGE_PIXELS changed; update DOWNSCALE_MAX_PIXELS to match"
+    );
+
+    #[test]
+    fn downscale_pixel_cap_matches_buzz_media() {
+        assert_eq!(DOWNSCALE_MAX_PIXELS, 100_000_000);
+        assert_eq!(DOWNSCALE_MAX_ALLOC, 800_000_000);
+        assert!(BUZZ_MEDIA_VALIDATION_SOURCE.contains(&format!(
+            "pub const MAX_IMAGE_PIXELS: u64 = {};",
+            "100_000_000"
+        )));
+        assert!(!exceeds_downscale_pixel_cap(10_000, 10_000));
+        assert!(exceeds_downscale_pixel_cap(10_001, 10_000));
+        assert!(exceeds_downscale_pixel_cap(28_000, 28_000));
+    }
+
+    /// PNG signature, IHDR, a padding tEXt chunk, IEND: a file that declares
+    /// a geometry without carrying any pixel data, padded past the inline
+    /// budget so `tool_result_content` takes the downscale path.
+    fn png_header_base64(width: u32, height: u32, color_type: u8) -> String {
+        use base64::Engine as _;
+        fn chunk(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+            let mut body = Vec::with_capacity(4 + payload.len());
+            body.extend_from_slice(kind);
+            body.extend_from_slice(payload);
+            let mut out = (payload.len() as u32).to_be_bytes().to_vec();
+            out.extend_from_slice(&body);
+            out.extend_from_slice(&crc32(&body).to_be_bytes());
+            out
+        }
+        // PNG chunk CRC (ISO 3309), so the decoder reads the header as valid.
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = 0xFFFF_FFFFu32;
+            for &b in bytes {
+                crc ^= u32::from(b);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 1 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
+                }
+            }
+            !crc
+        }
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, color_type, 0, 0, 0]);
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend(chunk(b"IHDR", &ihdr));
+        let mut padding = b"pad\0".to_vec();
+        padding.resize(128 * 1024, b'x');
+        bytes.extend(chunk(b"tEXt", &padding));
+        bytes.extend(chunk(b"IEND", &[]));
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn oversized_declared_geometry_is_elided_before_decode() {
+        // 784 MP Luma8 would pass a bytes-only guard (784 MB < 800 MB) and
+        // allocate before failing; the pixel check refuses it from the header.
+        let png = png_header_base64(28_000, 28_000, 0);
+        assert!(png.len() > 64 * 1024, "padding keeps the image over budget");
+        assert!(downscale_image_to_budget(&png, 64 * 1024).is_none());
+        let blocks = vec![Content::image(png, "image/png")];
+        let out = tool_result_content(&blocks, 64 * 1024, 64 * 1024);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(&out[0], ToolResultContent::Text(t) if t.contains("image elided")));
+    }
+
+    #[test]
+    fn one_hundred_megapixel_rgba_still_downscales() {
+        use base64::Engine as _;
+        use image::ImageEncoder as _;
+        let (width, height) = (10_000u32, 10_000u32);
+        let pixels = vec![0x7Fu8; (width as usize) * (height as usize) * 4];
+        let mut bytes = Vec::new();
+        image::codecs::png::PngEncoder::new_with_quality(
+            &mut bytes,
+            image::codecs::png::CompressionType::Fast,
+            image::codecs::png::FilterType::NoFilter,
+        )
+        .write_image(&pixels, width, height, image::ExtendedColorType::Rgba8)
+        .unwrap();
+        drop(pixels);
+        let png = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let fit = downscale_image_to_budget(&png, 64 * 1024).expect("100 MP RGBA8 downscales");
+        assert_eq!((fit.source_width, fit.source_height), (width, height));
+        assert!(fit.width < width && fit.height < height);
+        assert!(fit.data.len() <= 64 * 1024);
     }
 
     #[test]
