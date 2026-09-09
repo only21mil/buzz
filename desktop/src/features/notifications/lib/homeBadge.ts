@@ -1,5 +1,6 @@
 import type { FeedItem, HomeFeedResponse } from "@/shared/api/types";
 import { maxReadAt } from "@/features/channels/readState/readStateFormat";
+import { isInboxListedFeedItem } from "@/features/home/lib/inboxFeedItems";
 import {
   getThreadReference,
   isBroadcastReply,
@@ -47,7 +48,9 @@ export function buildHomeBadgeFeedItems(
     );
   }
 
-  return dedupeFeedItemsById(items);
+  // Only rows the Inbox actually lists may light the badge; see
+  // isInboxListedFeedItem for why feed reminders are dropped here.
+  return dedupeFeedItemsById(items.filter(isInboxListedFeedItem));
 }
 
 export function shouldCountTowardHomeBadgeSubtotal(
