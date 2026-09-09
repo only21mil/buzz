@@ -1692,6 +1692,20 @@ impl Db {
         .await
     }
 
+    /// Load one stored kind-46108 terminal check of a run by event ID, with
+    /// the relay clock's `accepted_at`.
+    pub async fn load_ci_check(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        check_event_id: &[u8],
+    ) -> Result<Option<ci::CiStoredEvent>> {
+        observability::observe(observability::Operation::Ci, async {
+            ci::load_ci_check(&self.pool, community_id, run_id, check_event_id).await
+        })
+        .await
+    }
+
     /// Upsert a CI control-plane signer grant (kind 46107).
     ///
     /// Idempotent per `(community, channel, target_repo_a, signer)`: the
