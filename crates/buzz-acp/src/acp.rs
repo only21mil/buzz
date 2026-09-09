@@ -194,6 +194,11 @@ pub struct AcpClient {
     /// `/skill` mapping in [`crate::queue::slash`] through
     /// [`available_commands`](Self::available_commands).
     available_commands: std::collections::HashMap<String, Vec<String>>,
+    /// Sessions the harness holds in plan mode for the current turn. While a
+    /// session is listed, an `ExitPlanMode` permission request is answered
+    /// with the keep-planning option instead of `allow_once`; see
+    /// [`choose_permission_option`].
+    plan_hold_sessions: std::collections::HashSet<String>,
     /// Whether the agent advertised `_meta.steering.supported: true` in its
     /// `initialize` response, meaning it implements the cross-adapter
     /// [`ACP_STEER_METHOD`] extension.
@@ -555,6 +560,7 @@ impl AcpClient {
             observer_context: ObserverContext::default(),
             active_run_id: None,
             available_commands: std::collections::HashMap::new(),
+            plan_hold_sessions: std::collections::HashSet::new(),
             steering_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
@@ -744,6 +750,7 @@ impl AcpClient {
         // when an adapter rejects or times out this best-effort fallback.
         self.goose_usage.close_session(session_id);
         self.available_commands.remove(session_id);
+        self.plan_hold_sessions.remove(session_id);
         result?;
         tracing::info!(target: "acp::session", "session deleted: {session_id}");
         Ok(())
@@ -963,6 +970,22 @@ impl AcpClient {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn available_commands(&self, session_id: &str) -> Option<&[String]> {
         self.available_commands.get(session_id).map(Vec::as_slice)
+    }
+
+    /// Hold `session_id` in plan mode: while set, an `ExitPlanMode` permission
+    /// request is answered with the keep-planning option (`plan`), so the
+    /// agent finishes its plan instead of being let out to execute it.
+    pub fn set_plan_hold(&mut self, session_id: &str, hold: bool) {
+        if hold {
+            self.plan_hold_sessions.insert(session_id.to_string());
+        } else {
+            self.plan_hold_sessions.remove(session_id);
+        }
+    }
+
+    /// Whether [`set_plan_hold`](Self::set_plan_hold) is active for the session.
+    pub fn plan_hold(&self, session_id: &str) -> bool {
+        self.plan_hold_sessions.contains(session_id)
     }
 
     /// Seed the advertised command list for a session without a live
@@ -2038,7 +2061,8 @@ impl AcpClient {
         // Mark as not yet responded — guards against double-response race.
         self.permission_responded = false;
 
-        let options = msg["params"]["options"]
+        let params = &msg["params"];
+        let options = params["options"]
             .as_array()
             .ok_or_else(|| AcpError::Protocol("permission request missing options".into()))?;
 
@@ -2048,40 +2072,27 @@ impl AcpClient {
             options.len()
         );
 
-        // Find allow_once by kind — NEVER hardcode optionId.
-        let allow_once = options
-            .iter()
-            .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("allow_once"));
-
-        let response = if let Some(opt) = allow_once {
-            let option_id = opt["optionId"]
-                .as_str()
-                .ok_or_else(|| AcpError::Protocol("allow_once option missing optionId".into()))?;
-            tracing::info!(
+        let plan_hold = params["sessionId"]
+            .as_str()
+            .is_some_and(|sid| self.plan_hold(sid));
+        let choice = choose_permission_option(params, plan_hold)?;
+        match choice.reason {
+            PermissionChoiceReason::AllowOnce => tracing::info!(
                 target: "acp::permission",
-                "auto-approving permission id={id} with allow_once optionId={option_id:?}"
-            );
-            permission_response_selected(&id, option_id)
-        } else {
-            // No allow_once — fall back to reject_once.
-            tracing::warn!(
+                "auto-approving permission id={id} with allow_once optionId={:?}",
+                choice.option_id
+            ),
+            PermissionChoiceReason::KeepPlanning => tracing::info!(
+                target: "acp::permission",
+                "plan hold: answering ExitPlanMode id={id} with keep-planning optionId={:?}",
+                choice.option_id
+            ),
+            PermissionChoiceReason::RejectFallback => tracing::warn!(
                 target: "acp::permission",
                 "no allow_once option found in permission request id={id}, falling back to reject_once"
-            );
-            let reject = options
-                .iter()
-                .find(|opt| opt.get("kind").and_then(|k| k.as_str()) == Some("reject_once"));
-
-            if let Some(opt) = reject {
-                let option_id = opt["optionId"].as_str().unwrap_or("reject");
-                permission_response_selected(&id, option_id)
-            } else {
-                return Err(AcpError::Protocol(
-                    "no suitable permission option found (neither allow_once nor reject_once)"
-                        .into(),
-                ));
-            }
-        };
+            ),
+        }
+        let response = permission_response_selected(&id, &choice.option_id);
 
         // Write the response first, then mark as responded.
         //
@@ -2176,6 +2187,90 @@ fn steer_prompt_blocks(prompt_blocks: &[&str]) -> Vec<serde_json::Value> {
 }
 
 /// Build a JSON-RPC permission response with `outcome: "selected"`.
+/// Why [`choose_permission_option`] picked its option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PermissionChoiceReason {
+    /// The ordinary auto-approval.
+    AllowOnce,
+    /// A plan-held session asked to leave plan mode; keep it planning.
+    KeepPlanning,
+    /// No `allow_once` was offered; the request is declined once.
+    RejectFallback,
+}
+
+/// The option a permission request is answered with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PermissionChoice {
+    pub option_id: String,
+    pub reason: PermissionChoiceReason,
+}
+
+/// Whether a `session/request_permission` is Claude Code's `ExitPlanMode`.
+///
+/// claude-agent-acp attaches `_meta.claudeCode.toolName` only for subagent
+/// requests, so the top-level shape is recognised by its tool kind
+/// (`switch_mode`) or by the keep-planning option it always offers
+/// (`{kind: "reject_once", optionId: "plan"}`).
+fn is_exit_plan_mode_request(params: &serde_json::Value) -> bool {
+    let tool_name = |v: &serde_json::Value| {
+        v["_meta"]["claudeCode"]["toolName"].as_str() == Some("ExitPlanMode")
+    };
+    tool_name(params)
+        || tool_name(&params["toolCall"])
+        || params["toolCall"]["kind"].as_str() == Some("switch_mode")
+        || keep_planning_option(params).is_some()
+}
+
+/// The `plan` reject option of an `ExitPlanMode` request, when offered.
+fn keep_planning_option(params: &serde_json::Value) -> Option<&serde_json::Value> {
+    params["options"].as_array()?.iter().find(|opt| {
+        opt["kind"].as_str() == Some("reject_once") && opt["optionId"].as_str() == Some("plan")
+    })
+}
+
+/// Pick the option for a permission request. Options are matched by `kind`,
+/// never by a hardcoded id, except for the plan hold where the connector's
+/// documented `plan` id is preferred and any `reject_once` is the fallback.
+pub(crate) fn choose_permission_option(
+    params: &serde_json::Value,
+    plan_hold: bool,
+) -> Result<PermissionChoice, AcpError> {
+    let options = params["options"]
+        .as_array()
+        .ok_or_else(|| AcpError::Protocol("permission request missing options".into()))?;
+    let by_kind = |kind: &str| {
+        options
+            .iter()
+            .find(|opt| opt["kind"].as_str() == Some(kind))
+    };
+    if plan_hold && is_exit_plan_mode_request(params) {
+        if let Some(opt) = keep_planning_option(params).or_else(|| by_kind("reject_once")) {
+            return Ok(PermissionChoice {
+                option_id: opt["optionId"].as_str().unwrap_or("plan").to_string(),
+                reason: PermissionChoiceReason::KeepPlanning,
+            });
+        }
+    }
+    if let Some(opt) = by_kind("allow_once") {
+        let option_id = opt["optionId"]
+            .as_str()
+            .ok_or_else(|| AcpError::Protocol("allow_once option missing optionId".into()))?;
+        return Ok(PermissionChoice {
+            option_id: option_id.to_string(),
+            reason: PermissionChoiceReason::AllowOnce,
+        });
+    }
+    if let Some(opt) = by_kind("reject_once") {
+        return Ok(PermissionChoice {
+            option_id: opt["optionId"].as_str().unwrap_or("reject").to_string(),
+            reason: PermissionChoiceReason::RejectFallback,
+        });
+    }
+    Err(AcpError::Protocol(
+        "no suitable permission option found (neither allow_once nor reject_once)".into(),
+    ))
+}
+
 fn permission_response_selected(id: &serde_json::Value, option_id: &str) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
@@ -2643,6 +2738,102 @@ mod tests {
         assert_eq!(prompt[0]["text"].as_str(), Some("/goal ship it"));
         assert!(prompt[0]["text"].as_str().unwrap().starts_with('/'));
         assert_eq!(prompt[1]["type"].as_str(), Some("text"));
+    }
+
+    fn exit_plan_mode_request(session_id: &str, with_meta: bool) -> serde_json::Value {
+        let mut tool_call = serde_json::json!({
+            "toolCallId": "tu-1",
+            "title": "Ready to code?",
+            "kind": "switch_mode",
+            "rawInput": {"plan": "1. do x"},
+        });
+        if with_meta {
+            tool_call["_meta"] = serde_json::json!({"claudeCode": {"toolName": "ExitPlanMode", "parentToolUseId": "p"}});
+        }
+        serde_json::json!({
+            "sessionId": session_id,
+            "toolCall": tool_call,
+            "options": [
+                {"kind": "allow_always", "name": "Yes, and auto-accept edits", "optionId": "acceptEdits"},
+                {"kind": "allow_once", "name": "Yes, and manually approve edits", "optionId": "default"},
+                {"kind": "reject_once", "name": "No, keep planning", "optionId": "plan"},
+            ]
+        })
+    }
+
+    #[test]
+    fn plan_hold_answers_exit_plan_mode_with_keep_planning() {
+        let params = exit_plan_mode_request("s", false);
+        let held = choose_permission_option(&params, true).unwrap();
+        assert_eq!(held.option_id, "plan");
+        assert_eq!(held.reason, PermissionChoiceReason::KeepPlanning);
+        // Same request without the hold is let out as usual.
+        let free = choose_permission_option(&params, false).unwrap();
+        assert_eq!(free.option_id, "default");
+        assert_eq!(free.reason, PermissionChoiceReason::AllowOnce);
+        // Subagent shape (meta present) is recognised too.
+        let meta = exit_plan_mode_request("s", true);
+        assert_eq!(
+            choose_permission_option(&meta, true).unwrap().reason,
+            PermissionChoiceReason::KeepPlanning
+        );
+    }
+
+    #[test]
+    fn plan_hold_leaves_other_permission_requests_on_allow_once() {
+        let edit = serde_json::json!({
+            "sessionId": "s",
+            "toolCall": {"toolCallId": "tu-2", "title": "Edit foo.rs", "kind": "edit"},
+            "options": [
+                {"kind": "allow_once", "name": "Allow", "optionId": "allow"},
+                {"kind": "reject_once", "name": "Reject", "optionId": "reject"},
+            ]
+        });
+        let choice = choose_permission_option(&edit, true).unwrap();
+        assert_eq!(choice.option_id, "allow");
+        assert_eq!(choice.reason, PermissionChoiceReason::AllowOnce);
+        // ExitPlanMode offered without the `plan` id still gets a reject_once.
+        let no_plan_id = serde_json::json!({
+            "sessionId": "s",
+            "toolCall": {"toolCallId": "tu-3", "kind": "switch_mode"},
+            "options": [
+                {"kind": "allow_once", "optionId": "default"},
+                {"kind": "reject_once", "optionId": "no"},
+            ]
+        });
+        let choice = choose_permission_option(&no_plan_id, true).unwrap();
+        assert_eq!(choice.option_id, "no");
+        assert_eq!(choice.reason, PermissionChoiceReason::KeepPlanning);
+        // No allow_once at all falls back to reject_once with the old reason.
+        let reject_only = serde_json::json!({
+            "sessionId": "s",
+            "options": [{"kind": "reject_once", "optionId": "r"}]
+        });
+        let choice = choose_permission_option(&reject_only, false).unwrap();
+        assert_eq!(choice.reason, PermissionChoiceReason::RejectFallback);
+        assert!(choose_permission_option(&serde_json::json!({"options": []}), false).is_err());
+    }
+
+    #[tokio::test]
+    async fn plan_hold_is_per_session_and_cleared_on_delete() {
+        let mut client = spawn_script(
+            r#"count=0
+while IFS= read -r line; do
+  printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$count,\"result\":{}}"
+  count=$((count + 1))
+done"#,
+        )
+        .await;
+        assert!(!client.plan_hold("a"));
+        client.set_plan_hold("a", true);
+        assert!(client.plan_hold("a"));
+        assert!(!client.plan_hold("b"));
+        client.set_plan_hold("a", false);
+        assert!(!client.plan_hold("a"));
+        client.set_plan_hold("a", true);
+        client.session_delete("a").await.expect("delete answered");
+        assert!(!client.plan_hold("a"));
+        client.shutdown().await;
     }
 
     #[test]
