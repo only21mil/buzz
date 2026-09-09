@@ -2,7 +2,8 @@
 
 use crate::kind::{
     KIND_CI_ARTIFACT_REFERENCE, KIND_CI_CHECK, KIND_CI_EVIDENCE_FINALIZED, KIND_CI_JOB_STATUS,
-    KIND_CI_LOG_REFERENCE, KIND_CI_REQUEST, KIND_CI_RUN_STATUS, KIND_CI_TEARDOWN_ATTESTATION,
+    KIND_CI_LOG_REFERENCE, KIND_CI_MERGE_BYPASS, KIND_CI_REQUEST, KIND_CI_RUN_STATUS,
+    KIND_CI_TEARDOWN_ATTESTATION,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use nostr::Tag;
@@ -1732,4 +1733,441 @@ fn validate_hex(value: &str, len: usize, message: &'static str) -> Result<(), Ci
         return Err(CiValidationError(message));
     }
     Ok(())
+}
+
+/// Longest window a kind-46109 merge bypass may cover, in seconds.
+pub const CI_MERGE_BYPASS_MAX_WINDOW_SECONDS: u64 = 3600;
+/// Longest accepted bypass reason, in bytes.
+pub const CI_MERGE_BYPASS_MAX_REASON_BYTES: usize = 1024;
+/// Longest accepted ref name in a bypass, in bytes.
+pub const CI_MERGE_BYPASS_MAX_REF_BYTES: usize = 1024;
+
+/// Owner-signed merge-gate bypass content for kind 46109.
+///
+/// One exact ref update `(ref_name, old_oid, new_oid)` of one repository,
+/// valid from `issued_at` until `expires_at` (at most one hour later). The
+/// signer must be the repository owner named by `target_repo_a`; role alone
+/// grants no bypass. The relay stores it and the merge gate consumes it once
+/// after the publish it covers wins; a bypass evaluated in shadow mode or on
+/// a push that loses the publish race stays usable until it expires.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CiMergeBypassEnvelope {
+    /// Always `CI_SCHEMA_VERSION`.
+    pub schema_version: u32,
+    /// Immutable repository coordinate `30617:<owner>:<repo-id>`.
+    pub target_repo_a: String,
+    /// Full ref name the bypass covers, for example `refs/heads/main`.
+    pub ref_name: String,
+    /// Exact object ID the ref must point at before the update.
+    pub old_oid: String,
+    /// Exact object ID the ref points at after the update.
+    pub new_oid: String,
+    /// Non-empty human reason recorded with the decision.
+    pub reason: String,
+    /// Window start in Unix seconds.
+    pub issued_at: u64,
+    /// Window end in Unix seconds, exclusive; at most one hour after `issued_at`.
+    pub expires_at: u64,
+}
+
+impl CiMergeBypassEnvelope {
+    /// Validate the context-free bypass shape.
+    pub fn validate(&self) -> Result<(), CiValidationError> {
+        if self.schema_version != CI_SCHEMA_VERSION {
+            return Err(CiValidationError("unsupported schema version"));
+        }
+        validate_repository_coordinate(&self.target_repo_a)?;
+        validate_bypass_ref_name(&self.ref_name)?;
+        validate_git_oid(&self.old_oid, "invalid bypass old object ID")?;
+        validate_git_oid(&self.new_oid, "invalid bypass new object ID")?;
+        if self.old_oid.len() != self.new_oid.len() {
+            return Err(CiValidationError("bypass object IDs must share one width"));
+        }
+        if is_zero_oid(&self.old_oid) || is_zero_oid(&self.new_oid) {
+            return Err(CiValidationError(
+                "bypass covers a ref update, never a create or delete",
+            ));
+        }
+        if self.old_oid == self.new_oid {
+            return Err(CiValidationError(
+                "bypass old and new object IDs must differ",
+            ));
+        }
+        validate_non_empty(&self.reason, "bypass reason must be non-empty")?;
+        if self.reason.len() > CI_MERGE_BYPASS_MAX_REASON_BYTES {
+            return Err(CiValidationError("bypass reason is too long"));
+        }
+        validate_safe_integer(self.issued_at, "issued_at exceeds safe integer")?;
+        validate_safe_integer(self.expires_at, "expires_at exceeds safe integer")?;
+        if self.expires_at <= self.issued_at {
+            return Err(CiValidationError("bypass expires_at must follow issued_at"));
+        }
+        if self.expires_at - self.issued_at > CI_MERGE_BYPASS_MAX_WINDOW_SECONDS {
+            return Err(CiValidationError("bypass window must not exceed one hour"));
+        }
+        Ok(())
+    }
+
+    /// Repository owner pubkey named by `target_repo_a`.
+    pub fn owner(&self) -> Result<&str, CiValidationError> {
+        repository_coordinate_owner(&self.target_repo_a)
+    }
+
+    /// Whether `now` (Unix seconds) falls inside `[issued_at, expires_at)`.
+    pub fn is_live_at(&self, now: u64) -> bool {
+        (self.issued_at..self.expires_at).contains(&now)
+    }
+
+    /// Whether the bypass names exactly this ref update.
+    pub fn covers(&self, ref_name: &str, old_oid: &str, new_oid: &str) -> bool {
+        self.ref_name == ref_name && self.old_oid == old_oid && self.new_oid == new_oid
+    }
+}
+
+/// Owner pubkey of a `30617:<owner>:<repo-id>` coordinate.
+pub fn repository_coordinate_owner(value: &str) -> Result<&str, CiValidationError> {
+    validate_repository_coordinate(value)?;
+    value
+        .split(':')
+        .nth(1)
+        .ok_or(CiValidationError("invalid repository coordinate"))
+}
+
+/// Build the required index tags for a kind 46109 merge bypass.
+pub fn merge_bypass_tags(
+    channel_id: &str,
+    envelope: &CiMergeBypassEnvelope,
+) -> Result<Vec<Tag>, CiValidationError> {
+    envelope.validate()?;
+    Uuid::parse_str(channel_id).map_err(|_| CiValidationError("invalid channel UUID"))?;
+    [vec!["h", channel_id], vec!["a", &envelope.target_repo_a]]
+        .into_iter()
+        .map(|parts| Tag::parse(parts).map_err(|_| CiValidationError("failed to build CI tag")))
+        .collect()
+}
+
+/// Validate required index tags against a kind 46109 merge bypass.
+///
+/// Exactly one `h` naming the channel and one `a` naming the coordinate;
+/// the run-event tags (`run`, `workflow`, `c`, `attempt`, `job`, `e`, `x`)
+/// are forbidden so a bypass can never be indexed as run evidence.
+pub fn validate_merge_bypass_tags(
+    tags: &[Tag],
+    channel_id: &str,
+    envelope: &CiMergeBypassEnvelope,
+) -> Result<(), CiValidationError> {
+    let expected = merge_bypass_tags(channel_id, envelope)?;
+    const FORBIDDEN: &[&str] = &["run", "workflow", "c", "attempt", "job", "e", "x"];
+    for tag in tags {
+        if let Some(name) = tag.as_slice().first().map(|part| part.as_str()) {
+            if FORBIDDEN.contains(&name) {
+                return Err(CiValidationError("forbidden reserved CI tag"));
+            }
+        }
+    }
+    for expected_tag in expected {
+        let expected_parts = expected_tag.as_slice();
+        let name = expected_parts[0].as_str();
+        let matching: Vec<&Tag> = tags
+            .iter()
+            .filter(|tag| {
+                tag.as_slice()
+                    .first()
+                    .is_some_and(|part| part.as_str() == name)
+            })
+            .collect();
+        if matching.len() != 1 {
+            return Err(CiValidationError("required CI tag must occur exactly once"));
+        }
+        let actual = matching[0].as_slice();
+        if actual.len() != expected_parts.len()
+            || !actual
+                .iter()
+                .zip(expected_parts.iter())
+                .all(|(left, right)| left.as_str() == right.as_str())
+        {
+            return Err(CiValidationError("CI tag does not match envelope"));
+        }
+    }
+    Ok(())
+}
+
+/// Verify a signed kind 46109 merge bypass and bind it to its channel and owner.
+///
+/// Checks the event ID and signature, the kind, the envelope shape, the
+/// index tags, and that the event signer is the repository owner named by
+/// `target_repo_a`. Channel role and window liveness are the caller's checks.
+pub fn validate_signed_ci_merge_bypass(
+    event: &nostr::Event,
+    channel_id: &str,
+) -> Result<CiMergeBypassEnvelope, CiValidationError> {
+    event
+        .verify()
+        .map_err(|_| CiValidationError("invalid CI event ID or signature"))?;
+    if event.kind.as_u16() as u32 != KIND_CI_MERGE_BYPASS {
+        return Err(CiValidationError("event kind is not a merge bypass"));
+    }
+    let envelope: CiMergeBypassEnvelope = serde_json::from_str(&event.content)
+        .map_err(|_| CiValidationError("invalid CI merge bypass content"))?;
+    let tags: Vec<Tag> = event.tags.iter().cloned().collect();
+    validate_merge_bypass_tags(&tags, channel_id, &envelope)?;
+    if envelope.owner()? != event.pubkey.to_hex() {
+        return Err(CiValidationError(
+            "merge bypass signer is not the repository owner",
+        ));
+    }
+    Ok(envelope)
+}
+
+fn validate_bypass_ref_name(value: &str) -> Result<(), CiValidationError> {
+    const MESSAGE: &str = "invalid bypass ref name";
+    if !value.starts_with("refs/")
+        || value.len() > CI_MERGE_BYPASS_MAX_REF_BYTES
+        || value.ends_with('/')
+        || value.ends_with(".lock")
+        || value.contains("..")
+        || value.contains("//")
+        || value.contains("/.")
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_graphic()
+                && !matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+        })
+    {
+        return Err(CiValidationError(MESSAGE));
+    }
+    Ok(())
+}
+
+fn is_zero_oid(value: &str) -> bool {
+    value.bytes().all(|byte| byte == b'0')
+}
+
+#[cfg(test)]
+mod merge_bypass_tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind};
+
+    const CHANNEL: &str = "46bba699-8251-43c7-943e-66be58376585";
+
+    fn envelope(owner: &Keys) -> CiMergeBypassEnvelope {
+        CiMergeBypassEnvelope {
+            schema_version: CI_SCHEMA_VERSION,
+            target_repo_a: format!("30617:{}:buzz", owner.public_key().to_hex()),
+            ref_name: "refs/heads/main".into(),
+            old_oid: "a".repeat(40),
+            new_oid: "b".repeat(40),
+            reason: "hotfix while CI is down".into(),
+            issued_at: 1_800_000_000,
+            expires_at: 1_800_003_600,
+        }
+    }
+
+    fn signed(keys: &Keys, envelope: &CiMergeBypassEnvelope, tags: Vec<Tag>) -> nostr::Event {
+        EventBuilder::new(
+            Kind::Custom(KIND_CI_MERGE_BYPASS as u16),
+            serde_json::to_string(envelope).expect("serialize"),
+        )
+        .tags(tags)
+        .sign_with_keys(keys)
+        .expect("sign")
+    }
+
+    #[test]
+    fn valid_envelope_passes_and_reports_owner_window_and_coverage() {
+        let owner = Keys::generate();
+        let envelope = envelope(&owner);
+        envelope.validate().expect("valid");
+        assert_eq!(
+            envelope.owner().expect("owner"),
+            owner.public_key().to_hex()
+        );
+        assert!(!envelope.is_live_at(1_799_999_999));
+        assert!(envelope.is_live_at(1_800_000_000));
+        assert!(envelope.is_live_at(1_800_003_599));
+        assert!(!envelope.is_live_at(1_800_003_600));
+        assert!(envelope.covers("refs/heads/main", &"a".repeat(40), &"b".repeat(40)));
+        assert!(!envelope.covers("refs/heads/main", &"b".repeat(40), &"a".repeat(40)));
+        assert!(!envelope.covers("refs/heads/dev", &"a".repeat(40), &"b".repeat(40)));
+    }
+
+    #[test]
+    fn window_is_bounded_to_one_hour_and_must_be_forward() {
+        let owner = Keys::generate();
+        let mut exact = envelope(&owner);
+        exact.expires_at = exact.issued_at + CI_MERGE_BYPASS_MAX_WINDOW_SECONDS;
+        exact.validate().expect("one hour is the ceiling");
+        let mut long = envelope(&owner);
+        long.expires_at = long.issued_at + CI_MERGE_BYPASS_MAX_WINDOW_SECONDS + 1;
+        assert_eq!(
+            long.validate().unwrap_err().0,
+            "bypass window must not exceed one hour"
+        );
+        let mut inverted = envelope(&owner);
+        inverted.expires_at = inverted.issued_at;
+        assert_eq!(
+            inverted.validate().unwrap_err().0,
+            "bypass expires_at must follow issued_at"
+        );
+        let mut huge = envelope(&owner);
+        huge.expires_at = CI_MAX_SAFE_INTEGER + 1;
+        assert!(huge.validate().is_err());
+    }
+
+    #[test]
+    fn shape_rules_reject_bad_refs_oids_reason_and_schema() {
+        let owner = Keys::generate();
+        for (mutate, message) in [
+            (
+                Box::new(|e: &mut CiMergeBypassEnvelope| e.schema_version = 2)
+                    as Box<dyn Fn(&mut CiMergeBypassEnvelope)>,
+                "unsupported schema version",
+            ),
+            (
+                Box::new(|e: &mut CiMergeBypassEnvelope| {
+                    e.target_repo_a = "30617:nope:buzz".into()
+                }),
+                "invalid repository coordinate owner",
+            ),
+            (
+                Box::new(|e: &mut CiMergeBypassEnvelope| e.ref_name = "main".into()),
+                "invalid bypass ref name",
+            ),
+            (
+                Box::new(|e: &mut CiMergeBypassEnvelope| e.ref_name = "refs/heads/a b".into()),
+                "invalid bypass ref name",
+            ),
+            (
+                Box::new(|e: &mut CiMergeBypassEnvelope| e.ref_name = "refs/heads/../x".into()),
+                "invalid bypass ref name",
+            ),
+            (
+                Box::new(|e: &mut CiMergeBypassEnvelope| e.old_oid = "A".repeat(40)),
+                "invalid bypass old object ID",
+            ),
+            (
+                Box::new(|e: &mut CiMergeBypassEnvelope| e.new_oid = "b".repeat(64)),
+                "bypass object IDs must share one width",
+            ),
+            (
+                Box::new(|e: &mut CiMergeBypassEnvelope| e.old_oid = "0".repeat(40)),
+                "bypass covers a ref update, never a create or delete",
+            ),
+            (
+                Box::new(|e: &mut CiMergeBypassEnvelope| e.new_oid = "0".repeat(40)),
+                "bypass covers a ref update, never a create or delete",
+            ),
+            (
+                Box::new(|e: &mut CiMergeBypassEnvelope| e.new_oid = e.old_oid.clone()),
+                "bypass old and new object IDs must differ",
+            ),
+            (
+                Box::new(|e: &mut CiMergeBypassEnvelope| e.reason = String::new()),
+                "bypass reason must be non-empty",
+            ),
+            (
+                Box::new(|e: &mut CiMergeBypassEnvelope| {
+                    e.reason = "r".repeat(CI_MERGE_BYPASS_MAX_REASON_BYTES + 1)
+                }),
+                "bypass reason is too long",
+            ),
+        ] {
+            let mut candidate = envelope(&owner);
+            mutate(&mut candidate);
+            assert_eq!(candidate.validate().unwrap_err().0, message);
+        }
+    }
+
+    #[test]
+    fn signed_bypass_binds_signature_kind_tags_and_owner() {
+        let owner = Keys::generate();
+        let envelope = envelope(&owner);
+        let tags = merge_bypass_tags(CHANNEL, &envelope).expect("tags");
+        let event = signed(&owner, &envelope, tags.clone());
+        assert_eq!(
+            validate_signed_ci_merge_bypass(&event, CHANNEL).expect("valid"),
+            envelope
+        );
+
+        // Another channel.
+        assert_eq!(
+            validate_signed_ci_merge_bypass(&event, "11111111-2222-4333-8444-555555555555")
+                .unwrap_err()
+                .0,
+            "CI tag does not match envelope"
+        );
+        // A non-owner signer, even with a perfect envelope.
+        let stranger = Keys::generate();
+        let forged = signed(&stranger, &envelope, tags.clone());
+        assert_eq!(
+            validate_signed_ci_merge_bypass(&forged, CHANNEL)
+                .unwrap_err()
+                .0,
+            "merge bypass signer is not the repository owner"
+        );
+        // A run-evidence tag is forbidden.
+        let mut poisoned = tags.clone();
+        poisoned.push(Tag::parse(["run", "018f47a2-7f0f-7cc1-9a55-01f93e42b1e0"]).unwrap());
+        let event = signed(&owner, &envelope, poisoned);
+        assert_eq!(
+            validate_signed_ci_merge_bypass(&event, CHANNEL)
+                .unwrap_err()
+                .0,
+            "forbidden reserved CI tag"
+        );
+        // A duplicated h tag.
+        let mut doubled = tags.clone();
+        doubled.push(Tag::parse(["h", CHANNEL]).unwrap());
+        let event = signed(&owner, &envelope, doubled);
+        assert_eq!(
+            validate_signed_ci_merge_bypass(&event, CHANNEL)
+                .unwrap_err()
+                .0,
+            "required CI tag must occur exactly once"
+        );
+        // Wrong kind.
+        let wrong_kind = EventBuilder::new(
+            Kind::Custom(KIND_CI_CHECK as u16),
+            serde_json::to_string(&envelope).unwrap(),
+        )
+        .tags(tags.clone())
+        .sign_with_keys(&owner)
+        .unwrap();
+        assert_eq!(
+            validate_signed_ci_merge_bypass(&wrong_kind, CHANNEL)
+                .unwrap_err()
+                .0,
+            "event kind is not a merge bypass"
+        );
+        // Unknown content field.
+        let mut value = serde_json::to_value(&envelope).unwrap();
+        value["role"] = serde_json::Value::String("owner".into());
+        let extra = EventBuilder::new(Kind::Custom(KIND_CI_MERGE_BYPASS as u16), value.to_string())
+            .tags(tags)
+            .sign_with_keys(&owner)
+            .unwrap();
+        assert_eq!(
+            validate_signed_ci_merge_bypass(&extra, CHANNEL)
+                .unwrap_err()
+                .0,
+            "invalid CI merge bypass content"
+        );
+    }
+
+    #[test]
+    fn signed_bypass_from_the_run_event_validator_is_refused() {
+        let owner = Keys::generate();
+        let envelope = envelope(&owner);
+        let event = signed(
+            &owner,
+            &envelope,
+            merge_bypass_tags(CHANNEL, &envelope).unwrap(),
+        );
+        assert_eq!(
+            validate_signed_ci_event(&event, CHANNEL, &HashSet::new())
+                .unwrap_err()
+                .0,
+            "event kind is not a CI envelope kind"
+        );
+    }
 }
