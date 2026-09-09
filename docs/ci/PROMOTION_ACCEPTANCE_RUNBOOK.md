@@ -21,14 +21,16 @@ acceptance.
 
 Use version 2 of [`promotion-evidence.schema.json`](promotion-evidence.schema.json) for the
 collected input and [`promotion-readiness-receipt.schema.json`](promotion-readiness-receipt.schema.json)
-for the emitted receipt. Keep evidence outside the candidate checkout in a
-mode-0700 directory. The verifier requires every `evidence_files` descriptor
-path to be absolute and to name a regular, non-symlinked mode-0600 file, and it
-additionally requires the immediate parent of the protected-CI receipt to be a
-canonical, caller-owned mode-0700 directory. A mode-0700 parent for the
-remaining descriptors is an operator obligation the verifier does not currently
-check. The emitted receipt is written as a mode-0600 file outside the candidate
-checkout.
+for the emitted receipt. Keep evidence under the external evidence root
+(`BUZZ_EVIDENCE_ROOT`; see `docs/delivery-lifecycle.md`, "Retained evidence").
+The verifier reads the bundle and every `evidence_files` descriptor through the
+`safe_read_receipt` helper in `scripts/protected-ci-receipt.py`: each path must
+be absolute, its immediate parent a canonical, non-symlink, caller-owned
+mode-0700 directory outside the candidate checkout, and the file a caller-owned,
+single-link, regular mode-0600 file. The same rule applies to every descriptor.
+The emitted receipt goes through the create-only `safe_publish` helper into an
+evidence root as canonical JSON at mode 0600; an existing file at `--receipt`
+is refused.
 
 The bundle must bind all of these identities exactly:
 
@@ -163,17 +165,21 @@ now=$(date -u +%s)
 python3 scripts/ci-promotion-readiness.py \
   --candidate-dir "$HOME/work/buzz-promotion-candidate" \
   --evidence "$HOME/work/buzz-promotion-evidence/promotion-evidence.json" \
-  --receipt "$HOME/work/buzz-promotion-evidence/promotion-readiness-receipt.json" \
+  --receipt "$HOME/work/buzz-promotion-evidence/promotion-readiness-receipt-$now.json" \
   --now "$now"
 ```
+
+`$HOME/work/buzz-promotion-evidence` is an evidence root here: caller-owned,
+mode 0700, outside the candidate checkout.
 
 Exit status 0 means the receipt was written and printed. Exit status 2 prints
 one `REFUSED:` reason and writes no receipt. Validate the input and output
 against their schemas before retaining or signing them.
 
-Re-running with the same `--receipt` path replaces an existing receipt in place,
-whereas `scripts/protected-ci-receipt.py acquire` refuses to replace an existing
-`--output`.
+Re-running with the same `--receipt` path is refused with `output already
+exists`, the same create-only rule `scripts/protected-ci-receipt.py acquire`
+applies to `--output`. Name a fresh receipt path for each run; identical inputs
+and the same `--now` produce byte-identical receipts at the two paths.
 
 The hermetic contract test is safe on a development host:
 

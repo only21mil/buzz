@@ -12,10 +12,8 @@ import json
 import os
 from pathlib import Path
 import re
-import stat
 import subprocess
 import sys
-import tempfile
 from typing import Any, NoReturn
 from urllib.parse import urlsplit
 import uuid
@@ -396,29 +394,47 @@ def image_id(value: Any, path: str) -> str:
     return result
 
 
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+# The promotion bundle retains signed event histories and decoded logs, so it
+# may exceed the 4 MiB receipt cap; every other evidence file keeps that cap.
+MAX_BUNDLE_BYTES = 64 * 1024 * 1024
 
 
-def secure_regular_file(path: Path, label: str) -> None:
+def read_evidence_file(
+    path: Path, label: str, candidate_dir: Path, *, limit: int = PROTECTED_CI.MAX_RECEIPT_BYTES
+) -> bytes:
+    """Read one retained evidence file under the shared external-evidence-root contract.
+
+    The immediate parent must be an evidence root (absolute, canonical,
+    caller-owned mode 0700, outside the candidate checkout) and the file a
+    caller-owned mode-0600 regular file with one link; the same helpers that
+    protected-ci-receipt.py uses for its own receipts enforce both.
+    """
     expect(path.is_absolute(), f"{label} path must be absolute")
-    expect(path.exists(), f"{label} is missing: {path}")
-    expect(not path.is_symlink() and path.is_file(), f"{label} must be a regular non-symlink file")
-    mode = path.stat().st_mode
-    expect(stat.S_IMODE(mode) == 0o600, f"{label} must have mode 0600")
-
-
-def load_json(path: Path, label: str) -> dict[str, Any]:
-    secure_regular_file(path, label)
     try:
-        with path.open(encoding="utf-8") as source:
-            return obj(json.load(source), label)
-    except (OSError, json.JSONDecodeError) as error:
-        refuse(f"{label} is unreadable or invalid JSON: {error}")
+        PROTECTED_CI.validate_evidence_root(path.parent, checkout=candidate_dir)
+        return PROTECTED_CI.safe_read_receipt(path, limit=limit)
+    except PROTECTED_CI.ReceiptError as error:
+        refuse(f"{label} is not retained evidence: {error}")
+
+
+def parse_json_bytes(raw: bytes, label: str) -> dict[str, Any]:
+    try:
+        return obj(json.loads(raw.decode("utf-8")), label)
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+        refuse(f"{label} is not valid JSON: {error}")
+
+
+def read_json_evidence(
+    descriptor: dict[str, Any], label: str, candidate_dir: Path
+) -> tuple[str, dict[str, Any]]:
+    """Validate a {path, sha256} descriptor and return the digest and parsed JSON."""
+    exact_fields(descriptor, {"path", "sha256"}, set(), label)
+    path = Path(text(field(descriptor, "path", label), f"{label}.path"))
+    expected_digest = sha256(field(descriptor, "sha256", label), f"{label}.sha256")
+    raw = read_evidence_file(path, label, candidate_dir)
+    actual_digest = hashlib.sha256(raw).hexdigest()
+    expect(actual_digest == expected_digest, f"{label} digest does not match retained file")
+    return actual_digest, parse_json_bytes(raw, label)
 
 
 def parse_utc(value: Any, path: str) -> int:
@@ -459,9 +475,9 @@ def validate_source(bundle: dict[str, Any], candidate_dir: Path) -> tuple[str, s
     ancestor = git(candidate_dir, "merge-base", "--is-ancestor", base, candidate, check=False)
     expect(ancestor.returncode == 0, f"base {base} is not an ancestor of candidate {candidate}")
 
-    status = git(candidate_dir, "status", "--porcelain=v1", "--untracked-files=all").stdout.splitlines()
-    allowed = {"?? pre-freeze-receipt.json", "?? protected-ci-receipt.json"}
-    dirty = [entry for entry in status if entry not in allowed]
+    # Retained evidence lives under an external evidence root, so no generated
+    # receipt is exempt from the clean-tree requirement.
+    dirty = git(candidate_dir, "status", "--porcelain=v1", "--untracked-files=all").stdout.splitlines()
     if dirty:
         refuse(f"candidate checkout is dirty: {dirty[0]}")
 
@@ -480,14 +496,9 @@ def validate_pre_freeze_receipt(
     base: str,
     now: int,
     max_age: int,
+    candidate_dir: Path,
 ) -> tuple[str, dict[str, Any]]:
-    exact_fields(descriptor, {"path", "sha256"}, set(), label)
-    path = Path(text(field(descriptor, "path", label), f"{label}.path"))
-    expected_digest = sha256(field(descriptor, "sha256", label), f"{label}.sha256")
-    secure_regular_file(path, label)
-    actual_digest = file_sha256(path)
-    expect(actual_digest == expected_digest, f"{label} digest does not match retained file")
-    receipt = load_json(path, label)
+    actual_digest, receipt = read_json_evidence(descriptor, label, candidate_dir)
     expect(field(receipt, "schema_version", label) == 1, f"{label} schema_version must be 1")
     expect(field(receipt, "source", label) == "pre-freeze", f"{label} source mismatch")
     expect(field(receipt, "repository", label) == REPOSITORY, f"{label} repository mismatch")
@@ -507,15 +518,16 @@ def validate_pre_freeze_receipt(
 
 
 def validate_protected_ci_receipt(
-    descriptor: dict[str, Any], label: str, candidate: str, now: int, max_age: int
+    descriptor: dict[str, Any], label: str, candidate: str, now: int, max_age: int,
+    candidate_dir: Path,
 ) -> tuple[str, dict[str, Any]]:
     exact_fields(descriptor, {"path", "sha256"}, set(), label)
     path = Path(text(field(descriptor, "path", label), f"{label}.path"))
     expected_digest = sha256(field(descriptor, "sha256", label), f"{label}.sha256")
+    raw = read_evidence_file(path, label, candidate_dir)
+    actual_digest = hashlib.sha256(raw).hexdigest()
+    expect(actual_digest == expected_digest, f"{label} digest does not match retained file")
     try:
-        raw = PROTECTED_CI.safe_read_receipt(path)
-        actual_digest = hashlib.sha256(raw).hexdigest()
-        expect(actual_digest == expected_digest, f"{label} digest does not match retained file")
         receipt = obj(json.loads(raw), label)
         PROTECTED_CI.require_bounded_json_depth(receipt)
         expect(raw == PROTECTED_CI.canonical_json(receipt),
@@ -550,16 +562,10 @@ def reverify_protected_ci_receipt(receipt: dict[str, Any], label: str) -> None:
 
 
 def validate_acceptance_verdict(
-    descriptor: dict[str, Any], candidate: str
+    descriptor: dict[str, Any], candidate: str, candidate_dir: Path
 ) -> tuple[str, dict[str, Any]]:
     label = "evidence_files.acceptance_verdict"
-    exact_fields(descriptor, {"path", "sha256"}, set(), label)
-    path = Path(text(field(descriptor, "path", label), f"{label}.path"))
-    expected_digest = sha256(field(descriptor, "sha256", label), f"{label}.sha256")
-    secure_regular_file(path, label)
-    actual_digest = file_sha256(path)
-    expect(actual_digest == expected_digest, "acceptance verdict digest mismatch")
-    verdict = load_json(path, label)
+    actual_digest, verdict = read_json_evidence(descriptor, label, candidate_dir)
     expect(verdict.get("candidate_sha") == candidate, "acceptance verdict candidate mismatch")
     expect(verdict.get("green") is True, "acceptance verdict is not green")
     security = obj(verdict.get("security"), "acceptance verdict security")
@@ -574,21 +580,21 @@ def validate_acceptance_verdict(
 
 
 def validate_acceptance_records(
-    descriptor: dict[str, Any], candidate: str
+    descriptor: dict[str, Any], candidate: str, candidate_dir: Path
 ) -> str:
     label = "evidence_files.acceptance_records"
     exact_fields(descriptor, {"path", "sha256"}, set(), label)
     path = Path(text(field(descriptor, "path", label), f"{label}.path"))
     expected_digest = sha256(field(descriptor, "sha256", label), f"{label}.sha256")
-    secure_regular_file(path, label)
-    actual_digest = file_sha256(path)
+    raw = read_evidence_file(path, label, candidate_dir)
+    actual_digest = hashlib.sha256(raw).hexdigest()
     expect(actual_digest == expected_digest, "acceptance records digest mismatch")
     records: list[dict[str, Any]] = []
     try:
-        for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        for line_number, raw_line in enumerate(raw.decode("utf-8").splitlines(), 1):
             expect(bool(raw_line.strip()), f"acceptance records line {line_number} is empty")
             records.append(obj(json.loads(raw_line), f"acceptance records line {line_number}"))
-    except (OSError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         refuse(f"acceptance records are unreadable or invalid JSONL: {error}")
 
     expected_keys = {
@@ -1553,19 +1559,19 @@ def validate_bundle(bundle: dict[str, Any], candidate_dir: Path, now: int, max_a
     )
     pre_digest, _ = validate_pre_freeze_receipt(
         obj(field(evidence_files, "pre_freeze", "evidence.evidence_files"), "evidence_files.pre_freeze"),
-        "evidence_files.pre_freeze", candidate, base, now, max_age,
+        "evidence_files.pre_freeze", candidate, base, now, max_age, candidate_dir,
     )
     ci_digest, protected_receipt = validate_protected_ci_receipt(
         obj(field(evidence_files, "protected_ci", "evidence.evidence_files"), "evidence_files.protected_ci"),
-        "evidence_files.protected_ci", candidate, now, max_age,
+        "evidence_files.protected_ci", candidate, now, max_age, candidate_dir,
     )
     acceptance_digest, _ = validate_acceptance_verdict(
         obj(field(evidence_files, "acceptance_verdict", "evidence.evidence_files"),
-            "evidence_files.acceptance_verdict"), candidate,
+            "evidence_files.acceptance_verdict"), candidate, candidate_dir,
     )
     acceptance_records_digest = validate_acceptance_records(
         obj(field(evidence_files, "acceptance_records", "evidence.evidence_files"),
-            "evidence_files.acceptance_records"), candidate,
+            "evidence_files.acceptance_records"), candidate, candidate_dir,
     )
     collection_manifest_digest = None
     if "collection_manifest" in evidence_files:
@@ -1581,8 +1587,9 @@ def validate_bundle(bundle: dict[str, Any], candidate_dir: Path, now: int, max_a
         manifest_path = Path(text(
             descriptor["path"], "evidence_files.collection_manifest.path"
         ))
-        secure_regular_file(manifest_path, "evidence_files.collection_manifest")
-        collection_manifest_digest = file_sha256(manifest_path)
+        collection_manifest_digest = hashlib.sha256(
+            read_evidence_file(manifest_path, "evidence_files.collection_manifest", candidate_dir)
+        ).hexdigest()
         expect(
             collection_manifest_digest
             == sha256(descriptor["sha256"], "evidence_files.collection_manifest.sha256"),
@@ -1663,23 +1670,20 @@ def validate_bundle(bundle: dict[str, Any], candidate_dir: Path, now: int, max_a
     }
 
 
-def canonical_bytes(value: dict[str, Any]) -> bytes:
-    return (json.dumps(value, indent=2, sort_keys=True, separators=(",", ": ")) + "\n").encode()
+def publish_receipt(path: Path, receipt: dict[str, Any], candidate_dir: Path) -> bytes:
+    """Publish the readiness receipt through the shared create-only evidence helper.
 
-
-def write_receipt(path: Path, payload: bytes, candidate_dir: Path) -> None:
+    The parent must already be an evidence root; the helper writes a mode-0600
+    temporary file beside the destination and renames it with RENAME_NOREPLACE,
+    so an existing receipt is never replaced.
+    """
     expect(path.is_absolute(), "receipt path must be absolute")
-    candidate_root = candidate_dir.resolve()
-    output = path.resolve(strict=False)
-    expect(not output.is_relative_to(candidate_root), "receipt must be written outside the candidate checkout")
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".promotion-receipt.", delete=False) as temporary:
-        temporary.write(payload)
-        temporary.flush()
-        os.fsync(temporary.fileno())
-        temporary_path = Path(temporary.name)
-    os.chmod(temporary_path, 0o600)
-    os.replace(temporary_path, path)
+    try:
+        PROTECTED_CI.validate_evidence_root(path.parent, checkout=candidate_dir)
+        PROTECTED_CI.safe_publish(path, receipt)
+    except PROTECTED_CI.ReceiptError as error:
+        refuse(f"receipt was not published: {error}")
+    return PROTECTED_CI.canonical_json(receipt)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1697,13 +1701,13 @@ def main() -> int:
     try:
         expect(arguments.now >= 0, "--now must be non-negative")
         expect(arguments.max_evidence_age > 0, "--max-evidence-age must be positive")
-        evidence_path = arguments.evidence.resolve()
-        bundle = load_json(evidence_path, "promotion evidence")
-        receipt = validate_bundle(bundle, arguments.candidate_dir.resolve(),
-                                  arguments.now, arguments.max_evidence_age)
-        receipt["evidence"]["bundle_sha256"] = file_sha256(evidence_path)
-        payload = canonical_bytes(receipt)
-        write_receipt(arguments.receipt, payload, arguments.candidate_dir.resolve())
+        candidate_dir = arguments.candidate_dir.resolve()
+        raw_bundle = read_evidence_file(arguments.evidence, "promotion evidence", candidate_dir,
+                                        limit=MAX_BUNDLE_BYTES)
+        bundle = parse_json_bytes(raw_bundle, "promotion evidence")
+        receipt = validate_bundle(bundle, candidate_dir, arguments.now, arguments.max_evidence_age)
+        receipt["evidence"]["bundle_sha256"] = hashlib.sha256(raw_bundle).hexdigest()
+        payload = publish_receipt(arguments.receipt, receipt, candidate_dir)
         sys.stdout.buffer.write(payload)
         return 0
     except GateError as error:
