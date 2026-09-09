@@ -180,7 +180,14 @@ export class ScopedQueryCache {
     this.generation += 1;
     for (const { client, stop } of [...this.clients]) {
       stop();
-      client.clear();
+      // Remove only the persisted roots. client.clear() would also destroy
+      // queries this cache never owned, such as ["identity"], and a destroyed
+      // query never reaches its mounted observers again: a later
+      // setQueryData(["identity"]) after an identity import would rebuild the
+      // query for nobody and the onboarding gate would keep the old pubkey.
+      client.removeQueries({
+        predicate: (query) => persistedQuery(query.queryKey),
+      });
     }
     this.memory.clear();
   }

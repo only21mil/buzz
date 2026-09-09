@@ -133,6 +133,28 @@ test("logout fences pending writes, responses and a late hydrate", async () => {
   assert.equal(store.values.size, 0);
 });
 
+test("clear keeps observers of queries the cache never persisted", async () => {
+  const cache = new ScopedQueryCache(new Store());
+  const live = client(),
+    attached = cache.attach(live, key());
+  await attached.ready;
+  live.setQueryData(["channels"], [{ id: "private" }]);
+  live.setQueryData(["identity"], { pubkey: alice });
+  const observer = new QueryObserver(live, {
+    queryKey: ["identity"],
+    queryFn: () => ({ pubkey: alice }),
+    staleTime: Infinity,
+  });
+  const seen = [];
+  const unsubscribe = observer.subscribe((result) => seen.push(result.data));
+  await cache.clear();
+  assert.equal(live.getQueryData(["channels"]), undefined);
+  live.setQueryData(["identity"], { pubkey: bob });
+  assert.equal(observer.getCurrentResult().data?.pubkey, bob);
+  assert.equal(seen.at(-1)?.pubkey, bob);
+  unsubscribe();
+});
+
 test("storage read failures miss safely and failed deletion reaches logout", async () => {
   const store = {
     read: async () => {
