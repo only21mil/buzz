@@ -17,11 +17,13 @@
 //! type `stop` for the desktop.
 //!
 //! Authorisation: the owner always; a sibling only when its `/stop` carries
-//! the `stop-origin` tag, which is what harness fan-out adds and generated
-//! text cannot. A sibling `/stop` without the tag is refused in-thread and
-//! consumed, so "@A /stop all" in another agent's reply cannot halt A's
-//! lanes. Anyone else's `/stop` falls through to the ordinary prompt path,
-//! like a non-owner `!cancel`.
+//! the `stop-origin` tag, which marks it as harness or tool-posted rather
+//! than plain reply text. A sibling `/stop` without the tag is refused
+//! in-thread and consumed, so "@A /stop all" in another agent's reply cannot
+//! halt A's lanes. A sibling with a posting tool can still craft the tag;
+//! the check separates deliberate posts from generated prose, not siblings
+//! from the owner. Anyone else's `/stop` falls through to the ordinary
+//! prompt path, like a non-owner `!cancel`.
 //!
 //! A `/stop` that lands while the turn's control channel was already taken
 //! by a steer or interrupt marks the scope stopped in the queue; the batch
@@ -132,9 +134,10 @@ pub(crate) enum StopGate {
 ///
 /// The owner is always allowed. A sibling (same owner attestation, checked
 /// through the cache the author gate just populated or the profile query)
-/// is allowed only when the `/stop` was forwarded by a harness, which is
-/// what the tag proves: a model cannot add tags to the text it posts, so
-/// "@A /stop all" in a sibling's generated reply cannot halt A's lanes.
+/// is allowed only when the `/stop` carries the tag, which marks it as
+/// harness or tool-posted rather than reply text, so "@A /stop all" in a
+/// sibling's generated reply cannot halt A's lanes. A sibling with a posting
+/// tool can craft the tag; that is a deliberate post, not an injection.
 pub(crate) async fn gate_stop(
     request: &StopRequest,
     event: &nostr::Event,

@@ -423,6 +423,9 @@ impl EventQueue {
             );
             self.in_flight_scopes.remove(&scope);
             self.in_flight_deadlines.remove(&scope);
+            // The hung turn was the one a `/stop` marked; the next turn in
+            // this scope must not inherit the discard.
+            self.stopped_scopes.remove(&scope);
             // Recover any withheld goose-native steer events for the expired
             // scope back to the queue front so normal dispatch delivers
             // them. Unlike the in-flight batch above (already delivered to a
@@ -758,6 +761,7 @@ impl EventQueue {
             );
             self.in_flight_scopes.remove(&scope);
             self.in_flight_deadlines.remove(&scope);
+            self.stopped_scopes.remove(&scope);
             // Symmetric with the flush_next expiry block: recover withheld
             // goose-native steer events for the expired scope so they are
             // not permanently orphaned in the side table.
@@ -2721,6 +2725,36 @@ mod tests {
         assert!(q.is_stopped(&scope));
         q.mark_complete(scope.clone());
         assert!(!q.is_stopped(&scope), "cleared when the turn returns");
+    }
+
+    #[test]
+    fn in_flight_expiry_clears_stopped_marker_on_both_paths() {
+        for use_flush_next in [true, false] {
+            let mut q = EventQueue::new(DedupMode::Queue);
+            let ch = Uuid::new_v4();
+            let scope = conv(ch);
+            q.push(make_queued(ch, "hung"));
+            let _hung = q.flush_next().expect("hung turn dispatched");
+            assert!(q.mark_stopped(&scope));
+            // The stopped turn never returns; force its deadline into the past.
+            q.in_flight_deadlines.insert(scope.clone(), Instant::now());
+            if use_flush_next {
+                assert!(q.flush_next().is_none(), "expiry only; nothing queued");
+            } else {
+                assert!(!q.has_flushable_work());
+            }
+            assert!(!q.is_scope_in_flight(scope.clone()), "backstop released");
+            assert!(!q.is_stopped(&scope), "expiry dropped the stale marker");
+
+            // A fresh turn's steer carry-over requeues normally.
+            q.push(make_queued(ch, "next"));
+            let next = q.flush_next().expect("fresh turn dispatched");
+            assert!(!q.is_stopped(&scope));
+            q.requeue_as_cancelled(next, CancelReason::Steer);
+            q.mark_complete(scope.clone());
+            let merged = q.flush_next().expect("carry-over re-dispatched");
+            assert_eq!(merged.events[0].event.content, "next");
+        }
     }
 
     #[test]

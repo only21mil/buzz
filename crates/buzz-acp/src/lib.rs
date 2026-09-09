@@ -4616,7 +4616,17 @@ fn recover_panicked_agent(
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
     if let Some(batch) = meta.recoverable_batch {
         if let Some(ch) = meta.channel_id {
-            if matches!(config.dedup_mode, DedupMode::Queue) && !removed_channels.contains(&ch) {
+            if queue.is_stopped(&batch.scope) {
+                // A `/stop` hit this turn before it panicked; the lane must
+                // not resume. mark_complete below clears the marker.
+                tracing::info!(
+                    channel_id = %ch,
+                    scope = %batch.scope.telemetry_label(),
+                    "dropping panicked batch for a stopped scope — /stop does not resume"
+                );
+            } else if matches!(config.dedup_mode, DedupMode::Queue)
+                && !removed_channels.contains(&ch)
+            {
                 // Dead-letter on exhaustion is logged inside requeue(); a
                 // panic path has no outcome to report, so no notice here.
                 let _ = queue.requeue(batch);
@@ -8395,6 +8405,86 @@ mod error_outcome_emission_tests {
             Some(channel_id.to_string().as_str())
         );
         assert_eq!(panic.turn_id.as_deref(), Some("panic-turn-id"));
+    }
+
+    #[tokio::test]
+    async fn panicked_stopped_turn_does_not_requeue_its_batch() {
+        let channel_id = Uuid::new_v4();
+        let scope = scope::SessionScope::Conversation { channel_id };
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), "work")
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert!(queue.push(QueuedEvent {
+            channel_id,
+            scope: scope.clone(),
+            event,
+            received_at: std::time::Instant::now(),
+            prompt_tag: "test".into(),
+        }));
+        let batch = queue.flush_next().expect("turn dispatched");
+
+        let mut pool = AgentPool::from_slots(vec![]);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let abort_handle = pool.join_set.spawn(async move {
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        pool.task_map_mut().insert(
+            abort_handle.id(),
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                scope: Some(scope.clone()),
+                turn_id: "stopped-then-panicked".to_string(),
+                started_at: 0,
+                recoverable_batch: Some(batch),
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        // `/stop` marked the in-flight turn; then the task dies.
+        assert!(queue.mark_stopped(&scope));
+        started_rx.await.unwrap();
+        abort_handle.abort();
+        let join_error = pool.join_set.join_next().await.unwrap().unwrap_err();
+
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let mut typing_channels = HashMap::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        recover_panicked_agent(
+            &mut pool,
+            &mut queue,
+            &config,
+            join_error,
+            &mut heartbeat_in_flight,
+            &HashSet::new(),
+            &mut typing_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+        );
+
+        // `requeue` would put the event back under a retry throttle, so
+        // check the queue itself, not just the next flush.
+        assert_eq!(
+            queue.queued_event_count(&scope),
+            0,
+            "the stopped turn's batch is dropped, not requeued"
+        );
+        assert!(queue.flush_next().is_none());
+        assert!(!queue.is_scope_in_flight(scope.clone()));
+        assert!(!queue.is_stopped(&scope), "marker cleared with the scope");
     }
 
     // Fix #3: a panicked thread-scoped task must clear its EXACT scope from the
