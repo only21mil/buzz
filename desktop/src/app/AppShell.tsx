@@ -277,10 +277,13 @@ export function AppShell() {
   const hasRestoredCommunityDestinationRef = React.useRef(false);
   React.useEffect(() => {
     const activeCommunityId = communitiesHook.activeCommunity?.id;
+    // The scoped query cache hydrates the last-known channel list with its
+    // original dataUpdatedAt, so only a fetch completed in this mount counts as
+    // live validation of the remembered channel.
     if (
       hasRestoredCommunityDestinationRef.current ||
       !channelsQuery.isSuccess ||
-      channelsQuery.dataUpdatedAt === 0 ||
+      !channelsQuery.isFetchedAfterMount ||
       !activeCommunityId
     ) {
       return;
