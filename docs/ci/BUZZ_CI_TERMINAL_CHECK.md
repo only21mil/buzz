@@ -60,6 +60,17 @@ event IDs; non-empty concurrency group. `validate_context` binds the check to
 its request: same run, workflow, repository, tip, base, attempt, and the group
 key derived from the request.
 
+Relay storage (`buzz_db::ci::store_ci_event`, migration
+`0041_ci_check_storage`) cross-checks the facts a check names before it is
+indexed: `run_status_event_id` must be a stored kind 46101 for the same
+request and attempt, terminal, with the same state and reason as the check;
+`evidence_finalized_event_id` and `teardown_attestation_event_id`, when
+present, must be stored kinds 46105 and 46106 for the same request and
+attempt. One check per request: a byte-identical replay returns the stored
+event, a different second check for the same request is refused, and a
+partial unique index on `(community_id, request_event_id)` for kind 46108
+holds the same rule under concurrent writers.
+
 ### Reader rules
 
 `buzz ci status` reports the check under `check` (or `null`). The reducer
@@ -141,11 +152,22 @@ per job.
 ## 5. Concurrency groups
 
 Key shape follows the GitHub `CI` workflow's
-`ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}`:
+`ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}`.
+On a `pull_request` event `github.ref` is `refs/pull/<N>/merge`, one group per
+pull request, not per branch name. The Buzz equivalent of that ref is the PR
+root event, scoped by the repository coordinate because one channel can serve
+more than one repository:
 
-- `ci-<workflow_id>-<source_branch>` for a pull-request request (every kind
-  46100 request carries its PR root event), with `cancel_in_progress = true`;
-- `ci-<workflow_id>-<tip_oid>` otherwise, with `cancel_in_progress = false`.
+- `ci-<workflow_id>-<target_repo_a>-<pr_root_event_id>-<source_branch>` for
+  a pull-request request (every kind 46100 request carries its PR root
+  event), with `cancel_in_progress = true`;
+- `ci-<workflow_id>-<target_repo_a>-<tip_oid>` otherwise, with
+  `cancel_in_progress = false`.
+
+`source_branch` is requester-signed and never checked against the pull
+request, so it names the ref but never identifies the group on its own: two
+forks pushing the same branch name, or two repositories on one channel, are
+different groups and never cancel each other.
 
 The key is recorded on the check as `concurrency_group`.
 
@@ -156,9 +178,11 @@ Behaviour at capacity one:
   the head is recorded `cancelled` with reason
   `concurrency_superseded_by:<event id>` without executing, its terminal
   status and check are published, and the cursor moves on.
-- Running attempt: every fifth reconciliation tick the handler asks the relay
-  for the next accepted request after the running one; a same-group initial
-  request cancels the running job through the watch seam in section 2.
+- Running attempt: every fifth reconciliation tick the handler reads the
+  same look-ahead window of eight accepted requests after the running one;
+  a same-group initial request anywhere in that window cancels the running
+  job through the watch seam in section 2, so an unrelated request accepted
+  right after the running one does not hide a later same-group request.
 - A rerun of the same run never supersedes its own lineage. Acceptance-bound
   polls (`poll_once_bound`) never look ahead.
 

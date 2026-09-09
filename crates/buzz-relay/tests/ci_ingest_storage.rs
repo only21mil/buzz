@@ -3,11 +3,12 @@
 use std::collections::HashSet;
 
 use buzz_core::ci::{
-    evidence_finalized_tags, job_status_tags, log_reference_tags, request_tags, run_status_tags,
-    teardown_attestation_tags, validate_signed_ci_event, CiEvidenceFinalizedEnvelope,
-    CiFinalizedJobAttempt, CiJobState, CiJobStatusEnvelope, CiLogReferenceEnvelope,
-    CiRequestEnvelope, CiRequestType, CiRunState, CiRunStatusEnvelope, CiSkipPolicy,
-    CiTeardownAttestationEnvelope, CiTeardownLease, ValidatedCiEnvelope, CI_SCHEMA_VERSION,
+    check_tags, evidence_finalized_tags, job_status_tags, log_reference_tags, request_tags,
+    run_status_tags, teardown_attestation_tags, validate_signed_ci_event, CiCheckEnvelope,
+    CiConcurrencyGroup, CiEvidenceFinalizedEnvelope, CiFinalizedJobAttempt, CiJobState,
+    CiJobStatusEnvelope, CiLogReferenceEnvelope, CiRequestEnvelope, CiRequestType, CiRunState,
+    CiRunStatusEnvelope, CiSkipPolicy, CiTeardownAttestationEnvelope, CiTeardownLease,
+    ValidatedCiEnvelope, CI_SCHEMA_VERSION,
 };
 use buzz_core::CommunityId;
 use buzz_db::ci::{
@@ -518,6 +519,585 @@ async fn store_terminal_job_chain(
     .await
     .expect("store terminal job fixture");
     log
+}
+
+/// A kind 46108 check for `request` that names `run_status_event_id` and the
+/// given terminal fact IDs.
+#[allow(clippy::too_many_arguments)]
+fn check(
+    control: &Keys,
+    channel_id: Uuid,
+    request: &CiRequestEnvelope,
+    request_event_id: &str,
+    run_status_event_id: &str,
+    conclusion: CiRunState,
+    reason: Option<&str>,
+    facts: Option<(&str, &str)>,
+    published_at: u64,
+) -> Event {
+    let envelope = CiCheckEnvelope {
+        schema_version: CI_SCHEMA_VERSION,
+        request_event_id: request_event_id.to_owned(),
+        run_id: request.run_id.clone(),
+        workflow_id: request.workflow_id.clone(),
+        target_repo_a: request.target_repo_a.clone(),
+        tip_oid: request.tip_oid.clone(),
+        base_oid: request.base_oid.clone(),
+        attempt: request.attempt,
+        conclusion,
+        reason: reason.map(str::to_owned),
+        run_status_event_id: run_status_event_id.to_owned(),
+        evidence_finalized_event_id: facts.map(|(evidence, _)| evidence.to_owned()),
+        teardown_attestation_event_id: facts.map(|(_, teardown)| teardown.to_owned()),
+        concurrency_group: CiConcurrencyGroup::of(request).key,
+        published_at,
+        relay_signer: control.public_key().to_hex(),
+    };
+    EventBuilder::new(
+        Kind::Custom(buzz_core::kind::KIND_CI_CHECK as u16),
+        serde_json::to_string(&envelope).expect("serialize check"),
+    )
+    .tags(check_tags(&channel_id.to_string(), &envelope).expect("check tags"))
+    .sign_with_keys(control)
+    .expect("sign check")
+}
+
+/// Store a request plus a run status stream ending in `terminal`, and return
+/// the request event and the terminal run status event.
+async fn store_terminal_run(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    actor: &Keys,
+    control: &Keys,
+    terminal: CiRunState,
+    authorized_status_signers: &HashSet<String>,
+) -> (CiRequestEnvelope, Event, Event) {
+    let (request, request_event) = new_stored_request(
+        pool,
+        community_id,
+        channel_id,
+        actor,
+        authorized_status_signers,
+    )
+    .await;
+    let mut last = None;
+    for (sequence, state) in [
+        (1, CiRunState::Queued),
+        (2, CiRunState::Running),
+        (3, terminal),
+    ] {
+        let event = run_status(
+            control,
+            channel_id,
+            &request,
+            &request_event.id.to_hex(),
+            sequence,
+            state,
+        );
+        store(
+            pool,
+            community_id,
+            channel_id,
+            &event,
+            authorized_status_signers,
+        )
+        .await
+        .expect("store run status fixture");
+        last = Some(event);
+    }
+    (request, request_event, last.expect("terminal run status"))
+}
+
+/// Store the full success chain for `request` (job stream, log, evidence,
+/// teardown, terminal success) and return the evidence, teardown and
+/// terminal run status events.
+async fn store_success_chain(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    control: &Keys,
+    request: &CiRequestEnvelope,
+    request_event: &Event,
+    authorized_status_signers: &HashSet<String>,
+) -> (Event, Event, Event) {
+    let log = store_terminal_job_chain(
+        pool,
+        community_id,
+        channel_id,
+        control,
+        request,
+        request_event,
+        authorized_status_signers,
+    )
+    .await;
+    let evidence = evidence_finalized(
+        control,
+        channel_id,
+        request,
+        &request_event.id.to_hex(),
+        "test",
+        &log.id.to_hex(),
+    );
+    store(
+        pool,
+        community_id,
+        channel_id,
+        &evidence,
+        authorized_status_signers,
+    )
+    .await
+    .expect("store evidence fact");
+    let teardown = teardown_attestation(control, channel_id, request, &request_event.id.to_hex());
+    store(
+        pool,
+        community_id,
+        channel_id,
+        &teardown,
+        authorized_status_signers,
+    )
+    .await
+    .expect("store teardown fact");
+    let success = run_status(
+        control,
+        channel_id,
+        request,
+        &request_event.id.to_hex(),
+        3,
+        CiRunState::Success,
+    );
+    store(
+        pool,
+        community_id,
+        channel_id,
+        &success,
+        authorized_status_signers,
+    )
+    .await
+    .expect("store terminal run success");
+    (evidence, teardown, success)
+}
+
+async fn cursors(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    run_id: &str,
+) -> Vec<i64> {
+    list_ci_run_events(
+        pool,
+        community_id,
+        channel_id,
+        Uuid::parse_str(run_id).expect("run id"),
+        0,
+        100,
+    )
+    .await
+    .expect("list run events")
+    .iter()
+    .map(|event| event.watch_cursor)
+    .collect()
+}
+
+async fn assert_check_refused(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    request: &CiRequestEnvelope,
+    rejected: &Event,
+    authorized_status_signers: &HashSet<String>,
+) -> buzz_db::DbError {
+    let before = cursors(pool, community_id, channel_id, &request.run_id).await;
+    let error = store(
+        pool,
+        community_id,
+        channel_id,
+        rejected,
+        authorized_status_signers,
+    )
+    .await
+    .expect_err("check must be refused");
+    assert_rejected_request_rolled_back(
+        pool,
+        community_id,
+        channel_id,
+        Uuid::parse_str(&request.run_id).expect("run id"),
+        rejected,
+        &before,
+    )
+    .await;
+    error
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn check_references_must_resolve_to_stored_events_of_the_same_request() {
+    let pool = pool().await;
+    let (community_id, channel_id) = tenant_channel(&pool).await;
+    let actor = Keys::generate();
+    let control = Keys::generate();
+    let signers = HashSet::from([control.public_key().to_hex()]);
+
+    // A failed run: the check must name its stored terminal run status.
+    let (failed, failed_event, failed_terminal) = store_terminal_run(
+        &pool,
+        community_id,
+        channel_id,
+        &actor,
+        &control,
+        CiRunState::Failure,
+        &signers,
+    )
+    .await;
+    let failed_request_id = failed_event.id.to_hex();
+    let unresolved = check(
+        &control,
+        channel_id,
+        &failed,
+        &failed_request_id,
+        &"ab".repeat(32),
+        CiRunState::Failure,
+        None,
+        None,
+        1_800_000_050,
+    );
+    assert!(matches!(
+        assert_check_refused(
+            &pool,
+            community_id,
+            channel_id,
+            &failed,
+            &unresolved,
+            &signers
+        )
+        .await,
+        buzz_db::DbError::InvalidData(_)
+    ));
+    let queued_status = list_ci_run_events(
+        &pool,
+        community_id,
+        channel_id,
+        Uuid::parse_str(&failed.run_id).expect("run id"),
+        0,
+        100,
+    )
+    .await
+    .expect("list")
+    .into_iter()
+    .find(|event| event.watch_cursor == 2)
+    .expect("queued run status");
+    let non_terminal = check(
+        &control,
+        channel_id,
+        &failed,
+        &failed_request_id,
+        &queued_status.stored_event.event.id.to_hex(),
+        CiRunState::Failure,
+        None,
+        None,
+        1_800_000_050,
+    );
+    assert!(matches!(
+        assert_check_refused(
+            &pool,
+            community_id,
+            channel_id,
+            &failed,
+            &non_terminal,
+            &signers
+        )
+        .await,
+        buzz_db::DbError::InvalidData(_)
+    ));
+
+    // A second run in the same channel: its terminal status is stored, but it
+    // belongs to another request.
+    let (_, _, other_terminal) = store_terminal_run(
+        &pool,
+        community_id,
+        channel_id,
+        &actor,
+        &control,
+        CiRunState::Failure,
+        &signers,
+    )
+    .await;
+    let foreign_status = check(
+        &control,
+        channel_id,
+        &failed,
+        &failed_request_id,
+        &other_terminal.id.to_hex(),
+        CiRunState::Failure,
+        None,
+        None,
+        1_800_000_050,
+    );
+    assert!(matches!(
+        assert_check_refused(
+            &pool,
+            community_id,
+            channel_id,
+            &failed,
+            &foreign_status,
+            &signers
+        )
+        .await,
+        buzz_db::DbError::InvalidData(_)
+    ));
+
+    // A successful run: both terminal facts must resolve for this request.
+    let (success, success_event) =
+        new_stored_request(&pool, community_id, channel_id, &actor, &signers).await;
+    let (evidence, teardown, success_terminal) = store_success_chain(
+        &pool,
+        community_id,
+        channel_id,
+        &control,
+        &success,
+        &success_event,
+        &signers,
+    )
+    .await;
+    let success_request_id = success_event.id.to_hex();
+    let unresolved_evidence = check(
+        &control,
+        channel_id,
+        &success,
+        &success_request_id,
+        &success_terminal.id.to_hex(),
+        CiRunState::Success,
+        None,
+        Some((&"cd".repeat(32), &teardown.id.to_hex())),
+        1_800_000_050,
+    );
+    assert!(matches!(
+        assert_check_refused(
+            &pool,
+            community_id,
+            channel_id,
+            &success,
+            &unresolved_evidence,
+            &signers
+        )
+        .await,
+        buzz_db::DbError::InvalidData(_)
+    ));
+    let wrong_kind = check(
+        &control,
+        channel_id,
+        &success,
+        &success_request_id,
+        &success_terminal.id.to_hex(),
+        CiRunState::Success,
+        None,
+        Some((&evidence.id.to_hex(), &evidence.id.to_hex())),
+        1_800_000_050,
+    );
+    assert!(matches!(
+        assert_check_refused(
+            &pool,
+            community_id,
+            channel_id,
+            &success,
+            &wrong_kind,
+            &signers
+        )
+        .await,
+        buzz_db::DbError::InvalidData(_)
+    ));
+
+    // Exact references are stored for both runs.
+    for (request, request_id, status, facts) in [
+        (&failed, &failed_request_id, &failed_terminal, None),
+        (
+            &success,
+            &success_request_id,
+            &success_terminal,
+            Some((evidence.id.to_hex(), teardown.id.to_hex())),
+        ),
+    ] {
+        let conclusion = if facts.is_some() {
+            CiRunState::Success
+        } else {
+            CiRunState::Failure
+        };
+        let event = check(
+            &control,
+            channel_id,
+            request,
+            request_id,
+            &status.id.to_hex(),
+            conclusion,
+            None,
+            facts.as_ref().map(|(e, t)| (e.as_str(), t.as_str())),
+            1_800_000_050,
+        );
+        assert!(matches!(
+            store(&pool, community_id, channel_id, &event, &signers)
+                .await
+                .expect("store exact check"),
+            StoreCiEventOutcome::Stored(_)
+        ));
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn check_conclusion_and_reason_must_agree_with_the_stored_terminal_run_status() {
+    let pool = pool().await;
+    let (community_id, channel_id) = tenant_channel(&pool).await;
+    let actor = Keys::generate();
+    let control = Keys::generate();
+    let signers = HashSet::from([control.public_key().to_hex()]);
+    let (request, request_event, terminal) = store_terminal_run(
+        &pool,
+        community_id,
+        channel_id,
+        &actor,
+        &control,
+        CiRunState::Failure,
+        &signers,
+    )
+    .await;
+    let request_id = request_event.id.to_hex();
+    let terminal_id = terminal.id.to_hex();
+
+    let contradiction = check(
+        &control,
+        channel_id,
+        &request,
+        &request_id,
+        &terminal_id,
+        CiRunState::Cancelled,
+        None,
+        None,
+        1_800_000_050,
+    );
+    assert!(matches!(
+        assert_check_refused(
+            &pool,
+            community_id,
+            channel_id,
+            &request,
+            &contradiction,
+            &signers
+        )
+        .await,
+        buzz_db::DbError::InvalidData(_)
+    ));
+    let extra_reason = check(
+        &control,
+        channel_id,
+        &request,
+        &request_id,
+        &terminal_id,
+        CiRunState::Failure,
+        Some("not_in_the_run_status"),
+        None,
+        1_800_000_050,
+    );
+    assert!(matches!(
+        assert_check_refused(
+            &pool,
+            community_id,
+            channel_id,
+            &request,
+            &extra_reason,
+            &signers
+        )
+        .await,
+        buzz_db::DbError::InvalidData(_)
+    ));
+
+    let agreeing = check(
+        &control,
+        channel_id,
+        &request,
+        &request_id,
+        &terminal_id,
+        CiRunState::Failure,
+        None,
+        None,
+        1_800_000_050,
+    );
+    assert!(matches!(
+        store(&pool, community_id, channel_id, &agreeing, &signers)
+            .await
+            .expect("store agreeing check"),
+        StoreCiEventOutcome::Stored(_)
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn a_second_check_for_the_same_request_is_refused_unless_identical() {
+    let pool = pool().await;
+    let (community_id, channel_id) = tenant_channel(&pool).await;
+    let actor = Keys::generate();
+    let control = Keys::generate();
+    let signers = HashSet::from([control.public_key().to_hex()]);
+    let (request, request_event, terminal) = store_terminal_run(
+        &pool,
+        community_id,
+        channel_id,
+        &actor,
+        &control,
+        CiRunState::Cancelled,
+        &signers,
+    )
+    .await;
+    let request_id = request_event.id.to_hex();
+    let terminal_id = terminal.id.to_hex();
+
+    let first = check(
+        &control,
+        channel_id,
+        &request,
+        &request_id,
+        &terminal_id,
+        CiRunState::Cancelled,
+        None,
+        None,
+        1_800_000_050,
+    );
+    assert!(matches!(
+        store(&pool, community_id, channel_id, &first, &signers)
+            .await
+            .expect("store first check"),
+        StoreCiEventOutcome::Stored(_)
+    ));
+    assert!(matches!(
+        store(&pool, community_id, channel_id, &first, &signers)
+            .await
+            .expect("replay identical check"),
+        StoreCiEventOutcome::Reused(_)
+    ));
+
+    let second = check(
+        &control,
+        channel_id,
+        &request,
+        &request_id,
+        &terminal_id,
+        CiRunState::Cancelled,
+        None,
+        None,
+        1_800_000_051,
+    );
+    assert_ne!(second.id, first.id);
+    assert!(matches!(
+        assert_check_refused(&pool, community_id, channel_id, &request, &second, &signers).await,
+        buzz_db::DbError::Conflict(_)
+    ));
+    let checks: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ci_run_events WHERE community_id=$1 AND event_kind=46108",
+    )
+    .bind(community_id.as_uuid())
+    .fetch_one(&pool)
+    .await
+    .expect("count checks");
+    assert_eq!(checks, 1);
 }
 
 async fn assert_rejected_request_rolled_back(

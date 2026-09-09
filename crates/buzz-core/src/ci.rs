@@ -269,16 +269,22 @@ impl CiRequestEnvelope {
 /// Concurrency group key for a request, shaped like the GitHub `CI`
 /// workflow's `ci-<workflow>-<ref or sha>` group.
 ///
-/// A pull-request request (every kind 46100 request carries its PR root event)
-/// is keyed by its source branch, so a newer request for the same branch
-/// supersedes an older one. The `cancel_in_progress` flag says whether an
-/// older non-terminal run in the same group is cancelled when a newer request
-/// arrives; it is set for pull-request refs, matching GitHub's behaviour on
-/// `pull_request` events.
+/// GitHub keys a `pull_request` run by `github.ref`, which is
+/// `refs/pull/<N>/merge`: one group per pull request. The Buzz equivalent is
+/// the PR root event (every kind 46100 request carries one), scoped by the
+/// repository coordinate because one channel can serve more than one
+/// repository. The requester-signed source branch is kept as the ref's name
+/// but never identifies the group on its own: two pull requests that share a
+/// branch name (two forks, or two repositories on one channel) are different
+/// groups. The `cancel_in_progress` flag says whether an older non-terminal
+/// run in the same group is cancelled when a newer request arrives; it is
+/// set for pull-request refs, matching GitHub's behaviour on `pull_request`
+/// events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiConcurrencyGroup {
-    /// Group key: `ci-<workflow_id>-<source_branch>` for PR refs, else
-    /// `ci-<workflow_id>-<tip_oid>`.
+    /// Group key:
+    /// `ci-<workflow_id>-<target_repo_a>-<pr_root_event_id>-<source_branch>`
+    /// for PR refs, else `ci-<workflow_id>-<target_repo_a>-<tip_oid>`.
     pub key: String,
     /// Whether an older in-flight run in this group is cancelled by a newer one.
     pub cancel_in_progress: bool,
@@ -289,12 +295,15 @@ impl CiConcurrencyGroup {
     pub fn of(request: &CiRequestEnvelope) -> Self {
         let pr_ref = !request.pr_root_event_id.is_empty();
         let selector = if pr_ref {
-            request.source_branch.as_str()
+            format!("{}-{}", request.pr_root_event_id, request.source_branch)
         } else {
-            request.tip_oid.as_str()
+            request.tip_oid.clone()
         };
         Self {
-            key: format!("ci-{}-{}", request.workflow_id, selector),
+            key: format!(
+                "ci-{}-{}-{}",
+                request.workflow_id, request.target_repo_a, selector
+            ),
             cancel_in_progress: pr_ref,
         }
     }

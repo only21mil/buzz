@@ -1078,36 +1078,15 @@ where
 
     /// Look past the channel head for a newer initial request in the head's
     /// concurrency group. GitHub's `cancel-in-progress` on pull-request refs
-    /// covers queued runs too: a newer push to the same branch makes the
-    /// older run's result moot, so the older head is recorded cancelled
+    /// covers queued runs too: a newer push to the same pull request makes
+    /// the older run's result moot, so the older head is recorded cancelled
     /// without running. Bounded to `SUPERSESSION_LOOKAHEAD` reads.
     fn find_superseder(
         &mut self,
         channel_id: &str,
         head: &AcceptedRequest,
     ) -> Result<Option<AcceptedRequest>, ProductionError> {
-        let group = CiConcurrencyGroup::of(&head.envelope);
-        if !group.cancel_in_progress {
-            return Ok(None);
-        }
-        let mut cursor = head.watch_cursor;
-        for _ in 0..SUPERSESSION_LOOKAHEAD {
-            let Some(next) = self
-                .relay
-                .next_accepted(channel_id, cursor)
-                .map_err(|_| ProductionError::Relay)?
-            else {
-                return Ok(None);
-            };
-            if next.channel_id != channel_id || next.watch_cursor <= cursor {
-                return Err(ProductionError::Invalid);
-            }
-            if supersedes(&group, head, &next) {
-                return Ok(Some(next));
-            }
-            cursor = next.watch_cursor;
-        }
-        Ok(None)
+        find_superseder_after(&mut self.relay, channel_id, head)
     }
 
     /// Record a queued head cancelled because `superseder` replaced it in its
@@ -1224,17 +1203,21 @@ where
             let Self {
                 relay, executor, ..
             } = self;
-            let group = CiConcurrencyGroup::of(&accepted.envelope);
+            let cancel_in_progress = CiConcurrencyGroup::of(&accepted.envelope).cancel_in_progress;
             let mut ticks = 0_u32;
             let mut watch = || {
                 ticks = ticks.wrapping_add(1);
-                if !group.cancel_in_progress || ticks % SUPERSESSION_PROBE_TICKS != 1 {
+                if !cancel_in_progress || ticks % SUPERSESSION_PROBE_TICKS != 1 {
                     return WatchDecision::Continue;
                 }
-                match relay.next_accepted(&accepted.channel_id, accepted.watch_cursor) {
-                    Ok(Some(next)) if supersedes(&group, accepted, &next) => WatchDecision::Cancel(
-                        format!("{CONCURRENCY_SUPERSEDED_REASON}:{}", next.event_id),
-                    ),
+                // The same bounded look-ahead as the queued-head path: an
+                // unrelated request accepted right after this one must not
+                // hide a later same-group request.
+                match find_superseder_after(relay, &accepted.channel_id, accepted) {
+                    Ok(Some(next)) => WatchDecision::Cancel(format!(
+                        "{CONCURRENCY_SUPERSEDED_REASON}:{}",
+                        next.event_id
+                    )),
                     _ => WatchDecision::Continue,
                 }
             };
@@ -1768,9 +1751,42 @@ fn host_now() -> Result<u64, ProductionError> {
         .map_err(|_| ProductionError::Invalid)
 }
 
+/// Look past `head` for a newer initial request in its concurrency group,
+/// bounded to `SUPERSESSION_LOOKAHEAD` relay reads. The queued-head path and
+/// the running-attempt watch share this window so both see the same
+/// superseder.
+fn find_superseder_after<R: RelayControl>(
+    relay: &mut R,
+    channel_id: &str,
+    head: &AcceptedRequest,
+) -> Result<Option<AcceptedRequest>, ProductionError> {
+    let group = CiConcurrencyGroup::of(&head.envelope);
+    if !group.cancel_in_progress {
+        return Ok(None);
+    }
+    let mut cursor = head.watch_cursor;
+    for _ in 0..SUPERSESSION_LOOKAHEAD {
+        let Some(next) = relay
+            .next_accepted(channel_id, cursor)
+            .map_err(|_| ProductionError::Relay)?
+        else {
+            return Ok(None);
+        };
+        if next.channel_id != channel_id || next.watch_cursor <= cursor {
+            return Err(ProductionError::Invalid);
+        }
+        if supersedes(&group, head, &next) {
+            return Ok(Some(next));
+        }
+        cursor = next.watch_cursor;
+    }
+    Ok(None)
+}
+
 /// Whether `next` replaces `head` in `group`: a later initial request for a
-/// different run in the same group. A rerun of the same run never supersedes
-/// its own lineage.
+/// different run in the same group, which since the group is keyed by
+/// repository and PR root event means the same pull request. A rerun of the
+/// same run never supersedes its own lineage.
 fn supersedes(group: &CiConcurrencyGroup, head: &AcceptedRequest, next: &AcceptedRequest) -> bool {
     next.watch_cursor > head.watch_cursor
         && next.envelope.run_id != head.envelope.run_id
@@ -4107,6 +4123,30 @@ mod tests {
             later
         }
 
+        /// A later initial request on the head's branch name from another
+        /// pull request (or, with `repo`, another repository on the channel).
+        fn other_pr_request(cursor: u64, repo: Option<&str>) -> AcceptedRequest {
+            let mut other = later_request(cursor, "feature");
+            other.event_id = "13".repeat(32);
+            other.envelope.run_id = "123e4567-e89b-12d3-a456-426614174031".into();
+            other.envelope.pr_root_event_id = "77".repeat(32);
+            other.envelope.trigger_event_id = "77".repeat(32);
+            if let Some(repo) = repo {
+                other.envelope.target_repo_a = repo.to_owned();
+            }
+            other
+        }
+
+        /// A third initial request for the head's pull request, distinct from
+        /// `later_request` so two same-group requests can coexist.
+        fn third_same_pr_request(cursor: u64) -> AcceptedRequest {
+            let mut third = later_request(cursor, "feature");
+            third.event_id = "14".repeat(32);
+            third.envelope.run_id = "123e4567-e89b-12d3-a456-426614174041".into();
+            third.envelope.idempotency_key = "123e4567-e89b-12d3-a456-426614174042".into();
+            third
+        }
+
         fn rerun_request(cursor: u64, event_id: &str) -> AcceptedRequest {
             let mut rerun = accepted();
             rerun.watch_cursor = cursor;
@@ -4225,7 +4265,10 @@ mod tests {
             assert_eq!(check.tip_oid, head.envelope.tip_oid);
             assert_eq!(check.run_id, head.envelope.run_id);
             assert_eq!(check.attempt, 1);
-            assert_eq!(check.concurrency_group, "ci-ci-feature");
+            assert_eq!(
+                check.concurrency_group,
+                CiConcurrencyGroup::of(&head.envelope).key
+            );
             assert_eq!(handler.store.cursor, head.watch_cursor);
         }
 
@@ -4280,6 +4323,155 @@ mod tests {
             let (_, record) = handler.store.run.clone().expect("run");
             assert_eq!(record.state(), RunState::Success);
             assert_eq!(handler.relay.checks[0].conclusion, CiRunState::Success);
+        }
+
+        /// The group is the pull request, not the branch name: a request from
+        /// another pull request that pushes the same branch name (a fork) is a
+        /// different group and leaves the head alone.
+        #[test]
+        fn a_same_branch_request_from_another_pull_request_does_not_supersede_the_head() {
+            let log = b"ok\n".to_vec();
+            let head = accepted();
+            let other = other_pr_request(8, None);
+            assert_eq!(other.envelope.source_branch, head.envelope.source_branch);
+            let mut handler = ProductionHandler::new(
+                HeadRelay::visible(vec![head.clone(), other]),
+                DeterministicSigner,
+                Executor(completion(&log)),
+                MemoryStore::default(),
+                MemoryOutput(log),
+            );
+
+            assert_eq!(handler.poll_once(CHANNEL).unwrap(), PollStep::Completed);
+
+            let (_, record) = handler.store.run.clone().expect("run");
+            assert_eq!(record.state(), RunState::Success);
+            assert_eq!(handler.relay.checks[0].conclusion, CiRunState::Success);
+        }
+
+        /// Two repositories on one channel with the same branch name and PR
+        /// root are still different groups.
+        #[test]
+        fn a_same_branch_request_for_another_repository_does_not_supersede_the_head() {
+            let log = b"ok\n".to_vec();
+            let head = accepted();
+            let mut other = other_pr_request(8, Some(&format!("30617:{}:fork", "23".repeat(32))));
+            other.envelope.pr_root_event_id = head.envelope.pr_root_event_id.clone();
+            other.envelope.trigger_event_id = head.envelope.trigger_event_id.clone();
+            let mut handler = ProductionHandler::new(
+                HeadRelay::visible(vec![head.clone(), other]),
+                DeterministicSigner,
+                Executor(completion(&log)),
+                MemoryStore::default(),
+                MemoryOutput(log),
+            );
+
+            assert_eq!(handler.poll_once(CHANNEL).unwrap(), PollStep::Completed);
+
+            let (_, record) = handler.store.run.clone().expect("run");
+            assert_eq!(record.state(), RunState::Success);
+        }
+
+        /// `supersedes` needs the same repository and pull request; the
+        /// branch name alone never qualifies, and the same pull request
+        /// still does.
+        #[test]
+        fn supersession_requires_the_same_pull_request_and_repository() {
+            let head = accepted();
+            let group = CiConcurrencyGroup::of(&head.envelope);
+            assert!(supersedes(&group, &head, &later_request(8, "feature")));
+            assert!(!supersedes(&group, &head, &other_pr_request(8, None)));
+            let mut other_repo = later_request(8, "feature");
+            other_repo.envelope.target_repo_a = format!("30617:{}:fork", "23".repeat(32));
+            assert!(!supersedes(&group, &head, &other_repo));
+            assert!(!supersedes(&group, &head, &later_request(8, "other")));
+        }
+
+        /// The running-attempt watch reads the same bounded window as the
+        /// queued-head path: an unrelated request accepted right after the
+        /// head does not hide a later same-group request.
+        #[test]
+        fn running_watch_looks_past_an_unrelated_request_to_the_superseder() {
+            let head = accepted();
+            let unrelated = later_request(8, "other");
+            let superseder = third_same_pr_request(9);
+            let mut relay = HeadRelay::visible(vec![head.clone(), unrelated, superseder.clone()]);
+
+            let found = find_superseder_after(&mut relay, CHANNEL, &head)
+                .expect("look-ahead")
+                .expect("superseder");
+            assert_eq!(found.event_id, superseder.event_id);
+        }
+
+        /// A (branch X) is running when B (branch Y) and then C (branch X,
+        /// same pull request) are accepted. C supersedes A even though B sits
+        /// between them in acceptance order.
+        #[test]
+        fn later_same_group_request_behind_an_unrelated_request_cancels_the_running_attempt() {
+            let reveal = Arc::new(AtomicBool::new(false));
+            let broker = ProcessBroker::default();
+            let hook_flag = Arc::clone(&reveal);
+            broker.0.lock().unwrap().on_admit = Some(Box::new(move || {
+                hook_flag.store(true, Ordering::SeqCst);
+            }));
+            let now = host_now().unwrap();
+            let mut head = accepted();
+            head.envelope.issued_at = now;
+            head.envelope.expires_at = now + 30;
+            let mut unrelated = later_request(8, "other");
+            unrelated.envelope.issued_at = now;
+            unrelated.envelope.expires_at = now + 30;
+            let mut superseder = third_same_pr_request(9);
+            superseder.envelope.issued_at = now;
+            superseder.envelope.expires_at = now + 30;
+            let relay = HeadRelay {
+                heads: vec![head.clone(), unrelated.clone(), superseder.clone()],
+                reveal_after: head.watch_cursor,
+                reveal,
+                published: Vec::new(),
+                run_statuses: Vec::new(),
+                checks: Vec::new(),
+            };
+            let client = RunnerV2Client::new(broker.clone(), 1).unwrap();
+            let mut bindings = bindings();
+            bindings.workflow_id = head.envelope.workflow_id.clone();
+            let (executor, output) = compose_runner_v2(
+                client,
+                Signer,
+                bindings,
+                job_metadata(),
+                SIGNER.into(),
+                Duration::from_millis(20),
+                AttemptControl {
+                    observer: None,
+                    command: None,
+                },
+            )
+            .unwrap();
+            let mut handler = ProductionHandler::new(
+                relay,
+                DeterministicSigner,
+                executor,
+                MemoryStore::default(),
+                output,
+            );
+
+            assert_eq!(handler.poll_once(CHANNEL).unwrap(), PollStep::Completed);
+
+            assert!(
+                !process_group_alive(broker.process_group()),
+                "the superseded job is gone"
+            );
+            assert_eq!(broker.cancels(), vec![CancelReason::UserRequest]);
+            let (_, record) = handler.store.run.clone().expect("run");
+            assert_eq!(record.state(), RunState::Cancelled);
+            assert_eq!(
+                record.reason(),
+                Some(format!("{CONCURRENCY_SUPERSEDED_REASON}:{}", superseder.event_id).as_str())
+            );
+            let check = handler.relay.checks.last().expect("check");
+            assert_eq!(check.conclusion, CiRunState::Cancelled);
+            assert_eq!(handler.store.cursor, head.watch_cursor);
         }
 
         /// Behaviour (c): a rerun whose parent attempt controld never stored
@@ -4482,7 +4674,10 @@ mod tests {
                 check.teardown_attestation_event_id.as_deref(),
                 record.terminal_facts().teardown_attestation_event_id()
             );
-            assert_eq!(check.concurrency_group, "ci-ci-feature");
+            assert_eq!(
+                check.concurrency_group,
+                CiConcurrencyGroup::of(&head.envelope).key
+            );
             assert_eq!(Some(check.published_at), record.finished_at());
             assert_eq!(check.relay_signer, SIGNER);
             assert!(check

@@ -4,8 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use buzz_core::ci::CiConcurrencyGroup;
 use buzz_core::ci::{
-    CiEvidenceFinalizedEnvelope, CiJobState, CiJobStatusEnvelope, CiRequestEnvelope, CiRequestType,
-    CiRunState, CiSkipPolicy, CiTeardownAttestationEnvelope, ValidatedCiEnvelope,
+    CiCheckEnvelope, CiEvidenceFinalizedEnvelope, CiJobState, CiJobStatusEnvelope,
+    CiRequestEnvelope, CiRequestType, CiRunState, CiRunStatusEnvelope, CiSkipPolicy,
+    CiTeardownAttestationEnvelope, ValidatedCiEnvelope,
 };
 use buzz_core::kind::{
     KIND_CI_ARTIFACT_REFERENCE, KIND_CI_CHECK, KIND_CI_EVIDENCE_FINALIZED, KIND_CI_JOB_STATUS,
@@ -639,6 +640,9 @@ async fn prepare_linked_event(
         ValidatedCiEnvelope::TeardownAttestation(teardown) => {
             validate_teardown_attestation(tx, community_id, projection.run_id, teardown).await?;
         }
+        ValidatedCiEnvelope::Check(check) => {
+            validate_check(tx, community_id, projection.run_id, request_event_id, check).await?;
+        }
         _ => {}
     }
     if matches!(
@@ -646,6 +650,126 @@ async fn prepare_linked_event(
         ValidatedCiEnvelope::RunStatus(status) if status.state == CiRunState::Success
     ) {
         validate_terminal_success(tx, community_id, projection.run_id).await?;
+    }
+    Ok(())
+}
+
+/// A kind 46108 check summarises stored facts for one request. It must be
+/// the only check for that request, name a stored terminal run status of the
+/// same request and attempt whose state and reason it repeats, and name
+/// terminal facts that are stored for the same request and attempt.
+async fn validate_check(
+    tx: &mut Transaction<'_, Postgres>,
+    community_id: CommunityId,
+    run_id: Uuid,
+    request_event_id: &[u8],
+    check: &CiCheckEnvelope,
+) -> Result<()> {
+    let attempt = i32::try_from(check.attempt)
+        .map_err(|_| DbError::InvalidData("CI check attempt exceeds i32".into()))?;
+    let existing: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS(
+            SELECT 1 FROM ci_run_events
+            WHERE community_id=$1 AND run_id=$2 AND request_event_id=$3 AND event_kind=$4
+        )
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(request_event_id)
+    .bind(KIND_CI_CHECK as i32)
+    .fetch_one(&mut **tx)
+    .await?;
+    if existing {
+        return Err(DbError::Conflict(
+            "CI check already stored for this request".into(),
+        ));
+    }
+
+    let run_status_event_id = decode_event_id(&check.run_status_event_id)?;
+    let status_row = sqlx::query(
+        r#"
+        SELECT index.status_state,stored.content
+        FROM ci_run_events AS index
+        JOIN events AS stored
+          ON stored.community_id=index.community_id
+         AND stored.created_at=index.event_created_at
+         AND stored.id=index.event_id
+        WHERE index.community_id=$1 AND index.run_id=$2 AND index.event_id=$3
+          AND index.request_event_id=$4 AND index.event_kind=$5 AND index.attempt=$6
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(&run_status_event_id)
+    .bind(request_event_id)
+    .bind(KIND_CI_RUN_STATUS as i32)
+    .bind(attempt)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| {
+        DbError::InvalidData(
+            "CI check run status reference does not resolve to a stored run status for its request"
+                .into(),
+        )
+    })?;
+    let state = parse_run_state(status_row.try_get("status_state")?)?;
+    if !state.is_terminal() {
+        return Err(DbError::InvalidData(
+            "CI check names a run status that is not terminal".into(),
+        ));
+    }
+    if state != check.conclusion {
+        return Err(DbError::InvalidData(
+            "CI check conclusion contradicts the stored terminal run status".into(),
+        ));
+    }
+    let status: CiRunStatusEnvelope = serde_json::from_str(status_row.try_get("content")?)
+        .map_err(|_| DbError::InvalidData("stored CI run status content is invalid".into()))?;
+    if status.reason != check.reason {
+        return Err(DbError::InvalidData(
+            "CI check reason differs from the stored terminal run status".into(),
+        ));
+    }
+
+    for (fact_event_id, event_kind) in [
+        (
+            check.evidence_finalized_event_id.as_deref(),
+            KIND_CI_EVIDENCE_FINALIZED,
+        ),
+        (
+            check.teardown_attestation_event_id.as_deref(),
+            KIND_CI_TEARDOWN_ATTESTATION,
+        ),
+    ] {
+        let Some(fact_event_id) = fact_event_id else {
+            continue;
+        };
+        let fact_event_id = decode_event_id(fact_event_id)?;
+        let exists: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM ci_run_events
+                WHERE community_id=$1 AND run_id=$2 AND event_id=$3
+                  AND request_event_id=$4 AND event_kind=$5 AND attempt=$6
+            )
+            "#,
+        )
+        .bind(community_id.as_uuid())
+        .bind(run_id)
+        .bind(fact_event_id)
+        .bind(request_event_id)
+        .bind(event_kind as i32)
+        .bind(attempt)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !exists {
+            return Err(DbError::InvalidData(
+                "CI check terminal fact reference does not resolve to a stored fact for its request"
+                    .into(),
+            ));
+        }
     }
     Ok(())
 }
