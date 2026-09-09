@@ -173,18 +173,29 @@ sibling agent.
 | Command | Status | Handled by | What happens |
 |---------|--------|------------|--------------|
 | `/goal <condition>`, `/goal clear`, `/goal active` | Live: pass-through | Connector | Sent unchanged as the first prompt block; Claude Code and codex-acp run their own `/goal`. |
-| `/<anything else>` (`/review`, `/compact`, connector skills) | Live: pass-through | Connector | Sent unchanged as the first prompt block. The harness records each seat's advertised commands (`available_commands_update`, per session id) and `queue::slash::unsupported_command_reply` renders "`/name` is not supported by this seat; available: ..." for a name outside that list; the prompt path applies it in the follow-up PR that wires slash replies. |
-| `/skill` | Mapping landed; prompt-path wiring in the follow-up PR | Harness | Lists the commands the seat's session advertised. Until the connector has sent `available_commands_update` for the session (it may never, for connectors without the extension) the reply says the skills are not known yet. |
-| `/skill <name> [args]` | Mapping landed; prompt-path wiring in the follow-up PR | Harness rewrite, then connector | Rewritten to the connector's skill invocation: `/<name> args` for claude-agent-acp, `$<name> args` for codex-acp. A name the seat did not advertise is refused with the advertised list; a matching name is forwarded in the advertised spelling. If no list has been captured yet the command is forwarded blind and the connector answers. |
-| `/stop`, `/stop all` | Reserved (follow-up PR) | Harness | Will cancel the lane's in-flight turn, drop its queued batches, and fan out to dispatched sibling agents. Passes through unchanged until then. |
+| `/<anything else>` (`/review`, `/compact`, connector skills) | Live: pass-through | Connector | Sent unchanged as the first prompt block. The harness records each seat's advertised commands (`available_commands_update`, per session id); `queue::slash::unsupported_command_reply` can render "`/name` is not supported by this seat" for a name outside that list but is not applied until a live check confirms which connectors advertise their built-ins. |
+| `/skill` | Live | Harness | Replies in-thread with the commands the seat's session advertised, without prompting the agent. The session always exists by the time the command is resolved, so a missing list means the connector has not sent `available_commands_update` yet (a fresh session's first update is read during its first turn) or does not implement it; the reply says so and suggests trying again after the next turn. |
+| `/skill <name> [args]` | Live | Harness rewrite, then connector | Rewritten to the connector's skill invocation: `/<name> args` for claude-agent-acp, `$<name> args` for codex-acp. A name the seat did not advertise is refused in-thread with the advertised list; a matching name is forwarded in the advertised spelling. If no list has been captured yet the command is forwarded blind and the connector answers. |
+| `/stop` | Live | Harness | Owner, or a sibling agent whose `/stop` carries a `stop-origin` tag (harness fan-out); consumed before the event is queued. The tag marks a harness or tool-posted `/stop`; one without it is reply text, refused in-thread and consumed, so "@A /stop all" generated in another agent's reply cannot halt A's lanes (a sibling with a posting tool can still craft the tag). `!cancel` stays owner-only. Cancels the in-flight turn for the command's session scope (`ControlSignal::Cancel`, the same path as `!cancel`), drops every queued batch for that scope so the lane does not resume, then fans out: one harness-authored `/stop` per sibling agent this agent mentioned in the channel (and thread, under the `thread` policy) since the turn started, each with a `p` tag for that sibling and a `["stop-origin", <original event id>]` tag, posted as a reply to the dispatch message. Acknowledges in the `/stop` thread ("Stopped this thread: cancelled turn ..., dropped N queued, notified ...", "Stop already in progress ...", or "Nothing running ...") and emits an observer `control_result` frame of type `stop`. When a steer or interrupt already took the turn's control channel, the acknowledgement says "Stop already in progress" and the scope is marked stopped, so the batch that turn hands back is discarded instead of re-dispatched. A `/stop` from anyone else falls through as an ordinary prompt. |
+| `/stop all` | Live | Harness | As `/stop`, for every in-flight turn and queued batch of this agent in the channel, one acknowledgement line per lane. |
 | `/plan [text]` | Reserved (follow-up PR) | Harness, then connector | Will switch the session to the agent's `plan` mode for one turn. Passes through unchanged until then (Claude Code's own `/plan` opens the plan file; codex-acp toggles its plan mode). |
+
+Stop is cancel, not kill. In-process children (Claude Code Agent-tool subagents,
+Codex subagents, MCP servers) run in the connector's process group and end with
+the turn: `session/cancel` interrupts them, and if the connector does not drain
+within the cancel grace the existing respawn path kills the process group.
+Sibling agents reached by relay message handle the forwarded `/stop` under the
+same rule with themselves as the parent, so a stop recurses one hop at a time. A
+harness remembers the last 256 `stop-origin` ids and ignores repeats, which also
+breaks cycles between siblings that dispatched each other. Fan-out replies
+mention only siblings, never people. Dispatch through DMs or other channels is
+not found by the lookback.
 
 The harness keeps the latest `available_commands_update` per ACP session id
 (`AcpClient::available_commands`); each update replaces the previous list. The
-parser, command table and `/skill` mapping live in `queue.rs` (module `slash`: `SlashCommand`,
-`SLASH_COMMAND_TABLE`, `rewrite_skill`, `handle_skill`,
-`unsupported_command_reply`). Until the prompt path calls them, every slash
-command still reaches the connector unchanged, exactly as before.
+parser, command table and `/skill` mapping live in `queue.rs` (module `slash`:
+`SlashCommand`, `SLASH_COMMAND_TABLE`, `rewrite_skill`, `handle_skill`);
+`/stop` lives in `stop_command.rs`.
 
 > **Note:** The default mode is `owner-only`. Agents without a registered `agent_owner_pubkey` will not respond to any events until the owner is resolved. Set `--respond-to anyone` to disable the gate entirely.
 

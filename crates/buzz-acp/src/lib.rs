@@ -19,6 +19,7 @@ mod scope;
 mod self_wake;
 mod setup_mode;
 mod sibling_auth;
+mod stop_command;
 mod usage;
 mod workflow_auth;
 
@@ -158,7 +159,7 @@ fn resolve_agent_owner(config: &Config) -> Option<String> {
 ///
 /// For unknown authors, queries their kind:0 profile to extract the NIP-OA
 /// auth tag and verify the owner matches. Result is cached.
-async fn is_owner_or_sibling(
+pub(crate) async fn is_owner_or_sibling(
     author: &str,
     owner_cache: &OwnerCache,
     rest_client: &relay::RestClient,
@@ -2019,6 +2020,10 @@ async fn tokio_main() -> Result<()> {
         config::startup_replay_floor(startup_watermark, config.replay_floor_unix),
         config.inbox_reorder_window_secs,
     );
+    // Stop-origin ids this harness already acted on, so a repeated or
+    // cyclic `/stop` fan-out is ignored (see `stop_command`).
+    let mut handled_stop_origins =
+        stop_command::StopOriginSet::new(stop_command::MAX_REMEMBERED_ORIGINS);
     match inbox_cursor.load_status() {
         CursorLoadStatus::Loaded => tracing::info!(
             path = %inbox_cursor.path().display(),
@@ -3155,6 +3160,82 @@ async fn tokio_main() -> Result<()> {
                                 }
                             }
 
+                            // `/stop` and `/stop all`: owner or sibling only. Sits
+                            // after the author gate so drops apply and before
+                            // queue.push so the event is never prompted. Unlike
+                            // `!cancel` the match tolerates leading mentions, so
+                            // the desktop composer's "@Fizz /stop" works. A
+                            // non-owner, non-sibling `/stop` falls through as an
+                            // ordinary prompt, exactly like `!cancel`.
+                            if let Some(stop) = stop_command::parse_stop_command(
+                                &buzz_event.event,
+                                kind_u32,
+                                &pubkey_hex,
+                                &[directory_display_name.as_str()],
+                            ) {
+                                let gate = stop_command::gate_stop(
+                                    &stop,
+                                    &buzz_event.event,
+                                    buzz_event.channel_id,
+                                    &effective_author,
+                                    &owner_cache,
+                                    &ctx.rest_client,
+                                )
+                                .await;
+                                if gate == stop_command::StopGate::Refused {
+                                    // Sibling `/stop` without a stop-origin tag:
+                                    // generated text, not harness fan-out. The
+                                    // refusal was posted in-thread; the event is
+                                    // consumed so it never prompts the agent.
+                                    inbox_cursor.mark_processed([&buzz_event.event]);
+                                    continue;
+                                }
+                                if gate == stop_command::StopGate::Authorised {
+                                    if !handled_stop_origins.insert(stop.origin.clone()) {
+                                        tracing::info!(
+                                            channel_id = %buzz_event.channel_id,
+                                            origin = %stop.origin,
+                                            "/stop with an already-handled origin — ignoring"
+                                        );
+                                        inbox_cursor.mark_processed([&buzz_event.event]);
+                                        continue;
+                                    }
+                                    let is_dm = channel_info
+                                        .as_ref()
+                                        .map(|info| info.channel_type == "dm")
+                                        .unwrap_or(true);
+                                    let scope = scope::SessionScope::derive(
+                                        config.session_policy,
+                                        buzz_event.channel_id,
+                                        is_dm,
+                                        &buzz_event.event,
+                                    );
+                                    stop_command::execute_stop(
+                                        stop_command::StopContext {
+                                            request: &stop,
+                                            event: &buzz_event.event,
+                                            channel_id: buzz_event.channel_id,
+                                            scope,
+                                            agent_pubkey_hex: &pubkey_hex,
+                                            max_turn_duration_secs: config.max_turn_duration_secs,
+                                        },
+                                        &mut pool,
+                                        &mut queue,
+                                        &ctx.rest_client,
+                                        &owner_cache,
+                                        observer.as_ref(),
+                                    )
+                                    .await;
+                                    inbox_cursor.mark_processed([&buzz_event.event]);
+                                    continue; // consumed — never queued
+                                }
+                                tracing::debug!(
+                                    channel_id = %buzz_event.channel_id,
+                                    author = %effective_author,
+                                    "/stop from a non-owner, non-sibling author — forwarding as a prompt"
+                                );
+                            }
+
                             let implicitly_addressed = is_implicitly_addressed_dm_message(
                                 &config.subscribe_mode,
                                 kind_u32,
@@ -3885,7 +3966,7 @@ enum LoopAction {
     Exit,
 }
 
-fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
+pub(crate) fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
     event.tags.iter().any(|t| {
         t.as_slice().first().map(|s| s.as_str()) == Some("p")
             && t.as_slice().get(1).map(|s| s.as_str()) == Some(agent_pubkey_hex)
@@ -4293,6 +4374,7 @@ async fn dispatch_pending_at(
                 channel_id: Some(channel_id),
                 scope: Some(scope.clone()),
                 turn_id,
+                started_at: pool::unix_now_secs(),
                 recoverable_batch,
                 control_tx: Some(control_tx),
                 steer_tx,
@@ -4479,7 +4561,22 @@ async fn handle_prompt_result(
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
         if !removed_channels.contains(&batch.channel_id) {
-            if matches!(
+            if queue.is_stopped(&batch.scope) {
+                // A `/stop` hit this turn while its control channel was
+                // already taken by a steer or interrupt, so the pool hands
+                // the batch back as a carry-over instead of dropping it the
+                // way a `Cancel` signal would. The lane was stopped: discard
+                // the batch rather than requeue it, or flush_next()'s
+                // cancelled-batch fallback would re-dispatch it and the lane
+                // would resume. mark_complete() below clears the marker.
+                tracing::info!(
+                    channel_id = %batch.channel_id,
+                    scope = %batch.scope.telemetry_label(),
+                    events = batch.events.len() + batch.cancelled_events.len(),
+                    "discarding returned batch for a stopped scope — /stop does not resume"
+                );
+                inbox_events_terminal = true;
+            } else if matches!(
                 result.outcome,
                 PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
             ) {
@@ -4869,7 +4966,17 @@ fn recover_panicked_agent(
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
     if let Some(batch) = meta.recoverable_batch {
         if let Some(ch) = meta.channel_id {
-            if matches!(config.dedup_mode, DedupMode::Queue) && !removed_channels.contains(&ch) {
+            if queue.is_stopped(&batch.scope) {
+                // A `/stop` hit this turn before it panicked; the lane must
+                // not resume. mark_complete below clears the marker.
+                tracing::info!(
+                    channel_id = %ch,
+                    scope = %batch.scope.telemetry_label(),
+                    "dropping panicked batch for a stopped scope — /stop does not resume"
+                );
+            } else if matches!(config.dedup_mode, DedupMode::Queue)
+                && !removed_channels.contains(&ch)
+            {
                 // Dead-letter on exhaustion is logged inside requeue(); a
                 // panic path has no outcome to report, so no notice here.
                 let _ = queue.requeue(batch);
@@ -5039,6 +5146,7 @@ async fn dispatch_heartbeat(
             channel_id: None,
             scope: None,
             turn_id,
+            started_at: pool::unix_now_secs(),
             recoverable_batch: None,
             control_tx: None,
             steer_tx: None,
@@ -5832,6 +5940,7 @@ mod owner_control_command_tests {
                 channel_id: Some(channel_id),
                 scope: Some(scope::SessionScope::Conversation { channel_id }),
                 turn_id: "test-turn-id".to_string(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: Some(control_tx),
                 steer_tx: None,
@@ -5878,6 +5987,7 @@ mod owner_control_command_tests {
                 channel_id: Some(scope.channel_id()),
                 scope: Some(scope),
                 turn_id: "t".to_string(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: Some(control_tx),
                 steer_tx: None,
@@ -8217,7 +8327,7 @@ mod error_outcome_emission_tests {
     /// Spawn a real but inert agent subprocess (`cat`) so the error paths have
     /// an `OwnedAgent` to move into respawn or return to the pool. The error
     /// branches never talk to the subprocess.
-    async fn dummy_agent(index: usize) -> OwnedAgent {
+    pub(crate) async fn dummy_agent(index: usize) -> OwnedAgent {
         OwnedAgent {
             index,
             acp: AcpClient::spawn("cat", &[], &[], false)
@@ -8290,6 +8400,7 @@ mod error_outcome_emission_tests {
                         channel_id: Some(channel_id),
                         scope: Some(batch.scope.clone()),
                         turn_id: format!("turn-{agent_index}"),
+                        started_at: 0,
                         recoverable_batch: Some(batch.clone()),
                         control_tx: None,
                         steer_tx: None,
@@ -8424,6 +8535,7 @@ mod error_outcome_emission_tests {
                 channel_id: Some(channel_id),
                 scope: Some(sibling.clone()),
                 turn_id: "sibling".into(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8497,6 +8609,7 @@ mod error_outcome_emission_tests {
                 channel_id: Some(channel_id),
                 scope: Some(scope::SessionScope::Conversation { channel_id }),
                 turn_id: "test-turn-id".into(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8575,6 +8688,7 @@ mod error_outcome_emission_tests {
                 channel_id: Some(channel_id),
                 scope: Some(scope::SessionScope::Conversation { channel_id }),
                 turn_id: "test-turn-id".into(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8700,6 +8814,7 @@ mod error_outcome_emission_tests {
                 channel_id: Some(channel_id),
                 scope: Some(scope::SessionScope::Conversation { channel_id }),
                 turn_id: "test-turn-id".into(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8772,6 +8887,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8854,6 +8970,7 @@ mod error_outcome_emission_tests {
                 channel_id: Some(channel_id),
                 scope: Some(scope::SessionScope::Conversation { channel_id }),
                 turn_id: "panic-turn-id".to_string(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -8904,6 +9021,86 @@ mod error_outcome_emission_tests {
         assert_eq!(panic.turn_id.as_deref(), Some("panic-turn-id"));
     }
 
+    #[tokio::test]
+    async fn panicked_stopped_turn_does_not_requeue_its_batch() {
+        let channel_id = Uuid::new_v4();
+        let scope = scope::SessionScope::Conversation { channel_id };
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), "work")
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert!(queue.push(QueuedEvent {
+            channel_id,
+            scope: scope.clone(),
+            event,
+            received_at: std::time::Instant::now(),
+            prompt_tag: "test".into(),
+        }));
+        let batch = queue.flush_next().expect("turn dispatched");
+
+        let mut pool = AgentPool::from_slots(vec![]);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let abort_handle = pool.join_set.spawn(async move {
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        pool.task_map_mut().insert(
+            abort_handle.id(),
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                scope: Some(scope.clone()),
+                turn_id: "stopped-then-panicked".to_string(),
+                started_at: 0,
+                recoverable_batch: Some(batch),
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        // `/stop` marked the in-flight turn; then the task dies.
+        assert!(queue.mark_stopped(&scope));
+        started_rx.await.unwrap();
+        abort_handle.abort();
+        let join_error = pool.join_set.join_next().await.unwrap().unwrap_err();
+
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let mut typing_channels = HashMap::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        recover_panicked_agent(
+            &mut pool,
+            &mut queue,
+            &config,
+            join_error,
+            &mut heartbeat_in_flight,
+            &HashSet::new(),
+            &mut typing_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            None,
+        );
+
+        // `requeue` would put the event back under a retry throttle, so
+        // check the queue itself, not just the next flush.
+        assert_eq!(
+            queue.queued_event_count(&scope),
+            0,
+            "the stopped turn's batch is dropped, not requeued"
+        );
+        assert!(queue.flush_next().is_none());
+        assert!(!queue.is_scope_in_flight(scope.clone()));
+        assert!(!queue.is_stopped(&scope), "marker cleared with the scope");
+    }
+
     // Fix #3: a panicked thread-scoped task must clear its EXACT scope from the
     // in-flight set (via meta.scope), not `Conversation(channel_id)`. Otherwise
     // the requeued batch stays wedged until the ~2h in-flight backstop.
@@ -8946,6 +9143,7 @@ mod error_outcome_emission_tests {
                 channel_id: Some(channel_id),
                 scope: Some(scope.clone()),
                 turn_id: "panic-turn-id".to_string(),
+                started_at: 0,
                 recoverable_batch: Some(batch),
                 control_tx: None,
                 steer_tx: None,
@@ -9045,6 +9243,7 @@ mod error_outcome_emission_tests {
                     channel_id: None,
                     scope: None,
                     turn_id: "test-turn-id".to_string(),
+                    started_at: 0,
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
@@ -9144,6 +9343,7 @@ mod error_outcome_emission_tests {
                     channel_id: None,
                     scope: None,
                     turn_id: "test-turn-id".to_string(),
+                    started_at: 0,
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
@@ -9254,6 +9454,7 @@ mod error_outcome_emission_tests {
                     channel_id: None,
                     scope: None,
                     turn_id: "test-turn-id".to_string(),
+                    started_at: 0,
                     recoverable_batch: None,
                     control_tx: None,
                     steer_tx: None,
@@ -9334,6 +9535,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -9433,6 +9635,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -9555,6 +9758,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -9699,6 +9903,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -9925,6 +10130,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
@@ -10015,6 +10221,7 @@ mod error_outcome_emission_tests {
                 channel_id: None,
                 scope: None,
                 turn_id: "test-turn-id".to_string(),
+                started_at: 0,
                 recoverable_batch: None,
                 control_tx: None,
                 steer_tx: None,
