@@ -48,7 +48,8 @@ class Provider(f.FakeClient):
             self.workflows[path] = run
             names = [*m.JOBS.values(), *m.AGGREGATES] if n == 1 else ["relay_e2e_canary" if n == 2 else "Desktop Release Candidate"]
             self.jobs[n] = [{"id": n * 100 + i, "run_id": n, "run_attempt": run["run_attempt"], "head_sha": HEAD,
-                             "name": name, "status": "completed", "conclusion": "success", "completed_at": f.COMPLETED,
+                             "name": name, "status": "completed", "conclusion": "success",
+                             "started_at": f.STAMP, "completed_at": f.COMPLETED,
                              "html_url": f"https://github.com/only21mil/buzz/actions/runs/{n}/job/{n * 100 + i}"}
                             for i, name in enumerate(names)]
         self.runs = []
@@ -115,7 +116,12 @@ class Provider(f.FakeClient):
         if kind == "runs":
             name = endpoint.split("/workflows/", 1)[1].split("/", 1)[0]
             return [copy.deepcopy(self.workflows[".github/workflows/" + name])]
-        if kind == "jobs": return copy.deepcopy(self.jobs[int(endpoint.split("/runs/", 1)[1].split("/", 1)[0])])
+        if kind == "jobs":
+            jobs = copy.deepcopy(self.jobs[int(endpoint.split("/runs/", 1)[1].split("/", 1)[0])])
+            if "/attempts/" in endpoint:
+                attempt = int(endpoint.split("/attempts/", 1)[1].split("/", 1)[0])
+                jobs = [job for job in jobs if job["run_attempt"] == attempt]
+            return jobs
         if kind == "artifacts": return copy.deepcopy(self.artifacts)
         return super().pages(endpoint, kind)
 
@@ -206,7 +212,7 @@ class LandingTests(unittest.TestCase):
     def test_service_and_compiler_image_evidence_is_required(self):
         def verify(key):
             job = next(job for job in self.p.jobs[1] if job["name"] == m.JOBS[key])
-            m.verify_source_proof(self.p.proofs[key], key, job, self.p.workflows[m.CI],
+            m.verify_source_proof(self.p.proofs[key], key, job["run_attempt"], self.p.workflows[m.CI],
                                   self.p.source, TREE, BINDINGS, "")
         for key in ("backend-integration", "relay-e2e", "desktop-integration-1", "desktop-integration-2"):
             for bad in (None, {}, {"buzz-postgres": "sha256:" + "f" * 64},
@@ -331,6 +337,102 @@ class LandingTests(unittest.TestCase):
         security = next(j for j in result["qualification"]["jobs"] if j["job"] == "security")
         self.assertEqual(security["source_job"]["run_attempt"], 2)
         self.assertEqual(base64.b64decode(result["source_receipt_bytes"]), original)
+
+    def retain(self, name, attempt, *, started=f.STAMP, completed=f.COMPLETED):
+        """Copy a job into a later attempt's listing the way a failed-jobs rerun does."""
+        origin = next(j for j in self.p.jobs[1] if j["name"] == name and j["run_attempt"] == attempt - 1)
+        copied = copy.deepcopy(origin)
+        copied.update(id=origin["id"] + 10000 * attempt, run_attempt=attempt, started_at=started, completed_at=completed,
+                      html_url=f"https://github.com/only21mil/buzz/actions/runs/1/job/{origin['id'] + 10000 * attempt}")
+        self.p.jobs[1].append(copied)
+        check = copy.deepcopy(next(c for c in self.p.runs if c["name"] == name))
+        check.update(id=copied["id"], html_url=copied["html_url"], details_url=copied["html_url"])
+        self.p.runs.append(check)
+        self.p.workflows[m.CI]["run_attempt"] = max(self.p.workflows[m.CI]["run_attempt"], attempt)
+        return copied
+
+    def test_retained_job_resolves_the_attempt_that_executed_it(self):
+        copied = self.retain("Dead Token Reference Guard", 2)
+        result = self.acquire()
+        guard = next(j for j in result["qualification"]["jobs"] if j["job"] == "dead-token-guard")
+        self.assertEqual(guard["source_job"]["id"], copied["id"])
+        self.assertEqual(guard["source_job"]["run_attempt"], 2)
+        self.assertEqual(guard["executed_attempt"], 1)
+        self.assertEqual(guard["artifact"]["name"], "qualification-1-dead-token-guard")
+        self.assertEqual(guard["source_proof"]["run_attempt"], 1)
+        attempts = [c[1] for c in result["evidence"]["calls"] if "/attempts/" in c[1]]
+        self.assertEqual(attempts, [m.PREFIX + "/actions/runs/1/attempts/1/jobs?per_page=100"])
+        self.assertEqual(m.validate(result, m.r.REPOSITORY, LAND, "main", NOW, 86400), result)
+
+    def test_retained_job_whose_origin_did_not_succeed_is_refused(self):
+        for mutate, message in ((lambda origin: origin.update(conclusion="failure"), "mirrors an unsuccessful attempt 1"),
+                                (lambda origin: origin.update(conclusion="skipped"), "mirrors an unsuccessful attempt 1"),
+                                (lambda origin: origin.update(status="in_progress", conclusion=None), "not a completed execution"),
+                                (lambda origin: origin.update(head_sha=LAND), "not a completed execution")):
+            with self.subTest(message=message):
+                self.p = Provider()
+                self.retain("Dead Token Reference Guard", 2)
+                origin = next(j for j in self.p.jobs[1] if j["name"] == "Dead Token Reference Guard" and j["run_attempt"] == 1)
+                mutate(origin)
+                with self.assertRaisesRegex(m.r.ReceiptError, message): self.acquire()
+
+    def test_retained_job_must_mirror_its_origin_timestamps(self):
+        for field, value in (("started", "2026-09-01T12:00:30Z"), ("completed", "2026-09-01T12:01:30Z")):
+            with self.subTest(field=field):
+                self.p = Provider()
+                self.retain("Dead Token Reference Guard", 2, **{field: value})
+                with self.assertRaisesRegex(m.r.ReceiptError, "proof missing or ambiguous: Dead Token"): self.acquire()
+
+    def test_retained_job_with_two_matching_earlier_proofs_is_refused(self):
+        self.retain("Dead Token Reference Guard", 2)
+        self.retain("Dead Token Reference Guard", 3)
+        second = copy.deepcopy(next(a for a in self.p.artifacts if a["name"] == "qualification-1-dead-token-guard"))
+        self.p.archives[f"{m.PREFIX}/actions/artifacts/9001/zip"] = self.p.archives[f"{m.PREFIX}/actions/artifacts/{second['id']}/zip"]
+        second.update(id=9001, name="qualification-2-dead-token-guard")
+        self.p.artifacts.append(second)
+        with self.assertRaisesRegex(m.r.ReceiptError, "proof missing or ambiguous: Dead Token"): self.acquire()
+
+    def test_retained_job_skips_an_earlier_execution_with_other_timestamps(self):
+        # attempt 1 executed (own timestamps), attempt 2 executed again, attempt 3 retains attempt 2
+        first = next(j for j in self.p.jobs[1] if j["name"] == "Dead Token Reference Guard")
+        first.update(started_at="2026-09-01T11:50:00Z", completed_at="2026-09-01T11:51:00Z")
+        self.retain("Dead Token Reference Guard", 2)
+        self.retain("Dead Token Reference Guard", 3)
+        artifact = next(a for a in self.p.artifacts if a["name"] == "qualification-1-dead-token-guard")
+        artifact["name"] = "qualification-2-dead-token-guard"
+        self.p.proofs["dead-token-guard"]["run_attempt"] = 2
+        self.p.pack("dead-token-guard")
+        result = self.acquire()
+        guard = next(j for j in result["qualification"]["jobs"] if j["job"] == "dead-token-guard")
+        self.assertEqual((guard["source_job"]["run_attempt"], guard["executed_attempt"]), (3, 2))
+        stale = copy.deepcopy(artifact)
+        stale.update(id=9002, name="qualification-1-dead-token-guard")
+        self.p.artifacts.append(stale)
+        self.p.archives[f"{m.PREFIX}/actions/artifacts/9002/zip"] = self.p.archives[f"{m.PREFIX}/actions/artifacts/{artifact['id']}/zip"]
+        result = self.acquire()
+        guard = next(j for j in result["qualification"]["jobs"] if j["job"] == "dead-token-guard")
+        self.assertEqual(guard["executed_attempt"], 2)
+
+    def test_fresh_jobs_record_their_own_attempt_without_attempt_lookups(self):
+        result = self.acquire()
+        self.assertTrue(all(j["executed_attempt"] == j["source_job"]["run_attempt"] == 1 for j in result["qualification"]["jobs"]))
+        self.assertFalse(any("/attempts/" in c[1] for c in result["evidence"]["calls"]))
+        self.p = Provider()
+        self.p.workflows[m.CI]["run_attempt"] = 2
+        job = copy.deepcopy(next(j for j in self.p.jobs[1] if j["name"] == "Security"))
+        job.update(id=999, run_attempt=2, started_at="2026-09-01T12:00:30Z", html_url="https://github.com/only21mil/buzz/actions/runs/1/job/999")
+        self.p.jobs[1].append(job)
+        check = copy.deepcopy(next(c for c in self.p.runs if c["name"] == "Security"))
+        check.update(id=999, html_url=job["html_url"], details_url=job["html_url"])
+        self.p.runs.append(check)
+        artifact = next(a for a in self.p.artifacts if a["name"] == "qualification-1-security")
+        artifact["name"] = "qualification-2-security"
+        self.p.proofs["security"]["run_attempt"] = 2
+        self.p.pack("security")
+        result = self.acquire()
+        security = next(j for j in result["qualification"]["jobs"] if j["job"] == "security")
+        self.assertEqual((security["source_job"]["run_attempt"], security["executed_attempt"]), (2, 2))
+        self.assertFalse(any("/attempts/" in c[1] for c in result["evidence"]["calls"]))
 
     def test_unreadable_epoch_is_not_treated_as_an_unset_epoch(self):
         api = mock.Mock()

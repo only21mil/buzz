@@ -226,6 +226,40 @@ def selected_job(executions, name, run, now):
     return job
 
 
+def executed_attempt(api, artifacts, key, name, job, run):
+    """Resolve the attempt whose execution produced the selected job entry.
+
+    A failed-jobs rerun copies every job it did not re-execute into the new
+    attempt's listing with a new job id, the new run_attempt and the original
+    started_at/completed_at. Its qualification artifact keeps the attempt that
+    executed it. A fresh execution uploads its own attempt's artifact.
+    """
+    attempt = job["run_attempt"]
+    live = {a["name"] for a in artifacts if not a["expired"]}
+    if f"qualification-{attempt}-{key}" in live:
+        return attempt
+    started = r.iso8601(job.get("started_at"), f"selected job {name} started_at")
+    completed = r.iso8601(job.get("completed_at"), f"selected job {name} completed_at")
+    matches = []
+    for earlier in range(1, attempt):
+        if f"qualification-{earlier}-{key}" not in live:
+            continue
+        listing = api.pages(PREFIX + f"/actions/runs/{run['id']}/attempts/{earlier}/jobs?per_page=100", "jobs")
+        origins = [j for j in listing if j.get("name") == name]
+        r.refuse(len(origins) == 1, f"retained source job origin is ambiguous: {name}")
+        origin = origins[0]
+        r.refuse(origin.get("run_attempt") == earlier and origin.get("run_id") == run["id"] and
+                 origin.get("head_sha") == run["head_sha"] and origin.get("status") == "completed",
+                 f"retained source job origin is not a completed execution of this run: {name}")
+        if (r.iso8601(origin.get("started_at"), f"attempt {earlier} job {name} started_at") == started and
+                r.iso8601(origin.get("completed_at"), f"attempt {earlier} job {name} completed_at") == completed):
+            r.refuse(origin.get("conclusion") == "success",
+                     f"retained source job mirrors an unsuccessful attempt {earlier}: {name}")
+            matches.append(earlier)
+    r.refuse(len(matches) == 1, f"successful whole-job proof missing or ambiguous: {name}; qualify affected work")
+    return matches[0]
+
+
 def source_run(api, path, event, head, now):
     runs = api.pages(PREFIX + f"/actions/workflows/{Path(path).name}/runs?head_sha={head}&event={event}&per_page=100", "runs")
     r.refuse(bool(runs), f"source workflow unavailable: {path}")
@@ -269,7 +303,7 @@ def source_run(api, path, event, head, now):
     return run
 
 
-def verify_source_proof(proof, key, job, run, source, target_tree, expected_bindings, epoch):
+def verify_source_proof(proof, key, attempt, run, source, target_tree, expected_bindings, epoch):
     r.exact_fields(proof, {"schema_version", "mode", "repository", "job", "run_id", "run_attempt", "head_sha",
                            "base_sha", "pull_request", "tested_sha", "tree_sha", "bindings", "context"}, "source proof")
     r.positive(proof.get("run_id"), "source run id")
@@ -277,7 +311,7 @@ def verify_source_proof(proof, key, job, run, source, target_tree, expected_bind
     r.refuse(proof.get("schema_version") == 1 and proof.get("mode") == "source" and
              proof.get("repository") == r.REPOSITORY and proof.get("job") == key,
              "source proof is ineligible or relabeled")
-    r.refuse(proof.get("run_id") == run["id"] and proof.get("run_attempt") == job["run_attempt"],
+    r.refuse(proof.get("run_id") == run["id"] and proof.get("run_attempt") == attempt,
              "source proof attempt mismatch")
     r.refuse(proof.get("head_sha") == source["head_sha"] and
              proof.get("base_sha") == source["pull_request"]["base_sha"] and
@@ -370,7 +404,8 @@ def qualify_source(api, source, target_tree, now, expected_bindings):
     proof_bindings = []
     for key, name in JOBS.items():
         job = selected_job(executions[CI], name, ci, now)
-        label = f"qualification-{job['run_attempt']}-{key}"
+        executed = executed_attempt(api, artifacts, key, name, job, ci)
+        label = f"qualification-{executed}-{key}"
         matches = [a for a in artifacts if a["name"] == label and not a["expired"]]
         r.refuse(len(matches) == 1, f"successful whole-job proof missing or ambiguous: {name}; qualify affected work")
         artifact = matches[0]
@@ -383,7 +418,7 @@ def qualify_source(api, source, target_tree, now, expected_bindings):
                      bundle.getinfo("protected-ci-qualification.json").file_size <= 256 * 1024,
                      "unexpected qualification archive contents")
             proof = json.loads(bundle.read("protected-ci-qualification.json"))
-        verify_source_proof(proof, key, job, ci, source, target_tree, expected_bindings, epoch)
+        verify_source_proof(proof, key, executed, ci, source, target_tree, expected_bindings, epoch)
         tested = api.one(PREFIX + f"/git/commits/{r.sha40(proof['tested_sha'], 'tested SHA')}")
         r.refuse(tested["sha"] == proof["tested_sha"] and tested["tree"]["sha"] == target_tree,
                  "provider tested tree differs")
@@ -393,7 +428,8 @@ def qualify_source(api, source, target_tree, now, expected_bindings):
             advisory = api.one("/repos/RustSec/advisory-db/git/ref/heads/main")
             r.refuse(proof["context"].get("advisory_sha") == advisory["object"]["sha"],
                      "Security advisory input changed; qualify Security again")
-        proof_bindings.append({"job": key, "source_job": job, "artifact": artifact, "source_proof": proof})
+        proof_bindings.append({"job": key, "source_job": job, "executed_attempt": executed,
+                               "artifact": artifact, "source_proof": proof})
     # Re-read the changing authority after downloading all proofs.
     r.refuse(r.snapshot(api, *r.REPOSITORY.split("/"), candidate, "main") == snap,
              "source checks or authority changed during acquisition")
