@@ -317,7 +317,7 @@ export function AppShell() {
       void goChannel(destination.channelId, { replace: true });
     }
   }, [
-    channelsQuery.dataUpdatedAt,
+    channelsQuery.isFetchedAfterMount,
     channelsQuery.isSuccess,
     communitiesHook.activeCommunity?.id,
     goChannel,
