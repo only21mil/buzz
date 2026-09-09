@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use self::ancestry::{pair_key, GitEvidence, GitReader};
-use self::apply::{ApplyReport, PlannedWrite};
+use self::apply::{ApplyReport, PlannedWrite, Skipped};
 use self::mirror::{CiSummary, MirrorPull};
 use super::{read_branches, RepositoryBranch, RepositoryBranchesResponse};
 use crate::commands::repo_sync::{github_auth_from_env, github_repo, GitHubRepo, GitRepo};
@@ -75,11 +75,25 @@ impl Event {
             .collect()
     }
 
-    /// Identities an event speaks for: its signer and, when present, the
-    /// principal named by its NIP-OA `auth` tag. The relay validated that tag
-    /// on write; the reducer does not re-verify it.
-    fn identities(&self) -> impl Iterator<Item = &str> {
-        std::iter::once(self.pubkey.as_str()).chain(self.value("auth"))
+    /// The principal named by a verified NIP-OA `auth` tag. Exactly one tag
+    /// counts (more than one means none, as in the relay helper) and it must
+    /// verify client-side against this event's signer: the relay does not
+    /// inspect `auth` tags on status ingest, so an unverified tag proves
+    /// nothing.
+    fn principal(&self) -> Option<String> {
+        let mut tags = self
+            .tags
+            .iter()
+            .filter(|tag| tag.first().map(String::as_str) == Some("auth"));
+        let tag = tags.next()?;
+        if tags.next().is_some() {
+            return None;
+        }
+        let signer = nostr::PublicKey::from_hex(&self.pubkey).ok()?;
+        let json = serde_json::to_string(tag).ok()?;
+        buzz_sdk::nip_oa::verify_auth_tag(&json, &signer)
+            .ok()
+            .map(|owner| owner.to_hex())
     }
 
     fn root(&self) -> Option<&str> {
@@ -138,7 +152,8 @@ struct Item {
     /// Merge commit proven to contain the head and to sit on both mains.
     merge_sha: Option<String>,
     merge_verified: bool,
-    /// `active`, `verified`, `merged_unrecorded` or `claimed_unverified`.
+    /// `active`, `verified`, `merged_unrecorded`, `claimed_unverified` or
+    /// `merged_branch_undeleted`.
     closure_state: String,
     closure_verified: bool,
     pending_writes: Vec<String>,
@@ -225,22 +240,27 @@ pub(super) async fn run(
                 "--apply refused: hosted refs and git main disagree; retry the read".into(),
             ));
         }
+        let (planned, skipped) = plan_writes(&ledger);
         apply::run(
-            client,
+            &apply::LiveBackend {
+                client,
+                reader: &backends.reader,
+            },
             &owner,
             repo,
-            &backends.reader,
             &buzz_main,
             &mirror_main,
-            plan_writes(&ledger),
+            planned,
+            skipped,
         )
         .await?
     } else {
+        let (planned, skipped) = plan_writes(&ledger);
         ApplyReport {
             mode: "dry_run".into(),
-            planned: plan_writes(&ledger),
+            planned,
             written: Vec::new(),
-            skipped: Vec::new(),
+            skipped,
         }
     };
     if let Some(limit) = options.limit {
@@ -562,6 +582,17 @@ fn verify(ledger: &mut Ledger, evidence: &Evidence) {
         }
         let claim_valid = claim_valid.map(|result| result.is_ok());
         let mirror_merge_valid = mirror_merge_valid.map(|result| result.is_ok());
+        if item.buzz_pr_id.is_none() {
+            // Branch-only rows have no status to record. A merged branch that
+            // still exists is its own terminal state, never a pending write.
+            item.closure_state = if item.merge_verified {
+                "merged_branch_undeleted"
+            } else {
+                "active"
+            }
+            .into();
+            continue;
+        }
         if !item.merge_verified {
             if closure_claimed {
                 item.closure_state = "claimed_unverified".into();
@@ -620,10 +651,24 @@ fn verify(ledger: &mut Ledger, evidence: &Evidence) {
     ledger.coverage_gaps = gaps;
 }
 
-/// Stale statuses behind proven merges, one write per root.
-fn plan_writes(ledger: &Ledger) -> Vec<PlannedWrite> {
-    let mut planned: Vec<PlannedWrite> = Vec::new();
+/// Blockers that keep a stale status from being written even after the merge
+/// is proven: the record itself is contradictory, so a human decides.
+const APPLY_GATES: [&str; 3] = [
+    "partial_pr_coverage",
+    "mismatched_head",
+    "status_precedes_revision",
+];
+
+/// Stale statuses behind proven merges, one write per root, and the writes
+/// held back because some row for that root carries an apply gate.
+fn plan_writes(ledger: &Ledger) -> (Vec<PlannedWrite>, Vec<Skipped>) {
+    let mut candidates: Vec<(PlannedWrite, Option<String>)> = Vec::new();
     for item in &ledger.items {
+        let gate = item
+            .blockers
+            .iter()
+            .find(|blocker| APPLY_GATES.contains(&blocker.as_str()))
+            .map(|blocker| format!("blocked_by:{blocker}"));
         for write in &item.pending_writes {
             let candidate = match write.as_str() {
                 "pr_status:merged" => PlannedWrite {
@@ -641,17 +686,40 @@ fn plan_writes(ledger: &Ledger) -> Vec<PlannedWrite> {
                     merge_commit: None,
                 },
             };
-            if candidate.root_id.is_empty()
-                || planned.iter().any(|existing| {
-                    existing.kind == candidate.kind && existing.root_id == candidate.root_id
-                })
-            {
-                continue;
+            if !candidate.root_id.is_empty() {
+                candidates.push((candidate, gate.clone()));
             }
-            planned.push(candidate);
         }
     }
-    planned
+    let gated: BTreeSet<(String, String)> = candidates
+        .iter()
+        .filter(|(_, gate)| gate.is_some())
+        .map(|(write, _)| (write.kind.clone(), write.root_id.clone()))
+        .collect();
+    let mut planned: Vec<PlannedWrite> = Vec::new();
+    let mut skipped: Vec<Skipped> = Vec::new();
+    for (write, gate) in candidates {
+        let key = (write.kind.clone(), write.root_id.clone());
+        if gated.contains(&key) {
+            if let Some(reason) = gate {
+                if !skipped
+                    .iter()
+                    .any(|s| s.planned.kind == key.0 && s.planned.root_id == key.1)
+                {
+                    skipped.push(Skipped {
+                        planned: write,
+                        reason,
+                    });
+                }
+            }
+        } else if !planned
+            .iter()
+            .any(|existing| existing.kind == key.0 && existing.root_id == key.1)
+        {
+            planned.push(write);
+        }
+    }
+    (planned, skipped)
 }
 
 // NIP-01 tie ordering: lower event ID wins at the same timestamp.
@@ -679,6 +747,16 @@ fn reduce(
     branches: &RepositoryBranchesResponse,
 ) -> Ledger {
     let coordinate = format!("30617:{owner}:{repo}");
+    // Identities each event speaks for: its signer plus a verified principal.
+    let identities: BTreeMap<&str, Vec<String>> = events
+        .iter()
+        .filter(|event| matches!(event.kind, 1618 | 1621 | 1630..=1633))
+        .map(|event| {
+            let mut ids = vec![event.pubkey.clone()];
+            ids.extend(event.principal());
+            (event.id.as_str(), ids)
+        })
+        .collect();
     let roots: BTreeMap<&str, &Event> = events
         .iter()
         .filter(|event| matches!(event.kind, 1618 | 1621) && event.has("a", &coordinate))
@@ -696,9 +774,10 @@ fn reduce(
             // status events into repository state. Roles are not guessed; a
             // status counts when one of its identities is the repository
             // owner or one of the root's identities.
-            let authorized = event.identities().any(|identity| {
-                identity == owner || root.identities().any(|root_id| root_id == identity)
-            });
+            let root_ids = &identities[root.id.as_str()];
+            let authorized = identities[event.id.as_str()]
+                .iter()
+                .any(|identity| identity == owner || root_ids.contains(identity));
             if authorized && event.value("a").is_none_or(|value| value == coordinate) {
                 accepted.push(event);
             } else {
@@ -1237,7 +1316,8 @@ mod tests {
         assert!(p8.merge_verified && p8.closure_verified && p8.pending_writes.is_empty());
         assert!(!p8.blockers.is_empty());
 
-        // Dangling branch and PR-less resolved issue stay visible.
+        // Dangling branches and PR-less resolved issues stay visible. A merged
+        // branch that still exists is terminal, never a pending write.
         let dangling = ledger
             .items
             .iter()
@@ -1245,6 +1325,16 @@ mod tests {
             .unwrap();
         assert!(has(dangling, "dangling_branch"));
         assert_eq!(dangling.closure_state, "active");
+        let undeleted = ledger
+            .items
+            .iter()
+            .find(|item| item.branch.as_deref() == Some("b17"))
+            .unwrap();
+        assert!(has(undeleted, "dangling_branch"));
+        assert_eq!(undeleted.closure_state, "merged_branch_undeleted");
+        assert!(undeleted.merge_verified && !undeleted.closure_verified);
+        assert!(undeleted.pending_writes.is_empty());
+        assert!(!has(undeleted, "closure_unrecorded"));
         let orphan = ledger
             .items
             .iter()
@@ -1252,9 +1342,10 @@ mod tests {
             .unwrap();
         assert!(has(orphan, "missing_pr_link") && has(orphan, "closure_unverified"));
 
-        // Superseded PR whose commit landed: merged but unrecorded, still flagged.
+        // Superseded PR whose commit landed: merged but unrecorded; its moved
+        // branch tip gates the write.
         let p11 = pr_item(&ledger, "p11");
-        assert!(has(p11, "superseded_pr"));
+        assert!(has(p11, "superseded_pr") && has(p11, "mismatched_head"));
         assert_eq!(p11.closure_state, "merged_unrecorded");
         assert_eq!(p11.mirror_pr_number, Some(11));
         let p12 = pr_item(&ledger, "p12");
@@ -1262,7 +1353,16 @@ mod tests {
         assert_eq!(p12.mirror_pr_number, Some(12));
         assert_eq!(p12.blockers, ["missing_issue_link"]);
 
-        let planned = plan_writes(&ledger);
+        // Apply gates: partial coverage (i14 has an unmerged second PR) and a
+        // status older than the revision (p16) hold their writes back.
+        let p14 = pr_item(&ledger, "p14");
+        assert!(has(p14, "partial_pr_coverage") && p14.merge_verified);
+        assert_eq!(p14.pending_writes, ["issue_status:resolved"]);
+        let p16 = pr_item(&ledger, "p16");
+        assert!(has(p16, "status_precedes_revision") && p16.merge_verified);
+        assert_eq!(p16.pending_writes, ["pr_status:merged"]);
+
+        let (planned, skipped) = plan_writes(&ledger);
         let keys: Vec<String> = planned
             .iter()
             .map(|write| format!("{}:{}", write.kind, write.root_id))
@@ -1270,10 +1370,36 @@ mod tests {
         assert_eq!(
             keys,
             [
-                "pr_status:p11",
+                "pr_status:p16-old",
                 "pr_status:p3",
                 "pr_status:p2",
                 "issue_status:i2"
+            ]
+        );
+        let held: Vec<(String, String)> = skipped
+            .iter()
+            .map(|s| {
+                (
+                    format!("{}:{}", s.planned.kind, s.planned.root_id),
+                    s.reason.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            held,
+            [
+                (
+                    "pr_status:p11".to_owned(),
+                    "blocked_by:mismatched_head".to_owned()
+                ),
+                (
+                    "pr_status:p16".to_owned(),
+                    "blocked_by:status_precedes_revision".to_owned()
+                ),
+                (
+                    "issue_status:i14".to_owned(),
+                    "blocked_by:partial_pr_coverage".to_owned()
+                ),
             ]
         );
         assert!(planned
@@ -1301,7 +1427,7 @@ mod tests {
             .items
             .iter()
             .all(|item| item.pending_writes.is_empty()));
-        assert!(plan_writes(&ledger).is_empty());
+        assert!(plan_writes(&ledger).0.is_empty());
         assert!(ledger
             .coverage_gaps
             .iter()
@@ -1316,7 +1442,7 @@ mod tests {
             .iter()
             .any(|gap| gap == "buzz_refs_snapshot_mismatch"));
         assert!(ledger.items.iter().all(|item| !item.merge_verified));
-        assert!(plan_writes(&ledger).is_empty());
+        assert!(plan_writes(&ledger).0.is_empty());
 
         let (mut ledger, mut evidence) = fixture_ledger();
         evidence.git.as_mut().unwrap().mirror_main = None;
@@ -1326,7 +1452,7 @@ mod tests {
             .iter()
             .any(|gap| gap == "mirror_main_unread"));
         assert!(!ledger.closure_verified);
-        assert!(plan_writes(&ledger).is_empty());
+        assert!(plan_writes(&ledger).0.is_empty());
     }
 
     #[test]
@@ -1344,57 +1470,89 @@ mod tests {
         );
     }
 
-    #[test]
-    fn status_authority_follows_the_root_auth_principal() {
-        // Root signed by the owner under a principal's auth tag; the status is
-        // signed by that principal directly. Both speak for the same identity.
-        let mut events = roots();
-        events[1].tags.push(vec![
-            "auth".into(),
-            "principal".into(),
-            "".into(),
-            "sig".into(),
-        ]);
-        events[1].pubkey = "owner".into();
-        events.push(event(
-            "merged",
-            1631,
-            3,
-            &[&["e", "pr", "", "root"], &["merge-commit", "merge"]],
-        ));
-        events.last_mut().unwrap().pubkey = "principal".into();
-        let ledger = reduce("owner", "repo", &events, &branches());
-        assert_eq!(
-            ledger.items[0].pr_status.as_deref(),
-            Some("merged_or_resolved")
-        );
-        assert!(!ledger.items[0]
-            .blockers
-            .iter()
-            .any(|v| v == "unrecognized_status_authority"));
+    fn auth_tag(principal: &nostr::Keys, agent: &nostr::Keys) -> Vec<String> {
+        let json = buzz_sdk::nip_oa::compute_auth_tag(
+            principal,
+            &agent.public_key(),
+            "created_at<4294967295",
+        )
+        .unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
 
-        // A status whose own auth tag names the root author also counts; an
-        // unrelated principal does not.
+    fn merged_status(pubkey: &str, tags: &[&[&str]]) -> Event {
+        let mut base: Vec<&[&str]> = vec![&["e", "pr", "", "root"], &["merge-commit", "merge"]];
+        base.extend_from_slice(tags);
+        let mut status = event("merged", 1631, 3, &base);
+        status.pubkey = pubkey.into();
+        status
+    }
+
+    fn pr_status(events: &[Event]) -> (String, bool) {
+        let ledger = reduce("owner", "repo", events, &branches());
+        let item = &ledger.items[0];
+        (
+            item.pr_status.clone().unwrap(),
+            item.blockers
+                .iter()
+                .any(|v| v == "unrecognized_status_authority"),
+        )
+    }
+
+    #[test]
+    fn status_authority_follows_a_verified_auth_principal_only() {
+        let principal = nostr::Keys::generate();
+        let agent = nostr::Keys::generate();
+        // Root signed by the agent under the principal's verified auth tag;
+        // the status is signed by the principal directly.
         let mut events = roots();
-        events.push(event(
-            "merged",
-            1631,
-            3,
-            &[&["e", "pr", "", "root"], &["auth", "author", "", "sig"]],
-        ));
-        events.last_mut().unwrap().pubkey = "agent".into();
-        let ledger = reduce("owner", "repo", &events, &branches());
-        assert_eq!(
-            ledger.items[0].pr_status.as_deref(),
-            Some("merged_or_resolved")
-        );
-        events.last_mut().unwrap().tags[1][1] = "someone-else".into();
-        let ledger = reduce("owner", "repo", &events, &branches());
-        assert_eq!(ledger.items[0].pr_status.as_deref(), Some("open"));
-        assert!(ledger.items[0]
-            .blockers
-            .iter()
-            .any(|v| v == "unrecognized_status_authority"));
+        events[1].pubkey = agent.public_key().to_hex();
+        events[1].tags.push(auth_tag(&principal, &agent));
+        events.push(merged_status(&principal.public_key().to_hex(), &[]));
+        assert_eq!(pr_status(&events), ("merged_or_resolved".into(), false));
+
+        // The status may instead carry its own verified tag naming the root's
+        // signer as principal.
+        let mut events = roots();
+        events[1].pubkey = principal.public_key().to_hex();
+        let mut status = merged_status(&agent.public_key().to_hex(), &[]);
+        status.tags.push(auth_tag(&principal, &agent));
+        events.push(status);
+        assert_eq!(pr_status(&events), ("merged_or_resolved".into(), false));
+
+        // Forged: a tag naming the repository owner, or the root's signer,
+        // with a bogus signature is ignored.
+        let forger = nostr::Keys::generate();
+        let mut events = roots();
+        events[1].pubkey = agent.public_key().to_hex();
+        let mut forged = merged_status(&forger.public_key().to_hex(), &[]);
+        forged.tags.push(vec![
+            "auth".into(),
+            "owner".into(),
+            "".into(),
+            "ab".repeat(64),
+        ]);
+        events.push(forged);
+        assert_eq!(pr_status(&events), ("open".into(), true));
+        events.last_mut().unwrap().tags[2][1] = agent.public_key().to_hex();
+        assert_eq!(pr_status(&events), ("open".into(), true));
+
+        // A tag signed for a different agent does not transfer.
+        let mut events = roots();
+        events[1].pubkey = agent.public_key().to_hex();
+        let other = nostr::Keys::generate();
+        let mut wrong = merged_status(&other.public_key().to_hex(), &[]);
+        wrong.tags.push(auth_tag(&principal, &agent));
+        events.push(wrong);
+        assert_eq!(pr_status(&events), ("open".into(), true));
+
+        // More than one auth tag means none.
+        let mut events = roots();
+        events[1].pubkey = agent.public_key().to_hex();
+        events[1].tags.push(auth_tag(&principal, &agent));
+        events[1].tags.push(auth_tag(&principal, &agent));
+        events.push(merged_status(&principal.public_key().to_hex(), &[]));
+        assert_eq!(pr_status(&events), ("open".into(), true));
     }
 
     #[test]

@@ -86,7 +86,8 @@ impl From<RawPull> for MirrorPull {
     }
 }
 
-/// All pull requests of the mirror in every state. Pages until a short page.
+/// All pull requests of the mirror in every state, paged in creation order
+/// so concurrent updates cannot reorder items across page boundaries.
 pub(super) async fn read_all_pulls(
     github: &GitHubRepo,
     auth: &GitHubAuth,
@@ -95,7 +96,7 @@ pub(super) async fn read_all_pulls(
     let mut all = Vec::new();
     for page in 1..=MAX_PAGES {
         let url = format!(
-            "https://api.github.com/repos/{}/{}/pulls?state=all&sort=updated&direction=desc&per_page={PAGE}&page={page}",
+            "https://api.github.com/repos/{}/{}/pulls?state=all&sort=created&direction=asc&per_page={PAGE}&page={page}",
             github.owner, github.repo
         );
         let response = github_get(&client, auth, url, "pull requests").await?;
