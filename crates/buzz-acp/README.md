@@ -164,6 +164,28 @@ buzz messages send --channel <channel-id> --reply-to <thread-root-id> \
   --mention <agent-pubkey> --content '!cancel'
 ```
 
+**Slash commands.** A message whose first token after the leading `@mention`s
+is `/word` is a slash command. It has to be a single event (no steer merge or
+cancelled carry-over) to qualify. Slash commands pass the author gate like any
+other message, so the issuer is always the owner, an allowlisted pubkey, or a
+sibling agent.
+
+| Command | Status | Handled by | What happens |
+|---------|--------|------------|--------------|
+| `/goal <condition>`, `/goal clear`, `/goal active` | Live: pass-through | Connector | Sent unchanged as the first prompt block; Claude Code and codex-acp run their own `/goal`. |
+| `/<anything else>` (`/review`, `/compact`, connector skills) | Live: pass-through | Connector | Sent unchanged as the first prompt block. The harness records each seat's advertised commands (`available_commands_update`, per session id) and `queue::slash::unsupported_command_reply` renders "`/name` is not supported by this seat; available: ..." for a name outside that list; the prompt path applies it in the follow-up PR that wires slash replies. |
+| `/skill` | Mapping landed; prompt-path wiring in the follow-up PR | Harness | Lists the commands the seat's session advertised. Before the first session exists the reply asks you to mention the agent once first. |
+| `/skill <name> [args]` | Mapping landed; prompt-path wiring in the follow-up PR | Harness rewrite, then connector | Rewritten to the connector's skill invocation: `/<name> args` for claude-agent-acp, `$<name> args` for codex-acp. A name the seat did not advertise is refused with the advertised list; if no list has been captured yet the command is forwarded blind and the connector answers. |
+| `/stop`, `/stop all` | Reserved (follow-up PR) | Harness | Will cancel the lane's in-flight turn, drop its queued batches, and fan out to dispatched sibling agents. Passes through unchanged until then. |
+| `/plan [text]` | Reserved (follow-up PR) | Harness, then connector | Will switch the session to the agent's `plan` mode for one turn. Passes through unchanged until then (Claude Code's own `/plan` opens the plan file; codex-acp toggles its plan mode). |
+
+The harness keeps the latest `available_commands_update` per ACP session id
+(`AcpClient::available_commands`); each update replaces the previous list. The
+parser, command table and `/skill` mapping live in `queue.rs` (module `slash`: `SlashCommand`,
+`SLASH_COMMAND_TABLE`, `rewrite_skill`, `handle_skill`,
+`unsupported_command_reply`). Until the prompt path calls them, every slash
+command still reaches the connector unchanged, exactly as before.
+
 > **Note:** The default mode is `owner-only`. Agents without a registered `agent_owner_pubkey` will not respond to any events until the owner is resolved. Set `--respond-to anyone` to disable the gate entirely.
 
 **Examples:**

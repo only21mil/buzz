@@ -187,6 +187,13 @@ pub struct AcpClient {
     /// Other agents may leave this unset — readers must treat `None` as
     /// "no active run to steer into" and fall back to cancel+merge.
     active_run_id: Option<String>,
+    /// Latest `available_commands_update` per session id (ACP slash-commands
+    /// extension), command names in advertised order (`/review`, or `$deploy`
+    /// for codex skills). Each update replaces the previous list for its
+    /// session; connectors send the full list on every change. Read by the
+    /// `/skill` mapping in [`crate::queue::slash`] through
+    /// [`available_commands`](Self::available_commands).
+    available_commands: std::collections::HashMap<String, Vec<String>>,
     /// Whether the agent advertised `_meta.steering.supported: true` in its
     /// `initialize` response, meaning it implements the cross-adapter
     /// [`ACP_STEER_METHOD`] extension.
@@ -547,6 +554,7 @@ impl AcpClient {
             observer_agent_index: None,
             observer_context: ObserverContext::default(),
             active_run_id: None,
+            available_commands: std::collections::HashMap::new(),
             steering_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
@@ -940,6 +948,19 @@ impl AcpClient {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn active_run_id(&self) -> Option<&str> {
         self.active_run_id.as_deref()
+    }
+
+    /// Command names this seat last advertised for `session_id` via
+    /// `available_commands_update`, in advertised order.
+    ///
+    /// `None` until the first update for that session arrives (typically
+    /// right after `session/new`), so callers can distinguish "no session
+    /// yet" from "session advertises nothing" (`Some(&[])`). Names keep the
+    /// connector's sigil (`/review`, `$deploy`);
+    /// [`crate::queue::slash::rewrite_skill`] strips it when matching.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn available_commands(&self, session_id: &str) -> Option<&[String]> {
+        self.available_commands.get(session_id).map(Vec::as_slice)
     }
 
     /// Whether the agent advertised the [`ACP_STEER_METHOD`] extension at
@@ -1865,10 +1886,16 @@ impl AcpClient {
             }
             "available_commands_update" => {
                 // Advertised slash commands (ACP slash-commands extension).
-                // Logged for observability; UI surfacing is a follow-up.
-                let names: Vec<&str> = update["availableCommands"]
+                // Captured per session for the `/skill` mapping; the log line
+                // stays for observability.
+                let names: Vec<String> = update["availableCommands"]
                     .as_array()
-                    .map(|cmds| cmds.iter().filter_map(|c| c["name"].as_str()).collect())
+                    .map(|cmds| {
+                        cmds.iter()
+                            .filter_map(|c| c["name"].as_str())
+                            .map(str::to_string)
+                            .collect()
+                    })
                     .unwrap_or_default();
                 tracing::info!(
                     target: "acp::update",
@@ -1876,6 +1903,16 @@ impl AcpClient {
                     names.len(),
                     names.join(", ")
                 );
+                match msg["params"]["sessionId"].as_str() {
+                    Some(session_id) => {
+                        self.available_commands
+                            .insert(session_id.to_string(), names);
+                    }
+                    None => tracing::debug!(
+                        target: "acp::update",
+                        "available_commands_update without sessionId; not captured"
+                    ),
+                }
                 false
             }
             "session_info_update" => {
@@ -3841,6 +3878,160 @@ mod tests {
             client.active_run_id(),
             Some("run-stable"),
             "non-string/non-null activeRunId must leave state untouched"
+        );
+    }
+
+    // ── available_commands_update capture (slash-commands extension) ──────
+
+    /// Build a `session/update` carrying `available_commands_update` with the
+    /// given command names, shaped like claude-agent-acp and codex-acp emit it
+    /// (`availableCommands: [{name, description, input?}]`).
+    fn available_commands_msg(session_id: Option<&str>, names: &[&str]) -> serde_json::Value {
+        let cmds: Vec<serde_json::Value> = names
+            .iter()
+            .map(|n| serde_json::json!({"name": n, "description": format!("{n} desc")}))
+            .collect();
+        let mut params = serde_json::Map::new();
+        if let Some(id) = session_id {
+            params.insert("sessionId".into(), serde_json::json!(id));
+        }
+        params.insert(
+            "update".into(),
+            serde_json::json!({
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": cmds,
+            }),
+        );
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": serde_json::Value::Object(params),
+        })
+    }
+
+    #[tokio::test]
+    async fn available_commands_captured_per_session() {
+        let mut client = spawn_inert_client().await;
+        assert!(
+            client.available_commands("sess-a").is_none(),
+            "no list before the first update"
+        );
+
+        let reset_idle = client.handle_session_update(&available_commands_msg(
+            Some("sess-a"),
+            &["/review", "/commit"],
+        ));
+        assert!(!reset_idle, "command advertisement is not a tool call");
+        assert_eq!(
+            client.available_commands("sess-a"),
+            Some(&["/review".to_string(), "/commit".to_string()][..])
+        );
+
+        // A second session keeps its own list; the first is untouched.
+        let _ = client.handle_session_update(&available_commands_msg(Some("sess-b"), &["$deploy"]));
+        assert_eq!(
+            client.available_commands("sess-b"),
+            Some(&["$deploy".to_string()][..])
+        );
+        assert_eq!(
+            client.available_commands("sess-a"),
+            Some(&["/review".to_string(), "/commit".to_string()][..])
+        );
+        assert!(client.available_commands("sess-c").is_none());
+    }
+
+    #[tokio::test]
+    async fn available_commands_replaced_on_commands_changed() {
+        let mut client = spawn_inert_client().await;
+        let _ = client.handle_session_update(&available_commands_msg(
+            Some("sess-a"),
+            &["/review", "/commit"],
+        ));
+        // Connector re-advertises after a skill is added and one removed: the
+        // new list replaces the old one wholesale (no merge).
+        let _ = client.handle_session_update(&available_commands_msg(
+            Some("sess-a"),
+            &["/review", "/deploy"],
+        ));
+        assert_eq!(
+            client.available_commands("sess-a"),
+            Some(&["/review".to_string(), "/deploy".to_string()][..])
+        );
+        // An empty advertisement is a real state ("advertises nothing"), not
+        // "unknown".
+        let _ = client.handle_session_update(&available_commands_msg(Some("sess-a"), &[]));
+        assert_eq!(client.available_commands("sess-a"), Some(&[][..]));
+    }
+
+    #[tokio::test]
+    async fn available_commands_without_session_id_not_captured() {
+        let mut client = spawn_inert_client().await;
+        let _ = client.handle_session_update(&available_commands_msg(None, &["/review"]));
+        assert!(
+            client.available_commands("sess-a").is_none(),
+            "an update with no sessionId cannot be attributed to a seat session"
+        );
+        // Entries without a string `name` are skipped, not fatal.
+        let msg = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess-a",
+                "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [{"name": "/ok"}, {"description": "nameless"}, {"name": 7}],
+                },
+            }
+        });
+        let _ = client.handle_session_update(&msg);
+        assert_eq!(
+            client.available_commands("sess-a"),
+            Some(&["/ok".to_string()][..])
+        );
+    }
+
+    #[tokio::test]
+    async fn available_commands_feed_skill_mapping_not_supported_reply() {
+        use crate::queue::slash::{
+            handle_skill, unsupported_command_reply, ConnectorKind, SlashAction, SlashCommand,
+        };
+        let mut client = spawn_inert_client().await;
+        let parsed = SlashCommand::parse("/skill deploy prod").unwrap();
+
+        // Before the seat advertises anything, /skill forwards blind.
+        assert_eq!(
+            handle_skill(
+                &parsed,
+                ConnectorKind::Codex,
+                client.available_commands("sess-a")
+            ),
+            SlashAction::Prompt("$deploy prod".into())
+        );
+
+        let _ = client.handle_session_update(&available_commands_msg(
+            Some("sess-a"),
+            &["$review", "$goal"],
+        ));
+        // After capture, an unadvertised skill is refused with the seat's list.
+        assert_eq!(
+            handle_skill(
+                &parsed,
+                ConnectorKind::Codex,
+                client.available_commands("sess-a")
+            ),
+            SlashAction::Reply("Unknown skill `deploy`; available: `review`, `goal`".into())
+        );
+        // And a pass-through command the seat did not advertise gets the
+        // not-supported reply, while an advertised one is forwarded.
+        let typo = SlashCommand::parse("/typo").unwrap();
+        assert_eq!(
+            unsupported_command_reply(&typo, client.available_commands("sess-a")),
+            Some("`/typo` is not supported by this seat; available: `review`, `goal`".into())
+        );
+        let goal = SlashCommand::parse("/goal ship it").unwrap();
+        assert_eq!(
+            unsupported_command_reply(&goal, client.available_commands("sess-a")),
+            None
         );
     }
 
