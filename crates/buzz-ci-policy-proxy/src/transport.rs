@@ -18,6 +18,7 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use buzz_ci_isolation_contract::{RuntimeEndpointIdentity, ValidatedAttemptLeaseBinding};
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
 use serde_json::Value;
 
@@ -523,10 +524,22 @@ fn configure_stream(stream: &UnixStream, timeout: Duration) -> Result<(), ProxyE
         .map_err(|error| ProxyError::Transport(format!("socket timeout setup failed: {error}")))
 }
 
+/// Resolve the connecting peer's UID with `SO_PEERCRED`, which only Linux and
+/// Android provide. Other Unix hosts compile so workspace-wide cargo commands
+/// work there, but every connection fails closed: the proxy is Linux CI
+/// infrastructure and must never admit a peer it cannot attribute.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn peer_uid(stream: &UnixStream) -> Result<u32, ProxyError> {
     getsockopt(stream, PeerCredentials)
         .map(|credentials| credentials.uid())
         .map_err(|error| ProxyError::Transport(format!("SO_PEERCRED failed: {error}")))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn peer_uid(_stream: &UnixStream) -> Result<u32, ProxyError> {
+    Err(ProxyError::Transport(
+        "SO_PEERCRED peer credentials are only available on Linux and Android".to_string(),
+    ))
 }
 
 #[derive(Debug)]
