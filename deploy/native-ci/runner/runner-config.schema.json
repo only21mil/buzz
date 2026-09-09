@@ -22,7 +22,11 @@
     "lane_epoch": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
     "admission_key_generation": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
     "isolation_profile_digest": { "$ref": "#/$defs/sha256" },
-    "audience_digest": { "$ref": "#/$defs/sha256" }
+    "audience_digest": { "$ref": "#/$defs/sha256" },
+    "acceptance_time_reference": {
+      "description": "Activation package time reference (unix seconds, nonzero u64) that the freezer binds to acceptance_template.time_reference; the runner judges every admission and cancel window against it, never the wall clock.",
+      "type": "integer", "minimum": 1, "maximum": 18446744073709551615
+    }
   },
   "oneOf": [
     {
@@ -39,7 +43,8 @@
         "execd_socket", "execd_uid", "execd_gid", "replay_journal",
         "connect_timeout_millis", "io_timeout_millis", "transport_attempts",
         "retry_delay_millis", "lane_manifest_digest", "lane_epoch",
-        "admission_key_generation", "isolation_profile_digest", "audience_digest"
+        "admission_key_generation", "isolation_profile_digest", "audience_digest",
+        "acceptance_time_reference"
       ]
     }
   ],
