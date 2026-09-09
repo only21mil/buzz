@@ -1569,6 +1569,66 @@ mod tests {
         assert!(matches!(result, Err(MediaError::FileTooLarge { .. })));
     }
 
+    #[test]
+    fn size_gate_passes_at_the_limit_and_names_it_one_byte_over() {
+        let mut config = test_config();
+        config.max_image_bytes = TINY_JPEG.len() as u64;
+        assert_eq!(validate_content(TINY_JPEG, &config).unwrap(), "image/jpeg");
+
+        config.max_image_bytes = TINY_JPEG.len() as u64 - 1;
+        let max = config.max_image_bytes;
+        let err = validate_content(TINY_JPEG, &config).unwrap_err();
+        assert!(matches!(
+            err,
+            MediaError::FileTooLarge { size, max: m }
+                if size == TINY_JPEG.len() as u64 && m == max
+        ));
+        assert!(
+            err.to_string().contains(&format!("max {max} bytes")),
+            "message must name the limit that fired: {err}"
+        );
+    }
+
+    #[test]
+    fn large_real_png_passes_under_the_default_cap() {
+        // Screenshot-sized noise is incompressible, so the PNG lands in the
+        // multi-megabyte range a real screenshot occupies.
+        let (width, height) = (1600u32, 1200u32);
+        let mut img = image::RgbImage::new(width, height);
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        for px in img.pixels_mut() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            *px = image::Rgb([
+                (seed & 0xff) as u8,
+                ((seed >> 8) & 0xff) as u8,
+                ((seed >> 16) & 0xff) as u8,
+            ]);
+        }
+        let mut bytes = Vec::new();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
+        assert!(
+            bytes.len() > 4 * 1024 * 1024,
+            "png is only {} bytes",
+            bytes.len()
+        );
+
+        let mut config = test_config();
+        config.max_image_bytes = crate::config::DEFAULT_MAX_IMAGE_BYTES;
+        assert_eq!(validate_content(&bytes, &config).unwrap(), "image/png");
+
+        config.max_image_bytes = bytes.len() as u64 - 1;
+        let err = validate_content(&bytes, &config).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains(&format!("max {} bytes", bytes.len() - 1)));
+    }
+
     // Minimal valid GIF89a (1x1 pixel) — full logical screen descriptor so imagesize can parse.
     const TINY_GIF: &[u8] = &[
         // Header

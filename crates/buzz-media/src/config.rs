@@ -33,6 +33,26 @@ impl FromStr for S3AddressingStyle {
     }
 }
 
+/// Default cap on a stored image original: 2 GiB.
+///
+/// This is the storage and transport limit only. The agent inline
+/// tool-result budget (`buzz_agent::config::MAX_TOOL_RESULT_BYTES`) and the
+/// relay websocket frame cap (`BUZZ_MAX_FRAME_BYTES`) are separate numbers on
+/// purpose: an image never rides the websocket (the event carries a `/media`
+/// URL), and a model cannot take a 2 GiB image inline.
+pub const DEFAULT_MAX_IMAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Default cap on an animated GIF original: 10 MiB.
+pub const DEFAULT_MAX_GIF_BYTES: u64 = 10 * 1024 * 1024;
+
+fn default_max_image_bytes() -> u64 {
+    DEFAULT_MAX_IMAGE_BYTES
+}
+
+fn default_max_gif_bytes() -> u64 {
+    DEFAULT_MAX_GIF_BYTES
+}
+
 fn default_max_video_bytes() -> u64 {
     524_288_000 // 500 MB
 }
@@ -67,9 +87,13 @@ pub struct MediaConfig {
     /// S3 URL addressing style. Defaults to path style for MinIO compatibility.
     #[serde(default)]
     pub s3_addressing_style: S3AddressingStyle,
-    /// Maximum upload size for images (bytes). Default: 50 MB.
+    /// Maximum upload size for images (bytes). Default: 2 GiB
+    /// ([`DEFAULT_MAX_IMAGE_BYTES`]); override with `BUZZ_MAX_IMAGE_BYTES`.
+    #[serde(default = "default_max_image_bytes")]
     pub max_image_bytes: u64,
-    /// Maximum upload size for animated GIFs (bytes). Default: 10 MB.
+    /// Maximum upload size for animated GIFs (bytes). Default: 10 MiB
+    /// ([`DEFAULT_MAX_GIF_BYTES`]); override with `BUZZ_MAX_GIF_BYTES`.
+    #[serde(default = "default_max_gif_bytes")]
     pub max_gif_bytes: u64,
     /// Maximum upload size for video files (bytes). Default: 500 MB.
     #[serde(default = "default_max_video_bytes")]
@@ -159,8 +183,21 @@ impl MediaConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{MediaConfig, S3AddressingStyle};
+    use super::{MediaConfig, S3AddressingStyle, DEFAULT_MAX_GIF_BYTES, DEFAULT_MAX_IMAGE_BYTES};
     use std::str::FromStr;
+
+    #[test]
+    fn image_caps_default_to_two_gib_originals() {
+        let config: MediaConfig = serde_json::from_str(
+            r#"{"s3_endpoint":"http://localhost:9000","s3_access_key":"k","s3_secret_key":"s","s3_bucket":"b","public_base_url":"http://localhost:3000/media"}"#,
+        )
+        .expect("defaults fill the caps");
+        assert_eq!(DEFAULT_MAX_IMAGE_BYTES, 2_147_483_648);
+        assert_eq!(config.max_image_bytes, DEFAULT_MAX_IMAGE_BYTES);
+        assert_eq!(config.max_gif_bytes, DEFAULT_MAX_GIF_BYTES);
+        assert!(config.max_gif_bytes <= config.max_image_bytes);
+        config.validate().expect("default caps validate");
+    }
 
     fn valid_config() -> MediaConfig {
         MediaConfig {

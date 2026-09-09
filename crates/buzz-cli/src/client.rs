@@ -70,8 +70,23 @@ const ALLOWED_MIMES: &[&str] = &[
     "video/mp4",
 ];
 
-/// Maximum file size for image uploads (50 MB).
-const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
+/// Default cap for image uploads: 2 GiB, matching the relay's stored-original
+/// default (`buzz_media::DEFAULT_MAX_IMAGE_BYTES`). The relay is authoritative;
+/// this guard only saves a doomed upload. Override with `BUZZ_MAX_IMAGE_BYTES`
+/// when the relay operator set a different cap.
+const DEFAULT_MAX_IMAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Effective image cap: `BUZZ_MAX_IMAGE_BYTES` when set to a positive integer,
+/// else [`DEFAULT_MAX_IMAGE_BYTES`].
+fn max_image_bytes() -> u64 {
+    max_image_bytes_from(std::env::var("BUZZ_MAX_IMAGE_BYTES").ok().as_deref())
+}
+
+fn max_image_bytes_from(raw: Option<&str>) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_MAX_IMAGE_BYTES)
+}
 
 /// Maximum file size for video uploads (500 MB).
 const MAX_VIDEO_BYTES: u64 = 500 * 1024 * 1024;
@@ -1309,13 +1324,14 @@ impl BuzzClient {
         let max = if mime.starts_with("video/") {
             MAX_VIDEO_BYTES
         } else {
-            MAX_IMAGE_BYTES
+            max_image_bytes()
         };
         if bytes.len() as u64 > max {
             return Err(CliError::Usage(format!(
-                "file too large: {} bytes (max {})",
+                "file too large: {} bytes (max {} bytes, {:.1} MiB)",
                 bytes.len(),
-                max
+                max,
+                max as f64 / (1024.0 * 1024.0)
             )));
         }
 
@@ -2931,5 +2947,20 @@ mod tests {
             Err(super::super::error::CliError::Other(message))
                 if message == "CI log error response exceeds signed byte cap"
         ));
+    }
+}
+
+#[cfg(test)]
+mod image_cap_tests {
+    use super::{max_image_bytes_from, DEFAULT_MAX_IMAGE_BYTES};
+
+    #[test]
+    fn image_cap_defaults_to_two_gib_and_honors_the_env_override() {
+        assert_eq!(DEFAULT_MAX_IMAGE_BYTES, 2_147_483_648);
+        assert_eq!(max_image_bytes_from(None), DEFAULT_MAX_IMAGE_BYTES);
+        assert_eq!(max_image_bytes_from(Some("52428800")), 52_428_800);
+        assert_eq!(max_image_bytes_from(Some(" 1024 ")), 1024);
+        assert_eq!(max_image_bytes_from(Some("0")), DEFAULT_MAX_IMAGE_BYTES);
+        assert_eq!(max_image_bytes_from(Some("lots")), DEFAULT_MAX_IMAGE_BYTES);
     }
 }

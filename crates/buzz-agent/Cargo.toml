@@ -39,6 +39,8 @@ tracing-subscriber = { workspace = true }
 async-trait = "0.1"
 axum = { workspace = true }
 base64 = "0.22"
+# Downscale oversized tool-result images to the inline budget instead of eliding them.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 hex = { workspace = true }
 sha2 = { workspace = true }
 urlencoding = "2"
