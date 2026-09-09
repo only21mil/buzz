@@ -1628,7 +1628,15 @@ mod tests {
             assert!(url.contains("host=%2Fwork%2F"));
             let pool = sqlx::PgPool::connect(&url).await.unwrap();
             buzz_db::migration::run_migrations(&pool).await.unwrap();
+            // `Config::from_env` self-bootstraps `BUZZ_GIT_REPO_PATH` (default
+            // `./repos`) with `create_dir_all`. The fence runs this test with cwd
+            // `/work` and fails the job when that directory is not empty afterwards,
+            // so keep the bootstrap on the sandbox tmpfs. Serialized fixture run
+            // (`--exact --test-threads=1`), so the process env is not shared.
+            let git_repo_path = tempfile::tempdir().expect("private git repo path");
+            std::env::set_var("BUZZ_GIT_REPO_PATH", git_repo_path.path());
             let state = test_state().await;
+            std::env::remove_var("BUZZ_GIT_REPO_PATH");
             let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::new_v4());
             let tenant = buzz_core::tenant::TenantContext::resolved(community, "draft-ingest.test");
             let owner = Keys::generate();
