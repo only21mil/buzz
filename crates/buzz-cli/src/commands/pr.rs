@@ -213,12 +213,22 @@ pub async fn cmd_pr_status(
         applied_as_commits: vec![],
     };
 
-    let builder =
-        with_git_provenance(buzz_sdk::build_git_status(status, &content, &meta).map_err(sdk_err)?)?;
-    let event = client.sign_event(builder)?;
-    let resp = client.submit_event(event).await?;
+    let resp = publish_pr_status(client, status, &content, meta).await?;
     println!("{resp}");
     Ok(())
+}
+
+/// Sign and submit one PR status event; returns the raw relay response.
+pub(crate) async fn publish_pr_status(
+    client: &BuzzClient,
+    status: buzz_sdk::GitStatus,
+    content: &str,
+    meta: GitStatusMeta,
+) -> Result<String, CliError> {
+    let builder =
+        with_git_provenance(buzz_sdk::build_git_status(status, content, &meta).map_err(sdk_err)?)?;
+    let event = client.sign_event(builder)?;
+    client.submit_event(event).await
 }
 
 pub async fn dispatch(cmd: crate::PrCmd, client: &BuzzClient) -> Result<(), CliError> {

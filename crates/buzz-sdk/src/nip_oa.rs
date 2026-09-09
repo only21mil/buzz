@@ -330,12 +330,34 @@ pub fn verify_auth_tag_for_action(
     auth_tag_json: &str,
     event: &nostr::Event,
 ) -> Result<PublicKey, SdkError> {
-    let owner =
-        verify_auth_tag_for_auth_event(auth_tag_json, &event.pubkey, event.created_at.as_secs())?;
+    verify_auth_tag_for_signed_kind(
+        auth_tag_json,
+        &event.pubkey,
+        event.kind.as_u16(),
+        event.created_at.as_secs(),
+    )
+}
+
+/// Verify delegated authority for an action known only by its signer, kind
+/// and `created_at`, including kind restrictions.
+///
+/// Same rules as [`verify_auth_tag_for_action`], for callers that hold an
+/// event in a shape other than [`nostr::Event`] (for example a client-side
+/// projection that dropped the signature after relay verification).
+///
+/// # Errors
+/// Returns an error for an invalid signature or an unsatisfied kind/time clause.
+pub fn verify_auth_tag_for_signed_kind(
+    auth_tag_json: &str,
+    agent_pubkey: &PublicKey,
+    kind: u16,
+    created_at: u64,
+) -> Result<PublicKey, SdkError> {
+    let owner = verify_auth_tag_for_auth_event(auth_tag_json, agent_pubkey, created_at)?;
     let parsed = parse_auth_tag_fields(auth_tag_json)?;
     for clause in parsed.conditions.split('&') {
-        if let Some(kind) = clause.strip_prefix("kind=") {
-            if kind.parse::<u16>().ok() != Some(event.kind.as_u16()) {
+        if let Some(bound) = clause.strip_prefix("kind=") {
+            if bound.parse::<u16>().ok() != Some(kind) {
                 return Err(SdkError::InvalidInput(
                     "action kind does not satisfy delegation".into(),
                 ));
