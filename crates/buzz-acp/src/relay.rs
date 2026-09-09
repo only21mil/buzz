@@ -651,6 +651,16 @@ enum RelayCommand {
         filter: ChannelFilter,
         replay_since: Option<u64>,
     },
+    /// Re-issue an active channel subscription with a new filter, replaying
+    /// from no later than `replay_floor` (unix seconds). Used when a channel
+    /// resolves as a DM after it was first subscribed with the `#p` filter:
+    /// events that arrived through the old REQ may have advanced `last_seen`
+    /// past DMs the old filter never requested.
+    Resubscribe {
+        channel_id: Uuid,
+        filter: ChannelFilter,
+        replay_floor: u64,
+    },
     /// Unsubscribe from a channel (sends a NIP-01 CLOSE).
     Unsubscribe { channel_id: Uuid },
     /// Reconnect to the relay (re-authenticate and resubscribe).
@@ -916,6 +926,31 @@ impl HarnessRelay {
             .await
             .map_err(|_| RelayError::ConnectionClosed)?;
         debug!("queued subscribe for channel {channel_id}");
+        Ok(())
+    }
+
+    /// Re-issue an active channel subscription with `filter`, replaying from
+    /// no later than `replay_floor`.
+    ///
+    /// The REQ reuses the channel's subscription id, so the relay replaces the
+    /// previous filter. Unlike [`subscribe_channel_from`](Self::subscribe_channel_from),
+    /// the floor is not a first-subscribe fallback: it lowers the channel's
+    /// replay window even when later events already advanced `last_seen`.
+    pub async fn resubscribe_channel_with_floor(
+        &mut self,
+        channel_id: Uuid,
+        filter: ChannelFilter,
+        replay_floor: u64,
+    ) -> Result<(), RelayError> {
+        self.cmd_tx
+            .send(RelayCommand::Resubscribe {
+                channel_id,
+                filter,
+                replay_floor,
+            })
+            .await
+            .map_err(|_| RelayError::ConnectionClosed)?;
+        debug!("queued resubscribe for channel {channel_id} (floor {replay_floor})");
         Ok(())
     }
 
@@ -1287,6 +1322,22 @@ impl BgState {
         }
     }
 
+    /// Lower the replay window for `channel_id` so the next REQ (immediate or
+    /// on reconnect) starts no later than `replay_floor`.
+    ///
+    /// `subscribe_since` is lowered or seeded; `last_seen` is lowered only when
+    /// present. Events replayed a second time are suppressed by the inbox
+    /// cursor's processed-id set in the main loop.
+    fn clamp_replay_floor(&mut self, channel_id: Uuid, replay_floor: u64) {
+        self.subscribe_since
+            .entry(channel_id)
+            .and_modify(|since| *since = (*since).min(replay_floor))
+            .or_insert(replay_floor);
+        if let Some(seen) = self.last_seen.get_mut(&channel_id) {
+            *seen = (*seen).min(replay_floor);
+        }
+    }
+
     /// Clear all per-channel state for a channel that is being unsubscribed.
     /// Prevents stale replay on re-subscribe and avoids unbounded state growth
     /// for channels that are removed and never re-added.
@@ -1420,6 +1471,17 @@ fn apply_command_to_state(state: &mut BgState, cmd: RelayCommand) {
                     .or(state.startup_watermark)
                     .unwrap_or_else(unix_now_secs)
             });
+        }
+        RelayCommand::Resubscribe {
+            channel_id,
+            filter,
+            replay_floor,
+        } => {
+            state
+                .active_subscriptions
+                .insert(channel_id, channel_sub_id(channel_id));
+            state.active_filters.insert(channel_id, filter);
+            state.clamp_replay_floor(channel_id, replay_floor);
         }
         RelayCommand::Unsubscribe { channel_id } => {
             state.active_subscriptions.remove(&channel_id);
@@ -1567,6 +1629,58 @@ async fn execute_connected_command(
                         channel_id,
                         filter,
                         replay_since,
+                    },
+                );
+                false
+            }
+        }
+        RelayCommand::Resubscribe {
+            channel_id,
+            filter,
+            replay_floor,
+        } => {
+            if let Some(retry_after) = state.check_rate_gate() {
+                debug!(
+                    "rate-gated: deferring resubscribe REQ for channel {channel_id} to rate_limited_pending"
+                );
+                apply_command_to_state(
+                    state,
+                    RelayCommand::Resubscribe {
+                        channel_id,
+                        filter,
+                        replay_floor,
+                    },
+                );
+                state.rate_limited_pending.insert(channel_id, retry_after);
+                return true;
+            }
+
+            state.clamp_replay_floor(channel_id, replay_floor);
+            let since = state
+                .last_seen
+                .get(&channel_id)
+                .copied()
+                .or_else(|| state.subscribe_since.get(&channel_id).copied());
+            let sent =
+                send_subscribe(ws, state, channel_id, agent_pubkey_hex, since, &filter).await;
+            if sent {
+                state
+                    .active_subscriptions
+                    .insert(channel_id, channel_sub_id(channel_id));
+                state.active_filters.insert(channel_id, filter);
+                state.rate_limited_pending.remove(&channel_id);
+                state.resubscribe_retry.remove(&channel_id);
+                true
+            } else {
+                warn!(
+                    "resubscribe REQ failed for channel {channel_id} — recording intent for reconnect"
+                );
+                apply_command_to_state(
+                    state,
+                    RelayCommand::Resubscribe {
+                        channel_id,
+                        filter,
+                        replay_floor,
                     },
                 );
                 false
@@ -4726,6 +4840,139 @@ mod tests {
             .expect("read test websocket frame");
         serde_json::from_str(message.to_text().expect("expected text frame"))
             .expect("parse test websocket frame")
+    }
+
+    #[tokio::test]
+    async fn resubscribe_with_floor_replays_dms_older_than_last_seen() {
+        let (mut ws, mut server) = test_ws_pair().await;
+        let mut state = BgState::new();
+        let channel_id = Uuid::new_v4();
+        let agent = "ab".repeat(32);
+        let dm_at = 1_787_279_643u64;
+
+        // 44100 arrives with the channel type unresolved: REQ carries #p.
+        assert!(
+            execute_connected_command(
+                &mut ws,
+                &mut state,
+                &agent,
+                RelayCommand::Subscribe {
+                    channel_id,
+                    filter: ChannelFilter {
+                        kinds: Some(vec![9]),
+                        require_mention: true,
+                    },
+                    replay_since: Some(dm_at - 12),
+                },
+            )
+            .await
+        );
+        let first = next_test_frame(&mut server).await;
+        assert_eq!(first[0], "REQ");
+        assert_eq!(first[1], channel_sub_id(channel_id));
+        assert_eq!(first[2]["#p"], json!([agent]));
+
+        // An owner @mention at T+30 flows through the old REQ and advances
+        // last_seen past the tag-less DM at T that #p never requested.
+        let keys = Keys::generate();
+        let mention = make_signed_channel_event(&keys, "@agent", dm_at + 30);
+        assert!(state.record_event(channel_id, &mention));
+        assert_eq!(state.last_seen.get(&channel_id), Some(&(dm_at + 30)));
+
+        // Resolution at T+40: re-subscribe without #p, floored at the
+        // membership time, so the DM at T is inside the replay window.
+        assert!(
+            execute_connected_command(
+                &mut ws,
+                &mut state,
+                &agent,
+                RelayCommand::Resubscribe {
+                    channel_id,
+                    filter: ChannelFilter {
+                        kinds: Some(vec![9]),
+                        require_mention: false,
+                    },
+                    replay_floor: dm_at - 12,
+                },
+            )
+            .await
+        );
+        let second = next_test_frame(&mut server).await;
+        assert_eq!(second[0], "REQ");
+        assert_eq!(
+            second[1],
+            channel_sub_id(channel_id),
+            "same sub id replaces the REQ"
+        );
+        assert!(
+            second[2].get("#p").is_none(),
+            "relaxed REQ must not carry #p"
+        );
+        assert_eq!(second[2]["#h"], json!([channel_id.to_string()]));
+        let since = second[2]["since"].as_u64().expect("since on the wire");
+        assert!(
+            since <= dm_at,
+            "since {since} must not skip the DM at {dm_at} (last_seen was {})",
+            dm_at + 30
+        );
+        assert!(
+            !state.active_filters[&channel_id].require_mention,
+            "state keeps the relaxed filter for reconnects"
+        );
+    }
+
+    #[test]
+    fn resubscribe_floor_applies_while_disconnected() {
+        let mut state = BgState::new();
+        let channel_id = Uuid::new_v4();
+        state.subscribe_since.insert(channel_id, 500);
+        state.last_seen.insert(channel_id, 900);
+        state.active_filters.insert(
+            channel_id,
+            ChannelFilter {
+                kinds: Some(vec![9]),
+                require_mention: true,
+            },
+        );
+
+        apply_command_to_state(
+            &mut state,
+            RelayCommand::Resubscribe {
+                channel_id,
+                filter: ChannelFilter {
+                    kinds: Some(vec![9]),
+                    require_mention: false,
+                },
+                replay_floor: 300,
+            },
+        );
+
+        assert_eq!(state.subscribe_since.get(&channel_id), Some(&300));
+        assert_eq!(
+            state.last_seen.get(&channel_id),
+            Some(&300),
+            "last_seen is lowered so the reconnect REQ replays from the floor"
+        );
+        assert_eq!(
+            state.channel_since(&channel_id),
+            Some(300),
+            "reconnect since honors the floor"
+        );
+        assert!(!state.active_filters[&channel_id].require_mention);
+
+        // A floor above the current window never widens it.
+        apply_command_to_state(
+            &mut state,
+            RelayCommand::Resubscribe {
+                channel_id,
+                filter: ChannelFilter {
+                    kinds: Some(vec![9]),
+                    require_mention: false,
+                },
+                replay_floor: 800,
+            },
+        );
+        assert_eq!(state.channel_since(&channel_id), Some(300));
     }
 
     fn make_signed_channel_event(keys: &Keys, content: &str, created_at_secs: u64) -> Event {
