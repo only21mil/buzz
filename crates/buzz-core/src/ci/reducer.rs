@@ -5,7 +5,7 @@
 //! relay-assigned watch cursor because evidence facts name event IDs and the
 //! terminal-success rule is defined by relay acceptance order.
 
-use buzz_core::ci::{
+use crate::ci::{
     CiArtifactReferenceEnvelope, CiCheckEnvelope, CiEvidenceFinalizedEnvelope, CiJobState,
     CiJobStatusEnvelope, CiLogReferenceEnvelope, CiRequestEnvelope, CiRequestType, CiRunState,
     CiRunStatusEnvelope, CiSkipPolicy, CiTeardownAttestationEnvelope, ValidatedCiEnvelope,
@@ -29,26 +29,37 @@ pub struct AcceptedCiEnvelope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CiReducedState {
+    /// Not every selected job is terminal yet.
     Pending,
+    /// Every required job succeeded and the terminal facts are consistent.
     Green,
+    /// A required job failed, was cancelled, or timed out.
     Red,
+    /// The run history is inconsistent or an infrastructure fault ended it.
     InfrastructureFailure,
 }
 
 /// One selected job attempt in the reduced status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CiReducedJob {
+    /// Static workflow job identifier.
     pub job_id: String,
+    /// Display name from the selected attempt's manifest, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Latest accepted state of the selected attempt, when any status exists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<CiJobState>,
+    /// Whether the job counts toward the run verdict, when known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub required: Option<bool>,
+    /// Start time in Unix seconds, when reported.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at: Option<u64>,
+    /// Finish time in Unix seconds, when reported.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<u64>,
+    /// Selected attempt number for this job.
     pub attempt: u32,
 }
 
@@ -58,12 +69,19 @@ pub struct CiReducedJob {
 /// the terminal run status it summarises and to agree with that status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CiReducedCheck {
+    /// Accepted kind-46108 event ID.
     pub event_id: String,
+    /// Attempt the check concludes.
     pub attempt: u32,
+    /// Terminal conclusion the check carries.
     pub conclusion: CiRunState,
+    /// Exact head object ID the check is about.
     pub sha: String,
+    /// Terminal kind-46101 run status the check names.
     pub run_status_event_id: String,
+    /// Signer-chosen publication time in Unix seconds.
     pub published_at: u64,
+    /// Terminal reason copied from the run status, when present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -71,14 +89,23 @@ pub struct CiReducedCheck {
 /// Deterministic state returned by the reducer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CiReduction {
+    /// Run identifier.
     pub run_id: String,
+    /// Exact head object ID the run tests.
     pub sha: String,
+    /// Greatest accepted request attempt.
     pub attempt: u32,
+    /// Aggregate state.
     pub state: CiReducedState,
+    /// Selected attempt per job, in job-ID order.
     pub jobs: Vec<CiReducedJob>,
+    /// Number of selected jobs that reached a terminal state.
     pub jobs_terminal: usize,
+    /// Number of selected jobs.
     pub jobs_total: usize,
+    /// Required jobs whose selected attempt did not succeed.
     pub required_failing: Vec<String>,
+    /// Reason for a red or infrastructure-failure state, when any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// Terminal check for the final request, once one is accepted.
@@ -88,8 +115,14 @@ pub struct CiReduction {
 /// A refusal that is separate from the reduced run state.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CiReducerError {
+    /// The caller's expected SHA is not the run's tip.
     #[error("expected SHA {requested} does not match resolved SHA {resolved}")]
-    ShaMismatch { requested: String, resolved: String },
+    ShaMismatch {
+        /// SHA the caller asked for.
+        requested: String,
+        /// SHA the run's request names.
+        resolved: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,7 +176,7 @@ pub fn reduce_verdict(
 }
 
 /// Validate signatures' already-decoded immutable coordinates and stream history.
-pub(super) fn validate_accepted_run(
+pub fn validate_accepted_run(
     request_event_id: &str,
     request: &CiRequestEnvelope,
     events: &[AcceptedCiEnvelope],
@@ -1244,7 +1277,7 @@ fn infrastructure_reduction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buzz_core::ci::{CiFinalizedJobAttempt, CiRequestType, CiTeardownLease, CI_SCHEMA_VERSION};
+    use crate::ci::{CiFinalizedJobAttempt, CiRequestType, CiTeardownLease, CI_SCHEMA_VERSION};
 
     const REQUEST_ID: u64 = 1;
 
@@ -1633,7 +1666,7 @@ mod tests {
             teardown_attestation_event_id: success.then(|| {
                 find(&|envelope| matches!(envelope, ValidatedCiEnvelope::TeardownAttestation(_)))
             }),
-            concurrency_group: buzz_core::ci::CiConcurrencyGroup::of(&request).key,
+            concurrency_group: crate::ci::CiConcurrencyGroup::of(&request).key,
             published_at: 32,
             relay_signer: "d".repeat(64),
         }

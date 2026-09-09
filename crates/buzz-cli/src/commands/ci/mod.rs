@@ -4,8 +4,7 @@ pub mod read_commands;
 // Helper modules encode the frozen wire contract (dead_code: relay-side surface).
 #[allow(dead_code)]
 pub mod evidence;
-#[allow(dead_code)]
-pub mod reducer;
+pub use buzz_core::ci::reducer;
 #[allow(dead_code)]
 pub mod run;
 #[allow(dead_code)]

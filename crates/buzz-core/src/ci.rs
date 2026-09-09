@@ -13,6 +13,9 @@ use thiserror::Error;
 use url::Url;
 use uuid::Uuid;
 
+/// Pure reduction of accepted CI envelopes into status and verdict state.
+pub mod reducer;
+
 /// Current CI envelope schema version.
 pub const CI_SCHEMA_VERSION: u32 = 1;
 /// Largest integer represented exactly by JavaScript consumers.
