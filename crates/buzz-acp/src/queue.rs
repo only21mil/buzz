@@ -1312,8 +1312,7 @@ pub(crate) mod slash {
     ///
     /// The harness table is deliberately tiny: everything not listed here is
     /// forwarded to the connector unchanged (`/goal`, `/review`, `/compact`,
-    /// connector-native skills). `/plan` is a reserved name whose harness
-    /// handling lands in a follow-up PR; until then it passes through.
+    /// connector-native skills).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum CommandRoute {
         /// `/skill` — the harness rewrites it into the connector's skill invocation.
@@ -1323,6 +1322,11 @@ pub(crate) mod slash {
         /// only reaches the prompt path when the author was neither owner nor
         /// sibling, in which case it is forwarded like any other command.
         Stop,
+        /// `/plan [text]` — the prompt path switches the session to the
+        /// agent's `plan` mode for one turn when it advertises one; a seat
+        /// without plan mode that advertises `/plan` (codex-acp) gets the
+        /// command untouched.
+        Plan,
         /// Forwarded to the connector as prompt block 0 without rewriting.
         PassThrough,
     }
@@ -1331,8 +1335,16 @@ pub(crate) mod slash {
     ///
     /// Names match case-insensitively. Keep this list in sync with the
     /// "Slash commands" table in `crates/buzz-acp/README.md`.
-    pub const SLASH_COMMAND_TABLE: &[(&str, CommandRoute)] =
-        &[("skill", CommandRoute::Skill), ("stop", CommandRoute::Stop)];
+    pub const SLASH_COMMAND_TABLE: &[(&str, CommandRoute)] = &[
+        ("skill", CommandRoute::Skill),
+        ("stop", CommandRoute::Stop),
+        ("plan", CommandRoute::Plan),
+    ];
+
+    /// Whether a captured command list advertises `name` (sigil-insensitive).
+    pub fn advertises(known: Option<&[String]>, name: &str) -> bool {
+        known.is_some_and(|list| advertised(list, name).is_some())
+    }
 
     /// Look up a parsed command in [`SLASH_COMMAND_TABLE`].
     pub fn route_command(cmd: &SlashCommand) -> CommandRoute {
@@ -6013,8 +6025,9 @@ mod tests {
     // ── Slash command parser, table and /skill mapping ──────────────────────
 
     use super::slash::{
-        handle_skill, render_skill_list, rewrite_skill, route_command, unsupported_command_reply,
-        CommandRoute, ConnectorKind, SkillError, SlashAction, SlashCommand,
+        advertises, handle_skill, render_skill_list, rewrite_skill, route_command,
+        unsupported_command_reply, CommandRoute, ConnectorKind, SkillError, SlashAction,
+        SlashCommand,
     };
 
     fn cmd(name: &str, args: &str) -> SlashCommand {
@@ -6078,7 +6091,14 @@ mod tests {
         assert_eq!(route_command(&cmd("SKILL", "x")), CommandRoute::Skill);
         assert_eq!(route_command(&cmd("stop", "")), CommandRoute::Stop);
         assert_eq!(route_command(&cmd("Stop", "all")), CommandRoute::Stop);
-        for name in ["goal", "plan", "review", "compact", "init", "unknown"] {
+        assert_eq!(route_command(&cmd("plan", "")), CommandRoute::Plan);
+        assert_eq!(route_command(&cmd("PLAN", "ship it")), CommandRoute::Plan);
+        let list = known(&["/plan", "$deploy"]);
+        assert!(advertises(Some(&list), "plan"));
+        assert!(advertises(Some(&list), "deploy"));
+        assert!(!advertises(Some(&list), "goal"));
+        assert!(!advertises(None, "plan"));
+        for name in ["goal", "review", "compact", "init", "unknown"] {
             assert_eq!(
                 route_command(&cmd(name, "")),
                 CommandRoute::PassThrough,
