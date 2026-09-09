@@ -4,8 +4,8 @@ use tauri::AppHandle;
 
 use super::{
     append_log_marker, current_instance_id, now_iso, process_belongs_to_us,
-    process_has_buzz_marker, process_is_running, terminate_process, ManagedAgentPairRuntime,
-    ManagedAgentRecord, ManagedAgentRuntimeKey,
+    process_has_buzz_marker, process_is_running, terminate_process, tracked_runtime_pid,
+    tracked_runtime_pids, ManagedAgentPairRuntime, ManagedAgentRecord, ManagedAgentRuntimeKey,
 };
 
 pub(crate) fn managed_agent_runtime_keys<T>(
@@ -93,11 +93,19 @@ fn stop_managed_agent_pair<R: tauri::Runtime>(
 }
 
 /// Terminate a legacy scalar-PID child (pre-pair records) and remove the
-/// agent-scoped pid file. Pair receipts are restored separately.
+/// agent-scoped pid file. Pair receipts are restored separately. A PID that
+/// names a tracked pair child is a live harness in another community, not a
+/// legacy orphan; it is left untouched.
 fn stop_legacy_scalar_pid<R: tauri::Runtime>(
     app: &AppHandle<R>,
     record: &mut ManagedAgentRecord,
+    runtimes: &HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
 ) -> Result<(), String> {
+    let tracked = tracked_runtime_pids(runtimes, &record.pubkey);
+    if record.runtime_pid.is_some_and(|pid| tracked.contains(&pid)) {
+        super::super::remove_agent_pid_file(app, &record.pubkey);
+        return Ok(());
+    }
     if let Some(pid) = record.runtime_pid.take() {
         if process_is_running(pid)
             && process_belongs_to_us(pid)
@@ -120,8 +128,8 @@ fn stop_legacy_scalar_pid<R: tauri::Runtime>(
 /// pairs in other communities. Clears the matching agent session cache
 /// (pair-scoped when a pair key resolves). When no pair is tracked for this
 /// workspace, only legacy scalar-PID cleanup runs.
-pub fn stop_managed_agent_workspace_pair(
-    app: &AppHandle,
+pub fn stop_managed_agent_workspace_pair<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     record: &mut ManagedAgentRecord,
     runtimes: &mut HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
 ) -> Result<(), String> {
@@ -133,7 +141,7 @@ pub fn stop_managed_agent_workspace_pair(
             state.clear_agent_session_cache(&pair_key);
             super::super::remove_agent_pid_file(app, &record.pubkey);
             let now = now_iso();
-            record.runtime_pid = None;
+            record.runtime_pid = tracked_runtime_pid(runtimes, record);
             record.updated_at = now.clone();
             record.last_stopped_at = Some(now);
             record.last_error = None;
@@ -142,11 +150,11 @@ pub fn stop_managed_agent_workspace_pair(
         Some(pair_key) => {
             // No tracked pair here — a pubkey-wide cache clear would disturb
             // live pairs in other communities, so stay pair-scoped.
-            stop_legacy_scalar_pid(app, record)?;
+            stop_legacy_scalar_pid(app, record, runtimes)?;
             state.clear_agent_session_cache(&pair_key);
         }
         None => {
-            stop_legacy_scalar_pid(app, record)?;
+            stop_legacy_scalar_pid(app, record, runtimes)?;
             state.clear_agent_session_caches(&record.pubkey);
         }
     }
@@ -160,7 +168,7 @@ pub fn stop_managed_agent_process<R: tauri::Runtime>(
 ) -> Result<(), String> {
     let keys = managed_agent_runtime_keys(runtimes, &record.pubkey);
     if keys.is_empty() {
-        return stop_legacy_scalar_pid(app, record);
+        return stop_legacy_scalar_pid(app, record, runtimes);
     }
 
     let mut errors = Vec::new();
@@ -171,7 +179,8 @@ pub fn stop_managed_agent_process<R: tauri::Runtime>(
     }
 
     let now = now_iso();
-    record.runtime_pid = None;
+    // A pair whose teardown failed stays tracked; keep naming it.
+    record.runtime_pid = tracked_runtime_pid(runtimes, record);
     record.updated_at = now.clone();
     record.last_stopped_at = Some(now);
     record.last_error = None;
