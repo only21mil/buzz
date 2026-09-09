@@ -121,6 +121,13 @@ export function ChannelRouteScreen({
     const cachedTarget = getCachedSearchHitEvent(targetMessageId);
     return cachedTarget ? [cachedTarget] : [];
   });
+  // True while the deep-linked target is still being fetched. The hydrated
+  // per-channel query cache can settle the timeline before `getEventById`
+  // resolves, and the thread-target sync must not treat that window as "head
+  // message gone" and close the thread.
+  const [isTargetFetchPending, setIsTargetFetchPending] = React.useState(() =>
+    Boolean((targetMessageId || targetThreadRootId) && !selectedPostId),
+  );
   const [activeSearchHighlight, setActiveSearchHighlight] =
     React.useState<SearchHighlightNavigation | null>(searchHighlight ?? null);
   const appliedSearchActivationIdRef = React.useRef<string | null>(
@@ -193,11 +200,13 @@ export function ChannelRouteScreen({
     // param-clear blanks the timeline. Resetting on channel / forum-post change
     // is handled by the effect below; here we only fetch when there's a target.
     if ((!targetMessageId && !targetThreadRootId) || selectedPostId) {
+      setIsTargetFetchPending(false);
       return () => {
         isCancelled = true;
       };
     }
 
+    setIsTargetFetchPending(true);
     const cachedTarget = getCachedSearchHitEvent(targetMessageId);
     if (cachedTarget) {
       setTargetMessageEvents((currentEvents) =>
@@ -227,6 +236,7 @@ export function ChannelRouteScreen({
           }
           return Array.from(eventsById.values());
         });
+        setIsTargetFetchPending(false);
       }
     });
 
@@ -262,6 +272,7 @@ export function ChannelRouteScreen({
       selectedForumPostId={selectedPostId}
       targetForumReplyId={targetReplyId}
       targetMessageEvents={targetMessageEvents}
+      targetMessageEventsPending={isTargetFetchPending}
       targetMessageId={targetMessageId}
       targetSearchMessageId={activeSearchHighlight?.messageId}
       targetSearchQuery={activeSearchHighlight?.query}
