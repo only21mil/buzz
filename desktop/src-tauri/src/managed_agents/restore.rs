@@ -399,7 +399,7 @@ pub async fn restore_managed_agents_on_launch(
                     continue;
                 }
                 record.updated_at = now.clone();
-                record.runtime_pid = None;
+                record.runtime_pid = Some(receipt.pid);
                 record.last_started_at = Some(now);
                 record.last_stopped_at = None;
                 record.last_exit_code = None;
