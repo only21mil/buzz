@@ -2174,6 +2174,11 @@ const PLAN_MODE_NOTICE: &str = "Plan mode on for this turn.";
 /// Restore the configured permission mode on a session a `/plan` turn left in
 /// plan mode, and drop the ExitPlanMode hold. Best effort: a transport error
 /// here is logged, since the caller is already ending or has ended the turn.
+///
+/// The restore follows the session-creation rule: the configured mode is
+/// only sent when the session advertised it at `session/new`. A mode the
+/// seat never listed is skipped with a warning instead of a round trip the
+/// connector would refuse (or, for goose, crash on).
 async fn end_plan_turn(
     agent: &mut OwnedAgent,
     session_id: &str,
@@ -2182,6 +2187,20 @@ async fn end_plan_turn(
 ) {
     agent.acp.set_plan_hold(session_id, false);
     agent.state.plan_mode_sessions.remove(scope);
+    let wire = ctx.permission_mode.as_wire_str();
+    let advertised = agent
+        .state
+        .session_modes
+        .get(session_id)
+        .is_some_and(|modes| modes.iter().any(|m| m == wire));
+    if !advertised {
+        tracing::warn!(
+            target: "pool::permission",
+            "configured permission mode {wire:?} is not advertised by session {session_id}; \
+             leaving the mode as the connector set it after the plan turn"
+        );
+        return;
+    }
     if let Err(error) =
         apply_permission_mode(&mut agent.acp, session_id, &ctx.permission_mode).await
     {
@@ -3623,22 +3642,24 @@ pub async fn run_prompt_task(
 
     // A `/plan` turn is over: put the configured mode back while the session
     // is still usable. Exits and transport failures skip the round trip; the
-    // session is invalidated below and the mode dies with it.
+    // session is invalidated below and the mode dies with it. An idle or hard
+    // timeout leaves the prompt in flight (`cancel_with_cleanup` below drains
+    // it), so no `session/set_config_option` may be written yet: the flags
+    // stay set and the leftover-restore path at the top of the next prompt
+    // puts the mode back if the session outlives the cleanup.
     if plan_turn {
-        let session_usable = !matches!(
-            prompt_result,
-            Err(AcpError::AgentExited)
+        if let PromptSource::Channel(scope) = &source {
+            match prompt_result {
+                Err(AcpError::IdleTimeout(_)) | Err(AcpError::HardTimeout { .. }) => {}
+                Err(AcpError::AgentExited)
                 | Err(AcpError::Io(_))
                 | Err(AcpError::WriteTimeout(_))
                 | Err(AcpError::Timeout(_))
-                | Err(AcpError::Protocol(_))
-        );
-        if let PromptSource::Channel(scope) = &source {
-            if session_usable {
-                end_plan_turn(&mut agent, &session_id, scope, &ctx).await;
-            } else {
-                agent.acp.set_plan_hold(&session_id, false);
-                agent.state.plan_mode_sessions.remove(scope);
+                | Err(AcpError::Protocol(_)) => {
+                    agent.acp.set_plan_hold(&session_id, false);
+                    agent.state.plan_mode_sessions.remove(scope);
+                }
+                _ => end_plan_turn(&mut agent, &session_id, scope, &ctx).await,
             }
         }
     }
@@ -8100,6 +8121,245 @@ done"#
             .collect();
         assert_eq!(methods, vec!["session/set_config_option", "session/prompt"]);
         assert_eq!(requests[0]["params"]["value"], "default");
+    }
+
+    /// Build a bare agent with one live session that advertised `modes`,
+    /// backed by the bash `script`, for the `/plan` prompt-path tests.
+    async fn plan_test_agent(script: String, scope: &SessionScope, modes: &[&str]) -> OwnedAgent {
+        let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+            .await
+            .expect("spawn wire-capture ACP");
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "legacy-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        agent
+            .state
+            .sessions
+            .insert(scope.clone(), "live-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(scope.clone(), ChannelDeliveryState::default());
+        agent.state.session_modes.insert(
+            "live-session".into(),
+            modes.iter().map(|m| m.to_string()).collect(),
+        );
+        agent
+    }
+
+    fn plan_test_batch(channel_id: Uuid, content: &str) -> FlushBatch {
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(9), content)
+            .sign_with_keys(&keys)
+            .unwrap();
+        FlushBatch {
+            channel_id,
+            scope: SessionScope::Conversation { channel_id },
+            events: vec![crate::queue::BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        }
+    }
+
+    fn plan_test_ctx(channel_id: Uuid, permission_mode: PermissionMode) -> PromptContext {
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.permission_mode = permission_mode;
+        ctx.channel_info = ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                crate::relay::ChannelInfo {
+                    name: "test-dm".into(),
+                    channel_type: "dm".into(),
+                },
+            )]),
+            ctx.rest_client.clone(),
+        );
+        ctx
+    }
+
+    fn captured_requests(capture: &std::path::Path) -> Vec<serde_json::Value> {
+        let requests = std::fs::read_to_string(capture)
+            .expect("read captured requests")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("captured request JSON"))
+            .collect();
+        std::fs::remove_file(capture).expect("remove capture");
+        requests
+    }
+
+    /// A `/plan` turn that ends in an idle timeout must not write
+    /// `session/set_config_option` while the prompt is still in flight: the
+    /// restore would race the late prompt response that `cancel_with_cleanup`
+    /// drains. The flags stay set through the cleanup, and the next prompt on
+    /// the scope restores the configured mode before it is sent.
+    #[tokio::test]
+    async fn plan_turn_ending_in_idle_timeout_restores_mode_after_cleanup() {
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let capture =
+            std::env::temp_dir().join(format!("buzz-acp-plan-idle-{}.ndjson", Uuid::new_v4()));
+        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        // Answers everything at once except the first `session/prompt`, which
+        // stays unanswered until `session/cancel` arrives (the idle timeout
+        // fires first), then completes as `cancelled`. Later prompts end
+        // normally.
+        let script = format!(
+            r#"prompt_id=''
+prompts=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{quoted_capture}'
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"session/prompt"'*)
+      prompts=$((prompts + 1))
+      if [ "$prompts" -eq 1 ]; then
+        prompt_id=$id
+      else
+        printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+      fi
+      ;;
+    *'"method":"session/cancel"'*) printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$prompt_id,\"result\":{{\"stopReason\":\"cancelled\"}}}}" ;;
+    *) printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{{\"stopReason\":\"end_turn\"}}}}" ;;
+  esac
+done"#
+        );
+        let agent = plan_test_agent(script, &scope, &["default", "acceptEdits", "plan"]).await;
+        let mut ctx = plan_test_ctx(channel_id, PermissionMode::AcceptEdits);
+        ctx.idle_timeout = Duration::from_millis(500);
+        let ctx = Arc::new(ctx);
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+
+        run_prompt_task(
+            agent,
+            Some(plan_test_batch(channel_id, "/plan ship the thing")),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "plan-idle".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("prompt result");
+        assert!(
+            matches!(result.outcome, PromptOutcome::Timeout(TimeoutKind::Idle)),
+            "expected idle timeout"
+        );
+        let agent = result.agent;
+        assert!(
+            agent.state.plan_mode_sessions.contains(&scope),
+            "flag survives the cleanup so the next prompt restores the mode"
+        );
+        assert!(agent.acp.plan_hold("live-session"));
+
+        run_prompt_task(
+            agent,
+            Some(plan_test_batch(channel_id, "carry on")),
+            None,
+            Arc::clone(&ctx),
+            result_tx,
+            None,
+            "after-idle".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("prompt result");
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        let mut agent = result.agent;
+        assert!(agent.state.plan_mode_sessions.is_empty());
+        assert!(!agent.acp.plan_hold("live-session"));
+        agent.acp.shutdown().await;
+
+        let requests = captured_requests(&capture);
+        let methods: Vec<&str> = requests
+            .iter()
+            .filter_map(|r| r["method"].as_str())
+            .collect();
+        assert_eq!(
+            methods,
+            vec![
+                "session/set_config_option",
+                "session/prompt",
+                "session/cancel",
+                "session/set_config_option",
+                "session/prompt",
+            ],
+            "no set_config_option between the timed-out prompt and its cancel"
+        );
+        assert_eq!(requests[0]["params"]["value"], "plan");
+        assert_eq!(
+            requests[3]["params"]["value"], "acceptEdits",
+            "configured mode restored before the next prompt"
+        );
+    }
+
+    /// The restore after a `/plan` turn follows the session-creation rule: a
+    /// configured mode the session never advertised is not sent.
+    #[tokio::test]
+    async fn plan_turn_restore_skips_unadvertised_configured_mode() {
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-plan-unadvertised-{}.ndjson",
+            Uuid::new_v4()
+        ));
+        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{quoted_capture}'
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$count,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+  count=$((count + 1))
+done"#
+        );
+        // The seat lists `plan` but not the configured `bypassPermissions`.
+        let agent = plan_test_agent(script, &scope, &["default", "plan"]).await;
+        let ctx = Arc::new(plan_test_ctx(channel_id, PermissionMode::BypassPermissions));
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        run_prompt_task(
+            agent,
+            Some(plan_test_batch(channel_id, "/plan ship the thing")),
+            None,
+            Arc::clone(&ctx),
+            result_tx,
+            None,
+            "plan-unadvertised".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("prompt result");
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        let mut agent = result.agent;
+        assert!(agent.state.plan_mode_sessions.is_empty());
+        assert!(!agent.acp.plan_hold("live-session"));
+        agent.acp.shutdown().await;
+
+        let requests = captured_requests(&capture);
+        let methods: Vec<&str> = requests
+            .iter()
+            .filter_map(|r| r["method"].as_str())
+            .collect();
+        assert_eq!(
+            methods,
+            vec!["session/set_config_option", "session/prompt"],
+            "plan set and prompt only; no restore to an unadvertised mode"
+        );
+        assert_eq!(requests[0]["params"]["value"], "plan");
     }
 
     #[test]
