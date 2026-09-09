@@ -1192,6 +1192,343 @@ pub fn slash_command_for_batch(batch: &FlushBatch, known_names: &[&str]) -> Opti
     extract_slash_command(&batch.events[0].event.content, known_names)
 }
 
+/// Slash-command table and `/skill` mapping.
+///
+/// Pure functions over the text [`extract_slash_command`] returns and the
+/// per-session command list [`crate::acp::AcpClient::available_commands`]
+/// captures. The prompt path (`pool::run_prompt_task`) does not call them yet:
+/// that wiring lands with the `/stop` PR, which also generalises the harness
+/// reply helper. Until then the module is exercised by its tests only, hence
+/// the `dead_code` allowance outside `cfg(test)`.
+pub(crate) mod slash {
+    #![cfg_attr(not(test), allow(dead_code))]
+
+    /// A slash command split into its name and argument string.
+    ///
+    /// Produced by [`SlashCommand::parse`] from the text
+    /// [`super::extract_slash_command`] returns (`"/goal ship it"` → name `goal`,
+    /// args `ship it`). `name` never carries the leading `/`; `args` is trimmed
+    /// and empty when the command was given alone.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct SlashCommand {
+        /// Command name without the leading `/`, as typed (case preserved).
+        pub name: String,
+        /// Everything after the name, trimmed. Empty when absent.
+        pub args: String,
+    }
+
+    impl SlashCommand {
+        /// Parse `"/name args"` into a [`SlashCommand`].
+        ///
+        /// Accepts the same shape [`super::extract_slash_command`] guarantees: a leading
+        /// `/` followed by an ASCII alphanumeric. The name runs to the first
+        /// whitespace. Returns `None` for anything else (empty input, no slash,
+        /// `//`, `/ name`).
+        pub fn parse(command: &str) -> Option<Self> {
+            let rest = command.trim().strip_prefix('/')?;
+            if !rest
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+            {
+                return None;
+            }
+            let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let (name, args) = rest.split_at(name_end);
+            Some(Self {
+                name: name.to_string(),
+                args: args.trim().to_string(),
+            })
+        }
+
+        /// Render back to wire form: `/name` or `/name args`.
+        pub fn to_wire(&self) -> String {
+            if self.args.is_empty() {
+                format!("/{}", self.name)
+            } else {
+                format!("/{} {}", self.name, self.args)
+            }
+        }
+    }
+
+    /// Which side owns a slash command.
+    ///
+    /// The harness table is deliberately tiny: everything not listed here is
+    /// forwarded to the connector unchanged (`/goal`, `/review`, `/compact`,
+    /// connector-native skills). `/stop` and `/plan` are reserved names whose
+    /// harness handling lands in follow-up PRs; until then they pass through.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum CommandRoute {
+        /// `/skill` — the harness rewrites it into the connector's skill invocation.
+        Skill,
+        /// Forwarded to the connector as prompt block 0 without rewriting.
+        PassThrough,
+    }
+
+    /// Harness slash-command table: `(name, route)`.
+    ///
+    /// Names match case-insensitively. Keep this list in sync with the
+    /// "Slash commands" table in `crates/buzz-acp/README.md`.
+    pub const SLASH_COMMAND_TABLE: &[(&str, CommandRoute)] = &[("skill", CommandRoute::Skill)];
+
+    /// Look up a parsed command in [`SLASH_COMMAND_TABLE`].
+    pub fn route_command(cmd: &SlashCommand) -> CommandRoute {
+        SLASH_COMMAND_TABLE
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&cmd.name))
+            .map(|(_, route)| *route)
+            .unwrap_or(CommandRoute::PassThrough)
+    }
+
+    /// Connector family, which decides how a skill is invoked on the wire.
+    ///
+    /// Claude Code exposes skills as `/name`; Codex advertises them as `$name`.
+    /// Anything else gets the generic `/name` form.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ConnectorKind {
+        /// `claude-agent-acp` (`@agentclientprotocol/claude-agent-acp`).
+        Claude,
+        /// `codex-acp`.
+        Codex,
+        /// Any other ACP agent (goose, buzz-agent, ...).
+        Other,
+    }
+
+    impl ConnectorKind {
+        /// Classify from either the `initialize` agent name
+        /// (`@agentclientprotocol/claude-agent-acp`) or the spawned command
+        /// identity (`codex-acp`, `claude-agent-acp`). Case-insensitive substring
+        /// match so package scopes, paths and `.cmd` suffixes do not matter.
+        pub fn detect(identity: &str) -> Self {
+            let lower = identity.to_ascii_lowercase();
+            if lower.contains("claude") {
+                Self::Claude
+            } else if lower.contains("codex") {
+                Self::Codex
+            } else {
+                Self::Other
+            }
+        }
+
+        /// Prefix a connector uses when a skill is invoked by name.
+        fn skill_sigil(self) -> char {
+            match self {
+                Self::Codex => '$',
+                Self::Claude | Self::Other => '/',
+            }
+        }
+    }
+
+    /// Why `/skill` did not turn into a prompt.
+    ///
+    /// Each variant renders to the reply the harness posts in-thread instead of
+    /// prompting the agent; see [`SkillError::reply_text`].
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum SkillError {
+        /// `/skill` alone but no `available_commands_update` has been captured
+        /// for this session: the session may not exist yet, or the connector
+        /// has not sent (or does not implement) the extension. Either way there
+        /// is nothing to list.
+        NoSession,
+        /// `/skill <name>` where `name` is not in the advertised list.
+        Unknown {
+            /// The requested skill name, without sigil.
+            name: String,
+            /// Advertised command names, sigils stripped, in advertised order.
+            available: Vec<String>,
+        },
+    }
+
+    impl SkillError {
+        /// Human-readable reply for the thread.
+        pub fn reply_text(&self) -> String {
+            match self {
+            Self::NoSession => {
+                "I do not know my skills for this session yet: the connector has not advertised any commands. Try `/skill` again after my next reply."
+                    .to_string()
+            }
+            Self::Unknown { name, available } => {
+                if name.is_empty() {
+                    "`/skill` needs a skill name after it, for example `/skill review`.".to_string()
+                } else if available.is_empty() {
+                    format!("Unknown skill `{name}`; this seat advertises no commands.")
+                } else {
+                    format!(
+                        "Unknown skill `{name}`; available: {}",
+                        available
+                            .iter()
+                            .map(|n| format!("`{n}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }
+            }
+        }
+        }
+    }
+
+    impl std::fmt::Display for SkillError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.reply_text())
+        }
+    }
+
+    /// Strip a leading `/` or `$` so advertised names compare with typed ones.
+    fn strip_sigil(name: &str) -> &str {
+        name.strip_prefix('/')
+            .or_else(|| name.strip_prefix('$'))
+            .unwrap_or(name)
+    }
+
+    /// The advertised spelling of `name` (typed, no sigil), matched without
+    /// regard to ASCII case, or `None` when the list does not advertise it.
+    fn advertised<'a>(known: &'a [String], name: &str) -> Option<&'a str> {
+        known
+            .iter()
+            .map(|k| strip_sigil(k))
+            .find(|k| k.eq_ignore_ascii_case(strip_sigil(name)))
+    }
+
+    /// Rewrite `/skill <name> [args]` into the connector's own skill invocation.
+    ///
+    /// * `known` is the seat's latest `available_commands_update` for this
+    ///   session (`None` when none has been captured yet).
+    /// * With a list, an unknown name is refused with
+    ///   [`SkillError::Unknown`] so the connector never sees a command it cannot
+    ///   run. Without a list the command is forwarded blind and the connector
+    ///   answers.
+    /// * Claude and unknown connectors get `/name args`; Codex gets `$name args`.
+    ///   With a list, `name` is forwarded in the advertised spelling so the
+    ///   connector sees exactly the command it announced.
+    ///
+    /// `cmd` must already be the `/skill` command with a non-empty first argument;
+    /// callers handle the bare `/skill` listing form via [`render_skill_list`]
+    /// (or use [`handle_skill`], which does both).
+    pub fn rewrite_skill(
+        cmd: &SlashCommand,
+        connector: ConnectorKind,
+        known: Option<&[String]>,
+    ) -> Result<String, SkillError> {
+        let mut parts = cmd.args.splitn(2, char::is_whitespace);
+        let raw_name = parts.next().unwrap_or("");
+        let name = strip_sigil(raw_name);
+        let rest = parts.next().map(str::trim).unwrap_or("");
+        if name.is_empty() {
+            return Err(SkillError::Unknown {
+                name: String::new(),
+                available: known.map(skill_names).unwrap_or_default(),
+            });
+        }
+        let name = match known {
+            Some(list) => advertised(list, name).ok_or_else(|| SkillError::Unknown {
+                name: name.to_string(),
+                available: skill_names(list),
+            })?,
+            None => name,
+        };
+        let sigil = connector.skill_sigil();
+        Ok(if rest.is_empty() {
+            format!("{sigil}{name}")
+        } else {
+            format!("{sigil}{name} {rest}")
+        })
+    }
+
+    /// Advertised names with sigils stripped, order preserved.
+    fn skill_names(known: &[String]) -> Vec<String> {
+        known.iter().map(|k| strip_sigil(k).to_string()).collect()
+    }
+
+    /// Render the reply for a bare `/skill`.
+    ///
+    /// Lists the advertised names when a list has been captured (or says the
+    /// seat advertises none); [`SkillError::NoSession`] when nothing has been
+    /// captured for the session yet.
+    pub fn render_skill_list(known: Option<&[String]>) -> Result<String, SkillError> {
+        let list = known.ok_or(SkillError::NoSession)?;
+        if list.is_empty() {
+            return Ok("This seat advertises no commands.".to_string());
+        }
+        let names = skill_names(list)
+            .into_iter()
+            .map(|n| format!("`{n}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(format!(
+            "Available skills: {names}. Use `/skill <name> [args]`."
+        ))
+    }
+
+    /// What the harness should do with a slash command.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum SlashAction {
+        /// Send this text as prompt block 0 (connector detects the leading sigil).
+        Prompt(String),
+        /// Post this text in-thread and do not prompt the agent.
+        Reply(String),
+    }
+
+    /// Resolve `/skill ...` into a prompt or an in-thread reply.
+    ///
+    /// Bare `/skill` lists the advertised commands; `/skill <name> [args]` is
+    /// rewritten via [`rewrite_skill`]. Every refusal becomes a
+    /// [`SlashAction::Reply`] with the [`SkillError`] text.
+    pub fn handle_skill(
+        cmd: &SlashCommand,
+        connector: ConnectorKind,
+        known: Option<&[String]>,
+    ) -> SlashAction {
+        if cmd.args.is_empty() {
+            return match render_skill_list(known) {
+                Ok(text) => SlashAction::Reply(text),
+                Err(err) => SlashAction::Reply(err.reply_text()),
+            };
+        }
+        match rewrite_skill(cmd, connector, known) {
+            Ok(wire) => SlashAction::Prompt(wire),
+            Err(err) => SlashAction::Reply(err.reply_text()),
+        }
+    }
+
+    /// Reply for a pass-through command this seat did not advertise.
+    ///
+    /// Returns `None` when the command should be forwarded: no list has been
+    /// captured yet, or the name is in the list. Returns `Some(reply)` when the
+    /// seat advertised a list that does not contain the command, so the harness
+    /// can answer instead of letting the connector treat `/typo` as prose.
+    ///
+    /// Callers must have already excluded harness-owned names via
+    /// [`route_command`]. Whether a given connector advertises its built-ins
+    /// (Claude Code's `/goal`, for example) is a live-check question; apply this
+    /// gate only once that is confirmed for the connector in play.
+    pub fn unsupported_command_reply(
+        cmd: &SlashCommand,
+        known: Option<&[String]>,
+    ) -> Option<String> {
+        let list = known?;
+        if advertised(list, &cmd.name).is_some() {
+            return None;
+        }
+        let names = skill_names(list);
+        Some(if names.is_empty() {
+            format!(
+                "`/{}` is not supported by this seat; it advertises no commands.",
+                cmd.name
+            )
+        } else {
+            format!(
+                "`/{}` is not supported by this seat; available: {}",
+                cmd.name,
+                names
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+    }
+}
+
 /// Conversation context fetched by the harness before prompting.
 #[derive(Debug, Clone)]
 pub enum ConversationContext {
@@ -5506,6 +5843,301 @@ mod tests {
         assert_eq!(
             slash_command_for_batch(&make_single_batch("@Eva hello"), &[]),
             None
+        );
+    }
+
+    // ── Slash command parser, table and /skill mapping ──────────────────────
+
+    use super::slash::{
+        handle_skill, render_skill_list, rewrite_skill, route_command, unsupported_command_reply,
+        CommandRoute, ConnectorKind, SkillError, SlashAction, SlashCommand,
+    };
+
+    fn cmd(name: &str, args: &str) -> SlashCommand {
+        SlashCommand {
+            name: name.into(),
+            args: args.into(),
+        }
+    }
+
+    fn known(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn test_slash_command_parse_table() {
+        let cases: &[(&str, Option<(&str, &str)>)] = &[
+            ("/skill", Some(("skill", ""))),
+            ("/skill   ", Some(("skill", ""))),
+            ("/skill review", Some(("skill", "review"))),
+            (
+                "/skill review  src/lib.rs  ",
+                Some(("skill", "review  src/lib.rs")),
+            ),
+            ("/goal ship it", Some(("goal", "ship it"))),
+            ("/Goal", Some(("Goal", ""))),
+            ("/a1-b_c x", Some(("a1-b_c", "x"))),
+            ("  /init", Some(("init", ""))),
+            ("/skill\treview\targ", Some(("skill", "review\targ"))),
+            ("", None),
+            ("/", None),
+            ("//comment", None),
+            ("/ skill", None),
+            ("skill", None),
+            ("@Eva /skill", None),
+        ];
+        for (input, expected) in cases {
+            let parsed = SlashCommand::parse(input);
+            match expected {
+                Some((name, args)) => {
+                    let parsed = parsed.unwrap_or_else(|| panic!("{input:?} should parse"));
+                    assert_eq!(parsed.name, *name, "name for {input:?}");
+                    assert_eq!(parsed.args, *args, "args for {input:?}");
+                }
+                None => assert!(parsed.is_none(), "{input:?} should not parse"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_slash_command_parse_roundtrips_extract() {
+        let extracted = extract_slash_command("@Eva /skill review now", &[]).unwrap();
+        let parsed = SlashCommand::parse(&extracted).unwrap();
+        assert_eq!(parsed, cmd("skill", "review now"));
+        assert_eq!(parsed.to_wire(), "/skill review now");
+        assert_eq!(cmd("skill", "").to_wire(), "/skill");
+    }
+
+    #[test]
+    fn test_route_command_table() {
+        assert_eq!(route_command(&cmd("skill", "")), CommandRoute::Skill);
+        assert_eq!(route_command(&cmd("SKILL", "x")), CommandRoute::Skill);
+        for name in [
+            "goal", "plan", "stop", "review", "compact", "init", "unknown",
+        ] {
+            assert_eq!(
+                route_command(&cmd(name, "")),
+                CommandRoute::PassThrough,
+                "/{name} must pass through in PR1"
+            );
+        }
+    }
+
+    #[test]
+    fn test_connector_kind_detect() {
+        assert_eq!(
+            ConnectorKind::detect("@agentclientprotocol/claude-agent-acp"),
+            ConnectorKind::Claude
+        );
+        assert_eq!(
+            ConnectorKind::detect("claude-agent-acp"),
+            ConnectorKind::Claude
+        );
+        assert_eq!(ConnectorKind::detect("Claude Code"), ConnectorKind::Claude);
+        assert_eq!(ConnectorKind::detect("codex-acp"), ConnectorKind::Codex);
+        assert_eq!(
+            ConnectorKind::detect("/usr/local/bin/codex"),
+            ConnectorKind::Codex
+        );
+        assert_eq!(ConnectorKind::detect("goose"), ConnectorKind::Other);
+        assert_eq!(ConnectorKind::detect("buzz-agent"), ConnectorKind::Other);
+        assert_eq!(ConnectorKind::detect(""), ConnectorKind::Other);
+    }
+
+    #[test]
+    fn test_rewrite_skill_claude_and_codex() {
+        let list = known(&["/review", "/commit", "$deploy"]);
+        assert_eq!(
+            rewrite_skill(&cmd("skill", "review"), ConnectorKind::Claude, Some(&list)),
+            Ok("/review".to_string())
+        );
+        assert_eq!(
+            rewrite_skill(
+                &cmd("skill", "review  src/lib.rs"),
+                ConnectorKind::Claude,
+                Some(&list)
+            ),
+            Ok("/review src/lib.rs".to_string())
+        );
+        assert_eq!(
+            rewrite_skill(
+                &cmd("skill", "review src"),
+                ConnectorKind::Codex,
+                Some(&list)
+            ),
+            Ok("$review src".to_string())
+        );
+        // Advertised with a `$` sigil (codex) still matches a bare typed name,
+        // and a typed sigil is tolerated.
+        assert_eq!(
+            rewrite_skill(&cmd("skill", "deploy"), ConnectorKind::Codex, Some(&list)),
+            Ok("$deploy".to_string())
+        );
+        assert_eq!(
+            rewrite_skill(
+                &cmd("skill", "/commit -m x"),
+                ConnectorKind::Claude,
+                Some(&list)
+            ),
+            Ok("/commit -m x".to_string())
+        );
+        // Case-insensitive match; the typed spelling is forwarded.
+        assert_eq!(
+            rewrite_skill(&cmd("skill", "Review"), ConnectorKind::Claude, Some(&list)),
+            Ok("/review".to_string())
+        );
+        // Unknown connector gets the generic slash form.
+        assert_eq!(
+            rewrite_skill(&cmd("skill", "review"), ConnectorKind::Other, Some(&list)),
+            Ok("/review".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_skill_blind_without_list() {
+        assert_eq!(
+            rewrite_skill(
+                &cmd("skill", "anything at all"),
+                ConnectorKind::Claude,
+                None
+            ),
+            Ok("/anything at all".to_string())
+        );
+        assert_eq!(
+            rewrite_skill(&cmd("skill", "anything"), ConnectorKind::Codex, None),
+            Ok("$anything".to_string())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_skill_unknown_name() {
+        let list = known(&["/review", "$deploy"]);
+        let err = rewrite_skill(
+            &cmd("skill", "nope now"),
+            ConnectorKind::Claude,
+            Some(&list),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SkillError::Unknown {
+                name: "nope".into(),
+                available: known(&["review", "deploy"]),
+            }
+        );
+        let empty_name =
+            rewrite_skill(&cmd("skill", "/ args"), ConnectorKind::Claude, Some(&list)).unwrap_err();
+        assert_eq!(
+            empty_name,
+            SkillError::Unknown {
+                name: String::new(),
+                available: known(&["review", "deploy"]),
+            }
+        );
+        assert!(
+            empty_name
+                .reply_text()
+                .starts_with("`/skill` needs a skill name"),
+            "empty name gets a usage reply, not an empty backticked name"
+        );
+        assert_eq!(
+            err.reply_text(),
+            "Unknown skill `nope`; available: `review`, `deploy`"
+        );
+        assert_eq!(err.to_string(), err.reply_text());
+
+        let empty: Vec<String> = Vec::new();
+        let err =
+            rewrite_skill(&cmd("skill", "nope"), ConnectorKind::Claude, Some(&empty)).unwrap_err();
+        assert_eq!(
+            err.reply_text(),
+            "Unknown skill `nope`; this seat advertises no commands."
+        );
+    }
+
+    #[test]
+    fn test_render_skill_list() {
+        assert_eq!(render_skill_list(None), Err(SkillError::NoSession));
+        assert!(
+            SkillError::NoSession
+                .reply_text()
+                .contains("not advertised any commands"),
+            "no-list reply says the commands are not known yet, not that no session exists"
+        );
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(
+            render_skill_list(Some(&empty)),
+            Ok("This seat advertises no commands.".to_string())
+        );
+        let list = known(&["/review", "$deploy", "commit"]);
+        assert_eq!(
+            render_skill_list(Some(&list)),
+            Ok(
+                "Available skills: `review`, `deploy`, `commit`. Use `/skill <name> [args]`."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_handle_skill_dispatch() {
+        let list = known(&["/review"]);
+        // Bare /skill → list reply, never a prompt.
+        assert_eq!(
+            handle_skill(&cmd("skill", ""), ConnectorKind::Claude, Some(&list)),
+            SlashAction::Reply(render_skill_list(Some(&list)).unwrap())
+        );
+        assert_eq!(
+            handle_skill(&cmd("skill", ""), ConnectorKind::Claude, None),
+            SlashAction::Reply(SkillError::NoSession.reply_text())
+        );
+        // Known name → rewritten prompt.
+        assert_eq!(
+            handle_skill(
+                &cmd("skill", "review src"),
+                ConnectorKind::Codex,
+                Some(&list)
+            ),
+            SlashAction::Prompt("$review src".into())
+        );
+        // Unknown name → refusal reply.
+        assert_eq!(
+            handle_skill(&cmd("skill", "typo"), ConnectorKind::Claude, Some(&list)),
+            SlashAction::Reply("Unknown skill `typo`; available: `review`".into())
+        );
+        // No list yet → forwarded blind.
+        assert_eq!(
+            handle_skill(&cmd("skill", "typo"), ConnectorKind::Claude, None),
+            SlashAction::Prompt("/typo".into())
+        );
+    }
+
+    #[test]
+    fn test_unsupported_command_reply() {
+        // No captured list → forward, no reply.
+        assert_eq!(unsupported_command_reply(&cmd("goal", "x"), None), None);
+        let list = known(&["/goal", "/review", "$deploy"]);
+        // Advertised (any sigil, any case) → forward.
+        assert_eq!(
+            unsupported_command_reply(&cmd("goal", "x"), Some(&list)),
+            None
+        );
+        assert_eq!(
+            unsupported_command_reply(&cmd("Deploy", ""), Some(&list)),
+            None
+        );
+        // Not advertised → clear reply naming the seat's commands.
+        assert_eq!(
+            unsupported_command_reply(&cmd("typo", "x"), Some(&list)),
+            Some(
+                "`/typo` is not supported by this seat; available: `goal`, `review`, `deploy`"
+                    .to_string()
+            )
+        );
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(
+            unsupported_command_reply(&cmd("typo", ""), Some(&empty)),
+            Some("`/typo` is not supported by this seat; it advertises no commands.".to_string())
         );
     }
 

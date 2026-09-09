@@ -55,8 +55,10 @@ non-secret Compose settings file separately from the mode-`0600` secret file:
 ```bash
 export BUZZ_COMPOSE_ENV_FILE=/path/to/compose.env
 export BUZZ_SECRET_ENV_FILE="$HOME/.config/sats/secrets.env"
-export BUZZ_PRE_FREEZE_RECEIPT=/path/to/pre-freeze-receipt.json
-evidence_dir=/absolute/private/evidence-directory # caller-owned mode 0700
+export BUZZ_EVIDENCE_ROOT=/absolute/private/evidence-directory # caller-owned mode 0700
+evidence_dir=$BUZZ_EVIDENCE_ROOT
+# The path ../../scripts/pre-freeze.sh printed for this commit's freeze run.
+export BUZZ_PRE_FREEZE_RECEIPT="$evidence_dir/pre-freeze-receipt-20260908T101112Z.json"
 ../../scripts/protected-ci-receipt.py acquire-main \
   --repository only21mil/buzz \
   --head 0123456789abcdef0123456789abcdef01234567 \
@@ -79,19 +81,23 @@ nonzero. Deploy records default to `$HOME/.local/state/buzz-relay/deploys`.
 
 The checked-out `HEAD`, `BUZZ_DEPLOY_SOURCE_REF` (default
 `refs/remotes/origin/main`), pre-freeze receipt, and protected-CI receipt must
-all name the requested full commit. Both receipts must be mode-safe JSON from
-`only21mil/buzz`, record `overall: "PASS"`, contain at least one passing check,
-and be no older than `BUZZ_DEPLOY_RECEIPT_MAX_AGE_SECONDS` (default 86400).
-The pre-freeze receipt comes from `scripts/pre-freeze.sh`. The protected-CI
+all name the requested full commit. Both receipts are retained evidence under
+the contract in `docs/delivery-lifecycle.md` ("Retained evidence"): named by
+explicit absolute `BUZZ_PRE_FREEZE_RECEIPT` and `BUZZ_PROTECTED_CI_RECEIPT`,
+each a mode-`0600` file whose immediate parent is a caller-owned mode-`0700`
+directory outside the checkout. Both must be JSON from `only21mil/buzz`, record
+`overall: "PASS"`, contain at least one passing check, and be no older than
+`BUZZ_DEPLOY_RECEIPT_MAX_AGE_SECONDS` (default 86400). The pre-freeze receipt
+comes from `scripts/pre-freeze.sh`. The protected-CI
 receipt must be the canonical `main`-scope receipt acquired for the landed
 commit: operator-acquired, with the exact GitHub repository, `main` ref,
 branch-rule, ruleset, and check-run bodies retained and hash-bound. GitHub does
 not sign those bodies, so the deploy runs `validate --reverify`, which requires
 the live GitHub authority to match the receipt binding through the pinned `gh`
 and the live `refs/heads/main` head to equal the landed commit; `GH_TOKEN` must
-be in the environment. `BUZZ_PROTECTED_CI_RECEIPT` is mandatory and absolute; its
-immediate parent must be caller-owned mode `0700`, and the receipt must be mode
-`0600`. Pull-request-scoped receipts, legacy JSON that merely asserts
+be in the environment. Neither receipt has a repository-root default; the
+checkout must be clean with no receipt file name exempt. Pull-request-scoped
+receipts, legacy JSON that merely asserts
 `protected: true` or `full_exact_head: true`, hand-edited receipts, and
 receipts GitHub no longer backs are refused. Reacquire after any rerun or
 ruleset change.

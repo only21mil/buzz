@@ -1207,7 +1207,7 @@ fn receipt_invalid_when_process_not_running() {
 
 // ── Test helpers ────────────────────────────────────────────────────────────
 
-fn minimal_record(pubkey: &str) -> crate::managed_agents::ManagedAgentRecord {
+pub(super) fn minimal_record(pubkey: &str) -> crate::managed_agents::ManagedAgentRecord {
     serde_json::from_str(&format!(
         r#"{{
             "pubkey": "{pubkey}",
@@ -1234,7 +1234,7 @@ fn minimal_record(pubkey: &str) -> crate::managed_agents::ManagedAgentRecord {
     .expect("minimal_record fixture")
 }
 
-fn make_pair_runtime_placeholder() -> crate::managed_agents::ManagedAgentPairRuntime {
+pub(super) fn make_pair_runtime_placeholder() -> crate::managed_agents::ManagedAgentPairRuntime {
     use std::process::{Command, Stdio};
     // Spawn a real child so ManagedAgentProcess's Child field is satisfied.
     // `true` exits immediately with 0 — just a handle we need for type purposes.

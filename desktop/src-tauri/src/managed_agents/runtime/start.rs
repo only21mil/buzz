@@ -44,7 +44,8 @@ pub(crate) fn start_managed_agent_process_scoped(
         super::super::remove_agent_runtime_receipt(app, &key);
     }
 
-    // Scalar PIDs are migration-only and never establish pair liveness.
+    // The scalar PID never establishes pair liveness; it is rewritten from
+    // the receipt once the new child exists.
     record.runtime_pid = None;
 
     let mut process = spawn_agent_child_with_replay_floor(
@@ -68,6 +69,7 @@ pub(crate) fn start_managed_agent_process_scoped(
         return Err(error);
     }
 
+    record.runtime_pid = Some(receipt.pid);
     record.updated_at = now.clone();
     record.last_started_at = Some(now);
     record.last_stopped_at = None;

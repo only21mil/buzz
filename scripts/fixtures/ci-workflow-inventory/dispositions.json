@@ -1,0 +1,8 @@
+{
+  "ci.yml:lint": {"disposition": "native", "native": "lint"},
+  "ci.yml:smoke": {"disposition": "native", "native": "smoke", "note": "two shards"},
+  "ci.yml:mac": {"disposition": "retained-github", "owner": "apple", "exit": "apple executor"},
+  "ci.yml:ios": {"disposition": "retained-github", "owner": "apple", "exit": "apple executor"},
+  "publish.yml:image": {"disposition": "disabled-for-fork"},
+  "publish.yml:windows": {"disposition": "disabled-for-fork"}
+}

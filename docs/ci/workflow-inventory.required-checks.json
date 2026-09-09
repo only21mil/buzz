@@ -1,0 +1,67 @@
+{
+  "source": "/repos/only21mil/buzz/rules/branches/main",
+  "repository": "only21mil/buzz",
+  "fetched_at": "2026-09-08T23:36:15+00:00",
+  "checks": [
+    {
+      "context": "Backend Integration (relay e2e)",
+      "integration_id": 15368
+    },
+    {
+      "context": "Dead Token Reference Guard",
+      "integration_id": 15368
+    },
+    {
+      "context": "Desktop",
+      "integration_id": 15368
+    },
+    {
+      "context": "Desktop Build (macOS)",
+      "integration_id": 15368
+    },
+    {
+      "context": "Desktop E2E Integration",
+      "integration_id": 15368
+    },
+    {
+      "context": "Desktop E2E Relay",
+      "integration_id": 15368
+    },
+    {
+      "context": "Desktop Release Candidate",
+      "integration_id": 15368
+    },
+    {
+      "context": "Detect Changed Paths",
+      "integration_id": 15368
+    },
+    {
+      "context": "Mobile",
+      "integration_id": 15368
+    },
+    {
+      "context": "Relay E2E",
+      "integration_id": 15368
+    },
+    {
+      "context": "Rust Lint",
+      "integration_id": 15368
+    },
+    {
+      "context": "Security",
+      "integration_id": 15368
+    },
+    {
+      "context": "Unit Tests",
+      "integration_id": 15368
+    },
+    {
+      "context": "Web",
+      "integration_id": 15368
+    },
+    {
+      "context": "relay_e2e_canary",
+      "integration_id": 15368
+    }
+  ]
+}

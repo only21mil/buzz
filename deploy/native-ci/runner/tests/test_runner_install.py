@@ -1057,6 +1057,50 @@ class RunnerInstallTests(unittest.TestCase):
         manifest_schema = json.loads((RUNNER_DIR / "package-manifest.schema.json").read_text())
         self.assertEqual(manifest_schema["properties"]["peer_policy"]["const"], INSTALLER.PEER_POLICY)
 
+    def test_runner_config_schema_accepts_rendered_v2_proxy_with_time_reference(self) -> None:
+        """Issue #149: the renderer, the freezer, and the runner binary all bind
+        acceptance_time_reference; the schema must accept exactly that shape."""
+        checker = shutil.which("check-jsonschema")
+        self.assertIsNotNone(checker, "check-jsonschema is required by the test gate")
+        schema = RUNNER_DIR / "runner-config.schema.json"
+        proxy = {
+            "connect_timeout_millis": 1000,
+            "io_timeout_millis": 5000,
+            "transport_attempts": 3,
+            "retry_delay_millis": 100,
+            "lane_manifest_digest": "11" * 32,
+            "lane_epoch": 4,
+            "admission_key_generation": 9,
+            "isolation_profile_digest": "22" * 32,
+            "audience_digest": "33" * 32,
+            "acceptance_time_reference": 1_800_000_000,
+        }
+        rendered = json.loads(RENDERER.config_bytes(self.controld_uid, self.controld_gid, proxy))
+        self.assertEqual(rendered["acceptance_time_reference"], 1_800_000_000)
+
+        def validate(instance: dict[str, object]) -> subprocess.CompletedProcess[str]:
+            with tempfile.NamedTemporaryFile("w", suffix=".json", dir=os.environ.get("TMPDIR")) as handle:
+                json.dump(instance, handle)
+                handle.flush()
+                return subprocess.run(
+                    [checker, "--schemafile", str(schema), handle.name],
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                )
+
+        accepted = validate(rendered)
+        self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+        for label, mutate in (
+            ("missing", lambda value: value.pop("acceptance_time_reference")),
+            ("zero", lambda value: value.__setitem__("acceptance_time_reference", 0)),
+            ("string", lambda value: value.__setitem__("acceptance_time_reference", "1800000000")),
+        ):
+            with self.subTest(label):
+                broken = dict(rendered)
+                mutate(broken)
+                self.assertNotEqual(validate(broken).returncode, 0, label)
+        dormant = json.loads(RENDERER.config_bytes(self.controld_uid, self.controld_gid))
+        self.assertEqual(validate(dormant).returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

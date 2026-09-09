@@ -38,7 +38,7 @@ import shutil
 import stat
 import subprocess
 import sys
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 from urllib.parse import parse_qsl, urlsplit
 import uuid
 import types
@@ -60,6 +60,7 @@ GH_GID = 0
 GH_MODE = 0o755
 GH_SHA256 = "16fdbf30d6f97bc5b0fb94745e00fa06ae68beb6c6653d7f584b32602800397d"
 RENAME_NOREPLACE = 1
+EVIDENCE_ROOT_VARIABLE = "BUZZ_EVIDENCE_ROOT"
 ACQUISITION_SNAPSHOTS = 2
 # Retained-body order for each scope. Offline validation replays exactly this
 # sequence, so a receipt with bodies missing, reordered, or added fails.
@@ -345,6 +346,52 @@ def enclosing_worktree(path: Path) -> Path | None:
     return None
 
 
+def is_private_directory(info: os.stat_result) -> bool:
+    """The one parent rule for retained evidence: a caller-owned mode-0700 directory."""
+    return (stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid()
+            and stat.S_IMODE(info.st_mode) == 0o700)
+
+
+def validate_evidence_root(path: Path, *, checkout: Path | None = None) -> Path:
+    """Require path to satisfy the retained-evidence root contract and return it.
+
+    Every retained evidence file (pre-freeze receipt, protected-CI receipt,
+    promotion bundle, acceptance verdict and records, readiness receipt) has
+    an evidence root as its immediate parent: an absolute, canonical,
+    non-symlink directory owned by the caller with mode 0700 and, when a
+    checkout is named, outside that checkout. safe_publish and
+    safe_read_receipt re-check the same rule on the directory they open.
+    """
+    refuse(path.is_absolute(), f"evidence root must be an absolute path: {path}", OutputError)
+    if checkout is not None:
+        # Checked first: a path inside the checkout is wrong whatever its mode,
+        # and the operator needs that reason, not the mode of the checkout.
+        checkout_root = checkout.resolve()
+        located = path.resolve(strict=False)
+        refuse(located != checkout_root and checkout_root not in located.parents,
+               f"evidence root must be outside the checkout {checkout_root}: {path}", OutputError)
+    try:
+        info = os.lstat(path)
+        refuse(not stat.S_ISLNK(info.st_mode), f"evidence root must not be a symlink: {path}",
+               OutputError)
+        refuse(path.resolve(strict=True) == path, f"evidence root path must be canonical: {path}",
+               OutputError)
+    except OSError as exc:
+        raise OutputError(f"cannot read evidence root {path}: {exc}") from exc
+    refuse(is_private_directory(info),
+           f"evidence root must be a caller-owned mode-0700 directory: {path}", OutputError)
+    return path
+
+
+def evidence_root_from_environment(*, checkout: Path | None = None,
+                                   environ: Mapping[str, str] = os.environ) -> Path:
+    """Resolve BUZZ_EVIDENCE_ROOT through validate_evidence_root."""
+    value = environ.get(EVIDENCE_ROOT_VARIABLE, "")
+    refuse(bool(value), f"{EVIDENCE_ROOT_VARIABLE} must name the absolute retained-evidence directory",
+           OutputError)
+    return validate_evidence_root(Path(value), checkout=checkout)
+
+
 def make_private_dir(path: Path) -> None:
     """Create path as a mode-0700 directory owned by the caller, or refuse."""
     try:
@@ -354,8 +401,7 @@ def make_private_dir(path: Path) -> None:
     else:
         os.chmod(path, 0o700)
     info = os.lstat(path)
-    refuse(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
-           and stat.S_IMODE(info.st_mode) == 0o700,
+    refuse(is_private_directory(info),
            f"gh state directory {path} must be a mode-0700 directory owned by the caller",
            ProviderError)
 
@@ -1270,7 +1316,7 @@ def safe_publish(path: Path, value: Any) -> None:
         opened_parent = os.fstat(dir_fd)
         refuse((opened_parent.st_dev, opened_parent.st_ino) ==
                (parent_info.st_dev, parent_info.st_ino), "output parent changed before open", OutputError)
-        refuse(opened_parent.st_uid == os.geteuid() and stat.S_IMODE(opened_parent.st_mode) == 0o700,
+        refuse(is_private_directory(opened_parent),
                "output parent must be owned by the caller with mode 0700", OutputError)
         try:
             os.stat(path.name, dir_fd=dir_fd, follow_symlinks=False)
@@ -1334,7 +1380,7 @@ def safe_publish(path: Path, value: Any) -> None:
         os.close(dir_fd)
 
 
-def safe_read_receipt(path: Path) -> bytes:
+def safe_read_receipt(path: Path, *, limit: int = MAX_RECEIPT_BYTES) -> bytes:
     refuse(path.is_absolute() and path.name not in ("", ".", ".."),
            "receipt path must be absolute with a valid basename", OutputError)
     parent = path.parent
@@ -1351,7 +1397,7 @@ def safe_read_receipt(path: Path) -> bytes:
         opened_parent = os.fstat(dir_fd)
         refuse((opened_parent.st_dev, opened_parent.st_ino) ==
                (parent_info.st_dev, parent_info.st_ino), "receipt parent identity changed", OutputError)
-        refuse(opened_parent.st_uid == os.geteuid() and stat.S_IMODE(opened_parent.st_mode) == 0o700,
+        refuse(is_private_directory(opened_parent),
                "receipt parent must be owned by the caller with mode 0700", OutputError)
         fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
         before = os.fstat(fd)
@@ -1359,12 +1405,12 @@ def safe_read_receipt(path: Path) -> bytes:
         refuse(before.st_uid == os.geteuid() and before.st_gid == os.getegid() and
                stat.S_IMODE(before.st_mode) == 0o600 and before.st_nlink == 1,
                "receipt must be caller-owned, mode 0600, and single-linked", OutputError)
-        refuse(0 < before.st_size <= MAX_RECEIPT_BYTES, "receipt size is outside the allowed range",
+        refuse(0 < before.st_size <= limit, "receipt size is outside the allowed range",
                OutputError)
         chunks = bytearray()
-        while chunk := os.read(fd, min(1024 * 1024, MAX_RECEIPT_BYTES + 1 - len(chunks))):
+        while chunk := os.read(fd, min(1024 * 1024, limit + 1 - len(chunks))):
             chunks.extend(chunk)
-            refuse(len(chunks) <= MAX_RECEIPT_BYTES, "receipt exceeds the size limit", OutputError)
+            refuse(len(chunks) <= limit, "receipt exceeds the size limit", OutputError)
         after = os.fstat(fd)
         path_info = os.stat(path.name, dir_fd=dir_fd, follow_symlinks=False)
         final_parent_path = os.lstat(parent)

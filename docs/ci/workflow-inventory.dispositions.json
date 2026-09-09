@@ -1,0 +1,257 @@
+{
+  "android-fork-release-apk.yml:build-unsigned": {
+    "disposition": "retained-github",
+    "owner": "#146 fork-native signed client release path",
+    "exit": "Android fork release moves to a Buzz release request (after #185 freezes the contract) or Victor parks the fork APK path"
+  },
+  "android-fork-release-apk.yml:sign": {
+    "disposition": "retained-github",
+    "owner": "#146 fork-native signed client release path",
+    "exit": "Victor decides keystore creation or unsigned-only; the android-release environment secrets do not exist yet",
+    "note": "The four BUZZ_ANDROID_RELEASE_* secrets are referenced but not provisioned (#146)."
+  },
+  "android-fork-release-apk.yml:verify-source": {
+    "disposition": "retained-github",
+    "owner": "#146 fork-native signed client release path",
+    "exit": "same as build-unsigned"
+  },
+  "android-fork-release-tag.yml:publish": {
+    "disposition": "retained-github",
+    "owner": "#146 fork-native signed client release path",
+    "exit": "tag publication moves to a signed Buzz release status event; needs contents:write on GitHub today"
+  },
+  "auto-tag-on-release-pr-merge.yml:auto-tag": {
+    "disposition": "retained-github",
+    "owner": "delivery lifecycle (docs/delivery-lifecycle.md)",
+    "exit": "release tagging moves to the Buzz landing procedure; the step already skips only21mil/buzz (line 64), so it is a no-op in the fork",
+    "note": "Runs on every merged main PR but exits early for only21mil/buzz; the fork tags releases through scripts/prepare-desktop-release.sh."
+  },
+  "benchmark-harbor.yml:test": {
+    "disposition": "retained-github",
+    "owner": "benchmarks/harbor-buzz-orchestra maintainers",
+    "exit": "job folds into ci.yml (native CI executes only .github/workflows/ci.yml) or the executor accepts other workflow paths"
+  },
+  "ci.yml:backend-integration": {
+    "disposition": "native",
+    "native": "backend-integration"
+  },
+  "ci.yml:changes": {
+    "disposition": "retained-github",
+    "owner": "#184 native CI program",
+    "exit": "native runs every required ci.yml job for main PRs without path filtering; the ruleset drops this context in the reviewed reversible cutover step",
+    "note": "GitHub-only path filter (dorny/paths-filter). Native requests select job_ids explicitly, so nothing replaces it."
+  },
+  "ci.yml:dead-token-guard": {
+    "disposition": "native",
+    "native": "dead-token-guard"
+  },
+  "ci.yml:desktop": {
+    "disposition": "native",
+    "native": "desktop",
+    "note": "Aggregate check over desktop-core and the four smoke shards; the ruleset requires this name, not the shards."
+  },
+  "ci.yml:desktop-build-macos": {
+    "disposition": "retained-github",
+    "owner": "#185 Apple executor into Buzz",
+    "exit": "an apple-mbp executor class produces this check natively, or Victor removes the context from the ruleset",
+    "note": "Only required check on a macOS runner; the Linux native executor cannot produce it."
+  },
+  "ci.yml:desktop-core": {
+    "disposition": "native",
+    "native": "desktop-core"
+  },
+  "ci.yml:desktop-e2e-integration": {
+    "disposition": "native",
+    "native": "desktop-e2e-integration"
+  },
+  "ci.yml:desktop-e2e-integration-shard": {
+    "disposition": "native",
+    "native": "desktop-e2e-integration-shard",
+    "note": "Needs docker compose (postgres, redis, minio) inside the executor; execd policy proxy admission is the gap to prove."
+  },
+  "ci.yml:desktop-e2e-relay": {
+    "disposition": "native",
+    "native": "desktop-e2e-relay"
+  },
+  "ci.yml:desktop-smoke-e2e": {
+    "disposition": "native",
+    "native": "desktop-smoke-e2e",
+    "note": "Four shards; scripts/protected-ci-reuse.py already keys reuse by desktop-smoke-{n}."
+  },
+  "ci.yml:mobile": {
+    "disposition": "native",
+    "native": "mobile"
+  },
+  "ci.yml:mobile-ios": {
+    "disposition": "retained-github",
+    "owner": "#185 Apple executor into Buzz",
+    "exit": "Apple release request contract and apple-mbp executor class accepted; until then admission needs a reviewed BUZZ_IOS_CI_RUNNER_LABELS selector",
+    "note": "Self-hosted MBP labels come from vars; not a required check."
+  },
+  "ci.yml:relay-e2e": {
+    "disposition": "native",
+    "native": "relay-e2e"
+  },
+  "ci.yml:rust-lint": {
+    "disposition": "native",
+    "native": "rust-lint"
+  },
+  "ci.yml:security": {
+    "disposition": "native",
+    "native": "security",
+    "note": "Reuse binds the RustSec advisory revision (docs/delivery-lifecycle.md); native execution must retain that binding."
+  },
+  "ci.yml:server-cross-compile": {
+    "disposition": "native",
+    "native": "server-cross-compile"
+  },
+  "ci.yml:unit-tests": {
+    "disposition": "native",
+    "native": "unit-tests"
+  },
+  "ci.yml:web": {
+    "disposition": "native",
+    "native": "web"
+  },
+  "desktop-release-cache-proof.yml:linux": {
+    "disposition": "disabled-for-fork"
+  },
+  "desktop-release-cache-proof.yml:macos": {
+    "disposition": "disabled-for-fork"
+  },
+  "desktop-release-cache-proof.yml:windows": {
+    "disposition": "disabled-for-fork"
+  },
+  "desktop-release-candidate.yml:validate": {
+    "disposition": "retained-github",
+    "owner": "delivery lifecycle (scripts/desktop_release.py verify-main)",
+    "exit": "landed desktop identity verification issues a Buzz-signed receipt instead of a GitHub check, or the check folds into ci.yml",
+    "note": "Required check produced outside ci.yml; native CI executes only ci.yml today."
+  },
+  "docker-pr.yml:build": {
+    "disposition": "retained-github",
+    "owner": "relay image publication (docker.yml)",
+    "exit": "executor admits linux/amd64 and linux/arm64 image builds through the execd policy proxy, or validation folds into ci.yml"
+  },
+  "docker.yml:build": {
+    "disposition": "retained-github",
+    "owner": "relay image publication (docker.yml)",
+    "exit": "relay image publishes from Buzz; GHCR push with OIDC attestations has no native equivalent",
+    "note": "Runs in the fork only when vars.GHCR_IMAGE is set."
+  },
+  "docker.yml:merge": {
+    "disposition": "retained-github",
+    "owner": "relay image publication (docker.yml)",
+    "exit": "same as docker.yml:build"
+  },
+  "docker.yml:push-gateway-build": {
+    "disposition": "disabled-for-fork"
+  },
+  "docker.yml:push-gateway-merge": {
+    "disposition": "disabled-for-fork"
+  },
+  "helm-chart.yml:install-on-kind": {
+    "disposition": "retained-github",
+    "owner": "helm chart publication",
+    "exit": "chart validation folds into ci.yml or a native workflow path; dispatch-only today"
+  },
+  "helm-chart.yml:lint-and-unittest": {
+    "disposition": "retained-github",
+    "owner": "helm chart publication",
+    "exit": "same as install-on-kind"
+  },
+  "helm-chart.yml:publish": {
+    "disposition": "retained-github",
+    "owner": "helm chart publication",
+    "exit": "chart publishes from Buzz; GHCR push has no native equivalent"
+  },
+  "linux-canary.yml:build": {
+    "disposition": "retained-github",
+    "owner": "#146 fork-native signed client release path",
+    "exit": "Linux canary builds run as a kind 46100 request against the native executor"
+  },
+  "macos-intel-canary.yml:build": {
+    "disposition": "disabled-for-fork"
+  },
+  "mesh-lifecycle.yml:lifecycle-smoke": {
+    "disposition": "retained-github",
+    "owner": "#184 native CI program",
+    "exit": "smoke folds into ci.yml (path-filtered PR job outside the native workflow path)"
+  },
+  "mobile-release-candidate.yml:publish": {
+    "disposition": "disabled-for-fork",
+    "note": "No if: gate, but the step refuses any repository other than block/buzz (line 50)."
+  },
+  "push-gateway-helm-chart.yml:publish": {
+    "disposition": "retained-github",
+    "owner": "push gateway chart publication",
+    "exit": "chart publishes from Buzz; GHCR push has no native equivalent"
+  },
+  "push-gateway-helm-chart.yml:validate": {
+    "disposition": "retained-github",
+    "owner": "push gateway chart publication",
+    "exit": "validation folds into ci.yml"
+  },
+  "relay_e2e_canary.yml:relay_e2e_canary": {
+    "disposition": "retained-github",
+    "owner": "#184 native CI program",
+    "exit": "canary dispatch becomes a kind 46100 request and the ruleset context follows; today the reviewed candidate attempt satisfies it (docs/delivery-lifecycle.md)",
+    "note": "Required check that only workflow_dispatch produces; nothing runs it automatically on a PR."
+  },
+  "release.yml:assemble-manifest": {
+    "disposition": "disabled-for-fork",
+    "note": "Transitively: requires every release job to succeed and those are gated on block/buzz."
+  },
+  "release.yml:release": {
+    "disposition": "disabled-for-fork"
+  },
+  "release.yml:release-linux": {
+    "disposition": "disabled-for-fork"
+  },
+  "release.yml:release-macos-x64": {
+    "disposition": "disabled-for-fork"
+  },
+  "release.yml:release-windows": {
+    "disposition": "disabled-for-fork",
+    "note": "No if: gate of its own; skipped because needs: setup is gated on block/buzz."
+  },
+  "release.yml:setup": {
+    "disposition": "disabled-for-fork"
+  },
+  "signed-macos-canary.yml:build": {
+    "disposition": "disabled-for-fork"
+  },
+  "sprig-image.yml:merge": {
+    "disposition": "retained-github",
+    "owner": "sprig image publication",
+    "exit": "image publishes from Buzz; GHCR push with attestations has no native equivalent"
+  },
+  "sprig-image.yml:publish": {
+    "disposition": "retained-github",
+    "owner": "sprig image publication",
+    "exit": "same as sprig-image.yml:merge"
+  },
+  "sprig-image.yml:validate": {
+    "disposition": "retained-github",
+    "owner": "sprig image publication",
+    "exit": "PR validation folds into ci.yml or the executor admits arm64 image builds"
+  },
+  "sprig.yml:build": {
+    "disposition": "retained-github",
+    "owner": "sprig release publication",
+    "exit": "sprig binaries build under a kind 46100 request; release upload stays a GitHub contents:write step until Buzz hosts releases"
+  },
+  "sprig.yml:publish": {
+    "disposition": "retained-github",
+    "owner": "sprig release publication",
+    "exit": "same as sprig.yml:build"
+  },
+  "sprig.yml:publish-tag": {
+    "disposition": "retained-github",
+    "owner": "sprig release publication",
+    "exit": "same as sprig.yml:build"
+  },
+  "windows-canary.yml:build": {
+    "disposition": "disabled-for-fork"
+  }
+}

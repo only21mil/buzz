@@ -172,3 +172,30 @@ test("home badge subtotal counts locally unread rows before channel exclusion", 
     true,
   );
 });
+
+test("home badge skips reminder feed items that the Inbox never lists", () => {
+  const items = buildHomeBadgeFeedItems(
+    homeFeed({
+      mentions: [feedItem("mention", "mention")],
+      needsAction: [
+        {
+          ...feedItem("stream-reminder", "needs_action"),
+          kind: 40007,
+          channelId: "stream-channel",
+        },
+        {
+          ...feedItem("approval", "needs_action"),
+          kind: 46010,
+          channelId: "stream-channel",
+        },
+      ],
+    }),
+    [],
+    new Set(),
+  );
+
+  assert.deepEqual(
+    items.map((item) => item.id),
+    ["mention", "approval"],
+  );
+});

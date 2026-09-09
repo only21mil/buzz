@@ -51,10 +51,50 @@ pub(crate) fn kill_stale_tracked_processes_with(
     changed
 }
 
+/// PIDs of every tracked pair child for `pubkey`, ordered by relay URL so
+/// repeated calls over the same map pick the same representative.
+pub(crate) fn tracked_runtime_pids(
+    runtimes: &HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
+    pubkey: &str,
+) -> Vec<u32> {
+    let mut pairs: Vec<(&str, u32)> = runtimes
+        .iter()
+        .filter(|(key, _)| key.pubkey.eq_ignore_ascii_case(pubkey))
+        .map(|(key, runtime)| (key.relay_url.as_str(), runtime.child.id()))
+        .collect();
+    pairs.sort_unstable();
+    pairs.into_iter().map(|(_, pid)| pid).collect()
+}
+
+/// The `runtime_pid` a record should carry given the tracked pairs: the
+/// current value while it still names a live pair child, else the first
+/// tracked pair, else `None`. Callers that stop pairs use this so the record
+/// keeps naming a supervised harness when another pair remains.
+pub(crate) fn tracked_runtime_pid(
+    runtimes: &HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
+    record: &ManagedAgentRecord,
+) -> Option<u32> {
+    let pids = tracked_runtime_pids(runtimes, &record.pubkey);
+    record
+        .runtime_pid
+        .filter(|pid| pids.contains(pid))
+        .or_else(|| pids.first().copied())
+}
+
 pub fn sync_managed_agent_processes(
     records: &mut [ManagedAgentRecord],
     runtimes: &mut HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
     _instance_id: &str,
+) -> (bool, Vec<String>) {
+    sync_managed_agent_processes_with(records, runtimes, process_is_running)
+}
+
+/// Injectable version of `sync_managed_agent_processes`. `is_running(pid)`
+/// decides whether an untracked `runtime_pid` still names a live process.
+pub(crate) fn sync_managed_agent_processes_with(
+    records: &mut [ManagedAgentRecord],
+    runtimes: &mut HashMap<ManagedAgentRuntimeKey, ManagedAgentPairRuntime>,
+    is_running: impl Fn(u32) -> bool,
 ) -> (bool, Vec<String>) {
     let mut changed = false;
     let mut exited = Vec::new();
@@ -108,14 +148,31 @@ pub fn sync_managed_agent_processes(
     }
 
     let exited_pubkeys: Vec<String> = exited.iter().map(|key| key.pubkey.clone()).collect();
+    let mut reaped_pids = Vec::new();
     for key in exited {
-        runtimes.remove(&key);
+        if let Some(runtime) = runtimes.remove(&key) {
+            reaped_pids.push(runtime.child.id());
+        }
     }
 
-    // `runtime_pid` is legacy bookkeeping. Pair runtimes and receipts are the
-    // authoritative lifecycle source; migration cleanup is handled separately.
+    // `runtime_pid` mirrors the harness this desktop supervises, so the
+    // on-disk record names a PID while a pair child runs. Pair runtimes and
+    // receipts stay the authoritative lifecycle source. Clear the field only
+    // on a confirmed exit: the pair reaped above, or an untracked PID that no
+    // longer runs. An untracked PID that is still alive belongs to a prior
+    // session; `kill_stale_tracked_processes` claims or releases it at launch.
     for record in records.iter_mut() {
-        if record.runtime_pid.take().is_some() {
+        if record.backend != crate::managed_agents::BackendKind::Local {
+            continue;
+        }
+        let next = match tracked_runtime_pid(runtimes, record) {
+            Some(pid) => Some(pid),
+            None => record
+                .runtime_pid
+                .filter(|pid| !reaped_pids.contains(pid) && is_running(*pid)),
+        };
+        if next != record.runtime_pid {
+            record.runtime_pid = next;
             record.updated_at = now_iso();
             changed = true;
         }

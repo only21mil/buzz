@@ -49,6 +49,8 @@
 //!   bounds are present and valid together. An absent block returns the
 //!   precise `policy_unavailable` 503 rather than inventing defaults.
 
+pub mod apple_release;
+
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
