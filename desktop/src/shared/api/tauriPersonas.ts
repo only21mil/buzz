@@ -5,6 +5,7 @@ import type {
   RespondToMode,
   UpdatePersonaInput,
 } from "@/shared/api/types";
+import { assertPersonaPromptPersisted } from "./agentPromptPersistence";
 
 export type RawPersona = {
   id: string;
@@ -93,6 +94,9 @@ export async function createPersona(
 function updatePersonaPayload(input: UpdatePersonaInput) {
   return {
     id: input.id,
+    expectedUpdatedAt: input.expectedUpdatedAt,
+    expectedContent: input.expectedContent,
+    expectedShared: input.expectedShared,
     displayName: input.displayName,
     avatarUrl: input.avatarUrl,
     systemPrompt: input.systemPrompt,
@@ -120,7 +124,9 @@ export async function updatePersona(
       `[updatePersona] pack write-back failed (edit saved locally): ${raw.writeback_warning}`,
     );
   }
-  return fromRawPersona(raw);
+  const persona = fromRawPersona(raw);
+  assertPersonaPromptPersisted(input, persona);
+  return persona;
 }
 
 /**
@@ -134,12 +140,14 @@ export async function updatePersona(
 export async function updatePersonaAndPublish(
   input: UpdatePersonaInput,
 ): Promise<PersonaSharePublicationResult> {
-  return fromRawPublicationResult(
+  const result = fromRawPublicationResult(
     await invokeTauri<RawPersonaSharePublicationResult>(
       "update_persona_and_publish",
       { input: updatePersonaPayload(input) },
     ),
   );
+  assertPersonaPromptPersisted(input, result.persona);
+  return result;
 }
 
 type RawPersonaSharePublicationResult = {

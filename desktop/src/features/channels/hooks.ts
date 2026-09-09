@@ -33,11 +33,6 @@ import type {
   UpdateChannelInput,
 } from "@/shared/api/types";
 import { useFocusedRefetchInterval } from "@/shared/lib/useDocumentVisible";
-import { useCommunities } from "@/features/communities/useCommunities";
-import {
-  readChannelSnapshot,
-  writeChannelSnapshot,
-} from "@/features/channels/channelSnapshot";
 import {
   CHANNEL_MEMBERS_STALE_TIME_MS,
   channelMembersQueryKey,
@@ -196,8 +191,6 @@ function setChannelArchivedState(
 }
 
 export function useChannelsQuery(options?: { enabled?: boolean }) {
-  const { activeCommunity } = useCommunities();
-  const relayUrl = activeCommunity?.relayUrl ?? null;
   const refetchInterval = useFocusedRefetchInterval(
     CHANNELS_REFETCH_INTERVAL_MS,
   );
@@ -207,21 +200,8 @@ export function useChannelsQuery(options?: { enabled?: boolean }) {
     queryKey: channelsQueryKey,
     queryFn: async () => {
       const channels = sortChannels(await getChannels());
-      if (relayUrl) {
-        writeChannelSnapshot(relayUrl, channels);
-      }
       return channels;
     },
-    // Paint the sidebar instantly from the last-known list for this relay, then
-    // revalidate. initialDataUpdatedAt:0 marks the seed as already-stale so the
-    // background refetch still fires immediately.
-    initialData: relayUrl
-      ? () => {
-          const snapshot = readChannelSnapshot(relayUrl);
-          return snapshot ? sortChannels(snapshot) : undefined;
-        }
-      : undefined,
-    initialDataUpdatedAt: 0,
     staleTime: CHANNELS_FOCUS_STALE_TIME_MS,
     refetchInterval,
     refetchOnWindowFocus: true,

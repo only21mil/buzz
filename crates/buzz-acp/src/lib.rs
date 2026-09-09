@@ -16,6 +16,7 @@ mod prompt_project;
 mod queue;
 mod relay;
 mod scope;
+mod self_wake;
 mod setup_mode;
 mod sibling_auth;
 mod usage;
@@ -1276,9 +1277,9 @@ fn handle_cancel_turn_control(
 /// post-cancel via `create_session_and_apply_model` (the turn restarts on the
 /// unchanged model + an `unsupported_model` result).
 ///
-/// Idle path: validate against the cached catalog *before* invalidating
-/// (pre-cancel guard), then set `desired_model` + invalidate. The override
-/// takes visible effect on the agent's next turn.
+/// Idle path: a fresh, non-empty cached catalog may reject the pick before
+/// invalidation. Empty or expired catalogs defer validation to the next
+/// `session/new`, which also refreshes the cache.
 async fn handle_switch_model_control(
     payload: &serde_json::Value,
     pool: &mut AgentPool,
@@ -1323,7 +1324,7 @@ async fn handle_switch_model_control(
             "turn_ending"
         }
     } else {
-        // Idle path: validate against the cached catalog before invalidating.
+        // Idle path: only a fresh, non-empty catalog can reject before invalidation.
         match pool.switch_idle_agent_model(channel_id, model_id).await {
             IdleSwitchResult::AmbiguousTarget => "ambiguous_target",
             IdleSwitchResult::Switched => "switched",
@@ -2337,9 +2338,8 @@ async fn tokio_main() -> Result<()> {
             last_maintenance = std::time::Instant::now();
             queue.compact_expired_state();
 
-            // Reap at most one session per maintenance tick. The close RPC has
-            // its own 3s end-to-end deadline, so maintenance never cancels a
-            // request after the adapter may already have applied it.
+            // Release at most one session per maintenance tick. Pending closes
+            // take priority over idle eviction and keep the same RPC deadline.
             let reaped = pool
                 .reap_idle_sessions(
                     Duration::from_secs(config.session_idle_ttl_secs),
@@ -2347,7 +2347,7 @@ async fn tokio_main() -> Result<()> {
                 )
                 .await;
             if reaped > 0 {
-                tracing::info!(reaped, "closed idle or excess ACP sessions");
+                tracing::info!(reaped, "released pending, idle, or excess ACP sessions");
             }
 
             // Slot refill: spawn background tasks for empty slots whose
@@ -2682,7 +2682,7 @@ async fn tokio_main() -> Result<()> {
                                 continue;
                             }
 
-                            if config.ignore_self && buzz_event.event.pubkey.to_hex() == pubkey_hex {
+                            if self_wake::should_ignore_self(&buzz_event, &pubkey_hex, config.ignore_self) {
                                 tracing::debug!(channel_id = %buzz_event.channel_id, "dropping self-authored event");
                                 inbox_cursor.mark_processed([&buzz_event.event]);
                                 continue;
@@ -4001,6 +4001,25 @@ fn is_auth_error(error: &acp::AcpError) -> bool {
     message.contains("Re-authenticate") || message.contains("API Error: 401")
 }
 
+/// Model availability failures can come from a stale provider observation
+/// inside the adapter process. Restart through the existing backoff/circuit
+/// breaker rather than repeatedly returning the same cached adapter to work.
+/// Only structured errors qualify; assistant text is not a recovery signal.
+fn is_model_availability_error(error: &acp::AcpError) -> bool {
+    let acp::AcpError::AgentError { message, .. } = error else {
+        return false;
+    };
+    if is_auth_error(error) {
+        return false;
+    }
+    let message = message.to_ascii_lowercase();
+    message.contains("model_not_found")
+        || message.contains("model not found")
+        || message.contains("no models available")
+        || message.contains("no available models")
+        || (message.contains("issue with the selected model") && message.contains("may not exist"))
+}
+
 /// Spawn a task that posts a user-visible failure notice to the relay.
 ///
 /// Shared by the hard-cap immediate dead-letter path and the retries-exhausted
@@ -4431,14 +4450,16 @@ async fn handle_prompt_result(
                 acp::AcpError::AgentError { code, .. } => Some(*code),
                 _ => None,
             };
-            if is_transport_error {
+            let is_model_error = is_model_availability_error(e);
+            if is_transport_error || is_model_error {
                 tracing::warn!(
                     agent = agent_index,
                     outcome = outcome_label,
                     configured_model = %harness_configured_model,
                     pid = harness_pid,
                     error = %e,
-                    "transport/protocol error — respawning agent"
+                    is_model_error,
+                    "transport/protocol or model availability error — respawning agent"
                 );
                 emit_turn_error(&e.to_string(), error_code);
 
@@ -7505,7 +7526,7 @@ mod error_outcome_emission_tests {
     use nostr::{EventBuilder, Keys, Kind};
     use std::collections::HashSet;
 
-    fn test_config() -> Config {
+    pub(crate) fn test_config() -> Config {
         Config {
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
@@ -9167,6 +9188,37 @@ mod error_outcome_emission_tests {
     }
 
     // ── is_auth_error classification ───────────────────────────────────────
+
+    #[test]
+    fn model_availability_recovery_only_classifies_specific_agent_errors() {
+        for message in [
+            "MODEL_NOT_FOUND: test-model",
+            "Model not found",
+            "No models available",
+            "No available models for provider",
+            "There's an issue with the selected model (test-model). It may not exist or you may not have access to it.",
+        ] {
+            assert!(is_model_availability_error(&AcpError::AgentError { code: -32000, message: message.into() }), "{message}");
+        }
+        for message in [
+            "Usage credits required for 1M context",
+            "Invalid model response",
+            "Tool failed: file not found",
+            "API Error: 401 model_not_found",
+            "Re-authenticate: no models available",
+        ] {
+            assert!(
+                !is_model_availability_error(&AcpError::AgentError {
+                    code: -32000,
+                    message: message.into()
+                }),
+                "{message}"
+            );
+        }
+        assert!(!is_model_availability_error(&AcpError::Protocol(
+            "model_not_found".into()
+        )));
+    }
 
     #[test]
     fn is_auth_error_matches_reauthenticate_message() {

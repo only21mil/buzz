@@ -93,3 +93,51 @@ test("selections survive option refreshes within the same repository", async () 
   assert.equal(result.current.activeBranch, "release");
   assert.equal(result.current.selectedTag, "v1");
 });
+
+test("removed remote branches fall back to the current default", async () => {
+  const { act, rerender, result } = await renderSelection(REPO_A);
+  act(() => result.current.selectBranch("release"));
+  rerender({ ...REPO_A, branchOptions: ["main"] });
+  assert.equal(result.current.activeBranch, "main");
+  rerender({ ...REPO_A, defaultBranch: "trunk", branchOptions: ["trunk"] });
+  assert.equal(result.current.activeBranch, "trunk");
+});
+
+test("an explicit local-only branch survives composed hook refreshes until repository switch", async () => {
+  const { act, renderHook } = await import("@testing-library/react");
+  const { useOptimisticProjectBranches } = await import(
+    "./useOptimisticProjectBranches.ts"
+  );
+  const observedBranches = [{ name: "main", commit: "a".repeat(40) }];
+  const { result, rerender } = renderHook(
+    (props) => {
+      const { branchOptions } = useOptimisticProjectBranches({
+        defaultBranch: props.defaultBranch,
+        observedBranches,
+        projectId: props.repositoryId,
+        // ProjectDetailScreen produces a fresh PR-reference list every render.
+        referencedBranches: [].map((pr) => pr.branchName ?? null),
+      });
+      return hookModule.useProjectRepositoryRefSelection({
+        ...props,
+        branchOptions,
+      });
+    },
+    { initialProps: REPO_A },
+  );
+  act(() => result.current.selectBranch("feature/local"));
+  assert.equal(result.current.activeBranch, "feature/local");
+  rerender({ ...REPO_A });
+  assert.equal(result.current.activeBranch, "feature/local");
+  rerender(REPO_B);
+  assert.equal(result.current.activeBranch, "trunk");
+});
+
+test("a local choice becomes a normal remote choice once it is observed", async () => {
+  const { act, rerender, result } = await renderSelection(REPO_A);
+  act(() => result.current.selectBranch("feature/local"));
+  rerender({ ...REPO_A, branchOptions: ["main", "feature/local"] });
+  assert.equal(result.current.activeBranch, "feature/local");
+  rerender({ ...REPO_A, branchOptions: ["main"] });
+  assert.equal(result.current.activeBranch, "main");
+});

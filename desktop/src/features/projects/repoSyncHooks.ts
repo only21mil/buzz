@@ -120,6 +120,7 @@ export function usePushProjectLocalRepositoryMutation(
 export function useCloneProjectRepositoryMutation(
   project: Project | null | undefined,
   reposDir?: string | null,
+  branchName?: string | null,
 ) {
   const queryClient = useQueryClient();
   return useMutation({
@@ -129,7 +130,7 @@ export function useCloneProjectRepositoryMutation(
         reposDir,
         projectDtag: project.dtag,
         cloneUrl: project.cloneUrls[0],
-        defaultBranch: project.defaultBranch,
+        defaultBranch: branchName ?? project.defaultBranch,
       });
     },
     onSuccess: async () => {

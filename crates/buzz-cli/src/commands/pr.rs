@@ -28,6 +28,7 @@ pub async fn cmd_open_pr(
     commit: &str,
     clone_urls: &[String],
     branch_name: Option<&str>,
+    target_branch: Option<&str>,
     merge_base: Option<&str>,
     euc: Option<&str>,
     labels: &[String],
@@ -56,6 +57,7 @@ pub async fn cmd_open_pr(
         commit: commit.to_string(),
         clone_urls: clone_urls.to_vec(),
         branch_name: branch_name.map(str::to_string),
+        target_branch: target_branch.map(str::to_string),
         merge_base: merge_base.map(str::to_string),
         revision_of: revision_of.map(str::to_string),
     };
@@ -231,6 +233,7 @@ pub async fn dispatch(cmd: crate::PrCmd, client: &BuzzClient) -> Result<(), CliE
             commit,
             clone,
             branch_name,
+            target_branch,
             merge_base,
             euc,
             label,
@@ -250,6 +253,7 @@ pub async fn dispatch(cmd: crate::PrCmd, client: &BuzzClient) -> Result<(), CliE
                 &commit,
                 &clone,
                 branch_name.as_deref(),
+                target_branch.as_deref(),
                 merge_base.as_deref(),
                 euc.as_deref(),
                 &label,
@@ -307,6 +311,9 @@ pub async fn dispatch(cmd: crate::PrCmd, client: &BuzzClient) -> Result<(), CliE
                 limit,
             )
             .await
+        }
+        PrCmd::Statuses { pr } => {
+            crate::commands::events::cmd_list_statuses(client, &pr, 1618, "pull request").await
         }
         PrCmd::Status {
             pr,

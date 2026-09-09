@@ -11,6 +11,26 @@ use crate::{AgentsCmd, RespondToArg};
 
 pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), CliError> {
     match command {
+        AgentsCmd::DraftRetry { request_id } => {
+            let owner = require_owner(client)?;
+            let event = crate::agent_management::load_outbox(
+                client.relay_url(),
+                client.keys(),
+                &owner,
+                &request_id,
+            )?;
+            submit_draft(
+                client,
+                crate::agent_management::BuiltDraftRequest {
+                    event,
+                    request_id,
+                    action: "retry",
+                },
+                false,
+            )
+            .await
+        }
+
         AgentsCmd::DraftCreate {
             channel,
             display_name,
@@ -26,21 +46,7 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
                     system_prompt: read_or_stdin(&system_prompt)?,
                 },
             )?;
-            let response = client.publish_ephemeral_event(built.event).await?;
-            let mut output: serde_json::Value = serde_json::from_str(&response)
-                .map_err(|e| CliError::Other(format!("invalid relay response: {e}")))?;
-            if let Some(obj) = output.as_object_mut() {
-                obj.insert("request_id".into(), built.request_id.into());
-                obj.insert("action".into(), built.action.into());
-                obj.insert("saved".into(), false.into());
-                obj.insert(
-                    "message".into(),
-                    "Draft sent to Buzz Desktop for owner review. Nothing changes until the owner saves it."
-                        .into(),
-                );
-            }
-            println!("{output}");
-            Ok(())
+            submit_draft(client, built, true).await
         }
 
         AgentsCmd::DraftUpdate {
@@ -68,21 +74,7 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
                     respond_to: respond_to.map(RespondToArg::to_wire),
                 },
             )?;
-            let response = client.publish_ephemeral_event(built.event).await?;
-            let mut output: serde_json::Value = serde_json::from_str(&response)
-                .map_err(|e| CliError::Other(format!("invalid relay response: {e}")))?;
-            if let Some(obj) = output.as_object_mut() {
-                obj.insert("request_id".into(), built.request_id.into());
-                obj.insert("action".into(), built.action.into());
-                obj.insert("saved".into(), false.into());
-                obj.insert(
-                    "message".into(),
-                    "Draft sent to Buzz Desktop for owner review. Nothing changes until the owner saves it."
-                        .into(),
-                );
-            }
-            println!("{output}");
-            Ok(())
+            submit_draft(client, built, true).await
         }
 
         AgentsCmd::Archive {
@@ -525,6 +517,34 @@ fn verify_archived_event<'a>(
         .collect();
 
     Ok(archived)
+}
+
+async fn submit_draft(
+    client: &BuzzClient,
+    built: crate::agent_management::BuiltDraftRequest,
+    retain: bool,
+) -> Result<(), CliError> {
+    let owner = require_owner(client)?;
+    if retain {
+        crate::agent_management::retain_outbox(client.relay_url(), client.keys(), &owner, &built)?;
+    }
+    eprintln!(
+        "Retained draft {}. Retry with: buzz agents draft-retry {}",
+        built.request_id, built.request_id
+    );
+    let response = client.submit_stored_event(built.event).await?;
+    let response: serde_json::Value =
+        serde_json::from_str(&response).map_err(|e| CliError::Other(e.to_string()))?;
+    if !response.to_string().contains("stored: agent-draft-v1") {
+        return Err(CliError::Other(
+            "relay did not confirm durable draft support; retained request may be retried".into(),
+        ));
+    }
+    println!(
+        "{}",
+        json!({"request_id":built.request_id,"action":built.action,"stored":true,"review_eligible":null,"applied":false,"saved":false,"message":"Ciphertext stored for the owner. Desktop checks registered-agent and shared-channel eligibility; receipt does not promise an actionable review."})
+    );
+    Ok(())
 }
 
 #[cfg(test)]

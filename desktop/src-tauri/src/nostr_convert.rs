@@ -466,11 +466,43 @@ pub fn search_response_from_events(events: &[Event]) -> SearchResponse {
 
 /// Convert kind:10100 agent profile events to the agent discovery format.
 ///
-/// Returns a JSON array of `{pubkey, name, ...}` objects parsed from each
-/// event's content.
+/// Policy-only records are not directory profiles. If historical duplicate
+/// replaceable events are returned, choose each author's newest event before
+/// deciding whether its content describes an agent.
+pub(super) fn event_has_agent_identity(event: &Event) -> bool {
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&event.content) else {
+        return false;
+    };
+    ["name", "display_name"].iter().any(|field| {
+        object
+            .get(*field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    })
+}
+
 pub fn agents_from_events(events: &[Event]) -> Value {
-    let arr: Vec<Value> = events
-        .iter()
+    let mut latest: Vec<(usize, &Event)> = Vec::new();
+    for (index, event) in events.iter().enumerate() {
+        if let Some((_, previous)) = latest
+            .iter_mut()
+            .find(|(_, previous)| previous.pubkey == event.pubkey)
+        {
+            if event.created_at > previous.created_at
+                || (event.created_at == previous.created_at && event.id < previous.id)
+            {
+                *previous = event;
+            }
+        } else {
+            latest.push((index, event));
+        }
+    }
+    latest.sort_by_key(|(index, _)| *index);
+
+    let arr: Vec<Value> = latest
+        .into_iter()
+        .map(|(_, event)| event)
+        .filter(|event| event_has_agent_identity(event))
         .map(|ev| {
             let mut v: Value = serde_json::from_str(&ev.content).unwrap_or_else(|_| json!({}));
             let pubkey = ev.pubkey.to_hex();
@@ -492,14 +524,21 @@ pub fn agents_from_events(events: &[Event]) -> Value {
                 if !obj.get("agent_type").is_some_and(Value::is_string) {
                     obj.insert("agent_type".to_string(), json!("agent"));
                 }
-                if !obj.get("channels").is_some_and(Value::is_array) {
-                    obj.insert("channels".to_string(), json!([]));
-                }
-                if !obj.get("channel_ids").is_some_and(Value::is_array) {
-                    obj.insert("channel_ids".to_string(), json!([]));
-                }
-                if !obj.get("capabilities").is_some_and(Value::is_array) {
-                    obj.insert("capabilities".to_string(), json!([]));
+                // These descriptive arrays must not poison typed directory
+                // decoding. Keep policy fields on their strict decode path.
+                for field in ["channels", "channel_ids", "capabilities"] {
+                    let strings = obj
+                        .get(field)
+                        .and_then(Value::as_array)
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter(|value| value.is_string())
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    obj.insert(field.to_string(), Value::Array(strings));
                 }
                 if !obj.get("status").is_some_and(Value::is_string) {
                     obj.insert("status".to_string(), json!("offline"));

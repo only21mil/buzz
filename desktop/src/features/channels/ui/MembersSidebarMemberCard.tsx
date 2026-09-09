@@ -94,7 +94,9 @@ const MEMBER_ROW_INSET_DIVIDER_CLASS =
 
 function formatRoleLabel(member: ChannelMember, memberIsBot: boolean) {
   if (memberIsBot) {
-    return "agent";
+    return member.role === "owner" || member.role === "admin"
+      ? `agent · ${member.role}`
+      : "agent";
   }
 
   if (member.role === "owner" || member.role === "admin") {
@@ -154,7 +156,10 @@ export function MembersSidebarMemberCard({
   const canModerateMember =
     canModerate && !memberIsBot && member.role !== "owner";
   const hasActions = memberIsBot
-    ? Boolean(managedAgent) || canRemoveMember || canViewActivity
+    ? Boolean(managedAgent) ||
+      canRemoveMember ||
+      canViewActivity ||
+      canChangeRole
     : canRemoveMember || canChangeRole || canModerateMember;
 
   const memberIdentity = (
@@ -267,6 +272,7 @@ export function MembersSidebarMemberCard({
           disabled={disabled}
           managedAgent={managedAgent}
           member={member}
+          memberLabel={memberLabel}
           memberIsBot={memberIsBot}
           moderationState={moderationState}
           onBan={onBan}
@@ -285,7 +291,7 @@ export function MembersSidebarMemberCard({
   );
 }
 
-const PEOPLE_ROLES = ["admin", "member", "guest"] as const;
+const MEMBER_ROLES = ["admin", "member", "guest"] as const;
 
 function MemberActionsMenu({
   canChangeRole,
@@ -295,6 +301,7 @@ function MemberActionsMenu({
   disabled,
   managedAgent,
   member,
+  memberLabel,
   memberIsBot,
   moderationState,
   onBan,
@@ -315,6 +322,7 @@ function MemberActionsMenu({
   disabled: boolean;
   managedAgent?: ManagedAgent;
   member: ChannelMember;
+  memberLabel: string;
   memberIsBot: boolean;
   moderationState?: MemberModerationState;
   onBan: (member: ChannelMember) => void;
@@ -328,8 +336,7 @@ function MemberActionsMenu({
   onViewActivity?: (pubkey: string) => void;
   pairAction?: ManagedAgentPairAction;
 }) {
-  const showChangeRole =
-    canChangeRole && !memberIsBot && member.role !== "owner";
+  const showChangeRole = canChangeRole && member.role !== "owner";
   const isBanned = moderationState?.banned ?? false;
   const isTimedOut = moderationState?.timedOut ?? false;
 
@@ -337,7 +344,8 @@ function MemberActionsMenu({
     <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
         <button
-          className="invisible relative z-20 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground group-hover/member:visible hover:bg-muted hover:text-foreground data-[state=open]:visible"
+          aria-label={`Actions for ${memberLabel}`}
+          className="relative z-20 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity group-hover/member:opacity-100 focus-visible:opacity-100 hover:bg-muted hover:text-foreground data-[state=open]:opacity-100"
           data-testid={`sidebar-member-menu-${member.pubkey}`}
           type="button"
         >
@@ -397,18 +405,20 @@ function MemberActionsMenu({
               Change role
             </DropdownMenuSubTrigger>
             <DropdownMenuSubContent>
-              {PEOPLE_ROLES.map((role) => (
-                <DropdownMenuItem
-                  data-testid={`sidebar-role-${role}-${member.pubkey}`}
-                  disabled={disabled || member.role === role}
-                  key={role}
-                  onClick={() => onChangeRole(member, role)}
-                >
-                  {role[0]?.toUpperCase()}
-                  {role.slice(1)}
-                  {member.role === role ? " (current)" : ""}
-                </DropdownMenuItem>
-              ))}
+              {(memberIsBot ? [...MEMBER_ROLES, "bot"] : MEMBER_ROLES).map(
+                (role) => (
+                  <DropdownMenuItem
+                    data-testid={`sidebar-role-${role}-${member.pubkey}`}
+                    disabled={disabled || member.role === role}
+                    key={role}
+                    onClick={() => onChangeRole(member, role)}
+                  >
+                    {role[0]?.toUpperCase()}
+                    {role.slice(1)}
+                    {member.role === role ? " (current)" : ""}
+                  </DropdownMenuItem>
+                ),
+              )}
             </DropdownMenuSubContent>
           </DropdownMenuSub>
         ) : null}

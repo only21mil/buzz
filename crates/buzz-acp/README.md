@@ -365,3 +365,29 @@ See the [root TESTING.md](../../TESTING.md) for the full integration testing gui
 ## License
 
 Apache-2.0
+
+### Explicit tooling self-wakes
+
+A detached helper signing with the agent's key can send a completion message
+with `buzz messages send --channel <UUID> --content 'tool completed' --wake-self`.
+The CLI adds the signing key's `p` tag and exactly `["wake","self"]`. This option
+supports kind 9 and uses the normal channel-membership preflight. `--reply-to`
+keeps the completion in its existing thread.
+
+ACP permits this message through its self-message guard only after verifying
+the event signature, signing agent, explicit target and single matching channel
+tag. Existing author policy still applies, including `respond-to=nobody`,
+owner/sibling authorization in DMs, and channel/kind subscription rules. The
+marker does not grant an unowned agent access or impersonate its owner for
+owner-interrupt scheduling. Completed replay is suppressed by the normal inbox
+cursor; accepted messages use the normal queue and pool lifecycle. Ordinary
+agent replies do not carry the marker, so self-mentions remain silent. Tools
+must opt in for each new intended wake; possessing an agent key already allows
+its holder to sign such explicit requests.
+
+Workflow wakes use the existing relay-signed `buzz:workflow-owner` and
+`buzz:workflow-mention` tags, bound to the authenticated connection's discovered
+relay identity and the destination channel. Only explicitly authored targets
+receive workflow-owner delegation; rendered input and legacy attribution-only
+`p` tags do not supply it. The existing owner/allowlist/DM policy still decides
+admission, and workflow recursion guards remain in force.

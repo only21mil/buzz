@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use buzz_core::kind::{
     event_kind_i32, is_ephemeral, is_parameterized_replaceable, KIND_AUTH, KIND_EVENT_REMINDER,
-    KIND_HUDDLE_STARTED, SHARED_GATED_KINDS,
+    KIND_HUDDLE_STARTED, KIND_PERSONA, SHARED_GATED_KINDS,
 };
 use buzz_core::{CommunityId, StoredEvent};
 
@@ -70,6 +70,9 @@ pub struct EventQuery {
     /// Restrict results to events with an `e` tag referencing any of these event IDs (hex).
     /// Uses JSONB containment (`tags @> ...`) against the `tags` column.
     pub e_tags: Option<Vec<String>>,
+    /// Restrict results to events with an `a` tag referencing any of these coordinates.
+    /// Matches the tag name and value at their protocol positions before SQL LIMIT.
+    pub a_tags: Option<Vec<String>>,
     /// Restrict to a custom tag name/value pair before SQL LIMIT.
     pub custom_tag: Option<(String, String)>,
     /// Restrict results to events in any of these channels, while retaining
@@ -123,6 +126,7 @@ impl EventQuery {
             authors: None,
             ids: None,
             e_tags: None,
+            a_tags: None,
             custom_tag: None,
             channel_ids: None,
             max_limit: None,
@@ -399,6 +403,7 @@ pub(crate) async fn query_events_on(
 
     // Use unqualified column names when no join, qualified when joined.
     let col_prefix = if q.p_tag_hex.is_some() { "e." } else { "" };
+    push_persona_head_filter(&mut qb, col_prefix, q);
 
     if let Some(ch) = q.channel_id {
         qb.push(format!(" AND {col_prefix}channel_id = "))
@@ -467,11 +472,14 @@ pub(crate) async fn query_events_on(
         }
     }
 
+    push_coordinate_filter(&mut qb, col_prefix, &q.a_tags);
+
     // e-tag pushdown via JSONB containment: tags @> '[["e","<hex>"]]'.
     // Multiple e-tags use OR (any match). Served by idx_events_tags_gin
     // (GIN, jsonb_path_ops — migrations/0004): the channel-window aux closure
     // fans this out once per retained row, which made unindexed containment
     // the dominant scroll-back cost (~1.7s/page on staging).
+
     if let Some(ref e_tags) = q.e_tags {
         if !e_tags.is_empty() {
             qb.push(" AND (");
@@ -678,6 +686,7 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
     };
 
     let col_prefix = if q.p_tag_hex.is_some() { "e." } else { "" };
+    push_persona_head_filter(&mut qb, col_prefix, q);
 
     if let Some(ch) = q.channel_id {
         qb.push(format!(" AND {col_prefix}channel_id = "))
@@ -739,6 +748,8 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
         }
     }
 
+    push_coordinate_filter(&mut qb, col_prefix, &q.a_tags);
+
     if let Some(ref e_tags) = q.e_tags {
         if !e_tags.is_empty() {
             qb.push(" AND (");
@@ -781,6 +792,71 @@ pub(crate) async fn count_events_on(conn: &mut sqlx::PgConnection, q: &EventQuer
     let cnt: i64 = row.try_get("cnt")?;
 
     Ok(cnt)
+}
+
+/// Read one live persona head even if storage contains superseded live rows.
+///
+/// Match the writer's community/author/kind/d identity and ordering. Channel,
+/// visibility, time, ID and tag filters apply to the winning head only: applying
+/// them to the competing versions could revive an old shared persona after its
+/// author replaced it with a private one. Deleted rows cannot win. Other kinds
+/// retain their existing read contracts (including channel-keyed NIP-29 state).
+fn push_persona_head_filter(qb: &mut QueryBuilder<Postgres>, col_prefix: &str, q: &EventQuery) {
+    if q.kinds
+        .as_ref()
+        .is_some_and(|kinds| !kinds.contains(&(KIND_PERSONA as i32)))
+    {
+        return;
+    }
+    // Qualify the outer row even without the mention join, so references in
+    // the correlated subquery cannot resolve to the competing head itself.
+    let outer = if col_prefix.is_empty() {
+        "events."
+    } else {
+        col_prefix
+    };
+    qb.push(format!(" AND ({outer}kind <> "))
+        .push_bind(KIND_PERSONA as i32)
+        .push(format!(
+            " OR NOT EXISTS (SELECT 1 FROM events persona_head \
+             WHERE persona_head.community_id = {outer}community_id \
+             AND persona_head.kind = {outer}kind \
+             AND persona_head.pubkey = {outer}pubkey \
+             AND persona_head.d_tag = {outer}d_tag \
+             AND persona_head.deleted_at IS NULL \
+             AND (persona_head.created_at > {outer}created_at \
+                  OR (persona_head.created_at = {outer}created_at \
+                      AND persona_head.id < {outer}id))))"
+        ));
+}
+
+/// Apply coordinate OR semantics inside the surrounding query's AND constraints.
+fn push_coordinate_filter(
+    qb: &mut QueryBuilder<sqlx::Postgres>,
+    col_prefix: &str,
+    coordinates: &Option<Vec<String>>,
+) {
+    let Some(coordinates) = coordinates else {
+        return;
+    };
+    if coordinates.is_empty() {
+        qb.push(" AND FALSE");
+        return;
+    }
+    qb.push(" AND (");
+    for (index, coordinate) in coordinates.iter().enumerate() {
+        if index > 0 {
+            qb.push(" OR ");
+        }
+        // Containment can use the tags GIN index, but ignores array positions.
+        // The EXISTS check excludes values found in a marker or another tag slot.
+        qb.push(format!("({col_prefix}tags @> "))
+            .push_bind(serde_json::json!([["a", coordinate]]))
+            .push(format!(" AND EXISTS (SELECT 1 FROM jsonb_array_elements({col_prefix}tags) AS coordinate_tag WHERE coordinate_tag->>0 = 'a' AND coordinate_tag->>1 = "))
+            .push_bind(coordinate.clone())
+            .push("))");
+    }
+    qb.push(")");
 }
 
 /// Soft-delete an event by setting `deleted_at = NOW()`.
@@ -1911,6 +1987,283 @@ mod tests {
             .expect("sign timestamped event")
     }
 
+    fn persona_version(keys: &Keys, slug: &str, version: &str, time: u64) -> nostr::Event {
+        EventBuilder::new(Kind::Custom(30175), version)
+            .tags([Tag::identifier(slug)])
+            .custom_created_at(nostr::Timestamp::from(1_800_000_000 + time))
+            .sign_with_keys(keys)
+            .expect("sign persona")
+    }
+
+    async fn assert_persona_query(pool: &PgPool, q: &EventQuery, expected: &[&nostr::Event]) {
+        let rows = query_events(pool, q).await.expect("query persona heads");
+        assert_eq!(
+            rows.iter().map(|row| row.event.id).collect::<Vec<_>>(),
+            expected.iter().map(|event| event.id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            count_events(pool, q).await.expect("count persona heads"),
+            expected.len() as i64
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn persona_heads_precede_limits_and_count_with_deterministic_ties() {
+        let pool = setup_pool().await;
+        let community = CommunityId::from_uuid(make_test_community(&pool).await);
+        let keys = Keys::generate();
+        let mut expected = Vec::new();
+        for (index, slug) in ["first", "second"].into_iter().enumerate() {
+            let newest = persona_version(&keys, slug, "new", 200 + index as u64);
+            let old = persona_version(&keys, slug, "old", 100 + index as u64);
+            let versions = if index == 0 {
+                [&old, &newest]
+            } else {
+                [&newest, &old]
+            };
+            // Seed the reported two-live-head state directly. The normal writer
+            // retires old rows; reads must also tolerate existing duplicates.
+            for event in versions {
+                insert_event(&pool, community, event, None).await.unwrap();
+            }
+            expected.push(newest);
+        }
+        // Exercise both arrival orders for equal timestamps, without depending
+        // on random keys to produce a particular event-id order.
+        for (index, slug) in ["tie-low-first", "tie-high-first"].into_iter().enumerate() {
+            let mut versions = [
+                persona_version(&keys, slug, "a", 300),
+                persona_version(&keys, slug, "b", 300),
+            ];
+            versions.sort_by_key(|event| event.id);
+            expected.push(versions[0].clone());
+            if index == 1 {
+                versions.reverse();
+            }
+            for event in &versions {
+                insert_event(&pool, community, event, None).await.unwrap();
+            }
+        }
+        expected.sort_by_key(|event| (std::cmp::Reverse(event.created_at), event.id));
+        let q = EventQuery {
+            kinds: Some(vec![30175]),
+            authors: Some(vec![keys.public_key().to_bytes().to_vec()]),
+            ..EventQuery::for_community(community)
+        };
+        assert_persona_query(&pool, &q, &expected.iter().collect::<Vec<_>>()).await;
+        for limit in [1, 2, 3, 20] {
+            let page = query_events(
+                &pool,
+                &EventQuery {
+                    limit: Some(limit),
+                    ..q.clone()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(page.len(), (limit as usize).min(expected.len()));
+            assert_eq!(
+                page.iter().map(|row| row.event.id).collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .take(limit as usize)
+                    .map(|event| event.id)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                count_events(
+                    &pool,
+                    &EventQuery {
+                        limit: Some(limit),
+                        ..q.clone()
+                    }
+                )
+                .await
+                .unwrap(),
+                4
+            );
+        }
+        let page = query_events(
+            &pool,
+            &EventQuery {
+                offset: Some(2),
+                limit: Some(2),
+                ..q.clone()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page.iter().map(|row| row.event.id).collect::<Vec<_>>(),
+            expected[2..]
+                .iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>()
+        );
+        let cursor = &expected[1];
+        let page = query_events(
+            &pool,
+            &EventQuery {
+                until: DateTime::from_timestamp(cursor.created_at.as_secs() as i64, 0),
+                before_id: Some(cursor.id.as_bytes().to_vec()),
+                ..q
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            page.iter().map(|row| row.event.id).collect::<Vec<_>>(),
+            expected[2..]
+                .iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn persona_head_selection_preserves_coordinate_and_visibility_boundaries() {
+        let pool = setup_pool().await;
+        let community = CommunityId::from_uuid(make_test_community(&pool).await);
+        let other = CommunityId::from_uuid(make_test_community(&pool).await);
+        let accessible = make_test_channel(&pool, *community.as_uuid(), None).await;
+        let inaccessible = make_test_channel(&pool, *community.as_uuid(), None).await;
+        let keys = Keys::generate();
+        let reader = Keys::generate();
+        let mentioned = reader.public_key().to_hex();
+        let old = EventBuilder::new(Kind::Custom(30175), "old shared persona")
+            .tags([
+                Tag::identifier("same"),
+                Tag::parse(["shared", "true"]).unwrap(),
+                Tag::parse(["p", &mentioned]).unwrap(),
+                Tag::parse(["a", "30617:author:old-repo"]).unwrap(),
+            ])
+            .custom_created_at(nostr::Timestamp::from(1_800_000_000))
+            .sign_with_keys(&keys)
+            .unwrap();
+        let head = persona_version(&keys, "same", "private head", 100);
+        insert_event(&pool, community, &old, Some(accessible))
+            .await
+            .unwrap();
+        insert_event(&pool, community, &head, Some(inaccessible))
+            .await
+            .unwrap();
+        crate::insert_mentions(&pool, community, &old, Some(accessible))
+            .await
+            .unwrap();
+        let q = EventQuery {
+            kinds: Some(vec![30175]),
+            authors: Some(vec![keys.public_key().to_bytes().to_vec()]),
+            d_tag: Some("same".into()),
+            ..EventQuery::for_community(community)
+        };
+        assert_persona_query(&pool, &q, &[&head]).await;
+        // Filters must never revive a superseded row, including when its head
+        // is private or has moved into a channel this reader cannot access.
+        for filtered in [
+            EventQuery {
+                ids: Some(vec![old.id.as_bytes().to_vec()]),
+                ..q.clone()
+            },
+            EventQuery {
+                until: DateTime::from_timestamp(1_800_000_050, 0),
+                ..q.clone()
+            },
+            EventQuery {
+                p_tag_hex: Some(mentioned),
+                ..q.clone()
+            },
+            EventQuery {
+                a_tags: Some(vec!["30617:author:old-repo".into()]),
+                ..q.clone()
+            },
+            EventQuery {
+                channel_id: Some(accessible),
+                ..q.clone()
+            },
+            EventQuery {
+                channel_ids: Some(vec![accessible]),
+                ..q.clone()
+            },
+            EventQuery {
+                global_only: true,
+                ..q.clone()
+            },
+        ] {
+            assert_persona_query(&pool, &filtered, &[]).await;
+        }
+        // Shared-gated COUNT uses the relay fallback. Its candidate query must
+        // have the same head semantics as REQ, including shared -> private.
+        let visible = query_events(
+            &pool,
+            &EventQuery {
+                shared_gated_reader: Some(reader.public_key().to_bytes().to_vec()),
+                ..q.clone()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(visible.is_empty());
+        let author = query_events(
+            &pool,
+            &EventQuery {
+                shared_gated_reader: Some(keys.public_key().to_bytes().to_vec()),
+                ..q.clone()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(author.len(), 1);
+        assert_eq!(author[0].event.id, head.id);
+
+        // A newer version in another community, a deleted version, a different
+        // author, kind or d-tag must not suppress this coordinate's live head.
+        let foreign = persona_version(&keys, "same", "foreign", 500);
+        insert_event(&pool, other, &foreign, None).await.unwrap();
+        let deleted = persona_version(&keys, "same", "deleted", 400);
+        insert_event(&pool, community, &deleted, None)
+            .await
+            .unwrap();
+        soft_delete_event(&pool, community, deleted.id.as_bytes())
+            .await
+            .unwrap();
+        let another_author = persona_version(&reader, "same", "other author", 300);
+        let another_slug = persona_version(&keys, "different", "other slug", 300);
+        let another_kind = EventBuilder::new(Kind::Custom(30178), "other kind")
+            .tags([Tag::identifier("same")])
+            .custom_created_at(nostr::Timestamp::from(1_800_000_300))
+            .sign_with_keys(&keys)
+            .unwrap();
+        for event in [&another_author, &another_slug, &another_kind] {
+            insert_event(&pool, community, event, None).await.unwrap();
+        }
+        assert_persona_query(&pool, &q, &[&head]).await;
+        assert_persona_query(
+            &pool,
+            &EventQuery {
+                community_id: other,
+                ..q.clone()
+            },
+            &[&foreign],
+        )
+        .await;
+        // Mixed-kind and unconstrained filters still deduplicate personas.
+        let all = EventQuery::for_community(community);
+        let mut expected = [&head, &another_author, &another_slug, &another_kind];
+        expected.sort_by_key(|event| (std::cmp::Reverse(event.created_at), event.id));
+        assert_persona_query(&pool, &all, &expected).await;
+        assert_persona_query(
+            &pool,
+            &EventQuery {
+                kinds: Some(vec![30175, 30178]),
+                ..all
+            },
+            &expected,
+        )
+        .await;
+    }
+
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn access_scope_is_applied_before_historical_page_limit() {
@@ -1956,6 +2309,201 @@ mod tests {
             events[1].event.id, older_accessible.id,
             "older accessible row must not be hidden behind newer inaccessible rows"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn coordinate_scope_precedes_limit_and_count_preserves_access() {
+        let pool = setup_pool().await;
+        let community_uuid = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_uuid);
+        let other = CommunityId::from_uuid(make_test_community(&pool).await);
+        let accessible = make_test_channel(&pool, community_uuid, None).await;
+        let inaccessible = make_test_channel(&pool, community_uuid, None).await;
+        let keys = Keys::generate();
+        // Include quotes to verify coordinates are bound values, never SQL text.
+        let quiet = "30617:owner:quiet' OR TRUE --";
+        let busy = "30617:owner:busy";
+        let event = |kind, tags: Vec<Vec<&str>>, time| {
+            EventBuilder::new(Kind::Custom(kind), "coordinate fixture")
+                .tags(tags.into_iter().map(|tag| Tag::parse(tag).expect("tag")))
+                .custom_created_at(nostr::Timestamp::from(1_800_000_000 + time))
+                .sign_with_keys(&keys)
+                .expect("sign fixture")
+        };
+        for kind in [1618, 1621] {
+            // The quiet repository sits entirely behind a page of busy events.
+            for (coordinate, start, total) in [(quiet, 0, 3), (busy, 10, 8)] {
+                for offset in 0..total {
+                    let e = event(
+                        kind,
+                        vec![vec!["a", coordinate], vec!["e", "thread"]],
+                        start + offset,
+                    );
+                    insert_event(&pool, community, &e, Some(accessible))
+                        .await
+                        .expect("insert repository event");
+                }
+            }
+            // Newer positional false positives must not spend a page or count.
+            for (offset, tags) in [
+                vec![vec!["a", "other", quiet]],
+                vec![vec![quiet, "a"]],
+                vec![vec!["x", "a", quiet]],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                insert_event(
+                    &pool,
+                    community,
+                    &event(kind, tags, 30 + offset as u64),
+                    Some(accessible),
+                )
+                .await
+                .expect("insert malformed coordinate");
+            }
+            for (tenant, channel, time) in [(other, None, 40), (community, Some(inaccessible), 41)]
+            {
+                insert_event(
+                    &pool,
+                    tenant,
+                    &event(kind, vec![vec!["a", quiet]], time),
+                    channel,
+                )
+                .await
+                .expect("insert inaccessible match");
+            }
+            let deleted = event(kind, vec![vec!["a", quiet]], 42);
+            insert_event(&pool, community, &deleted, None)
+                .await
+                .expect("insert deleted match");
+            soft_delete_event(&pool, community, &deleted.id.to_bytes())
+                .await
+                .expect("delete fixture event");
+            for (coordinate, total) in [(quiet, 3), (busy, 8)] {
+                for limit in [1, 2, 5, 20] {
+                    let q = EventQuery {
+                        kinds: Some(vec![kind as i32]),
+                        a_tags: Some(vec![coordinate.to_owned()]),
+                        channel_ids: Some(vec![accessible]),
+                        limit: Some(limit),
+                        ..EventQuery::for_community(community)
+                    };
+                    let rows = query_events(&pool, &q).await.expect("coordinate page");
+                    assert_eq!(
+                        rows.len() as i64,
+                        limit.min(total),
+                        "kind {kind}, coordinate {coordinate}, limit {limit}"
+                    );
+                    assert!(rows.iter().all(|row| row.event.tags.iter().any(|tag| {
+                        let parts = tag.as_slice();
+                        parts.first().map(String::as_str) == Some("a")
+                            && parts.get(1).map(String::as_str) == Some(coordinate)
+                    })));
+                    assert_eq!(
+                        count_events(&pool, &q).await.expect("coordinate count"),
+                        total
+                    );
+                }
+            }
+            // Both coordinate alternatives match this row, which must occur once.
+            // Trailing relay/marker data is valid; #p also exercises the table alias.
+            let recipient = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            let both = event(
+                kind,
+                vec![
+                    vec!["a", quiet, "wss://relay.example"],
+                    vec!["a", busy],
+                    vec!["e", "thread"],
+                    vec!["p", recipient],
+                ],
+                50,
+            );
+            insert_event(&pool, community, &both, Some(accessible))
+                .await
+                .expect("insert multi-coordinate event");
+            crate::insert_mentions(&pool, community, &both, Some(accessible))
+                .await
+                .expect("insert fixture mention");
+            let q = EventQuery {
+                kinds: Some(vec![kind as i32]),
+                a_tags: Some(vec![quiet.to_owned(), busy.to_owned()]),
+                e_tags: Some(vec!["thread".to_owned()]),
+                channel_ids: Some(vec![accessible]),
+                limit: Some(20),
+                ..EventQuery::for_community(community)
+            };
+            assert_eq!(
+                query_events(&pool, &q)
+                    .await
+                    .expect("coordinate OR page")
+                    .len(),
+                12
+            );
+            assert_eq!(
+                count_events(&pool, &q).await.expect("coordinate OR count"),
+                12
+            );
+            let mentioned = EventQuery {
+                p_tag_hex: Some(recipient.to_owned()),
+                ..q.clone()
+            };
+            let mentioned_rows = query_events(&pool, &mentioned)
+                .await
+                .expect("coordinate and mention page");
+            assert_eq!(mentioned_rows.len(), 1);
+            assert_eq!(mentioned_rows[0].event.id, both.id);
+            assert_eq!(
+                count_events(&pool, &mentioned)
+                    .await
+                    .expect("coordinate and mention count"),
+                1
+            );
+            let missing_thread = EventQuery {
+                e_tags: Some(vec!["missing".to_owned()]),
+                ..q.clone()
+            };
+            assert!(query_events(&pool, &missing_thread)
+                .await
+                .expect("tag AND page")
+                .is_empty());
+            assert_eq!(
+                count_events(&pool, &missing_thread)
+                    .await
+                    .expect("tag AND count"),
+                0
+            );
+            let no_access = EventQuery {
+                channel_ids: Some(vec![]),
+                ..q.clone()
+            };
+            assert!(query_events(&pool, &no_access)
+                .await
+                .expect("no access page")
+                .is_empty());
+            assert_eq!(
+                count_events(&pool, &no_access)
+                    .await
+                    .expect("no access count"),
+                0
+            );
+            let empty = EventQuery {
+                a_tags: Some(vec![]),
+                ..q
+            };
+            assert!(query_events(&pool, &empty)
+                .await
+                .expect("empty coordinate page")
+                .is_empty());
+            assert_eq!(
+                count_events(&pool, &empty)
+                    .await
+                    .expect("empty coordinate count"),
+                0
+            );
+        }
+        pool.close().await;
     }
 
     #[tokio::test]

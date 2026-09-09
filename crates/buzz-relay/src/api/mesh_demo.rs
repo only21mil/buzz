@@ -146,6 +146,7 @@ fn echo_error(status: StatusCode, what: &str, e: &ReliableStreamError) -> Respon
 
 #[cfg(test)]
 mod tests {
+    use std::process::{Child, Command, Stdio};
     use std::time::Duration;
 
     use axum::body::to_bytes;
@@ -162,21 +163,85 @@ mod tests {
     const TEST_LEASE_TTL: Duration = Duration::from_secs(30);
     const _: () = assert!(TEST_LEASE_TTL.as_secs() > ECHO_TIMEOUT.as_secs());
 
-    fn pool() -> deadpool_redis::Pool {
-        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
-        deadpool_redis::Config::from_url(url)
-            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
-            .expect("create redis pool")
+    /// Own a fresh Redis process for each test. TCP and persistence are disabled,
+    /// so neither REDIS_URL nor an existing local Redis can receive test traffic.
+    struct RedisFixture {
+        child: Child,
+        _dir: tempfile::TempDir,
+        directory: SessionDirectory,
     }
 
-    async fn redis_directory_if_available() -> Option<SessionDirectory> {
-        let pool = pool();
-        let mut conn = pool.get().await.ok()?;
-        redis::cmd("PING")
-            .query_async::<String>(&mut *conn)
+    impl RedisFixture {
+        async fn start() -> Self {
+            let dir = tempfile::tempdir().expect("create private Redis fixture directory");
+            let socket = dir.path().join("redis.sock");
+            let pool = deadpool_redis::Config {
+                url: None,
+                connection: Some(deadpool_redis::ConnectionInfo {
+                    addr: deadpool_redis::ConnectionAddr::Unix(socket.clone()),
+                    redis: Default::default(),
+                }),
+                pool: None,
+            }
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("create fixture Redis pool");
+            let child = Command::new("redis-server")
+                .args([
+                    "--port",
+                    "0",
+                    "--save",
+                    "",
+                    "--appendonly",
+                    "no",
+                    "--daemonize",
+                    "no",
+                    "--unixsocketperm",
+                    "700",
+                    "--unixsocket",
+                ])
+                .arg(&socket)
+                .current_dir(dir.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("mesh demo tests require redis-server on PATH for an isolated fixture");
+            // Install cleanup before the first await, including startup failures.
+            let mut fixture = Self {
+                child,
+                _dir: dir,
+                directory: SessionDirectory::with_lease_ttl(pool.clone(), TEST_LEASE_TTL),
+            };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    assert!(
+                        fixture
+                            .child
+                            .try_wait()
+                            .expect("check fixture Redis process")
+                            .is_none(),
+                        "fixture Redis exited before becoming ready"
+                    );
+                    if let Ok(mut conn) = pool.get().await {
+                        if let Ok(pong) = redis::cmd("PING").query_async::<String>(&mut *conn).await
+                        {
+                            assert_eq!(pong, "PONG");
+                            break;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
             .await
-            .ok()?;
-        Some(SessionDirectory::with_lease_ttl(pool, TEST_LEASE_TTL))
+            .expect("fixture Redis did not become ready within five seconds");
+            fixture
+        }
+    }
+
+    impl Drop for RedisFixture {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 
     struct NoopTransport;
@@ -230,31 +295,36 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    /// First post for a session acquires the fenced lease and reports `owned`.
+    /// Identical session IDs in independent fixtures each start at generation one.
     #[tokio::test]
     async fn demo_join_owned_arm_reports_generation() {
-        let Some(directory) = redis_directory_if_available().await else {
-            return;
-        };
-        let router = ReliableStreamRouter::new(
-            directory.clone(),
-            std::sync::Arc::new(NoopTransport),
-            RuntimeId([7; 32]),
-        );
-        let resp = run_demo_join(
-            &router,
-            &directory,
-            DemoEchoRequest {
-                community_id: Uuid::new_v4(),
-                session_id: Uuid::new_v4(),
-                payload: "unused".into(),
-            },
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_json(resp).await;
-        assert_eq!(body["outcome"], "owned");
-        assert!(body["generation"].as_u64().is_some());
+        let first = RedisFixture::start().await;
+        let second = RedisFixture::start().await;
+        let community_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        for (fixture, runtime) in [(&first, RuntimeId([7; 32])), (&second, RuntimeId([8; 32]))] {
+            let directory = &fixture.directory;
+            let router = ReliableStreamRouter::new(
+                directory.clone(),
+                std::sync::Arc::new(NoopTransport),
+                runtime,
+            );
+            let resp = run_demo_join(
+                &router,
+                directory,
+                DemoEchoRequest {
+                    community_id,
+                    session_id,
+                    payload: "unused".into(),
+                },
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_json(resp).await;
+            assert_eq!(body["outcome"], "owned");
+            assert_eq!(body["generation"], 1);
+            assert_eq!(body["owner_runtime_id"], runtime.to_string());
+        }
     }
 
     /// Second runtime forwards to the owner and round-trips the payload
@@ -262,9 +332,8 @@ mod tests {
     /// end to end over a real mesh stream pair.
     #[tokio::test]
     async fn demo_join_forwarded_arm_round_trips_echo() {
-        let Some(directory) = redis_directory_if_available().await else {
-            return;
-        };
+        let fixture = RedisFixture::start().await;
+        let directory = fixture.directory.clone();
         let community_id = Uuid::new_v4();
         let session_id = Uuid::new_v4();
 
@@ -339,7 +408,12 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
         assert_eq!(body["outcome"], "forwarded");
+        assert_eq!(body["generation"], 1);
+        assert_eq!(body["owner_runtime_id"], owner_runtime.to_string());
         assert_eq!(body["echoed_payload"], "mesh echo evidence");
         owner_task.abort();
+        if let Err(error) = owner_task.await {
+            assert!(error.is_cancelled(), "owner echo task failed: {error}");
+        }
     }
 }

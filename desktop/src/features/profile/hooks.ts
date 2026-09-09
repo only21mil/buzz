@@ -349,7 +349,7 @@ export function useUsersBatchQuery(
     // staging; RESEARCH/PERF_STAGING_SCROLLBACK.md). Resolve from the
     // per-pubkey entry cache first and hit the network only for pubkeys not
     // freshly resolved.
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       const now = Date.now();
       const profiles: UsersBatchResponse["profiles"] = {};
       const missing: string[] = [];
@@ -372,6 +372,9 @@ export function useUsersBatchQuery(
           identityPubkey,
           toFetch,
         );
+        // Live profiles cancel aggregate queries, but the coalesced transport
+        // can still finish. Fence its explicit cache and presentation writes.
+        signal.throwIfAborted();
         commitCurrentProfileBatchEpoch(batchEpoch, () => {
           if (relayUrl) {
             writeCachedUserLabels(relayUrl, fresh.profiles, fresh.missing);

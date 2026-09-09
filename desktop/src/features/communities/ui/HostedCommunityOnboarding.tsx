@@ -1,3 +1,5 @@
+import { Capability, useCapability } from "@/platform/web/capabilities";
+import { CapabilityGate } from "@/shared/ui/CapabilityGate";
 import * as React from "react";
 import { AlertCircle, LoaderCircle } from "lucide-react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
@@ -71,7 +73,7 @@ type HostedCommunityOnboardingProps = {
   stageHidden?: boolean;
 };
 
-export function HostedCommunityOnboarding({
+function HostedCommunityOnboardingContent({
   onBack,
   onReady,
   stageHidden = false,
@@ -773,5 +775,23 @@ export function HostedCommunityOnboarding({
 
       {signInDialog}
     </div>
+  );
+}
+
+export function HostedCommunityOnboarding(
+  props: HostedCommunityOnboardingProps,
+) {
+  const available = useCapability(Capability.HostedCommunities);
+  return (
+    <>
+      <CapabilityGate capability={Capability.HostedCommunities}>
+        <HostedCommunityOnboardingContent {...props} />
+      </CapabilityGate>
+      {!available ? (
+        <Button onClick={props.onBack} type="button" variant="ghost">
+          Back
+        </Button>
+      ) : null}
+    </>
   );
 }

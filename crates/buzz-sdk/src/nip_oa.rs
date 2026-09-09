@@ -319,6 +319,32 @@ pub fn verify_auth_tag_for_auth_event(
     Ok(owner_pubkey)
 }
 
+/// Verify delegated authority for a signed action, including kind restrictions.
+///
+/// Admission credentials are connection-wide; privileged actions must also
+/// satisfy every `kind=` clause against the action being authorized.
+///
+/// # Errors
+/// Returns an error for an invalid signature or an unsatisfied kind/time clause.
+pub fn verify_auth_tag_for_action(
+    auth_tag_json: &str,
+    event: &nostr::Event,
+) -> Result<PublicKey, SdkError> {
+    let owner =
+        verify_auth_tag_for_auth_event(auth_tag_json, &event.pubkey, event.created_at.as_secs())?;
+    let parsed = parse_auth_tag_fields(auth_tag_json)?;
+    for clause in parsed.conditions.split('&') {
+        if let Some(kind) = clause.strip_prefix("kind=") {
+            if kind.parse::<u16>().ok() != Some(event.kind.as_u16()) {
+                return Err(SdkError::InvalidInput(
+                    "action kind does not satisfy delegation".into(),
+                ));
+            }
+        }
+    }
+    Ok(owner)
+}
+
 /// Parse a NIP-OA `auth` tag JSON string into a [`Tag`] without verifying the
 /// signature.
 ///
@@ -697,5 +723,33 @@ mod tests {
         let bad =
             serde_json::json!(["auth", OWNER_PUBKEY_HEX, "kind=1&", "a".repeat(128)]).to_string();
         assert!(parse_auth_tag(&bad).is_err());
+    }
+    #[test]
+    fn action_delegation_checks_kind_time_and_signer() {
+        let owner = Keys::generate();
+        let agent = Keys::generate();
+        let other = Keys::generate();
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9001), "")
+            .custom_created_at(nostr::Timestamp::from(100))
+            .sign_with_keys(&agent)
+            .unwrap();
+        for conditions in ["", "kind=9001", "created_at>99&created_at<101&kind=9001"] {
+            let tag = compute_auth_tag(&owner, &agent.public_key(), conditions).unwrap();
+            assert_eq!(
+                verify_auth_tag_for_action(&tag, &event).unwrap(),
+                owner.public_key()
+            );
+        }
+        for conditions in [
+            "kind=9002",
+            "created_at>100",
+            "created_at<100",
+            "kind=9001&kind=9002",
+        ] {
+            let tag = compute_auth_tag(&owner, &agent.public_key(), conditions).unwrap();
+            assert!(verify_auth_tag_for_action(&tag, &event).is_err());
+        }
+        let tag = compute_auth_tag(&owner, &other.public_key(), "").unwrap();
+        assert!(verify_auth_tag_for_action(&tag, &event).is_err());
     }
 }

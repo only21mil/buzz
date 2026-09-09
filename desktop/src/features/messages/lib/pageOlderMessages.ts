@@ -1,4 +1,4 @@
-import type { QueryClient } from "@tanstack/react-query";
+import type { Query, QueryClient } from "@tanstack/react-query";
 
 import {
   appendOlderChannelWindow,
@@ -11,7 +11,7 @@ import { getChannelWindowEvents } from "@/shared/api/channelWindow";
 
 const CHANNEL_WINDOW_PAGE_SIZE = 50;
 export type PageOlderResult = { hasOlderMessages: boolean };
-const inFlightPasses = new Map<string, Promise<PageOlderResult>>();
+const inFlightPasses = new WeakMap<Query, Promise<PageOlderResult>>();
 
 /** Fetch exactly one server-defined older window and append it atomically. */
 export function pageOlderMessagesUntilRowFloor(
@@ -19,12 +19,22 @@ export function pageOlderMessagesUntilRowFloor(
   channelId: string,
   shouldContinue: () => boolean,
 ): Promise<PageOlderResult> {
-  const running = inFlightPasses.get(channelId);
+  const queryKey = channelWindowKey(channelId);
+  const windowQuery = queryClient
+    .getQueryCache()
+    .find({ queryKey, exact: true });
+  if (!windowQuery) return Promise.resolve({ hasOlderMessages: false });
+  const running = inFlightPasses.get(windowQuery);
   if (running) return running;
-  const pass = runPage(queryClient, channelId, shouldContinue).finally(() => {
-    inFlightPasses.delete(channelId);
+  // Revocation/identity cleanup removes the query. A same-channel rejoin owns
+  // a new query, even if its history cursor has exactly the same value.
+  const isCurrent = () =>
+    queryClient.getQueryCache().find({ queryKey, exact: true }) ===
+      windowQuery && shouldContinue();
+  const pass = runPage(queryClient, channelId, isCurrent).finally(() => {
+    inFlightPasses.delete(windowQuery);
   });
-  inFlightPasses.set(channelId, pass);
+  inFlightPasses.set(windowQuery, pass);
   return pass;
 }
 

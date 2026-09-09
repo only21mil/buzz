@@ -1,3 +1,4 @@
+import { Capability, isCapabilityAvailable } from "@/platform/web/capabilities";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import * as React from "react";
@@ -622,7 +623,8 @@ export function HuddleProvider({
       memberPubkeys: string[],
       channelName?: string,
     ) => {
-      if (busyRef.current) return;
+      if (!isCapabilityAvailable(Capability.HuddleAudio) || busyRef.current)
+        return;
       busyRef.current = true;
 
       tokenRef.current += 1;
@@ -699,7 +701,8 @@ export function HuddleProvider({
       ephemeralChannelId: string,
       huddleThreadEventId?: string,
     ) => {
-      if (busyRef.current) return;
+      if (!isCapabilityAvailable(Capability.HuddleAudio) || busyRef.current)
+        return;
       busyRef.current = true;
       tokenRef.current += 1;
       const myToken = tokenRef.current;

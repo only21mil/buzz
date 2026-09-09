@@ -61,6 +61,63 @@ pub(crate) async fn acquire_channel_membership_lock(
     Ok(())
 }
 
+// Lock the current community role until the membership mutation commits.
+// The channel lock has already been acquired; role rows use FOR SHARE so a
+// concurrent relay-admin demotion cannot invalidate the authority mid-write.
+async fn community_role_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community: CommunityId,
+    pubkey: &[u8],
+) -> Result<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT role FROM relay_members WHERE community_id = $1 AND pubkey = $2 FOR SHARE",
+    )
+    .bind(community.as_uuid())
+    .bind(hex::encode(pubkey))
+    .fetch_optional(&mut **tx)
+    .await?)
+}
+
+async fn community_membership_authority_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    community: CommunityId,
+    channel_id: Uuid,
+    actor: &[u8],
+    target: &[u8],
+    requested_role: Option<MemberRole>,
+) -> Result<bool> {
+    let role = community_role_tx(tx, community, actor).await?;
+    if !matches!(role.as_deref(), Some("owner") | Some("admin")) {
+        return Ok(false);
+    }
+    if role.as_deref() == Some("admin") {
+        let target_community_role = community_role_tx(tx, community, target).await?;
+        let target_channel_role = get_active_role_tx(tx, community, channel_id, target).await?;
+        // An active member retaining their own role needs no community grant.
+        // Keep this check under the membership lock, and never exempt removal,
+        // reactivation, a role change, or a different actor targeting an admin.
+        if actor == target
+            && requested_role
+                .is_some_and(|requested| target_channel_role.as_deref() == Some(requested.as_str()))
+        {
+            return Ok(false);
+        }
+        if matches!(
+            target_community_role.as_deref(),
+            Some("owner") | Some("admin")
+        ) || matches!(
+            target_channel_role.as_deref(),
+            Some("owner") | Some("admin")
+        ) || requested_role == Some(MemberRole::Owner)
+        {
+            return Err(DbError::AccessDenied(
+                "an admin cannot change an owner or fellow admin".into(),
+            ));
+        }
+    }
+    Ok(true)
+}
+
 /// Add a member to a channel.
 ///
 /// Role enforcement:
@@ -97,6 +154,20 @@ pub async fn add_member(
     acquire_channel_membership_lock(&mut tx, community_id, channel_id).await?;
 
     let channel = get_channel_tx(&mut tx, community_id, channel_id).await?;
+    let community_authorized = match invited_by {
+        Some(actor) => {
+            community_membership_authority_tx(
+                &mut tx,
+                community_id,
+                channel_id,
+                actor,
+                pubkey,
+                Some(role),
+            )
+            .await?
+        }
+        None => false,
+    };
 
     let effective_role = if channel.visibility == "private" {
         let inviter = invited_by.ok_or_else(|| {
@@ -106,7 +177,7 @@ pub async fn add_member(
         // Bootstrap: channel creator may add themselves as the first member.
         let is_creator_bootstrap = inviter == pubkey && inviter == channel.created_by.as_slice();
 
-        if !is_creator_bootstrap {
+        if !is_creator_bootstrap && !community_authorized {
             let inviter_role_str = get_active_role_tx(&mut tx, community_id, channel_id, inviter)
                 .await?
                 .ok_or_else(|| {
@@ -139,6 +210,7 @@ pub async fn add_member(
                 None => None,
             };
             match granter_role.as_deref() {
+                _ if community_authorized => role,
                 Some("owner") | Some("admin") => role,
                 _ => {
                     return Err(DbError::AccessDenied(
@@ -174,7 +246,7 @@ pub async fn add_member(
             None => None,
         };
         let actor_role: Option<MemberRole> = actor_role.and_then(|r| r.parse().ok());
-        if !actor_role.is_some_and(|r| r.is_elevated()) {
+        if !community_authorized && !actor_role.is_some_and(|r| r.is_elevated()) {
             return Err(DbError::AccessDenied(
                 "only owners/admins may change an active member's role".to_string(),
             ));
@@ -281,7 +353,20 @@ pub async fn remove_member(
     // as `add_member`).
     acquire_channel_membership_lock(&mut tx, community_id, channel_id).await?;
 
-    if !is_self_remove {
+    // Prove the target channel belongs to this tenant even when community
+    // authority allows a principal who has no channel membership row.
+    get_channel_tx(&mut tx, community_id, channel_id).await?;
+    let community_authorized = !is_self_remove
+        && community_membership_authority_tx(
+            &mut tx,
+            community_id,
+            channel_id,
+            actor_pubkey,
+            pubkey,
+            None,
+        )
+        .await?;
+    if !is_self_remove && !community_authorized {
         let actor_role_str = get_active_role_tx(&mut tx, community_id, channel_id, actor_pubkey)
             .await?
             .ok_or_else(|| DbError::AccessDenied("actor is not an active member".to_string()))?;

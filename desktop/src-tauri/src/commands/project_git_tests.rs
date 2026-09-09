@@ -30,3 +30,25 @@ fn snapshot_reports_exact_commit_count_beyond_preview_limit() {
     assert_eq!(snapshot.commits.len(), 50);
     assert_eq!(snapshot.commit_count, Some(51));
 }
+
+#[test]
+fn selected_branch_filters_non_branch_and_invalid_refs() {
+    for branch in [
+        "refs/tags/v1",
+        "refs/remotes/origin/main",
+        "feature//a",
+        "feature/.hidden",
+        "feature.lock",
+        "--help",
+    ] {
+        assert_eq!(
+            super::normalize_branch_option(Some(branch)),
+            None,
+            "{branch}"
+        );
+    }
+    assert_eq!(
+        super::normalize_branch_option(Some("refs/heads/feature/a")),
+        Some("feature/a".to_string())
+    );
+}

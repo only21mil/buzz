@@ -2911,16 +2911,10 @@ channels = "ALL"
         );
     }
 
-    // --- Integration tests: full env-var → CliArgs → Config::from_args() path ---
+    // --- Integration tests: CLI → CliArgs → Config::from_args() path ---
     //
-    // These tests exercise the actual wiring: BUZZ_ACP_ALLOWED_RESPOND_TO in the
-    // environment causes clap to populate CliArgs::allowed_respond_to, which then
-    // flows through Config::from_args() to produce a ConfigError. If the #[arg(env)]
-    // attribute or field name were removed, these tests would fail.
-    //
-    // We pass the value via the CLI flag (`--allowed-respond-to`) rather than
-    // std::env::set_var to avoid test-parallelism races on shared env state.
-    // The env-var wiring is covered by the clap #[arg(env)] attribute itself.
+    // Explicit flags override ambient policy values. The unset case checks the
+    // env binding, then disables it locally without mutating the process env.
 
     // A minimal valid private key for test use (secp256k1 scalar = 1).
     const TEST_PRIVATE_KEY: &str =
@@ -2979,15 +2973,29 @@ channels = "ALL"
 
     #[test]
     fn allowed_respond_to_full_path_unset_allows_all() {
-        // No --allowed-respond-to flag → anyone is accepted.
-        let args = CliArgs::try_parse_from([
-            "buzz-acp",
-            "--private-key",
-            TEST_PRIVATE_KEY,
-            "--respond-to",
-            "anyone",
-        ])
-        .expect("clap should parse args");
+        use clap::{CommandFactory, FromArgMatches};
+
+        // Model an unset binding without mutating the shared process environment.
+        let command = CliArgs::command();
+        assert_eq!(
+            command
+                .get_arguments()
+                .find(|arg| arg.get_id() == "allowed_respond_to")
+                .and_then(|arg| arg.get_env()),
+            Some(std::ffi::OsStr::new("BUZZ_ACP_ALLOWED_RESPOND_TO"))
+        );
+        let matches = command
+            .mut_arg("allowed_respond_to", |arg| arg.env(None::<&str>))
+            .try_get_matches_from([
+                "buzz-acp",
+                "--private-key",
+                TEST_PRIVATE_KEY,
+                "--respond-to",
+                "anyone",
+            ])
+            .expect("clap should parse args");
+        let args = CliArgs::from_arg_matches(&matches).expect("clap should populate args");
+        assert_eq!(args.allowed_respond_to, None);
         let result = Config::from_args(args);
 
         assert!(

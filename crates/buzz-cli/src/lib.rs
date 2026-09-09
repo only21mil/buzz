@@ -192,6 +192,9 @@ enum Cmd {
     /// Manage your custom emoji set (workspace palette is the union of all members' sets)
     #[command(subcommand)]
     Emoji(EmojiCmd),
+    /// Fetch raw signed Nostr events
+    #[command(subcommand)]
+    Events(EventsCmd),
     /// List, open, and manage direct messages
     #[command(subcommand)]
     Dms(DmsCmd),
@@ -265,6 +268,8 @@ impl RespondToArg {
 
 #[derive(Subcommand)]
 pub enum AgentsCmd {
+    /// Retry the exact retained encrypted request after an uncertain delivery.
+    DraftRetry { request_id: String },
     /// Open a prefilled create-agent form in the owner's Buzz Desktop
     DraftCreate {
         /// Current channel UUID; the new agent is added here after save
@@ -398,6 +403,9 @@ pub enum MessagesCmd {
         /// Pubkey to mention (hex or npub; repeatable). Supplying any explicit identity permits unresolved or ambiguous @Name text as presentation-only; uniquely resolved member names still notify.
         #[arg(long = "mention")]
         mentions: Vec<String>,
+        /// Explicitly wake the signing agent (kind 9 only); adds its own mention.
+        #[arg(long)]
+        wake_self: bool,
     },
     /// Send a code diff / patch to a channel
     SendDiff {
@@ -831,6 +839,16 @@ pub enum DmsCmd {
 }
 
 #[derive(Subcommand)]
+pub enum EventsCmd {
+    /// Fetch an event by its 64-character hex ID
+    Get {
+        /// Event ID (64-character hex)
+        #[arg(long)]
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum UsersCmd {
     /// Look up user profiles by pubkey or name
     Get {
@@ -1200,6 +1218,33 @@ pub enum ReposCmd {
         /// Repository identifier (d-tag).
         #[arg(long)]
         id: String,
+    },
+    /// List hosted branches and their divergence from the default branch.
+    Branches {
+        /// Repository identifier (d-tag).
+        #[arg(long, visible_alias = "repo-id")]
+        id: String,
+        /// Owner pubkey. Defaults to your identity.
+        #[arg(long, visible_alias = "repo-owner")]
+        owner: Option<String>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read issue, PR and merge claims with explicit missing-proof blockers.
+    Reconcile {
+        /// Repository owner pubkey (64-char hex).
+        #[arg(long)]
+        repo_owner: String,
+        /// Repository identifier (d-tag).
+        #[arg(long)]
+        repo_id: String,
+        /// Maximum work items, applied after repository filtering and reduction.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Emit stable JSON (also the default output).
+        #[arg(long)]
+        json: bool,
     },
     /// Bootstrap an absent Buzz `main` from exact GitHub `main` once.
     ///
@@ -1595,6 +1640,9 @@ pub enum PrCmd {
         /// Recommended branch name
         #[arg(long)]
         branch_name: Option<String>,
+        /// Base branch to merge into (defaults to the repository default)
+        #[arg(long)]
+        target_branch: Option<String>,
         /// Most recent common ancestor with the target branch
         #[arg(long)]
         merge_base: Option<String>,
@@ -1679,6 +1727,12 @@ pub enum PrCmd {
         /// Maximum number of results
         #[arg(long)]
         limit: Option<u32>,
+    },
+    /// List NIP-34 lifecycle events for a pull request
+    Statuses {
+        /// Pull request root event ID
+        #[arg(long)]
+        pr: String,
     },
     /// Set status on a PR (open/merged/closed/draft — NIP-34 kind:1630-1633)
     Status {
@@ -1768,6 +1822,12 @@ pub enum IssuesCmd {
         /// Maximum number of results
         #[arg(long)]
         limit: Option<u32>,
+    },
+    /// List NIP-34 lifecycle events for an issue
+    Statuses {
+        /// Issue root event ID
+        #[arg(long)]
+        issue: String,
     },
     /// Set status on an issue (open/resolved/closed/draft — NIP-34 kind:1630-1633)
     Status {
@@ -2144,6 +2204,9 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Canvas(sub) => commands::channels::dispatch_canvas(sub, &client).await,
         Cmd::Reactions(sub) => commands::reactions::dispatch(sub, &client).await,
         Cmd::Emoji(sub) => commands::emoji::dispatch(sub, &client).await,
+        Cmd::Events(sub) => match sub {
+            EventsCmd::Get { id } => commands::events::cmd_get_event(&client, &id).await,
+        },
         Cmd::Dms(sub) => commands::dms::dispatch(sub, &client).await,
         Cmd::Users(sub) => commands::users::dispatch(sub, &client, &cli.format).await,
         Cmd::Workflows(sub) => commands::workflows::dispatch(sub, &client).await,
@@ -2492,6 +2555,8 @@ mod tests {
             &commit,
             "--clone",
             "https://example.com/repo.git",
+            "--target-branch",
+            "release/v2",
             "--issue",
             &issue_id,
             "--external-id",
@@ -2500,6 +2565,7 @@ mod tests {
         .expect("origin-link flags should parse");
 
         let Cmd::Pr(PrCmd::Open {
+            target_branch,
             issue_id: parsed_issue_id,
             external_id,
             ..
@@ -2507,6 +2573,7 @@ mod tests {
         else {
             panic!("expected pr open");
         };
+        assert_eq!(target_branch.as_deref(), Some("release/v2"));
         assert_eq!(parsed_issue_id.as_deref(), Some(issue_id.as_str()));
         assert_eq!(external_id.as_deref(), Some("github:pull/42"));
     }
@@ -2595,6 +2662,56 @@ mod tests {
     }
 
     #[test]
+    fn repo_branches_parses_human_and_json_modes() {
+        for (args, expected_json) in [
+            (vec!["buzz", "repos", "branches", "--id", "repo"], false),
+            (
+                vec!["buzz", "repos", "branches", "--id", "repo", "--json"],
+                true,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(args).expect("repos branches should parse");
+            assert!(matches!(
+                cli.command,
+                Cmd::Repos(ReposCmd::Branches { id, json, owner: None }) if id == "repo" && json == expected_json
+            ));
+        }
+    }
+
+    #[test]
+    fn repo_reconcile_parses_coordinate_and_post_filter_limit() {
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "repos",
+            "reconcile",
+            "--repo-owner",
+            "owner",
+            "--repo-id",
+            "repo",
+            "--limit",
+            "0",
+            "--json",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Cmd::Repos(ReposCmd::Reconcile { repo_owner, repo_id, limit: Some(0), json: true }) if repo_owner == "owner" && repo_id == "repo")
+        );
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "repos",
+            "branches",
+            "--repo-owner",
+            "owner",
+            "--repo-id",
+            "repo",
+        ])
+        .unwrap();
+        assert!(
+            matches!(cli.command, Cmd::Repos(ReposCmd::Branches { owner: Some(owner), id, .. }) if owner == "owner" && id == "repo")
+        );
+    }
+
+    #[test]
     fn command_inventory_is_stable() {
         let expected_groups: Vec<&str> = vec![
             "agents",
@@ -2603,6 +2720,7 @@ mod tests {
             "ci",
             "dms",
             "emoji",
+            "events",
             "feed",
             "issues",
             "media",
@@ -2667,6 +2785,7 @@ mod tests {
                 "archive",
                 "archived",
                 "draft-create",
+                "draft-retry",
                 "draft-update",
                 "unarchive"
             ]
@@ -2750,12 +2869,14 @@ mod tests {
             names(&cmd, "repos"),
             vec![
                 "bind",
+                "branches",
                 "create",
                 "get",
                 "import-main",
                 "list",
                 "promote",
                 "protect",
+                "reconcile",
                 "rm",
                 "stage-ci",
                 "status"
@@ -2778,7 +2899,7 @@ mod tests {
         assert_eq!(protect_names, vec!["list", "remove", "set"]);
         assert_eq!(
             names(&cmd, "pr"),
-            vec!["get", "list", "open", "status", "update"]
+            vec!["get", "list", "open", "status", "statuses", "update"]
         );
         assert_eq!(
             names(&cmd, "patches"),
@@ -2799,8 +2920,9 @@ mod tests {
         );
         assert_eq!(
             names(&cmd, "issues"),
-            vec!["assign", "create", "get", "list", "status", "unassign"]
+            vec!["assign", "create", "get", "list", "status", "statuses", "unassign"]
         );
+        assert_eq!(names(&cmd, "events"), vec!["get"]);
         assert_eq!(names(&cmd, "media"), vec!["get"]);
         assert_eq!(names(&cmd, "upload"), vec!["file"]);
         assert_eq!(names(&cmd, "pack"), vec!["inspect", "validate"]);
@@ -2822,21 +2944,22 @@ mod tests {
     #[test]
     fn subcommand_counts_are_stable() {
         let expected: Vec<(&str, usize)> = vec![
-            ("agents", 5),
+            ("agents", 6),
             ("canvas", 2),
             ("channels", 16),
             ("dms", 4),
             ("emoji", 5),
+            ("events", 1),
             ("feed", 1),
-            ("issues", 6),
+            ("issues", 7),
             ("media", 1),
             ("messages", 8),
             ("pack", 2),
             ("patches", 4),
-            ("pr", 5),
+            ("pr", 6),
             ("projects", 8),
             ("reactions", 3),
-            ("repos", 10),
+            ("repos", 12),
             ("social", 7),
             ("upload", 1),
             ("users", 5),

@@ -615,7 +615,7 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
             Ok(Scope::UsersWrite)
         }
         // NIP-AM: agent turn metrics are agent-authored global events (encrypted to owner).
-        KIND_AGENT_TURN_METRIC => Ok(Scope::MessagesWrite),
+        KIND_AGENT_TURN_METRIC | buzz_core::kind::KIND_AGENT_DRAFT | buzz_core::kind::KIND_AGENT_DRAFT_DECISION => Ok(Scope::MessagesWrite),
         // NIP-56 reports are ordinary member writes into the mod-only queue.
         // Ingest persists them to `moderation_reports` and suppresses public
         // storage/fanout; reports are signals, never enforcement triggers.
@@ -1514,18 +1514,16 @@ fn validate_diff_event(event: &Event) -> Result<(), String> {
 /// * exactly one `d` tag with a 64-hex value (`d_tag = lower_hex(HMAC...)`),
 /// * exactly one `p` tag with a 64-hex pubkey (the owner counterparty).
 ///
-/// Content is opaque NIP-44 ciphertext; we do not parse it.
+/// Content is opaque NIP-44 ciphertext; we do not parse it. Ingest also
+/// binds the owner to the author's durable NIP-OA mapping before storage.
 fn validate_engram_envelope(event: &Event) -> Result<(), String> {
     let mut d_tags: Vec<&str> = Vec::new();
     let mut p_tags: Vec<&str> = Vec::new();
     for tag in event.tags.iter() {
         let parts = tag.as_slice();
-        if parts.len() < 2 {
-            continue;
-        }
         match parts[0].as_str() {
-            "d" => d_tags.push(&parts[1]),
-            "p" => p_tags.push(&parts[1]),
+            "d" => d_tags.push(tag.content().unwrap_or("")),
+            "p" => p_tags.push(tag.content().unwrap_or("")),
             _ => {}
         }
     }
@@ -2390,7 +2388,12 @@ async fn ingest_event_inner(
     const MAX_TIMESTAMP_DRIFT_SECS: i64 = 900; // ±15 minutes
     let now = chrono::Utc::now().timestamp();
     let event_ts = event.created_at.as_secs() as i64;
-    if (event_ts - now).abs() > MAX_TIMESTAMP_DRIFT_SECS {
+    if (event_ts - now).abs() > MAX_TIMESTAMP_DRIFT_SECS
+        && !matches!(
+            kind_u32,
+            buzz_core::kind::KIND_AGENT_DRAFT | buzz_core::kind::KIND_AGENT_DRAFT_DECISION
+        )
+    {
         return Err(IngestError::Rejected(
             "invalid: event timestamp too far from server time".into(),
         ));
@@ -2673,7 +2676,14 @@ async fn ingest_event_inner(
         // member/open gate here lets the owning human act on private agent channels
         // without being a member (OQ1 decision; see validate_edit_ownership /
         // validate_admin_event for per-kind enforcement).
-        let skip_membership = kind_u32 == KIND_NIP29_JOIN_REQUEST
+        let community_member_command =
+            matches!(kind_u32, KIND_NIP29_PUT_USER | KIND_NIP29_REMOVE_USER)
+                && crate::handlers::moderation_authz::channel_admin_grant(tenant, state, &event)
+                    .await
+                    .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?
+                    .is_some();
+        let skip_membership = community_member_command
+            || kind_u32 == KIND_NIP29_JOIN_REQUEST
             || kind_u32 == KIND_NIP29_CREATE_GROUP
             || kind_u32 == KIND_STREAM_MESSAGE_EDIT
             || kind_u32 == KIND_NIP29_EDIT_METADATA
@@ -3027,6 +3037,18 @@ async fn ingest_event_inner(
     if kind_u32 == KIND_AGENT_ENGRAM {
         validate_engram_envelope(&event)
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+        if !crate::handlers::req::event_visible_to_reader(
+            state,
+            tenant.community(),
+            &event,
+            event.pubkey.as_bytes(),
+        )
+        .await
+        {
+            return Err(IngestError::AuthFailed(
+                "restricted: agent-engram `p` tag must be the attested owner of this agent".into(),
+            ));
+        }
     }
 
     if kind_u32 == KIND_AGENT_TURN_METRIC {
@@ -3064,6 +3086,123 @@ async fn ingest_event_inner(
                     .into(),
             ));
         }
+    }
+
+    if matches!(
+        kind_u32,
+        buzz_core::kind::KIND_AGENT_DRAFT | buzz_core::kind::KIND_AGENT_DRAFT_DECISION
+    ) {
+        if event_ts > now + MAX_TIMESTAMP_DRIFT_SECS {
+            return Err(IngestError::Rejected(
+                "invalid: future draft timestamp".into(),
+            ));
+        }
+        if kind_u32 == buzz_core::kind::KIND_AGENT_DRAFT {
+            let route =
+                buzz_core::agent_drafts::validate_request(&event).map_err(IngestError::Rejected)?;
+            for key in [route.agent, route.owner] {
+                if state
+                    .db
+                    .is_archived(tenant.community(), &key.to_hex())
+                    .await
+                    .map_err(|e| IngestError::Internal(e.to_string()))?
+                {
+                    return Err(IngestError::AuthFailed(
+                        "restricted: draft identity archived".into(),
+                    ));
+                }
+            }
+            let owned = state
+                .db
+                .is_agent_owner(
+                    tenant.community(),
+                    route.agent.as_bytes(),
+                    route.owner.as_bytes(),
+                )
+                .await
+                .map_err(|e| IngestError::Internal(e.to_string()))?;
+            if !owned {
+                return Err(IngestError::AuthFailed(
+                    "restricted: draft agent owner mismatch".into(),
+                ));
+            }
+        } else {
+            let decision = buzz_core::agent_drafts::validate_decision(&event)
+                .map_err(IngestError::Rejected)?;
+            if decision.state == buzz_core::agent_drafts::DecisionState::Applying {
+                let request = state
+                    .db
+                    .get_event_by_id(tenant.community(), decision.request_event.as_bytes())
+                    .await
+                    .map_err(|e| IngestError::Internal(e.to_string()))?
+                    .ok_or_else(|| {
+                        IngestError::AuthFailed("restricted: draft unavailable".into())
+                    })?;
+                let route = buzz_core::agent_drafts::validate_request(&request.event)
+                    .map_err(IngestError::Rejected)?;
+                if route.owner != decision.owner
+                    || !state
+                        .db
+                        .is_agent_owner(
+                            tenant.community(),
+                            route.agent.as_bytes(),
+                            route.owner.as_bytes(),
+                        )
+                        .await
+                        .map_err(|e| IngestError::Internal(e.to_string()))?
+                {
+                    return Err(IngestError::AuthFailed(
+                        "restricted: draft unavailable".into(),
+                    ));
+                }
+                for key in [route.agent, route.owner] {
+                    if state
+                        .db
+                        .is_archived(tenant.community(), &key.to_hex())
+                        .await
+                        .map_err(|e| IngestError::Internal(e.to_string()))?
+                    {
+                        return Err(IngestError::AuthFailed(
+                            "restricted: draft identity archived".into(),
+                        ));
+                    }
+                    if !state
+                        .db
+                        .is_member(tenant.community(), route.channel, key.as_bytes())
+                        .await
+                        .map_err(|e| IngestError::Internal(e.to_string()))?
+                    {
+                        return Err(IngestError::AuthFailed(
+                            "restricted: draft review requires current shared channel membership"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+        }
+        let (stored, inserted) = state
+            .db
+            .store_agent_draft(tenant.community(), &event)
+            .await
+            .map_err(|e| match e {
+                buzz_db::DbError::Conflict(_)
+                | buzz_db::DbError::AccessDenied(_)
+                | buzz_db::DbError::InvalidData(_) => IngestError::Rejected(e.to_string()),
+                _ => IngestError::Internal(e.to_string()),
+            })?;
+        emit_product_feedback_success(tracer, tenant, &event, &auth);
+        if inserted {
+            dispatch_persistent_event(
+                tenant,
+                state,
+                &stored,
+                kind_u32,
+                &auth.pubkey().to_hex(),
+                None,
+            )
+            .await;
+        }
+        return Ok(IngestResult { event_id: event_id_hex, accepted: true, message: "stored: agent-draft-v1; review eligibility is decided by the owner's Desktop; applied=false".into() });
     }
 
     if kind_u32 == KIND_EVENT_REMINDER {
@@ -3478,6 +3617,21 @@ async fn ingest_event_inner(
             accepted: true,
             message: String::new(),
         });
+    }
+
+    // Audit a community-authorized channel command before storage. An audit
+    // failure must reject the write, rather than enter the legacy best-effort
+    // side-effect path and acknowledge an unaudited command.
+    if let Some(grant) =
+        crate::handlers::moderation_authz::channel_admin_grant(tenant, state, &event)
+            .await
+            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?
+    {
+        crate::handlers::moderation_authz::audit_channel_admin_event(tenant, state, &event, &grant)
+            .await
+            .map_err(|e| {
+                IngestError::Internal(format!("error: channel moderation audit failed: {e}"))
+            })?;
     }
 
     let (stored_event, was_inserted) = if let Some(validated) = &validated_ci_event {

@@ -3,7 +3,9 @@ use super::project_git_exec::{
     validate_workspace_clone_url, GitAuthConfig,
 };
 use super::project_git_push::push_project_local_repository_blocking;
-use super::project_repo_paths::{canonical_repos_roots, find_local_repo_dir};
+use super::project_repo_paths::{
+    find_local_repo_for_branch, local_project_checkouts, LocalProjectCheckout,
+};
 use crate::app_state::AppState;
 use serde::Serialize;
 use std::time::UNIX_EPOCH;
@@ -50,12 +52,14 @@ pub struct ProjectLocalRepoSnapshotInfo {
 pub struct ProjectLocalRepoInfo {
     pub name: String,
     pub path: String,
+    pub branch: Option<String>,
 }
 #[derive(Serialize)]
 pub struct ProjectRepoSyncStatusInfo {
     pub local_path: Option<String>,
     pub local_branch: Option<String>,
     pub local_branches: Vec<String>,
+    pub local_checkouts: Vec<LocalProjectCheckout>,
     pub local_head: Option<String>,
     pub local_short_head: Option<String>,
     pub remote_branch: Option<String>,
@@ -493,11 +497,9 @@ fn snapshot_from_worktree(
     }
 }
 
-/// Normalizes a relay-supplied branch option through the shared
-/// [`clean_branch`] validation, so every command applies the same character
-/// allowlist and flag-injection rejection before the value reaches git.
+/// Normalize a branch option through the shared branch-command validation.
 pub(crate) fn normalize_branch_option(branch: Option<&str>) -> Option<String> {
-    clean_branch(branch.map(str::to_string))
+    super::project_git_branches::normalize_branch(branch?, "selected").ok()
 }
 
 pub(crate) fn compare_local_remote_status(
@@ -671,6 +673,7 @@ pub(crate) fn compare_local_remote_status(
         local_path: Some(repo_dir.display().to_string()),
         local_branch,
         local_branches,
+        local_checkouts: Vec::new(),
         local_head: local_head.clone(),
         local_short_head: local_head.as_deref().map(short_hash),
         remote_branch: Some(branch),
@@ -772,20 +775,13 @@ pub async fn get_project_repo_snapshot(
                 &auth,
             )?;
         } else {
-            let mut clone_args = vec!["clone", "--filter=blob:none"];
-            if let Some(ref branch) = branch {
-                clone_args.push("--branch");
-                clone_args.push(branch.as_str());
-            }
-            clone_args.push(clone_url.as_str());
-            clone_args.push(repo_path);
-            if run_git(&clone_args, None, &auth).is_err() && branch.is_some() {
-                run_git(
-                    &["clone", "--filter=blob:none", clone_url.as_str(), repo_path],
-                    None,
-                    &auth,
-                )?;
-            }
+            super::project_git_workflow::clone_selected_branch(
+                &repo_dir,
+                &clone_url,
+                branch.as_deref(),
+                &auth,
+                true,
+            )?;
         }
 
         let snapshot =
@@ -810,11 +806,19 @@ pub async fn get_project_local_repo_snapshot(
     let base_branch = clean_branch(base_branch);
 
     tauri::async_runtime::spawn_blocking(move || {
-        let Some(repo_dir) =
-            find_local_repo_dir(repos_dir.as_deref(), &project_dtag, clone_url.as_deref())?
+        let Some(checkout) = find_local_repo_for_branch(
+            repos_dir.as_deref(),
+            &project_dtag,
+            clone_url.as_deref(),
+            branch.as_deref(),
+        )?
         else {
             return Ok(None);
         };
+        if branch.is_some() && checkout.branch != branch {
+            return Ok(None);
+        }
+        let repo_dir = checkout.path;
         let snapshot =
             snapshot_from_worktree(&repo_dir, &auth, branch.as_deref(), base_branch.as_deref());
         Ok(Some(ProjectLocalRepoSnapshotInfo {
@@ -831,35 +835,14 @@ pub async fn list_project_local_repositories(
     repos_dir: Option<String>,
 ) -> Result<Vec<ProjectLocalRepoInfo>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let repos_roots = canonical_repos_roots(repos_dir.as_deref())?;
-        let mut seen_paths = std::collections::HashSet::new();
-        let mut repos = Vec::new();
-        for repos_root in repos_roots {
-            let entries = std::fs::read_dir(&repos_root)
-                .map_err(|error| format!("read reposDir: {error}"))?;
-            for entry in entries.filter_map(Result::ok) {
-                let Some(file_type) = entry.file_type().ok() else {
-                    continue;
-                };
-                if !file_type.is_dir() && !file_type.is_symlink() {
-                    continue;
-                }
-                let Ok(path) = entry.path().canonicalize() else {
-                    continue;
-                };
-                if !path.starts_with(&repos_root) || !path.is_dir() || !path.join(".git").exists() {
-                    continue;
-                }
-                if !seen_paths.insert(path.clone()) {
-                    continue;
-                }
-                repos.push(ProjectLocalRepoInfo {
-                    name: entry.file_name().to_string_lossy().to_string(),
-                    path: path.display().to_string(),
-                });
-            }
-        }
-        repos.sort_by(|left, right| left.name.cmp(&right.name));
+        let repos = local_project_checkouts(repos_dir.as_deref(), None)?
+            .into_iter()
+            .map(|checkout| ProjectLocalRepoInfo {
+                name: checkout.name(),
+                path: checkout.path.display().to_string(),
+                branch: checkout.branch,
+            })
+            .collect();
         Ok(repos)
     })
     .await
@@ -879,13 +862,18 @@ pub async fn get_project_repo_sync_status(
     let auth = build_git_auth_config(&state)?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let Some(repo_dir) =
-            find_local_repo_dir(repos_dir.as_deref(), &project_dtag, Some(&clone_url))?
-        else {
+        let Some(repo_dir) = find_local_repo_for_branch(
+            repos_dir.as_deref(),
+            &project_dtag,
+            Some(&clone_url),
+            normalize_branch_option(branch_name.as_deref()).as_deref(),
+        )?
+        .map(|checkout| checkout.path) else {
             return Ok(ProjectRepoSyncStatusInfo {
                 local_path: None,
                 local_branch: None,
                 local_branches: Vec::new(),
+                local_checkouts: Vec::new(),
                 local_head: None,
                 local_short_head: None,
                 remote_branch: branch_name
@@ -905,13 +893,18 @@ pub async fn get_project_repo_sync_status(
             });
         };
 
-        Ok(compare_local_remote_status(
+        let mut status = compare_local_remote_status(
             &repo_dir,
             &clone_url,
             branch_name.as_deref(),
             base_branch.as_deref(),
             &auth,
-        ))
+        );
+        status.local_checkouts = local_project_checkouts(
+            repos_dir.as_deref(),
+            Some((&project_dtag, Some(&clone_url))),
+        )?;
+        Ok(status)
     })
     .await
     .map_err(|error| format!("repo sync status task failed: {error}"))?
@@ -930,9 +923,13 @@ pub async fn push_project_local_repository(
     let auth = build_git_auth_config(&state)?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let Some(repo_dir) =
-            find_local_repo_dir(repos_dir.as_deref(), &project_dtag, Some(&clone_url))?
-        else {
+        let Some(repo_dir) = find_local_repo_for_branch(
+            repos_dir.as_deref(),
+            &project_dtag,
+            Some(&clone_url),
+            normalize_branch_option(branch_name.as_deref()).as_deref(),
+        )?
+        .map(|checkout| checkout.path) else {
             return Err("No local checkout found.".to_string());
         };
         push_project_local_repository_blocking(
@@ -961,9 +958,13 @@ pub async fn pull_project_local_repository(
     let auth = build_git_auth_config(&state)?;
 
     tauri::async_runtime::spawn_blocking(move || {
-        let Some(repo_dir) =
-            find_local_repo_dir(repos_dir.as_deref(), &project_dtag, Some(&clone_url))?
-        else {
+        let Some(repo_dir) = find_local_repo_for_branch(
+            repos_dir.as_deref(),
+            &project_dtag,
+            Some(&clone_url),
+            normalize_branch_option(branch_name.as_deref()).as_deref(),
+        )?
+        .map(|checkout| checkout.path) else {
             return Err("No local checkout found.".to_string());
         };
         let status =

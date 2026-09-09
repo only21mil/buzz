@@ -261,3 +261,264 @@ test("browser image editor refuses HTML response bytes", async () => {
     /requires image content/,
   );
 });
+
+function fakePicker(files, event = "change") {
+  const previousDocument = globalThis.document;
+  let removed = false;
+  const input = new EventTarget();
+  input.files = files;
+  input.remove = () => {
+    removed = true;
+  };
+  input.click = () =>
+    queueMicrotask(() => input.dispatchEvent(new Event(event)));
+  globalThis.document = { createElement: () => input };
+  return {
+    removed: () => removed,
+    restore: () => {
+      globalThis.document = previousDocument;
+    },
+  };
+}
+
+function uploadOptions(progressId) {
+  return {
+    headers: {
+      "x-buzz-progress-id": Buffer.from(progressId).toString("base64"),
+    },
+  };
+}
+
+test("picker rejects a file one byte over its limit before reading it", async () => {
+  registerMediaCommands(new BrowserWorkspace());
+  let read = false;
+  const picker = fakePicker([
+    {
+      size: 100 * 1024 * 1024 + 1,
+      arrayBuffer: async () => {
+        read = true;
+        throw new Error("must not read");
+      },
+    },
+  ]);
+  try {
+    await assert.rejects(
+      dispatch("pick_and_upload_media", {}),
+      /Maximum is 100MB/,
+    );
+    assert.equal(read, false);
+    assert.equal(picker.removed(), true);
+  } finally {
+    picker.restore();
+  }
+});
+
+test("picker size preflight allows the exact advertised boundary", async () => {
+  registerMediaCommands(new BrowserWorkspace());
+  let read = false;
+  const picker = fakePicker([
+    {
+      size: 100 * 1024 * 1024,
+      arrayBuffer: async () => {
+        read = true;
+        throw new Error("synthetic read stop");
+      },
+    },
+  ]);
+  try {
+    await assert.rejects(
+      dispatch("pick_and_upload_media", {}),
+      /synthetic read stop/,
+    );
+    assert.equal(read, true);
+  } finally {
+    picker.restore();
+  }
+});
+
+test("array upload rejects an oversized sparse input before copying", async () => {
+  const data = [];
+  data.length = 100 * 1024 * 1024 + 1;
+  data[Symbol.iterator] = () => {
+    throw new Error("must not copy");
+  };
+  await assert.rejects(uploadBrowserMedia({ data }), /Maximum is 100MB/);
+});
+
+test("picker cancel settles and removes its input", async () => {
+  registerMediaCommands(new BrowserWorkspace());
+  const picker = fakePicker([], "cancel");
+  try {
+    assert.deepEqual(await dispatch("pick_and_upload_media", {}), []);
+    assert.equal(picker.removed(), true);
+  } finally {
+    picker.restore();
+  }
+});
+
+test("cancel while preparing stops upload before signing or fetching and allows retry", async () => {
+  registerMediaCommands(new BrowserWorkspace());
+  let signed = 0;
+  register("sign_event", () => {
+    signed += 1;
+    throw new Error("must not sign");
+  });
+  let fetched = false;
+  globalThis.fetch = async () => {
+    fetched = true;
+    throw new Error("must not fetch");
+  };
+  const stop = await listen("media-upload-phase", (event) => {
+    if (event.payload.phase === "preparing") {
+      return dispatch("cancel_media_upload", {
+        progressId: "cancel-preparing",
+      });
+    }
+  });
+  try {
+    await assert.rejects(
+      uploadBrowserMedia(
+        new Uint8Array([1]),
+        uploadOptions("cancel-preparing"),
+      ),
+      { name: "AbortError" },
+    );
+    assert.equal(signed, 0);
+    assert.equal(fetched, false);
+  } finally {
+    stop();
+  }
+  installSigner();
+  globalThis.fetch = async (_url, init) =>
+    Response.json(
+      descriptor(init.headers.get("X-SHA-256"), init.body.byteLength),
+    );
+  await uploadBrowserMedia(
+    new Uint8Array([1]),
+    uploadOptions("cancel-preparing"),
+  );
+});
+
+test("cancel during file read prevents a later upload", async () => {
+  registerMediaCommands(new BrowserWorkspace());
+  let fetched = false;
+  globalThis.fetch = async () => {
+    fetched = true;
+    throw new Error("must not fetch");
+  };
+  const picker = fakePicker([
+    {
+      size: 1,
+      name: "note.txt",
+      type: "text/plain",
+      arrayBuffer: async () => {
+        await dispatch("cancel_media_upload", { progressId: "cancel-read" });
+        return new Uint8Array([1]).buffer;
+      },
+    },
+  ]);
+  try {
+    await assert.rejects(
+      dispatch("pick_and_upload_media", { progressId: "cancel-read" }),
+      { name: "AbortError" },
+    );
+    assert.equal(fetched, false);
+  } finally {
+    picker.restore();
+  }
+});
+
+test("fallback cancels unused response body before retrying", async () => {
+  installSigner();
+  let canceled = false;
+  const paths = [];
+  globalThis.fetch = async (url, init) => {
+    paths.push(new URL(url).pathname);
+    if (paths.length === 1) {
+      return new Response(
+        new ReadableStream({
+          cancel() {
+            canceled = true;
+          },
+        }),
+        { status: 404 },
+      );
+    }
+    assert.equal(canceled, true);
+    return Response.json(
+      descriptor(init.headers.get("X-SHA-256"), init.body.byteLength),
+    );
+  };
+  await uploadBrowserMedia(new Uint8Array([1]));
+  assert.deepEqual(paths, ["/upload", "/media/upload"]);
+});
+
+test("descriptor stream over its limit is canceled and releases the reader", async () => {
+  installSigner();
+  let canceled = false;
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new Uint8Array(64 * 1024 + 1));
+    },
+    cancel() {
+      canceled = true;
+    },
+  });
+  globalThis.fetch = async () => new Response(body);
+  await assert.rejects(
+    uploadBrowserMedia(new Uint8Array([1])),
+    /descriptor exceeds the 64KB limit/,
+  );
+  assert.equal(canceled, true);
+  assert.equal(body.locked, false);
+});
+
+test("descriptor exactly at its limit succeeds", async () => {
+  installSigner();
+  globalThis.fetch = async (_url, init) => {
+    const json = JSON.stringify(descriptor(init.headers.get("X-SHA-256"), 1));
+    return new Response(json.padEnd(64 * 1024, " "));
+  };
+  const result = await uploadBrowserMedia(new Uint8Array([1]));
+  assert.equal(result.size, 1);
+});
+
+test("rejected image response is canceled before any read", async () => {
+  registerMediaCommands(new BrowserWorkspace());
+  let canceled = false;
+  const body = new ReadableStream({
+    cancel() {
+      canceled = true;
+    },
+  });
+  globalThis.fetch = async () =>
+    new Response(body, {
+      headers: {
+        "Content-Type": "image/png",
+        "Content-Length": String(50 * 1024 * 1024 + 1),
+      },
+    });
+  await assert.rejects(
+    dispatch("fetch_media_bytes", {
+      url: `https://relay.example/media/${"a".repeat(64)}.png`,
+    }),
+    /50MB limit/,
+  );
+  assert.equal(canceled, true);
+  assert.equal(body.locked, false);
+});
+
+test("upload transport failure clears cancellation ownership for retry", async () => {
+  installSigner();
+  globalThis.fetch = async () => {
+    throw new Error("network down");
+  };
+  const options = uploadOptions("network-retry");
+  await assert.rejects(
+    uploadBrowserMedia(new Uint8Array([1]), options),
+    /network down/,
+  );
+  globalThis.fetch = async (_url, init) =>
+    Response.json(descriptor(init.headers.get("X-SHA-256"), 1));
+  await uploadBrowserMedia(new Uint8Array([1]), options);
+});

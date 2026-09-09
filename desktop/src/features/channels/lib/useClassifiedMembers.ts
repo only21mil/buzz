@@ -34,6 +34,7 @@ export function useClassifiedMembers(
     (member: ChannelMember) => {
       const normalized = normalizePubkey(member.pubkey);
       return (
+        member.isAgent ||
         member.role === "bot" ||
         managedAgentPubkeys.has(normalized) ||
         relayAgentPubkeys.has(normalized)

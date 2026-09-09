@@ -46,7 +46,10 @@ for (const destination of ["channel", "forum"]) {
   });
 }
 
-test("foreign clipboard identity is verified and rejected before sending plain text", async ({
+// A pasted mention whose pubkey is not a member is verified against the relay
+// and then blocks the send: the draft stays put and no event leaves the
+// composer until the author picks a real recipient or drops the sigil.
+test("foreign clipboard identity is verified and blocks the send", async ({
   page,
 }) => {
   await installMockBridge(page);
@@ -76,12 +79,11 @@ test("foreign clipboard identity is verified and rejected before sending plain t
     )
     .toBe(true);
   await page.getByTestId("send-message").click();
-  await expect(input).toHaveText("");
-  await expect
-    .poll(async () =>
-      (await sentEvents(page, content)).map((event) =>
-        event.tags.filter((tag) => tag[0] === "p"),
-      ),
-    )
-    .toEqual([[]]);
+  await expect(
+    page.getByText("That @mention is not linked to a member.", {
+      exact: false,
+    }),
+  ).toBeVisible();
+  await expect(input).toHaveText(content);
+  expect(await sentEvents(page, content)).toEqual([]);
 });

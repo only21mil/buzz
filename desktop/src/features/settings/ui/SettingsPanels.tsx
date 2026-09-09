@@ -1,3 +1,6 @@
+import { formatThemeLabel, pairedThemeLabel } from "./themeLabels";
+import { Capability } from "@/platform/web/capabilities";
+import { CapabilityGate } from "@/shared/ui/CapabilityGate";
 import { useMemo, useState } from "react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import {
@@ -249,35 +252,6 @@ export const settingsSections: SettingsSectionDescriptor[] = [
     icon: Download,
   },
 ];
-
-function formatThemeLabel(name: string): string {
-  return name
-    .split("-")
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-    .join(" ");
-}
-
-/**
- * Derive a display label for a paired theme from its light variant name.
- * Strips mode-specific tokens (light, latte, dawn, lotus, ochin, lighter, plus)
- * from any position, handling names like "github-light-default", "light-plus",
- * "material-theme-lighter", and "gruvbox-light-soft".
- */
-function pairedThemeLabel(lightName: string): string {
-  const modeTokens = new Set([
-    "light",
-    "latte",
-    "dawn",
-    "lotus",
-    "ochin",
-    "lighter",
-    "plus",
-  ]);
-  const parts = lightName.split("-").filter((t) => !modeTokens.has(t));
-  // If stripping removed everything (e.g. "light-plus"), fall back to the raw name
-  const base = parts.length > 0 ? parts.join("-") : lightName;
-  return formatThemeLabel(base);
-}
 
 /**
  * Categorize themes into three groups:
@@ -949,27 +923,41 @@ export function renderSettingsSection(
         />
       );
     case "voice":
-      return <VoiceSettingsCard />;
+      return (
+        <CapabilityGate capability={Capability.HuddleAudio}>
+          <VoiceSettingsCard />
+        </CapabilityGate>
+      );
     case "experimental":
       return <ExperimentalFeaturesCard />;
     case "agents":
       return (
-        <div className="space-y-12">
-          <PreventSleepSettingsCard />
-          <HarnessesSettingsPanel />
-          <AgentDefaultsSettingsCard />
-        </div>
+        <CapabilityGate capability={Capability.ManagedAgents}>
+          <div className="space-y-12">
+            <PreventSleepSettingsCard />
+            <HarnessesSettingsPanel />
+            <AgentDefaultsSettingsCard />
+          </div>
+        </CapabilityGate>
       );
     case "channel-templates":
       return <ChannelTemplatesSettingsCard />;
     case "compute":
-      return <MeshComputeSettingsCard />;
+      return (
+        <CapabilityGate capability={Capability.Mesh}>
+          <MeshComputeSettingsCard />
+        </CapabilityGate>
+      );
     case "appearance":
       return <ThemeSettingsCard />;
     case "shortcuts":
       return <KeyboardShortcutsCard />;
     case "hosted-communities":
-      return <HostedCommunitiesSettingsCard />;
+      return (
+        <CapabilityGate capability={Capability.HostedCommunities}>
+          <HostedCommunitiesSettingsCard />
+        </CapabilityGate>
+      );
     case "community-members":
       return (
         <CommunityMembersSettingsCard currentPubkey={props.currentPubkey} />
@@ -979,9 +967,17 @@ export function renderSettingsSection(
     case "custom-emoji":
       return <CustomEmojiSettingsCard />;
     case "local-archive":
-      return <LocalArchiveSettingsCard />;
+      return (
+        <CapabilityGate capability={Capability.LocalArchive}>
+          <LocalArchiveSettingsCard />
+        </CapabilityGate>
+      );
     case "mobile":
-      return <MobilePairingCard currentPubkey={props.currentPubkey} />;
+      return (
+        <CapabilityGate capability={Capability.Pairing}>
+          <MobilePairingCard currentPubkey={props.currentPubkey} />
+        </CapabilityGate>
+      );
     case "updates":
       return <UpdateChecker />;
     default: {

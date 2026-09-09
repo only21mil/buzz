@@ -14,7 +14,10 @@ use super::project_git_exec::{
     validate_local_clone_url_for_workspace, validate_workspace_clone_url,
 };
 use super::project_git_workflow::clone_project_repository_blocking;
-use super::project_repo_paths::find_local_repo_dir;
+use super::project_repo_paths::{
+    checkout_mismatch_message, find_local_repo_dir, find_local_repo_for_branch,
+    worktree_add_command,
+};
 
 /// Result of [`open_project_terminal`]: where the terminal opened and
 /// whether a fresh clone was made to get there.
@@ -22,6 +25,8 @@ use super::project_repo_paths::find_local_repo_dir;
 pub struct ProjectTerminalResult {
     pub path: String,
     pub cloned: bool,
+    pub mismatch: Option<String>,
+    pub worktree_command: Option<String>,
 }
 
 /// Inputs for preparing an authenticated local merge-conflict recovery.
@@ -127,15 +132,41 @@ pub async fn open_project_terminal(
         // An inaccessible repos root (fresh machine, nothing cloned yet) is
         // not fatal here — the clone path below creates the default root. A
         // misconfigured explicit reposDir still errors in clone_destination_root.
-        let local_dir =
-            find_local_repo_dir(repos_dir.as_deref(), &project_dtag, clone_url.as_deref())
-                .ok()
-                .flatten();
-        if let Some(repo_dir) = local_dir {
+        let branch = normalize_branch_option(default_branch.as_deref());
+        if default_branch.is_some() && branch.is_none() {
+            return Err("Invalid selected branch.".to_string());
+        }
+        let local_dir = find_local_repo_for_branch(
+            repos_dir.as_deref(),
+            &project_dtag,
+            clone_url.as_deref(),
+            branch.as_deref(),
+        )
+        .or_else(|error| {
+            if repos_dir.is_none() {
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        })?;
+        if let Some(checkout) = local_dir {
+            if let Some(branch) = branch.as_deref() {
+                if checkout.branch.as_deref() != Some(branch) {
+                    return Ok(ProjectTerminalResult {
+                        path: checkout.path.display().to_string(),
+                        cloned: false,
+                        mismatch: Some(checkout_mismatch_message(&checkout, branch)),
+                        worktree_command: Some(worktree_add_command(&checkout, branch)),
+                    });
+                }
+            }
+            let repo_dir = checkout.path;
             launch_terminal_at(&repo_dir)?;
             return Ok(ProjectTerminalResult {
                 path: repo_dir.display().to_string(),
                 cloned: false,
+                mismatch: None,
+                worktree_command: None,
             });
         }
 
@@ -157,6 +188,8 @@ pub async fn open_project_terminal(
         Ok(ProjectTerminalResult {
             path: clone_result.path,
             cloned: clone_result.cloned,
+            mismatch: None,
+            worktree_command: None,
         })
     })
     .await

@@ -88,7 +88,8 @@ export function buildMentionCandidates({
         ...candidate,
         pubkey,
         currentPubkey,
-        relayAgents: relayAgents,
+        relayAgents,
+        managedAgentPubkeys,
         mentionableAgentPubkeys,
         directoryAgentPubkeys,
       })

@@ -1495,6 +1495,8 @@ pub struct GitPullRequestMeta {
     pub clone_urls: Vec<String>,
     /// Recommended branch name (`branch-name` tag).
     pub branch_name: Option<String>,
+    /// Explicit base branch (`target-branch` tag), otherwise the repository default.
+    pub target_branch: Option<String>,
     /// Most recent common ancestor with the target branch (`merge-base` tag).
     pub merge_base: Option<String>,
     /// Root patch event this PR revises, which should then be closed
@@ -1562,6 +1564,14 @@ pub fn build_git_pull_request(
     tags.push(tag(&clone_tag)?);
     if let Some(ref branch) = meta.branch_name {
         tags.push(tag(&["branch-name", branch])?);
+    }
+    if let Some(ref branch) = meta.target_branch {
+        if branch.trim().is_empty() || branch.chars().any(char::is_control) {
+            return Err(SdkError::InvalidInput(
+                "target_branch must be a nonempty branch name".into(),
+            ));
+        }
+        tags.push(tag(&["target-branch", branch])?);
     }
     if let Some(ref base) = meta.merge_base {
         check_commit_hex(base, "merge_base")?;
@@ -4374,6 +4384,7 @@ mod tests {
             commit: "c".repeat(40),
             clone_urls: vec!["https://example.com/repo.git".to_string()],
             branch_name: Some("feat/x".to_string()),
+            target_branch: Some("release/v2".to_string()),
             labels: vec!["enhancement".to_string()],
             channel_id: Some("11111111-1111-4111-8111-111111111111".to_string()),
             ..Default::default()
@@ -4388,10 +4399,25 @@ mod tests {
         assert!(has_tag(&ev, "t", "enhancement"));
         assert!(has_tag(&ev, "h", "11111111-1111-4111-8111-111111111111"));
         assert!(has_tag(&ev, "branch-name", "feat/x"));
+        assert!(has_tag(&ev, "target-branch", "release/v2"));
         assert_eq!(
             full_clone_tag(&ev),
             vec!["https://example.com/repo.git".to_string()]
         );
+    }
+
+    #[test]
+    fn git_pr_rejects_empty_or_control_character_target_branch() {
+        for target in ["", " ", "main\n"] {
+            let meta = GitPullRequestMeta {
+                subject: "s".to_string(),
+                commit: "c".repeat(40),
+                clone_urls: vec!["https://example.com/repo.git".to_string()],
+                target_branch: Some(target.to_string()),
+                ..Default::default()
+            };
+            assert!(build_git_pull_request(&pr_repo(), "", &meta).is_err());
+        }
     }
 
     #[test]
@@ -4407,6 +4433,10 @@ mod tests {
         };
         let ev = sign(build_git_pull_request(&pr_repo(), "", &meta).unwrap());
         assert_eq!(full_clone_tag(&ev).len(), 2);
+        assert!(!ev
+            .tags
+            .iter()
+            .any(|tag| tag.as_slice()[0] == "target-branch"));
     }
 
     #[test]

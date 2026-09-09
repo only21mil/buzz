@@ -118,3 +118,42 @@ test("derives branch commits and deletion safeguards", () => {
     "The repository's default branch cannot be deleted.",
   );
 });
+
+test("branch labels distinguish remote-only, local-only and checked-out refs", async () => {
+  const { projectBranchLocationLabel } = await import("./projectBranches.ts");
+  const remote = ["main", "feature/remote"];
+  const local = ["main", "feature/local"];
+  const checkouts = [
+    { branch: "main" },
+    { branch: "feature/local" },
+    { branch: null },
+  ];
+  assert.equal(
+    projectBranchLocationLabel("feature/remote", remote, local, checkouts),
+    "Remote",
+  );
+  assert.equal(
+    projectBranchLocationLabel("feature/local", remote, local, checkouts),
+    "Local · Checked out",
+  );
+  assert.equal(
+    projectBranchLocationLabel("main", remote, local, checkouts),
+    "Remote · Local · Checked out",
+  );
+});
+
+test("branch options omit tag and tracking refs and retain discovered worktree branches", async () => {
+  const { projectBranchOptionsFromSync } = await import("./projectBranches.ts");
+  assert.deepEqual(
+    projectBranchOptionsFromSync(
+      ["main", "refs/tags/v1", "refs/remotes/origin/main"],
+      {
+        localBranch: "main",
+        localHead: "a".repeat(40),
+        localBranches: ["main"],
+        localCheckouts: [{ branch: "feature/worktree" }, { branch: null }],
+      },
+    ),
+    ["main", "feature/worktree"],
+  );
+});

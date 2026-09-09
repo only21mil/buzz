@@ -1,4 +1,5 @@
 import { expectedPublicationScope } from "./publicationScope";
+import { enrichChannelMemberProfiles } from "./relayChannelMemberProfiles";
 import { relayClient } from "@/shared/api/relayClient";
 import type { RelayEvent } from "@/shared/api/types";
 import type { BrowserIdentityManager } from "./identity";
@@ -659,6 +660,7 @@ async function getChannelMembers(body: unknown, client: RelayQueryClient) {
       },
     ];
   });
+  await enrichChannelMemberProfiles(members, client);
   return { members, next_cursor: null };
 }
 

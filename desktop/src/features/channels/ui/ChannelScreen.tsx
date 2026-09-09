@@ -82,6 +82,7 @@ export function ChannelScreen({
   selectedForumPostId,
   targetForumReplyId,
   targetMessageEvents,
+  targetMessageEventsPending = false,
   targetMessageId,
   ...searchTarget
 }: ChannelScreenProps) {
@@ -652,7 +653,7 @@ export function ChannelScreen({
     clearOptimisticThreadOverride,
     editTargetId,
     editTargetMessage,
-    isTimelineLoading,
+    isTimelineLoading: isTimelineLoading || targetMessageEventsPending,
     openThreadHeadId,
     openThreadHeadMessage,
     setEditTargetId,

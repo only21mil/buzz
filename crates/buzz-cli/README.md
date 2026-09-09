@@ -65,6 +65,11 @@ buzz users set-status --clear                 # remove your status
 buzz dms open --pubkey <hex>
 buzz dms list
 
+# Raw signed events and NIP-34 lifecycle history
+buzz events get --id <event-id>
+buzz issues statuses --issue <issue-root-event-id>
+buzz pr statuses --pr <pull-request-root-event-id>
+
 # Workflows
 buzz workflows list --channel <uuid>
 buzz workflows trigger --workflow <uuid>
@@ -102,6 +107,11 @@ buzz repos import-main --id my-repo --commit <exact-40-hex-GitHub-main>
 # Pipe to jq
 buzz channels list | jq '.[].name'
 ```
+
+`events get` prints the stored signed event object and returns exit code 1 when
+the ID is absent. Each `statuses` entry contains the raw signed `event`, an
+explicit `signer`, and `trusted`. A status is trusted when its signer is the
+root author or the owner in the root event's repository `a` tag.
 
 `protect set` replaces every existing rule for the exact ref pattern. Any
 constraint omitted from the command is removed. `protect list` reports malformed
@@ -351,3 +361,45 @@ stdout: raw relay JSON
 stderr: {"error": "category", "message": "detail"}
 exit:   0=ok  1=user  2=network  3=auth  4=other  5=write conflict
 ```
+
+### Local branches and worktrees
+
+Buzz hosts Git refs; checkouts and worktrees stay on your machine. Use the
+repository's exact clone URL and ordinary Git commands:
+
+```bash
+git ls-remote --heads "$BUZZ_CLONE_URL"
+git clone --branch feature/a "$BUZZ_CLONE_URL" repo-feature-a
+# From an existing checkout, create a separate worktree without switching it:
+git fetch origin
+git worktree add ../repo-feature-a feature/a
+git worktree list
+# In a clean checkout, explicitly switch when you intend to change its branch:
+git checkout feature/a
+```
+
+Desktop clones the selected Project branch. Open in Terminal reuses a checkout
+or registered worktree on that branch. When existing checkouts use other
+branches, it explains the mismatch and offers a copyable worktree command.
+It never switches an existing checkout automatically. Remote branches remain
+browsable without cloning. Use a new, unused directory for each worktree.
+
+For replacing or deleting a published branch, lease the exact observed tip so
+a concurrent update fails safely. Existing server branch protections still apply:
+
+```bash
+SOURCE_REF=refs/heads/feature/a
+EXPECTED_SHA="$(git ls-remote origin "$SOURCE_REF" | awk '{print $1}')"
+test -n "$EXPECTED_SHA"
+git push --force-with-lease="$SOURCE_REF:$EXPECTED_SHA" origin "HEAD:$SOURCE_REF"
+# Read the tip again before a later deletion; never reuse an old lease by accident.
+EXPECTED_SHA="$(git ls-remote origin "$SOURCE_REF" | awk '{print $1}')"
+test -n "$EXPECTED_SHA"
+git push --force-with-lease="$SOURCE_REF:$EXPECTED_SHA" origin ":$SOURCE_REF"
+```
+
+`buzz pr open --branch-name feature/a --target-branch main` explicitly records
+compare and base branches (alongside the required repository, subject, commit,
+and clone arguments). Omitting `--target-branch` keeps the repository-default
+behavior. Desktop Create PR preselects the Project branch and repository,
+with the repository default as the base.

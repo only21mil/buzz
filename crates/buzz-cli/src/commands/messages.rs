@@ -562,6 +562,19 @@ fn match_profiles_by_name(events: &[serde_json::Value], name: &str) -> Vec<(Stri
     matches
 }
 
+// Validate before network reads, uploads or publication.
+fn self_wake_tag(wake_self: bool, kind: Option<u16>) -> Result<Option<nostr::Tag>, CliError> {
+    if !wake_self {
+        return Ok(None);
+    }
+    if !matches!(kind, None | Some(9)) {
+        return Err(CliError::Usage("--wake-self requires kind 9".into()));
+    }
+    nostr::Tag::parse(["wake", "self"])
+        .map(Some)
+        .map_err(|error| CliError::Other(format!("self wake tag: {error}")))
+}
+
 pub struct SendMessageParams {
     pub channel_id: String,
     pub content: String,
@@ -570,6 +583,8 @@ pub struct SendMessageParams {
     pub broadcast: bool,
     pub files: Vec<String>,
     pub mentions: Vec<String>,
+    /// Request an explicit kind-9 wake addressed to the signing agent.
+    pub wake_self: bool,
 }
 
 pub async fn cmd_send_message(
@@ -581,11 +596,20 @@ pub async fn cmd_send_message(
     // quoting — the source of countless self-inflicted command-substitution
     // bugs for agent and human users alike.
     p.content = read_or_stdin(&p.content)?;
+    if p.content.trim().is_empty() && p.files.is_empty() {
+        return Err(CliError::Usage(
+            "message content must not be empty: provide --content text, pipe text to stdin, or attach a file".into(),
+        ));
+    }
     validate_content_size(&p.content)?;
     if let Some(ref r) = p.reply_to {
         validate_hex64(r)?;
     }
     let channel_uuid = parse_uuid(&p.channel_id)?;
+    let wake_tag = self_wake_tag(p.wake_self, p.kind)?;
+    if p.wake_self {
+        p.mentions.push(client.keys().public_key().to_hex());
+    }
 
     let explicit_mentions = normalize_explicit_mentions(&p.mentions)?;
     let stripped = strip_code_regions(&p.content);
@@ -678,7 +702,7 @@ pub async fn cmd_send_message(
         }
     };
 
-    let event = client.sign_event(builder)?;
+    let event = client.sign_event(builder.tags(wake_tag))?;
     let emitted_mentions = event_mention_pubkeys(&event);
     let resp = client.submit_event(event).await?;
     let mut output: serde_json::Value = serde_json::from_str(&normalize_write_response(&resp))
@@ -881,6 +905,7 @@ pub async fn dispatch(
             broadcast,
             files,
             mentions,
+            wake_self,
         } => {
             cmd_send_message(
                 client,
@@ -892,6 +917,7 @@ pub async fn dispatch(
                     broadcast,
                     files,
                     mentions,
+                    wake_self,
                 },
             )
             .await
@@ -1393,3 +1419,7 @@ mod tests {
         assert_eq!(match_profiles_by_name(&events, "Aaron").len(), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "messages_self_wake_tests.rs"]
+mod self_wake_tests;

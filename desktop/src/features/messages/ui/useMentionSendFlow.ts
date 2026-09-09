@@ -51,6 +51,7 @@ import {
 } from "./useMentionSendFlow.helpers";
 import { buildAgentAddressMentionTags } from "@/features/messages/lib/agentAddressMention.mjs";
 import { AgentMentionAuthorizationError } from "@/features/messages/lib/agentMentionRevalidation";
+import { prepareMentionSendTargets } from "@/features/messages/lib/unresolvedMentionFeedback";
 import type { UseMentionSendFlowOptions } from "./useMentionSendFlow.types";
 
 export function useMentionSendFlow({
@@ -767,9 +768,8 @@ export function useMentionSendFlow({
           getComposerRevision() !== composerRevision
         )
           return;
-        const savedMentionRefs = mentions.getDraftMentionRefs(trimmed).slice();
-        const selectedMentionPubkeys = mentions.extractMentionPubkeys(trimmed);
-        const selectedPersonas = mentions.extractMentionPersonas(trimmed);
+        const { savedMentionRefs, selectedMentionPubkeys, selectedPersonas } =
+          prepareMentionSendTargets(trimmed, mentions, setNonMemberPromptError);
         const dmThreadAgentMentionErrorMessage = dmThreadAgentMentionError({
           trimmed,
           isThreadReply: capturedThreadContext != null,
@@ -918,6 +918,7 @@ export function useMentionSendFlow({
     },
     [
       completeSend,
+      mentions,
       effectiveDraftKey,
       sourceOwner,
       getComposerRevision,
@@ -925,15 +926,6 @@ export function useMentionSendFlow({
       createMentionedPersonaAgents,
       customEmoji,
       getManagedAgentsByPubkey,
-      mentions.extractMentionPersonas,
-      mentions.extractMentionPubkeys,
-      mentions.hasResolvedMembers,
-      mentions.isAgentPubkey,
-      mentions.isManagedAgentPubkey,
-      mentions.memberPubkeys,
-      mentions.getDraftMentionRefs,
-      mentions.settlePendingMentionBindings,
-      mentions.registerMentionPubkey,
       onPrepareSendChannel,
       activePreparedLinkPreviews,
     ],

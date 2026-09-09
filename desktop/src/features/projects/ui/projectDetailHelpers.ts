@@ -45,3 +45,25 @@ export function snapshotHasContent(
         snapshot.contributors.length > 0),
   );
 }
+
+export type ProjectDetailScreenProps = {
+  commitHash?: string;
+  projectId: string;
+  entityNavigationId?: string;
+  tab?: import("@/shared/lib/entityLink").EntityLinkTab;
+  pullRequestId?: string;
+  issueId?: string;
+  repositoryId?: string;
+};
+
+export const PROJECT_DETAIL_PANEL_SEARCH_KEYS = [
+  "profile",
+  "profileTab",
+  "profileView",
+] as const;
+export const PROJECT_REPOSITORY_SEARCH_KEYS = [
+  "repositoryId",
+  "issueId",
+  "pullRequestId",
+  "commitHash",
+] as const;

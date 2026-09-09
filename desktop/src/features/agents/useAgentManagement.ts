@@ -29,16 +29,24 @@ import {
   enqueueAgentManagementReview,
   type AgentManagementReview,
 } from "./agentManagementBuffer";
-import { useChannelsQuery } from "@/features/channels/hooks";
+import { channelsQueryKey, useChannelsQuery } from "@/features/channels/hooks";
 import { resolveManagedAgentAvatarUrl } from "./ui/managedAgentAvatar";
 import type { AgentCreateIntent } from "./ui/agentCreateIntent";
 import { editPersonaDialogState } from "./ui/personaDialogState";
 import type {
+  AgentPersona,
+  Channel,
+  ManagedAgent,
   CreatePersonaInput,
   UpdatePersonaInput,
 } from "@/shared/api/types";
 
-function updateInputFromRequest(
+import {
+  assertAgentManagementReviewCurrent,
+  assertAgentManagementUpdateTarget,
+} from "./agentManagementReview";
+
+export function updateInputFromRequest(
   request: Extract<AgentManagementRequest, { action: "update" }>,
   current: UpdatePersonaInput,
 ): UpdatePersonaInput {
@@ -74,6 +82,10 @@ export function useAgentManagement() {
   const [request, setRequest] = React.useState<AgentManagementRequest | null>(
     null,
   );
+  const [reviewTarget, setReviewTarget] = React.useState<{
+    requestId: string;
+    persona: AgentPersona;
+  } | null>(null);
   const [error, setError] = React.useState<string | null>(null);
   const createdAgentAttachment = useCreatedAgentChannelAttachment();
   const seenRequestIds = React.useRef(new Set<string>());
@@ -89,6 +101,7 @@ export function useAgentManagement() {
       pendingRequestId.current = review.request.requestId;
       sourceAgentPubkey.current = review.agentPubkey;
       setError(null);
+      setReviewTarget(null);
       setRequest(review.request);
     },
   );
@@ -154,6 +167,15 @@ export function useAgentManagement() {
     [],
   );
 
+  React.useEffect(
+    () => () => {
+      // A callback retained by an old dialog cannot save after community remount.
+      pendingRequestId.current = null;
+      sourceAgentPubkey.current = null;
+    },
+    [],
+  );
+
   const matchingPersonas = React.useMemo(() => {
     if (request?.action !== "update") return [];
     const target = request.request.agentName.trim().toLocaleLowerCase();
@@ -166,27 +188,33 @@ export function useAgentManagement() {
   const currentPersona =
     matchingPersonas.length === 1 ? matchingPersonas[0] : undefined;
 
+  React.useEffect(() => {
+    if (request?.action !== "update" || !currentPersona) return;
+    setReviewTarget((previous) =>
+      previous?.requestId === request.requestId
+        ? previous
+        : { requestId: request.requestId, persona: currentPersona },
+    );
+  }, [currentPersona, request]);
+  const reviewedPersona =
+    reviewTarget?.requestId === request?.requestId
+      ? (reviewTarget?.persona ?? null)
+      : null;
+
   const isPending =
     createPersonaMutation.isPending ||
     updatePersonaMutation.isPending ||
     createAgentMutation.isPending;
 
-  function assertAgentCanActFromOrigin(channelId: string) {
-    const targetChannel = (channelsQuery.data ?? []).find(
-      (channel) => channel.id === channelId,
-    );
-    const requestingPubkey = sourceAgentPubkey.current?.toLowerCase();
-    if (
-      !targetChannel?.isMember ||
-      !requestingPubkey ||
-      !targetChannel.memberPubkeys.some(
-        (pubkey) => pubkey.toLowerCase() === requestingPubkey,
-      )
-    ) {
-      throw new Error(
-        "An agent can only manage agents from a channel you both belong to.",
-      );
-    }
+  function assertReviewIsCurrent(requestId: string, channelId: string) {
+    assertAgentManagementReviewCurrent({
+      requestId,
+      activeRequestId: pendingRequestId.current,
+      agentPubkey: sourceAgentPubkey.current,
+      channelId,
+      agents: queryClient.getQueryData<ManagedAgent[]>(managedAgentsQueryKey),
+      channels: queryClient.getQueryData<Channel[]>(channelsQueryKey),
+    });
   }
 
   async function submitCreate(
@@ -199,7 +227,7 @@ export function useAgentManagement() {
     }
     setError(null);
     try {
-      assertAgentCanActFromOrigin(request.request.channelId);
+      assertReviewIsCurrent(request.requestId, request.request.channelId);
       const runtimes = await availableRuntimesForStart(runtimesQuery);
       const runtime = runtimes.find(
         (candidate) => candidate.id === input.runtime,
@@ -213,6 +241,7 @@ export function useAgentManagement() {
         undefined,
         runtime.avatarUrl,
       );
+      assertReviewIsCurrent(request.requestId, request.request.channelId);
       const persona = await createPersonaMutation.mutateAsync({
         ...input,
         avatarUrl,
@@ -222,6 +251,7 @@ export function useAgentManagement() {
         const targetChannel = (channelsQuery.data ?? []).find(
           (channel) => channel.id === request.request.channelId,
         );
+        assertReviewIsCurrent(request.requestId, request.request.channelId);
         await createManagedInstanceForDefinition({
           backendIntent: backendIntent ?? undefined,
           createManagedAgent: createAgentMutation.mutateAsync,
@@ -258,13 +288,24 @@ export function useAgentManagement() {
     }
     setError(null);
     try {
-      assertAgentCanActFromOrigin(request.request.channelId);
-      await updatePersonaMutation.mutateAsync(input);
+      assertReviewIsCurrent(request.requestId, request.request.channelId);
+      const current = queryClient
+        .getQueryData<AgentPersona[]>(personasQueryKey)
+        ?.find((persona) => persona.id === reviewedPersona?.id);
+      const reviewRevision = assertAgentManagementUpdateTarget(
+        reviewedPersona,
+        current,
+        input.id,
+      );
+      await updatePersonaMutation.mutateAsync({
+        ...input,
+        ...reviewRevision,
+      });
       await Promise.all([
         queryClient.invalidateQueries({ queryKey: personasQueryKey }),
         queryClient.invalidateQueries({ queryKey: managedAgentsQueryKey }),
       ]);
-      dismiss();
+      if (pendingRequestId.current === request.requestId) dismiss();
       return true;
     } catch (cause) {
       setError(
@@ -293,13 +334,13 @@ export function useAgentManagement() {
   );
 
   const editInitialValues = React.useMemo(() => {
-    if (request?.action !== "update" || !currentPersona) return null;
+    if (request?.action !== "update" || !reviewedPersona) return null;
     return updateInputFromRequest(
       request,
-      editPersonaDialogState(currentPersona)
+      editPersonaDialogState(reviewedPersona)
         .initialValues as UpdatePersonaInput,
     );
-  }, [currentPersona, request]);
+  }, [reviewedPersona, request]);
 
   const editError = React.useMemo(() => {
     if (request?.action !== "update") return error;

@@ -273,6 +273,9 @@ const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     ("src/commands/team_snapshot/tests.rs", 1, 0),
     ("src/commands/teams/pending/tests/gate.rs", 1, 0),
     ("src/commands/teams/sharing/tests.rs", 4, 0),
+    // Mock-relay route for the durable agent-draft command tests; production
+    // drafts publish through `relay::submit_retained_event_in_scope`.
+    ("src/commands/agent_drafts/tests/native_commands.rs", 1, 0),
     // Mock-relay route in its in-file tests; production publish goes through
     // the guarded boundary-1 funnel (`submit_signed_event_at_with_keys`).
     ("src/commands/personas/sharing.rs", 1, 0),

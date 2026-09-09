@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { afterEach, test } from "node:test";
 
 import { registerRelayWorkflowsMembersCommands } from "./relayWorkflowsMembers.ts";
@@ -10,6 +11,12 @@ import {
 
 const PUBKEY = "a".repeat(64);
 const TARGET = "b".repeat(64);
+const AGENT_PROFILE_FOLD_FIXTURE = JSON.parse(
+  await readFile(
+    new URL("../../../../fixtures/agent-profile-fold.json", import.meta.url),
+    "utf8",
+  ),
+);
 
 const identity = {
   pubkey: () => PUBKEY,
@@ -400,6 +407,7 @@ test("list_relay_agents folds sparse and complete kind:10100 profiles", async ()
   const result = await dispatch("list_relay_agents");
   assert.deepEqual(result[0], {
     pubkey: PUBKEY,
+    owner_pubkey: null,
     name: "Scout",
     agent_type: "assistant",
     channels: ["general"],
@@ -411,6 +419,7 @@ test("list_relay_agents folds sparse and complete kind:10100 profiles", async ()
   });
   assert.deepEqual(result[1], {
     pubkey: TARGET,
+    owner_pubkey: null,
     name: "Builder",
     agent_type: "agent",
     channels: [],
@@ -420,8 +429,90 @@ test("list_relay_agents folds sparse and complete kind:10100 profiles", async ()
     respond_to: null,
     respond_to_allowlist: [],
   });
-  assert.deepEqual(client.calls.fetchEvents, [{ kinds: [10100] }]);
+  assert.deepEqual(client.calls.fetchEvents, [
+    { kinds: [10100] },
+    { kinds: [0], authors: [PUBKEY], limit: 1 },
+    { kinds: [0], authors: [TARGET], limit: 1 },
+  ]);
   assert.equal(getUnregisteredCommandMissCount(), 0);
+});
+
+test("list_relay_agents skips an authoritative sparse head", async () => {
+  const profileEvent = (id, createdAt, content) =>
+    event({
+      id,
+      kind: 10100,
+      createdAt,
+      content: JSON.stringify(content),
+    });
+  const complete = profileEvent(
+    "agent-complete",
+    10,
+    AGENT_PROFILE_FOLD_FIXTURE.complete,
+  );
+  const sparse = profileEvent(
+    "agent-sparse",
+    20,
+    AGENT_PROFILE_FOLD_FIXTURE.sparsePolicyUpdate,
+  );
+  const replacement = profileEvent(
+    "agent-replacement",
+    30,
+    AGENT_PROFILE_FOLD_FIXTURE.replacement,
+  );
+  const client = clientFixture({ events: [complete, sparse] });
+  registerRelayWorkflowsMembersCommands(identity, client);
+
+  assert.deepEqual(await dispatch("list_relay_agents"), []);
+
+  client.calls.fetchEvents.length = 0;
+  client.fetchEvents = async (filter) => {
+    client.calls.fetchEvents.push(filter);
+    return [complete, sparse, replacement];
+  };
+  assert.deepEqual(await dispatch("list_relay_agents"), [
+    {
+      pubkey: PUBKEY,
+      owner_pubkey: null,
+      ...AGENT_PROFILE_FOLD_FIXTURE.replacement,
+    },
+  ]);
+});
+
+test("list_relay_agents parses only the authoritative profile head", async () => {
+  const oldMalformed = event({
+    id: "agent-old-malformed",
+    kind: 10100,
+    createdAt: 10,
+    content: JSON.stringify({ name: "Old", respond_to: 42 }),
+  });
+  const current = event({
+    id: "agent-current",
+    kind: 10100,
+    createdAt: 20,
+    content: JSON.stringify({ name: "New", respond_to: "anyone" }),
+  });
+  const client = clientFixture({ events: [oldMalformed, current] });
+  registerRelayWorkflowsMembersCommands(identity, client);
+
+  const expected = [
+    {
+      pubkey: PUBKEY,
+      owner_pubkey: null,
+      name: "New",
+      agent_type: "agent",
+      channels: [],
+      channel_ids: [],
+      capabilities: [],
+      status: "offline",
+      respond_to: "anyone",
+      respond_to_allowlist: [],
+    },
+  ];
+  assert.deepEqual(await dispatch("list_relay_agents"), expected);
+
+  client.fetchEvents = async () => [current, oldMalformed];
+  assert.deepEqual(await dispatch("list_relay_agents"), expected);
 });
 
 test("update_profile_at_relay compare-writes through the explicit relay seam", async () => {

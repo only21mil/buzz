@@ -21,6 +21,8 @@ export type ChannelScreenProps = {
   selectedForumPostId: string | null;
   targetForumReplyId: string | null;
   targetMessageEvents: RelayEvent[];
+  /** Route target events are still being fetched; hold thread targets open. */
+  targetMessageEventsPending?: boolean;
   targetMessageId: string | null;
   /** Exact clicked result id, retained after route target cleanup. */
   targetSearchMessageId?: string;

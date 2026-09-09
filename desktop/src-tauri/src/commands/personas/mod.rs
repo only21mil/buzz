@@ -26,7 +26,8 @@ fn trim_optional(value: Option<String>) -> Option<String> {
     })
 }
 
-mod pending;
+pub(in crate::commands) mod pending;
+mod retained_write;
 pub(in crate::commands) use pending::retain_persona_pending;
 pub(in crate::commands) use pending::retain_persona_pending_at;
 pub(crate) use pending::tombstone_persona_at;
@@ -36,6 +37,7 @@ pub use create::create_persona;
 mod sharing;
 pub use sharing::set_persona_shared;
 pub use sharing::update_persona_and_publish;
+pub(in crate::commands) mod review_revision;
 mod update;
 pub use update::update_persona;
 mod inbound;

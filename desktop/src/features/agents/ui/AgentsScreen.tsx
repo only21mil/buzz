@@ -1,4 +1,5 @@
 import * as React from "react";
+import { DurableDraftQueue } from "./DurableDraftQueue";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { usePersonasQuery } from "@/features/agents/hooks";
@@ -122,6 +123,7 @@ export function AgentsScreen() {
       onOpenProfilePanel={handleOpenProfilePanel}
     >
       <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
+        <DurableDraftQueue />
         <div className="flex min-h-0 min-w-0 flex-1 flex-row overflow-hidden">
           <React.Suspense fallback={<ViewLoadingFallback kind="agents" />}>
             <AgentsView />

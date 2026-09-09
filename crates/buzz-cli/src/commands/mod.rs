@@ -4,6 +4,7 @@ pub mod channels;
 pub mod ci;
 pub mod dms;
 pub mod emoji;
+pub mod events;
 pub mod feed;
 pub mod issues;
 pub mod mem;

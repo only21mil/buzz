@@ -192,6 +192,9 @@ pub async fn handle_side_effects(
     event: &Event,
     state: &Arc<AppState>,
 ) -> anyhow::Result<()> {
+    if matches!(kind, 9000 | 9001 | 9002 | 9005 | 9008) {
+        validate_admin_event(tenant, kind, event, state).await?;
+    }
     match kind {
         0 => handle_kind0_profile(tenant, event, state).await,
         5 => handle_standard_deletion_event(tenant, event, state).await,
@@ -445,6 +448,10 @@ pub async fn validate_admin_event(
         return Err(anyhow::anyhow!("channel is archived"));
     }
 
+    let community_grant =
+        super::moderation_authz::channel_admin_grant(tenant, state, event).await?;
+    let community_authorized = community_grant.is_some();
+
     match kind {
         9000 => {
             // An absent role tag means "no role change requested": for an existing
@@ -480,6 +487,7 @@ pub async fn validate_admin_event(
             // Self-promotion is caught by the role-change guard below.
             if channel.visibility == "private"
                 && target_pubkey != actor_bytes
+                && !community_authorized
                 && !actor_role.is_some_and(|r| r.is_elevated())
             {
                 return Err(anyhow::anyhow!(
@@ -505,7 +513,7 @@ pub async fn validate_admin_event(
                 .zip(requested_role)
                 .filter(|(m, role)| m.role != role.as_str())
             {
-                if !actor_role.is_some_and(|r| r.is_elevated()) {
+                if !community_authorized && !actor_role.is_some_and(|r| r.is_elevated()) {
                     return Err(anyhow::anyhow!(
                         "only owners/admins may change an active member's role"
                     ));
@@ -579,6 +587,16 @@ pub async fn validate_admin_event(
                 Ok(())
             } else {
                 let members = state.db.get_members(tenant.community(), channel_id).await?;
+                if community_authorized {
+                    if members
+                        .iter()
+                        .any(|m| m.pubkey == target_pubkey && m.role == "owner")
+                        && members.iter().filter(|m| m.role == "owner").count() <= 1
+                    {
+                        return Err(anyhow::anyhow!("cannot remove the last owner"));
+                    }
+                    return Ok(());
+                }
                 let actor_member = members.iter().find(|m| m.pubkey == actor_bytes);
                 match actor_member {
                     Some(m) if m.role == "owner" || m.role == "admin" => Ok(()),
@@ -702,6 +720,9 @@ pub async fn validate_admin_event(
                 let k = t.kind().to_string();
                 k == "name" || k == "about" || k == "archived" || k == "visibility" || k == "ttl"
             });
+            if community_authorized {
+                return Ok(());
+            }
             if has_privileged_tag {
                 let members = state.db.get_members(tenant.community(), channel_id).await?;
                 let actor_member = members.iter().find(|m| m.pubkey == actor_bytes);
@@ -779,6 +800,10 @@ pub async fn validate_admin_event(
                 _ => {} // Same channel — OK
             }
 
+            if community_authorized {
+                return Ok(());
+            }
+
             // Check if actor is the event author.
             // For relay-signed REST messages, the real author is in the p tag.
             let author =
@@ -826,6 +851,9 @@ pub async fn validate_admin_event(
             }
         }
         9008 => {
+            if community_authorized {
+                return Ok(());
+            }
             // DELETE_GROUP: owner only, or the owning human of the channel's agent-owner.
             let members = state.db.get_members(tenant.community(), channel_id).await?;
             let actor_member = members.iter().find(|m| m.pubkey == actor_bytes);
@@ -1164,7 +1192,10 @@ fn group_member_tags(
     let mut tags = vec![Tag::parse(["d", group_id])?];
     for member in members {
         let pubkey_hex = hex::encode(&member.pubkey);
-        let role = if agent_pubkeys.contains(&member.pubkey) {
+        // Keep authorization roles intact. Only ordinary agent members use the
+        // legacy bot display role. Attest bot identity separately so discovery
+        // can find agents with elevated or guest roles without changing authority.
+        let role = if member.role == "member" && agent_pubkeys.contains(&member.pubkey) {
             "bot"
         } else {
             &member.role
@@ -1172,6 +1203,9 @@ fn group_member_tags(
         // NIP-29 convention: ["p", pubkey, relay_url, role]. Empty relay_url
         // because the canonical relay is implicit (this event is signed by it).
         tags.push(Tag::parse(["p", &pubkey_hex, "", role])?);
+        if agent_pubkeys.contains(&member.pubkey) {
+            tags.push(Tag::parse(["bot", &pubkey_hex])?);
+        }
     }
     Ok(tags)
 }
@@ -1464,6 +1498,11 @@ async fn handle_put_user(
     }
 
     let actor_bytes = event.pubkey.to_bytes().to_vec();
+    let grant = super::moderation_authz::channel_admin_grant(tenant, state, event).await?;
+    let membership_principal = grant
+        .as_ref()
+        .map(|g| g.principal.as_slice())
+        .unwrap_or(&actor_bytes);
 
     state
         .db
@@ -1472,7 +1511,7 @@ async fn handle_put_user(
             channel_id,
             &target_pubkey,
             role,
-            Some(&actor_bytes),
+            Some(membership_principal),
         )
         .await?;
     state.invalidate_membership(tenant, channel_id, &target_pubkey);
@@ -1533,6 +1572,11 @@ async fn handle_remove_user(
         extract_h_tag_channel(event).ok_or_else(|| anyhow::anyhow!("missing h tag"))?;
     let target_pubkey = extract_p_tag(event).ok_or_else(|| anyhow::anyhow!("missing p tag"))?;
     let actor_bytes = event.pubkey.to_bytes().to_vec();
+    let grant = super::moderation_authz::channel_admin_grant(tenant, state, event).await?;
+    let membership_principal = grant
+        .as_ref()
+        .map(|g| g.principal.as_slice())
+        .unwrap_or(&actor_bytes);
 
     // Guard: prevent last-owner orphaning on self-removal (kind 9001).
     if target_pubkey == actor_bytes {
@@ -1550,7 +1594,12 @@ async fn handle_remove_user(
 
     state
         .db
-        .remove_member(tenant.community(), channel_id, &target_pubkey, &actor_bytes)
+        .remove_member(
+            tenant.community(),
+            channel_id,
+            &target_pubkey,
+            membership_principal,
+        )
         .await?;
     state.invalidate_membership(tenant, channel_id, &target_pubkey);
     evict_live_channel_subscriptions(tenant, state, channel_id, &target_pubkey).await;
@@ -2512,7 +2561,7 @@ async fn handle_standard_deletion_event(
 }
 
 /// Extract channel UUID from `h` tag (NIP-29 group ID).
-fn extract_h_tag_channel(event: &Event) -> Option<Uuid> {
+pub(crate) fn extract_h_tag_channel(event: &Event) -> Option<Uuid> {
     for tag in event.tags.iter() {
         if tag.kind().to_string() == "h" {
             if let Some(val) = tag.content() {
@@ -2526,7 +2575,7 @@ fn extract_h_tag_channel(event: &Event) -> Option<Uuid> {
 }
 
 /// Extract target pubkey from first `p` tag.
-fn extract_p_tag(event: &Event) -> Option<Vec<u8>> {
+pub(crate) fn extract_p_tag(event: &Event) -> Option<Vec<u8>> {
     for tag in event.tags.iter() {
         if tag.kind().to_string() == "p" {
             if let Some(val) = tag.content() {
@@ -3630,39 +3679,49 @@ mod tests {
     }
 
     #[test]
-    fn discovery_roles_label_agents_as_bots_without_changing_admins() {
+    fn discovery_preserves_agent_authority_and_legacy_bot_members() {
         let channel_id = Uuid::new_v4();
-        let agent_admin = member(channel_id, 1, "admin");
-        let human_admin = member(channel_id, 2, "admin");
-        let human_member = member(channel_id, 3, "member");
-        let members = vec![
-            agent_admin.clone(),
-            human_admin.clone(),
-            human_member.clone(),
-        ];
-        let agent_pubkeys = HashSet::from([agent_admin.pubkey.clone()]);
+        let roles = ["owner", "admin", "member", "guest", "bot"];
+        let members: Vec<_> = roles
+            .iter()
+            .enumerate()
+            .map(|(index, role)| member(channel_id, index as u8 + 1, role))
+            .collect();
+        let agent_pubkeys = members.iter().map(|member| member.pubkey.clone()).collect();
         let group_id = channel_id.to_string();
-
         let member_tags =
             group_member_tags(&group_id, &members, &agent_pubkeys).expect("member tags");
-        assert!(member_tags.contains(
-            &Tag::parse(["p", &hex::encode(&agent_admin.pubkey), "", "bot"])
-                .expect("agent member tag")
-        ));
-        assert!(member_tags.contains(
-            &Tag::parse(["p", &hex::encode(&human_admin.pubkey), "", "admin"])
-                .expect("human admin tag")
-        ));
-        assert!(member_tags.contains(
-            &Tag::parse(["p", &hex::encode(&human_member.pubkey), "", "member"])
-                .expect("human member tag")
-        ));
-
+        assert_eq!(member_tags.len(), members.len() * 2 + 1);
+        for (member, expected) in members
+            .iter()
+            .zip(["owner", "admin", "bot", "guest", "bot"])
+        {
+            assert!(member_tags.contains(
+                &Tag::parse(["p", &hex::encode(&member.pubkey), "", expected])
+                    .expect("agent member tag")
+            ));
+            assert!(member_tags.contains(
+                &Tag::parse(["bot", &hex::encode(&member.pubkey)])
+                    .expect("independent agent identity")
+            ));
+        }
         let admin_tags = group_admin_tags(&group_id, &members).expect("admin tags");
-        assert!(admin_tags.contains(
-            &Tag::parse(["p", &hex::encode(&agent_admin.pubkey), "admin"])
-                .expect("agent admin tag")
-        ));
+        assert_eq!(admin_tags.len(), 3);
+        for member in &members[..2] {
+            assert!(admin_tags.contains(
+                &Tag::parse(["p", &hex::encode(&member.pubkey), &member.role])
+                    .expect("agent authority tag")
+            ));
+        }
+        let human_tags =
+            group_member_tags(&group_id, &members, &HashSet::new()).expect("human tags");
+        assert!(human_tags.iter().all(|tag| tag.as_slice()[0] != "bot"));
+        for member in &members {
+            assert!(human_tags.contains(
+                &Tag::parse(["p", &hex::encode(&member.pubkey), "", &member.role])
+                    .expect("human member tag")
+            ));
+        }
     }
 
     async fn discovery_test_state() -> (Arc<AppState>, sqlx::PgPool, tempfile::TempDir) {

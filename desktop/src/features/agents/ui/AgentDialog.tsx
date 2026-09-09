@@ -1,3 +1,10 @@
+import { Capability, useCapability } from "@/platform/web/capabilities";
+import {
+  Dialog,
+  DialogContent,
+  DialogTitle,
+  DialogDescription,
+} from "@/shared/ui/dialog";
 import * as React from "react";
 
 import type {
@@ -100,6 +107,20 @@ type AgentDialogProps =
  * lifecycle is keyed on [open, agent.pubkey]).
  */
 export function AgentDialog(props: AgentDialogProps) {
+  const runtimeAvailable = useCapability(Capability.ManagedAgents);
+  if (!runtimeAvailable && props.mode !== "definition-edit") {
+    if (props.mode === "instance-edit" && !props.open) return null;
+    return (
+      <Dialog open onOpenChange={props.onOpenChange}>
+        <DialogContent>
+          <DialogTitle>Run agents on desktop</DialogTitle>
+          <DialogDescription>
+            Open Buzz desktop to configure and run agents.
+          </DialogDescription>
+        </DialogContent>
+      </Dialog>
+    );
+  }
   if (props.mode === "instance-edit") {
     return (
       // A running instance knows its own backend, so the respond-to warning can

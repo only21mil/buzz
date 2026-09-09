@@ -1,3 +1,5 @@
+import { Capability } from "@/platform/web/capabilities";
+import { CapabilityGate } from "@/shared/ui/CapabilityGate";
 import * as React from "react";
 import { AlertCircle, ExternalLink, LoaderCircle } from "lucide-react";
 
@@ -35,7 +37,7 @@ type HostedCommunityCreateFlowProps = {
   onComplete: () => void;
 };
 
-export function HostedCommunityCreateFlow({
+function HostedCommunityCreateFlowContent({
   onComplete,
 }: HostedCommunityCreateFlowProps) {
   const onboarding = useCommunityOnboarding();
@@ -453,5 +455,15 @@ export function HostedCommunityCreateFlow({
         </Button>
       </div>
     </form>
+  );
+}
+
+export function HostedCommunityCreateFlow(
+  props: HostedCommunityCreateFlowProps,
+) {
+  return (
+    <CapabilityGate capability={Capability.HostedCommunities}>
+      <HostedCommunityCreateFlowContent {...props} />
+    </CapabilityGate>
   );
 }

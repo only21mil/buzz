@@ -1,3 +1,4 @@
+import { assertManagedAgentPromptPersisted } from "./agentPromptPersistence";
 import {
   fromRawManagedAgent,
   invokeTauri,
@@ -6,6 +7,7 @@ import {
 import type {
   ManagedAgent,
   ManagedAgentRuntimeStatus,
+  UpdateManagedAgentInput,
 } from "@/shared/api/types";
 
 export type StartManagedAgentInput = {
@@ -103,4 +105,24 @@ export async function reconcileManagedAgentRuntimes(
   communities: readonly { relayUrl: string }[],
 ): Promise<ManagedAgentRuntimeStatus[]> {
   return invokeTauri("reconcile_managed_agent_runtimes", { communities });
+}
+
+type RawUpdateManagedAgentResponse = {
+  agent: RawManagedAgent;
+  profile_sync_error: string | null;
+};
+
+export async function updateManagedAgent(
+  input: UpdateManagedAgentInput,
+): Promise<{ agent: ManagedAgent; profileSyncError: string | null }> {
+  const response = await invokeTauri<RawUpdateManagedAgentResponse>(
+    "update_managed_agent",
+    { input },
+  );
+  const agent = fromRawManagedAgent(response.agent);
+  assertManagedAgentPromptPersisted(input, agent);
+  return {
+    agent,
+    profileSyncError: response.profile_sync_error,
+  };
 }

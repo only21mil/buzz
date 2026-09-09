@@ -1,3 +1,4 @@
+import { Capability, useCapability } from "@/platform/web/capabilities";
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -32,9 +33,10 @@ export function WaveMessageAttachment({
   searchQuery,
 }: WaveMessageAttachmentProps) {
   const queryClient = useQueryClient();
+  const huddleAvailable = useCapability(Capability.HuddleAudio);
   const { isStarting, startHuddle } = useHuddle();
   const startHuddleDisabled =
-    !channelId || isStarting || huddleMemberPubkeysPending;
+    !huddleAvailable || !channelId || isStarting || huddleMemberPubkeysPending;
 
   const handleStartHuddle = React.useCallback(
     async (event: React.MouseEvent<HTMLButtonElement>) => {

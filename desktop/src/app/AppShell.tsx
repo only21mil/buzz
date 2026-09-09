@@ -1,5 +1,6 @@
 import { useDetachedToastScope } from "@/features/messages/ui/useDetachedToastScope";
 import { OwnerReviewDialogs } from "./OwnerReviewDialogs";
+import { useDurableDraftBridge } from "@/features/agents/useDurableDraftQueue";
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useLocation } from "@tanstack/react-router";
@@ -190,6 +191,10 @@ export function AppShell() {
     identityQuery.data?.pubkey,
     communitiesHook.activeCommunity?.relayUrl,
   );
+  useDurableDraftBridge(
+    identityQuery.data?.pubkey,
+    communitiesHook.activeCommunity?.relayUrl,
+  );
   useAgentsDataRefresh();
   // Chunk F: auto-restart drifted idle agents (per-agent opt-out, default ON).
   useAutoRestartPolicy();
@@ -272,10 +277,13 @@ export function AppShell() {
   const hasRestoredCommunityDestinationRef = React.useRef(false);
   React.useEffect(() => {
     const activeCommunityId = communitiesHook.activeCommunity?.id;
+    // The scoped query cache hydrates the last-known channel list with its
+    // original dataUpdatedAt, so only a fetch completed in this mount counts as
+    // live validation of the remembered channel.
     if (
       hasRestoredCommunityDestinationRef.current ||
       !channelsQuery.isSuccess ||
-      channelsQuery.dataUpdatedAt === 0 ||
+      !channelsQuery.isFetchedAfterMount ||
       !activeCommunityId
     ) {
       return;
@@ -309,7 +317,7 @@ export function AppShell() {
       void goChannel(destination.channelId, { replace: true });
     }
   }, [
-    channelsQuery.dataUpdatedAt,
+    channelsQuery.isFetchedAfterMount,
     channelsQuery.isSuccess,
     communitiesHook.activeCommunity?.id,
     goChannel,

@@ -1,6 +1,6 @@
+import { Capability, useCapability } from "@/platform/web/capabilities";
 import { ProjectLoadState } from "./ProjectLoadState";
 import { findProjectHomeByChannelId } from "@/features/projects/lib/projectHomeChannel";
-import { isTauri } from "@tauri-apps/api/core";
 import { ExternalLink, FolderGit2 } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
@@ -43,7 +43,6 @@ import {
   profilePanelViewFromSearch,
 } from "@/features/profile/ui/UserProfilePanelUtils";
 import { useIdentityQuery } from "@/shared/api/hooks";
-import { openProjectMergeRecoveryTerminal } from "@/shared/api/projectGit";
 import { useMainInsetRef } from "@/shared/layout/MainInsetContext";
 import { channelContentTopPaddingMeasurement } from "@/shared/layout/chromeLayout";
 import { useMeasuredCssVariable } from "@/shared/layout/useMeasuredCssVariable";
@@ -72,6 +71,7 @@ import { showProjectCloneErrorToast } from "./projectGitErrorToast";
 import {
   projectTerminalLabel,
   useOpenProjectTerminal,
+  useOpenProjectMergeRecoveryTerminal,
 } from "./useOpenProjectTerminal";
 import type { CreateIssueDialogInput } from "./CreateIssueDialog";
 import { ProjectBranchActionDialogs } from "./ProjectBranchActionDialogs";
@@ -80,34 +80,17 @@ import { ProjectRepositoryManagement } from "./ProjectRepositoryManagement";
 import { UnavailableProjectRepositories } from "./UnavailableProjectRepositories";
 import {
   PROJECT_TAB_CRUMB_LABELS,
+  PROJECT_DETAIL_PANEL_SEARCH_KEYS,
+  PROJECT_REPOSITORY_SEARCH_KEYS,
+  type ProjectDetailScreenProps,
   projectPeople,
   pushPullTitle,
   snapshotHasContent,
 } from "./projectDetailHelpers";
 
-type ProjectDetailScreenProps = {
-  commitHash?: string;
-  projectId: string;
-  entityNavigationId?: string;
-  tab?: import("@/shared/lib/entityLink").EntityLinkTab;
-  pullRequestId?: string;
-  issueId?: string;
-  repositoryId?: string;
-};
-
-const PROJECT_DETAIL_PANEL_SEARCH_KEYS = [
-  "profile",
-  "profileTab",
-  "profileView",
-] as const;
-const PROJECT_REPOSITORY_SEARCH_KEYS = [
-  "repositoryId",
-  "issueId",
-  "pullRequestId",
-  "commitHash",
-] as const;
-
 export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
+  const localGitAvailable = useCapability(Capability.LocalGit);
+  const terminalAvailable = useCapability(Capability.Terminal);
   const { commitHash, projectId, pullRequestId, issueId, repositoryId } = props;
   const { goChannel, goProject, goProjects } = useAppNavigation();
   const { activeCommunity } = useCommunities();
@@ -292,6 +275,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   const cloneRepoMutation = useCloneProjectRepositoryMutation(
     repository,
     activeCommunity?.reposDir,
+    activeBranch,
   );
   const createIssueMutation = useCreateProjectIssueMutation(repository);
   const updatePullRequestMutation = useUpdateProjectPullRequestMutation(
@@ -369,7 +353,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
     const results = await Promise.all([
       repoSnapshotQuery.refetch(),
       repoStateQuery.refetch(),
-      ...(isTauri() ? [repoSyncStatusQuery.refetch()] : []),
+      ...(localGitAvailable ? [repoSyncStatusQuery.refetch()] : []),
     ]);
     const error = results.find((result) => result.error)?.error;
     if (error) {
@@ -380,28 +364,38 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       return;
     }
     toast.success("Remote state refreshed.");
-  }, [repoSnapshotQuery, repoStateQuery, repoSyncStatusQuery]);
+  }, [
+    localGitAvailable,
+    repoSnapshotQuery,
+    repoStateQuery,
+    repoSyncStatusQuery,
+  ]);
   // Compact branch + remote/local controls shared by the readme and Files
   // tab headers.
   const filesSourceControls: RepoSourceHeaderControls = {
     branch: activeBranch ?? "",
     branchOptions: branchOptionsWithLocal,
+    remoteBranches: managedBranches.map((branch) => branch.name),
+    localBranches: repoSyncStatusQuery.data?.localBranches ?? [],
+    localCheckouts: repoSyncStatusQuery.data?.localCheckouts ?? [],
     selectedTag,
     tagOptions: repoStateQuery.data?.tags ?? [],
     onBranchChange: handleBranchChange,
     onTagChange: handleTagChange,
     onCreateBranch: () => branchActions.setCreateOpen(true),
     createBranchDisabled:
-      !isTauri() || branchActions.createPending || !activeBranchCommit,
+      !localGitAvailable || branchActions.createPending || !activeBranchCommit,
     createBranchTitle: createBranchReason ?? "Create a remote branch",
     onDeleteBranch: () => branchActions.setDeleteOpen(true),
     deleteBranchDisabled:
-      !isTauri() || branchActions.deletePending || Boolean(deleteBranchReason),
+      !localGitAvailable ||
+      branchActions.deletePending ||
+      Boolean(deleteBranchReason),
     deleteBranchTitle: deleteBranchReason ?? "Delete this remote branch",
     source: selectedTag ? "remote" : repoSource,
     onSourceChange: setRepoSource,
     localDisabled:
-      !isTauri() ||
+      !localGitAvailable ||
       Boolean(selectedTag) ||
       (!repoSyncStatusQuery.data?.localPath &&
         !localRepoSnapshotQuery.data &&
@@ -413,7 +407,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
         : "Local missing",
     ...repoRemote.controls,
     onCloneLocal:
-      isTauri() &&
+      localGitAvailable &&
       !selectedTag &&
       repository?.cloneUrls[0] &&
       repoRemote.canCloneLocally
@@ -422,24 +416,32 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
           }
         : undefined,
     clonePending: cloneRepoMutation.isPending,
-    canPush: !selectedTag && (repoSyncStatusQuery.data?.canPush ?? false),
-    onPush: selectedTag
-      ? undefined
-      : () => {
-          void handlePushLocalRepo();
-        },
+    canPush:
+      localGitAvailable &&
+      !selectedTag &&
+      (repoSyncStatusQuery.data?.canPush ?? false),
+    onPush:
+      !localGitAvailable || selectedTag
+        ? undefined
+        : () => {
+            void handlePushLocalRepo();
+          },
     pushDisabled:
       pushLocalRepoMutation.isPending || !repoSyncStatusQuery.data?.canPush,
     pushPending: pushLocalRepoMutation.isPending,
     pushTitle:
       repoSyncStatusQuery.data?.pushBlockReason ??
       pushPullTitle("Push", repoSyncStatusQuery.data?.aheadCount, "local"),
-    canPull: !selectedTag && (repoSyncStatusQuery.data?.canPull ?? false),
-    onPull: selectedTag
-      ? undefined
-      : () => {
-          void handlePullLocalRepo();
-        },
+    canPull:
+      localGitAvailable &&
+      !selectedTag &&
+      (repoSyncStatusQuery.data?.canPull ?? false),
+    onPull:
+      !localGitAvailable || selectedTag
+        ? undefined
+        : () => {
+            void handlePullLocalRepo();
+          },
     pullDisabled:
       pullLocalRepoMutation.isPending || !repoSyncStatusQuery.data?.canPull,
     pullPending: pullLocalRepoMutation.isPending,
@@ -584,7 +586,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       await Promise.all([
         repoSnapshotQuery.refetch(),
         localRepoSnapshotQuery.refetch(),
-        ...(isTauri() ? [repoSyncStatusQuery.refetch()] : []),
+        ...(localGitAvailable ? [repoSyncStatusQuery.refetch()] : []),
         repoStateQuery.refetch(),
       ]);
     } catch (error) {
@@ -593,6 +595,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       );
     }
   }, [
+    localGitAvailable,
     localRepoSnapshotQuery,
     pushLocalRepoMutation,
     repoSnapshotQuery,
@@ -677,7 +680,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       await Promise.all([
         repoSnapshotQuery.refetch(),
         localRepoSnapshotQuery.refetch(),
-        ...(isTauri() ? [repoSyncStatusQuery.refetch()] : []),
+        ...(localGitAvailable ? [repoSyncStatusQuery.refetch()] : []),
         repoStateQuery.refetch(),
       ]);
     } catch (error) {
@@ -686,6 +689,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       );
     }
   }, [
+    localGitAvailable,
     localRepoSnapshotQuery,
     pullLocalRepoMutation,
     repoSnapshotQuery,
@@ -700,25 +704,9 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       hasLocalCheckout,
     });
   }, [activeBranch, hasLocalCheckout, openTerminal, repository]);
-  const handleOpenMergeRecoveryTerminal = React.useCallback(
-    async (input: {
-      expectedCommit: string;
-      sourceBranch: string;
-      sourceCloneUrl: string;
-      targetBranch: string;
-    }) => {
-      const targetCloneUrl = repository?.cloneUrls[0];
-      if (!repository || !targetCloneUrl) {
-        throw new Error("No project selected.");
-      }
-      return openProjectMergeRecoveryTerminal({
-        ...input,
-        projectDtag: repository.dtag,
-        reposDir: activeCommunity?.reposDir,
-        targetCloneUrl,
-      });
-    },
-    [activeCommunity?.reposDir, repository],
+  const handleOpenMergeRecoveryTerminal = useOpenProjectMergeRecoveryTerminal(
+    repository,
+    activeCommunity?.reposDir,
   );
 
   if (projectQuery.isLoading) {
@@ -934,13 +922,20 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
                 localSnapshotError={localRepoSnapshotQuery.error}
                 localSnapshotLoading={localRepoSnapshotQuery.isLoading}
                 onBranchChange={handleBranchChange}
-                onOpenMergeRecoveryTerminal={handleOpenMergeRecoveryTerminal}
-                onOpenTerminal={() => {
-                  if (!isTauri()) return;
-                  void handleOpenTerminal();
-                }}
+                onOpenMergeRecoveryTerminal={
+                  terminalAvailable
+                    ? handleOpenMergeRecoveryTerminal
+                    : undefined
+                }
+                onOpenTerminal={
+                  terminalAvailable
+                    ? () => {
+                        void handleOpenTerminal();
+                      }
+                    : undefined
+                }
                 terminalTitle={
-                  isTauri()
+                  terminalAvailable
                     ? projectTerminalLabel(hasLocalCheckout)
                     : "Terminals require the desktop app"
                 }

@@ -26,6 +26,21 @@ pub async fn submit_signed_event_at_with_keys(
     submit_signed_event_now(event, state, api_base_url, keys).await
 }
 
+/// Submit retained signed bytes under a revocable captured owner/community scope.
+/// Admission waits revalidate the native epoch before any network send.
+pub async fn submit_retained_event_in_scope(
+    event: &nostr::Event,
+    state: &AppState,
+    publication: MessagePublication,
+) -> Result<SubmitEventResponse, String> {
+    if event.pubkey != publication.keys.public_key() {
+        return Err("retained event does not match captured owner".into());
+    }
+    crate::relay_admission::wait_for_rate_limit().await;
+    publication.validate()?;
+    submit_signed_event_now(event, state, &publication.api_base_url, &publication.keys).await
+}
+
 async fn submit_signed_event_now(
     event: &nostr::Event,
     state: &AppState,

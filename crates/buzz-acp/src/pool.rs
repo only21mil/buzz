@@ -20,7 +20,7 @@
 //! `AcpClient` is NOT Clone — ownership moves out on claim and back on return.
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -86,8 +86,8 @@ pub struct TaskMeta {
     pub successful_steer_deliveries: HashSet<SuccessfulSteerDelivery>,
 }
 
-/// Agent-level model capabilities. Populated on first session creation.
-/// The catalog is the same across all sessions for a given agent process.
+/// Agent-level model capabilities. Refreshed on every session creation because
+/// upstream model availability can change while the adapter process stays alive.
 /// Fields are read by the desktop's `get_agent_models` Tauri command (Phase 3).
 #[allow(dead_code)] // Scaffolding for desktop integration — fields read via serde.
 pub struct AgentModelCapabilities {
@@ -95,6 +95,53 @@ pub struct AgentModelCapabilities {
     pub config_options_raw: Vec<serde_json::Value>,
     /// Unstable: SessionModelState from session/new.
     pub available_models_raw: Option<serde_json::Value>,
+    /// When the adapter last returned this catalog from `session/new`.
+    captured_at: Instant,
+}
+
+/// A non-empty model catalog may reject an idle model switch only briefly.
+/// The adapter remains the authority, and a new session refreshes this cache.
+const MODEL_CATALOG_MAX_AGE: Duration = Duration::from_secs(60);
+
+impl AgentModelCapabilities {
+    fn definitively_excludes(&self, model_id: &str, now: Instant) -> bool {
+        let has_models = self.config_options_raw.iter().any(|option| {
+            option
+                .get("options")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|options| !options.is_empty())
+        }) || self
+            .available_models_raw
+            .as_ref()
+            .and_then(|models| models.get("availableModels"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|models| !models.is_empty());
+
+        has_models
+            && now.saturating_duration_since(self.captured_at) <= MODEL_CATALOG_MAX_AGE
+            && !model_in_catalog(
+                &self.config_options_raw,
+                self.available_models_raw.as_ref(),
+                model_id,
+            )
+    }
+}
+
+#[derive(Clone)]
+struct PendingSessionClose {
+    session_id: String,
+    reason: &'static str,
+    delete_after_close: bool,
+    attempts: u8,
+}
+
+const MAX_PENDING_CLOSE_ATTEMPTS: u8 = 3;
+
+enum PendingCloseRetry {
+    None,
+    Released,
+    Retained,
+    Exhausted { session_id: String, attempts: u8 },
 }
 
 /// Successful deliveries associated with one live channel session.
@@ -140,6 +187,8 @@ pub struct SessionState {
     /// Per-scope successful-delivery state. Created with the ACP session and
     /// cleared atomically with every invalidation path.
     pub deliveries: HashMap<SessionScope, ChannelDeliveryState>,
+    /// Invalidated sessions whose adapter-side release has not been confirmed.
+    pending_closes: VecDeque<PendingSessionClose>,
 }
 
 impl SessionState {
@@ -313,6 +362,29 @@ impl SessionState {
         self.core_sections.clear();
         self.canvas_sections.clear();
         self.deliveries.clear();
+        self.pending_closes.clear();
+    }
+
+    fn retain_failed_close(
+        &mut self,
+        session_id: String,
+        reason: &'static str,
+        delete_after_close: bool,
+    ) {
+        if let Some(pending) = self
+            .pending_closes
+            .iter_mut()
+            .find(|pending| pending.session_id == session_id)
+        {
+            pending.delete_after_close |= delete_after_close;
+            return;
+        }
+        self.pending_closes.push_back(PendingSessionClose {
+            session_id,
+            reason,
+            delete_after_close,
+            attempts: 1,
+        });
     }
 
     pub(crate) fn mark_scope_delivery_success(
@@ -344,7 +416,7 @@ pub struct OwnedAgent {
     pub index: usize,
     pub acp: AcpClient,
     pub state: SessionState,
-    /// Model catalog from first session/new. None until first session created.
+    /// Most recent model catalog from `session/new`. None until a session is created.
     pub model_capabilities: Option<AgentModelCapabilities>,
     /// Desired model ID (from `Config.model`). Applied after every `session_new_full()`.
     pub desired_model: Option<String>,
@@ -427,23 +499,77 @@ impl OwnedAgent {
                 false
             }
         };
-        if delete_after_close {
-            if let Err(error) = self.acp.session_delete(session_id).await {
-                tracing::warn!(
-                    target: "pool::session",
-                    session_id,
-                    reason,
-                    %error,
-                    "best-effort session delete fallback failed"
-                );
+        let deleted = if delete_after_close {
+            match self.acp.session_delete(session_id).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "pool::session",
+                        session_id,
+                        reason,
+                        %error,
+                        "best-effort session delete fallback failed"
+                    );
+                    false
+                }
             }
+        } else {
+            false
+        };
+        closed || deleted
+    }
+
+    async fn release_invalidated_session(
+        &mut self,
+        session_id: String,
+        reason: &'static str,
+        delete_after_close: bool,
+    ) {
+        if !self
+            .release_session_best_effort(&session_id, reason, delete_after_close)
+            .await
+        {
+            self.state
+                .retain_failed_close(session_id, reason, delete_after_close);
         }
-        closed
+    }
+
+    async fn retry_one_pending_close(&mut self) -> PendingCloseRetry {
+        let Some(pending) = self.state.pending_closes.front().cloned() else {
+            return PendingCloseRetry::None;
+        };
+        if self
+            .release_session_best_effort(
+                &pending.session_id,
+                pending.reason,
+                pending.delete_after_close,
+            )
+            .await
+        {
+            self.state.pending_closes.pop_front();
+            return PendingCloseRetry::Released;
+        }
+
+        let Some(front) = self.state.pending_closes.front_mut() else {
+            return PendingCloseRetry::None;
+        };
+        front.attempts = front.attempts.saturating_add(1);
+        let attempts = front.attempts;
+        let session_id = front.session_id.clone();
+        if attempts >= MAX_PENDING_CLOSE_ATTEMPTS {
+            PendingCloseRetry::Exhausted {
+                session_id,
+                attempts,
+            }
+        } else {
+            self.state.pending_closes.rotate_left(1);
+            PendingCloseRetry::Retained
+        }
     }
 
     pub async fn invalidate_source(&mut self, source: &PromptSource, reason: &'static str) {
         if let Some(session_id) = self.state.take_source_session(source) {
-            self.release_session_best_effort(&session_id, reason, true)
+            self.release_invalidated_session(session_id, reason, true)
                 .await;
         }
     }
@@ -453,7 +579,7 @@ impl OwnedAgent {
         let Some(session_id) = self.state.take_channel_session(scope) else {
             return false;
         };
-        self.release_session_best_effort(&session_id, reason, true)
+        self.release_invalidated_session(session_id, reason, true)
             .await;
         true
     }
@@ -1125,6 +1251,26 @@ impl AgentPool {
     pub async fn return_agent(&mut self, mut agent: OwnedAgent) {
         self.apply_scope_invalidations(&mut agent).await;
         let idx = agent.index;
+        // The result loop can immediately dispatch queued work before idle
+        // maintenance runs. Give pending releases one bounded attempt at this
+        // exclusive handoff so a continuously busy worker cannot starve them.
+        if let PendingCloseRetry::Exhausted {
+            session_id,
+            attempts,
+        } = agent.retry_one_pending_close().await
+        {
+            tracing::warn!(
+                agent = idx,
+                session_id,
+                attempts,
+                "pending ACP session close exhausted on return; restarting adapter"
+            );
+            agent.state.invalidate_all();
+            agent.acp.shutdown().await;
+            self.session_owners.retain(|_, owner| *owner != idx);
+            self.pending_scope_invalidations.remove(&idx);
+            return;
+        }
         if self.agents[idx].is_some() {
             // This is a bug: two tasks returned the same agent index. Log it
             // loudly so it shows up in production logs, then overwrite — the
@@ -1351,7 +1497,9 @@ impl AgentPool {
         count
     }
 
-    /// Close at most one idle or least-recently-used session per maintenance tick.
+    /// Retry one pending close or reap one idle session per maintenance tick.
+    /// Three failed release attempts retire the adapter so process shutdown
+    /// releases every session before the normal slot-refill path replaces it.
     pub async fn reap_idle_sessions(
         &mut self,
         idle_ttl: Duration,
@@ -1366,6 +1514,37 @@ impl AgentPool {
             let Some(agent) = self.agents[index].as_mut() else {
                 continue;
             };
+            match agent.retry_one_pending_close().await {
+                PendingCloseRetry::None => {}
+                PendingCloseRetry::Released => {
+                    self.reap_cursor = (index + 1) % len;
+                    return 1;
+                }
+                PendingCloseRetry::Retained => {
+                    self.reap_cursor = (index + 1) % len;
+                    return 0;
+                }
+                PendingCloseRetry::Exhausted {
+                    session_id,
+                    attempts,
+                } => {
+                    tracing::warn!(
+                        agent = index,
+                        session_id,
+                        attempts,
+                        "pending ACP session close exhausted retries; restarting adapter"
+                    );
+                    let Some(mut agent) = self.agents[index].take() else {
+                        return 0;
+                    };
+                    agent.state.invalidate_all();
+                    agent.acp.shutdown().await;
+                    self.session_owners.retain(|_, owner| *owner != index);
+                    self.pending_scope_invalidations.remove(&index);
+                    self.reap_cursor = (index + 1) % len;
+                    return 0;
+                }
+            }
             if let Some(reaped) = agent
                 .reap_one_idle_session(idle_ttl, max_live_sessions)
                 .await
@@ -1442,14 +1621,10 @@ impl AgentPool {
             return IdleSwitchResult::NoIdleAgent;
         };
 
-        // Pre-cancel guard against the cached catalog. None = catalog not yet
-        // populated (no session ever created); defer validation to apply time.
+        // An empty or expired catalog is not evidence that a model is absent.
+        // Accept the switch and let the next session/new refresh the catalog.
         if let Some(caps) = agent.model_capabilities.as_ref() {
-            if !model_in_catalog(
-                &caps.config_options_raw,
-                caps.available_models_raw.as_ref(),
-                model_id,
-            ) {
+            if caps.definitively_excludes(model_id, Instant::now()) {
                 return IdleSwitchResult::UnsupportedModel;
             }
         }
@@ -1490,8 +1665,8 @@ pub enum IdleSwitchResult {
     AmbiguousTarget,
     /// `desired_model` set and the selected session invalidated.
     Switched,
-    /// Desired model is not in the agent's cached catalog — pick rejected,
-    /// session untouched.
+    /// Desired model is absent from a fresh, non-empty catalog. The pick is
+    /// rejected and the session remains untouched.
     UnsupportedModel,
     /// No idle agent available (all checked out / none spawned).
     NoIdleAgent,
@@ -1662,13 +1837,13 @@ async fn create_session_and_apply_model(
         }
     }
 
-    // Populate model capabilities on first session creation.
-    if agent.model_capabilities.is_none() {
-        agent.model_capabilities = Some(AgentModelCapabilities {
-            config_options_raw: extract_model_config_options(&resp.raw),
-            available_models_raw: extract_model_state(&resp.raw),
-        });
-    }
+    // Every session/new is a fresh adapter observation. Replacing the cache
+    // prevents a transient empty first response from living for the process.
+    agent.model_capabilities = Some(AgentModelCapabilities {
+        config_options_raw: extract_model_config_options(&resp.raw),
+        available_models_raw: extract_model_state(&resp.raw),
+        captured_at: Instant::now(),
+    });
 
     let mut session_config = resp.raw.clone();
     // Apply desired_model if set, matching against the fresh session/new response.
@@ -1722,7 +1897,11 @@ async fn create_session_and_apply_model(
             Err(error @ AcpError::AgentError { .. }) => {
                 // This new session has not entered pool state; reject without leaking it.
                 agent
-                    .release_session_best_effort(&resp.session_id, "startup_effort_rejected", true)
+                    .release_invalidated_session(
+                        resp.session_id.clone(),
+                        "startup_effort_rejected",
+                        true,
+                    )
                     .await;
                 return Err(error);
             }
@@ -3104,8 +3283,8 @@ pub async fn run_prompt_task(
                             &control_signal,
                         ) {
                             agent
-                                .release_session_best_effort(
-                                    &session_id,
+                                .release_invalidated_session(
+                                    session_id,
                                     "completed_before_rotate_or_switch",
                                     true,
                                 )
@@ -3344,9 +3523,10 @@ pub async fn run_prompt_task(
         }
         Err(e) => {
             tracing::error!(target: "pool::prompt", "session_prompt error: {e}");
-            // AgentError means the agent caught a problem before mutating
-            // session state (e.g. bad LLM response). The session is healthy —
-            // don't invalidate it. Other errors may have corrupted state.
+            // Preserve sessions for ordinary application errors. The result
+            // handler separately restarts adapters reporting model availability
+            // failures, which may retain stale process-wide provider state.
+            // Other errors may have corrupted session state.
             if !matches!(e, AcpError::AgentError { .. }) {
                 agent
                     .invalidate_source(&source, "session_prompt_error")
@@ -6474,6 +6654,234 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_model_error_recovers_after_provider_returns() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let capture = std::env::temp_dir().join(format!("buzz-model-recovery-{}", Uuid::new_v4()));
+        let recovered = capture.with_extension("recovered");
+        let script = format!(
+            r#"
+            # Model availability is cached once per adapter process. A provider
+            # recovery alone cannot repair this process's negative observation.
+            ready=0
+            [ -f '{}' ] && ready=1
+            count=0
+            while IFS= read -r line; do
+                printf '%s\n' "$line" >> '{}'
+                case "$line" in
+                    *'"method":"initialize"'*) result='{{"protocolVersion":1}}' ;;
+                    *'"method":"session/new"'*) result='{{"sessionId":"fresh-session"}}' ;;
+                    *'"method":"session/prompt"'*)
+                        if [ "$ready" -eq 0 ]; then
+                            printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32000,"message":"There is an issue with the selected model (test-model). It may not exist or you may not have access to it."}}}}\n' "$count"
+                            count=$((count + 1))
+                            continue
+                        fi
+                        result='{{"stopReason":"end_turn"}}' ;;
+                    *) result='{{}}' ;;
+                esac
+                printf '{{"jsonrpc":"2.0","id":%s,"result":%s}}\n' "$count" "$result"
+                count=$((count + 1))
+            done
+        "#,
+            recovered.display(),
+            capture.display()
+        );
+        let mut config = crate::error_outcome_emission_tests::test_config();
+        config.agent_command = "bash".into();
+        config.agent_args = vec!["-c".into(), script];
+        let (acp, protocol_version, agent_name) = crate::spawn_and_init(
+            &config.agent_command,
+            &config.agent_args,
+            &[],
+            false,
+            0,
+            None,
+        )
+        .await
+        .expect("spawn synthetic stale adapter");
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name,
+            goose_system_prompt_supported: None,
+            protocol_version,
+        };
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        agent
+            .state
+            .sessions
+            .insert(scope.clone(), "stale-session".into());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0; 16 * 1024];
+                let _ = socket.read(&mut request).await;
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]").await;
+            }
+        });
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.rest_client.base_url = base_url;
+        ctx.channel_info = ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                crate::relay::ChannelInfo {
+                    name: "test-dm".into(),
+                    channel_type: "dm".into(),
+                },
+            )]),
+            ctx.rest_client.clone(),
+        );
+        ctx.dedup_mode = DedupMode::Queue;
+        let ctx = Arc::new(ctx);
+        let batch = |text: &str| FlushBatch {
+            channel_id,
+            scope: scope.clone(),
+            events: vec![crate::queue::BatchEvent {
+                event: EventBuilder::new(Kind::Custom(9), text)
+                    .sign_with_keys(&ctx.agent_keys)
+                    .unwrap(),
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        run_prompt_task(
+            agent,
+            Some(batch("ordinary owner message")),
+            None,
+            Arc::clone(&ctx),
+            result_tx.clone(),
+            None,
+            "failed-turn".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("ordinary prompt result");
+        assert!(
+            matches!(
+                result.outcome,
+                PromptOutcome::Error(AcpError::AgentError { .. })
+            ),
+            "fixture must reach a real session/prompt AgentError"
+        );
+        std::fs::write(&recovered, b"provider recovered").unwrap();
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            TaskMeta {
+                agent_index: 0,
+                channel_id: Some(channel_id),
+                scope: Some(scope.clone()),
+                turn_id: "failed-turn".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = crate::queue::EventQueue::new(DedupMode::Queue);
+        let mut circuits = vec![crate::SlotCircuit {
+            crash_times: vec![],
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, mut respawn_rx) = mpsc::channel(1);
+        let mut tasks = tokio::task::JoinSet::new();
+        crate::handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut false,
+            &HashSet::new(),
+            &mut circuits,
+            &respawn_tx,
+            &mut tasks,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            !pool.any_idle(),
+            "model availability error must retire the cached adapter"
+        );
+        assert!(circuits[0].respawn_in_flight);
+        assert_eq!(
+            queue.queued_event_count(channel_id),
+            1,
+            "failed owner message stays queued within its retry budget"
+        );
+        let respawn = tokio::time::timeout(Duration::from_secs(10), respawn_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (acp, protocol_version, agent_name) =
+            respawn.result.expect("replacement adapter initialized");
+        let agent = OwnedAgent {
+            index: respawn.index,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name,
+            goose_system_prompt_supported: None,
+            protocol_version,
+        };
+        pool.return_agent(agent).await;
+        let agent = pool.try_claim(Some(&scope)).await.unwrap();
+        run_prompt_task(
+            agent,
+            Some(batch("next ordinary owner message")),
+            None,
+            Arc::clone(&ctx),
+            result_tx,
+            None,
+            "recovered-turn".into(),
+        )
+        .await;
+        let mut result = result_rx.recv().await.unwrap();
+        assert!(
+            matches!(result.outcome, PromptOutcome::Ok(StopReason::EndTurn)),
+            "next normal message must reach the recovered provider"
+        );
+        result.agent.acp.shutdown().await;
+        while tasks.join_next().await.is_some() {}
+        server.abort();
+        let requests: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let methods: Vec<_> = requests
+            .iter()
+            .filter_map(|v| v["method"].as_str())
+            .collect();
+        assert_eq!(methods.iter().filter(|&&m| m == "initialize").count(), 2);
+        assert_eq!(methods.iter().filter(|&&m| m == "session/new").count(), 1);
+        let prompts: Vec<_> = requests
+            .iter()
+            .filter(|v| v["method"] == "session/prompt")
+            .collect();
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0]["params"]["sessionId"], "stale-session");
+        assert_eq!(prompts[1]["params"]["sessionId"], "fresh-session");
+        std::fs::remove_file(capture).unwrap();
+        std::fs::remove_file(recovered).unwrap();
+    }
+
+    #[tokio::test]
     async fn run_prompt_task_commits_standing_context_only_after_acp_success() {
         let capture = std::env::temp_dir().join(format!(
             "buzz-acp-standing-lifecycle-{}.ndjson",
@@ -7205,6 +7613,60 @@ done"#
             );
         }
         std::fs::remove_file(capture).unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_catalog_refreshes_on_each_session_new() {
+        let script = r#"
+            read _first || exit 1
+            echo '{"jsonrpc":"2.0","id":0,"result":{"sessionId":"first","configOptions":[{"category":"model","options":[{"value":"stale-model"}]}]}}'
+            read _second || exit 1
+            echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"second","configOptions":[{"category":"model","options":[{"value":"recovered-model"}]}]}}'
+            sleep 1
+        "#;
+        let acp = AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+            .await
+            .expect("failed to spawn test agent");
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "test".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let ctx = make_prompt_context_no_owner();
+
+        create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None)
+            .await
+            .expect("first session");
+        let first = agent.model_capabilities.as_ref().expect("first catalog");
+        assert!(model_in_catalog(
+            &first.config_options_raw,
+            first.available_models_raw.as_ref(),
+            "stale-model"
+        ));
+
+        create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None)
+            .await
+            .expect("second session");
+        let refreshed = agent
+            .model_capabilities
+            .as_ref()
+            .expect("refreshed catalog");
+        assert!(model_in_catalog(
+            &refreshed.config_options_raw,
+            refreshed.available_models_raw.as_ref(),
+            "recovered-model"
+        ));
+        assert!(!model_in_catalog(
+            &refreshed.config_options_raw,
+            refreshed.available_models_raw.as_ref(),
+            "stale-model"
+        ));
     }
 
     #[tokio::test]
@@ -9006,6 +9468,246 @@ for line in sys.stdin:
             .all(|request| request["params"]["sessionId"] == "session-to-drop"));
         assert!(!agent.state.has_channel_state(&channel_id));
         let _ = std::fs::remove_file(capture);
+    }
+
+    #[tokio::test]
+    async fn stale_empty_model_catalog_does_not_reject_idle_switch() {
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-empty-model-catalog-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let script = format!(
+            r#"
+                for id in 0 1; do
+                    read REQUEST || exit 1
+                    printf '%s\n' "$REQUEST" >> '{}'
+                    printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id"
+                done
+                sleep 1
+            "#,
+            capture.display()
+        );
+        let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+            .await
+            .expect("failed to spawn test agent");
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let mut state = SessionState::default();
+        state.sessions.insert(scope, "stale-session".into());
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state,
+            model_capabilities: Some(AgentModelCapabilities {
+                config_options_raw: vec![],
+                available_models_raw: None,
+                captured_at: Instant::now(),
+            }),
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "unknown".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+        let result = pool
+            .switch_idle_agent_model(channel_id, "recovered-model")
+            .await;
+
+        assert_eq!(result, IdleSwitchResult::Switched);
+        let agent = pool.agents[0].as_ref().expect("agent remains idle");
+        assert_eq!(agent.desired_model.as_deref(), Some("recovered-model"));
+        assert!(!agent.state.has_channel_state(&channel_id));
+        let requests = std::fs::read_to_string(&capture).expect("captured invalidation requests");
+        assert_eq!(requests.lines().count(), 2);
+        let _ = std::fs::remove_file(capture);
+    }
+
+    #[test]
+    fn only_fresh_nonempty_catalog_can_reject_model() {
+        let catalog = |captured_at| AgentModelCapabilities {
+            config_options_raw: vec![serde_json::json!({
+                "category": "model",
+                "options": [{ "value": "known-model" }]
+            })],
+            available_models_raw: None,
+            captured_at,
+        };
+        let now = Instant::now();
+
+        assert!(catalog(now).definitively_excludes("missing-model", now));
+        assert!(
+            !catalog(now - MODEL_CATALOG_MAX_AGE - Duration::from_millis(1))
+                .definitively_excludes("missing-model", now)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_invalidation_close_is_retried_on_maintenance_tick() {
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-pending-close-{}.ndjson",
+            uuid::Uuid::new_v4()
+        ));
+        let script = format!(
+            r#"
+                for id in 0 1; do
+                    read REQUEST || exit 1
+                    printf '%s\n' "$REQUEST" >> '{}'
+                    printf '{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32000,"message":"adapter still closing"}}}}\n' "$id"
+                done
+                for id in 2 3; do
+                    read REQUEST || exit 1
+                    printf '%s\n' "$REQUEST" >> '{}'
+                    printf '{{"jsonrpc":"2.0","id":%s,"result":{{}}}}\n' "$id"
+                done
+                sleep 1
+            "#,
+            capture.display(),
+            capture.display()
+        );
+        let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+            .await
+            .expect("failed to spawn test agent");
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let mut state = SessionState::default();
+        state
+            .sessions
+            .insert(scope.clone(), "session-needs-retry".into());
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state,
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "unknown".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+        assert_eq!(pool.invalidate_scope_session(&scope).await, 1);
+        assert_eq!(
+            pool.reap_idle_sessions(Duration::from_secs(30), 8).await,
+            1,
+            "maintenance must retry the retained close"
+        );
+
+        let requests: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+            .expect("captured close retry requests")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid JSON-RPC"))
+            .collect();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0]["method"], "session/close");
+        assert_eq!(requests[1]["method"], "session/delete");
+        assert_eq!(requests[2]["method"], "session/close");
+        assert_eq!(requests[3]["method"], "session/delete");
+        assert!(requests
+            .iter()
+            .all(|request| request["params"]["sessionId"] == "session-needs-retry"));
+        let _ = std::fs::remove_file(capture);
+    }
+
+    #[tokio::test]
+    async fn pending_close_progresses_with_continuous_backlog() {
+        let script = r#"
+            for id in 0 1 2 3 4 5; do
+                read _request || exit 1
+                printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"still stuck"}}\n' "$id"
+            done
+            sleep 10
+        "#;
+        let acp = AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+            .await
+            .expect("failed to spawn test agent");
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let mut state = SessionState::default();
+        state
+            .sessions
+            .insert(scope.clone(), "session-never-closes".into());
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state,
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "unknown".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+        assert_eq!(pool.invalidate_scope_session(&scope).await, 1);
+        // Match the result-loop ordering: return, immediately dispatch again,
+        // then maintenance while the worker is checked out. There is always
+        // another queued turn, so the idle maintenance path never gets a slot.
+        let mut backlog = VecDeque::from([1, 2, 3]);
+        let mut agent = pool.try_claim(Some(&scope)).await.expect("first turn");
+        while let Some(turn) = backlog.pop_front() {
+            assert_eq!(pool.reap_idle_sessions(Duration::from_secs(30), 8).await, 0);
+            pool.return_agent(agent).await;
+            let next = pool.try_claim(Some(&scope)).await;
+            if turn == 2 {
+                assert!(
+                    next.is_none(),
+                    "third failed release must retire the busy adapter"
+                );
+                assert!(
+                    !backlog.is_empty(),
+                    "queued work must still exist at retirement"
+                );
+                return;
+            }
+            agent = next.expect("worker remains usable before retry exhaustion");
+        }
+        panic!("pending close never exhausted while backlog stayed ready");
+    }
+
+    #[tokio::test]
+    async fn exhausted_pending_close_restarts_adapter_slot() {
+        let script = r#"
+            for id in 0 1 2 3 4 5; do
+                read _request || exit 1
+                printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"still stuck"}}\n' "$id"
+            done
+            sleep 10
+        "#;
+        let acp = AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+            .await
+            .expect("failed to spawn test agent");
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let mut state = SessionState::default();
+        state
+            .sessions
+            .insert(scope.clone(), "session-never-closes".into());
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state,
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "unknown".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+        assert_eq!(pool.invalidate_scope_session(&scope).await, 1);
+        assert!(pool.slot_alive(0));
+        assert_eq!(pool.reap_idle_sessions(Duration::from_secs(30), 8).await, 0);
+        assert!(pool.slot_alive(0));
+        assert_eq!(pool.reap_idle_sessions(Duration::from_secs(30), 8).await, 0);
+        assert!(
+            !pool.slot_alive(0),
+            "three failed release attempts must retire the adapter for refill"
+        );
     }
 
     #[tokio::test]

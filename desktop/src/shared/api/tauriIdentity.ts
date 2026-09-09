@@ -1,3 +1,4 @@
+import { scopedQueryCache } from "./scopedQueryCache";
 import { invokeTauri } from "@/shared/api/tauri";
 import type { Identity, IdentityStorage } from "@/shared/api/types";
 import { removeAllMessageSnapshots } from "@/features/messages/lib/messageSnapshot";
@@ -41,6 +42,7 @@ export async function importIdentity(
   // The old pubkey is not reliably available on every replacement path. Purge
   // every identity bucket after native replacement succeeds, before callers
   // can remount against the new signer.
+  await scopedQueryCache.clear();
   removeAllMessageSnapshots();
   invalidateProfileBatchCoalescer();
   return identity;
@@ -50,6 +52,7 @@ export async function persistCurrentIdentity(): Promise<Identity> {
   const identity = fromRawIdentity(
     await invokeTauri<RawIdentity>("persist_current_identity"),
   );
+  await scopedQueryCache.clear();
   removeAllMessageSnapshots();
   invalidateProfileBatchCoalescer();
   return identity;
@@ -65,6 +68,7 @@ export async function persistCurrentIdentity(): Promise<Identity> {
 export async function signOut(): Promise<void> {
   // The native command may relaunch before its promise resolves. Invalidate
   // captured writes and purge plaintext snapshots before invoking it.
+  await scopedQueryCache.clear();
   removeAllMessageSnapshots();
   invalidateProfileBatchCoalescer();
   await invokeTauri("sign_out");

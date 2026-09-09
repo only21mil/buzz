@@ -276,8 +276,10 @@ export async function replayLiveSubscriptions({
         sendRaw([
           "REQ",
           subId,
+          // Gap history is paged below. Suppress historical results while
+          // preserving the live predicate for delayed or backdated events.
           shouldPageReplay
-            ? subscription.filter
+            ? { ...subscription.filter, limit: 0 }
             : buildReconnectReplayFilter(subscription.filter, replaySince),
         ]),
       ),

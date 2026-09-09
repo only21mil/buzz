@@ -1,48 +1,120 @@
+use std::collections::HashSet;
+
+use serde_json::Value;
 use uuid::Uuid;
 
 use crate::client::{extract_d_tag, normalize_write_response, BuzzClient};
 use crate::error::CliError;
 use crate::validate::{parse_uuid, sdk_err, validate_hex64};
 
-/// List DM conversations by querying kind:41001 (relay-confirmed DMs) filtered by our pubkey.
-pub async fn cmd_list_dms(client: &BuzzClient, limit: Option<u32>) -> Result<(), CliError> {
+const MAX_DM_DISCOVERY_EVENTS: u32 = 10_000;
+
+fn tag_values(event: &Value, name: &str) -> Vec<String> {
+    event
+        .get("tags")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_array)
+        .filter(|tag| tag.first().and_then(Value::as_str) == Some(name))
+        .filter_map(|tag| tag.get(1).and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+fn has_tag(event: &Value, name: &str) -> bool {
+    event
+        .get("tags")
+        .and_then(Value::as_array)
+        .is_some_and(|tags| {
+            tags.iter()
+                .filter_map(Value::as_array)
+                .any(|tag| tag.first().and_then(Value::as_str) == Some(name))
+        })
+}
+
+fn dm_projection(metadata: Vec<Value>, hidden: &HashSet<String>, limit: u32) -> Vec<Value> {
+    let mut dms = metadata
+        .into_iter()
+        .filter(|event| {
+            tag_values(event, "t").iter().any(|value| value == "dm") || has_tag(event, "hidden")
+        })
+        .filter_map(|event| {
+            let dm_id = extract_d_tag(&event);
+            if dm_id.is_empty() || hidden.contains(&dm_id) {
+                return None;
+            }
+            Some(serde_json::json!({
+                "dm_id": dm_id,
+                "participants": tag_values(&event, "p"),
+                "created_at": event.get("created_at").and_then(Value::as_u64).unwrap_or(0),
+            }))
+        })
+        .collect::<Vec<_>>();
+    dms.sort_by(|left, right| {
+        right
+            .get("created_at")
+            .and_then(Value::as_u64)
+            .cmp(&left.get("created_at").and_then(Value::as_u64))
+            .then_with(|| {
+                left.get("dm_id")
+                    .and_then(Value::as_str)
+                    .cmp(&right.get("dm_id").and_then(Value::as_str))
+            })
+    });
+    dms.truncate(limit as usize);
+    dms
+}
+
+async fn list_dms(client: &BuzzClient, limit: Option<u32>) -> Result<Vec<Value>, CliError> {
     let my_pk = client.keys().public_key().to_hex();
     let limit = limit.unwrap_or(50).min(200);
-    let filter = serde_json::json!({
-        "kinds": [41001],
-        "#p": [my_pk],
-        "limit": limit
-    });
-    let resp = client.query(&filter).await?;
-    let events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
-    let dms: Vec<serde_json::Value> = events
+    let membership = client
+        .query_all_bounded(
+            serde_json::json!({"kinds": [39002], "#p": [&my_pk]}),
+            MAX_DM_DISCOVERY_EVENTS,
+        )
+        .await?;
+    let mut channel_ids = membership
         .iter()
-        .map(|e| {
-            let dm_id = extract_d_tag(e);
-            let participants: Vec<String> = e
-                .get("tags")
-                .and_then(|t| t.as_array())
-                .map(|tags| {
-                    tags.iter()
-                        .filter_map(|tag| {
-                            let arr = tag.as_array()?;
-                            if arr.first()?.as_str()? == "p" {
-                                arr.get(1)?.as_str().map(|s| s.to_string())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+        .map(extract_d_tag)
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    channel_ids.sort();
+    channel_ids.dedup();
+
+    let metadata = if channel_ids.is_empty() {
+        Vec::new()
+    } else {
+        client
+            .query_all_bounded(
+                serde_json::json!({"kinds": [39000], "#d": channel_ids}),
+                MAX_DM_DISCOVERY_EVENTS,
+            )
+            .await?
+    };
+
+    let visibility = client
+        .query_paginated(
             serde_json::json!({
-                "dm_id": dm_id,
-                "participants": participants,
-                "created_at": e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
-            })
-        })
-        .collect();
-    let output = serde_json::to_string(&dms).unwrap_or_default();
+                "kinds": [buzz_core::kind::KIND_DM_VISIBILITY],
+                "#p": [&my_pk]
+            }),
+            1,
+        )
+        .await?;
+    let hidden = visibility
+        .first()
+        .map(|event| tag_values(event, "h").into_iter().collect())
+        .unwrap_or_default();
+    Ok(dm_projection(metadata, &hidden, limit))
+}
+
+/// List DM conversations from the current NIP-29 membership and metadata events.
+pub async fn cmd_list_dms(client: &BuzzClient, limit: Option<u32>) -> Result<(), CliError> {
+    let dms = list_dms(client, limit).await?;
+    let output = serde_json::to_string(&dms)
+        .map_err(|error| CliError::Other(format!("failed to serialize DM list: {error}")))?;
     println!("{output}");
     Ok(())
 }
@@ -132,5 +204,140 @@ pub async fn dispatch(cmd: crate::DmsCmd, client: &BuzzClient) -> Result<(), Cli
         DmsCmd::Open { pubkeys } => cmd_open_dm(client, &pubkeys).await,
         DmsCmd::AddMember { channel, pubkey } => cmd_add_dm_member(client, &channel, &pubkey).await,
         DmsCmd::Hide { channel } => cmd_hide_dm(client, &channel).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+
+    use axum::{extract::State, routing::post, Json, Router};
+    use nostr::Keys;
+    use serde_json::Value;
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct QueryState {
+        filters: Arc<Mutex<Vec<Value>>>,
+        membership: Vec<Value>,
+        metadata: Vec<Value>,
+        visibility: Vec<Value>,
+    }
+
+    async fn query_handler(
+        State(state): State<QueryState>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        state
+            .filters
+            .lock()
+            .expect("query capture lock")
+            .push(body.clone());
+        let kinds = body
+            .as_array()
+            .and_then(|filters| filters.first())
+            .and_then(|filter| filter.get("kinds"));
+        let events = if kinds == Some(&serde_json::json!([39002])) {
+            state.membership
+        } else if kinds == Some(&serde_json::json!([39000])) {
+            state.metadata
+        } else if kinds == Some(&serde_json::json!([buzz_core::kind::KIND_DM_VISIBILITY])) {
+            state.visibility
+        } else {
+            Vec::new()
+        };
+        Json(Value::Array(events))
+    }
+
+    async fn query_server(state: QueryState) -> (String, Arc<Mutex<Vec<Value>>>) {
+        let filters = state.filters.clone();
+        let app = Router::new()
+            .route("/query", post(query_handler))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address: SocketAddr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), filters)
+    }
+
+    #[tokio::test]
+    async fn list_discovers_dms_from_current_membership_events() {
+        let (url, filters) = query_server(QueryState::default()).await;
+        let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
+
+        cmd_list_dms(&client, Some(50)).await.unwrap();
+
+        let filters = filters.lock().unwrap();
+        assert!(filters.iter().any(|body| {
+            body.as_array().is_some_and(|entries| {
+                entries.iter().any(|filter| {
+                    filter.get("kinds") == Some(&serde_json::json!([39002]))
+                        && filter.get("#p").is_some()
+                })
+            })
+        }));
+    }
+
+    #[tokio::test]
+    async fn list_returns_a_live_synthetic_dm() {
+        let dm_id = Uuid::new_v4().to_string();
+        let participant = "a".repeat(64);
+        let state = QueryState {
+            membership: vec![serde_json::json!({
+                "id": "1".repeat(64),
+                "created_at": 10,
+                "tags": [["d", dm_id], ["p", participant]]
+            })],
+            metadata: vec![serde_json::json!({
+                "id": "2".repeat(64),
+                "created_at": 20,
+                "tags": [["d", dm_id], ["hidden"], ["t", "dm"], ["p", participant]]
+            })],
+            ..QueryState::default()
+        };
+        let (url, _) = query_server(state).await;
+        let client = BuzzClient::new(url, Keys::generate(), None, None).unwrap();
+
+        let dms = list_dms(&client, Some(50)).await.unwrap();
+
+        assert_eq!(dms.len(), 1);
+        assert_eq!(dms[0]["dm_id"], dm_id);
+        assert_eq!(dms[0]["participants"], serde_json::json!([participant]));
+    }
+
+    #[test]
+    fn projection_uses_dm_metadata_and_excludes_hidden_conversations() {
+        let visible_id = Uuid::new_v4().to_string();
+        let hidden_id = Uuid::new_v4().to_string();
+        let participant = "a".repeat(64);
+        let metadata = vec![
+            serde_json::json!({
+                "created_at": 20,
+                "tags": [["d", visible_id], ["hidden"], ["t", "dm"], ["p", participant]]
+            }),
+            serde_json::json!({
+                "created_at": 30,
+                "tags": [["d", hidden_id], ["hidden"], ["t", "dm"]]
+            }),
+            serde_json::json!({
+                "created_at": 40,
+                "tags": [["d", Uuid::new_v4().to_string()], ["t", "stream"]]
+            }),
+        ];
+        let hidden = HashSet::from([hidden_id]);
+
+        let projected = dm_projection(metadata, &hidden, 50);
+
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0]["dm_id"], visible_id);
+        assert_eq!(
+            projected[0]["participants"],
+            serde_json::json!([participant])
+        );
     }
 }

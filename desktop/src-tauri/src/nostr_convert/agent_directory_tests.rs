@@ -40,6 +40,92 @@ fn managed_agent_event(
 }
 
 #[test]
+fn relay_agent_directory_tolerates_malformed_descriptive_arrays() {
+    use crate::managed_agents::{RelayAgentInfo, RespondTo};
+
+    let peer = ev(
+        10100,
+        r#"{"name":"Valid peer","respond_to":"owner-only"}"#,
+        vec![],
+    );
+    for field in ["channels", "channel_ids", "capabilities"] {
+        for (value, expected) in [
+            (
+                json!(["valid", 17, null, {}, [], false, "also-valid"]),
+                vec!["valid", "also-valid"],
+            ),
+            (json!(null), vec![]),
+            (json!("not-an-array"), vec![]),
+            (json!({}), vec![]),
+        ] {
+            let mut content = json!({
+                "name": "Mixed profile",
+                "status": "online",
+                "respond_to": "allowlist",
+                "respond_to_allowlist": ["a".repeat(64)],
+            });
+            content[field] = value;
+            let malformed = ev(10100, &content.to_string(), vec![]);
+            let events = [malformed.clone(), peer.clone()];
+            let converted = agents_from_events(&events);
+            let typed: Vec<RelayAgentInfo> =
+                serde_json::from_value(converted["agents"].clone()).expect("typed directory");
+            assert_eq!(typed.len(), 2, "field: {field}");
+            let mixed = typed
+                .iter()
+                .find(|agent| agent.name == "Mixed profile")
+                .unwrap();
+            let normalized = serde_json::to_value(mixed).unwrap();
+            assert_eq!(normalized[field], json!(expected), "field: {field}");
+            assert_eq!(mixed.respond_to, Some(RespondTo::Allowlist));
+            assert_eq!(mixed.respond_to_allowlist, vec!["a".repeat(64)]);
+
+            let directory = relay_agents_from_directory_events(&events, &[], &[]);
+            assert_eq!(directory.len(), 2, "field: {field}");
+            let mixed = directory
+                .iter()
+                .find(|agent| agent.pubkey == malformed.pubkey.to_hex())
+                .unwrap();
+            assert_eq!(mixed.status, "online");
+            assert!(
+                mixed.channel_ids.is_empty(),
+                "runtime profile cannot grant membership"
+            );
+        }
+    }
+}
+
+#[test]
+fn relay_agent_directory_rejects_malformed_policy_without_losing_valid_peers() {
+    let peer = ev(
+        10100,
+        r#"{"name":"Valid peer","respond_to":"owner-only"}"#,
+        vec![],
+    );
+    for (field, value) in [
+        ("respond_to", json!("unknown-mode")),
+        ("respond_to", json!(17)),
+        ("respond_to_allowlist", json!(["a".repeat(64), 17])),
+        ("respond_to_allowlist", json!("not-an-array")),
+        ("respond_to_allowlist", json!(null)),
+    ] {
+        let mut content = json!({"name": "Malformed policy", "respond_to": "allowlist"});
+        content[field] = value.clone();
+        let malformed = ev(10100, &content.to_string(), vec![]);
+        let converted = agents_from_events(std::slice::from_ref(&malformed));
+        assert_eq!(
+            converted["agents"][0][field], value,
+            "policy must remain strict"
+        );
+        for events in [[malformed.clone(), peer.clone()], [peer.clone(), malformed]] {
+            let directory = relay_agents_from_directory_events(&events, &[], &[]);
+            assert_eq!(directory.len(), 1, "field: {field}, value: {value}");
+            assert_eq!(directory[0].pubkey, peer.pubkey.to_hex());
+        }
+    }
+}
+
+#[test]
 fn managed_agent_directory_accepts_only_the_verified_owner_policy() {
     let agent_keys = Keys::generate();
     let owner_keys = Keys::generate();
@@ -458,4 +544,102 @@ fn membership_is_bound_to_viewer_destination_and_latest_removals() {
     let mut tampered = serde_json::to_value(valid).unwrap();
     tampered["content"] = json!("tampered");
     assert!(check(&[serde_json::from_value(tampered).unwrap()]).is_empty());
+}
+
+#[test]
+fn relay_bot_identity_preserves_foreign_agent_roles_without_granting_policy() {
+    let relay = Keys::generate();
+    let viewer = Keys::generate().public_key().to_hex();
+    let agent = Keys::generate();
+    let agent_pubkey = agent.public_key().to_hex();
+    let owner = Keys::generate();
+    let attacker = Keys::generate();
+    let auth = buzz_sdk_pkg::nip_oa::compute_auth_tag(&owner, &agent.public_key(), "")
+        .expect("owner attestation");
+    let auth: Vec<String> = serde_json::from_str(&auth).expect("auth values");
+    let profile = EventBuilder::new(Kind::Metadata, "{}")
+        .tags([Tag::parse(auth).expect("auth tag")])
+        .sign_with_keys(&agent)
+        .expect("signed profile");
+    let policy = managed_agent_event(
+        &owner,
+        &agent_pubkey,
+        "Shared",
+        "allowlist",
+        std::slice::from_ref(&viewer),
+    );
+    let forged_policy = managed_agent_event(&attacker, &agent_pubkey, "Forged", "anyone", &[]);
+    let membership = |signer: &Keys, role: &str, timestamp: u64, include_identity: bool| {
+        let mut tags = vec![
+            Tag::parse(["d", "target"]).expect("channel"),
+            Tag::parse(["p", &viewer, "", "member"]).expect("viewer"),
+            Tag::parse(["p", &agent_pubkey, "", role]).expect("agent role"),
+            // A bot marker without a matching member must not create membership.
+            Tag::parse(["bot", &attacker.public_key().to_hex()]).expect("orphan bot"),
+        ];
+        if include_identity {
+            tags.push(Tag::parse(["bot", &agent_pubkey]).expect("bot identity"));
+        }
+        EventBuilder::new(Kind::Custom(39002), "")
+            .tags(tags)
+            .custom_created_at(nostr::Timestamp::from(timestamp))
+            .sign_with_keys(signer)
+            .expect("signed membership")
+    };
+    let discover = |events: &[Event], destination: &str, current_viewer: &str| {
+        member_agent_channel_ids_for_viewer(
+            events,
+            &relay.public_key().to_hex(),
+            &std::collections::HashSet::new(),
+            current_viewer,
+            Some(destination),
+        )
+    };
+    for role in ["owner", "admin", "guest"] {
+        let event = membership(&relay, role, 10, true);
+        let memberships = discover(std::slice::from_ref(&event), "target", &viewer);
+        assert_eq!(memberships.len(), 1);
+        assert_eq!(memberships[&agent_pubkey], vec!["target"]);
+        let mut agents = relay_agents_from_directory_events(
+            &[],
+            &[policy.clone(), forged_policy.clone()],
+            std::slice::from_ref(&profile),
+        );
+        agents.retain(|agent| memberships.contains_key(&agent.pubkey));
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].owner_pubkey, Some(owner.public_key().to_hex()));
+        assert_eq!(
+            agents[0].respond_to,
+            Some(crate::managed_agents::RespondTo::Allowlist)
+        );
+        assert_eq!(agents[0].respond_to_allowlist, vec![viewer.clone()]);
+        assert!(relay_agents_from_directory_events(
+            &[],
+            std::slice::from_ref(&forged_policy),
+            std::slice::from_ref(&profile)
+        )
+        .is_empty());
+        assert!(discover(&[membership(&attacker, role, 10, true)], "target", &viewer).is_empty());
+        assert!(discover(std::slice::from_ref(&event), "other", &viewer).is_empty());
+        assert!(discover(
+            std::slice::from_ref(&event),
+            "target",
+            &attacker.public_key().to_hex()
+        )
+        .is_empty());
+        assert!(discover(
+            &[event.clone(), membership(&relay, role, 11, false)],
+            "target",
+            &viewer
+        )
+        .is_empty());
+        let mut tampered = serde_json::to_value(&event).expect("membership value");
+        tampered["content"] = json!("tampered");
+        assert!(discover(
+            &[serde_json::from_value(tampered).expect("tampered event")],
+            "target",
+            &viewer
+        )
+        .is_empty());
+    }
 }

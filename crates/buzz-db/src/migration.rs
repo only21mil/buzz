@@ -576,7 +576,7 @@ mod tests {
 
         assert_eq!(
             migrations.len(),
-            38,
+            40,
             "embedded migration matrix must contain the frozen prefix plus admitted tail"
         );
         assert_eq!(migrations[0].version, 1);
@@ -666,11 +666,41 @@ mod tests {
             .sql
             .as_str()
             .contains("CREATE TABLE moderation_actions"));
+        // 0006 is checksum-frozen. The admitted tail replaces its action CHECK;
+        // fresh desired-schema installs must enforce the same effective vocabulary.
+        assert_eq!(migrations[38].version, 39);
+        let audit_extension = migrations[38].sql.as_str();
+        assert!(audit_extension.contains("DROP CONSTRAINT moderation_actions_action_check"));
+        assert!(audit_extension
+            .contains("ADD CONSTRAINT moderation_actions_action_check CHECK (action IN ("));
+        let desired_audit = desired_schema
+            .split_once("CREATE TABLE moderation_actions (")
+            .unwrap()
+            .1
+            .split_once("target_pubkey")
+            .unwrap()
+            .0;
         for action in crate::moderation::MODERATION_ACTION_CHECK_VOCAB {
+            let quoted = format!("'{action}'");
             assert!(
-                migrations[5].sql.as_str().contains(&format!("'{action}'")),
-                "migration 0006 moderation_actions.action CHECK must allow {action}"
+                audit_extension.contains(&quoted),
+                "migration 0039 action CHECK must allow {action}"
             );
+            assert!(
+                desired_audit.contains(&quoted),
+                "desired-schema action CHECK must allow {action}"
+            );
+            if matches!(*action, "add_member" | "edit_metadata" | "delete_channel") {
+                assert!(
+                    !migrations[5].sql.as_str().contains(&quoted),
+                    "new action {action} must not be folded into frozen migration 0006"
+                );
+            } else {
+                assert!(
+                    migrations[5].sql.as_str().contains(&quoted),
+                    "migration 0006 must retain original action {action}"
+                );
+            }
         }
         assert!(!migrations[0].sql.as_str().contains("moderation_reports"));
         // NIP-RS retention is additive and boot-safe: seed replay watermarks
@@ -1913,7 +1943,9 @@ mod b1_ci_grants_ordering {
             vec![
                 (36, "workflow run error codes"),
                 (37, "push message kinds"),
-                (38, "push gateway dogfood profile")
+                (38, "push gateway dogfood profile"),
+                (39, "channel admin audit actions"),
+                (40, "agent drafts")
             ]
         );
         let ci_grants = migrations

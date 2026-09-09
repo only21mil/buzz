@@ -59,6 +59,12 @@ const CAPABILITY_OFF_MUTATIONS: ReadonlyArray<readonly [string, string]> = [
     "relay agent authority revalidation needs the desktop app",
   ],
 
+  // Durable agent drafts (native journal, claims and effects).
+  ["agent_draft_apply", "agent drafts need the desktop app"],
+  ["agent_draft_confirm", "agent drafts need the desktop app"],
+  ["agent_draft_prepare", "agent drafts need the desktop app"],
+  ["agent_draft_receive", "agent drafts need the desktop app"],
+
   // Local ACP runtimes and harnesses.
   ["connect_acp_runtime", "local runtime authentication needs the desktop app"],
   ["create_managed_agent", "managed agents need the desktop app"],
@@ -117,6 +123,10 @@ const CAPABILITY_OFF_READS: ReadonlyArray<readonly [string, DefaultFactory]> = [
   ["card_mint_key_status", () => "none"],
   ["list_agent_cards", () => []],
   ["load_agent_card", () => ""],
+
+  // Durable agent draft reads: no native journal in the browser.
+  ["agent_draft_backfill", () => []],
+  ["agent_draft_queue", () => ({ events: [], operations: [] })],
 
   // Agent discovery and runtime state reads.
   ["discover_acp_auth_methods", () => ({ methods: [] })],

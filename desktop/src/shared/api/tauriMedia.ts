@@ -1,4 +1,5 @@
 import { invoke as invokeTauriRaw, isTauri } from "@tauri-apps/api/core";
+import { checkBrowserUploadSize } from "../lib/browserMediaLimits";
 import { type BlobDescriptor, invokeTauri } from "./tauri";
 
 function encodeRawIpcHeader(value: string): string {
@@ -12,12 +13,14 @@ function encodeRawIpcHeader(value: string): string {
     .replace(/=+$/, "");
 }
 
-/** Transfer a browser File to Rust as a raw IPC body, avoiding JSON expansion. */
+/** Upload a File through the platform's raw-byte transport without JSON expansion. */
 export async function uploadMediaFile(
   file: File,
   progressId?: string,
   signal?: AbortSignal,
 ): Promise<BlobDescriptor> {
+  const native = isTauri();
+  if (!native) checkBrowserUploadSize(file.size);
   const headers: Record<string, string> = {
     "x-buzz-filename": encodeRawIpcHeader(file.name),
     "x-buzz-content-type": encodeRawIpcHeader(
@@ -31,13 +34,13 @@ export async function uploadMediaFile(
   if (signal?.aborted) throw new Error("upload cancelled");
   const bytes = new Uint8Array(await file.arrayBuffer());
   if (signal?.aborted) throw new Error("upload cancelled");
+  // The browser PAL accepts the signal directly; native IPC keeps its contract.
+  const options = { headers, ...(!native && signal ? { signal } : {}) };
   try {
     return await invokeTauriRaw<BlobDescriptor>(
       "upload_media_bytes_raw",
       bytes,
-      {
-        headers,
-      },
+      options,
     );
   } catch (error) {
     if (error instanceof Error) throw error;

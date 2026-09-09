@@ -49,6 +49,22 @@ async fn attachment_contract(migrated: bool) {
     .await
     .unwrap();
     assert_eq!(partitions.len(), 8);
+    // Every non-internal row-level trigger on the parent is cloned onto each
+    // partition (tgtype bit 0 is TRIGGER_TYPE_ROW). Count the parent's own
+    // triggers rather than a literal so a migration that adds one, such as
+    // 0040's agent-draft history guard, keeps this contract honest.
+    let parent_row_triggers: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_trigger \
+         WHERE tgrelid = 'events'::regclass AND tgparentid = 0 \
+         AND NOT tgisinternal AND (tgtype & 1) = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        parent_row_triggers >= 7,
+        "parent row triggers: {parent_row_triggers}"
+    );
     let before = trigger_catalog(&pool).await;
     for child in &partitions {
         let triggers: Vec<String> = sqlx::query_scalar(
@@ -59,7 +75,11 @@ async fn attachment_contract(migrated: bool) {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(triggers.len(), 7, "all current parent row triggers copied");
+        assert_eq!(
+            triggers.len() as i64,
+            parent_row_triggers,
+            "all current parent row triggers copied"
+        );
         // DETACH removes inherited triggers. Recreate their actual definitions
         // as standalone triggers, as pgschema 1.7.4 does during fresh bootstrap.
         sqlx::raw_sql(AssertSqlSafe(format!(

@@ -32,7 +32,6 @@ import type {
   ThreadRepliesResponse,
   CreateManagedAgentInput,
   AgentModelsResponse,
-  UpdateManagedAgentInput,
   AcpAvailabilityStatus,
   AcpRuntimeCatalogEntry,
   AuthStatus,
@@ -41,6 +40,7 @@ import type {
   GitBashPrerequisite,
   RuntimeConfigSurface,
 } from "@/shared/api/types";
+export { updateManagedAgent } from "@/shared/api/tauriManagedAgents";
 
 export * from "@/shared/api/tauriChannels";
 export { sendChannelMessage } from "@/shared/api/tauriMessages";
@@ -1027,24 +1027,6 @@ export type BakedEnvEntry = {
  */
 export async function getBakedBuildEnv(): Promise<BakedEnvEntry[]> {
   return invokeTauri<BakedEnvEntry[]>("get_baked_build_env");
-}
-
-type RawUpdateManagedAgentResponse = {
-  agent: RawManagedAgent;
-  profile_sync_error: string | null;
-};
-
-export async function updateManagedAgent(
-  input: UpdateManagedAgentInput,
-): Promise<{ agent: ManagedAgent; profileSyncError: string | null }> {
-  const response = await invokeTauri<RawUpdateManagedAgentResponse>(
-    "update_managed_agent",
-    { input },
-  );
-  return {
-    agent: fromRawManagedAgent(response.agent),
-    profileSyncError: response.profile_sync_error,
-  };
 }
 
 // ── Backend provider discovery ────────────────────────────────────────────────

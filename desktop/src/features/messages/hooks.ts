@@ -334,7 +334,7 @@ export function useChannelMessagesQuery(
       channel !== null &&
       channel.channelType !== "forum",
     queryKey,
-    queryFn: async () => {
+    queryFn: async ({ signal }) => {
       if (!channel) throw new Error("No channel selected.");
       const generationToken =
         subscriptionGeneration === true ? null : subscriptionGeneration;
@@ -344,6 +344,7 @@ export function useChannelMessagesQuery(
       );
       const requireCurrentRequest = () => {
         const isCurrent =
+          !signal.aborted &&
           (snapshotScope === null ||
             isMessageSnapshotScopeCurrent(snapshotScope)) &&
           isChannelHistoryRequestCurrent(historyRequest) &&

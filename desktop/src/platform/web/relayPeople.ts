@@ -2,6 +2,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils.js";
 import { relayClient } from "@/shared/api/relayClient";
 import type { RelayEvent } from "@/shared/api/types";
+import { verifyEvent } from "nostr-tools/pure";
 import type { BrowserIdentityManager } from "./identity";
 import { register } from "./registry";
 
@@ -237,6 +238,37 @@ function verifiedOwner(event: RelayEvent): string | null {
     if (verifySchnorr(signature, sha256(preimage), owner)) return owner;
   }
   return null;
+}
+
+/** Resolve ownership with the native directory's signed NIP-OA profile rules. */
+export function verifiedProfileOwner(event: RelayEvent): string | null {
+  const authTags = event.tags.filter((tag) => tag[0] === "auth");
+  if (event.kind !== 0 || authTags.length !== 1) return null;
+  const owner = verifiedOwner(event);
+  if (!owner) return null;
+  const conditions = authTags[0][2];
+  if (
+    conditions &&
+    !conditions.split("&").every((clause) => {
+      if (clause.startsWith("kind=")) return Number(clause.slice(5)) === 0;
+      if (clause.startsWith("created_at<"))
+        return event.created_at < Number(clause.slice(11));
+      if (clause.startsWith("created_at>"))
+        return event.created_at > Number(clause.slice(11));
+      return false;
+    })
+  )
+    return null;
+  // A fresh envelope avoids nostr-tools' cached verification symbol. The
+  // profile signature must bind the attestation to this author and timestamp.
+  const { id, kind, pubkey, content, created_at, tags, sig } = event;
+  try {
+    return verifyEvent({ id, kind, pubkey, content, created_at, tags, sig })
+      ? owner
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function userResult(event: RelayEvent) {

@@ -13,7 +13,11 @@ use crate::{
     util::now_iso,
 };
 
-use super::{pending, retain_persona_pending, trim_optional, trim_required};
+use super::{
+    pending, retain_persona_pending,
+    retained_write::{save_and_retain, LocalWrite},
+    trim_optional, trim_required,
+};
 
 #[tauri::command]
 pub async fn create_persona(
@@ -78,10 +82,11 @@ pub async fn create_persona(
         };
         apply_persona_behavior(&mut persona, input.behavior)?;
         personas.push(persona.clone());
-        save_personas(&app, &personas)?;
-        if let Err(e) = retain_persona_pending(&app, &state, &persona) {
-            eprintln!("buzz-desktop: persona-retain (create): {e}");
-        }
+        save_and_retain(
+            LocalWrite::CreatedPersona(&persona.id),
+            || save_personas(&app, &personas),
+            || retain_persona_pending(&app, &state, &persona),
+        )?;
         try_regenerate_nest(&app);
         Ok(persona)
     })

@@ -101,6 +101,14 @@ pub struct CreatePersonaRequest {
 #[serde(rename_all = "camelCase")]
 pub struct UpdatePersonaRequest {
     pub id: String,
+    /// Revision shown during an owner-reviewed draft; checked under the store lock.
+    #[serde(default)]
+    pub expected_updated_at: Option<String>,
+    /// Exact reviewed content, independent of second-resolution inbound timestamps.
+    #[serde(default)]
+    pub expected_content: Option<super::PersonaReviewContent>,
+    #[serde(default)]
+    pub expected_shared: Option<bool>,
     pub display_name: String,
     pub avatar_url: Option<String>,
     pub system_prompt: String,
