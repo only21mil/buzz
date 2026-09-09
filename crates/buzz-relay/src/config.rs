@@ -66,6 +66,142 @@ pub struct CiConfig {
     /// `missing_capability` until an Apple executor is registered. Only the
     /// names in `api::ci::apple_release::KNOWN_CAPABILITIES` are accepted.
     pub apple_executor_capabilities: std::collections::HashSet<String>,
+    /// Merge gate operating mode and bounds (`BUZZ_MERGE_GATE_*`).
+    pub merge_gate: MergeGateConfig,
+}
+
+/// Merge gate operating mode (`BUZZ_MERGE_GATE_MODE`).
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum MergeGateMode {
+    /// The gate does not run; a `require-check` rule is logged as skipped.
+    #[default]
+    Off,
+    /// The gate evaluates and records every decision but never refuses.
+    Shadow,
+    /// The gate refuses pushes that fail and fails closed on its own errors.
+    Enforce,
+}
+
+impl MergeGateMode {
+    /// Canonical lowercase name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::Enforce => "enforce",
+        }
+    }
+}
+
+impl std::str::FromStr for MergeGateMode {
+    type Err = ConfigError;
+
+    fn from_str(raw: &str) -> Result<Self, ConfigError> {
+        match raw.trim() {
+            "off" => Ok(Self::Off),
+            "shadow" => Ok(Self::Shadow),
+            "enforce" => Ok(Self::Enforce),
+            other => Err(ConfigError::InvalidValue(format!(
+                "{MERGE_GATE_MODE_ENV} must be one of off, shadow, enforce (got {other:?})"
+            ))),
+        }
+    }
+}
+
+/// Merge gate configuration. Defaults keep the gate off with the bounds the
+/// design names: checks stay fresh for a day, an allow decision fences the
+/// publish for five minutes (the pack subprocess timeout).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct MergeGateConfig {
+    /// Operating mode; default `off`.
+    pub mode: MergeGateMode,
+    /// Longest age of the selected check by relay `accepted_at`, in seconds.
+    /// Default 86400, ceiling 604800.
+    pub check_max_age_seconds: u64,
+    /// Longest gap between the hook decision and the publish fence, in
+    /// seconds. Default 300, ceiling 900.
+    pub decision_window_seconds: u64,
+}
+
+impl Default for MergeGateConfig {
+    fn default() -> Self {
+        Self {
+            mode: MergeGateMode::Off,
+            check_max_age_seconds: MERGE_GATE_DEFAULT_CHECK_MAX_AGE_SECONDS,
+            decision_window_seconds: MERGE_GATE_DEFAULT_DECISION_WINDOW_SECONDS,
+        }
+    }
+}
+
+const MERGE_GATE_MODE_ENV: &str = "BUZZ_MERGE_GATE_MODE";
+const MERGE_GATE_CHECK_MAX_AGE_ENV: &str = "BUZZ_MERGE_GATE_CHECK_MAX_AGE_SECONDS";
+const MERGE_GATE_DECISION_WINDOW_ENV: &str = "BUZZ_MERGE_GATE_DECISION_WINDOW_SECONDS";
+/// Default check freshness, one day.
+pub const MERGE_GATE_DEFAULT_CHECK_MAX_AGE_SECONDS: u64 = 24 * 60 * 60;
+/// Ceiling for check freshness, seven days.
+pub const MERGE_GATE_MAX_CHECK_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
+/// Default decision window, the pack subprocess timeout.
+pub const MERGE_GATE_DEFAULT_DECISION_WINDOW_SECONDS: u64 = 5 * 60;
+/// Ceiling for the decision window, fifteen minutes.
+pub const MERGE_GATE_MAX_DECISION_WINDOW_SECONDS: u64 = 15 * 60;
+
+fn merge_gate_config_from_env() -> Result<MergeGateConfig, ConfigError> {
+    let read = |name: &str| match std::env::var(name) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::InvalidValue(format!(
+            "{name} must be valid Unicode"
+        ))),
+    };
+    parse_merge_gate_config(
+        read(MERGE_GATE_MODE_ENV)?.as_deref(),
+        read(MERGE_GATE_CHECK_MAX_AGE_ENV)?.as_deref(),
+        read(MERGE_GATE_DECISION_WINDOW_ENV)?.as_deref(),
+    )
+}
+
+fn parse_merge_gate_config(
+    mode: Option<&str>,
+    check_max_age: Option<&str>,
+    decision_window: Option<&str>,
+) -> Result<MergeGateConfig, ConfigError> {
+    let bounded = |name: &str, raw: Option<&str>, default: u64, ceiling: u64| match raw {
+        None => Ok(default),
+        Some(raw) => {
+            let value = raw
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    ConfigError::InvalidValue(format!("{name} must be a positive integer"))
+                })?;
+            if value > ceiling {
+                return Err(ConfigError::InvalidValue(format!(
+                    "{name} must not exceed {ceiling}"
+                )));
+            }
+            Ok(value)
+        }
+    };
+    Ok(MergeGateConfig {
+        mode: match mode {
+            None => MergeGateMode::Off,
+            Some(raw) => raw.parse()?,
+        },
+        check_max_age_seconds: bounded(
+            MERGE_GATE_CHECK_MAX_AGE_ENV,
+            check_max_age,
+            MERGE_GATE_DEFAULT_CHECK_MAX_AGE_SECONDS,
+            MERGE_GATE_MAX_CHECK_MAX_AGE_SECONDS,
+        )?,
+        decision_window_seconds: bounded(
+            MERGE_GATE_DECISION_WINDOW_ENV,
+            decision_window,
+            MERGE_GATE_DEFAULT_DECISION_WINDOW_SECONDS,
+            MERGE_GATE_MAX_DECISION_WINDOW_SECONDS,
+        )?,
+    })
 }
 
 /// Validated CI request and acknowledgement bounds advertised by preflight.
@@ -959,6 +1095,7 @@ impl Config {
         let ci = CiConfig {
             policy: ci_policy_config_from_env()?,
             apple_executor_capabilities: apple_executor_capabilities_from_env()?,
+            merge_gate: merge_gate_config_from_env()?,
         };
 
         let auth = buzz_auth::AuthConfig {
@@ -2041,6 +2178,126 @@ mod tests {
                 "invalid CI policy must fail startup: {values:?}"
             );
         }
+    }
+
+    #[test]
+    fn merge_gate_defaults_to_off_with_design_bounds() {
+        let config = parse_merge_gate_config(None, None, None).expect("defaults");
+        assert_eq!(config, MergeGateConfig::default());
+        assert_eq!(config.mode, MergeGateMode::Off);
+        assert_eq!(config.check_max_age_seconds, 86_400);
+        assert_eq!(config.decision_window_seconds, 300);
+    }
+
+    #[test]
+    fn merge_gate_mode_parses_the_three_modes_and_refuses_others() {
+        for (raw, mode) in [
+            ("off", MergeGateMode::Off),
+            ("shadow", MergeGateMode::Shadow),
+            ("enforce", MergeGateMode::Enforce),
+            (" enforce ", MergeGateMode::Enforce),
+        ] {
+            let config = parse_merge_gate_config(Some(raw), None, None).expect("mode");
+            assert_eq!(config.mode, mode);
+            assert_eq!(config.mode.as_str(), raw.trim());
+        }
+        for raw in ["", "on", "true", "Shadow", "ENFORCE", "audit"] {
+            assert!(
+                matches!(
+                    parse_merge_gate_config(Some(raw), None, None),
+                    Err(ConfigError::InvalidValue(ref message))
+                        if message.contains("BUZZ_MERGE_GATE_MODE must be one of off, shadow, enforce")
+                ),
+                "{raw:?} must fail config load"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_gate_bounds_accept_ceilings_and_reject_zero_and_excess() {
+        let config = parse_merge_gate_config(Some("shadow"), Some("604800"), Some("900"))
+            .expect("ceilings are accepted");
+        assert_eq!(config.check_max_age_seconds, 604_800);
+        assert_eq!(config.decision_window_seconds, 900);
+        let config = parse_merge_gate_config(None, Some("3600"), Some(" 60 ")).expect("bounds");
+        assert_eq!(config.check_max_age_seconds, 3_600);
+        assert_eq!(config.decision_window_seconds, 60);
+
+        for (age, window, needle) in [
+            (
+                Some("0"),
+                None,
+                "BUZZ_MERGE_GATE_CHECK_MAX_AGE_SECONDS must be a positive integer",
+            ),
+            (
+                Some("-1"),
+                None,
+                "BUZZ_MERGE_GATE_CHECK_MAX_AGE_SECONDS must be a positive integer",
+            ),
+            (
+                Some("day"),
+                None,
+                "BUZZ_MERGE_GATE_CHECK_MAX_AGE_SECONDS must be a positive integer",
+            ),
+            (
+                Some("604801"),
+                None,
+                "BUZZ_MERGE_GATE_CHECK_MAX_AGE_SECONDS must not exceed 604800",
+            ),
+            (
+                None,
+                Some("0"),
+                "BUZZ_MERGE_GATE_DECISION_WINDOW_SECONDS must be a positive integer",
+            ),
+            (
+                None,
+                Some("901"),
+                "BUZZ_MERGE_GATE_DECISION_WINDOW_SECONDS must not exceed 900",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    parse_merge_gate_config(None, age, window),
+                    Err(ConfigError::InvalidValue(ref message)) if message == needle
+                ),
+                "{age:?}/{window:?} must fail with {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_gate_env_parser_reads_all_three_variables() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let names = [
+            MERGE_GATE_MODE_ENV,
+            MERGE_GATE_CHECK_MAX_AGE_ENV,
+            MERGE_GATE_DECISION_WINDOW_ENV,
+        ];
+        let previous: Vec<_> = names
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
+        for (name, value) in names.iter().zip(["enforce", "7200", "120"]) {
+            std::env::set_var(name, value);
+        }
+        let parsed = merge_gate_config_from_env();
+        std::env::set_var(MERGE_GATE_MODE_ENV, "audit");
+        let refused = merge_gate_config_from_env();
+        for (name, value) in previous {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        assert_eq!(
+            parsed.expect("parse merge gate environment"),
+            MergeGateConfig {
+                mode: MergeGateMode::Enforce,
+                check_max_age_seconds: 7_200,
+                decision_window_seconds: 120,
+            }
+        );
+        assert!(matches!(refused, Err(ConfigError::InvalidValue(_))));
     }
 
     #[test]

@@ -1616,6 +1616,12 @@ fn validate_non_empty(value: &str, message: &'static str) -> Result<(), CiValida
     Ok(())
 }
 
+/// Whether `value` is a static workflow job ID: at most 64 bytes, an ASCII
+/// letter or underscore first, then letters, digits, `-` or `_`.
+pub fn is_static_job_id(value: &str) -> bool {
+    validate_job_id(value).is_ok()
+}
+
 fn validate_job_id(value: &str) -> Result<(), CiValidationError> {
     if value.len() > 64 {
         return Err(CiValidationError("invalid static job ID"));
