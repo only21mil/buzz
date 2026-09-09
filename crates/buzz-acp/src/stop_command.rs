@@ -16,8 +16,17 @@
 //! from kind:9 alone. The observer also receives a `control_result` frame of
 //! type `stop` for the desktop.
 //!
-//! Authorisation is owner or sibling only; anyone else's `/stop` falls through
-//! to the ordinary prompt path, like a non-owner `!cancel`.
+//! Authorisation: the owner always; a sibling only when its `/stop` carries
+//! the `stop-origin` tag, which is what harness fan-out adds and generated
+//! text cannot. A sibling `/stop` without the tag is refused in-thread and
+//! consumed, so "@A /stop all" in another agent's reply cannot halt A's
+//! lanes. Anyone else's `/stop` falls through to the ordinary prompt path,
+//! like a non-owner `!cancel`.
+//!
+//! A `/stop` that lands while the turn's control channel was already taken
+//! by a steer or interrupt marks the scope stopped in the queue; the batch
+//! that turn returns is discarded instead of re-dispatched, so the lane does
+//! not resume.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -59,6 +68,9 @@ pub(crate) struct StopRequest {
     /// The id that started this stop tree: the event's own `stop-origin` tag
     /// when it is itself a fan-out, otherwise the event id.
     pub origin: String,
+    /// Whether the event carried a well-formed `stop-origin` tag, which only
+    /// harness fan-out adds. Siblings need it; the owner does not.
+    pub forwarded: bool,
 }
 
 /// Parse a `/stop` request out of a kind:9 event that mentions this agent.
@@ -85,31 +97,91 @@ pub(crate) fn parse_stop_command(
         args if args.eq_ignore_ascii_case("all") => true,
         _ => return None,
     };
-    let origin = event
-        .tags
-        .iter()
-        .find_map(|t| {
-            let parts = t.as_slice();
-            (parts.first().map(String::as_str) == Some(STOP_ORIGIN_TAG))
-                .then(|| parts.get(1))
-                .flatten()
-                .filter(|id| id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()))
-                .map(|id| id.to_ascii_lowercase())
-        })
-        .unwrap_or_else(|| event.id.to_hex());
-    Some(StopRequest { all, origin })
+    let tagged_origin = event.tags.iter().find_map(|t| {
+        let parts = t.as_slice();
+        (parts.first().map(String::as_str) == Some(STOP_ORIGIN_TAG))
+            .then(|| parts.get(1))
+            .flatten()
+            .filter(|id| id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()))
+            .map(|id| id.to_ascii_lowercase())
+    });
+    let forwarded = tagged_origin.is_some();
+    let origin = tagged_origin.unwrap_or_else(|| event.id.to_hex());
+    Some(StopRequest {
+        all,
+        origin,
+        forwarded,
+    })
 }
 
-/// Whether `author` may stop this agent's lanes: the owner or a verified
-/// sibling (same owner attestation). Uses the sibling cache the author gate
-/// just populated and falls back to the profile check for authors the gate
-/// admitted another way (allowlist, `anyone`).
-pub(crate) async fn is_stop_authorised(
+/// What the authorisation gate decided for a parsed `/stop`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopGate {
+    /// The owner, or a sibling whose `/stop` carries the `stop-origin` tag
+    /// (harness fan-out). Execute it.
+    Authorised,
+    /// A verified sibling without the tag: generated text, not fan-out. A
+    /// refusal was posted in-thread; consume the event without prompting.
+    Refused,
+    /// Anyone else. Falls through as an ordinary prompt, like `!cancel`.
+    NotAuthorised,
+}
+
+/// Decide whether `author` may stop this agent's lanes and post the refusal
+/// when a sibling tries without the `stop-origin` tag.
+///
+/// The owner is always allowed. A sibling (same owner attestation, checked
+/// through the cache the author gate just populated or the profile query)
+/// is allowed only when the `/stop` was forwarded by a harness, which is
+/// what the tag proves: a model cannot add tags to the text it posts, so
+/// "@A /stop all" in a sibling's generated reply cannot halt A's lanes.
+pub(crate) async fn gate_stop(
+    request: &StopRequest,
+    event: &nostr::Event,
+    channel_id: Uuid,
     author: &str,
     owner_cache: &OwnerCache,
     rest: &RestClient,
-) -> bool {
-    is_owner_or_sibling(author, owner_cache, rest).await == SiblingAuthorization::Authorized
+) -> StopGate {
+    if owner_cache.get() == Some(author) {
+        return StopGate::Authorised;
+    }
+    if is_owner_or_sibling(author, owner_cache, rest).await != SiblingAuthorization::Authorized {
+        tracing::debug!(
+            channel_id = %channel_id,
+            author = %author,
+            "/stop from a non-owner, non-sibling author — forwarding as a prompt"
+        );
+        return StopGate::NotAuthorised;
+    }
+    if request.forwarded {
+        return StopGate::Authorised;
+    }
+    tracing::warn!(
+        channel_id = %channel_id,
+        author = %author,
+        "/stop from a sibling without a stop-origin tag — refused"
+    );
+    let thread_ref = reply_thread_ref(event);
+    post_harness_notice(
+        rest,
+        channel_id,
+        Some(&thread_ref),
+        &sibling_refusal_text(author),
+        &[],
+        &[],
+    )
+    .await;
+    StopGate::Refused
+}
+
+/// Text of the in-thread refusal for a sibling `/stop` without the tag.
+pub(crate) fn sibling_refusal_text(author: &str) -> String {
+    format!(
+        "Ignored /stop from sibling agent {}: only the owner, or a harness fan-out \
+         carrying a stop-origin tag, can stop this lane. Text in an agent's reply cannot.",
+        short_pubkey(author)
+    )
 }
 
 /// Bounded set of handled stop-origin ids, insertion ordered.
@@ -448,7 +520,7 @@ pub(crate) async fn execute_stop(
     } = stop;
 
     let (lanes, dropped_ids): (Vec<LaneOutcome>, Vec<String>) = if request.all {
-        let lanes = pool
+        let lanes: Vec<LaneOutcome> = pool
             .signal_in_flight_tasks_for_channel(channel_id, ControlSignal::Cancel)
             .into_iter()
             .map(
@@ -473,17 +545,20 @@ pub(crate) async fn execute_stop(
                 },
             )
             .collect();
-        (lanes, queue.drain_channel(channel_id))
+        let dropped = queue.drain_channel(channel_id);
+        for lane in &lanes {
+            mark_lane_stopped(queue, lane);
+        }
+        (lanes, dropped)
     } else {
         let status = stop_scope(pool, &scope);
         let dropped = queue.drop_pending_for_scope(&scope);
-        (
-            vec![LaneOutcome {
-                scope: scope.clone(),
-                status,
-            }],
-            dropped,
-        )
+        let lane = LaneOutcome {
+            scope: scope.clone(),
+            status,
+        };
+        mark_lane_stopped(queue, &lane);
+        (vec![lane], dropped)
     };
 
     // Reactions added at push time for the dropped events are now stale.
@@ -558,6 +633,17 @@ pub(crate) async fn execute_stop(
         "/stop handled"
     );
     notified
+}
+
+/// Mark a stopped lane so the batch its turn returns is discarded. Matters
+/// when the turn's control channel was already taken (a steer or interrupt
+/// signalled first): the pool then returns the batch as a carry-over and,
+/// without the marker, the main loop would requeue it and the lane would
+/// resume. Harmless for a clean `Cancel`, whose batch the pool drops anyway.
+fn mark_lane_stopped(queue: &mut EventQueue, lane: &LaneOutcome) {
+    if lane.status != ScopeStop::Idle {
+        queue.mark_stopped(&lane.scope);
+    }
 }
 
 fn emit_stop_frame(
@@ -723,7 +809,8 @@ mod tests {
             parse_stop_command(&plain, KIND_STREAM_MESSAGE, &agent, &[]),
             Some(StopRequest {
                 all: false,
-                origin: plain.id.to_hex()
+                origin: plain.id.to_hex(),
+                forwarded: false,
             })
         );
         let mentioned = ev("@Fizz Buzz /stop ALL", vec![p(&agent)]);
@@ -774,9 +861,11 @@ mod tests {
             ],
             10,
         );
-        assert_eq!(
-            parse_stop_command(&fan_out, KIND_STREAM_MESSAGE, &agent, &[]).map(|r| r.origin),
-            Some(origin)
+        let parsed = parse_stop_command(&fan_out, KIND_STREAM_MESSAGE, &agent, &[]).unwrap();
+        assert_eq!(parsed.origin, origin);
+        assert!(
+            parsed.forwarded,
+            "a well-formed tag marks the stop as fan-out"
         );
         // A malformed origin tag falls back to the event id.
         let bad = signed(
@@ -785,9 +874,11 @@ mod tests {
             vec![p(&agent), Tag::parse([STOP_ORIGIN_TAG, "nope"]).unwrap()],
             10,
         );
-        assert_eq!(
-            parse_stop_command(&bad, KIND_STREAM_MESSAGE, &agent, &[]).map(|r| r.origin),
-            Some(bad.id.to_hex())
+        let parsed = parse_stop_command(&bad, KIND_STREAM_MESSAGE, &agent, &[]).unwrap();
+        assert_eq!(parsed.origin, bad.id.to_hex());
+        assert!(
+            !parsed.forwarded,
+            "a malformed tag does not count as fan-out"
         );
     }
 
@@ -859,17 +950,219 @@ mod tests {
         let sibling = "22".repeat(32);
         let allowlisted_human = "33".repeat(32);
         let stranger = Keys::generate().public_key().to_hex();
+        let agent = "ab".repeat(32);
         let cache = cache(&owner, &[&sibling], &[&allowlisted_human]);
         // Stranger lookups hit the relay: an empty profile result is a denial.
         let stub = stub(serde_json::json!([]), Keys::generate()).await;
+        let ch = Uuid::new_v4();
+        let author = Keys::generate();
+        let plain = signed(&author, "/stop", vec![p(&agent)], 10);
+        let fan_out = signed(
+            &author,
+            "/stop",
+            vec![
+                p(&agent),
+                Tag::parse([STOP_ORIGIN_TAG, &"9f".repeat(32)]).unwrap(),
+            ],
+            10,
+        );
+        let untagged = parse_stop_command(&plain, KIND_STREAM_MESSAGE, &agent, &[]).unwrap();
+        let tagged = parse_stop_command(&fan_out, KIND_STREAM_MESSAGE, &agent, &[]).unwrap();
+        assert!(!untagged.forwarded);
+        assert!(tagged.forwarded);
 
-        assert!(is_stop_authorised(&owner, &cache, &stub.rest).await);
-        assert!(is_stop_authorised(&sibling, &cache, &stub.rest).await);
+        // Owner: honoured with or without the tag.
+        assert_eq!(
+            gate_stop(&untagged, &plain, ch, &owner, &cache, &stub.rest).await,
+            StopGate::Authorised
+        );
+        assert_eq!(
+            gate_stop(&tagged, &fan_out, ch, &owner, &cache, &stub.rest).await,
+            StopGate::Authorised
+        );
+        // Sibling with the tag: harness fan-out, honoured.
+        assert_eq!(
+            gate_stop(&tagged, &fan_out, ch, &sibling, &cache, &stub.rest).await,
+            StopGate::Authorised
+        );
         assert!(
-            !is_stop_authorised(&allowlisted_human, &cache, &stub.rest).await,
+            stub.submitted.lock().unwrap().is_empty(),
+            "no refusal posted so far"
+        );
+        // Sibling without the tag: generated text, refused with a reply.
+        assert_eq!(
+            gate_stop(&untagged, &plain, ch, &sibling, &cache, &stub.rest).await,
+            StopGate::Refused
+        );
+        let submitted = stub.submitted.lock().unwrap().clone();
+        assert_eq!(submitted.len(), 1, "one refusal reply");
+        let refusal: nostr::Event = serde_json::from_value(submitted[0].clone()).unwrap();
+        assert_eq!(refusal.content, sibling_refusal_text(&sibling));
+        assert!(refusal
+            .content
+            .contains("Ignored /stop from sibling agent 22222222"));
+        assert!(refusal.content.contains("stop-origin"));
+        assert!(
+            !refusal.tags.iter().any(|t| t.as_slice()[0] == "p"),
+            "the refusal mentions nobody"
+        );
+        assert_eq!(
+            parse_thread_tags(&refusal).root_event_id.as_deref(),
+            Some(plain.id.to_hex().as_str()),
+            "refusal replies to the /stop"
+        );
+        // Allowlist humans and strangers fall through as prose either way.
+        assert_eq!(
+            gate_stop(
+                &tagged,
+                &fan_out,
+                ch,
+                &allowlisted_human,
+                &cache,
+                &stub.rest
+            )
+            .await,
+            StopGate::NotAuthorised,
             "allowlist humans cannot stop (open question 4: follows !cancel)"
         );
-        assert!(!is_stop_authorised(&stranger, &cache, &stub.rest).await);
+        assert_eq!(
+            gate_stop(&untagged, &plain, ch, &stranger, &cache, &stub.rest).await,
+            StopGate::NotAuthorised
+        );
+        assert_eq!(
+            stub.submitted.lock().unwrap().len(),
+            1,
+            "no further replies"
+        );
+        stub.server.abort();
+    }
+
+    #[tokio::test]
+    async fn stop_after_a_steer_took_control_discards_the_returning_batch() {
+        use crate::pool::{PromptOutcome, PromptResult, PromptSource};
+        use crate::queue::CancelReason;
+
+        let parent = Keys::generate();
+        let parent_hex = parent.public_key().to_hex();
+        let owner = "11".repeat(32);
+        let ch = Uuid::new_v4();
+        let scope = SessionScope::Conversation { channel_id: ch };
+        let stub = stub(serde_json::json!([]), parent.clone()).await;
+        let cache = cache(&owner, &[], &[]);
+
+        // A turn is in flight for the scope and a mid-turn steer already
+        // took its control channel, so the pool will hand the batch back as
+        // a Steer carry-over when the turn returns.
+        let mut queue = EventQueue::new(crate::config::DedupMode::Queue);
+        let work = signed(&Keys::generate(), "do the thing", vec![p(&parent_hex)], 500);
+        queue.push(crate::queue::QueuedEvent {
+            channel_id: ch,
+            scope: scope.clone(),
+            event: work,
+            received_at: std::time::Instant::now(),
+            prompt_tag: "t".into(),
+        });
+        let mut batch = queue.flush_next().expect("turn dispatched");
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let abort = pool.join_set.spawn(async {});
+        pool.task_map_mut().insert(
+            abort.id(),
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(ch),
+                scope: Some(scope.clone()),
+                turn_id: "turn-1".into(),
+                started_at: 400,
+                recoverable_batch: Some(batch.clone()),
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+
+        let stop_event = signed(&Keys::generate(), "/stop", vec![p(&parent_hex)], 700);
+        let request = StopRequest {
+            all: false,
+            origin: stop_event.id.to_hex(),
+            forwarded: false,
+        };
+        execute_stop(
+            StopContext {
+                request: &request,
+                event: &stop_event,
+                channel_id: ch,
+                scope: scope.clone(),
+                agent_pubkey_hex: &parent_hex,
+                max_turn_duration_secs: 60,
+            },
+            &mut pool,
+            &mut queue,
+            &stub.rest,
+            &cache,
+            None,
+        )
+        .await;
+        let submitted = stub.submitted.lock().unwrap().clone();
+        let ack: nostr::Event = serde_json::from_value(submitted.last().unwrap().clone()).unwrap();
+        assert!(ack
+            .content
+            .starts_with("Stop already in progress for this channel (turn turn-1)."));
+        assert!(queue.is_stopped(&scope), "/stop marked the in-flight scope");
+
+        // The steered turn returns with its batch, as pool::requeue_cancelled_batch
+        // does for Steer/Interrupt.
+        batch.cancel_reason = Some(CancelReason::Steer);
+        let mut heartbeat = false;
+        let mut history = vec![crate::SlotCircuit {
+            crash_times: vec![],
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut tasks = tokio::task::JoinSet::new();
+        crate::handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &crate::error_outcome_emission_tests::test_config(),
+            PromptResult {
+                agent: crate::error_outcome_emission_tests::dummy_agent(0).await,
+                source: PromptSource::Channel(scope.clone()),
+                turn_id: "turn-1".into(),
+                outcome: PromptOutcome::Cancelled,
+                batch: Some(batch),
+            },
+            &mut heartbeat,
+            &HashSet::new(),
+            &mut history,
+            &respawn_tx,
+            &mut tasks,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(
+            queue.flush_next().is_none(),
+            "the returned batch is discarded, not re-dispatched"
+        );
+        assert!(!queue.is_stopped(&scope), "marker cleared with the turn");
+        assert!(!queue.is_scope_in_flight(scope.clone()));
+        // A later mention starts a fresh turn as usual.
+        let later = signed(&Keys::generate(), "again", vec![p(&parent_hex)], 800);
+        queue.push(crate::queue::QueuedEvent {
+            channel_id: ch,
+            scope: scope.clone(),
+            event: later,
+            received_at: std::time::Instant::now(),
+            prompt_tag: "t".into(),
+        });
+        let fresh = queue.flush_next().expect("new work dispatches");
+        assert_eq!(fresh.events.len(), 1);
+        assert!(
+            fresh.cancelled_events.is_empty(),
+            "no carry-over from the stopped turn"
+        );
         stub.server.abort();
     }
 
@@ -1102,6 +1395,7 @@ mod tests {
         let request = StopRequest {
             all: true,
             origin: stop_event.id.to_hex(),
+            forwarded: false,
         };
         let observer = observer::ObserverHandle::in_process();
 

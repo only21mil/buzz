@@ -2894,13 +2894,24 @@ async fn tokio_main() -> Result<()> {
                                 &pubkey_hex,
                                 &[directory_display_name.as_str()],
                             ) {
-                                let authorised = stop_command::is_stop_authorised(
+                                let gate = stop_command::gate_stop(
+                                    &stop,
+                                    &buzz_event.event,
+                                    buzz_event.channel_id,
                                     &effective_author,
                                     &owner_cache,
                                     &ctx.rest_client,
                                 )
                                 .await;
-                                if authorised {
+                                if gate == stop_command::StopGate::Refused {
+                                    // Sibling `/stop` without a stop-origin tag:
+                                    // generated text, not harness fan-out. The
+                                    // refusal was posted in-thread; the event is
+                                    // consumed so it never prompts the agent.
+                                    inbox_cursor.mark_processed([&buzz_event.event]);
+                                    continue;
+                                }
+                                if gate == stop_command::StopGate::Authorised {
                                     if !handled_stop_origins.insert(stop.origin.clone()) {
                                         tracing::info!(
                                             channel_id = %buzz_event.channel_id,
@@ -4200,7 +4211,22 @@ async fn handle_prompt_result(
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
         if !removed_channels.contains(&batch.channel_id) {
-            if matches!(
+            if queue.is_stopped(&batch.scope) {
+                // A `/stop` hit this turn while its control channel was
+                // already taken by a steer or interrupt, so the pool hands
+                // the batch back as a carry-over instead of dropping it the
+                // way a `Cancel` signal would. The lane was stopped: discard
+                // the batch rather than requeue it, or flush_next()'s
+                // cancelled-batch fallback would re-dispatch it and the lane
+                // would resume. mark_complete() below clears the marker.
+                tracing::info!(
+                    channel_id = %batch.channel_id,
+                    scope = %batch.scope.telemetry_label(),
+                    events = batch.events.len() + batch.cancelled_events.len(),
+                    "discarding returned batch for a stopped scope — /stop does not resume"
+                );
+                inbox_events_terminal = true;
+            } else if matches!(
                 result.outcome,
                 PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
             ) {
@@ -7677,7 +7703,7 @@ mod error_outcome_emission_tests {
     /// Spawn a real but inert agent subprocess (`cat`) so the error paths have
     /// an `OwnedAgent` to move into respawn or return to the pool. The error
     /// branches never talk to the subprocess.
-    async fn dummy_agent(index: usize) -> OwnedAgent {
+    pub(crate) async fn dummy_agent(index: usize) -> OwnedAgent {
         OwnedAgent {
             index,
             acp: AcpClient::spawn("cat", &[], &[], false)

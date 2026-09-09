@@ -231,6 +231,12 @@ pub struct EventQueue {
     /// by `flush_next` / `has_flushable_work` (recover, not log-and-drop —
     /// the events were never delivered to the agent).
     withheld_native_steer: HashMap<SessionScope, Vec<QueuedEvent>>,
+    /// Scopes a `/stop` hit while a turn was in flight. The batch that turn
+    /// returns is discarded instead of being requeued, even when the pool
+    /// hands it back as a steer or interrupt carry-over because an earlier
+    /// signal had already taken the turn's control channel. Cleared by
+    /// [`mark_complete`](Self::mark_complete) when that turn returns.
+    stopped_scopes: HashSet<SessionScope>,
     /// Duration after which an in-flight channel is auto-expired as orphaned.
     /// Must be strictly greater than `max_turn_duration` so a turn running to
     /// the hard cap returns via `mark_complete` before the backstop fires.
@@ -255,6 +261,7 @@ impl EventQueue {
             cancelled_batches: HashMap::new(),
             cancel_reasons: HashMap::new(),
             withheld_native_steer: HashMap::new(),
+            stopped_scopes: HashSet::new(),
             in_flight_deadline: Duration::from_secs(DEFAULT_IN_FLIGHT_DEADLINE_SECS),
         }
     }
@@ -534,6 +541,7 @@ impl EventQueue {
         self.in_flight_scopes.remove(&scope);
         self.in_flight_deadlines.remove(&scope);
         self.in_flight_batch_sizes.remove(&scope);
+        self.stopped_scopes.remove(&scope);
         let now = Instant::now();
         match self.retry_after.get(&scope) {
             // Active throttle → scope was requeued; keep retry_counts intact.
@@ -896,6 +904,24 @@ impl EventQueue {
         self.retry_after.remove(scope);
         self.retry_counts.remove(scope);
         ids
+    }
+
+    /// Mark the scope's in-flight turn as stopped by `/stop`: whatever batch
+    /// that turn returns is discarded on return (see
+    /// [`is_stopped`](Self::is_stopped)). A no-op when nothing is in flight,
+    /// so the marker can never outlive the turn it was meant for.
+    pub fn mark_stopped(&mut self, scope: &SessionScope) -> bool {
+        if !self.in_flight_scopes.contains(scope) {
+            return false;
+        }
+        self.stopped_scopes.insert(scope.clone())
+    }
+
+    /// Whether a `/stop` hit the scope's in-flight turn. The main loop checks
+    /// this when the turn's batch comes back and discards it instead of
+    /// requeueing; [`mark_complete`](Self::mark_complete) clears the marker.
+    pub fn is_stopped(&self, scope: &SessionScope) -> bool {
+        self.stopped_scopes.contains(scope)
     }
 
     /// Whether a prompt is currently in-flight for the given scope (or channel,
@@ -2680,6 +2706,21 @@ mod tests {
             q.is_scope_in_flight(conv(ch)),
             "in-flight marker survives so mark_complete still pairs with the running turn"
         );
+    }
+
+    #[test]
+    fn stopped_marker_needs_an_in_flight_turn_and_clears_on_complete() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let scope = conv(ch);
+        assert!(!q.mark_stopped(&scope), "idle scope: nothing to mark");
+        assert!(!q.is_stopped(&scope));
+        q.push(make_queued(ch, "first"));
+        let _in_flight = q.flush_next().expect("first flushed");
+        assert!(q.mark_stopped(&scope));
+        assert!(q.is_stopped(&scope));
+        q.mark_complete(scope.clone());
+        assert!(!q.is_stopped(&scope), "cleared when the turn returns");
     }
 
     #[test]
