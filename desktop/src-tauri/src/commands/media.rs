@@ -123,6 +123,12 @@ fn fd_real_path(_file: &std::fs::File) -> Result<std::path::PathBuf, String> {
 /// attachment, accepted only for explicit download. Everything else (images,
 /// video, documents, archives, audio, text, data) is accepted; un-sniffable
 /// files fall back to `application/octet-stream` and are served as downloads.
+/// Decode ceiling for metadata stripping: the relay's `MAX_IMAGE_DECODE_BYTES`
+/// (100 MP at 16-bit RGBA). buzz-media is a dev-dependency only, so the number
+/// is repeated here; `decode_ceiling_matches_relay` below pins it to the real
+/// constant.
+const MAX_IMAGE_DECODE_BYTES: u64 = 800_000_000;
+
 const BLOCKED_MIME: &[&str] = &[
     "application/xhtml+xml",
     "image/svg+xml",
@@ -265,8 +271,12 @@ pub(crate) fn sanitize_image_for_upload(body: Vec<u8>, mime: &str) -> Result<Vec
     let mut decoder = reader
         .into_decoder()
         .map_err(|_| "failed to decode image for metadata removal".to_string())?;
+    // Match the relay's decode ceiling so the client never refuses an image
+    // the relay would accept; the image crate default (512 MiB) stops short.
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_IMAGE_DECODE_BYTES);
     decoder
-        .set_limits(image::Limits::default())
+        .set_limits(limits)
         .map_err(|_| "image exceeds safe decoding limits".to_string())?;
     let orientation = decoder
         .orientation()
@@ -797,6 +807,14 @@ pub(super) async fn upload_media_bytes_inner(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn decode_ceiling_matches_relay() {
+        assert_eq!(
+            super::MAX_IMAGE_DECODE_BYTES,
+            buzz_media_pkg::MAX_IMAGE_DECODE_BYTES
+        );
+    }
+
     use super::*;
 
     #[test]

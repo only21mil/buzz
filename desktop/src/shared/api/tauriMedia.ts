@@ -1,5 +1,4 @@
 import { invoke as invokeTauriRaw, isTauri } from "@tauri-apps/api/core";
-import { checkBrowserUploadSize } from "../lib/browserMediaLimits";
 import { type BlobDescriptor, invokeTauri } from "./tauri";
 
 function encodeRawIpcHeader(value: string): string {
@@ -20,7 +19,6 @@ export async function uploadMediaFile(
   signal?: AbortSignal,
 ): Promise<BlobDescriptor> {
   const native = isTauri();
-  if (!native) checkBrowserUploadSize(file.size);
   const headers: Record<string, string> = {
     "x-buzz-filename": encodeRawIpcHeader(file.name),
     "x-buzz-content-type": encodeRawIpcHeader(

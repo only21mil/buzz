@@ -1,4 +1,3 @@
-import { checkBrowserUploadSize as checkUploadSize } from "../../shared/lib/browserMediaLimits";
 import { blossomAuthorization } from "./mediaAuth";
 import { serverAuthority } from "./mediaAuthProtocol";
 import { type InvokeBody, type InvokeOptions, register } from "./registry";
@@ -53,7 +52,6 @@ function rawHeader(options: InvokeOptions | undefined, name: string) {
 
 function uploadInput(body: InvokeBody, options?: InvokeOptions) {
   if (body instanceof Uint8Array) {
-    checkUploadSize(body.byteLength);
     return {
       bytes: Uint8Array.from(body),
       filename: rawHeader(options, "x-buzz-filename"),
@@ -63,7 +61,6 @@ function uploadInput(body: InvokeBody, options?: InvokeOptions) {
     };
   }
   if (body instanceof ArrayBuffer) {
-    checkUploadSize(body.byteLength);
     return {
       bytes: new Uint8Array(body.slice(0)),
       filename: rawHeader(options, "x-buzz-filename"),
@@ -78,7 +75,6 @@ function uploadInput(body: InvokeBody, options?: InvokeOptions) {
   if (!Array.isArray(payload.data)) {
     throw new TypeError("upload_media_bytes requires a data array");
   }
-  checkUploadSize(payload.data.length);
   return {
     bytes: Uint8Array.from(payload.data as number[]),
     filename:
@@ -315,7 +311,6 @@ async function uploadBytes(
   workspace?: BrowserWorkspace,
 ): Promise<BlobDescriptor> {
   signal.throwIfAborted();
-  checkUploadSize(bytes.byteLength);
   await emitUploadPhase(progressId, "preparing");
   signal.throwIfAborted();
   const mediaOrigin = workspace
@@ -432,7 +427,9 @@ async function uploadFile(
   requireImage = false,
   workspace?: BrowserWorkspace,
 ): Promise<BlobDescriptor> {
-  checkUploadSize(file.size);
+  // No client-side byte cap: the relay's 413 names the real limit
+  // (`uploadSizeLimitMessage`), so the picker never refuses a file the relay
+  // would take.
   return withUploadController(progressId, async (signal) => {
     const bytes = new Uint8Array(await file.arrayBuffer());
     signal.throwIfAborted();

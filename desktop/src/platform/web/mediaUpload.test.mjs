@@ -326,60 +326,38 @@ function uploadOptions(progressId) {
   };
 }
 
-test("picker rejects a file one byte over its limit before reading it", async () => {
+test("picker surfaces the relay's 413 limit instead of a client-side cap", async () => {
+  installSigner();
   registerMediaCommands(new BrowserWorkspace());
+  globalThis.fetch = async () =>
+    Response.json(
+      {
+        error:
+          "file too large: 2147483649 bytes (max 2147483648 bytes, 2048.0 MiB)",
+        size: 2147483649,
+        max_bytes: 2147483648,
+      },
+      { status: 413 },
+    );
   let read = false;
   const picker = fakePicker([
     {
-      size: 100 * 1024 * 1024 + 1,
+      size: 2147483649,
       arrayBuffer: async () => {
         read = true;
-        throw new Error("must not read");
+        return Uint8Array.from([1, 2, 3]).buffer;
       },
     },
   ]);
   try {
     await assert.rejects(
       dispatch("pick_and_upload_media", {}),
-      /Maximum is 100MB/,
+      /^Error: File is too large \(2\.0 GiB\)\. This relay accepts up to 2\.0 GiB\.$/,
     );
-    assert.equal(read, false);
-    assert.equal(picker.removed(), true);
+    assert.equal(read, true, "the file reaches the relay; no local refusal");
   } finally {
     picker.restore();
   }
-});
-
-test("picker size preflight allows the exact advertised boundary", async () => {
-  registerMediaCommands(new BrowserWorkspace());
-  let read = false;
-  const picker = fakePicker([
-    {
-      size: 100 * 1024 * 1024,
-      arrayBuffer: async () => {
-        read = true;
-        throw new Error("synthetic read stop");
-      },
-    },
-  ]);
-  try {
-    await assert.rejects(
-      dispatch("pick_and_upload_media", {}),
-      /synthetic read stop/,
-    );
-    assert.equal(read, true);
-  } finally {
-    picker.restore();
-  }
-});
-
-test("array upload rejects an oversized sparse input before copying", async () => {
-  const data = [];
-  data.length = 100 * 1024 * 1024 + 1;
-  data[Symbol.iterator] = () => {
-    throw new Error("must not copy");
-  };
-  await assert.rejects(uploadBrowserMedia({ data }), /Maximum is 100MB/);
 });
 
 test("picker cancel settles and removes its input", async () => {

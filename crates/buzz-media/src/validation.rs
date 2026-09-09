@@ -14,6 +14,21 @@ use crate::error::MediaError;
 /// `video/mp4` and `validate_content()` rejects it here.
 const ALLOWED_MIME_TYPES: &[&str] = &["image/jpeg", "image/png", "image/gif", "image/webp"];
 
+/// Maximum pixel count for an uploaded image: 100 megapixels.
+///
+/// Covers 8K (7680x4320, 33 MP), a triple-5K desktop capture (44 MP) and
+/// wide panoramas. Worst-case full decode is 8 bytes per pixel (16-bit RGBA),
+/// so a picture at this cap needs 800 MB of decode memory; 8-bit RGBA needs
+/// 400 MB. [`MAX_IMAGE_DECODE_BYTES`] is derived from this number and is the
+/// only decode allocation cap in this crate; the byte cap on the stored
+/// original (`BUZZ_MAX_IMAGE_BYTES`, 2 GiB by default) is separate.
+pub const MAX_IMAGE_PIXELS: u64 = 100_000_000;
+
+/// Decode memory needed for a [`MAX_IMAGE_PIXELS`] image at 16-bit RGBA
+/// (8 bytes per pixel). Thumbnail generation decodes under this limit so the
+/// pixel gate above is the single dimension limit an upload can trip.
+pub const MAX_IMAGE_DECODE_BYTES: u64 = MAX_IMAGE_PIXELS * 8;
+
 const MP4_BRANDS: &[[u8; 4]] = &[
     *b"isom", *b"iso2", *b"iso3", *b"iso4", *b"iso5", *b"iso6", *b"iso7", *b"iso8", *b"iso9",
     *b"mp41", *b"mp42", *b"avc1", *b"dash", *b"M4V ",
@@ -260,9 +275,10 @@ pub fn validate_content(bytes: &[u8], config: &MediaConfig) -> Result<String, Me
     //    Fail closed: imagesize supports JPEG, PNG, GIF, WebP. If dimensions
     //    can't be parsed, reject — don't let unknown-geometry images reach the
     //    full decoder in thumbnail generation.
-    const MAX_PIXELS: u64 = 25_000_000; // 25 megapixels — 100MB max RGBA decode
+    //    The cap is `MAX_IMAGE_PIXELS` (100 MP, up to 800 MB decoded at
+    //    16-bit RGBA); the thumbnail decoder's allocation limit derives from it.
     let size = imagesize::blob_size(bytes).map_err(|_| MediaError::InvalidImage)?;
-    if (size.width as u64) * (size.height as u64) > MAX_PIXELS {
+    if (size.width as u64) * (size.height as u64) > MAX_IMAGE_PIXELS {
         return Err(MediaError::ImageTooLarge);
     }
 
@@ -1627,6 +1643,58 @@ mod tests {
         assert!(err
             .to_string()
             .contains(&format!("max {} bytes", bytes.len() - 1)));
+    }
+
+    /// PNG signature, IHDR with the given geometry, IEND. `imagesize` reads
+    /// only the header, so the pixel gate can be tested without encoding
+    /// a hundred megapixels.
+    fn png_header(width: u32, height: u32) -> Vec<u8> {
+        let mut out = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&width.to_be_bytes());
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[0x08, 0x02, 0x00, 0x00, 0x00]);
+        out.extend(png_chunk(b"IHDR", &ihdr));
+        out.extend(png_chunk(b"IEND", &[]));
+        out
+    }
+
+    #[test]
+    fn pixel_gate_is_one_hundred_megapixels() {
+        assert_eq!(MAX_IMAGE_PIXELS, 100_000_000);
+        assert_eq!(MAX_IMAGE_DECODE_BYTES, 800_000_000);
+        // 8-bit RGBA at the cap decodes into 400 MB; 16-bit RGBA into 800 MB.
+        assert_eq!(MAX_IMAGE_PIXELS * 4, 400_000_000);
+        // The image crate default (512 MiB) would reject a 16-bit image at the
+        // cap, so the thumbnail decoder must set its own limit.
+        const IMAGE_CRATE_DEFAULT_MAX_ALLOC: u64 = 512 * 1024 * 1024;
+        const _: () = assert!(MAX_IMAGE_DECODE_BYTES > IMAGE_CRATE_DEFAULT_MAX_ALLOC);
+    }
+
+    #[test]
+    fn pixel_gate_passes_exactly_one_hundred_megapixels() {
+        let config = test_config();
+        assert_eq!(
+            validate_content(&png_header(10_000, 10_000), &config).unwrap(),
+            "image/png"
+        );
+    }
+
+    #[test]
+    fn pixel_gate_rejects_one_hundred_megapixels_plus_one() {
+        let config = test_config();
+        let width = u32::try_from(MAX_IMAGE_PIXELS + 1).unwrap();
+        let err = validate_content(&png_header(width, 1), &config).unwrap_err();
+        assert!(matches!(err, MediaError::ImageTooLarge), "{err}");
+    }
+
+    #[test]
+    fn pixel_gate_passes_an_8k_screenshot() {
+        let config = test_config();
+        assert_eq!(
+            validate_content(&png_header(7680, 4320), &config).unwrap(),
+            "image/png"
+        );
     }
 
     // Minimal valid GIF89a (1x1 pixel) — full logical screen descriptor so imagesize can parse.
