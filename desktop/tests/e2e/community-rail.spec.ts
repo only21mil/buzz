@@ -32,6 +32,60 @@ async function seedCommunities(
   );
 }
 
+type CachedChannel = { id: string; name: string };
+
+// The client keeps each relay's channel list in a query-cache scope keyed by
+// relay and identity (shared/api/scopedQueryCache.ts), so a community's
+// channels are remembered by visiting it once. Tests that need the remembered
+// list to disagree with the live relay edit the visited community's query data
+// before switching away; the scope persists the edit with the rest of its
+// snapshot and restores it on the next switch.
+async function visitCommunity(
+  page: import("@playwright/test").Page,
+  communityId: string,
+) {
+  await page.getByTestId(`community-rail-button-${communityId}`).click();
+  await expect(
+    page.getByTestId(`community-rail-active-${communityId}`),
+  ).toBeVisible();
+  await expect(page.getByTestId("channel-general")).toBeVisible();
+}
+
+async function readCachedChannels(
+  page: import("@playwright/test").Page,
+): Promise<CachedChannel[]> {
+  return page.evaluate(() => {
+    const client = (
+      window as Window & {
+        __BUZZ_E2E_QUERY_CLIENT__?: {
+          getQueryData: (key: readonly unknown[]) => unknown;
+        };
+      }
+    ).__BUZZ_E2E_QUERY_CLIENT__;
+    if (!client) throw new Error("missing E2E query client seam");
+    const channels = client.getQueryData(["channels"]);
+    if (!Array.isArray(channels)) throw new Error("missing cached channels");
+    return channels as CachedChannel[];
+  });
+}
+
+async function writeCachedChannels(
+  page: import("@playwright/test").Page,
+  channels: CachedChannel[],
+) {
+  await page.evaluate((next) => {
+    const client = (
+      window as Window & {
+        __BUZZ_E2E_QUERY_CLIENT__?: {
+          setQueryData: (key: readonly unknown[], data: unknown) => unknown;
+        };
+      }
+    ).__BUZZ_E2E_QUERY_CLIENT__;
+    if (!client) throw new Error("missing E2E query client seam");
+    client.setQueryData(["channels"], next);
+  }, channels);
+}
+
 test.describe("community rail", () => {
   test("shows the rail with multiple communities despite a stale opt-out", async ({
     page,
@@ -412,33 +466,30 @@ test.describe("community rail", () => {
     await seedCommunities(page, [COMMUNITY_A, COMMUNITY_B], COMMUNITY_A.id);
     await page.goto("/");
     await expect(page.getByTestId("app-sidebar")).toBeVisible();
-    const rememberedChannelId = await page.evaluate((communityId) => {
-      const source = window.localStorage.getItem(
-        "buzz-channels.v1:ws://localhost:3000",
-      );
-      if (!source) throw new Error("missing source channel snapshot");
-      const snapshot = JSON.parse(source) as {
-        channels: Array<{ id: string; name: string }>;
-      };
-      const generalChannel = snapshot.channels.find(
-        (channel) => channel.name === "general",
-      );
-      if (!generalChannel) throw new Error("missing general channel snapshot");
-      window.localStorage.setItem(
-        "buzz-channels.v1:ws://localhost:3001",
-        source,
-      );
-      window.localStorage.setItem(
-        "buzz-community-destinations",
-        JSON.stringify({
-          [communityId]: {
-            kind: "channel",
-            channelId: generalChannel.id,
-          },
-        }),
-      );
-      return generalChannel.id;
-    }, COMMUNITY_B.id);
+
+    // Visiting Bravo once remembers its channel list; leaving from #general
+    // remembers that channel as Bravo's destination.
+    await visitCommunity(page, COMMUNITY_B.id);
+    const generalChannel = (await readCachedChannels(page)).find(
+      (channel) => channel.name === "general",
+    );
+    if (!generalChannel) throw new Error("missing general channel in cache");
+    const rememberedChannelId = generalChannel.id;
+    await page.getByTestId("channel-general").click();
+    await expect(page).toHaveURL(
+      new RegExp(`#/channels/${rememberedChannelId}$`),
+    );
+    await visitCommunity(page, COMMUNITY_A.id);
+    await expect
+      .poll(() =>
+        page.evaluate((communityId) => {
+          const raw = window.localStorage.getItem(
+            "buzz-community-destinations",
+          );
+          return raw ? JSON.parse(raw)[communityId] : null;
+        }, COMMUNITY_B.id),
+      )
+      .toEqual({ kind: "channel", channelId: rememberedChannelId });
 
     await page.evaluate(() => {
       const testWindow = window as typeof window & {
@@ -468,7 +519,22 @@ test.describe("community rail", () => {
   }) => {
     await installMockBridge(page, undefined, { skipCommunitySeed: true });
     await seedCommunities(page, [COMMUNITY_A, COMMUNITY_B], COMMUNITY_A.id);
-    await page.addInitScript((communityId) => {
+
+    await page.goto("/");
+    await expect(page.getByTestId("app-sidebar")).toBeVisible();
+
+    // Bravo's remembered channel list claims a channel the live relay does
+    // not have; the remembered destination points at that channel.
+    await visitCommunity(page, COMMUNITY_B.id);
+    const cached = await readCachedChannels(page);
+    await writeCachedChannels(
+      page,
+      cached.map((channel, index) =>
+        index === 0 ? { ...channel, id: "missing-channel" } : channel,
+      ),
+    );
+    await visitCommunity(page, COMMUNITY_A.id);
+    await page.evaluate((communityId) => {
       window.localStorage.setItem(
         "buzz-community-destinations",
         JSON.stringify({
@@ -476,30 +542,6 @@ test.describe("community rail", () => {
         }),
       );
     }, COMMUNITY_B.id);
-
-    await page.goto("/");
-    await expect
-      .poll(() =>
-        page.evaluate(() =>
-          window.localStorage.getItem("buzz-channels.v1:ws://localhost:3000"),
-        ),
-      )
-      .not.toBeNull();
-    await page.evaluate(() => {
-      const source = window.localStorage.getItem(
-        "buzz-channels.v1:ws://localhost:3000",
-      );
-      if (!source) throw new Error("missing source channel snapshot");
-      const snapshot = JSON.parse(source);
-      snapshot.channels = snapshot.channels.map(
-        (channel: Record<string, unknown>, index: number) =>
-          index === 0 ? { ...channel, id: "missing-channel" } : channel,
-      );
-      window.localStorage.setItem(
-        "buzz-channels.v1:ws://localhost:3001",
-        JSON.stringify(snapshot),
-      );
-    });
     await page.getByTestId(`community-rail-button-${COMMUNITY_B.id}`).click();
 
     await expect(page).not.toHaveURL(/#\/channels\//);
@@ -531,13 +573,7 @@ test.describe("community rail", () => {
     }, COMMUNITY_B.id);
     await page.goto("/");
     await expect(page.getByTestId("app-sidebar")).toBeVisible();
-    await expect
-      .poll(() =>
-        page.evaluate(() =>
-          window.localStorage.getItem("buzz-channels.v1:ws://localhost:3000"),
-        ),
-      )
-      .not.toBeNull();
+    await expect(page.getByTestId("channel-general")).toBeVisible();
     expect(
       await page.evaluate(async () => {
         const testWindow = window as Window & {
@@ -563,20 +599,6 @@ test.describe("community rail", () => {
         };
       }),
     ).toEqual({ released: 0, pending: 0 });
-    await page.evaluate(() => {
-      const source = window.localStorage.getItem(
-        "buzz-channels.v1:ws://localhost:3000",
-      );
-      if (!source) throw new Error("missing source channel snapshot");
-      const snapshot = JSON.parse(source);
-      snapshot.channels = snapshot.channels.filter(
-        (channel: { id: string }) => channel.id !== "general",
-      );
-      window.localStorage.setItem(
-        "buzz-channels.v1:ws://localhost:3001",
-        JSON.stringify(snapshot),
-      );
-    });
     await page.evaluate(() => {
       const config = (
         window as Window & {
