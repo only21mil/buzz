@@ -3425,6 +3425,7 @@ mod tests {
         let base = std::env::temp_dir().canonicalize().unwrap();
         tempfile::Builder::new()
             .prefix("landing-receipt-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir_in(base)
             .unwrap()
     }
