@@ -11,6 +11,7 @@ mod backend;
 mod codec;
 mod config;
 mod ipc;
+mod native_evidence;
 mod receipt;
 mod selector;
 mod service;
@@ -35,6 +36,7 @@ pub use ipc::{
 };
 #[cfg(target_os = "linux")]
 pub use ipc::{validate_systemd_environment, validate_systemd_listener, ActivationError};
+pub use native_evidence::{NativeEvidenceArtifact, NativeEvidencePolicy};
 pub use receipt::{
     acceptance_signing_policy, AcceptanceBindingReceipt, AcceptanceReceiptIdentity,
     AcceptanceReceiptPolicy, ReceiptError, ACCEPTANCE_BINDING_PATH, ACCEPTANCE_BINDING_SCHEMA,

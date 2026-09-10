@@ -625,6 +625,48 @@ fn await_request(args: &[String]) -> Result<()> {
     Err("accepted intake exceeded capture bound".into())
 }
 
+// Derive read authority from the same descriptors publication uses. No caller
+// supplied URL or digest bypasses prepare's complete receipt verification.
+fn evidence_read_plan(
+    authority: &Authority,
+    accepted: &AcceptedRequest,
+    completion: &AttemptCompletion,
+    bundle: &Bundle,
+    authority_sha256: &str,
+    bundle_sha256: &str,
+    now: u64,
+) -> Result<Value> {
+    let [job] = completion.jobs.as_slice() else {
+        return Err("one completed job required".into());
+    };
+    let policy = buzz_ci_keyholder::NativeEvidencePolicy {
+        not_before: now,
+        expires_at: now.checked_add(300).ok_or("read window overflow")?,
+        request_event_id: accepted.event_id.clone(),
+        run_id: accepted.envelope.run_id.clone(),
+        job_id: job.metadata.job_id.clone(),
+        attempt: job.attempt,
+        authority_sha256: authority_sha256.into(),
+        bundle_sha256: bundle_sha256.into(),
+        log_sha256: job.log.sha256.clone(),
+        artifacts: job
+            .artifacts
+            .iter()
+            .map(|a| buzz_ci_keyholder::NativeEvidenceArtifact {
+                artifact_id: a.artifact_id.clone(),
+                sha256: a.descriptor.sha256.clone(),
+            })
+            .collect(),
+    };
+    policy.validate()?;
+    Ok(
+        json!({"schema_version":1,"validated":true,"request_event_id":accepted.event_id,
+        "state":job.state,"relay_origin":bundle.relay_base_url,
+        "keyholder_selectors":authority.keyholder.keyholder_selectors,
+        "native_evidence":policy}),
+    )
+}
+
 pub(super) fn run(args: &[String]) -> Result<()> {
     if args[1] == "await-request" {
         return await_request(args);
@@ -634,22 +676,23 @@ pub(super) fn run(args: &[String]) -> Result<()> {
     }
     require(args.len() == 8)?;
     let publishing = args[1] == "publish";
-    let authority = load_authority(Path::new(&args[2]), &args[3], publishing)?;
+    let protected = publishing || nix::unistd::geteuid().as_raw() == 0;
+    let authority = load_authority(Path::new(&args[2]), &args[3], protected)?;
     let event: Event = serde_json::from_slice(&protected_read(
         Path::new(&args[4]),
         1024 * 1024,
-        publishing,
+        protected,
     )?)?;
     let source: Event = serde_json::from_slice(&protected_read(
         Path::new(&args[5]),
         1024 * 1024,
-        publishing,
+        protected,
     )?)?;
     // Retained completion may be published after admission expiry. Verify the
     // request at its own issue time, then require measured execution in-window.
     let accepted = validate_inputs(&authority, &event, &source, event.created_at.as_secs())?;
     let bundle_path = Path::new(&args[6]);
-    let bundle_bytes = protected_read(bundle_path, 16384, publishing)?;
+    let bundle_bytes = protected_read(bundle_path, 16384, protected)?;
     require(digest(&bundle_bytes) == args[7])?;
     let bundle: Bundle = serde_json::from_slice(&bundle_bytes)?;
     let (completion, evidence) = prepare(
@@ -657,13 +700,20 @@ pub(super) fn run(args: &[String]) -> Result<()> {
         &accepted,
         &bundle,
         bundle_path.parent().ok_or("bundle directory")?,
-        publishing,
+        protected,
     )?;
     if !publishing {
-        println!(
-            "{}",
-            json!({"validated":true,"request_event_id":accepted.event_id,"state":completion.jobs[0].state})
-        );
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let plan = evidence_read_plan(
+            &authority,
+            &accepted,
+            &completion,
+            &bundle,
+            &args[3],
+            &args[7],
+            now,
+        )?;
+        println!("{}", plan);
         return Ok(());
     }
     require(nix::unistd::geteuid().as_raw() == 1201 && nix::unistd::getegid().as_raw() == 1201)?;
@@ -726,6 +776,42 @@ pub(super) fn run(args: &[String]) -> Result<()> {
 mod tests {
     use super::*;
     use nostr::secp256k1::{Keypair, SecretKey};
+
+    #[test]
+    fn read_plan_uses_exact_completion_descriptors_for_both_native_profiles() {
+        for mac in [false, true] {
+            let f = fixture(mac);
+            let (completion, evidence) = f.prepare().unwrap();
+            let plan = evidence_read_plan(
+                &f.authority,
+                &f.accepted,
+                &completion,
+                &f.bundle,
+                &"11".repeat(32),
+                &"22".repeat(32),
+                500,
+            )
+            .unwrap();
+            let policy: buzz_ci_keyholder::NativeEvidencePolicy =
+                serde_json::from_value(plan["native_evidence"].clone()).unwrap();
+            assert_eq!(policy.request_event_id, f.accepted.event_id);
+            assert_eq!(policy.run_id, f.accepted.envelope.run_id);
+            assert_eq!(policy.job_id, f.authority.job_id);
+            assert_eq!(policy.attempt, f.accepted.envelope.attempt);
+            assert_eq!(policy.not_before, 500);
+            assert_eq!(policy.expires_at, 800);
+            assert_eq!(policy.log_sha256, digest(&evidence.0["job.log"]));
+            assert_eq!(
+                policy.artifacts[0].sha256,
+                digest(&evidence.0["result.json"])
+            );
+            assert_eq!(policy.paths().len(), 2);
+            assert!(policy
+                .paths()
+                .iter()
+                .all(|p| p.contains(&f.accepted.event_id)));
+        }
+    }
 
     #[test]
     fn capture_excludes_old_or_other_requests_and_refuses_ambiguous_fresh_requests() {
