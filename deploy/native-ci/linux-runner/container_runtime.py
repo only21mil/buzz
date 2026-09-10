@@ -128,7 +128,7 @@ def _command(spec: ContainerSpec, source: Path, script: Path, job_dir: Path) -> 
         "--ulimit=nofile=1024:1024", "--ulimit=core=0:0",
         "--mount", f"type=bind,src={source},dst=/source,ro=true,relabel=private",
         "--mount", f"type=bind,src={script},dst=/workflow.sh,ro=true,relabel=private",
-        "--tmpfs", f"/workspace:rw,exec,nosuid,nodev,notmpcopyup,size={spec.memory_mib}m,mode=0700,uid=1000,gid=1000",
+        "--mount", f"type=tmpfs,dst=/workspace,rw,exec,nosuid,nodev,notmpcopyup,tmpfs-size={spec.memory_mib}m,tmpfs-mode=0700,U=true",
         "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,notmpcopyup,size=256m,mode=1777",
         "--env=PATH=/usr/local/bin:/usr/bin:/bin", "--env=HOME=/workspace",
         "--env=LANG=C.UTF-8", "--workdir=/workspace", "--entrypoint=/bin/sh",

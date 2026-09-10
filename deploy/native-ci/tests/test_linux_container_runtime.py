@@ -81,6 +81,7 @@ class ContainerRuntimeTests(unittest.TestCase):
             self.assertIn(fixed, args)
         self.assertIn(f"type=bind,src={self.source},dst=/source,ro=true,relabel=private", args)
         self.assertIn(f"type=bind,src={self.script},dst=/workflow.sh,ro=true,relabel=private", args)
+        self.assertIn("type=tmpfs,dst=/workspace,rw,exec,nosuid,nodev,notmpcopyup,tmpfs-size=2048m,tmpfs-mode=0700,U=true", args)
         self.assertFalse(any("docker.sock" in arg or "podman.sock" in arg for arg in args))
         self.assertEqual(args[-1], "cp -R /source/. /workspace/; exec /bin/bash --noprofile --norc -e -o pipefail /workflow.sh")
 
