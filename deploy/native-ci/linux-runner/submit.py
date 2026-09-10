@@ -36,7 +36,7 @@ def _cancel(_signal: int, _frame: object) -> None:
 
 def _command(argv: list[str], *, timeout: int = 10) -> subprocess.CompletedProcess:
     return subprocess.run(argv, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root"},
-                          stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          cwd="/", stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                           timeout=timeout, check=False)
 
 

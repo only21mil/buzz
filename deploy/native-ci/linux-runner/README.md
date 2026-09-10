@@ -199,3 +199,6 @@ only the dedicated `/run/user/UID` using `BindPaths`. `ProtectHome=yes` masks
 that runtime directory even when `ReadWritePaths` lists it and prevents Podman
 from starting. The account home and jobs remain bounded writable paths under
 `/var/lib/buzzci/linux-runner`.
+Root control commands use `/` as their working directory so container absence
+readback under the runtime account does not inherit the operator's private
+working directory.

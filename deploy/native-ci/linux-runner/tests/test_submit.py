@@ -50,6 +50,17 @@ class SupervisorTests(unittest.TestCase):
         submit.validate_result(self.result if result is None else result, self.admission, self.profile,
                                self.profile_digest, self.invocation, self.state if state is None else state)
 
+    def test_control_commands_do_not_inherit_operator_working_directory(self):
+        previous = Path.cwd()
+        try:
+            with tempfile.TemporaryDirectory() as private:
+                os.chdir(private)
+                result = submit._command(["/usr/bin/pwd"])
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b"/\n")
+        finally:
+            os.chdir(previous)
+
     def test_launch_exposes_only_dedicated_runtime_under_private_home_mounts(self):
         account = SimpleNamespace(pw_uid=1234, pw_gid=1234, pw_name="buzzci-linux",
                                   pw_dir="/var/lib/buzzci/linux-runner/home")
