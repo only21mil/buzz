@@ -5,6 +5,7 @@
 //! - `transport` — Smart HTTP protocol (info/refs, upload-pack, receive-pack)
 //! - `hook` — Pre-receive hook script and injection
 //! - `policy` — Internal policy endpoint (HMAC-authenticated callback from hook)
+//! - `merge_gate` — Required-check merge gate the policy endpoint and finalize fence run
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -29,6 +30,7 @@ pub mod hook;
 pub mod hydrate;
 pub mod manifest;
 pub mod manifest_event;
+pub mod merge_gate;
 pub mod pack_cache;
 pub mod policy;
 pub mod snapshot;
