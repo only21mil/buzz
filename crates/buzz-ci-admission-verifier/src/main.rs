@@ -19,24 +19,77 @@ struct Policy {
     lane_manifest_digest: String,
     lane_epoch: u64,
     admission_key_generation: u64,
+    not_before: u64,
+    expires_at: u64,
+    max_wall_timeout_seconds: u32,
     workflow_digest: String,
-    job_intent_digest: String,
+    workflow_id: String,
+    job_id: String,
+    artifacts: Vec<Artifact>,
     isolation_profile_digest: String,
     trusted_base_oid: String,
     // The public workflow is a trusted-base artifact, not candidate code.
     workflow_file_sha256: String,
+    workflow_path: String,
+    #[serde(default)]
+    driver_file_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct Artifact {
+    artifact_id: String,
+    name: String,
+    media_type: String,
+    relative_name: String,
+    max_bytes: u32,
+}
+
+fn artifacts(registration: &v2::RegisterJobIntentRequest) -> Result<Vec<Artifact>, &'static str> {
+    registration
+        .artifacts
+        .iter()
+        .flatten()
+        .map(|item| {
+            Ok(Artifact {
+                artifact_id: item
+                    .artifact_id
+                    .as_str()
+                    .map_err(|_| "invalid artifact")?
+                    .into(),
+                name: item.name.as_str().map_err(|_| "invalid artifact")?.into(),
+                media_type: item
+                    .media_type
+                    .as_str()
+                    .map_err(|_| "invalid artifact")?
+                    .into(),
+                relative_name: item
+                    .relative_name
+                    .as_str()
+                    .map_err(|_| "invalid artifact")?
+                    .into(),
+                max_bytes: item.max_bytes,
+            })
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
 struct Verified {
     schema_version: u16,
     admission_message_digest: String,
+    workflow_id: String,
+    job_id: String,
+    artifacts: Vec<Artifact>,
     signed_request_digest: String,
     source_pin_event_id: String,
     candidate_sha: String,
     base_sha: String,
     workflow_digest: String,
     workflow_file_sha256: String,
+    workflow_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    driver_file_sha256: Option<String>,
     job_intent_digest: String,
     isolation_profile_digest: String,
     lane_manifest_digest: String,
@@ -68,15 +121,30 @@ fn oid(value: GitOid) -> Result<String, &'static str> {
 }
 
 fn verify(frame: &[u8], policy: &Policy, now: u64, live: bool) -> Result<Verified, &'static str> {
-    let (_, request) = v2::decode_request(frame).map_err(|_| "invalid v2 frame")?;
-    let v2::Request::AdmitAttempt(value) = request else {
-        return Err("admission required");
+    let (header, request) = v2::decode_request(frame).map_err(|_| "invalid v2 frame")?;
+    let v2::Request::RegisterJobIntent(registration) = request else {
+        return Err("signed job registration required");
     };
+    let value = registration.admission;
+    let artifact_list = artifacts(&registration)?;
+    if v2::intent_registration_request_frame_digest(header, &registration)
+        != Some(registration.request_frame_digest)
+        || v2::canonical_job_intent_digest(2, &registration) != value.job_intent_digest
+        || registration.request_event_id != value.signed_request_digest
+        || registration
+            .workflow_id
+            .as_str()
+            .map_err(|_| "invalid workflow")?
+            != policy.workflow_id
+        || registration.job_id.as_str().map_err(|_| "invalid job")? != policy.job_id
+        || artifact_list != policy.artifacts
+    {
+        return Err("registration outside installed job policy");
+    }
     if value.actor_pubkey != hash(&policy.actor_pubkey)?
         || value.audience_digest != hash(&policy.audience_digest)?
         || value.lane_manifest_digest != hash(&policy.lane_manifest_digest)?
         || value.workflow_digest != hash(&policy.workflow_digest)?
-        || value.job_intent_digest != hash(&policy.job_intent_digest)?
         || value.isolation_profile_digest != hash(&policy.isolation_profile_digest)?
         || value.lane_epoch != policy.lane_epoch
         || value.admission_key_generation != policy.admission_key_generation
@@ -84,6 +152,14 @@ fn verify(frame: &[u8], policy: &Policy, now: u64, live: bool) -> Result<Verifie
         || value.trust_class != TrustClass::AcceptedReviewed
         || value.wall_timeout_seconds == 0
         || value.wall_timeout_seconds > 2700
+        || policy.max_wall_timeout_seconds == 0
+        || policy.max_wall_timeout_seconds > 2700
+        || value.wall_timeout_seconds > policy.max_wall_timeout_seconds
+        || policy.not_before == 0
+        || policy.expires_at <= policy.not_before
+        || value.issued_at < policy.not_before
+        || value.expires_at > policy.expires_at
+        || (live && (now < policy.not_before || now >= policy.expires_at))
         || value.issued_at > value.expires_at
         || value.expires_at.saturating_sub(value.issued_at) > 2700
         || (live && (value.issued_at > now || value.expires_at <= now))
@@ -91,6 +167,15 @@ fn verify(frame: &[u8], policy: &Policy, now: u64, live: bool) -> Result<Verifie
         return Err("admission outside installed policy");
     }
     hash(&policy.workflow_file_sha256)?;
+    if !matches!(
+        policy.workflow_path.as_str(),
+        ".github/workflows/ci.yml" | ".buzz/workflows/native-macos.yml"
+    ) {
+        return Err("unsupported trusted workflow path");
+    }
+    if let Some(driver) = &policy.driver_file_sha256 {
+        hash(driver)?;
+    }
     let digest: [u8; 32] = Sha256::digest(v2::admission_signature_message(&value)).into();
     let signature =
         Signature::from_slice(&value.admission_signature).map_err(|_| "invalid signature")?;
@@ -102,12 +187,17 @@ fn verify(frame: &[u8], policy: &Policy, now: u64, live: bool) -> Result<Verifie
     Ok(Verified {
         schema_version: 2,
         admission_message_digest: hex::encode(digest),
+        workflow_id: policy.workflow_id.clone(),
+        job_id: policy.job_id.clone(),
+        artifacts: artifact_list,
         signed_request_digest: hex::encode(value.signed_request_digest),
         source_pin_event_id: hex::encode(value.source_pin_event_id),
         candidate_sha: oid(value.tip_oid)?,
         base_sha: oid(value.base_oid)?,
         workflow_digest: hex::encode(value.workflow_digest),
         workflow_file_sha256: policy.workflow_file_sha256.clone(),
+        workflow_path: policy.workflow_path.clone(),
+        driver_file_sha256: policy.driver_file_sha256.clone(),
         job_intent_digest: hex::encode(value.job_intent_digest),
         isolation_profile_digest: hex::encode(value.isolation_profile_digest),
         lane_manifest_digest: hex::encode(value.lane_manifest_digest),
@@ -130,7 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let policy: Policy = serde_json::from_slice(&bytes)?;
     let mut frame = Vec::new();
-    std::io::stdin().take(513).read_to_end(&mut frame)?;
+    std::io::stdin().take(993).read_to_end(&mut frame)?;
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let verified = verify(&frame, &policy, now, args[2] == "live")?;
     println!("{}", serde_json::to_string(&verified)?);
@@ -142,11 +232,11 @@ mod tests {
     use super::*;
     use nostr::secp256k1::{Keypair, SecretKey};
 
-    fn fixture() -> (v2::AdmitAttemptRequest, Policy) {
+    fn fixture() -> (v2::RegisterJobIntentRequest, Policy) {
         let secp = Secp256k1::new();
         let secret = SecretKey::from_slice(&[42; 32]).unwrap();
         let keypair = Keypair::from_secret_key(&secp, &secret);
-        let mut value = v2::AdmitAttemptRequest {
+        let value = v2::AdmitAttemptRequest {
             signed_request_digest: [1; 32],
             actor_pubkey: [2; 32],
             audience_digest: [3; 32],
@@ -170,10 +260,23 @@ mod tests {
             trust_class: TrustClass::AcceptedReviewed,
             admission_signature_algorithm: v2::AdmissionSignatureAlgorithm::Bip340Secp256k1Sha256,
         };
-        let digest = Sha256::digest(v2::admission_signature_message(&value)).into();
-        value.admission_signature = *secp
-            .sign_schnorr_no_aux_rand(&Message::from_digest(digest), &keypair)
-            .as_ref();
+        let text = |value| v2::WireText64::from_ascii(value).unwrap();
+        let mut value = v2::RegisterJobIntentRequest {
+            admission: value,
+            request_event_id: [1; 32],
+            workflow_id: text("ci"),
+            job_id: text("desktop-build-macos-unsigned"),
+            artifact_count: 1,
+            artifacts: [Some(v2::JobArtifactDeclaration {
+                artifact_id: text("result"),
+                name: text("result.json"),
+                relative_name: text("result.json"),
+                media_type: text("application/json"),
+                max_bytes: 32768,
+            })],
+            request_frame_digest: [1; 32],
+        };
+        sign(&mut value);
         let policy = Policy {
             admission_pubkey: keypair.x_only_public_key().0.to_string(),
             actor_pubkey: hex::encode([2; 32]),
@@ -181,17 +284,41 @@ mod tests {
             lane_manifest_digest: hex::encode([9; 32]),
             lane_epoch: 3,
             admission_key_generation: 4,
+            not_before: 90,
+            expires_at: 300,
+            max_wall_timeout_seconds: 60,
             workflow_digest: hex::encode([6; 32]),
-            job_intent_digest: hex::encode([7; 32]),
+            workflow_id: "ci".into(),
+            job_id: "desktop-build-macos-unsigned".into(),
+            artifacts: artifacts(&value).unwrap(),
             isolation_profile_digest: hex::encode([8; 32]),
             trusted_base_oid: hex::encode([13; 20]),
             workflow_file_sha256: hex::encode([14; 32]),
+            workflow_path: ".github/workflows/ci.yml".into(),
+            driver_file_sha256: None,
         };
         (value, policy)
     }
 
-    fn frame(value: v2::AdmitAttemptRequest) -> v2::EncodedFrame {
-        v2::encode_request([1; 16], v2::Request::AdmitAttempt(value))
+    fn sign(value: &mut v2::RegisterJobIntentRequest) {
+        let secp = Secp256k1::new();
+        let secret = SecretKey::from_slice(&[42; 32]).unwrap();
+        let keypair = Keypair::from_secret_key(&secp, &secret);
+        value.admission.job_intent_digest = v2::canonical_job_intent_digest(2, value);
+        let digest = Sha256::digest(v2::admission_signature_message(&value.admission)).into();
+        value.admission.admission_signature = *secp
+            .sign_schnorr_no_aux_rand(&Message::from_digest(digest), &keypair)
+            .as_ref();
+    }
+
+    fn frame(mut value: v2::RegisterJobIntentRequest) -> v2::EncodedFrame {
+        let header = v2::FrameHeader {
+            operation: buzz_ci_broker_protocol::Operation::RegisterJobIntent,
+            request_id: [1; 16],
+        };
+        value.request_frame_digest =
+            v2::intent_registration_request_frame_digest(header, &value).unwrap();
+        v2::encode_request(header.request_id, v2::Request::RegisterJobIntent(value))
     }
 
     #[test]
@@ -201,7 +328,9 @@ mod tests {
         assert_eq!(result.candidate_sha, hex::encode([12; 20]));
         assert_eq!(
             result.admission_message_digest,
-            hex::encode(Sha256::digest(v2::admission_signature_message(&value)))
+            hex::encode(Sha256::digest(v2::admission_signature_message(
+                &value.admission
+            )))
         );
         assert_eq!(result.attempt, 1);
     }
@@ -209,10 +338,10 @@ mod tests {
     #[test]
     fn refuses_changed_candidate_and_bad_signature() {
         let (mut value, policy) = fixture();
-        value.tip_oid = GitOid::Sha1([15; 20]);
+        value.admission.tip_oid = GitOid::Sha1([15; 20]);
         assert!(verify(frame(value).as_bytes(), &policy, 101, true).is_err());
         let (mut value, policy) = fixture();
-        value.admission_signature[0] ^= 1;
+        value.admission.admission_signature[0] ^= 1;
         assert!(verify(frame(value).as_bytes(), &policy, 101, true).is_err());
     }
 
@@ -223,7 +352,7 @@ mod tests {
             assert!(verify(frame(value).as_bytes(), &policy, now, true).is_err());
         }
         assert!(verify(frame(value).as_bytes(), &policy, 201, false).is_ok());
-        policy.job_intent_digest = hex::encode([15; 32]);
+        policy.job_id = "other-job".into();
         assert!(verify(frame(value).as_bytes(), &policy, 101, true).is_err());
     }
 
@@ -233,7 +362,44 @@ mod tests {
         let mut bytes = frame(value).as_bytes().to_vec();
         bytes.push(0);
         assert!(verify(&bytes, &policy, 101, true).is_err());
-        bytes.truncate(511);
+        bytes.truncate(991);
+        assert!(verify(&bytes, &policy, 101, true).is_err());
+    }
+    #[test]
+    fn accepts_new_signed_attempt_without_policy_reinstall() {
+        let (mut value, policy) = fixture();
+        let old_digest = value.admission.job_intent_digest;
+        value.admission.attempt = 2;
+        value.admission.parent_attempt = 1;
+        value.admission.issued_at = 102;
+        sign(&mut value);
+        assert_ne!(value.admission.job_intent_digest, old_digest);
+        let verified = verify(frame(value).as_bytes(), &policy, 103, true).unwrap();
+        assert_eq!(verified.attempt, 2);
+    }
+
+    #[test]
+    fn refuses_modified_registration_preimage_even_with_valid_frame_digest() {
+        let (mut value, policy) = fixture();
+        value.artifacts[0].as_mut().unwrap().relative_name =
+            v2::WireText64::from_ascii("other.json").unwrap();
+        assert!(verify(frame(value).as_bytes(), &policy, 101, true).is_err());
+        let (mut value, policy) = fixture();
+        value.workflow_id = v2::WireText64::from_ascii("other").unwrap();
+        assert!(verify(frame(value).as_bytes(), &policy, 101, true).is_err());
+    }
+
+    #[test]
+    fn refuses_lane_bounds_and_tampered_registration_header() {
+        let (value, mut policy) = fixture();
+        policy.max_wall_timeout_seconds = 59;
+        assert!(verify(frame(value).as_bytes(), &policy, 101, true).is_err());
+        policy.max_wall_timeout_seconds = 60;
+        policy.expires_at = 199;
+        assert!(verify(frame(value).as_bytes(), &policy, 101, true).is_err());
+        policy.expires_at = 300;
+        let mut bytes = frame(value).as_bytes().to_vec();
+        bytes[16] ^= 1;
         assert!(verify(&bytes, &policy, 101, true).is_err());
     }
 }
