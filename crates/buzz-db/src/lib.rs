@@ -1777,29 +1777,6 @@ impl Db {
     }
 
     /// Store an accepted kind-46109 merge bypass; `false` for a replay.
-    /// Every run for `(repository, candidate tip, workflow)`, newest first.
-    pub async fn list_ci_runs_for_tip(
-        &self,
-        community_id: CommunityId,
-        target_repo_a: &str,
-        tip_oid: &str,
-        workflow_id: &str,
-        limit: u32,
-    ) -> Result<Vec<ci::CiRunRecord>> {
-        observability::observe(observability::Operation::Ci, async {
-            ci::list_ci_runs_for_tip(
-                &self.pool,
-                community_id,
-                target_repo_a,
-                tip_oid,
-                workflow_id,
-                limit,
-            )
-            .await
-        })
-        .await
-    }
-
     /// Append one merge-gate decision row and return its id.
     pub async fn insert_merge_gate_decision(
         &self,

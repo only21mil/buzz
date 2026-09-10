@@ -1,5 +1,6 @@
-//! Merge gate storage contract: run selection by candidate tip and the
-//! append-only decision record the finalize fence reads.
+//! Merge gate storage contract: the landing read the gate selects runs
+//! with (workflow and channel scoping) and the append-only decision record
+//! the finalize fence reads.
 //! Run with scripts/postgres-test-local.py.
 
 use std::collections::HashSet;
@@ -8,7 +9,8 @@ use buzz_core::ci::{
     request_tags, validate_signed_ci_event, CiRequestEnvelope, CiRequestType, CI_SCHEMA_VERSION,
 };
 use buzz_core::CommunityId;
-use buzz_db::ci::{list_ci_runs_for_tip, store_ci_event};
+use buzz_db::ci::store_ci_event;
+use buzz_db::ci_landing::list_ci_runs_for_tip;
 use buzz_db::git_merge_gate::{
     find_merge_gate_allow, insert_merge_gate_decision, MergeGateDecisionInsert,
 };
@@ -142,23 +144,62 @@ async fn runs_for_tip_are_newest_first_and_scoped_to_repo_tip_and_workflow() {
     other_workflow.workflow_id = "release".into();
     store_request(&pool, community, channel, &actor, &other_workflow).await;
 
-    let runs = list_ci_runs_for_tip(&pool, community, &coordinate, &tip, "ci", 100)
-        .await
-        .expect("list runs");
+    let runs = list_ci_runs_for_tip(
+        &pool,
+        community,
+        channel,
+        &coordinate,
+        &tip,
+        Some("ci"),
+        100,
+    )
+    .await
+    .expect("list runs");
     assert_eq!(
         runs.iter().map(|r| r.run_id).collect::<Vec<_>>(),
         vec![newer, older]
     );
     assert_eq!(runs[1].base_oid, base);
-    assert_eq!(runs[1].workflow_digest, "44".repeat(32));
+    assert_eq!(hex::encode(&runs[1].workflow_digest), "44".repeat(32));
     assert_eq!(runs[0].base_oid, "55".repeat(20));
     assert_eq!(runs[0].channel_id, channel);
     assert!(runs[0].created_at >= runs[1].created_at);
 
-    let none = list_ci_runs_for_tip(&pool, community, &coordinate, &tip, "deploy", 100)
+    let none = list_ci_runs_for_tip(
+        &pool,
+        community,
+        channel,
+        &coordinate,
+        &tip,
+        Some("deploy"),
+        100,
+    )
+    .await
+    .expect("list runs");
+    assert!(none.is_empty());
+    let all = list_ci_runs_for_tip(&pool, community, channel, &coordinate, &tip, None, 100)
         .await
         .expect("list runs");
-    assert!(none.is_empty());
+    assert_eq!(
+        all.len(),
+        3,
+        "no workflow filter lists every workflow's run for the tip"
+    );
+    let other_channel = list_ci_runs_for_tip(
+        &pool,
+        community,
+        Uuid::new_v4(),
+        &coordinate,
+        &tip,
+        None,
+        100,
+    )
+    .await
+    .expect("list runs");
+    assert!(
+        other_channel.is_empty(),
+        "runs stay invisible outside their channel"
+    );
 }
 
 fn decision(coordinate: &str, code: &str, pusher: &str) -> MergeGateDecisionInsert {

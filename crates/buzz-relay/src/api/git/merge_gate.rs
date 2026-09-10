@@ -54,8 +54,6 @@ const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const RUN_EVENT_PAGE: u32 = 1_000;
 /// The CLI's bounded reducer window; a longer history is `gate_misconfigured`.
 const MAX_RUN_EVENTS: usize = 10_000;
-/// Rows read per `(repo, tip, workflow)` when selecting a run.
-const MAX_RUNS_FOR_TIP: u32 = 100;
 /// Budget for hydrating the published state inside the hook callback.
 const HYDRATE_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -946,14 +944,17 @@ async fn select_run(
     base_workflow_digest: &str,
     signer_union: &HashSet<String>,
 ) -> Result<LoadedRun, Refusal> {
-    let runs = state
+    // Channel-scoped by the landing read itself: a run of another channel
+    // stays invisible even when the coordinate string matches.
+    let runs: Vec<(buzz_db::ci_landing::CiRunRecord, String)> = state
         .db
         .list_ci_runs_for_tip(
             ctx.community,
+            ctx.channel_id,
             coordinate,
             candidate,
-            workflow_id,
-            MAX_RUNS_FOR_TIP,
+            Some(workflow_id),
+            buzz_db::ci_landing::MAX_CI_LANDING_ROWS,
         )
         .await
         .map_err(|e| {
@@ -961,12 +962,14 @@ async fn select_run(
                 RefusalCode::GateMisconfigured,
                 format!("run lookup failed: {e}"),
             )
-        })?;
-    let runs: Vec<_> = runs
+        })?
         .into_iter()
-        .filter(|run| run.channel_id == ctx.channel_id)
+        .map(|run| {
+            let digest = hex::encode(&run.workflow_digest);
+            (run, digest)
+        })
         .collect();
-    let Some(latest) = runs.first() else {
+    let Some((latest, latest_digest)) = runs.first() else {
         return Err(Refusal::new(
             RefusalCode::NoCheck,
             format!("no {workflow_id} run for candidate {candidate}"),
@@ -974,8 +977,8 @@ async fn select_run(
     };
     let selected = runs
         .iter()
-        .find(|run| run.base_oid == base && run.workflow_digest == base_workflow_digest);
-    let Some(selected) = selected else {
+        .find(|(run, digest)| run.base_oid == base && digest == base_workflow_digest);
+    let Some((selected, selected_digest)) = selected else {
         // Report why the newest run does not qualify.
         if latest.base_oid != base {
             return Err(Refusal::new(
@@ -989,8 +992,8 @@ async fn select_run(
         return Err(Refusal::new(
             RefusalCode::WorkflowDigestMismatch,
             format!(
-                "latest {workflow_id} run {} used workflow digest {} but the workflow at base {base} digests to {base_workflow_digest}",
-                latest.run_id, latest.workflow_digest
+                "latest {workflow_id} run {} used workflow digest {latest_digest} but the workflow at base {base} digests to {base_workflow_digest}",
+                latest.run_id
             ),
         ));
     };
@@ -1086,7 +1089,7 @@ async fn select_run(
     Ok(LoadedRun {
         run_id: selected.run_id,
         base_oid: selected.base_oid.clone(),
-        workflow_digest: selected.workflow_digest.clone(),
+        workflow_digest: selected_digest.clone(),
         request_event_id: request_stored.stored_event.event.id.to_hex(),
         request,
         events,
