@@ -430,6 +430,43 @@ where
     T: HttpTransport,
     A: Nip98Authorizer,
 {
+    /// Read the original signed request from authenticated accepted intake.
+    /// This preserves the exact event for operator staging and still validates
+    /// its signature, channel and request envelope before returning it.
+    pub fn next_accepted_event(
+        &mut self,
+        channel_id: &str,
+        after_cursor: u64,
+    ) -> Result<Option<(u64, nostr::Event)>, SourceError> {
+        if channel_id.is_empty() {
+            return Err(SourceError::InvalidConfig);
+        }
+        let mut url = self.endpoint("ci/control/accepted")?;
+        url.query_pairs_mut()
+            .append_pair("channel_id", channel_id)
+            .append_pair("after_cursor", &after_cursor.to_string())
+            .append_pair("limit", "1");
+        let response = self.request(HttpMethod::Get, url, Vec::new(), None, None)?;
+        let wire: AcceptedResponse =
+            serde_json::from_slice(&response.body).map_err(|_| SourceError::InvalidResponse)?;
+        let Some(item) = wire.accepted else {
+            return Ok(None);
+        };
+        if item.channel_id != channel_id || item.watch_cursor <= after_cursor {
+            return Err(SourceError::InvalidRequest);
+        }
+        let event: nostr::Event =
+            serde_json::from_value(item.event).map_err(|_| SourceError::InvalidRequest)?;
+        if !matches!(
+            validate_signed_ci_event(&event, channel_id, &HashSet::new())
+                .map_err(|_| SourceError::InvalidRequest)?,
+            ValidatedCiEnvelope::Request(_)
+        ) {
+            return Err(SourceError::InvalidRequest);
+        }
+        Ok(Some((item.watch_cursor, event)))
+    }
+
     fn endpoint(&self, path: &str) -> Result<Url, SourceError> {
         self.base_url
             .join(path)
@@ -648,25 +685,10 @@ where
         channel_id: &str,
         after_cursor: u64,
     ) -> Result<Option<AcceptedRequest>, Self::Error> {
-        if channel_id.is_empty() {
-            return Err(SourceError::InvalidConfig);
-        }
-        let mut url = self.endpoint("ci/control/accepted")?;
-        url.query_pairs_mut()
-            .append_pair("channel_id", channel_id)
-            .append_pair("after_cursor", &after_cursor.to_string())
-            .append_pair("limit", "1");
-        let response = self.request(HttpMethod::Get, url, Vec::new(), None, None)?;
-        let wire: AcceptedResponse =
-            serde_json::from_slice(&response.body).map_err(|_| SourceError::InvalidResponse)?;
-        let Some(item) = wire.accepted else {
+        let Some((watch_cursor, event)) = self.next_accepted_event(channel_id, after_cursor)?
+        else {
             return Ok(None);
         };
-        if item.channel_id != channel_id || item.watch_cursor <= after_cursor {
-            return Err(SourceError::InvalidRequest);
-        }
-        let event: nostr::Event =
-            serde_json::from_value(item.event).map_err(|_| SourceError::InvalidRequest)?;
         let event_id = event.id.to_hex();
         let envelope = match validate_signed_ci_event(&event, channel_id, &HashSet::new())
             .map_err(|_| SourceError::InvalidRequest)?
@@ -675,8 +697,8 @@ where
             _ => return Err(SourceError::InvalidRequest),
         };
         Ok(Some(AcceptedRequest {
-            channel_id: item.channel_id,
-            watch_cursor: item.watch_cursor,
+            channel_id: channel_id.to_owned(),
+            watch_cursor,
             event_id,
             envelope,
         }))

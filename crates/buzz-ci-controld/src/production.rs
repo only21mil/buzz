@@ -544,6 +544,8 @@ pub enum PollStep {
     Idle,
     /// One accepted request settled and the cursor advanced.
     Completed,
+    /// An unowned request was skipped by advancing only the local cursor.
+    Skipped,
     /// The head request's publication was refused as an unauthorized status
     /// signer before the activation grant; it is recorded as deferred and the
     /// cursor did not move.
@@ -617,7 +619,18 @@ where
 {
     /// Consume at most one accepted request after the durable channel cursor.
     pub fn poll_once(&mut self, channel_id: &str) -> Result<PollStep, ProductionError> {
-        self.poll_head(channel_id, false, None)
+        self.poll_head(channel_id, false, None, None)
+    }
+
+    /// Poll with an explicit intake owner. Unowned requests advance only this
+    /// store's cursor. Existing local run state is a conflict requiring repair,
+    /// so this cannot silently abandon work claimed before selection was enabled.
+    pub fn poll_once_selected(
+        &mut self,
+        channel_id: &str,
+        owns: &dyn Fn(&AcceptedRequest) -> bool,
+    ) -> Result<PollStep, ProductionError> {
+        self.poll_head(channel_id, false, None, Some(owns))
     }
 
     /// Consume only the exact frozen request selected by an acceptance stage.
@@ -626,7 +639,35 @@ where
         channel_id: &str,
         expected: &AcceptedRequestBinding,
     ) -> Result<PollStep, ProductionError> {
-        self.poll_head(channel_id, false, Some(expected))
+        self.poll_head(channel_id, false, Some(expected), None)
+    }
+
+    /// Acknowledge one exact relay-accepted request before an operator submits
+    /// its signed native admission. Retain the intake cursor so a later bounded
+    /// poll publishes completion through the ordinary durable state machine.
+    /// This never invokes the executor or asserts that execution started.
+    pub fn acknowledge_once_bound(
+        &mut self,
+        expected: &AcceptedRequestBinding,
+    ) -> Result<String, ProductionError> {
+        let cursor = self
+            .store
+            .cursor(&expected.channel_id)
+            .map_err(|_| ProductionError::Store)?;
+        let accepted = self
+            .relay
+            .next_accepted(&expected.channel_id, cursor)
+            .map_err(|_| ProductionError::Relay)?
+            .ok_or(ProductionError::Invalid)?;
+        if !expected.matches(&accepted) || accepted.watch_cursor <= cursor {
+            return Err(ProductionError::Invalid);
+        }
+        let identity = run_identity(&accepted)?;
+        let (_, record) = self.load_or_queue(&accepted, &identity)?;
+        if record.state() != RunState::Queued {
+            return Err(ProductionError::Invalid);
+        }
+        self.publish_run(&accepted, &record, "run:queued")
     }
 
     /// Replay every deferred publication through the ordinary pending path
@@ -652,7 +693,7 @@ where
             self.republish(key, stored)?;
         }
         if !deferred.is_empty() {
-            while self.poll_head(channel_id, true, None)? == PollStep::Completed {}
+            while self.poll_head(channel_id, true, None, None)? == PollStep::Completed {}
         }
         Ok(deferred.len())
     }
@@ -697,7 +738,7 @@ where
                 .ok_or(ProductionError::PublicationConflict)?;
             self.republish(key, stored)?;
         }
-        let _ = self.poll_head(channel_id, true, Some(expected))?;
+        let _ = self.poll_head(channel_id, true, Some(expected), None)?;
         Ok(deferred.len())
     }
 
@@ -1023,6 +1064,7 @@ where
         channel_id: &str,
         terminal_only: bool,
         expected: Option<&AcceptedRequestBinding>,
+        owns: Option<&dyn Fn(&AcceptedRequest) -> bool>,
     ) -> Result<PollStep, ProductionError> {
         let cursor = self
             .store
@@ -1040,6 +1082,25 @@ where
         }
         if expected.is_some_and(|binding| !binding.matches(&accepted)) {
             return Err(ProductionError::Invalid);
+        }
+        if owns.is_some_and(|owns| !owns(&accepted)) {
+            let identity = run_identity(&accepted)?;
+            if self
+                .store
+                .load_run(&identity)
+                .map_err(|_| ProductionError::Store)?
+                .is_some()
+            {
+                return Err(ProductionError::PublicationConflict);
+            }
+            if !self
+                .store
+                .advance_cursor(channel_id, cursor, accepted.watch_cursor)
+                .map_err(|_| ProductionError::Store)?
+            {
+                return Err(ProductionError::PublicationConflict);
+            }
+            return Ok(PollStep::Skipped);
         }
         if terminal_only {
             let identity = run_identity(&accepted)?;
@@ -2807,6 +2868,41 @@ mod tests {
         DeterministicSigner
             .sign(KIND_CI_JOB_STATUS, &content, tags)
             .expect("signed job status")
+    }
+
+    #[test]
+    fn operator_acknowledgement_is_exact_idempotent_and_never_dispatches() {
+        let accepted = accepted();
+        let mut binding = frozen_binding(&accepted);
+        let mut handler = ProductionHandler::new(
+            Relay {
+                accepted: Some(accepted),
+                published: Vec::new(),
+                job_statuses: Vec::new(),
+                intent_signal: None,
+                refuse_publication: false,
+            },
+            DeterministicSigner,
+            FailingExecutor,
+            MemoryStore::default(),
+            MemoryOutput(Vec::new()),
+        );
+        binding.event_id = "99".repeat(32);
+        assert!(matches!(
+            handler.acknowledge_once_bound(&binding),
+            Err(ProductionError::Invalid)
+        ));
+        assert!(handler.store.run.is_none());
+        binding = frozen_binding(handler.relay.accepted.as_ref().unwrap());
+        let first = handler.acknowledge_once_bound(&binding).unwrap();
+        assert_eq!(handler.acknowledge_once_bound(&binding).unwrap(), first);
+        assert_eq!(handler.store.cursor, 0);
+        assert_eq!(
+            handler.store.run.as_ref().unwrap().1.state(),
+            RunState::Queued
+        );
+        assert_eq!(handler.relay.published, vec![KIND_CI_RUN_STATUS]);
+        assert!(handler.relay.job_statuses.is_empty());
     }
 
     #[test]

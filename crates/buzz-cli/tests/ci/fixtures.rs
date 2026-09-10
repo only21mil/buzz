@@ -59,7 +59,7 @@ pub fn preflight_response() -> Value {
         "base_ref": "refs/heads/main",
         "base_oid": BASE_OID,
         "workflow_id": WORKFLOW_ID,
-        "workflow_path": ".buzz/workflows/ci.yaml",
+        "workflow_path": ".github/workflows/ci.yml",
         "workflow_digest": WORKFLOW_DIGEST,
         "canonical_workflow_base64": CANONICAL_WORKFLOW_BASE64,
         "jobs": [

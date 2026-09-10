@@ -109,10 +109,27 @@ pub(crate) struct CapacityOneService<
     poll_interval: Duration,
     acceptance: AcceptanceJournal,
     background_polling: bool,
+    fixture_intake: FixtureIntake,
     #[cfg(test)]
     crash_before_provider_effect: bool,
     #[cfg(test)]
     crash_after_provider_effect: bool,
+}
+
+/// Ownership comes from trusted fixture configuration. Digest, source and
+/// execution validation remain downstream so owned fixture failures stay visible.
+pub(crate) struct FixtureIntake {
+    actor: String,
+    workflow_id: String,
+    job_ids: Vec<String>,
+}
+
+impl FixtureIntake {
+    fn owns(&self, accepted: &AcceptedRequest) -> bool {
+        accepted.envelope.actor == self.actor
+            && accepted.envelope.workflow_id == self.workflow_id
+            && accepted.envelope.job_ids == self.job_ids
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -157,7 +174,7 @@ trait AcceptanceRecoveryProvider {
 
 pub(crate) trait ServiceController: Send + 'static {
     fn service_status(&self) -> CapacityOneStatus;
-    fn service_poll_once(&mut self) -> Result<(), ControllerError>;
+    fn service_poll_once(&mut self, intake: &FixtureIntake) -> Result<(), ControllerError>;
     fn service_poll_bound(
         &mut self,
         expected: &AcceptedRequestBinding,
@@ -187,8 +204,9 @@ where
         self.status()
     }
 
-    fn service_poll_once(&mut self) -> Result<(), ControllerError> {
-        self.poll_once().map(|_| ())
+    fn service_poll_once(&mut self, intake: &FixtureIntake) -> Result<(), ControllerError> {
+        self.poll_once_selected(&|accepted| intake.owns(accepted))
+            .map(|_| ())
     }
 
     fn service_poll_bound(
@@ -474,6 +492,11 @@ impl CapacityOneService {
             .first()
             .filter(|_| active.jobs.len() == 1)
             .ok_or(ServiceError::InvalidConfig)?;
+        let fixture_intake = FixtureIntake {
+            actor: binding.acceptance.actor.public_key.clone(),
+            workflow_id: bindings.workflow_id.clone(),
+            job_ids: bindings.job_ids.clone(),
+        };
         let metadata = JobMetadata {
             job_id: job.job_id.clone(),
             name: job.name.clone(),
@@ -566,6 +589,7 @@ impl CapacityOneService {
             poll_interval,
             acceptance,
             background_polling,
+            fixture_intake,
             #[cfg(test)]
             crash_before_provider_effect: false,
             #[cfg(test)]
@@ -610,7 +634,7 @@ where
             .ok_or(ControllerError::Infrastructure(
                 TerminalInfrastructureReason::State,
             ))?;
-        let result = controller.service_poll_once();
+        let result = controller.service_poll_once(&self.fixture_intake);
         self.status = controller.service_status();
         result
     }
@@ -3062,15 +3086,15 @@ mod tests {
     }
 
     type FakeExecutor = RunnerV2AttemptExecutor<FakeRunnerTransport, FakeAdmissionSigner>;
-    type FakeController = CapacityOneController<
+    type FakeController<P = FakeStore> = CapacityOneController<
         FakeRelay,
         FakeCiSigner,
         FakeExecutor,
-        FakeStore,
+        P,
         RunnerV2EvidenceReader<FakeRunnerTransport>,
     >;
-    type FakeService = CapacityOneService<
-        FakeController,
+    type FakeService<P = FakeStore> = CapacityOneService<
+        FakeController<P>,
         FakeRunnerTransport,
         FakeExecutor,
         FakeRelay,
@@ -3203,14 +3227,14 @@ mod tests {
         }
     }
 
-    fn fake_service(
+    fn fake_service<P: ControlStore + Send + 'static>(
         root: &std::path::Path,
         owner_uid: u32,
         binding: &AcceptanceBinding,
         relay: FakeRelay,
-        store: FakeStore,
+        store: P,
         runner: FakeRunnerTransport,
-    ) -> FakeService {
+    ) -> FakeService<P> {
         relay.0.lock().unwrap().nip98_generation = binding.fixture.export_generation;
         let bindings = runner_bindings(binding);
         let metadata = JobMetadata {
@@ -3269,6 +3293,11 @@ mod tests {
         )
         .unwrap();
         let status = controller.status();
+        let acceptance =
+            AcceptanceJournal::open(root.canonicalize().unwrap(), owner_uid, binding.clone())
+                .unwrap();
+        let background_polling =
+            background_polling_enabled(acceptance.completed_sequences().unwrap());
         FakeService {
             controller: Some(controller),
             controller_worker: None,
@@ -3287,13 +3316,13 @@ mod tests {
             acceptance_authority: AcceptanceAuthority::new(binding).unwrap(),
             status,
             poll_interval,
-            acceptance: AcceptanceJournal::open(
-                root.canonicalize().unwrap(),
-                owner_uid,
-                binding.clone(),
-            )
-            .unwrap(),
-            background_polling: false,
+            acceptance,
+            background_polling,
+            fixture_intake: FixtureIntake {
+                actor: binding.acceptance.actor.public_key.clone(),
+                workflow_id: runner_bindings(binding).workflow_id,
+                job_ids: runner_bindings(binding).job_ids,
+            },
             crash_before_provider_effect: false,
             crash_after_provider_effect: false,
         }
@@ -3374,6 +3403,262 @@ mod tests {
             .unwrap()
             .selected_attempt_id
             .unwrap()
+    }
+
+    #[test]
+    fn background_poll_reopens_durable_cursor_after_foreign_intake() {
+        let binding = provider_binding();
+        let (root, owner_uid) = provider_root();
+        let (store_root, _) = provider_root();
+        let relay = FakeRelay::default();
+        let runner = FakeRunnerTransport(Arc::new(Mutex::new(FakeRunnerState {
+            conclusion: BrokerConclusion::Success,
+            active: None,
+            terminal: None,
+            evidence: None,
+            starts: 0,
+            starts_by_request: HashMap::new(),
+            last_request: None,
+            cancels: 0,
+            drift: false,
+            exchanges: 0,
+        })));
+        let mut fixture = frozen_request(&binding, AcceptanceMutation::Run);
+        fixture.watch_cursor = 3;
+        for (cursor, workflow, job) in [
+            (1, "CI", "dead-token-guard"),
+            (2, "native-macos", "desktop-build-macos-unsigned"),
+        ] {
+            let mut native = fixture.clone();
+            native.watch_cursor = cursor;
+            native.event_id = format!("{cursor:064x}");
+            native.envelope.workflow_id = workflow.to_owned();
+            native.envelope.job_ids = vec![job.to_owned()];
+            relay.0.lock().unwrap().accepted.push_back(native);
+        }
+        relay.0.lock().unwrap().accepted.push_back(fixture.clone());
+        let open_store = || DurableControlStore::open(store_root.path(), owner_uid).unwrap();
+        let mut service = fake_service(
+            root.path(),
+            owner_uid,
+            &binding,
+            relay.clone(),
+            open_store(),
+            runner.clone(),
+        );
+        prime_journal(&service.acceptance, COMPLETE_ACCEPTANCE_SEQUENCE, None);
+        for cursor in 1..=2 {
+            drop(service);
+            service = fake_service(
+                root.path(),
+                owner_uid,
+                &binding,
+                relay.clone(),
+                open_store(),
+                runner.clone(),
+            );
+            assert!(service.background_polling);
+            service.poll_once().unwrap();
+            assert_eq!(open_store().cursor(&fixture.channel_id).unwrap(), cursor);
+            assert!(relay.0.lock().unwrap().events.is_empty());
+            assert_eq!(runner.0.lock().unwrap().exchanges, 0);
+        }
+        drop(service);
+        service = fake_service(
+            root.path(),
+            owner_uid,
+            &binding,
+            relay.clone(),
+            open_store(),
+            runner.clone(),
+        );
+        service
+            .attempt_commands
+            .send(AttemptCommand::Continue)
+            .unwrap();
+        service.poll_once().unwrap();
+        drop(service);
+        assert_eq!(open_store().cursor(&fixture.channel_id).unwrap(), 3);
+        let runs = open_store()
+            .load_run_attempts(
+                Uuid::parse_str(&fixture.envelope.run_id).unwrap(),
+                fixture.envelope.attempt,
+            )
+            .unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].1.state(), buzz_ci_controld::RunState::Success);
+        assert_eq!(runner.0.lock().unwrap().starts, 1);
+    }
+
+    #[test]
+    fn background_poll_isolates_native_intake_and_recovers_cursor_failures() {
+        for failure in ["none", "cursor", "existing_run", "owned_digest"] {
+            let binding = provider_binding();
+            let (root, owner_uid) = provider_root();
+            let relay = FakeRelay::default();
+            let store = FakeStore::default();
+            let runner_state = Arc::new(Mutex::new(FakeRunnerState {
+                conclusion: BrokerConclusion::Success,
+                active: None,
+                terminal: None,
+                evidence: None,
+                starts: 0,
+                starts_by_request: HashMap::new(),
+                last_request: None,
+                cancels: 0,
+                drift: false,
+                exchanges: 0,
+            }));
+            let runner = FakeRunnerTransport(runner_state.clone());
+            let mut fixture = frozen_request(&binding, AcceptanceMutation::Run);
+            let mut linux = fixture.clone();
+            linux.watch_cursor = 1;
+            linux.event_id = "a1".repeat(32);
+            linux.envelope.workflow_id = "CI".to_owned();
+            linux.envelope.job_ids = vec!["dead-token-guard".to_owned()];
+            let mut mac = linux.clone();
+            mac.watch_cursor = 2;
+            mac.event_id = "a2".repeat(32);
+            mac.envelope.workflow_id = "native-macos".to_owned();
+            mac.envelope.job_ids = vec!["desktop-build-macos-unsigned".to_owned()];
+            let mut foreign_actor = fixture.clone();
+            foreign_actor.watch_cursor = 3;
+            foreign_actor.event_id = "a3".repeat(32);
+            foreign_actor.envelope.actor = "a4".repeat(32);
+            let mut foreign_job = fixture.clone();
+            foreign_job.watch_cursor = 4;
+            foreign_job.event_id = "a5".repeat(32);
+            foreign_job.envelope.job_ids = vec!["other-job".to_owned()];
+            fixture.watch_cursor = 5;
+            if failure == "owned_digest" {
+                fixture.event_id = "a6".repeat(32);
+                fixture.envelope.workflow_digest = "a7".repeat(32);
+            }
+            for request in [&linux, &mac, &foreign_actor, &foreign_job, &fixture] {
+                request.envelope.validate().unwrap();
+            }
+            relay.0.lock().unwrap().accepted.extend([
+                linux.clone(),
+                mac,
+                foreign_actor,
+                foreign_job,
+                fixture.clone(),
+            ]);
+            let mut service = fake_service(
+                root.path(),
+                owner_uid,
+                &binding,
+                relay.clone(),
+                store.clone(),
+                runner.clone(),
+            );
+            prime_journal(&service.acceptance, COMPLETE_ACCEPTANCE_SEQUENCE, None);
+            drop(service);
+            service = fake_service(
+                root.path(),
+                owner_uid,
+                &binding,
+                relay.clone(),
+                store.clone(),
+                runner.clone(),
+            );
+            assert!(service.background_polling);
+            if failure == "cursor" {
+                store.0.lock().unwrap().fail_cursor_once = true;
+            } else if failure == "existing_run" {
+                let identity = RunIdentity::new(
+                    linux.event_id.clone(),
+                    Uuid::parse_str(&linux.envelope.run_id).unwrap(),
+                    linux.envelope.attempt,
+                    linux.envelope.target_repo_a.clone(),
+                    linux.envelope.tip_oid.clone(),
+                    linux.envelope.workflow_id.clone(),
+                )
+                .unwrap();
+                let record = RunRecord::queued(identity.clone(), linux.envelope.issued_at).unwrap();
+                store.0.lock().unwrap().runs.push((identity, 1, record));
+            }
+            if matches!(failure, "cursor" | "existing_run") {
+                assert!(service.poll_once().is_err());
+                assert_eq!(store.0.lock().unwrap().cursor, 0);
+                assert!(store.0.lock().unwrap().publications.is_empty());
+                assert!(relay.0.lock().unwrap().events.is_empty());
+                assert_eq!(runner_state.lock().unwrap().exchanges, 0);
+                assert!(service.status().terminal_reason().is_some());
+                if failure == "existing_run" {
+                    assert_eq!(store.0.lock().unwrap().runs.len(), 1);
+                    continue;
+                }
+                drop(service);
+                service = fake_service(
+                    root.path(),
+                    owner_uid,
+                    &binding,
+                    relay.clone(),
+                    store.clone(),
+                    runner.clone(),
+                );
+            }
+            for cursor in 1..=4 {
+                service.poll_once().unwrap();
+                let state = store.0.lock().unwrap();
+                assert_eq!(state.cursor, cursor);
+                assert!(state.runs.is_empty());
+                assert!(state.publications.is_empty());
+                assert!(relay.0.lock().unwrap().events.is_empty());
+                assert_eq!(runner_state.lock().unwrap().exchanges, 0);
+                drop(state);
+                // A restart reads the committed cursor and continues with the next head.
+                drop(service);
+                service = fake_service(
+                    root.path(),
+                    owner_uid,
+                    &binding,
+                    relay.clone(),
+                    store.clone(),
+                    runner.clone(),
+                );
+            }
+            service
+                .attempt_commands
+                .send(AttemptCommand::Continue)
+                .unwrap();
+            let outcome = service.poll_once();
+            if failure == "owned_digest" {
+                assert_eq!(
+                    outcome,
+                    Err(ControllerError::Infrastructure(
+                        TerminalInfrastructureReason::Runner
+                    ))
+                );
+            } else {
+                outcome.unwrap();
+            }
+            assert_eq!(
+                store.0.lock().unwrap().cursor,
+                if failure == "owned_digest" { 4 } else { 5 }
+            );
+            assert_eq!(store.0.lock().unwrap().runs.len(), 1);
+            assert_eq!(
+                runner_state.lock().unwrap().starts,
+                usize::from(failure != "owned_digest")
+            );
+            let state = relay.0.lock().unwrap();
+            assert!(!state.events.is_empty());
+            for event in state.events.values() {
+                let content: serde_json::Value = serde_json::from_str(&event.content).unwrap();
+                assert_eq!(content["request_event_id"], fixture.event_id);
+            }
+            let record = &store.0.lock().unwrap().runs[0].2;
+            assert_eq!(
+                record.state(),
+                if failure == "owned_digest" {
+                    buzz_ci_controld::RunState::InfrastructureFailure
+                } else {
+                    buzz_ci_controld::RunState::Success
+                }
+            );
+        }
     }
 
     #[test]

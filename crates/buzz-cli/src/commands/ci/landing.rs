@@ -50,7 +50,7 @@ pub const LANDING_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_MAX_AGE_SECONDS: u64 = 86_400;
 /// Upper bound on a receipt, as `protected-ci-receipt.py` enforces.
 pub const MAX_RECEIPT_BYTES: usize = 4 * 1024 * 1024;
-/// The one workflow path the relay preflight resolves at the trusted base.
+/// The ordinary CI workflow used by the protected merge gate.
 pub const WORKFLOW_PATH: &str = ".github/workflows/ci.yml";
 /// The gated ref.
 pub const MAIN_REF: &str = "refs/heads/main";

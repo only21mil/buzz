@@ -17,6 +17,9 @@ use uuid::Uuid;
 /// Pure reduction of accepted CI envelopes into status and verdict state.
 pub mod reducer;
 
+/// Fixed trusted-base workflow locations selected by CI preflight.
+pub mod workflow;
+
 /// Current CI envelope schema version.
 pub const CI_SCHEMA_VERSION: u32 = 1;
 /// Largest integer represented exactly by JavaScript consumers.

@@ -314,6 +314,73 @@ pub struct RegisterJobIntentRequest {
     pub request_frame_digest: [u8; 32],
 }
 
+/// Canonical JobIntentV2 digest shared by portable and privileged verifiers.
+/// Signature bytes, request-frame digest and the self job-intent digest are excluded.
+pub fn canonical_job_intent_digest(
+    schema_version: u16,
+    value: &RegisterJobIntentRequest,
+) -> [u8; 32] {
+    let mut bytes = Vec::with_capacity(360);
+    bytes.extend_from_slice(JOB_INTENT_DIGEST_DOMAIN);
+    bytes.extend_from_slice(&schema_version.to_be_bytes());
+    bytes.extend_from_slice(&value.admission.signed_request_digest);
+    bytes.extend_from_slice(&value.admission.actor_pubkey);
+    bytes.extend_from_slice(&value.admission.audience_digest);
+    bytes.extend_from_slice(&value.admission.idempotency_digest);
+    bytes.extend_from_slice(&value.admission.source_pin_event_id);
+    bytes.extend_from_slice(&value.admission.workflow_digest);
+    bytes.extend_from_slice(&value.admission.isolation_profile_digest);
+    bytes.extend_from_slice(&value.admission.lane_manifest_digest);
+    bytes.extend_from_slice(&value.admission.lane_epoch.to_be_bytes());
+    bytes.push(value.admission.admission_signature_algorithm as u8);
+    bytes.extend_from_slice(&value.admission.admission_key_generation.to_be_bytes());
+    bytes.extend_from_slice(&value.admission.run_id);
+    intent_put_oid(&mut bytes, value.admission.tip_oid);
+    intent_put_oid(&mut bytes, value.admission.base_oid);
+    bytes.extend_from_slice(&value.admission.issued_at.to_be_bytes());
+    bytes.extend_from_slice(&value.admission.expires_at.to_be_bytes());
+    bytes.extend_from_slice(&value.admission.wall_timeout_seconds.to_be_bytes());
+    bytes.extend_from_slice(&value.admission.attempt.to_be_bytes());
+    bytes.extend_from_slice(&value.admission.parent_attempt.to_be_bytes());
+    bytes.push(value.admission.trust_class as u8);
+    bytes.extend_from_slice(&value.request_event_id);
+    intent_put_text(&mut bytes, value.workflow_id);
+    intent_put_text(&mut bytes, value.job_id);
+    bytes.push(value.artifact_count);
+    for artifact in value.artifacts {
+        match artifact {
+            Some(artifact) => {
+                bytes.push(1);
+                intent_put_text(&mut bytes, artifact.artifact_id);
+                intent_put_text(&mut bytes, artifact.name);
+                intent_put_text(&mut bytes, artifact.media_type);
+                intent_put_text(&mut bytes, artifact.relative_name);
+                bytes.extend_from_slice(&artifact.max_bytes.to_be_bytes());
+            }
+            None => bytes.push(0),
+        }
+    }
+    Sha256::digest(&bytes).into()
+}
+
+fn intent_put_text(bytes: &mut Vec<u8>, value: WireText64) {
+    bytes.push(value.len);
+    bytes.extend_from_slice(&value.bytes);
+}
+
+fn intent_put_oid(bytes: &mut Vec<u8>, oid: GitOid) {
+    match oid {
+        GitOid::Sha1(value) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&value);
+        }
+        GitOid::Sha256(value) => {
+            bytes.push(2);
+            bytes.extend_from_slice(&value);
+        }
+    }
+}
+
 /// Result of create-once JobIntent registration. This response exposes no
 /// execution binding or lease; it only echoes authenticated registration
 /// coordinates.
