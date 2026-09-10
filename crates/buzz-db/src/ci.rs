@@ -391,6 +391,74 @@ pub async fn list_ci_run_events(
     rows.into_iter().map(row_to_ci_stored_event).collect()
 }
 
+/// One `ci_runs` row a merge gate selects by candidate tip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CiRunRecord {
+    /// Stable run UUID.
+    pub run_id: Uuid,
+    /// Repository channel the run was published to.
+    pub channel_id: Uuid,
+    /// Immutable kind-46100 request event ID (32 bytes).
+    pub initial_request_event_id: Vec<u8>,
+    /// Trusted base object ID the request named.
+    pub base_oid: String,
+    /// Hex SHA-256 of the trusted-base workflow bytes the request named.
+    pub workflow_digest: String,
+    /// Relay clock at run creation.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Every run for `(repository, candidate tip, workflow)`, newest first.
+///
+/// Reads `idx_ci_runs_repo_tip` (migration 0032). The merge gate takes the
+/// first row whose `base_oid` and `workflow_digest` match the push, so a
+/// newer run over the same tip decides ahead of an older one.
+pub async fn list_ci_runs_for_tip(
+    pool: &PgPool,
+    community_id: CommunityId,
+    target_repo_a: &str,
+    tip_oid: &str,
+    workflow_id: &str,
+    limit: u32,
+) -> Result<Vec<CiRunRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT run_id,channel_id,initial_request_event_id,base_oid,workflow_digest,created_at
+        FROM ci_runs
+        WHERE community_id=$1 AND target_repo_a=$2 AND tip_oid=$3 AND workflow_id=$4
+        ORDER BY created_at DESC, run_id
+        LIMIT $5
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(target_repo_a)
+    .bind(tip_oid)
+    .bind(workflow_id)
+    .bind(i64::from(limit.clamp(1, 1_000)))
+    .fetch_all(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Ci,
+        )
+        .await?,
+    )
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let digest: Vec<u8> = row.try_get("workflow_digest")?;
+            Ok(CiRunRecord {
+                run_id: row.try_get("run_id")?,
+                channel_id: row.try_get("channel_id")?,
+                initial_request_event_id: row.try_get("initial_request_event_id")?,
+                base_oid: row.try_get("base_oid")?,
+                workflow_digest: hex::encode(digest),
+                created_at: row.try_get("created_at")?,
+            })
+        })
+        .collect()
+}
+
 /// Load one stored kind-46108 terminal check of `run_id` by its event ID.
 ///
 /// Returns the canonical signed event with the relay clock's `accepted_at`,
