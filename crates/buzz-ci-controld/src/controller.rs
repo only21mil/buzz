@@ -298,6 +298,8 @@ impl From<&ProductionError> for TerminalInfrastructureReason {
 pub enum PollOutcome {
     Idle,
     CompletedOne,
+    /// Only the cursor advanced past a request owned by another controller.
+    SkippedOne,
     /// The head request's publication replay was deferred until the
     /// activation grant is approved; the controller stays ready.
     Deferred,
@@ -353,7 +355,7 @@ where
     /// terminal for this process, so a host cannot spin or admit later work on
     /// uncertain infrastructure state.
     pub fn poll_once(&mut self) -> Result<PollOutcome, ControllerError> {
-        self.poll_once_with_binding(None)
+        self.poll_once_with_binding(None, None)
     }
 
     /// Poll only the exact frozen request selected by an acceptance stage.
@@ -361,12 +363,21 @@ where
         &mut self,
         expected: &AcceptedRequestBinding,
     ) -> Result<PollOutcome, ControllerError> {
-        self.poll_once_with_binding(Some(expected))
+        self.poll_once_with_binding(Some(expected), None)
+    }
+
+    /// Poll only owned intake, advancing the local cursor past unowned requests.
+    pub fn poll_once_selected(
+        &mut self,
+        owns: &dyn Fn(&crate::production::AcceptedRequest) -> bool,
+    ) -> Result<PollOutcome, ControllerError> {
+        self.poll_once_with_binding(None, Some(owns))
     }
 
     fn poll_once_with_binding(
         &mut self,
         expected: Option<&AcceptedRequestBinding>,
+        owns: Option<&dyn Fn(&crate::production::AcceptedRequest) -> bool>,
     ) -> Result<PollOutcome, ControllerError> {
         if let Some(reason) = self.status.terminal_reason() {
             return Err(ControllerError::Terminal(reason));
@@ -376,13 +387,19 @@ where
             Some(binding) => self
                 .handler
                 .poll_once_bound(self.config.channel_id(), binding),
-            None => self.handler.poll_once(self.config.channel_id()),
+            None => match owns {
+                Some(owns) => self
+                    .handler
+                    .poll_once_selected(self.config.channel_id(), owns),
+                None => self.handler.poll_once(self.config.channel_id()),
+            },
         };
         match result {
             Ok(step) => {
                 self.status = CapacityOneStatus::ready();
                 Ok(match step {
                     PollStep::Completed => PollOutcome::CompletedOne,
+                    PollStep::Skipped => PollOutcome::SkippedOne,
                     PollStep::Idle => PollOutcome::Idle,
                     PollStep::Deferred => PollOutcome::Deferred,
                 })

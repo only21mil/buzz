@@ -544,6 +544,8 @@ pub enum PollStep {
     Idle,
     /// One accepted request settled and the cursor advanced.
     Completed,
+    /// An unowned request was skipped by advancing only the local cursor.
+    Skipped,
     /// The head request's publication was refused as an unauthorized status
     /// signer before the activation grant; it is recorded as deferred and the
     /// cursor did not move.
@@ -617,7 +619,18 @@ where
 {
     /// Consume at most one accepted request after the durable channel cursor.
     pub fn poll_once(&mut self, channel_id: &str) -> Result<PollStep, ProductionError> {
-        self.poll_head(channel_id, false, None)
+        self.poll_head(channel_id, false, None, None)
+    }
+
+    /// Poll with an explicit intake owner. Unowned requests advance only this
+    /// store's cursor. Existing local run state is a conflict requiring repair,
+    /// so this cannot silently abandon work claimed before selection was enabled.
+    pub fn poll_once_selected(
+        &mut self,
+        channel_id: &str,
+        owns: &dyn Fn(&AcceptedRequest) -> bool,
+    ) -> Result<PollStep, ProductionError> {
+        self.poll_head(channel_id, false, None, Some(owns))
     }
 
     /// Consume only the exact frozen request selected by an acceptance stage.
@@ -626,7 +639,7 @@ where
         channel_id: &str,
         expected: &AcceptedRequestBinding,
     ) -> Result<PollStep, ProductionError> {
-        self.poll_head(channel_id, false, Some(expected))
+        self.poll_head(channel_id, false, Some(expected), None)
     }
 
     /// Acknowledge one exact relay-accepted request before an operator submits
@@ -680,7 +693,7 @@ where
             self.republish(key, stored)?;
         }
         if !deferred.is_empty() {
-            while self.poll_head(channel_id, true, None)? == PollStep::Completed {}
+            while self.poll_head(channel_id, true, None, None)? == PollStep::Completed {}
         }
         Ok(deferred.len())
     }
@@ -725,7 +738,7 @@ where
                 .ok_or(ProductionError::PublicationConflict)?;
             self.republish(key, stored)?;
         }
-        let _ = self.poll_head(channel_id, true, Some(expected))?;
+        let _ = self.poll_head(channel_id, true, Some(expected), None)?;
         Ok(deferred.len())
     }
 
@@ -1051,6 +1064,7 @@ where
         channel_id: &str,
         terminal_only: bool,
         expected: Option<&AcceptedRequestBinding>,
+        owns: Option<&dyn Fn(&AcceptedRequest) -> bool>,
     ) -> Result<PollStep, ProductionError> {
         let cursor = self
             .store
@@ -1068,6 +1082,25 @@ where
         }
         if expected.is_some_and(|binding| !binding.matches(&accepted)) {
             return Err(ProductionError::Invalid);
+        }
+        if owns.is_some_and(|owns| !owns(&accepted)) {
+            let identity = run_identity(&accepted)?;
+            if self
+                .store
+                .load_run(&identity)
+                .map_err(|_| ProductionError::Store)?
+                .is_some()
+            {
+                return Err(ProductionError::PublicationConflict);
+            }
+            if !self
+                .store
+                .advance_cursor(channel_id, cursor, accepted.watch_cursor)
+                .map_err(|_| ProductionError::Store)?
+            {
+                return Err(ProductionError::PublicationConflict);
+            }
+            return Ok(PollStep::Skipped);
         }
         if terminal_only {
             let identity = run_identity(&accepted)?;

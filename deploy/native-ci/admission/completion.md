@@ -32,6 +32,14 @@ package inventory and corresponding lane/build identity before admission.
 `desktop-build.sh` is unchanged. No new credentials or keyholder peer identities
 are needed. Existing peer UID/GID 1201 supplies the control-plane socket calls.
 
+The installed fixture controller must include intake isolation before any native
+request is published. Its background poll selects only its configured fixture
+actor, workflow ID and job IDs. Other requests advance only its own durable
+cursor, without signed run facts or execution. An existing local run for an
+unowned request closes capacity for reconciliation; upgrading does not erase or
+repair facts published by an older controller. Fixture digest and execution
+failures still use the ordinary failure path.
+
 The live relay and keyholder must support the current kind 46108 check, exact
 event query, and evidence upload/readback operations. The scoped status-signer
 grant must be accepted and read back before `begin`. Old pre-46108 deployments
