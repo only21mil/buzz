@@ -8,8 +8,8 @@
 //!    (fast-forward or two-parent merge landing, [`classify_update`]);
 //! 2. resolves the workflow blob at the base through the published state
 //!    (`hydrate_for_read` + `resolve_workflow_at_base`);
-//! 3. selects the latest `ci_runs` row for the candidate whose base and
-//!    workflow digest match, reads only that run's events, validates them
+//! 3. selects the latest `ci_runs` row for the candidate, requires its base
+//!    and workflow digest to match, reads only its events, validates them
 //!    against the live signer union, and reduces them with
 //!    `buzz_core::ci::reducer` ([`evaluate_run_history`]);
 //! 4. requires the pinned jobs green and the selected kind-46108 check
@@ -56,6 +56,9 @@ const RUN_EVENT_PAGE: u32 = 1_000;
 const MAX_RUN_EVENTS: usize = 10_000;
 /// Budget for hydrating the published state inside the hook callback.
 const HYDRATE_TIMEOUT: Duration = Duration::from_secs(8);
+/// One budget for all refs, including hydration, verification and audit writes.
+/// Leave four seconds for the policy callback and its 10-second curl deadline.
+const EVALUATION_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Refusal codes of design section 1.4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -490,6 +493,32 @@ pub(crate) async fn evaluate_push_gate(
     state: &Arc<AppState>,
     ctx: &GatePushContext<'_>,
 ) -> Vec<Denial> {
+    match tokio::time::timeout(EVALUATION_TIMEOUT, evaluate_push_gate_inner(state, ctx)).await {
+        Ok(denials) => denials,
+        Err(_) => {
+            let mode = state.config.ci.merge_gate.mode;
+            error!(
+                repo = %ctx.repo_id,
+                mode = mode.as_str(),
+                "merge_gate decision=refuse code=gate_misconfigured: evaluation deadline exceeded; decision rows may be incomplete"
+            );
+            if mode != MergeGateMode::Enforce {
+                return Vec::new();
+            }
+            ctx.ref_updates
+                .iter()
+                .filter(|update| update.old_oid != ZERO_OID && update.new_oid != ZERO_OID)
+                .filter(|update| EffectiveRules::for_ref(&update.ref_name, ctx.rules).is_gated())
+                .map(|update| Denial {
+                    ref_name: update.ref_name.clone(),
+                    reason: "merge gate: gate_misconfigured: evaluation deadline exceeded".into(),
+                })
+                .collect()
+        }
+    }
+}
+
+async fn evaluate_push_gate_inner(state: &Arc<AppState>, ctx: &GatePushContext<'_>) -> Vec<Denial> {
     let mode = state.config.ci.merge_gate.mode;
     let gated: Vec<(&HookRefUpdate, EffectiveRules)> = ctx
         .ref_updates
@@ -931,8 +960,8 @@ async fn signer_union(
     Ok(signers)
 }
 
-/// Select the latest run for `(repository, candidate, workflow)` whose base
-/// and workflow digest match the push, and load only its history.
+/// Select the latest run for `(repository, candidate, workflow)`, require its
+/// base and workflow digest to match the push, and load only its history.
 #[allow(clippy::too_many_arguments)]
 async fn select_run(
     state: &Arc<AppState>,
@@ -954,7 +983,7 @@ async fn select_run(
             coordinate,
             candidate,
             Some(workflow_id),
-            buzz_db::ci_landing::MAX_CI_LANDING_ROWS,
+            1,
         )
         .await
         .map_err(|e| {
@@ -969,34 +998,30 @@ async fn select_run(
             (run, digest)
         })
         .collect();
-    let Some((latest, latest_digest)) = runs.first() else {
+    let Some((selected, selected_digest)) = runs.first() else {
         return Err(Refusal::new(
             RefusalCode::NoCheck,
             format!("no {workflow_id} run for candidate {candidate}"),
         ));
     };
-    let selected = runs
-        .iter()
-        .find(|(run, digest)| run.base_oid == base && digest == base_workflow_digest);
-    let Some((selected, selected_digest)) = selected else {
-        // Report why the newest run does not qualify.
-        if latest.base_oid != base {
-            return Err(Refusal::new(
-                RefusalCode::BaseMoved,
-                format!(
-                    "latest {workflow_id} run {} tested candidate {candidate} against base {} but the ref is at {base}",
-                    latest.run_id, latest.base_oid
-                ),
-            ));
-        }
+    if selected.base_oid != base {
+        return Err(Refusal::new(
+            RefusalCode::BaseMoved,
+            format!(
+                "latest {workflow_id} run {} tested candidate {candidate} against base {} but the ref is at {base}",
+                selected.run_id, selected.base_oid
+            ),
+        ));
+    }
+    if selected_digest != base_workflow_digest {
         return Err(Refusal::new(
             RefusalCode::WorkflowDigestMismatch,
             format!(
-                "latest {workflow_id} run {} used workflow digest {latest_digest} but the workflow at base {base} digests to {base_workflow_digest}",
-                latest.run_id
+                "latest {workflow_id} run {} used workflow digest {selected_digest} but the workflow at base {base} digests to {base_workflow_digest}",
+                selected.run_id
             ),
         ));
-    };
+    }
 
     let channel = ctx.channel_id.to_string();
     let request_stored = state
@@ -1065,6 +1090,9 @@ async fn select_run(
             ));
         }
         for stored in page {
+            // Signature verification is CPU work. Yield between events so the
+            // whole-push deadline can cancel even a full 10,000-event history.
+            tokio::task::yield_now().await;
             let event = &stored.stored_event.event;
             let envelope = validate_signed_ci_event(event, &channel, signer_union)
                 .map_err(|error| history_signer_refusal(selected.run_id, event, error))?;

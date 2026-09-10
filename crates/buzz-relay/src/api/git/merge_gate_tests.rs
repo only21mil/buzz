@@ -1564,6 +1564,96 @@ mod harness {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires Postgres and git"]
+    async fn audit_write_deadline_preserves_shadow_and_refuses_enforce() {
+        for mode in [MergeGateMode::Shadow, MergeGateMode::Enforce] {
+            let h = Harness::start(|config| config.ci.merge_gate.mode = mode).await;
+            let base = h.main_oid_on_relay();
+            let candidate = h.candidate(&base, "timeout.txt", "deadline\n", "deadline");
+            h.seed_run(PINNED, &candidate, &base, &digest(WORKFLOW_V1), Seed::Green)
+                .await;
+            // The candidate is green, but the audit write cannot finish. Hold
+            // this lock until the real hook has returned, past the gate budget.
+            let mut lock = h.pool.begin().await.expect("audit lock transaction");
+            sqlx::query("LOCK TABLE git_merge_gate_decisions IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *lock)
+                .await
+                .expect("lock audit table");
+            let started = std::time::Instant::now();
+            let result = h.push(&format!("{candidate}:refs/heads/main"));
+            let elapsed = started.elapsed();
+            lock.rollback().await.expect("release audit lock");
+            assert!(
+                elapsed >= EVALUATION_TIMEOUT,
+                "the gate must reach its deadline"
+            );
+            assert!(
+                elapsed < Duration::from_secs(10),
+                "hook must return before curl times out: {elapsed:?}"
+            );
+            if mode == MergeGateMode::Shadow {
+                result.expect("shadow must allow despite a stalled audit write");
+                assert_eq!(h.main_oid_on_relay(), candidate);
+            } else {
+                assert_refused(result, "gate_misconfigured");
+                assert_eq!(h.main_oid_on_relay(), base);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires Postgres and git"]
+    async fn newest_run_mismatch_supersedes_older_green() {
+        let h = Harness::start(|config| config.ci.merge_gate.mode = MergeGateMode::Enforce).await;
+        let base = h.main_oid_on_relay();
+        let v1 = digest(WORKFLOW_V1);
+        for (name, newer_base, newer_digest, code) in [
+            ("base", "7".repeat(40), v1.clone(), "base_moved"),
+            (
+                "digest",
+                base.clone(),
+                "8".repeat(64),
+                "workflow_digest_mismatch",
+            ),
+        ] {
+            let candidate = h.candidate(&base, "order.txt", name, name);
+            let (older, _) = h
+                .seed_run(PINNED, &candidate, &base, &v1, Seed::Green)
+                .await;
+            // Make chronology deterministic independent of clock precision.
+            sqlx::query(
+                "UPDATE ci_runs SET created_at = created_at - interval '1 hour' WHERE run_id = $1",
+            )
+            .bind(older)
+            .execute(&h.pool)
+            .await
+            .expect("backdate older run");
+            h.seed_run(PINNED, &candidate, &newer_base, &newer_digest, Seed::Green)
+                .await;
+            assert_refused(h.push(&format!("{candidate}:refs/heads/main")), code);
+            assert_eq!(h.last_decision().await.0, code);
+            assert_eq!(h.main_oid_on_relay(), base);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires Postgres and git"]
+    async fn require_check_alone_blocks_delete_recreate() {
+        // Harness announcements deliberately contain require-check alone.
+        for mode in [
+            MergeGateMode::Off,
+            MergeGateMode::Shadow,
+            MergeGateMode::Enforce,
+        ] {
+            let h = Harness::start(|config| config.ci.merge_gate.mode = mode).await;
+            let base = h.main_oid_on_relay();
+            let result = h.push(":refs/heads/main");
+            assert_refused(result, "no-delete");
+            assert_eq!(h.main_oid_on_relay(), base);
+        }
+    }
+
     // Multi-threaded: the test thread blocks on `git push` while the relay
     // listener must keep serving on other workers.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
