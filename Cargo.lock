@@ -971,6 +971,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-ci-admission-verifier"
+version = "0.1.0"
+dependencies = [
+ "buzz-ci-broker-protocol",
+ "hex",
+ "nostr",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
 name = "buzz-ci-broker-protocol"
 version = "0.1.0"
 dependencies = [
