@@ -13,8 +13,8 @@ spec.loader.exec_module(broker)
 
 class BrokerTests(unittest.TestCase):
     def test_read_frame_refuses_truncation_and_suffix(self):
-        self.assertEqual(broker.read_frame(io.BytesIO(b'x' * 512)), b'x' * 512)
-        for size in (0, 511, 513, 1024):
+        self.assertEqual(broker.read_frame(io.BytesIO(b'x' * 992)), b'x' * 992)
+        for size in (0, 991, 993, 1024):
             with self.assertRaises(ValueError):
                 broker.read_frame(io.BytesIO(b'x' * size))
 
@@ -39,6 +39,19 @@ class BrokerTests(unittest.TestCase):
     def test_public_wire_header_does_not_select_replay_path(self):
         request = {'run_id': 'a' * 32, 'attempt': 2}
         self.assertEqual(broker.record_path(request, 'admitted').name, 'a' * 32 + '-2.admitted')
+
+    def test_crash_record_blocks_new_work_until_cleanup_proven(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(broker, 'STATE', Path(directory)), patch.object(broker, 'protected'):
+            prior = Path(directory) / ('a' * 32 + '-1.admitted')
+            prior.write_text('{}')
+            with self.assertRaises(ValueError):
+                broker.require_no_unfinished()
+            receipt = prior.with_suffix('.receipt')
+            receipt.write_text('{"cleanup_complete": false}')
+            with self.assertRaises(ValueError):
+                broker.require_no_unfinished()
+            receipt.write_text('{"cleanup_complete": true}')
+            broker.require_no_unfinished()
 
 
 if __name__ == '__main__':

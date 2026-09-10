@@ -14,6 +14,7 @@ STATE = Path('/private/var/db/buzz-native-macos-ci')
 FILES = {'broker.py', 'payload.py', 'desktop-build.sh', 'buzz-ci-admission-verifier', 'policy.json'}
 HELPER = Path('/usr/local/libexec/buzz-macos-build/buzz_macos_build_supervisor.py')
 HELPER_SHA256 = 'c0d6fcd6d5922b61353e07e4402932099efa8004803c8d09305e2273237a3ef7'
+LEGACY_MANIFEST_SHA256 = '5a60649f517e6b8db3463e53c5e1af2740107dc19b45410d5be6d3959c84e8e7'
 
 
 def require(ok, message):
@@ -32,6 +33,20 @@ def read_file(path):
         os.close(fd)
 
 
+def publish_package(destination, snapshot, inventory):
+    destination.mkdir(mode=0o755)
+    os.chmod(destination, 0o755)
+    for name, value in dict(snapshot, **{'installation.json': inventory}).items():
+        path = destination / name
+        mode = 0o600 if name in ('policy.json', 'installation.json') else 0o755 if name == 'buzz-ci-admission-verifier' else 0o644
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(value)
+            stream.flush()
+            os.fchmod(stream.fileno(), mode)
+            os.fsync(stream.fileno())
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--package', type=Path, required=True)
@@ -48,7 +63,14 @@ def main():
     snapshot = {name: read_file(package / name) for name in FILES}
     for name, value in snapshot.items():
         require(hashlib.sha256(value).hexdigest() == inventory['files'][name], 'package digest mismatch')
+    policy = json.loads(snapshot['policy.json'])
+    require(policy.get('workflow_path') == '.buzz/workflows/native-macos.yml'
+            and policy.get('workflow_id') == 'native-macos'
+            and policy.get('job_id') == 'desktop-build-macos-unsigned'
+            and policy.get('driver_file_sha256') == hashlib.sha256(snapshot['desktop-build.sh']).hexdigest(),
+            'policy does not bind the fixed native workflow and installed driver')
     require(hashlib.sha256(read_file(HELPER)).hexdigest() == HELPER_SHA256, 'existing boundary changed')
+    require(hashlib.sha256(read_file(HELPER.parent / 'installation.json')).hexdigest() == LEGACY_MANIFEST_SHA256, 'existing boundary manifest changed')
     # Do not overwrite old Apple scripts, prior installations, or service state.
     require(not DEST.exists() and not DEST.is_symlink() and not STATE.exists() and not STATE.is_symlink(), 'installation already exists')
     for parent in (DEST.parent, STATE.parent):
@@ -57,14 +79,7 @@ def main():
             require(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022, 'unsafe installation parent')
             listing = subprocess.check_output(['/bin/ls', '-lde', str(path)], text=True)
             require('+' not in listing.split()[0], 'installation parent ACL')
-    DEST.mkdir(mode=0o755)
-    for name, value in dict(snapshot, **{'installation.json': raw}).items():
-        path = DEST / name
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o755 if name == 'buzz-ci-admission-verifier' else 0o644)
-        with os.fdopen(fd, 'wb') as stream:
-            stream.write(value)
-            stream.flush()
-            os.fsync(stream.fileno())
+    publish_package(DEST, snapshot, raw)
     STATE.mkdir(mode=0o700)
     print(json.dumps({'installed': str(DEST), 'inventory_sha256': args.expected_inventory_sha256,
                       'service_started': False, 'account_changed': False}))

@@ -33,9 +33,9 @@ def main():
     parser.add_argument('--verifier', type=Path, required=True)
     parser.add_argument('--policy', type=Path, required=True)
     args = parser.parse_args()
-    frame = sys.stdin.buffer.read(513)
-    if len(frame) != 512:
-        raise ValueError('one v2 admission frame required')
+    frame = sys.stdin.buffer.read(993)
+    if len(frame) != 992:
+        raise ValueError('one v2 job registration frame required')
     verification = subprocess.run([str(args.verifier), str(args.policy),
                                    'live' if args.operation == 'run' else 'retained'],
                                   input=frame, capture_output=True, check=True, timeout=10)

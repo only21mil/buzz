@@ -24,6 +24,7 @@ INSTALL = Path('/usr/local/libexec/buzz-native-macos-ci')
 STATE = Path('/private/var/db/buzz-native-macos-ci')
 LEGACY = Path('/usr/local/libexec/buzz-macos-build')
 LEGACY_HASH = 'c0d6fcd6d5922b61353e07e4402932099efa8004803c8d09305e2273237a3ef7'
+LEGACY_MANIFEST_HASH = '5a60649f517e6b8db3463e53c5e1af2740107dc19b45410d5be6d3959c84e8e7'
 ENV = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'LANG': 'en_US.UTF-8'}
 FILES = {'broker.py', 'payload.py', 'desktop-build.sh', 'buzz-ci-admission-verifier', 'policy.json'}
 
@@ -61,6 +62,9 @@ def installation():
     helper = LEGACY / 'buzz_macos_build_supervisor.py'
     protected(helper)
     require(hashlib.sha256(helper.read_bytes()).hexdigest() == LEGACY_HASH, 'legacy boundary drift')
+    legacy_manifest = LEGACY / 'installation.json'
+    protected(legacy_manifest)
+    require(hashlib.sha256(legacy_manifest.read_bytes()).hexdigest() == LEGACY_MANIFEST_HASH, 'legacy manifest drift')
     spec = importlib.util.spec_from_file_location('buzz_legacy_boundary', helper)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -68,8 +72,8 @@ def installation():
 
 
 def read_frame(stream):
-    frame = stream.read(513)
-    require(len(frame) == 512, 'one complete v2 admission required')
+    frame = stream.read(993)
+    require(len(frame) == 992, 'one complete v2 job registration required')
     return frame
 
 
@@ -102,6 +106,18 @@ def load_record(request):
     protected(path)
     value = json.loads(path.read_bytes())
     require(value == request, 'attempt identity mismatch')
+
+
+def require_no_unfinished():
+    # Only root creates these files. A missing receipt means cleanup is unproven,
+    # even if a crashed broker left no running process and an empty HOME.
+    for path in STATE.glob('*.admitted'):
+        protected(path)
+        receipt = path.with_suffix('.receipt')
+        require(receipt.exists(), 'unfinished prior admission requires operator recovery')
+        protected(receipt)
+        value = json.loads(receipt.read_bytes())
+        require(value.get('cleanup_complete') is True, 'prior cleanup requires operator recovery')
 
 
 def execute(helper, root, request, builder, darwin_parent):
@@ -177,6 +193,7 @@ def run(helper, request):
         require(info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o600
                 and stat.S_ISREG(info.st_mode) and info.st_nlink == 1, 'unsafe shared lock')
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        require_no_unfinished()
         require(not helper.uid_processes(590), 'build account already active')
         fd = helper.home_directory(manifest['builder_home'])
         try:

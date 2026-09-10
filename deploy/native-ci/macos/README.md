@@ -8,23 +8,32 @@ service to register.
 
 ## Trust and input
 
-`broker.py run` consumes exactly one 512-byte broker v2 `AdmitAttempt` frame on
+`broker.py run` consumes exactly one 992-byte broker v2 `RegisterJobIntent` frame on
 stdin. It invokes `buzz-ci-admission-verifier` against a root-owned policy and
-requires the existing BIP-340 detached admission signature. The verifier uses
+requires the embedded existing BIP-340 detached admission signature.
+The registration frame digest and canonical JobIntentV2 digest are recomputed,
+so the authenticated job preimage can change per run while the installed job
+policy remains fixed. The verifier uses
 the shared protocol decoder and canonical `admission_signature_message`; this
 is the same admission signature as the Linux native plane. It rejects a wrong
 key, actor, audience, base, workflow, job intent, isolation profile, lane, epoch,
 key generation, deadline, or malformed frame.
 
 The public policy contains `admission_pubkey`, `actor_pubkey`, `audience_digest`,
-`lane_manifest_digest`, `lane_epoch`, `admission_key_generation`,
-`workflow_digest`, `job_intent_digest`, `isolation_profile_digest`,
-`trusted_base_oid`, and `workflow_file_sha256`. These are deployment-authority
-inputs. Populate them from the reviewed native job/lane authority, never from
-the candidate or a caller-supplied JSON object. The job-intent digest must name
-the fixed `desktop-build-macos-unsigned` mapping. The workflow file hash pins
-`.github/workflows/ci.yml` from the trusted base independently of candidate
-source. Policy changes require a reviewed package update.
+`lane_manifest_digest`, `lane_epoch`, `admission_key_generation`, `not_before`,
+`expires_at`, `max_wall_timeout_seconds`, `workflow_digest`, `workflow_id`,
+`job_id`, `artifacts`, `isolation_profile_digest`, `trusted_base_oid`,
+`workflow_file_sha256`, `workflow_path`, and `driver_file_sha256`. Populate these
+from the reviewed native job/lane authority, never from candidate input. The
+Mac identity is workflow `native-macos`, job `desktop-build-macos-unsigned`,
+path `.buzz/workflows/native-macos.yml`. The one declared `result.json` artifact
+is the root-generated terminal build metadata receipt, maximum 32768 bytes.
+The raw app is not exported by this qualification.
+
+The trusted-base workflow and driver are both fetched and hash-checked before
+candidate code runs. The installer also requires the policy's driver hash to
+equal the installed driver bytes. Policy changes require a reviewed package
+update; new signed run/attempt/source coordinates do not.
 
 The source fetch uses the fixed public Buzz mirror and exact signed `tip_oid`.
 The base workflow is fetched and hash-checked before any candidate program
@@ -36,11 +45,12 @@ exist in the admission frame.
 ## Existing host boundary
 
 The candidate reuses the MBP's root-owned Apple supervisor at
-`/usr/local/libexec/buzz-macos-build`. Its SHA-256 is pinned in the broker and
-installer, and its installed manifest validates the existing helper files and
+`/usr/local/libexec/buzz-macos-build`. Its code and installation-manifest SHA-256 hashes are pinned in the broker
+and installer. That manifest validates the existing helper files and
 sandbox policy on every invocation. The old Apple files remain untouched.
 The shared `supervisor.lock` serializes all use of UID/GID 590. The broker
-refuses an occupied account or a nonempty registered HOME. Under the lock it
+refuses an occupied account, a nonempty registered HOME, or any prior admission
+without a receipt proving cleanup. Under the lock it
 uses the existing inode-attested HOME and Darwin scratch lifecycle, then kills
 all source descendants before deleting owned job state. Failed cleanup cannot
 produce success. A hard-killed broker leaves the next run closed for operator
@@ -95,8 +105,9 @@ job output is bounded data in a separate root-owned `.log` file.
 `submit.py` is the on-demand Framework transport adapter. The trusted controller
 first validates the public request and source pin, selects the root-owned
 `desktop-build-macos-unsigned` job intent and lane, and obtains the existing
-keyholder's detached v2 admission signature. It serializes that actual admission
-with `v2::encode_request`, then pipes the frame into:
+keyholder's detached v2 admission signature. It serializes the actual
+`RegisterJobIntentRequest`, which embeds the signed admission, with
+`v2::encode_request`, then pipes the frame into:
 
 ```sh
 python3 submit.py --operation run \

@@ -1,0 +1,16 @@
+name: native-macos
+
+on:
+  workflow_dispatch:
+
+jobs:
+  desktop-build-macos-unsigned:
+    name: Desktop Build (macOS unsigned app)
+    runs-on: apple-mbp
+    timeout-minutes: 45
+    steps:
+      # The native adapter verifies these trusted-base script bytes against its
+      # installed driver before checking out candidate source. No candidate
+      # script supplies the privileged entrypoint or the workload command.
+      - name: Build unsigned desktop app
+        run: bash deploy/native-ci/macos/desktop-build.sh

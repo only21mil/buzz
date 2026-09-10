@@ -11,7 +11,17 @@ mkdir -p desktop/src-tauri/binaries
 for sidecar in buzz-acp buzz-agent buzz-backend-kubernetes buzz-dev-mcp git-credential-nostr buzz; do
     touch "desktop/src-tauri/binaries/$sidecar-$target"
 done
-mesh_rev=$(python3 -c 'import tomllib; d=tomllib.load(open("Cargo.lock", "rb")); p=next(p for p in d["package"] if p["name"] == "mesh-llm-sdk"); print(p["source"].rsplit("#", 1)[1])')
+mesh_rev=$(/usr/bin/python3 -I -c '
+import re
+from pathlib import Path
+packages = re.split(r"(?m)^\[\[package\]\]\s*$", Path("Cargo.lock").read_text())
+matches = [p for p in packages if re.search(r"(?m)^name = \"mesh-llm-sdk\"$", p)]
+if len(matches) != 1:
+    raise SystemExit("exactly one mesh package required")
+sources = re.findall(r"(?m)^source = \"git\+https://github.com/Mesh-LLM/mesh-llm\.git[^\"\n]*#([0-9a-f]{40})\"$", matches[0])
+if len(sources) != 1:
+    raise SystemExit("exactly one pinned public mesh source required")
+print(sources[0])')
 [[ "$mesh_rev" =~ ^[0-9a-f]{40}$ ]]
 cargo fetch --manifest-path desktop/src-tauri/Cargo.toml
 mesh_root=$(find "$CARGO_HOME/git/checkouts" -path "*/${mesh_rev:0:7}" -type d -name "${mesh_rev:0:7}" | head -1)
