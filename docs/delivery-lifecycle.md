@@ -103,8 +103,21 @@ export BUZZ_EVIDENCE_ROOT="$HOME/work/buzz-evidence"
 bundle when that broader gate applies. It accepts only the canonical
 `pull-request` receipt, and after every offline invariant passes it re-verifies
 that receipt against live GitHub through the pinned `gh` and `GH_TOKEN`,
-including the live pull request and `main` head. That is its only network
-call; it does not acquire evidence or create approval.
+including the live pull request and `main` head. It also requires a separate
+root-installed native authority context and rechecks the three native runs with
+the pinned `buzz ci verdict` command. The context binds repository, channel,
+relay origin, current signers and workflow policy; the evidence bundle cannot
+choose this authority. See [the promotion runbook](ci/PROMOTION_ACCEPTANCE_RUNBOOK.md)
+for installation and historical reuse requirements. These readbacks do not
+create approval or replace protected CI.
+
+Both readiness and `deploy-local.sh` require all six mandatory pre-freeze checks
+(`clean-tree`, `rust-format`, `rust-clippy`, `base-lineage`, `native-ci-python`,
+`postgres-discovery`), unique nonempty names, PASS status and integer zero exit
+codes for every check. The producer reports PASS only after the whole requested
+run completes, including `--test`. HUP, INT and TERM produce a nonzero exit and
+FAIL evidence; SIGKILL cannot publish a receipt. Consumers require the explicit
+receipt path and never substitute an older PASS when that file is absent.
 
 ## Landing
 

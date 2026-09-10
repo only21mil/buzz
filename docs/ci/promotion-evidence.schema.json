@@ -234,7 +234,7 @@
     "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "sig128": {"type": "string", "pattern": "^[0-9a-f]{128}$"},
     "uuid": {"type": "string", "format": "uuid"},
-    "job_id": {"type": "string", "pattern": "^[A-Za-z0-9_]{1,64}$"},
+    "job_id": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_-]{0,63}$"},
     "image_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
     "file_descriptor": {
       "type": "object",

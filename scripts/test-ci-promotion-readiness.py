@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 
 SCRIPT = Path(__file__).with_name("ci-promotion-readiness.py")
@@ -135,6 +136,46 @@ def fake_client(gh, identity=None, runner=None):
     return client
 
 
+# Only this test wrapper replaces root-owned policy reads and native transport.
+# Fixtures are independent of the submitted bundle; production has no fake switch.
+native = json.loads(os.environ["TEST_NATIVE_AUTHORITY"])
+readiness.time.time = lambda: native["now"]
+read_count = 0
+
+def fake_authority_file(path, **kwargs):
+    global read_count
+    if str(path) == "/test/buzz":
+        return b"fixture native CLI"
+    read_count += 1
+    if native.get("drift") == "policy" and read_count > 1:
+        return b"revoked"
+    return json.dumps(native["context"]).encode()
+
+readiness.read_native_authority_file = fake_authority_file
+real_run = readiness.subprocess.run
+
+def native_run(command, **kwargs):
+    if command[0] != "/test/buzz":
+        return real_run(command, **kwargs)
+    assert command[1:4] == ["--relay", "https://relay.example.invalid", "ci"]
+    assert kwargs["env"]["BUZZ_CI_CHANNEL"] == native["context"]["channel_id"]
+    assert set(kwargs["env"]) <= {"BUZZ_PRIVATE_KEY", "BUZZ_AUTH_TAG", "LC_ALL", "NO_COLOR",
+                                   "BUZZ_CI_CHANNEL", "BUZZ_CI_STATUS_SIGNERS"}
+    if native.get("drift") == "timeout":
+        raise readiness.subprocess.TimeoutExpired(command, 60)
+    if native.get("drift") == "failure":
+        return readiness.subprocess.CompletedProcess(command, 3, b"", b"fixture auth refusal")
+    if native.get("drift") == "malformed":
+        return readiness.subprocess.CompletedProcess(command, 0, b"{broken", b"")
+    if native.get("drift") == "expiry":
+        native["now"] = native["context"]["valid_until"]
+    run_id = command[command.index("--run") + 1]
+    value = native["runs"][run_id].copy()
+    if native.get("drift") in value:
+        value[native["drift"]] = "changed"
+    return readiness.subprocess.CompletedProcess(command, 0, json.dumps(value).encode(), b"")
+
+readiness.subprocess.run = native_run
 readiness.PROTECTED_CI.resolve_gh = lambda: (fixture.receipt.GH_PATH,
                                              fixture.FakeClient().identity)
 readiness.PROTECTED_CI.GhClient = fake_client
@@ -183,7 +224,8 @@ class PromotionReadinessTest(unittest.TestCase):
             "base_sha": self.base,
             "timestamp": timestamp,
             "overall": "PASS",
-            "checks": [{"name": "source", "status": "PASS"}],
+            "checks": [{"name": name, "status": "PASS", "exit_code": 0} for name in
+                       ("clean-tree", "rust-format", "rust-clippy", "base-lineage", "native-ci-python", "postgres-discovery")],
         })
         self.wrapper = self.root / "readiness-with-fake-github.py"
         self.wrapper.write_text(FAKE_GITHUB_WRAPPER, encoding="utf-8")
@@ -223,6 +265,27 @@ class PromotionReadinessTest(unittest.TestCase):
                 records.append(self.acceptance_record("probe", probe, run=run_number))
         write_jsonl(self.acceptance_records_path, records)
         self.bundle = self.valid_bundle()
+        self.native_context = {
+            "repository": "only21mil/buzz", "target_repo_a": f"30617:{xonly_pubkey(ACTOR_SECRET)}:buzz",
+            "source_clone_url": "https://example.invalid/only21mil/buzz.git",
+            "channel_id": "46bba699-8251-43c7-943e-66be58376585",
+            "relay_url": "https://relay.example.invalid", "status_signers": [xonly_pubkey(SIGNER_SECRET)],
+            "workflow_id": "ci", "workflow_digest": DIGEST_C, "job_ids": ["build"],
+            "cli_path": "/test/buzz", "cli_sha256": hashlib.sha256(b"fixture native CLI").hexdigest(),
+            "valid_from": 0, "valid_until": NOW + 10 * 86400, "max_evidence_age": 86400,
+            "historical_reuse": {},
+        }
+        self.native_runs = {}
+        for name in ("staging", "production_canary", "deliberate_red"):
+            section = self.bundle[name]["event_evidence"]
+            content = json.loads(section["requests"][0]["content"])
+            self.native_runs[content["run_id"]] = {
+                "run_id": content["run_id"], "sha": content["tip_oid"],
+                "attempt": 2 if name == "production_canary" else 1,
+                "verdict": "red" if name == "deliberate_red" else "green",
+                "jobs_total": 1, "jobs_terminal": 1, "required_failing": [],
+            }
+        self.native_drift = "none"
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -678,7 +741,8 @@ class PromotionReadinessTest(unittest.TestCase):
         event["sig"] = schnorr_sign(secret, bytes.fromhex(event["id"]))
 
     def invoke(
-        self, bundle: dict, *, now: int = NOW, receipt_path: Path | None = None
+        self, bundle: dict, *, now: int = NOW, receipt_path: Path | None = None,
+        native_now: int | None = None, max_age: int = 86400
     ) -> subprocess.CompletedProcess[str]:
         """Run the verifier; the receipt is create-only, so each call gets a fresh path."""
         bundle_path = self.evidence_dir / "bundle.json"
@@ -689,14 +753,17 @@ class PromotionReadinessTest(unittest.TestCase):
         write_json(bundle_path, bundle)
         return subprocess.run(
             [sys.executable, str(self.wrapper), str(SCRIPT), str(PROTECTED_TEST_SCRIPT),
+             "--native-context", "/test/context",
              "--candidate-dir", str(self.repo),
              "--evidence", str(bundle_path),
              "--receipt", str(receipt_path),
-             "--now", str(now)],
+             "--now", str(now), "--max-evidence-age", str(max_age)],
             check=False,
             capture_output=True,
             text=True,
-            env={**os.environ, "TEST_FAKE_GITHUB": json.dumps(
+            env={**os.environ, "TEST_NATIVE_AUTHORITY": json.dumps({"context": self.native_context,
+                 "runs": self.native_runs, "drift": self.native_drift,
+                 "now": now if native_now is None else native_now}), "TEST_FAKE_GITHUB": json.dumps(
                 {"client": self.fake_github_client, "drift": self.github_drift})},
         )
 
@@ -1146,13 +1213,154 @@ class PromotionReadinessTest(unittest.TestCase):
         self.resign_event(event, content)
         self.assert_refused(bundle, "also_reruns contains an unknown job")
 
+    def test_native_authority_substitution_revocation_and_live_drift(self) -> None:
+        baseline = self.invoke(self.bundle)
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        for name, replacement in {
+            "target_repo_a": "30617:" + "a" * 64 + ":other", "channel_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "relay_url": "https://other.example.invalid", "status_signers": [xonly_pubkey(7)],
+            "workflow_id": "other", "workflow_digest": DIGEST_B, "job_ids": ["other"],
+            "source_clone_url": "https://other.example.invalid/buzz.git", "valid_until": NOW - 1,
+            "valid_from": NOW + 1, "cli_sha256": DIGEST_A,
+        }.items():
+            with self.subTest(field=name):
+                original = self.native_context[name]
+                self.native_context[name] = replacement
+                self.assert_refused(self.bundle, "native")
+                self.native_context[name] = original
+        for drift in ("policy", "run_id", "sha", "attempt", "verdict", "jobs_total", "jobs_terminal",
+                      "timeout", "failure", "malformed"):
+            with self.subTest(drift=drift):
+                self.native_drift = drift
+                self.assert_refused(self.bundle, "native authority")
+        self.native_drift = "none"
+
+    def test_self_consistent_substituted_native_signer_is_refused(self) -> None:
+        with unittest.mock.patch.dict(globals(), {"SIGNER_SECRET": 7}):
+            forged = self.valid_bundle()
+        # This is a correctly signed, structurally valid alternate test history.
+        section = forged["staging"]["event_evidence"]
+        READINESS.validate_ci_event_structure(section, self.candidate, self.base, "staging", "success")
+        self.assert_refused(forged, "outside current authority")
+
+    def test_native_history_freshness_requires_exact_operator_reuse(self) -> None:
+        with unittest.mock.patch.object(READINESS.time, "time", return_value=NOW + 86400), \
+                unittest.mock.patch.object(READINESS, "read_native_authority_file") as reader:
+            reader.side_effect = lambda path, **kwargs: (b"fixture native CLI" if str(path) == "/test/buzz"
+                                                       else json.dumps(self.native_context).encode())
+            authority = READINESS.NativeAuthority(Path("/test/context"), 86400)
+            section = self.bundle["staging"]["event_evidence"]
+            with self.assertRaisesRegex(READINESS.GateError, "stale native history"):
+                READINESS.validate_ci_event_evidence(section, self.candidate, self.base, "staging", "success", authority)
+            digest = hashlib.sha256(READINESS.PROTECTED_CI.canonical_json(section)).hexdigest()
+            authority.context["historical_reuse"][digest] = NOW + 2 * 86400
+            READINESS.validate_ci_event_evidence(section, self.candidate, self.base, "staging", "success", authority)
+            self.assertEqual(authority.runs[0]["mode"], "historical-reuse")
+            authority.context["status_signers"] = [xonly_pubkey(7)]
+            with self.assertRaisesRegex(READINESS.GateError, "outside current authority"):
+                READINESS.validate_ci_event_evidence(section, self.candidate, self.base, "staging", "success", authority)
+
+    def test_native_job_ids_match_protocol_and_initial_linux_mac_jobs(self) -> None:
+        schema = json.loads((REPO_ROOT / "docs/ci/promotion-evidence.schema.json").read_text())
+        self.assertEqual(schema["$defs"]["job_id"]["pattern"], READINESS.JOB_ID.pattern)
+        for job in ("dead-token-guard", "desktop-build-macos-unsigned"):
+            with self.subTest(job=job), \
+                    unittest.mock.patch.object(READINESS.time, "time", return_value=NOW), \
+                    unittest.mock.patch.object(READINESS, "read_native_authority_file") as reader:
+                self.native_context["job_ids"] = [job]
+                reader.side_effect = lambda path, **kwargs: (
+                    b"fixture native CLI" if str(path) == "/test/buzz"
+                    else json.dumps(self.native_context).encode())
+                authority = READINESS.NativeAuthority(Path("/test/context"), 86400)
+                section = self.signed_event_evidence("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", jobs=(job,), rerun_job=job)
+                result = READINESS.validate_ci_event_evidence(
+                    section, self.candidate, self.base, "staging", "success", authority)
+                self.assertEqual(result["job_ids"], [job])
+        for job in ("", "1job", "-job", "job/name", "job name", "a" * 65):
+            with self.subTest(invalid_job=job), self.assertRaises(READINESS.GateError):
+                READINESS.job_ids([job], "native job")
+
+    def test_native_clock_ignores_backdated_caller_epoch(self) -> None:
+        self.native_context["valid_until"] = NOW + 60
+        result = self.invoke(self.bundle, now=NOW, native_now=NOW + 60)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("native authority is expired", result.stderr)
+        self.assertFalse(self.receipt_path.exists())
+        self.native_context["valid_until"] = NOW + 86400
+        self.native_context["valid_from"] = NOW
+        result = self.invoke(self.bundle, now=NOW, native_now=NOW - 1)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("not yet valid", result.stderr)
+
+    def test_native_max_age_can_only_tighten_root_policy(self) -> None:
+        self.native_context["max_evidence_age"] = 1
+        result = self.invoke(self.bundle, max_age=10**9)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("stale native history", result.stderr)
+        self.assertFalse(self.receipt_path.exists())
+        self.native_context["max_evidence_age"] = 86400
+        result = self.invoke(self.bundle, max_age=600, native_now=NOW + 1000)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("stale native history", result.stderr)
+
+    def test_native_expired_reuse_ignores_backdated_caller_epoch(self) -> None:
+        self.native_context["max_evidence_age"] = 1
+        for name in ("staging", "production_canary", "deliberate_red"):
+            section = self.bundle[name]["event_evidence"]
+            history = hashlib.sha256(READINESS.PROTECTED_CI.canonical_json(section)).hexdigest()
+            self.native_context["historical_reuse"][history] = NOW + 60
+        baseline = self.invoke(self.bundle)
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        result = self.invoke(self.bundle, now=NOW, native_now=NOW + 60)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("stale native history", result.stderr)
+        self.assertFalse(self.receipt_path.exists())
+
+    def test_native_authority_expiry_during_live_verification_refuses_receipt(self) -> None:
+        self.native_drift = "expiry"
+        result = self.invoke(self.bundle)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("native authority expired during verification", result.stderr)
+        self.assertFalse(self.receipt_path.exists())
+
+    def test_native_context_cannot_be_a_producer_owned_file(self) -> None:
+        context = self.evidence_dir / "untrusted-context.json"
+        write_json(context, self.native_context)
+        with self.assertRaisesRegex(READINESS.GateError, "root-owned"):
+            READINESS.NativeAuthority(context, 86400)
+
+    def test_pre_freeze_real_consumer_rejects_incomplete_receipts(self) -> None:
+        original = json.loads(self.pre_freeze_path.read_bytes())
+        for label, mutate in {
+            "missing": lambda r: r["checks"].pop(),
+            "duplicate": lambda r: r["checks"].append(r["checks"][0]),
+            "nonzero": lambda r: r["checks"][0].update(exit_code=143),
+            "malformed": lambda r: r["checks"].append(None),
+            "interrupted": lambda r: r.update(overall="FAIL"),
+            "failed": lambda r: r["checks"][0].update(status="FAIL"),
+        }.items():
+            with self.subTest(case=label):
+                receipt = copy.deepcopy(original)
+                mutate(receipt)
+                write_json(self.pre_freeze_path, receipt)
+                bundle = copy.deepcopy(self.bundle)
+                bundle["evidence_files"]["pre_freeze"]["sha256"] = hashlib.sha256(self.pre_freeze_path.read_bytes()).hexdigest()
+                self.assert_refused(bundle, "REFUSED:")
+        self.pre_freeze_path.write_text("{broken")
+        malformed = copy.deepcopy(self.bundle)
+        malformed["evidence_files"]["pre_freeze"]["sha256"] = hashlib.sha256(self.pre_freeze_path.read_bytes()).hexdigest()
+        self.assert_refused(malformed, "REFUSED:")
+        write_json(self.evidence_dir / "pre-freeze-receipt-20200101T000000Z.json", original)
+        self.pre_freeze_path.unlink()
+        self.assert_refused(self.bundle, "pre_freeze")
+
     def test_mixed_job_attempt_ranges_are_returned_per_job(self) -> None:
         evidence = self.signed_event_evidence(
             "55555555-5555-4555-8555-555555555555",
             retry=True,
             jobs=("build", "lint"),
         )
-        result = READINESS.validate_ci_event_evidence(
+        result = READINESS.validate_ci_event_structure(
             evidence, self.candidate, self.base, "mixed", "success"
         )
         self.assertEqual(result["attempts"], [1, 2])
@@ -1173,7 +1381,7 @@ class PromotionReadinessTest(unittest.TestCase):
                 content["also_reruns"] = ["lint"]
                 self.resign_event(event, content)
         with self.assertRaisesRegex(READINESS.GateError, "rerun fanout"):
-            READINESS.validate_ci_event_evidence(
+            READINESS.validate_ci_event_structure(
                 evidence, self.candidate, self.base, "mixed", "success"
             )
 
@@ -1184,7 +1392,7 @@ class PromotionReadinessTest(unittest.TestCase):
             jobs=("build", "lint"),
             also_reruns=("lint",),
         )
-        result = READINESS.validate_ci_event_evidence(
+        result = READINESS.validate_ci_event_structure(
             evidence, self.candidate, self.base, "mixed", "success"
         )
         self.assertEqual(result["job_attempts"], {"build": [1, 2], "lint": [1, 2]})
@@ -1196,7 +1404,7 @@ class PromotionReadinessTest(unittest.TestCase):
             jobs=("build", "lint"),
             reruns=(("build", ()), ("lint", ())),
         )
-        result = READINESS.validate_ci_event_evidence(
+        result = READINESS.validate_ci_event_structure(
             evidence, self.candidate, self.base, "per-job", "success"
         )
         self.assertEqual(
@@ -1212,7 +1420,7 @@ class PromotionReadinessTest(unittest.TestCase):
             retry=True,
             rerun_actor_secret=RERUN_ACTOR_SECRET,
         )
-        result = READINESS.validate_ci_event_evidence(
+        result = READINESS.validate_ci_event_structure(
             evidence, self.candidate, self.base, "rerun-actor", "success"
         )
         actors = [self.event_content(request)["actor"] for request in evidence["requests"]]
@@ -1244,7 +1452,7 @@ class PromotionReadinessTest(unittest.TestCase):
                     content["url"] = mutate(content["url"])
                     self.resign_event(event, content)
                     with self.assertRaisesRegex(READINESS.GateError, expected_error):
-                        READINESS.validate_ci_event_evidence(
+                        READINESS.validate_ci_event_structure(
                             evidence, self.candidate, self.base, label, "success"
                         )
 
@@ -1369,12 +1577,13 @@ class PromotionReadinessTest(unittest.TestCase):
         self.assertIn("landing merge_sha does not match candidate", result.stderr)
         self.assertIn("fake-github-clients=0", result.stderr)
 
-    def test_re_verification_without_pinned_client_is_refused(self) -> None:
+    def test_real_entry_requires_native_context_and_github_still_requires_token(self) -> None:
         bundle_path = self.evidence_dir / "bundle.json"
         write_json(bundle_path, self.bundle)
         environment = {key: value for key, value in os.environ.items() if key != "GH_TOKEN"}
         result = subprocess.run(
             [sys.executable, str(SCRIPT),
+             "--native-context", "/test/context",
              "--candidate-dir", str(self.repo),
              "--evidence", str(bundle_path),
              "--receipt", str(self.evidence_dir / "receipt.json"),
@@ -1382,7 +1591,10 @@ class PromotionReadinessTest(unittest.TestCase):
             check=False, capture_output=True, text=True, env=environment,
         )
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("re-verification against GitHub failed: GH_TOKEN is required", result.stderr)
+        self.assertIn("native authority unavailable", result.stderr)
+        with unittest.mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertRaisesRegex(READINESS.GateError, "GH_TOKEN is required"):
+                READINESS.reverify_protected_ci_receipt(self.protected_receipt, "protected CI")
         self.assertFalse((self.evidence_dir / "receipt.json").exists())
 
     def test_noncanonical_protected_ci_receipt_is_refused(self) -> None:
@@ -1506,6 +1718,7 @@ class PromotionReadinessTest(unittest.TestCase):
         write_json(bundle_path, self.bundle)
         result = subprocess.run(
             [sys.executable, str(SCRIPT),
+             "--native-context", "/test/context",
              "--candidate-dir", str(self.repo),
              "--evidence", str(bundle_path),
              "--receipt", str(self.evidence_dir / "receipt.json"),
