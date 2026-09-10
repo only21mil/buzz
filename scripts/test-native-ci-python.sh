@@ -19,6 +19,7 @@ done
 python3 scripts/test-ci-promotion-readiness.py
 python3 scripts/test-protected-ci-receipt.py
 python3 scripts/test-protected-ci-reuse.py
+python3 scripts/test-ci-apt-retry.py
 bash scripts/test-ci-path-filter-contract.sh
 bash scripts/test-relay-e2e-canary-contract.sh
 python3 scripts/test-populate-ci-promotion-relay-origin.py

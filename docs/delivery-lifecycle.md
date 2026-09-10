@@ -180,11 +180,29 @@ The entrypoint verifies the new helper's exact committed bytes before loading it
   failed attempt. Missing/tied chronology and overlapping attempts are refused.
   The selected job's latest positive attempt must
   succeed too; failed, skipped, cancelled, pending, ambiguous or stale work
-  cannot fall back to an earlier pass. A successful job retained by a
-  failed-jobs rerun keeps its own attempt. Source execution and receipts expire
-  after 24 hours.
+  cannot fall back to an earlier pass. A failed-jobs rerun does not keep a
+  retained job on its own attempt: GitHub copies each job it did not
+  re-execute into the new attempt's listing with a new job id, the new
+  `run_attempt` and the original `started_at`/`completed_at`, while the
+  job's artifact keeps the attempt that executed it. The verifier treats the
+  selected entry as fresh when `qualification-<selected attempt>-<job>`
+  exists. Otherwise it reads `/actions/runs/{id}/attempts/{n}/jobs` for
+  every earlier attempt `n` that has a `qualification-<n>-<job>` artifact and
+  accepts exactly one whose job is a completed success of the same run and
+  head with identical `started_at`/`completed_at`; that `n` is recorded as
+  `executed_attempt` beside the selected job. A timestamp match against an
+  unsuccessful origin, no match, or two matches refuses. Only a success can
+  be retained this way: a retained copy of a failed execution carries
+  `conclusion: failure` and `selected_job` refuses it before any artifact is
+  read, and a re-executed job gets new timestamps and its own artifact. In
+  the receipt, `checks[].source_job_attempt` records the listing attempt of
+  the selected entry, while `jobs[].executed_attempt` records the attempt
+  that executed the job; readers wanting the execution consult `jobs[]`.
+  `protected-ci-reuse.py` applies the same rule to its `ci-reuse-<n>-<job>`
+  artifacts and records `executed_attempt` in its reuse proof.
+  Source execution and receipts expire after 24 hours.
 - Immutable source artifacts belong to that CI run and each selected job's
-  attempt, and their provider archive digests verify. The provider independently
+  executed attempt, and their provider archive digests verify. The provider independently
   resolves the tested Git objects. Workflow/action pins, verifier policy,
   toolchain manifests and dependency lockfiles match the landed Git objects.
   Capture retains actual tool versions, runner image revision, OS package

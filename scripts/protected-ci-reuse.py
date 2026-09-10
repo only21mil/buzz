@@ -183,6 +183,39 @@ def validate_source(source, *, job, run, pr, landed, current_authority, current_
     return True
 
 
+def executed_attempt(api, run, job, source_job, artifacts):
+    """Resolve the attempt whose execution produced the selected job entry.
+
+    A failed-jobs rerun copies every job it did not re-execute into the new
+    attempt's listing with a new job id, the new run_attempt and the original
+    started_at/completed_at. Its ci-reuse artifact keeps the attempt that
+    executed it. A fresh execution uploads its own attempt's artifact.
+    """
+    attempt = source_job["run_attempt"]
+    names = {item["name"] for item in artifacts}
+    if f"ci-reuse-{attempt}-{job}" in names:
+        return attempt
+    started = receipt.iso8601(source_job.get("started_at"), "source job started_at")
+    completed = receipt.iso8601(source_job.get("completed_at"), "source job completed_at")
+    matches = []
+    for earlier in range(1, attempt):
+        if f"ci-reuse-{earlier}-{job}" not in names:
+            continue
+        listing = api.pages(PREFIX + f"/actions/runs/{run['id']}/attempts/{earlier}/jobs", "jobs")
+        origins = [item for item in listing if item.get("name") == JOBS[job]]
+        need(len(origins) == 1, "retained source job origin is missing or ambiguous")
+        origin = origins[0]
+        need(origin.get("run_attempt") == earlier and origin.get("run_id") == run["id"] and
+             origin.get("head_sha") == run["head_sha"] and origin.get("status") == "completed",
+             "retained source job origin is not a completed execution of this run")
+        if (receipt.iso8601(origin.get("started_at"), f"attempt {earlier} job started_at") == started and
+                receipt.iso8601(origin.get("completed_at"), f"attempt {earlier} job completed_at") == completed):
+            need(origin.get("conclusion") == "success", f"retained source job mirrors an unsuccessful attempt {earlier}")
+            matches.append(earlier)
+    need(len(matches) == 1, "source dependency/context proof missing or ambiguous")
+    return matches[0]
+
+
 def acquire_reuse(api, job, head, current_context):
     need(re.fullmatch(r"[0-9a-f]{40}", head) is not None, "landed SHA must be exact")
     need(api.one(PREFIX + "/git/ref/heads/main")["object"]["sha"] == head, "main authority moved")
@@ -201,9 +234,10 @@ def acquire_reuse(api, job, head, current_context):
     completed = dt.datetime.fromisoformat(run["updated_at"].replace("Z", "+00:00"))
     age = (dt.datetime.now(dt.timezone.utc) - completed).total_seconds()
     need(0 <= age <= MAX_AGE, "source protected result expired")
-    # A failed-jobs rerun does not repeat already-successful jobs. Bind the
-    # newest execution of this job to its own attempt, while still requiring
-    # the latest overall workflow and every current protected check to pass.
+    # Select the newest listing entry of this job, then bind its artifact to
+    # the attempt that executed it (a failed-jobs rerun copies retained jobs
+    # into the new attempt's listing), while still requiring the latest
+    # overall workflow and every current protected check to pass.
     executions = api.pages(PREFIX + f"/actions/runs/{run['id']}/jobs?filter=all", "jobs")
     executions = [item for item in executions if item["name"] == JOBS[job]]
     need(bool(executions), "source job is absent")
@@ -217,9 +251,10 @@ def acquire_reuse(api, job, head, current_context):
     job_completed = dt.datetime.fromisoformat(source_job["completed_at"].replace("Z", "+00:00"))
     job_age = (dt.datetime.now(dt.timezone.utc) - job_completed).total_seconds()
     need(0 <= job_age <= MAX_AGE, "source job result expired")
-    artifact_name = f"ci-reuse-{job_attempt}-{job}"
     artifacts = api.pages(PREFIX + f"/actions/runs/{run['id']}/artifacts", "artifacts")
-    artifacts = [item for item in artifacts if item["name"] == artifact_name and not item["expired"]]
+    artifacts = [item for item in artifacts if not item["expired"]]
+    executed = executed_attempt(api, run, job, source_job, artifacts)
+    artifacts = [item for item in artifacts if item["name"] == f"ci-reuse-{executed}-{job}"]
     need(len(artifacts) == 1, "source dependency/context proof missing or ambiguous")
     artifact = artifacts[0]
     archive = api.raw(PREFIX + f"/actions/artifacts/{artifact['id']}/zip")
@@ -231,7 +266,7 @@ def acquire_reuse(api, job, head, current_context):
     current_authority = authority(api)
     validate_source(source, job=job, run=run, pr=pr, landed=landed,
                     current_authority=current_authority, current_context=current_context,
-                    workflow_hash=hashlib.sha256(Path(WORKFLOW).read_bytes()).hexdigest(), job_attempt=job_attempt)
+                    workflow_hash=hashlib.sha256(Path(WORKFLOW).read_bytes()).hexdigest(), job_attempt=executed)
     # The source job attests command execution. Resolve its claimed Git inputs
     # independently so a digest-valid artifact cannot merely relabel its tree.
     source_commit = api.one(PREFIX + f"/git/commits/{source_head}")
@@ -258,7 +293,7 @@ def acquire_reuse(api, job, head, current_context):
     need(api.one(PREFIX + "/git/ref/heads/main")["object"]["sha"] == head, "main moved during reuse verification")
     return {"schema_version": 1, "mode": "reused", "repository": REPO, "job": job, "head_sha": head,
             "landed": landed, "pull_request": pr, "source_run": run, "source_job": source_job,
-            "source_artifact": artifact, "source_proof": source, "protected_checks": checks,
+            "executed_attempt": executed, "source_artifact": artifact, "source_proof": source, "protected_checks": checks,
             "source_commit": source_commit, "tested_commit": tested_commit,
             "authority": current_authority, "context": current_context,
             "canonical_refs": "GitHub main verified; Buzz relay readback remains a delivery gate",
