@@ -70,7 +70,7 @@ Populate these fields from their independent authority:
 | `lane.host_profile_digest` | SHA256 of exact reviewed host public profile bytes with measured host, toolchain, UID and sandbox/runtime facts |
 | `lane.suite_identity` | SHA256 of the exact trusted workflow bytes, equal to `workflow_digest` |
 | `lane.isolation_profile_digest` | SHA256 of exact reviewed semantic runner profile bytes |
-| `lane.not_before`, `lane.expires_at` | Explicit reviewed lane activation window in Unix seconds |
+| `lane.not_before`, `lane.expires_at` | Actual reviewed activation time in Unix seconds and exactly 30 days later; do not start the window while source or CI is pending |
 | `lane.max_wall_timeout_seconds` | Linux 300; Mac 2700 |
 
 Linux semantic profile is supplied by the Linux package at
@@ -117,8 +117,11 @@ Retain the executable SHA256 and review it with the public authority preimages,
 runner package inventories and this operation. After root's review, install
 the binary root:root 0755 at `/usr/local/libexec/buzz-ci-native-admission`.
 Install each reviewed public authority root:root 0444 in a fresh directory
-under `/var/lib/buzzci/native-admission/`. All directory ancestors must be
-root-owned and deny group/other writes. Reusing the keyholder's existing peer
+under `/var/lib/buzzci/native-admission/`. Stage the public signed request and
+source event root:root 0444 beside the authority. Use root:root 0755 directories
+so UID/GID 1201 can traverse and read these public inputs. All directory
+ancestors must be root-owned and deny group/other writes. Never pass the
+private Victor mode-0700 evidence directory directly to that UID. Reusing the keyholder's existing peer
 UID/GID needs no service restart, credential export or policy expansion.
 
 Before generating runner installation packages, derive each reusable public
@@ -131,8 +134,9 @@ policy from the same authority bytes:
 
 Save stdout as `policy.json` in the corresponding runner package and review its
 inventory. Do not install an old static per-attempt `job_intent_digest` policy.
-After the owner-signed request has been accepted and read back, validate before
-signing:
+Issue the owner-signed request at or after the lane activation time, within
+the unchanged live relay request bounds. After acceptance and exact readback,
+validate before signing:
 
 ```sh
 /usr/local/libexec/buzz-ci-native-admission check \
@@ -157,6 +161,10 @@ Do not retry by changing any bound request field. The runner reuses the same
 signed frame for replay/readback. Retain the actual manifest signature and
 canonical request/source events as public evidence. No test-key frame counts
 as a live qualification.
+
+Lane expiry closes new admission. Renew only through reviewed policy replacement;
+source or profile changes require recalculation and review. Do not widen relay
+expiry/timeout policy just to make a qualification pass.
 
 The first live attempt remains held until the real validation PR, request,
 final integrated workflow/base, measured profiles, package inventories and

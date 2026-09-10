@@ -269,6 +269,7 @@ fn validate_inputs(
         || envelope.job_ids != [authority.job_id.clone()]
         || envelope.request_type != CiRequestType::Run
         || envelope.issued_at > now
+        || envelope.issued_at < authority.lane.not_before
         || envelope.expires_at <= now
         || envelope.expires_at - envelope.issued_at > 2700
         || event.created_at.as_secs() != envelope.issued_at
@@ -503,5 +504,14 @@ mod tests {
         authority.lane.max_wall_timeout_seconds = 300;
         authority.lane.suite_identity = "11".repeat(32);
         assert!(authority.validate().is_err());
+    }
+    #[test]
+    fn request_issue_time_must_start_at_or_after_lane_activation() {
+        let (mut authority, keys, source, envelope) = fixture();
+        let event = sign(&keys, &envelope);
+        authority.lane.not_before = envelope.issued_at + 1;
+        assert!(validate_inputs(&authority, &event, &source, 101).is_err());
+        authority.lane.not_before = envelope.issued_at;
+        assert!(validate_inputs(&authority, &event, &source, 101).is_ok());
     }
 }
