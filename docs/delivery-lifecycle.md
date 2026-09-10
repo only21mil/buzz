@@ -118,6 +118,22 @@ following before calling the landing complete:
 - the operator's exact landed qualification receipt, including the maintained
   `desktop_release.py verify-main` identity check on the actual merge commit.
 
+The relay merge gate (`docs/ci/BUZZ_CI_TERMINAL_CHECK.md` section 7) applies
+when the announcement carries a `require-check` rule and
+`BUZZ_MERGE_GATE_MODE` is `shadow` or `enforce`. In `enforce` the push to
+`main` lands only as a fast-forward or a two-parent merge of a candidate whose
+latest run at the current base reduced green, with every pinned job
+successful and a kind-46108 `success` check accepted by the relay inside
+`BUZZ_MERGE_GATE_CHECK_MAX_AGE_SECONDS`. A refusal reads
+`merge gate: <code>: <detail>`; the codes are `no_check`, `check_pending`,
+`check_not_success`, `reducer_disagrees`, `base_moved`, `not_descendant`,
+`parent_shape`, `tree_mismatch`, `workflow_digest_mismatch`,
+`required_jobs_missing`, `signer_unauthorized`, `check_expired`,
+`bypass_invalid` and `gate_misconfigured`. A refused push publishes nothing:
+rerun or re-request CI for the candidate, or rebase on the new base. The
+owner can sign a kind-46109 bypass for one exact `(ref, old, new)` update,
+valid for at most one hour and consumed once by the publish it covered.
+
 A merge does not launch CI, a desktop candidate workflow, chart validation,
 image builds or rolling Sprig builds. Protected PRs qualify the full ordinary
 suite once, including both cross-target link builds. Explicit release tags,

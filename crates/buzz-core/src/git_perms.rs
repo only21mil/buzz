@@ -503,7 +503,7 @@ pub struct EffectiveRules {
     pub push_role: Option<MemberRole>,
     /// Whether non-fast-forward is forbidden (any match sets this).
     pub no_force_push: bool,
-    /// Whether deletion is forbidden (any match sets this).
+    /// Whether deletion is forbidden (no-delete or any require-check match).
     pub no_delete: bool,
     /// Whether direct push is denied (any match sets this).
     pub require_patch: bool,
@@ -556,6 +556,10 @@ impl EffectiveRules {
                     .extend(job_ids.iter().cloned());
             }
         }
+
+        // A gated ref cannot be deleted and then recreated without a check.
+        // This structural protection applies even when check evaluation is off.
+        no_delete = no_delete || !require_checks.is_empty();
 
         Self {
             push_role,
@@ -1089,6 +1093,28 @@ mod tests {
 
     fn jobs(ids: &[&str]) -> BTreeSet<String> {
         ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn require_check_implies_no_delete_for_matching_refs() {
+        let rule = parse_protection_tag(&["refs/heads/main", "require-check:ci:unit"]).unwrap();
+        assert!(!rule.no_delete, "no-delete was not explicitly configured");
+        assert!(EffectiveRules::for_ref("refs/heads/main", std::slice::from_ref(&rule)).no_delete);
+        for ref_name in ["refs/heads/main", "refs/heads/topic"] {
+            let update = RefUpdate {
+                ref_name: ref_name.into(),
+                kind: UpdateKind::Delete,
+                old_oid: "1".repeat(40),
+                new_oid: "0".repeat(40),
+            };
+            let result =
+                evaluate_ref_update(&update, MemberRole::Owner, std::slice::from_ref(&rule));
+            if ref_name == "refs/heads/main" {
+                assert!(result.unwrap_err().reason.contains("no-delete"));
+            } else {
+                assert!(result.is_ok());
+            }
+        }
     }
 
     #[test]

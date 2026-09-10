@@ -1833,7 +1833,7 @@ pub(crate) struct PushContext {
 /// backend failure all return *without* a 2xx. This is the unique
 /// constructor of a push 2xx, so the seam is structural (not by
 /// convention).
-async fn finalize_push(state: &Arc<AppState>, ctx: PushContext) -> Response {
+pub(crate) async fn finalize_push(state: &Arc<AppState>, ctx: PushContext) -> Response {
     // The push fence, part 0 — **a rejected push publishes nothing.**
     //
     // `ctx.pack.ok` is false when git aborted the ref updates: either the
@@ -1863,6 +1863,64 @@ async fn finalize_push(state: &Arc<AppState>, ctx: PushContext) -> Response {
         drop(ctx.repo_handle);
         return response;
     }
+
+    // Merge gate fence (design 1.7), enforce mode only: every gated ref
+    // that changed in the workspace needs an allow decision for exactly
+    // (ref, old, new, pusher) inside the decision window, else the push is
+    // refused before any pointer write. Closes the case where the hook did
+    // not run. The claims carry the bypass to consume after the CAS wins.
+    let pusher_hex = hex::encode(ctx.pusher.to_bytes());
+    let fence_claims = if state.config.ci.merge_gate.mode == crate::config::MergeGateMode::Enforce {
+        let workspace_refs = match super::cas_publish::snapshot_workspace_state(
+            ctx.repo_handle.path(),
+            &state.config.git_repo_path,
+        )
+        .await
+        {
+            Ok((refs, _head)) => refs,
+            Err(e) => {
+                error!(
+                    owner = %ctx.owner,
+                    repo = %ctx.repo_id,
+                    error = %e,
+                    "merge gate fence: workspace snapshot failed"
+                );
+                return (
+                    StatusCode::FORBIDDEN,
+                    "merge gate: gate_misconfigured: workspace state unavailable",
+                )
+                    .into_response();
+            }
+        };
+        match super::merge_gate::finalize_fence(
+            state,
+            ctx.tenant.community(),
+            &ctx.owner,
+            &ctx.repo_id,
+            &pusher_hex,
+            &ctx.parent_state.parent.refs,
+            &workspace_refs,
+        )
+        .await
+        {
+            Ok(claims) => claims,
+            Err(detail) => {
+                warn!(
+                    owner = %ctx.owner,
+                    repo = %ctx.repo_id,
+                    detail = %detail,
+                    "merge gate fence refused the publish"
+                );
+                return (
+                    StatusCode::FORBIDDEN,
+                    format!("merge gate: gate_misconfigured: {detail}"),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        Vec::new()
+    };
 
     // Step 7 (CAS). The PushContext binds `parent_state` (observed at
     // hydrate) to the CAS predicate here — no re-reading of the pointer
@@ -1945,6 +2003,11 @@ async fn finalize_push(state: &Arc<AppState>, ctx: PushContext) -> Response {
         }
     };
 
+    // The CAS won: consume every bypass the fence claimed (design 1.5). A
+    // CAS loser returned above without reaching this line, so its bypass
+    // stays usable for the retry.
+    super::merge_gate::consume_bypasses(state, ctx.tenant.community(), &fence_claims).await;
+
     // Derived after CAS: kind:30618 ref-state event over the *committed*
     // manifest's refs/head. Spec §Implementation Correspondence:
     // "kind:30618 is derived after CAS, never the commit." We emit only
@@ -1973,7 +2036,7 @@ async fn finalize_push(state: &Arc<AppState>, ctx: PushContext) -> Response {
             repo_id: &ctx.repo_id,
             head: &success.manifest.head,
             refs: &success.manifest.refs,
-            actor_pubkey_hex: &hex::encode(ctx.pusher.to_bytes()),
+            actor_pubkey_hex: &pusher_hex,
         };
         match build_ref_state_event(&inputs, &state.relay_keypair) {
             Ok(event) => {

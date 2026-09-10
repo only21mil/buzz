@@ -3,7 +3,8 @@
 //! The hook is a shell script that:
 //! 1. Reads `old_oid new_oid ref_name` lines from stdin
 //! 2. For each non-create/non-delete, runs `git merge-base --is-ancestor`
-//!    (inheriting quarantine env vars)
+//!    and reads the new commit's parents, tree, and parent trees
+//!    (inheriting quarantine env vars) for the merge gate
 //! 3. POSTs the payload to the relay's internal policy endpoint with HMAC
 //! 4. Exits non-zero on ANY non-200 response (fail-closed)
 //!
@@ -65,11 +66,54 @@ while read -r old_oid new_oid ref_name; do
     # inherited from our environment (git sets them for quarantine). Any git
     # subprocess we call sees the quarantined objects automatically.
     IS_ANCESTOR="false"
+    # Merge-gate commit facts (design 1.1). Empty lists, empty tree and false
+    # for creates and deletes. Every substitution below runs under
+    # `set -eo pipefail`, so a missing object declines the push here.
+    PARENTS=""
+    PARENT_COUNT=0
+    TREE=""
+    PARENT_TREES=""
+    PARENT_TREE_COUNT=0
+    OLD_IN_SECOND="false"
     if [ "$old_oid" != "$ZERO" ] && [ "$new_oid" != "$ZERO" ]; then
         # Exit 0 = is ancestor (FF), exit 1 = not ancestor (NFF),
         # exit 128 = error → treat as NFF (fail-closed).
         if git merge-base --is-ancestor "$old_oid" "$new_oid" 2>/dev/null; then
             IS_ANCESTOR="true"
+        fi
+        # new_oid must peel to a commit; a blob, a tree or a missing object
+        # fails this substitution and declines the push.
+        NEW_COMMIT=$(git rev-parse --verify --quiet --end-of-options "${new_oid}^{commit}")
+        # A tag object pointing at a commit peels to a different OID. Its
+        # commit facts stay empty so a gated ref refuses it as parent_shape;
+        # ungated refs (tags) are unaffected.
+        if [ "$NEW_COMMIT" = "$new_oid" ]; then
+            PARENT_LINE=$(git rev-list --parents -n 1 --end-of-options "$new_oid")
+            # "<new> <p1> <p2> ..." -> the parents alone.
+            PARENTS=${PARENT_LINE#"$new_oid"}
+            PARENTS=${PARENTS# }
+            TREE=$(git rev-parse --verify --quiet --end-of-options "${new_oid}^{tree}")
+            PARENT_COUNT=0
+            for parent in $PARENTS; do
+                PARENT_COUNT=$((PARENT_COUNT + 1))
+            done
+            if [ "$PARENT_COUNT" -le 2 ]; then
+                for parent in $PARENTS; do
+                    PARENT_TREE=$(git rev-parse --verify --quiet --end-of-options "${parent}^{tree}")
+                    if [ -n "$PARENT_TREES" ]; then
+                        PARENT_TREES="${PARENT_TREES} "
+                    fi
+                    PARENT_TREES="${PARENT_TREES}${PARENT_TREE}"
+                    PARENT_TREE_COUNT=$((PARENT_TREE_COUNT + 1))
+                done
+            fi
+            if [ "$PARENT_COUNT" -eq 2 ]; then
+                SECOND_PARENT=${PARENTS#* }
+                # Exit 0 = ancestor; exit 1 and exit 128 both count as false.
+                if git merge-base --is-ancestor "$old_oid" "$SECOND_PARENT" 2>/dev/null; then
+                    OLD_IN_SECOND="true"
+                fi
+            fi
         fi
     fi
 
@@ -78,34 +122,66 @@ while read -r old_oid new_oid ref_name; do
     # Git ref names can't contain most special chars, but belt-and-suspenders.
     SAFE_REF=$(printf '%s' "$ref_name" | sed 's/\\/\\\\/g; s/"/\\"/g')
 
+    # OID lists as JSON arrays and as concatenated HMAC strings.
+    PARENTS_JSON=""
+    PARENTS_CAT=""
+    for parent in $PARENTS; do
+        if [ -n "$PARENTS_JSON" ]; then
+            PARENTS_JSON="${PARENTS_JSON},"
+        fi
+        PARENTS_JSON="${PARENTS_JSON}\"${parent}\""
+        PARENTS_CAT="${PARENTS_CAT}${parent}"
+    done
+    PARENT_TREES_JSON=""
+    PARENT_TREES_CAT=""
+    for parent_tree in $PARENT_TREES; do
+        if [ -n "$PARENT_TREES_JSON" ]; then
+            PARENT_TREES_JSON="${PARENT_TREES_JSON},"
+        fi
+        PARENT_TREES_JSON="${PARENT_TREES_JSON}\"${parent_tree}\""
+        PARENT_TREES_CAT="${PARENT_TREES_CAT}${parent_tree}"
+    done
+
     if [ -n "$REFS" ]; then
         REFS="${REFS},"
     fi
-    REFS="${REFS}{\"old_oid\":\"${old_oid}\",\"new_oid\":\"${new_oid}\",\"ref_name\":\"${SAFE_REF}\",\"is_ancestor\":${IS_ANCESTOR}}"
+    REFS="${REFS}{\"old_oid\":\"${old_oid}\",\"new_oid\":\"${new_oid}\",\"ref_name\":\"${SAFE_REF}\",\"is_ancestor\":${IS_ANCESTOR},\"parents\":[${PARENTS_JSON}],\"tree\":\"${TREE}\",\"parent_trees\":[${PARENT_TREES_JSON}],\"old_in_second_parent\":${OLD_IN_SECOND}}"
 
-    # HMAC line: ref_name first (for sorting), then oids + is_ancestor.
-    # is_ancestor as "1" or "0" to match Rust's b"1"/b"0".
+    # HMAC line: ref_name first (for sorting), then oids + is_ancestor, then
+    # the v2 commit facts as length-prefixed concatenations. Booleans as "1"
+    # or "0" to match Rust's b"1"/b"0"; an empty tree travels as "-".
     if [ "$IS_ANCESTOR" = "true" ]; then
-        echo "${ref_name} ${old_oid} ${new_oid} 1" >> "$HMAC_FILE"
+        IS_ANC_BIT=1
     else
-        echo "${ref_name} ${old_oid} ${new_oid} 0" >> "$HMAC_FILE"
+        IS_ANC_BIT=0
     fi
+    if [ "$OLD_IN_SECOND" = "true" ]; then
+        SECOND_BIT=1
+    else
+        SECOND_BIT=0
+    fi
+    TREE_FIELD=${TREE:--}
+    echo "${ref_name} ${old_oid} ${new_oid} ${IS_ANC_BIT} ${PARENT_COUNT}:${PARENTS_CAT} ${TREE_FIELD} ${PARENT_TREE_COUNT}:${PARENT_TREES_CAT} ${SECOND_BIT}" >> "$HMAC_FILE"
 done
 
 # Phase 2: Compute HMAC-SHA256 signature.
 # Payload format MUST match relay's compute_hmac() in policy.rs:
-#   repo_id | repo_owner | community_id | pusher_pubkey | (old_oid + new_oid + ref_name + is_ancestor) per ref sorted by ref_name | timestamp
+#   repo_id | repo_owner | community_id | pusher_pubkey | (old_oid + new_oid + ref_name + is_ancestor + commit facts) per ref sorted by ref_name | timestamp
 TIMESTAMP=$(date +%s)
 
 # Structurally unambiguous HMAC format (matches Rust's compute_hmac):
-# len(repo_id):repo_id | repo_owner | pusher | (old_oid + new_oid + len(ref):ref + is_anc)* | timestamp
+# len(repo_id):repo_id | repo_owner | pusher | (old_oid + new_oid + len(ref):ref + is_anc
+#   + len(parents):p1p2... + "|" + tree + "|" + len(parent_trees):t1t2... + "|" + old_in_second)* | timestamp
 REPO_ID_LEN=${#BUZZ_REPO_ID}
 HMAC_INPUT="${REPO_ID_LEN}:${BUZZ_REPO_ID}|${BUZZ_REPO_OWNER}|${BUZZ_COMMUNITY_ID}|${BUZZ_PUSHER_PUBKEY}|"
 # Sort by ref_name (field 1) — matches Rust's sort_by(|a, b| a.ref_name.cmp(&b.ref_name))
 if [ -f "$HMAC_FILE" ]; then
-    sort "$HMAC_FILE" | while IFS=' ' read ref_name old_oid new_oid is_anc; do
+    sort "$HMAC_FILE" | while IFS=' ' read ref_name old_oid new_oid is_anc parents tree parent_trees second; do
         REF_LEN=${#ref_name}
-        printf '%s%s%s:%s%s' "$old_oid" "$new_oid" "$REF_LEN" "$ref_name" "$is_anc"
+        if [ "$tree" = "-" ]; then
+            tree=""
+        fi
+        printf '%s%s%s:%s%s%s|%s|%s|%s' "$old_oid" "$new_oid" "$REF_LEN" "$ref_name" "$is_anc" "$parents" "$tree" "$parent_trees" "$second"
     done > "$HMAC_FILE.concat"
     HMAC_INPUT="${HMAC_INPUT}$(cat "$HMAC_FILE.concat")"
     rm -f "$HMAC_FILE.concat"

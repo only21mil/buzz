@@ -99,6 +99,21 @@ pub struct HookRefUpdate {
     /// Result of `git merge-base --is-ancestor old new`.
     /// For creates/deletes this is false (ignored by classifier).
     pub is_ancestor: bool,
+    /// Ordered parent OIDs of `new_oid` (`git rev-list --parents -n 1`),
+    /// computed in quarantine. Empty for creates, deletes, and a `new_oid`
+    /// that is a tag object rather than a commit.
+    #[serde(default)]
+    pub parents: Vec<String>,
+    /// Tree OID of `new_oid`; empty when `parents` is empty.
+    #[serde(default)]
+    pub tree: String,
+    /// Tree OID per parent, present only when `parents.len() <= 2`.
+    #[serde(default)]
+    pub parent_trees: Vec<String>,
+    /// `git merge-base --is-ancestor old_oid parents[1]` when there are two
+    /// parents, else false. Exit 128 counts as false.
+    #[serde(default)]
+    pub old_in_second_parent: bool,
 }
 
 /// Response to the hook — either allow or deny.
@@ -136,9 +151,12 @@ impl From<Denial> for DenialResponse {
 /// len(repo_id):repo_id | repo_owner(64) | community_id(36) | pusher(64) | sorted_refs | timestamp
 /// ```
 /// where each ref is: `old_oid(40) + new_oid(40) + len(ref_name):ref_name + is_ancestor("1"/"0")`
+/// followed by the v2 merge-gate commit facts
+/// `len(parents):p1p2... | tree | len(parent_trees):t1t2... | old_in_second_parent("1"/"0")`.
 ///
 /// Fixed-length fields (OIDs=40, pubkeys=64) need no length prefix.
-/// Variable-length fields (repo_id, ref_name) are length-prefixed to prevent concatenation ambiguity.
+/// Variable-length fields (repo_id, ref_name, the OID lists) are length-prefixed to
+/// prevent concatenation ambiguity; `tree` is either one OID or empty.
 fn compute_hmac(secret: &[u8], req: &HookCallbackRequest) -> Vec<u8> {
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC can take key of any size");
 
@@ -165,6 +183,22 @@ fn compute_hmac(secret: &[u8], req: &HookCallbackRequest) -> Vec<u8> {
         mac.update(b":");
         mac.update(r.ref_name.as_bytes());
         mac.update(if r.is_ancestor { b"1" } else { b"0" });
+        // v2 commit facts, bound together with the ref they describe.
+        mac.update(r.parents.len().to_string().as_bytes());
+        mac.update(b":");
+        for parent in &r.parents {
+            mac.update(parent.as_bytes());
+        }
+        mac.update(b"|");
+        mac.update(r.tree.as_bytes());
+        mac.update(b"|");
+        mac.update(r.parent_trees.len().to_string().as_bytes());
+        mac.update(b":");
+        for parent_tree in &r.parent_trees {
+            mac.update(parent_tree.as_bytes());
+        }
+        mac.update(b"|");
+        mac.update(if r.old_in_second_parent { b"1" } else { b"0" });
     }
     mac.update(b"|");
     mac.update(req.timestamp.to_string().as_bytes());
@@ -182,6 +216,41 @@ fn verify_hmac(secret: &[u8], req: &HookCallbackRequest) -> bool {
     // Constant-time comparison.
     use subtle::ConstantTimeEq;
     expected.ct_eq(&provided).into()
+}
+
+/// Upper bound on parents the hook may report for one commit.
+const MAX_REPORTED_PARENTS: usize = 64;
+
+fn is_oid(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Structural checks on the v2 commit facts (design 1.1): every OID is 40
+/// hex, an empty tree (create, delete, tag object) carries no parents, a
+/// root commit carries a tree and no parents, and parent trees are reported
+/// only for one or two parents, one per parent.
+fn validate_commit_facts(r: &HookRefUpdate) -> Result<(), &'static str> {
+    if r.parents.len() > MAX_REPORTED_PARENTS || !r.parents.iter().all(|p| is_oid(p)) {
+        return Err("invalid parents");
+    }
+    if !(r.tree.is_empty() || is_oid(&r.tree)) || (r.tree.is_empty() && !r.parents.is_empty()) {
+        return Err("invalid tree");
+    }
+    if !r.parent_trees.iter().all(|t| is_oid(t)) {
+        return Err("invalid parent_trees");
+    }
+    let expected_trees = if r.parents.len() <= 2 {
+        r.parents.len()
+    } else {
+        0
+    };
+    if r.parent_trees.len() != expected_trees {
+        return Err("invalid parent_trees");
+    }
+    if r.old_in_second_parent && r.parents.len() != 2 {
+        return Err("invalid old_in_second_parent");
+    }
+    Ok(())
 }
 
 /// Map an active channel role to the role used only for repository Git policy.
@@ -248,6 +317,9 @@ pub async fn hook_policy_check(
             || r.ref_name.bytes().any(|b| b <= 0x20 || b == 0x7f)
         {
             return (StatusCode::FORBIDDEN, "invalid ref_name").into_response();
+        }
+        if let Err(reason) = validate_commit_facts(r) {
+            return (StatusCode::FORBIDDEN, reason).into_response();
         }
     }
 
@@ -404,20 +476,45 @@ pub async fn hook_policy_check(
         })
         .collect();
 
-    match evaluate_push(&updates, git_role, &rules) {
-        Ok(()) => Json(HookCallbackResponse {
-            allowed: true,
-            denials: vec![],
-        })
-        .into_response(),
-        Err(denials) => {
-            let response = HookCallbackResponse {
-                allowed: false,
-                denials: denials.into_iter().map(DenialResponse::from).collect(),
-            };
-            (StatusCode::FORBIDDEN, Json(response)).into_response()
-        }
+    if let Err(denials) = evaluate_push(&updates, git_role, &rules) {
+        let response = HookCallbackResponse {
+            allowed: false,
+            denials: denials.into_iter().map(DenialResponse::from).collect(),
+        };
+        return (StatusCode::FORBIDDEN, Json(response)).into_response();
     }
+
+    // 10. Merge gate (design section 1). Only ref updates whose effective
+    // rules pin a required check are evaluated, and only in shadow or
+    // enforce mode; `off` logs the gated refs as skipped like an unknown
+    // rule. Shadow records every decision and never refuses; enforce
+    // refuses on any refusal code and on any error of its own.
+    let gate_denials = super::merge_gate::evaluate_push_gate(
+        &state,
+        &super::merge_gate::GatePushContext {
+            community,
+            repo_owner: &req.repo_owner,
+            repo_id: &req.repo_id,
+            channel_id,
+            pusher: &req.pusher_pubkey,
+            rules: &rules,
+            ref_updates: &req.ref_updates,
+        },
+    )
+    .await;
+    if !gate_denials.is_empty() {
+        let response = HookCallbackResponse {
+            allowed: false,
+            denials: gate_denials.into_iter().map(DenialResponse::from).collect(),
+        };
+        return (StatusCode::FORBIDDEN, Json(response)).into_response();
+    }
+
+    Json(HookCallbackResponse {
+        allowed: true,
+        denials: vec![],
+    })
+    .into_response()
 }
 
 /// Generate the HMAC signature for a hook callback payload.
@@ -446,7 +543,7 @@ pub fn generate_hook_hmac(
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::api::git) mod tests {
     use super::*;
 
     fn make_request() -> HookCallbackRequest {
@@ -460,12 +557,30 @@ mod tests {
                 new_oid: "2".repeat(40),
                 ref_name: "refs/heads/main".to_string(),
                 is_ancestor: true,
+                parents: vec!["1".repeat(40)],
+                tree: "3".repeat(40),
+                parent_trees: vec!["4".repeat(40)],
+                old_in_second_parent: false,
             }],
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
             signature: String::new(),
+        }
+    }
+
+    /// A create or delete carries no commit facts.
+    fn bare_update(old_oid: String, new_oid: String, ref_name: &str) -> HookRefUpdate {
+        HookRefUpdate {
+            old_oid,
+            new_oid,
+            ref_name: ref_name.to_string(),
+            is_ancestor: false,
+            parents: Vec::new(),
+            tree: String::new(),
+            parent_trees: Vec::new(),
+            old_in_second_parent: false,
         }
     }
 
@@ -667,6 +782,109 @@ mod tests {
     }
 
     #[test]
+    fn hmac_tampered_parents_rejected() {
+        let secret = b"test-secret";
+        let mut req = make_request();
+        sign_request(&mut req, secret);
+        req.ref_updates[0].parents = vec!["5".repeat(40)];
+        assert!(!verify_hmac(secret, &req));
+        let mut req = make_request();
+        sign_request(&mut req, secret);
+        req.ref_updates[0].parents.push("1".repeat(40));
+        assert!(!verify_hmac(secret, &req));
+    }
+
+    #[test]
+    fn hmac_tampered_tree_rejected() {
+        let secret = b"test-secret";
+        let mut req = make_request();
+        sign_request(&mut req, secret);
+        req.ref_updates[0].tree = "5".repeat(40);
+        assert!(!verify_hmac(secret, &req));
+    }
+
+    #[test]
+    fn hmac_tampered_parent_trees_rejected() {
+        let secret = b"test-secret";
+        let mut req = make_request();
+        sign_request(&mut req, secret);
+        req.ref_updates[0].parent_trees = vec!["5".repeat(40)];
+        assert!(!verify_hmac(secret, &req));
+    }
+
+    #[test]
+    fn hmac_tampered_old_in_second_parent_rejected() {
+        let secret = b"test-secret";
+        let mut req = make_request();
+        sign_request(&mut req, secret);
+        req.ref_updates[0].old_in_second_parent = true;
+        assert!(!verify_hmac(secret, &req));
+    }
+
+    /// Moving an OID between `parents` and `parent_trees` keeps the same
+    /// bytes in a different field; the length prefixes must still change
+    /// the HMAC.
+    #[test]
+    fn hmac_field_boundaries_are_bound() {
+        let secret = b"test-secret";
+        let mut a = make_request();
+        a.ref_updates[0].parents = vec!["7".repeat(40), "8".repeat(40)];
+        a.ref_updates[0].parent_trees = vec!["9".repeat(40), "6".repeat(40)];
+        let mut b = a.clone();
+        b.ref_updates[0].parents = vec!["7".repeat(40)];
+        b.ref_updates[0].parent_trees = vec!["8".repeat(40), "9".repeat(40), "6".repeat(40)];
+        assert_ne!(compute_hmac(secret, &a), compute_hmac(secret, &b));
+    }
+
+    #[test]
+    fn commit_facts_validation_matches_hook_shapes() {
+        let ok = make_request().ref_updates.remove(0);
+        assert!(validate_commit_facts(&ok).is_ok());
+        assert!(validate_commit_facts(&bare_update(
+            "0".repeat(40),
+            "2".repeat(40),
+            "refs/heads/main"
+        ))
+        .is_ok());
+
+        let mut merge = ok.clone();
+        merge.parents = vec!["1".repeat(40), "5".repeat(40)];
+        merge.parent_trees = vec!["4".repeat(40), "3".repeat(40)];
+        merge.old_in_second_parent = true;
+        assert!(validate_commit_facts(&merge).is_ok());
+
+        let mut octopus = merge.clone();
+        octopus.parents.push("6".repeat(40));
+        octopus.parent_trees.clear();
+        octopus.old_in_second_parent = false;
+        assert!(validate_commit_facts(&octopus).is_ok());
+
+        let mut bad = ok.clone();
+        bad.tree.clear();
+        assert_eq!(validate_commit_facts(&bad), Err("invalid tree"));
+        // A root commit force-pushed over an existing ref: tree, no parents.
+        let mut root = ok.clone();
+        root.parents.clear();
+        root.parent_trees.clear();
+        assert!(validate_commit_facts(&root).is_ok());
+        let mut bad = ok.clone();
+        bad.parent_trees.clear();
+        assert_eq!(validate_commit_facts(&bad), Err("invalid parent_trees"));
+        let mut bad = ok.clone();
+        bad.parents = vec!["zz".repeat(20)];
+        assert_eq!(validate_commit_facts(&bad), Err("invalid parents"));
+        let mut bad = ok.clone();
+        bad.old_in_second_parent = true;
+        assert_eq!(
+            validate_commit_facts(&bad),
+            Err("invalid old_in_second_parent")
+        );
+        let mut bad = octopus.clone();
+        bad.parent_trees = vec!["4".repeat(40)];
+        assert_eq!(validate_commit_facts(&bad), Err("invalid parent_trees"));
+    }
+
+    #[test]
     fn hmac_tampered_owner_rejected() {
         let secret = b"test-secret";
         let mut req = make_request();
@@ -708,12 +926,11 @@ mod tests {
     fn hmac_deterministic_across_ref_order() {
         let secret = b"test-secret";
         let mut req1 = make_request();
-        req1.ref_updates.push(HookRefUpdate {
-            old_oid: "3".repeat(40),
-            new_oid: "4".repeat(40),
-            ref_name: "refs/heads/develop".to_string(),
-            is_ancestor: false,
-        });
+        req1.ref_updates.push(bare_update(
+            "3".repeat(40),
+            "4".repeat(40),
+            "refs/heads/develop",
+        ));
         let mut req2 = req1.clone();
         // Reverse the ref order — HMAC should be the same (sorted internally).
         req2.ref_updates.reverse();
@@ -754,20 +971,21 @@ mod tests {
         let community_id = uuid::Uuid::from_u128(1).to_string();
         let timestamp: u64 = 1700000000;
 
-        // Two refs, intentionally out of sorted order to test sorting.
+        // Two refs, intentionally out of sorted order to test sorting. The
+        // main update is a two-parent merge with full commit facts; the
+        // feature update is a create with none.
         let ref_updates = vec![
             HookRefUpdate {
                 old_oid: "b".repeat(40),
                 new_oid: "c".repeat(40),
                 ref_name: "refs/heads/main".to_string(),
                 is_ancestor: true,
+                parents: vec!["b".repeat(40), "e".repeat(40)],
+                tree: "1".repeat(40),
+                parent_trees: vec!["2".repeat(40), "1".repeat(40)],
+                old_in_second_parent: true,
             },
-            HookRefUpdate {
-                old_oid: "a".repeat(40),
-                new_oid: "d".repeat(40),
-                ref_name: "refs/heads/feature".to_string(),
-                is_ancestor: false,
-            },
+            bare_update("0".repeat(40), "d".repeat(40), "refs/heads/feature"),
         ];
 
         // Compute Rust-side HMAC.
@@ -799,16 +1017,20 @@ WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 HMAC_FILE="$WORK_DIR/hmac"
 
-# Write refs in the order they'd arrive (main first, feature second)
-echo "refs/heads/main {old1} {new1} 1" >> "$HMAC_FILE"
-echo "refs/heads/feature {old2} {new2} 0" >> "$HMAC_FILE"
+# Write refs in the order they'd arrive (main first, feature second), in the
+# exact line shape the hook writes: ref old new anc parents tree parent_trees second.
+echo "refs/heads/main {old1} {new1} 1 2:{old1}{p2} {tree} 2:{t1}{tree} 1" >> "$HMAC_FILE"
+echo "refs/heads/feature {old2} {new2} 0 0: - 0: 0" >> "$HMAC_FILE"
 
 # Build HMAC input — exact logic from hook script
 REPO_ID_LEN=${{#BUZZ_REPO_ID}}
 HMAC_INPUT="${{REPO_ID_LEN}}:${{BUZZ_REPO_ID}}|${{BUZZ_REPO_OWNER}}|${{BUZZ_COMMUNITY_ID}}|${{BUZZ_PUSHER_PUBKEY}}|"
-sort "$HMAC_FILE" | while IFS=' ' read -r ref_name old_oid new_oid is_anc; do
+sort "$HMAC_FILE" | while IFS=' ' read -r ref_name old_oid new_oid is_anc parents tree parent_trees second; do
     REF_LEN=${{#ref_name}}
-    printf '%s%s%s:%s%s' "$old_oid" "$new_oid" "$REF_LEN" "$ref_name" "$is_anc"
+    if [ "$tree" = "-" ]; then
+        tree=""
+    fi
+    printf '%s%s%s:%s%s%s|%s|%s|%s' "$old_oid" "$new_oid" "$REF_LEN" "$ref_name" "$is_anc" "$parents" "$tree" "$parent_trees" "$second"
 done > "$HMAC_FILE.concat"
 HMAC_INPUT="${{HMAC_INPUT}}$(cat "$HMAC_FILE.concat")|${{TIMESTAMP}}"
 
@@ -823,7 +1045,10 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "$BUZZ_HOOK_SECRET" -hex 
             timestamp = timestamp,
             old1 = "b".repeat(40),
             new1 = "c".repeat(40),
-            old2 = "a".repeat(40),
+            p2 = "e".repeat(40),
+            tree = "1".repeat(40),
+            t1 = "2".repeat(40),
+            old2 = "0".repeat(40),
             new2 = "d".repeat(40),
         );
 
@@ -863,6 +1088,10 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "$BUZZ_HOOK_SECRET" -hex 
             new_oid: "2".repeat(40),
             ref_name: "refs/heads/main".to_string(),
             is_ancestor: true,
+            parents: vec!["1".repeat(40)],
+            tree: "3".repeat(40),
+            parent_trees: vec!["4".repeat(40)],
+            old_in_second_parent: false,
         }];
 
         let rust_sig = generate_hook_hmac(
@@ -881,19 +1110,24 @@ export LC_ALL=C
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 HMAC_FILE="$WORK_DIR/hmac"
-echo "refs/heads/main {old} {new} 1" >> "$HMAC_FILE"
+echo "refs/heads/main {old} {new} 1 1:{old} {tree} 1:{ptree} 0" >> "$HMAC_FILE"
 BUZZ_REPO_ID="{repo_id}"
 REPO_ID_LEN=${{#BUZZ_REPO_ID}}
 HMAC_INPUT="${{REPO_ID_LEN}}:${{BUZZ_REPO_ID}}|{owner}|{community_id}|{pusher}|"
-sort "$HMAC_FILE" | while IFS=' ' read -r ref_name old_oid new_oid is_anc; do
+sort "$HMAC_FILE" | while IFS=' ' read -r ref_name old_oid new_oid is_anc parents tree parent_trees second; do
     REF_LEN=${{#ref_name}}
-    printf '%s%s%s:%s%s' "$old_oid" "$new_oid" "$REF_LEN" "$ref_name" "$is_anc"
+    if [ "$tree" = "-" ]; then
+        tree=""
+    fi
+    printf '%s%s%s:%s%s%s|%s|%s|%s' "$old_oid" "$new_oid" "$REF_LEN" "$ref_name" "$is_anc" "$parents" "$tree" "$parent_trees" "$second"
 done > "$HMAC_FILE.concat"
 HMAC_INPUT="${{HMAC_INPUT}}$(cat "$HMAC_FILE.concat")|{timestamp}"
 printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "{secret}" -hex 2>/dev/null | sed 's/.*= //'
 "#,
             old = "1".repeat(40),
             new = "2".repeat(40),
+            tree = "3".repeat(40),
+            ptree = "4".repeat(40),
             repo_id = repo_id,
             owner = repo_owner,
             community_id = community_id,
@@ -923,7 +1157,17 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "{secret}" -hex 2>/dev/nu
 
     // ── hook_policy_check binding gate (requires Postgres) ──────────────
 
-    async fn policy_test_state() -> (Arc<AppState>, tempfile::TempDir) {
+    pub(in crate::api::git) async fn policy_test_state() -> (Arc<AppState>, tempfile::TempDir) {
+        let (state, git_storage, _pool) = policy_test_state_with(|_| {}).await;
+        (state, git_storage)
+    }
+
+    /// Relay state for hook and merge-gate tests. `configure` edits the
+    /// loaded config before `AppState` is built (bind address, gate mode,
+    /// signer set). The pool is returned for direct SQL assertions.
+    pub(in crate::api::git) async fn policy_test_state_with(
+        configure: impl FnOnce(&mut crate::config::Config),
+    ) -> (Arc<AppState>, tempfile::TempDir, sqlx::PgPool) {
         let git_storage = tempfile::tempdir().expect("fixture Git storage");
         let mut config = crate::config::Config::from_env_with_test_git_paths(git_storage.path())
             .expect("fixture config loads");
@@ -932,6 +1176,7 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "{secret}" -hex 2>/dev/nu
         config.database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
             .expect("explicit isolated test database URL required");
+        configure(&mut config);
         let pool = sqlx::PgPool::connect(&config.database_url)
             .await
             .expect("connect test DB");
@@ -964,7 +1209,7 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "{secret}" -hex 2>/dev/nu
             nostr::Keys::generate(),
             media_storage,
         );
-        (Arc::new(state), git_storage)
+        (Arc::new(state), git_storage, pool)
     }
 
     /// Announce `repo_id` with the given tags, then push to it as its own
@@ -996,12 +1241,11 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "{secret}" -hex 2>/dev/nu
             repo_owner: owner_hex.clone(),
             community_id: community.as_uuid().to_string(),
             pusher_pubkey: owner_hex,
-            ref_updates: vec![HookRefUpdate {
-                old_oid: "0".repeat(40),
-                new_oid: "2".repeat(40),
-                ref_name: "refs/heads/main".to_string(),
-                is_ancestor: false,
-            }],
+            ref_updates: vec![bare_update(
+                "0".repeat(40),
+                "2".repeat(40),
+                "refs/heads/main",
+            )],
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -1013,7 +1257,9 @@ printf '%s' "$HMAC_INPUT" | openssl dgst -sha256 -hmac "{secret}" -hex 2>/dev/nu
         hook_policy_check(State(Arc::clone(state)), Json(req)).await
     }
 
-    async fn body_string(response: axum::response::Response) -> (StatusCode, String) {
+    pub(in crate::api::git) async fn body_string(
+        response: axum::response::Response,
+    ) -> (StatusCode, String) {
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await

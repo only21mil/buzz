@@ -763,7 +763,7 @@ struct EffectivePrSnapshot {
 /// Fail-closed:
 /// - workflow path absent in the base tree → 404 `workflow_not_found`
 /// - blob too large / git failure → 5xx
-async fn resolve_workflow_at_base(
+pub(crate) async fn resolve_workflow_at_base(
     repo_path: &Path,
     base_oid: &str,
 ) -> Result<ResolvedWorkflow, (StatusCode, Json<Value>)> {
@@ -824,9 +824,10 @@ fn workflow_id(bytes: &[u8]) -> String {
 }
 
 /// A workflow resolved from the trusted base with its canonical byte set.
-struct ResolvedWorkflow {
+pub(crate) struct ResolvedWorkflow {
     workflow_path: String,
-    workflow_digest: String,
+    /// Hex SHA-256 of the canonical workflow bytes at the base.
+    pub(crate) workflow_digest: String,
     canonical_workflow_base64: String,
     workflow_id: String,
     jobs: Vec<ParsedJob>,

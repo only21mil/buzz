@@ -29,9 +29,15 @@ inherited quarantine environment:
 - `old_in_second_parent`: `git merge-base --is-ancestor <old_oid> <parents[1]>`
   when there are two parents, else false. Exit 128 counts as false.
 
-Every substitution runs under the script's `set -eo pipefail`, so a missing
-object or a `new_oid` that is a tag rather than a commit declines the push
-before the callback. `HookRefUpdate` gains the same fields. The HMAC payload
+The hook computes facts before it knows which refs are gated. Under
+`set -eo pipefail`, a missing object or a blob/tree that cannot peel to a
+commit declines an update before the callback, even on an ungated ref in
+`off` or `shadow`. A tag pointing to a commit sends empty facts and remains
+valid on an ungated ref; the gate refuses it as `parent_shape`. The callback
+also refuses more than 64 reported parents on any updated ref. These are
+transport-wide limits; repositories using blob/tree refs or commits with
+more than 64 parents cannot update those refs through this hook.
+`HookRefUpdate` gains the same fields. The HMAC payload
 (`compute_hmac`, `policy.rs` line 142, and its bash mirror) appends
 `len(parents):p1p2...|tree|len(parent_trees):t1t2...|old_in_second_parent`
 after `is_ancestor` per ref (`bash_hmac_matches_rust_hmac` fixtures change
@@ -57,8 +63,13 @@ tree, because kind-46100 `job_ids` and `workflow_digest` are requester-signed
 matching patterns: two values for one ref merge into the union of job ids per
 workflow; two workflow ids require both. Job ids use the static job grammar.
 
-The relay honours the rule only when `BUZZ_MERGE_GATE_MODE` is `shadow` or
-`enforce`; in `off` it is logged as skipped like an unknown rule today
+A matching `require-check` also implies `no-delete` in every mode, preventing
+a delete followed by an unchecked create even when `no-delete` is omitted.
+Initial creation still follows the existing role rules. Include `no-delete`
+explicitly in the announcement so its intended protection is visible.
+
+The relay evaluates terminal checks only when `BUZZ_MERGE_GATE_MODE` is
+`shadow` or `enforce`; in `off` check evaluation is logged as skipped
 (`policy.rs` line 320), so the announcement can carry it before the relay
 deploys. The owner declares refs, workflow, and jobs; the operator decides.
 
@@ -102,8 +113,8 @@ decides, as in today's provider chronology rule, and must satisfy:
    (`InfrastructureFailure`, or a `success` check while the reducer is not
    green). `load_ci_reducer_events` is not widened. Only the selected run's
    events are read and signature-validated, capped at the CLI's 10,000-event
-   window (`dispatch.rs` line 22, longer is `gate_misconfigured`), which
-   keeps one callback inside the hook's `curl --max-time 10` budget.
+   window (`dispatch.rs` line 22, longer is `gate_misconfigured`). Signature
+   verification yields between events so the evaluation deadline can fire.
 4. The reduced green set covers the pinned job ids: each appears in
    `request.job_ids`, is `required: true` in its signed manifest, and is
    terminal-good at its selected attempt; else `required_jobs_missing`, even
@@ -120,7 +131,7 @@ decides, as in today's provider chronology rule, and must satisfy:
    `api/ci.rs` line 1681 builds, so a revoked signer's old checks stop
    counting; else `signer_unauthorized`.
 7. Fresh by the relay clock: `now - ci_run_events.accepted_at <=
-   BUZZ_MERGE_GATE_MAX_CHECK_AGE_SECONDS` (`buzz-db/src/ci.rs` line 355);
+   BUZZ_MERGE_GATE_CHECK_MAX_AGE_SECONDS` (`buzz-db/src/ci.rs` line 355);
    `published_at` and `created_at` are signer-chosen and never consulted.
    Default 86400, the landing verifier's `MAX_AGE`; else `check_expired`.
 
@@ -152,9 +163,11 @@ A new owner-signed kind `46109 KIND_CI_MERGE_BYPASS`, stored through the CI
 ingest gate like kind 46107 (`handlers/ingest.rs` line 2867), with content
 `{schema_version: 1, target_repo_a, ref_name, old_oid, new_oid, reason,
 issued_at, expires_at}`.
-Acceptance: `event.pubkey` is the kind-30617 author and holds the channel
-Owner role; `expires_at - issued_at <= 3600`; `reason` non-empty; the `a` and
-`h` tags match. `is_ci_event_kind` (`ingest.rs` line 57) admits the kind, and
+Acceptance: `event.pubkey` is the repository owner named by `target_repo_a`
+and holds channel Owner or Admin authority, or community Owner or Admin
+authority. The gate rechecks the issuer against the resolved kind-30617
+author. `expires_at - issued_at <= 3600`; `reason` non-empty; the `a` and `h`
+tags match. `is_ci_event_kind` (`ingest.rs` line 57) admits the kind, and
 `required_scope_for_kind` maps it to `JobsWrite` like kind 46107. Storage is a
 new table `ci_merge_bypasses` (migration 0042) keyed by `(community,
 event_id)`, indexed on `(community, target_repo_a, ref_name, old_oid,
@@ -172,13 +185,22 @@ bypass; the owner signs one exact merge commit.
 
 - `BUZZ_MERGE_GATE_MODE`: `off` (default), `shadow`, `enforce`. Any other
   value fails config load and the relay does not start.
-- `BUZZ_MERGE_GATE_MAX_CHECK_AGE_SECONDS`: default 86400, ceiling 604800.
+- `BUZZ_MERGE_GATE_CHECK_MAX_AGE_SECONDS`: default 86400, ceiling 604800.
 - `BUZZ_MERGE_GATE_DECISION_WINDOW_SECONDS`: default 300 (`PACK_OPS_TIMEOUT`,
   `transport.rs` line 45), ceiling 900. See 1.7.
 
-`shadow` evaluates everything, writes the decision record, logs
-`merge_gate decision=<allow|refuse> code=...`, and never refuses. `enforce`
-fails closed: a database error, an empty signer union, a rule naming no
+The entire merge-gate evaluation has one six-second deadline across all refs,
+hydration, signer and history reads, bypass lookup, and decision writes.
+The hook's `curl --max-time 10` leaves four seconds for the ordinary policy
+checks and response delivery. On timeout the relay logs `gate_misconfigured`
+and cancels evaluation without waiting for an audit write. Completed rows
+remain; the timed-out evaluation may have no row. Shadow observation must
+include the logs and verify every expected decision row before cutover.
+
+`shadow` evaluates and records within that budget, logs
+`merge_gate decision=<allow|refuse> code=...`, and never refuses for a gate
+error or timeout. Ordinary authentication and branch protection still apply.
+`enforce` fails closed: a database error, an empty signer union, a rule naming no
 workflow or job, a callback missing the new fields, or a reducer panic guard
 answer 403 `gate_misconfigured`.
 
@@ -321,7 +343,8 @@ ruleset waits for Victor's approval. Code lands first through GitHub CI.
 3. Relay config and restart (config gate): `BUZZ_MERGE_GATE_MODE=shadow`,
    age 86400, window 300; confirm the mode in the journal. Rollback: unset.
 4. Announcement (owner signature): republish kind 30617 for `buzz` with the
-   pinned rule on `refs/heads/main`, every other tag byte-for-byte.
+   pinned rule and explicit `no-delete` on `refs/heads/main`, every other tag
+   byte-for-byte. `require-check` implies deletion protection if omitted.
    Rollback: republish without the rule.
 5. Shadow observation: three real landings, each with one `decision=allow`
    row for the landed `(old, new)`; any `refuse` is a bug to fix first.

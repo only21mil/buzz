@@ -265,7 +265,7 @@ impl ParentState {
 /// HEAD is the symref target (e.g. `refs/heads/main`), unprefixed — the
 /// manifest stores published ref state, not protocol formatting. Detached
 /// HEAD or no HEAD yields an empty string.
-async fn snapshot_workspace_state(
+pub(crate) async fn snapshot_workspace_state(
     repo_path: &Path,
     scratch_dir: &Path,
 ) -> Result<(BTreeMap<String, String>, String), CasError> {
