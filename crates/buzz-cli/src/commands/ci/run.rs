@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
+use buzz_core::ci::workflow::workflow_path_for_selector;
 use buzz_core::ci::{
     request_tags, validate_signed_ci_event, CiRequestEnvelope, CiRequestType, CiRunState,
     CiSkipPolicy, ValidatedCiEnvelope, CI_MAX_SAFE_INTEGER, CI_SCHEMA_VERSION,
@@ -299,6 +300,11 @@ fn validate_preflight(
     validate_nonempty_text(&response.base_ref, "base ref")?;
     validate_nonempty_text(&response.workflow_path, "workflow path")?;
     validate_workflow_path(&response.workflow_path)?;
+    if response.workflow_path != workflow_path_for_selector(request.workflow_selector.as_deref()) {
+        return Err(preflight_error(
+            "workflow path does not match the registered selector",
+        ));
+    }
     validate_nonempty_text(&response.workflow_id, "workflow_id")?;
     validate_lower_hex(&response.workflow_digest, 64, "workflow digest")?;
     if let Some(selector) = &request.workflow_selector {
@@ -815,6 +821,68 @@ mod tests {
         let validated =
             validate_preflight(preflight(), &preflight_request(), "https://relay.example").unwrap();
         assert_eq!(validated.selected_jobs[0].job_id, "test");
+    }
+
+    #[test]
+    fn native_preflight_pins_registered_path_and_independently_hashes_bytes() {
+        let mut request = preflight_request();
+        request.workflow_selector = Some("native-macos".into());
+        let mut response = preflight();
+        response.workflow_id = "native-macos".into();
+        response.workflow_path = ".buzz/workflows/native-macos.yml".into();
+        let bytes = b"name: native-macos\njobs:\n  test:\n    runs-on: apple-mbp\n";
+        response.workflow_digest = hex::encode(Sha256::digest(bytes));
+        response.canonical_workflow_base64 = BASE64_STANDARD.encode(bytes);
+        assert!(validate_preflight(response.clone(), &request, "https://relay.example").is_ok());
+
+        for path in [
+            ".github/workflows/ci.yml",
+            ".buzz/workflows/other.yml",
+            "../native-macos.yml",
+        ] {
+            let mut wrong = response.clone();
+            wrong.workflow_path = path.into();
+            assert!(validate_preflight(wrong, &request, "https://relay.example").is_err());
+        }
+        let mut wrong = response.clone();
+        wrong.workflow_id = "ci".into();
+        assert!(validate_preflight(wrong, &request, "https://relay.example").is_err());
+        let mut wrong = response.clone();
+        wrong.canonical_workflow_base64 = BASE64_STANDARD.encode(b"name: candidate-controlled\n");
+        assert!(validate_preflight(wrong, &request, "https://relay.example").is_err());
+        let mut wrong = response.clone();
+        wrong.workflow_digest = "f".repeat(64);
+        assert!(validate_preflight(wrong, &request, "https://relay.example").is_err());
+
+        for selector in [
+            None,
+            Some(".buzz/workflows/native-macos.yml".into()),
+            Some(response.workflow_digest.clone()),
+        ] {
+            request.workflow_selector = selector;
+            assert!(
+                validate_preflight(response.clone(), &request, "https://relay.example").is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_preflight_name_digest_and_default_keep_default_path() {
+        let response = preflight();
+        for selector in [
+            None,
+            Some(response.workflow_id.clone()),
+            Some(response.workflow_digest.clone()),
+        ] {
+            let mut request = preflight_request();
+            request.workflow_selector = selector;
+            assert!(
+                validate_preflight(response.clone(), &request, "https://relay.example").is_ok()
+            );
+            let mut wrong = response.clone();
+            wrong.workflow_path = ".buzz/workflows/native-macos.yml".into();
+            assert!(validate_preflight(wrong, &request, "https://relay.example").is_err());
+        }
     }
 
     #[test]
