@@ -31,6 +31,7 @@ members = [
     "crates/buzz-backend-kubernetes",
     "crates/buzz-ci-acceptance-ctl",
     "crates/buzz-ci-broker-protocol",
+    "crates/buzz-ci-admission-verifier",
     "crates/buzz-ci-keyholder",
     "crates/buzz-ci-execd",
     "crates/buzz-ci-runner",

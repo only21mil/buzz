@@ -14,8 +14,8 @@ use buzz_ci_broker_protocol::v2::{
     DescribeAttemptEvidenceRequest, EvidenceChunkResponse, EvidenceDescriptionResponse,
     EvidenceDescriptor, FrameHeader, GetAttemptRequest, IntentRegistrationResponse,
     ReadAttemptEvidenceRequest, RegisterJobIntentRequest, Request, WireText64,
-    EXECUTION_BINDING_DIGEST_DOMAIN, JOB_INTENT_DIGEST_DOMAIN,
-    LANE_ACTIVATION_MANIFEST_V1_DIGEST_DOMAIN, MAX_EVIDENCE_CHUNK_SIZE, MAX_EVIDENCE_ITEMS,
+    EXECUTION_BINDING_DIGEST_DOMAIN, LANE_ACTIVATION_MANIFEST_V1_DIGEST_DOMAIN,
+    MAX_EVIDENCE_CHUNK_SIZE, MAX_EVIDENCE_ITEMS,
 };
 use buzz_ci_broker_protocol::{BrokerState, Conclusion, GitOid, ResponseCode, TrustClass};
 use nostr::secp256k1::{schnorr::Signature, Message, XOnlyPublicKey, SECP256K1};
@@ -224,47 +224,34 @@ impl JobIntentV2 {
 
     /// Return the canonical domain-separated intent digest.
     pub fn digest(self) -> [u8; 32] {
-        let mut bytes = Vec::with_capacity(360);
-        bytes.extend_from_slice(JOB_INTENT_DIGEST_DOMAIN);
-        put_u16(&mut bytes, self.schema_version);
-        bytes.extend_from_slice(&self.signed_request_digest);
-        bytes.extend_from_slice(&self.actor_pubkey);
-        bytes.extend_from_slice(&self.audience_digest);
-        bytes.extend_from_slice(&self.idempotency_digest);
-        bytes.extend_from_slice(&self.source_pin_event_id);
-        bytes.extend_from_slice(&self.workflow_digest);
-        bytes.extend_from_slice(&self.isolation_profile_digest);
-        bytes.extend_from_slice(&self.lane_manifest_digest);
-        put_u64(&mut bytes, self.lane_epoch);
-        bytes.push(self.admission_signature_algorithm as u8);
-        put_u64(&mut bytes, self.admission_key_generation);
-        bytes.extend_from_slice(&self.run_id);
-        put_oid(&mut bytes, self.tip_oid);
-        put_oid(&mut bytes, self.base_oid);
-        put_u64(&mut bytes, self.issued_at);
-        put_u64(&mut bytes, self.expires_at);
-        put_u32(&mut bytes, self.wall_timeout_seconds);
-        put_u32(&mut bytes, self.attempt);
-        put_u32(&mut bytes, self.parent_attempt);
-        bytes.push(self.trust_class as u8);
-        bytes.extend_from_slice(&self.request_event_id);
-        put_text(&mut bytes, self.workflow_id);
-        put_text(&mut bytes, self.job_id);
-        bytes.push(self.artifact_count);
-        for artifact in self.artifacts {
-            match artifact {
-                Some(artifact) => {
-                    bytes.push(1);
-                    put_text(&mut bytes, artifact.artifact_id);
-                    put_text(&mut bytes, artifact.name);
-                    put_text(&mut bytes, artifact.media_type);
-                    put_text(&mut bytes, artifact.relative_name);
-                    put_u32(&mut bytes, artifact.max_bytes);
-                }
-                None => bytes.push(0),
-            }
-        }
-        sha256(&bytes)
+        let admission = AdmitAttemptRequest {
+            signed_request_digest: self.signed_request_digest,
+            actor_pubkey: self.actor_pubkey,
+            audience_digest: self.audience_digest,
+            idempotency_digest: self.idempotency_digest,
+            source_pin_event_id: self.source_pin_event_id,
+            workflow_digest: self.workflow_digest,
+            isolation_profile_digest: self.isolation_profile_digest,
+            lane_manifest_digest: self.lane_manifest_digest,
+            lane_epoch: self.lane_epoch,
+            admission_signature_algorithm: self.admission_signature_algorithm,
+            admission_key_generation: self.admission_key_generation,
+            run_id: self.run_id,
+            tip_oid: self.tip_oid,
+            base_oid: self.base_oid,
+            issued_at: self.issued_at,
+            expires_at: self.expires_at,
+            wall_timeout_seconds: self.wall_timeout_seconds,
+            attempt: self.attempt,
+            parent_attempt: self.parent_attempt,
+            trust_class: self.trust_class,
+            job_intent_digest: [0; 32],
+            admission_signature: [0; 64],
+        };
+        buzz_ci_broker_protocol::v2::canonical_job_intent_digest(
+            self.schema_version,
+            &registration_from_intent(admission, self),
+        )
     }
 
     fn validate(
