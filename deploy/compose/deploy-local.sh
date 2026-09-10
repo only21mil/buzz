@@ -157,6 +157,11 @@ if not isinstance(checks, list) or not checks:
 if any(not isinstance(check, dict) or check.get("status") != "PASS" for check in checks):
     refuse("contains a check without PASS status")
 
+try:
+    evidence.validate_pre_freeze_checks(receipt)
+except evidence.ReceiptError as error:
+    refuse(str(error))
+
 base_sha = receipt.get("base_sha")
 if not isinstance(base_sha, str) or re.fullmatch(r"[0-9a-f]{40}", base_sha) is None:
     refuse("base_sha must be a full 40-character lowercase commit")

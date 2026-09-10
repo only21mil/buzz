@@ -163,11 +163,58 @@ python3 scripts/populate-ci-promotion-relay-origin.py \
 ```bash
 now=$(date -u +%s)
 python3 scripts/ci-promotion-readiness.py \
+  --native-context /etc/buzz/ci-promotion-authority.json \
   --candidate-dir "$HOME/work/buzz-promotion-candidate" \
   --evidence "$HOME/work/buzz-promotion-evidence/promotion-evidence.json" \
   --receipt "$HOME/work/buzz-promotion-evidence/promotion-readiness-receipt-$now.json" \
   --now "$now"
 ```
+
+The native context is installed separately by the operator, after checking the
+actual repository announcement, relay configuration, current signer authority,
+and workflow policy. It is never generated from the bundle. The default path is
+`/etc/buzz/ci-promotion-authority.json`; `--native-context` selects another
+operator-installed context. Every component of its absolute canonical path and
+the CLI path must be root-owned and not writable by group or other users. Files
+must be regular, have one link, and contain no symlinks. This verifier does not
+install policy, change credentials, or grant signing authority.
+
+The context has exactly these fields:
+
+| Field | Required operator binding |
+| --- | --- |
+| `repository` | `only21mil/buzz` |
+| `target_repo_a`, `source_clone_url` | Canonical native repository address and exact source clone URL |
+| `channel_id`, `relay_url` | Repository channel UUID and canonical HTTPS relay origin |
+| `status_signers` | Current, nonempty authorized relay signer public keys |
+| `workflow_id`, `workflow_digest`, `job_ids` | Current workflow identity, SHA-256 policy digest and complete ordered job selection |
+| `cli_path`, `cli_sha256` | Independently installed CLI and its exact SHA-256 |
+| `valid_from`, `valid_until` | UTC epoch interval in which this authority context is current |
+| `historical_reuse` | Object mapping an explicitly approved whole-history SHA-256 to its expiry epoch; empty by default |
+
+Each signed request must match that context and the candidate/base under review.
+After local checks, the verifier supplies the context's channel and signer set
+to `buzz --relay <origin> ci verdict --run <run> --expect-sha <sha>` for staging,
+canary, and deliberate-red. It compares the actual run, commit, attempt, verdict
+and terminal job counts. Missing access, failed authentication or an unavailable
+CLI refuses qualification. Existing CLI credentials stay in the operator's
+configured environment; never put a private key in a command or policy file.
+The context and CLI bytes are checked again before publication so a revocation
+or policy change during verification refuses the result.
+
+Native freshness applies to every signed event's creation timestamp using
+`--now` and `--max-evidence-age`. Evidence more than 300 seconds in the future is refused.
+Old evidence requires an exact entry in `historical_reuse`: hash the canonical
+JSON plus LF of the entire `event_evidence` section. Its expiry must be within
+the context's validity interval and after verification time. Historical reuse
+still requires the current signer/workflow bindings and a passing live readback;
+it does not claim the jobs ran again. Retain original accepted scenario histories
+and their approvals; a new wrapper timestamp cannot make them fresh. The output
+records each history digest, `fresh` or `historical-reuse`, the live verdict
+digest, and the independent authority digest.
+
+This broader qualification is separate from `ci landing` and does not weaken or
+replace its trusted-context enforcement or any GitHub protected check.
 
 `$HOME/work/buzz-promotion-evidence` is an evidence root here: caller-owned,
 mode 0700, outside the candidate checkout.
@@ -179,7 +226,8 @@ against their schemas before retaining or signing them.
 Re-running with the same `--receipt` path is refused with `output already
 exists`, the same create-only rule `scripts/protected-ci-receipt.py acquire`
 applies to `--output`. Name a fresh receipt path for each run; identical inputs
-and the same `--now` produce byte-identical receipts at the two paths.
+and the same `--now`, authority and live readbacks produce byte-identical receipts
+at the two paths.
 
 The hermetic contract test is safe on a development host:
 

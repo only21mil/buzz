@@ -598,10 +598,39 @@ PY
   "base_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "timestamp": "${receipt_timestamp}",
   "overall": "PASS",
-  "checks": [{"name": "targeted", "status": "PASS"}]
+  "checks": [
+    {"name": "clean-tree", "status": "PASS", "exit_code": 0},
+    {"name": "rust-format", "status": "PASS", "exit_code": 0},
+    {"name": "rust-clippy", "status": "PASS", "exit_code": 0},
+    {"name": "base-lineage", "status": "PASS", "exit_code": 0},
+    {"name": "native-ci-python", "status": "PASS", "exit_code": 0},
+    {"name": "postgres-discovery", "status": "PASS", "exit_code": 0}
+  ]
 }
 JSON
   chmod 600 "${pre_freeze_receipt_path}"
+  # Preserve an older PASS beside the explicit receipt to catch fallback selection.
+  if [[ ${scenario} == local_receipt_* ]]; then
+    cp "${pre_freeze_receipt_path}" "${case_dir}/pre-freeze-receipt-20200101T000000Z.json"
+    python3 - "${pre_freeze_receipt_path}" "${scenario}" <<'PYTEST'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+receipt = json.loads(path.read_bytes())
+case = sys.argv[2].removeprefix('local_receipt_')
+if case == 'absent':
+    path.unlink()
+elif case == 'malformed':
+    path.write_text('{broken')
+else:
+    if case == 'missing': receipt['checks'].pop()
+    elif case == 'duplicate': receipt['checks'].append(receipt['checks'][0])
+    elif case == 'nonzero': receipt['checks'][0]['exit_code'] = 143
+    elif case == 'failed': receipt['checks'][0]['status'] = 'FAIL'
+    elif case == 'interrupted': receipt['overall'] = 'FAIL'
+    else: raise AssertionError(case)
+    path.write_text(json.dumps(receipt))
+PYTEST
+  fi
   [[ ${scenario} != check_pre_freeze_world_readable ]] || chmod 644 "${pre_freeze_receipt_path}"
   python3 - "${compose_dir}/../../scripts/test-protected-ci-receipt.py" \
     "${case_dir}/protected-ci-receipt.json" "${protected_ci_head}" \
@@ -648,6 +677,7 @@ receipt = fixture.receipt
 ReceiptError = receipt.ReceiptError
 validate_evidence_root = receipt.validate_evidence_root
 safe_read_receipt = receipt.safe_read_receipt
+validate_pre_freeze_checks = receipt.validate_pre_freeze_checks
 drift = {
     "reverify_forged_receipt": "no_runs",
     "reverify_check_drift": "check_failure",
@@ -969,6 +999,11 @@ set -e
 [[ ${missing_token_rc} -ne 0 ]] || fail 'check mode accepted a missing GH_TOKEN'
 assert_contains "${scratch}/check-missing-gh-token.output" \
   'GH_TOKEN must be set so the protected-CI receipt can be re-verified against GitHub'
+
+for receipt_case in missing duplicate nonzero failed malformed interrupted absent; do
+  run_case "local_receipt_${receipt_case}" failure check
+  assert_not_contains "${scratch}/local_receipt_${receipt_case}/commands.log" '^docker '
+done
 
 run_case check_success success check
 assert_contains "${scratch}/check_success/output" '^PREFLIGHT PASSED:'
