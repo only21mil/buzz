@@ -74,6 +74,9 @@ use crate::config::CiPolicyConfig;
 use crate::state::AppState;
 use crate::tenant::bind_community;
 use buzz_core::channel::MemberRole;
+use buzz_core::ci::workflow::workflow_path_for_selector;
+#[cfg(test)]
+use buzz_core::ci::workflow::DEFAULT_WORKFLOW_PATH;
 use buzz_core::ci::{CiArtifactReferenceEnvelope, CiRequestEnvelope, ValidatedCiEnvelope};
 use buzz_core::kind::{
     KIND_CI_ARTIFACT_REFERENCE, KIND_CI_JOB_STATUS, KIND_CI_LOG_REFERENCE, KIND_GIT_PR_UPDATE,
@@ -106,14 +109,6 @@ const PREFLIGHT_OID_OUTPUT_BYTES: u64 = 1024;
 /// memory in this process.
 const MAX_WORKFLOW_BYTES: u64 = 128 * 1024;
 
-/// Authoritative default CI workflow path inside the trusted base tree.
-///
-/// This is the value the materializer and the execd `act` plan both use
-/// (`crates/buzz-ci-materializer/src/{plan,execute,tree}.rs`,
-/// `buzz-ci-execd/src/normal_source.rs`). The relay asserts it resolves in
-/// the base tree and fails closed (`workflow_not_found`) when absent.
-const DEFAULT_WORKFLOW_PATH: &str = ".github/workflows/ci.yml";
-
 /// Static identifier used when the canonical workflow defines no top-level
 /// `name`. Pinned by the CLI fixtures, the auth gate, the DB `ci_runs`
 /// projection, and the runner (`workflow_id: "ci"` everywhere).
@@ -132,7 +127,7 @@ pub struct PreflightRequest {
     pub target_repo_a: String,
     /// Exact full source object ID (SHA-1 or SHA-256).
     pub requested_tip_oid: String,
-    /// Optional workflow ID or digest selector.
+    /// Optional workflow ID or digest selector; `native-macos` selects its fixed registered path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workflow_selector: Option<String>,
     /// Optional explicit static job selection.
@@ -438,27 +433,12 @@ pub async fn ci_preflight(
     // source tip (protocol contract §9.4).  The relay holds no broker lease,
     // so we run the materializer's exact substitution: read the trusted-base
     // workflow blob from the hydrated object store.
-    let workflow = resolve_workflow_at_base(repo.path(), &base_oid).await?;
-
-    // Selector binding (protocol §9.4): a 64-hex selector selects by digest,
-    // any other non-empty selector by workflow_id; the resolved single
-    // eligible workflow must match, else `workflow_not_found`.
-    if let Some(selector) = request.workflow_selector.as_deref() {
-        let matches = if is_hex_oid(selector) && selector.len() == 64 {
-            selector == workflow.workflow_digest
-        } else {
-            selector == workflow.workflow_id
-        };
-        if !matches {
-            return Err(api_error(
-                StatusCode::NOT_FOUND,
-                &format!(
-                    "workflow_not_found: selector {selector} does not resolve \
-                     to the workflow at {DEFAULT_WORKFLOW_PATH} in trusted base {base_oid}"
-                ),
-            ));
-        }
-    }
+    let workflow = resolve_selected_workflow_at_base(
+        repo.path(),
+        &base_oid,
+        request.workflow_selector.as_deref(),
+    )
+    .await?;
 
     // Job selection (protocol contract §9.5) — parsed from the canonical
     // workflow bytes, never the client.
@@ -767,15 +747,24 @@ pub(crate) async fn resolve_workflow_at_base(
     repo_path: &Path,
     base_oid: &str,
 ) -> Result<ResolvedWorkflow, (StatusCode, Json<Value>)> {
+    resolve_selected_workflow_at_base(repo_path, base_oid, None).await
+}
+
+async fn resolve_selected_workflow_at_base(
+    repo_path: &Path,
+    base_oid: &str,
+    selector: Option<&str>,
+) -> Result<ResolvedWorkflow, (StatusCode, Json<Value>)> {
+    let workflow_path = workflow_path_for_selector(selector);
     let deadline = Instant::now() + PREFLIGHT_GIT_TIMEOUT;
-    let spec = format!("{base_oid}:{DEFAULT_WORKFLOW_PATH}");
+    let spec = format!("{base_oid}:{workflow_path}");
     let blob_oid = git_rev_parse_object(repo_path, &spec, deadline)
         .await
         .ok_or_else(|| {
             api_error(
                 StatusCode::NOT_FOUND,
                 &format!(
-                    "workflow_not_found: no CI workflow at {DEFAULT_WORKFLOW_PATH} in trusted base {base_oid}"
+                    "workflow_not_found: no CI workflow at {workflow_path} in trusted base {base_oid}"
                 ),
             )
         })?;
@@ -799,13 +788,32 @@ pub(crate) async fn resolve_workflow_at_base(
             &format!("invalid canonical workflow at trusted base {base_oid}: {reason}"),
         )
     })?;
-    Ok(ResolvedWorkflow {
-        workflow_path: DEFAULT_WORKFLOW_PATH.to_string(),
+    let resolved = ResolvedWorkflow {
+        workflow_path: workflow_path.to_string(),
         workflow_digest: hex::encode(Sha256::digest(&bytes)),
         canonical_workflow_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
         workflow_id: workflow_id(&bytes),
         jobs,
-    })
+    };
+    // Only the registered path is consulted. Unknown selectors cannot select
+    // another repository path, and native-macos must match the canonical name.
+    if let Some(selector) = selector {
+        let matches = if is_hex_oid(selector) && selector.len() == 64 {
+            selector == resolved.workflow_digest
+        } else {
+            selector == resolved.workflow_id
+        };
+        if !matches {
+            return Err(api_error(
+                StatusCode::NOT_FOUND,
+                &format!(
+                    "workflow_not_found: selector {selector} does not resolve \
+                     to the workflow at {workflow_path} in trusted base {base_oid}"
+                ),
+            ));
+        }
+    }
+    Ok(resolved)
 }
 
 /// Top-level workflow `name:` (a stable static identifier when defined),
@@ -4798,6 +4806,110 @@ jobs:
             .await
             .expect("workflow bytes must read");
         assert_eq!(bytes.as_slice(), b"jobs:\n  test:\n    runs-on: linux\n");
+
+        // Ordinary omission/name/digest resolution still reads the default.
+        let ordinary = resolve_workflow_at_base(&bare, &tip).await.unwrap();
+        assert_eq!(ordinary.workflow_id, "ci");
+        for selector in ["ci", ordinary.workflow_digest.as_str()] {
+            let selected = resolve_selected_workflow_at_base(&bare, &tip, Some(selector))
+                .await
+                .unwrap();
+            assert_eq!(selected.workflow_path, DEFAULT_WORKFLOW_PATH);
+            assert_eq!(selected.workflow_digest, ordinary.workflow_digest);
+        }
+
+        let native_path = ".buzz/workflows/native-macos.yml";
+        let native_bytes =
+            b"name: native-macos\njobs:\n  desktop-build-macos-unsigned:\n    runs-on: apple-mbp\n";
+        std::fs::create_dir_all(source.join(".buzz/workflows")).unwrap();
+        std::fs::write(source.join(native_path), native_bytes).unwrap();
+        run_ok(&source, &["add", "--all"]);
+        run_ok(&source, &["commit", "-m", "register native workflow"]);
+        run_ok(&source, &["push", bare.to_str().unwrap(), "main:main"]);
+        let native_base = String::from_utf8(run_ok(&source, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // A workflow present only in the candidate cannot register against an
+        // older trusted base, even when the same object store contains it.
+        let (status, body) = resolve_selected_workflow_at_base(&bare, &tip, Some("native-macos"))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            body.0["error"],
+            format!("workflow_not_found: no CI workflow at {native_path} in trusted base {tip}")
+        );
+
+        // The candidate shadows both workflow paths, but each selector still
+        // resolves its canonical bytes from the supplied trusted base.
+        std::fs::write(
+            source.join(native_path),
+            b"name: impostor\njobs:\n  injected:\n    runs-on: apple-mbp\n",
+        )
+        .unwrap();
+        std::fs::write(
+            source.join(DEFAULT_WORKFLOW_PATH),
+            b"name: Candidate\njobs:\n  injected:\n    runs-on: linux\n",
+        )
+        .unwrap();
+        run_ok(&source, &["add", "--all"]);
+        run_ok(&source, &["commit", "-m", "candidate shadows workflows"]);
+        run_ok(&source, &["push", bare.to_str().unwrap(), "main:main"]);
+        let candidate = String::from_utf8(run_ok(&source, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let native = resolve_selected_workflow_at_base(&bare, &native_base, Some("native-macos"))
+            .await
+            .unwrap();
+        assert_eq!(native.workflow_path, native_path);
+        assert_eq!(native.workflow_id, "native-macos");
+        assert_eq!(
+            native.workflow_digest,
+            hex::encode(Sha256::digest(native_bytes))
+        );
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(native.canonical_workflow_base64)
+                .unwrap(),
+            native_bytes
+        );
+        assert_eq!(native.jobs.len(), 1);
+        assert_eq!(native.jobs[0].job_id, "desktop-build-macos-unsigned");
+        assert_eq!(
+            resolve_workflow_at_base(&bare, &native_base)
+                .await
+                .unwrap()
+                .workflow_digest,
+            ordinary.workflow_digest
+        );
+
+        // A renamed native workflow is not a match, and raw paths, unknown
+        // names, and native digests cannot expand the ordinary workflow set.
+        let (status, body) =
+            resolve_selected_workflow_at_base(&bare, &candidate, Some("native-macos"))
+                .await
+                .err()
+                .unwrap();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0["error"], format!("workflow_not_found: selector native-macos does not resolve to the workflow at {native_path} in trusted base {candidate}"));
+        for selector in [
+            native_path,
+            "../native-macos",
+            "unknown",
+            native.workflow_digest.as_str(),
+        ] {
+            let (status, body) =
+                resolve_selected_workflow_at_base(&bare, &native_base, Some(selector))
+                    .await
+                    .err()
+                    .unwrap();
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(body.0["error"], format!("workflow_not_found: selector {selector} does not resolve to the workflow at {DEFAULT_WORKFLOW_PATH} in trusted base {native_base}"));
+        }
 
         // An arbitrary object ID that is not reachable fails closed.
         let ghost = "1".repeat(40);
