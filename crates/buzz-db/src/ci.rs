@@ -1446,7 +1446,7 @@ async fn load_ci_event_by_id_tx(
     row.map(row_to_ci_stored_event).transpose()
 }
 
-fn row_to_ci_stored_event(row: sqlx::postgres::PgRow) -> Result<CiStoredEvent> {
+pub(crate) fn row_to_ci_stored_event(row: sqlx::postgres::PgRow) -> Result<CiStoredEvent> {
     let watch_cursor = row.try_get("watch_cursor")?;
     let accepted_at = row.try_get("accepted_at")?;
     let stored_event = event::row_to_stored_event(row)?.ok_or_else(|| {

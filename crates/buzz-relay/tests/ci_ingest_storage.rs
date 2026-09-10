@@ -2432,3 +2432,229 @@ async fn load_ci_check_returns_the_stored_check_with_its_relay_accepted_at() {
         Err(buzz_db::DbError::InvalidData(_))
     ));
 }
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn landing_reads_list_runs_for_a_tip_newest_first_with_their_stored_checks() {
+    use buzz_db::ci_landing::{
+        list_ci_run_checks, list_ci_runs_for_tip, list_merge_gate_decisions,
+    };
+
+    let pool = pool().await;
+    let (community_id, channel_id) = tenant_channel(&pool).await;
+    let actor = Keys::generate();
+    let control = Keys::generate();
+    let signers: HashSet<String> = [control.public_key().to_hex()].into_iter().collect();
+
+    // An older run without a check, then a newer green run with a check.
+    let (older_envelope, older_request) =
+        new_stored_request(&pool, community_id, channel_id, &actor, &signers).await;
+    let (request_envelope, request_event) =
+        new_stored_request(&pool, community_id, channel_id, &actor, &signers).await;
+    let (evidence, teardown, terminal) = store_success_chain(
+        &pool,
+        community_id,
+        channel_id,
+        &control,
+        &request_envelope,
+        &request_event,
+        &signers,
+    )
+    .await;
+    let check_event = check(
+        &control,
+        channel_id,
+        &request_envelope,
+        &request_event.id.to_hex(),
+        &terminal.id.to_hex(),
+        CiRunState::Success,
+        None,
+        Some((&evidence.id.to_hex(), &teardown.id.to_hex())),
+        1_800_000_050,
+    );
+    let stored = match store(&pool, community_id, channel_id, &check_event, &signers)
+        .await
+        .expect("store check")
+    {
+        StoreCiEventOutcome::Stored(stored) => stored,
+        StoreCiEventOutcome::Reused(_) => panic!("fresh check must be stored"),
+    };
+
+    let runs = list_ci_runs_for_tip(
+        &pool,
+        community_id,
+        channel_id,
+        &request_envelope.target_repo_a,
+        &request_envelope.tip_oid,
+        Some("ci"),
+        10,
+    )
+    .await
+    .expect("list runs for tip");
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].run_id.to_string(), request_envelope.run_id);
+    assert_eq!(runs[1].run_id.to_string(), older_envelope.run_id);
+    assert_eq!(
+        runs[0].initial_request_event_id,
+        request_event.id.as_bytes().to_vec()
+    );
+    assert_eq!(
+        runs[1].initial_request_event_id,
+        older_request.id.as_bytes().to_vec()
+    );
+    assert_eq!(runs[0].base_oid, request_envelope.base_oid);
+    assert_eq!(runs[0].workflow_id, "ci");
+    assert_eq!(
+        hex::encode(&runs[0].workflow_digest),
+        request_envelope.workflow_digest
+    );
+    assert!(runs[0].created_at >= runs[1].created_at);
+
+    // Another workflow, another channel, or a limit of one narrows the list.
+    assert!(list_ci_runs_for_tip(
+        &pool,
+        community_id,
+        channel_id,
+        &request_envelope.target_repo_a,
+        &request_envelope.tip_oid,
+        Some("release"),
+        10,
+    )
+    .await
+    .expect("other workflow")
+    .is_empty());
+    assert!(list_ci_runs_for_tip(
+        &pool,
+        community_id,
+        Uuid::new_v4(),
+        &request_envelope.target_repo_a,
+        &request_envelope.tip_oid,
+        None,
+        10,
+    )
+    .await
+    .expect("other channel")
+    .is_empty());
+    let latest = list_ci_runs_for_tip(
+        &pool,
+        community_id,
+        channel_id,
+        &request_envelope.target_repo_a,
+        &request_envelope.tip_oid,
+        None,
+        1,
+    )
+    .await
+    .expect("latest run only");
+    assert_eq!(latest.len(), 1);
+    assert_eq!(latest[0].run_id, runs[0].run_id);
+
+    // The newer run lists its check with the indexed accepted_at; the older
+    // run has none; another channel sees none.
+    let checks = list_ci_run_checks(&pool, community_id, channel_id, runs[0].run_id)
+        .await
+        .expect("list checks");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0].stored_event.event, check_event);
+    assert_eq!(checks[0].watch_cursor, stored.watch_cursor);
+    assert_eq!(checks[0].accepted_at, stored.accepted_at);
+    assert!(
+        list_ci_run_checks(&pool, community_id, channel_id, runs[1].run_id)
+            .await
+            .expect("older run checks")
+            .is_empty()
+    );
+    assert!(
+        list_ci_run_checks(&pool, community_id, Uuid::new_v4(), runs[0].run_id)
+            .await
+            .expect("other channel checks")
+            .is_empty()
+    );
+
+    // Decision rows read newest first, narrowed by old_oid when given.
+    let repo = &request_envelope.target_repo_a;
+    let landed = "66".repeat(20);
+    for (old, code, mode) in [
+        (request_envelope.base_oid.clone(), "check_pending", "shadow"),
+        (request_envelope.base_oid.clone(), "allow", "enforce"),
+        ("77".repeat(20), "allow", "enforce"),
+    ] {
+        sqlx::query(
+            "INSERT INTO git_merge_gate_decisions \
+             (community_id, target_repo_a, ref_name, old_oid, new_oid, candidate_oid, \
+              classification, run_id, check_event_id, signer, code, mode, pusher) \
+             VALUES ($1, $2, 'refs/heads/main', $3, $4, $5, 'merge', $6, $7, $8, $9, $10, $11)",
+        )
+        .bind(community_id.as_uuid())
+        .bind(repo)
+        .bind(&old)
+        .bind(&landed)
+        .bind(&request_envelope.tip_oid)
+        .bind(runs[0].run_id)
+        .bind(check_event.id.as_bytes().to_vec())
+        .bind(control.public_key().to_hex())
+        .bind(code)
+        .bind(mode)
+        .bind(actor.public_key().to_hex())
+        .execute(&pool)
+        .await
+        .expect("insert decision row");
+    }
+    let decisions = list_merge_gate_decisions(
+        &pool,
+        community_id,
+        repo,
+        "refs/heads/main",
+        &landed,
+        Some(&request_envelope.base_oid),
+        10,
+    )
+    .await
+    .expect("list decisions");
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(decisions[0].code, "allow");
+    assert_eq!(decisions[0].mode, "enforce");
+    assert_eq!(decisions[1].code, "check_pending");
+    assert_eq!(decisions[0].run_id, Some(runs[0].run_id));
+    assert_eq!(
+        decisions[0].check_event_id.as_deref(),
+        Some(check_event.id.as_bytes().as_slice())
+    );
+    assert_eq!(
+        decisions[0].signer.as_deref(),
+        Some(control.public_key().to_hex().as_str())
+    );
+    assert_eq!(
+        decisions[0].candidate_oid.as_deref(),
+        Some(request_envelope.tip_oid.as_str())
+    );
+    assert!(decisions[0].decided_at >= decisions[1].decided_at);
+    let all = list_merge_gate_decisions(
+        &pool,
+        community_id,
+        repo,
+        "refs/heads/main",
+        &landed,
+        None,
+        10,
+    )
+    .await
+    .expect("all decisions");
+    assert_eq!(all.len(), 3);
+    assert!(list_merge_gate_decisions(
+        &pool,
+        community_id,
+        "30617:other:repo",
+        "refs/heads/main",
+        &landed,
+        None,
+        10,
+    )
+    .await
+    .expect("other repository")
+    .is_empty());
+    assert!(matches!(
+        list_merge_gate_decisions(&pool, community_id, repo, "", &landed, None, 10).await,
+        Err(buzz_db::DbError::InvalidData(_))
+    ));
+}
