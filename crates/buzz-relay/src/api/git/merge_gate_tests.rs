@@ -1547,6 +1547,7 @@ mod harness {
                     rules: std::slice::from_ref(&rules),
                     ref_updates: std::slice::from_ref(&update),
                 },
+                tokio::time::Instant::now() + EVALUATION_TIMEOUT,
             )
             .await
         }
@@ -1604,6 +1605,78 @@ mod harness {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires Postgres and git"]
+    async fn callback_authorization_spends_gate_deadline() {
+        use crate::api::git::policy::{generate_hook_hmac, hook_policy_check, HookCallbackRequest};
+        use axum::{extract::State, http::StatusCode, Json};
+        for mode in [MergeGateMode::Shadow, MergeGateMode::Enforce] {
+            let h = Harness::start(|config| config.ci.merge_gate.mode = mode).await;
+            let base = h.main_oid_on_relay();
+            let candidate = h.candidate(&base, "auth.txt", "authorization\n", "authorization");
+            h.seed_run(PINNED, &candidate, &base, &digest(WORKFLOW_V1), Seed::Green)
+                .await;
+            let mut req = HookCallbackRequest {
+                repo_id: h.repo_id.clone(),
+                repo_owner: h.owner_hex(),
+                community_id: h.community.as_uuid().to_string(),
+                pusher_pubkey: h.owner_hex(),
+                ref_updates: vec![h.facts(&base, &candidate)],
+                timestamp: Utc::now().timestamp() as u64,
+                signature: String::new(),
+            };
+            req.signature = generate_hook_hmac(
+                h.state.config.git_hook_hmac_secret.as_bytes(),
+                &req.repo_id,
+                &req.repo_owner,
+                &req.community_id,
+                &req.pusher_pubkey,
+                &req.ref_updates,
+                req.timestamp,
+            );
+            let mut audit_lock = h.pool.begin().await.expect("audit transaction");
+            sqlx::query("LOCK TABLE git_merge_gate_decisions IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *audit_lock)
+                .await
+                .expect("lock audit writes");
+            let mut auth_lock = h.pool.begin().await.expect("authorization transaction");
+            sqlx::query("LOCK TABLE channel_members IN ACCESS EXCLUSIVE MODE")
+                .execute(&mut *auth_lock)
+                .await
+                .expect("lock authorization reads");
+            let release_auth = tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(4)).await;
+                auth_lock
+                    .rollback()
+                    .await
+                    .expect("release authorization reads");
+            });
+            let started = std::time::Instant::now();
+            // Drive the signed callback directly so transport authorization
+            // before the hook cannot consume the controlled four-second delay.
+            let response = hook_policy_check(State(h.state.clone()), Json(req)).await;
+            let elapsed = started.elapsed();
+            audit_lock.rollback().await.expect("release audit writes");
+            release_auth.await.expect("authorization release task");
+            assert!(elapsed >= EVALUATION_TIMEOUT);
+            assert!(
+                elapsed < Duration::from_secs(8),
+                "callback reset the budget after authorization: {elapsed:?}"
+            );
+            let (status, body) = crate::api::git::policy::tests::body_string(response).await;
+            if mode == MergeGateMode::Shadow {
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert!(body.contains("\"allowed\":true"), "{body}");
+            } else {
+                assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+                assert!(
+                    body.contains("gate_misconfigured: evaluation deadline exceeded"),
+                    "{body}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires Postgres and git"]
     async fn newest_run_mismatch_supersedes_older_green() {
         let h = Harness::start(|config| config.ci.merge_gate.mode = MergeGateMode::Enforce).await;
         let base = h.main_oid_on_relay();
@@ -1618,17 +1691,10 @@ mod harness {
             ),
         ] {
             let candidate = h.candidate(&base, "order.txt", name, name);
-            let (older, _) = h
-                .seed_run(PINNED, &candidate, &base, &v1, Seed::Green)
+            h.seed_run(PINNED, &candidate, &base, &v1, Seed::Green)
                 .await;
-            // Make chronology deterministic independent of clock precision.
-            sqlx::query(
-                "UPDATE ci_runs SET created_at = created_at - interval '1 hour' WHERE run_id = $1",
-            )
-            .bind(older)
-            .execute(&h.pool)
-            .await
-            .expect("backdate older run");
+            // Requests are accepted in separate committed transactions, so
+            // the second run is newer without mutating immutable run identity.
             h.seed_run(PINNED, &candidate, &newer_base, &newer_digest, Seed::Green)
                 .await;
             assert_refused(h.push(&format!("{candidate}:refs/heads/main")), code);
@@ -1648,8 +1714,14 @@ mod harness {
         ] {
             let h = Harness::start(|config| config.ci.merge_gate.mode = mode).await;
             let base = h.main_oid_on_relay();
-            let result = h.push(":refs/heads/main");
-            assert_refused(result, "no-delete");
+            let stderr = h
+                .push(":refs/heads/main")
+                .expect_err("deletion must be refused");
+            assert!(
+                stderr.contains("ref deletion denied: no-delete is set"),
+                "{stderr}"
+            );
+            assert!(stderr.contains("pre-receive hook declined"), "{stderr}");
             assert_eq!(h.main_oid_on_relay(), base);
         }
     }

@@ -274,6 +274,10 @@ pub async fn hook_policy_check(
     State(state): State<Arc<AppState>>,
     Json(req): Json<HookCallbackRequest>,
 ) -> Response {
+    // Authorization and policy reads spend the same budget as the merge gate.
+    // A slow read must not grant the gate a fresh six seconds at callback end.
+    let gate_deadline = tokio::time::Instant::now() + super::merge_gate::EVALUATION_TIMEOUT;
+
     // 1. Validate input fields (cheap structural checks before expensive HMAC).
     // This prevents wasting CPU on malformed payloads.
     if req.repo_id.is_empty() || req.repo_id.len() > 64 {
@@ -500,6 +504,7 @@ pub async fn hook_policy_check(
             rules: &rules,
             ref_updates: &req.ref_updates,
         },
+        gate_deadline,
     )
     .await;
     if !gate_denials.is_empty() {

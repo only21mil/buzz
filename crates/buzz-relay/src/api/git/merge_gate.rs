@@ -57,8 +57,9 @@ const MAX_RUN_EVENTS: usize = 10_000;
 /// Budget for hydrating the published state inside the hook callback.
 const HYDRATE_TIMEOUT: Duration = Duration::from_secs(8);
 /// One budget for all refs, including hydration, verification and audit writes.
-/// Leave four seconds for the policy callback and its 10-second curl deadline.
-const EVALUATION_TIMEOUT: Duration = Duration::from_secs(6);
+/// Starts at callback entry, leaving four seconds for response delivery before
+/// the hook's 10-second curl deadline. Existing authorization still fails closed.
+pub(crate) const EVALUATION_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Refusal codes of design section 1.4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -492,8 +493,9 @@ fn repo_coordinate(owner: &str, repo_id: &str) -> String {
 pub(crate) async fn evaluate_push_gate(
     state: &Arc<AppState>,
     ctx: &GatePushContext<'_>,
+    deadline: tokio::time::Instant,
 ) -> Vec<Denial> {
-    match tokio::time::timeout(EVALUATION_TIMEOUT, evaluate_push_gate_inner(state, ctx)).await {
+    match tokio::time::timeout_at(deadline, evaluate_push_gate_inner(state, ctx)).await {
         Ok(denials) => denials,
         Err(_) => {
             let mode = state.config.ci.merge_gate.mode;
