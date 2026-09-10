@@ -50,6 +50,18 @@ class SupervisorTests(unittest.TestCase):
         submit.validate_result(self.result if result is None else result, self.admission, self.profile,
                                self.profile_digest, self.invocation, self.state if state is None else state)
 
+    def test_launch_exposes_only_dedicated_runtime_under_private_home_mounts(self):
+        account = SimpleNamespace(pw_uid=1234, pw_gid=1234, pw_name="buzzci-linux",
+                                  pw_dir="/var/lib/buzzci/linux-runner/home")
+        with patch.object(submit.pwd, "getpwuid", return_value=account), \
+             patch.object(submit, "_command", return_value=subprocess.CompletedProcess([], 0)) as command:
+            submit._launch("buzz-ci-linux-test.service", Path("/private/claim"), self.profile)
+        argv = command.call_args.args[0]
+        self.assertIn("--property=ProtectHome=tmpfs", argv)
+        self.assertIn("--property=BindPaths=/run/user/1234", argv)
+        self.assertNotIn("--property=ProtectHome=yes", argv)
+        self.assertIn("--property=ProtectSystem=strict", argv)
+
     def test_matching_source_and_actual_exit_are_required(self):
         self.validate()
         for change in ("admission", "profile_sha256", "invocation_digest", "job_id", "cleanup_proven"):

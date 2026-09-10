@@ -193,3 +193,9 @@ The pinned official Ubuntu image has not been run during source preparation.
 The reviewed host operation must first verify `/bin/bash`, `cp`, `grep` and the
 shell builtins required by the actual workload. Python and `rg` are not needed
 inside this profile because qualification bookkeeping becomes native evidence.
+
+The host unit hides other home directories with `ProtectHome=tmpfs` and exposes
+only the dedicated `/run/user/UID` using `BindPaths`. `ProtectHome=yes` masks
+that runtime directory even when `ReadWritePaths` lists it and prevents Podman
+from starting. The account home and jobs remain bounded writable paths under
+`/var/lib/buzzci/linux-runner`.
