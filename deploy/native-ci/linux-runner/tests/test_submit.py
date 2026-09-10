@@ -72,6 +72,7 @@ class SupervisorTests(unittest.TestCase):
         self.assertIn("--property=BindPaths=/run/user/1234", argv)
         self.assertNotIn("--property=ProtectHome=yes", argv)
         self.assertIn("--property=ProtectSystem=strict", argv)
+        self.assertIn("--property=RestrictSUIDSGID=no", argv)
 
     def test_matching_source_and_actual_exit_are_required(self):
         self.validate()

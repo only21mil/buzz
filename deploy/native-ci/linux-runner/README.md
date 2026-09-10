@@ -206,3 +206,7 @@ The workspace uses Podman's typed tmpfs mount with `U=true`, which sets its
 owner from the fixed container user `1000:1000`. Its mode stays 0700 and its
 size, exec, nosuid and nodev bounds are unchanged. Raw `uid`/`gid` options on
 `--tmpfs` are rejected by the installed Podman 5.8.4 parser.
+The host Podman helper permits setuid/setgid metadata creation because image
+preload and each subordinate-ID layer copy preserve Ubuntu file modes. The
+container still drops all capabilities, enforces no-new-privileges and mounts
+its image read-only. No workflow command executes on the host.

@@ -81,7 +81,10 @@ def _launch(unit: str, directory: Path, profile: dict) -> None:
         raise Refused("dedicated runtime account required")
     # newuidmap/newgidmap need their installed privilege transition for rootless
     # Podman. NoNewPrivileges is enforced inside the container, not on this host
-    # helper service. The job never executes on the host as this account.
+    # helper service. Podman also preserves setuid/setgid image metadata while
+    # creating each subordinate-ID layer copy, so RestrictSUIDSGID must be off
+    # here. The job never executes on the host as this account; container
+    # no-new-privileges, dropped capabilities and read-only image remain fixed.
     properties = [
         "User=" + str(account.pw_uid), "Group=" + str(account.pw_gid),
         "RemainAfterExit=yes", "SuccessExitStatus=1", "KillMode=control-group", "TimeoutStopSec=45",
@@ -89,7 +92,7 @@ def _launch(unit: str, directory: Path, profile: dict) -> None:
         "TasksMax=512", "LimitCORE=0", "LimitFSIZE=2147483648", "PrivateTmp=yes",
         "ProtectSystem=strict", "ProtectHome=tmpfs", "ProtectKernelTunables=yes", "ProtectKernelModules=yes",
         "BindPaths=/run/user/" + str(account.pw_uid),
-        "ProtectKernelLogs=yes", "RestrictRealtime=yes", "RestrictSUIDSGID=yes",
+        "ProtectKernelLogs=yes", "RestrictRealtime=yes", "RestrictSUIDSGID=no",
         "ReadWritePaths=" + account.pw_dir + " " + str(worker.JOB_ROOT) + " /run/user/" + str(account.pw_uid),
         "StandardInput=file:" + str(directory / "registration.bin"),
         "StandardOutput=file:" + str(directory / "stdout.json"),
