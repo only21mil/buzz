@@ -10,7 +10,7 @@ use crate::ci::{
     CiJobStatusEnvelope, CiLogReferenceEnvelope, CiRequestEnvelope, CiRequestType, CiRunState,
     CiRunStatusEnvelope, CiSkipPolicy, CiTeardownAttestationEnvelope, ValidatedCiEnvelope,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use thiserror::Error;
 
@@ -26,7 +26,7 @@ pub struct AcceptedCiEnvelope {
 }
 
 /// Aggregate state shared by `status` and `verdict`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CiReducedState {
     /// Not every selected job is terminal yet.

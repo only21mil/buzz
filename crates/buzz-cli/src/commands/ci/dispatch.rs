@@ -70,6 +70,28 @@ pub async fn dispatch(cmd: CiCmd, client: &BuzzClient) -> Result<(), CliError> {
             let trusted = resolve_required_trusted_context()?;
             super::read_commands::cmd_watch(client, &run, timeout_seconds, &trusted).await
         }
+        CiCmd::Landing { action, verify } => match (action, verify) {
+            (
+                Some(super::landing::LandingCmd::Validate {
+                    receipt,
+                    reverify,
+                    max_age_seconds,
+                }),
+                _,
+            ) => {
+                super::landing::cmd_landing_validate(client, &receipt, reverify, max_age_seconds)
+                    .await
+            }
+            (None, Some(args)) => {
+                let trusted = resolve_required_trusted_context()?;
+                super::landing::cmd_landing(client, &args, &trusted).await
+            }
+            (None, None) => Err(CliError::Usage(
+                "buzz ci landing needs --repo-owner, --repo-id, --candidate, --base, --landed, \
+                 and --output, or the validate subcommand"
+                    .into(),
+            )),
+        },
     }
 }
 

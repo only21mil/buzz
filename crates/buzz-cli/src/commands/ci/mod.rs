@@ -1,5 +1,6 @@
 use clap::Subcommand;
 pub mod dispatch;
+pub mod landing;
 pub mod read_commands;
 // Helper modules encode the frozen wire contract (dead_code: relay-side surface).
 #[allow(dead_code)]
@@ -78,5 +79,15 @@ pub enum CiCmd {
         /// Hard deadline for the complete watch, in seconds
         #[arg(long)]
         timeout_seconds: u64,
+    },
+    /// Verify a Buzz-native landing on relay main and publish a receipt
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+    Landing {
+        /// `validate` re-verifies an existing receipt
+        #[command(subcommand)]
+        action: Option<landing::LandingCmd>,
+        /// Verification inputs
+        #[command(flatten)]
+        verify: Option<landing::LandingVerifyArgs>,
     },
 }

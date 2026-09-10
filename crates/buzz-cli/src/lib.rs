@@ -2851,7 +2851,7 @@ mod tests {
         assert_eq!(names(&cmd, "canvas"), vec!["get", "set"]);
         assert_eq!(
             names(&cmd, "ci"),
-            vec!["logs", "rerun", "run", "status", "verdict", "watch"]
+            vec!["landing", "logs", "rerun", "run", "status", "verdict", "watch"]
         );
         assert_eq!(names(&cmd, "reactions"), vec!["add", "get", "remove"]);
         assert_eq!(
