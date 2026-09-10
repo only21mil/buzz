@@ -275,18 +275,20 @@ def supervise(directory: Path, profile: dict, profile_digest: str, admission: di
                 # readback. Failure keeps the root claim quarantined. Never let
                 # an unavailable readback skip the exact-unit stop attempt.
                 try:
-                    if descriptor is None:
-                        slice_state = _state(slice_name)
-                        slice_identity = slice_state.get("InvocationID", "")
-                        descriptor, _, _ = _cgroup(slice_name, slice_state)
-                    cgroup_empty = _wait_empty_cgroup(descriptor)
-                except (Refused, OSError, ValueError, subprocess.SubprocessError):
-                    cgroup_empty = False
-                try:
                     stopped = _command([SYSTEMCTL, "stop", unit], timeout=50).returncode == 0
                     after = _state(unit)
                     stopped = stopped and after.get("ActiveState") in {"inactive", "failed"}
                 finally:
+                    # Stop the child before measuring the still-active parent slice,
+                    # including any runtime helpers retained after the worker exits.
+                    try:
+                        if descriptor is None:
+                            slice_state = _state(slice_name)
+                            slice_identity = slice_state.get("InvocationID", "")
+                            descriptor, _, _ = _cgroup(slice_name, slice_state)
+                        cgroup_empty = _wait_empty_cgroup(descriptor)
+                    except (Refused, OSError, ValueError, subprocess.SubprocessError):
+                        cgroup_empty = False
                     try:
                         # Stop only the exact slice invocation observed during our launch.
                         current_slice = _state(slice_name)

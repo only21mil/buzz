@@ -150,7 +150,7 @@ class SupervisorTests(unittest.TestCase):
                 states = self.lifecycle_states()
                 with patch.object(submit, "_state", side_effect=states), patch.object(submit, "_launch"), \
                      patch.object(submit, "_cgroup", return_value=(descriptor, Path(temporary), (1, 2))), \
-                     patch.object(submit, "_wait_empty_cgroup", return_value=cgroup_empty), \
+                     patch.object(submit, "_wait_empty_cgroup", side_effect=lambda fd: (self.assertEqual(command.call_args.args[0], [submit.SYSTEMCTL, "stop", "buzz-ci-linux-" + self.invocation + ".service"]), cgroup_empty)[1]), \
                      patch.object(submit, "_container_absent", return_value=container_absent), \
                      patch.object(worker, "_read_root_file", return_value=json.dumps(self.result).encode()), \
                      patch.object(submit, "_command", return_value=subprocess.CompletedProcess([], 0, b"")) as command:
@@ -174,7 +174,7 @@ class SupervisorTests(unittest.TestCase):
             command.assert_not_called()
 
     def test_partial_start_failure_still_stops_exact_unit(self):
-        with patch.object(submit, "_state", side_effect=[{"LoadState": "not-found"}, {"ActiveState": "inactive"}, self.slice_state, {"ActiveState": "inactive"}, self.slice_state, {"ActiveState": "inactive"}]), \
+        with patch.object(submit, "_state", side_effect=[{"LoadState": "not-found"}, {"ActiveState": "inactive"}, {"ActiveState": "inactive"}, self.slice_state, self.slice_state, {"ActiveState": "inactive"}]), \
              patch.object(submit, "_launch", side_effect=Refused("start")), \
              patch.object(submit, "_container_absent", return_value=False) as absent, \
              patch.object(submit, "_command", return_value=subprocess.CompletedProcess([], 0, b"")) as command:
