@@ -12,9 +12,9 @@ use buzz_ci_keyholder::{
     decode_response, encode_request, AcceptanceMutation, CanonicalPayload,
     DescribeAcceptanceRequest, DescribeAcceptanceResponse, DescribeRequest, DescribeResponse,
     ErrorCode, FrameHeader, HttpMethod as KeyholderHttpMethod, KeySelector, KeyholderClient,
-    ManifestKind, Nip98AuthorizeRequest, Nip98Signer, OperationSet, PeerPolicy, PublicIdentity,
-    QueryFilter, Request, Response, SelectorSet, SignAcceptanceMutationRequest, SignCiEventRequest,
-    SignManifestRequest, SignatureResponse, Url as KeyholderUrl, HEADER_SIZE,
+    ManifestKind, Nip98AuthorizeRequest, Nip98Signer, Operation, OperationSet, PeerPolicy,
+    PublicIdentity, QueryFilter, Request, Response, SelectorSet, SignAcceptanceMutationRequest,
+    SignCiEventRequest, SignManifestRequest, SignatureResponse, Url as KeyholderUrl, HEADER_SIZE,
     KEYHOLDER_SOCKET_PATH, MAX_BODY_SIZE,
 };
 use nostr::secp256k1::{schnorr::Signature, Message, XOnlyPublicKey, SECP256K1};
@@ -153,6 +153,7 @@ pub enum KeyholderError {
 pub struct UnixKeyholderClient {
     config: KeyholderClientConfig,
     ci_pubkey: String,
+    expected_operations: OperationSet,
     /// Activation-bound acceptance actor, bound after the keyholder's
     /// `describe_acceptance` matched the receipt. Only a client that publishes
     /// the five frozen acceptance events binds one.
@@ -172,14 +173,25 @@ impl UnixKeyholderClient {
     /// Validate the binding and perform an authenticated describe handshake.
     pub fn connect(config: KeyholderClientConfig) -> Result<Self, KeyholderError> {
         config.validate()?;
-        Self::connect_validated(config)
+        Self::connect_validated(config, OperationSet::ALL)
     }
 
-    fn connect_validated(config: KeyholderClientConfig) -> Result<Self, KeyholderError> {
+    /// Connect to the standalone native signer, without fixture acceptance authority.
+    /// The exact four-operation policy is required; broader or narrower policies fail.
+    pub fn connect_native(config: KeyholderClientConfig) -> Result<Self, KeyholderError> {
+        config.validate()?;
+        Self::connect_validated(config, native_operations())
+    }
+
+    fn connect_validated(
+        config: KeyholderClientConfig,
+        expected_operations: OperationSet,
+    ) -> Result<Self, KeyholderError> {
         let ci_pubkey = config.keyholder_selectors.ci_event.public_key.clone();
         let mut client = Self {
             config,
             ci_pubkey,
+            expected_operations,
             acceptance_actor: None,
         };
         let description = KeyholderClient::describe(&mut client, DescribeRequest)?;
@@ -190,14 +202,15 @@ impl UnixKeyholderClient {
     #[cfg(test)]
     fn connect_for_test(config: KeyholderClientConfig) -> Result<Self, KeyholderError> {
         config.validate_common()?;
-        Self::connect_validated(config)
+        Self::connect_validated(config, OperationSet::ALL)
     }
 
     /// Bind the acceptance actor this client may name as a `POST /events`
     /// publisher. The actor must be distinct from every keyholder selector.
     pub fn bind_acceptance_actor(&mut self, actor: PublicIdentity) -> Result<(), KeyholderError> {
         let selectors = self.config.keyholder_selectors.selector_set()?;
-        if actor.public_key == [0; 32]
+        if self.expected_operations != OperationSet::ALL
+            || actor.public_key == [0; 32]
             || actor.generation == 0
             || [
                 KeySelector::CiEvent,
@@ -252,10 +265,14 @@ impl UnixKeyholderClient {
 
     fn validate_description(&self, value: DescribeResponse) -> Result<(), KeyholderError> {
         let expected = self.config.keyholder_selectors.selector_set()?;
+        let peer_policy = PeerPolicy {
+            allowed_operations: self.expected_operations,
+            ..expected_client_policy()
+        };
         if value.ci_event != expected.identity(KeySelector::CiEvent)
             || value.nip98 != expected.identity(KeySelector::Nip98)
             || value.manifest != expected.identity(KeySelector::Manifest)
-            || value.peer_policy != expected_client_policy()
+            || value.peer_policy != peer_policy
         {
             return Err(KeyholderError::WrongIdentity);
         }
@@ -767,6 +784,13 @@ fn validate_socket_file(path: &Path, expected_owner_uid: u32) -> Result<(), Keyh
     Ok(())
 }
 
+fn native_operations() -> OperationSet {
+    OperationSet::only(Operation::Describe)
+        .union(OperationSet::only(Operation::SignCiEvent))
+        .union(OperationSet::only(Operation::Nip98Authorize))
+        .union(OperationSet::only(Operation::SignManifest))
+}
+
 #[cfg(target_os = "linux")]
 fn expected_client_policy() -> PeerPolicy {
     use nix::unistd::{getegid, geteuid};
@@ -857,6 +881,8 @@ mod tests {
     #[derive(Clone, Copy)]
     enum Reply {
         Describe,
+        DescribeNative,
+        DescribeIncomplete,
         SignCiEvent,
         DescribeAcceptance,
         SignAcceptance,
@@ -960,13 +986,22 @@ mod tests {
                     .expect("request body");
                 let (request_header, request) = decode_request(&frame).expect("request");
                 let (response_header, response) = match reply {
-                    Reply::Describe => (
+                    Reply::Describe | Reply::DescribeNative | Reply::DescribeIncomplete => (
                         request_header,
                         Response::Describe(DescribeResponse {
                             ci_event: selector_state.identity(KeySelector::CiEvent),
                             nip98: selector_state.identity(KeySelector::Nip98),
                             manifest: selector_state.identity(KeySelector::Manifest),
-                            peer_policy: expected_client_policy(),
+                            peer_policy: PeerPolicy {
+                                allowed_operations: match reply {
+                                    Reply::DescribeNative => native_operations(),
+                                    Reply::DescribeIncomplete => {
+                                        OperationSet::only(Operation::Describe)
+                                    }
+                                    _ => OperationSet::ALL,
+                                },
+                                ..expected_client_policy()
+                            },
                         }),
                     ),
                     Reply::Stale => (
@@ -1132,6 +1167,30 @@ mod tests {
         });
         ready_rx.recv().expect("server ready");
         (directory, path, handle)
+    }
+
+    #[test]
+    fn native_and_fixture_clients_require_their_exact_operation_sets() {
+        for (reply, operations, accepted) in [
+            (Reply::Describe, OperationSet::ALL, true),
+            (Reply::DescribeNative, native_operations(), true),
+            (Reply::Describe, native_operations(), false),
+            (Reply::DescribeNative, OperationSet::ALL, false),
+            (Reply::DescribeIncomplete, native_operations(), false),
+        ] {
+            let (_directory, path, server) = spawn_server(vec![reply]);
+            let config = config(path, 500, 1);
+            config.validate_common().unwrap();
+            let result = UnixKeyholderClient::connect_validated(config, operations);
+            assert_eq!(result.is_ok(), accepted);
+            if accepted && operations == native_operations() {
+                assert_eq!(
+                    result.unwrap().bind_acceptance_actor(actor_identity()),
+                    Err(KeyholderError::InvalidConfig)
+                );
+            }
+            server.join().unwrap();
+        }
     }
 
     #[test]

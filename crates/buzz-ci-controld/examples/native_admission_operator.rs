@@ -324,7 +324,7 @@ fn run() -> Result<()> {
         );
         return Ok(());
     }
-    let mut signer = UnixKeyholderClient::connect(authority.keyholder.clone())?;
+    let mut signer = UnixKeyholderClient::connect_native(authority.keyholder.clone())?;
     let bindings = authority.bindings()?;
     let admission = prepare_signed_admission(&accepted, &bindings, &mut signer)?;
     let (header, registration) = prepare_job_intent_registration(admission, &accepted, &bindings)?;

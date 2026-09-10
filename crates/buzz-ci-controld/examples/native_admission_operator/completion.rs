@@ -464,7 +464,7 @@ fn connect_relay(authority: &Authority, url: &str) -> Result<NativeRelay> {
     Ok(AuthenticatedRelay::new(
         url.parse()?,
         transport,
-        UnixKeyholderClient::connect(authority.keyholder.clone())?,
+        UnixKeyholderClient::connect_native(authority.keyholder.clone())?,
     )?)
 }
 
@@ -524,7 +524,7 @@ fn begin(args: &[String]) -> Result<()> {
     };
     let mut handler = ProductionHandler::new(
         relay,
-        UnixKeyholderClient::connect(authority.keyholder.clone())?,
+        UnixKeyholderClient::connect_native(authority.keyholder.clone())?,
         UnavailableAttempt,
         store.clone(),
         RetainedEvidence(BTreeMap::new()),
@@ -594,7 +594,7 @@ fn await_request(args: &[String]) -> Result<()> {
         let mut relay = AuthenticatedRelay::new(
             args[5].parse()?,
             transport,
-            UnixKeyholderClient::connect(keyholder)?,
+            UnixKeyholderClient::connect_native(keyholder)?,
         )?;
         let next = relay.next_accepted_event(&authority.channel_id, cursor)?;
         require(std::time::Instant::now() < deadline)?;
@@ -681,7 +681,7 @@ pub(super) fn run(args: &[String]) -> Result<()> {
         store.load_publication(&format!("{}:run:queued", accepted.event_id))?,
         Some(StoredPublication::Accepted { .. })
     ))?;
-    let signer = UnixKeyholderClient::connect(authority.keyholder.clone())?;
+    let signer = UnixKeyholderClient::connect_native(authority.keyholder.clone())?;
     let signer_key = signer.pubkey().to_owned();
     let mut handler = ProductionHandler::new(
         relay,
