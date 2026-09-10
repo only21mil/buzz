@@ -65,6 +65,17 @@ def _empty_cgroup(descriptor: int) -> bool:
     return len(content) <= 4096 and b"populated 0" in content.splitlines()
 
 
+def _wait_empty_cgroup(descriptor: int, timeout: float = 10) -> bool:
+    # A service can be reported exited while dying tasks still contribute to
+    # recursive population. Retain the slice and wait for the actual counter.
+    deadline = time.monotonic() + timeout
+    while not _empty_cgroup(descriptor):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+    return True
+
+
 def _container_absent(profile: dict, invocation: str) -> bool:
     account = pwd.getpwuid(profile["runtime_uid"])
     result = _command(["/usr/sbin/runuser", "--user", account.pw_name, "--", "/usr/bin/env", "-i",
@@ -268,7 +279,7 @@ def supervise(directory: Path, profile: dict, profile_digest: str, admission: di
                         slice_state = _state(slice_name)
                         slice_identity = slice_state.get("InvocationID", "")
                         descriptor, _, _ = _cgroup(slice_name, slice_state)
-                    cgroup_empty = _empty_cgroup(descriptor)
+                    cgroup_empty = _wait_empty_cgroup(descriptor)
                 except (Refused, OSError, ValueError, subprocess.SubprocessError):
                     cgroup_empty = False
                 try:

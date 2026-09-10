@@ -56,6 +56,18 @@ class SupervisorTests(unittest.TestCase):
         submit.validate_result(self.result if result is None else result, self.admission, self.profile,
                                self.profile_digest, self.invocation, self.state if state is None else state)
 
+    def test_waits_for_actual_population_zero_and_times_out_on_survivors(self):
+        with patch.object(submit, "_empty_cgroup", side_effect=[False, False, True]) as empty, \
+             patch.object(submit.time, "sleep"):
+            self.assertTrue(submit._wait_empty_cgroup(42))
+            self.assertEqual(empty.call_count, 3)
+        with patch.object(submit, "_empty_cgroup", return_value=False), \
+             patch.object(submit.time, "monotonic", side_effect=[0, 11]):
+            self.assertFalse(submit._wait_empty_cgroup(42))
+        with patch.object(submit, "_empty_cgroup", side_effect=FileNotFoundError):
+            with self.assertRaises(FileNotFoundError):
+                submit._wait_empty_cgroup(42)
+
     def test_missing_events_and_removed_directory_never_prove_empty(self):
         with tempfile.TemporaryDirectory() as parent:
             directory = Path(parent) / "slice"
@@ -138,7 +150,7 @@ class SupervisorTests(unittest.TestCase):
                 states = self.lifecycle_states()
                 with patch.object(submit, "_state", side_effect=states), patch.object(submit, "_launch"), \
                      patch.object(submit, "_cgroup", return_value=(descriptor, Path(temporary), (1, 2))), \
-                     patch.object(submit, "_empty_cgroup", return_value=cgroup_empty), \
+                     patch.object(submit, "_wait_empty_cgroup", return_value=cgroup_empty), \
                      patch.object(submit, "_container_absent", return_value=container_absent), \
                      patch.object(worker, "_read_root_file", return_value=json.dumps(self.result).encode()), \
                      patch.object(submit, "_command", return_value=subprocess.CompletedProcess([], 0, b"")) as command:
@@ -177,7 +189,7 @@ class SupervisorTests(unittest.TestCase):
             with patch.object(submit, "_state", side_effect=self.lifecycle_states()), \
                  patch.object(submit, "_launch"), \
                  patch.object(submit, "_cgroup", return_value=(descriptor, Path(temporary), (1, 2))), \
-                 patch.object(submit, "_empty_cgroup", return_value=False) as empty, \
+                 patch.object(submit, "_wait_empty_cgroup", return_value=False) as empty, \
                  patch.object(submit, "_container_absent", return_value=False) as absent, \
                  patch.object(worker, "_read_root_file", return_value=b"invalid"), \
                  patch.object(submit, "_command", return_value=subprocess.CompletedProcess([], 0, b"")) as command:

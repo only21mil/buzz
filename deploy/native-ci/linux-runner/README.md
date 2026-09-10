@@ -176,7 +176,8 @@ The root supervisor retains the child service's invocation identity and exit
 status with `RemainAfterExit=yes`. It places that child in a unique root-owned
 `buzzcilinux<invocation>.slice` and opens the slice cgroup while the child runs.
 The active slice keeps its cgroup after systemd removes the exited child cgroup.
-Root reads the slice's actual recursive `populated 0`, stops the exact child and
+Root waits up to ten seconds for the slice's actual recursive `populated 0`,
+then stops the exact child and
 slice, and proves both inactive. The v2 supervisor receipt binds the child
 invocation, slice invocation, and observed slice path/device/inode. Missing
 cgroup events, removed directories and changed identities remain failures.
