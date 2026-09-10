@@ -264,37 +264,7 @@ where
         accepted: &AcceptedRequest,
         bindings: &StaticAdmissionBindings,
     ) -> Result<IntentRegistrationResponse, RunnerV2Error> {
-        let declared = bindings
-            .artifacts
-            .first()
-            .ok_or(RunnerV2Error::InvalidRequest)?;
-        if bindings.artifacts.len() != 1 || accepted.envelope.job_ids.len() != 1 {
-            return Err(RunnerV2Error::InvalidRequest);
-        }
-        let mut request = RegisterJobIntentRequest {
-            admission,
-            request_event_id: decode_array(&accepted.event_id)?,
-            workflow_id: WireText64::from_ascii(&bindings.workflow_id)
-                .map_err(|_| RunnerV2Error::InvalidRequest)?,
-            job_id: WireText64::from_ascii(&bindings.job_ids[0])
-                .map_err(|_| RunnerV2Error::InvalidRequest)?,
-            artifact_count: 1,
-            artifacts: [Some(JobArtifactDeclaration {
-                artifact_id: WireText64::from_ascii(&declared.artifact_id)
-                    .map_err(|_| RunnerV2Error::InvalidRequest)?,
-                name: WireText64::from_ascii(&declared.name)
-                    .map_err(|_| RunnerV2Error::InvalidRequest)?,
-                media_type: WireText64::from_ascii(&declared.media_type)
-                    .map_err(|_| RunnerV2Error::InvalidRequest)?,
-                relative_name: WireText64::from_ascii(&declared.relative_name)
-                    .map_err(|_| RunnerV2Error::InvalidRequest)?,
-                max_bytes: declared.max_bytes,
-            })],
-            request_frame_digest: [0; 32],
-        };
-        let header = deterministic_registration_header(request);
-        request.request_frame_digest = intent_registration_request_frame_digest(header, &request)
-            .ok_or(RunnerV2Error::InvalidRequest)?;
+        let (header, request) = prepare_job_intent_registration(admission, accepted, bindings)?;
         let frame = v2::encode_request(header.request_id, Request::RegisterJobIntent(request));
         let response = self
             .transport
@@ -496,6 +466,51 @@ where
     ) -> Result<v2::BrokerResponse, RunnerV2Error> {
         self.exchange(Request::CancelAttempt(request))
     }
+}
+
+/// Construct the canonical registration frame without opening a transport.
+/// Check its intent digest against the accepted event and static bindings.
+pub fn prepare_job_intent_registration(
+    admission: AdmitAttemptRequest,
+    accepted: &AcceptedRequest,
+    bindings: &StaticAdmissionBindings,
+) -> Result<(FrameHeader, RegisterJobIntentRequest), RunnerV2Error> {
+    bindings.validate()?;
+    if admission.job_intent_digest != job_intent_digest(admission, accepted, bindings)? {
+        return Err(RunnerV2Error::InvalidRequest);
+    }
+    let declared = bindings
+        .artifacts
+        .first()
+        .ok_or(RunnerV2Error::InvalidRequest)?;
+    if bindings.artifacts.len() != 1 || accepted.envelope.job_ids.len() != 1 {
+        return Err(RunnerV2Error::InvalidRequest);
+    }
+    let mut request = RegisterJobIntentRequest {
+        admission,
+        request_event_id: decode_array(&accepted.event_id)?,
+        workflow_id: WireText64::from_ascii(&bindings.workflow_id)
+            .map_err(|_| RunnerV2Error::InvalidRequest)?,
+        job_id: WireText64::from_ascii(&bindings.job_ids[0])
+            .map_err(|_| RunnerV2Error::InvalidRequest)?,
+        artifact_count: 1,
+        artifacts: [Some(JobArtifactDeclaration {
+            artifact_id: WireText64::from_ascii(&declared.artifact_id)
+                .map_err(|_| RunnerV2Error::InvalidRequest)?,
+            name: WireText64::from_ascii(&declared.name)
+                .map_err(|_| RunnerV2Error::InvalidRequest)?,
+            media_type: WireText64::from_ascii(&declared.media_type)
+                .map_err(|_| RunnerV2Error::InvalidRequest)?,
+            relative_name: WireText64::from_ascii(&declared.relative_name)
+                .map_err(|_| RunnerV2Error::InvalidRequest)?,
+            max_bytes: declared.max_bytes,
+        })],
+        request_frame_digest: [0; 32],
+    };
+    let header = deterministic_registration_header(request);
+    request.request_frame_digest = intent_registration_request_frame_digest(header, &request)
+        .ok_or(RunnerV2Error::InvalidRequest)?;
+    Ok((header, request))
 }
 
 /// Construct the exact JobIntentV2, bind it to one accepted request, and ask
