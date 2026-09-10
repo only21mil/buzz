@@ -26,6 +26,8 @@ pub mod channel_members;
 pub mod ci;
 /// CI control-plane signer grants.
 pub mod ci_grants;
+/// Owner-signed merge-gate bypasses (kind 46109) and their consumption.
+pub mod ci_merge_bypass;
 /// Community lifecycle and host-map persistence.
 pub mod community;
 /// Direct message channel persistence.
@@ -1686,6 +1688,85 @@ impl Db {
                 run_id,
                 after_cursor,
                 limit,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// Load one stored kind-46108 terminal check of a run by event ID, with
+    /// the relay clock's `accepted_at`.
+    pub async fn load_ci_check(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        check_event_id: &[u8],
+    ) -> Result<Option<ci::CiStoredEvent>> {
+        observability::observe(observability::Operation::Ci, async {
+            ci::load_ci_check(&self.pool, community_id, run_id, check_event_id).await
+        })
+        .await
+    }
+
+    /// Store an accepted kind-46109 merge bypass; `false` for a replay.
+    pub async fn insert_ci_merge_bypass(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        event_id: &[u8],
+        issuer_pubkey: &str,
+        envelope: &buzz_core::ci::CiMergeBypassEnvelope,
+    ) -> Result<bool> {
+        observability::observe(observability::Operation::Ci, async {
+            ci_merge_bypass::insert_ci_merge_bypass(
+                &self.pool,
+                community_id,
+                channel_id,
+                event_id,
+                issuer_pubkey,
+                envelope,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// Every stored bypass for one exact ref update, oldest accepted first.
+    pub async fn list_ci_merge_bypasses(
+        &self,
+        community_id: CommunityId,
+        target_repo_a: &str,
+        ref_name: &str,
+        old_oid: &str,
+        new_oid: &str,
+    ) -> Result<Vec<ci_merge_bypass::CiMergeBypassRecord>> {
+        observability::observe(observability::Operation::Ci, async {
+            ci_merge_bypass::list_ci_merge_bypasses(
+                &self.pool,
+                community_id,
+                target_repo_a,
+                ref_name,
+                old_oid,
+                new_oid,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// Consume a bypass once, naming the allowing decision row.
+    pub async fn consume_ci_merge_bypass(
+        &self,
+        community_id: CommunityId,
+        event_id: &[u8],
+        decision_id: Uuid,
+    ) -> Result<bool> {
+        observability::observe(observability::Operation::Ci, async {
+            ci_merge_bypass::consume_ci_merge_bypass(
+                &self.pool,
+                community_id,
+                event_id,
+                decision_id,
             )
             .await
         })

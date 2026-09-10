@@ -391,6 +391,56 @@ pub async fn list_ci_run_events(
     rows.into_iter().map(row_to_ci_stored_event).collect()
 }
 
+/// Load one stored kind-46108 terminal check of `run_id` by its event ID.
+///
+/// Returns the canonical signed event with the relay clock's `accepted_at`,
+/// the freshness authority a merge gate consults (signer-chosen
+/// `published_at` and `created_at` are never trusted). The lookup is bound to
+/// the run and the check kind: an unknown ID, an event of another run, or a
+/// stored event that is not a check all return `None`. Membership scoping is
+/// the caller's job (`get_ci_run_member_channel`); the gate reads the run it
+/// already resolved from `ci_runs`.
+pub async fn load_ci_check(
+    pool: &PgPool,
+    community_id: CommunityId,
+    run_id: Uuid,
+    check_event_id: &[u8],
+) -> Result<Option<CiStoredEvent>> {
+    if check_event_id.len() != 32 {
+        return Err(DbError::InvalidData(
+            "CI check event ID must be 32 bytes".into(),
+        ));
+    }
+    let row = sqlx::query(
+        r#"
+        SELECT index.watch_cursor,index.accepted_at,index.event_kind,
+               stored.id,stored.pubkey,stored.created_at,stored.kind,stored.tags,
+               stored.content,stored.sig,stored.received_at,stored.channel_id
+        FROM ci_run_events AS index
+        JOIN events AS stored
+          ON stored.community_id=index.community_id
+         AND stored.created_at=index.event_created_at
+         AND stored.id=index.event_id
+        WHERE index.community_id=$1 AND index.run_id=$2 AND index.event_id=$3
+          AND index.event_kind=$4
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(run_id)
+    .bind(check_event_id)
+    .bind(KIND_CI_CHECK as i32)
+    .fetch_optional(
+        &mut *crate::observability::acquire(
+            pool,
+            crate::observability::PoolRole::Writer,
+            crate::observability::Operation::Ci,
+        )
+        .await?,
+    )
+    .await?;
+    row.map(row_to_ci_stored_event).transpose()
+}
+
 /// Load the accepted request and job-status events needed by the selected-graph reducer.
 pub async fn load_ci_reducer_events(
     pool: &PgPool,

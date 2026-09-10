@@ -15,11 +15,11 @@ use buzz_core::kind::{
     is_relay_admin_kind, KIND_AGENT_ENGRAM, KIND_AGENT_PROFILE, KIND_AGENT_TURN_METRIC,
     KIND_APPROVAL_DENY, KIND_APPROVAL_GRANT, KIND_AUTH, KIND_BOOKMARK_LIST, KIND_BOOKMARK_SET,
     KIND_CANVAS, KIND_CI_ARTIFACT_REFERENCE, KIND_CI_CHECK, KIND_CI_EVIDENCE_FINALIZED,
-    KIND_CI_GRANT, KIND_CI_JOB_STATUS, KIND_CI_LOG_REFERENCE, KIND_CI_REQUEST, KIND_CI_RUN_STATUS,
-    KIND_CI_TEARDOWN_ATTESTATION, KIND_CONTACT_LIST, KIND_DELETION, KIND_DM_ADD_MEMBER,
-    KIND_DM_HIDE, KIND_DM_OPEN, KIND_EMOJI_LIST, KIND_EMOJI_SET, KIND_EVENT_REMINDER,
-    KIND_FOLLOW_SET, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_GIFT_WRAP,
-    KIND_GIT_ISSUE, KIND_GIT_PATCH, KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST,
+    KIND_CI_GRANT, KIND_CI_JOB_STATUS, KIND_CI_LOG_REFERENCE, KIND_CI_MERGE_BYPASS,
+    KIND_CI_REQUEST, KIND_CI_RUN_STATUS, KIND_CI_TEARDOWN_ATTESTATION, KIND_CONTACT_LIST,
+    KIND_DELETION, KIND_DM_ADD_MEMBER, KIND_DM_HIDE, KIND_DM_OPEN, KIND_EMOJI_LIST, KIND_EMOJI_SET,
+    KIND_EVENT_REMINDER, KIND_FOLLOW_SET, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_FORUM_VOTE,
+    KIND_GIFT_WRAP, KIND_GIT_ISSUE, KIND_GIT_PATCH, KIND_GIT_PR_UPDATE, KIND_GIT_PULL_REQUEST,
     KIND_GIT_REPO_ANNOUNCEMENT, KIND_GIT_REPO_STATE, KIND_GIT_STATUS_CLOSED, KIND_GIT_STATUS_DRAFT,
     KIND_GIT_STATUS_MERGED, KIND_GIT_STATUS_OPEN, KIND_HUDDLE_ENDED, KIND_HUDDLE_GUIDELINES,
     KIND_HUDDLE_PARTICIPANT_JOINED, KIND_HUDDLE_PARTICIPANT_LEFT, KIND_HUDDLE_STARTED,
@@ -66,6 +66,7 @@ fn is_ci_event_kind(kind: u32) -> bool {
             | KIND_CI_TEARDOWN_ATTESTATION
             | KIND_CI_GRANT
             | KIND_CI_CHECK
+            | KIND_CI_MERGE_BYPASS
     )
 }
 
@@ -726,7 +727,8 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_CI_EVIDENCE_FINALIZED
         | KIND_CI_TEARDOWN_ATTESTATION
         | KIND_CI_GRANT
-        | KIND_CI_CHECK => Ok(Scope::JobsWrite),
+        | KIND_CI_CHECK
+        | KIND_CI_MERGE_BYPASS => Ok(Scope::JobsWrite),
         _ => Err("restricted: unknown event kind"),
     }
 }
@@ -2870,8 +2872,49 @@ async fn ingest_event_inner(
     // event row is stored (see the grant storage branch below). `None` for
     // every non-grant kind.
     let mut validated_ci_grant: Option<ValidatedCiGrant> = None;
+    // A validated kind-46109 merge bypass. Stored to `ci_merge_bypasses` after
+    // the canonical event row (see the storage branch below).
+    let mut validated_ci_merge_bypass: Option<buzz_core::ci::CiMergeBypassEnvelope> = None;
 
-    let validated_ci_event = if kind_u32 == KIND_CI_GRANT {
+    let validated_ci_event = if kind_u32 == KIND_CI_MERGE_BYPASS {
+        // Kind 46109 enters the CI ingest gate but is not run evidence: it
+        // never reaches `store_ci_event` or the status-signer union. The
+        // envelope binds the event signer to the repository owner named by
+        // `target_repo_a`; the signer must also hold the channel owner or
+        // admin role (or community owner/admin), the same authority a signer
+        // grant needs. Role alone grants nothing: an admin who is not the
+        // announcement owner is refused by the envelope check first.
+        let ch_id = channel_id.ok_or_else(|| {
+            IngestError::Rejected("invalid: CI merge bypass events require a channel h tag".into())
+        })?;
+        let envelope = buzz_core::ci::validate_signed_ci_merge_bypass(&event, &ch_id.to_string())
+            .map_err(|error| IngestError::Rejected(format!("invalid: {error}")))?;
+        let channel_role = state
+            .db
+            .get_member_role(tenant.community(), ch_id, &event.pubkey.to_bytes())
+            .await
+            .map_err(|e| {
+                IngestError::Internal(format!("error: ci merge bypass issuer role check: {e}"))
+            })?;
+        if !matches!(channel_role.as_deref(), Some("owner") | Some("admin")) {
+            let community_role = state
+                .db
+                .get_relay_member(tenant.community(), &event.pubkey.to_hex())
+                .await
+                .map_err(|e| {
+                    IngestError::Internal(format!("error: ci merge bypass issuer role check: {e}"))
+                })?
+                .map(|member| member.role);
+            if !matches!(community_role.as_deref(), Some("owner") | Some("admin")) {
+                return Err(IngestError::AuthFailed(
+                    "restricted: only the repository owner holding the channel owner or admin role may issue a merge bypass"
+                        .into(),
+                ));
+            }
+        }
+        validated_ci_merge_bypass = Some(envelope);
+        None
+    } else if kind_u32 == KIND_CI_GRANT {
         // Kind 46107 is admitted to the CI ingest gate (see `is_ci_event_kind`)
         // but is NOT a run-event envelope: it does NOT round-trip through
         // `validate_signed_ci_event`/`store_ci_event`. Instead the grant
@@ -3695,6 +3738,35 @@ async fn ingest_event_inner(
                 IngestError::Internal(format!("error: persisting CI signer grant: {e}"))
             })?;
         result
+    } else if kind_u32 == KIND_CI_MERGE_BYPASS {
+        // Kind 46109 storage: the canonical event row, then the bypass row
+        // the merge gate reads. A replay of the same event keeps the stored
+        // row and its consumption state.
+        let ch_id = channel_id.ok_or_else(|| {
+            IngestError::Rejected("invalid: CI merge bypass event requires a channel".into())
+        })?;
+        let envelope = validated_ci_merge_bypass.take().ok_or_else(|| {
+            IngestError::Rejected("invalid: CI merge bypass event was not validated".into())
+        })?;
+        let result = state
+            .db
+            .insert_event_with_thread_metadata(tenant.community(), &event, Some(ch_id), None)
+            .await
+            .map_err(|e| IngestError::Internal(format!("error: database error: {e}")))?;
+        state
+            .db
+            .insert_ci_merge_bypass(
+                tenant.community(),
+                ch_id,
+                event.id.as_bytes(),
+                &event.pubkey.to_hex(),
+                &envelope,
+            )
+            .await
+            .map_err(|e| {
+                IngestError::Internal(format!("error: persisting CI merge bypass: {e}"))
+            })?;
+        result
     } else if buzz_core::kind::is_replaceable(kind_u32) {
         // NIP-16 replaceable event — atomic replace with stale-write protection.
         // channel_id is None for global kinds (0, 1, 3) due to step 5b above.
@@ -4347,6 +4419,7 @@ mod tests {
             KIND_CI_TEARDOWN_ATTESTATION,
             KIND_CI_GRANT,
             KIND_CI_CHECK,
+            KIND_CI_MERGE_BYPASS,
         ] {
             assert_eq!(
                 required_scope_for_kind(kind, &event).expect("known CI kind"),
@@ -4376,6 +4449,7 @@ mod tests {
             KIND_CI_TEARDOWN_ATTESTATION,
             KIND_CI_GRANT,
             KIND_CI_CHECK,
+            KIND_CI_MERGE_BYPASS,
         ] {
             assert!(
                 is_ci_event_kind(kind),

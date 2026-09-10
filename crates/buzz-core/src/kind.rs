@@ -582,6 +582,10 @@ pub const KIND_CI_GRANT: u32 = 46107;
 /// Signed terminal check for one CI run attempt: the one event a merge gate
 /// reads for the run's conclusion, head SHA, run ID, and attempt.
 pub const KIND_CI_CHECK: u32 = 46108;
+/// Owner-signed merge-gate bypass for one exact ref update: the repository
+/// owner authorises `(ref_name, old_oid, new_oid)` to land without a green
+/// kind-46108 check, inside a window of at most one hour. Consumed once.
+pub const KIND_CI_MERGE_BYPASS: u32 = 46109;
 /// Trigger workflow execution.
 pub const KIND_WORKFLOW_TRIGGER: u32 = 46020;
 /// Grant pending approval.
@@ -771,6 +775,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_CI_TEARDOWN_ATTESTATION,
     KIND_CI_GRANT,
     KIND_CI_CHECK,
+    KIND_CI_MERGE_BYPASS,
     KIND_WORKFLOW_TRIGGER,
     KIND_APPROVAL_GRANT,
     KIND_APPROVAL_DENY,

@@ -12,7 +12,7 @@ use buzz_core::ci::{
 };
 use buzz_core::CommunityId;
 use buzz_db::ci::{
-    get_ci_run_request, list_ci_run_events, load_ci_reducer_events, store_ci_event,
+    get_ci_run_request, list_ci_run_events, load_ci_check, load_ci_reducer_events, store_ci_event,
     StoreCiEventOutcome,
 };
 use buzz_relay::ci::{reduce_signed_ci_graph, SignedCiGraphInput};
@@ -2305,4 +2305,130 @@ async fn run_read_exports_bind_membership_channel_and_cursor_bounds() {
         None,
         "deleted channels must not resolve runs"
     );
+}
+
+/// `load_ci_check` returns the stored kind-46108 event by ID with the relay
+/// clock's `accepted_at`, bound to the run and the check kind: the request of
+/// the same run, a check of another run, and another community all miss.
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn load_ci_check_returns_the_stored_check_with_its_relay_accepted_at() {
+    let pool = pool().await;
+    let (community_id, channel_id) = tenant_channel(&pool).await;
+    let actor = Keys::generate();
+    let control = Keys::generate();
+    let signers: HashSet<String> = [control.public_key().to_hex()].into_iter().collect();
+
+    let (request_envelope, request_event) =
+        new_stored_request(&pool, community_id, channel_id, &actor, &signers).await;
+    let (evidence, teardown, terminal) = store_success_chain(
+        &pool,
+        community_id,
+        channel_id,
+        &control,
+        &request_envelope,
+        &request_event,
+        &signers,
+    )
+    .await;
+    let check_event = check(
+        &control,
+        channel_id,
+        &request_envelope,
+        &request_event.id.to_hex(),
+        &terminal.id.to_hex(),
+        CiRunState::Success,
+        None,
+        Some((&evidence.id.to_hex(), &teardown.id.to_hex())),
+        1_800_000_050,
+    );
+    let stored = match store(&pool, community_id, channel_id, &check_event, &signers)
+        .await
+        .expect("store check")
+    {
+        StoreCiEventOutcome::Stored(stored) => stored,
+        StoreCiEventOutcome::Reused(_) => panic!("fresh check must be stored"),
+    };
+    let run_id = Uuid::parse_str(&request_envelope.run_id).expect("run id");
+
+    let loaded = load_ci_check(&pool, community_id, run_id, check_event.id.as_bytes())
+        .await
+        .expect("load check")
+        .expect("check is stored");
+    assert_eq!(loaded.stored_event.event, check_event);
+    assert_eq!(loaded.watch_cursor, stored.watch_cursor);
+    assert_eq!(loaded.accepted_at, stored.accepted_at);
+    let indexed_accepted_at: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+        "SELECT accepted_at FROM ci_run_events WHERE community_id=$1 AND event_id=$2",
+    )
+    .bind(community_id.as_uuid())
+    .bind(check_event.id.as_bytes().to_vec())
+    .fetch_one(&pool)
+    .await
+    .expect("indexed accepted_at");
+    assert_eq!(loaded.accepted_at, indexed_accepted_at);
+    let envelope = validate_signed_ci_event(
+        &loaded.stored_event.event,
+        &channel_id.to_string(),
+        &signers,
+    )
+    .expect("stored check re-validates");
+    assert!(matches!(
+        envelope,
+        ValidatedCiEnvelope::Check(ref check) if check.tip_oid == request_envelope.tip_oid
+    ));
+
+    // The same run's request is stored but is not a check.
+    assert!(
+        load_ci_check(&pool, community_id, run_id, request_event.id.as_bytes())
+            .await
+            .expect("lookup by request id")
+            .is_none()
+    );
+    // A check of another run does not resolve under this run.
+    let (other_envelope, other_request) =
+        new_stored_request(&pool, community_id, channel_id, &actor, &signers).await;
+    let (other_evidence, other_teardown, other_terminal) = store_success_chain(
+        &pool,
+        community_id,
+        channel_id,
+        &control,
+        &other_envelope,
+        &other_request,
+        &signers,
+    )
+    .await;
+    let other_check = check(
+        &control,
+        channel_id,
+        &other_envelope,
+        &other_request.id.to_hex(),
+        &other_terminal.id.to_hex(),
+        CiRunState::Success,
+        None,
+        Some((&other_evidence.id.to_hex(), &other_teardown.id.to_hex())),
+        1_800_000_051,
+    );
+    store(&pool, community_id, channel_id, &other_check, &signers)
+        .await
+        .expect("store other check");
+    assert!(
+        load_ci_check(&pool, community_id, run_id, other_check.id.as_bytes())
+            .await
+            .expect("lookup across runs")
+            .is_none()
+    );
+    // Another community never sees it.
+    let (foreign_community, _) = tenant_channel(&pool).await;
+    assert!(
+        load_ci_check(&pool, foreign_community, run_id, check_event.id.as_bytes())
+            .await
+            .expect("lookup across communities")
+            .is_none()
+    );
+    // A malformed ID is refused before any query.
+    assert!(matches!(
+        load_ci_check(&pool, community_id, run_id, &[1_u8; 31]).await,
+        Err(buzz_db::DbError::InvalidData(_))
+    ));
 }

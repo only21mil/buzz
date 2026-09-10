@@ -13,6 +13,7 @@
 //! ```
 
 use crate::channel::MemberRole;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// Machine-readable token prefixing the push-policy denial for a kind:30617
@@ -281,6 +282,12 @@ pub struct ProtectionRule {
     /// via the NIP-34 patch workflow. This is intentional: the ref is fully governed
     /// by the patch review process.
     pub require_patch: bool,
+    /// Terminal checks the merge gate requires before an update lands:
+    /// workflow ID to the job IDs that must be green, from
+    /// `require-check:<workflow_id>:<job_id>[+<job_id>...]`. Empty when the
+    /// pattern is not gated. The relay honours it only when its merge gate
+    /// mode is `shadow` or `enforce`.
+    pub require_checks: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// Errors from parsing a `buzz-protect` tag.
@@ -296,6 +303,8 @@ pub enum RuleParseError {
     UnknownRule(String),
     /// Invalid role in `push:<role>`.
     InvalidRole(String),
+    /// Malformed `require-check:<workflow_id>:<job_id>[+<job_id>...]` value.
+    InvalidRequireCheck(String),
 }
 
 impl fmt::Display for RuleParseError {
@@ -306,6 +315,7 @@ impl fmt::Display for RuleParseError {
             Self::InvalidPattern(e) => write!(f, "invalid pattern: {e}"),
             Self::UnknownRule(r) => write!(f, "unknown rule: {r:?}"),
             Self::InvalidRole(r) => write!(f, "invalid role in push rule: {r:?}"),
+            Self::InvalidRequireCheck(r) => write!(f, "invalid require-check rule: {r:?}"),
         }
     }
 }
@@ -337,10 +347,19 @@ pub fn parse_protection_tag_with_warnings(
     let mut no_force_push = false;
     let mut no_delete = false;
     let mut require_patch = false;
+    let mut require_checks: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut unknown_rules = Vec::new();
 
     for &rule_str in &values[1..] {
-        if let Some(role_str) = rule_str.strip_prefix("push:") {
+        if let Some(check_str) = rule_str.strip_prefix("require-check:") {
+            let (workflow_id, job_ids) = parse_require_check(check_str)
+                .ok_or_else(|| RuleParseError::InvalidRequireCheck(rule_str.to_string()))?;
+            // Union: two values for one workflow merge their job IDs.
+            require_checks
+                .entry(workflow_id)
+                .or_default()
+                .extend(job_ids);
+        } else if let Some(role_str) = rule_str.strip_prefix("push:") {
             let role: MemberRole = role_str
                 .parse()
                 .map_err(|_| RuleParseError::InvalidRole(role_str.to_string()))?;
@@ -379,9 +398,35 @@ pub fn parse_protection_tag_with_warnings(
             no_force_push,
             no_delete,
             require_patch,
+            require_checks,
         },
         unknown_rules,
     ))
+}
+
+/// Parse the value after `require-check:` into a workflow ID and its job IDs.
+///
+/// The workflow ID is non-empty with no whitespace or `:`; job IDs are `+`
+/// separated, each in the static job grammar (`ci::is_static_job_id`), at
+/// least one, duplicates collapsed. Anything else is `None`.
+fn parse_require_check(value: &str) -> Option<(String, BTreeSet<String>)> {
+    let (workflow_id, jobs) = value.split_once(':')?;
+    if workflow_id.is_empty()
+        || workflow_id.len() > 255
+        || workflow_id
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte == b':' || !byte.is_ascii_graphic())
+    {
+        return None;
+    }
+    let mut job_ids = BTreeSet::new();
+    for job_id in jobs.split('+') {
+        if !crate::ci::is_static_job_id(job_id) {
+            return None;
+        }
+        job_ids.insert(job_id.to_string());
+    }
+    Some((workflow_id.to_string(), job_ids))
 }
 
 /// Result of parsing protection tags — includes rules and any warnings.
@@ -462,6 +507,9 @@ pub struct EffectiveRules {
     pub no_delete: bool,
     /// Whether direct push is denied (any match sets this).
     pub require_patch: bool,
+    /// Required terminal checks, unioned across matching rules: job IDs
+    /// merge per workflow and every named workflow is required.
+    pub require_checks: BTreeMap<String, BTreeSet<String>>,
     /// Whether any explicit rule matched (vs. using defaults).
     pub has_explicit_match: bool,
 }
@@ -473,6 +521,7 @@ impl EffectiveRules {
         let mut no_force_push = false;
         let mut no_delete = false;
         let mut require_patch = false;
+        let mut require_checks: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut has_explicit_match = false;
 
         for rule in rules {
@@ -499,6 +548,13 @@ impl EffectiveRules {
             no_force_push = no_force_push || rule.no_force_push;
             no_delete = no_delete || rule.no_delete;
             require_patch = require_patch || rule.require_patch;
+            // Union: job IDs merge per workflow; two workflows require both.
+            for (workflow_id, job_ids) in &rule.require_checks {
+                require_checks
+                    .entry(workflow_id.clone())
+                    .or_default()
+                    .extend(job_ids.iter().cloned());
+            }
         }
 
         Self {
@@ -506,8 +562,14 @@ impl EffectiveRules {
             no_force_push,
             no_delete,
             require_patch,
+            require_checks,
             has_explicit_match,
         }
+    }
+
+    /// Whether any matching rule requires a terminal check.
+    pub fn is_gated(&self) -> bool {
+        !self.require_checks.is_empty()
     }
 }
 
@@ -1023,5 +1085,144 @@ mod tests {
         let denials = result.unwrap_err();
         assert_eq!(denials.len(), 1);
         assert_eq!(denials[0].ref_name, "refs/heads/main");
+    }
+
+    fn jobs(ids: &[&str]) -> BTreeSet<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_require_check_rule_pins_workflow_and_jobs() {
+        let rule = parse_protection_tag(&[
+            "refs/heads/main",
+            "no-force-push",
+            "no-delete",
+            "require-check:ci:backend-integration+dead-token-guard+rust-lint+unit-tests",
+        ])
+        .unwrap();
+        assert!(rule.no_force_push);
+        assert!(rule.no_delete);
+        assert_eq!(rule.require_checks.len(), 1);
+        assert_eq!(
+            rule.require_checks["ci"],
+            jobs(&[
+                "backend-integration",
+                "dead-token-guard",
+                "rust-lint",
+                "unit-tests"
+            ])
+        );
+        // No rule: not gated.
+        let plain = parse_protection_tag(&["refs/heads/main", "no-force-push"]).unwrap();
+        assert!(plain.require_checks.is_empty());
+    }
+
+    #[test]
+    fn parse_require_check_rule_unions_values_in_one_tag_and_dedupes_jobs() {
+        let rule = parse_protection_tag(&[
+            "refs/heads/main",
+            "require-check:ci:unit-tests+rust-lint",
+            "require-check:ci:rust-lint+web",
+            "require-check:release:build",
+        ])
+        .unwrap();
+        assert_eq!(
+            rule.require_checks["ci"],
+            jobs(&["rust-lint", "unit-tests", "web"])
+        );
+        assert_eq!(rule.require_checks["release"], jobs(&["build"]));
+        let duplicated =
+            parse_protection_tag(&["refs/heads/main", "require-check:ci:unit+unit"]).unwrap();
+        assert_eq!(duplicated.require_checks["ci"], jobs(&["unit"]));
+    }
+
+    #[test]
+    fn parse_require_check_rule_rejects_malformed_values() {
+        for value in [
+            "require-check:",
+            "require-check:ci",
+            "require-check:ci:",
+            "require-check::unit",
+            "require-check:ci:unit+",
+            "require-check:ci:+unit",
+            "require-check:ci:1unit",
+            "require-check:ci:unit tests",
+            "require-check:ci:unit.tests",
+            "require-check:c i:unit",
+            "require-check:ci:x:unit",
+        ] {
+            assert!(
+                matches!(
+                    parse_protection_tag(&["refs/heads/main", value]),
+                    Err(RuleParseError::InvalidRequireCheck(ref raw)) if raw == value
+                ),
+                "{value:?} must be a malformed require-check"
+            );
+        }
+        // Job ID over 64 bytes.
+        let long = format!("require-check:ci:{}", "j".repeat(65));
+        assert!(matches!(
+            parse_protection_tag(&["refs/heads/main", &long]),
+            Err(RuleParseError::InvalidRequireCheck(_))
+        ));
+    }
+
+    #[test]
+    fn parse_require_check_keeps_unknown_rule_reporting() {
+        let (rule, unknown) = parse_protection_tag_with_warnings(&[
+            "refs/heads/main",
+            "require-checks:ci:unit",
+            "require-check:ci:unit",
+            "yolo",
+        ])
+        .unwrap();
+        assert_eq!(rule.require_checks["ci"], jobs(&["unit"]));
+        assert_eq!(unknown, vec!["require-checks:ci:unit", "yolo"]);
+    }
+
+    #[test]
+    fn effective_rules_union_require_checks_per_workflow_and_across_workflows() {
+        let rules = vec![
+            parse_protection_tag(&["refs/heads/*", "require-check:ci:unit-tests+rust-lint"])
+                .unwrap(),
+            parse_protection_tag(&["refs/heads/main", "require-check:ci:web"]).unwrap(),
+            parse_protection_tag(&["refs/heads/main", "require-check:release:build"]).unwrap(),
+            parse_protection_tag(&["refs/tags/*", "require-check:ci:mobile"]).unwrap(),
+        ];
+        let main = EffectiveRules::for_ref("refs/heads/main", &rules);
+        assert!(main.is_gated());
+        assert_eq!(main.require_checks.len(), 2);
+        assert_eq!(
+            main.require_checks["ci"],
+            jobs(&["rust-lint", "unit-tests", "web"])
+        );
+        assert_eq!(main.require_checks["release"], jobs(&["build"]));
+
+        let feature = EffectiveRules::for_ref("refs/heads/feature", &rules);
+        assert_eq!(feature.require_checks.len(), 1);
+        assert_eq!(
+            feature.require_checks["ci"],
+            jobs(&["rust-lint", "unit-tests"])
+        );
+
+        let tag = EffectiveRules::for_ref("refs/tags/v1", &rules);
+        assert_eq!(tag.require_checks["ci"], jobs(&["mobile"]));
+
+        let ungated = EffectiveRules::for_ref("refs/notes/x", &rules);
+        assert!(!ungated.is_gated());
+        assert!(!ungated.has_explicit_match);
+    }
+
+    #[test]
+    fn parse_protection_tags_surfaces_require_check_errors_as_malformed() {
+        let tags = vec![vec![
+            "buzz-protect".to_string(),
+            "refs/heads/main".to_string(),
+            "require-check:ci:bad job".to_string(),
+        ]];
+        assert!(matches!(
+            parse_protection_tags(&tags),
+            Err(RuleParseError::InvalidRequireCheck(_))
+        ));
     }
 }
