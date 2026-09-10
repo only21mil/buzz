@@ -270,6 +270,8 @@ buzz-relay	buzz_relay	api::ci::tests::route_ci_run_events_pages_by_durable_curso
 buzz-relay	buzz_relay	api::ci::tests::route_ci_run_events_query_is_exact_and_bounded	crates/buzz-relay/src/api/ci.rs	external	PostgreSQL plus CI evidence storage; existing acceptance scope
 buzz-relay	buzz_relay	api::ci::tests::route_ci_run_reads_fail_closed_for_non_members_and_unknown_runs	crates/buzz-relay/src/api/ci.rs	external	PostgreSQL plus CI evidence storage; existing acceptance scope
 buzz-relay	buzz_relay	api::ci::tests::route_ci_run_request_exports_the_immutable_request	crates/buzz-relay/src/api/ci.rs	external	PostgreSQL plus CI evidence storage; existing acceptance scope
+buzz-relay	buzz_relay	api::ci::tests::route_ci_checks_lists_runs_for_a_tip_newest_first	crates/buzz-relay/src/api/ci.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	api::ci::tests::route_merge_gate_decisions_are_owner_or_admin_only_and_newest_first	crates/buzz-relay/src/api/ci.rs	migration	fixture applies migrations to empty database
 buzz-relay	buzz_relay	api::ci::tests::route_log_read_uses_tenant_host_not_config_host	crates/buzz-relay/src/api/ci.rs	external	PostgreSQL plus CI evidence storage; existing acceptance scope
 buzz-relay	buzz_relay	api::ci::tests::route_malformed_coordinate_is_400_in_both_domains	crates/buzz-relay/src/api/ci.rs	migration	fixture applies migrations to empty database
 buzz-relay	buzz_relay	api::ci::tests::route_member_resolvable_repo_returns_deterministic_outcome_no_501	crates/buzz-relay/src/api/ci.rs	migration	fixture applies migrations to empty database
@@ -338,6 +340,7 @@ buzz-relay	ci_ingest_storage	check_conclusion_and_reason_must_agree_with_the_sto
 buzz-relay	ci_ingest_storage	check_references_must_resolve_to_stored_events_of_the_same_request	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
 buzz-relay	ci_ingest_storage	either_terminal_fact_seals_reruns_with_full_transaction_rollback	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
 buzz-relay	ci_ingest_storage	load_ci_check_returns_the_stored_check_with_its_relay_accepted_at	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
+buzz-relay	ci_ingest_storage	landing_reads_list_runs_for_a_tip_newest_first_with_their_stored_checks	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
 buzz-relay	ci_ingest_storage	request_and_status_chain_round_trip_into_reducer	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
 buzz-relay	ci_ingest_storage	rerun_final_facts_bind_only_the_final_request_and_selected_graph	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database
 buzz-relay	ci_ingest_storage	run_read_exports_bind_membership_channel_and_cursor_bounds	crates/buzz-relay/tests/ci_ingest_storage.rs	migration	fixture applies migrations to empty database

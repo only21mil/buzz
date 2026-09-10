@@ -251,6 +251,67 @@ run only the operator command above. Historical six-job proofs cannot bootstrap
 missing whole-job coverage, and an old verifier cannot consume a version-2
 receipt. No ruleset relaxation or blanket main run is part of bootstrap.
 
+## Buzz-native landing verifier (not yet authoritative)
+
+`buzz ci landing` is the future replacement for `protected-ci-receipt.py
+acquire-main` and `protected-ci-landing.py`. It reads the Buzz relay and a
+local checkout, never GitHub Actions, and follows
+`docs/ci/BUZZ_MERGE_GATE_DESIGN.md` section 2. Until the cutover step in
+`docs/ci/BUZZ_CI_TERMINAL_CHECK.md` section 6 names it as the landing gate,
+its receipt is evidence next to the GitHub-backed receipts above, not a
+substitute for them. Running it changes nothing on the relay.
+
+```bash
+export BUZZ_CI_CHANNEL=<repository channel UUID>
+export BUZZ_CI_STATUS_SIGNERS=<comma-separated control-plane signer pubkeys>
+buzz ci landing \
+  --repo-owner 73c705675d848ad38a919a5fa07687f55b4f0863c21969941c216b44f9e7a812 \
+  --repo-id buzz --checkout "$reviewed_checkout" \
+  --candidate FULL_REVIEWED_CANDIDATE_SHA --base FULL_REVIEWED_BASE_SHA \
+  --landed FULL_LANDED_SHA --github-mirror only21mil/buzz \
+  --output "$evidence_dir/buzz-native-landing.json"
+buzz ci landing validate --receipt "$evidence_dir/buzz-native-landing.json" --reverify
+```
+
+Every proof is a named check in the receipt with a refusal code; the verdict
+is `PASS` only when every gating check passes, and a refusal exits 1 after
+the receipt is still published. Per-workflow checks carry `:<workflow_id>`.
+
+| Check | Refusal codes | What it proves |
+|-------|---------------|----------------|
+| `relay_main` | `relay_main_mismatch`, `relay_main_unavailable` | `git ls-remote` of the relay's `refs/heads/main` names `--landed`, read before and after the relay reads. |
+| `objects_present`, `parent_shape` | `object_missing`, `parent_shape` | The landed commit's parents are exactly `[base, candidate]` (`merge`) or `[base]` with `landed == candidate` (`fast_forward`). |
+| `tree_match` | `tree_mismatch` | `landed^{tree}` equals `candidate^{tree}`. |
+| `base_ancestry` | `not_descendant` | `git merge-base --is-ancestor base candidate`. |
+| `require_check_rule` | `gate_misconfigured` | The owner-signed kind-30617 announcement carries a `require-check:<workflow>:<jobs>` rule for `refs/heads/main`. |
+| `run_selected`, `run_base`, `workflow_digest` | `no_check`, `base_moved`, `workflow_digest_mismatch`, `gate_misconfigured` | The latest run for `(repo, candidate, workflow)` names the reviewed base and the digest of `.github/workflows/ci.yml` at that base. |
+| `run_history` | `check_pending`, `check_not_success`, `reducer_disagrees`, `history_unavailable` | The complete signed run history reduces to Green for the candidate under the shared reducer. |
+| `required_jobs` | `required_jobs_missing` | Every pinned job is requested, required, and terminal-good at its selected attempt. |
+| `check_bound`, `check_listed` | `no_check`, `check_not_success`, `base_moved`, `reducer_disagrees` | The selected kind-46108 check is a success for the candidate on the base and is stored with the same `accepted_at` the run listing reports. |
+| `check_signer` | `signer_unauthorized` | The check's signer is in `BUZZ_CI_STATUS_SIGNERS`. |
+| `check_fresh` | `check_expired` | The relay clock's `accepted_at` is within `--max-age-seconds` (default 86400, the relay's `BUZZ_MERGE_GATE_CHECK_MAX_AGE_SECONDS` default). Signer-chosen `published_at` is recorded and never consulted. |
+| `gate_decision` | `no_decision`, `gate_shadow`, any gate refusal code, `relay_route_unavailable` | The merge gate's decision row for `(refs/heads/main, base, landed)` is `allow`, with a bypass recorded when one applied. Non-gating while the relay's mode is `off`; a `shadow` allow needs `--allow-shadow`. |
+| `github_mirror` | `mirror_lag`, `mirror_unavailable` (warning only) | `gh api` reads the mirror's `main`; disagreement is recorded, not gating, because the mirror timer lags. |
+| `desktop_verify_main` | `desktop_verifier_source_differs`, `desktop_verify_main_failed` | The checkout's `scripts/desktop_release.py` equals the landed tree's, and `verify-main --commit <landed>` passes as a subprocess. |
+
+The receipt (`policy: buzz-native-landing-v1`, `schema_version: 1`) retains
+the complete run history as base64 bodies with per-event SHA-256 values and a
+history digest, records the relay `main` reads, the rule, the trusted signer
+set, the reduction, the bound check with its `accepted_at`, the decision rows,
+the mirror read, and every check. It is published create-only under a
+caller-owned mode-0700 parent as a mode-0600 file, like the other receipts.
+`buzz ci landing validate` re-hashes and re-validates the retained bodies,
+replays the reducer and the history rules offline, and with `--reverify`
+repeats the relay `main`, run listing, and decision reads. The relay serves
+the two reads behind it, `GET /ci/checks` (any member) and
+`GET /ci/merge-gate/decisions` (owner or admin), NIP-98 authenticated and
+keyed on the announcement coordinate the verifier resolved.
+
+What this verifier cannot prove today, per the design's section 2.4: the
+provider's independent chronology, the live GitHub ruleset, and the runner
+image and dependency inventory the `qualification-*` artifacts capture. Those
+stay with the scripts above until the cutover step retires them.
+
 ## Deployment preflight
 
 Production deployment is approval-gated. Run it only from a clean checkout of
