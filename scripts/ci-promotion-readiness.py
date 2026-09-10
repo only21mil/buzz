@@ -785,8 +785,9 @@ class NativeAuthority:
     hash-pinned CLI separately; no producer receipt is accepted as current policy.
     """
 
-    def __init__(self, path: Path, now: int, max_age: int):
-        self.path, self.now, self.max_age = path, now, max_age
+    def __init__(self, path: Path, max_age: int):
+        self.path = path
+        self.now = now = int(time.time())
         self.started = time.monotonic()
         self.raw = read_native_authority_file(path)
         self.context = parse_json_bytes(self.raw, "native authority")
@@ -794,7 +795,7 @@ class NativeAuthority:
         exact_fields(context, {
             "repository", "target_repo_a", "source_clone_url", "channel_id", "relay_url",
             "status_signers", "workflow_id", "workflow_digest", "job_ids", "cli_path",
-            "cli_sha256", "valid_from", "valid_until", "historical_reuse",
+            "cli_sha256", "valid_from", "valid_until", "max_evidence_age", "historical_reuse",
         }, set(), "native authority")
         expect(context["repository"] == REPOSITORY, "native authority repository mismatch")
         for name in ("target_repo_a", "source_clone_url", "workflow_id"):
@@ -811,6 +812,9 @@ class NativeAuthority:
         start = integer(context["valid_from"], "native authority.valid_from")
         end = integer(context["valid_until"], "native authority.valid_until")
         expect(0 <= start <= now < end, "native authority is expired or not yet valid")
+        policy_max_age = integer(context["max_evidence_age"], "native authority.max_evidence_age")
+        expect(policy_max_age > 0 and max_age > 0, "native authority freshness limits must be positive")
+        self.max_age = min(max_age, policy_max_age)
         reuse = obj(context["historical_reuse"], "native authority.historical_reuse")
         for digest, expiry in reuse.items():
             sha256(digest, "native authority historical digest")
@@ -851,8 +855,11 @@ class NativeAuthority:
                           "mode": "historical-reuse" if historical else "fresh"})
 
     def check_current(self) -> None:
-        current = self.now + int(time.monotonic() - self.started)
-        expect(current < self.context["valid_until"], "native authority expired during verification")
+        # Wall time catches forward adjustments; elapsed time prevents rollback
+        # from extending the lifetime accepted at construction. Neither is caller input.
+        current = max(int(time.time()), self.now + int(time.monotonic() - self.started))
+        expect(self.context["valid_from"] <= current < self.context["valid_until"],
+               "native authority expired during verification")
         for run in self.runs:
             if run["mode"] == "fresh":
                 expect(current - run["oldest"] <= self.max_age, "native history expired during verification")
@@ -1854,7 +1861,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--candidate-dir", required=True, type=Path)
     result.add_argument("--evidence", required=True, type=Path)
     result.add_argument("--receipt", required=True, type=Path)
-    result.add_argument("--now", required=True, type=int, help="UTC epoch used for deterministic freshness checks")
+    result.add_argument("--now", required=True, type=int, help="UTC epoch for non-native evidence checks; native authority uses the actual clock")
     result.add_argument("--max-evidence-age", type=int, default=86400)
     return result
 
@@ -1868,9 +1875,10 @@ def main() -> int:
         raw_bundle = read_evidence_file(arguments.evidence, "promotion evidence", candidate_dir,
                                         limit=MAX_BUNDLE_BYTES)
         bundle = parse_json_bytes(raw_bundle, "promotion evidence")
-        authority = NativeAuthority(arguments.native_context, arguments.now, arguments.max_evidence_age)
+        authority = NativeAuthority(arguments.native_context, arguments.max_evidence_age)
         receipt = validate_bundle(bundle, candidate_dir, arguments.now, arguments.max_evidence_age, authority)
         receipt["evidence"]["bundle_sha256"] = hashlib.sha256(raw_bundle).hexdigest()
+        authority.check_current()
         payload = publish_receipt(arguments.receipt, receipt, candidate_dir)
         sys.stdout.buffer.write(payload)
         return 0

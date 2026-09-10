@@ -138,7 +138,8 @@ receipt is written.
 ## Run the deterministic verifier
 
 Choose a fixed UTC epoch for `--now`; it is part of the receipt so identical
-inputs and the same epoch produce identical bytes.
+inputs and the same epoch produce identical bytes while native authority and
+freshness remain valid against the actual clock.
 
 Populate all three signed-event sections from the relay configuration used by
 the collection commands. The utility maps `ws` to `http` and `wss` to `https`,
@@ -190,6 +191,7 @@ The context has exactly these fields:
 | `workflow_id`, `workflow_digest`, `job_ids` | Current workflow identity, SHA-256 policy digest and complete ordered job selection |
 | `cli_path`, `cli_sha256` | Independently installed CLI and its exact SHA-256 |
 | `valid_from`, `valid_until` | UTC epoch interval in which this authority context is current |
+| `max_evidence_age` | Positive maximum native event age in seconds; caller options may only tighten it |
 | `historical_reuse` | Object mapping an explicitly approved whole-history SHA-256 to its expiry epoch; empty by default |
 
 Each signed request must match that context and the candidate/base under review.
@@ -202,8 +204,12 @@ configured environment; never put a private key in a command or policy file.
 The context and CLI bytes are checked again before publication so a revocation
 or policy change during verification refuses the result.
 
-Native freshness applies to every signed event's creation timestamp using
-`--now` and `--max-evidence-age`. Evidence more than 300 seconds in the future is refused.
+Native authority validity, historical reuse expiry, and every signed event's
+freshness use the actual UTC clock, checked again after live verification.
+`--now` controls only non-native evidence checks. `--max-evidence-age` caps
+native age at the smaller of the caller value and root-owned `max_evidence_age`;
+it cannot extend the policy limit. Evidence more than 300 seconds in the future
+is refused.
 Old evidence requires an exact entry in `historical_reuse`: hash the canonical
 JSON plus LF of the entire `event_evidence` section. Its expiry must be within
 the context's validity interval and after verification time. Historical reuse

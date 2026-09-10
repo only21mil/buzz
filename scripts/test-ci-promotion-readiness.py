@@ -139,6 +139,7 @@ def fake_client(gh, identity=None, runner=None):
 # Only this test wrapper replaces root-owned policy reads and native transport.
 # Fixtures are independent of the submitted bundle; production has no fake switch.
 native = json.loads(os.environ["TEST_NATIVE_AUTHORITY"])
+readiness.time.time = lambda: native["now"]
 read_count = 0
 
 def fake_authority_file(path, **kwargs):
@@ -166,6 +167,8 @@ def native_run(command, **kwargs):
         return readiness.subprocess.CompletedProcess(command, 3, b"", b"fixture auth refusal")
     if native.get("drift") == "malformed":
         return readiness.subprocess.CompletedProcess(command, 0, b"{broken", b"")
+    if native.get("drift") == "expiry":
+        native["now"] = native["context"]["valid_until"]
     run_id = command[command.index("--run") + 1]
     value = native["runs"][run_id].copy()
     if native.get("drift") in value:
@@ -269,7 +272,8 @@ class PromotionReadinessTest(unittest.TestCase):
             "relay_url": "https://relay.example.invalid", "status_signers": [xonly_pubkey(SIGNER_SECRET)],
             "workflow_id": "ci", "workflow_digest": DIGEST_C, "job_ids": ["build"],
             "cli_path": "/test/buzz", "cli_sha256": hashlib.sha256(b"fixture native CLI").hexdigest(),
-            "valid_from": 0, "valid_until": NOW + 10 * 86400, "historical_reuse": {},
+            "valid_from": 0, "valid_until": NOW + 10 * 86400, "max_evidence_age": 86400,
+            "historical_reuse": {},
         }
         self.native_runs = {}
         for name in ("staging", "production_canary", "deliberate_red"):
@@ -737,7 +741,8 @@ class PromotionReadinessTest(unittest.TestCase):
         event["sig"] = schnorr_sign(secret, bytes.fromhex(event["id"]))
 
     def invoke(
-        self, bundle: dict, *, now: int = NOW, receipt_path: Path | None = None
+        self, bundle: dict, *, now: int = NOW, receipt_path: Path | None = None,
+        native_now: int | None = None, max_age: int = 86400
     ) -> subprocess.CompletedProcess[str]:
         """Run the verifier; the receipt is create-only, so each call gets a fresh path."""
         bundle_path = self.evidence_dir / "bundle.json"
@@ -752,12 +757,13 @@ class PromotionReadinessTest(unittest.TestCase):
              "--candidate-dir", str(self.repo),
              "--evidence", str(bundle_path),
              "--receipt", str(receipt_path),
-             "--now", str(now)],
+             "--now", str(now), "--max-evidence-age", str(max_age)],
             check=False,
             capture_output=True,
             text=True,
             env={**os.environ, "TEST_NATIVE_AUTHORITY": json.dumps({"context": self.native_context,
-                 "runs": self.native_runs, "drift": self.native_drift}), "TEST_FAKE_GITHUB": json.dumps(
+                 "runs": self.native_runs, "drift": self.native_drift,
+                 "now": now if native_now is None else native_now}), "TEST_FAKE_GITHUB": json.dumps(
                 {"client": self.fake_github_client, "drift": self.github_drift})},
         )
 
@@ -1238,10 +1244,11 @@ class PromotionReadinessTest(unittest.TestCase):
         self.assert_refused(forged, "outside current authority")
 
     def test_native_history_freshness_requires_exact_operator_reuse(self) -> None:
-        with unittest.mock.patch.object(READINESS, "read_native_authority_file") as reader:
+        with unittest.mock.patch.object(READINESS.time, "time", return_value=NOW + 86400), \
+                unittest.mock.patch.object(READINESS, "read_native_authority_file") as reader:
             reader.side_effect = lambda path, **kwargs: (b"fixture native CLI" if str(path) == "/test/buzz"
                                                        else json.dumps(self.native_context).encode())
-            authority = READINESS.NativeAuthority(Path("/test/context"), NOW + 86400, 86400)
+            authority = READINESS.NativeAuthority(Path("/test/context"), 86400)
             section = self.bundle["staging"]["event_evidence"]
             with self.assertRaisesRegex(READINESS.GateError, "stale native history"):
                 READINESS.validate_ci_event_evidence(section, self.candidate, self.base, "staging", "success", authority)
@@ -1253,11 +1260,54 @@ class PromotionReadinessTest(unittest.TestCase):
             with self.assertRaisesRegex(READINESS.GateError, "outside current authority"):
                 READINESS.validate_ci_event_evidence(section, self.candidate, self.base, "staging", "success", authority)
 
+    def test_native_clock_ignores_backdated_caller_epoch(self) -> None:
+        self.native_context["valid_until"] = NOW + 60
+        result = self.invoke(self.bundle, now=NOW, native_now=NOW + 60)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("native authority is expired", result.stderr)
+        self.assertFalse(self.receipt_path.exists())
+        self.native_context["valid_until"] = NOW + 86400
+        self.native_context["valid_from"] = NOW
+        result = self.invoke(self.bundle, now=NOW, native_now=NOW - 1)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("not yet valid", result.stderr)
+
+    def test_native_max_age_can_only_tighten_root_policy(self) -> None:
+        self.native_context["max_evidence_age"] = 1
+        result = self.invoke(self.bundle, max_age=10**9)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("stale native history", result.stderr)
+        self.assertFalse(self.receipt_path.exists())
+        self.native_context["max_evidence_age"] = 86400
+        result = self.invoke(self.bundle, max_age=600, native_now=NOW + 1000)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("stale native history", result.stderr)
+
+    def test_native_expired_reuse_ignores_backdated_caller_epoch(self) -> None:
+        self.native_context["max_evidence_age"] = 1
+        for name in ("staging", "production_canary", "deliberate_red"):
+            section = self.bundle[name]["event_evidence"]
+            history = hashlib.sha256(READINESS.PROTECTED_CI.canonical_json(section)).hexdigest()
+            self.native_context["historical_reuse"][history] = NOW + 60
+        baseline = self.invoke(self.bundle)
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        result = self.invoke(self.bundle, now=NOW, native_now=NOW + 60)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("stale native history", result.stderr)
+        self.assertFalse(self.receipt_path.exists())
+
+    def test_native_authority_expiry_during_live_verification_refuses_receipt(self) -> None:
+        self.native_drift = "expiry"
+        result = self.invoke(self.bundle)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("native authority expired during verification", result.stderr)
+        self.assertFalse(self.receipt_path.exists())
+
     def test_native_context_cannot_be_a_producer_owned_file(self) -> None:
         context = self.evidence_dir / "untrusted-context.json"
         write_json(context, self.native_context)
         with self.assertRaisesRegex(READINESS.GateError, "root-owned"):
-            READINESS.NativeAuthority(context, NOW, 86400)
+            READINESS.NativeAuthority(context, 86400)
 
     def test_pre_freeze_real_consumer_rejects_incomplete_receipts(self) -> None:
         original = json.loads(self.pre_freeze_path.read_bytes())
