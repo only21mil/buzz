@@ -201,7 +201,7 @@ fn prepare(
         == "CI"
     {
         require(
-            proof["schema_version"] == "buzz-ci-native-linux-supervisor/v1"
+            proof["schema_version"] == "buzz-ci-native-linux-supervisor/v2"
                 && proof["native_result"] == result,
         )?;
         require(
@@ -215,6 +215,7 @@ fn prepare(
             "container_absent",
             "recursive_cgroup_empty",
             "unit_inactive",
+            "slice_inactive",
         ] {
             require(proof[name] == true)?;
         }
@@ -227,6 +228,17 @@ fn prepare(
         require(
             result["invocation_digest"] == invocation
                 && proof["unit"] == format!("buzz-ci-linux-{invocation}.service"),
+        )?;
+        let slice_name = format!("buzzcilinux{invocation}.slice");
+        let slice_invocation_id = text_field(&proof, "slice_invocation_id")?;
+        require(
+            proof["slice"] == slice_name
+                && proof["cgroup_path"] == format!("/sys/fs/cgroup/{slice_name}")
+                && proof["cgroup_observation"] == "retained-slice-populated-zero"
+                && slice_invocation_id.len() == 32
+                && slice_invocation_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
         )?;
         let invocation_id = text_field(&proof, "invocation_id")?;
         require(
@@ -856,7 +868,7 @@ mod tests {
                 "materialization":{"candidate_sha":fixture.authority.candidate_oid,"base_sha":fixture.authority.trusted_base_oid,"workflow_file_sha256":fixture.authority.workflow_digest,"tree_sha":"88".repeat(20),"checkout_sha256":"77".repeat(32)},
                 "workflow_execution":{"schema_version":"buzz-ci-native-shell-projection/v1","job_id":"dead-token-guard","trusted_base_sha":fixture.authority.trusted_base_oid,"workflow_file_sha256":fixture.authority.workflow_digest,"script_sha256":"66".repeat(32),"executed_step_indices":[1],"native_step_indices":[0,2,3]},
                 "container":{"exit_code":0,"reason":"success","container_name":format!("buzzci-{invocation}"),"cleanup_proven":true,"stdout_sha256":digest(b"pass\n"),"stderr_sha256":digest(b""),"stdout_relative_path":"stdout.log","stderr_relative_path":"stderr.log","stdout_bytes":5,"stderr_bytes":0,"stdout_truncated":false,"stderr_truncated":false}});
-            let proof = json!({"schema_version":"buzz-ci-native-linux-supervisor/v1","registration_sha256":fixture.bundle.registration_sha256,"container_absent":true,"recursive_cgroup_empty":true,"unit_inactive":true,"unit":format!("buzz-ci-linux-{invocation}.service"),"invocation_id":"aa".repeat(16),"exec_main_code":1,"exec_main_status":0,"cgroup_device":12,"cgroup_inode":34,"finished_at":104});
+            let proof = json!({"schema_version":"buzz-ci-native-linux-supervisor/v2","registration_sha256":fixture.bundle.registration_sha256,"container_absent":true,"recursive_cgroup_empty":true,"unit_inactive":true,"slice_inactive":true,"slice":format!("buzzcilinux{invocation}.slice"),"slice_invocation_id":"bb".repeat(16),"cgroup_path":format!("/sys/fs/cgroup/buzzcilinux{invocation}.slice"),"cgroup_observation":"retained-slice-populated-zero","unit":format!("buzz-ci-linux-{invocation}.service"),"invocation_id":"aa".repeat(16),"exec_main_code":1,"exec_main_status":0,"cgroup_device":12,"cgroup_inode":34,"finished_at":104});
             fs::write(fixture.directory.path().join("stdout.log"), b"pass\n").unwrap();
             fs::write(fixture.directory.path().join("stderr.log"), b"").unwrap();
             fixture.write_result(result, proof);
@@ -882,6 +894,24 @@ mod tests {
                     .unwrap(),
                 fs::read(fixture.directory.path().join("result.json")).unwrap()
             );
+        }
+    }
+
+    #[test]
+    fn refuses_missing_or_rebound_linux_slice_cleanup() {
+        for field in [
+            "slice",
+            "slice_invocation_id",
+            "cgroup_path",
+            "cgroup_observation",
+            "slice_inactive",
+        ] {
+            let mut fixture = fixture(false);
+            let result = fixture.result();
+            let mut proof = fixture.proof();
+            proof[field] = Value::Null;
+            fixture.write_result(result, proof);
+            assert!(fixture.prepare().is_err());
         }
     }
 

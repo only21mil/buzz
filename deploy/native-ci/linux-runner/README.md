@@ -172,15 +172,22 @@ failure, cancel, timeout, replay and cleanup qualification through the installed
 supervisor, then verify the native signed completion against the exact receipt.
 
 
-The root supervisor uses `RemainAfterExit=yes` to retain the exact unit identity
-and actual main exit status until readback. It opens the cgroup directory while
-the unit is owned, proves its recursive `populated` counter is zero, then stops
-the unit and proves it inactive. Partial start failure still triggers exact-unit
-cleanup and container-absence readback. Refusal paths also attempt recursive
-cgroup readback, but never publish a successful supervisor receipt. Unavailable
-readback retains quarantine even if stopping the unit succeeds. An existing
-invocation unit is never reused or removed. The supervisor itself does not
-publish events or sign anything.
+The root supervisor retains the child service's invocation identity and exit
+status with `RemainAfterExit=yes`. It places that child in a unique root-owned
+`buzzcilinux<invocation>.slice` and opens the slice cgroup while the child runs.
+The active slice keeps its cgroup after systemd removes the exited child cgroup.
+Root reads the slice's actual recursive `populated 0`, stops the exact child and
+slice, and proves both inactive. The v2 supervisor receipt binds the child
+invocation, slice invocation, and observed slice path/device/inode. Missing
+cgroup events, removed directories and changed identities remain failures.
+Neither directory absence nor a zero link count substitutes for population
+readback. Partial start and refusal paths attempt cleanup but cannot publish
+success without every observation. Unavailable readback retains quarantine.
+
+On Linux 7.1.8, removed cgroups can retain dying kernel tasks. A preopened events
+FD becomes unavailable after removal, so the root-owned slice is necessary for
+fresh recursive population measurement. Existing v1 supervisor claims require
+root investigation when upgrading; they are not reinterpreted as v2 slice proof.
 
 Outer `NoNewPrivileges=yes` would prevent the installed `newuidmap` and
 `newgidmap` helpers from creating the subordinate-ID mapping. The host helper

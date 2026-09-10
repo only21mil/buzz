@@ -41,7 +41,7 @@ def _command(argv: list[str], *, timeout: int = 10) -> subprocess.CompletedProce
 
 
 def _state(unit: str) -> dict[str, str]:
-    properties = "ActiveState,SubState,ExecMainPID,ExecMainCode,ExecMainStatus,InvocationID,ControlGroup,LoadState"
+    properties = "ActiveState,SubState,ExecMainPID,ExecMainCode,ExecMainStatus,InvocationID,ControlGroup,LoadState,Slice"
     result = _command([SYSTEMCTL, "show", unit, "--property=" + properties])
     if result.returncode != 0 or len(result.stdout) > 16384:
         raise Refused("unit readback unavailable")
@@ -87,6 +87,7 @@ def _launch(unit: str, directory: Path, profile: dict) -> None:
     # no-new-privileges, dropped capabilities and read-only image remain fixed.
     properties = [
         "User=" + str(account.pw_uid), "Group=" + str(account.pw_gid),
+        "Slice=buzzcilinux" + unit.removeprefix("buzz-ci-linux-").removesuffix(".service") + ".slice",
         "RemainAfterExit=yes", "SuccessExitStatus=1", "KillMode=control-group", "TimeoutStopSec=45",
         "Delegate=yes", "UMask=0077", "MemoryMax=3221225472", "MemorySwapMax=0", "CPUQuota=200%",
         "TasksMax=512", "LimitCORE=0", "LimitFSIZE=2147483648", "PrivateTmp=yes",
@@ -161,12 +162,13 @@ def require_no_unfinished(root: Path) -> None:
         try:
             proof = json.loads(worker._read_root_file(directory / "supervisor.json", 65536))
             registration = worker._read_root_file(directory / "registration.bin", 992)
-            if (proof["schema_version"] != "buzz-ci-native-linux-supervisor/v1"
+            if (proof["schema_version"] != "buzz-ci-native-linux-supervisor/v2"
                     or any(proof.get(key) is not True for key in
-                           ("container_absent", "recursive_cgroup_empty", "unit_inactive"))
+                           ("container_absent", "recursive_cgroup_empty", "unit_inactive", "slice_inactive"))
                     or len(registration) != 992
                     or proof["registration_sha256"] != hashlib.sha256(registration).hexdigest()
                     or not re.fullmatch(r"[0-9a-f]{32}", proof["invocation_id"])
+                    or not re.fullmatch(r"[0-9a-f]{32}", proof["slice_invocation_id"])
                     or type(proof["finished_at"]) is not int):
                 raise Refused("invalid prior supervisor completion")
             result = proof["native_result"]
@@ -179,6 +181,10 @@ def require_no_unfinished(root: Path) -> None:
                 "profile_sha256": result["profile_sha256"]})).hexdigest()
             if directory.name != logical_digest or proof["unit"] != "buzz-ci-linux-" + invocation + ".service":
                 raise Refused("prior completion belongs to another claim")
+            if (proof["slice"] != "buzzcilinux" + invocation + ".slice"
+                    or proof["cgroup_path"] != "/sys/fs/cgroup/" + proof["slice"]
+                    or proof["cgroup_observation"] != "retained-slice-populated-zero"):
+                raise Refused("prior completion lacks bound slice cleanup")
             validate_result(result, admission, {"job_id": result["job_id"]}, result["profile_sha256"],
                             invocation, {"ExecMainCode": str(proof["exec_main_code"]),
                                          "ExecMainStatus": str(proof["exec_main_status"])})
@@ -190,6 +196,7 @@ def supervise(directory: Path, profile: dict, profile_digest: str, admission: di
     invocation = hashlib.sha256(worker._canonical({"admission_message_digest": admission["admission_message_digest"],
                                                   "profile_sha256": profile_digest})).hexdigest()
     unit = "buzz-ci-linux-" + invocation + ".service"
+    slice_name = "buzzcilinux" + invocation + ".slice"
     deadline = time.monotonic() + min(profile["maximum_wall_seconds"], admission["wall_timeout_seconds"],
                                       admission["expires_at"] - int(time.time()))
     if deadline <= time.monotonic():
@@ -198,6 +205,8 @@ def supervise(directory: Path, profile: dict, profile_digest: str, admission: di
     launched = False
     state = {}
     stopped = False
+    slice_stopped = False
+    slice_identity = ""
     proof = None
     container_absent = False
     cgroup_empty = False
@@ -205,13 +214,24 @@ def supervise(directory: Path, profile: dict, profile_digest: str, admission: di
     try:
         if _state(unit).get("LoadState") != "not-found":
             raise Refused("invocation unit already exists")
+        previous_slice = _state(slice_name)
+        if previous_slice.get("ActiveState") != "inactive" or previous_slice.get("InvocationID"):
+            raise Refused("invocation slice already exists")
         launched = True
         _launch(unit, directory, profile)
         first = _state(unit)
         identity = first.get("InvocationID", "")
         if len(identity) != 32:
             raise Refused("worker invocation identity unavailable")
-        descriptor, cgroup_path, cgroup_identity = _cgroup(unit, first)
+        slice_first = _state(slice_name)
+        slice_identity = slice_first.get("InvocationID", "")
+        if (not re.fullmatch(r"[0-9a-f]{32}", slice_identity)
+                or slice_first.get("ControlGroup") != "/" + slice_name
+                or first.get("Slice") != slice_name
+                or first.get("ControlGroup") not in {"", "/" + slice_name + "/" + unit}
+                or (not first.get("ControlGroup") and first.get("SubState") not in {"exited", "failed"})):
+            raise Refused("worker slice binding unavailable")
+        descriptor, cgroup_path, cgroup_identity = _cgroup(slice_name, slice_first)
         while True:
             state = _state(unit)
             if state.get("InvocationID") != identity:
@@ -229,8 +249,10 @@ def supervise(directory: Path, profile: dict, profile_digest: str, admission: di
         raw = worker._read_root_file(directory / "stdout.json", 32769)
         result = json.loads(raw)
         validate_result(result, admission, profile, profile_digest, invocation, state)
-        proof = {"schema_version": "buzz-ci-native-linux-supervisor/v1", "native_result": result,
+        proof = {"schema_version": "buzz-ci-native-linux-supervisor/v2", "native_result": result,
                  "unit": unit, "invocation_id": identity,
+                 "slice": slice_name, "slice_invocation_id": slice_identity,
+                 "cgroup_observation": "retained-slice-populated-zero",
                  "cgroup_path": str(cgroup_path), "cgroup_device": cgroup_identity[0],
                  "cgroup_inode": cgroup_identity[1], "exec_main_code": int(state["ExecMainCode"]),
                  "exec_main_status": int(state["ExecMainStatus"]), "container_absent": True,
@@ -243,7 +265,9 @@ def supervise(directory: Path, profile: dict, profile_digest: str, admission: di
                 # an unavailable readback skip the exact-unit stop attempt.
                 try:
                     if descriptor is None:
-                        descriptor, _, _ = _cgroup(unit, _state(unit))
+                        slice_state = _state(slice_name)
+                        slice_identity = slice_state.get("InvocationID", "")
+                        descriptor, _, _ = _cgroup(slice_name, slice_state)
                     cgroup_empty = _empty_cgroup(descriptor)
                 except (Refused, OSError, ValueError, subprocess.SubprocessError):
                     cgroup_empty = False
@@ -252,15 +276,22 @@ def supervise(directory: Path, profile: dict, profile_digest: str, admission: di
                     after = _state(unit)
                     stopped = stopped and after.get("ActiveState") in {"inactive", "failed"}
                 finally:
-                    # Read container storage after stop: stopping the unit alone
-                    # does not remove a container left by a dead worker.
-                    container_absent = _container_absent(profile, invocation)
+                    try:
+                        # Stop only the exact slice invocation observed during our launch.
+                        current_slice = _state(slice_name)
+                        if slice_identity and current_slice.get("InvocationID") == slice_identity:
+                            slice_stopped = _command([SYSTEMCTL, "stop", slice_name], timeout=50).returncode == 0
+                            slice_stopped = slice_stopped and _state(slice_name).get("ActiveState") == "inactive"
+                    finally:
+                        # Stopping a unit does not remove retained container storage.
+                        container_absent = _container_absent(profile, invocation)
         finally:
             if descriptor is not None:
                 os.close(descriptor)
-    if not stopped or not container_absent or not cgroup_empty or proof is None:
+    if not stopped or not slice_stopped or not container_absent or not cgroup_empty or proof is None:
         raise Refused("unit cleanup unproven")
     proof["unit_inactive"] = True
+    proof["slice_inactive"] = True
     proof["finished_at"] = int(time.time())
     return proof
 

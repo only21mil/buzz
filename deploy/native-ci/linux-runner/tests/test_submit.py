@@ -30,7 +30,9 @@ class SupervisorTests(unittest.TestCase):
         self.profile_digest = "d" * 64
         self.invocation = hashlib.sha256(worker._canonical({"admission_message_digest": "1" * 64,
                                                           "profile_sha256": self.profile_digest})).hexdigest()
-        self.state = {"InvocationID": "e" * 32, "SubState": "exited", "ActiveState": "active",
+        self.slice_name = "buzzcilinux" + self.invocation + ".slice"
+        self.slice_state = {"InvocationID": "f" * 32, "ActiveState": "active", "ControlGroup": "/" + self.slice_name}
+        self.state = {"Slice": self.slice_name, "ControlGroup": "/" + self.slice_name + "/buzz-ci-linux-" + self.invocation + ".service", "InvocationID": "e" * 32, "SubState": "exited", "ActiveState": "active",
                       "ExecMainCode": "1", "ExecMainStatus": "0"}
         self.result = {"schema_version": "buzz-ci-native-linux-receipt/v1", "admission": self.admission,
                        "profile_sha256": self.profile_digest, "invocation_digest": self.invocation,
@@ -46,9 +48,41 @@ class SupervisorTests(unittest.TestCase):
                                               "workflow_file_sha256": "c" * 64, "script_sha256": "b" * 64,
                                               "executed_step_indices": [1], "native_step_indices": [0, 2, 3]}}
 
+    def lifecycle_states(self):
+        return [{"LoadState": "not-found"}, {"ActiveState": "inactive"}, self.state, self.slice_state,
+                self.state, {"ActiveState": "inactive"}, self.slice_state, {"ActiveState": "inactive"}]
+
     def validate(self, result=None, state=None):
         submit.validate_result(self.result if result is None else result, self.admission, self.profile,
                                self.profile_digest, self.invocation, self.state if state is None else state)
+
+    def test_missing_events_and_removed_directory_never_prove_empty(self):
+        with tempfile.TemporaryDirectory() as parent:
+            directory = Path(parent) / "slice"
+            directory.mkdir()
+            descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with self.assertRaises(FileNotFoundError):
+                    submit._empty_cgroup(descriptor)
+                events = directory / "cgroup.events"
+                events.write_text("populated 1\nfrozen 0\n")
+                self.assertFalse(submit._empty_cgroup(descriptor))
+                events.write_text("populated 0\nfrozen 0\n")
+                self.assertTrue(submit._empty_cgroup(descriptor))
+                events.unlink()
+                directory.rmdir()
+                with self.assertRaises(FileNotFoundError):
+                    submit._empty_cgroup(descriptor)
+            finally:
+                os.close(descriptor)
+
+    def test_existing_slice_is_not_started_or_stopped(self):
+        with patch.object(submit, "_state", side_effect=[{"LoadState": "not-found"}, self.slice_state]), \
+             patch.object(submit, "_launch") as launch, patch.object(submit, "_command") as command:
+            with self.assertRaises(Refused):
+                submit.supervise(Path("/unused"), self.profile, self.profile_digest, self.admission)
+            launch.assert_not_called()
+            command.assert_not_called()
 
     def test_control_commands_do_not_inherit_operator_working_directory(self):
         previous = Path.cwd()
@@ -73,6 +107,7 @@ class SupervisorTests(unittest.TestCase):
         self.assertNotIn("--property=ProtectHome=yes", argv)
         self.assertIn("--property=ProtectSystem=strict", argv)
         self.assertIn("--property=RestrictSUIDSGID=no", argv)
+        self.assertIn("--property=Slice=buzzcilinuxtest.slice", argv)
 
     def test_matching_source_and_actual_exit_are_required(self):
         self.validate()
@@ -100,7 +135,7 @@ class SupervisorTests(unittest.TestCase):
         for container_absent, cgroup_empty, succeeds in ((True, True, True), (False, True, False), (True, False, False)):
             with tempfile.TemporaryDirectory() as temporary:
                 descriptor = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
-                states = [{"LoadState": "not-found"}, self.state, self.state, {"ActiveState": "inactive"}]
+                states = self.lifecycle_states()
                 with patch.object(submit, "_state", side_effect=states), patch.object(submit, "_launch"), \
                      patch.object(submit, "_cgroup", return_value=(descriptor, Path(temporary), (1, 2))), \
                      patch.object(submit, "_empty_cgroup", return_value=cgroup_empty), \
@@ -111,6 +146,8 @@ class SupervisorTests(unittest.TestCase):
                         proof = submit.supervise(Path(temporary), self.profile, self.profile_digest, self.admission)
                         self.assertTrue(proof["unit_inactive"])
                         self.assertTrue(proof["recursive_cgroup_empty"])
+                        self.assertTrue(proof["slice_inactive"])
+                        self.assertEqual(proof["slice"], self.slice_name)
                     else:
                         with self.assertRaises(Refused):
                             submit.supervise(Path(temporary), self.profile, self.profile_digest, self.admission)
@@ -125,7 +162,7 @@ class SupervisorTests(unittest.TestCase):
             command.assert_not_called()
 
     def test_partial_start_failure_still_stops_exact_unit(self):
-        with patch.object(submit, "_state", side_effect=[{"LoadState": "not-found"}, {}, {"ActiveState": "inactive"}]), \
+        with patch.object(submit, "_state", side_effect=[{"LoadState": "not-found"}, {"ActiveState": "inactive"}, self.slice_state, {"ActiveState": "inactive"}, self.slice_state, {"ActiveState": "inactive"}]), \
              patch.object(submit, "_launch", side_effect=Refused("start")), \
              patch.object(submit, "_container_absent", return_value=False) as absent, \
              patch.object(submit, "_command", return_value=subprocess.CompletedProcess([], 0, b"")) as command:
@@ -137,8 +174,7 @@ class SupervisorTests(unittest.TestCase):
     def test_invalid_worker_output_still_measures_cleanup_and_stops(self):
         with tempfile.TemporaryDirectory() as temporary:
             descriptor = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
-            with patch.object(submit, "_state", side_effect=[{"LoadState": "not-found"}, self.state,
-                                                           self.state, {"ActiveState": "inactive"}]), \
+            with patch.object(submit, "_state", side_effect=self.lifecycle_states()), \
                  patch.object(submit, "_launch"), \
                  patch.object(submit, "_cgroup", return_value=(descriptor, Path(temporary), (1, 2))), \
                  patch.object(submit, "_empty_cgroup", return_value=False) as empty, \
@@ -156,8 +192,10 @@ class SupervisorTests(unittest.TestCase):
     def proof(self):
         result = copy.deepcopy(self.result)
         result["admission"] = self.admission.copy()
-        return {"schema_version": "buzz-ci-native-linux-supervisor/v1", "native_result": result,
+        return {"schema_version": "buzz-ci-native-linux-supervisor/v2", "native_result": result,
                 "unit": "buzz-ci-linux-" + self.invocation + ".service", "invocation_id": "e" * 32,
+                "slice": self.slice_name, "slice_invocation_id": "f" * 32, "slice_inactive": True,
+                "cgroup_path": "/sys/fs/cgroup/" + self.slice_name, "cgroup_observation": "retained-slice-populated-zero",
                 "container_absent": True, "recursive_cgroup_empty": True, "unit_inactive": True,
                 "exec_main_code": 1, "exec_main_status": 0, "finished_at": int(time.time())}
 
@@ -224,7 +262,7 @@ class SupervisorTests(unittest.TestCase):
 
     def test_invalid_or_unclean_prior_proof_quarantines_successor(self):
         variants = [b"{", b"{}", b"null"]
-        for key in ("container_absent", "recursive_cgroup_empty", "unit_inactive"):
+        for key in ("container_absent", "recursive_cgroup_empty", "unit_inactive", "slice_inactive"):
             proof = self.proof()
             proof[key] = False
             variants.append(worker._canonical(proof))
