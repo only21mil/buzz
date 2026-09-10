@@ -70,6 +70,28 @@ pub async fn dispatch(cmd: CiCmd, client: &BuzzClient) -> Result<(), CliError> {
             let trusted = resolve_required_trusted_context()?;
             super::read_commands::cmd_watch(client, &run, timeout_seconds, &trusted).await
         }
+        CiCmd::Landing { action, verify } => match (action, verify) {
+            (
+                Some(super::landing::LandingCmd::Validate {
+                    receipt,
+                    reverify,
+                    max_age_seconds,
+                }),
+                _,
+            ) => {
+                super::landing::cmd_landing_validate(client, &receipt, reverify, max_age_seconds)
+                    .await
+            }
+            (None, Some(args)) => {
+                let trusted = resolve_required_trusted_context()?;
+                super::landing::cmd_landing(client, &args, &trusted).await
+            }
+            (None, None) => Err(CliError::Usage(
+                "buzz ci landing needs --repo-owner, --repo-id, --candidate, --base, --landed, \
+                 and --output, or the validate subcommand"
+                    .into(),
+            )),
+        },
     }
 }
 
@@ -88,6 +110,19 @@ fn resolve_required_trusted_context() -> Result<RunTrustedContext, CliError> {
         channel_id,
         status_signers: signers,
     })
+}
+
+/// The trusted context when the operator exported it, `None` when both
+/// `BUZZ_CI_CHANNEL` and `BUZZ_CI_STATUS_SIGNERS` are unset, and an error
+/// when only one is set or either is malformed. Offline receipt validation
+/// anchors the receipt's recorded trust to this.
+pub(super) fn resolve_optional_trusted_context() -> Result<Option<RunTrustedContext>, CliError> {
+    let channel = std::env::var_os("BUZZ_CI_CHANNEL");
+    let signers = std::env::var_os("BUZZ_CI_STATUS_SIGNERS");
+    if channel.is_none() && signers.is_none() {
+        return Ok(None);
+    }
+    resolve_required_trusted_context().map(Some)
 }
 
 fn parse_status_signers() -> Result<HashSet<String>, CliError> {
@@ -572,9 +607,7 @@ mod tests {
         F: FnOnce() -> Fut,
         Fut: std::future::Future,
     {
-        use tokio::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::const_new(());
-        let _guard = LOCK.lock().await;
+        let _guard = crate::commands::ci::CI_ENV_LOCK.lock().await;
         f().await;
     }
 

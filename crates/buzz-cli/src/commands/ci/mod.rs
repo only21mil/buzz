@@ -1,5 +1,6 @@
 use clap::Subcommand;
 pub mod dispatch;
+pub mod landing;
 pub mod read_commands;
 // Helper modules encode the frozen wire contract (dead_code: relay-side surface).
 #[allow(dead_code)]
@@ -9,6 +10,12 @@ pub use buzz_core::ci::reducer;
 pub mod run;
 #[allow(dead_code)]
 pub mod watch;
+
+/// One lock for every test that mutates the process environment
+/// (`BUZZ_CI_CHANNEL`, `BUZZ_CI_STATUS_SIGNERS`, `BUZZ_PRIVATE_KEY`), so the
+/// dispatch and landing tests never interleave their `set_var` calls.
+#[cfg(test)]
+pub(crate) static CI_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Commands for triggering and inspecting Buzz CI runs.
 #[derive(Subcommand)]
@@ -78,5 +85,15 @@ pub enum CiCmd {
         /// Hard deadline for the complete watch, in seconds
         #[arg(long)]
         timeout_seconds: u64,
+    },
+    /// Verify a Buzz-native landing on relay main and publish a receipt
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+    Landing {
+        /// `validate` re-verifies an existing receipt
+        #[command(subcommand)]
+        action: Option<landing::LandingCmd>,
+        /// Verification inputs
+        #[command(flatten)]
+        verify: Option<landing::LandingVerifyArgs>,
     },
 }

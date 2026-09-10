@@ -96,6 +96,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(api::ci::get_ci_run_request),
         )
         .route("/ci/runs/{run_id}/events", get(api::ci::get_ci_run_events))
+        .route("/ci/checks", get(api::ci::get_ci_checks))
+        .route(
+            "/ci/merge-gate/decisions",
+            get(api::ci::get_ci_merge_gate_decisions),
+        )
         .route(
             "/workflows/{workflow_id}/runs",
             get(api::bridge::workflow_runs),
