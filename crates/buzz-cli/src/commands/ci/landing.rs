@@ -3555,7 +3555,7 @@ mod tests {
         std::fs::write(
             checkout.join("scripts/desktop_release.py"),
             format!(
-                "import sys\nprint('stub verify-main', sys.argv[1:])\nsys.exit({verifier_exit})\n"
+                "import json\nimport sys\nprint('stub verify-main', json.dumps(sys.argv[1:]))\nsys.exit({verifier_exit})\n"
             ),
         )
         .unwrap();
@@ -3981,9 +3981,7 @@ mod tests {
     /// The validate entry through the real CLI grammar on a published receipt.
     #[tokio::test]
     async fn validate_cli_entry_anchors_to_the_environment() {
-        use tokio::sync::Mutex;
-        static ENV: Mutex<()> = Mutex::const_new(());
-        let _guard = ENV.lock().await;
+        let _guard = crate::commands::ci::CI_ENV_LOCK.lock().await;
 
         let scenario = Scenario::new(0);
         let dir = private_dir();
@@ -4477,13 +4475,17 @@ mod tests {
         let detail =
             desktop_verify_main(&changed.checkout, &changed.landed, Some("only21mil/buzz"))
                 .unwrap();
-        assert!(detail.contains("'--repo', 'only21mil/buzz'"), "{detail}");
+        assert!(
+            detail.contains("\"--repo\", \"only21mil/buzz\""),
+            "{detail}"
+        );
 
-        // An untracked scripts/subprocess.py must not shadow the standard
-        // library: the stub imports sys only, so prove isolation by placing a
-        // poisoned module the interpreter would import first without -I.
+        // An untracked module in scripts/ must not shadow the standard
+        // library. `json` is not a built-in module (unlike `sys`), so without
+        // -I the interpreter would import this poisoned copy from the script
+        // directory first and the stub would exit "shadowed stdlib".
         std::fs::write(
-            unchanged.checkout.join("scripts/sys.py"),
+            unchanged.checkout.join("scripts/json.py"),
             "raise SystemExit('shadowed stdlib')\n",
         )
         .unwrap();

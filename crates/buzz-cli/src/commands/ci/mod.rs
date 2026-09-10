@@ -11,6 +11,12 @@ pub mod run;
 #[allow(dead_code)]
 pub mod watch;
 
+/// One lock for every test that mutates the process environment
+/// (`BUZZ_CI_CHANNEL`, `BUZZ_CI_STATUS_SIGNERS`, `BUZZ_PRIVATE_KEY`), so the
+/// dispatch and landing tests never interleave their `set_var` calls.
+#[cfg(test)]
+pub(crate) static CI_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Commands for triggering and inspecting Buzz CI runs.
 #[derive(Subcommand)]
 pub enum CiCmd {

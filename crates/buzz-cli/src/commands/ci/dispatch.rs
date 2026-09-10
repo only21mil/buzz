@@ -607,9 +607,7 @@ mod tests {
         F: FnOnce() -> Fut,
         Fut: std::future::Future,
     {
-        use tokio::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::const_new(());
-        let _guard = LOCK.lock().await;
+        let _guard = crate::commands::ci::CI_ENV_LOCK.lock().await;
         f().await;
     }
 
