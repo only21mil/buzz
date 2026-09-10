@@ -2,6 +2,7 @@
 """Framework controller adapter: send an existing signed v2 frame to the MBP."""
 import argparse
 import json
+import hashlib
 from pathlib import Path
 import subprocess
 import sys
@@ -29,7 +30,7 @@ def check_receipt(receipt, expected, operation):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--operation', choices=('run', 'cancel', 'status'), required=True)
+    parser.add_argument('--operation', choices=('run', 'cancel', 'status', 'log'), required=True)
     parser.add_argument('--verifier', type=Path, required=True)
     parser.add_argument('--policy', type=Path, required=True)
     args = parser.parse_args()
@@ -47,6 +48,19 @@ def main():
     except (KeyboardInterrupt, subprocess.TimeoutExpired):
         subprocess.run(REMOTE + ['cancel'], input=frame, capture_output=True, timeout=30, check=True)
         raise
+    if args.operation == 'log':
+        if len(result.stdout) > 1024 * 1024:
+            raise ValueError('oversized log')
+        status = subprocess.run(REMOTE + ['status'], input=frame, capture_output=True, timeout=30, check=True)
+        if len(status.stdout) > 16384:
+            raise ValueError('oversized status')
+        receipt = json.loads(status.stdout)
+        check_receipt(receipt, expected, 'status')
+        if (receipt.get('log', {}).get('sha256') != hashlib.sha256(result.stdout).hexdigest()
+                or receipt['log']['byte_length'] != len(result.stdout)):
+            raise ValueError('log differs from broker receipt')
+        sys.stdout.buffer.write(result.stdout)
+        return
     if len(result.stdout) > 16384:
         raise ValueError('oversized broker result')
     receipt = json.loads(result.stdout)

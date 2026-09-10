@@ -4,8 +4,11 @@
 Linux or Mac native runner. The 992-byte frame embeds the signed v2
 admission and the canonical job-intent preimage. The tool
 uses the existing `prepare_signed_admission`, registration encoder and
-`UnixKeyholderClient`. It creates no keys, publishes no events and starts no
-runner. The installed keyholder at source `5bfe6d48` already supports this
+`UnixKeyholderClient`. Its `policy`, `check` and `sign` commands publish no
+events and start no runner. The explicit `begin` and `publish` commands connect
+accepted requests to the existing publication state machine; see
+[operator completion](completion.md). No command creates keys or starts a runner.
+The installed keyholder at source `5bfe6d48` already supports this
 `SignManifest(JobIntentV2)` operation.
 
 The operator validates a genuinely signed kind 46100 request with

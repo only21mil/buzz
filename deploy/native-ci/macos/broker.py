@@ -26,6 +26,8 @@ LEGACY = Path('/usr/local/libexec/buzz-macos-build')
 LEGACY_HASH = 'c0d6fcd6d5922b61353e07e4402932099efa8004803c8d09305e2273237a3ef7'
 LEGACY_MANIFEST_HASH = '5a60649f517e6b8db3463e53c5e1af2740107dc19b45410d5be6d3959c84e8e7'
 ENV = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'LANG': 'en_US.UTF-8'}
+LOG_CAP = 1024 * 1024
+
 FILES = {'broker.py', 'payload.py', 'desktop-build.sh', 'buzz-ci-admission-verifier', 'policy.json'}
 
 
@@ -120,6 +122,29 @@ def require_no_unfinished():
         require(value.get('cleanup_complete') is True, 'prior cleanup requires operator recovery')
 
 
+def drain_log(fd, kept, count):
+    """Retain the first bounded bytes and count every byte read from the pipe."""
+    for _ in range(16):
+        try:
+            chunk = os.read(fd, 65536)
+        except BlockingIOError:
+            return count
+        if not chunk:
+            return count
+        count += len(chunk)
+        kept.extend(chunk[:max(0, LOG_CAP - len(kept))])
+    return count
+
+
+def log_metadata(request):
+    path = record_path(request, 'log')
+    protected(path)
+    value = path.read_bytes()
+    require(len(value) <= LOG_CAP, 'log exceeds cap')
+    return {'sha256': hashlib.sha256(value).hexdigest(), 'byte_length': len(value),
+            'cap_bytes': LOG_CAP}
+
+
 def execute(helper, root, request, builder, darwin_parent):
     read_fd, write_fd = os.pipe()
     log_read, log_write = os.pipe()
@@ -148,20 +173,21 @@ def execute(helper, root, request, builder, darwin_parent):
     os.close(log_write)
     os.set_blocking(log_read, False)
     tail = bytearray()
+    count = 0
     try:
         with os.fdopen(write_fd, 'wb') as stream:
             stream.write(json.dumps(request).encode())
         timeout = min(request['wall_timeout_seconds'], request['expires_at'] - time.time())
         deadline = time.monotonic() + timeout
         while True:
-            helper.drain_log(log_read, tail)
+            count = drain_log(log_read, tail, count)
             if record_path(request, 'cancel').exists():
                 return 'cancelled', None
             if time.monotonic() >= deadline:
                 return 'timed_out', None
             found, status = os.waitpid(pid, os.WNOHANG)
             if found:
-                helper.drain_log(log_read, tail)
+                count = drain_log(log_read, tail, count)
                 code = os.waitstatus_to_exitcode(status)
                 return ('success' if code == 0 else 'failure'), code
             time.sleep(0.25)
@@ -169,8 +195,11 @@ def execute(helper, root, request, builder, darwin_parent):
         try:
             with helper.cleanup_signals():
                 helper.stop_builder(590, pid)
-                # Diagnostics remain bounded data in a root-owned file.
+                count = drain_log(log_read, tail, count)
+                # Exact retained bytes and truncation are separate facts.
                 write_new(record_path(request, 'log'), bytes(tail))
+                write_new(record_path(request, 'log-metadata'), json.dumps(dict(
+                    log_metadata(request), observed_bytes=count, truncated=count > len(tail)), sort_keys=True).encode())
         finally:
             os.close(log_read)
 
@@ -188,6 +217,7 @@ def run(helper, request):
     owned = False
     admitted = False
     conclusion, code, cleaned = 'failure', None, False
+    started_at = int(time.time())
     try:
         info = os.fstat(lock)
         require(info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o600
@@ -231,7 +261,11 @@ def run(helper, request):
                 receipt = dict(request, job_id='desktop-build-macos-unsigned',
                                conclusion=conclusion if cleaned else 'cleanup_failed',
                                exit_code=code, cleanup_complete=cleaned,
-                               completed_at=int(time.time()))
+                               started_at=started_at, completed_at=int(time.time()))
+                log_path = record_path(request, 'log-metadata')
+                if log_path.exists():
+                    protected(log_path)
+                    receipt['log'] = json.loads(log_path.read_bytes())
                 write_new(record_path(request, 'receipt'), json.dumps(receipt, sort_keys=True).encode())
     return receipt
 
@@ -242,7 +276,7 @@ def interrupted(_signal, _frame):
 
 def main():
     require(sys.platform == 'darwin' and os.geteuid() == 0, 'macOS root broker required')
-    require(len(sys.argv) == 2 and sys.argv[1] in ('run', 'cancel', 'status'), 'fixed operation required')
+    require(len(sys.argv) == 2 and sys.argv[1] in ('run', 'cancel', 'status', 'log'), 'fixed operation required')
     require(os.environ.get('SUDO_UID') == str(pwd.getpwnam('m5mbp').pw_uid), 'operator transport required')
     os.umask(0o077)
     os.environ.clear()
@@ -267,6 +301,14 @@ def main():
             path = record_path(request, 'receipt')
             protected(path)
             receipt = json.loads(path.read_bytes())
+            if operation == 'log':
+                log_path = record_path(request, 'log')
+                protected(log_path)
+                value = log_path.read_bytes()
+                require(len(value) <= LOG_CAP and receipt.get('log', {}).get('sha256') == hashlib.sha256(value).hexdigest()
+                        and receipt['log']['byte_length'] == len(value), 'log receipt mismatch')
+                sys.stdout.buffer.write(value)
+                return
     print(json.dumps(receipt, sort_keys=True))
 
 

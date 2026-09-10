@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+import hashlib
 from pathlib import Path
 import tempfile
 import unittest
@@ -12,6 +13,27 @@ spec.loader.exec_module(broker)
 
 
 class BrokerTests(unittest.TestCase):
+    def test_bounded_log_keeps_exact_prefix_and_counts_discarded_bytes(self):
+        kept = bytearray()
+        with patch.object(broker, 'LOG_CAP', 4), patch.object(broker.os, 'read', side_effect=[b'abc', b'def', BlockingIOError()]):
+            count = broker.drain_log(99, kept, 0)
+        self.assertEqual(bytes(kept), b'abcd')
+        self.assertEqual(count, 6)
+
+    def test_continuous_log_flood_cannot_starve_deadline_checks(self):
+        with patch.object(broker.os, 'read', return_value=b'x' * 65536) as read:
+            kept = bytearray()
+            count = broker.drain_log(99, kept, 0)
+        self.assertEqual(read.call_count, 16)
+        self.assertEqual(count, 1024 * 1024)
+        self.assertEqual(len(kept), broker.LOG_CAP)
+
+    def test_log_metadata_binds_exact_retained_bytes(self):
+        request = {'run_id': 'a' * 32, 'attempt': 1}
+        with tempfile.TemporaryDirectory() as directory, patch.object(broker, 'STATE', Path(directory)), patch.object(broker, 'protected'):
+            broker.write_new(broker.record_path(request, 'log'), b'build\n')
+            self.assertEqual(broker.log_metadata(request), {'sha256': hashlib.sha256(b'build\n').hexdigest(), 'byte_length': 6, 'cap_bytes': broker.LOG_CAP})
+
     def test_read_frame_refuses_truncation_and_suffix(self):
         self.assertEqual(broker.read_frame(io.BytesIO(b'x' * 992)), b'x' * 992)
         for size in (0, 991, 993, 1024):

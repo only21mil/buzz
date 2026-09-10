@@ -93,7 +93,7 @@ sudo -n /usr/bin/python3 -I \
   /usr/local/libexec/buzz-native-macos-ci/broker.py run
 ```
 
-`cancel` and `status` accept the same verified frame to identify a retained
+`cancel`, `status`, and `log` accept the same verified frame to identify a retained
 attempt. They require the existing authenticated operator transport as well as
 an exact match with the root-retained admission. They are local operation
 selectors, not alternative v2 wire operations. Cancel creates a root-owned
@@ -134,6 +134,13 @@ failing workload and cancellation while a workload runs. Confirm the shared
 lock refuses overlap with an existing Apple build and the operator's private
 files remain inaccessible to the build UID. Verify old installed helper hashes
 again afterward.
+
+The `log` operation returns only that admission's retained combined output.
+The root receipt binds its SHA256, retained and observed byte counts, cap and
+truncation flag, plus measured start and completion times. The first 1 MiB is
+retained. The publication operator refuses truncated evidence under the current
+CI protocol. See [operator completion](../admission/completion.md) for the
+explicit capture, queued acknowledgement, root submission and publication path.
 
 The receipt carries the v2 canonical admission-message digest,
 `signed_request_digest`, source pin, candidate/base, workflow/job/profile/lane

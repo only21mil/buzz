@@ -629,6 +629,34 @@ where
         self.poll_head(channel_id, false, Some(expected))
     }
 
+    /// Acknowledge one exact relay-accepted request before an operator submits
+    /// its signed native admission. Retain the intake cursor so a later bounded
+    /// poll publishes completion through the ordinary durable state machine.
+    /// This never invokes the executor or asserts that execution started.
+    pub fn acknowledge_once_bound(
+        &mut self,
+        expected: &AcceptedRequestBinding,
+    ) -> Result<String, ProductionError> {
+        let cursor = self
+            .store
+            .cursor(&expected.channel_id)
+            .map_err(|_| ProductionError::Store)?;
+        let accepted = self
+            .relay
+            .next_accepted(&expected.channel_id, cursor)
+            .map_err(|_| ProductionError::Relay)?
+            .ok_or(ProductionError::Invalid)?;
+        if !expected.matches(&accepted) || accepted.watch_cursor <= cursor {
+            return Err(ProductionError::Invalid);
+        }
+        let identity = run_identity(&accepted)?;
+        let (_, record) = self.load_or_queue(&accepted, &identity)?;
+        if record.state() != RunState::Queued {
+            return Err(ProductionError::Invalid);
+        }
+        self.publish_run(&accepted, &record, "run:queued")
+    }
+
     /// Replay every deferred publication through the ordinary pending path
     /// (exact retry, exact-event read-back, re-sign), then settle the channel
     /// head when its run is already terminal so the cursor moves past the
@@ -2807,6 +2835,41 @@ mod tests {
         DeterministicSigner
             .sign(KIND_CI_JOB_STATUS, &content, tags)
             .expect("signed job status")
+    }
+
+    #[test]
+    fn operator_acknowledgement_is_exact_idempotent_and_never_dispatches() {
+        let accepted = accepted();
+        let mut binding = frozen_binding(&accepted);
+        let mut handler = ProductionHandler::new(
+            Relay {
+                accepted: Some(accepted),
+                published: Vec::new(),
+                job_statuses: Vec::new(),
+                intent_signal: None,
+                refuse_publication: false,
+            },
+            DeterministicSigner,
+            FailingExecutor,
+            MemoryStore::default(),
+            MemoryOutput(Vec::new()),
+        );
+        binding.event_id = "99".repeat(32);
+        assert!(matches!(
+            handler.acknowledge_once_bound(&binding),
+            Err(ProductionError::Invalid)
+        ));
+        assert!(handler.store.run.is_none());
+        binding = frozen_binding(handler.relay.accepted.as_ref().unwrap());
+        let first = handler.acknowledge_once_bound(&binding).unwrap();
+        assert_eq!(handler.acknowledge_once_bound(&binding).unwrap(), first);
+        assert_eq!(handler.store.cursor, 0);
+        assert_eq!(
+            handler.store.run.as_ref().unwrap().1.state(),
+            RunState::Queued
+        );
+        assert_eq!(handler.relay.published, vec![KIND_CI_RUN_STATUS]);
+        assert!(handler.relay.job_statuses.is_empty());
     }
 
     #[test]

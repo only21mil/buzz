@@ -1,5 +1,5 @@
-//! Explicit operator admission through the existing authenticated keyholder.
-//! No credential loading, relay publication, or runner execution occurs here.
+//! Explicit native admission and completion through the existing keyholder.
+//! Publication is opt-in through begin/publish. No command executes a runner.
 #![forbid(unsafe_code)]
 
 use buzz_ci_broker_protocol::v2;
@@ -27,6 +27,9 @@ use std::{
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[path = "native_admission_operator/completion.rs"]
+mod completion;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -290,6 +293,14 @@ fn validate_inputs(
 
 fn run() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
+    if args.get(1).is_some_and(|command| {
+        command == "publish"
+            || command == "check-completion"
+            || command == "begin"
+            || command == "await-request"
+    }) {
+        return completion::run(&args);
+    }
     if args.len() < 4 || !matches!(args[1].as_str(), "policy" | "check" | "sign") {
         return Err("usage: native_admission_operator policy|check|sign AUTHORITY REVIEWED_SHA256 [SIGNED_REQUEST SOURCE_PIN]".into());
     }
@@ -339,7 +350,7 @@ mod tests {
     use buzz_core::ci::{request_tags, CiRequestEnvelope, CI_SCHEMA_VERSION};
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 
-    fn fixture() -> (Authority, Keys, Event, CiRequestEnvelope) {
+    pub(super) fn fixture() -> (Authority, Keys, Event, CiRequestEnvelope) {
         // Only deterministic offline test keys. No fixture output is operational evidence.
         let keys = Keys::parse(&"01".repeat(32)).unwrap();
         let actor = keys.public_key().to_hex();
@@ -397,7 +408,7 @@ mod tests {
         (authority, keys, source, envelope)
     }
 
-    fn sign(keys: &Keys, envelope: &CiRequestEnvelope) -> Event {
+    pub(super) fn sign(keys: &Keys, envelope: &CiRequestEnvelope) -> Event {
         EventBuilder::new(
             Kind::Custom(46100),
             serde_json::to_string(envelope).unwrap(),
