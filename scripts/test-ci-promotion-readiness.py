@@ -1260,6 +1260,26 @@ class PromotionReadinessTest(unittest.TestCase):
             with self.assertRaisesRegex(READINESS.GateError, "outside current authority"):
                 READINESS.validate_ci_event_evidence(section, self.candidate, self.base, "staging", "success", authority)
 
+    def test_native_job_ids_match_protocol_and_initial_linux_mac_jobs(self) -> None:
+        schema = json.loads((REPO_ROOT / "docs/ci/promotion-evidence.schema.json").read_text())
+        self.assertEqual(schema["$defs"]["job_id"]["pattern"], READINESS.JOB_ID.pattern)
+        for job in ("dead-token-guard", "desktop-build-macos-unsigned"):
+            with self.subTest(job=job), \
+                    unittest.mock.patch.object(READINESS.time, "time", return_value=NOW), \
+                    unittest.mock.patch.object(READINESS, "read_native_authority_file") as reader:
+                self.native_context["job_ids"] = [job]
+                reader.side_effect = lambda path, **kwargs: (
+                    b"fixture native CLI" if str(path) == "/test/buzz"
+                    else json.dumps(self.native_context).encode())
+                authority = READINESS.NativeAuthority(Path("/test/context"), 86400)
+                section = self.signed_event_evidence("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", jobs=(job,), rerun_job=job)
+                result = READINESS.validate_ci_event_evidence(
+                    section, self.candidate, self.base, "staging", "success", authority)
+                self.assertEqual(result["job_ids"], [job])
+        for job in ("", "1job", "-job", "job/name", "job name", "a" * 65):
+            with self.subTest(invalid_job=job), self.assertRaises(READINESS.GateError):
+                READINESS.job_ids([job], "native job")
+
     def test_native_clock_ignores_backdated_caller_epoch(self) -> None:
         self.native_context["valid_until"] = NOW + 60
         result = self.invoke(self.bundle, now=NOW, native_now=NOW + 60)

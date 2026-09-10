@@ -24,7 +24,7 @@ import uuid
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 SIGNATURE = re.compile(r"^[0-9a-f]{128}$")
-JOB_ID = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+JOB_ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
 IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 CI_EVENT_KINDS = {46101, 46102, 46103, 46104, 46105, 46106}
 RUN_STATES = {
