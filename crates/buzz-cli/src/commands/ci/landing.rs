@@ -56,6 +56,8 @@ pub const WORKFLOW_PATH: &str = ".github/workflows/ci.yml";
 pub const MAIN_REF: &str = "refs/heads/main";
 /// The maintained desktop identity gate the verifier executes.
 pub const DESKTOP_VERIFIER: &str = "scripts/desktop_release.py";
+/// The metadata blob `desktop_release.py` keys the candidate identity on.
+pub const DESKTOP_METADATA: &str = ".release/desktop-candidate.json";
 const MAX_CI_RUN_EVENTS: usize = 10_000;
 const MAX_SAFE_CURSOR: u64 = (1_u64 << 53) - 1;
 
@@ -1466,6 +1468,20 @@ fn read_mirror_main(repository: &str) -> Result<String, String> {
     Ok(sha)
 }
 
+/// Whether the desktop candidate identity differs between `landed` and its
+/// first parent: the metadata blob `desktop_release.py` keys its identity
+/// on. A changed blob puts `verify-main` in release mode, which queries the
+/// pull request on the GitHub repository it is given.
+fn desktop_identity_changed(checkout: &Path, landed: &str) -> Result<bool, Refusal> {
+    let entry = |commit: &str| {
+        git_line(checkout, &["ls-tree", commit, "--", DESKTOP_METADATA])
+            .map_err(|error| Refusal::new("desktop_verify_main_failed", error))
+    };
+    let current = entry(landed)?;
+    let parent = entry(&format!("{landed}^1"))?;
+    Ok(current != parent)
+}
+
 /// Run the maintained desktop identity gate on the landed commit after
 /// proving the checkout's verifier bytes equal the landed tree's.
 fn desktop_verify_main(
@@ -1487,9 +1503,21 @@ fn desktop_verify_main(
             format!("{DESKTOP_VERIFIER} in the checkout differs from the landed tree"),
         ));
     }
+    if mirror.is_none() && desktop_identity_changed(checkout, landed)? {
+        return Err(Refusal::new(
+            "desktop_release_repo_unset",
+            format!(
+                "{DESKTOP_METADATA} changed between {landed} and its first parent, so verify-main \
+                 needs the release pull request; pass --github-mirror owner/repo"
+            ),
+        ));
+    }
+    // -I isolates the interpreter from the checkout's `scripts/` directory and
+    // the caller's PYTHON* environment, so an untracked module cannot shadow
+    // the standard library the maintained gate imports.
     let mut command = Command::new("python3");
     command
-        .arg(DESKTOP_VERIFIER)
+        .args(["-I", DESKTOP_VERIFIER])
         .args(["verify-main", "--commit", landed]);
     if let Some(mirror) = mirror {
         command.args(["--repo", mirror]);
@@ -2195,13 +2223,107 @@ async fn cmd_landing_with_git_url(
 
 // ── Validate ──
 
-/// Offline replay of a receipt: hashes, signatures, reducer, and rules.
+/// Where offline validation anchors the receipt's recorded trust.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustAnchor {
+    /// `BUZZ_CI_CHANNEL` and `BUZZ_CI_STATUS_SIGNERS` were exported and the
+    /// receipt's context is within them.
+    Environment,
+    /// No environment context; the live relay reads with `--reverify` anchor
+    /// the recorded check instead.
+    Relay,
+    /// No environment context and no live reads: offline PASS proves the
+    /// receipt is self-consistent, not that its signer set had authority.
+    Unanchored,
+}
+
+/// Compare the receipt's recorded trust with the operator's exported context.
+pub fn evaluate_trust_anchor(
+    receipt: &LandingReceipt,
+    anchor: Option<&RunTrustedContext>,
+    reverify: bool,
+) -> (TrustAnchor, bool, Result<String, Refusal>) {
+    match anchor {
+        Some(anchor) => {
+            let foreign: Vec<&String> = receipt
+                .trusted
+                .status_signers
+                .iter()
+                .filter(|signer| !anchor.status_signers.contains(*signer))
+                .collect();
+            if receipt.trusted.channel_id != anchor.channel_id {
+                (
+                    TrustAnchor::Environment,
+                    true,
+                    Err(Refusal::new(
+                        "trusted_context_mismatch",
+                        format!(
+                            "receipt channel {} is not BUZZ_CI_CHANNEL {}",
+                            receipt.trusted.channel_id, anchor.channel_id
+                        ),
+                    )),
+                )
+            } else if !foreign.is_empty() {
+                (
+                    TrustAnchor::Environment,
+                    true,
+                    Err(Refusal::new(
+                        "trusted_context_mismatch",
+                        format!(
+                            "receipt signers outside BUZZ_CI_STATUS_SIGNERS: {}",
+                            foreign
+                                .iter()
+                                .map(|signer| signer.as_str())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        ),
+                    )),
+                )
+            } else {
+                (
+                    TrustAnchor::Environment,
+                    true,
+                    Ok(format!(
+                        "receipt channel and {} signer(s) are within the exported trusted context",
+                        receipt.trusted.status_signers.len()
+                    )),
+                )
+            }
+        }
+        None if reverify => (
+            TrustAnchor::Relay,
+            false,
+            Err(Refusal::new(
+                "trusted_context_unanchored",
+                "BUZZ_CI_CHANNEL and BUZZ_CI_STATUS_SIGNERS are unset; the live relay reads anchor the recorded check",
+            )),
+        ),
+        None => (
+            TrustAnchor::Unanchored,
+            true,
+            Err(Refusal::new(
+                "trusted_context_unanchored",
+                "BUZZ_CI_CHANNEL and BUZZ_CI_STATUS_SIGNERS are unset and --reverify was not given; \
+                 offline validation cannot prove the recorded signer set had authority",
+            )),
+        ),
+    }
+}
+
+/// Offline replay of a receipt: trust anchor, hashes, signatures, reducer,
+/// and rules. `anchor` is the operator's exported trusted context; without
+/// it, and without `reverify`, the replay refuses `trusted_context_unanchored`.
 pub fn validate_receipt_offline(
     receipt: &LandingReceipt,
     max_age_seconds: u64,
-) -> Vec<LandingCheck> {
+    anchor: Option<&RunTrustedContext>,
+    reverify: bool,
+) -> (TrustAnchor, Vec<LandingCheck>) {
     let mut ledger = Ledger::default();
     let now = Utc::now();
+    let (trust, gating, outcome) = evaluate_trust_anchor(receipt, anchor, reverify);
+    ledger.record("trusted_context", gating, outcome);
     ledger.gate(
         "receipt_policy",
         if receipt.policy == LANDING_POLICY && receipt.schema_version == LANDING_SCHEMA_VERSION {
@@ -2319,7 +2441,7 @@ pub fn validate_receipt_offline(
             },
         );
     }
-    ledger.checks
+    (trust, ledger.checks)
 }
 
 /// `buzz ci landing validate` entry point.
@@ -2329,10 +2451,12 @@ pub async fn cmd_landing_validate(
     reverify: bool,
     max_age_seconds: u64,
 ) -> Result<(), CliError> {
+    let anchor = crate::commands::ci::dispatch::resolve_optional_trusted_context()?;
     let bytes = read_receipt(receipt_path)?;
     let receipt: LandingReceipt = serde_json::from_slice(&bytes)
         .map_err(|error| CliError::Usage(format!("receipt is not a landing receipt: {error}")))?;
-    let mut checks = validate_receipt_offline(&receipt, max_age_seconds);
+    let (trust, mut checks) =
+        validate_receipt_offline(&receipt, max_age_seconds, anchor.as_ref(), reverify);
     if reverify {
         checks.extend(reverify_live(client, &receipt).await);
     }
@@ -2343,6 +2467,7 @@ pub async fn cmd_landing_validate(
         "landed": receipt.landed,
         "recorded_verdict": receipt.verdict,
         "reverified": reverify,
+        "trust": trust,
         "verdict": if valid && receipt.verdict == "PASS" { "PASS" } else { "REFUSED" },
         "checks": checks,
     });
@@ -3414,6 +3539,13 @@ mod tests {
     }
 
     fn git_fixture(verifier_exit: i32) -> GitFixture {
+        git_fixture_with(verifier_exit, false)
+    }
+
+    /// `candidate_metadata` adds `.release/desktop-candidate.json` in the
+    /// candidate commit, so the landed commit's desktop identity differs from
+    /// its first parent's.
+    fn git_fixture_with(verifier_exit: i32, candidate_metadata: bool) -> GitFixture {
         let dir = private_dir();
         let checkout = dir.path().join("checkout");
         std::fs::create_dir_all(checkout.join(".github/workflows")).unwrap();
@@ -3437,6 +3569,15 @@ mod tests {
         )
         .unwrap();
         std::fs::write(checkout.join("README.md"), "candidate\n").unwrap();
+        if candidate_metadata {
+            std::fs::create_dir_all(checkout.join(".release")).unwrap();
+            std::fs::write(
+                checkout.join(DESKTOP_METADATA),
+                "{\"version\":\"1.2.3\",\"tag\":\"desktop-v1.2.3\"}\n",
+            )
+            .unwrap();
+            git(&checkout, &["add", DESKTOP_METADATA]);
+        }
         git(
             &checkout,
             &["commit", "-q", "-am", "candidate", "--no-gpg-sign"],
@@ -3735,10 +3876,28 @@ mod tests {
         let bytes = read_receipt(&output).unwrap();
         let parsed: LandingReceipt = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed, receipt);
-        let checks = validate_receipt_offline(&parsed, DEFAULT_MAX_AGE_SECONDS);
+        let anchor = trusted_for(&scenario.fx);
+        let (trust, checks) =
+            validate_receipt_offline(&parsed, DEFAULT_MAX_AGE_SECONDS, Some(&anchor), false);
+        assert_eq!(trust, TrustAnchor::Environment);
         assert!(all_gating_pass(&checks), "{checks:#?}");
+        assert_pass(&checks, "trusted_context");
         assert_pass(&checks, "retained_bodies:ci");
         assert_pass(&checks, "recorded_check:ci");
+
+        // Without an exported context the offline replay is unanchored: it
+        // refuses unless the live reads are requested, and then only warns.
+        let (trust, checks) =
+            validate_receipt_offline(&parsed, DEFAULT_MAX_AGE_SECONDS, None, false);
+        assert_eq!(trust, TrustAnchor::Unanchored);
+        assert_refused(&checks, "trusted_context", "trusted_context_unanchored");
+        let (trust, checks) =
+            validate_receipt_offline(&parsed, DEFAULT_MAX_AGE_SECONDS, None, true);
+        assert_eq!(trust, TrustAnchor::Relay);
+        let warned = checks_named(&checks, "trusted_context");
+        assert_eq!(warned.result, CheckResult::Warn);
+        assert!(!warned.gating);
+        assert!(all_gating_pass(&checks));
 
         // One retained byte changed: the offline replay refuses.
         let mut tampered = parsed.clone();
@@ -3749,14 +3908,147 @@ mod tests {
         let position = raw.iter().position(|b| *b == b'r').unwrap();
         raw[position] = b'R';
         body.base64 = base64::engine::general_purpose::STANDARD.encode(&raw);
-        let checks = validate_receipt_offline(&tampered, DEFAULT_MAX_AGE_SECONDS);
+        let (_, checks) =
+            validate_receipt_offline(&tampered, DEFAULT_MAX_AGE_SECONDS, Some(&anchor), false);
         assert_refused(&checks, "retained_bodies:ci", "retained_body_tampered");
 
         // A receipt whose verdict disagrees with its checks is inconsistent.
         let mut lying = parsed.clone();
         lying.landing_checks[0].result = CheckResult::Refused;
-        let checks = validate_receipt_offline(&lying, DEFAULT_MAX_AGE_SECONDS);
+        let (_, checks) =
+            validate_receipt_offline(&lying, DEFAULT_MAX_AGE_SECONDS, Some(&anchor), false);
         assert_refused(&checks, "receipt_verdict", "receipt_inconsistent");
+    }
+
+    #[tokio::test]
+    async fn offline_validate_refuses_a_receipt_outside_the_exported_trusted_context() {
+        let scenario = Scenario::new(0);
+        let dir = private_dir();
+        let output = dir.path().join("anchor.json");
+        let receipt = scenario.verify(&scenario.args(&output)).await;
+        assert_eq!(receipt.verdict, "PASS");
+
+        // A forged receipt naming an attacker signer set is self-consistent:
+        // rebuild the whole history under a stranger control key.
+        let mut forged_scenario = Scenario::new(0);
+        forged_scenario.fx.control = Keys::generate();
+        forged_scenario.history = build_history(&forged_scenario.fx, None);
+        let forged = forged_scenario
+            .verify(&forged_scenario.args(&dir.path().join("forged.json")))
+            .await;
+        assert_eq!(
+            forged.verdict, "PASS",
+            "self-consistent under its own signer set"
+        );
+
+        // The operator's exported context anchors the replay: the genuine
+        // receipt is within it, the forged one is not.
+        let anchor = trusted_for(&scenario.fx);
+        let (_, checks) =
+            validate_receipt_offline(&receipt, DEFAULT_MAX_AGE_SECONDS, Some(&anchor), false);
+        assert!(all_gating_pass(&checks), "{checks:#?}");
+        let (_, checks) =
+            validate_receipt_offline(&forged, DEFAULT_MAX_AGE_SECONDS, Some(&anchor), false);
+        assert_refused(&checks, "trusted_context", "trusted_context_mismatch");
+        assert!(checks_named(&checks, "trusted_context")
+            .detail
+            .unwrap()
+            .contains("signers outside"));
+        assert!(!all_gating_pass(&checks));
+        // A superset environment still anchors; another channel refuses.
+        let mut wider = anchor.clone();
+        wider
+            .status_signers
+            .insert(Keys::generate().public_key().to_hex());
+        let (_, checks) =
+            validate_receipt_offline(&receipt, DEFAULT_MAX_AGE_SECONDS, Some(&wider), false);
+        assert_pass(&checks, "trusted_context");
+        let mut other_channel = anchor.clone();
+        other_channel.channel_id = "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee".into();
+        let (_, checks) = validate_receipt_offline(
+            &receipt,
+            DEFAULT_MAX_AGE_SECONDS,
+            Some(&other_channel),
+            false,
+        );
+        assert_refused(&checks, "trusted_context", "trusted_context_mismatch");
+        assert!(checks_named(&checks, "trusted_context")
+            .detail
+            .unwrap()
+            .contains("channel"));
+    }
+
+    /// The validate entry through the real CLI grammar on a published receipt.
+    #[tokio::test]
+    async fn validate_cli_entry_anchors_to_the_environment() {
+        use tokio::sync::Mutex;
+        static ENV: Mutex<()> = Mutex::const_new(());
+        let _guard = ENV.lock().await;
+
+        let scenario = Scenario::new(0);
+        let dir = private_dir();
+        let output = dir.path().join("cli.json");
+        let receipt = scenario.verify(&scenario.args(&output)).await;
+        assert_eq!(receipt.verdict, "PASS");
+        let receipt_arg = output.display().to_string();
+        let argv = |extra: &[&str]| -> Vec<String> {
+            let mut args: Vec<String> = ["buzz", "ci", "landing", "validate", "--receipt"]
+                .iter()
+                .map(|arg| arg.to_string())
+                .collect();
+            args.push(receipt_arg.clone());
+            args.extend(extra.iter().map(|arg| arg.to_string()));
+            args
+        };
+        let signer = scenario.fx.control.public_key().to_hex();
+        let stranger = Keys::generate().public_key().to_hex();
+        let private_key = Keys::generate().secret_key().to_secret_hex();
+        std::env::set_var("BUZZ_PRIVATE_KEY", &private_key);
+        std::env::remove_var("BUZZ_AUTH_TAG");
+
+        // Anchored to a matching environment: exit 0.
+        std::env::set_var("BUZZ_CI_CHANNEL", CHANNEL);
+        std::env::set_var("BUZZ_CI_STATUS_SIGNERS", &signer);
+        assert_eq!(crate::run_from_args(argv(&[])).await, 0);
+        // Superset signer set still anchors.
+        std::env::set_var("BUZZ_CI_STATUS_SIGNERS", format!("{stranger},{signer}"));
+        assert_eq!(crate::run_from_args(argv(&[])).await, 0);
+        // A signer set that excludes the receipt's signer refuses (exit 1).
+        std::env::set_var("BUZZ_CI_STATUS_SIGNERS", &stranger);
+        assert_eq!(crate::run_from_args(argv(&[])).await, 1);
+        // Another channel refuses.
+        std::env::set_var("BUZZ_CI_STATUS_SIGNERS", &signer);
+        std::env::set_var("BUZZ_CI_CHANNEL", "bbbbbbbb-bbbb-4ccc-8ddd-eeeeeeeeeeee");
+        assert_eq!(crate::run_from_args(argv(&[])).await, 1);
+        // Half an environment is a usage error; none is unanchored (exit 1).
+        std::env::remove_var("BUZZ_CI_CHANNEL");
+        assert_eq!(crate::run_from_args(argv(&[])).await, 1);
+        std::env::remove_var("BUZZ_CI_STATUS_SIGNERS");
+        assert_eq!(crate::run_from_args(argv(&[])).await, 1);
+        // A tampered receipt refuses even inside a matching environment.
+        std::env::set_var("BUZZ_CI_CHANNEL", CHANNEL);
+        std::env::set_var("BUZZ_CI_STATUS_SIGNERS", &signer);
+        let mut tampered: LandingReceipt =
+            serde_json::from_slice(&read_receipt(&output).unwrap()).unwrap();
+        tampered.runs[0].history_sha256 = Some("0".repeat(64));
+        let tampered_path = dir.path().join("tampered.json");
+        publish_receipt(&tampered_path, &serde_json::to_vec(&tampered).unwrap()).unwrap();
+        let tampered_arg = tampered_path.display().to_string();
+        assert_eq!(
+            crate::run_from_args([
+                "buzz",
+                "ci",
+                "landing",
+                "validate",
+                "--receipt",
+                tampered_arg.as_str()
+            ])
+            .await,
+            1
+        );
+        std::env::remove_var("BUZZ_CI_CHANNEL");
+        std::env::remove_var("BUZZ_CI_STATUS_SIGNERS");
+        std::env::remove_var("BUZZ_PRIVATE_KEY");
     }
 
     #[tokio::test]
@@ -4168,5 +4460,34 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("mode 0700"), "{error}");
+    }
+
+    #[test]
+    fn desktop_release_mode_needs_the_mirror_and_runs_python_isolated() {
+        let unchanged = git_fixture(0);
+        assert!(!desktop_identity_changed(&unchanged.checkout, &unchanged.landed).unwrap());
+        assert!(desktop_verify_main(&unchanged.checkout, &unchanged.landed, None).is_ok());
+
+        let changed = git_fixture_with(0, true);
+        assert!(desktop_identity_changed(&changed.checkout, &changed.landed).unwrap());
+        let refusal = desktop_verify_main(&changed.checkout, &changed.landed, None).unwrap_err();
+        assert_eq!(refusal.code, "desktop_release_repo_unset");
+        assert!(refusal.detail.contains("--github-mirror"));
+        // With the mirror named, the maintained gate runs and receives --repo.
+        let detail =
+            desktop_verify_main(&changed.checkout, &changed.landed, Some("only21mil/buzz"))
+                .unwrap();
+        assert!(detail.contains("'--repo', 'only21mil/buzz'"), "{detail}");
+
+        // An untracked scripts/subprocess.py must not shadow the standard
+        // library: the stub imports sys only, so prove isolation by placing a
+        // poisoned module the interpreter would import first without -I.
+        std::fs::write(
+            unchanged.checkout.join("scripts/sys.py"),
+            "raise SystemExit('shadowed stdlib')\n",
+        )
+        .unwrap();
+        let detail = desktop_verify_main(&unchanged.checkout, &unchanged.landed, None).unwrap();
+        assert!(detail.contains("stub verify-main"), "{detail}");
     }
 }

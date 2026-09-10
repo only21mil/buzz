@@ -112,6 +112,19 @@ fn resolve_required_trusted_context() -> Result<RunTrustedContext, CliError> {
     })
 }
 
+/// The trusted context when the operator exported it, `None` when both
+/// `BUZZ_CI_CHANNEL` and `BUZZ_CI_STATUS_SIGNERS` are unset, and an error
+/// when only one is set or either is malformed. Offline receipt validation
+/// anchors the receipt's recorded trust to this.
+pub(super) fn resolve_optional_trusted_context() -> Result<Option<RunTrustedContext>, CliError> {
+    let channel = std::env::var_os("BUZZ_CI_CHANNEL");
+    let signers = std::env::var_os("BUZZ_CI_STATUS_SIGNERS");
+    if channel.is_none() && signers.is_none() {
+        return Ok(None);
+    }
+    resolve_required_trusted_context().map(Some)
+}
+
 fn parse_status_signers() -> Result<HashSet<String>, CliError> {
     let raw = std::env::var("BUZZ_CI_STATUS_SIGNERS").map_err(|_| {
         CliError::Usage(

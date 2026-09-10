@@ -292,7 +292,7 @@ the receipt is still published. Per-workflow checks carry `:<workflow_id>`.
 | `check_fresh` | `check_expired` | The relay clock's `accepted_at` is within `--max-age-seconds` (default 86400, the relay's `BUZZ_MERGE_GATE_CHECK_MAX_AGE_SECONDS` default). Signer-chosen `published_at` is recorded and never consulted. |
 | `gate_decision` | `no_decision`, `gate_shadow`, any gate refusal code, `relay_route_unavailable` | The merge gate's decision row for `(refs/heads/main, base, landed)` is `allow`, with a bypass recorded when one applied. Non-gating while the relay's mode is `off`; a `shadow` allow needs `--allow-shadow`. |
 | `github_mirror` | `mirror_lag`, `mirror_unavailable` (warning only) | `gh api` reads the mirror's `main`; disagreement is recorded, not gating, because the mirror timer lags. |
-| `desktop_verify_main` | `desktop_verifier_source_differs`, `desktop_verify_main_failed` | The checkout's `scripts/desktop_release.py` equals the landed tree's, and `verify-main --commit <landed>` passes as a subprocess. |
+| `desktop_verify_main` | `desktop_verifier_source_differs`, `desktop_release_repo_unset`, `desktop_verify_main_failed` | The checkout's `scripts/desktop_release.py` equals the landed tree's, and `verify-main --commit <landed>` passes as an isolated `python3 -I` subprocess; a changed desktop identity needs `--github-mirror`. |
 
 The receipt (`policy: buzz-native-landing-v1`, `schema_version: 1`) retains
 the complete run history as base64 bodies with per-event SHA-256 values and a
@@ -306,6 +306,28 @@ repeats the relay `main`, run listing, and decision reads. The relay serves
 the two reads behind it, `GET /ci/checks` (any member) and
 `GET /ci/merge-gate/decisions` (owner or admin), NIP-98 authenticated and
 keyed on the announcement coordinate the verifier resolved.
+
+The receipt is unsigned, so the replay anchors the receipt's recorded
+channel and signer set to something outside the file. The `trusted_context`
+check reports the anchor as `trust` in the output. With `BUZZ_CI_CHANNEL`
+and `BUZZ_CI_STATUS_SIGNERS` exported (`trust: environment`), the receipt's
+channel must equal the exported channel and its signers must be a subset of
+the exported set, else `trusted_context_mismatch` refuses. With both unset
+and `--reverify` (`trust: relay`), the live run listing proves the relay
+stored the recorded check under its own signer authority, and the check only
+warns. With both unset and no `--reverify` (`trust: unanchored`), the replay
+refuses `trusted_context_unanchored`: a self-consistent receipt built under
+an attacker's signer set would otherwise pass, so an offline PASS is only
+meaningful inside the operator's exported context. Setting one variable
+without the other is a usage error.
+
+`desktop_verify_main` runs `python3 -I` so nothing in the checkout's
+`scripts/` shadows the standard library. When the landed commit's
+`.release/desktop-candidate.json` blob differs from its first parent's, the
+maintained gate is in release mode and needs the pull request from the
+GitHub repository named by `--github-mirror`; without the flag the verifier
+refuses `desktop_release_repo_unset` instead of letting `desktop_release.py`
+query its default repository.
 
 What this verifier cannot prove today, per the design's section 2.4: the
 provider's independent chronology, the live GitHub ruleset, and the runner
