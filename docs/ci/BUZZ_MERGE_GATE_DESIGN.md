@@ -189,10 +189,12 @@ bypass; the owner signs one exact merge commit.
 - `BUZZ_MERGE_GATE_DECISION_WINDOW_SECONDS`: default 300 (`PACK_OPS_TIMEOUT`,
   `transport.rs` line 45), ceiling 900. See 1.7.
 
-The entire merge-gate evaluation has one six-second deadline across all refs,
-hydration, signer and history reads, bypass lookup, and decision writes.
-The hook's `curl --max-time 10` leaves four seconds for the ordinary policy
-checks and response delivery. On timeout the relay logs `gate_misconfigured`
+The merge-gate deadline is six seconds after callback entry. Authorization
+and ordinary policy reads spend that budget before the gate starts; the gate
+uses only the time remaining for all refs, hydration, signer and history
+reads, bypass lookup, and decision writes. The hook's `curl --max-time 10`
+leaves four seconds for response delivery. Authorization still fails closed
+and must finish before the gate can allow a shadow push. On timeout the relay logs `gate_misconfigured`
 and cancels evaluation without waiting for an audit write. Completed rows
 remain; the timed-out evaluation may have no row. Shadow observation must
 include the logs and verify every expected decision row before cutover.
