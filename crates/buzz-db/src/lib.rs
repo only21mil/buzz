@@ -26,6 +26,8 @@ pub mod channel_members;
 pub mod ci;
 /// CI control-plane signer grants.
 pub mod ci_grants;
+/// Read-only queries behind the Buzz-native landing verifier.
+pub mod ci_landing;
 /// Owner-signed merge-gate bypasses (kind 46109) and their consumption.
 pub mod ci_merge_bypass;
 /// Community lifecycle and host-map persistence.
@@ -41,6 +43,8 @@ pub mod event;
 /// Home feed queries.
 pub mod feed;
 /// Git repository name registry (NIP-34 kind:30617).
+pub mod git_merge_gate;
+
 pub mod git_repo;
 /// Embedded database migrations.
 pub mod migration;
@@ -1708,7 +1712,112 @@ impl Db {
         .await
     }
 
+    /// Every run recorded for one exact tip in a member-resolved channel,
+    /// newest first, optionally narrowed to one workflow.
+    pub async fn list_ci_runs_for_tip(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        target_repo_a: &str,
+        tip_oid: &str,
+        workflow_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<ci_landing::CiRunRecord>> {
+        observability::observe(observability::Operation::Ci, async {
+            ci_landing::list_ci_runs_for_tip(
+                &self.pool,
+                community_id,
+                channel_id,
+                target_repo_a,
+                tip_oid,
+                workflow_id,
+                limit,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// Every stored kind-46108 check of one run with its relay `accepted_at`.
+    pub async fn list_ci_run_checks(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<Vec<ci::CiStoredEvent>> {
+        observability::observe(observability::Operation::Ci, async {
+            ci_landing::list_ci_run_checks(&self.pool, community_id, channel_id, run_id).await
+        })
+        .await
+    }
+
+    /// Merge gate decision rows for one ref update, newest first.
+    pub async fn list_merge_gate_decisions(
+        &self,
+        community_id: CommunityId,
+        target_repo_a: &str,
+        ref_name: &str,
+        new_oid: &str,
+        old_oid: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<ci_landing::MergeGateDecisionRecord>> {
+        observability::observe(observability::Operation::Ci, async {
+            ci_landing::list_merge_gate_decisions(
+                &self.pool,
+                community_id,
+                target_repo_a,
+                ref_name,
+                new_oid,
+                old_oid,
+                limit,
+            )
+            .await
+        })
+        .await
+    }
+
     /// Store an accepted kind-46109 merge bypass; `false` for a replay.
+    /// Append one merge-gate decision row and return its id.
+    pub async fn insert_merge_gate_decision(
+        &self,
+        community_id: CommunityId,
+        insert: &git_merge_gate::MergeGateDecisionInsert,
+    ) -> Result<Uuid> {
+        observability::observe(observability::Operation::Ci, async {
+            git_merge_gate::insert_merge_gate_decision(&self.pool, community_id, insert).await
+        })
+        .await
+    }
+
+    /// Latest `allow` decision for one exact update by one pusher since `not_before`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn find_merge_gate_allow(
+        &self,
+        community_id: CommunityId,
+        target_repo_a: &str,
+        ref_name: &str,
+        old_oid: &str,
+        new_oid: &str,
+        pusher: &str,
+        not_before: DateTime<Utc>,
+    ) -> Result<Option<git_merge_gate::MergeGateAllowRecord>> {
+        observability::observe(observability::Operation::Ci, async {
+            git_merge_gate::find_merge_gate_allow(
+                &self.pool,
+                community_id,
+                target_repo_a,
+                ref_name,
+                old_oid,
+                new_oid,
+                pusher,
+                not_before,
+            )
+            .await
+        })
+        .await
+    }
+
+    /// Store an accepted kind-46109 bypass; `false` on an exact replay.
     pub async fn insert_ci_merge_bypass(
         &self,
         community_id: CommunityId,

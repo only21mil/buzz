@@ -90,6 +90,9 @@ rand = { workspace = true }
 # Private temporary bare repositories for bounded main-ref sync operations
 tempfile = "3"
 
+# Effective UID for the caller-owned receipt directory rule (`ci landing`)
+nix = { version = "0.31", default-features = false, features = ["user"] }
+
 [dev-dependencies]
 # Minimal HTTP test server for retry/policy integration tests
 axum = { workspace = true }

@@ -763,7 +763,7 @@ struct EffectivePrSnapshot {
 /// Fail-closed:
 /// - workflow path absent in the base tree → 404 `workflow_not_found`
 /// - blob too large / git failure → 5xx
-async fn resolve_workflow_at_base(
+pub(crate) async fn resolve_workflow_at_base(
     repo_path: &Path,
     base_oid: &str,
 ) -> Result<ResolvedWorkflow, (StatusCode, Json<Value>)> {
@@ -824,9 +824,10 @@ fn workflow_id(bytes: &[u8]) -> String {
 }
 
 /// A workflow resolved from the trusted base with its canonical byte set.
-struct ResolvedWorkflow {
+pub(crate) struct ResolvedWorkflow {
     workflow_path: String,
-    workflow_digest: String,
+    /// Hex SHA-256 of the canonical workflow bytes at the base.
+    pub(crate) workflow_digest: String,
     canonical_workflow_base64: String,
     workflow_id: String,
     jobs: Vec<ParsedJob>,
@@ -1140,6 +1141,30 @@ async fn authorize_ci_read(
     repo_name: &str,
     command: &'static str,
 ) -> Result<uuid::Uuid, PreflightReject> {
+    authorize_ci_read_with(
+        state,
+        tenant,
+        caller,
+        owner_hex,
+        repo_name,
+        command,
+        read_role_allows,
+    )
+    .await
+}
+
+/// `authorize_ci_read` with the caller's role predicate: the run and check
+/// reads accept any recognized role, the merge-gate decision read only
+/// `owner` or `admin`.
+async fn authorize_ci_read_with(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    caller: &nostr::PublicKey,
+    owner_hex: &str,
+    repo_name: &str,
+    command: &'static str,
+    role_allows: fn(Option<&str>) -> bool,
+) -> Result<uuid::Uuid, PreflightReject> {
     let Ok(owner_bytes) = hex::decode(owner_hex) else {
         return Err(PreflightReject {
             status: StatusCode::NOT_FOUND,
@@ -1204,7 +1229,7 @@ async fn authorize_ci_read(
         .get_member_role(tenant.community(), channel_id, &caller.to_bytes())
         .await
     {
-        Ok(role) if read_role_allows(role.as_deref()) => Ok(channel_id),
+        Ok(role) if role_allows(role.as_deref()) => Ok(channel_id),
         Ok(_) => Err(PreflightReject {
             status: StatusCode::FORBIDDEN,
             message: "forbidden: not a member of this repository".into(),
@@ -1230,6 +1255,14 @@ fn read_role_allows(role: Option<&str>) -> bool {
         Some(r) => r.parse::<MemberRole>().is_ok(),
         None => false,
     }
+}
+
+/// Merge-gate decision reads are for the repository's owner or admins.
+fn admin_role_allows(role: Option<&str>) -> bool {
+    matches!(
+        role.and_then(|r| r.parse::<MemberRole>().ok()),
+        Some(MemberRole::Owner | MemberRole::Admin)
+    )
 }
 
 /// A fail-closed preflight rejection with its precise HTTP status.
@@ -1461,6 +1494,290 @@ pub async fn get_ci_run_events(
         request_event_id: request.stored_event.event.id.to_hex(),
         events,
         next_cursor,
+    };
+    serde_json::to_value(response)
+        .map(Json)
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "response unavailable"))
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CiChecksQuery {
+    target_repo_a: String,
+    tip_oid: String,
+    #[serde(default)]
+    workflow_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CiChecksRunResponse {
+    run_id: String,
+    request_event_id: String,
+    workflow_id: String,
+    workflow_digest: String,
+    tip_oid: String,
+    base_oid: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    checks: Vec<CiRunEventResponse>,
+}
+
+#[derive(Serialize)]
+struct CiChecksResponse {
+    target_repo_a: String,
+    tip_oid: String,
+    runs: Vec<CiChecksRunResponse>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct MergeGateDecisionsQuery {
+    target_repo_a: String,
+    #[serde(rename = "ref")]
+    ref_name: String,
+    new_oid: String,
+    #[serde(default)]
+    old_oid: Option<String>,
+}
+
+#[derive(Serialize)]
+struct MergeGateDecisionResponse {
+    id: String,
+    old_oid: String,
+    new_oid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    candidate_oid: Option<String>,
+    classification: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    check_event_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signer: Option<String>,
+    code: String,
+    mode: String,
+    pusher: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bypass_event_id: Option<String>,
+    decided_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Serialize)]
+struct MergeGateDecisionsResponse {
+    target_repo_a: String,
+    #[serde(rename = "ref")]
+    ref_name: String,
+    new_oid: String,
+    /// The relay's current merge gate mode, so a verifier knows whether an
+    /// absent decision row means "not gated" or "not evaluated".
+    mode: &'static str,
+    /// The relay's check freshness bound in seconds.
+    check_max_age_seconds: u64,
+    decisions: Vec<MergeGateDecisionResponse>,
+}
+
+fn is_lower_hex_oid(value: &str) -> bool {
+    is_hex_oid(value) && !value.bytes().any(|b| b.is_ascii_uppercase())
+}
+
+fn parse_ci_checks_query(uri: &axum::http::Uri) -> Result<CiChecksQuery, PreflightApiError> {
+    let invalid = || api_error(StatusCode::BAD_REQUEST, "invalid CI checks query");
+    let Query(query) = Query::<CiChecksQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+    if !is_lower_hex_oid(&query.tip_oid) {
+        return Err(invalid());
+    }
+    if let Some(workflow_id) = &query.workflow_id {
+        if workflow_id.is_empty()
+            || workflow_id.len() > 255
+            || workflow_id.bytes().any(|b| !b.is_ascii_graphic())
+        {
+            return Err(invalid());
+        }
+    }
+    Ok(query)
+}
+
+fn parse_merge_gate_decisions_query(
+    uri: &axum::http::Uri,
+) -> Result<MergeGateDecisionsQuery, PreflightApiError> {
+    let invalid = || {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid merge gate decisions query",
+        )
+    };
+    let Query(query) =
+        Query::<MergeGateDecisionsQuery>::try_from_uri(uri).map_err(|_| invalid())?;
+    if !query.ref_name.starts_with("refs/")
+        || query.ref_name.len() > 1024
+        || query.ref_name.bytes().any(|b| !b.is_ascii_graphic())
+        || !is_lower_hex_oid(&query.new_oid)
+    {
+        return Err(invalid());
+    }
+    if let Some(old_oid) = &query.old_oid {
+        if !is_lower_hex_oid(old_oid) || old_oid.len() != query.new_oid.len() {
+            return Err(invalid());
+        }
+    }
+    Ok(query)
+}
+
+/// Resolve a `30617:<owner>:<repo>` coordinate to its member channel for a
+/// GET read, hiding unknown and malformed repositories as 404.
+async fn authorize_ci_coordinate_read(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    caller: &nostr::PublicKey,
+    target_repo_a: &str,
+    command: &'static str,
+    role_allows: fn(Option<&str>) -> bool,
+) -> Result<uuid::Uuid, PreflightApiError> {
+    let (owner_hex, repo_name) = parse_repo_coordinate(target_repo_a)
+        .filter(|(owner, repo)| validate_repo_id(owner, repo).is_ok_and(|name| name == *repo))
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "repository not found"))?;
+    authorize_ci_read_with(
+        state,
+        tenant,
+        caller,
+        owner_hex,
+        repo_name,
+        command,
+        role_allows,
+    )
+    .await
+    .map_err(|reject| api_error(reject.status, &reject.message))
+}
+
+/// List the runs a repository recorded for one exact tip, newest first, with
+/// every stored kind-46108 check and its relay `accepted_at`.
+///
+/// `GET /ci/checks?target_repo_a=<a>&tip_oid=<oid>[&workflow_id=<id>]`,
+/// NIP-98 authenticated and member-scoped like the run reads. Nothing here
+/// decides: the landing verifier reads the runs, applies the latest-run rule
+/// itself, and validates every event it retains.
+pub async fn get_ci_checks(
+    State(state): State<Arc<AppState>>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Json<Value>, PreflightApiError> {
+    let (tenant, caller) = authenticate_ci_run_read(&state, &headers, &uri).await?;
+    let query = parse_ci_checks_query(&uri)?;
+    let channel_id = authorize_ci_coordinate_read(
+        &state,
+        &tenant,
+        &caller,
+        &query.target_repo_a,
+        "ci-checks",
+        read_role_allows,
+    )
+    .await?;
+    let runs = state
+        .db
+        .list_ci_runs_for_tip(
+            tenant.community(),
+            channel_id,
+            &query.target_repo_a,
+            &query.tip_oid,
+            query.workflow_id.as_deref(),
+            buzz_db::ci_landing::MAX_CI_LANDING_ROWS,
+        )
+        .await
+        .map_err(|_| ci_run_unavailable())?;
+    let mut response_runs = Vec::with_capacity(runs.len());
+    for run in runs {
+        let checks = state
+            .db
+            .list_ci_run_checks(tenant.community(), channel_id, run.run_id)
+            .await
+            .map_err(|_| ci_run_unavailable())?
+            .into_iter()
+            .map(|stored| {
+                Ok(CiRunEventResponse {
+                    watch_cursor: ci_watch_cursor(stored.watch_cursor)?,
+                    accepted_at: stored.accepted_at,
+                    event: stored.stored_event.event,
+                })
+            })
+            .collect::<Result<Vec<_>, PreflightApiError>>()?;
+        response_runs.push(CiChecksRunResponse {
+            run_id: run.run_id.to_string(),
+            request_event_id: hex::encode(run.initial_request_event_id),
+            workflow_id: run.workflow_id,
+            workflow_digest: hex::encode(run.workflow_digest),
+            tip_oid: run.tip_oid,
+            base_oid: run.base_oid,
+            created_at: run.created_at,
+            checks,
+        });
+    }
+    let response = CiChecksResponse {
+        target_repo_a: query.target_repo_a,
+        tip_oid: query.tip_oid,
+        runs: response_runs,
+    };
+    serde_json::to_value(response)
+        .map(Json)
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "response unavailable"))
+}
+
+/// List the merge gate's append-only decision rows for one ref update.
+///
+/// `GET /ci/merge-gate/decisions?target_repo_a=<a>&ref=<ref>&new_oid=<oid>[&old_oid=<oid>]`,
+/// NIP-98 authenticated; only the repository's owner or admins may read.
+/// Rows are keyed on the coordinate the caller resolved and was authorized
+/// for, never on a value an event carried.
+pub async fn get_ci_merge_gate_decisions(
+    State(state): State<Arc<AppState>>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+) -> Result<Json<Value>, PreflightApiError> {
+    let (tenant, caller) = authenticate_ci_run_read(&state, &headers, &uri).await?;
+    let query = parse_merge_gate_decisions_query(&uri)?;
+    authorize_ci_coordinate_read(
+        &state,
+        &tenant,
+        &caller,
+        &query.target_repo_a,
+        "ci-merge-gate-decisions",
+        admin_role_allows,
+    )
+    .await?;
+    let decisions = state
+        .db
+        .list_merge_gate_decisions(
+            tenant.community(),
+            &query.target_repo_a,
+            &query.ref_name,
+            &query.new_oid,
+            query.old_oid.as_deref(),
+            buzz_db::ci_landing::MAX_CI_LANDING_ROWS,
+        )
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "merge gate unavailable"))?
+        .into_iter()
+        .map(|row| MergeGateDecisionResponse {
+            id: row.id.to_string(),
+            old_oid: row.old_oid,
+            new_oid: row.new_oid,
+            candidate_oid: row.candidate_oid,
+            classification: row.classification,
+            run_id: row.run_id.map(|id| id.to_string()),
+            check_event_id: row.check_event_id.map(hex::encode),
+            signer: row.signer,
+            code: row.code,
+            mode: row.mode,
+            pusher: row.pusher,
+            bypass_event_id: row.bypass_event_id.map(hex::encode),
+            decided_at: row.decided_at,
+        })
+        .collect();
+    let response = MergeGateDecisionsResponse {
+        target_repo_a: query.target_repo_a,
+        ref_name: query.ref_name,
+        new_oid: query.new_oid,
+        mode: state.config.ci.merge_gate.mode.as_str(),
+        check_max_age_seconds: state.config.ci.merge_gate.check_max_age_seconds,
+        decisions,
     };
     serde_json::to_value(response)
         .map(Json)
@@ -3056,6 +3373,7 @@ mod tests {
         community: CommunityId,
         host: String,
         owner: nostr::Keys,
+        pool: sqlx::PgPool,
         _git_storage: tempfile::TempDir,
     }
 
@@ -3130,7 +3448,7 @@ mod tests {
             .await
             .expect("insert owner as channel member");
 
-            let (state, git_storage) = Self::make_state(pool, &owner).await;
+            let (state, git_storage) = Self::make_state(pool.clone(), &owner).await;
 
             // Seed the exact kind:30617 repository announcement the route test
             // fixture depends on, bound to the test channel (the relay's git
@@ -3145,6 +3463,7 @@ mod tests {
                 community: CommunityId::from_uuid(community_id),
                 host,
                 owner,
+                pool,
                 _git_storage: git_storage,
             }
         }
@@ -4668,5 +4987,321 @@ jobs:
                 "invalid query must fail closed: {invalid}"
             );
         }
+    }
+
+    // ── landing verifier reads: /ci/checks and /ci/merge-gate/decisions ──
+
+    #[test]
+    fn ci_checks_query_is_exact_and_bounded() {
+        let repo = well_formed_repo_a();
+        let tip = "a".repeat(40);
+        let parsed = parse_ci_checks_query(
+            &format!("/ci/checks?target_repo_a={repo}&tip_oid={tip}&workflow_id=ci")
+                .parse()
+                .unwrap(),
+        )
+        .expect("well-formed query");
+        assert_eq!(
+            parsed,
+            CiChecksQuery {
+                target_repo_a: repo.clone(),
+                tip_oid: tip.clone(),
+                workflow_id: Some("ci".into()),
+            }
+        );
+        let without_workflow = parse_ci_checks_query(
+            &format!("/ci/checks?target_repo_a={repo}&tip_oid={tip}")
+                .parse()
+                .unwrap(),
+        )
+        .expect("workflow is optional");
+        assert_eq!(without_workflow.workflow_id, None);
+
+        for invalid in [
+            format!("target_repo_a={repo}"),
+            format!("tip_oid={tip}"),
+            format!("target_repo_a={repo}&tip_oid={}", "A".repeat(40)),
+            format!("target_repo_a={repo}&tip_oid={}", "a".repeat(39)),
+            format!("target_repo_a={repo}&tip_oid={tip}&workflow_id="),
+            format!("target_repo_a={repo}&tip_oid={tip}&workflow_id=c%20i"),
+            format!("target_repo_a={repo}&tip_oid={tip}&extra=1"),
+        ] {
+            let error = parse_ci_checks_query(&format!("/ci/checks?{invalid}").parse().unwrap())
+                .expect_err("invalid query must fail closed");
+            assert_eq!(error.0, StatusCode::BAD_REQUEST, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn merge_gate_decisions_query_is_exact() {
+        let repo = well_formed_repo_a();
+        let new = "b".repeat(40);
+        let old = "c".repeat(40);
+        let parsed = parse_merge_gate_decisions_query(
+            &format!(
+                "/ci/merge-gate/decisions?target_repo_a={repo}&ref=refs/heads/main&new_oid={new}&old_oid={old}"
+            )
+            .parse()
+            .unwrap(),
+        )
+        .expect("well-formed query");
+        assert_eq!(
+            parsed,
+            MergeGateDecisionsQuery {
+                target_repo_a: repo.clone(),
+                ref_name: "refs/heads/main".into(),
+                new_oid: new.clone(),
+                old_oid: Some(old.clone()),
+            }
+        );
+        for invalid in [
+            format!("target_repo_a={repo}&ref=main&new_oid={new}"),
+            format!("target_repo_a={repo}&ref=refs/heads/main"),
+            format!(
+                "target_repo_a={repo}&ref=refs/heads/main&new_oid={new}&old_oid={}",
+                "c".repeat(64)
+            ),
+            format!("target_repo_a={repo}&ref=refs/heads/main&new_oid={new}&mode=enforce"),
+        ] {
+            let error = parse_merge_gate_decisions_query(
+                &format!("/ci/merge-gate/decisions?{invalid}")
+                    .parse()
+                    .unwrap(),
+            )
+            .expect_err("invalid query must fail closed");
+            assert_eq!(error.0, StatusCode::BAD_REQUEST, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn merge_gate_decision_reads_are_owner_or_admin_only() {
+        assert!(admin_role_allows(Some("owner")));
+        assert!(admin_role_allows(Some("admin")));
+        for role in [
+            Some("member"),
+            Some("guest"),
+            Some("bot"),
+            Some("root"),
+            None,
+        ] {
+            assert!(!admin_role_allows(role), "{role:?}");
+        }
+        assert!(read_role_allows(Some("member")));
+    }
+
+    impl TestHarness {
+        /// Add a plain `member` of the test channel and return its keys.
+        async fn seed_member(&self) -> nostr::Keys {
+            let member = nostr::Keys::generate();
+            sqlx::query(
+                "INSERT INTO channel_members (community_id, channel_id, pubkey, role) \
+                 VALUES ($1, $2, $3, 'member') ON CONFLICT DO NOTHING",
+            )
+            .bind(self.community.as_uuid())
+            .bind(uuid::Uuid::parse_str(TEST_CHANNEL).unwrap())
+            .bind(member.public_key().to_bytes())
+            .execute(&self.pool)
+            .await
+            .expect("insert member");
+            member
+        }
+
+        /// Insert one merge gate decision row for `(main, old, new)`.
+        async fn seed_decision(&self, old_oid: &str, new_oid: &str, code: &str, mode: &str) {
+            sqlx::query(
+                "INSERT INTO git_merge_gate_decisions \
+                 (community_id, target_repo_a, ref_name, old_oid, new_oid, candidate_oid, \
+                  classification, code, mode, pusher) \
+                 VALUES ($1, $2, 'refs/heads/main', $3, $4, $5, 'merge', $6, $7, $8)",
+            )
+            .bind(self.community.as_uuid())
+            .bind(self.repo_a())
+            .bind(old_oid)
+            .bind(new_oid)
+            .bind("22".repeat(20))
+            .bind(code)
+            .bind(mode)
+            .bind(self.owner.public_key().to_hex())
+            .execute(&self.pool)
+            .await
+            .expect("insert decision");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scratch Postgres and CI evidence storage"]
+    async fn route_ci_checks_lists_runs_for_a_tip_newest_first() {
+        if !preflight_scratch_env_ready() {
+            return;
+        }
+        let harness = TestHarness::connect().await;
+        let (older_run, older_request) = harness.seed_run_history().await;
+        let (newer_run, newer_request) = harness.seed_run_history().await;
+        let repo = harness.repo_a();
+        let tip = "22".repeat(20);
+
+        let response = ci_run_response(
+            harness.state.clone(),
+            &harness.host,
+            &harness.owner,
+            &format!("/ci/checks?target_repo_a={repo}&tip_oid={tip}&workflow_id=ci"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = response_json(response).await;
+        assert_eq!(value["target_repo_a"], repo);
+        assert_eq!(value["tip_oid"], tip);
+        let runs = value["runs"].as_array().expect("runs array");
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0]["run_id"], newer_run);
+        assert_eq!(runs[0]["request_event_id"], newer_request);
+        assert_eq!(runs[1]["run_id"], older_run);
+        assert_eq!(runs[1]["request_event_id"], older_request);
+        assert_eq!(runs[0]["workflow_id"], "ci");
+        assert_eq!(runs[0]["workflow_digest"], "44".repeat(32));
+        assert_eq!(runs[0]["base_oid"], "33".repeat(20));
+        assert!(runs[0]["created_at"].is_string());
+        // No check is stored for the seeded history yet.
+        assert_eq!(runs[0]["checks"].as_array().expect("checks").len(), 0);
+
+        // Another workflow or tip lists nothing.
+        for query in [
+            format!("target_repo_a={repo}&tip_oid={tip}&workflow_id=release"),
+            format!("target_repo_a={repo}&tip_oid={}", "23".repeat(20)),
+        ] {
+            let response = ci_run_response(
+                harness.state.clone(),
+                &harness.host,
+                &harness.owner,
+                &format!("/ci/checks?{query}"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = response_json(response).await;
+            assert_eq!(value["runs"].as_array().expect("runs").len(), 0);
+        }
+
+        // A non-member is refused; an unknown repository is hidden.
+        let response = ci_run_response(
+            harness.state.clone(),
+            &harness.host,
+            &nostr::Keys::generate(),
+            &format!("/ci/checks?target_repo_a={repo}&tip_oid={tip}"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = ci_run_response(
+            harness.state.clone(),
+            &harness.host,
+            &harness.owner,
+            &format!(
+                "/ci/checks?target_repo_a=30617:{}:missing&tip_oid={tip}",
+                harness.owner.public_key().to_hex()
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = ci_run_response(
+            harness.state.clone(),
+            &harness.host,
+            &harness.owner,
+            &format!("/ci/checks?target_repo_a={repo}&tip_oid={tip}&limit=1"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires scratch Postgres and CI evidence storage"]
+    async fn route_merge_gate_decisions_are_owner_or_admin_only_and_newest_first() {
+        if !preflight_scratch_env_ready() {
+            return;
+        }
+        let harness = TestHarness::connect().await;
+        let repo = harness.repo_a();
+        let old = "33".repeat(20);
+        let new = "55".repeat(20);
+        harness
+            .seed_decision(&old, &new, "check_pending", "shadow")
+            .await;
+        harness.seed_decision(&old, &new, "allow", "shadow").await;
+        harness
+            .seed_decision(&"34".repeat(20), &new, "allow", "enforce")
+            .await;
+
+        let path = format!(
+            "/ci/merge-gate/decisions?target_repo_a={repo}&ref=refs/heads/main&new_oid={new}&old_oid={old}"
+        );
+        let response =
+            ci_run_response(harness.state.clone(), &harness.host, &harness.owner, &path).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = response_json(response).await;
+        assert_eq!(value["target_repo_a"], repo);
+        assert_eq!(value["ref"], "refs/heads/main");
+        assert_eq!(value["new_oid"], new);
+        assert_eq!(value["mode"], "off");
+        assert_eq!(value["check_max_age_seconds"], 86_400);
+        let decisions = value["decisions"].as_array().expect("decisions");
+        assert_eq!(
+            decisions.len(),
+            2,
+            "old_oid narrows to the two matching rows"
+        );
+        assert_eq!(decisions[0]["code"], "allow");
+        assert_eq!(decisions[0]["mode"], "shadow");
+        assert_eq!(decisions[1]["code"], "check_pending");
+        assert_eq!(decisions[0]["old_oid"], old);
+        assert_eq!(decisions[0]["candidate_oid"], "22".repeat(20));
+        assert_eq!(decisions[0]["pusher"], harness.owner.public_key().to_hex());
+        assert!(decisions[0]["decided_at"].is_string());
+        assert!(decisions[0].get("check_event_id").is_none());
+
+        let unscoped = format!(
+            "/ci/merge-gate/decisions?target_repo_a={repo}&ref=refs/heads/main&new_oid={new}"
+        );
+        let response = ci_run_response(
+            harness.state.clone(),
+            &harness.host,
+            &harness.owner,
+            &unscoped,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = response_json(response).await;
+        assert_eq!(value["decisions"].as_array().expect("decisions").len(), 3);
+
+        // A plain member may read runs and checks but not decisions.
+        let member = harness.seed_member().await;
+        let response = ci_run_response(harness.state.clone(), &harness.host, &member, &path).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = ci_run_response(
+            harness.state.clone(),
+            &harness.host,
+            &member,
+            &format!(
+                "/ci/checks?target_repo_a={repo}&tip_oid={}",
+                "22".repeat(20)
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // A stranger is refused and a malformed query fails closed.
+        let response = ci_run_response(
+            harness.state.clone(),
+            &harness.host,
+            &nostr::Keys::generate(),
+            &path,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = ci_run_response(
+            harness.state.clone(),
+            &harness.host,
+            &harness.owner,
+            &format!("/ci/merge-gate/decisions?target_repo_a={repo}&ref=main&new_oid={new}"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

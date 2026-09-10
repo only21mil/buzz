@@ -220,3 +220,100 @@ owner would have to decide and do the following, in order:
 
 Until step 4 lands, GitHub keeps the gate and this change only makes the Buzz
 side able to publish a terminal result a ruleset could later require.
+
+## 7. Relay merge gate (authority path b)
+
+The relay's pre-receive policy callback can require a green kind-46108 check
+before a protected ref moves. Design: `BUZZ_MERGE_GATE_DESIGN.md`. Code:
+`crates/buzz-relay/src/api/git/merge_gate.rs`, `hook.rs`, `policy.rs`, and
+the publish fence in `transport.rs`. Storage: migration `0042_ci_merge_gate`.
+
+### Configuration
+
+| Variable | Values | Default |
+|----------|--------|---------|
+| `BUZZ_MERGE_GATE_MODE` | `off`, `shadow`, `enforce`; any other value fails config load | `off` |
+| `BUZZ_MERGE_GATE_CHECK_MAX_AGE_SECONDS` | 1 to 604800; longest age of the selected check by relay `accepted_at` | 86400 |
+| `BUZZ_MERGE_GATE_DECISION_WINDOW_SECONDS` | 1 to 900; longest gap between the hook decision and the publish fence | 300 |
+
+`off` evaluates nothing and logs each gated ref as skipped. `shadow`
+evaluates every gated ref, writes the decision record, logs
+`merge_gate decision=<allow|refuse> code=<code>`, and never refuses.
+`enforce` refuses on every refusal code and fails closed on its own errors.
+
+### Scope: the `require-check` rule
+
+A repository opts in through its kind-30617 announcement:
+
+```text
+["buzz-protect", "refs/heads/main", "no-force-push", "no-delete",
+ "require-check:ci:backend-integration+dead-token-guard+desktop+desktop-e2e-integration+desktop-e2e-relay+mobile+relay-e2e+rust-lint+security+unit-tests+web"]
+```
+
+`require-check:<workflow_id>:<job_id>[+<job_id>...]` names the workflow whose
+terminal check is required and pins the job ids that must be green. Two
+values for one workflow merge their job ids; two workflow ids require both.
+The pinned set lives in the owner-signed announcement, never in the
+candidate tree. A malformed value is a malformed protection rule and denies
+every push to the repository, like a bad `push:<role>`.
+
+### What the gate requires
+
+For a fast-forward (`parents == [old]`) the candidate is the new commit;
+for a landing merge (`parents == [old, candidate]`, candidate contains
+`old`, merge tree equals the candidate tree) the candidate is the second
+parent. The hook computes these facts in git's quarantine and binds them
+into the HMAC payload. The gate then takes the latest `ci_runs` row for
+`(repository, candidate, workflow_id)` whose `base_oid` is the ref's current
+tip and whose `workflow_digest` equals the digest of
+`.github/workflows/ci.yml` at that tip, reads only that run's events,
+validates each against the live signer union (`ci_status_signer_pubkeys`
+plus active kind-46107 grants), reduces them with the shared reducer, and
+requires `green` with every pinned job requested, `required: true` and
+successful. The selected check must conclude `success`, name the candidate
+and base, be signed by the union, and have been accepted by the relay inside
+`BUZZ_MERGE_GATE_CHECK_MAX_AGE_SECONDS`; `published_at` is never consulted.
+
+### Kind 46109, owner bypass
+
+`KIND_CI_MERGE_BYPASS = 46109` is signed by the repository owner (the
+kind-30617 author, who must also hold the channel owner or admin role) with
+content `{schema_version, target_repo_a, ref_name, old_oid, new_oid, reason,
+issued_at, expires_at}` and the `h` and `a` index tags. The window is at
+most one hour. The gate keys the lookup on the coordinate it resolved from
+the pushed repository's own announcement, accepts a bypass only for exactly
+`(ref_name, old_oid, new_oid)` inside its window and unconsumed, and records
+it on the decision. Consumption (`ci_merge_bypasses.consumed_by`, the
+allowing decision row) happens only after the publish CAS wins, so a bypass
+evaluated in `shadow` or on a push that lost the CAS race stays usable.
+
+### Decision record and publish fence
+
+Every evaluation appends one `git_merge_gate_decisions` row (repository,
+ref, old, new, candidate, classification, run, check, signer, code, mode,
+pusher, bypass, `decided_at`). In `enforce` mode `finalize_push` requires an
+`allow` row for exactly `(ref, old, new, pusher)` decided inside
+`BUZZ_MERGE_GATE_DECISION_WINDOW_SECONDS` before it publishes a gated ref.
+
+### Refusal codes
+
+The pusher sees `remote: error: push denied by policy (HTTP 403)` with a
+JSON denial whose reason reads `merge gate: <code>: <detail>`, identifiers
+shortened to 12 hex (the relay log keeps them complete):
+
+| Code | Meaning |
+|------|---------|
+| `no_check` | No run for the candidate, or the run has no accepted kind-46108 yet |
+| `check_pending` | The selected run's latest attempt is still running |
+| `check_not_success` | The run reduced red, or the check concludes other than `success` |
+| `reducer_disagrees` | The history is inconsistent, or the check disagrees with the reduction |
+| `base_moved` | The run or check names another base than the ref's current tip |
+| `not_descendant` | The merge's second parent does not contain the base |
+| `parent_shape` | Not a fast-forward and not a two-parent merge whose first parent is the base |
+| `tree_mismatch` | The merge tree differs from the candidate tree |
+| `workflow_digest_mismatch` | The run was digested against another workflow than the one at the base |
+| `required_jobs_missing` | A pinned job was not requested, not required, or not successful |
+| `signer_unauthorized` | A run event or the check is signed outside the live signer union |
+| `check_expired` | The check's relay `accepted_at` is older than the configured age |
+| `bypass_invalid` | The only bypass for this update is consumed, outside its window, or not the owner's |
+| `gate_misconfigured` | The gate could not decide: hydration, database, workflow, signer union, or an over-long history |

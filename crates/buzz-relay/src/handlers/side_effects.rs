@@ -2941,7 +2941,7 @@ const DEFAULT_HEAD: &str = "refs/heads/main";
 /// pointer body (e.g. a non-empty manifest from a previous announce/push pair
 /// for the same `(owner, repo)`) surfaces as an error rather than silently
 /// succeeding — that would mask a real misconfiguration.
-async fn seed_manifest_pointer(
+pub(crate) async fn seed_manifest_pointer(
     state: &Arc<AppState>,
     tenant: &TenantContext,
     owner_hex: &str,
