@@ -51,13 +51,13 @@ class ContainerRuntimeTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.source = self.root / "source"
-        self.source.mkdir(mode=0o755)
-        self.script = self.root / "workflow.sh"
-        self.script.write_text("printf hello\n")
-        self.script.chmod(0o644)
         self.job_dir = self.root / "job"
         self.job_dir.mkdir(mode=0o700)
+        self.source = self.job_dir / "source"
+        self.source.mkdir(mode=0o755)
+        self.script = self.job_dir / "workflow.sh"
+        self.script.write_text("printf hello\n")
+        self.script.chmod(0o644)
         self.spec = RUNTIME.ContainerSpec("a" * 64, "registry.example/ci@sha256:" + "b" * 64)
 
     def run_fake(self, process, *, control=(1, 0, 1), cancelled=lambda: False, clock=None):
@@ -79,8 +79,8 @@ class ContainerRuntimeTests(unittest.TestCase):
         self.assertEqual(args[:3], ["/usr/bin/podman", "--remote=false", "run"])
         for fixed in ("--userns=auto:size=65536", "--user=1000:1000", "--network=none", "--pull=never", "--cap-drop=ALL", "--read-only", "--unsetenv-all", "--http-proxy=false"):
             self.assertIn(fixed, args)
-        self.assertIn(f"type=bind,src={self.source},dst=/source,ro=true", args)
-        self.assertIn(f"type=bind,src={self.script},dst=/workflow.sh,ro=true", args)
+        self.assertIn(f"type=bind,src={self.source},dst=/source,ro=true,relabel=private", args)
+        self.assertIn(f"type=bind,src={self.script},dst=/workflow.sh,ro=true,relabel=private", args)
         self.assertFalse(any("docker.sock" in arg or "podman.sock" in arg for arg in args))
         self.assertEqual(args[-1], "cp -R /source/. /workspace/; exec /bin/bash --noprofile --norc -e -o pipefail /workflow.sh")
 
@@ -170,6 +170,19 @@ class ContainerRuntimeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 RUNTIME._safe_path(self.script, directory=False, owner=os.getuid())
             launch.assert_not_called()
+
+    def test_private_relabel_refuses_shared_source_and_linked_script_before_launch(self):
+        shared = self.root / "shared"
+        shared.mkdir(mode=0o755)
+        with patch.object(RUNTIME.subprocess, "Popen") as launch, patch.object(RUNTIME, "_control") as control:
+            with self.assertRaisesRegex(ValueError, "fresh job-owned"):
+                RUNTIME.run_container(self.spec, shared, self.script, self.job_dir, lambda: False)
+            external = self.root / "shared-script"
+            external.hardlink_to(self.script)
+            with self.assertRaisesRegex(ValueError, "fresh job-owned"):
+                RUNTIME.run_container(self.spec, self.source, self.script, self.job_dir, lambda: False)
+            launch.assert_not_called()
+            control.assert_not_called()
 
     def test_control_errors_never_prove_absence(self):
         with patch.object(RUNTIME.subprocess, "run", side_effect=subprocess.TimeoutExpired("podman", 20)):

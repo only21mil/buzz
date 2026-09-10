@@ -75,7 +75,7 @@ Populate these fields from their independent authority:
 
 Linux semantic profile is supplied by the Linux package at
 `deploy/native-ci/linux-runner/profile.semantic.json`. Its current hash is
-`002b0dfc5001683362ce7da4c2248d25ead169dc11c125d2696662bd6c51ac61`.
+`380c42ed223751205db5bd8c68b8924d4d7067aca0788db94a55383a0508c698`.
 Any profile change requires recalculation and review; this historical hash is
 not an exemption. The Mac producer supplies its measured public host profile.
 The helper uses the maintained `LaneActivationManifestV1::digest` method to

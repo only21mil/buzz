@@ -9,8 +9,9 @@ a provisioned mode-0700 /run/user/<uid>, delegated cgroup v2 controllers, and th
 digest-pinned image already in that account's rootless storage. The image must
 provide /bin/bash and cp. Source directories must be traversable and files
 readable by container UID 1000, which maps to a subordinate host UID. SELinux
-hosts need an approved bind-mount labeling policy. This module does not disable
-labels or relabel source data. These requirements need an authorized live smoke.
+hosts use private container labels on the fresh job-owned source and script.
+Shared checkouts cannot be supplied as mounts. These requirements need an
+authorized live smoke.
 """
 from __future__ import annotations
 
@@ -125,8 +126,8 @@ def _command(spec: ContainerSpec, source: Path, script: Path, job_dir: Path) -> 
         "--memory", f"{spec.memory_mib}m", "--memory-swap", f"{spec.memory_mib}m",
         "--cpus", str(spec.cpus), "--pids-limit", str(spec.pids_limit),
         "--ulimit=nofile=1024:1024", "--ulimit=core=0:0",
-        "--mount", f"type=bind,src={source},dst=/source,ro=true",
-        "--mount", f"type=bind,src={script},dst=/workflow.sh,ro=true",
+        "--mount", f"type=bind,src={source},dst=/source,ro=true,relabel=private",
+        "--mount", f"type=bind,src={script},dst=/workflow.sh,ro=true,relabel=private",
         "--tmpfs", f"/workspace:rw,exec,nosuid,nodev,notmpcopyup,size={spec.memory_mib}m,mode=0700,uid=1000,gid=1000",
         "--tmpfs", "/tmp:rw,nosuid,nodev,noexec,notmpcopyup,size=256m,mode=1777",
         "--env=PATH=/usr/local/bin:/usr/bin:/bin", "--env=HOME=/workspace",
@@ -186,6 +187,10 @@ def run_container(
     job_dir = _safe_path(job_dir, directory=True, owner=uid)
     if job_dir.stat().st_uid != uid or stat.S_IMODE(job_dir.stat().st_mode) != 0o700:
         raise ValueError("private runtime-owned job directory required")
+    if (source != job_dir / "source" or script != job_dir / "workflow.sh"
+            or source.stat().st_uid != uid or script.stat().st_uid != uid
+            or script.stat().st_nlink != 1):
+        raise ValueError("private relabel requires fresh job-owned source and script")
     if (job_dir / "container.cid").exists() or (job_dir / "container.cid").is_symlink():
         raise ValueError("invocation already started")
     name = f"buzzci-{spec.invocation_digest}"

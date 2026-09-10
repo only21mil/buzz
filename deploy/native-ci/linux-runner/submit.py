@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
 import signal
 import stat
 import subprocess
@@ -143,6 +144,44 @@ def validate_result(result: dict, admission: dict, profile: dict, profile_digest
         raise Refused("container outcome does not prove declared conclusion")
 
 
+def require_no_unfinished(root: Path) -> None:
+    """Only root's complete, bound cleanup evidence releases a retained claim."""
+    for directory in root.iterdir():
+        if directory.name == "capacity.lock":
+            continue
+        metadata = directory.lstat()
+        if (not re.fullmatch(r"[0-9a-f]{64}", directory.name)
+                or not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != 0
+                or stat.S_IMODE(metadata.st_mode) != 0o700):
+            raise Refused("unsafe retained supervisor claim")
+        try:
+            proof = json.loads(worker._read_root_file(directory / "supervisor.json", 65536))
+            registration = worker._read_root_file(directory / "registration.bin", 992)
+            if (proof["schema_version"] != "buzz-ci-native-linux-supervisor/v1"
+                    or any(proof.get(key) is not True for key in
+                           ("container_absent", "recursive_cgroup_empty", "unit_inactive"))
+                    or len(registration) != 992
+                    or proof["registration_sha256"] != hashlib.sha256(registration).hexdigest()
+                    or not re.fullmatch(r"[0-9a-f]{32}", proof["invocation_id"])
+                    or type(proof["finished_at"]) is not int):
+                raise Refused("invalid prior supervisor completion")
+            result = proof["native_result"]
+            admission = result["admission"]
+            logical_digest = hashlib.sha256(worker._canonical({
+                "run_id": admission["run_id"], "attempt": admission["attempt"],
+                "job_id": result["job_id"]})).hexdigest()
+            invocation = hashlib.sha256(worker._canonical({
+                "admission_message_digest": admission["admission_message_digest"],
+                "profile_sha256": result["profile_sha256"]})).hexdigest()
+            if directory.name != logical_digest or proof["unit"] != "buzz-ci-linux-" + invocation + ".service":
+                raise Refused("prior completion belongs to another claim")
+            validate_result(result, admission, {"job_id": result["job_id"]}, result["profile_sha256"],
+                            invocation, {"ExecMainCode": str(proof["exec_main_code"]),
+                                         "ExecMainStatus": str(proof["exec_main_status"])})
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, Refused) as error:
+            raise Refused("unfinished or unclean prior admission requires root recovery") from error
+
+
 def supervise(directory: Path, profile: dict, profile_digest: str, admission: dict) -> dict:
     invocation = hashlib.sha256(worker._canonical({"admission_message_digest": admission["admission_message_digest"],
                                                   "profile_sha256": profile_digest})).hexdigest()
@@ -156,6 +195,8 @@ def supervise(directory: Path, profile: dict, profile_digest: str, admission: di
     state = {}
     stopped = False
     proof = None
+    container_absent = False
+    cgroup_empty = False
     signal_sent = False
     try:
         if _state(unit).get("LoadState") != "not-found":
@@ -184,8 +225,6 @@ def supervise(directory: Path, profile: dict, profile_digest: str, admission: di
         raw = worker._read_root_file(directory / "stdout.json", 32769)
         result = json.loads(raw)
         validate_result(result, admission, profile, profile_digest, invocation, state)
-        if not _container_absent(profile, invocation) or not _empty_cgroup(descriptor):
-            raise Refused("container or worker descendants remain")
         proof = {"schema_version": "buzz-ci-native-linux-supervisor/v1", "native_result": result,
                  "unit": unit, "invocation_id": identity,
                  "cgroup_path": str(cgroup_path), "cgroup_device": cgroup_identity[0],
@@ -193,13 +232,29 @@ def supervise(directory: Path, profile: dict, profile_digest: str, admission: di
                  "exec_main_status": int(state["ExecMainStatus"]), "container_absent": True,
                  "recursive_cgroup_empty": True}
     finally:
-        if launched:
-            stopped = _command([SYSTEMCTL, "stop", unit], timeout=50).returncode == 0
-            after = _state(unit)
-            stopped = stopped and after.get("ActiveState") in {"inactive", "failed"}
-        if descriptor is not None:
-            os.close(descriptor)
-    if not stopped or proof is None:
+        try:
+            if launched:
+                # Even a refused/partial launch must attempt independent cleanup
+                # readback. Failure keeps the root claim quarantined. Never let
+                # an unavailable readback skip the exact-unit stop attempt.
+                try:
+                    if descriptor is None:
+                        descriptor, _, _ = _cgroup(unit, _state(unit))
+                    cgroup_empty = _empty_cgroup(descriptor)
+                except (Refused, OSError, ValueError, subprocess.SubprocessError):
+                    cgroup_empty = False
+                try:
+                    stopped = _command([SYSTEMCTL, "stop", unit], timeout=50).returncode == 0
+                    after = _state(unit)
+                    stopped = stopped and after.get("ActiveState") in {"inactive", "failed"}
+                finally:
+                    # Read container storage after stop: stopping the unit alone
+                    # does not remove a container left by a dead worker.
+                    container_absent = _container_absent(profile, invocation)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+    if not stopped or not container_absent or not cgroup_empty or proof is None:
         raise Refused("unit cleanup unproven")
     proof["unit_inactive"] = True
     proof["finished_at"] = int(time.time())
@@ -220,6 +275,7 @@ def main() -> int:
     lock_fd = os.open(SUPERVISOR_ROOT / "capacity.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     with os.fdopen(lock_fd, "rb") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        require_no_unfinished(SUPERVISOR_ROOT)
         directory = worker.claim_job(SUPERVISOR_ROOT, admission, profile["job_id"])
         worker._publish_bytes(directory / "registration.bin", registration)
         worker._publish_bytes(directory / "stdout.json", b"")

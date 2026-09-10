@@ -19,8 +19,14 @@ The worker reads the verifier output, matches the selected job, signed isolation
 profile and sole `result.json` artifact declaration to its installed profile,
 then claims a persistent `(run_id, job_id, attempt)` directory under a global
 capacity-one lock. Replaying a logical attempt refuses execution even if its
-signing window or admission signature changes. An incomplete prior claim also
-refuses; it requires root recovery and cannot be cleared by job code.
+signing window or admission signature changes. Before claiming any new run or
+attempt, the root supervisor checks every retained root claim while holding its
+own capacity lock. Missing, malformed, mismatched or unclean
+`supervisor.json` evidence quarantines the entire slot, including after a
+supervisor crash. Only a complete root receipt with independently measured
+container absence, recursive cgroup emptiness and unit inactivity permits a
+new attempt. A worker receipt cannot release quarantine. Recovery requires
+root investigation and retained evidence; deleting a claim is not recovery.
 
 The fixed GitHub URL supplies content-addressed objects only. Its branch heads
 and refs confer no authority. The signed candidate/base and canonical source-pin
@@ -83,8 +89,14 @@ Install root-owned, non-group/world-writable files:
 - `/etc/buzzci/linux-runner/profile.semantic.json`, exact bytes from this package
 - `/etc/buzzci/linux-runner/profile.json`, deployment binding described below
 
-Python 3, system PyYAML, Git, rootless Podman and an approved SELinux bind-label
-policy are required. The dedicated locked-login `buzzci-linux` account must have its
+Python 3, system PyYAML, Git and rootless Podman with private SELinux bind
+relabeling support are required. Both read-only mounts use `relabel=private`
+on the fresh `source` tree and `workflow.sh` inside the runtime-owned private
+job directory. Shared checkouts and external script paths are refused before
+Podman starts; SELinux labeling remains enabled. The host preflight reported
+SELinux enforcing on 2026-09-10. Label application and container access still
+require the authorized live acceptance run. The dedicated locked-login
+`buzzci-linux` account must have its
 own home/container storage at `/var/lib/buzzci/linux-runner/home`, a non-overlapping subordinate UID/GID range, a
 private `/run/user/UID`, and delegated cgroup v2 controllers. The account must
 not read other principals' homes or signing state. Preload the exact pinned
@@ -99,7 +111,7 @@ worker execution nor qualification pulls an image or installs dependencies.
   "runtime_uid": 1234,
   "verifier_sha256": "<SHA-256 of installed verifier>",
   "admission_policy_sha256": "<SHA-256 of exact admission.json bytes>",
-  "semantic_profile_sha256": "002b0dfc5001683362ce7da4c2248d25ead169dc11c125d2696662bd6c51ac61",
+  "semantic_profile_sha256": "380c42ed223751205db5bd8c68b8924d4d7067aca0788db94a55383a0508c698",
   "workflow_path": ".github/workflows/ci.yml",
   "workflow_id": "CI",
   "job_id": "dead-token-guard",
@@ -151,8 +163,10 @@ python3 -m unittest discover -s deploy/native-ci/tests -p test_linux_container_r
 
 The tests run the actual guard command on clean and deliberate-failure input,
 exercise source/workflow refusal paths, and check mocked Podman success,
-failure, cancellation, timeout, bounded output and cleanup failures. They do
-not prove that Podman, subordinate mappings, cgroups or SELinux work on a host.
+failure, cancellation, timeout, bounded output and cleanup failures. Supervisor
+regressions cover a process exiting without cleanup, successor
+run and attempt refusal, invalid prior evidence and clean completion followed
+by replay refusal. They do not prove that Podman, subordinate mappings, cgroups or SELinux work on a host.
 Before claiming live readiness, run a genuine signed supported job, deliberate
 failure, cancel, timeout, replay and cleanup qualification through the installed
 supervisor, then verify the native signed completion against the exact receipt.
@@ -162,8 +176,11 @@ The root supervisor uses `RemainAfterExit=yes` to retain the exact unit identity
 and actual main exit status until readback. It opens the cgroup directory while
 the unit is owned, proves its recursive `populated` counter is zero, then stops
 the unit and proves it inactive. Partial start failure still triggers exact-unit
-cleanup. An existing invocation unit is never reused or removed. The supervisor
-itself does not publish events or sign anything.
+cleanup and container-absence readback. Refusal paths also attempt recursive
+cgroup readback, but never publish a successful supervisor receipt. Unavailable
+readback retains quarantine even if stopping the unit succeeds. An existing
+invocation unit is never reused or removed. The supervisor itself does not
+publish events or sign anything.
 
 Outer `NoNewPrivileges=yes` would prevent the installed `newuidmap` and
 `newgidmap` helpers from creating the subordinate-ID mapping. The host helper

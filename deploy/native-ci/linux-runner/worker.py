@@ -98,6 +98,8 @@ def _load_profile(*, for_submission: bool = False) -> tuple[dict, str]:
     for key in ("workflow_path", "workflow_id", "job_id", "image", "memory_mib", "cpus", "pids_limit"):
         if semantic.get(key) != profile[key]:
             raise Refused("installed profile differs from signed runtime semantics")
+    if semantic.get("bind_mount_selinux_relabel") != "private":
+        raise Refused("installed bind labeling differs from runtime semantics")
     if semantic.get("wall_timeout_seconds") != profile["maximum_wall_seconds"]:
         raise Refused("installed deadline differs from signed runtime semantics")
     ContainerSpec("0" * 64, profile["image"], profile["maximum_wall_seconds"], profile["memory_mib"],

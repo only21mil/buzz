@@ -1,4 +1,6 @@
 import copy
+from contextlib import ExitStack
+import io
 import hashlib
 import json
 import os
@@ -8,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,7 +24,7 @@ class SupervisorTests(unittest.TestCase):
     def setUp(self):
         submit._cancelled = False
         self.profile = {"job_id": "dead-token-guard", "maximum_wall_seconds": 300, "runtime_uid": 1234}
-        self.admission = {"admission_message_digest": "1" * 64, "candidate_sha": "a" * 40,
+        self.admission = {"run_id": "a" * 32, "attempt": 1, "admission_message_digest": "1" * 64, "candidate_sha": "a" * 40,
                           "base_sha": "b" * 40, "workflow_file_sha256": "c" * 64,
                           "wall_timeout_seconds": 300, "expires_at": int(time.time()) + 300}
         self.profile_digest = "d" * 64
@@ -98,12 +101,139 @@ class SupervisorTests(unittest.TestCase):
             command.assert_not_called()
 
     def test_partial_start_failure_still_stops_exact_unit(self):
-        with patch.object(submit, "_state", side_effect=[{"LoadState": "not-found"}, {"ActiveState": "inactive"}]), \
+        with patch.object(submit, "_state", side_effect=[{"LoadState": "not-found"}, {}, {"ActiveState": "inactive"}]), \
              patch.object(submit, "_launch", side_effect=Refused("start")), \
+             patch.object(submit, "_container_absent", return_value=False) as absent, \
              patch.object(submit, "_command", return_value=subprocess.CompletedProcess([], 0, b"")) as command:
             with self.assertRaises(Refused):
                 submit.supervise(Path("/unused"), self.profile, self.profile_digest, self.admission)
             self.assertEqual(command.call_args.args[0][1], "stop")
+            absent.assert_called_once()
+
+    def test_invalid_worker_output_still_measures_cleanup_and_stops(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            descriptor = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
+            with patch.object(submit, "_state", side_effect=[{"LoadState": "not-found"}, self.state,
+                                                           self.state, {"ActiveState": "inactive"}]), \
+                 patch.object(submit, "_launch"), \
+                 patch.object(submit, "_cgroup", return_value=(descriptor, Path(temporary), (1, 2))), \
+                 patch.object(submit, "_empty_cgroup", return_value=False) as empty, \
+                 patch.object(submit, "_container_absent", return_value=False) as absent, \
+                 patch.object(worker, "_read_root_file", return_value=b"invalid"), \
+                 patch.object(submit, "_command", return_value=subprocess.CompletedProcess([], 0, b"")) as command:
+                with self.assertRaises(ValueError):
+                    submit.supervise(Path(temporary), self.profile, self.profile_digest, self.admission)
+                empty.assert_called_once_with(descriptor)
+                absent.assert_called_once_with(self.profile, self.invocation)
+                self.assertEqual(command.call_args.args[0][1], "stop")
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+
+    def proof(self):
+        result = copy.deepcopy(self.result)
+        result["admission"] = self.admission.copy()
+        return {"schema_version": "buzz-ci-native-linux-supervisor/v1", "native_result": result,
+                "unit": "buzz-ci-linux-" + self.invocation + ".service", "invocation_id": "e" * 32,
+                "container_absent": True, "recursive_cgroup_empty": True, "unit_inactive": True,
+                "exec_main_code": 1, "exec_main_status": 0, "finished_at": int(time.time())}
+
+    def main_environment(self, root):
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        original_lstat = Path.lstat
+
+        def root_lstat(path):
+            metadata = original_lstat(path)
+            if path == root or root in path.parents:
+                fields = list(metadata)
+                fields[4] = 0
+                return os.stat_result(fields)
+            return metadata
+
+        stack.enter_context(patch.object(Path, "lstat", root_lstat))
+        stack.enter_context(patch.object(submit, "SUPERVISOR_ROOT", root))
+        stack.enter_context(patch.object(os, "geteuid", return_value=0))
+        stack.enter_context(patch.object(worker, "_load_profile", return_value=(self.profile, self.profile_digest)))
+        stack.enter_context(patch.object(worker, "verify_admission", side_effect=lambda frame: self.admission.copy()))
+        # Test files belong to the test user; production validates root ownership.
+        stack.enter_context(patch.object(worker, "_read_root_file", side_effect=lambda path, limit: path.read_bytes()))
+        stack.enter_context(patch.object(submit.signal, "signal"))
+        stack.enter_context(patch.object(sys, "argv", ["submit.py", "run"]))
+        stack.enter_context(patch.object(sys, "stdout", SimpleNamespace(buffer=io.BytesIO())))
+        return stack
+
+    def run_main(self):
+        with patch.object(sys, "stdin", SimpleNamespace(buffer=io.BytesIO(b"x" * 992))):
+            return submit.main()
+
+    def test_refusal_quarantines_successor_run_and_attempt_after_lock_release(self):
+        for successor in ({"run_id": "b" * 32}, {"attempt": 2}):
+            with self.subTest(successor=successor), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                with self.main_environment(root), patch.object(submit, "supervise", side_effect=Refused("unclean")) as run:
+                    with self.assertRaisesRegex(Refused, "unclean"):
+                        self.run_main()
+                    self.admission.update(successor)
+                    with self.assertRaisesRegex(Refused, "root recovery"):
+                        self.run_main()
+                    self.assertEqual(run.call_count, 1)
+                    self.assertEqual(len(list(root.glob("*/registration.bin"))), 1)
+
+    @unittest.skipUnless(hasattr(os, "fork"), "Linux crash regression")
+    def test_hard_exit_leaves_slot_quarantined(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.main_environment(root), patch.object(submit, "supervise", side_effect=lambda *args: os._exit(23)):
+                child = os.fork()
+                if child == 0:
+                    try:
+                        self.run_main()
+                    finally:
+                        os._exit(24)
+                _, status = os.waitpid(child, 0)
+                self.assertEqual(os.waitstatus_to_exitcode(status), 23)
+            with self.main_environment(root), patch.object(submit, "supervise") as run:
+                self.admission["run_id"] = "b" * 32
+                with self.assertRaisesRegex(Refused, "root recovery"):
+                    self.run_main()
+                run.assert_not_called()
+
+    def test_invalid_or_unclean_prior_proof_quarantines_successor(self):
+        variants = [b"{", b"{}", b"null"]
+        for key in ("container_absent", "recursive_cgroup_empty", "unit_inactive"):
+            proof = self.proof()
+            proof[key] = False
+            variants.append(worker._canonical(proof))
+        proof = self.proof()
+        proof["registration_sha256"] = "0" * 64
+        variants.append(worker._canonical(proof))
+        proof = self.proof()
+        proof["registration_sha256"] = hashlib.sha256(b"x" * 992).hexdigest()
+        proof["unit"] = "buzz-ci-linux-" + "0" * 64 + ".service"
+        variants.append(worker._canonical(proof))
+        for data in variants:
+            with self.subTest(data=data), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                with self.main_environment(root), patch.object(submit, "supervise") as run:
+                    directory = worker.claim_job(root, self.admission, self.profile["job_id"])
+                    worker._publish_bytes(directory / "registration.bin", b"x" * 992)
+                    worker._publish_bytes(directory / "supervisor.json", data)
+                    self.admission["attempt"] += 1
+                    with self.assertRaisesRegex(Refused, "root recovery"):
+                        self.run_main()
+                    run.assert_not_called()
+
+    def test_complete_root_proof_allows_new_attempt_but_refuses_replay(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with self.main_environment(root), patch.object(submit, "supervise", side_effect=lambda *args: self.proof()) as run:
+                self.assertEqual(self.run_main(), 0)
+                with self.assertRaises(FileExistsError):
+                    self.run_main()
+                self.admission = dict(self.admission, attempt=2)
+                self.assertEqual(self.run_main(), 0)
+                self.assertEqual(run.call_count, 2)
+                self.assertEqual(len(list(root.glob("*/supervisor.json"))), 2)
 
 
 if __name__ == "__main__":
