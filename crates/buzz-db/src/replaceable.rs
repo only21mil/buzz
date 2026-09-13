@@ -243,13 +243,12 @@ impl Db {
             ));
         }
 
-        tx.commit().await?;
+        // The replaceable event and its denormalized mention index are one
+        // authoritative discovery write. An indexing error must roll back the
+        // new event and restore the previously-live event.
+        crate::insert_mentions_in_transaction(&mut tx, community_id, event, channel_id).await?;
 
-        // Mentions are a denormalized index — safe outside the transaction.
-        // insert_event() normally handles this, but we inlined the INSERT above.
-        if let Err(e) = crate::insert_mentions(&self.pool, community_id, event, channel_id).await {
-            tracing::warn!(event_id = %event.id, "Failed to insert mentions: {e}");
-        }
+        tx.commit().await?;
 
         Ok((
             StoredEvent::with_received_at(event.clone(), received_at, channel_id, true),
