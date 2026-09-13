@@ -242,6 +242,10 @@ type E2eConfig = {
     acpAuthMethodsError?: string;
     /** When set, the `delete_custom_harness` mock command throws with this message. */
     deleteCustomHarnessError?: string;
+    /** When set, workflow updates fail with this message. */
+    workflowUpdateError?: string;
+    /** When set, workflow deletion fails with this message. */
+    workflowDeleteError?: string;
     connectAcpRuntimeResult?: RawConnectAcpRuntimeResult;
     connectAcpRuntimeDelayMs?: number;
     connectAcpRuntimeError?: string;
@@ -1368,6 +1372,18 @@ declare global {
     __BUZZ_E2E_RELEASE_CHANNELS_READ__?: () => number;
     /** Number of channel reads currently held by the seam. */
     __BUZZ_E2E_CHANNELS_READ_PENDING__?: number;
+    /** Start or stop holding `get_users_batch` responses. Turning the hold off
+     *  flushes everything held; either call returns the number released, so a
+     *  spec can prove a relay identity lookup was genuinely pinned open. */
+    __BUZZ_E2E_HOLD_USERS_BATCH__?: (hold: boolean) => number;
+    /** Number of `get_users_batch` calls currently held. */
+    __BUZZ_E2E_USERS_BATCH_PENDING__?: () => number;
+    /** Last payload written through the clipboard command (plain + sidecar). */
+    __BUZZ_E2E_LAST_CLIPBOARD__?: { html: string | null; text: string };
+    /** Hold renderer-owned audio fetches until their cancellation command. */
+    __BUZZ_E2E_HOLD_MEDIA_FETCHES__?: boolean;
+    /** Exact active/peak mock audio-fetch ownership for scheduler tests. */
+    __BUZZ_E2E_MEDIA_FETCH_STATE__?: { active: number; peak: number };
   }
 }
 
@@ -1436,6 +1452,11 @@ const CHARLIE_PUBKEY =
   "554cef57437abac34522ac2c9f0490d685b72c80478cf9f7ed6f9570ee8624ea";
 const OUTSIDER_PUBKEY =
   "df8e91b86fda13a9a67896df77232f7bdab2ba9c3e165378e1ba3d24c13a328e";
+// A non-member human whose display name has a space in it. Multi-word names are
+// the case a plain-text copy cannot recover — "@John Smith" is indistinguishable
+// from "@John" followed by a word — so the clipboard round-trip fixtures use it.
+const MULTI_WORD_NON_MEMBER_PUBKEY =
+  "7c1f2ad0b4e93856a1d0c2f4e6b8093a5d7f1c3e5a79b1d3f5072a4c6e80931b";
 const PROFILE_ONLY_AGENT_PUBKEY =
   "8f83d6b7f3d74f7d933ae3a54dd8c6cc85c7f98e531c16e5a827b953441a8d67";
 // A relay-classified bot agent whose declared NIP-OA owner is the mock viewer,
@@ -1471,6 +1492,14 @@ type DeferredGetEvent = {
   run: () => Promise<string>;
 };
 let deferredGetEventQueue: DeferredGetEvent[] = [];
+// ── get_users_batch hold seam ───────────────────────────────────────────────
+// Toggled at runtime by `__BUZZ_E2E_HOLD_USERS_BATCH__(hold)` rather than fixed
+// at boot by a mock-config flag, because a mention-identity spec needs both
+// sides of the hold in one page: profiles resolved normally first (so one paste
+// verifies instantly from local state), then the relay lookup pinned open (so a
+// second paste of the same label is provably still deciding).
+let holdUsersBatch = false;
+let heldUsersBatchReleases: Array<() => void> = [];
 let deferNextChannelsRead = false;
 let deferredChannelsReadResolve: (() => void) | null = null;
 
@@ -1482,6 +1511,7 @@ const mockDisplayNames = new Map<string, string>([
   [PROFILE_ONLY_AGENT_PUBKEY, "mira"],
   [OWNED_RELAY_AGENT_PUBKEY, "nadia"],
   [OUTSIDER_PUBKEY, "outsider"],
+  [MULTI_WORD_NON_MEMBER_PUBKEY, "John Smith"],
   [DEFAULT_REAL_IDENTITY.pubkey, DEFAULT_REAL_IDENTITY.username],
 ]);
 const mockAgentPubkeys = new Set([
@@ -3316,6 +3346,7 @@ let mockRelayAgents: RawRelayAgent[] = defaultMockRelayAgents.map((agent) => ({
 
 type MockWorkflow = {
   id: string;
+  revision: string;
   name: string;
   owner_pubkey: string;
   channel_id: string | null;
@@ -3355,6 +3386,16 @@ type RawWorkflowRun = {
 const mockWorkflows: MockWorkflow[] = [];
 let mockWorkflowRuns: RawWorkflowRun[] = [];
 let mockWorkflowIdCounter = 0;
+
+// ── Mock audio-fetch hold/state seam ──────────────────────────────────────
+// Renderer-owned audio transfer behind the shared scheduler cap
+// (`audioMediaLoadScheduler`, max 3 concurrent). The hold flag and the
+// active/peak counters let specs pin the cap and the unmount cancellation
+// deterministically. Restored from upstream for the voice-note scheduler
+// regression test; the cancel/release commands mirror the native protocol
+// in `tauriMedia.ts`.
+const cancelledAudioFetchIds = new Set<string>();
+const mockAudioFetchControllers = new Map<string, AbortController>();
 
 function resetMockWorkflows() {
   mockWorkflows.length = 0;
@@ -3402,6 +3443,7 @@ function handleCreateWorkflow(args: {
       : `workflow_${mockWorkflowIdCounter}`;
   const workflow: MockWorkflow = {
     id: `mock-wf-${mockWorkflowIdCounter}`,
+    revision: `mock-revision-${mockWorkflowIdCounter}-1`,
     name,
     owner_pubkey: MOCK_IDENTITY_PUBKEY,
     channel_id: args.channelId,
@@ -3425,13 +3467,22 @@ function handleCreateWorkflow(args: {
 function handleUpdateWorkflow(args: {
   workflowId: string;
   yamlDefinition: string;
+  expectedRevision: string;
 }) {
   const workflow = mockWorkflows.find((w) => w.id === args.workflowId);
   if (!workflow) throw new Error(`Workflow ${args.workflowId} not found`);
+  const configuredError = window.__BUZZ_E2E__?.mock?.workflowUpdateError;
+  if (configuredError) throw new Error(configuredError);
+  if (workflow.revision !== args.expectedRevision) {
+    throw new Error(
+      "workflow changed since it was loaded; refresh and try again",
+    );
+  }
   const definition = parseWorkflowDefinition(args.yamlDefinition);
   if (typeof definition.name === "string") workflow.name = definition.name;
   workflow.definition = definition;
   workflow.updated_at = Math.floor(Date.now() / 1000);
+  workflow.revision = `mock-revision-${workflow.id}-${workflow.updated_at}-${Math.random()}`;
 
   const trigger = definition.trigger as Record<string, unknown> | undefined;
   return {
@@ -3444,6 +3495,8 @@ function handleUpdateWorkflow(args: {
 }
 
 function handleDeleteWorkflow(args: { workflowId: string }) {
+  const configuredError = window.__BUZZ_E2E__?.mock?.workflowDeleteError;
+  if (configuredError) throw new Error(configuredError);
   const index = mockWorkflows.findIndex((w) => w.id === args.workflowId);
   if (index === -1) throw new Error(`Workflow ${args.workflowId} not found`);
   mockWorkflows.splice(index, 1);
@@ -3594,6 +3647,7 @@ const mockPresence = new Map<string, PresenceStatus>([
   [PROFILE_ONLY_AGENT_PUBKEY, "online"],
   [OWNED_RELAY_AGENT_PUBKEY, "online"],
   [OUTSIDER_PUBKEY, "offline"],
+  [MULTI_WORD_NON_MEMBER_PUBKEY, "offline"],
 ]);
 const mockFeedOverrides: RawHomeFeedResponse["feed"] = {
   mentions: [],
@@ -6015,6 +6069,11 @@ async function handleGetUsersBatch(
   if (usersBatchDelayMs > 0) {
     await new Promise<void>((resolve) => {
       window.setTimeout(resolve, usersBatchDelayMs);
+    });
+  }
+  if (holdUsersBatch) {
+    await new Promise<void>((resolve) => {
+      heldUsersBatchReleases.push(resolve);
     });
   }
 
@@ -10112,6 +10171,7 @@ export function maybeInstallE2eTauriMocks() {
   window.__BUZZ_E2E_COMMANDS__ = [];
   window.__BUZZ_E2E_COMMAND_PAYLOADS__ = [];
   window.__BUZZ_E2E_COMMAND_LOG__ = [];
+  window.__BUZZ_E2E_MEDIA_FETCH_STATE__ = { active: 0, peak: 0 };
   window.__BUZZ_E2E_EMIT_MOCK_HUDDLE_TTS_SPEAKER__ = (payload) =>
     emit("huddle-tts-speaker-level", payload);
   window.__BUZZ_E2E_SIGNED_EVENTS__ = [];
@@ -10288,6 +10348,17 @@ export function maybeInstallE2eTauriMocks() {
     window.__BUZZ_E2E_GET_EVENT_CALL_COUNT__ = 0;
     return queued.length;
   };
+  holdUsersBatch = false;
+  heldUsersBatchReleases = [];
+  window.__BUZZ_E2E_HOLD_USERS_BATCH__ = (hold: boolean) => {
+    holdUsersBatch = hold;
+    // Releasing on the way out of the hold, not on the way in, is what lets a
+    // spec keep one lookup pinned while another resolves from local state.
+    const queued = hold ? [] : heldUsersBatchReleases.splice(0);
+    for (const release of queued) release();
+    return queued.length;
+  };
+  window.__BUZZ_E2E_USERS_BATCH_PENDING__ = () => heldUsersBatchReleases.length;
   window.__BUZZ_E2E_EMIT_MOCK_READ_STATE__ = ({
     clientId,
     contexts,
@@ -12723,6 +12794,72 @@ export function maybeInstallE2eTauriMocks() {
           },
           activeConfig,
         );
+      case "fetch_audio_bytes": {
+        // Renderer-owned audio transfer behind the shared scheduler cap. The
+        // hold flag and active/peak counters let specs pin the cap and the
+        // unmount cancellation deterministically (see the seam state above).
+        const input = payload as { requestId?: string; url: string };
+        const requestId = input.requestId ?? crypto.randomUUID();
+        const controller = new AbortController();
+        mockAudioFetchControllers.set(requestId, controller);
+        if (cancelledAudioFetchIds.has(requestId)) controller.abort();
+        if (!window.__BUZZ_E2E_MEDIA_FETCH_STATE__) {
+          window.__BUZZ_E2E_MEDIA_FETCH_STATE__ = { active: 0, peak: 0 };
+        }
+        const stats = window.__BUZZ_E2E_MEDIA_FETCH_STATE__;
+        stats.active += 1;
+        stats.peak = Math.max(stats.peak, stats.active);
+        try {
+          if (window.__BUZZ_E2E_HOLD_MEDIA_FETCHES__) {
+            // Held until the flag clears or the owning scheduler slot aborts.
+            // Polling the flag (rather than parking forever) lets specs hold
+            // the load, assert the loading UI, then release into playback.
+            await new Promise<void>((resolve, reject) => {
+              const timer = window.setInterval(() => {
+                if (!window.__BUZZ_E2E_HOLD_MEDIA_FETCHES__) {
+                  window.clearInterval(timer);
+                  resolve();
+                }
+              }, 25);
+              const rejectCancelled = () => {
+                window.clearInterval(timer);
+                reject(new DOMException("fetch cancelled", "AbortError"));
+              };
+              if (controller.signal.aborted) {
+                rejectCancelled();
+                return;
+              }
+              controller.signal.addEventListener("abort", rejectCancelled, {
+                once: true,
+              });
+            });
+          }
+          const response = await fetch(input.url, {
+            signal: controller.signal,
+          });
+          if (!response.ok) throw new Error(`fetch failed: ${response.status}`);
+          return await response.arrayBuffer();
+        } finally {
+          stats.active -= 1;
+          mockAudioFetchControllers.delete(requestId);
+        }
+      }
+      case "cancel_media_fetch": {
+        const requestId = (payload as { requestId?: string }).requestId;
+        if (requestId) {
+          cancelledAudioFetchIds.add(requestId);
+          mockAudioFetchControllers.get(requestId)?.abort();
+        }
+        return null;
+      }
+      case "release_media_fetch": {
+        const requestId = (payload as { requestId?: string }).requestId;
+        if (requestId) {
+          cancelledAudioFetchIds.delete(requestId);
+          mockAudioFetchControllers.delete(requestId);
+        }
+        return null;
+      }
       case "fetch_media_bytes": {
         // The real command fetches relay media through Rust reqwest and
         // replies with raw bytes (`tauri::ipc::Response` → ArrayBuffer). In
@@ -12772,9 +12909,15 @@ export function maybeInstallE2eTauriMocks() {
         return [];
       case "copy_image_to_clipboard":
         return;
-      case "copy_text_to_clipboard":
-        await navigator.clipboard.writeText((payload as { text: string }).text);
+      case "copy_text_to_clipboard": {
+        // `navigator.clipboard.writeText` carries only the plain flavor, so
+        // capture the dual-flavor payload for specs asserting on the identity
+        // sidecar (mirrors upstream's LAST_CLIPBOARD seam).
+        const { html, text } = payload as { html?: string; text: string };
+        window.__BUZZ_E2E_LAST_CLIPBOARD__ = { html: html ?? null, text };
+        await navigator.clipboard.writeText(text);
         return;
+      }
       case "read_clipboard_text":
         return navigator.clipboard.readText();
       case "get_event":
