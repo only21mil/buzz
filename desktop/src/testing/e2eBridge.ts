@@ -1245,6 +1245,8 @@ declare global {
       push_block_reason: string | null;
       can_pull: boolean;
       pull_block_reason: string | null;
+      fetch_failed: boolean;
+      fetch_error: string | null;
     };
     __BUZZ_E2E_SET_RELAY_CONNECTION_STATE__?: (state: ConnectionState) => void;
     __BUZZ_E2E_GET_RELAY_CONNECTION_STATE__?: () => ConnectionState;
@@ -11534,6 +11536,8 @@ export function maybeInstallE2eTauriMocks() {
             push_block_reason: "No local checkout found.",
             can_pull: false,
             pull_block_reason: "No local checkout found.",
+            fetch_failed: false,
+            fetch_error: null,
           }
         );
       case "list_project_local_repositories":
@@ -11587,6 +11591,8 @@ export function maybeInstallE2eTauriMocks() {
           push_block_reason: "Local branch is already pushed.",
           can_pull: false,
           pull_block_reason: "Local branch is up to date.",
+          fetch_failed: false,
+          fetch_error: null,
         };
         return {
           path,

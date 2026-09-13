@@ -22,6 +22,26 @@ export function pushPullTitle(
   return `${verb} ${count} ${side} ${count === 1 ? "commit" : "commits"}`;
 }
 
+/** Tooltip for the fetch button. A failed fetch means the counts describe
+ * cached refs, so the stale notice wins over any "up to date" claim. */
+export function fetchTitleForSyncStatus(
+  status:
+    | {
+        fetchFailed: boolean;
+        fetchError: string | null;
+        pullBlockReason: string | null;
+      }
+    | null
+    | undefined,
+) {
+  if (status?.fetchFailed) {
+    return (
+      status.fetchError ?? "Remote state may be stale. The last fetch failed."
+    );
+  }
+  return status?.pullBlockReason ?? "Check for remote changes";
+}
+
 /** Returns the normalized owner and contributor pubkeys for a project. */
 export function projectPeople(project: Project) {
   return [
