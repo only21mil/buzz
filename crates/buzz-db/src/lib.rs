@@ -65,6 +65,8 @@ pub mod reaction;
 pub mod relay_invite;
 /// Relay-level membership persistence (NIP-43).
 pub mod relay_members;
+/// Deployment-global relay operator/moderator roster persistence.
+pub mod relay_operators;
 /// Replaceable event persistence and coordinate-serialized repository tombstones.
 pub mod replaceable;
 /// Replica freshness fence for keyset-cursor read routing.

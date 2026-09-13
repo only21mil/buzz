@@ -1,0 +1,93 @@
+[
+  {
+    "proposed_target": "0043_channel_roster_snapshot_fence.sql",
+    "source_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
+    "source_path": "migrations/0032_channel_roster_snapshot_fence.sql",
+    "source_sha256": "e0291a5fde08e7cfdd6e723009c896d8a0d1c381a943365d0227db3b423441e3",
+    "adapted_sql_sha256": "e0291a5fde08e7cfdd6e723009c896d8a0d1c381a943365d0227db3b423441e3",
+    "prerequisites": [29],
+    "operations": [
+      "define-function:guard_channel_roster_snapshot",
+      "create-trigger:trg_events_guard_channel_roster_snapshot"
+    ],
+    "desired_schema_delta": "kind 39002 roster snapshot fence trigger on events"
+  },
+  {
+    "proposed_target": "0044_replica_heartbeat_vacuum_truncate.sql",
+    "source_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
+    "source_path": "migrations/0034_replica_heartbeat_vacuum_truncate.sql",
+    "source_sha256": "bfdccc3686a8f52a4717853f336440a7c4ca8f00512c499caeef71c14b984085",
+    "adapted_sql_sha256": "bfdccc3686a8f52a4717853f336440a7c4ca8f00512c499caeef71c14b984085",
+    "prerequisites": [26],
+    "operations": [
+      "alter-table:replica_heartbeat:vacuum_truncate"
+    ],
+    "desired_schema_delta": "disable vacuum_truncate on replica_heartbeat"
+  },
+  {
+    "proposed_target": "0045_relay_operators.sql",
+    "source_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
+    "source_path": "migrations/0035_relay_operators.sql",
+    "source_sha256": "b0c6f97c5b0fb1e1eeef51c050ad24cef0946bb0a6a118d795aceacc294a445a",
+    "adapted_sql_sha256": "8f9dcf710b733f6dd5d058e2d639efa5428a92c7a6167429208ffc5508ba4d33",
+    "prerequisites": [39],
+    "operations": [
+      "create-table:relay_operators",
+      "alter-table:moderation_actions:actor_authority",
+      "alter-table:moderation_reports:admin_processing",
+      "alter-table:product_feedback:status",
+      "alter-table:moderation_actions:fork-audit-vocabulary"
+    ],
+    "desired_schema_delta": "relay_operators roster plus admin column amendments; re-asserts fork 0039 action CHECK"
+  },
+  {
+    "proposed_target": "0046_relay_admin_actions.sql",
+    "source_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
+    "source_path": "migrations/0036_relay_admin_actions.sql",
+    "source_sha256": "ddb9258a3eac3c128a580fa895a6dd7b03f88a83f8d87eb35ff31d045fa8e5ae",
+    "adapted_sql_sha256": "ddb9258a3eac3c128a580fa895a6dd7b03f88a83f8d87eb35ff31d045fa8e5ae",
+    "prerequisites": [45],
+    "operations": [
+      "create-table:relay_admin_actions",
+      "create-table:relay_admin_outbox"
+    ],
+    "desired_schema_delta": "relay_admin_actions state machine and relay_admin_outbox queue"
+  },
+  {
+    "proposed_target": "0047_relay_admin_action_lease.sql",
+    "source_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
+    "source_path": "migrations/0037_relay_admin_action_lease.sql",
+    "source_sha256": "61e80c9a2aa48a99a352458f627e587c55d12b216d39e5d5ee3917a8346bf277",
+    "adapted_sql_sha256": "61e80c9a2aa48a99a352458f627e587c55d12b216d39e5d5ee3917a8346bf277",
+    "prerequisites": [46],
+    "operations": [
+      "alter-table:relay_admin_actions:lease",
+      "alter-table:relay_admin_outbox:retry"
+    ],
+    "desired_schema_delta": "action lease columns and outbox retry scheduling"
+  },
+  {
+    "proposed_target": "0048_relay_admin_outbox_claim_token.sql",
+    "source_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
+    "source_path": "migrations/0038_relay_admin_outbox_claim_token.sql",
+    "source_sha256": "340edc00a0cdee7063d00dfed247ba2ff6a8c6afa6013e26d93bfadccb961df7",
+    "adapted_sql_sha256": "340edc00a0cdee7063d00dfed247ba2ff6a8c6afa6013e26d93bfadccb961df7",
+    "prerequisites": [47],
+    "operations": [
+      "alter-table:relay_admin_outbox:claim_token"
+    ],
+    "desired_schema_delta": "outbox claim token fencing"
+  },
+  {
+    "proposed_target": "0049_relay_operator_audit.sql",
+    "source_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
+    "source_path": "migrations/0039_relay_operator_audit.sql",
+    "source_sha256": "9e307c41c82fc487d1e541aa828e6e90bd5f2f0ebad35dc908cd385c6c855cbc",
+    "adapted_sql_sha256": "9e307c41c82fc487d1e541aa828e6e90bd5f2f0ebad35dc908cd385c6c855cbc",
+    "prerequisites": [45],
+    "operations": [
+      "create-table:relay_operator_audit"
+    ],
+    "desired_schema_delta": "append-only relay operator roster audit trail"
+  }
+]

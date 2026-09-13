@@ -719,11 +719,9 @@ pub struct AppState {
     pub mesh: Arc<std::sync::OnceLock<crate::mesh_boot::MeshHandle>>,
 
     /// Backing store for DB-managed admin roster grants (`relay_operators`).
-    /// Defaults to [`crate::api::admin::roster::NoDbRoster`] (reads resolve
-    /// empty, writes report unavailable) until P03 lands the roster migration
-    /// and swaps in the `Db`-backed store via [`AppState::set_admin_roster`].
-    /// Never a constructor parameter, so `AppState::new` call sites stay
-    /// untouched. Config grants resolve without touching this store.
+    /// Wired to the `Db`-backed store in [`AppState::new`]; tests may swap in
+    /// [`crate::api::admin::roster::NoDbRoster`] via [`AppState::set_admin_roster`].
+    /// Config grants resolve without touching this store.
     pub admin_roster: Arc<dyn crate::api::admin::roster::AdminRosterStore>,
 }
 
@@ -812,6 +810,7 @@ impl AppState {
             Arc::new(RedisNip98ReplayGuard::new(redis_pool.clone()));
         let admission_rate_limiter = Arc::new(RedisRateLimiter::new(redis_pool.clone()));
         let audit_enabled = audit_arc.is_some();
+        let admin_roster = crate::api::admin::roster::db_roster(db.clone());
         let state = Self {
             config: Arc::new(config),
             db,
@@ -898,7 +897,7 @@ impl AppState {
             // `crates/buzz-test-client` once those land).
             tracer: Arc::new(crate::conformance::NoopTracer),
             mesh: Arc::new(std::sync::OnceLock::new()),
-            admin_roster: crate::api::admin::roster::no_db_roster(),
+            admin_roster,
         };
         (
             state,

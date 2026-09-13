@@ -908,6 +908,132 @@
       ],
       "status": "applied-frozen",
       "notes": ""
+    },
+    {
+      "version": 43,
+      "file": "migrations/0043_channel_roster_snapshot_fence.sql",
+      "description": "channel roster snapshot fence",
+      "sha256": "e0291a5fde08e7cfdd6e723009c896d8a0d1c381a943365d0227db3b423441e3",
+      "sqlx_sha384": "0f52d4406f730870bc6331419943e5cfe6fe7f71e13cb294bcf9c2a41157689828ed2ae93ee2b3a9a88e2eef71b9cd93",
+      "fork_origin_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
+      "origin_class": "adopted-byte-identical-from-upstream-0032",
+      "operations": [
+        "define-function:guard_channel_roster_snapshot",
+        "create-trigger:trg_events_guard_channel_roster_snapshot"
+      ],
+      "prerequisites": [
+        29
+      ],
+      "status": "applied-tail",
+      "notes": "P08 tail: upstream 0032 under fork 0043."
+    },
+    {
+      "version": 44,
+      "file": "migrations/0044_replica_heartbeat_vacuum_truncate.sql",
+      "description": "replica heartbeat vacuum truncate",
+      "sha256": "bfdccc3686a8f52a4717853f336440a7c4ca8f00512c499caeef71c14b984085",
+      "sqlx_sha384": "e05fa0759bfa36a1127cc92fd573e67071c26ceca6601b4e50d6fbb9b097bd1213a5d48f925f58ba2bf7781edff3a318",
+      "fork_origin_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
+      "origin_class": "adopted-byte-identical-from-upstream-0034",
+      "operations": [
+        "alter-table:replica_heartbeat:vacuum_truncate"
+      ],
+      "prerequisites": [
+        26
+      ],
+      "status": "applied-tail",
+      "notes": "P08 tail: upstream 0034 under fork 0044."
+    },
+    {
+      "version": 45,
+      "file": "migrations/0045_relay_operators.sql",
+      "description": "relay operators",
+      "sha256": "8f9dcf710b733f6dd5d058e2d639efa5428a92c7a6167429208ffc5508ba4d33",
+      "sqlx_sha384": "ed2708922752e61ccb9e07dbb51a5165e82022406c2710d154294d0dfc066a54468d50a15e3f8796d7162ea3e9fb6d09",
+      "fork_origin_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
+      "origin_class": "adapted-from-upstream-0035",
+      "operations": [
+        "create-table:relay_operators",
+        "alter-table:moderation_actions:actor_authority",
+        "alter-table:moderation_reports:admin_processing",
+        "alter-table:product_feedback:status",
+        "alter-table:moderation_actions:fork-audit-vocabulary"
+      ],
+      "prerequisites": [
+        39
+      ],
+      "status": "applied-tail",
+      "notes": "P08 tail: upstream 0035 under fork 0045."
+    },
+    {
+      "version": 46,
+      "file": "migrations/0046_relay_admin_actions.sql",
+      "description": "relay admin actions",
+      "sha256": "ddb9258a3eac3c128a580fa895a6dd7b03f88a83f8d87eb35ff31d045fa8e5ae",
+      "sqlx_sha384": "c40f33b75db83d49b43e1bc215cbe0b96bd02f1db5084edfa4fc3289539d912658ce5ec3c3dfb2e3d79d045aa1e358ce",
+      "fork_origin_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
+      "origin_class": "adopted-byte-identical-from-upstream-0036",
+      "operations": [
+        "create-table:relay_admin_actions",
+        "create-table:relay_admin_outbox"
+      ],
+      "prerequisites": [
+        45
+      ],
+      "status": "applied-tail",
+      "notes": "P08 tail: upstream 0036 under fork 0046."
+    },
+    {
+      "version": 47,
+      "file": "migrations/0047_relay_admin_action_lease.sql",
+      "description": "relay admin action lease",
+      "sha256": "61e80c9a2aa48a99a352458f627e587c55d12b216d39e5d5ee3917a8346bf277",
+      "sqlx_sha384": "305693f62f0d76cc107c4872c4e8526791581f827c09ab30e1b5be0ff94e6efa2f906af6e93e64d2c8d2c70c958b083d",
+      "fork_origin_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
+      "origin_class": "adopted-byte-identical-from-upstream-0037",
+      "operations": [
+        "alter-table:relay_admin_actions:lease",
+        "alter-table:relay_admin_outbox:retry"
+      ],
+      "prerequisites": [
+        46
+      ],
+      "status": "applied-tail",
+      "notes": "P08 tail: upstream 0037 under fork 0047."
+    },
+    {
+      "version": 48,
+      "file": "migrations/0048_relay_admin_outbox_claim_token.sql",
+      "description": "relay admin outbox claim token",
+      "sha256": "340edc00a0cdee7063d00dfed247ba2ff6a8c6afa6013e26d93bfadccb961df7",
+      "sqlx_sha384": "410d3e2075bdfe0c98c7472c9b23802759dfba12f9b452767e154baf4045362e6cd4998db72e6a7d35c05f26ca004f78",
+      "fork_origin_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
+      "origin_class": "adopted-byte-identical-from-upstream-0038",
+      "operations": [
+        "alter-table:relay_admin_outbox:claim_token"
+      ],
+      "prerequisites": [
+        47
+      ],
+      "status": "applied-tail",
+      "notes": "P08 tail: upstream 0038 under fork 0048."
+    },
+    {
+      "version": 49,
+      "file": "migrations/0049_relay_operator_audit.sql",
+      "description": "relay operator audit",
+      "sha256": "9e307c41c82fc487d1e541aa828e6e90bd5f2f0ebad35dc908cd385c6c855cbc",
+      "sqlx_sha384": "cc24b0187f3b73f7dde23c4d683d9c7e23c220fc9fd38236f905b42ae656eae5c659319785c24016b5ee55ad97f146cf",
+      "fork_origin_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
+      "origin_class": "adopted-byte-identical-from-upstream-0039",
+      "operations": [
+        "create-table:relay_operator_audit"
+      ],
+      "prerequisites": [
+        45
+      ],
+      "status": "applied-tail",
+      "notes": "P08 tail: upstream 0039 under fork 0049."
     }
   ],
   "upstream_only": [
@@ -937,9 +1063,9 @@
       "sha256": "e0291a5fde08e7cfdd6e723009c896d8a0d1c381a943365d0227db3b423441e3",
       "sqlx_sha384": "0f52d4406f730870bc6331419943e5cfe6fe7f71e13cb294bcf9c2a41157689828ed2ae93ee2b3a9a88e2eef71b9cd93",
       "summary": "Trigger guarding kind 39002 snapshots against stale mixed-version writers",
-      "disposition": "candidate-append-in-P08",
-      "owner": "P03/P08",
-      "reason": "Complements the UD-1 complete-roster port. Append byte-identical above the verified maximum in P08 after checking the fork 39002 emission path takes the same lock order."
+      "disposition": "adopted-at-fork-0043",
+      "owner": "P08",
+      "reason": "Adopted byte-identical as fork 0043."
     },
     {
       "upstream_version": 33,
@@ -957,9 +1083,9 @@
       "sha256": "bfdccc3686a8f52a4717853f336440a7c4ca8f00512c499caeef71c14b984085",
       "sqlx_sha384": "e05fa0759bfa36a1127cc92fd573e67071c26ceca6601b4e50d6fbb9b097bd1213a5d48f925f58ba2bf7781edff3a318",
       "summary": "Disable vacuum truncation on the single-row replica_heartbeat table",
-      "disposition": "candidate-append-in-P08",
-      "owner": "P03/P08",
-      "reason": "Fork 0026 table is byte-identical to upstream 0026, so the ALTER applies cleanly. Append in P08 with a heartbeat concurrency/lock test on fresh and upgrade paths."
+      "disposition": "adopted-at-fork-0044",
+      "owner": "P08",
+      "reason": "Adopted byte-identical as fork 0044."
     },
     {
       "upstream_version": 35,
@@ -967,9 +1093,9 @@
       "sha256": "b0c6f97c5b0fb1e1eeef51c050ad24cef0946bb0a6a118d795aceacc294a445a",
       "sqlx_sha384": "cd52840f42f04ea71d04064e9d789f9efd280ba3e105caf12c864b8792d4b82ae0ab672a5e492e005f5467abb33b6031",
       "summary": "Deployment-global operator/moderator roster plus moderation column amendments",
-      "disposition": "deferred-to-P04",
-      "owner": "P04",
-      "reason": "Admin protocol decision owned by P04 (#3777). Note: amends moderation_actions/moderation_reports/product_feedback, overlapping fork 0039 CHECK vocabulary; any adoption must land after fork 0039 and preserve it."
+      "disposition": "adopted-at-fork-0045-adapted",
+      "owner": "P08",
+      "reason": "Adapted as fork 0045; preserves fork 0039 moderation_actions CHECK vocabulary."
     },
     {
       "upstream_version": 36,
@@ -977,9 +1103,9 @@
       "sha256": "ddb9258a3eac3c128a580fa895a6dd7b03f88a83f8d87eb35ff31d045fa8e5ae",
       "sqlx_sha384": "c40f33b75db83d49b43e1bc215cbe0b96bd02f1db5084edfa4fc3289539d912658ce5ec3c3dfb2e3d79d045aa1e358ce",
       "summary": "relay_admin_actions enforcement state machine plus relay_admin_outbox queue",
-      "disposition": "deferred-to-P04",
-      "owner": "P04",
-      "reason": "Same admin bundle as upstream 0035; adopt as one unit or not at all."
+      "disposition": "adopted-at-fork-0046",
+      "owner": "P08",
+      "reason": "Adopted byte-identical as fork 0046."
     },
     {
       "upstream_version": 37,
@@ -987,9 +1113,9 @@
       "sha256": "61e80c9a2aa48a99a352458f627e587c55d12b216d39e5d5ee3917a8346bf277",
       "sqlx_sha384": "305693f62f0d76cc107c4872c4e8526791581f827c09ab30e1b5be0ff94e6efa2f906af6e93e64d2c8d2c70c958b083d",
       "summary": "Exclusive action leases plus outbox retry columns",
-      "disposition": "deferred-to-P04",
-      "owner": "P04",
-      "reason": "Same admin bundle as upstream 0035; adopt as one unit or not at all."
+      "disposition": "adopted-at-fork-0047",
+      "owner": "P08",
+      "reason": "Adopted byte-identical as fork 0047."
     },
     {
       "upstream_version": 38,
@@ -997,9 +1123,9 @@
       "sha256": "340edc00a0cdee7063d00dfed247ba2ff6a8c6afa6013e26d93bfadccb961df7",
       "sqlx_sha384": "410d3e2075bdfe0c98c7472c9b23802759dfba12f9b452767e154baf4045362e6cd4998db72e6a7d35c05f26ca004f78",
       "summary": "Per-claim opaque token fencing outbox delivery completion",
-      "disposition": "deferred-to-P04",
-      "owner": "P04",
-      "reason": "Same admin bundle as upstream 0035; adopt as one unit or not at all."
+      "disposition": "adopted-at-fork-0048",
+      "owner": "P08",
+      "reason": "Adopted byte-identical as fork 0048."
     },
     {
       "upstream_version": 39,
@@ -1007,9 +1133,9 @@
       "sha256": "9e307c41c82fc487d1e541aa828e6e90bd5f2f0ebad35dc908cd385c6c855cbc",
       "sqlx_sha384": "cc24b0187f3b73f7dde23c4d683d9c7e23c220fc9fd38236f905b42ae656eae5c659319785c24016b5ee55ad97f146cf",
       "summary": "Append-only audit trail for operator roster mutations",
-      "disposition": "deferred-to-P04",
-      "owner": "P04",
-      "reason": "Same admin bundle as upstream 0035; adopt as one unit or not at all."
+      "disposition": "adopted-at-fork-0049",
+      "owner": "P08",
+      "reason": "Adopted byte-identical as fork 0049."
     },
     {
       "upstream_version": 41,
@@ -1041,5 +1167,6 @@
       "owner": "P03",
       "reason": "Retraction of tables the fork never created; nothing to drop. Recorded so a future merge never mistakes 0041/0042 absence for a gap."
     }
-  ]
+  ],
+  "tail_manifest": "scripts/migrations-0043-0049.sha256"
 }

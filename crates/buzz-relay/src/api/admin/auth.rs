@@ -443,9 +443,12 @@ mod tests {
         assert_eq!(principal.source, AdminSource::OwnerFallback);
         // Listing the same key as an operator keeps it an operator, but the
         // grant source becomes config: the allowlist outranks the fallback.
-        let principal =
-            resolve_config_principal(std::slice::from_ref(&owner), Some(&hex::encode(pubkey(9))), pubkey(9))
-                .expect("config grant");
+        let principal = resolve_config_principal(
+            std::slice::from_ref(&owner),
+            Some(&hex::encode(pubkey(9))),
+            pubkey(9),
+        )
+        .expect("config grant");
         assert_eq!(principal.source, AdminSource::Config);
         // Staffing any operator deactivates the break-glass grant entirely:
         // the owner key alone no longer resolves once the list is non-empty.

@@ -29,6 +29,8 @@ def frozen_operations(root):
     doc = json.loads((root / OPERATION_MAP).read_text())
     ops = {}
     for entry in doc['fork']:
+        if entry['version'] > FROZEN_LAST:
+            continue
         for op in entry['operations']:
             ops.setdefault(op, entry['version'])
     return ops

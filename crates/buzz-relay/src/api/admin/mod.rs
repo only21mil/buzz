@@ -528,7 +528,11 @@ async fn delete_operator(
     let target_hex = canonical_pubkey_param(&pubkey_hex)?;
     reject_config_backed(&state, &target_hex)?;
     let target_bytes = hex_to_bytes32(&target_hex)?;
-    if !state.admin_roster.revoke(&target_bytes).await? {
+    if !state
+        .admin_roster
+        .revoke(&target_bytes, &principal.pubkey)
+        .await?
+    {
         return Err(ApiError::not_found());
     }
     Ok(Json(
@@ -1101,7 +1105,7 @@ mod nip98_tests {
                 .map(|prev| prev.as_str().to_owned()))
         }
 
-        async fn revoke(&self, pubkey: &[u8; 32]) -> Result<bool, RosterError> {
+        async fn revoke(&self, pubkey: &[u8; 32], _actor: &[u8; 32]) -> Result<bool, RosterError> {
             Ok(self
                 .grants
                 .lock()

@@ -356,6 +356,10 @@ mod tests {
             "push_gateway_challenges",
             "push_gateway_installations",
             "push_gateway_delegations",
+            "relay_operators",
+            "relay_admin_actions",
+            "relay_admin_outbox",
+            "relay_operator_audit",
             "push_gateway_endpoint_quotas",
             "push_gateway_delivery_auth_replays",
             "push_gateway_delivery_request_replays",
@@ -576,7 +580,7 @@ mod tests {
 
         assert_eq!(
             migrations.len(),
-            42,
+            49,
             "embedded migration matrix must contain the frozen prefix plus admitted tail"
         );
         assert_eq!(migrations[0].version, 1);
@@ -1166,7 +1170,15 @@ mod tests {
     /// Versions beyond the frozen 0042 prefix approved for the tail. Empty:
     /// appending a migration must extend this list deliberately, or the
     /// contiguity test below fails closed on the unseen tail.
-    const APPROVED_EXTRA_TAIL: &[(i64, &str)] = &[];
+    const APPROVED_EXTRA_TAIL: &[(i64, &str)] = &[
+        (43, "channel roster snapshot fence"),
+        (44, "replica heartbeat vacuum truncate"),
+        (45, "relay operators"),
+        (46, "relay admin actions"),
+        (47, "relay admin action lease"),
+        (48, "relay admin outbox claim token"),
+        (49, "relay operator audit"),
+    ];
 
     #[test]
     fn migration_versions_are_contiguous_unique_and_tail_approved() {
@@ -2196,7 +2208,14 @@ mod b1_ci_grants_ordering {
                 (39, "channel admin audit actions"),
                 (40, "agent drafts"),
                 (41, "ci check storage"),
-                (42, "ci merge gate")
+                (42, "ci merge gate"),
+                (43, "channel roster snapshot fence"),
+                (44, "replica heartbeat vacuum truncate"),
+                (45, "relay operators"),
+                (46, "relay admin actions"),
+                (47, "relay admin action lease"),
+                (48, "relay admin outbox claim token"),
+                (49, "relay operator audit"),
             ]
         );
         let ci_grants = migrations

@@ -140,8 +140,74 @@ pub trait AdminRosterStore: Send + Sync + std::fmt::Debug {
     ) -> Result<Option<String>, RosterError>;
 
     /// Remove the grant for `pubkey`. Returns whether a row existed; removing
-    /// a missing grant is a no-op that writes no audit row.
-    async fn revoke(&self, pubkey: &[u8; 32]) -> Result<bool, RosterError>;
+    /// a missing grant is a no-op that writes no audit row. `actor` is the
+    /// authenticated operator performing the revocation.
+    async fn revoke(&self, pubkey: &[u8; 32], actor: &[u8; 32]) -> Result<bool, RosterError>;
+}
+
+/// `Db`-backed roster store wired in production after the P08 migration tail.
+#[derive(Debug, Clone)]
+pub struct DbRoster {
+    db: buzz_db::Db,
+}
+
+/// Build the production roster store backed by `relay_operators`.
+pub fn db_roster(db: buzz_db::Db) -> Arc<dyn AdminRosterStore> {
+    Arc::new(DbRoster { db })
+}
+
+#[async_trait::async_trait]
+impl AdminRosterStore for DbRoster {
+    async fn role_for_pubkey(
+        &self,
+        pubkey: &[u8; 32],
+    ) -> Result<Option<StoredAdminRole>, RosterError> {
+        let row = self
+            .db
+            .get_relay_operator(pubkey)
+            .await
+            .map_err(|err| RosterError::Internal(err.to_string()))?;
+        Ok(row.and_then(|entry| StoredAdminRole::parse(&entry.role)))
+    }
+
+    async fn list_entries(&self) -> Result<Vec<RosterEntry>, RosterError> {
+        let rows = self
+            .db
+            .list_relay_operators()
+            .await
+            .map_err(|err| RosterError::Internal(err.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                let role = StoredAdminRole::parse(&row.role).ok_or_else(|| {
+                    RosterError::Internal(format!("unknown roster role: {}", row.role))
+                })?;
+                Ok(RosterEntry {
+                    pubkey_hex: hex::encode(&row.pubkey),
+                    role,
+                    added_by_hex: Some(hex::encode(&row.added_by)),
+                })
+            })
+            .collect()
+    }
+
+    async fn grant(
+        &self,
+        pubkey: &[u8; 32],
+        role: StoredAdminRole,
+        added_by: &[u8; 32],
+    ) -> Result<Option<String>, RosterError> {
+        self.db
+            .upsert_relay_operator(pubkey, role.as_str(), added_by)
+            .await
+            .map_err(|err| RosterError::Internal(err.to_string()))
+    }
+
+    async fn revoke(&self, pubkey: &[u8; 32], actor: &[u8; 32]) -> Result<bool, RosterError> {
+        self.db
+            .remove_relay_operator(pubkey, actor)
+            .await
+            .map_err(|err| RosterError::Internal(err.to_string()))
+    }
 }
 
 /// Placeholder store wired until P03 lands the roster migration.
@@ -180,7 +246,7 @@ impl AdminRosterStore for NoDbRoster {
         ))
     }
 
-    async fn revoke(&self, _pubkey: &[u8; 32]) -> Result<bool, RosterError> {
+    async fn revoke(&self, _pubkey: &[u8; 32], _actor: &[u8; 32]) -> Result<bool, RosterError> {
         Err(RosterError::Unavailable(
             "relay_operators table pending (P03 migration)",
         ))
@@ -217,7 +283,7 @@ mod tests {
             Err(RosterError::Unavailable(_))
         ));
         assert!(matches!(
-            store.revoke(&[7u8; 32]).await,
+            store.revoke(&[7u8; 32], &[8u8; 32]).await,
             Err(RosterError::Unavailable(_))
         ));
     }
