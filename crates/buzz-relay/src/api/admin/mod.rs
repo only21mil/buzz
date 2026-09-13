@@ -710,6 +710,7 @@ mod tests {
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.admin = Some(crate::config::AdminConfig {
             host: "admin.example".to_string(),
+            auth: crate::config::AdminAuth::Disabled,
             web_dir: None,
         });
         config.database_url = test_database_url();
