@@ -29,11 +29,34 @@ pub enum ConfigError {
     InvalidValue(String),
 }
 
-/// Deny-by-default read-only deployment-admin configuration.
+/// Authentication mode for the deployment-admin API.
+///
+/// Selected by `BUZZ_ADMIN_AUTH`: unset or `nip98` selects [`AdminAuth::Nip98`]
+/// (fail-secure default), `disabled` selects [`AdminAuth::Disabled`], and any
+/// other value is a startup error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminAuth {
+    /// No credential check. The operator asserts the admin API is protected
+    /// at the network layer (reverse proxy, VPN, firewall). A `WARN` is
+    /// logged on every boot. Always read-only: mutations resolve no
+    /// principal, so they always `403`.
+    Disabled,
+    /// NIP-98 HTTP Auth (kind 27235) on every request. The authenticated
+    /// pubkey resolves to an operator/moderator principal at request time.
+    /// Read-write per resolved principal.
+    Nip98,
+}
+
+/// Deny-by-default deployment-admin configuration.
+///
+/// Reads are available in both auth modes. Mutations and staffing routes
+/// require a resolved principal, which only [`AdminAuth::Nip98`] provides.
 #[derive(Debug, Clone)]
 pub struct AdminConfig {
     /// Exact admin HTTP authority.
     pub host: String,
+    /// Authentication mode selected at startup.
+    pub auth: AdminAuth,
     /// Optional admin SPA bundle directory.
     pub web_dir: Option<std::path::PathBuf>,
 }
@@ -1033,27 +1056,29 @@ impl Config {
 
         // Note: intentionally not prefixed with BUZZ_ — this is a relay-identity
         // config that may be shared across multiple services (e.g., ACP agent).
+        // A malformed value is a startup error, not a warning: the owner key
+        // is the break-glass admin root when RELAY_OPERATOR_PUBKEYS is empty,
+        // so silently dropping it could lock every operator out.
         let relay_owner_pubkey = std::env::var("RELAY_OWNER_PUBKEY")
             .ok()
             .map(|s| s.trim().to_lowercase())
             .filter(|s| !s.is_empty())
-            .and_then(|s| {
-                // Must be exactly 64 lowercase hex characters (32-byte pubkey).
+            .map(|s| {
                 let valid = s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit());
                 if valid {
-                    Some(s)
+                    Ok(s)
                 } else {
-                    warn!(
-                        "RELAY_OWNER_PUBKEY is not a valid 64-char hex pubkey — ignoring. \
-                         Got: {s:?}"
-                    );
-                    None
+                    Err(ConfigError::InvalidValue(format!(
+                        "RELAY_OWNER_PUBKEY is not a valid 64-char hex pubkey — got: {s:?}. \
+                         Fix or unset it."
+                    )))
                 }
-            });
+            })
+            .transpose()?;
 
         // Note: intentionally not prefixed with BUZZ_ — same relay-identity
         // config family as RELAY_OWNER_PUBKEY. Comma-separated 64-char hex
-        // pubkeys. Unlike RELAY_OWNER_PUBKEY (warn-and-ignore), an invalid
+        // pubkeys. Like RELAY_OWNER_PUBKEY, an invalid
         // entry here is a hard config error: silently dropping an operator
         // pubkey would silently disable provisioning for that operator.
         let relay_operator_api_origin = std::env::var("RELAY_OPERATOR_API_ORIGIN")
@@ -1085,10 +1110,15 @@ impl Config {
             Err(_) => Vec::new(),
         };
         if !relay_operator_pubkeys.is_empty() && relay_operator_api_origin.is_none() {
-            return Err(ConfigError::InvalidValue(
-                "RELAY_OPERATOR_API_ORIGIN is required when RELAY_OPERATOR_PUBKEYS is configured"
-                    .to_string(),
-            ));
+            // No boot error: RELAY_OPERATOR_PUBKEYS is shared by the community
+            // provisioning endpoints (which need the canonical origin) and the
+            // admin console (which does not). Provisioning fails closed at
+            // request time until the origin is set.
+            warn!(
+                "RELAY_OPERATOR_PUBKEYS is set but RELAY_OPERATOR_API_ORIGIN is not: \
+                 community provisioning endpoints will refuse requests until it is set. \
+                 The admin console is unaffected."
+            );
         }
 
         let ci_status_signer_pubkeys = parse_pubkey_set_env("BUZZ_CI_STATUS_SIGNER_PUBKEYS")?;
@@ -1344,7 +1374,8 @@ impl Config {
             })
         };
 
-        // Read-only deployment-admin surface. The route is absent when the host is unset.
+        // Deployment-admin surface. The route is absent when the host is unset.
+        // `BUZZ_ADMIN_AUTH` selects the credential check; unset means NIP-98.
         let admin = match std::env::var("BUZZ_ADMIN_HOST")
             .ok()
             .map(|value| value.trim().to_owned())
@@ -1356,6 +1387,36 @@ impl Config {
                     return Err(ConfigError::InvalidValue(
                         "BUZZ_ADMIN_HOST must be an exact authority".to_string(),
                     ));
+                }
+                let auth = match std::env::var("BUZZ_ADMIN_AUTH")
+                    .ok()
+                    .map(|value| value.trim().to_owned())
+                    .filter(|value| !value.is_empty())
+                    .as_deref()
+                {
+                    None | Some("nip98") => AdminAuth::Nip98,
+                    Some("disabled") => {
+                        warn!(
+                            "BUZZ_ADMIN_AUTH=disabled: the admin API checks no credential. \
+                             Protect it at the network layer (reverse proxy, VPN, firewall). \
+                             The API is read-only in this mode."
+                        );
+                        AdminAuth::Disabled
+                    }
+                    Some(other) => {
+                        return Err(ConfigError::InvalidValue(format!(
+                            "BUZZ_ADMIN_AUTH={other:?} is invalid: use \"nip98\" or \"disabled\""
+                        )));
+                    }
+                };
+                if std::env::var("BUZZ_ADMIN_TOKEN")
+                    .ok()
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    warn!(
+                        "BUZZ_ADMIN_TOKEN is set but token authentication is not supported; \
+                         the value is ignored. Remove it from the environment."
+                    );
                 }
                 let web_dir = std::env::var("BUZZ_ADMIN_WEB_DIR")
                     .ok()
@@ -1369,7 +1430,11 @@ impl Config {
                         )));
                     }
                 }
-                Some(AdminConfig { host, web_dir })
+                Some(AdminConfig {
+                    host,
+                    auth,
+                    web_dir,
+                })
             }
         };
 
@@ -2301,7 +2366,9 @@ mod tests {
     }
 
     #[test]
-    fn relay_operator_pubkeys_require_api_origin() {
+    fn relay_operator_pubkeys_boot_without_api_origin() {
+        // The origin is needed only by community provisioning. The admin
+        // console shares the allowlist and must boot without it.
         let _guard = ENV_MUTEX.lock().unwrap();
         std::env::set_var(
             "RELAY_OPERATOR_PUBKEYS",
@@ -2311,10 +2378,10 @@ mod tests {
         let result = Config::load_env();
         std::env::remove_var("RELAY_OPERATOR_PUBKEYS");
 
-        assert!(matches!(
-            result,
-            Err(ConfigError::InvalidValue(ref msg)) if msg.contains("RELAY_OPERATOR_API_ORIGIN is required")
-        ));
+        assert!(
+            result.is_ok(),
+            "boot must succeed without RELAY_OPERATOR_API_ORIGIN"
+        );
     }
 
     #[test]
