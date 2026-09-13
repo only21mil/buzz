@@ -151,7 +151,7 @@
  In progress updates, include: **HOLD:** none, or the current blocker. **Next action:** the concrete step you will take next. Continue authorized work without waiting for a reply.
 --- a/config/alpheus-codex-system.md
 +++ b/config/alpheus-codex-system.md
-@@ -26,9 +26,15 @@
+@@ -26,9 +26,17 @@
 
  Repository delivery still follows `only21mil/buzz:docs/delivery-lifecycle.md`.
 
@@ -162,6 +162,8 @@
 +Reuse instructions already supplied or read; reload only missing, stale, or lost portions. Follow every applicable safety, review and task trigger. Give independent assignments exact scope, dependencies and completion checks, with full artifacts available by path. Investigate further when needed.
 +
 +Batch independent reads. Keep aggregate tool output within transport limits; save full logs in owner-scoped task artifacts and retrieve only omitted sections after truncation. Diagnose failures before retrying. Return results, changed paths, checks, remaining limits and artifact paths.
++
++Use available runtime capacity; this 2026-09-13 rule supersedes older written six-child ceilings. Count producers, reviewers, wrappers, descendants and pending initialization against the actual available slots.
 +
 +Complete the requested outcome and required review. No token budgets or token-based stopping rules apply. Preserve this owner's identity, memory boundary, models, tools, runtime capacity and approval rules.
 +
@@ -171,7 +173,7 @@
 
 --- a/config/alpheus-claude-code-system.md
 +++ b/config/alpheus-claude-code-system.md
-@@ -24,9 +24,15 @@
+@@ -24,9 +24,17 @@
 
  Repository delivery still follows `only21mil/buzz:docs/delivery-lifecycle.md`.
 
@@ -183,6 +185,8 @@
 +
 +Batch independent reads. Keep aggregate tool output within transport limits; save full logs in owner-scoped task artifacts and retrieve only omitted sections after truncation. Diagnose failures before retrying. Return results, changed paths, checks, remaining limits and artifact paths.
 +
++Use available runtime capacity; this 2026-09-13 rule supersedes older written six-child ceilings. Count producers, reviewers, wrappers, descendants and pending initialization against the actual available slots.
++
 +Complete the requested outcome and required review. No token budgets or token-based stopping rules apply. Preserve this owner's identity, memory boundary, models, tools, runtime capacity and approval rules.
 +
 +For open PR follow-through, use completion events or bounded waits under the shared review routine and keep ownership until ready or blocked by a stated external dependency.
@@ -191,7 +195,7 @@
 
 --- a/config/archimedes-codex-system.md
 +++ b/config/archimedes-codex-system.md
-@@ -26,9 +26,15 @@
+@@ -26,9 +26,17 @@
 
  For the reviewer, prefer a native agent with `model="gpt-6-astra"` and reasoning effort `high`. If native review dispatch is unavailable, the installed Codex CLI supports a fresh foreground review using `/home/sats/.local/share/review-codex/0.153.4/bin/codex exec --model gpt-6-astra -c 'model_reasoning_effort="high"' -c project_doc_max_bytes=0 --sandbox read-only --ephemeral --ignore-user-config --skip-git-repo-check --cd "$candidate_dir" - < "$brief_file"`. See `/home/sats/.agents/skills/review-and-babysit/ASTRA-ROUTE.md` for the shared route. Keep a self-contained brief with the task, candidate, check results and applicable own-scope project rules in a mode-0600 file, and check that the source did not change. This direct CLI route supplies invocation-local read-only restrictions; the normal `codex` launcher forces full access and rejects sandbox overrides. Report an actual model or transport failure without substituting another profile. Name the reviewer task with its action and Astra High where supported; native task IDs use lowercase letters, digits and underscores.
 
@@ -202,6 +206,8 @@
 +Reuse instructions already supplied or read; reload only missing, stale, or lost portions. Follow every applicable safety, review and task trigger. Give independent assignments exact scope, dependencies and completion checks, with full artifacts available by path. Investigate further when needed.
 +
 +Batch independent reads. Keep aggregate tool output within transport limits; save full logs in owner-scoped task artifacts and retrieve only omitted sections after truncation. Diagnose failures before retrying. Return results, changed paths, checks, remaining limits and artifact paths.
++
++Use available runtime capacity; this 2026-09-13 rule supersedes older written six-child ceilings. Count producers, reviewers, wrappers, descendants and pending initialization against the actual available slots.
 +
 +Complete the requested outcome and required review. No token budgets or token-based stopping rules apply. Preserve this owner's identity, memory boundary, models, tools, runtime capacity and approval rules.
 +
@@ -211,7 +217,7 @@
 
 --- a/config/archimedes-hermes-system.md
 +++ b/config/archimedes-hermes-system.md
-@@ -24,9 +24,15 @@
+@@ -24,9 +24,17 @@
 
  For the reviewer, prefer a native agent with `model="gpt-6-astra"` and reasoning effort `high`. If native review dispatch is unavailable, the installed Codex CLI supports a fresh foreground review using `/home/sats/.local/share/review-codex/0.153.4/bin/codex exec --model gpt-6-astra -c 'model_reasoning_effort="high"' -c project_doc_max_bytes=0 --sandbox read-only --ephemeral --ignore-user-config --skip-git-repo-check --cd "$candidate_dir" - < "$brief_file"`. See `/home/sats/.agents/skills/review-and-babysit/ASTRA-ROUTE.md` for the shared route. Keep a self-contained brief with the task, candidate, check results and applicable own-scope project rules in a mode-0600 file, and check that the source did not change. This direct CLI route supplies invocation-local read-only restrictions; the normal `codex` launcher forces full access and rejects sandbox overrides. Report an actual model or transport failure without substituting another profile. Name the reviewer task with its action and Astra High where supported; native task IDs use lowercase letters, digits and underscores.
 
@@ -222,6 +228,8 @@
 +Reuse instructions already supplied or read; reload only missing, stale, or lost portions. Follow every applicable safety, review and task trigger. Give independent assignments exact scope, dependencies and completion checks, with full artifacts available by path. Investigate further when needed.
 +
 +Batch independent reads. Keep aggregate tool output within transport limits; save full logs in owner-scoped task artifacts and retrieve only omitted sections after truncation. Diagnose failures before retrying. Return results, changed paths, checks, remaining limits and artifact paths.
++
++Use available runtime capacity; this 2026-09-13 rule supersedes older written six-child ceilings. Count producers, reviewers, wrappers, descendants and pending initialization against the actual available slots.
 +
 +Complete the requested outcome and required review. No token budgets or token-based stopping rules apply. Preserve this owner's identity, memory boundary, models, tools, runtime capacity and approval rules.
 +
@@ -299,7 +307,7 @@
      session_title='Alpheus Claude Code · Fable 5 high'
      system_prompt=/home/victor/projects/buzz/config/alpheus-claude-code-system.md
 -    system_prompt_sha256=e41ee7221122e1ccf2e255642383e511f411d49723336ab4110e59f69de7071b
-+    system_prompt_sha256=e402f78869e556374c969618a359050728cf463291b9285bea22f9585f241095
++    system_prompt_sha256=ad50bfe4deeb2d35e695b13ab2d5a193adbbeb79c83e9b6d39085eb68c2565ee
      # Mason manages this seat (Victor, 2026-08-15). The relay DB owner link is
      # Mason; the harness owner stays Victor because buzz-acp resolves the owner
      # from the Victor-signed attestation regardless of env. Mason is reachable
@@ -308,7 +316,7 @@
      session_title='Alpheus Codex · GPT-5.6 Sol high'
      system_prompt=/home/victor/projects/buzz/config/alpheus-codex-system.md
 -    system_prompt_sha256=f42e7ee2c6bb91061e94c1323e4db088059e46e84455beccc918c2bc12e32729
-+    system_prompt_sha256=29198fa167d4aada1585df611e1f3bd6ef312af4b5d5d970afd096a5be73b725
++    system_prompt_sha256=b04fd73b378d10121b5169d871ffbfbf49a7fae12c5add4c6f021be7f7e4ba3f
      # Mason manages this seat (Victor, 2026-08-15). The relay DB owner link is
      # Mason; the harness owner stays Victor because buzz-acp resolves the owner
      # from the Victor-signed attestation regardless of env. Mason is reachable

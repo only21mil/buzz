@@ -29,10 +29,12 @@ The September 12 instruction-loading repair already removed the obsolete
 efficiency paragraph; the inspected preimages have no blanket document-load
 ban. This package builds on those saved bytes.
 
-The Alpheus and Archimedes changes replace only the efficiency paragraph, correct the blanket
+The Alpheus and Archimedes efficiency changes correct the blanket
 full-context reread claim, and retain the existing PR follow-through ownership
-rule. They preserve Alpheus identity, memory, models, tools, capacity, and
-approval rules. They introduce no Sats canon pointer or Sats design policy.
+rule. They preserve each owner's identity, memory, models, tools, and approval rules.
+The September 13 capacity rule explicitly supersedes older written six-child
+ceilings with actual available runtime capacity and counts pending initialization,
+wrappers and descendants against those slots. Runtime configuration is unchanged. They introduce no Sats canon pointer or Sats design policy.
 The Archimedes copies under Victor's projects directory are deployment copies,
 not active owner sources. Their owner-scoped files and launcher under
 `/home/sats/buzz-agents/` belong to the separate family rollout. The Victor

@@ -61,33 +61,33 @@
     {
       "path": "config/alpheus-codex-system.md",
       "before_sha256": "f42e7ee2c6bb91061e94c1323e4db088059e46e84455beccc918c2bc12e32729",
-      "after_sha256": "29198fa167d4aada1585df611e1f3bd6ef312af4b5d5d970afd096a5be73b725",
+      "after_sha256": "b04fd73b378d10121b5169d871ffbfbf49a7fae12c5add4c6f021be7f7e4ba3f",
       "mode": "0o600"
     },
     {
       "path": "config/alpheus-claude-code-system.md",
       "before_sha256": "e41ee7221122e1ccf2e255642383e511f411d49723336ab4110e59f69de7071b",
-      "after_sha256": "e402f78869e556374c969618a359050728cf463291b9285bea22f9585f241095",
+      "after_sha256": "ad50bfe4deeb2d35e695b13ab2d5a193adbbeb79c83e9b6d39085eb68c2565ee",
       "mode": "0o600"
     },
     {
       "path": "config/archimedes-codex-system.md",
       "before_sha256": "0dcf1fefe4bf82019beed6b9fc9f6e236745353a9f5cff0365f42742ad92a23e",
-      "after_sha256": "d457d54746b49a9a0769855bdf79897308189f727702ca3566a2581798300d3a",
+      "after_sha256": "94a86a3e63f7cd10071cc48f973be416eefadf20f75873441d816d0ec81dd1d5",
       "mode": "0o600"
     },
     {
       "path": "config/archimedes-hermes-system.md",
       "before_sha256": "648dcf2114d107b04e23081876fa6c4e94b2f47404cae59fecbb0e3ec54db31b",
-      "after_sha256": "efafc161af758655d3f4e9298b74c2892721bccdde1eaa5d32558eedd8c92fd6",
+      "after_sha256": "5ce71b2a2049fd6109a295587f012e1dddb84dadb61bb3a388f306633239243b",
       "mode": "0o600"
     },
     {
       "path": "scripts/launch_buzz_agent.sh",
       "before_sha256": "caaa91feb9d1f6321af1abef5754cd6dd7e41dfeb0f9dd12ab04bd6b6271208e",
-      "after_sha256": "12a13d4c0a5e2c32032e9ceb9302a813f478f0b709a71c2bf8ef79d6aebc4f6e",
+      "after_sha256": "0689e48d2b7a471c89a09b36e937d588d52c542ffea6a7a0135babad2197a0d3",
       "mode": "0o755"
     }
   ],
-  "patch_sha256": "b67c4c09c9582fa12fb53a99569a54bde33264c5cb7fe952913f51e18e0d58a5"
+  "patch_sha256": "35ac79ff1ad52fd972acb8ec765f04a9fe8ae9efddc5b5ed5dcd415e75270054"
 }
