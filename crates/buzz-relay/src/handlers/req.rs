@@ -795,6 +795,52 @@ pub(crate) fn count_fallback_exceeded(candidate_count: usize) -> bool {
     candidate_count > COUNT_FALLBACK_CANDIDATE_LIMIT as usize
 }
 
+/// Failure modes for [`collect_count_union_ids`].
+pub(crate) enum CountUnionError {
+    /// The union scan exceeded the exact-count budget — the caller rejects
+    /// with its narrower-constraints message rather than counting a prefix.
+    BudgetExceeded,
+    /// The candidate fetch itself failed.
+    Backend(String),
+}
+
+/// Collect one COUNT filter's matching event IDs into a shared union set.
+///
+/// Multi-filter COUNT must return the union across filters, not the sum of
+/// per-filter counts: overlapping filters would otherwise double-count the
+/// same event. The fetch is bounded by the exact-count budget
+/// ([`apply_count_fallback_limit`]) like every other COUNT fallback, so an
+/// over-budget union rejects instead of returning a truncated number.
+pub(crate) async fn collect_count_union_ids(
+    state: &AppState,
+    community: CommunityId,
+    path: &'static str,
+    mut query: EventQuery,
+    filter: &Filter,
+    pubkey_bytes: &[u8],
+    union_ids: &mut HashSet<nostr::EventId>,
+) -> Result<(), CountUnionError> {
+    apply_count_fallback_limit(&mut query);
+    let stored_events = state
+        .db
+        .query_events_routed_bounded(path, &query)
+        .await
+        .map_err(|e| CountUnionError::Backend(e.to_string()))?;
+    if count_fallback_exceeded(stored_events.len()) {
+        return Err(CountUnionError::BudgetExceeded);
+    }
+    for se in stored_events {
+        if !filters_match(std::slice::from_ref(filter), &se) {
+            continue;
+        }
+        if !event_visible_to_reader(state, community, &se.event, pubkey_bytes).await {
+            continue;
+        }
+        union_ids.insert(se.event.id);
+    }
+    Ok(())
+}
+
 /// Returns `true` if all constraints in this filter can be fully represented
 /// in SQL by `filter_to_query_params` — meaning `count_events()` will produce
 /// an exact count without post-filtering.
