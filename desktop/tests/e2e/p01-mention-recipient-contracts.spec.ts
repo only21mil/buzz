@@ -541,10 +541,7 @@ for (const mixed of [false, true]) {
   });
 }
 for (const selection of ["picker", "automatic"]) {
-  // QUARANTINE — needs __BUZZ_E2E_HOLD_USERS_BATCH__ and
-  // __BUZZ_E2E_USERS_BATCH_PENDING__ (P01b bridge). Not part of the edit/paste
-  // product-decision batch.
-  test.fixme(`qualified ${selection} selection retires a pending paste of the original label`, async ({
+  test(`qualified ${selection} selection retires a pending paste of the original label`, async ({
     page,
   }) => {
     const [a, b, pasted] = ["a".repeat(64), "b".repeat(64), "c".repeat(64)];
