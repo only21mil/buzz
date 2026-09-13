@@ -465,10 +465,7 @@ void main() {
     await tester.pumpAndSettle();
 
     // The connection group sits below the fold; bring it into view.
-    await tester.scrollUntilVisible(
-      find.text('Identity (pubkey)'),
-      300,
-    );
+    await tester.scrollUntilVisible(find.text('Identity (pubkey)'), 300);
     await tester.pumpAndSettle();
 
     // The public key is copyable; the secret never renders as text.
