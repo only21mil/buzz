@@ -191,9 +191,14 @@ void main() {
           '09b3065e3570a3a4054660dccd66e12774a99a904fdb0ca02dbc6c3136249506';
       const sessionSecretHex =
           'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
+      const recoveryPrivkey =
+          '1111111111111111111111111111111111111111111111111111111111111111';
       late _ControllableSocket socket;
       late PairingNotifier notifier;
       late String recoveryCode;
+      late _AuthenticatedFakeAuthNotifier recoveryAuth;
+      late _FakeDeviceAuth deviceAuth;
+      late _MutableClock grantClock;
 
       setUp(() {
         final source = nostr.Keys(sourceSecret);
@@ -201,6 +206,16 @@ void main() {
             'nostrpair://${source.public}'
             '?secret=$sessionSecretHex'
             '&relay=wss%3A%2F%2Fpairing.buzz.xyz&v=1&mode=recover';
+        deviceAuth = _FakeDeviceAuth();
+        grantClock = _MutableClock(DateTime.utc(2026, 9, 13, 12));
+        recoveryAuth = _AuthenticatedFakeAuthNotifier(
+          Community.create(
+            name: 'Recovery',
+            relayUrl: 'https://relay.test',
+            pubkey: nostr.Keys(recoveryPrivkey).public,
+            nsec: _RecoveryRelayConfig.nsec,
+          ),
+        );
         notifier = PairingNotifier(
           socketFactory:
               ({
@@ -221,11 +236,31 @@ void main() {
           overrides: [
             pairingProvider.overrideWith(() => notifier),
             relayConfigProvider.overrideWith(_RecoveryRelayConfig.new),
+            authProvider.overrideWith(() => recoveryAuth),
+            deviceAuthGatewayProvider.overrideWithValue(deviceAuth),
+            exportAuthorizationClockProvider.overrideWithValue(grantClock.read),
           ],
         );
         container.read(pairingProvider);
         notifier = container.read(pairingProvider.notifier);
       });
+
+      /// Lets the async export gate (device auth, grant, publish) finish.
+      Future<void> settleExport() async {
+        for (var i = 0; i < 50; i++) {
+          await Future<void>.delayed(Duration.zero);
+        }
+      }
+
+      /// Published NIP-44 payloads that carry this phone's nsec.
+      List<Map<String, dynamic>> nsecPayloads() => socket
+          .decryptedPublishedMessages(sourceSecret)
+          .where(
+            (message) =>
+                message['type'] == 'payload' &&
+                message['payload_type'] == 'nsec',
+          )
+          .toList();
 
       test('recovery URI enables phone-to-desktop transfer', () async {
         await notifier.pair(recoveryCode);
@@ -234,10 +269,12 @@ void main() {
         expect(state.status, PairingStatus.confirmingSas);
         expect(state.sendsIdentityToDesktop, isTrue);
         expect(state.sasCode, hasLength(6));
+        // Opening recovery proves nothing: no device auth runs yet.
+        expect(deviceAuth.authenticateCalls, 0);
       });
 
       test(
-        'matching SAS sends nsec and successful completion finishes',
+        'matching SAS plus device auth sends nsec to the confirmed peer',
         () async {
           await notifier.pair(recoveryCode);
           notifier.confirmSas();
@@ -249,7 +286,9 @@ void main() {
             message: {'type': 'sas-confirm'},
             includeTranscriptHash: true,
           );
+          await settleExport();
 
+          expect(deviceAuth.authenticateCalls, 1);
           expect(
             container.read(pairingProvider).status,
             PairingStatus.transferring,
@@ -264,6 +303,13 @@ void main() {
             ),
             isTrue,
           );
+          // The export goes only to the desktop that confirmed SAS.
+          final payloadEvents = socket.publishedPayloadEvents();
+          expect(payloadEvents, hasLength(2)); // offer + nsec payload
+          for (final event in payloadEvents) {
+            expect(event.kind, 24134);
+            expect(event.pTag, nostr.Keys(sourceSecret).public);
+          }
 
           socket.sendSourceMessage(
             sourceSecret: sourceSecret,
@@ -283,6 +329,7 @@ void main() {
           message: {'type': 'sas-confirm'},
           includeTranscriptHash: true,
         );
+        await settleExport();
         socket.sendSourceMessage(
           sourceSecret: sourceSecret,
           sessionSecretHex: sessionSecretHex,
@@ -292,6 +339,108 @@ void main() {
         final state = container.read(pairingProvider);
         expect(state.status, PairingStatus.error);
         expect(state.errorMessage, contains('could not store'));
+      });
+
+      test('SAS confirmation alone never sends the identity', () async {
+        await notifier.pair(recoveryCode);
+        // User confirms before the desktop does: payload arrives later.
+        notifier.confirmSas();
+        await settleExport();
+
+        expect(deviceAuth.authenticateCalls, 0);
+        expect(nsecPayloads(), isEmpty);
+        expect(
+          container.read(pairingProvider).status,
+          PairingStatus.confirmingSas,
+        );
+      });
+
+      test('cancelled device auth sends nothing and aborts', () async {
+        deviceAuth.next = const ExportAuthCancelled();
+        await notifier.pair(recoveryCode);
+        notifier.confirmSas();
+        socket.sendSourceMessage(
+          sourceSecret: sourceSecret,
+          sessionSecretHex: sessionSecretHex,
+          message: {'type': 'sas-confirm'},
+          includeTranscriptHash: true,
+        );
+        await settleExport();
+
+        final state = container.read(pairingProvider);
+        expect(state.status, PairingStatus.error);
+        expect(state.errorMessage, contains('not sent'));
+        expect(nsecPayloads(), isEmpty);
+        expect(
+          socket
+              .decryptedPublishedMessages(sourceSecret)
+              .any(
+                (message) =>
+                    message['type'] == 'abort' &&
+                    message['reason'] == 'export_cancelled',
+              ),
+          isTrue,
+        );
+      });
+
+      test('unavailable device auth fails closed without prompting', () async {
+        deviceAuth.canAuthenticateResult = false;
+        await notifier.pair(recoveryCode);
+        notifier.confirmSas();
+        socket.sendSourceMessage(
+          sourceSecret: sourceSecret,
+          sessionSecretHex: sessionSecretHex,
+          message: {'type': 'sas-confirm'},
+          includeTranscriptHash: true,
+        );
+        await settleExport();
+
+        final state = container.read(pairingProvider);
+        expect(state.status, PairingStatus.error);
+        expect(deviceAuth.authenticateCalls, 0);
+        expect(nsecPayloads(), isEmpty);
+      });
+
+      test('expired approval denies the export', () async {
+        // The user sits on the OS prompt past the grant deadline.
+        deviceAuth.onAuthenticate = () async {
+          grantClock.advance(exportGrantTtl + const Duration(seconds: 1));
+        };
+        await notifier.pair(recoveryCode);
+        notifier.confirmSas();
+        socket.sendSourceMessage(
+          sourceSecret: sourceSecret,
+          sessionSecretHex: sessionSecretHex,
+          message: {'type': 'sas-confirm'},
+          includeTranscriptHash: true,
+        );
+        await settleExport();
+
+        final state = container.read(pairingProvider);
+        expect(state.status, PairingStatus.error);
+        expect(state.errorMessage, contains('expired'));
+        expect(nsecPayloads(), isEmpty);
+      });
+
+      test('pairing reset wipes pending export grants', () async {
+        await notifier.pair(recoveryCode);
+        final grants = container.read(exportAuthorizationProvider.notifier);
+        const binding = ExportGrantRequest(
+          communityId: 'community-1',
+          identityPubkey: 'pubkey-1',
+          action: ExportAction.pairingExport,
+          peerPubkey: 'peer-1',
+          sessionIdHex: 'session-1',
+          transcriptHashHex: 'transcript-1',
+        );
+        final grant = await grants.authorizeExport(request: binding);
+
+        notifier.reset();
+
+        expect(
+          () => grants.consumeGrant(grantId: grant.id, binding: binding),
+          throwsA(isA<ExportGrantDenied>()),
+        );
       });
     });
   });
@@ -335,6 +484,64 @@ class FakeAuthNotifier extends AsyncNotifier<AuthState>
     state = AsyncData(
       AuthState(status: AuthStatus.authenticated, community: community),
     );
+  }
+}
+
+/// An already-signed-in identity for export-gate tests. The export binding
+/// reads the community from [authProvider], so recovery tests need a real
+/// community here, not the unauthenticated [FakeAuthNotifier].
+class _AuthenticatedFakeAuthNotifier extends AsyncNotifier<AuthState>
+    implements AuthNotifier {
+  _AuthenticatedFakeAuthNotifier(this.community);
+
+  final Community community;
+
+  @override
+  Future<AuthState> build() async =>
+      AuthState(status: AuthStatus.authenticated, community: community);
+
+  @override
+  Future<void> signOut() async {
+    state = const AsyncData(AuthState(status: AuthStatus.unauthenticated));
+  }
+
+  @override
+  Future<void> authenticateWithCommunity(Community next) async {
+    state = AsyncData(
+      AuthState(status: AuthStatus.authenticated, community: next),
+    );
+  }
+}
+
+/// Controllable device-auth stand-in for the export gate.
+class _FakeDeviceAuth implements DeviceAuthGateway {
+  bool canAuthenticateResult = true;
+  ExportAuthException? next;
+  int authenticateCalls = 0;
+  Future<void> Function()? onAuthenticate;
+
+  @override
+  Future<bool> canAuthenticate() async => canAuthenticateResult;
+
+  @override
+  Future<void> authenticate({required String reason}) async {
+    authenticateCalls += 1;
+    await onAuthenticate?.call();
+    final failure = next;
+    if (failure != null) throw failure;
+  }
+}
+
+/// Hand-rolled clock so tests can push a grant past its deadline.
+class _MutableClock {
+  _MutableClock(this.current);
+
+  DateTime current;
+
+  DateTime read() => current;
+
+  void advance(Duration delta) {
+    current = current.add(delta);
   }
 }
 
@@ -407,6 +614,17 @@ class _ControllableSocket extends PairingSocket {
         )
         .toList();
   }
+
+  /// Raw published events that carry an encrypted payload, with the p-tag
+  /// recipient exposed so tests can prove the export went to one peer only.
+  List<({String pTag, int kind})> publishedPayloadEvents() => published
+      .map(
+        (event) => (
+          pTag: ((event['tags'] as List).single as List).last as String,
+          kind: event['kind'] as int,
+        ),
+      )
+      .toList();
 
   void sendSourceMessage({
     required String sourceSecret,

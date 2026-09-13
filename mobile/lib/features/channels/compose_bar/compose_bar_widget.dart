@@ -85,7 +85,12 @@ class ComposeBar extends HookConsumerWidget {
       attachments: attachments,
     );
     final voiceNoteRef = useRef(voiceNote)..value = voiceNote;
+    // Map of displayName → selected mention candidate built as the user selects
+    // mentions. Declared before the draft lifecycle so restored drafts can
+    // hydrate it, and so every send resolves against the same bindings.
+    final mentionMap = useRef(<String, MentionCandidate>{});
     _useComposeDraftLifecycle(
+      mentionMap: mentionMap,
       ref: ref,
       controller: controller,
       draftKey: draftKey,
@@ -201,10 +206,6 @@ class ComposeBar extends HookConsumerWidget {
     // Mention state --------------------------------------------------------
     final mentionQuery = useState<String?>(null);
     final mentionStartIdx = useState(-1);
-    // Map of displayName → selected mention candidate built as the user selects
-    // mentions. Used to pass resolved pubkeys directly to onSend and to attach
-    // selected non-member agents before the message is published.
-    final mentionMap = useRef(<String, MentionCandidate>{});
 
     // Channel autocomplete state ----------------------------------------------
     final channelQuery = useState<String?>(null);
@@ -222,9 +223,7 @@ class ComposeBar extends HookConsumerWidget {
     // owners so @mention suggestions show names ("managed by …" included).
     final relayAgents = ref.watch(agentDirectoryProvider).asData?.value;
     final agentOwners = ref.watch(agentOwnersProvider).asData?.value;
-    final agentMentionLabels = _agentMentionLabels(
-      candidates: mentionMap.value.values,
-    );
+    final agentMentionLabels = _agentMentionLabels(bindings: mentionMap.value);
     final agentMentionLabelsKey = (agentMentionLabels.toList()..sort()).join(
       '\u0000',
     );
@@ -237,6 +236,11 @@ class ComposeBar extends HookConsumerWidget {
         final memberList = membersAsync.asData?.value ?? <ChannelMember>[];
         final pubkeys = [
           ...memberList.map((m) => m.pubkey),
+          // Restored draft identities need profile preloads too, so the
+          // mention picker can revalidate them against current state.
+          ...mentionMap.value.values
+              .where((c) => c.requiresRevalidation && c.pubkey.isNotEmpty)
+              .map((c) => c.pubkey),
           ...?relayAgents?.map((a) => a.pubkey),
           ...?agentOwners?.values,
         ];
@@ -246,6 +250,8 @@ class ComposeBar extends HookConsumerWidget {
         return null;
       },
       [
+        draftIdentity,
+        draftKey,
         membersAsync.asData?.value.length,
         relayAgents?.length,
         agentOwners?.length,
@@ -349,7 +355,12 @@ class ComposeBar extends HookConsumerWidget {
 
     // Insert a selected mention into the text field.
     void insertMention(MentionCandidate candidate) {
-      final name = candidate.label;
+      // Same-name picks keep their own recipient: the second Scout gets a
+      // qualified label instead of overwriting the first selection.
+      final name = selectedMentionLabel(candidate.label, candidate.pubkey, {
+        for (final entry in mentionMap.value.entries)
+          entry.key: entry.value.pubkey,
+      });
       // Track the resolved candidate so we can pass its pubkey and prepare
       // selected non-member agents at send time.
       mentionMap.value[name] = candidate;
@@ -425,11 +436,46 @@ class ComposeBar extends HookConsumerWidget {
       // `_reportSendCancelledByCommunitySwitch`.
       final messenger = ScaffoldMessenger.maybeOf(context);
 
-      // Extract pubkeys for mentions present in the final text.
-      final selectedMentions = <MentionCandidate>[
-        for (final entry in mentionMap.value.entries)
-          if (hasMention(text, entry.key)) entry.value,
-      ];
+      // Extract pubkeys for mentions present in the final text. Resolution
+      // binds every label to its exact selected identity: same-name picks
+      // keep their own recipient, ambiguity fails visibly, and restored
+      // draft identities must still exist before anything is sent.
+      List<MentionCandidate> selectedMentions;
+      try {
+        selectedMentions = _resolveComposerMentions(
+          text,
+          mentionMap.value,
+          buildMentionCandidates(
+            members: membersAsync.asData?.value ?? const <ChannelMember>[],
+            relayAgents: const [],
+            sharedChannelIds: const {},
+            userCache: userCache,
+            ownerByAgentPubkey: agentOwners ?? const {},
+          ),
+          buildMentionCandidates(
+            members: membersAsync.asData?.value ?? const [],
+            relayAgents: relayAgents ?? const [],
+            sharedChannelIds: {
+              for (final c in channels)
+                if (c.isMember && !c.isArchived) c.id,
+            },
+            userCache: userCache,
+            ownerByAgentPubkey: agentOwners ?? const {},
+            currentPubkey: currentPubkey,
+            // Reuse ordinary search-result classification, not membership as
+            // permission. Persisted keys/flags themselves prove no role.
+            searchResults: [
+              for (final c in mentionMap.value.values)
+                if (c.requiresRevalidation &&
+                    userCache[c.pubkey.toLowerCase()] != null)
+                  userCache[c.pubkey.toLowerCase()]!,
+            ],
+          ),
+        );
+      } on FormatException catch (error) {
+        messenger?.showSnackBar(SnackBar(content: Text(error.message)));
+        return;
+      }
       final outgoing = _OutgoingMentions(selectedMentions);
       final scan = await _scanNonMemberMentions(
         ref,
@@ -549,12 +595,12 @@ class ComposeBar extends HookConsumerWidget {
             if (context.mounted &&
                 queueGeneration == uploadGeneration.value &&
                 draftRevision.value == clearedDraftRevision) {
-              controller.value = draftText;
               attachments.value = draftAttachments;
               retainedForRetry = true;
               mentionMap.value
                 ..clear()
                 ..addAll(draftMentions);
+              controller.value = draftText;
               focusNode.requestFocus();
             }
           } finally {

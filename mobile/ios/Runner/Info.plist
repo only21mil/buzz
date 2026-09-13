@@ -49,6 +49,8 @@
 	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>Buzz uses the camera to take profile photos and animated avatars, attach photos to messages, and scan QR codes for device pairing.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Buzz uses Face ID to confirm it is you before exporting your private identity to a paired desktop.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Buzz needs microphone access so you can speak in Huddles and record voice notes.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
