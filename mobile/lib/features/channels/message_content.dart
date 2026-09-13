@@ -858,7 +858,7 @@ class _MentionPill extends StatelessWidget {
               size: fontSize * 0.95,
               color: context.colors.primary,
             ),
-            const SizedBox(width: Grid.quarter),
+            const SizedBox(width: Grid.quarter + 1),
           ] else
             Transform.translate(
               offset: const Offset(0, -Grid.quarter),
