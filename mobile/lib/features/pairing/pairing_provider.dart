@@ -25,6 +25,7 @@ enum PairingStatus {
   idle,
   connecting,
   confirmingSas,
+  authorizingExport,
   transferring,
   storing,
   success,
@@ -96,6 +97,7 @@ class PairingNotifier extends Notifier<PairingState> {
   Future<void> pair(String rawInput) async {
     if (state.status == PairingStatus.connecting ||
         state.status == PairingStatus.confirmingSas ||
+        state.status == PairingStatus.authorizingExport ||
         state.status == PairingStatus.transferring) {
       return;
     }
@@ -113,12 +115,13 @@ class PairingNotifier extends Notifier<PairingState> {
     if (state.status != PairingStatus.confirmingSas) return;
 
     // If the desktop's sas-confirm has already arrived and been verified,
-    // transition immediately and process any buffered payload.
+    // move to the export gate (phone-to-desktop) or process buffered
+    // inbound payload (desktop-to-phone).
     if (_sasConfirmReceived) {
-      state = state.copyWith(status: PairingStatus.transferring);
       if (_sendIdentityToSource) {
-        _sendIdentityPayload();
+        unawaited(_authorizeAndSendIdentity());
       } else {
+        state = state.copyWith(status: PairingStatus.transferring);
         final pending = _pendingPayload;
         if (pending != null) {
           _pendingPayload = null;
@@ -159,6 +162,13 @@ class PairingNotifier extends Notifier<PairingState> {
     _userConfirmedSas = false;
     _pendingPayload = null;
     _sendIdentityToSource = false;
+    // The pairing session is over: any export grant minted for it dies here.
+    try {
+      ref.read(exportAuthorizationProvider.notifier).invalidateAll();
+    } catch (_) {
+      // Grant store unavailable in this scope; remaining grants stay bound
+      // to this dead session and fail the binding check.
+    }
   }
 
   // ── NIP-AB pairing flow ─────────────────────────────────────────────────
@@ -416,10 +426,10 @@ class PairingNotifier extends Notifier<PairingState> {
     // that the transcript hash is verified.
     if (_userConfirmedSas) {
       _userConfirmedSas = false;
-      state = state.copyWith(status: PairingStatus.transferring);
       if (_sendIdentityToSource) {
-        _sendIdentityPayload();
+        unawaited(_authorizeAndSendIdentity());
       } else {
+        state = state.copyWith(status: PairingStatus.transferring);
         final pending = _pendingPayload;
         if (pending != null) {
           _pendingPayload = null;
@@ -430,28 +440,130 @@ class PairingNotifier extends Notifier<PairingState> {
     // Otherwise stay in confirmingSas — user must still confirm via confirmSas().
   }
 
-  void _sendIdentityPayload() {
-    final nsec = ref.read(relayConfigProvider).nsec;
-    if (nsec == null || nsec.isEmpty) {
+  /// Fresh device-auth gate for the phone-to-desktop identity export.
+  ///
+  /// Runs only after both sides confirmed SAS. A successful OS prompt mints
+  /// a short-lived grant bound to this community, identity, peer, and
+  /// transcript; the grant is consumed before the nsec is read or published.
+  /// Any failure aborts the session without sending anything: the export
+  /// fails closed and the desktop is told the pairing ended.
+  Future<void> _authorizeAndSendIdentity() async {
+    // Mark confirmed so the SAS screen shows the waiting state while the
+    // OS prompt is up, whichever side confirmed first.
+    state = state.copyWith(
+      status: PairingStatus.authorizingExport,
+      userConfirmedSas: true,
+    );
+    try {
+      // Await the future: the first read of the async auth provider is
+      // loading, and exporting on a loading read would fail closed
+      // spuriously even for a signed-in identity.
+      final community = (await ref.read(authProvider.future)).community;
+      final nsec = ref.read(relayConfigProvider).nsec;
+      if (community == null || nsec == null || nsec.isEmpty) {
+        throw const ExportGrantDenied(
+          'No identity is available on this phone.',
+        );
+      }
+      final String pubkey;
+      try {
+        pubkey = nostr.Keys(nostr.Nip19.decode(payload: nsec).data).public;
+      } catch (_) {
+        throw const ExportGrantDenied(
+          'No identity is available on this phone.',
+        );
+      }
+      final sourcePubkey = _sourcePubkey;
+      final sessionId = _sessionId;
+      if (sourcePubkey == null || sessionId == null) {
+        throw const ExportGrantDenied('Pairing session is no longer valid.');
+      }
+      final request = ExportGrantRequest(
+        communityId: community.id,
+        identityPubkey: pubkey,
+        action: ExportAction.pairingExport,
+        peerPubkey: sourcePubkey,
+        sessionIdHex: bytesToHex(sessionId),
+        transcriptHashHex: _transcriptHashHex(),
+      );
+      final grants = ref.read(exportAuthorizationProvider.notifier);
+      final grant = await grants.authorizeExport(
+        request: request,
+        reason: 'Confirm it is you to send your Buzz identity to this desktop.',
+      );
+      grants.consumeGrant(grantId: grant.id, binding: request);
+      if (state.status != PairingStatus.authorizingExport) {
+        // The session moved on (timeout, abort, reset) while the OS prompt
+        // was up. The grant is already consumed; do not publish.
+        _sendAbort('export_cancelled');
+        _cleanup();
+        state = const PairingState(
+          status: PairingStatus.error,
+          errorMessage: 'Pairing ended before the identity could be sent.',
+        );
+        return;
+      }
+      final content = _encryptMessage({
+        'type': 'payload',
+        'payload_type': 'nsec',
+        'payload': nsec,
+      });
+      _publishEvent(
+        kind: 24134,
+        content: content,
+        tags: [
+          ['p', sourcePubkey],
+        ],
+      );
+      state = state.copyWith(status: PairingStatus.transferring);
+    } on ExportAuthCancelled catch (e) {
+      _sendAbort('export_cancelled');
+      _cleanup();
+      state = PairingState(
+        status: PairingStatus.error,
+        errorMessage: e.message,
+      );
+    } on ExportAuthException catch (e) {
+      _sendAbort('export_denied');
+      _cleanup();
+      state = PairingState(
+        status: PairingStatus.error,
+        errorMessage: e.message,
+      );
+    } catch (_) {
       _sendAbort('protocol_error');
       _cleanup();
       state = const PairingState(
         status: PairingStatus.error,
-        errorMessage: 'No identity is available on this phone.',
+        errorMessage: 'Could not send the identity. Nothing was transferred.',
       );
-      return;
     }
-    final content = _encryptMessage({
-      'type': 'payload',
-      'payload_type': 'nsec',
-      'payload': nsec,
-    });
-    _publishEvent(
-      kind: 24134,
-      content: content,
-      tags: [
-        ['p', _sourcePubkey!],
-      ],
+  }
+
+  /// Hex transcript hash for the current pairing session. Throws
+  /// [ExportGrantDenied] when session state is gone, so the export gate
+  /// fails closed instead of binding a grant to partial state.
+  String _transcriptHashHex() {
+    final sessionId = _sessionId;
+    final sourcePubkey = _sourcePubkey;
+    final ephemeralPubkey = _ephemeralPubkey;
+    final sasInput = _sasInput;
+    final sessionSecret = _sessionSecret;
+    if (sessionId == null ||
+        sourcePubkey == null ||
+        ephemeralPubkey == null ||
+        sasInput == null ||
+        sessionSecret == null) {
+      throw const ExportGrantDenied('Pairing session is no longer valid.');
+    }
+    return bytesToHex(
+      deriveTranscriptHash(
+        sessionId,
+        hexToBytes(sourcePubkey),
+        hexToBytes(ephemeralPubkey),
+        sasInput,
+        sessionSecret,
+      ),
     );
   }
 

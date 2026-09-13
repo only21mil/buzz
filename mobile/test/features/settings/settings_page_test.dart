@@ -3,14 +3,15 @@ import 'package:buzz/features/settings/settings_page.dart';
 import 'package:buzz/shared/community/community_membership_provider.dart';
 import 'package:buzz/shared/community/community.dart';
 import 'package:buzz/shared/community/community_provider.dart';
+import 'package:buzz/shared/relay/relay.dart';
 import 'package:buzz/shared/theme/theme.dart';
 import 'package:buzz/shared/push/push_bridge.dart';
-import 'package:buzz/shared/relay/app_lifecycle_provider.dart';
 import 'package:buzz/shared/widgets/app_list.dart';
 import 'package:buzz/shared/widgets/app_list_card.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:nostr/nostr.dart' as nostr;
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
@@ -435,9 +436,66 @@ void main() {
       isTrue,
     );
   });
+
+  testWidgets('identity row copies the public key, never the nsec', (
+    tester,
+  ) async {
+    SharedPreferences.setMockInitialValues({});
+    final prefs = await SharedPreferences.getInstance();
+    final nsec = nostr.Keys.generate().nsec;
+    final pubkey = pubkeyFromNsec(nsec)!;
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          savedPrefsProvider.overrideWithValue(prefs),
+          relayConfigProvider.overrideWith(() => _NsecRelayConfig(nsec: nsec)),
+          appLifecycleProvider.overrideWith(_SettingsLifecycleNotifier.new),
+        ],
+        child: MaterialApp(
+          theme: AppTheme.light(),
+          home: SettingsPage(
+            profileHeader: const SizedBox.shrink(),
+            invitePageBuilder: (_) => const SizedBox.shrink(),
+            identityRecoveryPageBuilder: (_) => const SizedBox.shrink(),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    // The connection group sits below the fold; bring it into view.
+    await tester.scrollUntilVisible(
+      find.text('Identity (pubkey)'),
+      300,
+    );
+    await tester.pumpAndSettle();
+
+    // The public key is copyable; the secret never renders as text.
+    expect(find.text('Identity (pubkey)'), findsOneWidget);
+    expect(find.textContaining(nsec), findsNothing);
+    expect(
+      find.bySemanticsLabel(RegExp('Copy identity public key')),
+      findsOneWidget,
+    );
+    expect(find.textContaining(pubkey.substring(0, 8)), findsNothing);
+    // The recovery row opens the pairing page; the key gate itself runs
+    // at publish time in the pairing provider, not on navigation.
+    expect(find.text('Send identity to desktop'), findsOneWidget);
+  });
 }
 
 class _SettingsLifecycleNotifier extends AppLifecycleNotifier {
   @override
   AppLifecycleState build() => AppLifecycleState.resumed;
+}
+
+class _NsecRelayConfig extends RelayConfigNotifier {
+  _NsecRelayConfig({required String nsec}) : _nsec = nsec;
+
+  final String _nsec;
+
+  @override
+  RelayConfig build() =>
+      RelayConfig(baseUrl: 'https://relay.example', nsec: _nsec);
 }

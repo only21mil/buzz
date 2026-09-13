@@ -246,6 +246,19 @@ class _MarkdownEditingController extends TextEditingController {
       if (prefix.isNotEmpty) spans.add(TextSpan(text: prefix, style: style));
 
       final label = match.group(2)!;
+      // A qualified label (Name + 64-hex key) renders as plain colored text,
+      // not a chip: the full label must stay visible and wrapping inside its
+      // bounds instead of spilling the key out as raw text.
+      if (RegExp(r'\([0-9a-f]{64}\)').hasMatch(label)) {
+        spans.add(
+          TextSpan(
+            text: '@$label',
+            style: style.copyWith(color: context.colors.primary),
+          ),
+        );
+        offset = match.end;
+        continue;
+      }
       spans.add(
         WidgetSpan(
           alignment: PlaceholderAlignment.baseline,
