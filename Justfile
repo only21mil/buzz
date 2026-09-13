@@ -692,7 +692,7 @@ mobile-fix:
 
 # Run mobile lint and format checks
 mobile-check:
-    unset GIT_DIR GIT_WORK_TREE; cd {{mobile_dir}} && dart format --output=none --set-exit-if-changed . && flutter analyze && node ./scripts/check-file-sizes.mjs
+    unset GIT_DIR GIT_WORK_TREE; cd {{mobile_dir}} && dart format --output=none --set-exit-if-changed . && flutter analyze && node ./scripts/check-file-sizes.mjs && python3 ../scripts/check-pubspec-keys.py
 
 # Run mobile tests
 mobile-test:
