@@ -270,6 +270,12 @@ sync command and no cross-system rollback.
 
 ## Commands
 
+`buzz --help` prints this whole surface as an indented tree — every group with
+its subcommands and their descriptions — so there is no need to run `--help`
+once per group to find a command. `buzz -h` keeps the short group-level
+summary, and `buzz <group> <subcommand> --help` has the flags and examples.
+The table below mirrors that tree for readers who are not at a terminal.
+
 | Group | Subcommand | Description |
 |-------|-----------|-------------|
 | `messages` | `send` | Send a message to a channel |

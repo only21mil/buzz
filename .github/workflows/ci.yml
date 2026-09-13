@@ -72,6 +72,9 @@ jobs:
               - 'scripts/pre-freeze.sh'
               - 'scripts/test-ci-promotion-readiness.py'
               - 'scripts/test-ci-path-filter-contract.sh'
+              - 'scripts/check-branch-skew.sh'
+              - 'scripts/test-check-branch-skew.sh'
+              - 'scripts/test-workflow-fork-guards.sh'
               - 'scripts/test-protected-ci-receipt.py'
               - 'scripts/test-relay-e2e-canary-contract.sh'
               - 'Justfile'
@@ -91,6 +94,7 @@ jobs:
               - 'scripts/check-file-sizes-core.mjs'
               - 'scripts/check-file-sizes-core.test.mjs'
               - 'web/**'
+              - 'admin-web/**'
               - 'admin-web/package.json'
               - 'package.json'
               - 'pnpm-lock.yaml'
@@ -103,6 +107,8 @@ jobs:
               - 'scripts/check-file-sizes-core.test.mjs'
               - 'scripts/check-android-google-free.py'
               - 'scripts/test-check-android-google-free.sh'
+              - 'scripts/check-pubspec-keys.py'
+              - 'scripts/test-check-pubspec-keys.sh'
               - 'mobile/**'
               - 'scripts/mobile-release.sh'
               - 'scripts/mobile-worktree-overrides.sh'
@@ -146,12 +152,18 @@ jobs:
         run: node --test scripts/check-file-sizes-core.test.mjs
       - name: Android Google SDK-free guard unit tests
         run: scripts/test-check-android-google-free.sh
+      - name: Pubspec manifest guard unit tests
+        run: scripts/test-check-pubspec-keys.sh
       - name: PostgreSQL discovery contract
         run: scripts/test-postgres-test-discovery.sh
       - name: Protected CI reuse contract
         run: python3 scripts/test-protected-ci-reuse.py
       - name: CI path filter contract
         run: scripts/test-ci-path-filter-contract.sh
+      - name: Branch-skew contract
+        run: scripts/test-check-branch-skew.sh
+      - name: Workflow fork-guard contract
+        run: scripts/test-workflow-fork-guards.sh
 
       - name: Capture successful qualification inputs
         env:
@@ -1048,6 +1060,10 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Web lint and format
         run: just web-check
+      - name: Web unit tests
+        run: just web-test
+      - name: Admin-web check
+        run: pnpm -C admin-web check
       - name: Web build
         run: just web-build
       - name: Save pnpm store cache
@@ -1115,6 +1131,8 @@ jobs:
           path: ~/.pub-cache
           key: pub-${{ runner.os }}-${{ hashFiles('mobile/pubspec.lock') }}
           restore-keys: pub-${{ runner.os }}-
+      - name: Pubspec manifest guard
+        run: python3 scripts/check-pubspec-keys.py
       - name: Install dependencies
         run: cd mobile && flutter pub get
       - name: Save pub cache

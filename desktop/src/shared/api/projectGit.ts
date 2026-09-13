@@ -86,6 +86,8 @@ type RawProjectRepoSyncStatus = {
   push_block_reason: string | null;
   can_pull: boolean;
   pull_block_reason: string | null;
+  fetch_failed?: boolean | null;
+  fetch_error?: string | null;
 };
 
 type RawProjectRepoPushResult = {
@@ -306,6 +308,8 @@ function fromRawProjectRepoSyncStatus(
     pushBlockReason: status.push_block_reason,
     canPull: status.can_pull,
     pullBlockReason: status.pull_block_reason,
+    fetchFailed: status.fetch_failed ?? false,
+    fetchError: status.fetch_error ?? null,
   };
 }
 

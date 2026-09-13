@@ -51,6 +51,8 @@ const COMMANDS = [
       push_block_reason: "Local Git is unavailable in the browser build.",
       can_pull: false,
       pull_block_reason: "Local Git is unavailable in the browser build.",
+      fetch_failed: false,
+      fetch_error: null,
     },
   },
   { name: "list_project_local_repositories", value: [] },

@@ -340,6 +340,46 @@ mod tests {
             web_dir: None,
         });
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+        assemble_state(config, pool).await
+    }
+
+    /// Isolated scratch database for tests that read rows. Same explicit chain
+    /// as `bridge.rs` and `operator.rs`: a disposable Postgres URL must be
+    /// supplied, never the deployment default.
+    fn test_database_url() -> String {
+        std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("TEST_DATABASE_URL"))
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .expect("explicit isolated test database URL required")
+    }
+
+    /// Unknown-id lookups only return 404 after a real database round trip, so
+    /// these tests need a reachable Postgres. Uses a real connection, not a
+    /// lazy pool, so a missing fixture fails fast instead of surfacing as a
+    /// 500 that looks like a product bug. Expected statuses stay as-is: a
+    /// missing row is 404, never 500.
+    async fn test_state_with_database() -> Arc<crate::state::AppState> {
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.require_relay_membership = false;
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        config.admin = Some(crate::config::AdminConfig {
+            host: "admin.example".to_string(),
+            web_dir: None,
+        });
+        config.database_url = test_database_url();
+        let pool = sqlx::PgPool::connect(&config.database_url)
+            .await
+            .expect("isolated test database must be reachable");
+        assemble_state(config, pool).await
+    }
+
+    /// Shared AppState assembly. Host-gate and method tests reject before any
+    /// database access, so they run on the lazy pool; row lookups use the
+    /// connected pool from [`test_state_with_database`].
+    async fn assemble_state(
+        config: crate::config::Config,
+        pool: sqlx::PgPool,
+    ) -> Arc<crate::state::AppState> {
         let db = buzz_db::Db::from_pool(pool.clone());
         let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
             .create_pool(Some(deadpool_redis::Runtime::Tokio1))
@@ -390,8 +430,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL fixture"]
     async fn report_detail_rejects_unknown_report() {
-        let response = router(test_state().await)
+        let response = router(test_state_with_database().await)
             .oneshot(
                 Request::builder()
                     .uri(format!("/reports/{}", Uuid::nil()))
@@ -420,8 +461,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL fixture"]
     async fn feedback_attachment_rejects_unknown_feedback() {
-        let response = router(test_state().await)
+        let response = router(test_state_with_database().await)
             .oneshot(
                 Request::builder()
                     .uri(format!("/feedback/{}/attachments/{HASH}", Uuid::nil()))
