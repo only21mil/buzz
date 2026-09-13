@@ -1163,6 +1163,255 @@ mod tests {
         );
     }
 
+    /// Versions beyond the frozen 0042 prefix approved for the tail. Empty:
+    /// appending a migration must extend this list deliberately, or the
+    /// contiguity test below fails closed on the unseen tail.
+    const APPROVED_EXTRA_TAIL: &[(i64, &str)] = &[];
+
+    #[test]
+    fn migration_versions_are_contiguous_unique_and_tail_approved() {
+        let mut migrations: Vec<_> = MIGRATOR.iter().collect();
+        migrations.sort_by_key(|migration| migration.version);
+        let versions: Vec<i64> = migrations.iter().map(|m| m.version).collect();
+
+        let mut unique = versions.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            versions, unique,
+            "embedded migration versions must be unique"
+        );
+        assert!(
+            versions.starts_with(&[1]),
+            "migration numbering must start at 1"
+        );
+        for pair in versions.windows(2) {
+            assert_eq!(
+                pair[1],
+                pair[0] + 1,
+                "migration versions must be contiguous with no gaps"
+            );
+        }
+
+        // The frozen prefix is pinned by description, not just count, and any
+        // tail past 0042 must be approved entry by entry.
+        let mut by_version: std::collections::HashMap<i64, &str> = migrations
+            .iter()
+            .map(|m| (m.version, m.description.as_ref()))
+            .collect();
+        for (version, description) in [
+            (36, "workflow run error codes"),
+            (37, "push message kinds"),
+            (38, "push gateway dogfood profile"),
+            (39, "channel admin audit actions"),
+            (40, "agent drafts"),
+            (41, "ci check storage"),
+            (42, "ci merge gate"),
+        ] {
+            assert_eq!(
+                by_version.remove(&version),
+                Some(description),
+                "frozen tail migration {version:04} must keep its pinned identity"
+            );
+        }
+        let extra: Vec<(i64, &str)> = versions
+            .iter()
+            .filter(|v| **v > 42)
+            .map(|v| (*v, by_version[v]))
+            .collect();
+        assert_eq!(
+            extra, APPROVED_EXTRA_TAIL,
+            "unapproved migration tail: extend APPROVED_EXTRA_TAIL deliberately"
+        );
+    }
+
+    #[test]
+    fn migration_checksums_match_file_bytes_and_are_unique() {
+        use sha2::Digest;
+
+        let migrations: Vec<_> = MIGRATOR.iter().collect();
+        let mut seen = std::collections::HashSet::new();
+        for migration in &migrations {
+            assert!(
+                seen.insert(migration.checksum.as_ref().to_vec()),
+                "duplicate sqlx checksum on migration {}",
+                migration.version
+            );
+        }
+
+        // SQLx 0.9 records SHA-384 over the raw file bytes. Recompute a
+        // spread of pinned files so a silent byte edit fails here too.
+        for (version, sql) in [
+            (
+                1,
+                include_str!("../../../migrations/0001_initial_schema.sql"),
+            ),
+            (6, include_str!("../../../migrations/0006_moderation.sql")),
+            (
+                29,
+                include_str!("../../../migrations/0029_workflow_run_snapshots.sql"),
+            ),
+            (35, include_str!("../../../migrations/0035_ci_grants.sql")),
+            (
+                36,
+                include_str!("../../../migrations/0036_workflow_run_error_codes.sql"),
+            ),
+            (
+                40,
+                include_str!("../../../migrations/0040_agent_drafts.sql"),
+            ),
+            (
+                42,
+                include_str!("../../../migrations/0042_ci_merge_gate.sql"),
+            ),
+        ] {
+            let migration = migrations
+                .iter()
+                .find(|m| m.version == version)
+                .expect("pinned migration present");
+            let expected = sha2::Sha384::digest(sql.as_bytes()).to_vec();
+            assert_eq!(
+                migration.checksum.as_ref(),
+                expected.as_slice(),
+                "sqlx checksum mismatch on migration {version:04}"
+            );
+        }
+    }
+
+    fn added_columns(statement: &str) -> Vec<String> {
+        let normalized = normalize_sql(statement);
+        let mut columns = Vec::new();
+        let mut rest = normalized.as_str();
+        while let Some(pos) = rest.find("add column") {
+            rest = rest[pos + "add column".len()..].trim_start();
+            if let Some(name) = rest
+                .split(|ch: char| ch.is_whitespace() || ch == '(' || ch == ';' || ch == ',')
+                .next()
+                .map(|s| s.trim_matches('"').to_owned())
+                .filter(|s| !s.is_empty())
+            {
+                columns.push(name);
+            }
+        }
+        columns
+    }
+
+    #[test]
+    fn no_table_is_created_twice_across_migrations() {
+        let mut migrations: Vec<_> = MIGRATOR.iter().collect();
+        migrations.sort_by_key(|migration| migration.version);
+        let mut created: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut duplicates = Vec::new();
+        for migration in migrations {
+            for statement in split_sql_statements(migration.sql.as_ref()) {
+                let normalized = normalize_sql(&statement);
+                if !normalized.starts_with("create table") || normalized.contains(" partition of ")
+                {
+                    continue;
+                }
+                if let Some(table) = identifier_after_keyword(&statement, "create table") {
+                    if let Some(first) = created.insert(table.clone(), migration.version) {
+                        duplicates.push(format!(
+                            "{table} created by {:04} and {:04}",
+                            first, migration.version
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            duplicates.is_empty(),
+            "each table must be created exactly once:\n{}",
+            duplicates.join("\n")
+        );
+    }
+
+    #[test]
+    fn no_column_is_added_twice_except_pinned_search_tsv_evolution() {
+        // events.search_tsv is intentionally dropped and re-added as the FTS
+        // policy evolves (negative skip-set, fresh-install allowlist, lease
+        // exclusion, agent-draft exclusion). Every other ADD COLUMN must be
+        // unique per table.
+        let pinned_search_tsv_chain = [5, 8, 14, 40];
+        let mut migrations: Vec<_> = MIGRATOR.iter().collect();
+        migrations.sort_by_key(|migration| migration.version);
+        let mut added: std::collections::HashMap<(String, String), i64> =
+            std::collections::HashMap::new();
+        let mut duplicates = Vec::new();
+        let mut search_tsv_versions = Vec::new();
+        for migration in migrations {
+            for statement in split_sql_statements(migration.sql.as_ref()) {
+                if !normalize_sql(&statement).contains("alter table") {
+                    continue;
+                }
+                let Some(table) = identifier_after_keyword(&statement, "alter table") else {
+                    continue;
+                };
+                for column in added_columns(&statement) {
+                    if table == "events" && column == "search_tsv" {
+                        search_tsv_versions.push(migration.version);
+                        continue;
+                    }
+                    if let Some(first) =
+                        added.insert((table.clone(), column.clone()), migration.version)
+                    {
+                        duplicates.push(format!(
+                            "{table}.{column} added by {first:04} and {:04}",
+                            migration.version
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            duplicates.is_empty(),
+            "each column must be added exactly once:\n{}",
+            duplicates.join("\n")
+        );
+        assert_eq!(
+            search_tsv_versions, pinned_search_tsv_chain,
+            "search_tsv evolution chain changed: update the pin deliberately"
+        );
+    }
+
+    #[test]
+    fn agent_drafts_stale_dependency_comment_is_preserved_and_corrected_beside_sql() {
+        // The 0040 file header claims a 0039 dependency that does not exist.
+        // The applied bytes stay frozen; the correction lives in the
+        // operation map, and this test locks both sides together.
+        let sql = include_str!("../../../migrations/0040_agent_drafts.sql");
+        let first_line = sql.lines().next().unwrap_or("");
+        assert_eq!(
+            first_line, "-- Depends on reserved 0039 relay authorization migration; source only.",
+            "applied 0040 bytes must stay frozen, stale comment included"
+        );
+
+        let map: serde_json::Value =
+            serde_json::from_str(include_str!("../../../migrations/operation-map.json"))
+                .expect("operation map parses");
+        let entry = map
+            .get("fork")
+            .and_then(|fork| fork.as_array())
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|e| e.get("version") == Some(&40.into()))
+            })
+            .expect("operation map covers 0040");
+        assert_eq!(
+            entry.get("prerequisites"),
+            Some(&serde_json::json!([1])),
+            "0040 depends only on the 0001 base, not on 0039"
+        );
+        assert!(
+            entry
+                .get("notes")
+                .and_then(|n| n.as_str())
+                .is_some_and(|n| n.contains("CORRECTED DEPENDENCY")),
+            "0040 correction must be recorded beside the SQL"
+        );
+    }
+
     #[test]
     fn migration_lint_detects_tables_missing_community_id_by_default() {
         let sql = r#"
