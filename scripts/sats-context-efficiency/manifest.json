@@ -71,11 +71,23 @@
       "mode": "0o600"
     },
     {
+      "path": "config/archimedes-codex-system.md",
+      "before_sha256": "0dcf1fefe4bf82019beed6b9fc9f6e236745353a9f5cff0365f42742ad92a23e",
+      "after_sha256": "d457d54746b49a9a0769855bdf79897308189f727702ca3566a2581798300d3a",
+      "mode": "0o600"
+    },
+    {
+      "path": "config/archimedes-hermes-system.md",
+      "before_sha256": "648dcf2114d107b04e23081876fa6c4e94b2f47404cae59fecbb0e3ec54db31b",
+      "after_sha256": "efafc161af758655d3f4e9298b74c2892721bccdde1eaa5d32558eedd8c92fd6",
+      "mode": "0o600"
+    },
+    {
       "path": "scripts/launch_buzz_agent.sh",
       "before_sha256": "caaa91feb9d1f6321af1abef5754cd6dd7e41dfeb0f9dd12ab04bd6b6271208e",
       "after_sha256": "12a13d4c0a5e2c32032e9ceb9302a813f478f0b709a71c2bf8ef79d6aebc4f6e",
       "mode": "0o755"
     }
   ],
-  "patch_sha256": "fa67c1953ad685eefb8e513336cae37c1ee495eb0de8005b7562ff85e322e3cb"
+  "patch_sha256": "b67c4c09c9582fa12fb53a99569a54bde33264c5cb7fe952913f51e18e0d58a5"
 }

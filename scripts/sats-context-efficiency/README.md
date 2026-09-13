@@ -2,7 +2,8 @@
 
 This package records the accepted context-efficiency and Fable 5.1 high design
 standards for the nine Framework Sats Buzz prompt files, plus owner-neutral
-context-efficiency instructions for the two Alpheus prompts. It is a candidate for
+context-efficiency instructions for two Alpheus prompts and two Archimedes
+deployment copies. It is a candidate for
 independent review. It does not install files or activate running agents.
 
 The maintained saved files are under `/home/victor/projects/buzz/config/` and
@@ -13,7 +14,7 @@ with the complete live launcher would import unrelated operational changes.
 This package therefore tracks only the exact prompt changes and matching pins.
 It does not replace the saved-file owner or the historical migration owner.
 
-`manifest.json` binds twelve exact preimages and postimages. `saved-prompts.patch`
+`manifest.json` binds fourteen exact preimages and postimages. `saved-prompts.patch`
 adds task-triggered references to the maintained Sats context-efficiency and
 design standards. Required safety and review instructions remain complete;
 there are no per-agent token budgets or token-based stopping rules. The design
@@ -28,10 +29,15 @@ The September 12 instruction-loading repair already removed the obsolete
 efficiency paragraph; the inspected preimages have no blanket document-load
 ban. This package builds on those saved bytes.
 
-The Alpheus changes replace only the efficiency paragraph, correct the blanket
+The Alpheus and Archimedes changes replace only the efficiency paragraph, correct the blanket
 full-context reread claim, and retain the existing PR follow-through ownership
 rule. They preserve Alpheus identity, memory, models, tools, capacity, and
 approval rules. They introduce no Sats canon pointer or Sats design policy.
+The Archimedes copies under Victor's projects directory are deployment copies,
+not active owner sources. Their owner-scoped files and launcher under
+`/home/sats/buzz-agents/` belong to the separate family rollout. The Victor
+launcher has no Archimedes prompt pins. This package does not touch that
+owner's files or claim active Archimedes adoption.
 
 Run the read-only check against the current owner or an exact retained copy:
 

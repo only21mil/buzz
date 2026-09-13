@@ -16,8 +16,9 @@ SEATS = (
     "sats-codex", "sats-codex-2", "sats-codex-r", "sats-dsv4f",
     "sats-glm", "sats-glm52", "sats-hermes", "sats-claude-code",
     "sats-claude-code-r", "alpheus-codex", "alpheus-claude-code",
+    "archimedes-codex", "archimedes-hermes",
 )
-ACTIVE = SEATS[:7] + SEATS[9:]
+ACTIVE = SEATS[:7] + SEATS[9:11]
 LAUNCHER = "scripts/launch_buzz_agent.sh"
 EXPECTED = {f"config/{seat}-system.md" for seat in SEATS} | {LAUNCHER}
 
@@ -67,7 +68,7 @@ def verify(source):
         check("fail 'Sats Claude Code and Sats Claude Code-R are retired" in candidate,
               "Retired-seat rejection missing")
         subprocess.run(["bash", "-n", str(staged / LAUNCHER)], check=True)
-    print("PASS: twelve exact sources, patch, nine pins, preserved launcher, shell syntax; no installation")
+    print("PASS: fourteen exact sources, patch, nine pins, preserved launcher, shell syntax; no installation")
 
 
 if __name__ == "__main__":

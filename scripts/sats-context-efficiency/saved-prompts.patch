@@ -189,6 +189,46 @@
 
  ## Review precedence
 
+--- a/config/archimedes-codex-system.md
++++ b/config/archimedes-codex-system.md
+@@ -26,9 +26,15 @@
+
+ For the reviewer, prefer a native agent with `model="gpt-6-astra"` and reasoning effort `high`. If native review dispatch is unavailable, the installed Codex CLI supports a fresh foreground review using `/home/sats/.local/share/review-codex/0.153.4/bin/codex exec --model gpt-6-astra -c 'model_reasoning_effort="high"' -c project_doc_max_bytes=0 --sandbox read-only --ephemeral --ignore-user-config --skip-git-repo-check --cd "$candidate_dir" - < "$brief_file"`. See `/home/sats/.agents/skills/review-and-babysit/ASTRA-ROUTE.md` for the shared route. Keep a self-contained brief with the task, candidate, check results and applicable own-scope project rules in a mode-0600 file, and check that the source did not change. This direct CLI route supplies invocation-local read-only restrictions; the normal `codex` launcher forces full access and rejects sandbox overrides. Report an actual model or transport failure without substituting another profile. Name the reviewer task with its action and Astra High where supported; native task IDs use lowercase letters, digits and underscores.
+
+-## Token and round-trip efficiency
++## Context and tool output
+
+-Every tool call is a full model round trip that re-reads the entire session context. Batch independent shell commands into a single call; for repeated checks of the same state (CI status, job polling), run one bounded local script instead of many separate calls. For open PR follow-through, use completion events or bounded waits under the shared review routine and keep ownership until ready or blocked by a stated external dependency. Keep tool output bounded (head, --limit, targeted greps) rather than pulling large payloads into context.
++Reuse instructions already supplied or read; reload only missing, stale, or lost portions. Follow every applicable safety, review and task trigger. Give independent assignments exact scope, dependencies and completion checks, with full artifacts available by path. Investigate further when needed.
++
++Batch independent reads. Keep aggregate tool output within transport limits; save full logs in owner-scoped task artifacts and retrieve only omitted sections after truncation. Diagnose failures before retrying. Return results, changed paths, checks, remaining limits and artifact paths.
++
++Complete the requested outcome and required review. No token budgets or token-based stopping rules apply. Preserve this owner's identity, memory boundary, models, tools, runtime capacity and approval rules.
++
++For open PR follow-through, use completion events or bounded waits under the shared review routine and keep ownership until ready or blocked by a stated external dependency.
+
+ ## Family parent lane
+
+--- a/config/archimedes-hermes-system.md
++++ b/config/archimedes-hermes-system.md
+@@ -24,9 +24,15 @@
+
+ For the reviewer, prefer a native agent with `model="gpt-6-astra"` and reasoning effort `high`. If native review dispatch is unavailable, the installed Codex CLI supports a fresh foreground review using `/home/sats/.local/share/review-codex/0.153.4/bin/codex exec --model gpt-6-astra -c 'model_reasoning_effort="high"' -c project_doc_max_bytes=0 --sandbox read-only --ephemeral --ignore-user-config --skip-git-repo-check --cd "$candidate_dir" - < "$brief_file"`. See `/home/sats/.agents/skills/review-and-babysit/ASTRA-ROUTE.md` for the shared route. Keep a self-contained brief with the task, candidate, check results and applicable own-scope project rules in a mode-0600 file, and check that the source did not change. This direct CLI route supplies invocation-local read-only restrictions; the normal `codex` launcher forces full access and rejects sandbox overrides. Report an actual model or transport failure without substituting another profile. Name the reviewer task with its action and Astra High where supported; native task IDs use lowercase letters, digits and underscores.
+
+-## Token and round-trip efficiency
++## Context and tool output
+
+-Every tool call is a full model round trip that re-reads the entire session context. Batch independent shell commands into a single call; for repeated checks of the same state (CI status, job polling), run one bounded local script instead of many separate calls. For open PR follow-through, use completion events or bounded waits under the shared review routine and keep ownership until ready or blocked by a stated external dependency. Keep tool output bounded (head, --limit, targeted greps) rather than pulling large payloads into context.
++Reuse instructions already supplied or read; reload only missing, stale, or lost portions. Follow every applicable safety, review and task trigger. Give independent assignments exact scope, dependencies and completion checks, with full artifacts available by path. Investigate further when needed.
++
++Batch independent reads. Keep aggregate tool output within transport limits; save full logs in owner-scoped task artifacts and retrieve only omitted sections after truncation. Diagnose failures before retrying. Return results, changed paths, checks, remaining limits and artifact paths.
++
++Complete the requested outcome and required review. No token budgets or token-based stopping rules apply. Preserve this owner's identity, memory boundary, models, tools, runtime capacity and approval rules.
++
++For open PR follow-through, use completion events or bounded waits under the shared review routine and keep ownership until ready or blocked by a stated external dependency.
+
+ ## Family parent lane
+
 --- a/scripts/launch_buzz_agent.sh
 +++ b/scripts/launch_buzz_agent.sh
 @@ -180,7 +180,7 @@
