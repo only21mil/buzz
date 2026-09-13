@@ -20,15 +20,20 @@ stay linked as background, not as instructions.
 | Common ancestor | 5bf78671 | 5bf78671f45178f8de02ba18d3d321cbbf19cd1f |
 
 See pinned-refs.md for what each pin means and which ones resolve in this
-checkout. See current-state.md for why source, upstream, and deployed identity
+checkout. See current-state-matrix.md for why source, upstream, and deployed identity
 are three separate columns that must never be merged into one.
 
 ## Files
 
-- current-state.md. Source vs upstream vs deployed matrix. No guessed green cells.
+P00 writes markdown only. P00b (PR #227) writes the two JSON ledgers. The
+split is deliberate so P08 merges both branches with no filename conflicts.
+
+- current-state-matrix.md. Source vs upstream vs deployed matrix. No guessed green cells.
 - pinned-refs.md. The four pins, full SHAs, verification commands.
-- adoption-ledger.md. Skeleton covering all 86 finding IDs and all 29
-  post-snapshot upstream commits. Every row starts open.
+- adoption-ledger.md. Human index over all 86 finding IDs, port-order notes,
+  and cross-references into the JSON ledgers. It duplicates no JSON row.
+- upstream-dispositions.json (P00b). All 29 post-snapshot commits.
+- finding-dispositions.json (P00b). 28 key pre-snapshot gaps.
 - ci-checks.md. Required CI checks as observed at the fork tip, with the
   ruleset caveat spelled out.
 - release-identity.md. Release identity and version routes per platform.
