@@ -16,8 +16,8 @@ use auth::{
 };
 use axum::{
     body::Bytes,
-    extract::{OriginalUri, Path, Query, State},
-    http::{header, HeaderMap, HeaderValue, Method},
+    extract::{Path, Query, State},
+    http::{header, HeaderMap, HeaderValue, Method, Uri},
     middleware::{self, Next},
     response::Response,
     routing::get,
@@ -108,19 +108,23 @@ fn validate(value: Option<&str>, allowed: &[&str], code: &'static str) -> Result
 }
 
 /// Request target (path plus query string) the NIP-98 `u` tag signs.
-/// `OriginalUri` preserves the pre-nesting target including the query string.
-fn request_target(uri: &OriginalUri) -> String {
-    uri.0
-        .path_and_query()
+///
+/// This is the post-nesting `Uri`: axum strips the `/api/admin/v1` mount
+/// prefix before inner handlers run, and `authorize` re-adds it. That keeps
+/// the canonical URL identical whether the router is nested (production) or
+/// mounted directly (tests). Using `OriginalUri` here would double the
+/// prefix under the production nest and 401 every authenticated request.
+fn request_target(uri: &Uri) -> String {
+    uri.path_and_query()
         .map(|target| target.as_str().to_owned())
-        .unwrap_or_else(|| uri.0.path().to_owned())
+        .unwrap_or_else(|| uri.path().to_owned())
 }
 
 async fn reports(
     State(state): State<Arc<crate::state::AppState>>,
     headers: HeaderMap,
     method: Method,
-    uri: OriginalUri,
+    uri: Uri,
     Query(query): Query<ReportQuery>,
 ) -> Result<Json<Vec<buzz_db::admin_moderation::AdminReport>>, ApiError> {
     authorize(
@@ -161,7 +165,7 @@ async fn report_detail(
     State(state): State<Arc<crate::state::AppState>>,
     headers: HeaderMap,
     method: Method,
-    uri: OriginalUri,
+    uri: Uri,
     Path(id): Path<Uuid>,
 ) -> Result<Json<buzz_db::admin_moderation::AdminReportDetail>, ApiError> {
     authorize(
@@ -196,7 +200,7 @@ async fn feedback(
     State(state): State<Arc<crate::state::AppState>>,
     headers: HeaderMap,
     method: Method,
-    uri: OriginalUri,
+    uri: Uri,
 ) -> Result<Json<Vec<FeedbackSummary>>, ApiError> {
     authorize(
         &state,
@@ -231,7 +235,7 @@ async fn feedback_detail(
     State(state): State<Arc<crate::state::AppState>>,
     headers: HeaderMap,
     method: Method,
-    uri: OriginalUri,
+    uri: Uri,
     Path(id): Path<Uuid>,
 ) -> Result<Json<buzz_db::admin_moderation::AdminFeedback>, ApiError> {
     authorize(
@@ -254,7 +258,7 @@ async fn feedback_attachment(
     State(state): State<Arc<crate::state::AppState>>,
     headers: HeaderMap,
     method: Method,
-    uri: OriginalUri,
+    uri: Uri,
     Path((id, sha256)): Path<(Uuid, String)>,
 ) -> Result<Response, ApiError> {
     authorize(
@@ -332,7 +336,7 @@ async fn probe(
     State(state): State<Arc<crate::state::AppState>>,
     headers: HeaderMap,
     method: Method,
-    uri: OriginalUri,
+    uri: Uri,
 ) -> Result<Json<ProbeResponse>, ApiError> {
     let principal = authorize(
         &state,
@@ -385,7 +389,7 @@ async fn list_operators(
     State(state): State<Arc<crate::state::AppState>>,
     headers: HeaderMap,
     method: Method,
-    uri: OriginalUri,
+    uri: Uri,
 ) -> Result<Json<Vec<OperatorEntry>>, ApiError> {
     let principal = authorize(
         &state,
@@ -424,7 +428,7 @@ async fn get_operator(
     State(state): State<Arc<crate::state::AppState>>,
     headers: HeaderMap,
     method: Method,
-    uri: OriginalUri,
+    uri: Uri,
     Path(pubkey_hex): Path<String>,
 ) -> Result<Json<OperatorEntry>, ApiError> {
     let principal = authorize(
@@ -473,7 +477,7 @@ async fn put_operator(
     State(state): State<Arc<crate::state::AppState>>,
     headers: HeaderMap,
     method: Method,
-    uri: OriginalUri,
+    uri: Uri,
     Path(pubkey_hex): Path<String>,
     body: Bytes,
 ) -> Result<Json<OperatorEntry>, ApiError> {
@@ -511,7 +515,7 @@ async fn delete_operator(
     State(state): State<Arc<crate::state::AppState>>,
     headers: HeaderMap,
     method: Method,
-    uri: OriginalUri,
+    uri: Uri,
     Path(pubkey_hex): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let principal = authorize(
@@ -1850,5 +1854,66 @@ mod nip98_tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Production mounts this router nested at `/api/admin/v1` (see
+    /// `router.rs`). The signed URL must match through that nest: axum
+    /// strips the prefix before handlers run and `authorize` re-adds it.
+    /// Mounting unnested here would prove nothing about the deployed path.
+    #[tokio::test]
+    async fn nested_mount_signs_the_prefixed_url() {
+        use axum::Router;
+
+        let operator = Keys::generate();
+        let state = default_nip98_state(std::slice::from_ref(&operator)).await;
+        let nested = Router::new().nest("/api/admin/v1", router(state));
+
+        let url = admin_url("/probe");
+        let auth = nip98_header(&operator, &url, "GET", None, true, None);
+        let response = nested
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/v1/probe")
+                    .header(header::HOST, "admin.example")
+                    .header(header::AUTHORIZATION, auth)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["role"], "operator");
+    }
+
+    /// Negative control for the nest math: a signature over the unprefixed
+    /// path must not authenticate through the nested mount.
+    #[tokio::test]
+    async fn nested_mount_rejects_the_unprefixed_url() {
+        use axum::Router;
+
+        let operator = Keys::generate();
+        let state = default_nip98_state(std::slice::from_ref(&operator)).await;
+        let nested = Router::new().nest("/api/admin/v1", router(state));
+
+        let auth = nip98_header(
+            &operator,
+            "https://admin.example/probe",
+            "GET",
+            None,
+            true,
+            None,
+        );
+        let response = nested
+            .oneshot(
+                Request::builder()
+                    .uri("/api/admin/v1/probe")
+                    .header(header::HOST, "admin.example")
+                    .header(header::AUTHORIZATION, auth)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
