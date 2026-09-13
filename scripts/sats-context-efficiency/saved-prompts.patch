@@ -149,6 +149,46 @@
 +For all UI/UX and other design work, read the Sats design standard in `/home/victor/Obsidian/Victor/Agent-Shared/knowledge/wiki/systems/sats-model-tier-provider-policy.md`. Use foreground `claude -p --model claude-fable-5-1 --effort high`, reuse existing Fable design artifacts, and try Victor's other existing Claude account only on confirmed usage exhaustion. Follow that standard's real-CLI account route, private brief handling, runtime evidence, and failure rules. Astra retains code implementation and repairs. This external design route is the reviewed exception to native child-model defaults; it changes no current seat model, capacity, approval, privacy, or retirement rule.
 
  In progress updates, include: **HOLD:** none, or the current blocker. **Next action:** the concrete step you will take next. Continue authorized work without waiting for a reply.
+--- a/config/alpheus-codex-system.md
++++ b/config/alpheus-codex-system.md
+@@ -26,9 +26,15 @@
+
+ Repository delivery still follows `only21mil/buzz:docs/delivery-lifecycle.md`.
+
+-## Token and round-trip efficiency
++## Context and tool output
+
+-Every tool call is a full model round trip that re-reads the entire session context. Batch independent shell commands into a single call; for repeated checks of the same state (CI status, job polling), run one bounded local script instead of many separate calls. For open PR follow-through, use completion events or bounded waits under the shared review routine and keep ownership until ready or blocked by a stated external dependency. Keep tool output bounded (head, --limit, targeted greps) rather than pulling large payloads into context.
++Reuse instructions already supplied or read; reload only missing, stale, or lost portions. Follow every applicable safety, review and task trigger. Give independent assignments exact scope, dependencies and completion checks, with full artifacts available by path. Investigate further when needed.
++
++Batch independent reads. Keep aggregate tool output within transport limits; save full logs in owner-scoped task artifacts and retrieve only omitted sections after truncation. Diagnose failures before retrying. Return results, changed paths, checks, remaining limits and artifact paths.
++
++Complete the requested outcome and required review. No token budgets or token-based stopping rules apply. Preserve this owner's identity, memory boundary, models, tools, runtime capacity and approval rules.
++
++For open PR follow-through, use completion events or bounded waits under the shared review routine and keep ownership until ready or blocked by a stated external dependency.
+
+ ## Review precedence
+
+--- a/config/alpheus-claude-code-system.md
++++ b/config/alpheus-claude-code-system.md
+@@ -24,9 +24,15 @@
+
+ Repository delivery still follows `only21mil/buzz:docs/delivery-lifecycle.md`.
+
+-## Token and round-trip efficiency
++## Context and tool output
+
+-Every tool call is a full model round trip that re-reads the entire session context. Batch independent shell commands into a single call; for repeated checks of the same state (CI status, job polling), run one bounded local script instead of many separate calls. For open PR follow-through, use completion events or bounded waits under the shared review routine and keep ownership until ready or blocked by a stated external dependency. Keep tool output bounded (head, --limit, targeted greps) rather than pulling large payloads into context.
++Reuse instructions already supplied or read; reload only missing, stale, or lost portions. Follow every applicable safety, review and task trigger. Give independent assignments exact scope, dependencies and completion checks, with full artifacts available by path. Investigate further when needed.
++
++Batch independent reads. Keep aggregate tool output within transport limits; save full logs in owner-scoped task artifacts and retrieve only omitted sections after truncation. Diagnose failures before retrying. Return results, changed paths, checks, remaining limits and artifact paths.
++
++Complete the requested outcome and required review. No token budgets or token-based stopping rules apply. Preserve this owner's identity, memory boundary, models, tools, runtime capacity and approval rules.
++
++For open PR follow-through, use completion events or bounded waits under the shared review routine and keep ownership until ready or blocked by a stated external dependency.
+
+ ## Review precedence
+
 --- a/scripts/launch_buzz_agent.sh
 +++ b/scripts/launch_buzz_agent.sh
 @@ -180,7 +180,7 @@
@@ -214,3 +254,21 @@
      ;;
    alpheus-claude-code)
      private_key=${BUZZ_ALPHEUS_CLAUDE_PRIVATE_KEY:-}
+@@ -432,7 +432,7 @@
+     model='claude-fable-5[1m]'
+     session_title='Alpheus Claude Code · Fable 5 high'
+     system_prompt=/home/victor/projects/buzz/config/alpheus-claude-code-system.md
+-    system_prompt_sha256=e41ee7221122e1ccf2e255642383e511f411d49723336ab4110e59f69de7071b
++    system_prompt_sha256=e402f78869e556374c969618a359050728cf463291b9285bea22f9585f241095
+     # Mason manages this seat (Victor, 2026-08-15). The relay DB owner link is
+     # Mason; the harness owner stays Victor because buzz-acp resolves the owner
+     # from the Victor-signed attestation regardless of env. Mason is reachable
+@@ -458,7 +458,7 @@
+     model='gpt-6-astra[medium]'
+     session_title='Alpheus Codex · GPT-5.6 Sol high'
+     system_prompt=/home/victor/projects/buzz/config/alpheus-codex-system.md
+-    system_prompt_sha256=f42e7ee2c6bb91061e94c1323e4db088059e46e84455beccc918c2bc12e32729
++    system_prompt_sha256=29198fa167d4aada1585df611e1f3bd6ef312af4b5d5d970afd096a5be73b725
+     # Mason manages this seat (Victor, 2026-08-15). The relay DB owner link is
+     # Mason; the harness owner stays Victor because buzz-acp resolves the owner
+     # from the Victor-signed attestation regardless of env. Mason is reachable

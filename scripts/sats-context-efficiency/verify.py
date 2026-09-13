@@ -15,8 +15,9 @@ PACKAGE = Path(__file__).resolve().parent
 SEATS = (
     "sats-codex", "sats-codex-2", "sats-codex-r", "sats-dsv4f",
     "sats-glm", "sats-glm52", "sats-hermes", "sats-claude-code",
-    "sats-claude-code-r",
+    "sats-claude-code-r", "alpheus-codex", "alpheus-claude-code",
 )
+ACTIVE = SEATS[:7] + SEATS[9:]
 LAUNCHER = "scripts/launch_buzz_agent.sh"
 EXPECTED = {f"config/{seat}-system.md" for seat in SEATS} | {LAUNCHER}
 
@@ -58,7 +59,7 @@ def verify(source):
         pattern = r"system_prompt_sha256=[0-9a-f]{64}"
         check(re.sub(pattern, "PIN", original) == re.sub(pattern, "PIN", candidate),
               "Launcher change beyond pins")
-        for seat in SEATS[:7]:
+        for seat in ACTIVE:
             path = f"config/{seat}-system.md"
             check(f"system_prompt={manifest['source_owner']}/{path}\n"
                   f"    system_prompt_sha256={digest(staged / path)}" in candidate,
@@ -66,7 +67,7 @@ def verify(source):
         check("fail 'Sats Claude Code and Sats Claude Code-R are retired" in candidate,
               "Retired-seat rejection missing")
         subprocess.run(["bash", "-n", str(staged / LAUNCHER)], check=True)
-    print("PASS: ten exact sources, patch, seven pins, preserved launcher, shell syntax; no installation")
+    print("PASS: twelve exact sources, patch, nine pins, preserved launcher, shell syntax; no installation")
 
 
 if __name__ == "__main__":

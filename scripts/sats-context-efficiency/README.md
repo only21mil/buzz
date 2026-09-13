@@ -1,7 +1,8 @@
 # Saved Sats prompt update, September 13, 2026
 
 This package records the accepted context-efficiency and Fable 5.1 high design
-standards for the nine Framework Sats Buzz prompt files. It is a candidate for
+standards for the nine Framework Sats Buzz prompt files, plus owner-neutral
+context-efficiency instructions for the two Alpheus prompts. It is a candidate for
 independent review. It does not install files or activate running agents.
 
 The maintained saved files are under `/home/victor/projects/buzz/config/` and
@@ -12,7 +13,7 @@ with the complete live launcher would import unrelated operational changes.
 This package therefore tracks only the exact prompt changes and matching pins.
 It does not replace the saved-file owner or the historical migration owner.
 
-`manifest.json` binds ten exact preimages and postimages. `saved-prompts.patch`
+`manifest.json` binds twelve exact preimages and postimages. `saved-prompts.patch`
 adds task-triggered references to the maintained Sats context-efficiency and
 design standards. Required safety and review instructions remain complete;
 there are no per-agent token budgets or token-based stopping rules. The design
@@ -20,12 +21,17 @@ pointer preserves existing Fable artifact reuse and confirmed-usage account
 failover through the maintained standard. No design or model call is needed
 to apply this instruction update.
 
-Seven active-seat prompt pins change. The two retired Claude prompts remain
+Nine active-seat prompt pins change. The two retired Sats Claude prompts remain
 dormant and have no launcher pins. All other launcher bytes, native seat
 models, capacity, retirement rejection and scope boundaries are preserved.
 The September 12 instruction-loading repair already removed the obsolete
 efficiency paragraph; the inspected preimages have no blanket document-load
 ban. This package builds on those saved bytes.
+
+The Alpheus changes replace only the efficiency paragraph, correct the blanket
+full-context reread claim, and retain the existing PR follow-through ownership
+rule. They preserve Alpheus identity, memory, models, tools, capacity, and
+approval rules. They introduce no Sats canon pointer or Sats design policy.
 
 Run the read-only check against the current owner or an exact retained copy:
 

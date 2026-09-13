@@ -59,11 +59,23 @@
       "mode": "0o600"
     },
     {
+      "path": "config/alpheus-codex-system.md",
+      "before_sha256": "f42e7ee2c6bb91061e94c1323e4db088059e46e84455beccc918c2bc12e32729",
+      "after_sha256": "29198fa167d4aada1585df611e1f3bd6ef312af4b5d5d970afd096a5be73b725",
+      "mode": "0o600"
+    },
+    {
+      "path": "config/alpheus-claude-code-system.md",
+      "before_sha256": "e41ee7221122e1ccf2e255642383e511f411d49723336ab4110e59f69de7071b",
+      "after_sha256": "e402f78869e556374c969618a359050728cf463291b9285bea22f9585f241095",
+      "mode": "0o600"
+    },
+    {
       "path": "scripts/launch_buzz_agent.sh",
       "before_sha256": "caaa91feb9d1f6321af1abef5754cd6dd7e41dfeb0f9dd12ab04bd6b6271208e",
-      "after_sha256": "6342c223c01ab404722238ae5afb736d116b7271156f2b45bc127dcf3dff2c5a",
+      "after_sha256": "12a13d4c0a5e2c32032e9ceb9302a813f478f0b709a71c2bf8ef79d6aebc4f6e",
       "mode": "0o755"
     }
   ],
-  "patch_sha256": "367102b6a4f79e4d309fd0f87aaa22dbe40432f9407050d5aeef9ee3b9b4a2d4"
+  "patch_sha256": "fa67c1953ad685eefb8e513336cae37c1ee495eb0de8005b7562ff85e322e3cb"
 }
