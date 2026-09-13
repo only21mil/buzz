@@ -1165,6 +1165,10 @@ async fn dispatch_action_with_generation(
             headers,
             body,
         } => {
+            // The rendered URL is the last place a template can turn into a
+            // cleartext destination. Reject before claiming the effect or
+            // touching DNS, so a bad render never sends headers or a body.
+            crate::schema::require_https_webhook_url(url)?;
             let candidate_payload = serde_json::to_value(WebhookEffectPayload {
                 url: url.clone(),
                 method: method.clone().unwrap_or_else(|| "POST".to_owned()),
@@ -1210,6 +1214,9 @@ async fn dispatch_action_with_generation(
                     "stored webhook effect payload has a mismatched idempotency key".into(),
                 ));
             }
+            // Stored claims predate nothing: re-check the frozen URL in case
+            // the definition was saved before HTTPS enforcement existed.
+            crate::schema::require_https_webhook_url(&payload.url)?;
             info!(run_id = %run_id, step = step_id, "CallWebhook delivery");
 
             #[cfg(feature = "reqwest")]
@@ -3069,6 +3076,40 @@ mod tests {
             }
             other => panic!("unexpected action: {other:?}"),
         }
+    }
+
+    #[test]
+    fn rendered_cleartext_webhook_url_rejected_before_send() {
+        // Definition load allows templated URLs. The executor enforces HTTPS
+        // on the rendered value before claiming the effect or touching DNS,
+        // so a template resolving to cleartext never sends headers or a body.
+        let ctx = make_trigger();
+        let step = Step {
+            id: "hook".to_owned(),
+            name: None,
+            if_expr: None,
+            timeout_secs: None,
+            action: ActionDef::CallWebhook {
+                url: "{{steps.setup.output.url}}".to_owned(),
+                method: None,
+                headers: None,
+                body: None,
+            },
+        };
+        let outputs = HashMap::from([(
+            "setup".into(),
+            json!({ "url": "http://internal:1902/hook" }),
+        )]);
+        let resolved = resolve_step_templates(&step, &ctx, &outputs).unwrap();
+        let ActionDef::CallWebhook { url, .. } = resolved else {
+            panic!("expected CallWebhook");
+        };
+        assert_eq!(url, "http://internal:1902/hook");
+        let err = crate::schema::require_https_webhook_url(&url).unwrap_err();
+        assert!(
+            matches!(err, WorkflowError::InvalidDefinition(_)),
+            "rendered http webhook url must be rejected, got: {err}"
+        );
     }
 
     #[tokio::test]

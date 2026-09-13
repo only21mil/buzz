@@ -243,7 +243,7 @@ pub async fn ci_preflight(
     let url = super::bridge::nip98_expected_url(&state.config.relay_url, &tenant, "/ci/preflight");
     let super::bridge::VerifiedBridgeAuth {
         pubkey,
-        event_id_bytes: _event_id_bytes,
+        event_id_bytes,
         ..
     } = super::bridge::verify_bridge_auth(
         &headers,
@@ -252,6 +252,10 @@ pub async fn ci_preflight(
         Some(&body),
         state.config.require_auth_token,
     )?;
+
+    // Same replay fence as every other NIP-98 route: without the shared
+    // `SET NX EX` claim, a captured preflight authorization replays.
+    super::bridge::check_nip98_replay(&state, &tenant, event_id_bytes).await?;
 
     // Parse the request body.
     let request: PreflightRequest = serde_json::from_slice(&body)

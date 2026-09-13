@@ -831,8 +831,13 @@ pub async fn validate_admin_event(
 
             // Not the author, or author who is no longer a member of a private channel —
             // must be owner/admin or the owning human of the message's agent-author.
-            let members = state.db.get_members(tenant.community(), channel_id).await?;
-            if actor_is_channel_owner_or_admin(&members, &actor_bytes) {
+            // Single role lookup: a full roster scan would miss an owner/admin
+            // past the roster paging boundary on large channels.
+            let actor_role = state
+                .db
+                .get_member_role(tenant.community(), channel_id, &actor_bytes)
+                .await?;
+            if actor_role.is_some_and(|role| role == "owner" || role == "admin") {
                 Ok(())
             } else {
                 // Allow the owning human of the agent that authored the target message,
@@ -2681,12 +2686,6 @@ fn author_delete_can_use_self_delete_path(author: &[u8], actor: &[u8], event: &E
     author == actor && !has_moderation_delete_metadata(event)
 }
 
-fn actor_is_channel_owner_or_admin(members: &[MemberRecord], actor: &[u8]) -> bool {
-    members
-        .iter()
-        .any(|m| m.pubkey == actor && (m.role == "owner" || m.role == "admin"))
-}
-
 #[cfg(test)]
 fn delete_tombstone_content(
     actor_hex: String,
@@ -3724,6 +3723,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn group_member_snapshot_keeps_members_past_one_thousand() {
+        // Port of upstream e0940927f (#5765): the 39002 snapshot builder must
+        // not truncate at the historical 1,000-row roster boundary. A late
+        // joining owner at position 1,501 must appear with its role intact.
+        let channel_id = Uuid::new_v4();
+        let members: Vec<MemberRecord> = (0_u16..1_501)
+            .map(|index| MemberRecord {
+                channel_id,
+                pubkey: vec![(index >> 8) as u8, index as u8],
+                role: if index == 1_500 { "owner" } else { "member" }.to_string(),
+                joined_at: chrono::Utc::now(),
+                invited_by: None,
+                removed_at: None,
+            })
+            .collect();
+
+        let tags = group_member_tags(&channel_id.to_string(), &members, &HashSet::new())
+            .expect("build tags");
+        assert_eq!(tags.len(), 1_502, "d tag plus every member p tag");
+
+        let late_pubkey = hex::encode(&members[1_500].pubkey);
+        assert!(tags.iter().any(|tag| {
+            let fields = tag.as_slice();
+            fields.len() == 4
+                && fields[0] == "p"
+                && fields[1] == late_pubkey
+                && fields[3] == "owner"
+        }));
+    }
+
     async fn discovery_test_state() -> (Arc<AppState>, sqlx::PgPool, tempfile::TempDir) {
         let git_storage = tempfile::tempdir().expect("fixture Git storage");
         let mut config = crate::config::Config::from_env_with_test_git_paths(git_storage.path())
@@ -4050,37 +4080,5 @@ mod tests {
         assert!(!author_delete_can_use_self_delete_path(
             &actor, &actor, &event
         ));
-    }
-
-    #[test]
-    fn member_role_is_not_owner_or_admin_for_moderation_metadata() {
-        let channel_id = Uuid::new_v4();
-        let actor = vec![7_u8; 32];
-        let members = vec![MemberRecord {
-            channel_id,
-            pubkey: actor.clone(),
-            role: "member".to_string(),
-            joined_at: chrono::Utc::now(),
-            invited_by: None,
-            removed_at: None,
-        }];
-
-        assert!(!actor_is_channel_owner_or_admin(&members, &actor));
-    }
-
-    #[test]
-    fn admin_role_is_owner_or_admin_for_moderation_metadata() {
-        let channel_id = Uuid::new_v4();
-        let actor = vec![7_u8; 32];
-        let members = vec![MemberRecord {
-            channel_id,
-            pubkey: actor.clone(),
-            role: "admin".to_string(),
-            joined_at: chrono::Utc::now(),
-            invited_by: None,
-            removed_at: None,
-        }];
-
-        assert!(actor_is_channel_owner_or_admin(&members, &actor));
     }
 }
