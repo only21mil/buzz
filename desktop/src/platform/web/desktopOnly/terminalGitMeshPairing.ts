@@ -100,6 +100,8 @@ export function registerTerminalGitMeshPairingCommands(): void {
     push_block_reason: "Local Git is unavailable in the browser build.",
     can_pull: false,
     pull_block_reason: "Local Git is unavailable in the browser build.",
+    fetch_failed: false,
+    fetch_error: null,
   }));
   registerOffRead("list_project_local_repositories", () => []);
   registerMutations(PROJECT_GIT_MUTATIONS);

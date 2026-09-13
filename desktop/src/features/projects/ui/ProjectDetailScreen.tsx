@@ -83,6 +83,7 @@ import {
   PROJECT_DETAIL_PANEL_SEARCH_KEYS,
   PROJECT_REPOSITORY_SEARCH_KEYS,
   type ProjectDetailScreenProps,
+  fetchTitleForSyncStatus,
   projectPeople,
   pushPullTitle,
   snapshotHasContent,
@@ -457,8 +458,7 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       repoSnapshotQuery.isFetching ||
       repoStateQuery.isFetching ||
       repoSyncStatusQuery.isFetching,
-    fetchTitle:
-      repoSyncStatusQuery.data?.pullBlockReason ?? "Check for remote changes",
+    fetchTitle: fetchTitleForSyncStatus(repoSyncStatusQuery.data),
   };
   const projectPending = projectQuery.isPending;
   React.useEffect(() => {
