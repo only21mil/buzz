@@ -63,6 +63,19 @@ async function authHeaders(
   };
 }
 
+export interface CloneResult {
+  fs: LightningFS;
+  dir: string;
+  /**
+   * True when the refresh fetch failed and the returned checkout may be
+   * behind the relay. Only set when a usable local clone already exists —
+   * a fresh clone failure still throws.
+   */
+  stale: boolean;
+  /** The fetch failure behind `stale`, for logging or display. */
+  fetchError?: Error;
+}
+
 /**
  * Ensure a shallow clone exists in IndexedDB. If it already exists, fetch
  * the latest for the given ref.
@@ -71,7 +84,7 @@ export async function ensureClone(
   owner: string,
   repoName: string,
   ref: string,
-): Promise<{ fs: LightningFS; dir: string }> {
+): Promise<CloneResult> {
   const fs = getFs(owner, repoName);
   const dir = getDir(owner, repoName);
   const url = repoGitUrl(owner, repoName);
@@ -97,8 +110,15 @@ export async function ensureClone(
         singleBranch: true,
         headers,
       });
-    } catch {
-      // fetch may fail if ref hasn't changed — that's fine
+    } catch (error) {
+      // The local clone is still readable — report it as stale so the UI
+      // can say so instead of silently showing old data as current.
+      return {
+        fs,
+        dir,
+        stale: true,
+        fetchError: error instanceof Error ? error : new Error(String(error)),
+      };
     }
   } else {
     await clone({
@@ -114,7 +134,7 @@ export async function ensureClone(
     });
   }
 
-  return { fs, dir };
+  return { fs, dir, stale: false };
 }
 
 export interface TreeEntry {
