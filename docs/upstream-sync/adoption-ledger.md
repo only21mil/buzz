@@ -1,10 +1,25 @@
-# Adoption ledger skeleton
+# Adoption ledger index
 
 Every pre-snapshot adoption claim and every post-snapshot upstream commit gets
-exactly one disposition here before P08. Status starts at open on all rows.
-A row closes only with a fork landing SHA plus test evidence, or an explicit
-accepted absence with a revisit trigger. Deferred rows stay discoverable after
-any ancestry change.
+exactly one disposition before P08. Two machine-readable JSON files hold the
+authoritative rows; this markdown is the human index over all 86 finding IDs
+plus the cross-reference between the two.
+
+- upstream-dispositions.json (P00b, PR #227): all 29 post-snapshot commits.
+- finding-dispositions.json (P00b, PR #227): 28 key pre-snapshot gaps, namely
+  UD-10, UD-1, UD-2, FIND-3777, UD-4, UD-5, RB-3, UD-12, UD-3, D5, UD-9, D3,
+  D10, D8, MW-2, MW-7, MW-8, UD-11, UD-7, UD-8, UD-13, MS-1, MS-2, MS-6, MS-5,
+  CD-4, DB-CANDIDATES, and PRESNAP-MISC.
+- This file: the full 86-ID map, so the 58 IDs without a JSON row stay
+  visible, plus port-order notes and the said-but-unproved claims list.
+
+Status starts at open on all rows. A row closes only with a fork landing SHA
+plus test evidence, or an explicit accepted absence with a revisit trigger.
+Deferred rows stay discoverable after any ancestry change. Until PR #227
+merges, the JSON paths above refer to branch
+cursor/wave1-p00b-ledger-9723; after it merges they resolve on main next to
+this file, and P08 merges both branches without filename conflicts since P00
+writes only .md and P00b only .json.
 
 Severity follows the audit synthesis, which already corrected several
 inherited ratings. Evidence letters: V means checked against source or git
@@ -130,45 +145,24 @@ historical evidence. An inferred runtime effect is not a test result.
 Count check: 31 strategy/process plus 18 backend plus 10 desktop plus 8
 mobile/web plus 15 CI/delivery plus 4 build equals 86 IDs. Aliases from the
 older B1-B3 and C1-C5 reports map onto RB-3/RB-4/RB-5 and MW-3/MW-4/MW-5/D2/D1
-and stay traceable through those rows.
+and stay traceable through those rows. Of the 86, 25 have JSON coverage in
+finding-dispositions.json alongside three aggregate rows (FIND-3777,
+DB-CANDIDATES, PRESNAP-MISC); the remaining 61 stay owned by this index until
+P08 assigns them. The 29 commits live entirely in upstream-dispositions.json.
 
 ## Post-snapshot upstream commits
 
-Recommendations only. No row authorizes implementation. Port order must respect
-the dependency notes, especially the npub chain 18 through 23 and the help
-pair 6 before 5.
+Authoritative rows live in upstream-dispositions.json, landed by the P00b
+worker (PR #227, branch cursor/wave1-p00b-ledger-9723). That file holds all 29
+commits with origin SHA, decision, owner, landing or absence, tests, and
+revisit triggers. This ledger does not repeat them.
 
-| # | Upstream SHA | Subject | Decision | Disposition |
-| --- | --- | --- | --- | --- |
-| 1 | 4cd82f513 | Databricks reuse | keep existing conditional hold | open |
-| 2 | 6c35e82bd | Pi setup hints | adapt safe copy after adapter decision | open |
-| 3 | f3940ff21 | pinned MinIO images | adapt digests and compose refs | open |
-| 4 | 78618804e | per-agent ACP session scope | reconcile design first | open |
-| 5 | e17cdd9d5 | prompt uses help | adapt after entry 6 | open |
-| 6 | 44c1cc7df | CLI help tree | adapt with fork-only groups | open |
-| 7 | ec11f8e2f | avatar paths | adapt after correctness work | open |
-| 8 | d07457687 | exact mobile mentions | adapt with identity binding tests | open |
-| 9 | f3408fc62 | quota backoff | re-derive against fork client | open |
-| 10 | 9847b0967 | login-shell probe tests | defer until foundation decision | open |
-| 11 | 6146c4fd1 | default branch plus NIP-98 fix | split: land payload-tag fix early, branch ops need policy | open |
-| 12 | 813bbd141 | Buzz Pi adapter | decision needed before replacing launcher | open |
-| 13 | 092c6a727 | mention wrapping | adapt, keep fork mention authority | open |
-| 14 | 00209076c | presence persistence | adapt early with failure tests | open |
-| 15 | cec5c8fd9 | inbox truncation | adapt, keep fork badge semantics | open |
-| 16 | 051c3a270 | missing model errors | explicit behavior decision, test both paths | open |
-| 17 | 12023a3cb | Astra adapter minimum | adapt early with boundary tests | open |
-| 18 | bfc384855 | npub foundation | adapt before entries 19-23 | open |
-| 19 | 2226b6f95 | npub controls | adapt with entry 18 | open |
-| 20 | ad2a84131 | npub displays | adapt with entry 18 | open |
-| 21 | ad9591c43 | roster ordering | adapt after entry 18 | open |
-| 22 | 82656ffea | mobile npub | adapt as identity series | open |
-| 23 | 93761e411 | push npub | adapt with entry 22 | open |
-| 24 | c045321a7 | ACP overflow pacing | adapt to fork structure | open |
-| 25 | 218633b8f | link-preview pacing | re-derive and adapt | open |
-| 26 | 44316ff72 | mesh rc9 | optional coordinated update or explicit defer | open |
-| 27 | cd54e2682 | Responses routing | investigate then adapt | open |
-| 28 | 86c189e85 | ACP wake and session fences | adapt, keep held-thread recovery | open |
-| 29 | fa1b27bcc | mobile code styling | adapt without prohibited packages | open |
+What this file adds on top of the JSON is port order. Respect these chains
+when scheduling: the npub series 18 through 23 in numeric order, the help pair
+with entry 6 before entry 5, entry 14 (presence) and entry 17 (Astra floor)
+early, and the entry 11 split with the payload-tag fix landing ahead of the
+default-branch operations. Entry 12 (Pi adapter) needs its launcher decision
+before anything downstream of it moves.
 
 ## Pre-snapshot items that stay on this ledger
 
@@ -185,17 +179,22 @@ IFC, Google-dependent segmentation, closed hosted-browser PR108 recovery.
 
 ## Claims needing disposition
 
-The audit names these as said-but-unproved. Each needs a row above to close
-with evidence or an accepted-absence note:
+The audit names these as said-but-unproved. Each needs a JSON row or an index
+row below to close with evidence or an accepted-absence note. Where a JSON
+file already owns the claim, the JSON wins and this list only points at it.
 
 - Pre-snapshot adoption completeness, especially e0940927f, d8281b9c9,
-  86b9142a0, 24ec6a468, 5aed49b50, 70895b355.
-- "428 unchanged upstream blobs means adopted", rejected as proof.
+  86b9142a0, 24ec6a468, 5aed49b50, 70895b355. Owned by
+  finding-dispositions.json (UD-1, UD-2, FIND-3777 rows and pre-snapshot
+  miscellany); the full ID map above keeps the stragglers visible.
+- "428 unchanged upstream blobs means adopted", rejected as proof. Index-only,
+  no JSON row needed.
 - "Cherry-pick preserves identity", rejected; use unsquashed merges, record
-  cherry-picks as exceptional ports only.
+  cherry-picks as exceptional ports only. Index-only.
 - Blanket full-suite rerun claims and blanket delete recommendations, both
-  rejected in favor of targeted action.
+  rejected in favor of targeted action. Index-only.
 - Either unqualified "native accepted" or "never ran", both superseded by the
-  per-stage status matrix in known-holds.md.
+  per-stage status matrix in known-holds.md. Index-only.
 - Plaintext-settings and missing-key-dependency claims, both corrected and
-  still leaving real export-auth and admin-role gaps.
+  still leaving real export-auth and admin-role gaps. Export auth owned by
+  the UD-2 JSON row; the correction note stays here.

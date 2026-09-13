@@ -1,5 +1,9 @@
 # Ignored tests inventory
 
+Ledger home note: the BC-1 through BC-4 rows have no counterpart in P00b's
+finding-dispositions.json, so this file owns them until P01 dispositions them.
+Cross-reference only, nothing duplicated.
+
 From the recovered check run at 1e05fce2: root Rust 5819 passed, 8 failed,
 669 ignored across 168 result summaries; relay library alone 1038 passed, 8
 failed, 89 ignored; Tauri 2853 passed, 15 ignored; desktop frontend 6253
