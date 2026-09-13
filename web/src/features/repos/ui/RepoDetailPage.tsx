@@ -32,6 +32,7 @@ import { RepoTreeSection } from "./RepoTreeSection";
 import { RepoCommitsSection } from "./RepoCommitsSection";
 import { RepoReadmeSection } from "./RepoReadmeSection";
 import { RepoWorkItemsSection } from "./RepoWorkItemsSection";
+import { StaleCloneBanner } from "./StaleCloneBanner";
 
 function CopyableUrl({ url }: { url: string }) {
   const [copied, setCopied] = useState(false);
@@ -288,6 +289,8 @@ export function RepoDetailPage() {
     error: treeError,
     cloneError,
     isCloneLoading,
+    isCloneStale,
+    cloneFetchError,
   } = useGitTree(browseOwner, repoName, defaultRef);
   const {
     data: fetchedCommits,
@@ -387,6 +390,11 @@ export function RepoDetailPage() {
 
         {/* Refs & HEAD */}
         <RepoRefsSection refs={refs} isLoading={refsLoading} />
+
+        {/* Cached clone when refresh failed */}
+        {!showMockRepo && isCloneStale && !browseError && (
+          <StaleCloneBanner fetchError={cloneFetchError} />
+        )}
 
         {/* Clone/browse error banner */}
         {browseError && (
