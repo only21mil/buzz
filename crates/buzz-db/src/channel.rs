@@ -19,8 +19,9 @@ use crate::channel_members::acquire_channel_membership_lock;
 pub use crate::channel_members::{
     add_member, get_accessible_channel_ids, get_accessible_channels, get_agent_pubkeys,
     get_bot_members, get_member_count, get_member_counts_bulk, get_member_role, get_members,
-    get_members_bulk, get_users_bulk, is_member, membership_pairs, remove_member,
-    AccessibleChannel, BotChannelEntry, BotMemberRecord, MemberRecord, MemberRole, UserRecord,
+    get_members_bulk, get_members_paged, get_users_bulk, is_member, membership_pairs,
+    remove_member, AccessibleChannel, BotChannelEntry, BotMemberRecord, MemberRecord, MemberRole,
+    UserRecord,
 };
 pub use buzz_core::channel::{ChannelType, ChannelVisibility};
 
@@ -1200,6 +1201,81 @@ mod tests {
             .await
             .expect("load accessible channel ids");
         assert_eq!(channel_ids.len(), channel_count as usize);
+    }
+
+    /// `get_members` must return the complete roster, not a truncated prefix.
+    ///
+    /// The relay builds the kind 39002 (NIP-29 group members) snapshot and every
+    /// admin role lookup from this list, so a cap silently hides late joiners:
+    /// their clients never discover the channel, and an owner past the cutoff
+    /// reads as a non-member.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn get_members_returns_full_roster_beyond_1000() {
+        let pool = setup_pool().await;
+        let community_id = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_id);
+        let creator = random_pubkey();
+
+        // create_test_channel also inserts the creator as the first (owner) member.
+        let channel = create_test_channel(
+            &pool,
+            community_id,
+            "high-volume-roster",
+            ChannelType::Stream,
+            ChannelVisibility::Open,
+            None,
+            &creator,
+            None,
+        )
+        .await
+        .expect("create test channel");
+
+        // Bulk-insert additional members with strictly increasing `joined_at`, so
+        // member N lands at roster position N (the creator holds position 0).
+        // The final member is an owner joining well past the old 1000-row cutoff.
+        let extra_members = 1_500;
+        sqlx::query(
+            r#"
+            INSERT INTO channel_members (community_id, channel_id, pubkey, role, joined_at)
+            SELECT
+                $1,
+                $2,
+                decode(lpad(to_hex(n), 64, '0'), 'hex'),
+                (CASE WHEN n = $3 THEN 'owner' ELSE 'member' END)::member_role,
+                NOW() + (n || ' seconds')::interval
+            FROM generate_series(1, $3) n
+            "#,
+        )
+        .bind(community_id)
+        .bind(channel.id)
+        .bind(extra_members)
+        .execute(&pool)
+        .await
+        .expect("insert high-volume channel members");
+
+        let members = get_members(&pool, community, channel.id)
+            .await
+            .expect("load channel members");
+
+        assert_eq!(
+            members.len(),
+            extra_members as usize + 1,
+            "get_members truncated the roster"
+        );
+
+        // The last joiner sits at the final roster position — past any
+        // 1000-row cap — which also pins the documented `joined_at` ordering.
+        let late_owner = hex::decode(format!("{extra_members:064x}")).expect("hex pubkey");
+        let late = members.last().expect("roster is non-empty");
+        assert_eq!(
+            late.pubkey, late_owner,
+            "member who joined after the 1000th must be present and ordered last"
+        );
+        assert_eq!(
+            late.role, "owner",
+            "role of a late-joining owner must resolve correctly"
+        );
     }
 
     /// A random non-admin, non-owner user cannot remove someone else's bot.

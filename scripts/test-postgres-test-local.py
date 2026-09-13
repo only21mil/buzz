@@ -151,24 +151,59 @@ class IsolationTests(unittest.TestCase):
                 self.assertEqual(runner.schema_mode(name, 'buzz_db-1234'), 'desired')
 
     def test_admission_map_requires_hash_for_new_migration(self):
+        import hashlib
         import json
         import shutil
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / 'migrations').mkdir()
-            for migration in (frozen.ROOT / 'migrations').glob('*.sql'):
-                if int(migration.name.split('_')[0]) <= 35:
-                    shutil.copy(migration, root / 'migrations')
+            shutil.copytree(frozen.ROOT / 'migrations', root / 'migrations')
             (root / 'scripts').mkdir()
             shutil.copy(frozen.ROOT / 'scripts/migrations-0001-0035.sha256', root / 'scripts')
-            (root / 'migrations/0036_new.sql').write_text('-- new migration\n')
+            shutil.copy(frozen.ROOT / 'scripts/migrations-0036-0042.sha256', root / 'scripts')
+            shutil.copy(frozen.ROOT / 'scripts/migrations-0043-0049.sha256', root / 'scripts')
+            (root / 'migrations/0050_new.sql').write_text('-- new migration\n')
             ledger = root / 'map.json'
-            ledger.write_text('[]')
+            tail_entries = json.loads(
+                (frozen.ROOT / 'migrations/admission-map.json').read_text()
+            )
+            ledger.write_text(json.dumps(tail_entries))
             with self.assertRaisesRegex(ValueError, 'missing from admission map'):
                 frozen.check(root, ledger)
-            ledger.write_text(json.dumps([{'proposed_target': '0036_new.sql'}]))
+            ledger.write_text(
+                json.dumps(tail_entries + [{'proposed_target': '0050_new.sql'}])
+            )
             with self.assertRaisesRegex(ValueError, 'admission map missing source_commit'):
                 frozen.check(root, ledger)
+            # A complete entry passes: typed empty prerequisites are allowed
+            # for an independent operation, and fresh operations admit.
+            sql = (root / 'migrations/0050_new.sql').read_bytes()
+            entry = {
+                'proposed_target': '0050_new.sql',
+                'source_commit': 'abc123',
+                'source_path': 'migrations/0050_new.sql',
+                'source_sha256': hashlib.sha256(sql).hexdigest(),
+                'adapted_sql_sha256': hashlib.sha256(sql).hexdigest(),
+                'prerequisites': [],
+                'operations': ['create-table:brand_new_table'],
+                'desired_schema_delta': 'adds brand_new_table',
+            }
+            ledger.write_text(json.dumps(tail_entries + [entry]))
+            frozen.check(root, ledger)
+            # A missing prerequisites key still fails: empty must be explicit.
+            del entry['prerequisites']
+            ledger.write_text(json.dumps(tail_entries + [entry]))
+            with self.assertRaisesRegex(ValueError, 'admission map missing prerequisites'):
+                frozen.check(root, ledger)
+            # Re-applying a frozen operation under a new number fails unless
+            # the entry declares it in supersedes.
+            entry['prerequisites'] = []
+            entry['operations'] = ['create-table:agent_drafts']
+            ledger.write_text(json.dumps(tail_entries + [entry]))
+            with self.assertRaisesRegex(ValueError, 'duplicate semantic operation'):
+                frozen.check(root, ledger)
+            entry['supersedes'] = ['create-table:agent_drafts']
+            ledger.write_text(json.dumps(tail_entries + [entry]))
+            frozen.check(root, ledger)
 
     def test_inventory_selects_each_ignored_test_exactly(self):
         class Result:
@@ -184,6 +219,7 @@ class IsolationTests(unittest.TestCase):
             shutil.copytree(frozen.ROOT / 'migrations', root / 'migrations')
             (root / 'scripts').mkdir()
             shutil.copy(frozen.ROOT / 'scripts/migrations-0001-0035.sha256', root / 'scripts')
+            shutil.copy(frozen.ROOT / 'scripts/migrations-0036-0042.sha256', root / 'scripts')
             frozen.check(root)
             original = next((root / 'migrations').glob('0001_*.sql'))
             data = original.read_bytes()
@@ -191,6 +227,13 @@ class IsolationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'frozen migration changed'):
                 frozen.check(root)
             original.write_bytes(data)
+            # The 0036-0042 extension is frozen too, not just the old prefix.
+            extended = next((root / 'migrations').glob('0040_*.sql'))
+            extended_data = extended.read_bytes()
+            extended.write_bytes(extended_data + b'\n')
+            with self.assertRaisesRegex(ValueError, 'frozen migration changed'):
+                frozen.check(root)
+            extended.write_bytes(extended_data)
             (root / 'migrations/0001_collision.sql').write_text('-- collision\n')
             with self.assertRaisesRegex(ValueError, 'duplicate migration version|unrecorded historical'):
                 frozen.check(root)

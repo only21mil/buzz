@@ -667,6 +667,14 @@ dd {
   color: #9f2424;
 }
 
+.state.auth-prompt {
+  max-width: 32rem;
+}
+
+.state.auth-prompt a {
+  color: inherit;
+}
+
 @media (max-width: 720px) {
   .app-header {
     width: min(100% - 2rem, 1120px);

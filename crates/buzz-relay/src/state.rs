@@ -717,6 +717,12 @@ pub struct AppState {
     /// byte-identically to a relay without the mesh. Access via
     /// [`AppState::mesh`].
     pub mesh: Arc<std::sync::OnceLock<crate::mesh_boot::MeshHandle>>,
+
+    /// Backing store for DB-managed admin roster grants (`relay_operators`).
+    /// Wired to the `Db`-backed store in [`AppState::new`]; tests may swap in
+    /// [`crate::api::admin::roster::NoDbRoster`] via [`AppState::set_admin_roster`].
+    /// Config grants resolve without touching this store.
+    pub admin_roster: Arc<dyn crate::api::admin::roster::AdminRosterStore>,
 }
 
 impl AppState {
@@ -804,6 +810,7 @@ impl AppState {
             Arc::new(RedisNip98ReplayGuard::new(redis_pool.clone()));
         let admission_rate_limiter = Arc::new(RedisRateLimiter::new(redis_pool.clone()));
         let audit_enabled = audit_arc.is_some();
+        let admin_roster = crate::api::admin::roster::db_roster(db.clone());
         let state = Self {
             config: Arc::new(config),
             db,
@@ -890,6 +897,7 @@ impl AppState {
             // `crates/buzz-test-client` once those land).
             tracer: Arc::new(crate::conformance::NoopTracer),
             mesh: Arc::new(std::sync::OnceLock::new()),
+            admin_roster,
         };
         (
             state,
@@ -904,6 +912,21 @@ impl AppState {
     /// must no-op to today's behavior. Set once by `main.rs` after boot.
     pub fn mesh(&self) -> Option<&crate::mesh_boot::MeshHandle> {
         self.mesh.get()
+    }
+
+    /// Swap the admin roster backing store. Used by tests and by P03 when the
+    /// `Db`-backed store lands. Call before wrapping the state in `Arc`.
+    pub fn set_admin_roster(
+        &mut self,
+        store: Arc<dyn crate::api::admin::roster::AdminRosterStore>,
+    ) {
+        self.admin_roster = store;
+    }
+
+    /// Swap the NIP-98 replay guard. Used by tests to avoid Redis.
+    /// Call before wrapping the state in `Arc`.
+    pub fn set_nip98_replay(&mut self, guard: Arc<dyn buzz_auth::Nip98ReplayGuard>) {
+        self.nip98_replay = guard;
     }
 
     /// Record an event ID as locally-published for dedup, scoped to the
