@@ -148,6 +148,13 @@ export default defineConfig({
         "**/huddle-transcription.spec.ts",
         "**/agent-numeric-tuning.spec.ts",
         "**/needs-restart-screenshots.spec.ts",
+        "**/p01-persistent-agent-audience-contracts.spec.ts",
+        "**/p01-mention-recipient-contracts.spec.ts",
+        "**/p01-mention-clipboard-contracts.spec.ts",
+        "**/p01-voice-note-contracts.spec.ts",
+        "**/p01-workflow-contracts.spec.ts",
+        "**/p01-onboarding-contracts.spec.ts",
+        "**/p01-mobile-contracts.spec.ts",
       ],
       use: {
         ...devices["Desktop Chrome"],
