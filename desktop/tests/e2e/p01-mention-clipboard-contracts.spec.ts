@@ -565,13 +565,7 @@ test("composer copy and cut round-trip the mention they were pasted with", async
   await pasteIntoComposer(page, cut);
   await expectComposerChip(page);
 });
-// QUARANTINE — reproduced 2026-09-13 in this file: the fork send gate
-// (features/messages/lib/unresolvedMentionFeedback.ts, fork-only, no upstream
-// counterpart) rejects bare-text pastes naming a known non-member with
-// "That @mention is not linked to a member", where upstream binds and sends.
-// Hand to the P06 desktop owner: adjust the gate for profile-known
-// non-members or record an intentional exclusion, then un-quarantine.
-test.fixme("an identity the pasted content never shows binds no name", async ({
+test("an identity the pasted content never shows binds no name", async ({
   page,
 }) => {
   await page.goto("/");
@@ -608,13 +602,7 @@ test.fixme("an identity the pasted content never shows binds no name", async ({
     IMPOSTOR_PUBKEY,
   );
 });
-// QUARANTINE — reproduced 2026-09-13 in this file: the fork send gate
-// (features/messages/lib/unresolvedMentionFeedback.ts, fork-only, no upstream
-// counterpart) rejects bare-text pastes naming a known non-member with
-// "That @mention is not linked to a member", where upstream binds and sends.
-// Hand to the P06 desktop owner: adjust the gate for profile-known
-// non-members or record an intentional exclusion, then un-quarantine.
-test.fixme("an identity vouched for only by dropped markup binds no name", async ({
+test("an identity vouched for only by dropped markup binds no name", async ({
   page,
 }) => {
   await page.goto("/");
@@ -652,13 +640,7 @@ test.fixme("an identity vouched for only by dropped markup binds no name", async
     IMPOSTOR_PUBKEY,
   );
 });
-// QUARANTINE — reproduced 2026-09-13 in this file: the fork send gate
-// (features/messages/lib/unresolvedMentionFeedback.ts, fork-only, no upstream
-// counterpart) rejects bare-text pastes naming a known non-member with
-// "That @mention is not linked to a member", where upstream binds and sends.
-// Hand to the P06 desktop owner: adjust the gate for profile-known
-// non-members or record an intentional exclusion, then un-quarantine.
-test.fixme("a visible pair no trusted state vouches for binds no name", async ({
+test("a visible pair no trusted state vouches for binds no name", async ({
   page,
 }) => {
   await page.goto("/");

@@ -237,9 +237,7 @@ for (const removal of ["delete", "audience-remove", "audience-unpin"]) {
       .toEqual([removal === "audience-unpin" ? [a, b] : [b]]);
   });
 }
-// QUARANTINE — fork edit_message sends mentionPubkeys only, not mentionTags.
-// Pending product decision: send tags on edit or assert pubkeys instead.
-test.fixme("selected duplicate labels survive send, reopen, replacement and second reopen", async ({
+test("selected duplicate labels survive send, reopen, replacement and second reopen", async ({
   page,
 }) => {
   await install(page);
@@ -376,9 +374,7 @@ test("edit focus transfers after menu exit; Escape still restores the trigger", 
   await expect(input).toHaveText("menu focus handoff edited");
 });
 
-// QUARANTINE — fork edit_message sends mentionPubkeys only, not mentionTags.
-// Pending product decision: send tags on edit or assert pubkeys instead.
-test.fixme("editing to a longer typed member drops the original shorter reference", async ({
+test("editing to a longer typed member drops the original shorter reference", async ({
   page,
 }) => {
   await installMockBridge(page, {
@@ -607,11 +603,7 @@ for (const selection of ["picker", "automatic"]) {
   });
 }
 for (const mismatchedKey of [false, true]) {
-  // QUARANTINE (mismatched-key case only) — paste qualifier agreement: fork
-  // binds differently than spec. Pending product decision on mismatched-key
-  // rejection behavior.
-  const run = mismatchedKey ? test.fixme : test;
-  run(`qualified chip copy/paste ${mismatchedKey ? "rejects a mismatched key" : "preserves its exact recipient"}`, async ({
+  test(`qualified chip copy/paste ${mismatchedKey ? "rejects a mismatched key" : "preserves its exact recipient"}`, async ({
     page,
   }) => {
     await install(page);

@@ -1129,6 +1129,10 @@ declare global {
       channelName: string;
       kind?: number;
     }) => boolean;
+    /** Start or stop holding `get_users_batch` responses. */
+    __BUZZ_E2E_HOLD_USERS_BATCH__?: (hold: boolean) => number;
+    /** Number of `get_users_batch` calls currently held. */
+    __BUZZ_E2E_USERS_BATCH_PENDING__?: () => number;
     __BUZZ_E2E_HAS_MOCK_OWNER_KIND_SUBSCRIPTION__?: (input: {
       ownerPubkey: string;
       kind: number;
@@ -1504,6 +1508,8 @@ let holdUsersBatch = false;
 let heldUsersBatchReleases: Array<() => void> = [];
 let deferNextChannelsRead = false;
 let deferredChannelsReadResolve: (() => void) | null = null;
+let holdUsersBatch = false;
+let heldUsersBatchReleases: Array<() => void> = [];
 
 const mockDisplayNames = new Map<string, string>([
   [MOCK_IDENTITY_PUBKEY, DEFAULT_MOCK_IDENTITY.display_name],
@@ -9382,12 +9388,24 @@ async function handleEditMessage(
     content: string;
     mediaTags?: string[][] | null;
     emojiTags?: string[][] | null;
+    mentionPubkeys?: string[] | null;
+    mentionTags?: string[][] | null;
+    suppressLinkPreviews?: boolean;
   },
   config: E2eConfig | undefined,
 ): Promise<void> {
   const mediaTags = args.mediaTags ?? [];
   const emojiTags = args.emojiTags ?? [];
-  const extraTags = [...mediaTags, ...emojiTags];
+  const mentionPubkeys = args.mentionPubkeys ?? [];
+  const mentionTags = args.mentionTags;
+  const extraTags = [
+    ...mediaTags,
+    ...emojiTags,
+    ...mentionPubkeys.map((pubkey) => ["p", pubkey]),
+    ...(mentionTags ?? []),
+    ...(mentionTags ? [["buzz:mention-snapshot"]] : []),
+    ...(args.suppressLinkPreviews ? [["link-preview", "none"]] : []),
+  ];
   const tags = [["h", args.channelId], ["e", args.eventId], ...extraTags];
   const content = args.content.trim();
   const identity = getIdentity(config);
@@ -10324,6 +10342,15 @@ export function maybeInstallE2eTauriMocks() {
   deferredGetEventQueue = [];
   deferNextChannelsRead = false;
   deferredChannelsReadResolve = null;
+  holdUsersBatch = false;
+  heldUsersBatchReleases = [];
+  window.__BUZZ_E2E_HOLD_USERS_BATCH__ = (hold: boolean) => {
+    holdUsersBatch = hold;
+    const queued = hold ? [] : heldUsersBatchReleases.splice(0);
+    for (const release of queued) release();
+    return queued.length;
+  };
+  window.__BUZZ_E2E_USERS_BATCH_PENDING__ = () => heldUsersBatchReleases.length;
   window.__BUZZ_E2E_CHANNELS_READ_PENDING__ = 0;
   window.__BUZZ_E2E_DEFER_NEXT_CHANNELS_READ__ = () => {
     if (deferredChannelsReadResolve) {
