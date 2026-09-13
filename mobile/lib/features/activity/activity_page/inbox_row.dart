@@ -80,7 +80,7 @@ class _InboxRow extends HookConsumerWidget {
         pubkey: ref.watch(userCacheProvider.select((cache) => cache[pubkey])),
     };
     final profile = profiles[senderPubkey];
-    final senderLabel = profile?.displayName ?? shortPubkey(item.item.pubkey);
+    final senderLabel = profile?.label ?? truncateNpub(item.item.pubkey);
     final profileMentionNames = {
       for (final pubkey in mentionPubkeys)
         if (profiles[pubkey]?.displayName?.trim().isNotEmpty == true)

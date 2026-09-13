@@ -12,6 +12,7 @@ import 'package:buzz/features/channels/message_content.dart';
 import 'package:buzz/features/channels/channels_provider.dart';
 import 'package:buzz/shared/read_state/read_state_provider.dart';
 import 'package:buzz/shared/profile/user_cache_provider.dart';
+import 'package:buzz/shared/identity/npub.dart';
 import 'package:buzz/shared/profile/user_profile.dart';
 import 'package:buzz/shared/theme/theme.dart';
 import 'package:buzz/shared/widgets/anchored_popover_menu.dart';
@@ -30,7 +31,7 @@ void main() {
   final testMention = FeedItem(
     id: 'm1',
     kind: 9,
-    pubkey: 'alice_pk',
+    pubkey: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     content: 'Hey check this out',
     createdAt: now - 120,
     channelId: 'ch1',
@@ -98,9 +99,12 @@ void main() {
     ),
   ];
 
+  const aliceHex =
+      'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+
   final testUsers = <String, UserProfile>{
-    'alice_pk': const UserProfile(
-      pubkey: 'alice_pk',
+    aliceHex: const UserProfile(
+      pubkey: aliceHex,
       displayName: 'Alice',
       nip05Handle: 'alice@example.com',
     ),
@@ -482,7 +486,7 @@ void main() {
     FeedItem dmMessage(String id, int age) => FeedItem(
       id: id,
       kind: 9,
-      pubkey: 'alice_pk',
+      pubkey: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       content: 'dm body $id',
       createdAt: now - age,
       channelId: 'dm1',
@@ -586,7 +590,7 @@ void main() {
     final threadMention = FeedItem(
       id: 'reply-event',
       kind: 9,
-      pubkey: 'alice_pk',
+      pubkey: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       content: 'Reply in a thread',
       createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
       channelId: 'ch1',
@@ -841,8 +845,7 @@ void main() {
     await tester.pumpWidget(await buildTestable(users: const {}));
     await tester.pumpAndSettle();
 
-    // Sender label falls back to the (short) pubkey.
-    expect(find.text('alice_pk'), findsOneWidget);
+    expect(find.text(truncateNpub(aliceHex)), findsOneWidget);
     expect(find.text('Alice'), findsNothing);
   });
 }

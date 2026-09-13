@@ -7,6 +7,7 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import '../../shared/auth/auth.dart';
 import '../../shared/custom_emoji/custom_emoji.dart';
 import '../../shared/custom_emoji/custom_emoji_provider.dart';
+import '../../shared/identity/npub.dart';
 import '../../shared/mentions/agent_identity_provider.dart';
 import '../../shared/relay/relay.dart';
 import '../profile/profile_provider.dart';
@@ -34,10 +35,7 @@ class AddMembersException implements Exception {
   const AddMembersException(this.failures);
 
   String get message => failures.entries
-      .map(
-        (entry) =>
-            '${entry.key.length > 8 ? '${entry.key.substring(0, 8)}…' : entry.key}: ${entry.value}',
-      )
+      .map((entry) => '${truncateNpub(entry.key)}: ${entry.value}')
       .join('; ');
 
   @override
@@ -70,7 +68,7 @@ class ChannelMember {
     if (displayName case final name? when name.trim().isNotEmpty) {
       return name.trim();
     }
-    return pubkey.length > 8 ? '${pubkey.substring(0, 8)}…' : pubkey;
+    return truncateNpub(pubkey);
   }
 }
 
@@ -155,12 +153,14 @@ class DirectoryUser {
   final String? displayName;
   final String? avatarUrl;
   final String? nip05Handle;
+  final bool isAgent;
 
   const DirectoryUser({
     required this.pubkey,
     this.displayName,
     this.avatarUrl,
     this.nip05Handle,
+    this.isAgent = false,
   });
 
   String get label {
@@ -172,7 +172,7 @@ class DirectoryUser {
     if (nip05 != null && nip05.isNotEmpty) {
       return nip05;
     }
-    return pubkey.length > 8 ? '${pubkey.substring(0, 8)}…' : pubkey;
+    return truncateNpub(pubkey);
   }
 
   String get secondaryLabel {
@@ -180,11 +180,18 @@ class DirectoryUser {
     if (nip05 != null && nip05.isNotEmpty && nip05 != label) {
       return nip05;
     }
-    return pubkey.length > 16 ? '${pubkey.substring(0, 16)}…' : pubkey;
+    final display = displayName?.trim();
+    return display != null && display.isNotEmpty ? truncateNpub(pubkey) : '';
   }
 
-  /// First visible character used when no avatar image is available.
-  String get initial => label.isNotEmpty ? label[0].toUpperCase() : '?';
+  /// Avatar initial keyed to the hex public key when unnamed.
+  String get initial {
+    final display = displayName?.trim();
+    if (display != null && display.isNotEmpty) return display[0].toUpperCase();
+    final nip05 = nip05Handle?.trim();
+    if (nip05 != null && nip05.isNotEmpty) return nip05[0].toUpperCase();
+    return pubkey.isNotEmpty ? pubkey[0].toUpperCase() : '?';
+  }
 }
 
 /// Whether the mobile DM directory should show local preview identities.

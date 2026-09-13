@@ -217,9 +217,7 @@ class _DmAppBarTitle extends ConsumerWidget {
     final animatedAvatar = parseAnimatedAvatarUrl(avatarUrl);
     final initial =
         profile?.initial ??
-        (channel.participants.isNotEmpty
-            ? channel.participants.first[0].toUpperCase()
-            : '?');
+        dmAvatarInitial(channel, currentPubkey: currentPubkey);
     final presenceLabel = switch (presence) {
       'online' => 'Online',
       'away' => 'Away',

@@ -46,7 +46,7 @@ class _SystemMessageRow extends HookConsumerWidget {
       final profile =
           userCache[pubkey.toLowerCase()] ??
           ref.read(userCacheProvider.notifier).get(pubkey.toLowerCase());
-      return profile?.label ?? shortPubkey(pubkey);
+      return profile?.label ?? truncateNpub(pubkey);
     }
 
     final reactions = groupedMessages == null

@@ -1,5 +1,7 @@
 import 'package:flutter/foundation.dart';
 
+import '../identity/npub.dart';
+
 @immutable
 class UserProfile {
   final String pubkey;
@@ -11,6 +13,8 @@ class UserProfile {
   /// NIP-OA verified owner pubkey from the profile's `auth` tag; non-null
   /// means this identity is an agent (mirrors desktop's `ownerPubkey`).
   final String? ownerPubkey;
+
+  bool get isAgent => ownerPubkey != null;
 
   const UserProfile({
     required this.pubkey,
@@ -29,15 +33,18 @@ class UserProfile {
     nip05Handle: json['nip05_handle'] as String?,
   );
 
-  /// Short label: display name, or first 8 chars of pubkey.
-  String get label =>
-      displayName ??
-      '${pubkey.length >= 8 ? pubkey.substring(0, 8) : pubkey}...';
+  /// Short label: display name, or the compact npub form of the public key.
+  String get label {
+    final name = displayName;
+    return name != null && name.trim().isNotEmpty ? name : truncateNpub(pubkey);
+  }
 
   /// First letter for fallback avatar.
-  String get initial =>
-      (displayName?.isNotEmpty == true ? displayName! : pubkey)[0]
-          .toUpperCase();
+  String get initial {
+    final name = displayName?.trim();
+    if (name != null && name.isNotEmpty) return name[0].toUpperCase();
+    return pubkey.isNotEmpty ? pubkey[0].toUpperCase() : '?';
+  }
 }
 
 /// Optional profile handle shown beside a message author's display name.

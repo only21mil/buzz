@@ -9,6 +9,7 @@ import '../../shared/theme/theme.dart';
 import '../../shared/widgets/avatar_image.dart';
 import '../../shared/widgets/modal_presentation.dart';
 import '../channels/message_content.dart';
+import '../../shared/identity/npub.dart';
 import '../../shared/profile/user_cache_provider.dart';
 import '../profile/user_profile_sheet.dart';
 import '../../shared/profile/user_profile.dart';
@@ -53,7 +54,7 @@ class ForumPostCard extends HookConsumerWidget {
     final profile =
         ref.watch(userCacheProvider.select((cache) => cache[pk])) ??
         ref.read(userCacheProvider.notifier).get(pk);
-    final displayName = profile?.label ?? _shortPubkey(post.pubkey);
+    final displayName = profile?.label ?? truncateNpub(post.pubkey);
     final profileMentionNames = ref.watch(
       userCacheProvider.select(
         (cache) => _buildMentionNames(post.mentionPubkeys, cache),
@@ -330,11 +331,6 @@ class _PostAvatar extends StatelessWidget {
       ),
     );
   }
-}
-
-String _shortPubkey(String pubkey) {
-  if (pubkey.length > 12) return '${pubkey.substring(0, 8)}\u2026';
-  return pubkey;
 }
 
 Map<String, String> _buildMentionNames(

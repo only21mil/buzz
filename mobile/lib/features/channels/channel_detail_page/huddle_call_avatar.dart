@@ -255,5 +255,5 @@ String _huddleParticipantLabel({
   final directoryName = fallbackLabel?.trim();
   return (profileName?.isNotEmpty == true ? profileName : null) ??
       (directoryName?.isNotEmpty == true ? directoryName : null) ??
-      (pubkey.isEmpty ? 'Participant' : shortPubkey(pubkey));
+      (pubkey.isEmpty ? 'Participant' : truncateNpub(pubkey));
 }
