@@ -4,9 +4,7 @@ use super::project_git_exec::{
 };
 use super::project_git_push::push_project_local_repository_blocking;
 pub(crate) use super::project_git_sync::{compare_local_remote_status, ProjectRepoSyncStatusInfo};
-use super::project_repo_paths::{
-    find_local_repo_for_branch, local_project_checkouts, LocalProjectCheckout,
-};
+use super::project_repo_paths::{find_local_repo_for_branch, local_project_checkouts};
 use crate::app_state::AppState;
 use serde::Serialize;
 use std::time::UNIX_EPOCH;

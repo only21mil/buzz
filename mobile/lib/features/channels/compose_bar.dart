@@ -63,4 +63,6 @@ part 'compose_bar/send_button.dart';
 part 'compose_bar/voice_note.dart';
 part 'compose_bar/layout.dart';
 part 'compose_bar/dock.dart';
+part 'compose_bar/send_handler.dart';
+part 'compose_bar/composer_interactions.dart';
 part 'compose_bar/compose_bar_widget.dart';
