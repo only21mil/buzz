@@ -58,6 +58,9 @@ class _RemoveCommunitySection extends ConsumerWidget {
 }
 
 class _IdentityRow extends StatelessWidget {
+  /// Copies the public key only. This is not a private-key export: the nsec
+  /// never leaves secure storage here, and the phone-to-desktop export in
+  /// the pairing flow needs fresh device auth plus a bound grant.
   const _IdentityRow({required this.nsec});
 
   final String nsec;
