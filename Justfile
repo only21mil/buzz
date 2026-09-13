@@ -666,6 +666,10 @@ web-fix:
 web-typecheck:
     cd {{web_dir}} && pnpm typecheck
 
+# Run web unit tests
+web-test:
+    cd {{web_dir}} && pnpm test
+
 # Build web frontend assets
 web-build:
     cd {{web_dir}} && pnpm build

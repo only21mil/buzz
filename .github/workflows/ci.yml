@@ -72,6 +72,9 @@ jobs:
               - 'scripts/pre-freeze.sh'
               - 'scripts/test-ci-promotion-readiness.py'
               - 'scripts/test-ci-path-filter-contract.sh'
+              - 'scripts/check-branch-skew.sh'
+              - 'scripts/test-check-branch-skew.sh'
+              - 'scripts/test-workflow-fork-guards.sh'
               - 'scripts/test-protected-ci-receipt.py'
               - 'scripts/test-relay-e2e-canary-contract.sh'
               - 'Justfile'
@@ -91,6 +94,7 @@ jobs:
               - 'scripts/check-file-sizes-core.mjs'
               - 'scripts/check-file-sizes-core.test.mjs'
               - 'web/**'
+              - 'admin-web/**'
               - 'admin-web/package.json'
               - 'package.json'
               - 'pnpm-lock.yaml'
@@ -156,6 +160,10 @@ jobs:
         run: python3 scripts/test-protected-ci-reuse.py
       - name: CI path filter contract
         run: scripts/test-ci-path-filter-contract.sh
+      - name: Branch-skew contract
+        run: scripts/test-check-branch-skew.sh
+      - name: Workflow fork-guard contract
+        run: scripts/test-workflow-fork-guards.sh
 
       - name: Capture successful qualification inputs
         env:
@@ -1052,6 +1060,10 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Web lint and format
         run: just web-check
+      - name: Web unit tests
+        run: just web-test
+      - name: Admin-web check
+        run: pnpm -C admin-web check
       - name: Web build
         run: just web-build
       - name: Save pnpm store cache
