@@ -5203,6 +5203,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn addressable_replacement_rolls_back_when_mention_indexing_fails() {
+        use buzz_core::kind::KIND_READ_STATE;
         use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 
         let admin = PgPool::connect(&admin_url().await)
@@ -5215,22 +5216,26 @@ mod tests {
         let keys = Keys::generate();
         seed_community_channel(&pool, community_uuid, channel, &keys).await;
         let community = CommunityId::from_uuid(community_uuid);
-        let owner = keys.public_key().to_hex();
+        // Exercise mention-index rollback, not kind:39002 roster validation.
+        let d_tag = format!("rollback-mention:{channel}");
+        let mention = hex::encode(keys.public_key().to_bytes());
         let tags = || {
             vec![
-                Tag::parse(["d", channel.to_string().as_str()]).expect("d tag"),
-                Tag::parse(["p", owner.as_str(), "", "owner"]).expect("p tag"),
+                Tag::parse(["d", d_tag.as_str()]).expect("d tag"),
+                Tag::parse(["t", "read-state"]).expect("t tag"),
+                Tag::parse(["p", mention.as_str()]).expect("p tag"),
             ]
         };
+        let kind = Kind::Custom(KIND_READ_STATE as u16);
         let base = Timestamp::now().as_secs();
-        let old = EventBuilder::new(Kind::Custom(39002), "old")
+        let old = EventBuilder::new(kind.clone(), "old")
             .tags(tags())
             .custom_created_at(Timestamp::from(base))
             .sign_with_keys(&keys)
             .expect("sign old");
         db.replace_addressable_event(community, &old, Some(channel))
             .await
-            .expect("insert old roster");
+            .expect("insert old replaceable event");
 
         sqlx::query(
             "CREATE FUNCTION reject_test_mention() RETURNS trigger AS $$ \
@@ -5248,7 +5253,7 @@ mod tests {
         .await
         .expect("install failure injection");
 
-        let new = EventBuilder::new(Kind::Custom(39002), "new")
+        let new = EventBuilder::new(kind, "new")
             .tags(tags())
             .custom_created_at(Timestamp::from(base + 1))
             .sign_with_keys(&keys)
@@ -5261,14 +5266,19 @@ mod tests {
 
         let live_id: Vec<u8> = sqlx::query_scalar(
             "SELECT id FROM events WHERE community_id=$1 AND channel_id=$2 \
-             AND kind=39002 AND deleted_at IS NULL",
+             AND kind=$3 AND deleted_at IS NULL",
         )
         .bind(community.as_uuid())
         .bind(channel)
+        .bind(KIND_READ_STATE as i32)
         .fetch_one(&pool)
         .await
-        .expect("query live roster");
-        assert_eq!(live_id, old.id.as_bytes(), "old roster must remain live");
+        .expect("query live replaceable event");
+        assert_eq!(
+            live_id,
+            old.id.as_bytes(),
+            "old replaceable event must remain live"
+        );
         let new_rows: i64 =
             sqlx::query_scalar("SELECT count(*) FROM events WHERE community_id=$1 AND id=$2")
                 .bind(community.as_uuid())
@@ -5276,7 +5286,10 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .expect("count rolled-back event");
-        assert_eq!(new_rows, 0, "new roster must roll back with its index");
+        assert_eq!(
+            new_rows, 0,
+            "new replaceable event must roll back with its index"
+        );
 
         drop_scratch_db(&admin, pool, &scratch_name).await;
     }
