@@ -981,8 +981,8 @@ jobs:
       - name: Download pinned invite S3 tools
         run: |
           mkdir -p target/invite-tools
-          curl --fail --location --retry 3 --output target/invite-tools/minio https://dl.min.io/server/minio/release/linux-amd64/archive/minio.RELEASE.2025-09-07T16-13-09Z
-          curl --fail --location --retry 3 --output target/invite-tools/mc https://dl.min.io/client/mc/release/linux-amd64/archive/mc.RELEASE.2025-08-13T08-35-41Z
+          curl --fail --location --retry 3 --output target/invite-tools/minio https://github.com/minio/minio/releases/download/RELEASE.2025-09-07T16-13-09Z/minio.linux-amd64.RELEASE.2025-09-07T16-13-09Z
+          curl --fail --location --retry 3 --output target/invite-tools/mc https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z
           sha256sum --check <<'CHECKSUMS'
           7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f  target/invite-tools/minio
           01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891  target/invite-tools/mc
