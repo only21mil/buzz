@@ -52,10 +52,13 @@ export function SpoilerInline({
 
   const handleClick = React.useCallback(
     (event: React.MouseEvent<HTMLElement>) => {
-      if (revealed && isBlock && event.target !== event.currentTarget) return;
+      // Hidden spoilers reveal in capture only; bubbling here would toggle twice
+      // when the click target is a nested link or the spoiler shell itself.
+      if (!revealed) return;
+      if (event.target !== event.currentTarget) return;
       toggleRevealed();
     },
-    [isBlock, revealed, toggleRevealed],
+    [revealed, toggleRevealed],
   );
 
   const handleKeyDown = React.useCallback(
