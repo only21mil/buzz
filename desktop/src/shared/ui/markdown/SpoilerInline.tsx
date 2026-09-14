@@ -32,14 +32,6 @@ export function SpoilerInline({
     setRevealed((value) => !value);
   }, []);
 
-  const handlePointerDownCapture = React.useCallback(
-    (event: React.PointerEvent<HTMLElement>) => {
-      if (revealed) return;
-      event.stopPropagation();
-    },
-    [revealed],
-  );
-
   const handleClickCapture = React.useCallback(
     (event: React.MouseEvent<HTMLElement>) => {
       if (revealed) return;
@@ -76,7 +68,6 @@ export function SpoilerInline({
     onClick: handleClick,
     onClickCapture: handleClickCapture,
     onKeyDown: handleKeyDown,
-    onPointerDownCapture: handlePointerDownCapture,
     role: "button",
     tabIndex: 0,
   } as const;
