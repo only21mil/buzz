@@ -1129,10 +1129,6 @@ declare global {
       channelName: string;
       kind?: number;
     }) => boolean;
-    /** Start or stop holding `get_users_batch` responses. */
-    __BUZZ_E2E_HOLD_USERS_BATCH__?: (hold: boolean) => number;
-    /** Number of `get_users_batch` calls currently held. */
-    __BUZZ_E2E_USERS_BATCH_PENDING__?: () => number;
     __BUZZ_E2E_HAS_MOCK_OWNER_KIND_SUBSCRIPTION__?: (input: {
       ownerPubkey: string;
       kind: number;
@@ -1508,8 +1504,6 @@ let holdUsersBatch = false;
 let heldUsersBatchReleases: Array<() => void> = [];
 let deferNextChannelsRead = false;
 let deferredChannelsReadResolve: (() => void) | null = null;
-let holdUsersBatch = false;
-let heldUsersBatchReleases: Array<() => void> = [];
 
 const mockDisplayNames = new Map<string, string>([
   [MOCK_IDENTITY_PUBKEY, DEFAULT_MOCK_IDENTITY.display_name],
@@ -10377,17 +10371,6 @@ export function maybeInstallE2eTauriMocks() {
     window.__BUZZ_E2E_GET_EVENT_CALL_COUNT__ = 0;
     return queued.length;
   };
-  holdUsersBatch = false;
-  heldUsersBatchReleases = [];
-  window.__BUZZ_E2E_HOLD_USERS_BATCH__ = (hold: boolean) => {
-    holdUsersBatch = hold;
-    // Releasing on the way out of the hold, not on the way in, is what lets a
-    // spec keep one lookup pinned while another resolves from local state.
-    const queued = hold ? [] : heldUsersBatchReleases.splice(0);
-    for (const release of queued) release();
-    return queued.length;
-  };
-  window.__BUZZ_E2E_USERS_BATCH_PENDING__ = () => heldUsersBatchReleases.length;
   window.__BUZZ_E2E_EMIT_MOCK_READ_STATE__ = ({
     clientId,
     contexts,
