@@ -5215,11 +5215,11 @@ mod tests {
         let keys = Keys::generate();
         seed_community_channel(&pool, community_uuid, channel, &keys).await;
         let community = CommunityId::from_uuid(community_uuid);
-        let member = Keys::generate().public_key().to_hex();
+        let owner = keys.public_key().to_hex();
         let tags = || {
             vec![
                 Tag::parse(["d", channel.to_string().as_str()]).expect("d tag"),
-                Tag::parse(["p", member.as_str(), "", "member"]).expect("p tag"),
+                Tag::parse(["p", owner.as_str(), "", "owner"]).expect("p tag"),
             ]
         };
         let base = Timestamp::now().as_secs();
