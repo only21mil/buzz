@@ -888,11 +888,11 @@ mod tests {
     /// `insert_mentions` must index every p-tag even past Postgres's
     /// bind-parameter statement cap.
     ///
-    /// Relay-signed kind 39002 member snapshots carry one p-tag per channel
+    /// Relay-signed kind 39002 member snapshots can carry one p-tag per channel
     /// member, and a multi-row INSERT binds 6 parameters per row — a single
     /// statement tops out at ~10.9k rows against the 65,535-parameter limit.
-    /// Clients discover their channels via `{kinds:[39002], "#p":[me]}`, so a
-    /// failed insert silently breaks discovery for the whole channel.
+    /// Use a non-roster kind here so the test exercises chunking without
+    /// constructing 11k canonical membership rows for the 39002 roster guard.
     #[tokio::test]
     #[ignore = "requires Postgres"]
     async fn insert_mentions_indexes_rosters_past_bind_parameter_cap() {
@@ -905,7 +905,15 @@ mod tests {
         let tags: Vec<Tag> = (1..=mention_count)
             .map(|n| Tag::parse(["p", &format!("{n:064x}")]).expect("p tag"))
             .collect();
-        let event = store_feed_event(&pool, community, 39002, "", Some(channel), tags).await;
+        let event = store_feed_event(
+            &pool,
+            community,
+            KIND_STREAM_MESSAGE,
+            "",
+            Some(channel),
+            tags,
+        )
+        .await;
 
         let indexed: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM event_mentions WHERE community_id = $1 AND event_id = $2",
