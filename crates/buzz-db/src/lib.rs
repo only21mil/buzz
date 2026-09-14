@@ -5218,7 +5218,8 @@ mod tests {
         let community = CommunityId::from_uuid(community_uuid);
         // Exercise mention-index rollback, not kind:39002 roster validation.
         let d_tag = format!("rollback-mention:{channel}");
-        let mention = hex::encode(keys.public_key().to_bytes());
+        let mentioned = Keys::generate();
+        let mention = hex::encode(mentioned.public_key().to_bytes());
         let tags = || {
             vec![
                 Tag::parse(["d", d_tag.as_str()]).expect("d tag"),
@@ -5228,7 +5229,7 @@ mod tests {
         };
         let kind = Kind::Custom(KIND_READ_STATE as u16);
         let base = Timestamp::now().as_secs();
-        let old = EventBuilder::new(kind.clone(), "old")
+        let old = EventBuilder::new(kind, "old")
             .tags(tags())
             .custom_created_at(Timestamp::from(base))
             .sign_with_keys(&keys)
