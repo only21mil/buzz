@@ -51,7 +51,6 @@ import {
 } from "./useMentionSendFlow.helpers";
 import { buildAgentAddressMentionTags } from "@/features/messages/lib/agentAddressMention.mjs";
 import { AgentMentionAuthorizationError } from "@/features/messages/lib/agentMentionRevalidation";
-import { unresolvedMentionError } from "@/features/messages/lib/unresolvedMentionFeedback";
 import type { UseMentionSendFlowOptions } from "./useMentionSendFlow.types";
 
 export function useMentionSendFlow({
@@ -769,23 +768,8 @@ export function useMentionSendFlow({
         )
           return;
         const savedMentionRefs = mentions.getDraftMentionRefs(trimmed).slice();
-        const resolvedMentionLabels = new Set<string>();
-        const selectedMentionPubkeys = mentions.extractMentionPubkeys(
-          trimmed,
-          [],
-          (displayName) => resolvedMentionLabels.add(displayName),
-        );
+        const selectedMentionPubkeys = mentions.extractMentionPubkeys(trimmed);
         const selectedPersonas = mentions.extractMentionPersonas(trimmed);
-        const unresolvedMentionErrorMessage = unresolvedMentionError(trimmed, [
-          ...savedMentionRefs.map((ref) => ref.displayName),
-          ...resolvedMentionLabels,
-          ...selectedPersonas.map((target) => target.displayName),
-        ]);
-        if (unresolvedMentionErrorMessage) {
-          setNonMemberPromptError(unresolvedMentionErrorMessage);
-          toast.error(unresolvedMentionErrorMessage);
-          return;
-        }
         const dmThreadAgentMentionErrorMessage = dmThreadAgentMentionError({
           trimmed,
           isThreadReply: capturedThreadContext != null,

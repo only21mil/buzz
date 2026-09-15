@@ -20,10 +20,7 @@ void main() {
     final community = Community.create(
       name: 'Team',
       relayUrl: 'wss://relay.example',
-      nsec: nostr.Nip19.encode(
-        prefix: nostr.Nip19Prefix.nsec,
-        data: privHex,
-      ),
+      nsec: nostr.Nip19.encode(prefix: nostr.Nip19Prefix.nsec, data: privHex),
     );
 
     await tester.pumpWidget(

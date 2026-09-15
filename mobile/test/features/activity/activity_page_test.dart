@@ -486,7 +486,8 @@ void main() {
     FeedItem dmMessage(String id, int age) => FeedItem(
       id: id,
       kind: 9,
-      pubkey: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      pubkey:
+          'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       content: 'dm body $id',
       createdAt: now - age,
       channelId: 'dm1',
@@ -590,7 +591,8 @@ void main() {
     final threadMention = FeedItem(
       id: 'reply-event',
       kind: 9,
-      pubkey: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      pubkey:
+          'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       content: 'Reply in a thread',
       createdAt: DateTime.now().millisecondsSinceEpoch ~/ 1000,
       channelId: 'ch1',

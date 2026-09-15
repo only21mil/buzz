@@ -28,14 +28,16 @@ void main() {
     );
   }
 
-  test('resolveDmChannelDisplayLabel uses compact npub for unnamed counterpart',
-      () {
-    final channel = dmChannel(pubkeys: [self, other]);
-    expect(
-      resolveDmChannelDisplayLabel(channel, currentPubkey: self),
-      truncateNpub(other),
-    );
-  });
+  test(
+    'resolveDmChannelDisplayLabel uses compact npub for unnamed counterpart',
+    () {
+      final channel = dmChannel(pubkeys: [self, other]);
+      expect(
+        resolveDmChannelDisplayLabel(channel, currentPubkey: self),
+        truncateNpub(other),
+      );
+    },
+  );
 
   test('dmAvatarInitial keys unnamed counterpart to hex not npub', () {
     final channel = dmChannel(pubkeys: [self, other]);
