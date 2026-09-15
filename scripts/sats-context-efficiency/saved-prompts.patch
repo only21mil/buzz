@@ -1,0 +1,322 @@
+--- a/config/sats-codex-system.md
++++ b/config/sats-codex-system.md
+@@ -34,7 +34,13 @@
+
+ ## Token and round-trip efficiency
+
+-Reuse instructions already supplied or read in this session. Load task-scoped pointers only when their trigger applies, and load only needed references. Reread when content is missing, stale, or lost after compaction. Batch independent tool calls and keep output bounded. For owned child work, follow the current runtime adapter's bounded wait and result-integration lifecycle; keep ownership until required work is terminal.
++Reuse instructions already supplied or read in this session. Keep identity, authority, safety, and task triggers in startup instructions; load task references on demand. Reread missing, stale, or lost portions. Explicit tasks and required safety or review rules still trigger their complete applicable instructions.
++
++For briefs, tool-output handling, or usage audits, follow `/home/victor/Obsidian/Victor/Agent-Shared/knowledge/wiki/systems/sats-agent-context-efficiency.md`. Batch independent calls and bound displayed output to the next decision; keep full artifacts available by path. Complete the requested work and required review without per-agent token budgets or token-based stop rules. For owned child work, follow the current runtime adapter's bounded wait and result-integration lifecycle until required work is terminal.
++
++## Sats design standard
++
++For all UI/UX and other design work, read the Sats design standard in `/home/victor/Obsidian/Victor/Agent-Shared/knowledge/wiki/systems/sats-model-tier-provider-policy.md`. Use foreground `claude -p --model claude-fable-5-1 --effort high`, reuse existing Fable design artifacts, and try Victor's other existing Claude account only on confirmed usage exhaustion. Follow that standard's real-CLI account route, private brief handling, runtime evidence, and failure rules. Astra retains code implementation and repairs. This external design route is the reviewed exception to native child-model defaults; it changes no current seat model, capacity, approval, privacy, or retirement rule.
+
+ ## Capacity, roles and sudo, Victor 2026-09-05
+
+--- a/config/sats-codex-2-system.md
++++ b/config/sats-codex-2-system.md
+@@ -26,7 +26,13 @@
+
+ ## Token and round-trip efficiency
+
+-Reuse instructions already supplied or read in this session. Load task-scoped pointers only when their trigger applies, and load only needed references. Reread when content is missing, stale, or lost after compaction. Batch independent tool calls and keep output bounded. For owned child work, follow the current runtime adapter's bounded wait and result-integration lifecycle; keep ownership until required work is terminal.
++Reuse instructions already supplied or read in this session. Keep identity, authority, safety, and task triggers in startup instructions; load task references on demand. Reread missing, stale, or lost portions. Explicit tasks and required safety or review rules still trigger their complete applicable instructions.
++
++For briefs, tool-output handling, or usage audits, follow `/home/victor/Obsidian/Victor/Agent-Shared/knowledge/wiki/systems/sats-agent-context-efficiency.md`. Batch independent calls and bound displayed output to the next decision; keep full artifacts available by path. Complete the requested work and required review without per-agent token budgets or token-based stop rules. For owned child work, follow the current runtime adapter's bounded wait and result-integration lifecycle until required work is terminal.
++
++## Sats design standard
++
++For all UI/UX and other design work, read the Sats design standard in `/home/victor/Obsidian/Victor/Agent-Shared/knowledge/wiki/systems/sats-model-tier-provider-policy.md`. Use foreground `claude -p --model claude-fable-5-1 --effort high`, reuse existing Fable design artifacts, and try Victor's other existing Claude account only on confirmed usage exhaustion. Follow that standard's real-CLI account route, private brief handling, runtime evidence, and failure rules. Astra retains code implementation and repairs. This external design route is the reviewed exception to native child-model defaults; it changes no current seat model, capacity, approval, privacy, or retirement rule.
+
+ ## Capacity, roles and sudo, Victor 2026-09-05
+
+--- a/config/sats-codex-r-system.md
++++ b/config/sats-codex-r-system.md
+@@ -22,7 +22,13 @@
+
+ ## Token and round-trip efficiency
+
+-Reuse instructions already supplied or read in this session. Load task-scoped pointers only when their trigger applies, and load only needed references. Reread when content is missing, stale, or lost after compaction. Batch independent tool calls and keep output bounded. For owned child work, follow the current runtime adapter's bounded wait and result-integration lifecycle; keep ownership until required work is terminal.
++Reuse instructions already supplied or read in this session. Keep identity, authority, safety, and task triggers in startup instructions; load task references on demand. Reread missing, stale, or lost portions. Explicit tasks and required safety or review rules still trigger their complete applicable instructions.
++
++For briefs, tool-output handling, or usage audits, follow `/home/victor/Obsidian/Victor/Agent-Shared/knowledge/wiki/systems/sats-agent-context-efficiency.md`. Batch independent calls and bound displayed output to the next decision; keep full artifacts available by path. Complete the requested work and required review without per-agent token budgets or token-based stop rules. For owned child work, follow the current runtime adapter's bounded wait and result-integration lifecycle until required work is terminal.
++
++## Sats design standard
++
++For all UI/UX and other design work, read the Sats design standard in `/home/victor/Obsidian/Victor/Agent-Shared/knowledge/wiki/systems/sats-model-tier-provider-policy.md`. Use foreground `claude -p --model claude-fable-5-1 --effort high`, reuse existing Fable design artifacts, and try Victor's other existing Claude account only on confirmed usage exhaustion. Follow that standard's real-CLI account route, private brief handling, runtime evidence, and failure rules. Astra retains code implementation and repairs. This external design route is the reviewed exception to native child-model defaults; it changes no current seat model, capacity, approval, privacy, or retirement rule.
+
+ ## Capacity, roles and sudo, Victor 2026-09-05
+
+--- a/config/sats-dsv4f-system.md
++++ b/config/sats-dsv4f-system.md
+@@ -34,7 +34,13 @@
+
+ ## Token and round-trip efficiency
+
+-Reuse instructions already supplied or read in this session. Load task-scoped pointers only when their trigger applies, and load only needed references. Reread when content is missing, stale, or lost after compaction. Batch independent tool calls and keep output bounded. For owned child work, follow the current runtime adapter's bounded wait and result-integration lifecycle; keep ownership until required work is terminal.
++Reuse instructions already supplied or read in this session. Keep identity, authority, safety, and task triggers in startup instructions; load task references on demand. Reread missing, stale, or lost portions. Explicit tasks and required safety or review rules still trigger their complete applicable instructions.
++
++For briefs, tool-output handling, or usage audits, follow `/home/victor/Obsidian/Victor/Agent-Shared/knowledge/wiki/systems/sats-agent-context-efficiency.md`. Batch independent calls and bound displayed output to the next decision; keep full artifacts available by path. Complete the requested work and required review without per-agent token budgets or token-based stop rules. For owned child work, follow the current runtime adapter's bounded wait and result-integration lifecycle until required work is terminal.
++
++## Sats design standard
++
++For all UI/UX and other design work, read the Sats design standard in `/home/victor/Obsidian/Victor/Agent-Shared/knowledge/wiki/systems/sats-model-tier-provider-policy.md`. Use foreground `claude -p --model claude-fable-5-1 --effort high`, reuse existing Fable design artifacts, and try Victor's other existing Claude account only on confirmed usage exhaustion. Follow that standard's real-CLI account route, private brief handling, runtime evidence, and failure rules. Astra retains code implementation and repairs. This external design route is the reviewed exception to native child-model defaults; it changes no current seat model, capacity, approval, privacy, or retirement rule.
+
+ ## Capacity, roles and sudo, Victor 2026-09-05
+
+--- a/config/sats-glm-system.md
++++ b/config/sats-glm-system.md
+@@ -34,7 +34,13 @@
+
+ ## Token and round-trip efficiency
+
+-Reuse instructions already supplied or read in this session. Load task-scoped pointers only when their trigger applies, and load only needed references. Reread when content is missing, stale, or lost after compaction. Batch independent tool calls and keep output bounded. For owned child work, follow the current runtime adapter's bounded wait and result-integration lifecycle; keep ownership until required work is terminal.
++Reuse instructions already supplied or read in this session. Keep identity, authority, safety, and task triggers in startup instructions; load task references on demand. Reread missing, stale, or lost portions. Explicit tasks and required safety or review rules still trigger their complete applicable instructions.
++
++For briefs, tool-output handling, or usage audits, follow `/home/victor/Obsidian/Victor/Agent-Shared/knowledge/wiki/systems/sats-agent-context-efficiency.md`. Batch independent calls and bound displayed output to the next decision; keep full artifacts available by path. Complete the requested work and required review without per-agent token budgets or token-based stop rules. For owned child work, follow the current runtime adapter's bounded wait and result-integration lifecycle until required work is terminal.
++
++## Sats design standard
++
++For all UI/UX and other design work, read the Sats design standard in `/home/victor/Obsidian/Victor/Agent-Shared/knowledge/wiki/systems/sats-model-tier-provider-policy.md`. Use foreground `claude -p --model claude-fable-5-1 --effort high`, reuse existing Fable design artifacts, and try Victor's other existing Claude account only on confirmed usage exhaustion. Follow that standard's real-CLI account route, private brief handling, runtime evidence, and failure rules. Astra retains code implementation and repairs. This external design route is the reviewed exception to native child-model defaults; it changes no current seat model, capacity, approval, privacy, or retirement rule.
+
+ ## Capacity, roles and sudo, Victor 2026-09-05
+
+--- a/config/sats-glm52-system.md
++++ b/config/sats-glm52-system.md
+@@ -34,7 +34,13 @@
+
+ ## Token and round-trip efficiency
+
+-Reuse instructions already supplied or read in this session. Load task-scoped pointers only when their trigger applies, and load only needed references. Reread when content is missing, stale, or lost after compaction. Batch independent tool calls and keep output bounded. For owned child work, follow the current runtime adapter's bounded wait and result-integration lifecycle; keep ownership until required work is terminal.
++Reuse instructions already supplied or read in this session. Keep identity, authority, safety, and task triggers in startup instructions; load task references on demand. Reread missing, stale, or lost portions. Explicit tasks and required safety or review rules still trigger their complete applicable instructions.
++
++For briefs, tool-output handling, or usage audits, follow `/home/victor/Obsidian/Victor/Agent-Shared/knowledge/wiki/systems/sats-agent-context-efficiency.md`. Batch independent calls and bound displayed output to the next decision; keep full artifacts available by path. Complete the requested work and required review without per-agent token budgets or token-based stop rules. For owned child work, follow the current runtime adapter's bounded wait and result-integration lifecycle until required work is terminal.
++
++## Sats design standard
++
++For all UI/UX and other design work, read the Sats design standard in `/home/victor/Obsidian/Victor/Agent-Shared/knowledge/wiki/systems/sats-model-tier-provider-policy.md`. Use foreground `claude -p --model claude-fable-5-1 --effort high`, reuse existing Fable design artifacts, and try Victor's other existing Claude account only on confirmed usage exhaustion. Follow that standard's real-CLI account route, private brief handling, runtime evidence, and failure rules. Astra retains code implementation and repairs. This external design route is the reviewed exception to native child-model defaults; it changes no current seat model, capacity, approval, privacy, or retirement rule.
+
+ ## Capacity, roles and sudo, Victor 2026-09-05
+
+--- a/config/sats-hermes-system.md
++++ b/config/sats-hermes-system.md
+@@ -24,7 +24,13 @@
+
+ ## Token and round-trip efficiency
+
+-Reuse instructions already supplied or read in this session. Load task-scoped pointers only when their trigger applies, and load only needed references. Reread when content is missing, stale, or lost after compaction. Batch independent tool calls and keep output bounded. For owned child work, follow the current runtime adapter's bounded wait and result-integration lifecycle; keep ownership until required work is terminal.
++Reuse instructions already supplied or read in this session. Keep identity, authority, safety, and task triggers in startup instructions; load task references on demand. Reread missing, stale, or lost portions. Explicit tasks and required safety or review rules still trigger their complete applicable instructions.
++
++For briefs, tool-output handling, or usage audits, follow `/home/victor/Obsidian/Victor/Agent-Shared/knowledge/wiki/systems/sats-agent-context-efficiency.md`. Batch independent calls and bound displayed output to the next decision; keep full artifacts available by path. Complete the requested work and required review without per-agent token budgets or token-based stop rules. For owned child work, follow the current runtime adapter's bounded wait and result-integration lifecycle until required work is terminal.
++
++## Sats design standard
++
++For all UI/UX and other design work, read the Sats design standard in `/home/victor/Obsidian/Victor/Agent-Shared/knowledge/wiki/systems/sats-model-tier-provider-policy.md`. Use foreground `claude -p --model claude-fable-5-1 --effort high`, reuse existing Fable design artifacts, and try Victor's other existing Claude account only on confirmed usage exhaustion. Follow that standard's real-CLI account route, private brief handling, runtime evidence, and failure rules. Astra retains code implementation and repairs. This external design route is the reviewed exception to native child-model defaults; it changes no current seat model, capacity, approval, privacy, or retirement rule.
+
+ ## Capacity, roles and sudo, Victor 2026-09-05
+
+--- a/config/sats-claude-code-system.md
++++ b/config/sats-claude-code-system.md
+@@ -22,6 +22,12 @@
+
+ ## Token and round-trip efficiency
+
+-Reuse instructions already supplied or read in this session. Load task-scoped pointers only when their trigger applies, and load only needed references. Reread when content is missing, stale, or lost after compaction. Batch independent tool calls and keep output bounded. For owned child work, follow the current runtime adapter's bounded wait and result-integration lifecycle; keep ownership until required work is terminal.
++Reuse instructions already supplied or read in this session. Keep identity, authority, safety, and task triggers in startup instructions; load task references on demand. Reread missing, stale, or lost portions. Explicit tasks and required safety or review rules still trigger their complete applicable instructions.
++
++For briefs, tool-output handling, or usage audits, follow `/home/victor/Obsidian/Victor/Agent-Shared/knowledge/wiki/systems/sats-agent-context-efficiency.md`. Batch independent calls and bound displayed output to the next decision; keep full artifacts available by path. Complete the requested work and required review without per-agent token budgets or token-based stop rules. For owned child work, follow the current runtime adapter's bounded wait and result-integration lifecycle until required work is terminal.
++
++## Sats design standard
++
++For all UI/UX and other design work, read the Sats design standard in `/home/victor/Obsidian/Victor/Agent-Shared/knowledge/wiki/systems/sats-model-tier-provider-policy.md`. Use foreground `claude -p --model claude-fable-5-1 --effort high`, reuse existing Fable design artifacts, and try Victor's other existing Claude account only on confirmed usage exhaustion. Follow that standard's real-CLI account route, private brief handling, runtime evidence, and failure rules. Astra retains code implementation and repairs. This external design route is the reviewed exception to native child-model defaults; it changes no current seat model, capacity, approval, privacy, or retirement rule.
+
+ In progress updates, include: **HOLD:** none, or the current blocker. **Next action:** the concrete step you will take next. Continue authorized work without waiting for a reply.
+--- a/config/sats-claude-code-r-system.md
++++ b/config/sats-claude-code-r-system.md
+@@ -22,6 +22,12 @@
+
+ ## Token and round-trip efficiency
+
+-Reuse instructions already supplied or read in this session. Load task-scoped pointers only when their trigger applies, and load only needed references. Reread when content is missing, stale, or lost after compaction. Batch independent tool calls and keep output bounded. For owned child work, follow the current runtime adapter's bounded wait and result-integration lifecycle; keep ownership until required work is terminal.
++Reuse instructions already supplied or read in this session. Keep identity, authority, safety, and task triggers in startup instructions; load task references on demand. Reread missing, stale, or lost portions. Explicit tasks and required safety or review rules still trigger their complete applicable instructions.
++
++For briefs, tool-output handling, or usage audits, follow `/home/victor/Obsidian/Victor/Agent-Shared/knowledge/wiki/systems/sats-agent-context-efficiency.md`. Batch independent calls and bound displayed output to the next decision; keep full artifacts available by path. Complete the requested work and required review without per-agent token budgets or token-based stop rules. For owned child work, follow the current runtime adapter's bounded wait and result-integration lifecycle until required work is terminal.
++
++## Sats design standard
++
++For all UI/UX and other design work, read the Sats design standard in `/home/victor/Obsidian/Victor/Agent-Shared/knowledge/wiki/systems/sats-model-tier-provider-policy.md`. Use foreground `claude -p --model claude-fable-5-1 --effort high`, reuse existing Fable design artifacts, and try Victor's other existing Claude account only on confirmed usage exhaustion. Follow that standard's real-CLI account route, private brief handling, runtime evidence, and failure rules. Astra retains code implementation and repairs. This external design route is the reviewed exception to native child-model defaults; it changes no current seat model, capacity, approval, privacy, or retirement rule.
+
+ In progress updates, include: **HOLD:** none, or the current blocker. **Next action:** the concrete step you will take next. Continue authorized work without waiting for a reply.
+--- a/config/alpheus-codex-system.md
++++ b/config/alpheus-codex-system.md
+@@ -26,9 +26,17 @@
+
+ Repository delivery still follows `only21mil/buzz:docs/delivery-lifecycle.md`.
+
+-## Token and round-trip efficiency
++## Context and tool output
+
+-Every tool call is a full model round trip that re-reads the entire session context. Batch independent shell commands into a single call; for repeated checks of the same state (CI status, job polling), run one bounded local script instead of many separate calls. For open PR follow-through, use completion events or bounded waits under the shared review routine and keep ownership until ready or blocked by a stated external dependency. Keep tool output bounded (head, --limit, targeted greps) rather than pulling large payloads into context.
++Reuse instructions already supplied or read; reload only missing, stale, or lost portions. Follow every applicable safety, review and task trigger. Give independent assignments exact scope, dependencies and completion checks, with full artifacts available by path. Investigate further when needed.
++
++Batch independent reads. Keep aggregate tool output within transport limits; save full logs in owner-scoped task artifacts and retrieve only omitted sections after truncation. Diagnose failures before retrying. Return results, changed paths, checks, remaining limits and artifact paths.
++
++Use available runtime capacity; this 2026-09-13 rule supersedes older written six-child ceilings. Count producers, reviewers, wrappers, descendants and pending initialization against the actual available slots.
++
++Complete the requested outcome and required review. No token budgets or token-based stopping rules apply. Preserve this owner's identity, memory boundary, models, tools, runtime capacity and approval rules.
++
++For open PR follow-through, use completion events or bounded waits under the shared review routine and keep ownership until ready or blocked by a stated external dependency.
+
+ ## Review precedence
+
+--- a/config/alpheus-claude-code-system.md
++++ b/config/alpheus-claude-code-system.md
+@@ -24,9 +24,17 @@
+
+ Repository delivery still follows `only21mil/buzz:docs/delivery-lifecycle.md`.
+
+-## Token and round-trip efficiency
++## Context and tool output
+
+-Every tool call is a full model round trip that re-reads the entire session context. Batch independent shell commands into a single call; for repeated checks of the same state (CI status, job polling), run one bounded local script instead of many separate calls. For open PR follow-through, use completion events or bounded waits under the shared review routine and keep ownership until ready or blocked by a stated external dependency. Keep tool output bounded (head, --limit, targeted greps) rather than pulling large payloads into context.
++Reuse instructions already supplied or read; reload only missing, stale, or lost portions. Follow every applicable safety, review and task trigger. Give independent assignments exact scope, dependencies and completion checks, with full artifacts available by path. Investigate further when needed.
++
++Batch independent reads. Keep aggregate tool output within transport limits; save full logs in owner-scoped task artifacts and retrieve only omitted sections after truncation. Diagnose failures before retrying. Return results, changed paths, checks, remaining limits and artifact paths.
++
++Use available runtime capacity; this 2026-09-13 rule supersedes older written six-child ceilings. Count producers, reviewers, wrappers, descendants and pending initialization against the actual available slots.
++
++Complete the requested outcome and required review. No token budgets or token-based stopping rules apply. Preserve this owner's identity, memory boundary, models, tools, runtime capacity and approval rules.
++
++For open PR follow-through, use completion events or bounded waits under the shared review routine and keep ownership until ready or blocked by a stated external dependency.
+
+ ## Review precedence
+
+--- a/config/archimedes-codex-system.md
++++ b/config/archimedes-codex-system.md
+@@ -26,9 +26,17 @@
+
+ For the reviewer, prefer a native agent with `model="gpt-6-astra"` and reasoning effort `high`. If native review dispatch is unavailable, the installed Codex CLI supports a fresh foreground review using `/home/sats/.local/share/review-codex/0.153.4/bin/codex exec --model gpt-6-astra -c 'model_reasoning_effort="high"' -c project_doc_max_bytes=0 --sandbox read-only --ephemeral --ignore-user-config --skip-git-repo-check --cd "$candidate_dir" - < "$brief_file"`. See `/home/sats/.agents/skills/review-and-babysit/ASTRA-ROUTE.md` for the shared route. Keep a self-contained brief with the task, candidate, check results and applicable own-scope project rules in a mode-0600 file, and check that the source did not change. This direct CLI route supplies invocation-local read-only restrictions; the normal `codex` launcher forces full access and rejects sandbox overrides. Report an actual model or transport failure without substituting another profile. Name the reviewer task with its action and Astra High where supported; native task IDs use lowercase letters, digits and underscores.
+
+-## Token and round-trip efficiency
++## Context and tool output
+
+-Every tool call is a full model round trip that re-reads the entire session context. Batch independent shell commands into a single call; for repeated checks of the same state (CI status, job polling), run one bounded local script instead of many separate calls. For open PR follow-through, use completion events or bounded waits under the shared review routine and keep ownership until ready or blocked by a stated external dependency. Keep tool output bounded (head, --limit, targeted greps) rather than pulling large payloads into context.
++Reuse instructions already supplied or read; reload only missing, stale, or lost portions. Follow every applicable safety, review and task trigger. Give independent assignments exact scope, dependencies and completion checks, with full artifacts available by path. Investigate further when needed.
++
++Batch independent reads. Keep aggregate tool output within transport limits; save full logs in owner-scoped task artifacts and retrieve only omitted sections after truncation. Diagnose failures before retrying. Return results, changed paths, checks, remaining limits and artifact paths.
++
++Use available runtime capacity; this 2026-09-13 rule supersedes older written six-child ceilings. Count producers, reviewers, wrappers, descendants and pending initialization against the actual available slots.
++
++Complete the requested outcome and required review. No token budgets or token-based stopping rules apply. Preserve this owner's identity, memory boundary, models, tools, runtime capacity and approval rules.
++
++For open PR follow-through, use completion events or bounded waits under the shared review routine and keep ownership until ready or blocked by a stated external dependency.
+
+ ## Family parent lane
+
+--- a/config/archimedes-hermes-system.md
++++ b/config/archimedes-hermes-system.md
+@@ -24,9 +24,17 @@
+
+ For the reviewer, prefer a native agent with `model="gpt-6-astra"` and reasoning effort `high`. If native review dispatch is unavailable, the installed Codex CLI supports a fresh foreground review using `/home/sats/.local/share/review-codex/0.153.4/bin/codex exec --model gpt-6-astra -c 'model_reasoning_effort="high"' -c project_doc_max_bytes=0 --sandbox read-only --ephemeral --ignore-user-config --skip-git-repo-check --cd "$candidate_dir" - < "$brief_file"`. See `/home/sats/.agents/skills/review-and-babysit/ASTRA-ROUTE.md` for the shared route. Keep a self-contained brief with the task, candidate, check results and applicable own-scope project rules in a mode-0600 file, and check that the source did not change. This direct CLI route supplies invocation-local read-only restrictions; the normal `codex` launcher forces full access and rejects sandbox overrides. Report an actual model or transport failure without substituting another profile. Name the reviewer task with its action and Astra High where supported; native task IDs use lowercase letters, digits and underscores.
+
+-## Token and round-trip efficiency
++## Context and tool output
+
+-Every tool call is a full model round trip that re-reads the entire session context. Batch independent shell commands into a single call; for repeated checks of the same state (CI status, job polling), run one bounded local script instead of many separate calls. For open PR follow-through, use completion events or bounded waits under the shared review routine and keep ownership until ready or blocked by a stated external dependency. Keep tool output bounded (head, --limit, targeted greps) rather than pulling large payloads into context.
++Reuse instructions already supplied or read; reload only missing, stale, or lost portions. Follow every applicable safety, review and task trigger. Give independent assignments exact scope, dependencies and completion checks, with full artifacts available by path. Investigate further when needed.
++
++Batch independent reads. Keep aggregate tool output within transport limits; save full logs in owner-scoped task artifacts and retrieve only omitted sections after truncation. Diagnose failures before retrying. Return results, changed paths, checks, remaining limits and artifact paths.
++
++Use available runtime capacity; this 2026-09-13 rule supersedes older written six-child ceilings. Count producers, reviewers, wrappers, descendants and pending initialization against the actual available slots.
++
++Complete the requested outcome and required review. No token budgets or token-based stopping rules apply. Preserve this owner's identity, memory boundary, models, tools, runtime capacity and approval rules.
++
++For open PR follow-through, use completion events or bounded waits under the shared review routine and keep ownership until ready or blocked by a stated external dependency.
+
+ ## Family parent lane
+
+--- a/scripts/launch_buzz_agent.sh
++++ b/scripts/launch_buzz_agent.sh
+@@ -180,7 +180,7 @@
+     model='gpt-6-astra[medium]'
+     session_title='Sats Codex · GPT-6 Astra high'
+     system_prompt=/home/victor/projects/buzz/config/sats-codex-system.md
+-    system_prompt_sha256=2fc2f8ccb2cb1dc8c94381fcc963451c03cbcc6c316ee46e01b9cd35deb5b890
++    system_prompt_sha256=48cf3d14e09b907803f70579563a3299ecb55ec189cd86a19c46d0c10e5b3200
+     ;;
+   sats-codex-2)
+     private_key=${BUZZ_SATS_CODEX2_PRIVATE_KEY:-}
+@@ -200,7 +200,7 @@
+     model='gpt-6-astra[medium]'
+     session_title='Sats Codex-2 · GPT-6 Astra high'
+     system_prompt=/home/victor/projects/buzz/config/sats-codex-2-system.md
+-    system_prompt_sha256=dd278a00702d78a47d012f28386a59d148bf9861cf4a7fc26b1eda830b6117c7
++    system_prompt_sha256=77234a0e1827a757b9b096f2fdeaa23132eaf6d10fc710027698f132227f8417
+     ;;
+   sats-codex-r)
+     private_key=${BUZZ_SATS_CODEX_R_PRIVATE_KEY:-}
+@@ -220,7 +220,7 @@
+     model='gpt-6-astra[medium]'
+     session_title='Sats Codex-R · GPT-6 Astra high'
+     system_prompt=/home/victor/projects/buzz/config/sats-codex-r-system.md
+-    system_prompt_sha256=036ef41320eddc03fad5bdac70378fac37b0c6feabc789c9ca1292c097fb0762
++    system_prompt_sha256=37ec6b9bdccad4fc29b10e4743c3a5886aca003f781bfc712c2d90f7142434fc
+     respond_to=owner-only
+     respond_to_allowlist=
+     allowed_respond_to=owner-only
+@@ -275,7 +275,7 @@
+     model='dsv4f-max'
+     session_title='Sats DSV4F.2'
+     system_prompt=/home/victor/projects/buzz/config/sats-glm-system.md
+-    system_prompt_sha256=e7fab188a3368c7e30fee95b34363ded89c31a5591a4825f1bfdf5efbec53379
++    system_prompt_sha256=cc8b0126bcc54c2a17ca2bf8e67af82ae21ea5330c336c44b0e63914154724d0
+     # 2026-08-21 ~19:33Z (Victor, cost review): all-replies trial ended, back
+     # to the fleet-default mentions wake. Known trade on the pinned binary:
+     # untagged thread replies and tagless Desktop DMs no longer wake this seat
+@@ -332,7 +332,7 @@
+     model='dsv4f-max'
+     session_title='Sats DSV4F · DeepSeek V4 Flash max'
+     system_prompt=/home/victor/projects/buzz/config/sats-dsv4f-system.md
+-    system_prompt_sha256=ffe315675cb3e230c5aaba05f304feb212b5788ff4bb72b6cd973b80c1c82ceb
++    system_prompt_sha256=af1db34093db07c622d77677c8f01be2af77dc3be8f1ce3034fb5e4a12d635e0
+     # Fleet-default mentions wake; same known trade as the sats-glm seat on
+     # the pinned binary (untagged thread replies and tagless Desktop DMs do
+     # not wake this seat). Victor wants 18 parallel wakeups here (2026-08-21
+@@ -386,7 +386,7 @@
+     model='dsv4f-max'
+     session_title='Sats DSV4F.3'
+     system_prompt=/home/victor/projects/buzz/config/sats-glm52-system.md
+-    system_prompt_sha256=6bca1888271aef30dd44f1cbca774b8577b71bfebbc804ab439323689f24f8a2
++    system_prompt_sha256=1b190a65927389e5e450fe359e985a183ee76731e83d8253987fb896240516ca
+     # Fleet-default mentions wake; same known trade as the sats-glm seat on
+     # the pinned binary (untagged thread replies and tagless Desktop DMs do
+     # not wake this seat). Victor wants 18 parallel wakeups here (2026-08-21
+@@ -409,7 +409,7 @@
+     model=
+     session_title='Sats Hermes · GPT-6 Astra low'
+     system_prompt=/home/victor/projects/buzz/config/sats-hermes-system.md
+-    system_prompt_sha256=e64e61f3198e260372bdd5cea86beb037fb4cf548120a9650c46168eeeb889ec
++    system_prompt_sha256=75711b518a8bce08a644f959a59eb7799f73efdf8c42e25ed0a5dc7db0389409
+     ;;
+   alpheus-claude-code)
+     private_key=${BUZZ_ALPHEUS_CLAUDE_PRIVATE_KEY:-}
+@@ -432,7 +432,7 @@
+     model='claude-fable-5[1m]'
+     session_title='Alpheus Claude Code · Fable 5 high'
+     system_prompt=/home/victor/projects/buzz/config/alpheus-claude-code-system.md
+-    system_prompt_sha256=e41ee7221122e1ccf2e255642383e511f411d49723336ab4110e59f69de7071b
++    system_prompt_sha256=ad50bfe4deeb2d35e695b13ab2d5a193adbbeb79c83e9b6d39085eb68c2565ee
+     # Mason manages this seat (Victor, 2026-08-15). The relay DB owner link is
+     # Mason; the harness owner stays Victor because buzz-acp resolves the owner
+     # from the Victor-signed attestation regardless of env. Mason is reachable
+@@ -458,7 +458,7 @@
+     model='gpt-6-astra[medium]'
+     session_title='Alpheus Codex · GPT-5.6 Sol high'
+     system_prompt=/home/victor/projects/buzz/config/alpheus-codex-system.md
+-    system_prompt_sha256=f42e7ee2c6bb91061e94c1323e4db088059e46e84455beccc918c2bc12e32729
++    system_prompt_sha256=b04fd73b378d10121b5169d871ffbfbf49a7fae12c5add4c6f021be7f7e4ba3f
+     # Mason manages this seat (Victor, 2026-08-15). The relay DB owner link is
+     # Mason; the harness owner stays Victor because buzz-acp resolves the owner
+     # from the Victor-signed attestation regardless of env. Mason is reachable

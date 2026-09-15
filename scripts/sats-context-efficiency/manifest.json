@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "source_owner": "/home/victor/projects/buzz",
+  "base_commit": "1e05fce27c658bf09a2c45fbebd1d8388d33bb15",
+  "issue": "4ac7eba21762a0b74776326017cc1f557deba2d8e044837d176d513b0de0e855",
+  "files": [
+    {
+      "path": "config/sats-codex-system.md",
+      "before_sha256": "2fc2f8ccb2cb1dc8c94381fcc963451c03cbcc6c316ee46e01b9cd35deb5b890",
+      "after_sha256": "48cf3d14e09b907803f70579563a3299ecb55ec189cd86a19c46d0c10e5b3200",
+      "mode": "0o600"
+    },
+    {
+      "path": "config/sats-codex-2-system.md",
+      "before_sha256": "dd278a00702d78a47d012f28386a59d148bf9861cf4a7fc26b1eda830b6117c7",
+      "after_sha256": "77234a0e1827a757b9b096f2fdeaa23132eaf6d10fc710027698f132227f8417",
+      "mode": "0o600"
+    },
+    {
+      "path": "config/sats-codex-r-system.md",
+      "before_sha256": "036ef41320eddc03fad5bdac70378fac37b0c6feabc789c9ca1292c097fb0762",
+      "after_sha256": "37ec6b9bdccad4fc29b10e4743c3a5886aca003f781bfc712c2d90f7142434fc",
+      "mode": "0o600"
+    },
+    {
+      "path": "config/sats-dsv4f-system.md",
+      "before_sha256": "ffe315675cb3e230c5aaba05f304feb212b5788ff4bb72b6cd973b80c1c82ceb",
+      "after_sha256": "af1db34093db07c622d77677c8f01be2af77dc3be8f1ce3034fb5e4a12d635e0",
+      "mode": "0o600"
+    },
+    {
+      "path": "config/sats-glm-system.md",
+      "before_sha256": "e7fab188a3368c7e30fee95b34363ded89c31a5591a4825f1bfdf5efbec53379",
+      "after_sha256": "cc8b0126bcc54c2a17ca2bf8e67af82ae21ea5330c336c44b0e63914154724d0",
+      "mode": "0o600"
+    },
+    {
+      "path": "config/sats-glm52-system.md",
+      "before_sha256": "6bca1888271aef30dd44f1cbca774b8577b71bfebbc804ab439323689f24f8a2",
+      "after_sha256": "1b190a65927389e5e450fe359e985a183ee76731e83d8253987fb896240516ca",
+      "mode": "0o600"
+    },
+    {
+      "path": "config/sats-hermes-system.md",
+      "before_sha256": "e64e61f3198e260372bdd5cea86beb037fb4cf548120a9650c46168eeeb889ec",
+      "after_sha256": "75711b518a8bce08a644f959a59eb7799f73efdf8c42e25ed0a5dc7db0389409",
+      "mode": "0o600"
+    },
+    {
+      "path": "config/sats-claude-code-system.md",
+      "before_sha256": "0a078b1f6b088dc8c4f380ac66af6dd73c0d761325ca664cc53b12de9b6f5937",
+      "after_sha256": "9e4b3efc1159b176f7d1a80797442a784184e27214fb39a1c20555d91135cb20",
+      "mode": "0o644"
+    },
+    {
+      "path": "config/sats-claude-code-r-system.md",
+      "before_sha256": "05f08cc1e2365807872c45f8798110ac66938749d6858997df23ac9b7bd38f3d",
+      "after_sha256": "02719b9930164645d0484b28dcd22def41d7a3bf9e8d6ff2a22f8b14500c374c",
+      "mode": "0o600"
+    },
+    {
+      "path": "config/alpheus-codex-system.md",
+      "before_sha256": "f42e7ee2c6bb91061e94c1323e4db088059e46e84455beccc918c2bc12e32729",
+      "after_sha256": "b04fd73b378d10121b5169d871ffbfbf49a7fae12c5add4c6f021be7f7e4ba3f",
+      "mode": "0o600"
+    },
+    {
+      "path": "config/alpheus-claude-code-system.md",
+      "before_sha256": "e41ee7221122e1ccf2e255642383e511f411d49723336ab4110e59f69de7071b",
+      "after_sha256": "ad50bfe4deeb2d35e695b13ab2d5a193adbbeb79c83e9b6d39085eb68c2565ee",
+      "mode": "0o600"
+    },
+    {
+      "path": "config/archimedes-codex-system.md",
+      "before_sha256": "0dcf1fefe4bf82019beed6b9fc9f6e236745353a9f5cff0365f42742ad92a23e",
+      "after_sha256": "94a86a3e63f7cd10071cc48f973be416eefadf20f75873441d816d0ec81dd1d5",
+      "mode": "0o600"
+    },
+    {
+      "path": "config/archimedes-hermes-system.md",
+      "before_sha256": "648dcf2114d107b04e23081876fa6c4e94b2f47404cae59fecbb0e3ec54db31b",
+      "after_sha256": "5ce71b2a2049fd6109a295587f012e1dddb84dadb61bb3a388f306633239243b",
+      "mode": "0o600"
+    },
+    {
+      "path": "scripts/launch_buzz_agent.sh",
+      "before_sha256": "caaa91feb9d1f6321af1abef5754cd6dd7e41dfeb0f9dd12ab04bd6b6271208e",
+      "after_sha256": "0689e48d2b7a471c89a09b36e937d588d52c542ffea6a7a0135babad2197a0d3",
+      "mode": "0o755"
+    }
+  ],
+  "patch_sha256": "35ac79ff1ad52fd972acb8ec765f04a9fe8ae9efddc5b5ed5dcd415e75270054"
+}
