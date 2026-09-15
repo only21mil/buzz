@@ -111,7 +111,7 @@ void main() {
         'lib/features/settings/settings_page/connection_section.dart',
       ).readAsStringSync();
       expect(source, contains('Identity (pubkey)'));
-      expect(source, contains('copyToClipboard(context, pubkey'));
+      expect(source, contains('copyToClipboard(context, npub'));
       expect(source, isNot(contains('copyToClipboard(context, nsec')));
     });
 

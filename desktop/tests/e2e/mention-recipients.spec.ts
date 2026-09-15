@@ -46,10 +46,10 @@ for (const destination of ["channel", "forum"]) {
   });
 }
 
-// A pasted mention whose pubkey is not a member is verified against the relay
-// and then blocks the send: the draft stays put and no event leaves the
-// composer until the author picks a real recipient or drops the sigil.
-test("foreign clipboard identity is verified and blocks the send", async ({
+// A pasted mention whose pubkey is not a member is verified against the relay.
+// D2 bind-and-send keeps the plain-text draft sendable without tagging the
+// unverified foreign key once lookup completes.
+test("foreign clipboard identity is verified and sends without tagging the foreign key", async ({
   page,
 }) => {
   await installMockBridge(page);
@@ -78,14 +78,14 @@ test("foreign clipboard identity is verified and blocks the send", async ({
       ),
     )
     .toBe(true);
+  await expect(input.locator(".mention-chip")).toHaveCount(0);
   await page.getByTestId("send-message").click();
-  await expect(
-    page.getByText("That @mention is not linked to a member.", {
-      exact: false,
-    }),
-  ).toBeVisible();
-  await expect(input).toHaveText(content);
-  expect(await sentEvents(page, content)).toEqual([]);
+  await expect(input).toHaveText("");
+  const events = await sentEvents(page, content);
+  expect(events).toHaveLength(1);
+  expect(
+    events[0].tags.filter((tag) => tag[0] === "p").map((tag) => tag[1]),
+  ).not.toContain(foreign);
 });
 
 // ── Restored upstream regression coverage ─────────────────────────────
@@ -95,8 +95,9 @@ test("foreign clipboard identity is verified and blocks the send", async ({
 // edit (fork edit_message payloads carry mentionPubkeys, not mentionTags),
 // narrow-composer chip-wrap styling, historical/absent-roster thread repair, and
 // qualified/abbreviated copy-paste — the fork renders hex qualifiers, not npub
-// (Scout (bb22a529…f260)), and blocks unresolvable sends instead of sending
-// unbound. Those are fork contract differences, not missing coverage.
+// (Scout (bb22a529…f260)), and D2 sends unbound paste mentions as plain text
+// without tagging unverified keys. Those are fork contract differences, not
+// missing coverage.
 
 const FIRST = TEST_IDENTITIES.alice.pubkey;
 const SECOND = TEST_IDENTITIES.bob.pubkey;
