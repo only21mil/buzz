@@ -34,6 +34,8 @@ import 'send_message_provider.dart';
 import 'small_avatar.dart';
 import 'timeline_message.dart';
 
+part 'thread_detail_page/avatar.dart';
+
 /// Full-screen thread detail page.
 /// Shows replies, typing indicators, and the reply composer.
 class ThreadDetailPage extends HookConsumerWidget {
@@ -966,33 +968,6 @@ class _ThreadMessage extends ConsumerWidget {
               ),
             ),
           ),
-        ),
-      ),
-    );
-  }
-}
-
-class _Avatar extends StatelessWidget {
-  final UserProfile? profile;
-  final String pubkey;
-
-  const _Avatar({required this.profile, required this.pubkey});
-
-  @override
-  Widget build(BuildContext context) {
-    final initial =
-        profile?.initial ?? (pubkey.isNotEmpty ? pubkey[0].toUpperCase() : '?');
-    final avatarUrl = profile?.avatarUrl;
-
-    return AvatarImage(
-      imageUrl: avatarUrl,
-      radius: messageAvatarSize / 2,
-      backgroundColor: context.colors.primaryContainer,
-      fallback: Text(
-        initial,
-        style: context.textTheme.labelMedium?.copyWith(
-          color: context.colors.onPrimaryContainer,
-          fontWeight: FontWeight.w600,
         ),
       ),
     );

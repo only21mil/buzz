@@ -29,6 +29,8 @@ import '../../shared/profile/user_profile.dart';
 import 'recent_searches_provider.dart';
 import 'search_provider.dart';
 
+part 'search_page/section_label.dart';
+
 enum _SearchFilter { all, messages, channels, people }
 
 const _searchFieldMinHeight = 36.0;
@@ -963,38 +965,4 @@ class _MessageTile extends ConsumerWidget {
       );
     }
   }
-}
-
-class _SectionLabel extends StatelessWidget {
-  final String label;
-
-  const _SectionLabel({required this.label});
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(
-        Grid.gutter,
-        Grid.xs,
-        Grid.gutter,
-        Grid.half,
-      ),
-      child: Text(
-        label,
-        key: ValueKey('search-section-${label.toLowerCase()}'),
-        style: activityContextTextStyle.copyWith(
-          color: context.colors.onSurfaceVariant,
-        ),
-      ),
-    );
-  }
-}
-
-extension on _SearchFilter {
-  String get label => switch (this) {
-    _SearchFilter.all => 'All',
-    _SearchFilter.messages => 'Messages',
-    _SearchFilter.channels => 'Channels',
-    _SearchFilter.people => 'People',
-  };
 }
