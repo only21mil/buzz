@@ -1034,6 +1034,26 @@
       ],
       "status": "applied-tail",
       "notes": "P08 tail: upstream 0039 under fork 0049."
+    },
+    {
+      "version": 50,
+      "file": "migrations/0050_agent_drafts_soft_delete.sql",
+      "description": "agent drafts soft delete",
+      "sha256": "69aeaf8666c4d8d4d8b15979e87ccb6b1fdcf43d465be15871c9b8c3137f7b1d",
+      "sqlx_sha384": "57373338aed1743c43bc448dad7cdde0c8c83c1f0c5f72c3ff61f1bd8eeb31ebd395a8c8e06ee0cb09303d49c19bcfc2",
+      "fork_origin_commit": "86cf5af263a6c1455be9b7b935f8b10db4be08e2",
+      "origin_class": "fork-original",
+      "operations": [
+        "define-function:preserve_agent_draft_history:soft_delete"
+      ],
+      "supersedes": [
+        "define-function:preserve_agent_draft_history"
+      ],
+      "prerequisites": [
+        40
+      ],
+      "status": "proposed-tail",
+      "notes": "Replaces the 0040 function body only; the trigger events_preserve_agent_drafts is untouched. Not yet applied to any database."
     }
   ],
   "upstream_only": [
@@ -1168,5 +1188,5 @@
       "reason": "Retraction of tables the fork never created; nothing to drop. Recorded so a future merge never mistakes 0041/0042 absence for a gap."
     }
   ],
-  "tail_manifest": "scripts/migrations-0043-0049.sha256"
+  "tail_manifest": "scripts/migrations-0043-0050.sha256"
 }

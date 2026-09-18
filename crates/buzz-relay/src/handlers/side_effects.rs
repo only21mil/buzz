@@ -2574,7 +2574,7 @@ pub(crate) fn extract_h_tag_channel(event: &Event) -> Option<Uuid> {
 
 /// Extract target pubkey from first `p` tag.
 /// Kind 14201 (draft request) and 14202 (draft decision) rows are durable
-/// review history. The database trigger from migration 0040 blocks
+/// review history. The database trigger from migrations 0040 and 0050 blocks
 /// hard deletes and rewrites; this check turns an explicit deletion request
 /// into a policy rejection before any query runs.
 pub(crate) fn is_agent_draft_kind(kind: u32) -> bool {

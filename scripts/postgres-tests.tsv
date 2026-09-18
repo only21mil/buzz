@@ -65,6 +65,7 @@ buzz-db	buzz_db	migration::tests::pre_0007_ambiguous_nip_rs_data_blocks_without_
 buzz-db	buzz_db	migration::tests::push_message_kinds_fresh_install	crates/buzz-db/src/migration.rs	migration	push packet fresh migration fixture
 buzz-db	buzz_db	migration::tests::push_message_kinds_populated_upgrade_preserves_authority	crates/buzz-db/src/migration.rs	migration	push packet populated migration authority-preservation fixture
 buzz-db	buzz_db	migration::tests::run_migrations_applies_consolidated_initial_schema_on_fresh_database	crates/buzz-db/src/migration.rs	migration	fixture applies migrations to empty database
+buzz-db	buzz_db	migration::tests::agent_draft_rows_soft_delete_but_never_rewrite_or_hard_delete	crates/buzz-db/src/migration.rs	migration	fixture applies migrations to empty database
 buzz-db	buzz_db	moderation::tests::expired_ban_does_not_hide_active_timeout	crates/buzz-db/src/moderation.rs	desired	desired schema fixture
 buzz-db	buzz_db	moderation::tests::report_reingest_returns_same_id_and_preserves_resolution	crates/buzz-db/src/moderation.rs	desired	desired schema fixture
 buzz-db	buzz_db	moderation::tests::resolve_report_returns_false_after_report_is_closed	crates/buzz-db/src/moderation.rs	desired	desired schema fixture

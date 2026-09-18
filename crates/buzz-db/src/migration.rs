@@ -580,7 +580,7 @@ mod tests {
 
         assert_eq!(
             migrations.len(),
-            49,
+            50,
             "embedded migration matrix must contain the frozen prefix plus admitted tail"
         );
         assert_eq!(migrations[0].version, 1);
@@ -1178,6 +1178,7 @@ mod tests {
         (47, "relay admin action lease"),
         (48, "relay admin outbox claim token"),
         (49, "relay operator audit"),
+        (50, "agent drafts soft delete"),
     ];
 
     #[test]
@@ -2163,6 +2164,105 @@ mod tests {
             "fresh installs must default non-allowlisted kinds to NULL: {search_expression}"
         );
     }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn agent_draft_rows_soft_delete_but_never_rewrite_or_hard_delete() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        run_migrations(&pool).await.expect("apply migrations");
+
+        let community_id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(community_id)
+            .bind(format!("drafts-0050-{}.example", community_id.simple()))
+            .execute(&pool)
+            .await
+            .expect("insert community");
+        // Two draft rows (request, decision) and one ordinary message.
+        for (marker, kind) in [(1_u8, 14_201_i32), (2, 14_202), (3, 1)] {
+            sqlx::query(
+                "INSERT INTO events \
+                 (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at) \
+                 VALUES ($1, $2, $3, NOW(), $4, '[]'::jsonb, 'draft body', $5, NOW())",
+            )
+            .bind(community_id)
+            .bind(vec![marker; 32])
+            .bind(vec![marker + 10; 32])
+            .bind(kind)
+            .bind(vec![marker + 20; 64])
+            .execute(&pool)
+            .await
+            .expect("insert event");
+        }
+        let draft = vec![1_u8; 32];
+
+        // A soft delete is the relay's ordinary delete statement; it passes.
+        let soft = sqlx::query(
+            "UPDATE events SET deleted_at = NOW() \
+             WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL",
+        )
+        .bind(community_id)
+        .bind(&draft)
+        .execute(&pool)
+        .await
+        .expect("soft delete a draft row");
+        assert_eq!(soft.rows_affected(), 1);
+
+        // A bulk sweep whose range holds draft rows no longer aborts.
+        let sweep = sqlx::query(
+            "UPDATE events SET deleted_at = NOW() \
+             WHERE community_id = $1 AND deleted_at IS NULL",
+        )
+        .bind(community_id)
+        .execute(&pool)
+        .await
+        .expect("bulk soft delete across draft and ordinary rows");
+        assert_eq!(sweep.rows_affected(), 2);
+
+        // Bookkeeping columns stay writable.
+        sqlx::query("UPDATE events SET delivered_at = 1 WHERE community_id = $1 AND id = $2")
+            .bind(community_id)
+            .bind(&draft)
+            .execute(&pool)
+            .await
+            .expect("bookkeeping update on a draft row");
+
+        // Signed columns stay immutable.
+        for statement in [
+            "UPDATE events SET content = 'rewritten' WHERE community_id = $1 AND id = $2",
+            "UPDATE events SET tags = '[[\"x\"]]'::jsonb WHERE community_id = $1 AND id = $2",
+            "UPDATE events SET kind = 1 WHERE community_id = $1 AND id = $2",
+            "UPDATE events SET pubkey = $2 WHERE community_id = $1 AND id = $2",
+        ] {
+            let error = sqlx::query(statement)
+                .bind(community_id)
+                .bind(&draft)
+                .execute(&pool)
+                .await
+                .expect_err("draft rewrite must raise");
+            assert!(
+                error.to_string().contains("cannot be rewritten"),
+                "{statement}: {error}"
+            );
+        }
+
+        // A hard delete of a draft row still raises; an ordinary row deletes.
+        let error = sqlx::query("DELETE FROM events WHERE community_id = $1 AND id = $2")
+            .bind(community_id)
+            .bind(&draft)
+            .execute(&pool)
+            .await
+            .expect_err("draft hard delete must raise");
+        assert!(error.to_string().contains("cannot be deleted"), "{error}");
+        let ordinary = sqlx::query("DELETE FROM events WHERE community_id = $1 AND id = $2")
+            .bind(community_id)
+            .bind(vec![3_u8; 32])
+            .execute(&pool)
+            .await
+            .expect("ordinary row hard delete");
+        assert_eq!(ordinary.rows_affected(), 1);
+    }
 }
 
 #[cfg(test)]
@@ -2216,6 +2316,7 @@ mod b1_ci_grants_ordering {
                 (47, "relay admin action lease"),
                 (48, "relay admin outbox claim token"),
                 (49, "relay operator audit"),
+                (50, "agent drafts soft delete"),
             ]
         );
         let ci_grants = migrations

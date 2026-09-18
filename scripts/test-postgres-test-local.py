@@ -160,8 +160,8 @@ class IsolationTests(unittest.TestCase):
             (root / 'scripts').mkdir()
             shutil.copy(frozen.ROOT / 'scripts/migrations-0001-0035.sha256', root / 'scripts')
             shutil.copy(frozen.ROOT / 'scripts/migrations-0036-0042.sha256', root / 'scripts')
-            shutil.copy(frozen.ROOT / 'scripts/migrations-0043-0049.sha256', root / 'scripts')
-            (root / 'migrations/0050_new.sql').write_text('-- new migration\n')
+            shutil.copy(frozen.ROOT / 'scripts/migrations-0043-0050.sha256', root / 'scripts')
+            (root / 'migrations/0051_new.sql').write_text('-- new migration\n')
             ledger = root / 'map.json'
             tail_entries = json.loads(
                 (frozen.ROOT / 'migrations/admission-map.json').read_text()
@@ -170,17 +170,17 @@ class IsolationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'missing from admission map'):
                 frozen.check(root, ledger)
             ledger.write_text(
-                json.dumps(tail_entries + [{'proposed_target': '0050_new.sql'}])
+                json.dumps(tail_entries + [{'proposed_target': '0051_new.sql'}])
             )
             with self.assertRaisesRegex(ValueError, 'admission map missing source_commit'):
                 frozen.check(root, ledger)
             # A complete entry passes: typed empty prerequisites are allowed
             # for an independent operation, and fresh operations admit.
-            sql = (root / 'migrations/0050_new.sql').read_bytes()
+            sql = (root / 'migrations/0051_new.sql').read_bytes()
             entry = {
-                'proposed_target': '0050_new.sql',
+                'proposed_target': '0051_new.sql',
                 'source_commit': 'abc123',
-                'source_path': 'migrations/0050_new.sql',
+                'source_path': 'migrations/0051_new.sql',
                 'source_sha256': hashlib.sha256(sql).hexdigest(),
                 'adapted_sql_sha256': hashlib.sha256(sql).hexdigest(),
                 'prerequisites': [],

@@ -1887,12 +1887,25 @@ CREATE TABLE agent_drafts (
  UNIQUE (community_id,request_event_id)
 );
 
--- Ordinary deletion/age cleanup cannot erase a pending review or a terminal
--- tombstone. A future explicit retention horizon requires a separate migration.
+-- A draft request or decision row is never hard-deleted or rewritten, but a
+-- soft delete (deleted_at) and other bookkeeping updates pass; the relay
+-- refuses explicit draft deletions by policy before the query (0040 + 0050).
 CREATE FUNCTION preserve_agent_draft_history() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
  IF OLD.kind IN (14201,14202) THEN
-  RAISE EXCEPTION 'durable agent draft history cannot be deleted or rewritten';
+  IF TG_OP = 'DELETE' THEN
+   RAISE EXCEPTION 'durable agent draft history cannot be deleted';
+  END IF;
+  IF NEW.id IS DISTINCT FROM OLD.id
+   OR NEW.community_id IS DISTINCT FROM OLD.community_id
+   OR NEW.pubkey IS DISTINCT FROM OLD.pubkey
+   OR NEW.created_at IS DISTINCT FROM OLD.created_at
+   OR NEW.kind IS DISTINCT FROM OLD.kind
+   OR NEW.tags IS DISTINCT FROM OLD.tags
+   OR NEW.content IS DISTINCT FROM OLD.content
+   OR NEW.sig IS DISTINCT FROM OLD.sig THEN
+   RAISE EXCEPTION 'durable agent draft history cannot be rewritten';
+  END IF;
  END IF;
  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
  RETURN NEW;

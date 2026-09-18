@@ -89,5 +89,20 @@
       "create-table:relay_operator_audit"
     ],
     "desired_schema_delta": "append-only relay operator roster audit trail"
+  },
+  {
+    "proposed_target": "0050_agent_drafts_soft_delete.sql",
+    "source_commit": "86cf5af263a6c1455be9b7b935f8b10db4be08e2",
+    "source_path": "migrations/0050_agent_drafts_soft_delete.sql",
+    "source_sha256": "69aeaf8666c4d8d4d8b15979e87ccb6b1fdcf43d465be15871c9b8c3137f7b1d",
+    "adapted_sql_sha256": "69aeaf8666c4d8d4d8b15979e87ccb6b1fdcf43d465be15871c9b8c3137f7b1d",
+    "prerequisites": [40],
+    "operations": [
+      "define-function:preserve_agent_draft_history:soft_delete"
+    ],
+    "supersedes": [
+      "define-function:preserve_agent_draft_history"
+    ],
+    "desired_schema_delta": "preserve_agent_draft_history lets deleted_at and other bookkeeping columns change on kind 14201/14202 rows; hard DELETE and signed-column rewrites still raise"
   }
 ]
