@@ -92,7 +92,7 @@
   },
   {
     "proposed_target": "0050_agent_drafts_soft_delete.sql",
-    "source_commit": "86cf5af263a6c1455be9b7b935f8b10db4be08e2",
+    "source_commit": "0e64d397bd2f071752a98a3d62063335e0626f4a",
     "source_path": "migrations/0050_agent_drafts_soft_delete.sql",
     "source_sha256": "69aeaf8666c4d8d4d8b15979e87ccb6b1fdcf43d465be15871c9b8c3137f7b1d",
     "adapted_sql_sha256": "69aeaf8666c4d8d4d8b15979e87ccb6b1fdcf43d465be15871c9b8c3137f7b1d",
