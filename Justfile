@@ -327,26 +327,9 @@ test-unit:
         # in both the nextest and cargo-test fallback paths. Host/root
         # qualification remains a separate gated smoke suite.
         cargo nextest run -p buzz-ci-isolation-contract -p buzz-ci-materializer -p buzz-ci-policy-proxy
-        test "$(check-jsonschema --version)" = "check-jsonschema, version 0.38.0"
-        for suite in \
-            deploy/native-ci/acceptance/tests \
-            deploy/native-ci/activation/render_inputs/tests \
-            deploy/native-ci/activation/tests \
-            deploy/native-ci/activation/tests/clean_host_e2e \
-            deploy/native-ci/apple-release/tests \
-            deploy/native-ci/controld/tests \
-            deploy/native-ci/execd/tests \
-            deploy/native-ci/keyholder/tests \
-            deploy/native-ci/legacy_state_migration/tests \
-            deploy/native-ci/runner/tests \
-            deploy/native-ci/tests; do
-            python3 -m unittest discover "$suite" -p 'test_*.py'
-        done
-        python3 scripts/test-ci-promotion-readiness.py
-        python3 scripts/test-protected-ci-receipt.py
-        bash scripts/test-ci-path-filter-contract.sh
-        bash scripts/test-relay-e2e-canary-contract.sh
-        python3 scripts/test-populate-ci-promotion-relay-origin.py
+        # Discovered native-CI Python suites plus the protected-CI script tests;
+        # pre-freeze runs the same script, so local and CI coverage cannot drift.
+        bash scripts/test-native-ci-python.sh
     else
         ./scripts/run-tests.sh unit
     fi

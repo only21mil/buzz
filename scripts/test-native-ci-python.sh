@@ -1,19 +1,41 @@
 #!/usr/bin/env bash
-# Existing native-CI suites shared by unit tests and pre-freeze (issue #160).
+# Native-CI Python suites shared by `just test-unit` and pre-freeze (issue #160).
+# Suites are discovered, not listed: every directory under deploy/native-ci or
+# scripts/ that holds a test_*.py file runs. The fleet-bundle suites below are
+# excluded by name because they bind framework-desktop paths; each exclusion
+# must still exist so the list cannot go stale.
 set -euo pipefail
 test "$(check-jsonschema --version)" = "check-jsonschema, version 0.38.0"
-for suite in \
-  deploy/native-ci/acceptance/tests \
-  deploy/native-ci/activation/render_inputs/tests \
-  deploy/native-ci/activation/tests \
-  deploy/native-ci/activation/tests/clean_host_e2e \
-  deploy/native-ci/apple-release/tests \
-  deploy/native-ci/controld/tests \
-  deploy/native-ci/execd/tests \
-  deploy/native-ci/keyholder/tests \
-  deploy/native-ci/legacy_state_migration/tests \
-  deploy/native-ci/runner/tests \
-  deploy/native-ci/tests; do
+
+excluded_suites=(
+  scripts/mempool-genesis/activation/tests
+  scripts/mempool-genesis/tests
+  scripts/roster-migration/tests
+)
+for suite in "${excluded_suites[@]}"; do
+  [[ -d "$suite" ]] || {
+    printf 'stale suite exclusion, directory is gone: %s\n' "$suite" >&2
+    exit 1
+  }
+done
+
+mapfile -t discovered < <(
+  find deploy/native-ci scripts -name 'test_*.py' -not -path '*/node_modules/*' -printf '%h\n' | sort -u
+)
+suites=()
+for suite in "${discovered[@]}"; do
+  skip=0
+  for excluded in "${excluded_suites[@]}"; do
+    [[ "$suite" == "$excluded" ]] && skip=1
+  done
+  ((skip == 1)) || suites+=("$suite")
+done
+((${#suites[@]} > 0)) || {
+  printf 'no unittest suites discovered\n' >&2
+  exit 1
+}
+printf 'discovered %d unittest suites\n' "${#suites[@]}"
+for suite in "${suites[@]}"; do
   python3 -m unittest discover "$suite" -p "test_*.py"
 done
 python3 scripts/test-ci-promotion-readiness.py
