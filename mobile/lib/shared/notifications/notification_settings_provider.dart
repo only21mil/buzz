@@ -71,11 +71,23 @@ class NotificationSettingsNotifier extends Notifier<NotificationSettingsState> {
     final scopeGeneration = ++_scopeGeneration;
     final config = ref.watch(relayConfigProvider);
     final pubkey = ref.watch(myPubkeyProvider) ?? 'anon';
-    ref.watch(relaySessionProvider.select((state) => state.status));
     if (defaultTargetPlatform == TargetPlatform.android) {
       ref.listen(appLifecycleProvider, (previous, next) {
         if (previous != AppLifecycleState.resumed &&
             next == AppLifecycleState.resumed) {
+          final generation = ++_refreshGeneration;
+          Future.microtask(() => _refreshStatus(generation, scopeGeneration));
+        }
+      });
+      // A reconnect is when a burst of live events arrives, so re-read the
+      // native status then instead of rebuilding (which would reset
+      // `permission` to notDetermined until the round trip returns).
+      ref.listen(relaySessionProvider.select((state) => state.status), (
+        previous,
+        next,
+      ) {
+        if (previous != SessionStatus.connected &&
+            next == SessionStatus.connected) {
           final generation = ++_refreshGeneration;
           Future.microtask(() => _refreshStatus(generation, scopeGeneration));
         }

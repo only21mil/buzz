@@ -191,6 +191,45 @@ void main() {
     expect(state.activityChannelEnabled, isFalse);
   });
 
+  test('a relay reconnect keeps the granted permission', () async {
+    final bridge = _FakeBridge(
+      const AndroidNotificationStatus(
+        permission: AndroidNotificationPermission.granted,
+        priorityChannelEnabled: true,
+        activityChannelEnabled: true,
+      ),
+    );
+    final scope = await container(fakeBridge: bridge);
+    scope.read(notificationSettingsProvider);
+    await Future<void>.delayed(Duration.zero);
+    expect(
+      scope.read(notificationSettingsProvider).permission,
+      AndroidNotificationPermission.granted,
+    );
+    expect(bridge.statusReads, 1);
+
+    final session =
+        scope.read(relaySessionProvider.notifier) as _DisconnectedSession;
+    session.setStatus(SessionStatus.connecting);
+    session.setStatus(SessionStatus.connected);
+    session.setStatus(SessionStatus.disconnected);
+    session.setStatus(SessionStatus.connected);
+
+    // No rebuild: the state read right after the transitions is still granted.
+    expect(
+      scope.read(notificationSettingsProvider).permission,
+      AndroidNotificationPermission.granted,
+    );
+    await Future<void>.delayed(Duration.zero);
+    await Future<void>.delayed(Duration.zero);
+    expect(
+      scope.read(notificationSettingsProvider).permission,
+      AndroidNotificationPermission.granted,
+    );
+    // One native refresh per connect, none for the other transitions.
+    expect(bridge.statusReads, 3);
+  });
+
   test('persists preferences under relay and identity scope', () async {
     final scope = await container();
     final notifier = scope.read(notificationSettingsProvider.notifier);
@@ -254,6 +293,7 @@ class _FakeBridge extends AndroidNotificationBridge {
   final Completer<AndroidNotificationStatus>? permissionCompleter;
   int permissionRequests = 0;
   int channelEnsures = 0;
+  int statusReads = 0;
   final StreamController<AndroidNotificationStatus> _statusController =
       StreamController<AndroidNotificationStatus>.broadcast();
 
@@ -265,7 +305,10 @@ class _FakeBridge extends AndroidNotificationBridge {
       _statusController.add(value);
 
   @override
-  Future<AndroidNotificationStatus> getStatus() async => status;
+  Future<AndroidNotificationStatus> getStatus() async {
+    statusReads++;
+    return status;
+  }
 
   @override
   Future<AndroidNotificationStatus> requestPermission() async {
@@ -299,6 +342,8 @@ class _DisconnectedSession extends RelaySessionNotifier {
   @override
   SessionState build() =>
       const SessionState(status: SessionStatus.disconnected);
+
+  void setStatus(SessionStatus value) => state = SessionState(status: value);
 }
 
 class _FakeLifecycle extends AppLifecycleNotifier {
