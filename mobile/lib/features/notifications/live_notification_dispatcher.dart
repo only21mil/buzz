@@ -25,6 +25,9 @@ class LiveNotificationDispatcher {
     Set<String> authoredRootIds = const {},
     Set<String> mutedChannelIds = const {},
   }) async {
+    // The native bridge only exists on Android. Return before classifying so
+    // other platforms pay nothing per live event and never touch the deduper.
+    if (defaultTargetPlatform != TargetPlatform.android) return;
     final notification = classifyNotificationEvent(
       event: event,
       channel: channel,

@@ -2,6 +2,7 @@ import 'package:buzz/features/channels/channel.dart';
 import 'package:buzz/features/notifications/live_notification_dispatcher.dart';
 import 'package:buzz/shared/notifications/notifications.dart';
 import 'package:buzz/shared/relay/relay.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
@@ -131,6 +132,31 @@ void main() {
     );
 
     expect(bridge.attempts, 2);
+    expect(bridge.shows, hasLength(1));
+  });
+
+  test('never classifies or dedupes on a non-Android platform', () async {
+    final previousPlatform = debugDefaultTargetPlatformOverride;
+    addTearDown(() => debugDefaultTargetPlatformOverride = previousPlatform);
+    final bridge = _FakeBridge();
+    final scope = container(bridge: bridge);
+    final dispatcher = scope.read(liveNotificationDispatcherProvider);
+
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    await dispatcher.dispatch(
+      event: _event(),
+      channel: _channel,
+      myPubkey: 'me',
+    );
+    expect(bridge.attempts, 0);
+
+    // The same event still shows on Android, so iOS left no dedupe entry.
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    await dispatcher.dispatch(
+      event: _event(),
+      channel: _channel,
+      myPubkey: 'me',
+    );
     expect(bridge.shows, hasLength(1));
   });
 
