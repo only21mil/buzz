@@ -2,7 +2,7 @@ import 'dart:convert';
 
 import '../../shared/deeplink/deep_link.dart';
 import '../../shared/relay/nostr_models.dart';
-import '../../shared/utils/string_utils.dart';
+import '../../shared/identity/npub.dart';
 import '../channels/channel.dart';
 import '../channels/unread_badge/is_high_priority_event.dart';
 import '../channels/unread_badge/should_notify_for_event.dart';
@@ -47,7 +47,7 @@ NotificationEvent? classifyNotificationEvent({
   final normalizedSenderName = senderName?.trim();
   final senderLabel = normalizedSenderName?.isNotEmpty == true
       ? normalizedSenderName!
-      : shortPubkey(event.pubkey);
+      : truncateNpub(event.pubkey);
   final title = channel.isDm
       ? (normalizedSenderName?.isNotEmpty == true
             ? normalizedSenderName!

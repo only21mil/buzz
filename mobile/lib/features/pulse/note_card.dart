@@ -10,6 +10,7 @@ import '../../shared/widgets/avatar_image.dart';
 import '../channels/channel_detail_page.dart';
 import '../channels/channel_management_provider.dart';
 import '../channels/message_content.dart';
+import '../../shared/identity/npub.dart';
 import '../../shared/profile/user_cache_provider.dart';
 import '../profile/user_profile_sheet.dart';
 import 'compose_note_page.dart';
@@ -43,7 +44,7 @@ class NoteCard extends HookConsumerWidget {
     final profile =
         ref.watch(userCacheProvider.select((cache) => cache[pubkey])) ??
         ref.read(userCacheProvider.notifier).get(pubkey);
-    final displayName = profile?.label ?? _shortPubkey(pubkey);
+    final displayName = profile?.label ?? truncateNpub(pubkey);
     final effectiveUpvoted =
         pendingUpvote.value ?? reaction.reactedByCurrentUser;
     final effectiveCount = _effectiveCount(reaction, pendingUpvote.value);
@@ -70,7 +71,8 @@ class NoteCard extends HookConsumerWidget {
               radius: 18,
               backgroundColor: context.colors.primaryContainer,
               fallback: Text(
-                (profile?.initial ?? displayName[0]).toUpperCase(),
+                profile?.initial ??
+                    (pubkey.isNotEmpty ? pubkey[0].toUpperCase() : '?'),
                 style: context.textTheme.labelMedium?.copyWith(
                   color: context.colors.onPrimaryContainer,
                 ),
@@ -149,7 +151,7 @@ class NoteCard extends HookConsumerWidget {
                 if (note.replyParentId != null) ...[
                   const SizedBox(height: 2),
                   Text(
-                    'Replying to ${_shortPubkey(note.replyParentAuthor ?? note.replyParentId!)}',
+                    'Replying to ${_replyTargetLabel(note)}',
                     style: context.textTheme.labelSmall?.copyWith(
                       color: context.colors.onSurfaceVariant,
                     ),
@@ -312,8 +314,12 @@ class _ActionButton extends StatelessWidget {
 String _shareUri(UserNote note) =>
     'nostr:${nostr.Nip19.encodeShareableIdentifiers(prefix: nostr.Nip19Prefix.nevent, data: note.id, author: note.pubkey, kind: 1)}';
 
-String _shortPubkey(String pubkey) =>
-    pubkey.length <= 8 ? pubkey : '${pubkey.substring(0, 8)}…';
+String _replyTargetLabel(UserNote note) {
+  final author = note.replyParentAuthor;
+  if (author != null) return truncateNpub(author);
+  final eventId = note.replyParentId!;
+  return eventId.length <= 8 ? eventId : '${eventId.substring(0, 8)}…';
+}
 
 String formatPulseRelativeTime(int createdAt) {
   final date = DateTime.fromMillisecondsSinceEpoch(createdAt * 1000);

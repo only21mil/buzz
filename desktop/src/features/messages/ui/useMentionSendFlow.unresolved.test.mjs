@@ -88,15 +88,16 @@ for (const text of [
   });
 }
 
-test("still blocks an unknown mention beside a resolved renamed member", async () => {
+test("sends without tagging an unknown mention beside a resolved renamed member", async () => {
   const s = await setupMemberMentions(new Map([["Alice", KEY]]), [
     { pubkey: KEY, displayName: "Alicia", isMember: true },
   ]);
 
   await s.prompt("@Alicia and ||@missing|| please review");
 
-  assert.equal(s.events("SEND").length, 0);
-  assert.match(s.events("error")[0][1], /not linked to a member/);
+  assert.equal(s.events("error").length, 0);
+  assert.equal(s.events("SEND").length, 1);
+  assert.deepEqual(s.events("SEND")[0][2], [KEY]);
 });
 
 test("still rejects ambiguous typed current member names", async () => {

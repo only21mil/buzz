@@ -182,6 +182,23 @@ pub enum ActionDef {
     },
 }
 
+/// Require an `https://` webhook URL.
+///
+/// The executor calls this on the fully rendered URL before any DNS
+/// resolution or request construction, so a template that resolves to a
+/// cleartext URL is rejected at run time. Definition-time validation calls
+/// this only for literal (template-free) URLs; templated URLs cannot be
+/// judged until they render.
+pub(crate) fn require_https_webhook_url(url: &str) -> Result<(), WorkflowError> {
+    if url.trim_start().to_lowercase().starts_with("https://") {
+        Ok(())
+    } else {
+        Err(WorkflowError::InvalidDefinition(format!(
+            "call_webhook requires an https:// url, got '{url}'"
+        )))
+    }
+}
+
 impl WorkflowDef {
     /// True when any step performs an action that can exfiltrate channel data
     /// to an arbitrary external destination (`call_webhook`).
@@ -281,6 +298,33 @@ impl WorkflowDef {
                 {
                     return Err(WorkflowError::InvalidDefinition(format!(
                         "request_approval step '{}' requires from to be owner, admin, or a lowercase 64-hex pubkey",
+                        step.id
+                    )));
+                }
+                // SendDm and SetChannelTopic have no runtime implementation
+                // (the executor returns NotImplemented). Accepting them at
+                // load time lets a definition save cleanly and then fail on
+                // every run, so reject them here until delivery exists.
+                ActionDef::SendDm { .. } => {
+                    return Err(WorkflowError::InvalidDefinition(format!(
+                        "send_dm step '{}' is not supported: remove the step until DM delivery is implemented",
+                        step.id
+                    )));
+                }
+                ActionDef::SetChannelTopic { .. } => {
+                    return Err(WorkflowError::InvalidDefinition(format!(
+                        "set_channel_topic step '{}' is not supported: remove the step until topic updates are implemented",
+                        step.id
+                    )));
+                }
+                // A literal (template-free) cleartext webhook URL can never
+                // become safe at render time. Templated URLs are checked after
+                // rendering at execution time instead.
+                ActionDef::CallWebhook { url, .. }
+                    if !url.contains("{{") && require_https_webhook_url(url).is_err() =>
+                {
+                    return Err(WorkflowError::InvalidDefinition(format!(
+                        "call_webhook step '{}' requires an https:// url, got '{url}'",
                         step.id
                     )));
                 }
@@ -460,43 +504,102 @@ mod tests {
     fn parse_all_action_types() {
         // Avoid "# in YAML values (would close r# raw strings).
         // Use unquoted or single-quoted YAML values throughout.
+        // send_dm and set_channel_topic are deliberately absent: they have no
+        // runtime implementation and validation rejects them (see
+        // validate_rejects_unsupported_actions).
         let yaml = concat!(
             "name: All Actions\n",
             "trigger:\n  on: webhook\n",
             "steps:\n",
             "  - id: msg\n    action: send_message\n    text: Hello\n    channel: general\n",
-            "  - id: dm\n    action: send_dm\n    to: '{{trigger.author}}'\n    text: You triggered this\n",
-            "  - id: topic\n    action: set_channel_topic\n    topic: Status active\n",
             "  - id: react\n    action: add_reaction\n    emoji: white_check_mark\n",
             "  - id: hook\n    action: call_webhook\n    url: https://hooks.example.com/notify\n    method: POST\n",
             "  - id: approve\n    action: request_approval\n    from: admin\n    message: Approve?\n    timeout: 4h\n",
             "  - id: wait\n    action: delay\n    duration: 5m\n",
         );
         let (def, _) = parse_yaml(yaml).expect("parse failed");
-        assert_eq!(def.steps.len(), 7);
+        assert_eq!(def.steps.len(), 5);
 
         assert!(matches!(
             &def.steps[0].action,
             ActionDef::SendMessage { .. }
         ));
-        assert!(matches!(&def.steps[1].action, ActionDef::SendDm { .. }));
         assert!(matches!(
-            &def.steps[2].action,
-            ActionDef::SetChannelTopic { .. }
-        ));
-        assert!(matches!(
-            &def.steps[3].action,
+            &def.steps[1].action,
             ActionDef::AddReaction { .. }
         ));
         assert!(matches!(
-            &def.steps[4].action,
+            &def.steps[2].action,
             ActionDef::CallWebhook { .. }
         ));
         assert!(matches!(
-            &def.steps[5].action,
+            &def.steps[3].action,
             ActionDef::RequestApproval { .. }
         ));
-        assert!(matches!(&def.steps[6].action, ActionDef::Delay { .. }));
+        assert!(matches!(&def.steps[4].action, ActionDef::Delay { .. }));
+    }
+
+    #[test]
+    fn validate_rejects_unsupported_actions() {
+        // SendDm and SetChannelTopic parse but have no executor
+        // implementation. Saving them would fail on every run, so
+        // definition load rejects them.
+        for action_yaml in [
+            "  - id: dm\n    action: send_dm\n    to: '{{trigger.author}}'\n    text: You triggered this\n",
+            "  - id: topic\n    action: set_channel_topic\n    topic: Status active\n",
+        ] {
+            let yaml = format!("name: Unsupported\ntrigger:\n  on: webhook\nsteps:\n{action_yaml}");
+            let err = parse_yaml(&yaml).unwrap_err();
+            match &err {
+                WorkflowError::InvalidDefinition(msg) => {
+                    assert!(
+                        msg.contains("not supported"),
+                        "expected 'not supported' in: {msg}"
+                    );
+                }
+                other => panic!("expected InvalidDefinition, got: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_rejects_literal_insecure_webhook_url() {
+        for url in [
+            "http://hooks.example.com/notify",
+            "HTTP://hooks.example.com/notify",
+            "hooks.example.com/notify",
+        ] {
+            let yaml = format!(
+                "name: Cleartext\ntrigger:\n  on: webhook\nsteps:\n  - id: hook\n    action: call_webhook\n    url: {url}\n"
+            );
+            let err = parse_yaml(&yaml).unwrap_err();
+            match &err {
+                WorkflowError::InvalidDefinition(msg) => {
+                    assert!(
+                        msg.contains("https://"),
+                        "expected https requirement in: {msg}"
+                    );
+                }
+                other => panic!("expected InvalidDefinition, got: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_allows_templated_webhook_url() {
+        // A templated URL cannot be judged at load time; the executor checks
+        // the rendered value before sending.
+        let yaml = "name: Templated\ntrigger:\n  on: webhook\nsteps:\n  - id: hook\n    action: call_webhook\n    url: '{{steps.setup.output.url}}'\n";
+        parse_yaml(yaml).expect("templated webhook url must load");
+    }
+
+    #[test]
+    fn require_https_webhook_url_checks_scheme() {
+        assert!(require_https_webhook_url("https://hooks.example.com/x").is_ok());
+        assert!(require_https_webhook_url("HTTPS://hooks.example.com/x").is_ok());
+        assert!(require_https_webhook_url("http://hooks.example.com/x").is_err());
+        assert!(require_https_webhook_url("hooks.example.com/x").is_err());
+        assert!(require_https_webhook_url("ftp://hooks.example.com/x").is_err());
     }
 
     #[test]

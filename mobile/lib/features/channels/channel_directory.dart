@@ -219,7 +219,7 @@ Future<Map<String, String>> _resolveDmDisplayNames(
         ? profile.displayName!.trim()
         : profile.nip05?.trim().isNotEmpty == true
         ? profile.nip05!.trim()
-        : shortPubkey(profile.pubkey);
+        : truncateNpub(profile.pubkey);
     displayNames[profile.pubkey.toLowerCase()] = label;
   }
   return displayNames;

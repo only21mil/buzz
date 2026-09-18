@@ -24,6 +24,7 @@ BASE_INPUT=""
 TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 RECEIPT_STAMP="${TIMESTAMP//[-:]/}"
 OVERALL_FAILED=0
+RUN_COMPLETED=0
 FULL_CLIPPY=0
 RUN_TESTS=0
 
@@ -127,7 +128,7 @@ write_receipt() {
     local process_status="$1"
     local overall="FAIL"
 
-    if ((process_status == 0 && OVERALL_FAILED == 0)); then
+    if ((process_status == 0 && OVERALL_FAILED == 0 && RUN_COMPLETED == 1)); then
         overall="PASS"
     fi
 
@@ -183,8 +184,20 @@ PY
     return 0
 }
 
+interrupted() {
+    OVERALL_FAILED=1
+    record_result "interrupted" "signal $1" "$2" 0
+    exit "$2"
+}
+
 finish() {
     local process_status=$?
+    trap - EXIT
+    trap '' HUP INT TERM
+    if ((RUN_COMPLETED == 0 || OVERALL_FAILED != 0)); then
+        OVERALL_FAILED=1
+        ((process_status != 0)) || process_status=1
+    fi
     if ! write_receipt "$process_status"; then
         process_status=1
     fi
@@ -256,6 +269,9 @@ if ! RECORDS_FILE="$(mktemp "${TMPDIR:-/tmp}/buzz-pre-freeze-records.XXXXXX")"; 
     exit 1
 fi
 trap finish EXIT
+trap 'interrupted HUP 129' HUP
+trap 'interrupted INT 130' INT
+trap 'interrupted TERM 143' TERM
 
 cd -- "$REPO_ROOT" || exit 1
 export PATH="$REPO_ROOT/bin:$PATH"
@@ -606,4 +622,5 @@ if ((RUN_TESTS != 0)); then
     fi
 fi
 
+RUN_COMPLETED=1
 exit 0

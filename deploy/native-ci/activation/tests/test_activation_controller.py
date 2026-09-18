@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import base64
+import errno
 import importlib.util
 import json
 import os
@@ -5076,13 +5077,27 @@ while True:
         for _ in range(20):
             try:
                 state = Path(f"/proc/{descendant}/stat").read_text().split()[2]
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 break
             if state == "Z":
                 break
             time.sleep(0.05)
         else:
             self.fail("qualification descendant survived process-group timeout cleanup")
+
+    def test_qualification_timeout_handles_descendant_disappearing_during_proc_read(self) -> None:
+        original_read = Path.read_text
+        disappeared = []
+
+        def read_with_disappearance(path, *args, **kwargs):
+            if path.parent.parent == Path("/proc") and path.name == "stat":
+                disappeared.append(path)
+                raise ProcessLookupError(errno.ESRCH, "No such process")
+            return original_read(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", read_with_disappearance):
+            self.test_qualification_timeout_kills_descendant_process_group()
+        self.assertEqual(len(disappeared), 1)
 
     def test_failed_return_to_zero_attempts_all_steps_and_persists_truth(self) -> None:
         manifest, payloads, driver = self.fixture.load()

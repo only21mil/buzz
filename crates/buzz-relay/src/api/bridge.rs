@@ -271,6 +271,25 @@ fn extract_channel_from_filter(filter: &nostr::Filter) -> Option<uuid::Uuid> {
     })
 }
 
+/// Reject filter arrays larger than the shared WS bound.
+///
+/// The WebSocket REQ/COUNT parser enforces `MAX_FILTERS_PER_REQ` up front.
+/// The HTTP bridge parses attacker-controlled JSON arrays, so it enforces the
+/// same bound right after parsing and before any database work. Called on
+/// both `/query` and `/count`.
+fn reject_over_limit_filters(filter_count: usize) -> Result<(), (StatusCode, Json<Value>)> {
+    if filter_count > crate::protocol::MAX_FILTERS_PER_REQ {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "too many filters: got {filter_count}, maximum is {}",
+                crate::protocol::MAX_FILTERS_PER_REQ
+            ),
+        ));
+    }
+    Ok(())
+}
+
 //
 // The CLI injects extension fields (before_id, depth_limit, feed_types) into
 // Nostr filter JSON. nostr::Filter silently drops unknown fields during
@@ -1115,6 +1134,9 @@ async fn query_events_authed(
         .collect::<Result<_, _>>()
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
 
+    // Same filter-count bound as the WS REQ parser, before any DB work.
+    reject_over_limit_filters(filters.len())?;
+
     // P-gated kinds (gift wraps, member notifications, observer frames) require
     // the caller's own pubkey in the #p tag — same enforcement as WS REQ handler.
     let authed_pubkey_hex = pubkey.to_hex();
@@ -1506,7 +1528,23 @@ async fn query_events_authed(
         }
     }
 
+    dedup_bridge_events(&mut events);
+
     Ok((Json(Value::Array(events)), thread_aux_included))
+}
+
+/// Request-wide ID dedup for `/query` (NIP-01 OR semantics, mirroring the WS
+/// REQ handler's `seen_ids`): overlapping filters across the window, feed,
+/// thread, and catch-all phases must not emit the same event twice. Runs
+/// after acceptance in every phase, keeping the first occurrence in filter
+/// order. Locally signed overlays carry fresh IDs, so they pass through
+/// untouched. Values without an `id` field are kept.
+fn dedup_bridge_events(events: &mut Vec<Value>) {
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    events.retain(|v| match v.get("id").and_then(serde_json::Value::as_str) {
+        Some(id) => seen_ids.insert(id.to_owned()),
+        None => true,
+    });
 }
 
 /// Count events via HTTP bridge (NIP-98 auth). Returns `{"count": N}`.
@@ -1615,6 +1653,9 @@ async fn count_events_authed(
     let filters: Vec<nostr::Filter> = serde_json::from_slice(body)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
 
+    // Same filter-count bound as the WS COUNT parser, before any DB work.
+    reject_over_limit_filters(filters.len())?;
+
     // P-gated kinds enforcement — same as WS REQ and /query.
     let authed_pubkey_hex = pubkey.to_hex();
     if !crate::handlers::req::p_gated_filters_authorized(&filters, &authed_pubkey_hex) {
@@ -1642,6 +1683,12 @@ async fn count_events_authed(
         .await
         .map_err(|e| internal_error(&format!("channel access lookup: {e}")))?;
 
+    // NIP-45 union semantics, mirroring the WS COUNT handler: one filter is
+    // already exact on its fast path, so it keeps it; with several filters,
+    // matching IDs are collected into a single set instead of summing
+    // per-filter counts.
+    let union_mode = filters.len() > 1;
+    let mut union_ids: std::collections::HashSet<nostr::EventId> = std::collections::HashSet::new();
     let mut total: u64 = 0;
     for filter in &filters {
         let needs_author_only_filtering =
@@ -1685,7 +1732,31 @@ async fn count_events_authed(
                         .iter()
                         .all(|a| a.to_hex().eq_ignore_ascii_case(&authed_pubkey_hex))
             });
-            if crate::handlers::req::filter_fully_pushable(filter)
+            if union_mode {
+                match crate::handlers::req::collect_count_union_ids(
+                    state,
+                    tenant.community(),
+                    "bridge_count_union",
+                    query,
+                    filter,
+                    &pubkey_bytes,
+                    &mut union_ids,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(crate::handlers::req::CountUnionError::BudgetExceeded) => {
+                        metrics::counter!("buzz_count_fallback_rejections_total").increment(1);
+                        return Err(api_error(
+                            StatusCode::BAD_REQUEST,
+                            "count filter requires narrower constraints",
+                        ));
+                    }
+                    Err(crate::handlers::req::CountUnionError::Backend(e)) => {
+                        return Err(internal_error(&format!("count error: {e}")));
+                    }
+                }
+            } else if crate::handlers::req::filter_fully_pushable(filter)
                 && (!needs_author_only_filtering || author_is_self)
                 && !needs_result_gated_filtering
                 && !needs_shared_gate_filtering
@@ -1759,7 +1830,31 @@ async fn count_events_authed(
                         .iter()
                         .all(|a| a.to_hex().eq_ignore_ascii_case(&authed_pubkey_hex))
             });
-            if crate::handlers::req::filter_fully_pushable(filter)
+            if union_mode {
+                match crate::handlers::req::collect_count_union_ids(
+                    state,
+                    tenant.community(),
+                    "bridge_count_union",
+                    query,
+                    filter,
+                    &pubkey_bytes,
+                    &mut union_ids,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(crate::handlers::req::CountUnionError::BudgetExceeded) => {
+                        metrics::counter!("buzz_count_fallback_rejections_total").increment(1);
+                        return Err(api_error(
+                            StatusCode::BAD_REQUEST,
+                            "count filter requires narrower constraints",
+                        ));
+                    }
+                    Err(crate::handlers::req::CountUnionError::Backend(e)) => {
+                        return Err(internal_error(&format!("count error: {e}")));
+                    }
+                }
+            } else if crate::handlers::req::filter_fully_pushable(filter)
                 && (!needs_author_only_filtering || author_is_self)
                 && !needs_result_gated_filtering
                 && !needs_shared_gate_filtering
@@ -1811,6 +1906,10 @@ async fn count_events_authed(
                 }
             }
         }
+    }
+
+    if union_mode {
+        total = union_ids.len() as u64;
     }
 
     Ok(Json(serde_json::json!({ "count": total })))
@@ -2777,6 +2876,37 @@ mod tests {
         let (headers, Json(body)) = thread_aux_query_response(Json(serde_json::json!([])), true);
         assert_eq!(headers["x-buzz-thread-aux"], "1");
         assert_eq!(body, legacy_body);
+    }
+
+    #[test]
+    fn bridge_rejects_filter_arrays_over_the_shared_limit() {
+        assert!(reject_over_limit_filters(crate::protocol::MAX_FILTERS_PER_REQ).is_ok());
+        let (status, _) =
+            reject_over_limit_filters(crate::protocol::MAX_FILTERS_PER_REQ + 1).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn bridge_query_dedups_overlapping_filters_request_wide() {
+        let event = |id: &str| serde_json::json!({"id": id, "kind": 9});
+        let mut events = vec![
+            event("aaa"),
+            event("bbb"),
+            event("aaa"),
+            serde_json::json!({"kind": 39006}),
+            event("bbb"),
+            event("ccc"),
+        ];
+        dedup_bridge_events(&mut events);
+        assert_eq!(
+            events,
+            vec![
+                event("aaa"),
+                event("bbb"),
+                serde_json::json!({"kind": 39006}),
+                event("ccc"),
+            ]
+        );
     }
 
     fn aux_fixture(keys: &Keys, timestamp: u64, content: &str) -> buzz_core::StoredEvent {

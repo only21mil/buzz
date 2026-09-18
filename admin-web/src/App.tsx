@@ -6,7 +6,13 @@ import {
   useMemo,
   useState,
 } from "react";
-import { ApiFailure, request } from "./api";
+import {
+  type AuthMode,
+  ApiFailure,
+  probeAuthMode,
+  request,
+  requestObjectUrl,
+} from "./api";
 import type {
   FeedbackDetail,
   FeedbackSummary,
@@ -70,11 +76,17 @@ function StateView<T>({
   if (resource.loading && !resource.data)
     return <div className="state">Loading…</div>;
   if (resource.error && !resource.data) {
-    const forbidden =
-      resource.error instanceof ApiFailure && resource.error.status === 403;
+    const status =
+      resource.error instanceof ApiFailure ? resource.error.status : undefined;
     return (
       <div className="state error" role="alert">
-        <h2>{forbidden ? "Access denied" : "Could not load data"}</h2>
+        <h2>
+          {status === 403
+            ? "Access denied"
+            : status === 401
+              ? "Sign-in expired"
+              : "Could not load data"}
+        </h2>
         <p>{resource.error.message}</p>
         <button type="button" onClick={resource.refetch}>
           Retry
@@ -85,10 +97,10 @@ function StateView<T>({
   return resource.data ? children(resource.data) : null;
 }
 
-function Reports() {
+function Reports({ authMode }: { authMode: AuthMode }) {
   const resource = useResource(
-    () => request<Report[]>("/reports?status=open&limit=100"),
-    "reports",
+    () => request<Report[]>("/reports?status=open&limit=100", authMode),
+    `reports:${authMode}`,
   );
   return (
     <Page
@@ -135,10 +147,10 @@ function Reports() {
   );
 }
 
-function ReportDetail({ id }: { id: string }) {
+function ReportDetail({ id, authMode }: { id: string; authMode: AuthMode }) {
   const resource = useResource(
-    () => request<ReportDetailData>(`/reports/${id}`),
-    id,
+    () => request<ReportDetailData>(`/reports/${id}`, authMode),
+    `${id}:${authMode}`,
   );
   return (
     <Page
@@ -210,10 +222,10 @@ function ReportDetail({ id }: { id: string }) {
   );
 }
 
-function FeedbackList() {
+function FeedbackList({ authMode }: { authMode: AuthMode }) {
   const resource = useResource(
-    () => request<FeedbackSummary[]>("/feedback"),
-    "feedback",
+    () => request<FeedbackSummary[]>("/feedback", authMode),
+    `feedback:${authMode}`,
   );
   const [query, setQuery] = useState("");
   const [community, setCommunity] = useState("all");
@@ -419,10 +431,16 @@ function FeedbackResults({
   return children(results);
 }
 
-function FeedbackDetailView({ id }: { id: string }) {
+function FeedbackDetailView({
+  id,
+  authMode,
+}: {
+  id: string;
+  authMode: AuthMode;
+}) {
   const resource = useResource(
-    () => request<FeedbackDetail>(`/feedback/${id}`),
-    id,
+    () => request<FeedbackDetail>(`/feedback/${id}`, authMode),
+    `${id}:${authMode}`,
   );
   return (
     <Page
@@ -462,6 +480,7 @@ function FeedbackDetailView({ id }: { id: string }) {
                         <Attachment
                           key={`${attachment.hash}-${attachment.url}`}
                           attachment={attachment}
+                          authMode={authMode}
                         />
                       ))}
                     </dd>
@@ -595,8 +614,38 @@ function stripAttachmentMarkdown(
     .trim();
 }
 
-function Attachment({ attachment }: { attachment: FeedbackAttachment }) {
-  const url = attachment.url;
+function Attachment({
+  attachment,
+  authMode,
+}: {
+  attachment: FeedbackAttachment;
+  authMode: AuthMode;
+}) {
+  // <img> and <a> carry no Authorization header, so NIP-98 mode fetches the
+  // bytes through the credentialed API and renders an object URL. Disabled
+  // mode keeps the direct same-origin path.
+  const [objectUrl, setObjectUrl] = useState<string>();
+  useEffect(() => {
+    if (authMode === "disabled") return;
+    let revoked = false;
+    let created: string | undefined;
+    setObjectUrl(undefined);
+    requestObjectUrl(attachment.url, authMode).then(
+      (url) => {
+        if (revoked) URL.revokeObjectURL(url);
+        else {
+          created = url;
+          setObjectUrl(url);
+        }
+      },
+      () => {},
+    );
+    return () => {
+      revoked = true;
+      if (created) URL.revokeObjectURL(created);
+    };
+  }, [attachment.url, authMode]);
+  const url = objectUrl ?? attachment.url;
   const name =
     attachment.filename ?? `attachment-${attachment.hash.slice(0, 8)}`;
   const metadata = [
@@ -797,18 +846,69 @@ function ArrowIcon() {
   );
 }
 
+/// Shown in NIP-98 mode when no NIP-07 extension is present. Points the
+/// operator at nos2x or Alby instead of a token field: this console never
+/// accepts pasted secrets.
+function Nip07Screen() {
+  return (
+    <div className="app">
+      <div className="state auth-prompt">
+        <h2>Nostr extension required</h2>
+        <p>
+          This relay uses NIP-98 HTTP Auth. Install a NIP-07 browser extension
+          such as{" "}
+          <a
+            href="https://github.com/fiatjaf/nos2x"
+            target="_blank"
+            rel="noreferrer"
+          >
+            nos2x
+          </a>{" "}
+          or{" "}
+          <a href="https://getalby.com" target="_blank" rel="noreferrer">
+            Alby
+          </a>
+          , then reload this page. Your Nostr key signs each request.
+        </p>
+        <button type="button" onClick={() => location.reload()}>
+          Reload
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export function App() {
   const { path } = usePath();
+
+  // Probe once for the relay auth mode. Null means in flight (render nothing
+  // to avoid a flash). The mode is stable for the session.
+  const [authMode, setAuthMode] = useState<AuthMode | null>(null);
+  useEffect(() => {
+    let active = true;
+    probeAuthMode().then((mode) => {
+      if (active) setAuthMode(mode);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
   const report = path.match(/^\/reports\/([^/]+)$/);
   const feedback = path.match(/^\/feedback\/([^/]+)$/);
+
+  if (authMode === null) return null;
+  if (authMode === "nip98" && !(window as Window & { nostr?: unknown }).nostr)
+    return <Nip07Screen />;
+
   const content = report ? (
-    <ReportDetail id={report[1]} />
+    <ReportDetail id={report[1]} authMode={authMode} />
   ) : feedback ? (
-    <FeedbackDetailView id={feedback[1]} />
+    <FeedbackDetailView id={feedback[1]} authMode={authMode} />
   ) : path === "/feedback" ? (
-    <FeedbackList />
+    <FeedbackList authMode={authMode} />
   ) : (
-    <Reports />
+    <Reports authMode={authMode} />
   );
   return (
     <div className="app">

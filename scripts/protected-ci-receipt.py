@@ -278,6 +278,30 @@ def api_endpoint(value: str) -> str:
     return value
 
 
+PRE_FREEZE_REQUIRED_CHECKS = frozenset({
+    "clean-tree", "rust-format", "rust-clippy", "base-lineage",
+    "native-ci-python", "postgres-discovery",
+})
+
+
+def validate_pre_freeze_checks(receipt: Any) -> None:
+    """Reject partial local-gate receipts even when their completed checks passed."""
+    refuse(isinstance(receipt, dict) and receipt.get("overall") == "PASS",
+           "pre-freeze receipt does not record overall PASS")
+    checks = receipt.get("checks")
+    refuse(isinstance(checks, list) and bool(checks), "pre-freeze checks are missing")
+    names = set()
+    for check in checks:
+        refuse(isinstance(check, dict), "pre-freeze check is not an object")
+        name = check.get("name")
+        refuse(isinstance(name, str) and bool(name) and name not in names,
+               "pre-freeze check names are missing or duplicate")
+        names.add(name)
+        refuse(check.get("status") == "PASS" and type(check.get("exit_code")) is int
+               and check["exit_code"] == 0, "pre-freeze contains an unsuccessful check")
+    refuse(PRE_FREEZE_REQUIRED_CHECKS <= names, "pre-freeze mandatory checks are incomplete")
+
+
 def retains_body(endpoint: str) -> bool:
     """Whether a request's exact response body is retained in the receipt.
 

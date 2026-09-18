@@ -301,6 +301,12 @@ fn run() -> Result<()> {
     }) {
         return completion::run(&args);
     }
+    if args.len() == 4 && args[1] == "describe-keyholder" {
+        let authority = load_authority(Path::new(&args[2]), &args[3], true)?;
+        let _client = UnixKeyholderClient::connect_native(authority.keyholder)?;
+        println!("{}", json!({"validated":true,"signing":false}));
+        return Ok(());
+    }
     if args.len() < 4 || !matches!(args[1].as_str(), "policy" | "check" | "sign") {
         return Err("usage: native_admission_operator policy|check|sign AUTHORITY REVIEWED_SHA256 [SIGNED_REQUEST SOURCE_PIN]".into());
     }
@@ -324,7 +330,7 @@ fn run() -> Result<()> {
         );
         return Ok(());
     }
-    let mut signer = UnixKeyholderClient::connect(authority.keyholder.clone())?;
+    let mut signer = UnixKeyholderClient::connect_native(authority.keyholder.clone())?;
     let bindings = authority.bindings()?;
     let admission = prepare_signed_admission(&accepted, &bindings, &mut signer)?;
     let (header, registration) = prepare_job_intent_registration(admission, &accepted, &bindings)?;

@@ -14,6 +14,7 @@ export async function editMessage(
   emojiTags?: string[][],
   mentionPubkeys?: string[],
   suppressLinkPreviews?: boolean,
+  mentionTags?: string[][],
   expectedScope: PublicationScope = capturePublicationScope(),
 ): Promise<void> {
   expectedScope = await preparePublicationScope(expectedScope);
@@ -28,6 +29,7 @@ export async function editMessage(
       emojiTags: emojiTags ?? [],
       mentionPubkeys: mentionPubkeys ?? [],
       suppressLinkPreviews: suppressLinkPreviews ?? false,
+      mentionTags: mentionTags ?? null,
     },
   });
 }

@@ -25,6 +25,10 @@ cp "$evidence_tool" "$fixture/scripts/protected-ci-receipt.py"
 cat > "$fixture/bin/cargo" <<'SH'
 #!/usr/bin/env bash
 if [[ "$*" == "fmt --all -- --check" ]]; then
+    if [[ -n ${FAKE_CARGO_SIGNAL:-} ]]; then
+        kill -s "$FAKE_CARGO_SIGNAL" "$PPID"
+        exit 0
+    fi
     exit "${FAKE_CARGO_FMT_STATUS:-0}"
 fi
 printf 'unexpected cargo invocation: %s\n' "$*" >&2
@@ -60,7 +64,7 @@ expect_text() {
 # run_subject [--no-root] <arguments...>: run the fixture script with the
 # evidence root exported unless --no-root is given.
 run_subject() {
-    local -a environment=(TMPDIR="$runtime" BUZZ_EVIDENCE_ROOT="$evidence")
+    local -a environment=(TMPDIR="$runtime" BUZZ_EVIDENCE_ROOT="$evidence" FAKE_CARGO_SIGNAL="${FAKE_CARGO_SIGNAL:-}")
     if [[ "${1-}" == --no-root ]]; then
         environment=(TMPDIR="$runtime")
         shift
@@ -306,5 +310,70 @@ if [[ -d /dev/shm && -w /dev/shm ]] && [[ "$(stat -c %d /dev/shm)" != "$(stat -c
 else
     printf '%s\n' 'note: /dev/shm shares a filesystem with the fixture; EXDEV placement not exercised'
 fi
+
+# A signal received while a passing subprocess is running must not inherit that
+# subprocess's zero status in EXIT or publish a partial overall-PASS receipt.
+for signal in HUP INT TERM; do
+    case "$signal" in HUP) expected=129;; INT) expected=130;; TERM) expected=143;; esac
+    FAKE_CARGO_SIGNAL="$signal" run_subject --receipt "$evidence/pre-freeze-receipt-signal-$signal.json"
+    [[ "$status" == "$expected" ]] || fail "$signal did not preserve interrupted exit status"
+    python3 - "$evidence/pre-freeze-receipt-signal-$signal.json" "$expected" <<'PYTEST'
+import json, sys
+receipt = json.load(open(sys.argv[1]))
+assert receipt['overall'] == 'FAIL', receipt
+assert any(check['name'] == 'interrupted' and check['exit_code'] == int(sys.argv[2])
+           and check['status'] == 'FAIL' for check in receipt['checks']), receipt
+assert not any(check['name'] == 'native-ci-python' for check in receipt['checks'])
+PYTEST
+done
+
+# Complete all mandatory work, then interrupt the separately requested test.
+# Every command here is inert; no Rust build or native service runs.
+cat > "$fixture/bin/cargo" <<'SH'
+#!/usr/bin/env bash
+case "$1" in
+  fmt|clippy) exit 0 ;;
+  test)
+    if [[ -n ${FAKE_CARGO_SIGNAL:-} ]]; then
+      kill -s "$FAKE_CARGO_SIGNAL" "$PPID"
+    fi
+    exit 0 ;;
+  *) exit 99 ;;
+esac
+SH
+printf '#!/usr/bin/env bash\nexit 0\n' > "$fixture/scripts/test-native-ci-python.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$fixture/scripts/test-postgres-test-discovery.sh"
+git -C "$fixture" add bin/cargo scripts/test-native-ci-python.sh scripts/test-postgres-test-discovery.sh
+git -C "$fixture" commit -qm 'inert complete gate fixture'
+fixture_head=$(git -C "$fixture" rev-parse HEAD)
+git -C "$fixture" update-ref refs/remotes/buzz/main "$fixture_head"
+run_subject --full --test --receipt "$evidence/complete-with-tests.json"
+[[ "$status" == 0 ]] || fail "complete --test run failed: $(cat "$error")"
+python3 - "$evidence/complete-with-tests.json" <<'PYTEST'
+import json, sys
+receipt = json.load(open(sys.argv[1]))
+assert receipt['overall'] == 'PASS', receipt
+assert len(receipt['checks']) == 7, receipt
+assert all(check['status'] == 'PASS' and check['exit_code'] == 0 for check in receipt['checks'])
+PYTEST
+for signal in HUP INT TERM KILL; do
+    case "$signal" in HUP) expected=129;; INT) expected=130;; TERM) expected=143;; KILL) expected=137;; esac
+    target="$evidence/optional-test-signal-$signal.json"
+    FAKE_CARGO_SIGNAL="$signal" run_subject --full --test --receipt "$target"
+    [[ "$status" == "$expected" ]] || fail "$signal during optional test returned $status"
+    if [[ "$signal" == KILL ]]; then
+        [[ ! -e "$target" ]] || fail 'SIGKILL published a receipt'
+        continue
+    fi
+    python3 - "$target" "$expected" <<'PYTEST'
+import json, sys
+receipt = json.load(open(sys.argv[1]))
+assert receipt['overall'] == 'FAIL', receipt
+mandatory = {'clean-tree', 'rust-format', 'rust-clippy', 'base-lineage', 'native-ci-python', 'postgres-discovery'}
+assert mandatory <= {check['name'] for check in receipt['checks'] if check['status'] == 'PASS'}, receipt
+assert any(check['name'] == 'interrupted' and check['exit_code'] == int(sys.argv[2]) for check in receipt['checks']), receipt
+assert not any(check['name'] == 'rust-tests' for check in receipt['checks']), receipt
+PYTEST
+done
 
 printf '%s\n' 'PASS: pre-freeze argument and receipt contract'

@@ -9,7 +9,10 @@ use crate::error::{RelayError, Result};
 const MAX_SUB_ID_LENGTH: usize = 256;
 
 /// NIP-11 advertised limit: REQ messages with more filters than this are rejected.
-const MAX_FILTERS_PER_REQ: usize = 10;
+///
+/// The HTTP bridge (`/query`, `/count`) enforces the same bound after parsing
+/// attacker-controlled filter arrays and before any database work.
+pub(crate) const MAX_FILTERS_PER_REQ: usize = 10;
 
 /// A message sent by a NIP-01 client to the relay.
 #[derive(Debug, Clone)]

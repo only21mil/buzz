@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:buzz/features/channels/channel_management_provider.dart';
 import 'package:buzz/features/channels/mentions/mention_candidates.dart';
+import 'package:buzz/shared/identity/npub.dart';
 import 'package:buzz/shared/profile/user_profile.dart';
 import 'package:buzz/shared/mentions/agent_identity_provider.dart';
 
@@ -19,17 +20,15 @@ ChannelMember member(String pubkey, {String role = 'member'}) {
 }
 
 void main() {
-  test('role-only agent mentions fall back to a pubkey prefix label', () {
-    const pubkey = 'deadbeef0123456789';
-
+  test('role-only agent mentions fall back to a compact npub label', () {
     expect(
       mentionNamesWithDirectoryLabels(
-        mentionPubkeys: const [pubkey],
+        mentionPubkeys: [agentPubkey],
         profileMentionNames: const {},
         directoryDisplayNames: const {},
-        agentMentionPubkeys: const {pubkey},
+        agentMentionPubkeys: {agentPubkey},
       ),
-      const {pubkey: 'deadbeef'},
+      {agentPubkey: truncateNpub(agentPubkey)},
     );
   });
 
@@ -61,14 +60,14 @@ void main() {
       expect(formatOwnerLabel(userPubkey, userPubkey, const {}), 'you');
     });
 
-    test('prefers display name, then handle, then pubkey prefix', () {
+    test('prefers display name, then handle, then compact npub', () {
       final profiles = {
         ownerPubkey: UserProfile(pubkey: ownerPubkey, displayName: 'Wes'),
       };
       expect(formatOwnerLabel(ownerPubkey, userPubkey, profiles), 'Wes');
       expect(
         formatOwnerLabel(ownerPubkey, userPubkey, const {}),
-        '${'d' * 8}\u2026',
+        truncateNpub(ownerPubkey),
       );
     });
 

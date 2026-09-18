@@ -154,8 +154,10 @@ def inside_main():
                                      '-f', args.repo_root.resolve() / 'schema/schema.sql'], env,
                                     stdout=subprocess.DEVNULL)
                         url = 'postgresql://buzz_test@buzz-test.invalid/' + database + '?' + urlencode({'host': str(socket)})
+                        git_repo = local / 'git-repos'
                         test_env = dict(env, DATABASE_URL=url, TEST_DATABASE_URL=url,
-                                        BUZZ_TEST_DATABASE_URL=url, BUZZ_TEST_SCHEMA_MODE=mode(test, binary))
+                                        BUZZ_TEST_DATABASE_URL=url, BUZZ_TEST_SCHEMA_MODE=mode(test, binary),
+                                        BUZZ_GIT_REPO_PATH=str(git_repo))
                         result = command([binary, '--ignored', '--exact', test, '--nocapture',
                                           '--test-threads=1'], test_env, capture_output=True, text=True)
                         print(result.stdout, end='', flush=True)

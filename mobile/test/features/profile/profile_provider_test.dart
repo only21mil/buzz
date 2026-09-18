@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:buzz/features/profile/profile_provider.dart';
+import 'package:buzz/shared/identity/npub.dart';
 import 'package:buzz/shared/profile/user_cache_provider.dart';
 import 'package:buzz/shared/profile/user_profile.dart';
 import 'package:buzz/shared/relay/relay.dart';
@@ -106,7 +107,7 @@ void main() {
     expect(content, {'about': 'Building Buzz'});
     final profile = container.read(profileProvider).requireValue!;
     expect(profile.displayName, isNull);
-    expect(profile.label, '${keys.public.substring(0, 8)}...');
+    expect(profile.label, truncateNpub(keys.public));
   });
 
   test('malformed profile metadata can be repaired by an edit', () async {

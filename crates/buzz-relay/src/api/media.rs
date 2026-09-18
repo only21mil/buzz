@@ -1005,7 +1005,47 @@ mod tests {
         assert!(should_stream_as_video(bytes));
     }
 
+    /// Isolated scratch database for handler tests. Same explicit chain as
+    /// `bridge.rs` and `operator.rs`: a disposable Postgres URL must be
+    /// supplied, never the deployment default.
+    fn test_database_url() -> String {
+        std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("TEST_DATABASE_URL"))
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .expect("explicit isolated test database URL required")
+    }
+
+    /// Handler tests bind a tenant from the request host and read the media
+    /// sidecar gate, so they need a reachable Postgres with the relay.example
+    /// community seeded. Uses a real connection, not a lazy pool, so a
+    /// missing fixture fails fast instead of timing out mid-test.
     async fn test_state() -> (Arc<AppState>, tempfile::TempDir) {
+        let git_storage = tempfile::tempdir().expect("fixture Git storage");
+        let mut config = crate::config::Config::from_env_with_test_git_paths(git_storage.path())
+            .expect("fixture config loads");
+        config.require_relay_membership = false;
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        config.media_uploads_per_minute = 1;
+        config.media_max_concurrent_uploads = 2;
+        config.media_max_concurrent_uploads_per_pubkey = 1;
+        config.database_url = test_database_url();
+
+        let pool = sqlx::PgPool::connect(&config.database_url)
+            .await
+            .expect("isolated test database must be reachable");
+        let (state, git_storage) = assemble_state(config, pool, git_storage).await;
+        state
+            .db
+            .ensure_configured_community("relay.example")
+            .await
+            .expect("seed relay.example community for host-bound media tests");
+        (state, git_storage)
+    }
+
+    /// Service-free state for logic tests that never touch Postgres or Redis.
+    /// The upload rate limiter and concurrency permits live in process memory,
+    /// so these tests run with a lazy pool and no seed.
+    async fn test_state_without_database() -> (Arc<AppState>, tempfile::TempDir) {
         let git_storage = tempfile::tempdir().expect("fixture Git storage");
         let mut config = crate::config::Config::from_env_with_test_git_paths(git_storage.path())
             .expect("fixture config loads");
@@ -1016,10 +1056,18 @@ mod tests {
         config.media_max_concurrent_uploads_per_pubkey = 1;
 
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+        assemble_state(config, pool, git_storage).await
+    }
+
+    /// Shared AppState assembly. The caller picks the pool: connected for
+    /// handler tests, lazy for service-free logic tests. Redis and Postgres
+    /// clients stay lazy here, nothing connects during assembly.
+    async fn assemble_state(
+        config: crate::config::Config,
+        pool: sqlx::PgPool,
+        git_storage: tempfile::TempDir,
+    ) -> (Arc<AppState>, tempfile::TempDir) {
         let db = buzz_db::Db::from_pool(pool.clone());
-        db.ensure_configured_community("relay.example")
-            .await
-            .expect("seed relay.example community for host-bound media tests");
         let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
             .create_pool(Some(deadpool_redis::Runtime::Tokio1))
             .expect("redis pool");
@@ -1273,6 +1321,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL fixture"]
     async fn media_reads_reject_unauthenticated_get_and_head_before_sidecar_gate() {
         for method in ["GET", "HEAD"] {
             let response = media_get_auth_router()
@@ -1286,6 +1335,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL fixture"]
     async fn media_read_with_valid_server_scoped_token_reaches_sidecar_gate() {
         let keys = Keys::generate();
         let auth = media_get_auth_header(&keys, media_get_tags_for("relay.example", None));
@@ -1299,6 +1349,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL fixture"]
     async fn media_read_rejects_upload_verb_wrong_server_and_wrong_x() {
         let keys = Keys::generate();
         let now = Timestamp::now().as_secs();
@@ -1340,6 +1391,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL fixture"]
     async fn media_read_accepts_range_header_only_after_auth() {
         let keys = Keys::generate();
         let auth = media_get_auth_header(&keys, media_get_tags_for("relay.example", None));
@@ -1359,7 +1411,7 @@ mod tests {
 
     #[tokio::test]
     async fn upload_rate_limiter_is_scoped_by_community() {
-        let (state, _git_storage) = test_state().await;
+        let (state, _git_storage) = test_state_without_database().await;
         let pubkey = nostr::Keys::generate().public_key();
         let community_a = buzz_core::CommunityId::from_uuid(Uuid::from_u128(0xAAAA));
         let community_b = buzz_core::CommunityId::from_uuid(Uuid::from_u128(0xBBBB));
@@ -1374,7 +1426,7 @@ mod tests {
 
     #[tokio::test]
     async fn upload_concurrency_limit_is_scoped_by_community() {
-        let (state, _git_storage) = test_state().await;
+        let (state, _git_storage) = test_state_without_database().await;
         let pubkey = nostr::Keys::generate().public_key();
         let community_a = buzz_core::CommunityId::from_uuid(Uuid::from_u128(0xAAAA));
         let community_b = buzz_core::CommunityId::from_uuid(Uuid::from_u128(0xBBBB));

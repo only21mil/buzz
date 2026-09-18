@@ -193,9 +193,7 @@ class _DmAvatar extends ConsumerWidget {
     final avatarUrl = profile?.avatarUrl;
     final initial =
         profile?.initial ??
-        (channel.participants.isNotEmpty
-            ? channel.participants.first[0].toUpperCase()
-            : '?');
+        dmAvatarInitial(channel, currentPubkey: currentPubkey);
     return SizedBox(
       width: _kDmAvatarSize,
       height: _kDmAvatarSize,

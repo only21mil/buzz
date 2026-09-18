@@ -250,6 +250,28 @@ def apply_drift(client: FakeClient, name: str) -> None:
         raise ValueError(f"unknown drift {name!r}")
 
 
+class PreFreezeCheckTests(unittest.TestCase):
+    def test_complete_checks_pass_and_partial_or_failed_checks_refuse(self):
+        complete = {"overall": "PASS", "checks": [
+            {"name": name, "status": "PASS", "exit_code": 0}
+            for name in sorted(receipt.PRE_FREEZE_REQUIRED_CHECKS)]}
+        receipt.validate_pre_freeze_checks(complete)
+        for missing in receipt.PRE_FREEZE_REQUIRED_CHECKS:
+            partial = copy.deepcopy(complete)
+            partial["checks"] = [check for check in partial["checks"] if check["name"] != missing]
+            with self.subTest(missing=missing), self.assertRaisesRegex(receipt.ReceiptError, "incomplete"):
+                receipt.validate_pre_freeze_checks(partial)
+        for change in (lambda item: item["checks"].append(item["checks"][0]),
+                       lambda item: item["checks"][0].update(exit_code=143),
+                       lambda item: item["checks"][0].update(exit_code=False),
+                       lambda item: item["checks"][0].update(status="FAIL"),
+                       lambda item: item.update(overall="FAIL")):
+            broken = copy.deepcopy(complete)
+            change(broken)
+            with self.assertRaises(receipt.ReceiptError):
+                receipt.validate_pre_freeze_checks(broken)
+
+
 class ReceiptTests(unittest.TestCase):
     def setUp(self) -> None:
         # Keep GhClient's private gh home out of the developer's real state root.

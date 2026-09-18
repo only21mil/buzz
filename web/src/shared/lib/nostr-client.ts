@@ -137,6 +137,11 @@ export function queryEvents(
       } else if (type === "EOSE" && data[1] === subId) {
         if (!settled) {
           settled = true;
+          try {
+            ws.send(JSON.stringify(["CLOSE", subId]));
+          } catch {
+            // Already closing — the cleanup below finishes the job.
+          }
           cleanup();
           resolve(events);
         }
@@ -166,9 +171,13 @@ export function queryEvents(
 
     ws.addEventListener("close", () => {
       if (!settled) {
+        // The relay went away before EOSE — whatever arrived is a partial
+        // result, so reject instead of presenting it as complete.
         settled = true;
-        clearTimeout(timeout);
-        resolve(events);
+        cleanup();
+        reject(
+          new Error("Relay closed the connection before completing the query"),
+        );
       }
     });
   });

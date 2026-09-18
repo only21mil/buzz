@@ -471,7 +471,17 @@ pub async fn membership_pairs(
         .collect()
 }
 
-/// Returns all active members of the given channel.
+/// Returns all active members of the given channel, ordered by `joined_at`.
+///
+/// The roster is returned in full and is never truncated: callers use it to
+/// build the kind 39002 (NIP-29 group members) snapshot and to resolve actor
+/// roles for admin-event authorization, so a partial list silently hides late
+/// joiners from channel discovery and makes them read as non-members.
+///
+/// A `pubkey` tiebreak keeps the order deterministic when members share a
+/// timestamp. Callers that only need one member's role should use
+/// [`get_member_role`] or [`membership_pairs`] instead of filtering this list;
+/// callers that render rosters page by page should use [`get_members_paged`].
 ///
 /// Returns an empty list if the channel has been soft-deleted.
 pub async fn get_members(
@@ -485,12 +495,46 @@ pub async fn get_members(
         FROM channel_members cm
         JOIN channels c ON cm.community_id = c.community_id AND cm.channel_id = c.id AND c.deleted_at IS NULL
         WHERE cm.community_id = $1 AND cm.channel_id = $2 AND cm.removed_at IS NULL
-        ORDER BY cm.joined_at ASC
-        LIMIT 1000
+        ORDER BY cm.joined_at ASC, cm.pubkey ASC
         "#,
     )
     .bind(community_id.as_uuid())
     .bind(channel_id)
+    .fetch_all(&mut *crate::observability::acquire(pool, crate::observability::PoolRole::Writer, crate::observability::Operation::Membership).await?)
+    .await?;
+    rows.into_iter().map(row_to_member_record).collect()
+}
+
+/// Returns one page of active members of the given channel.
+///
+/// `limit` is clamped to `1..=1000`; `offset` counts from the oldest member.
+/// Ordering matches [`get_members`] (`joined_at`, then `pubkey`) so paging
+/// through with a stable offset covers the roster without gaps or overlap.
+/// Prefer [`get_members`] when the caller needs the whole roster for a
+/// decision; prefer this function for UI pagination.
+pub async fn get_members_paged(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    limit: u32,
+    offset: u64,
+) -> Result<Vec<MemberRecord>> {
+    let limit = limit.clamp(1, 1000) as i64;
+    let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+    let rows = sqlx::query(
+        r#"
+        SELECT cm.channel_id, cm.pubkey, cm.role::text AS role, cm.joined_at, cm.invited_by, cm.removed_at
+        FROM channel_members cm
+        JOIN channels c ON cm.community_id = c.community_id AND cm.channel_id = c.id AND c.deleted_at IS NULL
+        WHERE cm.community_id = $1 AND cm.channel_id = $2 AND cm.removed_at IS NULL
+        ORDER BY cm.joined_at ASC, cm.pubkey ASC
+        LIMIT $3 OFFSET $4
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(channel_id)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(&mut *crate::observability::acquire(pool, crate::observability::PoolRole::Writer, crate::observability::Operation::Membership).await?)
     .await?;
     rows.into_iter().map(row_to_member_record).collect()
@@ -1032,6 +1076,27 @@ impl Db {
         .await
     }
 
+    /// Returns one page of active members of a channel.
+    pub async fn get_members_paged(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<crate::channel_members::MemberRecord>> {
+        crate::observability::observe(crate::observability::Operation::Membership, async {
+            crate::channel_members::get_members_paged(
+                &self.pool,
+                community_id,
+                channel_id,
+                limit,
+                offset,
+            )
+            .await
+        })
+        .await
+    }
+
     /// Returns active members for multiple channels in a single query.
     pub async fn get_members_bulk(
         &self,
@@ -1146,5 +1211,109 @@ impl Db {
                 .await
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn setup_pool() -> PgPool {
+        let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("TEST_DATABASE_URL"))
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .expect("explicit isolated test database URL required");
+        PgPool::connect(&database_url)
+            .await
+            .expect("connect to test DB")
+    }
+
+    async fn make_test_community(pool: &PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        let host = format!("roster-test-{}.example", id.simple());
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(id)
+            .bind(host)
+            .execute(pool)
+            .await
+            .expect("insert test community");
+        id
+    }
+
+    async fn make_test_channel(pool: &PgPool, community_id: Uuid) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO channels (id, community_id, name, channel_type, visibility, created_by) \
+             VALUES ($1, $2, $3, 'stream', 'open', $4)",
+        )
+        .bind(id)
+        .bind(community_id)
+        .bind(format!("roster-channel-{}", id.simple()))
+        .bind(vec![0x11_u8; 32])
+        .execute(pool)
+        .await
+        .expect("insert test channel");
+        id
+    }
+
+    /// Bulk-insert `count` distinct members. `digest(.., 'sha256')` needs the
+    /// pgcrypto extension, which the base schema installs.
+    async fn seed_members(pool: &PgPool, community_id: Uuid, channel_id: Uuid, count: i32) {
+        sqlx::query(
+            "INSERT INTO channel_members (community_id, channel_id, pubkey, role) \
+             SELECT $1, $2, digest('roster-member-' || n::text, 'sha256'), 'member' \
+             FROM generate_series(1, $3) n",
+        )
+        .bind(community_id)
+        .bind(channel_id)
+        .bind(count)
+        .execute(pool)
+        .await
+        .expect("seed channel members");
+    }
+
+    /// UD-1: paging covers the same roster the unpaged read returns, with no
+    /// gaps and no overlap.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn get_members_paged_covers_roster_without_overlap() {
+        let pool = setup_pool().await;
+        let community_id = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_id);
+        let channel_id = make_test_channel(&pool, community_id).await;
+        seed_members(&pool, community_id, channel_id, 1_200).await;
+
+        let full = get_members(&pool, community, channel_id)
+            .await
+            .expect("load complete roster");
+        assert_eq!(full.len(), 1_200);
+
+        // Same-statement inserts share a timestamp, so the pubkey tiebreak is
+        // what keeps the order deterministic across pages.
+        let pubkeys: Vec<&[u8]> = full.iter().map(|m| m.pubkey.as_slice()).collect();
+        let mut sorted = pubkeys.clone();
+        sorted.sort_unstable();
+        assert_eq!(pubkeys, sorted);
+
+        let mut paged = Vec::with_capacity(1_200);
+        for (offset, expected) in [(0, 500), (500, 500), (1000, 200)] {
+            let page = get_members_paged(&pool, community, channel_id, 500, offset)
+                .await
+                .expect("load roster page");
+            assert_eq!(page.len(), expected);
+            paged.extend(page);
+        }
+
+        let full_keys: std::collections::HashSet<&[u8]> =
+            full.iter().map(|m| m.pubkey.as_slice()).collect();
+        let paged_keys: std::collections::HashSet<&[u8]> =
+            paged.iter().map(|m| m.pubkey.as_slice()).collect();
+        assert_eq!(paged_keys, full_keys);
+
+        // A zero limit clamps to one row rather than returning nothing.
+        let single = get_members_paged(&pool, community, channel_id, 0, 0)
+            .await
+            .expect("load clamped page");
+        assert_eq!(single.len(), 1);
     }
 }

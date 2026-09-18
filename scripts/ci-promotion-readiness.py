@@ -13,6 +13,8 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import stat
+import time
 import sys
 from typing import Any, NoReturn
 from urllib.parse import urlsplit
@@ -22,7 +24,7 @@ import uuid
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 SIGNATURE = re.compile(r"^[0-9a-f]{128}$")
-JOB_ID = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+JOB_ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
 IMAGE_ID = re.compile(r"^sha256:[0-9a-f]{64}$")
 CI_EVENT_KINDS = {46101, 46102, 46103, 46104, 46105, 46106}
 RUN_STATES = {
@@ -512,6 +514,10 @@ def validate_pre_freeze_receipt(
     expect(bool(checks), f"{label}.checks must not be empty")
     expect(all(obj(check, f"{label}.checks[]").get("status") == "PASS" for check in checks),
            f"{label} contains a non-PASS check")
+    try:
+        PROTECTED_CI.validate_pre_freeze_checks(receipt)
+    except PROTECTED_CI.ReceiptError as error:
+        refuse(f"{label} is invalid: {error}")
     expect(sha40(field(receipt, "base_sha", label), f"{label}.base_sha") == base,
            "pre-freeze receipt base_sha mismatch")
     return actual_digest, receipt
@@ -549,7 +555,7 @@ def validate_protected_ci_receipt(
 
 
 def reverify_protected_ci_receipt(receipt: dict[str, Any], label: str) -> None:
-    """Require live GitHub to still back the receipt; this is the verifier's only network call.
+    """Require live GitHub to still back the protected receipt.
 
     GitHub does not sign REST responses, so an offline receipt can be internally
     consistent without ever having contacted GitHub. Needs GH_TOKEN and the pinned gh.
@@ -751,9 +757,168 @@ def validate_status_history(
     return states[-1]
 
 
+def read_native_authority_file(path: Path, *, limit: int = 1024 * 1024) -> bytes:
+    """Read an operator-installed file whose complete path is root-controlled."""
+    expect(path.is_absolute() and path == path.resolve(), "native authority path must be canonical")
+    try:
+        for component in (path, *path.parents):
+            info = component.lstat()
+            expect(info.st_uid == 0 and not info.st_mode & 0o022
+                   and not stat.S_ISLNK(info.st_mode),
+                   "native authority path must be root-owned and not writable by other users")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            expect(stat.S_ISREG(info.st_mode) and info.st_nlink == 1,
+                   "native authority must be a regular single-link file")
+            raw = stream.read(limit + 1)
+            expect(len(raw) <= limit, "native authority file exceeds size limit")
+            return raw
+    except OSError as error:
+        refuse(f"native authority unavailable: {error.strerror}")
+
+
+class NativeAuthority:
+    """Independent operator policy plus the maintained CLI's live signed-run verifier.
+
+    The bundle cannot nominate its authority. Root installs this policy and the
+    hash-pinned CLI separately; no producer receipt is accepted as current policy.
+    """
+
+    def __init__(self, path: Path, max_age: int):
+        self.path = path
+        self.now = now = int(time.time())
+        self.started = time.monotonic()
+        self.raw = read_native_authority_file(path)
+        self.context = parse_json_bytes(self.raw, "native authority")
+        context = self.context
+        exact_fields(context, {
+            "repository", "target_repo_a", "source_clone_url", "channel_id", "relay_url",
+            "status_signers", "workflow_id", "workflow_digest", "job_ids", "cli_path",
+            "cli_sha256", "valid_from", "valid_until", "max_evidence_age", "historical_reuse",
+        }, set(), "native authority")
+        expect(context["repository"] == REPOSITORY, "native authority repository mismatch")
+        for name in ("target_repo_a", "source_clone_url", "workflow_id"):
+            text(context[name], f"native authority.{name}")
+        run_uuid(context["channel_id"], "native authority.channel_id")
+        self.origin = relay_http_origin(context["relay_url"], "native authority.relay_url")
+        expect(self.origin[0] == "https" and context["relay_url"].startswith("https://"), "native authority requires HTTPS")
+        sha256(context["workflow_digest"], "native authority.workflow_digest")
+        job_ids(context["job_ids"], "native authority.job_ids")
+        signers = array(context["status_signers"], "native authority.status_signers")
+        for signer in signers:
+            sha256(signer, "native authority.status_signers[]")
+        expect(bool(signers) and len(signers) == len(set(signers)), "native authority signers are empty or duplicate")
+        start = integer(context["valid_from"], "native authority.valid_from")
+        end = integer(context["valid_until"], "native authority.valid_until")
+        expect(0 <= start <= now < end, "native authority is expired or not yet valid")
+        policy_max_age = integer(context["max_evidence_age"], "native authority.max_evidence_age")
+        expect(policy_max_age > 0 and max_age > 0, "native authority freshness limits must be positive")
+        self.max_age = min(max_age, policy_max_age)
+        reuse = obj(context["historical_reuse"], "native authority.historical_reuse")
+        for digest, expiry in reuse.items():
+            sha256(digest, "native authority historical digest")
+            expect(type(expiry) is int and start < expiry <= end,
+                   "native authority historical reuse expiry is invalid")
+        self.cli = Path(text(context["cli_path"], "native authority.cli_path"))
+        self.check_cli()
+        self.runs: list[dict[str, Any]] = []
+
+    def check_cli(self) -> None:
+        digest = hashlib.sha256(read_native_authority_file(self.cli, limit=512 * 1024 * 1024)).hexdigest()
+        expect(digest == sha256(self.context["cli_sha256"], "native authority.cli_sha256"),
+               "native authority CLI digest mismatch")
+
+    def bind(self, section: dict[str, Any], result: dict[str, Any], state: str) -> None:
+        context = self.context
+        expect(section["channel_id"] == context["channel_id"], "native authority channel mismatch")
+        expect(relay_http_origin(section["relay_url"], "native evidence relay") == self.origin,
+               "native authority relay origin mismatch")
+        expect(set(section["authorized_relay_signers"]) <= set(context["status_signers"]),
+               "native evidence signer is outside current authority")
+        for name in ("target_repo_a", "workflow_id", "workflow_digest", "job_ids"):
+            expect(result[name] == context[name], f"native authority {name} mismatch")
+        for request in section["requests"]:
+            content = json.loads(request["content"])
+            expect(content["source_clone_url"] == context["source_clone_url"],
+                   "native authority source repository mismatch")
+        digest = hashlib.sha256(PROTECTED_CI.canonical_json(section)).hexdigest()
+        times = [integer(event["created_at"], "native event.created_at")
+                 for event in section["requests"] + section["events"]]
+        expect(all(0 <= timestamp <= self.now + 300 for timestamp in times),
+               "native history has invalid or future timestamps")
+        historical = min(times) < self.now - self.max_age
+        if historical:
+            expect(context["historical_reuse"].get(digest, 0) > self.now,
+                   "stale native history requires explicit current authority reuse approval")
+        self.runs.append({"result": result, "state": state, "sha256": digest, "oldest": min(times),
+                          "mode": "historical-reuse" if historical else "fresh"})
+
+    def check_current(self) -> None:
+        # Wall time catches forward adjustments; elapsed time prevents rollback
+        # from extending the lifetime accepted at construction. Neither is caller input.
+        current = max(int(time.time()), self.now + int(time.monotonic() - self.started))
+        expect(self.context["valid_from"] <= current < self.context["valid_until"],
+               "native authority expired during verification")
+        for run in self.runs:
+            if run["mode"] == "fresh":
+                expect(current - run["oldest"] <= self.max_age, "native history expired during verification")
+            if run["mode"] == "historical-reuse":
+                expect(current < self.context["historical_reuse"][run["sha256"]],
+                       "native historical reuse expired during verification")
+        expect(read_native_authority_file(self.path) == self.raw, "native authority changed during verification")
+        self.check_cli()
+
+    def reverify(self) -> list[dict[str, Any]]:
+        """Re-read current policy, then independently query every accepted run."""
+        self.check_current()
+        evidence = []
+        for run in self.runs:
+            expected = run["result"]
+            # Pass only the CLI's existing authentication inputs. Inheriting loader,
+            # proxy or TLS override variables would defeat the pinned executable/origin.
+            environment = {name: os.environ[name] for name in ("BUZZ_PRIVATE_KEY", "BUZZ_AUTH_TAG")
+                           if name in os.environ}
+            environment.update({"LC_ALL": "C.UTF-8", "NO_COLOR": "1",
+                                "BUZZ_CI_CHANNEL": self.context["channel_id"],
+                                "BUZZ_CI_STATUS_SIGNERS": ",".join(self.context["status_signers"])})
+            try:
+                response = subprocess.run(
+                    [str(self.cli), "--relay", self.context["relay_url"], "ci", "verdict", "--run",
+                     expected["run_id"], "--expect-sha", expected["tip_oid"]],
+                    env=environment, capture_output=True, timeout=60, check=False,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                refuse("native authority live verdict unavailable")
+            expect(response.returncode == 0, "native authority live verdict failed")
+            actual = parse_json_bytes(response.stdout, "native authority live verdict")
+            for name, value in {
+                "run_id": expected["run_id"], "sha": expected["tip_oid"],
+                "attempt": max(expected["attempts"]),
+                "verdict": "green" if run["state"] == "success" else "red",
+                "jobs_total": len(expected["job_ids"]), "jobs_terminal": len(expected["job_ids"]),
+            }.items():
+                expect(type(actual.get(name)) is type(value) and actual[name] == value,
+                       f"native authority live verdict {name} mismatch")
+            evidence.append({"run_id": expected["run_id"], "history_sha256": run["sha256"],
+                             "mode": run["mode"], "verdict_sha256": hashlib.sha256(response.stdout).hexdigest()})
+        self.check_current()
+        return evidence
+
+
 def validate_ci_event_evidence(
+    section: dict[str, Any], candidate: str, base: str, path: str, expected_run_state: str,
+    authority: NativeAuthority,
+) -> dict[str, Any]:
+    result = validate_ci_event_structure(section, candidate, base, path, expected_run_state)
+    authority.bind(section, result, expected_run_state)
+    return result
+
+
+def validate_ci_event_structure(
     section: dict[str, Any], candidate: str, base: str, path: str, expected_run_state: str
 ) -> dict[str, Any]:
+    """Validate signed structure only; callers must also bind independent authority."""
     exact_fields(
         section,
         {"channel_id", "relay_url", "authorized_relay_signers", "requests", "events", "decoded_logs"},
@@ -1315,7 +1480,7 @@ def validate_ci_event_evidence(
     return validated_result
 
 
-def validate_staging(section: dict[str, Any], candidate: str, base: str) -> dict[str, Any]:
+def validate_staging(section: dict[str, Any], candidate: str, base: str, authority: NativeAuthority) -> dict[str, Any]:
     path = "staging"
     exact_fields(section, {
         "candidate_sha", "absent_policy_status", "configured_policy_status", "root_executor_handoff",
@@ -1341,7 +1506,7 @@ def validate_staging(section: dict[str, Any], candidate: str, base: str) -> dict
            "a staging scenario did not pass")
     event_evidence = validate_ci_event_evidence(
         obj(field(section, "event_evidence", path), f"{path}.event_evidence"), candidate, base,
-        f"{path}.event_evidence", "success",
+        f"{path}.event_evidence", "success", authority,
     )
     log = validate_log_auth(obj(field(section, "log", path), f"{path}.log"), f"{path}.log")
     expect(log["sha256"] in event_evidence["log_digests"],
@@ -1381,7 +1546,7 @@ def validate_retry(section: dict[str, Any], event_evidence: dict[str, Any], path
 
 
 def validate_canary(
-    section: dict[str, Any], candidate: str, base: str, staging: dict[str, Any]
+    section: dict[str, Any], candidate: str, base: str, staging: dict[str, Any], authority: NativeAuthority
 ) -> dict[str, Any]:
     path = "production_canary"
     exact_fields(section, {"candidate_sha", "accepted_executed", "unaccepted_refused", "event_evidence", "retry"},
@@ -1394,7 +1559,7 @@ def validate_canary(
            "unaccepted code path was not refused")
     event_evidence = validate_ci_event_evidence(
         obj(field(section, "event_evidence", path), f"{path}.event_evidence"), candidate, base,
-        f"{path}.event_evidence", "success",
+        f"{path}.event_evidence", "success", authority,
     )
     parity_fields = ("target_repo_a", "workflow_id", "workflow_digest", "job_ids", "relay_signer")
     for name in parity_fields:
@@ -1409,7 +1574,7 @@ def validate_canary(
 
 def validate_deliberate_red(
     section: dict[str, Any], candidate: str, base: str, canary: dict[str, Any],
-    protected_contexts: list[str]
+    protected_contexts: list[str], authority: NativeAuthority
 ) -> dict[str, Any]:
     path = "deliberate_red"
     exact_fields(section, {
@@ -1433,7 +1598,7 @@ def validate_deliberate_red(
            "deliberate-red run must publish one terminal event")
     event_evidence = validate_ci_event_evidence(
         obj(field(section, "event_evidence", path), f"{path}.event_evidence"), red_sha, base,
-        f"{path}.event_evidence", "failure",
+        f"{path}.event_evidence", "failure", authority,
     )
     first = run_uuid(field(section, "first_run_id", path), f"{path}.first_run_id")
     expect(run_uuid(field(section, "duplicate_run_id", path), f"{path}.duplicate_run_id") == first,
@@ -1540,7 +1705,7 @@ def validate_landing(section: dict[str, Any], candidate: str) -> dict[str, str]:
     return result
 
 
-def validate_bundle(bundle: dict[str, Any], candidate_dir: Path, now: int, max_age: int) -> dict[str, Any]:
+def validate_bundle(bundle: dict[str, Any], candidate_dir: Path, now: int, max_age: int, authority: NativeAuthority) -> dict[str, Any]:
     exact_fields(bundle, {
         "schema_version", "repository", "candidate_sha", "base_sha", "tree_sha", "source",
         "evidence_files", "protected_ci", "tier2", "artifacts", "staging", "production_canary",
@@ -1602,12 +1767,12 @@ def validate_bundle(bundle: dict[str, Any], candidate_dir: Path, now: int, max_a
     )
     tier2 = validate_tier2(obj(field(bundle, "tier2", "evidence"), "tier2"), candidate, now)
     artifacts = validate_artifacts(obj(field(bundle, "artifacts", "evidence"), "artifacts"), candidate)
-    staging = validate_staging(obj(field(bundle, "staging", "evidence"), "staging"), candidate, base)
+    staging = validate_staging(obj(field(bundle, "staging", "evidence"), "staging"), candidate, base, authority)
     canary = validate_canary(obj(field(bundle, "production_canary", "evidence"), "production_canary"),
-                             candidate, base, staging)
+                             candidate, base, staging, authority)
     deliberate_red = validate_deliberate_red(
         obj(field(bundle, "deliberate_red", "evidence"), "deliberate_red"),
-        candidate, base, canary, contexts,
+        candidate, base, canary, contexts, authority,
     )
     deploy_rollback = validate_deploy_rollback(
         obj(field(bundle, "deployment", "evidence"), "deployment"),
@@ -1615,6 +1780,7 @@ def validate_bundle(bundle: dict[str, Any], candidate_dir: Path, now: int, max_a
     )
     landing = validate_landing(obj(field(bundle, "landing", "evidence"), "landing"), candidate)
     reverify_protected_ci_receipt(protected_receipt, "evidence_files.protected_ci")
+    native_readbacks = authority.reverify()
 
     return {
         "schema_version": 1,
@@ -1657,6 +1823,8 @@ def validate_bundle(bundle: dict[str, Any], candidate_dir: Path, now: int, max_a
             "log_authentication": "PASS",
         },
         "evidence": {
+            "native_authority_sha256": hashlib.sha256(authority.raw).hexdigest(),
+            "native_readbacks": native_readbacks,
             "pre_freeze_sha256": pre_digest,
             "protected_ci_sha256": ci_digest,
             "acceptance_verdict_sha256": acceptance_digest,
@@ -1688,10 +1856,12 @@ def publish_receipt(path: Path, receipt: dict[str, Any], candidate_dir: Path) ->
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("--native-context", type=Path, default=Path("/etc/buzz/ci-promotion-authority.json"),
+                        help="Root-installed current native authority policy; never bundle evidence")
     result.add_argument("--candidate-dir", required=True, type=Path)
     result.add_argument("--evidence", required=True, type=Path)
     result.add_argument("--receipt", required=True, type=Path)
-    result.add_argument("--now", required=True, type=int, help="UTC epoch used for deterministic freshness checks")
+    result.add_argument("--now", required=True, type=int, help="UTC epoch for non-native evidence checks; native authority uses the actual clock")
     result.add_argument("--max-evidence-age", type=int, default=86400)
     return result
 
@@ -1705,8 +1875,10 @@ def main() -> int:
         raw_bundle = read_evidence_file(arguments.evidence, "promotion evidence", candidate_dir,
                                         limit=MAX_BUNDLE_BYTES)
         bundle = parse_json_bytes(raw_bundle, "promotion evidence")
-        receipt = validate_bundle(bundle, candidate_dir, arguments.now, arguments.max_evidence_age)
+        authority = NativeAuthority(arguments.native_context, arguments.max_evidence_age)
+        receipt = validate_bundle(bundle, candidate_dir, arguments.now, arguments.max_evidence_age, authority)
         receipt["evidence"]["bundle_sha256"] = hashlib.sha256(raw_bundle).hexdigest()
+        authority.check_current()
         payload = publish_receipt(arguments.receipt, receipt, candidate_dir)
         sys.stdout.buffer.write(payload)
         return 0

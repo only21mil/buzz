@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../shared/crypto/nip_oa.dart';
+import '../../shared/identity/npub.dart';
 import '../../shared/relay/relay.dart';
 
 /// A relay agent parsed from its kind:10100 agent-profile event.
@@ -158,8 +159,7 @@ Map<String, String> mentionNamesWithDirectoryLabels({
   return names;
 }
 
-String _agentFallbackLabel(String pubkey) =>
-    pubkey.length >= 8 ? pubkey.substring(0, 8) : pubkey;
+String _agentFallbackLabel(String pubkey) => truncateNpub(pubkey);
 
 /// Keeps the role feed alive for consumers that render mentions outside the
 /// channel timeline, such as search results. A membership change refreshes the

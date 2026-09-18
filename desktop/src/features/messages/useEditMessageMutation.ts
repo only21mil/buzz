@@ -46,7 +46,11 @@ export function useEditMessageMutation(channel: Channel | null) {
       // Split so each rides its own validated Tauri arg — emoji tags must NOT
       // go through the imeta-only `mediaTags` channel (the Rust `imeta_tags`
       // guard rejects any non-imeta prefix), mirroring the send path.
-      const { mediaTags: imetaTags, emojiTags } = splitOutgoingTags(mediaTags);
+      const {
+        mediaTags: imetaTags,
+        emojiTags,
+        mentionTags,
+      } = splitOutgoingTags(mediaTags);
 
       await editMessage(
         channel.id,
@@ -56,6 +60,7 @@ export function useEditMessageMutation(channel: Channel | null) {
         emojiTags,
         mentionPubkeys,
         undefined,
+        mentionTags,
         publicationScope,
       );
     },

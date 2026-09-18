@@ -1240,6 +1240,185 @@ mod tests {
         );
     }
 
+    // The actual signing service supplies the token. The transport is the only
+    // relay double, so standalone policy refusal cannot be hidden by RecordingAuth.
+    struct NativeBackend([nostr::secp256k1::Keypair; 3]);
+    impl buzz_ci_keyholder::SigningBackend for NativeBackend {
+        fn public_key(
+            &self,
+            selector: buzz_ci_keyholder::KeySelector,
+        ) -> Result<[u8; 32], buzz_ci_keyholder::BackendError> {
+            Ok(self.0[selector_index(selector)]
+                .x_only_public_key()
+                .0
+                .serialize())
+        }
+        fn sign_digest(
+            &self,
+            selector: buzz_ci_keyholder::KeySelector,
+            digest: [u8; 32],
+        ) -> Result<[u8; 64], buzz_ci_keyholder::BackendError> {
+            Ok(nostr::secp256k1::SECP256K1
+                .sign_schnorr_no_aux_rand(
+                    &nostr::secp256k1::Message::from_digest(digest),
+                    &self.0[selector_index(selector)],
+                )
+                .serialize())
+        }
+    }
+    fn selector_index(s: buzz_ci_keyholder::KeySelector) -> usize {
+        match s {
+            buzz_ci_keyholder::KeySelector::CiEvent => 0,
+            buzz_ci_keyholder::KeySelector::Nip98 => 1,
+            buzz_ci_keyholder::KeySelector::Manifest => 2,
+        }
+    }
+    struct NativeAuth(buzz_ci_keyholder::ProductionKeyholder<NativeBackend>);
+    impl Nip98Authorizer for NativeAuth {
+        type Error = ();
+        fn authorization(&mut self, binding: &Nip98Binding) -> Result<Nip98Authorization, ()> {
+            use buzz_ci_keyholder::{
+                Nip98AuthorizeRequest, Nip98Signer, PeerIdentity, Request, Response,
+            };
+            binding.validate().map_err(|_| ())?;
+            let created_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| ())?
+                .as_secs();
+            let nonce = [5; 16];
+            let Response::Nip98Authorize(response) = self.0.handle(
+                PeerIdentity {
+                    uid: 1201,
+                    gid: 1201,
+                },
+                Request::Nip98Authorize(Nip98AuthorizeRequest {
+                    expected_generation: 1,
+                    signer: Nip98Signer::Nip98,
+                    method: buzz_ci_keyholder::HttpMethod::Get,
+                    url: buzz_ci_keyholder::Url::new(binding.url.to_string()).map_err(|_| ())?,
+                    payload_digest: None,
+                    created_at,
+                    nonce,
+                    query_filter: None,
+                }),
+            ) else {
+                return Err(());
+            };
+            let event: nostr::Event=serde_json::from_value(serde_json::json!({
+                "id":hex::encode(response.signed_digest), "pubkey":hex::encode(response.identity.public_key),
+                "created_at":created_at, "kind":27235, "content":"", "sig":hex::encode(response.signature),
+                "tags":[["u",binding.url.as_str()],["method","GET"],["nonce",hex::encode(nonce)]]
+            })).map_err(|_| ())?;
+            event.verify().map_err(|_| ())?;
+            Ok(Nip98Authorization::new(
+                format!(
+                    "Nostr {}",
+                    BASE64.encode(serde_json::to_vec(&event).map_err(|_| ())?)
+                ),
+                Nip98Proof {
+                    subject: event.pubkey.to_hex(),
+                    generation: 1,
+                    event_id: event.id.to_hex(),
+                },
+            ))
+        }
+    }
+
+    #[test]
+    fn native_evidence_export_uses_real_policy_and_checks_relay_bytes() {
+        use buzz_ci_keyholder::{
+            NativeEvidenceArtifact, NativeEvidencePolicy, Operation, OperationSet, PeerPolicy,
+            PublicIdentity, SelectorSet, SigningPolicy,
+        };
+        let bytes = b"actual relay evidence".to_vec();
+        let digest = hex::encode(Sha256::digest(&bytes));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let policy = NativeEvidencePolicy {
+            not_before: now - 1,
+            expires_at: now + 300,
+            request_event_id: "ab".repeat(32),
+            run_id: "123e4567-e89b-12d3-a456-426614174000".into(),
+            job_id: "job_1".into(),
+            attempt: 1,
+            authority_sha256: "11".repeat(32),
+            bundle_sha256: "22".repeat(32),
+            log_sha256: digest.clone(),
+            artifacts: vec![NativeEvidenceArtifact {
+                artifact_id: "result".into(),
+                sha256: digest.clone(),
+            }],
+        };
+        for (authorized, corrupt) in [(true, false), (false, false), (true, true)] {
+            let pairs = [1, 2, 3].map(|n| {
+                nostr::secp256k1::Keypair::from_secret_key(
+                    nostr::secp256k1::SECP256K1,
+                    &nostr::secp256k1::SecretKey::from_slice(&[n; 32]).unwrap(),
+                )
+            });
+            let identities = pairs.each_ref().map(|p| PublicIdentity {
+                public_key: p.x_only_public_key().0.serialize(),
+                generation: 1,
+            });
+            let selectors = SelectorSet::new(identities[0], identities[1], identities[2]).unwrap();
+            let peer = PeerPolicy {
+                uid: 1201,
+                gid: 1201,
+                allowed_operations: OperationSet::only(Operation::Nip98Authorize),
+            };
+            let signing = if authorized {
+                SigningPolicy::new_with_native_evidence(
+                    peer,
+                    selectors,
+                    "https://relay.example".into(),
+                    policy.clone(),
+                )
+            } else {
+                SigningPolicy::new(peer, selectors, "https://relay.example".into())
+            }
+            .unwrap();
+            let auth = NativeAuth(
+                buzz_ci_keyholder::ProductionKeyholder::new(signing, NativeBackend(pairs)).unwrap(),
+            );
+            let transport = RecordingTransport {
+                response: HttpResponse {
+                    status: 200,
+                    body: if corrupt {
+                        vec![0; bytes.len()]
+                    } else {
+                        bytes.clone()
+                    },
+                },
+                requests: vec![],
+            };
+            let mut relay = AuthenticatedRelay::new(
+                Url::parse("https://relay.example/").unwrap(),
+                transport,
+                auth,
+            )
+            .unwrap();
+            let path = policy
+                .paths()
+                .into_iter()
+                .find(|p| p.starts_with("/ci/logs/"))
+                .unwrap();
+            let result = relay.read_evidence_object(
+                &format!("https://relay.example{path}"),
+                &digest,
+                bytes.len() as u64,
+                bytes.len() as u64,
+            );
+            if authorized && !corrupt {
+                assert_eq!(result.unwrap().bytes, bytes);
+            } else {
+                assert!(result.is_err());
+            }
+            assert_eq!(relay.into_parts().0.requests.len(), usize::from(authorized));
+        }
+    }
+
     #[test]
     fn evidence_get_binds_canonical_url_size_digest_and_public_proof() {
         let bytes = b"readback".to_vec();

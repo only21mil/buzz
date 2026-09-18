@@ -1,0 +1,175 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buzz.dev/schemas/native-ci/keyholder-native-config-v2.json",
+  "title": "Buzz CI standalone native keyholder config v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "peer",
+    "selectors",
+    "nip98_origin"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 2
+    },
+    "peer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "uid",
+        "gid",
+        "allowed_operations"
+      ],
+      "properties": {
+        "uid": {
+          "$ref": "#/$defs/nonzeroU32"
+        },
+        "gid": {
+          "$ref": "#/$defs/nonzeroU32"
+        },
+        "allowed_operations": {
+          "const": [
+            "describe",
+            "sign_ci_event",
+            "nip98_authorize",
+            "sign_manifest"
+          ]
+        }
+      }
+    },
+    "selectors": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ci_event",
+        "nip98",
+        "manifest"
+      ],
+      "properties": {
+        "ci_event": {
+          "$ref": "#/$defs/identity"
+        },
+        "nip98": {
+          "$ref": "#/$defs/identity"
+        },
+        "manifest": {
+          "$ref": "#/$defs/identity"
+        }
+      }
+    },
+    "nip98_origin": {
+      "type": "string",
+      "pattern": "^https://[^/?#]+$",
+      "maxLength": 2048
+    },
+    "native_evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "not_before",
+        "expires_at",
+        "request_event_id",
+        "run_id",
+        "job_id",
+        "attempt",
+        "authority_sha256",
+        "bundle_sha256",
+        "log_sha256",
+        "artifacts"
+      ],
+      "properties": {
+        "not_before": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "expires_at": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "request_event_id": {
+          "$ref": "#/$defs/lowerHex64"
+        },
+        "run_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+          "maxLength": 36
+        },
+        "job_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_-]{0,63}$",
+          "maxLength": 64
+        },
+        "attempt": {
+          "$ref": "#/$defs/nonzeroU32"
+        },
+        "authority_sha256": {
+          "$ref": "#/$defs/lowerHex64"
+        },
+        "bundle_sha256": {
+          "$ref": "#/$defs/lowerHex64"
+        },
+        "log_sha256": {
+          "$ref": "#/$defs/lowerHex64"
+        },
+        "artifacts": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "artifact_id",
+              "sha256"
+            ],
+            "properties": {
+              "artifact_id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+                "maxLength": 128
+              },
+              "sha256": {
+                "$ref": "#/$defs/lowerHex64"
+              }
+            }
+          }
+        }
+      },
+      "description": "Exact root-staged completion binding. Runtime also enforces canonical object paths, unique artifact IDs and expires_at - not_before <= 900 seconds."
+    }
+  },
+  "$defs": {
+    "nonzeroU32": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "generation": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    },
+    "lowerHex64": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "public_key",
+        "generation"
+      ],
+      "properties": {
+        "public_key": {
+          "$ref": "#/$defs/lowerHex64"
+        },
+        "generation": {
+          "$ref": "#/$defs/generation"
+        }
+      }
+    }
+  }
+}

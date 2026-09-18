@@ -173,3 +173,16 @@ The first live attempt remains held until the real validation PR, request,
 final integrated workflow/base, measured profiles, package inventories and
 root review are complete. This source package contains no fabricated live
 policy, source pin, signature or successful execution receipt.
+
+## Standalone keyholder startup
+
+The native operator uses `UnixKeyholderClient::connect_native`, which requires
+exactly `describe`, `sign_ci_event`, `nip98_authorize`, and `sign_manifest` in
+the keyholder's public peer policy. It refuses fixture acceptance authority and
+cannot bind an acceptance actor. The fixture controller's existing `connect`
+path continues to require all six operations. A native keyholder configuration
+must omit the optional acceptance binding and both acceptance-only operations,
+and its service must load only the existing three native encrypted credentials.
+Keep the configured caller/server identities, generation-bound selectors, socket
+permissions and origin restrictions. Moving between the two configurations is a
+reviewed operation with clients stopped, not an automatic fallback.

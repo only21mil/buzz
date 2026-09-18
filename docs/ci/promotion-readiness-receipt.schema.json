@@ -112,10 +112,25 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "native_authority_sha256", "native_readbacks",
         "pre_freeze_sha256", "protected_ci_sha256", "acceptance_verdict_sha256",
         "acceptance_records_sha256", "dump_sha256", "bundle_sha256"
       ],
       "properties": {
+        "native_authority_sha256": { "$ref": "#/$defs/sha256" },
+        "native_readbacks": {
+          "type": "array", "minItems": 3, "maxItems": 3,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["run_id", "history_sha256", "mode", "verdict_sha256"],
+            "properties": {
+              "run_id": { "type": "string", "format": "uuid" },
+              "history_sha256": { "$ref": "#/$defs/sha256" },
+              "mode": { "enum": ["fresh", "historical-reuse"] },
+              "verdict_sha256": { "$ref": "#/$defs/sha256" }
+            }
+          }
+        },
         "pre_freeze_sha256": { "$ref": "#/$defs/sha256" },
         "protected_ci_sha256": { "$ref": "#/$defs/sha256" },
         "acceptance_verdict_sha256": { "$ref": "#/$defs/sha256" },

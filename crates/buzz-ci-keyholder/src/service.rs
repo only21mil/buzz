@@ -41,6 +41,7 @@ pub struct SigningPolicy {
     selectors: SelectorSet,
     nip98_origin: String,
     acceptance: Option<AcceptanceSigningPolicy>,
+    native_evidence: Option<crate::NativeEvidencePolicy>,
 }
 
 /// Five exact public event templates authorized for one activation scenario.
@@ -160,6 +161,7 @@ impl SigningPolicy {
             selectors,
             nip98_origin,
             acceptance: None,
+            native_evidence: None,
         })
     }
 
@@ -191,6 +193,19 @@ impl SigningPolicy {
             return Err(ServiceError::InvalidRequest);
         }
         policy.acceptance = Some(acceptance);
+        Ok(policy)
+    }
+
+    /// Construct native read authority without enabling acceptance operations.
+    pub fn new_with_native_evidence(
+        peer_policy: PeerPolicy,
+        selectors: SelectorSet,
+        nip98_origin: String,
+        evidence: crate::NativeEvidencePolicy,
+    ) -> Result<Self, ServiceError> {
+        evidence.validate()?;
+        let mut policy = Self::new(peer_policy, selectors, nip98_origin)?;
+        policy.native_evidence = Some(evidence);
         Ok(policy)
     }
 
@@ -241,6 +256,11 @@ impl SigningPolicy {
                     .acceptance
                     .as_ref()
                     .is_some_and(|acceptance| acceptance.evidence_get_paths.contains(parsed.path()))
+                && !self.native_evidence.as_ref().is_some_and(|evidence| {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .is_ok_and(|now| evidence.permits(parsed.path(), now.as_secs()))
+                })
             {
                 return Err(ServiceError::PolicyDenied);
             }
@@ -390,7 +410,7 @@ fn authorize_get(parsed: &ParsedUrl, request: &Nip98AuthorizeRequest) -> Result<
     Ok(())
 }
 
-fn canonical_evidence_get_path(path: &str) -> bool {
+pub(crate) fn canonical_evidence_get_path(path: &str) -> bool {
     let fields = path
         .strip_prefix('/')
         .map(|value| value.split('/').collect::<Vec<_>>());

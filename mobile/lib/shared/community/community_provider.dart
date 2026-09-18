@@ -6,6 +6,7 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:nostr/nostr.dart' as nostr;
 
 import '../auth/auth_provider.dart';
+import '../auth/export_authorization.dart';
 import '../push/dev_push_lease.dart';
 import '../push/push_bridge.dart';
 import '../push/push_lease_revocation_outbox.dart';
@@ -314,6 +315,13 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
     required bool invalidateAuthentication,
   }) {
     return ref.read(communityTransitionProvider).runExclusive(() async {
+      // The identity changed: drop export grants before touching storage.
+      try {
+        ref.read(exportAuthorizationProvider.notifier).invalidateAll();
+      } catch (_) {
+        // Keep removing; the binding check below still fails closed
+        // without a live grant.
+      }
       var revocationJournaled = false;
       final storage = ref.read(communityStorageProvider);
       final activeId = await storage.loadActiveId();
@@ -376,6 +384,12 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
       final storage = ref.read(communityStorageProvider);
       final activeId = await storage.loadActiveId();
       if (activeId == id) return;
+      try {
+        ref.read(exportAuthorizationProvider.notifier).invalidateAll();
+      } catch (_) {
+        // Keep switching; stale grants stay bound to the old community
+        // and fail the binding check.
+      }
       await ref.read(communityTransitionProvider).run();
       await storage.saveActiveId(id);
       // Reassign list state to trigger activeCommunityProvider (which watches

@@ -761,7 +761,7 @@ String _huddleReactionSenderName({
   final displayName = profile?.displayName?.trim();
   if (displayName?.isNotEmpty == true) return displayName!;
   if (localPubkey?.isNotEmpty == true) {
-    return 'Participant ${shortPubkey(localPubkey!)}';
+    return 'Participant ${truncateNpub(localPubkey!)}';
   }
   return 'Someone';
 }

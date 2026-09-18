@@ -26,6 +26,8 @@ pub struct KeyholderConfig {
     pub nip98_origin: String,
     /// Optional static locator and credential selector for acceptance authority.
     pub acceptance: Option<AcceptanceBindingConfig>,
+    /// Optional exact native completion evidence read authority.
+    pub native_evidence: Option<crate::NativeEvidencePolicy>,
 }
 
 /// Static acceptance authority configuration. Dynamic activation values are
@@ -45,7 +47,8 @@ impl KeyholderConfig {
     /// Load a bounded JSON configuration file.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let file = File::open(path).map_err(ConfigError::Read)?;
-        let length = file.metadata().map_err(ConfigError::Read)?.len();
+        let metadata = file.metadata().map_err(ConfigError::Read)?;
+        let length = metadata.len();
         if length == 0 || length > MAX_CONFIG_SIZE {
             return Err(ConfigError::Invalid);
         }
@@ -56,7 +59,11 @@ impl KeyholderConfig {
         if bytes.len() as u64 != length {
             return Err(ConfigError::Invalid);
         }
-        Self::from_slice(&bytes)
+        let config = Self::from_slice(&bytes)?;
+        if config.native_evidence.is_some() {
+            validate_native_file(path, &metadata)?;
+        }
+        Ok(config)
     }
 
     /// Parse and validate bounded public configuration bytes.
@@ -93,6 +100,12 @@ impl KeyholderConfig {
         {
             return Err(ConfigError::Invalid);
         }
+        if let Some(policy) = &raw.native_evidence {
+            if acceptance.is_some() {
+                return Err(ConfigError::Invalid);
+            }
+            policy.validate().map_err(|_| ConfigError::Invalid)?;
+        }
         Ok(Self {
             peer_policy: PeerPolicy {
                 uid: raw.peer.uid,
@@ -102,8 +115,44 @@ impl KeyholderConfig {
             selectors,
             nip98_origin: raw.nip98_origin,
             acceptance,
+            native_evidence: raw.native_evidence,
         })
     }
+}
+
+// Native authority is root-owned public configuration. The service account
+// cannot replace a file or directory in this chain, or edit the binding.
+#[cfg(unix)]
+fn validate_native_file(path: &Path, opened: &std::fs::Metadata) -> Result<(), ConfigError> {
+    use std::os::unix::fs::MetadataExt;
+    if !path.is_absolute() || std::fs::canonicalize(path).map_err(ConfigError::Read)? != path {
+        return Err(ConfigError::Invalid);
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(ConfigError::Read)?;
+    if metadata.dev() != opened.dev()
+        || metadata.ino() != opened.ino()
+        || !opened.is_file()
+        || opened.uid() != 0
+        || opened.mode() & 0o022 != 0
+        || !metadata.is_file()
+        || metadata.uid() != 0
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(ConfigError::Invalid);
+    }
+    for parent in path.ancestors().skip(1) {
+        let metadata = std::fs::symlink_metadata(parent).map_err(ConfigError::Read)?;
+        if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            return Err(ConfigError::Invalid);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_native_file(_: &Path, _: &std::fs::Metadata) -> Result<(), ConfigError> {
+    Err(ConfigError::Invalid)
 }
 
 /// Public configuration failure. Parse details and file paths are omitted.
@@ -126,6 +175,8 @@ struct RawConfig {
     nip98_origin: String,
     #[serde(default)]
     acceptance: Option<RawAcceptance>,
+    #[serde(default)]
+    native_evidence: Option<crate::NativeEvidencePolicy>,
 }
 
 #[derive(Deserialize)]

@@ -41,6 +41,7 @@ class PairingPage extends HookConsumerWidget {
     final pairingCodeExpanded = useState(false);
     final isBusy =
         pairingState.status == PairingStatus.connecting ||
+        pairingState.status == PairingStatus.authorizingExport ||
         pairingState.status == PairingStatus.transferring ||
         pairingState.status == PairingStatus.storing;
 
@@ -82,7 +83,9 @@ class PairingPage extends HookConsumerWidget {
       await handleScannerResult(code);
     }
 
-    final isVerifyingSas = pairingState.status == PairingStatus.confirmingSas;
+    final isVerifyingSas =
+        pairingState.status == PairingStatus.confirmingSas ||
+        pairingState.status == PairingStatus.authorizingExport;
     final themedSystemOverlayStyle =
         (context.theme.brightness == Brightness.dark
                 ? SystemUiOverlayStyle.light

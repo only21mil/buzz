@@ -117,7 +117,15 @@ fn run(config_path: PathBuf) -> ExitCode {
             config.nip98_origin,
             acceptance,
         ),
-        None => SigningPolicy::new(config.peer_policy, config.selectors, config.nip98_origin),
+        None => match config.native_evidence {
+            Some(evidence) => SigningPolicy::new_with_native_evidence(
+                config.peer_policy,
+                config.selectors,
+                config.nip98_origin,
+                evidence,
+            ),
+            None => SigningPolicy::new(config.peer_policy, config.selectors, config.nip98_origin),
+        },
     };
     let policy = match policy_result {
         Ok(policy) => policy,

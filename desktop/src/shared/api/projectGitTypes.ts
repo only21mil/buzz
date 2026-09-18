@@ -77,6 +77,10 @@ export type ProjectRepoSyncStatus = {
   pushBlockReason: string | null;
   canPull: boolean;
   pullBlockReason: string | null;
+  /** True when the poll's fetch failed, so counts describe cached refs. */
+  fetchFailed: boolean;
+  /** The fetch failure message when fetchFailed is true. */
+  fetchError: string | null;
 };
 
 export type ProjectRepoPushResult = {
