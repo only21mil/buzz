@@ -19,9 +19,19 @@ for suite in "${excluded_suites[@]}"; do
   }
 done
 
-mapfile -t discovered < <(
-  find deploy/native-ci scripts -name 'test_*.py' -not -path '*/node_modules/*' -printf '%h\n' | sort -u
-)
+# Discovery uses only bash builtins (globstar, no find/sort): the discovery
+# contract runs this script under a PATH that holds nothing but the tools it
+# is allowed to call.
+shopt -s globstar nullglob
+declare -A seen=()
+discovered=()
+for file in deploy/native-ci/**/test_*.py scripts/**/test_*.py; do
+  [[ "$file" == */node_modules/* ]] && continue
+  suite=${file%/*}
+  [[ -n "${seen[$suite]:-}" ]] && continue
+  seen[$suite]=1
+  discovered+=("$suite")
+done
 suites=()
 for suite in "${discovered[@]}"; do
   skip=0
