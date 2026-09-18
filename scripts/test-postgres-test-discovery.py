@@ -78,6 +78,7 @@ class DiscoveryTests(unittest.TestCase):
             'effect_recovery_uses_pinned_message_when_live_resolution_fails',
             'inline_driver_and_recovery_sweep_race_on_one_generation_fence',
             'recovery_sweep_completes_grant_when_inline_continuation_never_starts',
+            'recovery_sweep_purges_expired_workflow_state',
             'recovery_sweep_reclaims_expired_running_generation',
             'replay_reclaims_expired_run_then_conflicts_without_double_execution',
             'thread_effect_recovery_uses_pinned_ancestry_after_workflow_deletion',
