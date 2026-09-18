@@ -1,5 +1,6 @@
 //! Broker-backed dispatch handling behind explicit verification and persistence seams.
 
+use buzz_ci_broker_protocol::is_lower_hex;
 use std::io::Write;
 
 use buzz_core::ci::{CiJobState, CI_MAX_SAFE_INTEGER};
@@ -488,13 +489,6 @@ fn is_relative_evidence_path(path: &str) -> bool {
         && path
             .split('/')
             .all(|component| !component.is_empty() && component != "." && component != "..")
-}
-
-fn is_lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn decode_digest(value: &str) -> Option<[u8; 32]> {

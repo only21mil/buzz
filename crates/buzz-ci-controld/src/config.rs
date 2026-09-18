@@ -1,5 +1,6 @@
 //! Strict, secret-free configuration for dormant and capacity-one operation.
 
+use buzz_ci_broker_protocol::is_lower_hex;
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -399,13 +400,6 @@ fn valid_artifact_name(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-}
-
-fn is_lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_absolute_path(path: &Path) -> Result<(), ConfigError> {

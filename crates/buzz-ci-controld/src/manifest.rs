@@ -4,6 +4,7 @@
 //! receives a detached signature and cannot place key material in a manifest,
 //! command line, environment, log descriptor, or runner receipt.
 
+use buzz_ci_broker_protocol::is_lower_hex;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -527,13 +528,6 @@ fn safe_absolute_path(value: &str) -> bool {
                     .split('/')
                     .all(|component| !component.is_empty() && component != "." && component != "..")
         })
-}
-
-fn is_lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn valid_ulid(value: &str) -> bool {
