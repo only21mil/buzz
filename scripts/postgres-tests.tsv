@@ -341,6 +341,7 @@ buzz-relay	buzz_relay	workflow_resume::tests::recovery_sweep_completes_grant_whe
 buzz-relay	buzz_relay	workflow_resume::tests::recovery_sweep_reclaims_expired_running_generation	crates/buzz-relay/src/workflow_resume.rs	migration	fixture applies migrations to empty database
 buzz-relay	buzz_relay	workflow_resume::tests::replay_reclaims_expired_run_then_conflicts_without_double_execution	crates/buzz-relay/src/workflow_resume.rs	migration	fixture applies migrations to empty database
 buzz-relay	buzz_relay	workflow_resume::tests::thread_effect_recovery_uses_pinned_ancestry_after_workflow_deletion	crates/buzz-relay/src/workflow_resume.rs	migration	fixture applies migrations to empty database
+buzz-relay	buzz_relay	workflow_resume::tests::recovery_sweep_purges_expired_workflow_state	crates/buzz-relay/src/workflow_resume.rs	migration	fixture applies migrations to empty database
 buzz-relay	buzz_relay	workflow_sink::integration_tests::claimed_effect_recovery_precedes_archived_channel_validation	crates/buzz-relay/src/workflow_sink.rs	desired	desired schema fixture
 buzz-relay	buzz_relay	workflow_sink::integration_tests::pinned_thread_replays_identical_event_after_parent_and_channel_changes	crates/buzz-relay/src/workflow_sink.rs	desired	desired schema fixture
 buzz-relay	buzz_relay	workflow_sink::integration_tests::workflow_send_message_p_tags_mentioned_member	crates/buzz-relay/src/workflow_sink.rs	desired	desired schema fixture
