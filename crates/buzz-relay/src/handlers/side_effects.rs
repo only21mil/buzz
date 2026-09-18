@@ -768,17 +768,8 @@ pub(crate) async fn validate_admin_event(
             }
 
             // Extract target event from e tag to check authorship.
-            let target_id = event
-                .tags
-                .iter()
-                .find_map(|tag| {
-                    if tag.kind().to_string() == "e" {
-                        tag.content().and_then(|v| hex::decode(v).ok())
-                    } else {
-                        None
-                    }
-                })
-                .ok_or_else(|| anyhow::anyhow!("missing e tag for target event"))?;
+            let target_id = extract_e_tag_event_id(event)
+                .ok_or_else(|| anyhow::anyhow!("missing or invalid e tag for target event"))?;
 
             // Verify the target event exists and belongs to the h-tag channel
             // BEFORE storage. Fail closed: missing target → reject.
@@ -1885,24 +1876,7 @@ async fn handle_delete_event_side_effect(
     let channel_id =
         extract_h_tag_channel(event).ok_or_else(|| anyhow::anyhow!("missing h tag"))?;
 
-    // Extract target event ID from e tag
-    let target_id = event
-        .tags
-        .iter()
-        .find_map(|tag| {
-            if tag.kind().to_string() == "e" {
-                tag.content().and_then(|v| {
-                    let bytes = hex::decode(v).ok()?;
-                    if bytes.len() == 32 {
-                        Some(bytes)
-                    } else {
-                        None
-                    }
-                })
-            } else {
-                None
-            }
-        })
+    let target_id = extract_e_tag_event_id(event)
         .ok_or_else(|| anyhow::anyhow!("missing e tag for target event"))?;
 
     // Verify the target event belongs to the same channel as the h-tag.
@@ -2583,6 +2557,19 @@ pub(crate) fn extract_h_tag_channel(event: &Event) -> Option<Uuid> {
 }
 
 /// Extract target pubkey from first `p` tag.
+/// First `e` tag whose value decodes to a 32-byte event id. A missing,
+/// non-hex or wrong-length value is `None`, so callers reject it as input
+/// rather than surfacing a decode error later in the audit path.
+pub(crate) fn extract_e_tag_event_id(event: &Event) -> Option<Vec<u8>> {
+    event.tags.iter().find_map(|tag| {
+        if tag.kind().to_string() != "e" {
+            return None;
+        }
+        let bytes = hex::decode(tag.content()?).ok()?;
+        (bytes.len() == 32).then_some(bytes)
+    })
+}
+
 pub(crate) fn extract_p_tag(event: &Event) -> Option<Vec<u8>> {
     for tag in event.tags.iter() {
         if tag.kind().to_string() == "p" {
@@ -3639,6 +3626,32 @@ fn topic_for_subscription(channel_id: Option<Uuid>) -> EventTopic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn signed_event_with_tags(tags: Vec<Tag>) -> Event {
+        nostr::EventBuilder::new(nostr::Kind::Custom(9005), "")
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .expect("sign test event")
+    }
+
+    fn tag(parts: &[&str]) -> Tag {
+        Tag::parse(parts.iter().copied()).expect("valid test tag")
+    }
+
+    #[test]
+    fn e_tag_extractor_accepts_only_a_32_byte_hex_id() {
+        let valid = "ab".repeat(32);
+        let event = signed_event_with_tags(vec![tag(&["h", "chan"]), tag(&["e", &valid])]);
+        assert_eq!(extract_e_tag_event_id(&event), Some(vec![0xab; 32]));
+
+        // Malformed values are input errors, not decode failures later on.
+        for bad in ["not-hex", "zz", &"ab".repeat(31), &"ab".repeat(33), ""] {
+            let event = signed_event_with_tags(vec![tag(&["e", bad])]);
+            assert_eq!(extract_e_tag_event_id(&event), None, "value {bad:?}");
+        }
+        let no_e = signed_event_with_tags(vec![tag(&["p", &"cd".repeat(32)])]);
+        assert_eq!(extract_e_tag_event_id(&no_e), None);
+    }
 
     fn member(channel_id: Uuid, pubkey_byte: u8, role: &str) -> MemberRecord {
         MemberRecord {

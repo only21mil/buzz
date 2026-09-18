@@ -309,6 +309,13 @@ pub(crate) async fn channel_admin_grant(
     let channel_id = super::side_effects::extract_h_tag_channel(event)
         .ok_or_else(|| anyhow::anyhow!("missing or invalid h tag"))?;
     state.db.get_channel(community, channel_id).await?;
+    // A message deletion names its target once, as a 32-byte hex `e` tag.
+    // Checking it here keeps a malformed value a rejected input; the audit
+    // write below the grant must never be the first place it fails.
+    if action == ModerationAction::DeleteMessage {
+        super::side_effects::extract_e_tag_event_id(event)
+            .ok_or_else(|| anyhow::anyhow!("missing or invalid e tag"))?;
+    }
     let target_pubkey = match action {
         ModerationAction::ManageMembers | ModerationAction::Kick => Some(
             super::side_effects::extract_p_tag(event)
@@ -398,13 +405,7 @@ pub(crate) async fn audit_channel_admin_event(
         _ => return Ok(()),
     };
     let target = super::side_effects::extract_p_tag(event);
-    let target_event = event
-        .tags
-        .iter()
-        .find(|t| t.as_slice()[0] == "e")
-        .and_then(|t| t.content())
-        .map(hex::decode)
-        .transpose()?;
+    let target_event = super::side_effects::extract_e_tag_event_id(event);
     let provenance = format!(
         "event={} principal={} authority={:?}",
         event.id,
