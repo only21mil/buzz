@@ -4,29 +4,21 @@ import type { RelayEvent } from "@/shared/api/types";
 import type { BrowserIdentityManager } from "./identity";
 import { queryBridge, type QueryBridgeClient } from "./relayQueries";
 import { register, type InvokeBody } from "./registry";
+import {
+  objectBody,
+  optionalString,
+  requiredString,
+  type ObjectBody,
+} from "./commandBody";
 
 type MutationRelayClient = Pick<typeof relayClient, "publishEvent"> &
   QueryBridgeClient;
-
-type ObjectBody = Record<string, unknown>;
 
 const MAX_CONTENT_BYTES = 64 * 1024;
 const MAX_MENTIONS = 50;
 const MAX_EMOJI_CHARS = 64;
 const MAX_CUSTOM_EMOJI_SHORTCODE_BYTES = 64;
 const MAX_CUSTOM_EMOJI_URL_BYTES = 2048;
-
-function objectBody(body: InvokeBody, command: string): ObjectBody {
-  if (
-    !body ||
-    Array.isArray(body) ||
-    body instanceof ArrayBuffer ||
-    body instanceof Uint8Array
-  ) {
-    throw new TypeError(`${command} requires an object body`);
-  }
-  return body;
-}
 
 function requiredObject(
   body: ObjectBody,
@@ -44,23 +36,6 @@ function requiredObject(
     throw new TypeError(`${command} requires an ${field} object`);
   }
   return value as ObjectBody;
-}
-
-function requiredString(body: ObjectBody, field: string): string {
-  const value = body[field];
-  if (typeof value !== "string") {
-    throw new TypeError(`${field} must be a string`);
-  }
-  return value;
-}
-
-function optionalString(body: ObjectBody, field: string): string | undefined {
-  const value = body[field];
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== "string") {
-    throw new TypeError(`${field} must be a string`);
-  }
-  return value;
 }
 
 function optionalBoolean(body: ObjectBody, field: string): boolean {

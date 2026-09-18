@@ -5,6 +5,13 @@ import type { RelayEvent } from "@/shared/api/types";
 import type { BrowserIdentityManager } from "./identity";
 import { nip98Fetch } from "./nip98";
 import { dispatch, register } from "./registry";
+import {
+  objectBody,
+  optionalNumber,
+  optionalString,
+  requiredString,
+  type ObjectBody,
+} from "./commandBody";
 
 export type QueryBridgeClient = {
   queryEvents?: (
@@ -17,8 +24,6 @@ type RelayQueryClient = Pick<
   "fetchEvents" | "fetchFirstEvent" | "publishEvent"
 > &
   QueryBridgeClient;
-
-type ObjectBody = Record<string, unknown>;
 
 const pendingOwnedChannelIds = new Set<string>();
 
@@ -36,42 +41,6 @@ const STARTER_CHANNELS = [
     description: "Say hi, ask a question, or share what brought you here.",
   },
 ] as const;
-
-function objectBody(body: unknown, command: string): ObjectBody {
-  if (
-    !body ||
-    Array.isArray(body) ||
-    body instanceof ArrayBuffer ||
-    body instanceof Uint8Array
-  ) {
-    throw new TypeError(`${command} requires an object body`);
-  }
-  return body as ObjectBody;
-}
-
-function optionalString(body: ObjectBody, field: string): string | undefined {
-  const value = body[field];
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== "string") {
-    throw new TypeError(`${field} must be a string`);
-  }
-  return value;
-}
-
-function requiredString(body: ObjectBody, field: string): string {
-  const value = optionalString(body, field);
-  if (value === undefined) throw new TypeError(`${field} must be a string`);
-  return value;
-}
-
-function optionalNumber(body: ObjectBody, field: string): number | undefined {
-  const value = body[field];
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== "number" || !Number.isInteger(value)) {
-    throw new TypeError(`${field} must be an integer`);
-  }
-  return value;
-}
 
 function optionalStringArrays(body: ObjectBody, field: string): string[][] {
   const value = body[field];

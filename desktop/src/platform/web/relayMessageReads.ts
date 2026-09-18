@@ -3,11 +3,10 @@ import type { RelaySubscriptionFilter } from "@/shared/api/relayClientShared";
 import { KIND_HUDDLE_STARTED } from "@/shared/constants/kinds";
 import { queryBridge, type QueryBridgeClient } from "./relayQueries";
 import { register } from "./registry";
+import { objectBody, requiredString, type ObjectBody } from "./commandBody";
 
 type RelayMessageReadClient = Pick<typeof relayClient, "fetchFirstEvent"> &
   QueryBridgeClient;
-
-type ObjectBody = Record<string, unknown>;
 
 type RawCursor = {
   created_at: number;
@@ -51,26 +50,6 @@ const EVENT_KINDS = [
   45003,
   KIND_HUDDLE_STARTED,
 ];
-
-function objectBody(body: unknown, command: string): ObjectBody {
-  if (
-    !body ||
-    Array.isArray(body) ||
-    body instanceof ArrayBuffer ||
-    body instanceof Uint8Array
-  ) {
-    throw new TypeError(`${command} requires an object body`);
-  }
-  return body as ObjectBody;
-}
-
-function requiredString(body: ObjectBody, field: string): string {
-  const value = body[field];
-  if (typeof value !== "string") {
-    throw new TypeError(`${field} must be a string`);
-  }
-  return value;
-}
 
 function optionalUnsignedInteger(
   body: ObjectBody,
