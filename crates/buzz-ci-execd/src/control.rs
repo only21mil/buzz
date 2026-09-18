@@ -20,6 +20,7 @@ use buzz_ci_broker_protocol::{
     HEADER_SIZE, PROTOCOL_VERSION,
 };
 use nix::{
+    fcntl::{fcntl, FcntlArg, FdFlag},
     sys::socket::{
         getsockname, getsockopt, sockopt::AcceptConn, sockopt::PeerCredentials, sockopt::SockType,
         SockType as NixSockType, UnixAddr,
@@ -626,7 +627,20 @@ pub fn validate_systemd_environment() -> Result<(), ControlError> {
 }
 
 /// Validate the sole listener after the binary adopts systemd fd 3.
+///
+/// The returned listener is close-on-exec. execd spawns allowlisted host
+/// commands (nft, systemctl, systemd-run) with `std::process::Command`, and
+/// systemd hands fd 3 over without `FD_CLOEXEC`; without this flag every
+/// child would inherit the control socket and could `accept()` controller
+/// connections as if it were execd.
 pub fn validate_systemd_listener(listener: UnixListener) -> Result<UnixListener, ControlError> {
+    validate_listener_path(listener, Path::new(EXECD_SOCKET_PATH))
+}
+
+fn validate_listener_path(
+    listener: UnixListener,
+    expected_path: &Path,
+) -> Result<UnixListener, ControlError> {
     if getsockopt(&listener, SockType).map_err(nix_io)? != NixSockType::Stream {
         return Err(ControlError::Activation("fd 3 is not a stream socket"));
     }
@@ -636,12 +650,18 @@ pub fn validate_systemd_listener(listener: UnixListener) -> Result<UnixListener,
     let address = getsockname::<UnixAddr>(listener.as_raw_fd())
         .map_err(nix_io)
         .map_err(ControlError::Io)?;
-    if address.path() != Some(Path::new(EXECD_SOCKET_PATH)) {
+    if address.path() != Some(expected_path) {
         return Err(ControlError::Activation(
             "fd 3 is not the fixed execd socket",
         ));
     }
-
+    let flags = fcntl(&listener, FcntlArg::F_GETFD)
+        .map_err(nix_io)
+        .map_err(ControlError::Io)?;
+    let flags = FdFlag::from_bits_truncate(flags) | FdFlag::FD_CLOEXEC;
+    fcntl(&listener, FcntlArg::F_SETFD(flags))
+        .map_err(nix_io)
+        .map_err(ControlError::Io)?;
     Ok(listener)
 }
 
@@ -1309,6 +1329,34 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, ControlError::UnauthorizedOperation));
+    }
+
+    #[test]
+    fn listener_validation_requires_the_exact_path_and_sets_cloexec() {
+        let directory = tempfile::tempdir().expect("socket directory");
+        let socket_path = directory.path().join("execd.sock");
+        let listener = UnixListener::bind(&socket_path).expect("listener");
+        let before = fcntl(&listener, FcntlArg::F_GETFD).expect("descriptor flags");
+        // std sets close-on-exec on sockets it creates; clear it to model the
+        // inherited systemd descriptor, which arrives without the flag.
+        fcntl(
+            &listener,
+            FcntlArg::F_SETFD(FdFlag::from_bits_truncate(before) - FdFlag::FD_CLOEXEC),
+        )
+        .expect("clear close-on-exec");
+
+        let other = directory.path().join("other.sock");
+        let wrong = UnixListener::bind(&other).expect("other listener");
+        assert!(matches!(
+            validate_listener_path(wrong, &socket_path),
+            Err(ControlError::Activation(
+                "fd 3 is not the fixed execd socket"
+            ))
+        ));
+
+        let listener = validate_listener_path(listener, &socket_path).expect("valid listener");
+        let after = fcntl(&listener, FcntlArg::F_GETFD).expect("descriptor flags");
+        assert!(FdFlag::from_bits_truncate(after).contains(FdFlag::FD_CLOEXEC));
     }
 
     #[test]
