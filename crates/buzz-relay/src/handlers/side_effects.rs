@@ -18,6 +18,7 @@ use buzz_core::StoredEvent;
 use buzz_db::channel::{MemberRecord, MemberRole};
 
 use super::event::dispatch_persistent_event;
+use super::moderation_authz::ChannelAdminGrantCell;
 use crate::protocol::RelayMessage;
 use crate::state::AppState;
 use buzz_core::tenant::TenantContext;
@@ -186,20 +187,21 @@ pub async fn evict_all_channel_subscriptions(
 }
 
 /// Dispatch side effects for a stored event.
-pub async fn handle_side_effects(
+pub(crate) async fn handle_side_effects(
     tenant: &TenantContext,
     kind: u32,
     event: &Event,
     state: &Arc<AppState>,
+    admin_grant: &ChannelAdminGrantCell,
 ) -> anyhow::Result<()> {
     if matches!(kind, 9000 | 9001 | 9002 | 9005 | 9008) {
-        validate_admin_event(tenant, kind, event, state).await?;
+        validate_admin_event(tenant, kind, event, state, admin_grant).await?;
     }
     match kind {
         0 => handle_kind0_profile(tenant, event, state).await,
         5 => handle_standard_deletion_event(tenant, event, state).await,
-        9000 => handle_put_user(tenant, event, state).await,
-        9001 => handle_remove_user(tenant, event, state).await,
+        9000 => handle_put_user(tenant, event, state, admin_grant).await,
+        9001 => handle_remove_user(tenant, event, state, admin_grant).await,
         9002 => handle_edit_metadata(tenant, event, state).await,
         9005 => handle_delete_event_side_effect(tenant, event, state).await,
         9007 => handle_create_group(tenant, event, state).await,
@@ -415,11 +417,12 @@ async fn actor_owns_any_owner_agent(
 }
 
 /// Validate an admin kind event BEFORE storage.
-pub async fn validate_admin_event(
+pub(crate) async fn validate_admin_event(
     tenant: &TenantContext,
     kind: u32,
     event: &Event,
     state: &Arc<AppState>,
+    admin_grant: &ChannelAdminGrantCell,
 ) -> anyhow::Result<()> {
     // CREATE_GROUP doesn't need an existing channel — skip h-tag extraction
     if kind == 9007 {
@@ -448,9 +451,7 @@ pub async fn validate_admin_event(
         return Err(anyhow::anyhow!("channel is archived"));
     }
 
-    let community_grant =
-        super::moderation_authz::channel_admin_grant(tenant, state, event).await?;
-    let community_authorized = community_grant.is_some();
+    let community_authorized = admin_grant.resolve(tenant, state, event).await?.is_some();
 
     match kind {
         9000 => {
@@ -1478,6 +1479,7 @@ async fn handle_put_user(
     tenant: &TenantContext,
     event: &Event,
     state: &Arc<AppState>,
+    admin_grant: &ChannelAdminGrantCell,
 ) -> anyhow::Result<()> {
     let channel_id =
         extract_h_tag_channel(event).ok_or_else(|| anyhow::anyhow!("missing h tag"))?;
@@ -1503,9 +1505,9 @@ async fn handle_put_user(
     }
 
     let actor_bytes = event.pubkey.to_bytes().to_vec();
-    let grant = super::moderation_authz::channel_admin_grant(tenant, state, event).await?;
-    let membership_principal = grant
-        .as_ref()
+    let membership_principal = admin_grant
+        .resolve(tenant, state, event)
+        .await?
         .map(|g| g.principal.as_slice())
         .unwrap_or(&actor_bytes);
 
@@ -1572,14 +1574,15 @@ async fn handle_remove_user(
     tenant: &TenantContext,
     event: &Event,
     state: &Arc<AppState>,
+    admin_grant: &ChannelAdminGrantCell,
 ) -> anyhow::Result<()> {
     let channel_id =
         extract_h_tag_channel(event).ok_or_else(|| anyhow::anyhow!("missing h tag"))?;
     let target_pubkey = extract_p_tag(event).ok_or_else(|| anyhow::anyhow!("missing p tag"))?;
     let actor_bytes = event.pubkey.to_bytes().to_vec();
-    let grant = super::moderation_authz::channel_admin_grant(tenant, state, event).await?;
-    let membership_principal = grant
-        .as_ref()
+    let membership_principal = admin_grant
+        .resolve(tenant, state, event)
+        .await?
         .map(|g| g.principal.as_slice())
         .unwrap_or(&actor_bytes);
 

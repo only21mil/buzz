@@ -2346,6 +2346,9 @@ async fn ingest_event_inner(
     let event_id_hex = event.id.to_hex();
     let kind_u32 = event_kind_u32(&event);
     debug!(event_id = %event_id_hex, kind = kind_u32, "ingest_event");
+    // Community authority for a channel command is decided once per event and
+    // shared with the validator, the audit write and the side-effect handler.
+    let admin_grant = crate::handlers::moderation_authz::ChannelAdminGrantCell::new();
 
     if kind_u32 == KIND_AUTH {
         return Err(IngestError::Rejected(
@@ -2682,7 +2685,8 @@ async fn ingest_event_inner(
         // validate_admin_event for per-kind enforcement).
         let community_member_command =
             matches!(kind_u32, KIND_NIP29_PUT_USER | KIND_NIP29_REMOVE_USER)
-                && crate::handlers::moderation_authz::channel_admin_grant(tenant, state, &event)
+                && admin_grant
+                    .resolve(tenant, state, &event)
                     .await
                     .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?
                     .is_some();
@@ -2828,9 +2832,15 @@ async fn ingest_event_inner(
     validate_huddle_lifecycle_event(tenant, state, &event, kind_u32).await?;
 
     if crate::handlers::side_effects::is_admin_kind(kind_u32) {
-        crate::handlers::side_effects::validate_admin_event(tenant, kind_u32, &event, state)
-            .await
-            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+        crate::handlers::side_effects::validate_admin_event(
+            tenant,
+            kind_u32,
+            &event,
+            state,
+            &admin_grant,
+        )
+        .await
+        .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
 
     // Processed here (verify consent, mutate archived_identities, emit the
@@ -3667,12 +3677,12 @@ async fn ingest_event_inner(
     // Audit a community-authorized channel command before storage. An audit
     // failure must reject the write, rather than enter the legacy best-effort
     // side-effect path and acknowledge an unaudited command.
-    if let Some(grant) =
-        crate::handlers::moderation_authz::channel_admin_grant(tenant, state, &event)
-            .await
-            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?
+    if let Some(grant) = admin_grant
+        .resolve(tenant, state, &event)
+        .await
+        .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?
     {
-        crate::handlers::moderation_authz::audit_channel_admin_event(tenant, state, &event, &grant)
+        crate::handlers::moderation_authz::audit_channel_admin_event(tenant, state, &event, grant)
             .await
             .map_err(|e| {
                 IngestError::Internal(format!("error: channel moderation audit failed: {e}"))
@@ -3841,9 +3851,14 @@ async fn ingest_event_inner(
     }
 
     if crate::handlers::side_effects::is_side_effect_kind(kind_u32) {
-        let result =
-            crate::handlers::side_effects::handle_side_effects(tenant, kind_u32, &event, state)
-                .await;
+        let result = crate::handlers::side_effects::handle_side_effects(
+            tenant,
+            kind_u32,
+            &event,
+            state,
+            &admin_grant,
+        )
+        .await;
         if let Err(e) = &result {
             // error!, not warn!: the event was accepted but its side effects
             // (channel creation, git repo seeding, …) did not run — the relay

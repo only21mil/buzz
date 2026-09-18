@@ -200,9 +200,48 @@ fn decide_authority(
 }
 
 /// Community authority for a channel command. The signer remains the audit actor.
+#[derive(Debug)]
 pub(crate) struct ChannelAdminGrant {
     pub(crate) principal: Vec<u8>,
     pub(crate) authority: ModerationAuthority,
+}
+
+/// One community-authority decision per ingested command.
+///
+/// The membership gate, the pre-storage validator, the audit write and the
+/// side-effect handler all need the same answer for the same signed event, so
+/// the first caller evaluates [`channel_admin_grant`] and the rest share it.
+/// Errors are not memoized: an error rejects the command before any later
+/// site runs.
+#[derive(Default)]
+pub(crate) struct ChannelAdminGrantCell(tokio::sync::OnceCell<Option<ChannelAdminGrant>>);
+
+impl ChannelAdminGrantCell {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return the grant for `event`, evaluating [`channel_admin_grant`] on
+    /// the first successful call only.
+    pub(crate) async fn resolve(
+        &self,
+        tenant: &TenantContext,
+        state: &Arc<AppState>,
+        event: &nostr::Event,
+    ) -> anyhow::Result<Option<&ChannelAdminGrant>> {
+        self.resolve_with(|| channel_admin_grant(tenant, state, event))
+            .await
+    }
+
+    /// Memoize the first `Ok` result of `init`. An `Err` leaves the cell
+    /// empty, so a later call evaluates `init` again.
+    async fn resolve_with<F, Fut>(&self, init: F) -> anyhow::Result<Option<&ChannelAdminGrant>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<Option<ChannelAdminGrant>>>,
+    {
+        self.0.get_or_try_init(init).await.map(Option::as_ref)
+    }
 }
 
 /// Resolve community authority without converting admission into an implicit grant.
@@ -399,6 +438,84 @@ pub(crate) async fn audit_channel_admin_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn grant_cell_evaluates_once_per_command() {
+        let cell = ChannelAdminGrantCell::new();
+        let evaluations = AtomicUsize::new(0);
+        let init = || async {
+            evaluations.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(ChannelAdminGrant {
+                principal: vec![7; 32],
+                authority: ModerationAuthority::CommunityAdmin,
+            }))
+        };
+        // Four sites read the grant per ingest: membership gate, validator,
+        // audit and side effect. All four must share one evaluation.
+        for _ in 0..4 {
+            let grant = cell
+                .resolve_with(init)
+                .await
+                .expect("grant resolves")
+                .expect("grant present");
+            assert_eq!(grant.principal, vec![7; 32]);
+            assert_eq!(grant.authority, ModerationAuthority::CommunityAdmin);
+        }
+        assert_eq!(evaluations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn grant_cell_memoizes_a_none_grant() {
+        let cell = ChannelAdminGrantCell::new();
+        let evaluations = AtomicUsize::new(0);
+        let init = || async {
+            evaluations.fetch_add(1, Ordering::SeqCst);
+            Ok(None)
+        };
+        for _ in 0..3 {
+            assert!(cell.resolve_with(init).await.expect("resolves").is_none());
+        }
+        assert_eq!(evaluations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn grant_cell_does_not_memoize_an_error() {
+        let cell = ChannelAdminGrantCell::new();
+        let evaluations = AtomicUsize::new(0);
+        let failing = || async {
+            evaluations.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!(
+                "restricted: moderator principal is restricted"
+            ))
+        };
+        let err = cell
+            .resolve_with(failing)
+            .await
+            .expect_err("first evaluation fails");
+        assert!(err.to_string().starts_with("restricted:"));
+        // The cell stays empty after an error, so the next caller evaluates
+        // again instead of reading a stale verdict.
+        let err = cell
+            .resolve_with(failing)
+            .await
+            .expect_err("second evaluation fails");
+        assert!(err.to_string().starts_with("restricted:"));
+        assert_eq!(evaluations.load(Ordering::SeqCst), 2);
+        let recovered = || async {
+            evaluations.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(ChannelAdminGrant {
+                principal: vec![1; 32],
+                authority: ModerationAuthority::CommunityOwner,
+            }))
+        };
+        assert!(cell
+            .resolve_with(recovered)
+            .await
+            .expect("resolves")
+            .is_some());
+        assert_eq!(evaluations.load(Ordering::SeqCst), 3);
+    }
 
     /// Every community-wide action a community owner can take. Channel-local
     /// actions (DeleteMessage/Kick) are included — the owner holds them too.
