@@ -1,5 +1,6 @@
 //! Authenticated, bounded client for the isolated CI signing keyholder.
 
+use buzz_ci_broker_protocol::is_lower_hex;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
@@ -279,6 +280,11 @@ impl UnixKeyholderClient {
         Ok(())
     }
 
+    /// Retry `Unavailable` and `Timeout` with a fresh request id each time.
+    /// The keyholder is stateless and signs with `sign_schnorr_no_aux_rand`,
+    /// so a timed-out request that the keyholder did complete produced the
+    /// same signature the retry produces; a NIP-98 token retry only mints a
+    /// second nonce, which the relay treats as a distinct single-use token.
     fn exchange(&self, request: &Request) -> Result<Response, KeyholderError> {
         for attempt in 1..=self.config.keyholder_transport_attempts {
             match self.exchange_once(request) {
@@ -849,13 +855,6 @@ const fn keyholder_method(method: KeyholderHttpMethod) -> &'static str {
         KeyholderHttpMethod::Delete => "DELETE",
         KeyholderHttpMethod::Options => "OPTIONS",
     }
-}
-
-fn is_lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(all(test, target_os = "linux"))]

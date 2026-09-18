@@ -600,7 +600,11 @@ mod tests {
             Box::new(TestClosedExecutor),
             Box::new(TestClosedExecutor),
         );
-        let _ = compose_production_dispatch(1, adapters);
+        let dispatch = compose_production_dispatch(1, adapters);
+        assert!(
+            !matches!(dispatch, ProductionDispatch::Closed(_)),
+            "typed adapters must compose a configured dispatch"
+        );
     }
 
     #[test]

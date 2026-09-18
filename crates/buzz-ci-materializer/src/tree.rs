@@ -513,6 +513,10 @@ fn create_private_parents(staging: &Path, relative: &Path) -> Result<(), Materia
             ));
         };
         current.push(component);
+        // lstat-then-mkdir is not atomic, but staging is a fresh 0700 tree
+        // owned by the materializer uid, so only a same-uid process could
+        // swap a component in between. publish_no_replace and the
+        // /proc/self/fd re-digest of the published tree catch that case.
         match fs::symlink_metadata(&current) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
             Ok(_) => {
