@@ -212,8 +212,7 @@ class ExportAuthorizationNotifier extends Notifier<List<ExportGrant>> {
     required ExportGrantRequest request,
     String? reason,
   }) async {
-    final now = _now;
-    _prune(now);
+    _prune(_now);
     final gateway = ref.read(deviceAuthGatewayProvider);
     if (!await gateway.canAuthenticate()) {
       throw const ExportAuthUnavailable();
@@ -221,6 +220,9 @@ class ExportAuthorizationNotifier extends Notifier<List<ExportGrant>> {
     await gateway.authenticate(
       reason: reason ?? 'Confirm it is you to export your Buzz identity.',
     );
+    // The TTL starts once the prompt returns, so a slow Face ID or passcode
+    // entry does not eat into the grant.
+    final now = _now;
     final grant = ExportGrant(
       id: _uuid.v4(),
       request: request,
