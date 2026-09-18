@@ -26,8 +26,8 @@ use crate::state::AppState;
 /// Axum extractor that validates Blossom auth, the BUD-11 hash binding, and
 /// relay membership (NIP-43, when enabled) from headers BEFORE the request
 /// body is read. This prevents unauthenticated clients from forcing the
-/// server to buffer a body up to the image cap (`BUZZ_MAX_IMAGE_BYTES`,
-/// 2 GiB by default).
+/// server to spool a body up to the media caps (`BUZZ_MAX_IMAGE_BYTES`,
+/// 50 MiB by default; `BUZZ_MAX_FILE_BYTES`, 100 MB).
 ///
 /// Axum processes `FromRequestParts` extractors before `FromRequest` (body)
 /// extractors, so auth rejection happens before any body buffering.
@@ -50,6 +50,110 @@ enum UploadRouteMode {
 fn should_stream_as_video(sniff: &[u8]) -> bool {
     infer::get(sniff).is_some_and(|kind| kind.mime_type() == "video/mp4")
         || buzz_media::looks_like_iso_bmff(sniff)
+}
+
+fn is_image_mime(mime: Option<&str>) -> bool {
+    matches!(
+        mime,
+        Some("image/jpeg" | "image/png" | "image/gif" | "image/webp")
+    )
+}
+
+/// Byte cap for the non-video path, chosen from the sniffed prefix so the
+/// spool stops at the limit `validate_content` or `validate_file_content`
+/// will apply, instead of the larger of the two.
+fn non_video_body_cap(config: &buzz_media::MediaConfig, sniff: &[u8]) -> u64 {
+    match infer::get(sniff).map(|kind| kind.mime_type()) {
+        Some("image/gif") => config.max_gif_bytes,
+        mime if is_image_mime(mime) => config.max_image_bytes,
+        _ => config.max_file_bytes,
+    }
+}
+
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+}
+
+/// A request body spooled to a temp file. Dropping it deletes the file.
+#[derive(Debug)]
+struct SpooledBody {
+    file: tempfile::NamedTempFile,
+    size: u64,
+}
+
+impl SpooledBody {
+    /// Read the spooled bytes back once for the CPU-bound validate, hash and
+    /// decode step. Bounded by the cap `spool_body_to_disk` enforced.
+    async fn read_back(&self) -> Result<bytes::Bytes, MediaError> {
+        tokio::fs::read(self.file.path())
+            .await
+            .map(bytes::Bytes::from)
+            .map_err(|e| MediaError::Io(e.to_string()))
+    }
+}
+
+/// Stream a request body to disk, enforcing `max` while the bytes arrive.
+///
+/// The body is never accumulated in RAM during the network transfer. An
+/// oversized `Content-Length` is rejected before the first chunk is read;
+/// otherwise the spool stops at the first chunk that crosses `max`, so a
+/// client cannot make the relay read (or store) more than the cap plus one
+/// chunk. `size` in the error is the byte count seen so far.
+async fn spool_body_to_disk<S>(
+    mut body: S,
+    content_length: Option<u64>,
+    max: u64,
+) -> Result<SpooledBody, MediaError>
+where
+    S: futures_util::Stream<Item = Result<bytes::Bytes, axum::Error>> + Unpin,
+{
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    if let Some(cl) = content_length {
+        if cl > max {
+            return Err(MediaError::FileTooLarge { size: cl, max });
+        }
+    }
+
+    let file = tempfile::NamedTempFile::new().map_err(|e| MediaError::Io(e.to_string()))?;
+    let mut writer = tokio::fs::File::create(file.path())
+        .await
+        .map_err(|e| MediaError::Io(e.to_string()))?;
+    let mut size: u64 = 0;
+    while let Some(chunk) = body.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            // `RequestBodyLimitLayer` surfaces its cutoff as a stream error;
+            // report it as 413 like the video path does.
+            Err(error) if is_body_limit_error(&error) => {
+                return Err(MediaError::FileTooLarge { size, max });
+            }
+            Err(error) => return Err(MediaError::Io(error.to_string())),
+        };
+        size += chunk.len() as u64;
+        if size > max {
+            return Err(MediaError::FileTooLarge { size, max });
+        }
+        writer
+            .write_all(&chunk)
+            .await
+            .map_err(|e| MediaError::Io(e.to_string()))?;
+    }
+    writer
+        .flush()
+        .await
+        .map_err(|e| MediaError::Io(e.to_string()))?;
+
+    Ok(SpooledBody { file, size })
+}
+
+fn is_body_limit_error(error: &axum::Error) -> bool {
+    let msg = error.to_string();
+    msg.contains("length limit") || msg.contains("body limit") || msg.contains("LengthLimitError")
 }
 
 fn upload_route_mode(path: &str) -> Result<UploadRouteMode, MediaError> {
@@ -339,39 +443,41 @@ pub async fn upload_blob(
 
     let mut descriptor = if should_stream_as_video(&sniff) {
         // Video path: stream body directly to disk — never fully buffered in RAM.
-        let content_length = headers
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok());
         buzz_media::process_video_upload(
             &state.media_storage,
             &state.config.media,
             &auth.tenant,
             &auth.auth_event,
             replay,
-            content_length,
+            content_length(&headers),
             attribution,
         )
         .await?
     } else {
-        // Non-video path: buffer the body (bounded by the larger of the image
-        // and generic-file caps), then decide image-vs-generic by sniffed MIME.
-        // Images go through the thumbnailing pipeline; non-media attachments
-        // (docs, archives, text, data) take the generic file path and are
-        // served as downloads. Recognized audio/video cannot fall through it.
-        let max = state
-            .config
-            .media
-            .max_image_bytes
-            .max(state.config.media.max_file_bytes);
-        let bytes = axum::body::to_bytes(axum::body::Body::from_stream(replay), max as usize)
-            .await
-            .map_err(|_| MediaError::FileTooLarge { size: 0, max })?;
-
-        let is_image = matches!(
-            infer::get(&bytes).map(|t| t.mime_type()),
-            Some("image/jpeg" | "image/png" | "image/gif" | "image/webp")
+        // Non-video path: decide image-vs-generic from the sniffed prefix,
+        // then spool the body to disk under that type's cap. Images go
+        // through the thumbnailing pipeline; non-media attachments (docs,
+        // archives, text, data) take the generic file path and are served as
+        // downloads. Recognized audio/video cannot fall through it. The bytes
+        // enter RAM once, after the transfer, for the CPU-bound validate,
+        // hash and decode step, bounded by the cap that was just enforced.
+        let is_image = is_image_mime(infer::get(&sniff).map(|t| t.mime_type()));
+        if !is_image && auth.route_mode == UploadRouteMode::LegacyMedia {
+            let mime = infer::get(&sniff)
+                .map(|kind| kind.mime_type().to_string())
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            return Err(MediaError::DisallowedContentType(mime));
+        }
+        let cap = non_video_body_cap(&state.config.media, &sniff);
+        let spooled = spool_body_to_disk(replay, content_length(&headers), cap).await?;
+        tracing::debug!(
+            bytes = spooled.size,
+            cap,
+            is_image,
+            "non-video upload spooled"
         );
+        let bytes = spooled.read_back().await?;
+        drop(spooled);
 
         if is_image {
             buzz_media::process_upload(
@@ -383,11 +489,6 @@ pub async fn upload_blob(
                 attribution,
             )
             .await?
-        } else if auth.route_mode == UploadRouteMode::LegacyMedia {
-            let mime = infer::get(&bytes)
-                .map(|kind| kind.mime_type().to_string())
-                .unwrap_or_else(|| "application/octet-stream".to_string());
-            return Err(MediaError::DisallowedContentType(mime));
         } else {
             buzz_media::process_file_upload(
                 &state.media_storage,
@@ -1641,5 +1742,119 @@ mod tests {
     #[test]
     fn test_parse_byte_range_zero_start() {
         assert_eq!(parse_byte_range("bytes=0-0", 1000), Some((0, 0)));
+    }
+
+    fn media_config(image: u64, gif: u64, file: u64) -> buzz_media::MediaConfig {
+        serde_json::from_value(serde_json::json!({
+            "s3_endpoint": "http://localhost:9000",
+            "s3_access_key": "k",
+            "s3_secret_key": "s",
+            "s3_bucket": "b",
+            "public_base_url": "http://localhost:3000/media",
+            "max_image_bytes": image,
+            "max_gif_bytes": gif,
+            "max_file_bytes": file,
+        }))
+        .expect("media config")
+    }
+
+    #[test]
+    fn non_video_cap_follows_the_sniffed_type() {
+        let config = media_config(50, 10, 100);
+        let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR";
+        let gif = b"GIF89a\x01\x00\x01\x00";
+        let pdf = b"%PDF-1.4\n";
+        assert_eq!(non_video_body_cap(&config, png), 50);
+        assert_eq!(non_video_body_cap(&config, gif), 10);
+        assert_eq!(non_video_body_cap(&config, pdf), 100);
+        assert_eq!(non_video_body_cap(&config, b"plain text"), 100);
+    }
+
+    /// A body stream that counts how many chunks the spool pulled.
+    fn counted_chunks(
+        chunks: Vec<Vec<u8>>,
+        pulled: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl futures_util::Stream<Item = Result<bytes::Bytes, axum::Error>> + Unpin {
+        futures_util::stream::iter(chunks.into_iter().map(move |chunk| {
+            pulled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(bytes::Bytes::from(chunk))
+        }))
+    }
+
+    #[tokio::test]
+    async fn spool_rejects_oversized_content_length_before_reading_the_body() {
+        let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body = counted_chunks(vec![vec![1; 4]; 4], Arc::clone(&pulled));
+
+        let error = spool_body_to_disk(body, Some(17), 16)
+            .await
+            .expect_err("content-length over the cap is rejected");
+
+        assert!(matches!(
+            error,
+            MediaError::FileTooLarge { size: 17, max: 16 }
+        ));
+        assert_eq!(pulled.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn spool_stops_at_the_chunk_that_crosses_the_cap() {
+        let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let body = counted_chunks(vec![vec![1; 4]; 8], Arc::clone(&pulled));
+
+        let error = spool_body_to_disk(body, None, 16)
+            .await
+            .expect_err("a body over the cap is rejected");
+
+        assert!(matches!(
+            error,
+            MediaError::FileTooLarge { size: 20, max: 16 }
+        ));
+        assert_eq!(
+            pulled.load(std::sync::atomic::Ordering::SeqCst),
+            5,
+            "the spool reads up to the first chunk past the cap, not the whole body"
+        );
+    }
+
+    #[tokio::test]
+    async fn spool_accepts_a_body_exactly_at_the_cap_and_replays_it_byte_for_byte() {
+        let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let chunks: Vec<Vec<u8>> = (0u8..4).map(|i| vec![i; 4]).collect();
+        let expected: Vec<u8> = chunks.concat();
+        let body = counted_chunks(chunks, Arc::clone(&pulled));
+
+        let spooled = spool_body_to_disk(body, Some(16), 16)
+            .await
+            .expect("a body at the cap streams");
+
+        assert_eq!(spooled.size, 16);
+        assert_eq!(pulled.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(
+            spooled.read_back().await.expect("read back").as_ref(),
+            expected.as_slice()
+        );
+        let path = spooled.file.path().to_path_buf();
+        drop(spooled);
+        assert!(!path.exists(), "the temp file is removed with the spool");
+    }
+
+    #[tokio::test]
+    async fn spool_maps_the_body_limit_layer_cutoff_to_413() {
+        let body = futures_util::stream::iter(vec![
+            Ok(bytes::Bytes::from_static(b"1234")),
+            Err(axum::Error::new(std::io::Error::other(
+                "length limit exceeded",
+            ))),
+        ]);
+
+        let error = spool_body_to_disk(body, None, 1024)
+            .await
+            .expect_err("layer cutoff is a 413");
+
+        assert!(matches!(
+            error,
+            MediaError::FileTooLarge { size: 4, max: 1024 }
+        ));
     }
 }

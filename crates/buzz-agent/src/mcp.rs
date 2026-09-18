@@ -1109,8 +1109,8 @@ fn tool_result_content(
                     });
                     continue;
                 }
-                // Over budget: the storage cap on originals is 2 GiB, the
-                // inline budget is not. Shrink the picture to fit rather than
+                // Over budget: the storage cap on originals is operator-set
+                // (`BUZZ_MAX_IMAGE_BYTES`), the inline budget is not. Shrink the picture to fit rather than
                 // dropping it, and say so; the original stays where the tool
                 // read it from.
                 let remaining = max_bytes
