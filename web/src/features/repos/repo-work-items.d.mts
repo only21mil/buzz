@@ -79,6 +79,14 @@ export function repoWorkItemFilters(repoAddress: string): {
   statuses: NostrFilter;
 };
 
+export function partitionRepoWorkItemEvents(events: NostrEvent[]): {
+  issueEvents: NostrEvent[];
+  pullRequestEvents: NostrEvent[];
+  updateEvents: NostrEvent[];
+  commentEvents: NostrEvent[];
+  statusEvents: NostrEvent[];
+};
+
 export function parseRepoWorkItems(input: {
   issueEvents: NostrEvent[];
   pullRequestEvents: NostrEvent[];

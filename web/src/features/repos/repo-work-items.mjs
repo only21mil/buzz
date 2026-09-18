@@ -53,6 +53,44 @@ export function repoWorkItemFilters(repoAddress) {
   };
 }
 
+// Splits one multi-filter REQ result back into the per-filter lists that
+// parseRepoWorkItems expects. The filter kinds are disjoint, so kind alone
+// decides the bucket.
+export function partitionRepoWorkItemEvents(events) {
+  const partitioned = {
+    issueEvents: [],
+    pullRequestEvents: [],
+    updateEvents: [],
+    commentEvents: [],
+    statusEvents: [],
+  };
+  for (const event of events) {
+    switch (event.kind) {
+      case REPO_WORK_ITEM_KINDS.ISSUE:
+        partitioned.issueEvents.push(event);
+        break;
+      case REPO_WORK_ITEM_KINDS.PULL_REQUEST:
+        partitioned.pullRequestEvents.push(event);
+        break;
+      case REPO_WORK_ITEM_KINDS.PULL_REQUEST_UPDATE:
+        partitioned.updateEvents.push(event);
+        break;
+      case REPO_WORK_ITEM_KINDS.TEXT_NOTE:
+        partitioned.commentEvents.push(event);
+        break;
+      case REPO_WORK_ITEM_KINDS.STATUS_OPEN:
+      case REPO_WORK_ITEM_KINDS.STATUS_MERGED:
+      case REPO_WORK_ITEM_KINDS.STATUS_CLOSED:
+      case REPO_WORK_ITEM_KINDS.STATUS_DRAFT:
+        partitioned.statusEvents.push(event);
+        break;
+      default:
+        break;
+    }
+  }
+  return partitioned;
+}
+
 function isNonEmptyString(value) {
   return typeof value === "string" && value.length > 0;
 }
