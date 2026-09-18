@@ -35,6 +35,34 @@ pub struct WorkflowResumeSweepOutcome {
     pub found: usize,
     /// Candidates whose generation fence this pass acquired.
     pub claimed: usize,
+    /// Expired `workflow_state` rows deleted by this pass.
+    pub purged: u64,
+}
+
+/// Expired `workflow_state` rows deleted per sweep. Reads already treat
+/// expired rows as absent; this only bounds the reclamation batch.
+const WORKFLOW_STATE_PURGE_LIMIT: u32 = 1_000;
+
+/// Delete one batch of expired workflow state. Runs every sweep so the
+/// `idx_workflow_state_expires_at` index has a consumer; a failure is
+/// logged and retried next tick, never fatal to recovery.
+async fn purge_expired_workflow_state(db: &Db) -> u64 {
+    match db
+        .purge_expired_workflow_state(WORKFLOW_STATE_PURGE_LIMIT)
+        .await
+    {
+        Ok(purged) => {
+            if purged > 0 {
+                metrics::counter!("buzz_workflow_state_purged_total").increment(purged);
+                info!(purged, "purged expired workflow state");
+            }
+            purged
+        }
+        Err(error) => {
+            warn!("workflow state purge failed: {error}");
+            0
+        }
+    }
 }
 
 fn lease_duration(sweep_interval: Duration) -> Duration {
@@ -253,6 +281,7 @@ pub async fn run_workflow_resume_sweep_once(
     sweep_interval: Duration,
     resume_pending_age: Duration,
 ) -> Result<WorkflowResumeSweepOutcome, String> {
+    let purged = purge_expired_workflow_state(&db).await;
     let candidates = db
         .list_recoverable_workflow_resumes(
             duration_secs_i64(resume_pending_age),
@@ -279,7 +308,11 @@ pub async fn run_workflow_resume_sweep_once(
             Err(error) => warn!("workflow resume recovery attempt failed: {error}"),
         }
     }
-    Ok(WorkflowResumeSweepOutcome { found, claimed })
+    Ok(WorkflowResumeSweepOutcome {
+        found,
+        claimed,
+        purged,
+    })
 }
 
 /// Start the relay-owned startup pass and periodic recovery sweep.
@@ -1288,5 +1321,85 @@ steps:
                 .collect::<Vec<_>>(),
             vec!["before approval", "after approval"]
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn recovery_sweep_purges_expired_workflow_state() {
+        let fixture = recovery_fixture().await;
+        let written = fixture
+            .db
+            .write_workflow_state(
+                fixture.community_id,
+                fixture.run_id,
+                "step-1",
+                "cursor",
+                "\"live\"",
+                60,
+                None,
+            )
+            .await
+            .expect("write live state");
+        assert!(
+            matches!(written, buzz_db::WorkflowStateWriteOutcome::Written { .. }),
+            "live state must be written: {written:?}"
+        );
+        let written = fixture
+            .db
+            .write_workflow_state(
+                fixture.community_id,
+                fixture.run_id,
+                "step-2",
+                "stale",
+                "\"expired\"",
+                60,
+                None,
+            )
+            .await
+            .expect("write soon-expired state");
+        assert!(
+            matches!(written, buzz_db::WorkflowStateWriteOutcome::Written { .. }),
+            "soon-expired state must be written: {written:?}"
+        );
+        // Each step holds one write receipt, so the two rows come from two
+        // steps. State rows key on the run's workflow, not the run itself.
+        let workflow_id: Uuid = sqlx::query_scalar(
+            "SELECT workflow_id FROM workflow_runs WHERE community_id = $1 AND id = $2",
+        )
+        .bind(fixture.community_id.as_uuid())
+        .bind(fixture.run_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("resolve the run's workflow");
+        let expired = sqlx::query(
+            "UPDATE workflow_state SET expires_at = clock_timestamp() - interval '1 second' \
+             WHERE community_id = $1 AND workflow_id = $2 AND state_key = 'stale'",
+        )
+        .bind(fixture.community_id.as_uuid())
+        .bind(workflow_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("expire the stale row");
+        assert_eq!(expired.rows_affected(), 1, "one stale row expired");
+
+        let outcome = run_workflow_resume_sweep_once(
+            Arc::clone(&fixture.engine),
+            fixture.db.clone(),
+            Duration::from_secs(1),
+            Duration::ZERO,
+        )
+        .await
+        .expect("sweep");
+
+        assert_eq!(outcome.purged, 1, "the sweep deletes the expired row");
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_state WHERE community_id = $1 AND workflow_id = $2",
+        )
+        .bind(fixture.community_id.as_uuid())
+        .bind(workflow_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count rows");
+        assert_eq!(remaining, 1, "the live row survives");
     }
 }

@@ -460,7 +460,10 @@ fn reduce_checked(
 
     for (request_event, rerun) in ordered_requests.iter().skip(1).copied() {
         let rerun_id = request_event.event_id.as_str();
-        let selected_job = &rerun.job_ids[0];
+        let Some(selected_job) = rerun.job_ids.first() else {
+            reconciliation_reasons.push(format!("rerun request {rerun_id} selected no job"));
+            continue;
+        };
         let Some((parent_event, parent)) = selected.get(selected_job).copied() else {
             reconciliation_reasons.push(format!(
                 "rerun request {rerun_id} has no selected parent status"
@@ -865,7 +868,11 @@ fn validate_request_lineage(
                 event.event_id
             ));
         }
-        if !initial.job_ids.contains(&request.job_ids[0]) {
+        if !request
+            .job_ids
+            .first()
+            .is_some_and(|job| initial.job_ids.contains(job))
+        {
             return Err(format!(
                 "rerun request {} selected an unknown initial job",
                 event.event_id

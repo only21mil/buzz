@@ -33,14 +33,16 @@ impl FromStr for S3AddressingStyle {
     }
 }
 
-/// Default cap on a stored image original: 2 GiB.
+/// Default cap on a stored image original: 50 MiB.
 ///
 /// This is the storage and transport limit only. The agent inline
 /// tool-result budget (`buzz_agent::config::MAX_TOOL_RESULT_BYTES`) and the
 /// relay websocket frame cap (`BUZZ_MAX_FRAME_BYTES`) are separate numbers on
 /// purpose: an image never rides the websocket (the event carries a `/media`
-/// URL), and a model cannot take a 2 GiB image inline.
-pub const DEFAULT_MAX_IMAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// URL). Operators raise it with `BUZZ_MAX_IMAGE_BYTES`; the relay spools the
+/// body to disk while it arrives and holds at most one cap-bounded copy in
+/// RAM for validation and decode.
+pub const DEFAULT_MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Default cap on an animated GIF original: 10 MiB.
 pub const DEFAULT_MAX_GIF_BYTES: u64 = 10 * 1024 * 1024;
@@ -87,7 +89,7 @@ pub struct MediaConfig {
     /// S3 URL addressing style. Defaults to path style for MinIO compatibility.
     #[serde(default)]
     pub s3_addressing_style: S3AddressingStyle,
-    /// Maximum upload size for images (bytes). Default: 2 GiB
+    /// Maximum upload size for images (bytes). Default: 50 MiB
     /// ([`DEFAULT_MAX_IMAGE_BYTES`]); override with `BUZZ_MAX_IMAGE_BYTES`.
     #[serde(default = "default_max_image_bytes")]
     pub max_image_bytes: u64,
@@ -187,12 +189,12 @@ mod tests {
     use std::str::FromStr;
 
     #[test]
-    fn image_caps_default_to_two_gib_originals() {
+    fn image_caps_default_to_fifty_mib_originals() {
         let config: MediaConfig = serde_json::from_str(
             r#"{"s3_endpoint":"http://localhost:9000","s3_access_key":"k","s3_secret_key":"s","s3_bucket":"b","public_base_url":"http://localhost:3000/media"}"#,
         )
         .expect("defaults fill the caps");
-        assert_eq!(DEFAULT_MAX_IMAGE_BYTES, 2_147_483_648);
+        assert_eq!(DEFAULT_MAX_IMAGE_BYTES, 52_428_800);
         assert_eq!(config.max_image_bytes, DEFAULT_MAX_IMAGE_BYTES);
         assert_eq!(config.max_gif_bytes, DEFAULT_MAX_GIF_BYTES);
         assert!(config.max_gif_bytes <= config.max_image_bytes);

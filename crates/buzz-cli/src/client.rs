@@ -70,11 +70,11 @@ const ALLOWED_MIMES: &[&str] = &[
     "video/mp4",
 ];
 
-/// Default cap for image uploads: 2 GiB, matching the relay's stored-original
+/// Default cap for image uploads: 50 MiB, matching the relay's stored-original
 /// default (`buzz_media::DEFAULT_MAX_IMAGE_BYTES`). The relay is authoritative;
 /// this guard only saves a doomed upload. Override with `BUZZ_MAX_IMAGE_BYTES`
 /// when the relay operator set a different cap.
-const DEFAULT_MAX_IMAGE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Effective image cap: `BUZZ_MAX_IMAGE_BYTES` when set to a positive integer,
 /// else [`DEFAULT_MAX_IMAGE_BYTES`].
@@ -2955,8 +2955,8 @@ mod image_cap_tests {
     use super::{max_image_bytes_from, DEFAULT_MAX_IMAGE_BYTES};
 
     #[test]
-    fn image_cap_defaults_to_two_gib_and_honors_the_env_override() {
-        assert_eq!(DEFAULT_MAX_IMAGE_BYTES, 2_147_483_648);
+    fn image_cap_defaults_to_fifty_mib_and_honors_the_env_override() {
+        assert_eq!(DEFAULT_MAX_IMAGE_BYTES, 52_428_800);
         assert_eq!(max_image_bytes_from(None), DEFAULT_MAX_IMAGE_BYTES);
         assert_eq!(max_image_bytes_from(Some("52428800")), 52_428_800);
         assert_eq!(max_image_bytes_from(Some(" 1024 ")), 1024);

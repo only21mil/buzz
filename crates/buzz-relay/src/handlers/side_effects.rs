@@ -8,16 +8,17 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use buzz_core::kind::{
-    event_kind_u32, is_parameterized_replaceable, KIND_AGENT_PROFILE, KIND_DM_VISIBILITY,
-    KIND_GIT_REPO_ANNOUNCEMENT, KIND_IA_ARCHIVED, KIND_IA_ARCHIVED_LIST, KIND_IA_UNARCHIVED,
-    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_NIP29_GROUP_ADMINS,
-    KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA, KIND_NIP43_MEMBERSHIP_LIST, KIND_REACTION,
-    KIND_THREAD_SUMMARY,
+    event_kind_u32, is_parameterized_replaceable, KIND_AGENT_DRAFT, KIND_AGENT_DRAFT_DECISION,
+    KIND_AGENT_PROFILE, KIND_DM_VISIBILITY, KIND_GIT_REPO_ANNOUNCEMENT, KIND_IA_ARCHIVED,
+    KIND_IA_ARCHIVED_LIST, KIND_IA_UNARCHIVED, KIND_MEMBER_ADDED_NOTIFICATION,
+    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_NIP29_GROUP_ADMINS, KIND_NIP29_GROUP_MEMBERS,
+    KIND_NIP29_GROUP_METADATA, KIND_NIP43_MEMBERSHIP_LIST, KIND_REACTION, KIND_THREAD_SUMMARY,
 };
 use buzz_core::StoredEvent;
 use buzz_db::channel::{MemberRecord, MemberRole};
 
 use super::event::dispatch_persistent_event;
+use super::moderation_authz::ChannelAdminGrantCell;
 use crate::protocol::RelayMessage;
 use crate::state::AppState;
 use buzz_core::tenant::TenantContext;
@@ -186,20 +187,21 @@ pub async fn evict_all_channel_subscriptions(
 }
 
 /// Dispatch side effects for a stored event.
-pub async fn handle_side_effects(
+pub(crate) async fn handle_side_effects(
     tenant: &TenantContext,
     kind: u32,
     event: &Event,
     state: &Arc<AppState>,
+    admin_grant: &ChannelAdminGrantCell,
 ) -> anyhow::Result<()> {
     if matches!(kind, 9000 | 9001 | 9002 | 9005 | 9008) {
-        validate_admin_event(tenant, kind, event, state).await?;
+        validate_admin_event(tenant, kind, event, state, admin_grant).await?;
     }
     match kind {
         0 => handle_kind0_profile(tenant, event, state).await,
         5 => handle_standard_deletion_event(tenant, event, state).await,
-        9000 => handle_put_user(tenant, event, state).await,
-        9001 => handle_remove_user(tenant, event, state).await,
+        9000 => handle_put_user(tenant, event, state, admin_grant).await,
+        9001 => handle_remove_user(tenant, event, state, admin_grant).await,
         9002 => handle_edit_metadata(tenant, event, state).await,
         9005 => handle_delete_event_side_effect(tenant, event, state).await,
         9007 => handle_create_group(tenant, event, state).await,
@@ -265,6 +267,9 @@ pub async fn validate_standard_deletion_event(
             .get_event_by_id_including_deleted(tenant.community(), &target_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("target event not found"))?;
+        if is_agent_draft_kind(event_kind_u32(&target_event.event)) {
+            return Err(anyhow::anyhow!("draft events are immutable"));
+        }
 
         let target_author =
             effective_message_author(&target_event.event, &state.relay_keypair.public_key());
@@ -415,11 +420,12 @@ async fn actor_owns_any_owner_agent(
 }
 
 /// Validate an admin kind event BEFORE storage.
-pub async fn validate_admin_event(
+pub(crate) async fn validate_admin_event(
     tenant: &TenantContext,
     kind: u32,
     event: &Event,
     state: &Arc<AppState>,
+    admin_grant: &ChannelAdminGrantCell,
 ) -> anyhow::Result<()> {
     // CREATE_GROUP doesn't need an existing channel — skip h-tag extraction
     if kind == 9007 {
@@ -448,9 +454,7 @@ pub async fn validate_admin_event(
         return Err(anyhow::anyhow!("channel is archived"));
     }
 
-    let community_grant =
-        super::moderation_authz::channel_admin_grant(tenant, state, event).await?;
-    let community_authorized = community_grant.is_some();
+    let community_authorized = admin_grant.resolve(tenant, state, event).await?.is_some();
 
     match kind {
         9000 => {
@@ -767,17 +771,8 @@ pub async fn validate_admin_event(
             }
 
             // Extract target event from e tag to check authorship.
-            let target_id = event
-                .tags
-                .iter()
-                .find_map(|tag| {
-                    if tag.kind().to_string() == "e" {
-                        tag.content().and_then(|v| hex::decode(v).ok())
-                    } else {
-                        None
-                    }
-                })
-                .ok_or_else(|| anyhow::anyhow!("missing e tag for target event"))?;
+            let target_id = extract_e_tag_event_id(event)
+                .ok_or_else(|| anyhow::anyhow!("missing or invalid e tag for target event"))?;
 
             // Verify the target event exists and belongs to the h-tag channel
             // BEFORE storage. Fail closed: missing target → reject.
@@ -798,6 +793,9 @@ pub async fn validate_admin_event(
                     return Err(anyhow::anyhow!("target event has no channel"));
                 }
                 _ => {} // Same channel — OK
+            }
+            if is_agent_draft_kind(event_kind_u32(&target_event.event)) {
+                return Err(anyhow::anyhow!("draft events are immutable"));
             }
 
             if community_authorized {
@@ -1478,6 +1476,7 @@ async fn handle_put_user(
     tenant: &TenantContext,
     event: &Event,
     state: &Arc<AppState>,
+    admin_grant: &ChannelAdminGrantCell,
 ) -> anyhow::Result<()> {
     let channel_id =
         extract_h_tag_channel(event).ok_or_else(|| anyhow::anyhow!("missing h tag"))?;
@@ -1503,9 +1502,9 @@ async fn handle_put_user(
     }
 
     let actor_bytes = event.pubkey.to_bytes().to_vec();
-    let grant = super::moderation_authz::channel_admin_grant(tenant, state, event).await?;
-    let membership_principal = grant
-        .as_ref()
+    let membership_principal = admin_grant
+        .resolve(tenant, state, event)
+        .await?
         .map(|g| g.principal.as_slice())
         .unwrap_or(&actor_bytes);
 
@@ -1572,14 +1571,15 @@ async fn handle_remove_user(
     tenant: &TenantContext,
     event: &Event,
     state: &Arc<AppState>,
+    admin_grant: &ChannelAdminGrantCell,
 ) -> anyhow::Result<()> {
     let channel_id =
         extract_h_tag_channel(event).ok_or_else(|| anyhow::anyhow!("missing h tag"))?;
     let target_pubkey = extract_p_tag(event).ok_or_else(|| anyhow::anyhow!("missing p tag"))?;
     let actor_bytes = event.pubkey.to_bytes().to_vec();
-    let grant = super::moderation_authz::channel_admin_grant(tenant, state, event).await?;
-    let membership_principal = grant
-        .as_ref()
+    let membership_principal = admin_grant
+        .resolve(tenant, state, event)
+        .await?
         .map(|g| g.principal.as_slice())
         .unwrap_or(&actor_bytes);
 
@@ -1882,24 +1882,7 @@ async fn handle_delete_event_side_effect(
     let channel_id =
         extract_h_tag_channel(event).ok_or_else(|| anyhow::anyhow!("missing h tag"))?;
 
-    // Extract target event ID from e tag
-    let target_id = event
-        .tags
-        .iter()
-        .find_map(|tag| {
-            if tag.kind().to_string() == "e" {
-                tag.content().and_then(|v| {
-                    let bytes = hex::decode(v).ok()?;
-                    if bytes.len() == 32 {
-                        Some(bytes)
-                    } else {
-                        None
-                    }
-                })
-            } else {
-                None
-            }
-        })
+    let target_id = extract_e_tag_event_id(event)
         .ok_or_else(|| anyhow::anyhow!("missing e tag for target event"))?;
 
     // Verify the target event belongs to the same channel as the h-tag.
@@ -1921,6 +1904,9 @@ async fn handle_delete_event_side_effect(
                 return Err(anyhow::anyhow!("target event has no channel"));
             }
             _ => {} // Same channel — OK
+        }
+        if is_agent_draft_kind(event_kind_u32(&target_event.event)) {
+            return Err(anyhow::anyhow!("draft events are immutable"));
         }
     }
 
@@ -2466,6 +2452,13 @@ async fn handle_standard_deletion_event(
             );
             continue;
         }
+        if is_agent_draft_kind(event_kind_u32(&target_event.event)) {
+            tracing::debug!(
+                target_id = %hex::encode(&target_id),
+                "NIP-09 deletion ignored for immutable draft event"
+            );
+            continue;
+        }
 
         let meta = state
             .db
@@ -2580,6 +2573,27 @@ pub(crate) fn extract_h_tag_channel(event: &Event) -> Option<Uuid> {
 }
 
 /// Extract target pubkey from first `p` tag.
+/// Kind 14201 (draft request) and 14202 (draft decision) rows are durable
+/// review history. The database trigger from migration 0040 blocks
+/// hard deletes and rewrites; this check turns an explicit deletion request
+/// into a policy rejection before any query runs.
+pub(crate) fn is_agent_draft_kind(kind: u32) -> bool {
+    matches!(kind, KIND_AGENT_DRAFT | KIND_AGENT_DRAFT_DECISION)
+}
+
+/// First `e` tag whose value decodes to a 32-byte event id. A missing,
+/// non-hex or wrong-length value is `None`, so callers reject it as input
+/// rather than surfacing a decode error later in the audit path.
+pub(crate) fn extract_e_tag_event_id(event: &Event) -> Option<Vec<u8>> {
+    event.tags.iter().find_map(|tag| {
+        if tag.kind().to_string() != "e" {
+            return None;
+        }
+        let bytes = hex::decode(tag.content()?).ok()?;
+        (bytes.len() == 32).then_some(bytes)
+    })
+}
+
 pub(crate) fn extract_p_tag(event: &Event) -> Option<Vec<u8>> {
     for tag in event.tags.iter() {
         if tag.kind().to_string() == "p" {
@@ -3636,6 +3650,41 @@ fn topic_for_subscription(channel_id: Option<Uuid>) -> EventTopic {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn signed_event_with_tags(tags: Vec<Tag>) -> Event {
+        nostr::EventBuilder::new(nostr::Kind::Custom(9005), "")
+            .tags(tags)
+            .sign_with_keys(&nostr::Keys::generate())
+            .expect("sign test event")
+    }
+
+    fn tag(parts: &[&str]) -> Tag {
+        Tag::parse(parts.iter().copied()).expect("valid test tag")
+    }
+
+    #[test]
+    fn draft_kinds_are_the_only_immutable_deletion_targets() {
+        assert!(is_agent_draft_kind(KIND_AGENT_DRAFT));
+        assert!(is_agent_draft_kind(KIND_AGENT_DRAFT_DECISION));
+        for kind in [1, 5, 9, 9005, 14_200, 14_203, 45_001] {
+            assert!(!is_agent_draft_kind(kind), "kind {kind}");
+        }
+    }
+
+    #[test]
+    fn e_tag_extractor_accepts_only_a_32_byte_hex_id() {
+        let valid = "ab".repeat(32);
+        let event = signed_event_with_tags(vec![tag(&["h", "chan"]), tag(&["e", &valid])]);
+        assert_eq!(extract_e_tag_event_id(&event), Some(vec![0xab; 32]));
+
+        // Malformed values are input errors, not decode failures later on.
+        for bad in ["not-hex", "zz", &"ab".repeat(31), &"ab".repeat(33), ""] {
+            let event = signed_event_with_tags(vec![tag(&["e", bad])]);
+            assert_eq!(extract_e_tag_event_id(&event), None, "value {bad:?}");
+        }
+        let no_e = signed_event_with_tags(vec![tag(&["p", &"cd".repeat(32)])]);
+        assert_eq!(extract_e_tag_event_id(&no_e), None);
+    }
 
     fn member(channel_id: Uuid, pubkey_byte: u8, role: &str) -> MemberRecord {
         MemberRecord {

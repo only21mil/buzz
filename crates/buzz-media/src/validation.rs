@@ -21,7 +21,7 @@ const ALLOWED_MIME_TYPES: &[&str] = &["image/jpeg", "image/png", "image/gif", "i
 /// so a picture at this cap needs 800 MB of decode memory; 8-bit RGBA needs
 /// 400 MB. [`MAX_IMAGE_DECODE_BYTES`] is derived from this number and is the
 /// only decode allocation cap in this crate; the byte cap on the stored
-/// original (`BUZZ_MAX_IMAGE_BYTES`, 2 GiB by default) is separate.
+/// original (`BUZZ_MAX_IMAGE_BYTES`, 50 MiB by default) is separate.
 pub const MAX_IMAGE_PIXELS: u64 = 100_000_000;
 
 /// Decode memory needed for a [`MAX_IMAGE_PIXELS`] image at 16-bit RGBA
