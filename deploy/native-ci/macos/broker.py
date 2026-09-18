@@ -4,7 +4,6 @@
 Only the installed Rust verifier interprets the signed wire frame. The existing
 hash-pinned Apple supervisor supplies the UID and filesystem lifecycle helpers.
 """
-import contextlib
 import fcntl
 import hashlib
 import importlib.util

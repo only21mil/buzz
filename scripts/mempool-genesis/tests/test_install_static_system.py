@@ -299,7 +299,6 @@ class StaticManifestTests(unittest.TestCase):
     def test_closure_binding_requires_exact_package_source_set_and_hashes(self) -> None:
         temporary, package = self.make_package()
         self.addCleanup(temporary.cleanup)
-        manifest = json.loads((package / MODULE.MANIFEST_NAME).read_text())
         parsed_manifest, entries = MODULE.exact_manifest(package)
         state = self.make_closure(package)
         MODULE.bind_accepted_manifest(

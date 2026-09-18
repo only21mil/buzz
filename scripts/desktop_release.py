@@ -180,7 +180,6 @@ def previous_release(
 
 def bullet(commit: dict[str, str], repo: str) -> str:
     sha, subject = commit["sha"], commit["subject"]
-    short = sha[:12]
     pr_match = re.search(r" \(#([0-9]+)\)$", subject)
     if pr_match:
         pr = pr_match.group(1)

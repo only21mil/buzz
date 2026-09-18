@@ -1594,8 +1594,6 @@ def cross_bind(stage: Path, descriptor: dict[str, object]) -> tuple[Path, dict[s
         ):
             raise GuestError(f"execd package differs from {label} package")
     validate_prior_activation(prior_activation, activation)
-    activation_digest = activation.get("package_digest")
-    activation_id = activation.get("activation_id")
     scenario = validate_scenario_binding(scenario_raw, candidate_sha, activation, "scenario")
     validate_scenario_binding(prior_scenario_raw, candidate_sha, prior_activation, "prior scenario")
     public = json.loads(binding_raw, object_pairs_hook=reject_duplicates)

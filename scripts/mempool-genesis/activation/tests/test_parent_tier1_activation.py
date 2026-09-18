@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 from datetime import timedelta
 import importlib.util
-import io
 import json
 import os
 from pathlib import Path

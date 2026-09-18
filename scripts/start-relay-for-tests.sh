@@ -71,7 +71,7 @@ wait_healthy() {
   local service="$1"
   local container="$2"
   log "Waiting for ${service}..."
-  for attempt in $(seq 1 60); do
+  for _attempt in $(seq 1 60); do
     status=$(docker inspect --format='{{.State.Health.Status}}' "${container}" 2>/dev/null || echo "not_found")
     if [ "${status}" = "healthy" ]; then
       ok "${service} is healthy"
@@ -181,7 +181,7 @@ echo $! > /tmp/buzz-relay.pid
 # ── Poll readiness ───────────────────────────────────────────────────────────
 
 log "Waiting for relay readiness..."
-for attempt in $(seq 1 60); do
+for _attempt in $(seq 1 60); do
   if ! kill -0 "$(cat /tmp/buzz-relay.pid)" 2>/dev/null; then
     err "Relay process died"
     cat /tmp/buzz-relay.log

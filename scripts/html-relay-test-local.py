@@ -140,7 +140,7 @@ def main():
             pg_started = True
             command([paths['pg_ctl'], '-D', local / 'pg', '-l', logs / 'postgres.log', '-w', 'start'])
             command([paths['createdb'], '--template=template0', 'buzz_html'])
-            redis = start('redis', [paths['redis'], '--bind', '127.0.0.1', '--port', '16379',
+            start('redis', [paths['redis'], '--bind', '127.0.0.1', '--port', '16379',
                           '--dir', local / 'redis', '--save', '', '--appendonly', 'no'])
             fixture_access, fixture_secret = 'html_fixture_only', 'html_fixture_only_not_real'
             minio_env = dict(env, MINIO_ROOT_USER=fixture_access, MINIO_ROOT_PASSWORD=fixture_secret,

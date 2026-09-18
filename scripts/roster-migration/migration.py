@@ -262,7 +262,6 @@ def validate_owned_directory_chain(root: Path, absolute: str) -> Path:
     boundary = install_boundary(root)
     if target != boundary and boundary not in target.parents:
         raise MigrationError(f"install path escaped its owned boundary: {target}")
-    current = boundary
     relative = target.relative_to(boundary)
     for component in (Path("."), *relative.parents[::-1], relative):
         candidate = boundary if component == Path(".") else boundary / component
@@ -274,7 +273,6 @@ def validate_owned_directory_chain(root: Path, absolute: str) -> Path:
             raise MigrationError(f"unsafe install directory type: {candidate}")
         if metadata.st_uid != os.getuid() or stat.S_IMODE(metadata.st_mode) & 0o022:
             raise MigrationError(f"unsafe install directory owner or mode: {candidate}")
-        current = candidate
     return target
 
 
