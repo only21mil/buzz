@@ -114,7 +114,9 @@ impl Projection {
                     value.run_id.as_str(),
                     None,
                     value.attempt,
-                    (value.request_type == CiRequestType::Rerun).then(|| value.job_ids[0].clone()),
+                    (value.request_type == CiRequestType::Rerun)
+                        .then(|| value.job_ids.first().cloned())
+                        .flatten(),
                     None,
                     None,
                 ),
@@ -576,7 +578,10 @@ async fn prepare_request(
         ));
     }
     let initial = load_initial_request_tx(tx, community_id, run_id).await?;
-    let job_id = &request.job_ids[0];
+    let job_id = request
+        .job_ids
+        .first()
+        .ok_or_else(|| DbError::InvalidData("CI rerun selected no job".into()))?;
     if !initial.job_ids.contains(job_id) {
         return Err(DbError::InvalidData(
             "CI rerun selected an unknown initial job".into(),
@@ -1044,7 +1049,10 @@ async fn load_selected_terminal_jobs(
                 "CI selected graph contains a second initial request".into(),
             ));
         }
-        let selected_job = &request.job_ids[0];
+        let selected_job = request
+            .job_ids
+            .first()
+            .ok_or_else(|| DbError::InvalidData("CI rerun selected no job".into()))?;
         let parent_attempt = request.parent_attempt.ok_or_else(|| {
             DbError::InvalidData("CI rerun is missing its selected parent attempt".into())
         })?;
