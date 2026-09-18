@@ -274,6 +274,27 @@ test("save_ncryptsec_copy keeps the object URL alive until the download has star
   }
 });
 
+test("sign_event rejects malformed bodies before signing", async () => {
+  const manager = await BrowserIdentityManager.create(
+    new MemoryIdentityStore(),
+    new DirectNip49Codec(),
+  );
+  registerIdentityCommands(manager);
+  const cases = [
+    [undefined, /object body/],
+    [[1, 2], /object body/],
+    [{ kind: "1", content: "x", tags: [] }, /kind must be/],
+    [{ kind: 1.5, content: "x", tags: [] }, /kind must be/],
+    [{ kind: 1, content: 7, tags: [] }, /content must be/],
+    [{ kind: 1, content: "x", tags: "none" }, /tags must be/],
+    [{ kind: 1, content: "x", tags: [["h", 3]] }, /tags must be/],
+    [{ kind: 1, content: "x", tags: [], createdAt: -1 }, /createdAt must be/],
+  ];
+  for (const [body, message] of cases) {
+    await assert.rejects(dispatch("sign_event", body), message);
+  }
+});
+
 test("sign_event checks the actual signer even before the renderer learns of its replacement", async () => {
   const { capturePublicationScope, setPublicationScope } = await import(
     "../../shared/api/publicationScope.ts"
