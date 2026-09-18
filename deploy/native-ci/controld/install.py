@@ -1158,7 +1158,7 @@ def install(package: Path, root: Path, backup_root: Path, *, dry_run: bool = Fal
 
     by_target = {entry.target: entry for entry in entries}
     inventory = list(state["inventory"])
-    priors = backup_payloads(transaction, root, inventory)
+    backup_payloads(transaction, root, inventory)
     verify_unchanged_targets(root, entries, list(state["changed_targets"]))
     ensure_install_directories(root, manifest, list(state["created_directories"]))
     validate_created_directories(root, state, require_complete=False)

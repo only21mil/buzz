@@ -371,7 +371,6 @@ class CapabilityParityTests(unittest.TestCase):
 
     def capture_fixture(self, root: Path) -> tuple[dict[str, object], tuple[str, str, str]]:
         reference = manifest("reference")
-        pubkey = reference["identity"]["pubkey"]
         auth_tag = "owner1syntheticcaptureauth"
         private_key = "a" * 64
         codex_auth = '{"session":"synthetic-capture"}'

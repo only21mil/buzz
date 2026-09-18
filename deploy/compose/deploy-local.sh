@@ -1145,7 +1145,7 @@ verify_image_platform_binding() {
 capture_rollback_reference() {
   rollback_source=${prior_platform_image_id}
   rollback_source_image_id=${prior_platform_image_id}
-  rollback_source_resolution=platform-image-id
+  rollback_source_resolution='platform-image-id'
   if [[ ${prior_image_id} != "${prior_platform_image_id}" ]]; then
     printf 'Prior container image index %s differs from runnable platform image %s; preserving the index as evidence and retaining the platform image\n' \
       "${prior_image_id}" "${prior_platform_image_id}"

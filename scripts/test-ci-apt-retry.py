@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Hermetic shim tests for scripts/ci-apt-retry.sh: no apt, sudo or sleep runs."""
 from __future__ import annotations
-import os
 from pathlib import Path
 import subprocess
-import sys
 import tempfile
 import unittest
 

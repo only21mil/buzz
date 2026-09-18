@@ -1937,11 +1937,8 @@ def install(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, ob
 
         if not transaction_active:
             try:
-                receipt_prior = _verify_receipt_at(
-                    receipt_directory, manifest, uid, gid
-                )
+                _verify_receipt_at(receipt_directory, manifest, uid, gid)
             except FileNotFoundError:
-                receipt_prior = None
                 receipt_present = False
             else:
                 receipt_present = True

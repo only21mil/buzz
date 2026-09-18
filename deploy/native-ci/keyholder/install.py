@@ -1447,7 +1447,6 @@ def rollback(package: Path, root: Path, *, dry_run: bool = False) -> dict[str, o
                 receipt_artifacts["rollback-state-v1.json"] = state_snapshot
 
             created_directories = set(str(value) for value in receipt["created_directories"])
-            removed_directories = set(str(value) for value in state["removed_directories"])
             checkpointed_targets = set(str(value) for value in state["restored_targets"])
             for entry in entries:
                 try:

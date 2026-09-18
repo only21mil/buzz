@@ -918,7 +918,7 @@ def build_receipt(client: GhClient, number: int, head: str, base: str) -> dict[s
         timestamp = parsed_final_date.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
     except (TypeError, ValueError) as exc:
         raise ProviderError("final GitHub Date header is invalid") from exc
-    base_data = object_(pr_a.get("base"), "pull request base")
+    object_(pr_a.get("base"), "pull request base")
     return {
         "schema_version": 1, "source": "protected-ci", "scope": "pull-request",
         "repository": REPOSITORY,
