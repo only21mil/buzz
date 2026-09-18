@@ -1643,6 +1643,126 @@ mod tests {
         );
     }
 
+    /// Upstream issue #3527: `repos create --channel` must emit exactly one
+    /// `buzz-channel` tag, or the relay 404s the repository forever. The fork
+    /// requires a channel on create, so the malformed case must fail as a
+    /// usage error before any announcement is built.
+    #[test]
+    fn create_rejects_malformed_channel_uuid() {
+        for malformed in ["nope", "", "123e4567-e89b-12d3-a456"] {
+            let error = plan_repo_announcement(
+                None,
+                "demo",
+                &"a".repeat(64),
+                "https://relay.example",
+                None,
+                None,
+                &[],
+                None,
+                &[],
+                malformed,
+            )
+            .err()
+            .expect("malformed channel id must not build an announcement");
+            assert!(
+                matches!(error, crate::error::CliError::Usage(_)),
+                "channel {malformed:?} must be a usage error, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_with_channel_emits_exactly_one_binding_tag() {
+        let channel = uuid::Uuid::new_v4();
+        // Non-canonical spellings normalize to the hyphenated lowercase form.
+        for spelling in [
+            channel.to_string(),
+            channel.simple().to_string(),
+            channel.to_string().to_uppercase(),
+        ] {
+            let RepoAnnouncementPlan::Publish { builder, .. } = plan_repo_announcement(
+                None,
+                "demo",
+                &"a".repeat(64),
+                "https://relay.example",
+                Some("Demo"),
+                None,
+                &[],
+                None,
+                &[],
+                &spelling,
+            )
+            .expect("plan create") else {
+                panic!("new repository must publish");
+            };
+            let event = builder
+                .sign_with_keys(&Keys::generate())
+                .expect("sign create announcement");
+            let bindings: Vec<_> = event
+                .tags
+                .iter()
+                .filter(|tag| tag.as_slice().first().map(String::as_str) == Some("buzz-channel"))
+                .collect();
+            assert_eq!(bindings.len(), 1, "exactly one buzz-channel tag");
+            assert_eq!(
+                bindings[0].as_slice(),
+                ["buzz-channel", channel.to_string().as_str()]
+            );
+            assert!(event.tags.iter().any(|tag| tag.as_slice() == ["d", "demo"]));
+            assert!(event
+                .tags
+                .iter()
+                .any(|tag| tag.as_slice() == ["name", "Demo"]));
+        }
+    }
+
+    #[test]
+    fn create_over_broken_binding_is_a_conflict_not_a_rewrite() {
+        let channel = uuid::Uuid::new_v4().to_string();
+        let duplicate = signed_repo(
+            vec![
+                tag(&["d", "demo"]),
+                tag(&["buzz-channel", &channel]),
+                tag(&["buzz-channel", &uuid::Uuid::new_v4().to_string()]),
+            ],
+            "",
+            50,
+        );
+        let malformed = signed_repo(
+            vec![tag(&["d", "demo"]), tag(&["buzz-channel", "nope"])],
+            "",
+            50,
+        );
+        let extra_values = signed_repo(
+            vec![
+                tag(&["d", "demo"]),
+                tag(&["buzz-channel", &channel, "trailing"]),
+            ],
+            "",
+            50,
+        );
+        for existing in [&duplicate, &malformed, &extra_values] {
+            let error = plan_repo_announcement(
+                Some(existing),
+                "demo",
+                &"a".repeat(64),
+                "https://relay.example",
+                None,
+                None,
+                &[],
+                None,
+                &[],
+                &channel,
+            )
+            .err()
+            .expect("a broken existing binding must not be silently rewritten");
+            assert!(
+                matches!(error, crate::error::CliError::Conflict(_)),
+                "expected a conflict pointing at `buzz repos bind`, got {error:?}"
+            );
+        }
+    }
+
     #[test]
     fn desired_update_rejects_channel_rebinding() {
         let existing_channel = uuid::Uuid::new_v4().to_string();
