@@ -8,6 +8,7 @@ import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:shared_preferences_platform_interface/shared_preferences_platform_interface.dart';
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -233,9 +234,9 @@ void main() {
   test('persists preferences under relay and identity scope', () async {
     final scope = await container();
     final notifier = scope.read(notificationSettingsProvider.notifier);
-    notifier.setPriorityEnabled(false);
-    notifier.setActivityEnabled(true);
-    notifier.setPreviewsEnabled(true);
+    await notifier.setPriorityEnabled(false);
+    await notifier.setActivityEnabled(true);
+    await notifier.setPreviewsEnabled(true);
 
     final prefs = scope.read(savedPrefsProvider);
     expect(
@@ -256,6 +257,34 @@ void main() {
       ),
       isTrue,
     );
+  });
+
+  test('a failed preference write is logged and keeps the new state', () async {
+    final scope = await container();
+    final notifier = scope.read(notificationSettingsProvider.notifier);
+    final logs = <String>[];
+    final previousDebugPrint = debugPrint;
+    debugPrint = (String? message, {int? wrapWidth}) {
+      if (message != null) logs.add(message);
+    };
+    addTearDown(() => debugPrint = previousDebugPrint);
+    final previousStore = SharedPreferencesStorePlatform.instance;
+    SharedPreferencesStorePlatform.instance = _FailingStore();
+    addTearDown(() => SharedPreferencesStorePlatform.instance = previousStore);
+
+    await notifier.setPriorityEnabled(false);
+    await notifier.setPreviewsEnabled(true);
+
+    expect(scope.read(notificationSettingsProvider).priorityEnabled, isFalse);
+    expect(scope.read(notificationSettingsProvider).previewsEnabled, isTrue);
+    expect(logs, hasLength(2));
+    expect(
+      logs.first,
+      contains(
+        'android_notification_settings_v1:https://relay.example:anon:priority',
+      ),
+    );
+    expect(logs.first, contains('disk full'));
   });
 
   test('refreshes channel state from the native resume callback', () async {
@@ -326,6 +355,15 @@ class _FakeBridge extends AndroidNotificationBridge {
   void dispose() {
     _statusController.close();
     super.dispose();
+  }
+}
+
+class _FailingStore extends InMemorySharedPreferencesStore {
+  _FailingStore() : super.empty();
+
+  @override
+  Future<bool> setValue(String valueType, String key, Object value) async {
+    throw StateError('disk full');
   }
 }
 
