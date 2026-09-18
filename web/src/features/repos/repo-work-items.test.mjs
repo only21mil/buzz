@@ -4,7 +4,7 @@ import {
   parseRepoWorkItems,
   partitionRepoWorkItemEvents,
   repoWorkItemFilters,
-} from "./repo-work-items.mjs";
+} from "./repo-work-items.ts";
 
 const owner = "ab".repeat(32);
 const issueAuthor = "cd".repeat(32);

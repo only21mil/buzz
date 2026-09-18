@@ -6,7 +6,7 @@ import {
   partitionRepoWorkItemEvents,
   repoWorkItemFilters,
   type RepoWorkItems,
-} from "./repo-work-items.mjs";
+} from "./repo-work-items";
 
 export async function fetchRepoWorkItems(
   repoAddress: string,

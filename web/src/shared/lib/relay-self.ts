@@ -15,25 +15,26 @@
 
 const HEX_PUBKEY_RE = /^[0-9a-f]{64}$/;
 
-let cachedUrl = null;
-let cachedPromise = null;
+let cachedUrl: string | null = null;
+let cachedPromise: Promise<string | null> | null = null;
 
-export function isRelaySelfPubkey(value) {
+export function isRelaySelfPubkey(value: unknown): value is string {
   return typeof value === "string" && HEX_PUBKEY_RE.test(value);
 }
 
-async function fetchRelaySelf(baseUrl) {
+async function fetchRelaySelf(baseUrl: string): Promise<string | null> {
   const response = await fetch(`${baseUrl}/info`, {
     headers: { Accept: "application/nostr+json" },
   });
   if (!response.ok) {
     throw new Error(`Relay info request failed: HTTP ${response.status}`);
   }
-  const doc = await response.json();
+  const doc: unknown = await response.json();
   if (typeof doc !== "object" || doc === null || Array.isArray(doc)) {
     throw new Error("Malformed relay info document");
   }
-  return isRelaySelfPubkey(doc.self) ? doc.self : null;
+  const self = (doc as { self?: unknown }).self;
+  return isRelaySelfPubkey(self) ? self : null;
 }
 
 /**
@@ -41,22 +42,24 @@ async function fetchRelaySelf(baseUrl) {
  * advertises none. The result is cached per base URL; failures are not
  * cached so a later call retries.
  */
-export function getRelaySelf(baseUrl) {
+export function getRelaySelf(baseUrl: string): Promise<string | null> {
   if (!cachedPromise || cachedUrl !== baseUrl) {
+    const promise = fetchRelaySelf(baseUrl);
     cachedUrl = baseUrl;
-    cachedPromise = fetchRelaySelf(baseUrl);
-    cachedPromise.catch(() => {
+    cachedPromise = promise;
+    promise.catch(() => {
       if (cachedUrl === baseUrl) {
         cachedUrl = null;
         cachedPromise = null;
       }
     });
+    return promise;
   }
   return cachedPromise;
 }
 
 /** Drop the cached value (tests). */
-export function resetRelaySelfCache() {
+export function resetRelaySelfCache(): void {
   cachedUrl = null;
   cachedPromise = null;
 }

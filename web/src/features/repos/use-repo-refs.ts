@@ -1,13 +1,13 @@
 import { useQuery } from "@tanstack/react-query";
 import { queryEvents } from "@/shared/lib/nostr-client";
 import { relayHttpBaseUrl, relayWsUrl } from "@/shared/lib/relay-url";
-import { getRelaySelf } from "@/shared/lib/relay-self.mjs";
+import { getRelaySelf } from "@/shared/lib/relay-self";
 import {
   parseRefs,
   refsFilter,
   selectTrustedRefsEvents,
   type RepoRefs,
-} from "./repo-refs.mjs";
+} from "./repo-refs";
 
 export type { RepoRefs };
 

@@ -5,14 +5,20 @@
  * surface that through these fields instead of failing the whole page.
  */
 
-/** @typedef {{ stale?: boolean, fetchError?: unknown }} CloneData */
+import type { CloneResult } from "./git-client";
 
-/**
- * @param {CloneData | undefined} cloneData
- * @param {unknown} cloneError
- * @param {boolean} isCloneLoading
- */
-export function gitCloneBrowseMeta(cloneData, cloneError, isCloneLoading) {
+export interface GitCloneBrowseMeta {
+  cloneError: unknown;
+  isCloneLoading: boolean;
+  isCloneStale: boolean;
+  cloneFetchError: unknown;
+}
+
+export function gitCloneBrowseMeta(
+  cloneData: Pick<CloneResult, "stale" | "fetchError"> | undefined,
+  cloneError: unknown,
+  isCloneLoading: boolean,
+): GitCloneBrowseMeta {
   return {
     cloneError: cloneError ?? null,
     isCloneLoading: Boolean(isCloneLoading),
@@ -21,8 +27,7 @@ export function gitCloneBrowseMeta(cloneData, cloneError, isCloneLoading) {
   };
 }
 
-/** @param {unknown} fetchError */
-export function cloneFetchErrorMessage(fetchError) {
+export function cloneFetchErrorMessage(fetchError: unknown): string | null {
   if (fetchError instanceof Error) return fetchError.message;
   if (typeof fetchError === "string" && fetchError.length > 0)
     return fetchError;

@@ -5,7 +5,7 @@ import {
   getRelaySelf,
   isRelaySelfPubkey,
   resetRelaySelfCache,
-} from "./relay-self.mjs";
+} from "./relay-self.ts";
 
 const PUBKEY = "a".repeat(64);
 
