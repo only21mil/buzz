@@ -5419,12 +5419,8 @@ def _rollback_unlocked(
         driver.daemon_reload()
     except BaseException as error:
         errors.append(f"daemon-reload: {error}")
-    units: dict[str, dict[str, str]] | None = None
-    targets: dict[str, str] | None = None
     try:
-        targets = _prior_readback(
-            receipt, manifest, root, retain_roles=ROLLBACK_RECOVERY_ROLES,
-        )
+        _prior_readback(receipt, manifest, root, retain_roles=ROLLBACK_RECOVERY_ROLES)
     except BaseException as error:
         errors.append(f"prior target readback: {error}")
     if execd_package_rollback == "required":
@@ -5435,17 +5431,15 @@ def _rollback_unlocked(
     else:
         try:
             errors.extend(_restore_systemd_prior_errors(receipt, driver))
-            units = _systemd_prior_readback(receipt, manifest, root, driver)
+            _systemd_prior_readback(receipt, manifest, root, driver)
         except BaseException as error:
             errors.append(f"systemd prior readback: {error}")
-    generated_prior: dict[str, str] | None = None
     try:
-        generated_prior = _generated_prior_readback(receipt, root)
+        _generated_prior_readback(receipt, root)
     except BaseException as error:
         errors.append(f"acceptance prior readback: {error}")
-    ledger_prior: str | None = None
     try:
-        ledger_prior = _acceptance_ledger_prior_readback(receipt, root)
+        _acceptance_ledger_prior_readback(receipt, root)
     except BaseException as error:
         errors.append(f"acceptance ledger prior readback: {error}")
     if errors:

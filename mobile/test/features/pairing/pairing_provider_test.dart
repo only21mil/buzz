@@ -401,8 +401,9 @@ void main() {
         expect(nsecPayloads(), isEmpty);
       });
 
-      test('expired approval denies the export', () async {
-        // The user sits on the OS prompt past the grant deadline.
+      test('a slow OS prompt does not expire the export', () async {
+        // The user sits on the OS prompt longer than the grant TTL. The TTL
+        // starts once the prompt returns, so the export still goes through.
         deviceAuth.onAuthenticate = () async {
           grantClock.advance(exportGrantTtl + const Duration(seconds: 1));
         };
@@ -417,9 +418,9 @@ void main() {
         await settleExport();
 
         final state = container.read(pairingProvider);
-        expect(state.status, PairingStatus.error);
-        expect(state.errorMessage, contains('expired'));
-        expect(nsecPayloads(), isEmpty);
+        expect(state.status, PairingStatus.transferring);
+        expect(deviceAuth.authenticateCalls, 1);
+        expect(nsecPayloads(), hasLength(1));
       });
 
       test('pairing reset wipes pending export grants', () async {

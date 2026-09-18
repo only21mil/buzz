@@ -7,15 +7,26 @@
  * spoofed refs for someone else's repo.
  */
 
+import type { NostrEvent, NostrFilter } from "@/shared/lib/nostr-client";
+
 export const REPO_STATE_KIND = 30618;
+
+export interface RepoRefs {
+  branches: string[];
+  tags: string[];
+  head: { ref: string; sha: string } | null;
+}
 
 /**
  * Build the REQ filter for a repo's ref state. The authors constraint
  * applies only when the relay's own pubkey is known; relays on ephemeral
  * keys advertise no `self`, and an unfiltered query is the only option.
  */
-export function refsFilter(repoId, relaySelf) {
-  const filter = { kinds: [REPO_STATE_KIND], "#d": [repoId] };
+export function refsFilter(
+  repoId: string,
+  relaySelf: string | null,
+): NostrFilter {
+  const filter: NostrFilter = { kinds: [REPO_STATE_KIND], "#d": [repoId] };
   if (relaySelf) {
     filter.authors = [relaySelf];
   }
@@ -27,14 +38,17 @@ export function refsFilter(repoId, relaySelf) {
  * stale cache or a lax relay could still hand back spoofed events, so drop
  * anything not signed by the relay when its pubkey is known.
  */
-export function selectTrustedRefsEvents(events, relaySelf) {
+export function selectTrustedRefsEvents(
+  events: NostrEvent[],
+  relaySelf: string | null,
+): NostrEvent[] {
   if (!relaySelf) return events;
   return events.filter((event) => event && event.pubkey === relaySelf);
 }
 
 /** Keep the latest event per (pubkey, kind, d-tag) — NIP-33 ordering. */
-function dedupLatest(events) {
-  const best = new Map();
+function dedupLatest(events: NostrEvent[]): NostrEvent[] {
+  const best = new Map<string, NostrEvent>();
   for (const event of events) {
     const d = event.tags.find((tag) => tag[0] === "d")?.[1] ?? "";
     const key = `${event.pubkey}:${event.kind}:${d}`;
@@ -46,11 +60,11 @@ function dedupLatest(events) {
   return [...best.values()];
 }
 
-export function parseRefs(events) {
+export function parseRefs(events: NostrEvent[]): RepoRefs {
   const latest = dedupLatest(events);
-  const branches = [];
-  const tags = [];
-  let head = null;
+  const branches: string[] = [];
+  const tags: string[] = [];
+  let head: RepoRefs["head"] = null;
 
   for (const event of latest) {
     for (const tag of event.tags) {

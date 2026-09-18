@@ -1,3 +1,5 @@
+import type { NostrEvent, NostrFilter } from "@/shared/lib/nostr-client";
+
 export const REPO_WORK_ITEM_KINDS = {
   ISSUE: 1621,
   PULL_REQUEST: 1618,
@@ -7,7 +9,15 @@ export const REPO_WORK_ITEM_KINDS = {
   STATUS_MERGED: 1631,
   STATUS_CLOSED: 1632,
   STATUS_DRAFT: 1633,
-};
+} as const;
+
+export type ProjectIssueStatus =
+  | "Triage"
+  | "Backlog"
+  | "In Progress"
+  | "In Review"
+  | "Done"
+  | "Closed";
 
 export const PROJECT_ISSUE_STATUS = {
   TRIAGE: "Triage",
@@ -16,9 +26,75 @@ export const PROJECT_ISSUE_STATUS = {
   IN_REVIEW: "In Review",
   DONE: "Done",
   CLOSED: "Closed",
-};
+} as const satisfies Record<string, ProjectIssueStatus>;
 
-export function repoWorkItemFilters(repoAddress) {
+export interface RepoWorkItemComment {
+  id: string;
+  content: string;
+  author: string;
+  createdAt: number;
+}
+
+export interface ProjectIssue {
+  id: string;
+  title: string;
+  content: string;
+  author: string;
+  createdAt: number;
+  updatedAt: number;
+  labels: string[];
+  status: ProjectIssueStatus;
+  comments: RepoWorkItemComment[];
+}
+
+export interface ProjectPullRequestUpdate {
+  id: string;
+  content: string;
+  author: string;
+  createdAt: number;
+  commit: string | null;
+}
+
+export type ProjectPullRequestStatus = "Open" | "Merged" | "Closed" | "Draft";
+
+export interface ProjectPullRequest {
+  id: string;
+  title: string;
+  content: string;
+  author: string;
+  createdAt: number;
+  updatedAt: number;
+  labels: string[];
+  status: ProjectPullRequestStatus;
+  branchName: string | null;
+  targetBranch: string | null;
+  commit: string | null;
+  updateCount: number;
+  comments: RepoWorkItemComment[];
+}
+
+export interface RepoWorkItems {
+  issues: ProjectIssue[];
+  pullRequests: ProjectPullRequest[];
+}
+
+export interface RepoWorkItemFilters {
+  issues: NostrFilter;
+  pullRequests: NostrFilter;
+  pullRequestUpdates: NostrFilter;
+  comments: NostrFilter;
+  statuses: NostrFilter;
+}
+
+export interface RepoWorkItemEvents {
+  issueEvents: NostrEvent[];
+  pullRequestEvents: NostrEvent[];
+  updateEvents: NostrEvent[];
+  commentEvents: NostrEvent[];
+  statusEvents: NostrEvent[];
+}
+
+export function repoWorkItemFilters(repoAddress: string): RepoWorkItemFilters {
   return {
     issues: {
       kinds: [REPO_WORK_ITEM_KINDS.ISSUE],
@@ -53,36 +129,80 @@ export function repoWorkItemFilters(repoAddress) {
   };
 }
 
-function isNonEmptyString(value) {
+// Splits one multi-filter REQ result back into the per-filter lists that
+// parseRepoWorkItems expects. The filter kinds are disjoint, so kind alone
+// decides the bucket.
+export function partitionRepoWorkItemEvents(
+  events: NostrEvent[],
+): RepoWorkItemEvents {
+  const partitioned: RepoWorkItemEvents = {
+    issueEvents: [],
+    pullRequestEvents: [],
+    updateEvents: [],
+    commentEvents: [],
+    statusEvents: [],
+  };
+  for (const event of events) {
+    switch (event.kind) {
+      case REPO_WORK_ITEM_KINDS.ISSUE:
+        partitioned.issueEvents.push(event);
+        break;
+      case REPO_WORK_ITEM_KINDS.PULL_REQUEST:
+        partitioned.pullRequestEvents.push(event);
+        break;
+      case REPO_WORK_ITEM_KINDS.PULL_REQUEST_UPDATE:
+        partitioned.updateEvents.push(event);
+        break;
+      case REPO_WORK_ITEM_KINDS.TEXT_NOTE:
+        partitioned.commentEvents.push(event);
+        break;
+      case REPO_WORK_ITEM_KINDS.STATUS_OPEN:
+      case REPO_WORK_ITEM_KINDS.STATUS_MERGED:
+      case REPO_WORK_ITEM_KINDS.STATUS_CLOSED:
+      case REPO_WORK_ITEM_KINDS.STATUS_DRAFT:
+        partitioned.statusEvents.push(event);
+        break;
+      default:
+        break;
+    }
+  }
+  return partitioned;
+}
+
+function isNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
-export function getTag(event, name) {
+export function getTag(event: NostrEvent, name: string): string | undefined {
   const value = event.tags.find((tag) => tag[0] === name)?.[1];
   return isNonEmptyString(value) ? value : undefined;
 }
 
-function getAllTags(event, name) {
+function getAllTags(event: NostrEvent, name: string): string[] {
   return event.tags
     .filter((tag) => tag[0] === name && isNonEmptyString(tag[1]))
-    .map((tag) => tag[1]);
+    .map((tag) => tag[1] as string);
 }
 
-function repoOwnerFromAddress(repoAddress) {
+function repoOwnerFromAddress(repoAddress: string | undefined): string | null {
   const owner = (repoAddress ?? "").split(":")[1] ?? "";
   return /^[a-fA-F0-9]{64}$/.test(owner) ? owner.toLowerCase() : null;
 }
 
 // Match the desktop trust rule: lifecycle events and PR updates only count
 // when the root author or repository owner signed them.
-function allowedActorsForRoot(rootEvent) {
+function allowedActorsForRoot(rootEvent: NostrEvent): Set<string> {
   const allowed = new Set([rootEvent.pubkey.toLowerCase()]);
   const owner = repoOwnerFromAddress(getTag(rootEvent, "a"));
   if (owner) allowed.add(owner);
   return allowed;
 }
 
-function latestStatusForRoot(root, statusEvents, allowUppercaseReference) {
+function latestStatusForRoot(
+  root: NostrEvent,
+  statusEvents: NostrEvent[],
+  allowUppercaseReference: boolean,
+): NostrEvent | undefined {
   const allowedActors = allowedActorsForRoot(root);
   return statusEvents
     .filter(
@@ -97,7 +217,7 @@ function latestStatusForRoot(root, statusEvents, allowUppercaseReference) {
     .sort((left, right) => right.created_at - left.created_at)[0];
 }
 
-function eventsForRoot(rootId, events) {
+function eventsForRoot(rootId: string, events: NostrEvent[]): NostrEvent[] {
   return events
     .filter((event) =>
       event.tags.some(
@@ -107,7 +227,10 @@ function eventsForRoot(rootId, events) {
     .sort((left, right) => left.created_at - right.created_at);
 }
 
-function commentsForRoot(rootId, commentEvents) {
+function commentsForRoot(
+  rootId: string,
+  commentEvents: NostrEvent[],
+): RepoWorkItemComment[] {
   return eventsForRoot(rootId, commentEvents).map((event) => ({
     id: event.id,
     content: event.content,
@@ -116,7 +239,10 @@ function commentsForRoot(rootId, commentEvents) {
   }));
 }
 
-function issueStatus(issue, statusEvent) {
+function issueStatus(
+  issue: NostrEvent,
+  statusEvent: NostrEvent | undefined,
+): ProjectIssueStatus {
   if (statusEvent?.kind === REPO_WORK_ITEM_KINDS.STATUS_MERGED) {
     return PROJECT_ISSUE_STATUS.DONE;
   }
@@ -138,7 +264,11 @@ function issueStatus(issue, statusEvent) {
   return PROJECT_ISSUE_STATUS.BACKLOG;
 }
 
-function eventToIssue(issue, statusEvents, commentEvents) {
+function eventToIssue(
+  issue: NostrEvent,
+  statusEvents: NostrEvent[],
+  commentEvents: NostrEvent[],
+): ProjectIssue {
   const latestStatus = latestStatusForRoot(issue, statusEvents, false);
   const comments = commentsForRoot(issue.id, commentEvents);
   return {
@@ -162,7 +292,10 @@ function eventToIssue(issue, statusEvents, commentEvents) {
   };
 }
 
-function trustedUpdatesForPullRequest(pullRequest, updateEvents) {
+function trustedUpdatesForPullRequest(
+  pullRequest: NostrEvent,
+  updateEvents: NostrEvent[],
+): NostrEvent[] {
   const allowedActors = allowedActorsForRoot(pullRequest);
   return updateEvents.filter(
     (event) =>
@@ -171,7 +304,10 @@ function trustedUpdatesForPullRequest(pullRequest, updateEvents) {
   );
 }
 
-function pullRequestStatus(pullRequest, statusEvent) {
+function pullRequestStatus(
+  pullRequest: NostrEvent,
+  statusEvent: NostrEvent | undefined,
+): ProjectPullRequestStatus {
   if (statusEvent?.kind === REPO_WORK_ITEM_KINDS.STATUS_OPEN) return "Open";
   if (statusEvent?.kind === REPO_WORK_ITEM_KINDS.STATUS_MERGED) return "Merged";
   if (statusEvent?.kind === REPO_WORK_ITEM_KINDS.STATUS_CLOSED) return "Closed";
@@ -183,11 +319,11 @@ function pullRequestStatus(pullRequest, statusEvent) {
 }
 
 function eventToPullRequest(
-  pullRequest,
-  updateEvents,
-  commentEvents,
-  statusEvents,
-) {
+  pullRequest: NostrEvent,
+  updateEvents: NostrEvent[],
+  commentEvents: NostrEvent[],
+  statusEvents: NostrEvent[],
+): ProjectPullRequest {
   const trustedUpdates = trustedUpdatesForPullRequest(
     pullRequest,
     updateEvents,
@@ -196,15 +332,16 @@ function eventToPullRequest(
     (left, right) => right.created_at - left.created_at,
   )[0];
   const latestStatus = latestStatusForRoot(pullRequest, statusEvents, true);
-  const updates = eventsForRoot(pullRequest.id, trustedUpdates).map(
-    (event) => ({
-      id: event.id,
-      content: event.content,
-      author: event.pubkey,
-      createdAt: event.created_at,
-      commit: getTag(event, "c") ?? null,
-    }),
-  );
+  const updates: ProjectPullRequestUpdate[] = eventsForRoot(
+    pullRequest.id,
+    trustedUpdates,
+  ).map((event) => ({
+    id: event.id,
+    content: event.content,
+    author: event.pubkey,
+    createdAt: event.created_at,
+    commit: getTag(event, "c") ?? null,
+  }));
   const comments = commentsForRoot(pullRequest.id, commentEvents);
 
   return {
@@ -240,7 +377,8 @@ export function parseRepoWorkItems({
   updateEvents = [],
   commentEvents = [],
   statusEvents = [],
-}) {
+}: Pick<RepoWorkItemEvents, "issueEvents" | "pullRequestEvents"> &
+  Partial<RepoWorkItemEvents>): RepoWorkItems {
   return {
     issues: issueEvents
       .map((issue) => eventToIssue(issue, statusEvents, commentEvents))

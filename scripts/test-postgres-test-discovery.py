@@ -51,8 +51,18 @@ class DiscoveryTests(unittest.TestCase):
             env = dict(os.environ, PATH=directory, NATIVE_TRACE=str(trace))
             subprocess.run(['/bin/bash', str(helper)], env=env, check=True)
             calls = trace.read_text().splitlines()
-            self.assertEqual(sum(c.startswith('-m unittest discover ') for c in calls), 11)
-            self.assertIn('-m unittest discover deploy/native-ci/apple-release/tests -p test_*.py', calls)
+            excluded = {'scripts/mempool-genesis/activation/tests', 'scripts/mempool-genesis/tests',
+                        'scripts/roster-migration/tests'}
+            on_disk = {str(f.parent.relative_to(inventory.ROOT))
+                       for top in ('deploy/native-ci', 'scripts')
+                       for f in (inventory.ROOT / top).rglob('test_*.py')
+                       if 'node_modules' not in f.parts} - excluded
+            ran = {c.removeprefix('-m unittest discover ').removesuffix(' -p test_*.py')
+                   for c in calls if c.startswith('-m unittest discover ')}
+            self.assertEqual(ran, on_disk)
+            self.assertGreaterEqual(len(ran), 14)
+            for suite in ('apple-release', 'admission', 'linux-runner', 'macos'):
+                self.assertIn(f'-m unittest discover deploy/native-ci/{suite}/tests -p test_*.py', calls)
             self.assertIn('scripts/test-protected-ci-receipt.py', calls)
             self.assertIn('scripts/test-ci-promotion-readiness.py', calls)
             trace.write_text('')

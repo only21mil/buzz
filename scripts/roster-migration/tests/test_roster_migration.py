@@ -33,7 +33,6 @@ from migration import (
     parse_channel_members,
     preflight_external_dependencies,
     preflight_install_roots,
-    preflight_public_host,
     preflight_restore_memberships,
     preflight_unit_states,
     require_member_role,
@@ -1039,7 +1038,6 @@ class RosterMigrationTests(unittest.TestCase):
         with self.assertRaisesRegex(MigrationError, "required"):
             apply(self.root, Path(self.temp.name) / "missing-binding", execute_external=False)
         original = self.activation_manifest.read_bytes()
-        activation = json.loads(original)
         mutations = (
             lambda value: value.__setitem__("source_tree", "0" * 40),
             lambda value: value["ops_targets"][0].__setitem__("target", "/wrong"),

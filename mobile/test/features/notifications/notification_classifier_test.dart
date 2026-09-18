@@ -175,14 +175,6 @@ void main() {
     expect(trimNotificationBody('  hello\n\tthere  '), 'hello there');
   });
 
-  test('notificationIdForEvent is deterministic and Android-safe', () {
-    final first = notificationIdForEvent('event-1');
-
-    expect(notificationIdForEvent('event-1'), first);
-    expect(first, inInclusiveRange(1, 0x7fffffff));
-    expect(notificationIdForEvent('event-2'), isNot(first));
-  });
-
   group('notificationCategoryEnabled', () {
     test('master setting disables both categories', () {
       expect(

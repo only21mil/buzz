@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseRepoWorkItems, repoWorkItemFilters } from "./repo-work-items.mjs";
+import {
+  parseRepoWorkItems,
+  partitionRepoWorkItemEvents,
+  repoWorkItemFilters,
+} from "./repo-work-items.ts";
 
 const owner = "ab".repeat(32);
 const issueAuthor = "cd".repeat(32);
@@ -36,6 +40,51 @@ test("builds the desktop-compatible repository a-tag query set", () => {
       limit: 500,
     },
   });
+});
+
+test("partitions one multi-filter result by kind and drops strangers", () => {
+  const events = [
+    event({
+      id: "01".repeat(32),
+      kind: 1621,
+      pubkey: issueAuthor,
+      createdAt: 1,
+    }),
+    event({
+      id: "02".repeat(32),
+      kind: 1618,
+      pubkey: issueAuthor,
+      createdAt: 2,
+    }),
+    event({
+      id: "03".repeat(32),
+      kind: 1619,
+      pubkey: issueAuthor,
+      createdAt: 3,
+    }),
+    event({ id: "04".repeat(32), kind: 1, pubkey: issueAuthor, createdAt: 4 }),
+    event({ id: "05".repeat(32), kind: 1630, pubkey: owner, createdAt: 5 }),
+    event({ id: "06".repeat(32), kind: 1633, pubkey: owner, createdAt: 6 }),
+    event({ id: "07".repeat(32), kind: 30617, pubkey: owner, createdAt: 7 }),
+  ];
+
+  const partitioned = partitionRepoWorkItemEvents(events);
+
+  assert.deepEqual(
+    Object.fromEntries(
+      Object.entries(partitioned).map(([bucket, bucketEvents]) => [
+        bucket,
+        bucketEvents.map((bucketEvent) => bucketEvent.kind),
+      ]),
+    ),
+    {
+      issueEvents: [1621],
+      pullRequestEvents: [1618],
+      updateEvents: [1619],
+      commentEvents: [1],
+      statusEvents: [1630, 1633],
+    },
+  );
 });
 
 test("parses current issue and pull-request state using trusted updates", () => {

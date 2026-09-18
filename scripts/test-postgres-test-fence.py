@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Real kernel checks against controlled sentinels, never an existing database."""
 import json
-import os
 from pathlib import Path
 import socket
 import subprocess

@@ -115,9 +115,12 @@ extension _ChannelsNotifierLiveSubscriptions on ChannelsNotifier {
                 !_desiredLiveChannelIds.contains(event.channelId)) {
               return;
             }
+            // Local notifications are Android-only; skip the classifier and
+            // dedupe work on every other platform.
             _handleLiveEvent(
               event,
               canNotify:
+                  defaultTargetPlatform == TargetPlatform.android &&
                   subscription.notificationReady &&
                   _lifecycleRef.read(relaySessionProvider).status ==
                       SessionStatus.connected,

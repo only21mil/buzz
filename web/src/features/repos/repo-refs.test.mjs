@@ -6,7 +6,7 @@ import {
   refsFilter,
   REPO_STATE_KIND,
   selectTrustedRefsEvents,
-} from "./repo-refs.mjs";
+} from "./repo-refs.ts";
 
 const RELAY = "a".repeat(64);
 const SPOOFER = "b".repeat(64);

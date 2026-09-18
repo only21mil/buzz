@@ -113,7 +113,7 @@ grep -Fq 'https://github.com/only21mil/buzz/' CHANGELOG.md
 # Rebuild only commit provenance around the exact valid candidate tree. Each
 # refusal must reach the identity check, not fail earlier on release content.
 candidate=$(git rev-parse HEAD)
-tree=$(git rev-parse HEAD^{tree})
+tree=$(git rev-parse 'HEAD^{tree}')
 assert_provenance_refused() {
   local author_name="$1" author_email="$2" message="$3" expected="$4" rejected
   rejected=$(GIT_AUTHOR_NAME="$author_name" GIT_AUTHOR_EMAIL="$author_email" \

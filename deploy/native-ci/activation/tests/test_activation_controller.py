@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from collections.abc import Callable
 import base64
 import errno
 import importlib.util
@@ -1738,7 +1739,7 @@ class ActivationControllerTests(unittest.TestCase):
         manifest, payloads, driver = self.fixture.load()
         self.assertEqual(
             self.fixture.binding["scenario_sha256"],
-            "b71fa0055f981301b608bb730940d29f1b3474e20302d76975f0d21fa872eb05",
+            "95f66e85063272df0722157954228fd45528e27b01cd42dabddfc34ef9c67ef6",
         )
         staged = CONTROLLER.stage(manifest, payloads, self.fixture.root, driver, self.fixture.binding)
         self.assertEqual(staged["staged_zero"]["units"][activation_package.PERSISTENT_UNIT]["ActiveState"], "inactive")

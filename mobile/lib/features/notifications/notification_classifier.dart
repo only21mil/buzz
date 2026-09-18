@@ -1,5 +1,3 @@
-import 'dart:convert';
-
 import '../../shared/deeplink/deep_link.dart';
 import '../../shared/relay/nostr_models.dart';
 import '../../shared/identity/npub.dart';
@@ -58,7 +56,6 @@ NotificationEvent? classifyNotificationEvent({
 
   return NotificationEvent(
     eventId: event.id,
-    id: notificationIdForEvent(event.id),
     category: isPriority
         ? NotificationCategory.priority
         : NotificationCategory.activity,
@@ -79,16 +76,6 @@ String trimNotificationBody(String content) {
   return String.fromCharCodes(
     runes.take(notificationBodyMaxCharacters),
   ).trimRight();
-}
-
-int notificationIdForEvent(String eventId) {
-  var hash = 0x811c9dc5;
-  for (final byte in utf8.encode(eventId)) {
-    hash ^= byte;
-    hash = (hash * 0x01000193) & 0xffffffff;
-  }
-  final id = hash & 0x7fffffff;
-  return id == 0 ? 1 : id;
 }
 
 bool _mentionsPubkey(List<List<String>> tags, String pubkey) {

@@ -6,7 +6,6 @@ enum NotificationCategory { priority, activity }
 class NotificationEvent {
   const NotificationEvent({
     required this.eventId,
-    required this.id,
     required this.category,
     required this.title,
     required this.body,
@@ -14,7 +13,6 @@ class NotificationEvent {
   });
 
   final String eventId;
-  final int id;
   final NotificationCategory category;
   final String title;
   final String body;

@@ -60,6 +60,19 @@ void main() {
       expect(container.read(exportAuthorizationProvider), isEmpty);
     });
 
+    test('the grant TTL starts after the OS prompt returns', () async {
+      final notifier = container.read(exportAuthorizationProvider.notifier);
+      deviceAuth.onAuthenticate = () async =>
+          clock.advance(const Duration(seconds: 45));
+
+      final grant = await notifier.authorizeExport(request: request());
+
+      expect(grant.grantedAt, DateTime.utc(2026, 9, 13, 12, 0, 45));
+      expect(grant.expiresAt, grant.grantedAt.add(exportGrantTtl));
+      clock.advance(exportGrantTtl - const Duration(seconds: 1));
+      expect(grant.isExpiredAt(clock.read()), isFalse);
+    });
+
     test('replay of a consumed grant is denied', () async {
       final notifier = container.read(exportAuthorizationProvider.notifier);
       final grant = await notifier.authorizeExport(request: request());

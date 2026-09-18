@@ -71,11 +71,23 @@ class NotificationSettingsNotifier extends Notifier<NotificationSettingsState> {
     final scopeGeneration = ++_scopeGeneration;
     final config = ref.watch(relayConfigProvider);
     final pubkey = ref.watch(myPubkeyProvider) ?? 'anon';
-    ref.watch(relaySessionProvider.select((state) => state.status));
     if (defaultTargetPlatform == TargetPlatform.android) {
       ref.listen(appLifecycleProvider, (previous, next) {
         if (previous != AppLifecycleState.resumed &&
             next == AppLifecycleState.resumed) {
+          final generation = ++_refreshGeneration;
+          Future.microtask(() => _refreshStatus(generation, scopeGeneration));
+        }
+      });
+      // A reconnect is when a burst of live events arrives, so re-read the
+      // native status then instead of rebuilding (which would reset
+      // `permission` to notDetermined until the round trip returns).
+      ref.listen(relaySessionProvider.select((state) => state.status), (
+        previous,
+        next,
+      ) {
+        if (previous != SessionStatus.connected &&
+            next == SessionStatus.connected) {
           final generation = ++_refreshGeneration;
           Future.microtask(() => _refreshStatus(generation, scopeGeneration));
         }
@@ -122,8 +134,8 @@ class NotificationSettingsNotifier extends Notifier<NotificationSettingsState> {
   Future<void> setAlertsEnabled(bool enabled) async {
     if (!enabled) {
       _alertsMutationGeneration++;
-      _persist(alerts: false);
       state = state.copyWith(alertsEnabled: false, isRequesting: false);
+      await _persist(alerts: false);
       return;
     }
     if (defaultTargetPlatform != TargetPlatform.android) return;
@@ -147,7 +159,10 @@ class NotificationSettingsNotifier extends Notifier<NotificationSettingsState> {
         if (!_canApplyPermissionResult(scopeGeneration, mutationGeneration)) {
           return;
         }
-        _persist(alerts: true);
+        await _persist(alerts: true);
+        if (!_canApplyPermissionResult(scopeGeneration, mutationGeneration)) {
+          return;
+        }
       }
       state = state.copyWith(
         alertsEnabled:
@@ -168,19 +183,19 @@ class NotificationSettingsNotifier extends Notifier<NotificationSettingsState> {
     }
   }
 
-  void setPriorityEnabled(bool enabled) {
-    _persist(priority: enabled);
+  Future<void> setPriorityEnabled(bool enabled) {
     state = state.copyWith(priorityEnabled: enabled);
+    return _persist(priority: enabled);
   }
 
-  void setActivityEnabled(bool enabled) {
-    _persist(activity: enabled);
+  Future<void> setActivityEnabled(bool enabled) {
     state = state.copyWith(activityEnabled: enabled);
+    return _persist(activity: enabled);
   }
 
-  void setPreviewsEnabled(bool enabled) {
-    _persist(previews: enabled);
+  Future<void> setPreviewsEnabled(bool enabled) {
     state = state.copyWith(previewsEnabled: enabled);
+    return _persist(previews: enabled);
   }
 
   Future<void> refreshStatus() =>
@@ -219,17 +234,34 @@ class NotificationSettingsNotifier extends Notifier<NotificationSettingsState> {
       scopeGeneration == _scopeGeneration &&
       mutationGeneration == _alertsMutationGeneration;
 
-  void _persist({
+  /// Writes the given preferences and logs any that did not reach disk.
+  ///
+  /// In-memory state is already updated by the caller; a failed write leaves
+  /// it ahead of storage, which the log line makes visible instead of silent.
+  Future<void> _persist({
     bool? alerts,
     bool? priority,
     bool? activity,
     bool? previews,
-  }) {
+  }) async {
     final prefs = ref.read(savedPrefsProvider);
-    if (alerts != null) prefs.setBool('$_prefsKey:alerts', alerts);
-    if (priority != null) prefs.setBool('$_prefsKey:priority', priority);
-    if (activity != null) prefs.setBool('$_prefsKey:activity', activity);
-    if (previews != null) prefs.setBool('$_prefsKey:previews', previews);
+    final prefsKey = _prefsKey;
+    final writes = <String, bool>{
+      'alerts': ?alerts,
+      'priority': ?priority,
+      'activity': ?activity,
+      'previews': ?previews,
+    };
+    for (final entry in writes.entries) {
+      final key = '$prefsKey:${entry.key}';
+      try {
+        if (!await prefs.setBool(key, entry.value)) {
+          debugPrint('[NotificationSettings] $key was not persisted');
+        }
+      } catch (error) {
+        debugPrint('[NotificationSettings] persisting $key failed: $error');
+      }
+    }
   }
 
   bool? _readPreference(

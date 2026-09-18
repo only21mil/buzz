@@ -1,4 +1,4 @@
-import { cloneFetchErrorMessage } from "../git-clone-browse-meta.mjs";
+import { cloneFetchErrorMessage } from "../git-clone-browse-meta";
 
 export function StaleCloneBanner({ fetchError }: { fetchError: unknown }) {
   const detail = cloneFetchErrorMessage(fetchError);

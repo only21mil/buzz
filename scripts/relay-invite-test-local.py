@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Run fixed Relay E2E invite or HTML tenant cases with owned fenced services."""
 import argparse
-import json
 import os
 from pathlib import Path
 import runpy

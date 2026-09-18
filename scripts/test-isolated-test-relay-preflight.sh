@@ -12,8 +12,31 @@ cp "$repo_root/scripts/start-isolated-test-relay.sh" \
   "$repo_root/scripts/require-relay-key.sh" "$fixture/scripts/"
 
 # A closed PATH prevents the fixture from invoking any host service tools.
-ln -s "$(command -v bash)" "$mock_bin/bash"
-ln -s "$(command -v dirname)" "$mock_bin/dirname"
+# Only the real interpreter and dirname may enter it. A wrapper script that
+# re-invokes its tool by name would resolve to itself under this PATH and fork
+# a chain of identical processes until the pid limit (seen 2026-09-17).
+link_real_tool() {
+  local name=$1 resolved
+  resolved=$(readlink -f "$(command -v "$name")") || resolved=
+  if [[ -z "$resolved" || ! -f "$resolved" ]]; then
+    printf 'refusing to build the closed PATH: %s is not a regular file\n' "$name" >&2
+    exit 1
+  fi
+  case "$resolved" in
+    "$test_root"/*)
+      printf 'refusing to build the closed PATH: %s resolves inside the fixture\n' "$name" >&2
+      exit 1
+      ;;
+  esac
+  if [[ "$(head -c 2 "$resolved")" == '#!' ]]; then
+    printf 'refusing to build the closed PATH: %s is a script wrapper, not a binary: %s\n' \
+      "$name" "$resolved" >&2
+    exit 1
+  fi
+  ln -s "$resolved" "$mock_bin/$name"
+}
+link_real_tool bash
+link_real_tool dirname
 cat > "$mock_bin/lsof" <<'SH'
 #!/usr/bin/env bash
 printf 'lsof %s\n' "$*" >> "$ACTION_LOG"
@@ -30,7 +53,9 @@ chmod +x "$mock_bin/lsof" "$mock_bin/docker"
 run_launcher() {
   : > "$test_root/actions"
   status=0
-  env -i PATH="$mock_bin" ACTION_LOG="$test_root/actions" \
+  # timeout bounds the whole process group, so a runaway fixture cannot
+  # outlive this test.
+  timeout 30 env -i PATH="$mock_bin" ACTION_LOG="$test_root/actions" \
     LSOF_STATUS="$lsof_status" "$@" \
     bash "$fixture/scripts/start-isolated-test-relay.sh" \
     > "$test_root/output" 2>&1 || status=$?
@@ -82,7 +107,7 @@ echo 'Missing and empty identity: refused before service preflight'
 
 # The child shell expands the helper path and supplied identity.
 # shellcheck disable=SC2016
-env -i PATH="$mock_bin" BUZZ_RELAY_PRIVATE_KEY=fixture-presence-value \
+timeout 30 env -i PATH="$mock_bin" BUZZ_RELAY_PRIVATE_KEY=fixture-presence-value \
   bash -c 'source "$1"; [[ "$BUZZ_RELAY_PRIVATE_KEY" == fixture-presence-value ]]' \
   bash "$fixture/scripts/require-relay-key.sh" > "$test_root/helper-output" 2>&1
 [[ ! -s "$test_root/helper-output" ]]
