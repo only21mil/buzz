@@ -2541,43 +2541,127 @@ fn live_socket_identity(path: &Path) -> Result<SocketIdentity, ControlError> {
     })
 }
 
+/// Journal line for a host command that could not be spawned, timed out, or
+/// exited non-zero. `ControlError::HostAction` stays a plain unit variant so
+/// the closed protocol error set is unchanged; the errno, error kind and exit
+/// status an operator needs live in this stderr note instead.
+fn host_command_failure(
+    program: &Path,
+    arguments: &[&str],
+    stage: &'static str,
+    error: Option<&std::io::Error>,
+    status: Option<std::process::ExitStatus>,
+) -> ControlError {
+    let line = serde_json::json!({
+        "schema_version": "buzz-ci-acceptance-control-note/v1",
+        "event": "host_command_failed",
+        "program": program.display().to_string(),
+        "arguments": arguments,
+        "stage": stage,
+        "errno": error.and_then(std::io::Error::raw_os_error),
+        "error_kind": error.map(|error| format!("{:?}", error.kind())),
+        "exit_code": status.and_then(|status| status.code()),
+        "status": status.map(|status| status.to_string()),
+    });
+    eprintln!("{line}");
+    ControlError::HostAction
+}
+
+/// Spawn errors that a short retry resolves: `EAGAIN` from a saturated pid
+/// cgroup and `ETXTBSY` from an executable another process still holds open
+/// for writing across its own fork/exec window.
+fn spawn_error_is_transient(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ExecutableFileBusy
+    )
+}
+
+fn spawn_bounded_command(
+    program: &Path,
+    args: &[&str],
+) -> Result<std::process::Child, ControlError> {
+    const SPAWN_ATTEMPTS: u32 = 5;
+    const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(20);
+    let mut attempt = 1;
+    loop {
+        match Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => return Ok(child),
+            Err(error) if attempt < SPAWN_ATTEMPTS && spawn_error_is_transient(&error) => {
+                attempt += 1;
+                thread::sleep(SPAWN_RETRY_DELAY);
+            }
+            Err(error) => {
+                return Err(host_command_failure(
+                    program,
+                    args,
+                    "spawn",
+                    Some(&error),
+                    None,
+                ))
+            }
+        }
+    }
+}
+
 fn run_bounded_command(
     program: &Path,
     args: &[&str],
     timeout: Duration,
 ) -> Result<HostCommandOutput, ControlError> {
     const MAX_OUTPUT: usize = 64 * 1024;
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| ControlError::HostAction)?;
-    let stdout = child.stdout.take().ok_or(ControlError::HostAction)?;
-    let stderr = child.stderr.take().ok_or(ControlError::HostAction)?;
+    let mut child = spawn_bounded_command(program, args)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| host_command_failure(program, args, "stdout_pipe", None, None))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| host_command_failure(program, args, "stderr_pipe", None, None))?;
     let stdout_reader = thread::spawn(move || read_process_output(stdout, MAX_OUTPUT));
     let stderr_reader = thread::spawn(move || read_process_output(stderr, MAX_OUTPUT));
     let deadline = Instant::now() + timeout;
     let status = loop {
-        match child.try_wait().map_err(|_| ControlError::HostAction)? {
-            Some(value) => break value,
-            None if Instant::now() >= deadline => {
+        match child.try_wait() {
+            Ok(Some(value)) => break value,
+            Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(ControlError::HostAction);
+                return Err(host_command_failure(program, args, "timeout", None, None));
             }
-            None => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                return Err(host_command_failure(
+                    program,
+                    args,
+                    "wait",
+                    Some(&error),
+                    None,
+                ));
+            }
         }
     };
     let stdout = stdout_reader
         .join()
-        .map_err(|_| ControlError::HostAction)??;
+        .map_err(|_| host_command_failure(program, args, "stdout_read", None, Some(status)))??;
     let stderr = stderr_reader
         .join()
-        .map_err(|_| ControlError::HostAction)??;
+        .map_err(|_| host_command_failure(program, args, "stderr_read", None, Some(status)))??;
     if !status.success() {
-        return Err(ControlError::HostAction);
+        return Err(host_command_failure(
+            program,
+            args,
+            "exit",
+            None,
+            Some(status),
+        ));
     }
     Ok(HostCommandOutput { stdout, stderr })
 }
@@ -5105,6 +5189,41 @@ exit 1
         fs::write(&program, script).unwrap();
         fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
         Systemctl { program }
+    }
+
+    #[test]
+    fn bounded_command_retries_a_transiently_busy_executable_and_reports_failures() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("busy");
+        fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        // Hold the script open for writing across the first spawn attempts,
+        // which is the ETXTBSY race the fixture-backed tests hit under load.
+        let writer = OpenOptions::new().append(true).open(&program).unwrap();
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            drop(writer);
+        });
+        let output = run_bounded_command(&program, &[], Duration::from_secs(5)).unwrap();
+        release.join().unwrap();
+        assert!(output.stdout.is_empty());
+
+        let missing = directory.path().join("missing");
+        assert_eq!(
+            run_bounded_command(&missing, &[], Duration::from_secs(5))
+                .err()
+                .expect("missing program fails"),
+            ControlError::HostAction
+        );
+        let failing = directory.path().join("failing");
+        fs::write(&failing, "#!/bin/sh\nexit 3\n").unwrap();
+        fs::set_permissions(&failing, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            run_bounded_command(&failing, &[], Duration::from_secs(5))
+                .err()
+                .expect("non-zero exit fails"),
+            ControlError::HostAction
+        );
     }
 
     /// H6 clean host: every zero path aborted after the first service stop
