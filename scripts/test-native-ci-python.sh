@@ -5,6 +5,12 @@
 # excluded by name because they bind framework-desktop paths; each exclusion
 # must still exist so the list cannot go stale.
 set -euo pipefail
+# Discovery below uses associative arrays and globstar, which need bash 4+.
+# macOS ships bash 3.2, where `declare -A` fails with an unhelpful error.
+((BASH_VERSINFO[0] >= 4)) || {
+  printf 'bash 4 or newer is required, found %s\n' "$BASH_VERSION" >&2
+  exit 1
+}
 test "$(check-jsonschema --version)" = "check-jsonschema, version 0.38.0"
 
 excluded_suites=(
