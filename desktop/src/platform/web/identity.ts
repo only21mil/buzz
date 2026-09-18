@@ -293,6 +293,8 @@ export class BrowserIdentityManager {
   }
 }
 
+const BACKUP_URL_REVOKE_DELAY_MS = 60_000;
+
 export function registerIdentityCommands(
   manager: BrowserIdentityManager,
   reload: () => void = () => window.location.reload(),
@@ -371,7 +373,11 @@ export function registerIdentityCommands(
     anchor.href = url;
     anchor.download = `buzz-identity-${manager.pubkey().slice(0, 8)}.ncryptsec`;
     anchor.click();
-    queueMicrotask(() => URL.revokeObjectURL(url));
+    // Chromium starts the download inside click(); Firefox and Safari fetch
+    // the blob afterwards and abort if the URL is already revoked. Revoke
+    // once the browser has had time to start the download, not in a
+    // microtask.
+    setTimeout(() => URL.revokeObjectURL(url), BACKUP_URL_REVOKE_DELAY_MS);
     return anchor.download;
   });
 }
