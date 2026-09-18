@@ -10,8 +10,8 @@ const EVENT_PHRASES = {
   reaction_added: "Reaction added",
 } as const;
 
-export const TRIGGER_MESSAGE_LOADING_LABEL = "loading message";
-export const TRIGGER_AUTHOR_LOADING_LABEL = "loading author";
+const TRIGGER_MESSAGE_LOADING_LABEL = "loading message";
+const TRIGGER_AUTHOR_LOADING_LABEL = "loading author";
 
 function authorReference(
   condition: ParsedConditionExpression,
@@ -66,7 +66,7 @@ function textConditionDescription(
   }
 }
 
-export type WorkflowAuthorDescriptionSegments = {
+type WorkflowAuthorDescriptionSegments = {
   prefix: string;
   suffix: string;
 };

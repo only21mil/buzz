@@ -9,7 +9,7 @@ type ThreadReplyAncestor = {
   message: TimelineMessage;
 };
 
-export type MessageThreadPanelRenderItem = {
+type MessageThreadPanelRenderItem = {
   collapseDepthGuideAncestors: readonly TimelineMessage[];
   connectsToVisibleChild: boolean;
   continuationDepths: readonly number[];

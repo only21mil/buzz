@@ -37,7 +37,7 @@ export type BindPastedMentionIdentities = (input: {
   view: PastedMentionOccurrenceView;
 }) => void;
 
-export type MentionPasteBinding = {
+type MentionPasteBinding = {
   bindPastedMentionIdentities: BindPastedMentionIdentities;
   /**
    * Record explicit user intent for a label, retiring any pending paste that
@@ -59,7 +59,7 @@ export type MentionPasteBinding = {
  * expiry the send proceeds with what the composer truthfully shows: the chip
  * never lit, so plain text sends as plain text.
  */
-export const PENDING_MENTION_BINDING_TIMEOUT_MS = 10_000;
+const PENDING_MENTION_BINDING_TIMEOUT_MS = 10_000;
 
 /** Same bound as the mention maps this feeds. */
 const MAX_TRACKED_INTENTS = 200;

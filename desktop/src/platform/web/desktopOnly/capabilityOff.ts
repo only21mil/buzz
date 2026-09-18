@@ -44,10 +44,6 @@ export function registerOffMutation(command: string, hint?: string): void {
   });
 }
 
-export function getCapabilityOffCommands(): readonly string[] {
-  return [...offCommands].sort();
-}
-
 export function resetCapabilityOffForTests(): void {
   offCommands.clear();
 }

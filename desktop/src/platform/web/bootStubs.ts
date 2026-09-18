@@ -30,7 +30,7 @@ import { registerWebMediaTransferCommands } from "./webMediaTransfer";
 import { registerWebSocketCommands } from "./websocket";
 import { BrowserWorkspace, registerWorkspaceCommands } from "./workspace";
 
-export const INACTIVE_HUDDLE_STATE = {
+const INACTIVE_HUDDLE_STATE = {
   phase: "idle",
   parent_channel_id: null,
   ephemeral_channel_id: null,
@@ -44,7 +44,7 @@ export const INACTIVE_HUDDLE_STATE = {
   voice_input_mode: "push_to_talk",
 } as const;
 
-export function registerBootStubs(): void {
+function registerBootStubs(): void {
   register("get_os_idle_seconds", () => null);
   register("get_huddle_state", () => INACTIVE_HUDDLE_STATE);
   register("get_audio_output_device", () => ""); // "" = system default

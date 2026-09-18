@@ -12,7 +12,7 @@ type SocialFilter = {
   limit?: number;
 } & Partial<Record<`#${string}`, string[]>>;
 
-export type RelaySocialClient = {
+type RelaySocialClient = {
   fetchEvents(filter: SocialFilter): Promise<RelayEvent[]>;
   publishEvent(
     event: RelayEvent,

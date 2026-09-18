@@ -23,7 +23,7 @@ import { KIND_TEAM_CATALOG } from "@/shared/constants/kinds";
  * personas as well as teams, so it invalidates both stores.
  */
 
-export function teamCatalogQueryKey(communityId: string | null) {
+function teamCatalogQueryKey(communityId: string | null) {
   return ["team-catalog", communityId] as const;
 }
 

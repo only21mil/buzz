@@ -27,7 +27,7 @@ import type { AgentTeam } from "@/shared/api/types";
  */
 export type CatalogTeamShareLevel = "not-shared" | "none";
 
-export type CatalogTeamMember = {
+type CatalogTeamMember = {
   memberKey: string;
   displayName: string;
   systemPrompt: string;
@@ -77,7 +77,7 @@ export async function fetchTeamCatalogPublications(): Promise<
  * that coordinate is what stops the catalog from offering "Add" for an entry
  * the user already added, which would mint a second copy.
  */
-export function findLocalTeamForCatalogEntry(
+function findLocalTeamForCatalogEntry(
   localTeams: readonly AgentTeam[],
   publication: TeamCatalogPublication,
   isOwn: boolean,

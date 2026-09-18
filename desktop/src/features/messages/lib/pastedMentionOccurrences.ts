@@ -27,12 +27,12 @@ import {
  * while any edit to the token itself revokes the identity it carried. The
  * plugin stays granularity-agnostic: it tracks whatever range it is handed.
  */
-export const pastedMentionOccurrencesKey = new PluginKey<PastedMentionRanges>(
+const pastedMentionOccurrencesKey = new PluginKey<PastedMentionRanges>(
   "pastedMentionOccurrences",
 );
 
 /** A half-open document range, in the coordinates the editor state uses. */
-export type PastedMentionRange = { from: number; to: number };
+type PastedMentionRange = { from: number; to: number };
 
 type PastedMentionRanges = ReadonlyMap<number, PastedMentionRange>;
 

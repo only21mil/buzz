@@ -703,11 +703,7 @@ function CatalogListSkeleton() {
  * hides spoiler bodies, link destinations, and image sources, so the reviewed
  * text would differ from the system prompt sent to the agent.
  */
-export function AgentInstructionReview({
-  instructions,
-}: {
-  instructions: string;
-}) {
+function AgentInstructionReview({ instructions }: { instructions: string }) {
   return (
     <pre
       className="mt-3 w-full min-w-0 max-w-full whitespace-pre-wrap break-words font-sans text-sm leading-6 text-muted-foreground"

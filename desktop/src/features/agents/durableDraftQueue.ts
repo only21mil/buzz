@@ -10,8 +10,8 @@ import {
   type AgentManagementRequest,
 } from "./agentManagement";
 
-export const DRAFT_REQUEST_KIND = 14201;
-export const DRAFT_DECISION_KIND = 14202;
+const DRAFT_REQUEST_KIND = 14201;
+const DRAFT_DECISION_KIND = 14202;
 const PAGE_SIZE = 200;
 export type DurableDraftItem = {
   event: RelayEvent;
@@ -20,7 +20,7 @@ export type DurableDraftItem = {
   decision: "applying" | "applied" | "rejected" | null;
   operation: DraftOperation | null;
 };
-export type DurableDraftSnapshot = {
+type DurableDraftSnapshot = {
   scope: DraftScope | null;
   items: readonly DurableDraftItem[];
   ready: boolean;
@@ -48,7 +48,7 @@ function tag(event: RelayEvent, key: string): string | null {
   return matches.length === 1 && matches[0].length === 2 ? matches[0][1] : null;
 }
 
-export type DraftBridgeDependencies = {
+type DraftBridgeDependencies = {
   queue: (scope: DraftScope) => Promise<DraftQueue>;
   receive: (scope: DraftScope, event: RelayEvent) => Promise<void>;
   decrypt: (event: RelayEvent) => Promise<unknown>;

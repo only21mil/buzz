@@ -1,4 +1,4 @@
-export type BackgroundLinkPreviewResult =
+type BackgroundLinkPreviewResult =
   | { status: "cancelled" }
   | { status: "ready"; tags: string[][] };
 

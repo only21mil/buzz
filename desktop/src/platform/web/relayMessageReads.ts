@@ -137,7 +137,7 @@ export async function getThreadReplies(
   };
 }
 
-export async function getEvent(
+async function getEvent(
   body: unknown,
   client: RelayMessageReadClient,
 ): Promise<string> {

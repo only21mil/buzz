@@ -1,6 +1,6 @@
 import { verifyEvent, type Event as NostrEvent } from "nostr-tools/pure";
 
-export const BLOSSOM_AUTH_KIND = 24242;
+const BLOSSOM_AUTH_KIND = 24242;
 const GET_AUTH_LIFETIME_SECONDS = 600;
 const MEDIA_PATH_RE = /^\/media\/([\da-f]{64})(?:\.[^/?#]+)?$/;
 

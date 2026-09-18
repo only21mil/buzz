@@ -1,6 +1,6 @@
 import type { TriggerType } from "./workflowFormTypes";
 
-export const CONDITION_OPERATORS = [
+const CONDITION_OPERATORS = [
   "contains",
   "not_contains",
   "starts_with",
@@ -18,7 +18,7 @@ const EXACT_MATCH_OPERATORS = [
 ] as const satisfies readonly ConditionOperator[];
 const HEX_ID_PATTERN = /^[0-9a-fA-F]{64}$/;
 
-export type ConditionField = { label: string; value: string };
+type ConditionField = { label: string; value: string };
 export type ParsedConditionExpression = {
   field: string;
   operator: ConditionOperator;
@@ -59,12 +59,6 @@ export function conditionOperatorsForField(
     field.endsWith("_id")
     ? EXACT_MATCH_OPERATORS
     : CONDITION_OPERATORS;
-}
-
-export function defaultConditionOperatorForField(
-  field: string,
-): ConditionOperator {
-  return conditionOperatorsForField(field)[0];
 }
 
 export function conditionOperatorNeedsValue(

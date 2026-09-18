@@ -5,7 +5,7 @@ import type { Project } from "@/features/projects/hooks";
 
 export const PROJECT_HOME_TEMPLATE_ID = "builtin:project-home";
 
-export const PROJECT_HOME_CANVAS_TEMPLATE = `# Project Channel: {{PROJECT_NAME}}
+const PROJECT_HOME_CANVAS_TEMPLATE = `# Project Channel: {{PROJECT_NAME}}
 
 This channel is the working home of **{{PROJECT_NAME}}**.
 

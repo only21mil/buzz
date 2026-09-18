@@ -13,7 +13,7 @@ type EventTemplate = {
 
 type SignEvent = (template: EventTemplate) => Promise<string | RelayEvent>;
 
-export type Nip98Request = {
+type Nip98Request = {
   url: string;
   method: string;
   body?: string | Uint8Array;

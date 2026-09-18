@@ -1,4 +1,4 @@
-export type CommunityApplyQueue = {
+type CommunityApplyQueue = {
   run<T>(task: () => Promise<T>): Promise<T>;
 };
 

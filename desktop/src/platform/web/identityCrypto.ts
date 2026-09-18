@@ -7,7 +7,7 @@ import { decode, npubEncode, nsecEncode } from "nostr-tools/nip19";
 import { decrypt, encrypt } from "nostr-tools/nip49";
 import { truncatePubkey } from "@/shared/lib/pubkey";
 
-export const NIP49_LOG_N = 18;
+const NIP49_LOG_N = 18;
 const NIP49_SECURITY_BYTE = 0x02;
 const HEX_SECRET_RE = /^[0-9a-f]{64}$/i;
 const BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
@@ -34,7 +34,7 @@ export function hexToBytes(hex: string): Uint8Array {
   );
 }
 
-export function validateSecretKey(secret: Uint8Array): Uint8Array {
+function validateSecretKey(secret: Uint8Array): Uint8Array {
   if (secret.length !== 32) {
     secret.fill(0);
     throw new Error("Secret key must be exactly 32 bytes");

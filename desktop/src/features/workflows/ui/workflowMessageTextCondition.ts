@@ -9,7 +9,7 @@ export const MESSAGE_TEXT_CONDITION_OPERATORS = [
   "is_empty",
 ] as const;
 
-export type MessageTextConditionOperator =
+type MessageTextConditionOperator =
   (typeof MESSAGE_TEXT_CONDITION_OPERATORS)[number];
 
 export type MessageTextCondition = {

@@ -11,7 +11,7 @@ import {
 } from "./projectSnapshot";
 
 // Retain the fork's existing freshness interval until relay trials justify changing it.
-export const PROJECTS_STALE_TIME_MS = 60_000;
+const PROJECTS_STALE_TIME_MS = 60_000;
 export function projectCollectionQueryKey(scope: ProjectSnapshotScope | null) {
   return [
     "projects",

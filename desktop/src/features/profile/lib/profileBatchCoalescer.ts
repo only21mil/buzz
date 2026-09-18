@@ -18,7 +18,7 @@ const pendingBatches = new Map<string, PendingBatch>();
 const inFlightByScope = new Map<string, Map<string, InFlightEntry>>();
 let identityEpoch = 0;
 
-export type ProfileBatchEpoch = Readonly<{ value: number }>;
+type ProfileBatchEpoch = Readonly<{ value: number }>;
 
 function identityInvalidationError(): Error {
   return new Error("Profile batch scope invalidated by identity change");
@@ -28,9 +28,7 @@ export function captureProfileBatchEpoch(): ProfileBatchEpoch {
   return { value: identityEpoch };
 }
 
-export function requireCurrentProfileBatchEpoch(
-  epoch: ProfileBatchEpoch,
-): void {
+function requireCurrentProfileBatchEpoch(epoch: ProfileBatchEpoch): void {
   if (epoch.value !== identityEpoch) throw identityInvalidationError();
 }
 
