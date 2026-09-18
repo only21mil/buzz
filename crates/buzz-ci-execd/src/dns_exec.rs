@@ -51,6 +51,8 @@ pub const ACTIVATION_ROOT: &str = "/var/lib/buzzci/activation";
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MAX_COMMAND_OUTPUT: usize = 64 * 1024;
+/// Largest broker-pinned DNS file (`resolv.conf`, `hosts`) read back whole.
+const MAX_PINNED_FILE_BYTES: u64 = 64 * 1024;
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 const DIRECTORY_MODE: u32 = 0o700;
@@ -2176,7 +2178,10 @@ fn verify_published_file(
         inode: metadata.ino(),
     };
     let mut observed = Vec::new();
-    file.read_to_end(&mut observed)
+    // One byte past the expected length is enough to detect a longer file.
+    (&mut file)
+        .take(bytes.len() as u64 + 1)
+        .read_to_end(&mut observed)
         .map_err(|_| DnsExecFsError::UnsafeFile)?;
     if !safe_owned_file(&metadata, roots, mode)
         || observed != bytes
@@ -2234,8 +2239,13 @@ fn read_pinned_file(
     let mut file = File::from(descriptor);
     let metadata = file.metadata().map_err(|_| DnsExecFsError::UnsafeFile)?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
+    (&mut file)
+        .take(MAX_PINNED_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|_| DnsExecFsError::UnsafeFile)?;
+    if bytes.len() as u64 > MAX_PINNED_FILE_BYTES {
+        return Err(DnsExecFsError::UnsafeFile);
+    }
     Ok(BrokerPinnedFileReadback {
         requested_path: canonical.to_path_buf(),
         canonical_path: descriptor_canonical_path(roots, &file)?,
