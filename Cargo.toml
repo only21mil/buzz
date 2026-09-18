@@ -199,6 +199,12 @@ aws-creds = { git = "https://github.com/tlongwell-block/rust-s3", rev = "c9fce36
 # head containing nostr 0.44.7 and nostr-relay-pool 0.44.3 until release.
 # Keep nostr-database on the same source so nostr-sdk and relay-pool share its
 # type identities.
+# P07 audit 2026-09-13: crates.io now carries the fixed releases (nostr 0.44.7
+# and nostr-relay-pool 0.44.3, both published 2026-08-02), so dropping this pin
+# resolves to the fixed versions. Keep it until the swap lands. The swap must
+# touch both manifests and both locks together with targeted cargo update -p
+# only, never cargo update --workspace. Do not drop the pin just because
+# upstream resolves registry versions.
 nostr = { git = "https://github.com/nostrdevkit/nostr", rev = "94dac28e9a718d853170308aeb551b1ebf89a0d0" }
 nostr-database = { git = "https://github.com/nostrdevkit/nostr", rev = "94dac28e9a718d853170308aeb551b1ebf89a0d0" }
 nostr-relay-pool = { git = "https://github.com/nostrdevkit/nostr", rev = "94dac28e9a718d853170308aeb551b1ebf89a0d0" }

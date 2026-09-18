@@ -4,6 +4,7 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
+import '../../shared/identity/npub.dart';
 import '../../shared/mentions/agent_identity_provider.dart';
 import '../../shared/mentions/mention_tags.dart';
 import '../../shared/theme/theme.dart';
@@ -27,6 +28,8 @@ import '../../shared/profile/user_cache_provider.dart';
 import '../../shared/profile/user_profile.dart';
 import 'recent_searches_provider.dart';
 import 'search_provider.dart';
+
+part 'search_page/section_label.dart';
 
 enum _SearchFilter { all, messages, channels, people }
 
@@ -729,7 +732,7 @@ class _PeopleSection extends ConsumerWidget {
               key: ValueKey('search-person-leading-${user.pubkey}'),
               imageUrl: user.avatarUrl,
               radius: 20,
-              fallback: Text(user.label.substring(0, 1).toUpperCase()),
+              fallback: Text(user.initial),
             ),
             title: Text(
               user.label,
@@ -824,7 +827,7 @@ class _MessageTile extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final authorName = authorProfile?.label ?? shortPubkey(hit.pubkey);
+    final authorName = authorProfile?.label ?? truncateNpub(hit.pubkey);
     final timeAgo = relativeTime(hit.createdAt);
     final channelName = hit.channelName?.trim().replaceFirst(RegExp(r'^#'), '');
     final hasChannelName = channelName != null && channelName.isNotEmpty;
@@ -962,38 +965,4 @@ class _MessageTile extends ConsumerWidget {
       );
     }
   }
-}
-
-class _SectionLabel extends StatelessWidget {
-  final String label;
-
-  const _SectionLabel({required this.label});
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(
-        Grid.gutter,
-        Grid.xs,
-        Grid.gutter,
-        Grid.half,
-      ),
-      child: Text(
-        label,
-        key: ValueKey('search-section-${label.toLowerCase()}'),
-        style: activityContextTextStyle.copyWith(
-          color: context.colors.onSurfaceVariant,
-        ),
-      ),
-    );
-  }
-}
-
-extension on _SearchFilter {
-  String get label => switch (this) {
-    _SearchFilter.all => 'All',
-    _SearchFilter.messages => 'Messages',
-    _SearchFilter.channels => 'Channels',
-    _SearchFilter.people => 'People',
-  };
 }

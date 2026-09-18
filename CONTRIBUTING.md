@@ -150,7 +150,9 @@ just hooks
 if it doesn't already exist, and invokes `cargo`, `node`, and `pnpm` to trigger
 Hermit's lazy tool download (each tool is fetched once on first invocation and
 cached thereafter). You can also run `just bootstrap` independently at any time;
-it is safe to re-run.
+it is safe to re-run. Desktop Tauri builds need placeholder sidecar binaries on a
+fresh clone; run `just _ensure-sidecar-stubs` before raw `cargo` against
+`desktop/src-tauri`, or use `just desktop-tauri-test`.
 
 `just setup` then starts Docker services (Postgres on `:5432`, Redis on `:6379`,
 Adminer on `:8082`, Keycloak on `:8180` for local OAuth/OIDC testing, MinIO on

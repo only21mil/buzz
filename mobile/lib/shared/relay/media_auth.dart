@@ -86,15 +86,20 @@ class MediaGetAuthService {
   bool _isRelayMediaUrl(Uri uri, Uri relayUri) {
     if (uri.scheme != 'http' && uri.scheme != 'https') return false;
     if (uri.host.isEmpty || relayUri.host.isEmpty) return false;
-    // Extract the URL's origin and path. Query strings are ignored for media
-    // host/path detection, matching the fetch target shape used by descriptors.
-    final base = '${uri.scheme}://${uri.authority}';
-    final mediaAuthority = extractServerAuthority(base);
-    final relayAuthority = extractServerAuthority(_baseUrl);
-    if (mediaAuthority == null || relayAuthority == null) return false;
-    if (mediaAuthority.toLowerCase() != relayAuthority.toLowerCase()) {
+    // The scheme must match exactly: an http:// URL against an https://
+    // relay is a downgrade, never the relay, even on the same host.
+    // RelayConfig.baseUrl already folds ws/wss to http/https, so no
+    // websocket conversion happens here.
+    if (uri.scheme != relayUri.scheme) return false;
+    // Effective ports must match. Uri.port folds implicit scheme defaults,
+    // so https://host equals https://host:443 but never https://host:80,
+    // https://host:8443, or any other origin.
+    if (uri.port != relayUri.port) return false;
+    if (_normalizeHost(uri.host) != _normalizeHost(relayUri.host)) {
       return false;
     }
+    // Query strings are ignored for media host/path detection, matching the
+    // fetch target shape used by descriptors.
     return uri.path.startsWith('/media/');
   }
 
@@ -147,6 +152,18 @@ String? extractServerAuthority(String baseUrl) {
   final port = uri.hasPort ? uri.port : null;
   final authority = port == null ? host : '$host:$port';
   return _normalizeAuthority(authority);
+}
+
+/// Host comparison for the relay-origin gate, separate from
+/// [extractServerAuthority]: the Blossom `server` tag keeps its own
+/// normalization (wire semantics), while this gate compares scheme, host,
+/// and effective port strictly.
+String _normalizeHost(String host) {
+  var normalized = host.trim().toLowerCase();
+  if (normalized.endsWith('.')) {
+    normalized = normalized.substring(0, normalized.length - 1);
+  }
+  return normalized;
 }
 
 String _normalizeAuthority(String authority) {

@@ -58,6 +58,9 @@ class _RemoveCommunitySection extends ConsumerWidget {
 }
 
 class _IdentityRow extends StatelessWidget {
+  /// Copies the public key only. This is not a private-key export: the nsec
+  /// never leaves secure storage here, and the phone-to-desktop export in
+  /// the pairing flow needs fresh device auth plus a bound grant.
   const _IdentityRow({required this.nsec});
 
   final String nsec;
@@ -65,12 +68,14 @@ class _IdentityRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final privHex = nostr.Nip19.decode(payload: nsec).data;
-    final pubkey = privHex.isNotEmpty ? nostr.Keys(privHex).public : 'unknown';
+    final npub = privHex.isNotEmpty
+        ? canonicalNpub(nostr.Keys(privHex).public)
+        : null;
 
     return Semantics(
       button: true,
       label: 'Copy identity public key',
-      value: pubkey,
+      value: npub ?? 'Identity unavailable',
       child: AppListRow(
         icon: LucideIcons.key,
         title: 'Identity (pubkey)',
@@ -79,9 +84,11 @@ class _IdentityRow extends StatelessWidget {
           size: 18,
           color: context.colors.onSurfaceVariant,
         ),
-        onTap: () async {
-          await copyToClipboard(context, pubkey, message: 'Pubkey copied');
-        },
+        onTap: npub == null
+            ? null
+            : () async {
+                await copyToClipboard(context, npub, message: 'Pubkey copied');
+              },
       ),
     );
   }

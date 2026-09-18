@@ -51,7 +51,6 @@ import {
 } from "./useMentionSendFlow.helpers";
 import { buildAgentAddressMentionTags } from "@/features/messages/lib/agentAddressMention.mjs";
 import { AgentMentionAuthorizationError } from "@/features/messages/lib/agentMentionRevalidation";
-import { prepareMentionSendTargets } from "@/features/messages/lib/unresolvedMentionFeedback";
 import type { UseMentionSendFlowOptions } from "./useMentionSendFlow.types";
 
 export function useMentionSendFlow({
@@ -768,8 +767,9 @@ export function useMentionSendFlow({
           getComposerRevision() !== composerRevision
         )
           return;
-        const { savedMentionRefs, selectedMentionPubkeys, selectedPersonas } =
-          prepareMentionSendTargets(trimmed, mentions, setNonMemberPromptError);
+        const savedMentionRefs = mentions.getDraftMentionRefs(trimmed).slice();
+        const selectedMentionPubkeys = mentions.extractMentionPubkeys(trimmed);
+        const selectedPersonas = mentions.extractMentionPersonas(trimmed);
         const dmThreadAgentMentionErrorMessage = dmThreadAgentMentionError({
           trimmed,
           isThreadReply: capturedThreadContext != null,

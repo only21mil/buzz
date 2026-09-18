@@ -8,6 +8,7 @@ import 'package:buzz/features/forum/forum_posts_view.dart';
 import 'package:buzz/features/forum/forum_provider.dart';
 import 'package:buzz/features/forum/forum_thread_page.dart';
 import 'package:buzz/features/profile/profile_provider.dart';
+import 'package:buzz/shared/identity/npub.dart';
 import 'package:buzz/shared/profile/user_cache_provider.dart';
 import 'package:buzz/shared/profile/user_profile.dart';
 import 'package:buzz/shared/relay/relay.dart';
@@ -15,6 +16,8 @@ import 'package:buzz/shared/theme/theme.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 const _channelId = 'forum-channel';
+const _unknownAuthorHex =
+    '3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d';
 
 final _forumChannel = Channel(
   id: _channelId,
@@ -199,12 +202,11 @@ void main() {
     });
 
     testWidgets('shows truncated pubkey when no profile', (tester) async {
-      await tester.pumpWidget(
-        _buildPostCard(post: _makePost(pubkey: 'abcdef1234567890')),
-      );
+      const pubkey = _unknownAuthorHex;
+      await tester.pumpWidget(_buildPostCard(post: _makePost(pubkey: pubkey)));
       await tester.pumpAndSettle();
 
-      expect(find.text('abcdef12\u2026'), findsOneWidget);
+      expect(find.text(truncateNpub(pubkey)), findsOneWidget);
     });
 
     testWidgets(

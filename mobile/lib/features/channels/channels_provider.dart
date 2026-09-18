@@ -9,7 +9,7 @@ import '../../shared/community/community_provider.dart';
 import '../../shared/push/push_presentation_cache.dart';
 import '../../shared/relay/relay.dart';
 import '../../shared/theme/theme_provider.dart';
-import '../../shared/utils/string_utils.dart';
+import '../../shared/identity/npub.dart';
 import '../notifications/live_notification_dispatcher.dart';
 import '../../shared/profile/user_cache_provider.dart';
 import 'channel.dart';
@@ -442,7 +442,7 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
     final participants = data.channelType == 'dm'
         ? [
             for (final pk in data.participantPubkeys)
-              displayNames[pk.toLowerCase()] ?? shortPubkey(pk),
+              displayNames[pk.toLowerCase()] ?? truncateNpub(pk),
           ]
         : const <String>[];
     return Channel(

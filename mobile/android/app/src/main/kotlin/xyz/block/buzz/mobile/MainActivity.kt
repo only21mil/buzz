@@ -11,7 +11,7 @@ import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.os.Build
 import androidx.annotation.RequiresApi
-import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayOutputStream
@@ -78,10 +78,15 @@ internal object AndroidImageProcessor {
     }
 }
 
-class MainActivity : FlutterActivity() {
+// Device-auth adoption (P05 / upstream #5116) needs a FragmentActivity host
+// while this activity keeps owning the fork notification bridge, the media
+// upload channel, and the huddle permission callbacks. FlutterFragmentActivity
+// is that host: every override below is preserved across the switch.
+class MainActivity : FlutterFragmentActivity() {
     private var mediaUploadChannel: MethodChannel? = null
     private var huddleMediaPlugin: HuddleMediaPlugin? = null
     private var notificationBridge: AndroidNotificationBridge? = null
+    private var deviceAuthBridge: DeviceAuthBridge? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -91,6 +96,12 @@ class MainActivity : FlutterActivity() {
 
         notificationBridge?.dispose()
         notificationBridge = AndroidNotificationBridge(
+            activity = this,
+            binaryMessenger = flutterEngine.dartExecutor.binaryMessenger,
+        )
+
+        deviceAuthBridge?.dispose()
+        deviceAuthBridge = DeviceAuthBridge(
             activity = this,
             binaryMessenger = flutterEngine.dartExecutor.binaryMessenger,
         )
@@ -145,11 +156,22 @@ class MainActivity : FlutterActivity() {
         huddleMediaPlugin?.onRequestPermissionsResult(requestCode, permissions, grantResults)
     }
 
+    override fun onActivityResult(
+        requestCode: Int,
+        resultCode: Int,
+        data: Intent?,
+    ) {
+        super.onActivityResult(requestCode, resultCode, data)
+        deviceAuthBridge?.handleActivityResult(requestCode, resultCode)
+    }
+
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
         huddleMediaPlugin?.dispose()
         huddleMediaPlugin = null
         notificationBridge?.dispose()
         notificationBridge = null
+        deviceAuthBridge?.dispose()
+        deviceAuthBridge = null
         super.cleanUpFlutterEngine(flutterEngine)
     }
 

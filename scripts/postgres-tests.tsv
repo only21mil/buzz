@@ -16,6 +16,7 @@ buzz-db	buzz_db	archived_identities::tests::archived_identity_state_is_community
 buzz-db	buzz_db	channel::tests::accessible_channel_ids_are_not_truncated_at_one_thousand	crates/buzz-db/src/channel.rs	desired	desired schema fixture
 buzz-db	buzz_db	channel::tests::get_agent_pubkeys_filters_by_agent_type_and_community	crates/buzz-db/src/channel.rs	desired	desired schema fixture
 buzz-db	buzz_db	channel::tests::get_channel_is_scoped_when_channel_uuid_collides_across_communities	crates/buzz-db/src/channel.rs	desired	desired schema fixture
+buzz-db	buzz_db	channel::tests::get_members_returns_full_roster_beyond_1000	crates/buzz-db/src/channel.rs	desired	desired schema fixture
 buzz-db	buzz_db	channel::tests::get_users_bulk_is_scoped_when_pubkey_exists_in_multiple_communities	crates/buzz-db/src/channel.rs	desired	desired schema fixture
 buzz-db	buzz_db	channel::tests::kicked_owner_rejoins_as_member_not_owner	crates/buzz-db/src/channel.rs	desired	desired schema fixture
 buzz-db	buzz_db	channel::tests::membership_writes_serialize_on_the_shared_channel_lock	crates/buzz-db/src/channel.rs	desired	desired schema fixture
@@ -29,6 +30,7 @@ buzz-db	buzz_db	channel::tests::test_agent_owner_can_remove_bot	crates/buzz-db/s
 buzz-db	buzz_db	channel::tests::test_random_user_cannot_remove_bot	crates/buzz-db/src/channel.rs	desired	desired schema fixture
 buzz-db	buzz_db	channel::tests::test_unarchive_expired_ephemeral_channel_renews_ttl_deadline	crates/buzz-db/src/channel.rs	desired	desired schema fixture
 buzz-db	buzz_db	channel::tests::unprivileged_member_cannot_demote_a_co_owner	crates/buzz-db/src/channel.rs	desired	desired schema fixture
+buzz-db	buzz_db	channel_members::tests::get_members_paged_covers_roster_without_overlap	crates/buzz-db/src/channel_members.rs	desired	desired schema fixture
 buzz-db	buzz_db	ci_grants::tests::expired_grant_is_not_active	crates/buzz-db/src/ci_grants.rs	desired	desired schema fixture
 buzz-db	buzz_db	ci_grants::tests::future_grant_is_not_active	crates/buzz-db/src/ci_grants.rs	desired	desired schema fixture
 buzz-db	buzz_db	ci_grants::tests::grants_are_scoped_per_repo	crates/buzz-db/src/ci_grants.rs	desired	desired schema fixture
@@ -48,6 +50,7 @@ buzz-db	buzz_db	event::tests::reaction_single_tx_reactivates_soft_deleted_reacti
 buzz-db	buzz_db	event::tests::reaction_single_tx_stores_wrapped_max_shortcode	crates/buzz-db/src/event.rs	desired	desired schema fixture
 buzz-db	buzz_db	event::tests::release_due_reminder_rolls_back_only_the_matching_stamp	crates/buzz-db/src/event.rs	desired	desired schema fixture
 buzz-db	buzz_db	event::tests::reminder_claim_and_release_are_confined_to_their_community	crates/buzz-db/src/event.rs	desired	desired schema fixture
+buzz-db	buzz_db	feed::tests::insert_mentions_indexes_rosters_past_bind_parameter_cap	crates/buzz-db/src/feed.rs	desired	desired schema fixture
 buzz-db	buzz_db	feed::tests::query_activity_is_scoped_and_empty_channels_are_global_only	crates/buzz-db/src/feed.rs	desired	desired schema fixture
 buzz-db	buzz_db	feed::tests::query_mentions_is_scoped_across_communities	crates/buzz-db/src/feed.rs	desired	desired schema fixture
 buzz-db	buzz_db	feed::tests::query_needs_action_is_scoped_across_communities	crates/buzz-db/src/feed.rs	desired	desired schema fixture
@@ -114,6 +117,7 @@ buzz-db	buzz_db	session_policy::tests::idle_transaction_timeout_reaps_only_idle_
 buzz-db	buzz_db	session_policy::tests::migration_wait_and_cancellation_never_return_relaxed_session	crates/buzz-db/src/session_policy.rs	migration	database observability packet fixture; explicit schema contract
 buzz-db	buzz_db	session_policy::tests::writer_policy_bounds_waits_preserves_floor_and_recovers	crates/buzz-db/src/session_policy.rs	migration	database observability packet fixture; explicit schema contract
 buzz-db	buzz_db	session_policy::tests::writer_policy_rejects_non_read_committed_isolation	crates/buzz-db/src/session_policy.rs	migration	database observability packet fixture; explicit schema contract
+buzz-db	buzz_db	tests::addressable_replacement_rolls_back_when_mention_indexing_fails	crates/buzz-db/src/lib.rs	desired	desired schema fixture
 buzz-db	buzz_db	tests::allowlist_is_scoped_to_community	crates/buzz-db/src/lib.rs	desired	desired schema fixture
 buzz-db	buzz_db	tests::armed_pool_rejects_old_channel_inserts_through_public_api	crates/buzz-db/src/lib.rs	desired	desired schema fixture
 buzz-db	buzz_db	tests::channel_cursor_above_fence_stays_on_writer_preventing_middle_hole	crates/buzz-db/src/lib.rs	desired	desired schema fixture
@@ -259,6 +263,8 @@ buzz-push-gateway	buzz_push_gateway	postgres::tests::duplicated_retryable_releas
 buzz-push-gateway	buzz_push_gateway	postgres::tests::readiness_requires_migrated_schema_dml_and_no_ddl	crates/buzz-push-gateway/src/postgres.rs	migration	fixture installs its own gateway/FTS schema
 buzz-push-gateway	buzz_push_gateway	postgres::tests::reaper_deletes_active_child_of_retention_eligible_revoked_installation	crates/buzz-push-gateway/src/postgres.rs	migration	fixture installs its own gateway/FTS schema
 buzz-push-gateway	buzz_push_gateway	postgres::tests::retryable_release_frees_request_id_on_real_postgres	crates/buzz-push-gateway/src/postgres.rs	migration	fixture installs its own gateway/FTS schema
+buzz-relay	buzz_relay	api::admin::tests::feedback_attachment_rejects_unknown_feedback	crates/buzz-relay/src/api/admin/mod.rs	desired	requires disposable PostgreSQL fixture
+buzz-relay	buzz_relay	api::admin::tests::report_detail_rejects_unknown_report	crates/buzz-relay/src/api/admin/mod.rs	desired	requires disposable PostgreSQL fixture
 buzz-relay	buzz_relay	api::bridge::tests::nip98_replay_guard_rejects_cross_pod_replay_on_bridge_path	crates/buzz-relay/src/api/bridge.rs	external	Redis fixture (handler cases also require PostgreSQL)
 buzz-relay	buzz_relay	api::bridge::tests::nip98_replay_guard_rejects_same_pod_same_community_replay	crates/buzz-relay/src/api/bridge.rs	external	Redis fixture (handler cases also require PostgreSQL)
 buzz-relay	buzz_relay	api::bridge::tests::submit_event_invalid_json_body_increments_http_transport_counter	crates/buzz-relay/src/api/bridge.rs	external	Redis fixture (handler cases also require PostgreSQL)
@@ -304,6 +310,10 @@ buzz-relay	buzz_relay	api::invites::tests::malformed_and_unknown_v2_codes_are_fo
 buzz-relay	buzz_relay	api::invites::tests::mint_validates_max_uses_and_ttl_bounds	crates/buzz-relay/src/api/invites.rs	desired	desired schema fixture
 buzz-relay	buzz_relay	api::invites::tests::non_admin_cannot_mint	crates/buzz-relay/src/api/invites.rs	desired	desired schema fixture
 buzz-relay	buzz_relay	api::invites::tests::owner_mints_and_new_pubkey_claims	crates/buzz-relay/src/api/invites.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	api::media::tests::media_read_accepts_range_header_only_after_auth	crates/buzz-relay/src/api/media.rs	desired	requires disposable PostgreSQL fixture
+buzz-relay	buzz_relay	api::media::tests::media_read_rejects_upload_verb_wrong_server_and_wrong_x	crates/buzz-relay/src/api/media.rs	desired	requires disposable PostgreSQL fixture
+buzz-relay	buzz_relay	api::media::tests::media_read_with_valid_server_scoped_token_reaches_sidecar_gate	crates/buzz-relay/src/api/media.rs	desired	requires disposable PostgreSQL fixture
+buzz-relay	buzz_relay	api::media::tests::media_reads_reject_unauthenticated_get_and_head_before_sidecar_gate	crates/buzz-relay/src/api/media.rs	desired	requires disposable PostgreSQL fixture
 buzz-relay	buzz_relay	api::media::tests::nip_oa_membership_ingress_rejects_invalid_time_and_preserves_direct_members	crates/buzz-relay/src/api/media.rs	desired	desired schema fixture
 buzz-relay	buzz_relay	api::operator::tests::archive_publish_failure_is_retryable_and_preserves_timestamp	crates/buzz-relay/src/api/operator.rs	desired	desired schema fixture
 buzz-relay	buzz_relay	api::operator::tests::fresh_host_at_owner_limit_returns_limit_reached_conflict	crates/buzz-relay/src/api/operator.rs	desired	desired schema fixture

@@ -65,6 +65,8 @@ pub mod reaction;
 pub mod relay_invite;
 /// Relay-level membership persistence (NIP-43).
 pub mod relay_members;
+/// Deployment-global relay operator/moderator roster persistence.
+pub mod relay_operators;
 /// Replaceable event persistence and coordinate-serialized repository tombstones.
 pub mod replaceable;
 /// Replica freshness fence for keyset-cursor read routing.
@@ -115,10 +117,26 @@ use replaceable::{event_replacement_lock_key, repo_deletion_target};
 
 /// Extract p-tag mentions from an event and insert into the `event_mentions` table.
 ///
-/// Called after event insertion. Failures are logged but do not block event storage.
-/// Uses `INSERT ... ON CONFLICT DO NOTHING` so duplicate inserts are silently skipped.
+/// Called after event insertion. Uses `INSERT ... ON CONFLICT DO NOTHING` so
+/// duplicate inserts are silently skipped. All chunks share one transaction so
+/// a large broadcast indexes atomically: every p-tag lands or none does.
 pub async fn insert_mentions(
     pool: &PgPool,
+    community_id: CommunityId,
+    event: &nostr::Event,
+    channel_id: Option<Uuid>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    insert_mentions_in_transaction(&mut tx, community_id, event, channel_id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Insert mention rows on the caller's transaction. Replacement writes use
+/// this so the authoritative event and its discovery index commit or roll back
+/// as one unit.
+pub(crate) async fn insert_mentions_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     community_id: CommunityId,
     event: &nostr::Event,
     channel_id: Option<Uuid>,
@@ -168,24 +186,31 @@ pub async fn insert_mentions(
         return Ok(());
     }
 
-    // Single multi-row INSERT ... ON CONFLICT DO NOTHING — one round-trip regardless of mention count.
-    let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
-        "INSERT INTO event_mentions \
-         (community_id, pubkey_hex, event_id, event_created_at, channel_id, event_kind) ",
-    );
+    // Multi-row INSERT ... ON CONFLICT DO NOTHING, chunked to stay under
+    // Postgres's 65,535 bind-parameter statement cap (6 binds per row caps a
+    // single statement at ~10.9k rows). Relay-signed kind 39002 rosters carry
+    // one p-tag per channel member and can exceed that. The caller owns the
+    // transaction so all chunks share its commit boundary.
+    const MENTION_INSERT_CHUNK_ROWS: usize = 5_000;
+    for chunk in valid_pubkeys.chunks(MENTION_INSERT_CHUNK_ROWS) {
+        let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
+            "INSERT INTO event_mentions \
+             (community_id, pubkey_hex, event_id, event_created_at, channel_id, event_kind) ",
+        );
 
-    qb.push_values(&valid_pubkeys, |mut b, pubkey| {
-        b.push_bind(community_id.as_uuid())
-            .push_bind(pubkey.as_str())
-            .push_bind(event_id_bytes.as_slice())
-            .push_bind(created_at)
-            .push_bind(channel_id)
-            .push_bind(kind as i32);
-    });
+        qb.push_values(chunk, |mut b, pubkey| {
+            b.push_bind(community_id.as_uuid())
+                .push_bind(pubkey.as_str())
+                .push_bind(event_id_bytes.as_slice())
+                .push_bind(created_at)
+                .push_bind(channel_id)
+                .push_bind(kind as i32);
+        });
 
-    qb.push(" ON CONFLICT DO NOTHING");
+        qb.push(" ON CONFLICT DO NOTHING");
 
-    qb.build().execute(pool).await?;
+        qb.build().execute(&mut **tx).await?;
+    }
     Ok(())
 }
 
@@ -5173,6 +5198,101 @@ mod tests {
             "no anti-resurrection watermark is part of the repository deletion contract"
         );
         assert_eq!(live_repo_count(&db, community, &owner, &repo_id).await, 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn addressable_replacement_rolls_back_when_mention_indexing_fails() {
+        use buzz_core::kind::KIND_READ_STATE;
+        use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+
+        let admin = PgPool::connect(&admin_url().await)
+            .await
+            .expect("connect admin");
+        let (pool, scratch_name) = create_scratch_db(&admin, "atomic_addressable").await;
+        let db = Db::from_pool(pool.clone());
+        let community_uuid = Uuid::new_v4();
+        let channel = Uuid::new_v4();
+        let keys = Keys::generate();
+        seed_community_channel(&pool, community_uuid, channel, &keys).await;
+        let community = CommunityId::from_uuid(community_uuid);
+        // Exercise mention-index rollback, not kind:39002 roster validation.
+        let d_tag = format!("rollback-mention:{channel}");
+        let mentioned = Keys::generate();
+        let mention = hex::encode(mentioned.public_key().to_bytes());
+        let tags = || {
+            vec![
+                Tag::parse(["d", d_tag.as_str()]).expect("d tag"),
+                Tag::parse(["t", "read-state"]).expect("t tag"),
+                Tag::parse(["p", mention.as_str()]).expect("p tag"),
+            ]
+        };
+        let kind = Kind::Custom(KIND_READ_STATE as u16);
+        let base = Timestamp::now().as_secs();
+        let old = EventBuilder::new(kind, "old")
+            .tags(tags())
+            .custom_created_at(Timestamp::from(base))
+            .sign_with_keys(&keys)
+            .expect("sign old");
+        db.replace_addressable_event(community, &old, Some(channel))
+            .await
+            .expect("insert old replaceable event");
+
+        sqlx::query(
+            "CREATE FUNCTION reject_test_mention() RETURNS trigger AS $$ \
+             BEGIN RAISE EXCEPTION 'injected mention failure'; END; \
+             $$ LANGUAGE plpgsql",
+        )
+        .execute(&pool)
+        .await
+        .expect("create failure function");
+        sqlx::query(
+            "CREATE TRIGGER reject_test_mention BEFORE INSERT ON event_mentions \
+             FOR EACH ROW EXECUTE FUNCTION reject_test_mention()",
+        )
+        .execute(&pool)
+        .await
+        .expect("install failure injection");
+
+        let new = EventBuilder::new(kind, "new")
+            .tags(tags())
+            .custom_created_at(Timestamp::from(base + 1))
+            .sign_with_keys(&keys)
+            .expect("sign new");
+        let error = db
+            .replace_addressable_event(community, &new, Some(channel))
+            .await
+            .expect_err("mention failure must fail replacement");
+        assert!(error.to_string().contains("injected mention failure"));
+
+        let live_id: Vec<u8> = sqlx::query_scalar(
+            "SELECT id FROM events WHERE community_id=$1 AND channel_id=$2 \
+             AND kind=$3 AND deleted_at IS NULL",
+        )
+        .bind(community.as_uuid())
+        .bind(channel)
+        .bind(KIND_READ_STATE as i32)
+        .fetch_one(&pool)
+        .await
+        .expect("query live replaceable event");
+        assert_eq!(
+            live_id,
+            old.id.as_bytes(),
+            "old replaceable event must remain live"
+        );
+        let new_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM events WHERE community_id=$1 AND id=$2")
+                .bind(community.as_uuid())
+                .bind(new.id.as_bytes().as_slice())
+                .fetch_one(&pool)
+                .await
+                .expect("count rolled-back event");
+        assert_eq!(
+            new_rows, 0,
+            "new replaceable event must roll back with its index"
+        );
+
+        drop_scratch_db(&admin, pool, &scratch_name).await;
     }
 
     #[tokio::test]

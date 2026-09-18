@@ -666,6 +666,10 @@ web-fix:
 web-typecheck:
     cd {{web_dir}} && pnpm typecheck
 
+# Run web unit tests
+web-test:
+    cd {{web_dir}} && pnpm test
+
 # Build web frontend assets
 web-build:
     cd {{web_dir}} && pnpm build
@@ -692,7 +696,7 @@ mobile-fix:
 
 # Run mobile lint and format checks
 mobile-check:
-    unset GIT_DIR GIT_WORK_TREE; cd {{mobile_dir}} && dart format --output=none --set-exit-if-changed . && flutter analyze && node ./scripts/check-file-sizes.mjs
+    unset GIT_DIR GIT_WORK_TREE; cd {{mobile_dir}} && dart format --output=none --set-exit-if-changed . && flutter analyze && node ./scripts/check-file-sizes.mjs && python3 ../scripts/check-pubspec-keys.py
 
 # Run mobile tests
 mobile-test:

@@ -19,6 +19,10 @@ import {
 /**
  * Ensure the repo is cloned (or fetched) into IndexedDB.
  * Other hooks depend on this to get `fs` and `dir`.
+ *
+ * A failed refresh fetch does not fail this query: `data.stale` is true
+ * and reads fall back to the cached checkout. Consumers surface that via
+ * `isCloneStale` so the UI can say the view may be behind.
  */
 export function useGitClone(owner: string, repoName: string, ref: string) {
   return useQuery({
@@ -28,6 +32,18 @@ export function useGitClone(owner: string, repoName: string, ref: string) {
     enabled: !!owner && !!repoName && !!ref,
     retry: false,
   });
+}
+
+/** Clone status forwarded by every read hook. */
+function cloneStatus(cloneQuery: ReturnType<typeof useGitClone>) {
+  return {
+    cloneError: cloneQuery.error,
+    isCloneLoading: cloneQuery.isLoading,
+    /** True when the refresh fetch failed and reads come from cache. */
+    isCloneStale: cloneQuery.data?.stale ?? false,
+    /** The fetch failure behind a stale clone, for logging or display. */
+    cloneFetchError: cloneQuery.data?.fetchError ?? null,
+  };
 }
 
 /** Read tree entries at a path (or root). Directories first, then files, alphabetical. */
@@ -60,8 +76,7 @@ export function useGitTree(
 
   return {
     ...treeQuery,
-    cloneError: cloneQuery.error,
-    isCloneLoading: cloneQuery.isLoading,
+    ...cloneStatus(cloneQuery),
   };
 }
 
@@ -82,8 +97,7 @@ export function useGitLog(owner: string, repoName: string, ref: string) {
 
   return {
     ...logQuery,
-    cloneError: cloneQuery.error,
-    isCloneLoading: cloneQuery.isLoading,
+    ...cloneStatus(cloneQuery),
   };
 }
 
@@ -104,8 +118,7 @@ export function useGitReadme(owner: string, repoName: string, ref: string) {
 
   return {
     ...readmeQuery,
-    cloneError: cloneQuery.error,
-    isCloneLoading: cloneQuery.isLoading,
+    ...cloneStatus(cloneQuery),
   };
 }
 
@@ -118,7 +131,7 @@ export function useGitBlob(
 ) {
   const cloneQuery = useGitClone(owner, repoName, ref);
 
-  return useQuery({
+  const blobQuery = useQuery({
     queryKey: ["git-blob", owner, repoName, ref, filepath],
     queryFn: async () => {
       if (!cloneQuery.data) throw new Error("unreachable: enabled guards data");
@@ -129,6 +142,11 @@ export function useGitBlob(
     enabled: !!cloneQuery.data && !!filepath,
     staleTime: 5 * 60_000,
   });
+
+  return {
+    ...blobQuery,
+    ...cloneStatus(cloneQuery),
+  };
 }
 
 /**
@@ -147,7 +165,7 @@ export function useGitHtmlDoc(
 ) {
   const cloneQuery = useGitClone(owner, repoName, ref);
 
-  return useQuery({
+  const htmlQuery = useQuery({
     queryKey: ["git-html-doc", owner, repoName, ref, filepath],
     queryFn: async () => {
       if (!cloneQuery.data) throw new Error("unreachable: enabled guards data");
@@ -158,4 +176,9 @@ export function useGitHtmlDoc(
     enabled: enabled && !!cloneQuery.data && !!filepath,
     staleTime: 5 * 60_000,
   });
+
+  return {
+    ...htmlQuery,
+    ...cloneStatus(cloneQuery),
+  };
 }

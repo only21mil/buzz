@@ -1,6 +1,7 @@
 import AVFoundation
 import BuzzPushKit
 import Flutter
+import LocalAuthentication
 import UIKit
 import UserNotifications
 import os.log
@@ -28,6 +29,7 @@ import os.log
     keychainAccessGroup: pushKeychainAccessGroup
   )
   private var qrScannerChannel: FlutterMethodChannel?
+  private var deviceAuthChannel: FlutterMethodChannel?
   private var inlinePhotoPickerSupportChannel: FlutterMethodChannel?
   private var concentricSheetSurfaceChannel: FlutterMethodChannel?
   private var nativeAttachmentPopoverCoordinator: NativeAttachmentPopoverCoordinator?
@@ -69,6 +71,16 @@ import os.log
     )
     qrScannerChannel?.setMethodCallHandler { call, result in
       Self.handleQrScannerMethodCall(call, result: result)
+    }
+    // Fresh device-auth gate for private-key export (P05 / upstream #5116).
+    // LAContext device-owner policy accepts Face ID, Touch ID, or the device
+    // passcode, and fails closed when none is enrolled.
+    deviceAuthChannel = FlutterMethodChannel(
+      name: "buzz/device_auth",
+      binaryMessenger: messenger
+    )
+    deviceAuthChannel?.setMethodCallHandler { call, result in
+      Self.handleDeviceAuthMethodCall(call, result: result)
     }
     inlinePhotoPickerSupportChannel = FlutterMethodChannel(
       name: "buzz/inline_photo_picker",
@@ -223,6 +235,89 @@ import os.log
       .flatMap(\.windows)
       .first(where: \.isKeyWindow)?
       .safeAreaInsets.top ?? 0
+  }
+
+  /// Device-auth prompt for private-key export (P05 / upstream #5116).
+  ///
+  /// `canAuthenticate` reports whether device-owner authentication (Face ID,
+  /// Touch ID, or device passcode) can currently run. `authenticate` shows
+  /// the OS prompt with the caller-supplied reason and returns true only on
+  /// success. Cancellation, missing enrollment, and lockout all surface as
+  /// typed errors so Dart fails closed.
+  private static func handleDeviceAuthMethodCall(
+    _ call: FlutterMethodCall,
+    result: @escaping FlutterResult
+  ) {
+    switch call.method {
+    case "canAuthenticate":
+      guard call.arguments == nil else {
+        result(
+          FlutterError(
+            code: "invalid_arguments",
+            message: "canAuthenticate does not accept arguments.",
+            details: nil
+          )
+        )
+        return
+      }
+      result(LAContext().canEvaluatePolicy(.deviceOwnerAuthentication, error: nil))
+    case "authenticate":
+      guard let args = call.arguments as? [String: Any],
+        let reason = args["reason"] as? String,
+        !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+      else {
+        result(
+          FlutterError(
+            code: "invalid_arguments",
+            message: "authenticate requires a non-empty reason.",
+            details: nil
+          )
+        )
+        return
+      }
+      let context = LAContext()
+      var policyError: NSError?
+      guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &policyError) else {
+        result(
+          FlutterError(
+            code: "not_available",
+            message: "This phone has no Face ID, Touch ID, or passcode enrolled.",
+            details: nil
+          )
+        )
+        return
+      }
+      context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { success, error in
+        DispatchQueue.main.async {
+          if success {
+            result(true)
+            return
+          }
+          let code: String
+          switch (error as? LAError)?.code {
+          case .userCancel, .appCancel, .systemCancel:
+            code = "cancelled"
+          case .biometryNotAvailable, .biometryNotEnrolled, .passcodeNotSet:
+            code = "not_available"
+          case .biometryLockout:
+            // Locked out for too many failures, but the device passcode
+            // path stays available through the same policy on retry.
+            code = "auth_failed"
+          default:
+            code = "auth_failed"
+          }
+          result(
+            FlutterError(
+              code: code,
+              message: error?.localizedDescription ?? "Device verification did not pass.",
+              details: nil
+            )
+          )
+        }
+      }
+    default:
+      result(FlutterMethodNotImplemented)
+    }
   }
 
   override func application(

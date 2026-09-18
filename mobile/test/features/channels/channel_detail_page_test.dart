@@ -33,6 +33,7 @@ import 'package:buzz/shared/read_state/read_state_provider.dart';
 import 'package:buzz/features/channels/unread_badge/observed_unread_event.dart';
 import 'package:buzz/features/channels/small_avatar.dart';
 import 'package:buzz/features/profile/profile_provider.dart';
+import 'package:buzz/shared/identity/npub.dart';
 import 'package:buzz/shared/profile/user_cache_provider.dart';
 import 'package:buzz/shared/profile/user_profile.dart';
 import 'package:buzz/features/profile/user_profile_sheet.dart';
@@ -53,6 +54,10 @@ const _channelId = '11111111-2222-4333-8444-555555555555';
 const _huddleChannelId = '8d764100-fd8f-44cf-9c98-6d8fbd739b8c';
 const _otherChannelId = '22222222-3333-4444-8555-666666666666';
 const _otherHuddleChannelId = '9e875211-ae90-45df-8da9-7e9ace84ca9d';
+const _unknownAuthorHex =
+    '3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d';
+const _secondMemberHex =
+    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 
 final _mutableHuddleMembersProvider =
     NotifierProvider<_MutableHuddleMembersNotifier, List<ChannelMember>>(
@@ -418,6 +423,76 @@ void main() {
     SharedPreferences.setMockInitialValues({});
     _testPrefs = await SharedPreferences.getInstance();
   });
+
+  for (final thread in [false, true]) {
+    for (final reverse in [false, true]) {
+      testWidgets('signed qualified caller thread=$thread reverse=$reverse', (
+        tester,
+      ) async {
+        final first = 'a' * 64, second = 'b' * 64, sibling = 'c' * 64;
+        Future<void> tapProfile(String label, String key) async {
+          await tester.tap(find.text(label));
+          await tester.pumpAndSettle();
+          expect(
+            tester
+                .widget<UserProfileSheet>(find.byType(UserProfileSheet))
+                .pubkey,
+            key,
+          );
+          await tester.tap(find.byTooltip('Close sheet'));
+          await tester.pumpAndSettle();
+        }
+
+        for (final firstName in ['Scout', 'Renamed Scout', first, null]) {
+          for (final secondName in [null, 'Scout', 'Renamed Scout', second]) {
+            for (final bystander in [null, 'Bob', 'Scout']) {
+              final names = {
+                first: ?firstName,
+                second: ?secondName,
+                sibling: 'Alice',
+                'd' * 64: ?bystander,
+              };
+              final keys = [
+                first,
+                second.toUpperCase(),
+                sibling,
+                if (bystander != null) 'd' * 64,
+              ];
+              final event = _textMsg(
+                id: 'qualified',
+                pubkey: 'author',
+                content: '@Scout @Scout ($second) @Alice @Other (${'e' * 64})',
+                extraTags: [
+                  for (final key in reverse ? keys.reversed : keys) ['p', key],
+                ],
+              );
+              await tester.pumpWidget(
+                _buildTestable(
+                  messages: [event],
+                  users: {
+                    for (final e in names.entries)
+                      e.key: UserProfile(pubkey: e.key, displayName: e.value),
+                  },
+                  threadReplies: const {'qualified': []},
+                  initialThreadRootId: thread ? 'qualified' : null,
+                ),
+              );
+              await tester.pumpAndSettle();
+              await tapProfile('Scout (bbbbbbbb…bbbb)', second);
+              expect(find.text('Scout'), findsNothing);
+              expect(find.text('Bob'), findsNothing);
+              if (firstName != null) expect(find.text(firstName), findsNothing);
+              expect(find.text('Other (eeeeeeee…eeee)'), findsNothing);
+              await tapProfile('Alice', sibling);
+              expect(tester.takeException(), isNull);
+              await tester.pumpWidget(const SizedBox.shrink());
+              await tester.pumpAndSettle();
+            }
+          }
+        }
+      });
+    }
+  }
 
   group('Huddle DM identity gate', () {
     for (final scenario in [
@@ -3583,7 +3658,7 @@ void main() {
       final messages = [
         _textMsg(
           id: 'msg1',
-          pubkey: 'abcdef1234567890',
+          pubkey: _unknownAuthorHex,
           content: 'Hi',
           createdAt: 1000,
         ),
@@ -3593,8 +3668,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(findRichText('Hi'), findsOneWidget);
-      // Should show first 8 chars of pubkey + ellipsis
-      expect(find.text('abcdef12…'), findsOneWidget);
+      expect(find.text(truncateNpub(_unknownAuthorHex)), findsOneWidget);
     });
   });
 
@@ -6662,14 +6736,20 @@ void main() {
               id: 'sys-membership-avatar',
               payload: {
                 'type': 'member_joined',
-                'actor': 'alice',
-                'target': 'bob',
+                'actor': _unknownAuthorHex,
+                'target': _secondMemberHex,
               },
             ),
           ],
           users: {
-            'alice': const UserProfile(pubkey: 'alice', displayName: 'Alice'),
-            'bob': const UserProfile(pubkey: 'bob', displayName: 'Bob'),
+            _unknownAuthorHex: UserProfile(
+              pubkey: _unknownAuthorHex,
+              displayName: 'Alice',
+            ),
+            _secondMemberHex: UserProfile(
+              pubkey: _secondMemberHex,
+              displayName: 'Bob',
+            ),
           },
         ),
       );
@@ -6679,7 +6759,7 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.text('Copy public key'), findsOneWidget);
-      expect(find.text('alice'), findsNothing);
+      expect(find.text(_unknownAuthorHex), findsNothing);
       expect(find.byType(UserProfileSheet), findsOneWidget);
 
       TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
@@ -6690,13 +6770,7 @@ void main() {
       );
       await tester.ensureVisible(find.text('Copy public key'));
       await tester.pumpAndSettle();
-      final copyAction = find
-          .ancestor(
-            of: find.text('Copy public key'),
-            matching: find.byType(GestureDetector),
-          )
-          .last;
-      tester.widget<GestureDetector>(copyAction).onTap!();
+      await tester.tap(find.text('Copy public key'));
       await tester.pump();
       await tester.pump();
       expect(find.text('Public key copied'), findsOneWidget);

@@ -19,8 +19,10 @@
 //! 5. Verify `["u", <url>]` tag matches `expected_url` (normalised: case-insensitive
 //!    scheme/host, trailing slash stripped)
 //! 6. Verify `["method", <method>]` tag matches `expected_method` (case-insensitive)
-//! 7. If `["payload", <hash>]` tag is present **and** `body` is `Some`: verify
-//!    `SHA-256(body) == hex(payload_tag)`. This prevents body-substitution attacks.
+//! 7. If a `payload` tag is present **and** `body` is `Some`: the tag must
+//!    carry a hash and `SHA-256(body)` must equal it. A present tag without a
+//!    hash is malformed and rejected, never treated as absent. This prevents
+//!    body-substitution attacks.
 //! 8. Return `event.pubkey` on success.
 
 use nostr::{Alphabet, Event, Kind, SingleLetterTag, TagKind, Timestamp};
@@ -113,16 +115,23 @@ pub fn verify_nip98_event(
         )));
     }
 
-    // 7. If `payload` tag present AND body is Some: verify SHA-256(body) == payload hex.
-    let payload_tag = event.tags.find(TagKind::Payload).and_then(|t| t.content());
-
-    if let (Some(payload_hex), Some(body_bytes)) = (payload_tag, body) {
-        let computed: [u8; 32] = Sha256::digest(body_bytes).into();
-        let computed_hex = hex::encode(computed);
-        if computed_hex != payload_hex {
-            return Err(AuthError::Nip98Invalid(
-                "payload tag SHA-256 mismatch: request body does not match signed hash".to_string(),
-            ));
+    // 7. If a `payload` tag is present and `body` is `Some`: the tag MUST
+    // carry a hash and it must equal SHA-256(body). A present tag without a
+    // hash is malformed, not absent — treating it as absent would skip
+    // body-hash validation entirely.
+    if let Some(body_bytes) = body {
+        if let Some(tag) = event.tags.find(TagKind::Payload) {
+            let payload_hex = tag.content().ok_or_else(|| {
+                AuthError::Nip98Invalid("malformed `payload` tag: missing hash".to_string())
+            })?;
+            let computed: [u8; 32] = Sha256::digest(body_bytes).into();
+            let computed_hex = hex::encode(computed);
+            if computed_hex != payload_hex {
+                return Err(AuthError::Nip98Invalid(
+                    "payload tag SHA-256 mismatch: request body does not match signed hash"
+                        .to_string(),
+                ));
+            }
         }
     }
 
@@ -273,6 +282,35 @@ mod tests {
         let json = make_nip98_event(&keys, TEST_URL, TEST_METHOD, None, None);
         let result = verify_nip98_event(&json, TEST_URL, TEST_METHOD, Some(b"some body"));
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn payload_tag_without_hash_rejected_with_body() {
+        // A present `payload` tag without a hash is malformed, not absent.
+        // It must not silently skip body-hash validation.
+        use nostr::Tag;
+
+        let keys = Keys::generate();
+        let tags = vec![
+            Tag::parse(["u", TEST_URL]).unwrap(),
+            Tag::parse(["method", TEST_METHOD]).unwrap(),
+            Tag::parse(["payload"]).unwrap(),
+        ];
+        let event = EventBuilder::new(Kind::HttpAuth, "")
+            .tags(tags)
+            .sign_with_keys(&keys)
+            .expect("sign");
+        let json = serde_json::to_string(&event).unwrap();
+        let result = verify_nip98_event(&json, TEST_URL, TEST_METHOD, Some(b"hello world"));
+        match result {
+            Err(AuthError::Nip98Invalid(msg)) => {
+                assert!(
+                    msg.contains("malformed"),
+                    "expected malformed-tag rejection, got: {msg}"
+                );
+            }
+            other => panic!("expected Nip98Invalid, got: {other:?}"),
+        }
     }
 
     #[test]

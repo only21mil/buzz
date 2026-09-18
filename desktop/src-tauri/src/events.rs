@@ -387,15 +387,20 @@ pub fn build_forum_comment(
     Ok(EventBuilder::new(Kind::Custom(45003), content).tags(tags))
 }
 
+pub struct MessageEditTags<'a> {
+    pub media: &'a [Vec<String>],
+    pub custom_emoji: &'a [Vec<String>],
+    pub mentions: &'a [&'a str],
+    pub mention_refs: Option<&'a [Vec<String>]>,
+}
+
 /// Kind 40003 — edit a message with full content, media, emoji, mentions,
 /// and optional monotonic link-preview suppression.
 pub fn build_message_edit(
     channel_id: Uuid,
     target_event_id: EventId,
     content: &str,
-    media_tags: &[Vec<String>],
-    custom_emoji_tags: &[Vec<String>],
-    mentions: &[&str],
+    edit_tags: MessageEditTags<'_>,
     suppress_link_previews: bool,
 ) -> Result<EventBuilder, String> {
     check_content(content)?;
@@ -403,9 +408,13 @@ pub fn build_message_edit(
         tag(vec!["h", &channel_id.to_string()])?,
         tag(vec!["e", &target_event_id.to_hex()])?,
     ];
-    tags.extend(mention_tags(mentions)?);
-    imeta_tags(media_tags, &mut tags)?;
-    emoji_tags(custom_emoji_tags, &mut tags)?;
+    tags.extend(mention_tags(edit_tags.mentions)?);
+    imeta_tags(edit_tags.media, &mut tags)?;
+    emoji_tags(edit_tags.custom_emoji, &mut tags)?;
+    if let Some(mention_refs) = edit_tags.mention_refs {
+        mention_reference_tags(mention_refs, &mut tags)?;
+        tags.push(tag(vec!["buzz:mention-snapshot"])?);
+    }
     if suppress_link_previews {
         tags.push(tag(vec!["link-preview", "none"])?);
     }
@@ -898,8 +907,19 @@ mod tests {
         let target =
             EventId::from_hex("d24da132115ca0a46233cf4c2ad8338fbf914250cbcaa9181a6dd59533cb5ac1")
                 .unwrap();
-        let builder =
-            build_message_edit(channel, target, "hi @alice", &[], &[], mentions, false).unwrap();
+        let builder = build_message_edit(
+            channel,
+            target,
+            "hi @alice",
+            MessageEditTags {
+                media: &[],
+                custom_emoji: &[],
+                mentions,
+                mention_refs: None,
+            },
+            false,
+        )
+        .unwrap();
         let secret = nostr::SecretKey::from_hex(
             "0000000000000000000000000000000000000000000000000000000000000003",
         )

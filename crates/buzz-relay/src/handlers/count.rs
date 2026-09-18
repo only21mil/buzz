@@ -97,6 +97,12 @@ pub async fn handle_count(
     }
 
     // For each filter, count matching events with channel access enforcement.
+    // NIP-45 union semantics: overlapping filters count each matching event
+    // once. One filter is already exact on its fast path, so it keeps it;
+    // with several filters, matching IDs are collected into a single set
+    // instead of summing per-filter counts.
+    let union_mode = filters.len() > 1;
+    let mut union_ids: std::collections::HashSet<nostr::EventId> = std::collections::HashSet::new();
     let mut total: u64 = 0;
     for filter in &filters {
         // Determine if this filter can match author-only kinds — if so, the
@@ -168,7 +174,33 @@ pub async fn handle_count(
                         .iter()
                         .all(|a| a.to_hex().eq_ignore_ascii_case(&authed_pubkey_hex))
             });
-            if super::req::filter_fully_pushable(filter)
+            if union_mode {
+                match super::req::collect_count_union_ids(
+                    &state,
+                    conn.tenant.community(),
+                    "count_req_union",
+                    query,
+                    filter,
+                    &pubkey_bytes,
+                    &mut union_ids,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(super::req::CountUnionError::BudgetExceeded) => {
+                        metrics::counter!("buzz_count_fallback_rejections_total").increment(1);
+                        conn.send(RelayMessage::closed(
+                            &sub_id,
+                            "restricted: count filter requires narrower constraints",
+                        ));
+                        return;
+                    }
+                    Err(super::req::CountUnionError::Backend(e)) => {
+                        conn.send(RelayMessage::closed(&sub_id, &format!("error: {e}")));
+                        return;
+                    }
+                }
+            } else if super::req::filter_fully_pushable(filter)
                 && (!needs_author_only_filtering || author_is_self)
                 && !needs_result_gated_filtering
                 && !needs_shared_gate_filtering
@@ -248,7 +280,33 @@ pub async fn handle_count(
                         .iter()
                         .all(|a| a.to_hex().eq_ignore_ascii_case(&authed_pubkey_hex))
             });
-            if super::req::filter_fully_pushable(filter)
+            if union_mode {
+                match super::req::collect_count_union_ids(
+                    &state,
+                    conn.tenant.community(),
+                    "count_req_union",
+                    query,
+                    filter,
+                    &pubkey_bytes,
+                    &mut union_ids,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(super::req::CountUnionError::BudgetExceeded) => {
+                        metrics::counter!("buzz_count_fallback_rejections_total").increment(1);
+                        conn.send(RelayMessage::closed(
+                            &sub_id,
+                            "restricted: count filter requires narrower constraints",
+                        ));
+                        return;
+                    }
+                    Err(super::req::CountUnionError::Backend(e)) => {
+                        conn.send(RelayMessage::closed(&sub_id, &format!("error: {e}")));
+                        return;
+                    }
+                }
+            } else if super::req::filter_fully_pushable(filter)
                 && (!needs_author_only_filtering || author_is_self)
                 && !needs_result_gated_filtering
                 && !needs_shared_gate_filtering
@@ -303,6 +361,9 @@ pub async fn handle_count(
                 }
             }
         }
+    }
+    if union_mode {
+        total = union_ids.len() as u64;
     }
     conn.send(RelayMessage::count(&sub_id, total));
 }

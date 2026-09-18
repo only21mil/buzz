@@ -3,10 +3,10 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
+import '../../../shared/identity/npub.dart';
 import '../../../shared/theme/theme.dart';
 import '../../../shared/widgets/buzz_loading_indicator.dart';
 import '../../../shared/profile/user_cache_provider.dart';
-import '../date_formatters.dart';
 import 'observer_models.dart';
 import 'observer_subscription.dart';
 import 'transcript_item_widget.dart';
@@ -37,7 +37,7 @@ class AgentActivitySheet extends HookConsumerWidget {
     final profile = ref.watch(
       userCacheProvider.select((cache) => cache[agentPubkey.toLowerCase()]),
     );
-    final botName = profile?.label ?? shortPubkey(agentPubkey);
+    final botName = profile?.label ?? truncateNpub(agentPubkey);
 
     // Auto-scroll to bottom on new items.
     final sheetControllerRef = useRef<ScrollController?>(null);

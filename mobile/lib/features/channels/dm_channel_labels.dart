@@ -1,4 +1,4 @@
-import '../../shared/utils/string_utils.dart';
+import '../../shared/identity/npub.dart';
 import 'channel.dart';
 
 const int _dmParticipantPreviewLimit = 3;
@@ -33,7 +33,7 @@ String resolveDmChannelDisplayLabel(Channel channel, {String? currentPubkey}) {
       (
         label: index < channel.participants.length
             ? channel.participants[index]
-            : shortPubkey(channel.participantPubkeys[index]),
+            : truncateNpub(channel.participantPubkeys[index]),
         pubkey: channel.participantPubkeys[index].toLowerCase(),
       ),
   ];
@@ -52,6 +52,36 @@ String resolveDmChannelDisplayLabel(Channel channel, {String? currentPubkey}) {
   return labels.isNotEmpty
       ? formatDmParticipantDisplayName(labels)
       : channel.name;
+}
+
+/// Avatar initial for the DM's visible counterpart.
+String dmAvatarInitial(Channel channel, {String? currentPubkey}) {
+  final normalizedCurrent = currentPubkey?.toLowerCase();
+  var index = 0;
+  while (normalizedCurrent != null &&
+      index < channel.participantPubkeys.length &&
+      channel.participantPubkeys[index].toLowerCase() == normalizedCurrent) {
+    index++;
+  }
+
+  if (index >= channel.participantPubkeys.length) {
+    if (channel.participantPubkeys.isEmpty) {
+      final label = channel.participants.isNotEmpty
+          ? channel.participants.first
+          : '';
+      return label.isNotEmpty ? label[0].toUpperCase() : '?';
+    }
+    index = 0;
+  }
+
+  final pubkey = channel.participantPubkeys[index];
+  final label = index < channel.participants.length
+      ? channel.participants[index]
+      : truncateNpub(pubkey);
+  if (pubkey.isNotEmpty && label == truncateNpub(pubkey)) {
+    return pubkey[0].toUpperCase();
+  }
+  return label.isNotEmpty ? label[0].toUpperCase() : '?';
 }
 
 List<Channel> sortDmChannelsByDisplayLabel(

@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
 
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
+import { waitForAnimations } from "../helpers/animations";
 
 const IMAGE_SHA = "c".repeat(64);
 const IMAGE_URL = "http://127.0.0.1:4173/buzz.svg";
@@ -198,14 +199,30 @@ test("hidden spoiler links reveal without opening on the first click", async ({
       }),
   );
 
-  const popupPromise = page
-    .waitForEvent("popup", { timeout: 500 })
-    .catch(() => null);
+  await page.mouse.move(0, 0);
+  await waitForAnimations(page);
+
+  await page.evaluate(async () => {
+    const invoke = (
+      window as Window & {
+        __TAURI_INTERNALS__?: { invoke?: (cmd: string) => Promise<unknown> };
+      }
+    ).__TAURI_INTERNALS__?.invoke;
+    await invoke?.("clear_e2e_opened_external_urls");
+  });
+
   await secretLink.click({ force: true });
 
-  const popup = await popupPromise;
-  await popup?.close();
-  expect(popup).toBeNull();
+  const opened = await page.evaluate(async () => {
+    const invoke = (
+      window as Window & {
+        __TAURI_INTERNALS__?: { invoke?: (cmd: string) => Promise<unknown> };
+      }
+    ).__TAURI_INTERNALS__?.invoke;
+    return ((await invoke?.("get_e2e_opened_external_urls")) ?? []) as string[];
+  });
+  expect(opened).toEqual([]);
+
   await expect(spoiler).toHaveAttribute("data-revealed", "true");
 });
 

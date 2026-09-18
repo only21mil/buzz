@@ -43,6 +43,9 @@ allow = [
     "bzip2-1.0.6",
 ]
 confidence-threshold = 0.8
+# OpenSSL, MITNFA, Unicode-DFS-2016, and bzip2-1.0.6 are preemptive for
+# desktop/Tauri and optional feature paths outside the root workspace scan.
+unused-allowed-license = "allow"
 
 # mesh-llm workspace crates (pinned git dep) omit a per-crate `license` field in
 # their manifests, so cargo-deny reports them as unlicensed. The mesh-llm repo is
@@ -86,7 +89,397 @@ license-files = []
 
 [licenses.private]
 ignore = true
-
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"
+
+# Older duplicate versions below are allow-listed until upstream deps converge.
+
+# Duplicate allow-list: windows
+[[bans.skip]]
+name = "windows"
+version = "=0.61.3"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows-collections"
+version = "=0.2.0"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows-core"
+version = "=0.61.2"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows-future"
+version = "=0.2.1"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows-link"
+version = "=0.1.3"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows-numerics"
+version = "=0.2.0"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows-result"
+version = "=0.3.4"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows-strings"
+version = "=0.4.2"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows-sys"
+version = "=0.45.0"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows-sys"
+version = "=0.52.0"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows-sys"
+version = "=0.60.2"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows-targets"
+version = "=0.42.2"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows-targets"
+version = "=0.52.6"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows-threading"
+version = "=0.1.0"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows_aarch64_gnullvm"
+version = "=0.42.2"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows_aarch64_gnullvm"
+version = "=0.52.6"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows_aarch64_msvc"
+version = "=0.42.2"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows_aarch64_msvc"
+version = "=0.52.6"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows_i686_gnu"
+version = "=0.42.2"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows_i686_gnu"
+version = "=0.52.6"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows_i686_gnullvm"
+version = "=0.52.6"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows_i686_msvc"
+version = "=0.42.2"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows_i686_msvc"
+version = "=0.52.6"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows_x86_64_gnu"
+version = "=0.42.2"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows_x86_64_gnu"
+version = "=0.52.6"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows_x86_64_gnullvm"
+version = "=0.42.2"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows_x86_64_gnullvm"
+version = "=0.52.6"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows_x86_64_msvc"
+version = "=0.42.2"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+[[bans.skip]]
+name = "windows_x86_64_msvc"
+version = "=0.52.6"
+reason = "windows-rs version lines pinned by unrelated transitive crates; unification blocked upstream"
+
+
+# Duplicate allow-list: crypto
+[[bans.skip]]
+name = "block-buffer"
+version = "=0.10.4"
+reason = "crypto/rand stack version skew across nostr, mesh-llm, and iroh dependency trees"
+
+[[bans.skip]]
+name = "chacha20"
+version = "=0.9.1"
+reason = "crypto/rand stack version skew across nostr, mesh-llm, and iroh dependency trees"
+
+[[bans.skip]]
+name = "cpufeatures"
+version = "=0.2.17"
+reason = "crypto/rand stack version skew across nostr, mesh-llm, and iroh dependency trees"
+
+[[bans.skip]]
+name = "crypto-common"
+version = "=0.1.7"
+reason = "crypto/rand stack version skew across nostr, mesh-llm, and iroh dependency trees"
+
+[[bans.skip]]
+name = "digest"
+version = "=0.10.7"
+reason = "crypto/rand stack version skew across nostr, mesh-llm, and iroh dependency trees"
+
+[[bans.skip]]
+name = "getrandom"
+version = "=0.2.17"
+reason = "crypto/rand stack version skew across nostr, mesh-llm, and iroh dependency trees"
+
+[[bans.skip]]
+name = "getrandom"
+version = "=0.3.4"
+reason = "crypto/rand stack version skew across nostr, mesh-llm, and iroh dependency trees"
+
+[[bans.skip]]
+name = "hkdf"
+version = "=0.12.4"
+reason = "crypto/rand stack version skew across nostr, mesh-llm, and iroh dependency trees"
+
+[[bans.skip]]
+name = "hmac"
+version = "=0.12.1"
+reason = "crypto/rand stack version skew across nostr, mesh-llm, and iroh dependency trees"
+
+[[bans.skip]]
+name = "rand"
+version = "=0.8.6"
+reason = "crypto/rand stack version skew across nostr, mesh-llm, and iroh dependency trees"
+
+[[bans.skip]]
+name = "rand"
+version = "=0.9.4"
+reason = "crypto/rand stack version skew across nostr, mesh-llm, and iroh dependency trees"
+
+[[bans.skip]]
+name = "rand_chacha"
+version = "=0.3.1"
+reason = "crypto/rand stack version skew across nostr, mesh-llm, and iroh dependency trees"
+
+[[bans.skip]]
+name = "rand_core"
+version = "=0.6.4"
+reason = "crypto/rand stack version skew across nostr, mesh-llm, and iroh dependency trees"
+
+[[bans.skip]]
+name = "rand_core"
+version = "=0.9.5"
+reason = "crypto/rand stack version skew across nostr, mesh-llm, and iroh dependency trees"
+
+[[bans.skip]]
+name = "secp256k1"
+version = "=0.29.1"
+reason = "crypto/rand stack version skew across nostr, mesh-llm, and iroh dependency trees"
+
+[[bans.skip]]
+name = "secp256k1-sys"
+version = "=0.10.1"
+reason = "crypto/rand stack version skew across nostr, mesh-llm, and iroh dependency trees"
+
+[[bans.skip]]
+name = "sha2"
+version = "=0.10.9"
+reason = "crypto/rand stack version skew across nostr, mesh-llm, and iroh dependency trees"
+
+
+# Duplicate allow-list: prost
+[[bans.skip]]
+name = "prost"
+version = "=0.13.5"
+reason = "prost 0.13 vs 0.14 split in mesh-llm/tonic chain until upstream aligns"
+
+[[bans.skip]]
+name = "prost-derive"
+version = "=0.13.5"
+reason = "prost 0.13 vs 0.14 split in mesh-llm/tonic chain until upstream aligns"
+
+[[bans.skip]]
+name = "prost-types"
+version = "=0.13.5"
+reason = "prost 0.13 vs 0.14 split in mesh-llm/tonic chain until upstream aligns"
+
+
+# Duplicate allow-list: thiserror
+[[bans.skip]]
+name = "thiserror"
+version = "=1.0.69"
+reason = "nostr git pin still on thiserror 1.x while workspace uses 2.x"
+
+[[bans.skip]]
+name = "thiserror-impl"
+version = "=1.0.69"
+reason = "nostr git pin still on thiserror 1.x while workspace uses 2.x"
+
+
+# Duplicate allow-list: quick-xml
+[[bans.skip]]
+name = "quick-xml"
+version = "=0.38.4"
+reason = "rust-s3 and plist pins hold 0.38/0.39 until upstream bumps (see RUSTSEC-2026-0194/0195)"
+
+
+# Duplicate allow-list: nostr-media
+[[bans.skip]]
+name = "base64"
+version = "=0.13.1"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[[bans.skip]]
+name = "bitflags"
+version = "=1.3.2"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[[bans.skip]]
+name = "compact_str"
+version = "=0.7.1"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[[bans.skip]]
+name = "core-foundation"
+version = "=0.9.4"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[[bans.skip]]
+name = "darling"
+version = "=0.20.11"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[[bans.skip]]
+name = "darling_core"
+version = "=0.20.11"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[[bans.skip]]
+name = "darling_macro"
+version = "=0.20.11"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[[bans.skip]]
+name = "hashbrown"
+version = "=0.14.5"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[[bans.skip]]
+name = "hashbrown"
+version = "=0.16.1"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[[bans.skip]]
+name = "jni"
+version = "=0.21.1"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[[bans.skip]]
+name = "jni-sys"
+version = "=0.3.1"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[[bans.skip]]
+name = "nix"
+version = "=0.30.1"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[[bans.skip]]
+name = "ordered-float"
+version = "=2.10.1"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[[bans.skip]]
+name = "r-efi"
+version = "=5.3.0"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[[bans.skip]]
+name = "reqwest"
+version = "=0.12.28"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[[bans.skip]]
+name = "security-framework"
+version = "=2.11.1"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[[bans.skip]]
+name = "syn"
+version = "=1.0.109"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[[bans.skip]]
+name = "wasi"
+version = "=0.11.1+wasi-snapshot-preview1"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[[bans.skip]]
+name = "wasm-streams"
+version = "=0.4.2"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[[bans.skip]]
+name = "webpki-roots"
+version = "=0.26.11"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[[bans.skip]]
+name = "winnow"
+version = "=0.7.15"
+reason = "transitive duplicate from symphonia/nostr/mesh-llm chains; no safe workspace-wide unify"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Pinned git deps: mesh-llm (v0.74.0 tag), nostr (RUSTSEC fixes at 94dac28e),
+# rust-s3 fork (aws-creds patch for Blossom media).
+allow-git = [
+    "https://github.com/Mesh-LLM/mesh-llm",
+    "https://github.com/nostrdevkit/nostr",
+    "https://github.com/tlongwell-block/rust-s3",
+]
+unused-allowed-source = "allow"
+
