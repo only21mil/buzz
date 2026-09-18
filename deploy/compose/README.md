@@ -19,6 +19,10 @@ cd deploy/compose
 BUZZ_COMPOSE_TLS=true ./run.sh start
 ```
 
+`run.sh` is upstream-owned and starts whatever unpinned `BUZZ_IMAGE` sits in
+`.env`; the fork's pinned path is `deploy-local.sh`, and `run-local.sh` refuses
+unpinned mutating subcommands (see below).
+
 The bootstrap script should eventually replace manual `.env` editing for normal
 users. It is responsible for generating stable secrets and, optionally, an owner
 keypair.
