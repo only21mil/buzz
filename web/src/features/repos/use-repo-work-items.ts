@@ -3,35 +3,25 @@ import { queryEvents } from "@/shared/lib/nostr-client";
 import { relayWsUrl } from "@/shared/lib/relay-url";
 import {
   parseRepoWorkItems,
+  partitionRepoWorkItemEvents,
   repoWorkItemFilters,
   type RepoWorkItems,
-} from "./repo-work-items.mjs";
+} from "./repo-work-items";
 
 export async function fetchRepoWorkItems(
   repoAddress: string,
 ): Promise<RepoWorkItems> {
+  // One REQ with all five filters: one socket and one AUTH exchange per
+  // page load instead of five.
   const filters = repoWorkItemFilters(repoAddress);
-  const [
-    issueEvents,
-    pullRequestEvents,
-    updateEvents,
-    commentEvents,
-    statuses,
-  ] = await Promise.all([
-    queryEvents(relayWsUrl(), filters.issues),
-    queryEvents(relayWsUrl(), filters.pullRequests),
-    queryEvents(relayWsUrl(), filters.pullRequestUpdates),
-    queryEvents(relayWsUrl(), filters.comments),
-    queryEvents(relayWsUrl(), filters.statuses),
+  const events = await queryEvents(relayWsUrl(), [
+    filters.issues,
+    filters.pullRequests,
+    filters.pullRequestUpdates,
+    filters.comments,
+    filters.statuses,
   ]);
-
-  return parseRepoWorkItems({
-    issueEvents,
-    pullRequestEvents,
-    updateEvents,
-    commentEvents,
-    statusEvents: statuses,
-  });
+  return parseRepoWorkItems(partitionRepoWorkItemEvents(events));
 }
 
 export function useRepoWorkItems(

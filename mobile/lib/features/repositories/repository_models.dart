@@ -23,6 +23,22 @@ class Repository {
   final String defaultBranch;
 
   String get address => '$repositoryAnnouncementKind:$owner:$id';
+
+  // Value equality keeps one provider instance per repository even though
+  // every announcement reload builds fresh objects.
+  @override
+  bool operator ==(Object other) =>
+      other is Repository &&
+      other.id == id &&
+      other.name == name &&
+      other.description == description &&
+      other.owner == owner &&
+      other.createdAt == createdAt &&
+      other.defaultBranch == defaultBranch;
+
+  @override
+  int get hashCode =>
+      Object.hash(id, name, description, owner, createdAt, defaultBranch);
 }
 
 @immutable

@@ -27,13 +27,18 @@ const QUERY_TIMEOUT_MS = 10_000;
 
 /**
  * Open a WebSocket to `wsUrl`, authenticate via NIP-42 if challenged,
- * send a REQ with the given filter, collect EVENTs until EOSE, then
- * close and return them.
+ * send one REQ carrying the given filter or filters, collect EVENTs until
+ * EOSE, then close and return them.
+ *
+ * Pass an array when a page needs several filters: NIP-01 lets one REQ
+ * carry them all, so the relay sees one socket and one AUTH handshake
+ * instead of one per filter.
  */
 export function queryEvents(
   wsUrl: string,
-  filter: NostrFilter,
+  filter: NostrFilter | NostrFilter[],
 ): Promise<NostrEvent[]> {
+  const filters = Array.isArray(filter) ? filter : [filter];
   return new Promise((resolve, reject) => {
     const events: NostrEvent[] = [];
     const subId = `q-${Date.now().toString(36)}`;
@@ -67,7 +72,7 @@ export function queryEvents(
     const sendReq = () => {
       if (!reqSent) {
         reqSent = true;
-        ws.send(JSON.stringify(["REQ", subId, filter]));
+        ws.send(JSON.stringify(["REQ", subId, ...filters]));
       }
     };
 

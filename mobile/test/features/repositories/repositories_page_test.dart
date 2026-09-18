@@ -110,6 +110,59 @@ void main() {
     expect(find.byType(TextField), findsNothing);
   });
 
+  test('equal repositories from separate reloads share one snapshot', () async {
+    var requests = 0;
+    final container = _snapshotContainer(onRequest: () => requests++);
+    final first = container.listen(
+      repositorySnapshotProvider(testRepository),
+      (_, _) {},
+    );
+    addTearDown(first.close);
+    final reloaded = repositoriesFromEvents([
+      NostrEvent(
+        id: 'announcement-1',
+        pubkey: testRepository.owner,
+        createdAt: testRepository.createdAt,
+        kind: repositoryAnnouncementKind,
+        tags: [
+          ['d', testRepository.id],
+          ['name', testRepository.name],
+          ['description', testRepository.description],
+          ['default-branch', testRepository.defaultBranch],
+        ],
+        content: '',
+        sig: 'sig',
+      ),
+    ]).single;
+    expect(identical(reloaded, testRepository), isFalse);
+    expect(reloaded, testRepository);
+
+    await container.read(repositorySnapshotProvider(reloaded).future);
+
+    expect(
+      container.read(repositorySnapshotProvider(reloaded).notifier),
+      same(container.read(repositorySnapshotProvider(testRepository).notifier)),
+    );
+    expect(requests, 1);
+  });
+
+  test('disposes the snapshot once its detail page stops listening', () async {
+    var requests = 0;
+    final container = _snapshotContainer(onRequest: () => requests++);
+    final subscription = container.listen(
+      repositorySnapshotProvider(testRepository),
+      (_, _) {},
+    );
+    await container.read(repositorySnapshotProvider(testRepository).future);
+    expect(requests, 1);
+
+    subscription.close();
+    await Future<void>.delayed(Duration.zero);
+    await container.read(repositorySnapshotProvider(testRepository).future);
+
+    expect(requests, 2);
+  });
+
   test('signs the exact snapshot GET URL without a payload tag', () async {
     final keys = nostr.Keys.generate();
     http.Request? captured;
@@ -153,6 +206,33 @@ void main() {
     expect(tags, anyElement(equals(<String>['method', 'GET'])));
     expect(tags.any((tag) => tag.first == 'payload'), isFalse);
   });
+}
+
+ProviderContainer _snapshotContainer({required void Function() onRequest}) {
+  final keys = nostr.Keys.generate();
+  final client = http_testing.MockClient((request) async {
+    onRequest();
+    return http.Response(
+      jsonEncode({'files': <Object>[], 'truncated': false}),
+      200,
+    );
+  });
+  final container = ProviderContainer(
+    overrides: [
+      relayConfigProvider.overrideWith(
+        () => _FakeRelayConfigNotifier(
+          const RelayConfig(
+            baseUrl: 'https://relay.example/community',
+            nsec: null,
+          ),
+          nsec: keys.nsec,
+        ),
+      ),
+      repositoryHttpClientProvider.overrideWithValue(client),
+    ],
+  );
+  addTearDown(container.dispose);
+  return container;
 }
 
 class _FakeRepositoriesNotifier extends RepositoriesNotifier {

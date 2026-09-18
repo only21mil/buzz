@@ -8,7 +8,7 @@ import { relativeTime } from "@/shared/lib/relative-time";
 import { truncatePubkey } from "@/shared/lib/pubkey";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
-import type { ProjectIssue, ProjectPullRequest } from "../repo-work-items.mjs";
+import type { ProjectIssue, ProjectPullRequest } from "../repo-work-items";
 
 type RepoWorkItem = ProjectIssue | ProjectPullRequest;
 

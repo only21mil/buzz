@@ -3,7 +3,7 @@ import test from "node:test";
 import {
   cloneFetchErrorMessage,
   gitCloneBrowseMeta,
-} from "./git-clone-browse-meta.mjs";
+} from "./git-clone-browse-meta.ts";
 
 test("gitCloneBrowseMeta marks stale clones from ensureClone data", () => {
   const fresh = gitCloneBrowseMeta({ fs: {}, dir: "/a/b" }, null, false);

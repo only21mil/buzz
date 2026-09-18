@@ -161,9 +161,9 @@ class RepositorySnapshotNotifier extends AsyncNotifier<RepositorySnapshot> {
   }
 }
 
-final repositorySnapshotProvider =
-    AsyncNotifierProvider.family<
-      RepositorySnapshotNotifier,
-      RepositorySnapshot,
-      Repository
-    >((repository) => RepositorySnapshotNotifier(repository));
+// autoDispose: a detail page is the only listener, so the snapshot and its
+// error state go away with the page instead of accumulating per open.
+final repositorySnapshotProvider = AsyncNotifierProvider.autoDispose
+    .family<RepositorySnapshotNotifier, RepositorySnapshot, Repository>(
+      (repository) => RepositorySnapshotNotifier(repository),
+    );
