@@ -1327,7 +1327,7 @@ steps:
     #[ignore = "requires Postgres"]
     async fn recovery_sweep_purges_expired_workflow_state() {
         let fixture = recovery_fixture().await;
-        fixture
+        let written = fixture
             .db
             .write_workflow_state(
                 fixture.community_id,
@@ -1336,31 +1336,51 @@ steps:
                 "cursor",
                 "\"live\"",
                 60,
-                Some("0"),
+                None,
             )
             .await
             .expect("write live state");
-        fixture
+        assert!(
+            matches!(written, buzz_db::WorkflowStateWriteOutcome::Written { .. }),
+            "live state must be written: {written:?}"
+        );
+        let written = fixture
             .db
             .write_workflow_state(
                 fixture.community_id,
                 fixture.run_id,
-                "step-1",
+                "step-2",
                 "stale",
                 "\"expired\"",
                 60,
-                Some("0"),
+                None,
             )
             .await
             .expect("write soon-expired state");
-        sqlx::query(
-            "UPDATE workflow_state SET expires_at = clock_timestamp() - interval '1 second' \
-             WHERE run_id = $1 AND key = 'stale'",
+        assert!(
+            matches!(written, buzz_db::WorkflowStateWriteOutcome::Written { .. }),
+            "soon-expired state must be written: {written:?}"
+        );
+        // Each step holds one write receipt, so the two rows come from two
+        // steps. State rows key on the run's workflow, not the run itself.
+        let workflow_id: Uuid = sqlx::query_scalar(
+            "SELECT workflow_id FROM workflow_runs WHERE community_id = $1 AND id = $2",
         )
+        .bind(fixture.community_id.as_uuid())
         .bind(fixture.run_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("resolve the run's workflow");
+        let expired = sqlx::query(
+            "UPDATE workflow_state SET expires_at = clock_timestamp() - interval '1 second' \
+             WHERE community_id = $1 AND workflow_id = $2 AND state_key = 'stale'",
+        )
+        .bind(fixture.community_id.as_uuid())
+        .bind(workflow_id)
         .execute(&fixture.pool)
         .await
         .expect("expire the stale row");
+        assert_eq!(expired.rows_affected(), 1, "one stale row expired");
 
         let outcome = run_workflow_resume_sweep_once(
             Arc::clone(&fixture.engine),
@@ -1372,12 +1392,14 @@ steps:
         .expect("sweep");
 
         assert_eq!(outcome.purged, 1, "the sweep deletes the expired row");
-        let remaining: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM workflow_state WHERE run_id = $1")
-                .bind(fixture.run_id)
-                .fetch_one(&fixture.pool)
-                .await
-                .expect("count rows");
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_state WHERE community_id = $1 AND workflow_id = $2",
+        )
+        .bind(fixture.community_id.as_uuid())
+        .bind(workflow_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("count rows");
         assert_eq!(remaining, 1, "the live row survives");
     }
 }
