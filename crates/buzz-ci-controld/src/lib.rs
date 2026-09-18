@@ -24,6 +24,7 @@ pub use acceptance_socket::{
     ACCEPTANCE_BINDING_SCHEMA,
 };
 
+use buzz_ci_broker_protocol::is_lower_hex;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -36,7 +37,7 @@ pub const RUNNER_CONTROL_SOCKET_PATH: &str = "/run/buzzci/runner-control.sock";
 pub const RUNNER_OUTPUT_ROOT: &str = "/var/lib/buzzci/runner-output";
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 pub const DEFAULT_LIVENESS_WINDOW: Duration = Duration::from_secs(300);
-pub const MAX_SAFE_INTEGER: u64 = (1_u64 << 53) - 1;
+pub use buzz_ci_broker_protocol::MAX_SAFE_INTEGER;
 
 /// Trusted process configuration. Paths cannot be selected by a runner request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -699,13 +700,6 @@ fn require_event_id(value: &str) -> Result<(), StateError> {
         return Err(StateError::InvalidEventId);
     }
     Ok(())
-}
-
-fn is_lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 //! Crash-safe file-backed control state.
 
+use buzz_ci_broker_protocol::is_lower_hex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -626,13 +627,6 @@ fn validate_key(key: &str) -> Result<(), StoreError> {
 fn identity_key(identity: &RunIdentity) -> Result<String, StoreError> {
     let bytes = serde_json::to_vec(identity).map_err(|_| StoreError::InvalidSnapshot)?;
     Ok(hex::encode(Sha256::digest(bytes)))
-}
-
-fn is_lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(test)]

@@ -13,6 +13,7 @@ use std::net::IpAddr;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use buzz_ci_broker_protocol::is_lower_hex;
 use buzz_ci_broker_protocol::{GitOid, TrustClass};
 use buzz_ci_isolation_contract::PrincipalUids;
 use nix::dir::Dir;
@@ -448,13 +449,6 @@ fn safe_receipt_file(metadata: &fs::Metadata, roots: &DnsReceiptRoots) -> bool {
         && metadata.permissions().mode() & 0o7777 == DNS_RECEIPT_FILE_MODE
         && metadata.len() > 0
         && metadata.len() <= MAX_DNS_RECEIPT_BYTES
-}
-
-fn is_lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Why root-owned retained DNS state could not be recovered safely.

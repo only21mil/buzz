@@ -4,6 +4,7 @@
 //! supplies an HTTP transport and a NIP-98 authorizer; this module binds both
 //! to exact request bytes and validates every relay response fail-closed.
 
+use buzz_ci_broker_protocol::is_lower_hex;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::Read;
@@ -989,13 +990,6 @@ impl StoredObjectWire {
         }
         Ok(())
     }
-}
-
-fn is_lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn canonical_evidence_path(path: &str, expected_sha256: &str, expected_bytes: u64) -> bool {

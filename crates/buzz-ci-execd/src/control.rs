@@ -20,6 +20,7 @@ use buzz_ci_broker_protocol::{
     HEADER_SIZE, PROTOCOL_VERSION,
 };
 use nix::{
+    fcntl::{fcntl, FcntlArg, FdFlag},
     sys::socket::{
         getsockname, getsockopt, sockopt::AcceptConn, sockopt::PeerCredentials, sockopt::SockType,
         SockType as NixSockType, UnixAddr,
@@ -589,11 +590,15 @@ impl<D: ControlDispatch> ControlServer<D> {
     }
 
     /// Run maintenance and serve at most one ready connection without blocking.
-    pub fn serve_tick(&mut self, now: u64) -> Result<(), ControlError> {
+    ///
+    /// Returns `Ok(false)` when no connection was pending, so the caller can
+    /// sleep only then and drain a backlog without a fixed delay per
+    /// connection. A served connection that failed surfaces as `Err`.
+    pub fn serve_tick(&mut self, now: u64) -> Result<bool, ControlError> {
         self.dispatch.maintenance(now);
         let (stream, _) = match self.listener.accept() {
             Ok(connection) => connection,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
             Err(error) => return Err(ControlError::Accept(error)),
         };
         serve_stream_mode(
@@ -603,6 +608,7 @@ impl<D: ControlDispatch> ControlServer<D> {
             &mut self.dispatch,
             self.allow_v1,
         )
+        .map(|()| true)
     }
 }
 
@@ -626,7 +632,20 @@ pub fn validate_systemd_environment() -> Result<(), ControlError> {
 }
 
 /// Validate the sole listener after the binary adopts systemd fd 3.
+///
+/// The returned listener is close-on-exec. execd spawns allowlisted host
+/// commands (nft, systemctl, systemd-run) with `std::process::Command`, and
+/// systemd hands fd 3 over without `FD_CLOEXEC`; without this flag every
+/// child would inherit the control socket and could `accept()` controller
+/// connections as if it were execd.
 pub fn validate_systemd_listener(listener: UnixListener) -> Result<UnixListener, ControlError> {
+    validate_listener_path(listener, Path::new(EXECD_SOCKET_PATH))
+}
+
+fn validate_listener_path(
+    listener: UnixListener,
+    expected_path: &Path,
+) -> Result<UnixListener, ControlError> {
     if getsockopt(&listener, SockType).map_err(nix_io)? != NixSockType::Stream {
         return Err(ControlError::Activation("fd 3 is not a stream socket"));
     }
@@ -636,12 +655,18 @@ pub fn validate_systemd_listener(listener: UnixListener) -> Result<UnixListener,
     let address = getsockname::<UnixAddr>(listener.as_raw_fd())
         .map_err(nix_io)
         .map_err(ControlError::Io)?;
-    if address.path() != Some(Path::new(EXECD_SOCKET_PATH)) {
+    if address.path() != Some(expected_path) {
         return Err(ControlError::Activation(
             "fd 3 is not the fixed execd socket",
         ));
     }
-
+    let flags = fcntl(&listener, FcntlArg::F_GETFD)
+        .map_err(nix_io)
+        .map_err(ControlError::Io)?;
+    let flags = FdFlag::from_bits_truncate(flags) | FdFlag::FD_CLOEXEC;
+    fcntl(&listener, FcntlArg::F_SETFD(flags))
+        .map_err(nix_io)
+        .map_err(ControlError::Io)?;
     Ok(listener)
 }
 
@@ -1205,9 +1230,37 @@ mod tests {
         )
         .unwrap();
 
-        server.serve_tick(42).unwrap();
+        assert!(!server.serve_tick(42).unwrap());
 
         assert_eq!(observed.get(), 42);
+    }
+
+    #[test]
+    fn polling_tick_serves_one_queued_connection_and_reports_idle() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("execd.sock");
+        let listener = match UnixListener::bind(&socket) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("unexpected listener bind failure: {error}"),
+        };
+        let observed = Rc::new(Cell::new(0));
+        let mut server = ControlServer::new_polling(
+            listener,
+            PeerUidPolicy::new(961, 962).unwrap(),
+            MaintenanceCounter(Rc::clone(&observed)),
+        )
+        .unwrap();
+        // Two queued peers, neither holding a control UID. Each tick must
+        // consume exactly one of them; only the empty tick reports idle.
+        let first = UnixStream::connect(&socket).unwrap();
+        let second = UnixStream::connect(&socket).unwrap();
+
+        assert!(server.serve_tick(1).is_err());
+        assert!(server.serve_tick(2).is_err());
+        assert!(!server.serve_tick(3).unwrap());
+        assert_eq!(observed.get(), 3);
+        drop((first, second));
     }
 
     #[test]
@@ -1312,6 +1365,34 @@ mod tests {
     }
 
     #[test]
+    fn listener_validation_requires_the_exact_path_and_sets_cloexec() {
+        let directory = tempfile::tempdir().expect("socket directory");
+        let socket_path = directory.path().join("execd.sock");
+        let listener = UnixListener::bind(&socket_path).expect("listener");
+        let before = fcntl(&listener, FcntlArg::F_GETFD).expect("descriptor flags");
+        // std sets close-on-exec on sockets it creates; clear it to model the
+        // inherited systemd descriptor, which arrives without the flag.
+        fcntl(
+            &listener,
+            FcntlArg::F_SETFD(FdFlag::from_bits_truncate(before) - FdFlag::FD_CLOEXEC),
+        )
+        .expect("clear close-on-exec");
+
+        let other = directory.path().join("other.sock");
+        let wrong = UnixListener::bind(&other).expect("other listener");
+        assert!(matches!(
+            validate_listener_path(wrong, &socket_path),
+            Err(ControlError::Activation(
+                "fd 3 is not the fixed execd socket"
+            ))
+        ));
+
+        let listener = validate_listener_path(listener, &socket_path).expect("valid listener");
+        let after = fcntl(&listener, FcntlArg::F_GETFD).expect("descriptor flags");
+        assert!(FdFlag::from_bits_truncate(after).contains(FdFlag::FD_CLOEXEC));
+    }
+
+    #[test]
     fn activation_numbers_are_canonical() {
         assert_eq!(parse_canonical_u32("0"), Some(0));
         assert_eq!(parse_canonical_u32("4294967295"), Some(u32::MAX));
@@ -1328,6 +1409,89 @@ mod tests {
         let error = serve_verified_stream_mode_with_protocol(
             server,
             PeerRole::Runner,
+            &mut ClosedDispatch::new(),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ControlError::Frame("version 1 is disabled")
+        ));
+    }
+
+    /// The only shipped qualification client is `buzz-ci-production-qualification`.
+    /// Its frame must carry the version production execd accepts, and the same
+    /// header stamped as version 1 must be refused the way F1 of the CI crate
+    /// audit observed for the removed `buzz-ci-acceptance-ctl` launcher.
+    #[test]
+    fn production_protocol_mode_serves_the_shipped_qualification_client_version() {
+        use buzz_ci_acceptance_ctl::production_qualification::{
+            dispatch as qualify, ExchangeError, ProductionQualificationTransport,
+        };
+
+        struct Capture(Vec<u8>);
+        impl ProductionQualificationTransport for Capture {
+            fn exchange(&mut self, request_frame: &[u8]) -> Result<Vec<u8>, ExchangeError> {
+                self.0 = request_frame.to_vec();
+                Err(ExchangeError::Transport)
+            }
+        }
+
+        let input = serde_json::json!({
+            "schema_version": "buzz-ci-production-qualification-request/v2",
+            "request_id": "10".repeat(16),
+            "integrated_candidate_sha": "11".repeat(20),
+            "activation_package_digest": "12".repeat(32),
+            "fixture_digest": "13".repeat(32),
+            "principal_digest": "14".repeat(32),
+            "lane_manifest_digest": "15".repeat(32),
+            "broker_build_identity_digest": "16".repeat(32),
+            "host_profile_digest": "17".repeat(32),
+            "suite_digest": "18".repeat(32),
+            "isolation_profile_digest": "19".repeat(32),
+            "seccomp_profile_digest": "1a".repeat(32),
+            "executor_program_digest": "1b".repeat(32),
+            "executor_provenance_digest": "1c".repeat(32),
+            "nonce": "1d".repeat(32),
+            "controller_generation": 21,
+            "runner_generation": 22,
+            "lane_epoch": 23,
+            "admission_key_generation": 24,
+            "issued_at": 100,
+            "expires_at": 160
+        });
+        let mut capture = Capture(Vec::new());
+        let _ = qualify(&serde_json::to_vec(&input).unwrap(), 150, &mut capture);
+        let client_frame = capture.0;
+        assert_eq!(client_frame[4..6], v2::PROTOCOL_VERSION.to_be_bytes());
+        assert_ne!(client_frame[4..6], PROTOCOL_VERSION.to_be_bytes());
+
+        // Production mode (`allow_v1 == false`) reads the client's exact bytes
+        // past the version check and answers on the same connection.
+        let (mut client, server) = UnixStream::pair().expect("socketpair");
+        write_all_fd(&client, &client_frame).expect("write client frame");
+        serve_verified_stream_mode_with_protocol(
+            server,
+            PeerRole::Control,
+            &mut ClosedDispatch::new(),
+            false,
+            false,
+        )
+        .expect("version 2 qualification frame is served");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).expect("read response");
+        assert_eq!(response[..4], *b"BZCI");
+        assert_eq!(response[4..6], v2::PROTOCOL_VERSION.to_be_bytes());
+        assert_eq!(response[16..32], client_frame[16..32]);
+
+        let mut downgraded = client_frame;
+        downgraded[4..6].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        write_all_fd(&client, &downgraded[..HEADER_SIZE]).expect("write downgraded header");
+        let error = serve_verified_stream_mode_with_protocol(
+            server,
+            PeerRole::Control,
             &mut ClosedDispatch::new(),
             false,
             false,

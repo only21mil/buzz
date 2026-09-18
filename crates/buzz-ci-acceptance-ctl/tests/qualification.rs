@@ -3,10 +3,6 @@ use buzz_ci_acceptance_ctl::{
     QualificationTransport, MAX_INPUT_BYTES,
 };
 use serde_json::{json, Value};
-use std::{
-    io::Write,
-    process::{Command, Stdio},
-};
 
 #[derive(Default)]
 struct TransportSpy {
@@ -299,37 +295,4 @@ fn oversized_input_never_reaches_transport() {
     ));
     assert_eq!(spy.calls, 0);
     assert!(spy.bytes.is_empty());
-}
-
-#[test]
-fn standalone_cli_rejects_argv_and_invalid_input_with_empty_stdout() {
-    let argv = Command::new(env!("CARGO_BIN_EXE_buzz-ci-acceptance-ctl"))
-        .arg("--fault")
-        .output()
-        .unwrap();
-    assert_eq!(argv.status.code(), Some(2));
-    assert!(argv.stdout.is_empty());
-    let argv_error: Value = serde_json::from_slice(&argv.stderr).unwrap();
-    assert_eq!(argv_error["code"], "invalid_cli");
-
-    let mut invalid = valid_input();
-    invalid["repo"] = json!("forbidden/raw-repo");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_buzz-ci-acceptance-ctl"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(&input_bytes(&invalid))
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
-    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
-    assert_eq!(error["type"], "qualification_error");
-    assert_eq!(error["code"], "malformed_input");
 }

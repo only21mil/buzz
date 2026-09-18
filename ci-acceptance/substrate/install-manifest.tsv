@@ -3,12 +3,10 @@
 -	/etc/buzzci/authority	root	root	0700	directory
 -	/etc/buzzci/qualification-cases	root	root	0755	directory
 cargo-bin:buzz-ci-execd	/usr/libexec/buzz-ci-execd	root	root	0755	compiled-binary
-cargo-bin:buzz-ci-acceptance-ctl	/usr/libexec/buzz-ci-acceptance-ctl	root	buzzci-ctl	0750	compiled-binary
 buzz-ci-execd.service	/etc/systemd/system/buzz-ci-execd.service	root	root	0644	file
 buzz-ci-execd.socket	/etc/systemd/system/buzz-ci-execd.socket	root	root	0644	file
 -	/etc/systemd/system/buzz-ci-execd.service.d	root	root	0755	directory
 buzz-ci-execd.service.d/10-host-adapters.conf	/etc/systemd/system/buzz-ci-execd.service.d/10-host-adapters.conf	root	root	0644	file
-buzz-ci-acceptance-ctl.sudoers	/etc/sudoers.d/buzz-ci-acceptance-ctl	root	root	0440	file
 buzzci-control.tmpfiles	/usr/lib/tmpfiles.d/buzzci-control.conf	root	root	0644	file
 rendered:authority-v1.json.plan	/etc/buzzci/authority/authority-v1.json	root	root	0400	rendered-file
 rendered:host-adapters-v1.json.plan	/etc/buzzci/authority/host-adapters-v1.json	root	root	0400	rendered-file

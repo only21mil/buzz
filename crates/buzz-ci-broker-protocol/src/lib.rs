@@ -28,6 +28,18 @@ pub const MAX_BODY_SIZE: usize = ADMIT_QUALIFICATION_BODY_SIZE;
 pub const MAX_FRAME_SIZE: usize = HEADER_SIZE + MAX_BODY_SIZE;
 pub const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
+/// True when `value` is exactly `length` lowercase ASCII hexadecimal digits.
+///
+/// Every CI crate that validates digests, keys and object ids on the wire
+/// uses this one definition; uppercase and mixed case are rejected because
+/// the protocols carry normalized lowercase only.
+pub fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 const OP_RESPONSE_BIT: u16 = 0x8000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

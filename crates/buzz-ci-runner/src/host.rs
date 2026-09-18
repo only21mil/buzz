@@ -556,13 +556,16 @@ fn terminate_process_group(
     let grace_deadline = Instant::now() + Duration::from_millis(250);
     let mut leader_status = None;
     while Instant::now() < grace_deadline {
-        if leader_status.is_none() {
-            leader_status = child
-                .try_wait()
-                .map_err(|_| ExecutionBackendError::Unavailable)?;
+        leader_status = child
+            .try_wait()
+            .map_err(|_| ExecutionBackendError::Unavailable)?;
+        if leader_status.is_some() {
+            break;
         }
         thread::sleep(Duration::from_millis(10));
     }
+    // Stragglers in the group are killed whether or not the leader honoured
+    // SIGTERM; an exited leader just means the grace period ends early.
     let _ = nix::sys::signal::killpg(process_group, nix::sys::signal::Signal::SIGKILL);
     if let Some(status) = leader_status {
         Ok(status)
@@ -593,6 +596,24 @@ fn valid_env_key(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminating_a_group_returns_as_soon_as_the_leader_exits() {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleeping leader");
+        let started = Instant::now();
+        let status = terminate_process_group(&mut child).expect("terminate group");
+        assert!(!status.success());
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "grace burned in full: {:?}",
+            started.elapsed()
+        );
+    }
+
     use std::time::Instant;
 
     use super::*;

@@ -8,6 +8,7 @@ use uuid::Uuid;
 use buzz_ci_acceptance_ctl::acceptance_binding::{
     validate_acceptance_event_templates, ValidatedAcceptanceBinding,
 };
+use buzz_ci_broker_protocol::is_lower_hex;
 use buzz_ci_broker_protocol::v2::{
     decode_admission_signature_message, AdmissionSignatureAlgorithm,
 };
@@ -459,13 +460,6 @@ pub(crate) fn canonical_evidence_get_path(path: &str) -> bool {
         && object_id.is_none_or(valid_artifact)
         && canonical_number
         && is_lower_hex(sha256, 64)
-}
-
-fn is_lower_hex(value: &str, length: usize) -> bool {
-    value.len() == length
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// Sanitized service failure mapped to the closed public protocol errors.

@@ -66,6 +66,11 @@ fn run() -> Result<(), StartupError> {
         .map_err(|_| StartupError::Acceptance(AcceptanceSocketError::Activation))?;
     let mut next_poll = Instant::now();
     loop {
+        // Each acceptance connection is served inline, so a peer that
+        // connects and never half-closes stalls this loop for `timeout`.
+        // The peer is uid/gid gated in serve_connection; only the authorised
+        // acceptance-control account can hold the loop, and the poll below
+        // resumes once the read timeout fires.
         match listener.accept() {
             Ok((stream, _)) => {
                 let (uid, gid, timeout) = service.acceptance_credentials();

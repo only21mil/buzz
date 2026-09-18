@@ -3,7 +3,6 @@ set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 manifest=$script_dir/install-manifest.tsv
-sudoers=$script_dir/buzz-ci-acceptance-ctl.sudoers
 service=$script_dir/buzz-ci-execd.service
 socket=$script_dir/buzz-ci-execd.socket
 dropin=$script_dir/buzz-ci-execd.service.d/10-host-adapters.conf
@@ -31,7 +30,7 @@ awk -F '\t' '
   $5 !~ /^0[0-7]{3}$/ { bad = 1 }
   $6 !~ /^(directory|compiled-binary|file|rendered-file)$/ { bad = 1 }
   seen[$2]++ { bad = 1 }
-  END { if (bad || length(seen) != 29) exit 1 }
+  END { if (bad || length(seen) != 27) exit 1 }
 ' "$manifest" || fail 'invalid install manifest'
 
 manifest_row() {
@@ -44,8 +43,6 @@ manifest_row() {
 
 manifest_row /usr/libexec/buzz-ci-execd \
   $'cargo-bin:buzz-ci-execd\t/usr/libexec/buzz-ci-execd\troot\troot\t0755\tcompiled-binary'
-manifest_row /usr/libexec/buzz-ci-acceptance-ctl \
-  $'cargo-bin:buzz-ci-acceptance-ctl\t/usr/libexec/buzz-ci-acceptance-ctl\troot\tbuzzci-ctl\t0750\tcompiled-binary'
 manifest_row /etc/buzzci/authority \
   $'-\t/etc/buzzci/authority\troot\troot\t0700\tdirectory'
 manifest_row /etc/buzzci/authority/authority-v1.json \
@@ -58,8 +55,6 @@ manifest_row /etc/buzzci/qualification-cases \
   $'-\t/etc/buzzci/qualification-cases\troot\troot\t0755\tdirectory'
 manifest_row /etc/systemd/system/buzz-ci-execd.service.d/10-host-adapters.conf \
   $'buzz-ci-execd.service.d/10-host-adapters.conf\t/etc/systemd/system/buzz-ci-execd.service.d/10-host-adapters.conf\troot\troot\t0644\tfile'
-manifest_row /etc/sudoers.d/buzz-ci-acceptance-ctl \
-  $'buzz-ci-acceptance-ctl.sudoers\t/etc/sudoers.d/buzz-ci-acceptance-ctl\troot\troot\t0440\tfile'
 manifest_row /var/lib/buzzci/activation \
   $'-\t/var/lib/buzzci/activation\troot\troot\t0700\tdirectory'
 manifest_row /var/lib/buzzci/activation/state-v1.json \
@@ -235,18 +230,11 @@ if rg -n '^(Exec|User|Group|SupplementaryGroups|Sockets)=' "$dropin"; then
   fail 'host adapter drop-in adds a process or principal'
 fi
 
-grep -Fxq 'Defaults!/usr/libexec/buzz-ci-acceptance-ctl env_reset,!setenv' "$sudoers"
-grep -Fxq 'root ALL=(buzzci-ctl) NOPASSWD: /usr/libexec/buzz-ci-acceptance-ctl ""' "$sudoers"
-[[ $(wc -l <"$sudoers") -eq 2 ]] || fail 'sudoers contains an unexpected rule'
-if rg -n '[*?\[\]]|/bin/(ba|d?a|z|k)?sh|[[:space:]]-c([[:space:]]|$)' "$sudoers"; then
-  fail 'sudoers contains a wildcard or shell'
-fi
-if command -v visudo >/dev/null 2>&1; then
-  visudo -cf "$sudoers" >/dev/null
+if rg -n 'sudoers' "$manifest"; then
+  fail 'install manifest grants sudo'
 fi
 
-expected_keys='BUZZ_CI_ACCEPTANCE_CTL
-BUZZ_CI_BROKER_UNIT
+expected_keys='BUZZ_CI_BROKER_UNIT
 BUZZ_CI_EXECD_SOCKET
 BUZZ_CI_FIXTURE_REPO
 BUZZ_CI_GRAPH_FIXTURE_DIR
@@ -257,12 +245,11 @@ BUZZ_CI_QUALIFICATION_CASE_ROOT
 BUZZ_CI_RUNNER_CTL'
 actual_keys=$(awk -F= 'NF && $1 !~ /^#/ { print $1 }' "$harness" | sort)
 [[ $actual_keys == "$expected_keys" ]] || fail 'harness key set changed'
-grep -Fxq 'BUZZ_CI_ACCEPTANCE_CTL=/usr/libexec/buzz-ci-acceptance-ctl' "$harness"
 grep -Fxq 'BUZZ_CI_RUNNER_CTL=/usr/libexec/buzz-ci-runner' "$harness"
 grep -Fxq 'BUZZ_CI_QUALIFICATION_CASE_ROOT=/etc/buzzci/qualification-cases' "$harness"
-[[ $(awk -F= '$1 == "BUZZ_CI_ACCEPTANCE_CTL" { print $2 }' "$harness") \
-    != $(awk -F= '$1 == "BUZZ_CI_RUNNER_CTL" { print $2 }' "$harness") ]] \
-  || fail 'qualification and production controls are aliased'
+if rg -n 'ACCEPTANCE_CTL|buzz-ci-acceptance-ctl' "$harness"; then
+  fail 'harness.env names the removed v1 qualification launcher'
+fi
 
 grep -Fqx $'controller\tbuzzci-ctl\t961\t961\t/var/lib/buzzci/principals/ctl\t/usr/sbin/nologin' "$principals"
 for job_principal in buzzci-mat-01 buzzci-exec-01 buzzci-run-01; do
@@ -270,8 +257,6 @@ for job_principal in buzzci-mat-01 buzzci-exec-01 buzzci-run-01; do
     || fail "missing or duplicate job principal: $job_principal"
   [[ $(cut -f3 <<<"$job_row") != 961 && $(cut -f4 <<<"$job_row") != 961 ]] \
     || fail "ordinary job principal crosses control identity: $job_principal"
-  ! rg -Fq "$job_principal" "$sudoers" \
-    || fail "ordinary job principal received acceptance sudo: $job_principal"
 done
 
 repo_root=$(git -C "$script_dir" rev-parse --show-toplevel) \

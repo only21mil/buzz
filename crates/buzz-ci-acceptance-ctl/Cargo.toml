@@ -15,10 +15,6 @@ name = "buzz_ci_acceptance_ctl"
 path = "src/lib.rs"
 
 [[bin]]
-name = "buzz-ci-acceptance-ctl"
-path = "src/main.rs"
-
-[[bin]]
 name = "buzz-ci-capacity-one-canary"
 path = "src/bin/capacity_one_canary.rs"
 
