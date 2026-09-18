@@ -590,11 +590,15 @@ impl<D: ControlDispatch> ControlServer<D> {
     }
 
     /// Run maintenance and serve at most one ready connection without blocking.
-    pub fn serve_tick(&mut self, now: u64) -> Result<(), ControlError> {
+    ///
+    /// Returns `Ok(false)` when no connection was pending, so the caller can
+    /// sleep only then and drain a backlog without a fixed delay per
+    /// connection. A served connection that failed surfaces as `Err`.
+    pub fn serve_tick(&mut self, now: u64) -> Result<bool, ControlError> {
         self.dispatch.maintenance(now);
         let (stream, _) = match self.listener.accept() {
             Ok(connection) => connection,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
             Err(error) => return Err(ControlError::Accept(error)),
         };
         serve_stream_mode(
@@ -604,6 +608,7 @@ impl<D: ControlDispatch> ControlServer<D> {
             &mut self.dispatch,
             self.allow_v1,
         )
+        .map(|()| true)
     }
 }
 
@@ -1225,9 +1230,37 @@ mod tests {
         )
         .unwrap();
 
-        server.serve_tick(42).unwrap();
+        assert!(!server.serve_tick(42).unwrap());
 
         assert_eq!(observed.get(), 42);
+    }
+
+    #[test]
+    fn polling_tick_serves_one_queued_connection_and_reports_idle() {
+        let temporary = tempfile::tempdir().unwrap();
+        let socket = temporary.path().join("execd.sock");
+        let listener = match UnixListener::bind(&socket) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("unexpected listener bind failure: {error}"),
+        };
+        let observed = Rc::new(Cell::new(0));
+        let mut server = ControlServer::new_polling(
+            listener,
+            PeerUidPolicy::new(961, 962).unwrap(),
+            MaintenanceCounter(Rc::clone(&observed)),
+        )
+        .unwrap();
+        // Two queued peers, neither holding a control UID. Each tick must
+        // consume exactly one of them; only the empty tick reports idle.
+        let first = UnixStream::connect(&socket).unwrap();
+        let second = UnixStream::connect(&socket).unwrap();
+
+        assert!(server.serve_tick(1).is_err());
+        assert!(server.serve_tick(2).is_err());
+        assert!(!server.serve_tick(3).unwrap());
+        assert_eq!(observed.get(), 3);
+        drop((first, second));
     }
 
     #[test]

@@ -108,7 +108,8 @@ fn main() -> ExitCode {
                         }
                     };
                     match server.serve_tick(now) {
-                        Ok(()) => thread::sleep(Duration::from_millis(100)),
+                        Ok(true) => {}
+                        Ok(false) => thread::sleep(Duration::from_millis(100)),
                         Err(error @ ControlError::Accept(_)) => {
                             eprintln!(r#"{{"error":"control_listener","reason":"{error}"}}"#);
                             return ExitCode::from(4);
