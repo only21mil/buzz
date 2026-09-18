@@ -8,11 +8,11 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use buzz_core::kind::{
-    event_kind_u32, is_parameterized_replaceable, KIND_AGENT_PROFILE, KIND_DM_VISIBILITY,
-    KIND_GIT_REPO_ANNOUNCEMENT, KIND_IA_ARCHIVED, KIND_IA_ARCHIVED_LIST, KIND_IA_UNARCHIVED,
-    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_NIP29_GROUP_ADMINS,
-    KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA, KIND_NIP43_MEMBERSHIP_LIST, KIND_REACTION,
-    KIND_THREAD_SUMMARY,
+    event_kind_u32, is_parameterized_replaceable, KIND_AGENT_DRAFT, KIND_AGENT_DRAFT_DECISION,
+    KIND_AGENT_PROFILE, KIND_DM_VISIBILITY, KIND_GIT_REPO_ANNOUNCEMENT, KIND_IA_ARCHIVED,
+    KIND_IA_ARCHIVED_LIST, KIND_IA_UNARCHIVED, KIND_MEMBER_ADDED_NOTIFICATION,
+    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_NIP29_GROUP_ADMINS, KIND_NIP29_GROUP_MEMBERS,
+    KIND_NIP29_GROUP_METADATA, KIND_NIP43_MEMBERSHIP_LIST, KIND_REACTION, KIND_THREAD_SUMMARY,
 };
 use buzz_core::StoredEvent;
 use buzz_db::channel::{MemberRecord, MemberRole};
@@ -267,6 +267,9 @@ pub async fn validate_standard_deletion_event(
             .get_event_by_id_including_deleted(tenant.community(), &target_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("target event not found"))?;
+        if is_agent_draft_kind(event_kind_u32(&target_event.event)) {
+            return Err(anyhow::anyhow!("draft events are immutable"));
+        }
 
         let target_author =
             effective_message_author(&target_event.event, &state.relay_keypair.public_key());
@@ -790,6 +793,9 @@ pub(crate) async fn validate_admin_event(
                     return Err(anyhow::anyhow!("target event has no channel"));
                 }
                 _ => {} // Same channel — OK
+            }
+            if is_agent_draft_kind(event_kind_u32(&target_event.event)) {
+                return Err(anyhow::anyhow!("draft events are immutable"));
             }
 
             if community_authorized {
@@ -1899,6 +1905,9 @@ async fn handle_delete_event_side_effect(
             }
             _ => {} // Same channel — OK
         }
+        if is_agent_draft_kind(event_kind_u32(&target_event.event)) {
+            return Err(anyhow::anyhow!("draft events are immutable"));
+        }
     }
 
     // Look up thread metadata so we can pass parent/root IDs to the
@@ -2443,6 +2452,13 @@ async fn handle_standard_deletion_event(
             );
             continue;
         }
+        if is_agent_draft_kind(event_kind_u32(&target_event.event)) {
+            tracing::debug!(
+                target_id = %hex::encode(&target_id),
+                "NIP-09 deletion ignored for immutable draft event"
+            );
+            continue;
+        }
 
         let meta = state
             .db
@@ -2557,6 +2573,14 @@ pub(crate) fn extract_h_tag_channel(event: &Event) -> Option<Uuid> {
 }
 
 /// Extract target pubkey from first `p` tag.
+/// Kind 14201 (draft request) and 14202 (draft decision) rows are durable
+/// review history. The database trigger from migration 0040 blocks
+/// hard deletes and rewrites; this check turns an explicit deletion request
+/// into a policy rejection before any query runs.
+pub(crate) fn is_agent_draft_kind(kind: u32) -> bool {
+    matches!(kind, KIND_AGENT_DRAFT | KIND_AGENT_DRAFT_DECISION)
+}
+
 /// First `e` tag whose value decodes to a 32-byte event id. A missing,
 /// non-hex or wrong-length value is `None`, so callers reject it as input
 /// rather than surfacing a decode error later in the audit path.
@@ -3636,6 +3660,15 @@ mod tests {
 
     fn tag(parts: &[&str]) -> Tag {
         Tag::parse(parts.iter().copied()).expect("valid test tag")
+    }
+
+    #[test]
+    fn draft_kinds_are_the_only_immutable_deletion_targets() {
+        assert!(is_agent_draft_kind(KIND_AGENT_DRAFT));
+        assert!(is_agent_draft_kind(KIND_AGENT_DRAFT_DECISION));
+        for kind in [1, 5, 9, 9005, 14_200, 14_203, 45_001] {
+            assert!(!is_agent_draft_kind(kind), "kind {kind}");
+        }
     }
 
     #[test]
