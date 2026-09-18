@@ -843,9 +843,8 @@ ENV
   fi
 }
 
-run_local_image_case() {
-  local scenario=$1 image=$2 expected_image=$3 expected=$4
-  local case_dir=${scratch}/run-local-${scenario}
+prepare_run_local_case() {
+  local case_dir=$1
   mkdir -p "${case_dir}/bin"
   chmod 700 "${case_dir}"
   make_stubs "${case_dir}/bin"
@@ -866,6 +865,12 @@ BUZZ_S3_SECRET_KEY=test-s3-secret
 BUZZ_RELAY_OWNER_PUBKEY=test-owner-pubkey
 ENV
   chmod 600 "${case_dir}/secrets.env"
+}
+
+run_local_image_case() {
+  local scenario=$1 image=$2 expected_image=$3 expected=$4
+  local case_dir=${scratch}/run-local-${scenario}
+  prepare_run_local_case "${case_dir}"
 
   set +e
   if [[ ${image} == __unset__ ]]; then
@@ -899,6 +904,39 @@ ENV
       BUZZ_EXPECTED_IMAGE="${expected_image}" \
       "${compose_dir}/run-local.sh" ps -q relay >"${case_dir}/output" 2>&1
   fi
+  local rc=$?
+  set -e
+  if [[ ${expected} == success && ${rc} -ne 0 ]]; then
+    sed -n '1,160p' "${case_dir}/output" >&2
+    fail "run-local ${scenario} returned ${rc}, expected success"
+  fi
+  if [[ ${expected} == failure && ${rc} -eq 0 ]]; then
+    fail "run-local ${scenario} succeeded, expected failure"
+  fi
+}
+
+# run-local.sh with neither BUZZ_IMAGE nor BUZZ_EXPECTED_IMAGE: the compose
+# subcommand decides whether the runner may proceed.
+run_local_unpinned_case() {
+  local scenario=$1 expected=$2
+  shift 2
+  local case_dir=${scratch}/run-local-${scenario}
+  prepare_run_local_case "${case_dir}"
+
+  set +e
+  env -u BUZZ_IMAGE -u BUZZ_EXPECTED_IMAGE \
+    PATH="${case_dir}/bin:${PATH}" \
+    TEST_SCENARIO="${scenario}" \
+    TEST_COMMAND_LOG="${case_dir}/commands.log" \
+    TEST_CONTAINER_STATE="${case_dir}/container-state" \
+    TEST_DB_STATE="${case_dir}/db-state" \
+    TEST_DB_READ_COUNT="${case_dir}/db-read-count" \
+    TEST_VERIFY_CREATE_COUNT="${case_dir}/verify-create-count" \
+    TEST_VERIFY_REMOVE_COUNT="${case_dir}/verify-remove-count" \
+    TEST_PRIOR_REQUIRED_MIGRATION=31 \
+    BUZZ_SECRET_ENV_FILE="${case_dir}/secrets.env" \
+    BUZZ_COMPOSE_ENV_FILE="${case_dir}/compose.env" \
+    "${compose_dir}/run-local.sh" "$@" >"${case_dir}/output" 2>&1
   local rc=$?
   set -e
   if [[ ${expected} == success && ${rc} -ne 0 ]]; then
@@ -1156,6 +1194,18 @@ assert_contains "${scratch}/run-local-pinned/commands.log" \
   'sudo .*env BUZZ_IMAGE=localhost/buzz-relay:'
 assert_contains "${scratch}/run-local-pinned/commands.log" \
   'docker BUZZ_IMAGE=localhost/buzz-relay:.* ps -q relay'
+
+for unpinned_subcommand in up create run restart start pull; do
+  run_local_unpinned_case "unpinned_${unpinned_subcommand}" failure "${unpinned_subcommand}" -d relay
+  assert_contains "${scratch}/run-local-unpinned_${unpinned_subcommand}/output" \
+    "refused: ${unpinned_subcommand} requires BUZZ_EXPECTED_IMAGE"
+  assert_not_contains "${scratch}/run-local-unpinned_${unpinned_subcommand}/commands.log" '^sudo '
+done
+run_local_unpinned_case unpinned_no_subcommand failure
+assert_contains "${scratch}/run-local-unpinned_no_subcommand/output" 'a compose subcommand is required'
+assert_not_contains "${scratch}/run-local-unpinned_no_subcommand/commands.log" '^sudo '
+run_local_unpinned_case unpinned_ps success ps -q relay
+assert_contains "${scratch}/run-local-unpinned_ps/commands.log" '^docker BUZZ_IMAGE= compose .* ps -q relay'
 
 run_case migration_fail failure
 assert_contains "${scratch}/migration_fail/output" 'migration command failed'

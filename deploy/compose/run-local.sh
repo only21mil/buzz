@@ -6,6 +6,25 @@ compose_env_file=${BUZZ_COMPOSE_ENV_FILE:-${compose_dir}/.env}
 secret_env_file=${BUZZ_SECRET_ENV_FILE-${HOME}/.config/sats/secrets.env}
 expected_image=${BUZZ_EXPECTED_IMAGE-}
 
+# Without BUZZ_EXPECTED_IMAGE this runner must never create, start, or pull a
+# container: Compose would resolve the image from the env file instead of the
+# receipt-bound pin that deploy-local.sh supplies. Only subcommands that act on
+# existing state are allowed unpinned.
+if [[ -z ${expected_image} ]]; then
+  case "${1-}" in
+    ps|logs|config|exec|down|stop) ;;
+    '')
+      printf 'refused: a compose subcommand is required\n' >&2
+      exit 1
+      ;;
+    *)
+      printf 'refused: %s requires BUZZ_EXPECTED_IMAGE; use deploy-local.sh so the deployment image is pinned\n' \
+        "$1" >&2
+      exit 1
+      ;;
+  esac
+fi
+
 if [[ -n ${expected_image} ]]; then
   [[ -n ${BUZZ_IMAGE:-} ]] || {
     printf 'refused: BUZZ_IMAGE is required when BUZZ_EXPECTED_IMAGE is set\n' >&2

@@ -27,7 +27,7 @@ keypair.
 
 - Requires Docker Compose v2.24.4 or newer; the TLS override uses Compose's
   `!reset` tag to remove the direct relay port when Caddy terminates HTTPS.
-- Default `BUZZ_IMAGE` tracks `ghcr.io/block/buzz:main` for early testing. Pin it to `ghcr.io/block/buzz:sha-<7>` or a semver release tag for production once available.
+- `BUZZ_IMAGE` has no default; Compose refuses to load the project until it is set. Pin it to `ghcr.io/block/buzz:sha-<7>` or a semver release tag for production. `.env.example` carries `main` for early testing only.
 - Keep `BUZZ_RELAY_PRIVATE_KEY`, `BUZZ_GIT_HOOK_HMAC_SECRET`, database/Redis,
   and S3 secrets stable across restarts.
 - `RELAY_OWNER_PUBKEY` is intentionally not prefixed with `BUZZ_`; it must be a
@@ -115,7 +115,10 @@ run. The override never permits rollback after the database advances beyond
 that recorded migration.
 
 Do not use `run-local.sh up` as an upgrade command. Use `deploy-local.sh` so the
-backup, migration check, and rollback path cannot be skipped.
+backup, migration check, and rollback path cannot be skipped. Without
+`BUZZ_EXPECTED_IMAGE`, `run-local.sh` accepts only `ps`, `logs`, `config`,
+`exec`, `down`, and `stop`; any subcommand that could create or pull a container
+is refused.
 
 ## Validation
 
