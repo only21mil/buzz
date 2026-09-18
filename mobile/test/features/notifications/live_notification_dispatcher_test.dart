@@ -110,6 +110,27 @@ void main() {
     expect(bridge.shows, isEmpty);
   });
 
+  test('gives each delivered event its own notification id', () async {
+    final bridge = _FakeBridge();
+    final scope = container(bridge: bridge);
+    final dispatcher = scope.read(liveNotificationDispatcherProvider);
+
+    await dispatcher.dispatch(
+      event: _event(id: 'event-1'),
+      channel: _channel,
+      myPubkey: 'me',
+    );
+    await dispatcher.dispatch(
+      event: _event(id: 'event-2'),
+      channel: _channel,
+      myPubkey: 'me',
+    );
+
+    expect(bridge.ids, hasLength(2));
+    expect(bridge.ids.toSet(), hasLength(2));
+    expect(bridge.ids, everyElement(inInclusiveRange(1, 0x7fffffff)));
+  });
+
   test('deduplicates successful delivery but retries native failure', () async {
     final bridge = _FakeBridge(failuresRemaining: 1);
     final scope = container(bridge: bridge);
@@ -184,6 +205,7 @@ class _FakeBridge extends AndroidNotificationBridge {
 
   int failuresRemaining;
   int attempts = 0;
+  final List<int> ids = [];
   final List<_ShowCall> shows = [];
 
   @override
@@ -199,6 +221,7 @@ class _FakeBridge extends AndroidNotificationBridge {
       failuresRemaining--;
       throw PlatformException(code: 'test_failure');
     }
+    ids.add(id);
     shows.add(
       _ShowCall(title: title, body: body, channel: channel, route: route),
     );
@@ -248,17 +271,18 @@ class _RelayConfigNotifier extends RelayConfigNotifier {
   RelayConfig build() => RelayConfig(baseUrl: url);
 }
 
-NostrEvent _event({String content = 'hello'}) => NostrEvent(
-  id: 'event-1',
-  pubkey: 'alice',
-  createdAt: 100,
-  kind: EventKind.streamMessageV2,
-  tags: const [
-    ['h', 'channel-1'],
-  ],
-  content: content,
-  sig: 'sig',
-);
+NostrEvent _event({String id = 'event-1', String content = 'hello'}) =>
+    NostrEvent(
+      id: id,
+      pubkey: 'alice',
+      createdAt: 100,
+      kind: EventKind.streamMessageV2,
+      tags: const [
+        ['h', 'channel-1'],
+      ],
+      content: content,
+      sig: 'sig',
+    );
 
 final _channel = Channel(
   id: 'channel-1',
