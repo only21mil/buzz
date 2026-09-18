@@ -10,6 +10,7 @@ import type { Page } from "@playwright/test";
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge } from "../helpers/bridge";
 import { expectSmoothCorners } from "../helpers/css";
+import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 
 const AUDIO_URL = "http://127.0.0.1:4173/sounds/ping.mp3";
 
@@ -18,26 +19,6 @@ async function openMoreActionsMenu(page: Page, messageId: string) {
   await row.hover();
   await page.getByTestId(`more-actions-${messageId}`).click();
   await expect(page.locator('[role="menuitem"]').first()).toBeVisible();
-}
-
-async function waitForMockLiveSubscription(page: Page, channelName: string) {
-  await expect
-    .poll(() =>
-      page.evaluate(
-        (currentChannelName) =>
-          (
-            window as Window & {
-              __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
-                channelName: string;
-              }) => boolean;
-            }
-          ).__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
-            channelName: currentChannelName,
-          }) ?? false,
-        channelName,
-      ),
-    )
-    .toBe(true);
 }
 
 test.beforeEach(async ({ page }, testInfo) => {

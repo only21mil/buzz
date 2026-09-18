@@ -2,38 +2,10 @@ import { expect, test } from "@playwright/test";
 
 import { waitForAnimations } from "../helpers/animations";
 import { TEST_IDENTITIES, installMockBridge } from "../helpers/bridge";
+import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 
 const DEFAULT_MOCK_PUBKEY = "deadbeef".repeat(8);
 const SHOTS = "test-results/channel-row-decoration-pr";
-
-async function waitForMockLiveSubscription(
-  page: import("@playwright/test").Page,
-  channelName: string,
-  kind?: number,
-) {
-  await expect
-    .poll(async () => {
-      return page.evaluate(
-        ({ currentChannelName, kind: k }) => {
-          return (
-            (
-              window as Window & {
-                __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
-                  channelName: string;
-                  kind?: number;
-                }) => boolean;
-              }
-            ).__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
-              channelName: currentChannelName,
-              kind: k,
-            }) ?? false
-          );
-        },
-        { currentChannelName: channelName, kind },
-      );
-    })
-    .toBe(true);
-}
 
 async function getBadgeState(page: import("@playwright/test").Page) {
   return page.evaluate(() => {

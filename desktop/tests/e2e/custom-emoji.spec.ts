@@ -4,6 +4,7 @@ import * as path from "node:path";
 
 import { installMockBridge } from "../helpers/bridge";
 import { waitForAnimations } from "../helpers/animations";
+import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 
 // Custom-emoji end-to-end guard.
 //
@@ -20,28 +21,6 @@ import { waitForAnimations } from "../helpers/animations";
 // this spec uses the simpler mock-bridge setup like messaging.spec.ts.
 const SHORTCODE = "buzz";
 const MOCK_MEDIA_PROXY_PORT = 54321;
-
-async function waitForMockLiveSubscription(
-  page: import("@playwright/test").Page,
-  channelName: string,
-) {
-  await expect
-    .poll(async () =>
-      page.evaluate(
-        ({ ch }) =>
-          (
-            window as Window & {
-              __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
-                channelName: string;
-              }) => boolean;
-            }
-          ).__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({ channelName: ch }) ??
-          false,
-        { ch: channelName },
-      ),
-    )
-    .toBe(true);
-}
 
 async function openGeneral(page: import("@playwright/test").Page) {
   await page.goto("/");

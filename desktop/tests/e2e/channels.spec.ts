@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 
 import {
   KIND_HUDDLE_ENDED,
@@ -201,35 +202,6 @@ async function expectMembersTriggerCount(
     "aria-label",
     `View channel members (${count})`,
   );
-}
-
-async function waitForMockLiveSubscription(
-  page: import("@playwright/test").Page,
-  channelName: string,
-  kind?: number,
-) {
-  await expect
-    .poll(async () => {
-      return page.evaluate(
-        ({ currentChannelName, kind }) => {
-          return (
-            (
-              window as Window & {
-                __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
-                  channelName: string;
-                  kind?: number;
-                }) => boolean;
-              }
-            ).__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
-              channelName: currentChannelName,
-              kind,
-            }) ?? false
-          );
-        },
-        { currentChannelName: channelName, kind },
-      );
-    })
-    .toBe(true);
 }
 
 async function openMemberMenu(

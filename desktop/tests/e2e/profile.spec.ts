@@ -6,6 +6,7 @@ import {
   TEST_IDENTITIES,
 } from "../helpers/bridge";
 import { openProfileMenu, openSettings } from "../helpers/settings";
+import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 
 async function expectHomeView(page: import("@playwright/test").Page) {
   await expect(page.getByTestId("home-inbox-list")).toBeVisible();
@@ -140,24 +141,6 @@ async function addGenericAgent(
     },
     { agentName, channelId, systemPrompt },
   );
-}
-
-async function waitForMockLiveSubscription(page: Page, channelName: string) {
-  await expect
-    .poll(async () => {
-      return page.evaluate((channelName) => {
-        return (
-          (
-            window as Window & {
-              __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
-                channelName: string;
-              }) => boolean;
-            }
-          ).__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({ channelName }) ?? false
-        );
-      }, channelName);
-    })
-    .toBe(true);
 }
 
 test.beforeEach(async ({ page }) => {

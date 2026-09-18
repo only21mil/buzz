@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge } from "../helpers/bridge";
+import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 
 type MockMessageWindow = Window & {
   __BUZZ_E2E_EMIT_MOCK_MESSAGE__?: (input: {
@@ -19,24 +20,6 @@ const CHANNEL_NAME = "engineering";
 const MOCK_IDENTITY_PUBKEY = "deadbeef".repeat(8);
 const ALICE_PUBKEY =
   "953d3363262e86b770419834c53d2446409db6d918a57f8f339d495d54ab001f";
-
-async function waitForMockLiveSubscription(
-  page: import("@playwright/test").Page,
-  channelName: string,
-) {
-  await expect
-    .poll(async () => {
-      return page.evaluate((name) => {
-        return (
-          (
-            window as MockMessageWindow
-          ).__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({ channelName: name }) ??
-          false
-        );
-      }, channelName);
-    })
-    .toBe(true);
-}
 
 test.describe("channel shared header backdrop", () => {
   test.use({ viewport: { width: 1280, height: 720 } });

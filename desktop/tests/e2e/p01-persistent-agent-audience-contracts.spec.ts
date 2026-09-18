@@ -7,6 +7,7 @@
 import { expect, test, type Locator, type Page } from "@playwright/test";
 
 import { installMockBridge } from "../helpers/bridge";
+import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 
 const CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
 const RANDOM_CHANNEL_ID = "9dae0116-799b-5071-a0a8-fdd30a91a35d";
@@ -41,20 +42,6 @@ async function automaticallyMention(
     `@${displayName}`,
   );
   await composer.locator("[data-mention-picker-trigger]").click();
-}
-
-async function waitForMockLiveSubscription(page: Page, channelName: string) {
-  await expect
-    .poll(() =>
-      page.evaluate(
-        (currentChannelName) =>
-          window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
-            channelName: currentChannelName,
-          }) ?? false,
-        channelName,
-      ),
-    )
-    .toBe(true);
 }
 
 async function waitForTimelineSettled(page: Page) {
