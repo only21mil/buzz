@@ -1339,6 +1339,89 @@ mod tests {
         ));
     }
 
+    /// The only shipped qualification client is `buzz-ci-production-qualification`.
+    /// Its frame must carry the version production execd accepts, and the same
+    /// header stamped as version 1 must be refused the way F1 of the CI crate
+    /// audit observed for the removed `buzz-ci-acceptance-ctl` launcher.
+    #[test]
+    fn production_protocol_mode_serves_the_shipped_qualification_client_version() {
+        use buzz_ci_acceptance_ctl::production_qualification::{
+            dispatch as qualify, ExchangeError, ProductionQualificationTransport,
+        };
+
+        struct Capture(Vec<u8>);
+        impl ProductionQualificationTransport for Capture {
+            fn exchange(&mut self, request_frame: &[u8]) -> Result<Vec<u8>, ExchangeError> {
+                self.0 = request_frame.to_vec();
+                Err(ExchangeError::Transport)
+            }
+        }
+
+        let input = serde_json::json!({
+            "schema_version": "buzz-ci-production-qualification-request/v2",
+            "request_id": "10".repeat(16),
+            "integrated_candidate_sha": "11".repeat(20),
+            "activation_package_digest": "12".repeat(32),
+            "fixture_digest": "13".repeat(32),
+            "principal_digest": "14".repeat(32),
+            "lane_manifest_digest": "15".repeat(32),
+            "broker_build_identity_digest": "16".repeat(32),
+            "host_profile_digest": "17".repeat(32),
+            "suite_digest": "18".repeat(32),
+            "isolation_profile_digest": "19".repeat(32),
+            "seccomp_profile_digest": "1a".repeat(32),
+            "executor_program_digest": "1b".repeat(32),
+            "executor_provenance_digest": "1c".repeat(32),
+            "nonce": "1d".repeat(32),
+            "controller_generation": 21,
+            "runner_generation": 22,
+            "lane_epoch": 23,
+            "admission_key_generation": 24,
+            "issued_at": 100,
+            "expires_at": 160
+        });
+        let mut capture = Capture(Vec::new());
+        let _ = qualify(&serde_json::to_vec(&input).unwrap(), 150, &mut capture);
+        let client_frame = capture.0;
+        assert_eq!(client_frame[4..6], v2::PROTOCOL_VERSION.to_be_bytes());
+        assert_ne!(client_frame[4..6], PROTOCOL_VERSION.to_be_bytes());
+
+        // Production mode (`allow_v1 == false`) reads the client's exact bytes
+        // past the version check and answers on the same connection.
+        let (mut client, server) = UnixStream::pair().expect("socketpair");
+        write_all_fd(&client, &client_frame).expect("write client frame");
+        serve_verified_stream_mode_with_protocol(
+            server,
+            PeerRole::Control,
+            &mut ClosedDispatch::new(),
+            false,
+            false,
+        )
+        .expect("version 2 qualification frame is served");
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).expect("read response");
+        assert_eq!(response[..4], *b"BZCI");
+        assert_eq!(response[4..6], v2::PROTOCOL_VERSION.to_be_bytes());
+        assert_eq!(response[16..32], client_frame[16..32]);
+
+        let mut downgraded = client_frame;
+        downgraded[4..6].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+        let (client, server) = UnixStream::pair().expect("socketpair");
+        write_all_fd(&client, &downgraded[..HEADER_SIZE]).expect("write downgraded header");
+        let error = serve_verified_stream_mode_with_protocol(
+            server,
+            PeerRole::Control,
+            &mut ClosedDispatch::new(),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ControlError::Frame("version 1 is disabled")
+        ));
+    }
+
     #[test]
     fn short_and_malformed_frames_are_rejected() {
         let short = rejected(b"BZCI");

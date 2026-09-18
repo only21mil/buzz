@@ -8,12 +8,11 @@ use thiserror::Error;
 
 use crate::evidence::{atomic_publish, PublicationError, ROOT_READ_ONLY_FILE_MODE};
 
-pub const HARNESS_KEYS: [&str; 10] = [
+pub const HARNESS_KEYS: [&str; 9] = [
     "BUZZ_CI_EXECD_SOCKET",
     "BUZZ_CI_BROKER_UNIT",
     "BUZZ_CI_LEASE_STATE_ROOT",
     "BUZZ_CI_RUNNER_CTL",
-    "BUZZ_CI_ACCEPTANCE_CTL",
     "BUZZ_CI_QUALIFICATION_CASE_ROOT",
     "BUZZ_CI_FIXTURE_REPO",
     "BUZZ_CI_HARNESS_SIGNER",
@@ -28,7 +27,6 @@ pub struct HarnessConfig {
     pub broker_unit: String,
     pub lease_state_root: PathBuf,
     pub runner_entrypoint: PathBuf,
-    pub acceptance_entrypoint: PathBuf,
     pub qualification_case_root: PathBuf,
     pub fixture_repo: String,
     /// Lowercase 32-byte public signer key. Secret signing material is never
@@ -58,7 +56,6 @@ impl HarnessConfig {
             &self.execd_socket,
             &self.lease_state_root,
             &self.runner_entrypoint,
-            &self.acceptance_entrypoint,
             &self.qualification_case_root,
             &self.graph_reducer,
             &self.graph_fixture_dir,
@@ -96,7 +93,6 @@ impl HarnessConfig {
             self.broker_unit.clone(),
             path_text(&self.lease_state_root)?.to_owned(),
             path_text(&self.runner_entrypoint)?.to_owned(),
-            path_text(&self.acceptance_entrypoint)?.to_owned(),
             path_text(&self.qualification_case_root)?.to_owned(),
             self.fixture_repo.clone(),
             self.harness_signer.clone(),
@@ -160,7 +156,6 @@ mod tests {
             broker_unit: "buzz-ci-execd.service".to_owned(),
             lease_state_root: root.join("leases"),
             runner_entrypoint: root.join("bin/runner"),
-            acceptance_entrypoint: root.join("bin/acceptance-ctl"),
             qualification_case_root: root.join("qualification-cases"),
             fixture_repo: "only21mil/buzz-ci-fixtures".to_owned(),
             harness_signer: "11".repeat(32),

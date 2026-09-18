@@ -2,6 +2,10 @@
 //!
 //! Authentication happens outside this crate. Signer fields are non-zero
 //! claims bound into the request, never proof that a signer authenticated.
+//!
+//! The `qualification_v1` grammar validated here has no production wire
+//! encoding any more: its broker protocol version 1 frame is refused by
+//! production execd. [`production_qualification`] is the version 2 client.
 
 pub mod acceptance;
 pub mod acceptance_binding;
@@ -11,28 +15,14 @@ pub mod acceptance_binding_test_support;
 pub mod production;
 pub mod production_qualification;
 
-use std::{
-    fmt,
-    io::{Read, Write},
-    time::Duration,
-};
+use std::{fmt, io::Write};
 
-use buzz_ci_broker_protocol::{
-    decode_response, encode_request, BrokerResponse, FrameHeader, GitOid as ProtocolGitOid,
-    QualificationDirective as ProtocolDirective,
-    QualificationRequest as ProtocolQualificationRequest, Request, ResponseCode, HEADER_SIZE,
-    RESPONSE_BODY_SIZE,
-};
+use buzz_ci_broker_protocol::ResponseCode;
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 /// Maximum accepted standard-input document size.
 pub const MAX_INPUT_BYTES: usize = 64 * 1024;
-/// Fixed root-broker socket selected by the deployment contract.
-pub const BROKER_SOCKET_PATH: &str = "/run/buzzci/execd.sock";
-
-const RESPONSE_FRAME_SIZE: usize = HEADER_SIZE + RESPONSE_BODY_SIZE;
-const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One normalized 32-byte digest or signer identity.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -400,160 +390,6 @@ impl<W: Write> QualificationTransport for JsonLineTransport<W> {
     }
 }
 
-/// Fixed-socket transport used by the installed qualification binary.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct UnixQualificationTransport {
-    response: Option<BrokerResponse>,
-}
-
-impl UnixQualificationTransport {
-    /// Construct an empty transport. A response appears only after one exchange.
-    pub const fn new() -> Self {
-        Self { response: None }
-    }
-
-    /// Return the response from the completed successful exchange.
-    pub const fn response(&self) -> Option<BrokerResponse> {
-        self.response
-    }
-}
-
-/// Stable failure from the fixed qualification transport.
-#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-pub enum QualificationExchangeError {
-    #[error("qualification broker is unavailable")]
-    BrokerUnavailable,
-    #[error("qualification transport failed")]
-    TransportFailure,
-    #[error("qualification broker response was invalid")]
-    InvalidBrokerResponse,
-    #[error("qualification broker refused the request")]
-    Refused(ResponseCode),
-}
-
-impl QualificationExchangeError {
-    /// Stable machine-readable failure code.
-    pub const fn code(self) -> &'static str {
-        match self {
-            Self::BrokerUnavailable => "broker_unavailable",
-            Self::TransportFailure => "transport_failure",
-            Self::InvalidBrokerResponse => "invalid_broker_response",
-            Self::Refused(code) => response_code_name(code),
-        }
-    }
-}
-
-impl QualificationTransport for UnixQualificationTransport {
-    type Error = QualificationExchangeError;
-
-    fn exchange(&mut self, request: &QualificationRequest) -> Result<(), Self::Error> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::net::UnixStream;
-
-            let mut stream = UnixStream::connect(BROKER_SOCKET_PATH)
-                .map_err(|_| QualificationExchangeError::BrokerUnavailable)?;
-            stream
-                .set_read_timeout(Some(IO_TIMEOUT))
-                .and_then(|()| stream.set_write_timeout(Some(IO_TIMEOUT)))
-                .map_err(|_| QualificationExchangeError::TransportFailure)?;
-            exchange_stream(&mut stream, request, &mut self.response)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = request;
-            Err(QualificationExchangeError::BrokerUnavailable)
-        }
-    }
-}
-
-trait QualificationStream: Read + Write {
-    fn shutdown_write(&mut self) -> std::io::Result<()>;
-}
-
-#[cfg(unix)]
-impl QualificationStream for std::os::unix::net::UnixStream {
-    fn shutdown_write(&mut self) -> std::io::Result<()> {
-        self.shutdown(std::net::Shutdown::Write)
-    }
-}
-
-fn exchange_stream(
-    stream: &mut impl QualificationStream,
-    request: &QualificationRequest,
-    response_slot: &mut Option<BrokerResponse>,
-) -> Result<(), QualificationExchangeError> {
-    let request_id = request_id(request);
-    let request = Request::AdmitQualification(to_protocol_request(request));
-    let encoded = encode_request(request_id, request);
-    stream
-        .write_all(encoded.as_bytes())
-        .and_then(|()| stream.flush())
-        .map_err(|_| QualificationExchangeError::TransportFailure)?;
-    stream
-        .shutdown_write()
-        .map_err(|_| QualificationExchangeError::TransportFailure)?;
-
-    let mut response = Vec::with_capacity(RESPONSE_FRAME_SIZE);
-    stream
-        .take((RESPONSE_FRAME_SIZE + 1) as u64)
-        .read_to_end(&mut response)
-        .map_err(|_| QualificationExchangeError::TransportFailure)?;
-    if response.len() != RESPONSE_FRAME_SIZE {
-        return Err(QualificationExchangeError::InvalidBrokerResponse);
-    }
-    let decoded = decode_response(
-        FrameHeader {
-            operation: request.operation(),
-            request_id,
-        },
-        &response,
-    )
-    .map_err(|_| QualificationExchangeError::InvalidBrokerResponse)?;
-    *response_slot = Some(decoded);
-    if decoded.code == ResponseCode::Ok {
-        Ok(())
-    } else {
-        Err(QualificationExchangeError::Refused(decoded.code))
-    }
-}
-
-fn request_id(request: &QualificationRequest) -> [u8; 16] {
-    let mut request_id = [0; 16];
-    request_id.copy_from_slice(&request.nonce.as_bytes()[..16]);
-    request_id
-}
-
-fn to_protocol_request(request: &QualificationRequest) -> ProtocolQualificationRequest {
-    ProtocolQualificationRequest {
-        integrated_candidate_sha: protocol_oid(request.integrated_candidate_sha),
-        broker_build_identity: *request.broker_build_identity.as_bytes(),
-        host_profile_digest: *request.host_profile_digest.as_bytes(),
-        suite_identity: *request.suite_identity.as_bytes(),
-        fixture_signer: *request.fixture_signer.as_bytes(),
-        request_digest: *request.request_digest.as_bytes(),
-        manifest_digest: *request.manifest_digest.as_bytes(),
-        isolation_profile_digest: *request.isolation_profile_digest.as_bytes(),
-        source_oid: protocol_oid(request.source_oid),
-        base_oid: protocol_oid(request.base_oid),
-        job_identity: *request.job_identity.as_bytes(),
-        fixture_identity: *request.fixture_identity.as_bytes(),
-        nonce: *request.nonce.as_bytes(),
-        not_before: request.not_before,
-        expires_at: request.expires_at,
-        directive: request.directive.map(|directive| match directive {
-            QualificationDirective::TeardownFailure => ProtocolDirective::TeardownFailure,
-        }),
-    }
-}
-
-const fn protocol_oid(oid: GitOid) -> ProtocolGitOid {
-    match oid {
-        GitOid::Sha1(bytes) => ProtocolGitOid::Sha1(bytes),
-        GitOid::Sha256(bytes) => ProtocolGitOid::Sha256(bytes),
-    }
-}
-
 /// Stable lowercase name for a broker response code.
 pub const fn response_code_name(code: ResponseCode) -> &'static str {
     match code {
@@ -839,146 +675,4 @@ fn encode_hex(bytes: &[u8]) -> String {
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     encoded
-}
-
-#[cfg(test)]
-mod transport_tests {
-    use std::io::{Cursor, Read, Write};
-
-    use buzz_ci_broker_protocol::{
-        decode_request, encode_response, BrokerState, Conclusion, GitOid as ProtocolGitOid,
-        Operation,
-    };
-
-    use super::*;
-
-    struct ScriptedStream {
-        input: Cursor<Vec<u8>>,
-        output: Vec<u8>,
-        shutdown: bool,
-    }
-
-    impl Read for ScriptedStream {
-        fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
-            self.input.read(output)
-        }
-    }
-
-    impl Write for ScriptedStream {
-        fn write(&mut self, input: &[u8]) -> std::io::Result<usize> {
-            self.output.extend_from_slice(input);
-            Ok(input.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl QualificationStream for ScriptedStream {
-        fn shutdown_write(&mut self) -> std::io::Result<()> {
-            self.shutdown = true;
-            Ok(())
-        }
-    }
-
-    fn request() -> QualificationRequest {
-        QualificationRequest {
-            integrated_candidate_sha: GitOid::Sha256([2; 32]),
-            broker_build_identity: Hex32([3; 32]),
-            host_profile_digest: Hex32([4; 32]),
-            suite_identity: Hex32([5; 32]),
-            fixture_signer: Hex32([6; 32]),
-            request_digest: Hex32([7; 32]),
-            manifest_digest: Hex32([8; 32]),
-            isolation_profile_digest: Hex32([9; 32]),
-            source_oid: GitOid::Sha256([10; 32]),
-            base_oid: GitOid::Sha1([11; 20]),
-            job_identity: Hex32([12; 32]),
-            fixture_identity: Hex32([13; 32]),
-            nonce: Hex32([14; 32]),
-            not_before: 100,
-            expires_at: 200,
-            directive: Some(QualificationDirective::TeardownFailure),
-        }
-    }
-
-    fn response(code: ResponseCode) -> BrokerResponse {
-        BrokerResponse {
-            code,
-            retry_after_millis: 0,
-            attempt_id: [13; 16],
-            run_id: [0; 16],
-            accepted_request_digest: [7; 32],
-            job_manifest_digest: [8; 32],
-            tip_oid: None,
-            broker_state: BrokerState::Reconciling,
-            conclusion: Conclusion::None,
-            terminal_reason: 0,
-            generation: 1,
-            accepted_at: 100,
-            updated_at: 100,
-            lease_generation: 1,
-            evidence_set_digest: [0; 32],
-            teardown_digest: [0; 32],
-            attempt: 0,
-        }
-    }
-
-    fn stream(code: ResponseCode) -> ScriptedStream {
-        let header = FrameHeader {
-            operation: Operation::AdmitQualification,
-            request_id: [14; 16],
-        };
-        ScriptedStream {
-            input: Cursor::new(encode_response(header, response(code)).as_bytes().to_vec()),
-            output: Vec::new(),
-            shutdown: false,
-        }
-    }
-
-    #[test]
-    fn fixed_transport_emits_the_exact_qualification_frame() {
-        let request = request();
-        let mut stream = stream(ResponseCode::Ok);
-        let mut response_slot = None;
-        exchange_stream(&mut stream, &request, &mut response_slot).unwrap();
-        assert!(stream.shutdown);
-        let (header, decoded) = decode_request(&stream.output).unwrap();
-        assert_eq!(header.operation, Operation::AdmitQualification);
-        assert_eq!(header.request_id, [14; 16]);
-        assert_eq!(
-            decoded,
-            Request::AdmitQualification(ProtocolQualificationRequest {
-                integrated_candidate_sha: ProtocolGitOid::Sha256([2; 32]),
-                broker_build_identity: [3; 32],
-                host_profile_digest: [4; 32],
-                suite_identity: [5; 32],
-                fixture_signer: [6; 32],
-                request_digest: [7; 32],
-                manifest_digest: [8; 32],
-                isolation_profile_digest: [9; 32],
-                source_oid: ProtocolGitOid::Sha256([10; 32]),
-                base_oid: ProtocolGitOid::Sha1([11; 20]),
-                job_identity: [12; 32],
-                fixture_identity: [13; 32],
-                nonce: [14; 32],
-                not_before: 100,
-                expires_at: 200,
-                directive: Some(ProtocolDirective::TeardownFailure),
-            })
-        );
-        assert_eq!(response_slot, Some(response(ResponseCode::Ok)));
-    }
-
-    #[test]
-    fn fixed_transport_preserves_stable_broker_refusals() {
-        let mut stream = stream(ResponseCode::ReplayConflict);
-        let error = exchange_stream(&mut stream, &request(), &mut None).unwrap_err();
-        assert_eq!(
-            error,
-            QualificationExchangeError::Refused(ResponseCode::ReplayConflict)
-        );
-        assert_eq!(error.code(), "replay_conflict");
-    }
 }

@@ -1,15 +1,18 @@
 # buzz-ci-acceptance-ctl
 
-`buzz-ci-acceptance-ctl` is a qualification-only input gate. It reads one
-bounded JSON object from standard input. The object contains authenticated,
-normalized permit and admission fields. The gate rejects zero values,
-coordinate mismatches, non-qualification trust, invalid time bounds, unknown
-fields, and malformed encodings before it calls its transport.
+`buzz-ci-acceptance-ctl` is the qualification-only input library and the
+home of the acceptance binaries. Its `qualification_v1` validator reads one
+bounded JSON object with authenticated, normalized permit and admission fields
+and rejects zero values, coordinate mismatches, non-qualification trust,
+invalid time bounds, unknown fields, and malformed encodings before any
+transport runs. The validator's only optional directive is
+`"teardown_failure"`. Ordinary `buzz-ci-runner` does not depend on this crate.
 
-The binary has no flags or subcommands. In particular, it has no repository,
-workflow, job, generic fault, or acceptance-case input. Its only optional
-directive is `"teardown_failure"`. Ordinary `buzz-ci-runner` does not depend on
-this crate or invoke the binary.
+The crate no longer ships a `buzz-ci-acceptance-ctl` binary. That launcher
+encoded the validated request as a broker protocol version 1
+`AdmitQualification` frame, and production execd refuses version 1 at the
+transport (`ControlServer::new_polling`). The version 2 qualification client is
+`buzz-ci-production-qualification` below.
 
 The crate also builds `buzz-ci-capacity-one-canary`. That binary owns the
 activation acceptance sequence. It reads a scenario from standard input,
@@ -38,8 +41,12 @@ The canary is not part of the ordinary runner path. See
 activation status.
 
 The library exposes `QualificationTransport` for deterministic zero-transport
-validation tests. The installed binary maps the validated request into the
-fixed `AdmitQualification` frame and exchanges it only with
-`/run/buzzci/execd.sock`. Successful broker responses are JSON lines on standard
-output. Input and broker refusals are stable JSON errors on standard error and
-leave standard output empty.
+validation tests.
+
+`/usr/libexec/buzz-ci-production-qualification` is the closed version 2
+qualification probe. It reads one `buzz-ci-production-qualification-request/v2`
+JSON object on stdin, encodes it with `buzz_ci_broker_protocol::v2`, exchanges
+it only with `/run/buzzci/execd.sock`, and accepts only a response that echoes
+every activation and host binding. Successful receipts are JSON lines on
+standard output. Input and broker refusals are stable JSON errors on standard
+error and leave standard output empty.
