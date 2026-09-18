@@ -2,37 +2,14 @@ import { relayClient } from "@/shared/api/relayClient";
 import type { RelayEvent } from "@/shared/api/types";
 import { queryBridge, type QueryBridgeClient } from "./relayQueries";
 import { register } from "./registry";
+import {
+  objectBody,
+  optionalString,
+  requiredString,
+  type ObjectBody,
+} from "./commandBody";
 
 type RelayDiscoveryClient = QueryBridgeClient;
-type ObjectBody = Record<string, unknown>;
-
-function objectBody(body: unknown, command: string): ObjectBody {
-  if (
-    !body ||
-    Array.isArray(body) ||
-    body instanceof ArrayBuffer ||
-    body instanceof Uint8Array
-  ) {
-    throw new TypeError(`${command} requires an object body`);
-  }
-  return body as ObjectBody;
-}
-
-function optionalString(body: ObjectBody, field: string): string | undefined {
-  const value = body[field];
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== "string") {
-    throw new TypeError(`${field} must be a string`);
-  }
-  return value;
-}
-
-function requiredString(body: ObjectBody, field: string): string {
-  const value = optionalString(body, field);
-  if (value === undefined) throw new TypeError(`${field} must be a string`);
-  return value;
-}
-
 function optionalInteger(body: ObjectBody, field: string): number | undefined {
   const value = body[field];
   if (value === undefined || value === null) return undefined;

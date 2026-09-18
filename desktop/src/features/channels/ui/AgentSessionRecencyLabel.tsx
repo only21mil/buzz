@@ -40,10 +40,7 @@ function RecencyLabel({ label, title }: { label: string; title?: string }) {
   );
 }
 
-export function formatRelativeActivityTime(
-  timestamp: number,
-  now: number,
-): string {
+function formatRelativeActivityTime(timestamp: number, now: number): string {
   const elapsedMs = Math.max(0, now - timestamp);
   const totalSeconds = Math.floor(elapsedMs / 1_000);
 

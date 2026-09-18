@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 import { installMockBridge } from "../helpers/bridge";
+import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 
 // =============================================================================
 // Regression — a live broadcast reply must enter the authoritative channel
@@ -34,23 +35,6 @@ import { installMockBridge } from "../helpers/bridge";
 // parented event" fix can't false-green this spec.
 
 const CHANNEL = "general";
-
-async function waitForMockLiveSubscription(
-  page: import("@playwright/test").Page,
-  channelName: string,
-) {
-  await expect
-    .poll(() =>
-      page.evaluate(
-        (ch) =>
-          window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
-            channelName: ch,
-          }) ?? false,
-        channelName,
-      ),
-    )
-    .toBe(true);
-}
 
 async function emit(
   page: import("@playwright/test").Page,

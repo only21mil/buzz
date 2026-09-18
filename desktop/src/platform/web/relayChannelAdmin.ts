@@ -2,33 +2,12 @@ import { relayClient } from "@/shared/api/relayClient";
 import type { RelayEvent } from "@/shared/api/types";
 import type { BrowserIdentityManager } from "./identity";
 import { register } from "./registry";
+import { objectBody, requiredString } from "./commandBody";
 
 type RelayChannelAdminClient = Pick<
   typeof relayClient,
   "fetchFirstEvent" | "publishEvent"
 >;
-
-type ObjectBody = Record<string, unknown>;
-
-function objectBody(body: unknown, command: string): ObjectBody {
-  if (
-    !body ||
-    Array.isArray(body) ||
-    body instanceof ArrayBuffer ||
-    body instanceof Uint8Array
-  ) {
-    throw new TypeError(`${command} requires an object body`);
-  }
-  return body as ObjectBody;
-}
-
-function requiredString(body: ObjectBody, field: string): string {
-  const value = body[field];
-  if (typeof value !== "string") {
-    throw new TypeError(`${field} must be a string`);
-  }
-  return value;
-}
 
 function normalizedChannelUuid(channelId: string): string {
   let value = channelId.toLowerCase();

@@ -2,30 +2,9 @@ import { expect, test } from "@playwright/test";
 
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge } from "../helpers/bridge";
+import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 
 const SHOTS = "test-results/message-feedback";
-
-async function waitForMockLiveSubscription(
-  page: import("@playwright/test").Page,
-  channelName: string,
-) {
-  await expect
-    .poll(async () => {
-      return page.evaluate(
-        ({ ch }) =>
-          (
-            window as Window & {
-              __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
-                channelName: string;
-              }) => boolean;
-            }
-          ).__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({ channelName: ch }) ??
-          false,
-        { ch: channelName },
-      );
-    })
-    .toBe(true);
-}
 
 test("pending continuation keeps Sending next to its timestamp", async ({
   page,

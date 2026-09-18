@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 import {
   finishRecording,
   installVoiceNote,
@@ -306,20 +307,6 @@ async function openMoreActionsMenu(page: Page, messageId: string) {
   await row.hover();
   await page.getByTestId(`more-actions-${messageId}`).click();
   await expect(page.locator('[role="menuitem"]').first()).toBeVisible();
-}
-
-async function waitForMockLiveSubscription(page: Page, channelName: string) {
-  await expect
-    .poll(() =>
-      page.evaluate(
-        (currentChannelName) =>
-          window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
-            channelName: currentChannelName,
-          }) ?? false,
-        channelName,
-      ),
-    )
-    .toBe(true);
 }
 
 test("keeps pasted snapshots and channel drops out of an active voice note", async ({

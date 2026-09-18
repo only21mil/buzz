@@ -6,29 +6,11 @@ import {
 } from "../../src/shared/constants/kinds";
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
+import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 
 const HUDDLE_CHANNEL_ID = "11111111-1111-4111-8111-111111111111";
 const HUDDLE_PARENT_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
 const HUDDLE_THREAD_ROOT_ID = "mock-general-welcome";
-
-async function waitForMockLiveSubscription(
-  page: import("@playwright/test").Page,
-  channelName: string,
-  kind?: number,
-) {
-  await expect
-    .poll(() =>
-      page.evaluate(
-        ({ kind, name }) =>
-          window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
-            channelName: name,
-            kind,
-          }) ?? false,
-        { kind, name: channelName },
-      ),
-    )
-    .toBe(true);
-}
 
 async function setHuddleSnapshot(
   page: import("@playwright/test").Page,

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
+import { afterEach, mock, test } from "node:test";
 
 import { verifyEvent } from "nostr-tools/pure";
 import { assertNoIdentityKeyEgress } from "../../shared/lib/keyBackupEgress.ts";
@@ -230,6 +230,69 @@ test("backup passphrase generation honors bounded word count and separator", asy
     separator: "-",
   });
   assert.match(passphrase, /^[0-9a-f]{8}(?:-[0-9a-f]{8}){3}$/);
+});
+
+test("save_ncryptsec_copy keeps the object URL alive until the download has started", async () => {
+  const manager = await BrowserIdentityManager.create(
+    new MemoryIdentityStore(),
+    new DirectNip49Codec(),
+  );
+  registerIdentityCommands(manager);
+  const previous = {
+    document: globalThis.document,
+    createObjectURL: URL.createObjectURL,
+    revokeObjectURL: URL.revokeObjectURL,
+  };
+  const anchor = { click: mock.fn() };
+  const revoke = mock.fn();
+  globalThis.document = { createElement: () => anchor };
+  URL.createObjectURL = () => "blob:buzz/backup";
+  URL.revokeObjectURL = revoke;
+  mock.timers.enable({ apis: ["setTimeout"] });
+  try {
+    const name = await dispatch("save_ncryptsec_copy", {
+      ncryptsec: "ncryptsec1example",
+    });
+    assert.equal(
+      name,
+      `buzz-identity-${manager.pubkey().slice(0, 8)}.ncryptsec`,
+    );
+    assert.equal(anchor.href, "blob:buzz/backup");
+    assert.equal(anchor.click.mock.callCount(), 1);
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(revoke.mock.callCount(), 0);
+    mock.timers.tick(59_999);
+    assert.equal(revoke.mock.callCount(), 0);
+    mock.timers.tick(1);
+    assert.deepEqual(revoke.mock.calls[0].arguments, ["blob:buzz/backup"]);
+  } finally {
+    mock.timers.reset();
+    globalThis.document = previous.document;
+    URL.createObjectURL = previous.createObjectURL;
+    URL.revokeObjectURL = previous.revokeObjectURL;
+  }
+});
+
+test("sign_event rejects malformed bodies before signing", async () => {
+  const manager = await BrowserIdentityManager.create(
+    new MemoryIdentityStore(),
+    new DirectNip49Codec(),
+  );
+  registerIdentityCommands(manager);
+  const cases = [
+    [undefined, /object body/],
+    [[1, 2], /object body/],
+    [{ kind: "1", content: "x", tags: [] }, /kind must be/],
+    [{ kind: 1.5, content: "x", tags: [] }, /kind must be/],
+    [{ kind: 1, content: 7, tags: [] }, /content must be/],
+    [{ kind: 1, content: "x", tags: "none" }, /tags must be/],
+    [{ kind: 1, content: "x", tags: [["h", 3]] }, /tags must be/],
+    [{ kind: 1, content: "x", tags: [], createdAt: -1 }, /createdAt must be/],
+  ];
+  for (const [body, message] of cases) {
+    await assert.rejects(dispatch("sign_event", body), message);
+  }
 });
 
 test("sign_event checks the actual signer even before the renderer learns of its replacement", async () => {

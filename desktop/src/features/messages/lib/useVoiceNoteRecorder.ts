@@ -14,7 +14,7 @@ function supportedMimeType(): string | undefined {
   return MIME_CANDIDATES.find((type) => MediaRecorder.isTypeSupported(type));
 }
 
-export type VoiceNoteRecording = {
+type VoiceNoteRecording = {
   duration: number;
   file: File;
 };

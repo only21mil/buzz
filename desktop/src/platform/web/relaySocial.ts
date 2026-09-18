@@ -2,6 +2,12 @@ import { relayClient } from "@/shared/api/relayClient";
 import type { RelayEvent } from "@/shared/api/types";
 import type { BrowserIdentityManager } from "./identity";
 import { register } from "./registry";
+import {
+  objectBody,
+  optionalString,
+  requiredString,
+  type ObjectBody,
+} from "./commandBody";
 
 type SocialFilter = {
   ids?: string[];
@@ -12,7 +18,7 @@ type SocialFilter = {
   limit?: number;
 } & Partial<Record<`#${string}`, string[]>>;
 
-export type RelaySocialClient = {
+type RelaySocialClient = {
   fetchEvents(filter: SocialFilter): Promise<RelayEvent[]>;
   publishEvent(
     event: RelayEvent,
@@ -20,8 +26,6 @@ export type RelaySocialClient = {
     sendErrorMessage: string,
   ): Promise<RelayEvent>;
 };
-
-type ObjectBody = Record<string, unknown>;
 
 const MAX_CONTENT_BYTES = 64 * 1024;
 const MAX_MENTIONS = 50;
@@ -32,34 +36,6 @@ const MENTION_KINDS = [
   9, 40002, 1, 45001, 45003, 1618, 1619, 1621, 1630, 1631, 1632, 1633,
 ];
 const APPROVAL_KINDS = [46010, 46011, 46012];
-
-function objectBody(body: unknown, command: string): ObjectBody {
-  if (
-    !body ||
-    typeof body !== "object" ||
-    Array.isArray(body) ||
-    body instanceof ArrayBuffer ||
-    body instanceof Uint8Array
-  ) {
-    throw new TypeError(`${command} requires an object body`);
-  }
-  return body as ObjectBody;
-}
-
-function optionalString(body: ObjectBody, field: string): string | undefined {
-  const value = body[field];
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== "string") {
-    throw new TypeError(`${field} must be a string`);
-  }
-  return value;
-}
-
-function requiredString(body: ObjectBody, field: string): string {
-  const value = optionalString(body, field);
-  if (value === undefined) throw new TypeError(`${field} must be a string`);
-  return value;
-}
 
 function optionalInteger(body: ObjectBody, field: string): number | undefined {
   const value = body[field];

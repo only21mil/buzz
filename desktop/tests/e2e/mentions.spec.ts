@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 
 import {
   installMockBridge,
@@ -161,35 +162,6 @@ async function emitMockMessage(
     throw new Error("Mock message emitter is not installed");
   }
   return event;
-}
-
-async function waitForMockLiveSubscription(
-  page: import("@playwright/test").Page,
-  channelName: string,
-  kind?: number,
-) {
-  await expect
-    .poll(async () => {
-      return page.evaluate(
-        ({ currentChannelName, kind: expectedKind }) => {
-          return (
-            (
-              window as Window & {
-                __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
-                  channelName: string;
-                  kind?: number;
-                }) => boolean;
-              }
-            ).__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
-              channelName: currentChannelName,
-              kind: expectedKind,
-            }) ?? false
-          );
-        },
-        { currentChannelName: channelName, kind },
-      );
-    })
-    .toBe(true);
 }
 
 // The channel timeline renders off a `useDeferredValue` snapshot that lags the

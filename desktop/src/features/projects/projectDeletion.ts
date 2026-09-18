@@ -12,7 +12,7 @@ import {
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import type { Project } from "./projectModels";
 
-export type DeleteProjectEventTemplate = {
+type DeleteProjectEventTemplate = {
   kind: number;
   content: string;
   createdAt: number;

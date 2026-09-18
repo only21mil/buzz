@@ -17,14 +17,14 @@ export type WorkflowMessageCandidate = {
   createdAt: number | null;
 };
 
-export type WorkflowMessageCandidateInput = {
+type WorkflowMessageCandidateInput = {
   id: string;
   pubkey?: string | null;
   content?: string | null;
   createdAt?: number | null;
 };
 
-export type WorkflowMessageEventValidation = {
+type WorkflowMessageEventValidation = {
   channelId: string;
   requestedId?: string | null;
 };
@@ -109,7 +109,7 @@ export function validatedWorkflowMessageCandidate(
   };
 }
 
-export type WorkflowMessageSearchResult = {
+type WorkflowMessageSearchResult = {
   requestedId: string;
   event: RelayEvent | null | undefined;
 };

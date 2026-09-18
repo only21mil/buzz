@@ -2,31 +2,9 @@ import { relayClient } from "@/shared/api/relayClient";
 import type { RelayEvent } from "@/shared/api/types";
 import type { BrowserIdentityManager } from "./identity";
 import { register } from "./registry";
+import { objectBody, requiredString, type ObjectBody } from "./commandBody";
 
 type RelayDmClient = Pick<typeof relayClient, "fetchEvents" | "publishEvent">;
-type ObjectBody = Record<string, unknown>;
-
-function objectBody(body: unknown, command: string): ObjectBody {
-  if (
-    !body ||
-    typeof body !== "object" ||
-    Array.isArray(body) ||
-    body instanceof ArrayBuffer ||
-    body instanceof Uint8Array
-  ) {
-    throw new TypeError(`${command} requires an object body`);
-  }
-  return body as ObjectBody;
-}
-
-function requiredString(body: ObjectBody, field: string): string {
-  const value = body[field];
-  if (typeof value !== "string") {
-    throw new TypeError(`${field} must be a string`);
-  }
-  return value;
-}
-
 function requiredPubkeys(body: ObjectBody): string[] {
   const value = body.pubkeys;
   if (!Array.isArray(value)) {

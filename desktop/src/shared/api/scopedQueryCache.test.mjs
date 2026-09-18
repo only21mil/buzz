@@ -169,3 +169,73 @@ test("storage read failures miss safely and failed deletion reaches logout", asy
   await cache.attach(client(), key()).ready;
   await assert.rejects(cache.clear(), /clear failed/);
 });
+
+test("snapshot size limit counts UTF-8 bytes, not UTF-16 units", async () => {
+  const persisted = async (content) => {
+    const store = new Store(),
+      cache = new ScopedQueryCache(store);
+    const live = client(),
+      attached = cache.attach(live, key());
+    await attached.ready;
+    live.setQueryData(["channels"], [{ id: content }]);
+    attached.stop();
+    await new Promise((resolve) => setImmediate(resolve));
+    return store.values.size;
+  };
+  // Three million euro signs: 3M UTF-16 units, 9M UTF-8 bytes.
+  assert.equal(await persisted("€".repeat(3_000_000)), 0);
+  assert.equal(await persisted("a".repeat(3_000_000)), 1);
+});
+
+test("restore ignores snapshots with a future, negative or non-numeric savedAt", async () => {
+  for (const savedAt of [
+    Date.now() + 60_000,
+    -1,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    "0",
+    undefined,
+  ]) {
+    const store = new Store();
+    store.values.set(
+      key(),
+      JSON.stringify({
+        version: 1,
+        scope: key(),
+        savedAt,
+        state: {
+          mutations: [],
+          queries: [
+            {
+              queryKey: ["channels"],
+              queryHash: JSON.stringify(["channels"]),
+              state: {
+                data: [{ id: "stale" }],
+                dataUpdateCount: 1,
+                dataUpdatedAt: 1,
+                error: null,
+                errorUpdateCount: 0,
+                errorUpdatedAt: 0,
+                fetchFailureCount: 0,
+                fetchFailureReason: null,
+                fetchMeta: null,
+                isInvalidated: false,
+                status: "success",
+                fetchStatus: "idle",
+              },
+            },
+          ],
+        },
+      }),
+    );
+    const next = client(),
+      attached = new ScopedQueryCache(store).attach(next, key());
+    await attached.ready;
+    assert.equal(
+      next.getQueryData(["channels"]),
+      undefined,
+      `savedAt ${String(savedAt)} must not restore`,
+    );
+    attached.stop();
+  }
+});

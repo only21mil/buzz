@@ -48,7 +48,7 @@ const CUSTOM_ENTRY_ID = "\u0000custom";
 
 /**
  * "Add runtimes" — master-detail catalog dialog, modeled on the Agent
- * Catalog (PersonaCatalogDialog): searchable left chooser, right detail pane
+ * Catalog (CommunityCatalogDialog): searchable left chooser, right detail pane
  * with one neutral vendor-sourced sentence, operational setup state, and
  * technical details, plus a primary Install / setup-guide CTA pinned in a
  * bottom action bar (same position as the custom-harness Save button).

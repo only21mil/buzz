@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
+import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 
 // The channel and thread composers float over their conversation scrollers.
 // When the conversation is scrolled up, later rows pass underneath the
@@ -11,25 +12,6 @@ import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 
 const CHANNEL = "general";
 const TYPING_KIND = 20002;
-
-async function waitForMockLiveSubscription(
-  page: import("@playwright/test").Page,
-  channelName: string,
-  kind?: number,
-) {
-  await expect
-    .poll(() =>
-      page.evaluate(
-        ({ channelName, kind }) =>
-          window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
-            channelName,
-            kind,
-          }) ?? false,
-        { channelName, kind },
-      ),
-    )
-    .toBe(true);
-}
 
 async function emit(
   page: import("@playwright/test").Page,

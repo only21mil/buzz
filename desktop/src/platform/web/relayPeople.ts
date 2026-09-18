@@ -5,13 +5,13 @@ import type { RelayEvent } from "@/shared/api/types";
 import { verifyEvent } from "nostr-tools/pure";
 import type { BrowserIdentityManager } from "./identity";
 import { register } from "./registry";
+import { objectBody, requiredString, type ObjectBody } from "./commandBody";
 
 type RelayPeopleClient = Pick<
   typeof relayClient,
   "fetchEvents" | "fetchFirstEvent" | "publishEvent"
 >;
 
-type ObjectBody = Record<string, unknown>;
 type RelayFilter = Parameters<RelayPeopleClient["fetchEvents"]>[0];
 
 const MAX_SEARCH_LIMIT = 500;
@@ -19,27 +19,6 @@ const MAX_CONTACTS = 10_000;
 const HEX_PUBKEY = /^[0-9a-f]{64}$/i;
 const LOWER_HEX_PUBKEY = /^[0-9a-f]{64}$/;
 const LOWER_HEX_SIGNATURE = /^[0-9a-f]{128}$/;
-
-function objectBody(body: unknown, command: string): ObjectBody {
-  if (
-    !body ||
-    typeof body !== "object" ||
-    Array.isArray(body) ||
-    body instanceof ArrayBuffer ||
-    body instanceof Uint8Array
-  ) {
-    throw new TypeError(`${command} requires an object body`);
-  }
-  return body as ObjectBody;
-}
-
-function requiredString(body: ObjectBody, field: string): string {
-  const value = body[field];
-  if (typeof value !== "string") {
-    throw new TypeError(`${field} must be a string`);
-  }
-  return value;
-}
 
 function stringArray(body: ObjectBody, field: string): string[] {
   const value = body[field];

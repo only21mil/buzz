@@ -12,7 +12,7 @@ export type WorkflowAuthorCandidate = {
   isAgent: boolean;
 };
 
-export type WorkflowAuthorCandidateInput = {
+type WorkflowAuthorCandidateInput = {
   pubkey: string;
   displayName?: string | null;
   avatarUrl?: string | null;

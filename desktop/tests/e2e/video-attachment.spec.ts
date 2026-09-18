@@ -2,6 +2,7 @@ import { expect, type Locator, type Page, test } from "@playwright/test";
 
 import { installMockBridge } from "../helpers/bridge";
 import { expectCornerRadiusPx, expectSmoothCorners } from "../helpers/css";
+import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 
 const VIDEO_SHA = "b".repeat(64);
 const VIDEO_URL = `http://localhost:3000/media/${VIDEO_SHA}.mp4`;
@@ -30,24 +31,6 @@ const VIDEO_REVIEW_INDIGO_FOREGROUND_RGB = "rgb(141, 143, 245)";
 const VIDEO_REVIEW_NEUTRAL_DARK_RGB = "rgb(250, 250, 250)";
 const POSTER_DATA_URL =
   "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNjAgODAiPjxyZWN0IHdpZHRoPSIxNjAiIGhlaWdodD0iODAiIGZpbGw9IiMyNjQ2NTMiLz48Y2lyY2xlIGN4PSI1NCIgY3k9IjQwIiByPSIyMiIgZmlsbD0iI2YyYzE0ZSIvPjxwYXRoIGQ9Ik05MiAyNGg0NHYzMkg5MnoiIGZpbGw9IiNmNzgxNTQiLz48L3N2Zz4=";
-
-async function waitForMockLiveSubscription(page: Page, channelName: string) {
-  await expect
-    .poll(async () => {
-      return page.evaluate((channelName) => {
-        return (
-          (
-            window as Window & {
-              __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
-                channelName: string;
-              }) => boolean;
-            }
-          ).__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({ channelName }) ?? false
-        );
-      }, channelName);
-    })
-    .toBe(true);
-}
 
 function emitMockMessage(
   page: Page,

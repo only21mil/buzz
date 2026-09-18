@@ -12,7 +12,7 @@ export type InvokeOptions = {
   signal?: AbortSignal;
 };
 
-export type CommandHandler<T = unknown> = (
+type CommandHandler<T = unknown> = (
   body: InvokeBody,
   options?: InvokeOptions,
 ) => T | Promise<T>;

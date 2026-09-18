@@ -1,4 +1,3 @@
-import { Hash } from "lucide-react";
 import * as React from "react";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
@@ -32,7 +31,7 @@ const COLLAPSED_MENTION_ROWS = 3;
  * every search hit. Profiles for the discussing authors resolve in the same
  * hook so rows can show names and avatars.
  */
-export function useDiscussionChannels(query: string): {
+function useDiscussionChannels(query: string): {
   channels: DiscussionChannel[];
   hits: SearchHit[];
   isLoading: boolean;
@@ -313,100 +312,5 @@ function ParticipantFacepile({
         </span>
       ) : null}
     </span>
-  );
-}
-
-/**
- * Full-width channel list for the workspace "Channels" tab: every channel
- * where the repository (or its PRs/issues) is linked in chat, with the
- * people who discussed it there.
- */
-export function DiscussionChannelsPanel({ query }: { query: string }) {
-  const { channels, isLoading, isTruncated } = useDiscussionChannels(query);
-  const { goChannel } = useAppNavigation();
-  const channelName = useChannelNameLookup(channels.length > 0);
-  const profilesQuery = useUsersBatchQuery(
-    channels.flatMap((channel) => channel.participants),
-    { enabled: channels.length > 0 },
-  );
-  const profiles = profilesQuery.data?.profiles;
-
-  if (isLoading) {
-    return (
-      <p className="px-4 py-6 text-sm text-muted-foreground">
-        Searching channel discussions…
-      </p>
-    );
-  }
-  if (channels.length === 0) {
-    return (
-      <p className="px-4 py-6 text-sm text-muted-foreground">
-        No channels reference this repository yet. Paste its link (or a PR or
-        issue link) in a channel and it will show up here.
-      </p>
-    );
-  }
-
-  return (
-    <div>
-      <ul
-        className="divide-y divide-border/50"
-        data-testid="discussion-channels"
-      >
-        {channels.map((channel) => {
-          const name = channelName(channel.id, channel.name);
-          const speakers = channel.participants
-            .slice(0, 2)
-            .map((pubkey) => resolveUserLabel({ profiles, pubkey }));
-          const others = channel.participants.length - speakers.length;
-          return (
-            <li className="relative" key={channel.id}>
-              <button
-                className="flex w-full min-w-0 items-center gap-2.5 px-4 py-3 text-left transition-colors hover:bg-muted/30"
-                onClick={() => void goChannel(channel.id)}
-                type="button"
-              >
-                <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-muted/50">
-                  <Hash className="h-4 w-4 text-muted-foreground" />
-                </span>
-                <span className="min-w-0 flex-1 space-y-1">
-                  <span className="block truncate text-sm font-medium text-foreground">
-                    #{name}
-                  </span>
-                  <span className="block truncate text-xs text-muted-foreground">
-                    {speakers.join(", ")}
-                    {others > 0
-                      ? ` and ${others} ${others === 1 ? "other" : "others"}`
-                      : ""}{" "}
-                    · {channel.messageCount}
-                    {isTruncated ? "+" : ""}{" "}
-                    {channel.messageCount === 1 ? "message" : "messages"}
-                  </span>
-                </span>
-                <ParticipantFacepile
-                  participants={channel.participants}
-                  profiles={profiles}
-                />
-                <span
-                  className="hidden w-20 shrink-0 text-right text-xs text-muted-foreground sm:block"
-                  data-testid="project-channel-row-date"
-                  title={new Date(
-                    channel.lastActivityAt * 1_000,
-                  ).toLocaleString()}
-                >
-                  {relativeTime(channel.lastActivityAt)}
-                </span>
-              </button>
-            </li>
-          );
-        })}
-      </ul>
-      {isTruncated ? (
-        <p className="border-t border-border/50 px-4 py-2 text-xs text-muted-foreground">
-          Showing the latest {DISCUSSION_SEARCH_LIMIT} mentions; totals may be
-          higher.
-        </p>
-      ) : null}
-    </div>
   );
 }

@@ -45,15 +45,6 @@ import { getErrorMessage } from "./useMentionSendFlow.helpers";
 const inFlightDetachedStarts = new Map<string, Promise<unknown>>();
 
 /**
- * Drops every tracked in-flight start. Test-only isolation seam — one test's
- * held start must not suppress the next test's. Production deliberately never
- * calls this: see the map's doc for why entries survive community switches.
- */
-export function resetDetachedAgentStarts(): void {
-  inFlightDetachedStarts.clear();
-}
-
-/**
  * The backend fails a scope-mismatched start closed with a message ending in
  * "not sent". That reads wrong here: publish-first means the message *was*
  * published — only the wake was refused — so say what actually happened.

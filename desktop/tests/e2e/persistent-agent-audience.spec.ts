@@ -3,6 +3,7 @@ import { expect, test, type Locator, type Page } from "@playwright/test";
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge } from "../helpers/bridge";
 import { sentEvents } from "../helpers/mentionClipboard";
+import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 
 const SHOTS = "test-results/persistent-agent-audience";
 const CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
@@ -388,20 +389,6 @@ async function automaticallyMention(
     `@${displayName}`,
   );
   await composer.locator("[data-mention-picker-trigger]").click();
-}
-
-async function waitForMockLiveSubscription(page: Page, channelName: string) {
-  await expect
-    .poll(() =>
-      page.evaluate(
-        (currentChannelName) =>
-          window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
-            channelName: currentChannelName,
-          }) ?? false,
-        channelName,
-      ),
-    )
-    .toBe(true);
 }
 
 async function waitForTimelineSettled(page: Page) {

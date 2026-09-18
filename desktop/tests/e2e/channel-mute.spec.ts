@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 import { TEST_IDENTITIES, installMockBridge } from "../helpers/bridge";
+import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 
 const MOCK_PUBKEY = "deadbeef".repeat(8);
 const ENGINEERING_CHANNEL_ID = "1c7e1c02-87bb-5e88-b2da-5a7a9432d0c9";
@@ -24,28 +25,6 @@ function seedMuteState(
     },
     { key: MUTE_STORAGE_KEY, id: channelId },
   );
-}
-
-async function waitForMockLiveSubscription(
-  page: import("@playwright/test").Page,
-  channelName: string,
-) {
-  await expect
-    .poll(async () => {
-      return page.evaluate(
-        ({ ch }) =>
-          (
-            window as Window & {
-              __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
-                channelName: string;
-              }) => boolean;
-            }
-          ).__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({ channelName: ch }) ??
-          false,
-        { ch: channelName },
-      );
-    })
-    .toBe(true);
 }
 
 test.describe("channel muting", () => {

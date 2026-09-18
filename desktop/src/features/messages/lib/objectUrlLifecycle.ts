@@ -1,4 +1,4 @@
-export type ObjectUrlOwner = { previewUrl?: string };
+type ObjectUrlOwner = { previewUrl?: string };
 
 export function releaseObjectUrl(
   value: string | undefined,

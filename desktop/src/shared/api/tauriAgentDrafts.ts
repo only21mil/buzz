@@ -34,7 +34,7 @@ type RawDraftOperation = Omit<DraftOperation, "persona"> & {
   persona?: RawPersona | null;
 };
 export type DraftQueue = { events: RelayEvent[]; operations: DraftOperation[] };
-export type DraftPrepare = DraftScope & {
+type DraftPrepare = DraftScope & {
   requestEventId: string;
   action: DraftAction;
   input: CreatePersonaInput | UpdatePersonaInput | null;

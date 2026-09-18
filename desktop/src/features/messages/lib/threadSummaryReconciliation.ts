@@ -17,7 +17,7 @@ const THREAD_CONTENT_KINDS = new Set<number>(CHANNEL_TIMELINE_CONTENT_KINDS);
  * thread cache. Auxiliary events and optimistic rows do not contribute to the
  * relay's committed descendant count.
  */
-export function shouldInvalidateThreadReplies(
+function shouldInvalidateThreadReplies(
   cachedReplies: RelayEvent[] | undefined,
   descendantCount: number,
 ): boolean {

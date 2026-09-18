@@ -1,5 +1,4 @@
 import { isProjectSnapshotRow } from "../projectSnapshot";
-import { useProjectsQuery } from "@/features/projects/hooks";
 import type { Project } from "@/features/projects/projectModels";
 
 /** Resolves the canonical visible project home for a channel. */
@@ -18,7 +17,7 @@ export function findProjectHomeByChannelId(
   return matching.length === 1 ? matching[0] : null;
 }
 
-export type ProjectHomeCandidate = {
+type ProjectHomeCandidate = {
   owner: string;
   repositoryAddresses?: readonly string[];
   projectChannelId: string | null;
@@ -65,9 +64,4 @@ export function isProjectHomeChannel(
         hasAuthoritativeHomeBinding(project),
     ).length === 1
   );
-}
-
-export function useIsProjectHomeChannel(channelId: string | null | undefined) {
-  const projectsQuery = useProjectsQuery();
-  return isProjectHomeChannel(channelId, projectsQuery.data ?? []);
 }

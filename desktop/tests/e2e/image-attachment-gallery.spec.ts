@@ -3,6 +3,7 @@ import { expect, type Page, test } from "@playwright/test";
 import { installMockBridge } from "../helpers/bridge";
 import { waitForAnimations } from "../helpers/animations";
 import { expectCornerRadiusPx, expectSmoothCorners } from "../helpers/css";
+import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 
 const IMAGE_SHAS = ["a".repeat(64), "b".repeat(64), "c".repeat(64)];
 const SPOILER_VISIBLE_SHA = "d".repeat(64);
@@ -14,26 +15,6 @@ const NO_DIM_PORTRAIT_URL = "https://example.com/e2e/gallery-portrait.png";
 const NO_DIM_SECOND_URL = "https://example.com/e2e/gallery-second.png";
 const PROGRESSIVE_URL = "https://example.com/e2e/progressive-full.png";
 const PROGRESSIVE_THUMB_URL = "https://example.com/e2e/progressive-thumb.jpg";
-
-async function waitForMockLiveSubscription(page: Page, channelName: string) {
-  await expect
-    .poll(async () => {
-      return page.evaluate((name) => {
-        return (
-          (
-            window as Window & {
-              __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
-                channelName: string;
-              }) => boolean;
-            }
-          ).__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
-            channelName: name,
-          }) ?? false
-        );
-      }, channelName);
-    })
-    .toBe(true);
-}
 
 function imageImetaTag({
   dim,

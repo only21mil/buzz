@@ -121,9 +121,7 @@ async function writeProjectIssueAssignment({
   );
 }
 
-export function useProjectIssueWriteInvalidation(
-  project: Project | null | undefined,
-) {
+function useProjectIssueWriteInvalidation(project: Project | null | undefined) {
   const queryClient = useQueryClient();
   return React.useCallback(() => {
     void queryClient.invalidateQueries({

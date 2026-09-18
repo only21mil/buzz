@@ -1,5 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
+import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 import {
   copyBody,
   expectPrivateIdentity,
@@ -204,20 +205,6 @@ type ClipboardFlavors = {
   html: string;
   text: string;
 };
-
-async function waitForMockLiveSubscription(page: Page, channelName: string) {
-  await expect
-    .poll(() =>
-      page.evaluate(
-        (currentChannelName) =>
-          window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
-            channelName: currentChannelName,
-          }) ?? false,
-        channelName,
-      ),
-    )
-    .toBe(true);
-}
 
 async function waitForTimelineSettled(page: Page) {
   await expect(page.locator("[data-render-pending]")).toHaveCount(0);

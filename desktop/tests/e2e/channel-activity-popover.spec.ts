@@ -2,6 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
+import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 
 const SELF_PUBKEY = "deadbeef".repeat(8);
 const CHANNEL_GENERAL = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
@@ -18,26 +19,6 @@ type MockInboxFeedItem = {
   id: string;
   tags: string[][];
 };
-
-async function waitForMockLiveSubscription(page: Page, channelName: string) {
-  await expect
-    .poll(() =>
-      page.evaluate(
-        (name) =>
-          (
-            window as Window & {
-              __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
-                channelName: string;
-              }) => boolean;
-            }
-          ).__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
-            channelName: name,
-          }) ?? false,
-        channelName,
-      ),
-    )
-    .toBe(true);
-}
 
 async function emitMockMessage(
   page: Page,

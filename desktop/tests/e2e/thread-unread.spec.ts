@@ -1,34 +1,13 @@
 import { expect, test } from "@playwright/test";
 
 import { TEST_IDENTITIES, installMockBridge } from "../helpers/bridge";
+import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 
 type MockMessageEvent = {
   id: string;
   created_at: number;
   pubkey: string;
 };
-
-async function waitForMockLiveSubscription(
-  page: import("@playwright/test").Page,
-  channelName: string,
-) {
-  await expect
-    .poll(async () => {
-      return page.evaluate(
-        ({ ch }) =>
-          (
-            window as Window & {
-              __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
-                channelName: string;
-              }) => boolean;
-            }
-          ).__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({ channelName: ch }) ??
-          false,
-        { ch: channelName },
-      );
-    })
-    .toBe(true);
-}
 
 async function emitMockMessage(
   page: import("@playwright/test").Page,

@@ -2,6 +2,7 @@ import { relayClient } from "@/shared/api/relayClient";
 import type { RelayEvent } from "@/shared/api/types";
 import type { BrowserIdentityManager } from "./identity";
 import { type InvokeBody, register } from "./registry";
+import { objectBody, requiredString } from "./commandBody";
 
 const MAX_CONTENT_BYTES = 64 * 1024;
 
@@ -9,29 +10,6 @@ type RelayCanvasClient = Pick<
   typeof relayClient,
   "fetchFirstEvent" | "publishEvent"
 >;
-
-function objectBody(
-  body: InvokeBody,
-  command: string,
-): Record<string, unknown> {
-  if (
-    !body ||
-    Array.isArray(body) ||
-    body instanceof ArrayBuffer ||
-    body instanceof Uint8Array
-  ) {
-    throw new TypeError(`${command} requires an object body`);
-  }
-  return body;
-}
-
-function requiredString(body: Record<string, unknown>, field: string): string {
-  const value = body[field];
-  if (typeof value !== "string") {
-    throw new TypeError(`${field} must be a string`);
-  }
-  return value;
-}
 
 function canonicalUuid(value: string): string | null {
   let candidate = value;

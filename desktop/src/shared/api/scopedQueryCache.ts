@@ -25,6 +25,19 @@ const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
 const MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const MAX_MEMORY_SCOPES = 8;
 
+// JSON.stringify length counts UTF-16 units; the storage limit is bytes.
+function exceedsSnapshotBytes(serialized: string): boolean {
+  if (serialized.length > MAX_SNAPSHOT_BYTES) return true;
+  if (serialized.length * 3 <= MAX_SNAPSHOT_BYTES) return false;
+  return new TextEncoder().encode(serialized).byteLength > MAX_SNAPSHOT_BYTES;
+}
+
+function freshSavedAt(savedAt: unknown, now: number): boolean {
+  if (typeof savedAt !== "number" || !Number.isFinite(savedAt)) return false;
+  const age = now - savedAt;
+  return age >= 0 && age < MAX_AGE_MS;
+}
+
 export function queryCacheScopeKey(relay: string, pubkey: string): string {
   const url = new URL(relay);
   if (
@@ -99,7 +112,7 @@ export class ScopedQueryCache {
         state,
       };
       const serialized = JSON.stringify(snapshot);
-      if (serialized.length > MAX_SNAPSHOT_BYTES) return;
+      if (exceedsSnapshotBytes(serialized)) return;
       this.memory.delete(scope);
       this.memory.set(scope, serialized);
       const oldest = this.memory.keys().next().value;
@@ -138,7 +151,7 @@ export class ScopedQueryCache {
           if (
             snapshot.version === 1 &&
             snapshot.scope === scope &&
-            Date.now() - snapshot.savedAt < MAX_AGE_MS &&
+            freshSavedAt(snapshot.savedAt, Date.now()) &&
             snapshot.state?.queries?.every((query) =>
               persistedQuery(query.queryKey),
             )

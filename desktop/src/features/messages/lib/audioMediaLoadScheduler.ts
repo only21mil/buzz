@@ -10,7 +10,7 @@ type InternalTask = {
   started: boolean;
 };
 
-export type AudioMediaLoadHandle<T> = {
+type AudioMediaLoadHandle<T> = {
   cancel: () => void;
   promise: Promise<T>;
 };
