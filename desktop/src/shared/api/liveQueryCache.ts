@@ -80,10 +80,12 @@ export function applyLiveQueryCache(
         String(query.queryKey[0]),
       ),
   });
-  const channelIds = new Set(cachedQueries.map((query) => query.queryKey[1]));
-  for (const id of channelIds) {
-    if (typeof id !== "string") continue;
-    const referencesCachedEvent = cachedQueries.some((query) => {
+  // An event without an h tag (a reaction, edit or delete) lands in every
+  // channel whose cached queries hold one of its e-tag targets. That scan
+  // flattens each window and walks every cached event, so it only runs when
+  // the h tag is absent; an h-tagged event touches its own channel alone.
+  const referencesCachedEvent = (id: string) =>
+    cachedQueries.some((query) => {
       if (query.queryKey[1] !== id || !query.state.data) return false;
       if (references.includes(String(query.queryKey[2]))) return true;
       const events =
@@ -92,7 +94,10 @@ export function applyLiveQueryCache(
           : (query.state.data as RelayEvent[]);
       return events.some((item) => references.includes(item.id));
     });
-    if (id !== channelId && (channelId || !referencesCachedEvent)) continue;
+  const channelIds = new Set(cachedQueries.map((query) => query.queryKey[1]));
+  for (const id of channelIds) {
+    if (typeof id !== "string") continue;
+    if (channelId ? id !== channelId : !referencesCachedEvent(id)) continue;
     client.setQueryData<RelayEvent[]>(channelMessagesKey(id), (current) =>
       current ? mergeTimelineCacheMessages(current, event) : current,
     );

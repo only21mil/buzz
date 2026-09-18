@@ -254,6 +254,55 @@ test("thread-only and window-only caches receive live events without a timeline 
   );
 });
 
+test("an h-tagged live event never walks another channel's cached events", () => {
+  const client = cache();
+  seed(client);
+  let reads = 0;
+  const observed = (value) =>
+    new Proxy(value, {
+      get(target, property, receiver) {
+        reads++;
+        return Reflect.get(target, property, receiver);
+      },
+    });
+  client.setQueryData(
+    ["channel-messages", "other"],
+    observed([event("other-old", 9, [["h", "other"]])]),
+  );
+  client.setQueryData(
+    ["channel-window", "other"],
+    observed(emptyChannelWindowStore()),
+  );
+  applyLiveQueryCache(client, event("new", 9), self);
+  applyLiveQueryCache(
+    client,
+    event("react", 7, [
+      ["h", "channel"],
+      ["e", "old"],
+    ]),
+    self,
+  );
+  assert.equal(reads, 0);
+  assert.deepEqual(
+    client.getQueryData(["channel-messages", "channel"]).map((item) => item.id),
+    ["new", "old", "react"].sort(),
+  );
+
+  applyLiveQueryCache(client, event("delete", 5, [["e", "other-old"]]), self);
+  assert.ok(reads > 0);
+  assert.deepEqual(
+    client
+      .getQueryData(["channel-messages", "other"])
+      .map((item) => item.id)
+      .sort(),
+    ["delete", "other-old"],
+  );
+  assert.deepEqual(
+    client.getQueryData(["channel-messages", "channel"]).map((item) => item.id),
+    ["new", "old", "react"].sort(),
+  );
+});
+
 test("unrelated live events never enter persisted message caches", () => {
   const client = cache();
   seed(client);
