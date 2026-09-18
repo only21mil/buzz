@@ -29,9 +29,9 @@ check parity or terminal publication.
 ## Trusted source registration
 
 The Linux job is `dead-token-guard`, workflow ID `CI`, at
-`.github/workflows/ci.yml`. The current trusted base
-`aa81a7d266bc509ee8c9af450bc3a26f9da763e9` has workflow SHA256
-`cf3bdf62e87ed4793073581bc13eb901603c37991fa23224217374fee2eafb80`.
+`.github/workflows/ci.yml`. Resolve current authoritative main as the trusted
+base and calculate SHA256 from the exact workflow bytes at that commit.
+Independently compare both bindings with authoritative preflight before use.
 
 The Mac job is `desktop-build-macos-unsigned`, workflow ID `native-macos`, at
 `.buzz/workflows/native-macos.yml`. The explicit fixed selector extension and
