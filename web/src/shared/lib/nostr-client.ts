@@ -45,6 +45,7 @@ export function queryEvents(
     let settled = false;
     let reqSent = false;
     let authEventId: string | null = null;
+    let lastNotice: string | null = null;
     let unauthenticatedReqTimer: ReturnType<typeof setTimeout> | null = null;
 
     const ws = new WebSocket(wsUrl);
@@ -52,10 +53,13 @@ export function queryEvents(
     const timeout = setTimeout(() => {
       if (!settled) {
         settled = true;
-        ws.close();
-        reject(new Error(`Relay query timed out after ${QUERY_TIMEOUT_MS}ms`));
+        cleanup();
+        reject(queryError(`Relay query timed out after ${QUERY_TIMEOUT_MS}ms`));
       }
     }, QUERY_TIMEOUT_MS);
+
+    const queryError = (message: string) =>
+      new Error(lastNotice ? `${message}: ${lastNotice}` : message);
 
     const cleanup = () => {
       clearTimeout(timeout);
@@ -70,19 +74,21 @@ export function queryEvents(
     };
 
     const sendReq = () => {
-      if (!reqSent) {
+      if (!settled && !reqSent) {
         reqSent = true;
         ws.send(JSON.stringify(["REQ", subId, ...filters]));
       }
     };
 
     ws.addEventListener("open", () => {
+      if (settled) return;
       // Wait briefly for an AUTH challenge before sending REQ.
       // Buzz relays always send AUTH, but other relays may not.
       unauthenticatedReqTimer = setTimeout(() => sendReq(), 100);
     });
 
     ws.addEventListener("message", async (msg) => {
+      if (settled) return;
       let data: unknown;
       try {
         data = JSON.parse(String(msg.data));
@@ -159,10 +165,12 @@ export function queryEvents(
             typeof data[2] === "string"
               ? data[2]
               : "subscription closed by relay";
-          reject(new Error(reason));
+          reject(queryError(reason));
         }
       } else if (type === "NOTICE") {
-        // Informational notice from relay — ignore for now.
+        // Notices need not terminate a query, but retain the relay's reason
+        // if it subsequently closes the socket or never sends EOSE.
+        if (typeof data[1] === "string") lastNotice = data[1];
       }
     });
 
@@ -170,7 +178,7 @@ export function queryEvents(
       if (!settled) {
         settled = true;
         cleanup();
-        reject(new Error("WebSocket connection failed"));
+        reject(queryError("WebSocket connection failed"));
       }
     });
 
@@ -181,7 +189,7 @@ export function queryEvents(
         settled = true;
         cleanup();
         reject(
-          new Error("Relay closed the connection before completing the query"),
+          queryError("Relay closed the connection before completing the query"),
         );
       }
     });
