@@ -3217,6 +3217,16 @@ pub async fn run_prompt_task(
                             .state
                             .mark_scope_delivery_success(scope.clone(), true, []);
                     }
+                    let usage = agent.acp.take_turn_usage();
+                    publish_agent_turn_metric(
+                        &ctx,
+                        usage,
+                        Some(*cid),
+                        &session_id,
+                        &format!("{turn_id}:initial"),
+                        Some(acp_stop_to_core(&stop_reason)),
+                    )
+                    .await;
                 }
                 Err(AcpError::AgentExited) => {
                     agent.state.invalidate_all();
@@ -3241,7 +3251,18 @@ pub async fn run_prompt_task(
                         .cancel_with_cleanup(&session_id, ctx.idle_timeout)
                         .await
                     {
-                        Ok(_) => {
+                        Ok(stop_reason) => {
+                            let usage = agent.acp.take_turn_usage();
+                            publish_agent_turn_metric(
+                                &ctx,
+                                usage,
+                                Some(*cid),
+                                &session_id,
+                                &format!("{turn_id}:initial"),
+                                Some(acp_stop_to_core(&stop_reason)),
+                            )
+                            .await;
+
                             agent
                                 .invalidate_source(&source, "initial_message_idle_timeout")
                                 .await;
@@ -5687,9 +5708,8 @@ pub(crate) fn build_turn_metric_counts(
             // Field-local: present when the cumulative counter was monotonic
             // across this turn. Zero means no cache hits this turn (not absent).
             cache_read_tokens: usage.turn_cache_read_tokens,
-            // buzz-agent does not emit a cache-write count on the wire today;
-            // leave None rather than deriving it from other fields.
-            cache_write_tokens: None,
+            // Field-local: same contract as cache_read_tokens.
+            cache_write_tokens: usage.turn_cache_write_tokens,
         })
     } else {
         // Defense-in-depth: UsageTracker already sets all turn_* fields to None
@@ -5699,8 +5719,8 @@ pub(crate) fn build_turn_metric_counts(
         None
     };
     let cumulative_counts = Some(TokenCounts {
-        input_tokens: Some(usage.cumulative_input_tokens),
-        output_tokens: Some(usage.cumulative_output_tokens),
+        input_tokens: usage.cumulative_input_tokens,
+        output_tokens: usage.cumulative_output_tokens,
         // Present when every turn in the session reported a genuine provider
         // total. None when the session has never emitted one or any turn lacked
         // one. Never derived from input+output (NIP-AM MUST NOT).
@@ -5711,11 +5731,37 @@ pub(crate) fn build_turn_metric_counts(
         // Passes through directly — do not wrap in Some() as the field already
         // carries provenance (None vs Some(0) are distinct meanings).
         cache_read_tokens: usage.cumulative_cache_read_tokens,
-        // buzz-agent does not emit a cache-write count on the wire today;
-        // leave None rather than deriving it from other fields.
-        cache_write_tokens: None,
+        // Session-cumulative cache-write tokens; same provenance contract as
+        // cache_read_tokens.
+        cache_write_tokens: usage.cumulative_cache_write_tokens,
     });
     (turn_counts, cumulative_counts)
+}
+
+fn build_turn_metric_payload(
+    ctx: &PromptContext,
+    usage: &crate::usage::TurnUsage,
+    channel_id: Option<uuid::Uuid>,
+    turn_id: &str,
+    stop_reason: Option<buzz_core::agent_turn_metric::StopReason>,
+) -> buzz_core::agent_turn_metric::AgentTurnMetricPayload {
+    use buzz_core::agent_turn_metric::AgentTurnMetricPayload;
+    let (turn_counts, cumulative_counts) = build_turn_metric_counts(usage);
+    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    AgentTurnMetricPayload {
+        harness: ctx.harness_name.clone(),
+        model: usage.model.clone(),
+        pricing_identity: usage.pricing_identity.clone(),
+        channel_id: channel_id.map(|id| id.to_string()),
+        session_id: Some(usage.session_id.clone()),
+        turn_id: Some(turn_id.to_string()),
+        turn_seq: Some(usage.turn_seq),
+        timestamp,
+        turn: turn_counts,
+        cumulative: cumulative_counts,
+        delta_reliable: usage.delta_reliable,
+        stop_reason,
+    }
 }
 
 /// Best-effort: build and publish a `kind:44200` NIP-AM agent turn metric event.
@@ -5740,22 +5786,7 @@ async fn publish_agent_turn_metric(
         _ => return,
     };
 
-    let (turn_counts, cumulative_counts) = build_turn_metric_counts(&usage);
-    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let payload = AgentTurnMetricPayload {
-        harness: ctx.harness_name.clone(),
-        model: usage.model.clone(),
-        pricing_identity: None,
-        channel_id: channel_id.map(|id| id.to_string()),
-        session_id: Some(usage.session_id.clone()),
-        turn_id: Some(turn_id.to_string()),
-        turn_seq: Some(usage.turn_seq),
-        timestamp,
-        turn: turn_counts,
-        cumulative: cumulative_counts,
-        delta_reliable: usage.delta_reliable,
-        stop_reason,
-    };
+    let payload = build_turn_metric_payload(ctx, &usage, channel_id, turn_id, stop_reason);
     let ciphertext = match buzz_core::agent_turn_metric::encrypt_agent_turn_metric(
         &ctx.agent_keys,
         owner_pk,
@@ -11654,6 +11685,32 @@ for line in sys.stdin:
         assert_eq!(acp_stop_to_core(&StopReason::Refusal), CoreStop::Unknown);
     }
 
+    #[test]
+    fn metric_payload_preserves_pricing_identity_cache_writes_and_absence() {
+        let mut tracker = crate::usage::UsageTracker::default();
+        tracker.seed_zero_baseline("priced");
+        tracker.begin_turn("priced");
+        let raw = serde_json::json!({
+            "accumulatedInputTokens": 100, "accumulatedOutputTokens": 20,
+            "accumulatedCacheWriteTokens": 35,
+            "pricingIdentity": {"authority": "api.anthropic.com", "model": "claude-opus-4-5"}
+        });
+        let payload = serde_json::from_value(raw).unwrap();
+        tracker.record("priced", &payload);
+        let usage = tracker.take().unwrap();
+        let metric =
+            build_turn_metric_payload(&make_prompt_context_no_owner(), &usage, None, "turn", None);
+        assert_eq!(metric.pricing_identity, usage.pricing_identity);
+        assert!(metric.pricing_identity.is_some());
+        assert_eq!(metric.turn.unwrap().cache_write_tokens, Some(35));
+        assert_eq!(metric.cumulative.unwrap().cache_write_tokens, Some(35));
+        let mut absent = usage;
+        absent.cumulative_input_tokens = None;
+        let metric =
+            build_turn_metric_payload(&make_prompt_context_no_owner(), &absent, None, "turn", None);
+        assert!(metric.cumulative.unwrap().input_tokens.is_none());
+    }
+
     /// `publish_agent_turn_metric` is a no-op when `usage` is `None`.
     #[tokio::test]
     async fn test_publish_agent_turn_metric_noop_on_no_usage() {
@@ -11682,11 +11739,14 @@ for line in sys.stdin:
             turn_output_tokens: Some(50),
             turn_total_tokens: None,
             turn_cost_usd: None,
+            turn_cache_write_tokens: None,
             turn_cache_read_tokens: None,
-            cumulative_input_tokens: 100,
-            cumulative_output_tokens: 50,
+            cumulative_input_tokens: Some(100),
+            cumulative_output_tokens: Some(50),
             cumulative_total_tokens: None,
             cumulative_cost_usd: None,
+            pricing_identity: None,
+            cumulative_cache_write_tokens: None,
             cumulative_cache_read_tokens: None,
             model: None,
         };
@@ -11718,11 +11778,14 @@ for line in sys.stdin:
             turn_output_tokens: Some(80),
             turn_total_tokens: None,
             turn_cost_usd: Some(0.001),
+            turn_cache_write_tokens: None,
             turn_cache_read_tokens: None,
-            cumulative_input_tokens: 200,
-            cumulative_output_tokens: 80,
+            cumulative_input_tokens: Some(200),
+            cumulative_output_tokens: Some(80),
             cumulative_total_tokens: None,
             cumulative_cost_usd: Some(0.001),
+            pricing_identity: None,
+            cumulative_cache_write_tokens: None,
             cumulative_cache_read_tokens: None,
             model: None,
         };
@@ -11755,11 +11818,14 @@ for line in sys.stdin:
             turn_output_tokens: Some(20),
             turn_total_tokens: None,
             turn_cost_usd: None,
+            turn_cache_write_tokens: None,
             turn_cache_read_tokens: None,
-            cumulative_input_tokens: 150,
-            cumulative_output_tokens: 70,
+            cumulative_input_tokens: Some(150),
+            cumulative_output_tokens: Some(70),
             cumulative_total_tokens: None,
             cumulative_cost_usd: None,
+            pricing_identity: None,
+            cumulative_cache_write_tokens: None,
             cumulative_cache_read_tokens: None,
             model: None,
         };
@@ -11792,11 +11858,14 @@ for line in sys.stdin:
             turn_output_tokens: None,
             turn_total_tokens: None,
             turn_cost_usd: None,
+            turn_cache_write_tokens: None,
             turn_cache_read_tokens: None,
-            cumulative_input_tokens: 400,
-            cumulative_output_tokens: 100,
+            cumulative_input_tokens: Some(400),
+            cumulative_output_tokens: Some(100),
             cumulative_total_tokens: None,
             cumulative_cost_usd: None,
+            pricing_identity: None,
+            cumulative_cache_write_tokens: None,
             cumulative_cache_read_tokens: None,
             model: None,
         };
@@ -11826,11 +11895,14 @@ for line in sys.stdin:
             turn_output_tokens: Some(30),
             turn_total_tokens: Some(130), // genuine per-turn total
             turn_cost_usd: None,
+            turn_cache_write_tokens: None,
             turn_cache_read_tokens: None,
-            cumulative_input_tokens: 500,
-            cumulative_output_tokens: 120,
+            cumulative_input_tokens: Some(500),
+            cumulative_output_tokens: Some(120),
             cumulative_total_tokens: Some(620), // genuine cumulative total
             cumulative_cost_usd: None,
+            pricing_identity: None,
+            cumulative_cache_write_tokens: None,
             cumulative_cache_read_tokens: None,
             model: None,
         };
@@ -11875,11 +11947,14 @@ for line in sys.stdin:
             turn_output_tokens: Some(60),
             turn_total_tokens: None, // provider did not supply a total
             turn_cost_usd: None,
+            turn_cache_write_tokens: None,
             turn_cache_read_tokens: None,
-            cumulative_input_tokens: 200,
-            cumulative_output_tokens: 60,
+            cumulative_input_tokens: Some(200),
+            cumulative_output_tokens: Some(60),
             cumulative_total_tokens: None, // session has no total
             cumulative_cost_usd: None,
+            pricing_identity: None,
+            cumulative_cache_write_tokens: None,
             cumulative_cache_read_tokens: None,
             model: None,
         };
