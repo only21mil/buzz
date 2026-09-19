@@ -683,7 +683,7 @@ mod tests {
                 Filter::new().kind(Kind::TextNote),
                 Filter::new()
                     .kind(Kind::TextNote)
-                    .custom_tag(SingleLetterTag::lowercase(Alphabet::P), ["recipient"]),
+                    .custom_tag(SingleLetterTag::lowercase(Alphabet::P), "recipient"),
             ] {
                 for _ in 0..100 {
                     let registry = Arc::new(SubscriptionRegistry::new());
