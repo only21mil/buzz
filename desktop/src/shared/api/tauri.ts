@@ -1,3 +1,4 @@
+import type { PublicationScope } from "./publicationScope";
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import {
   fromRawInstallRuntimeResult,
@@ -577,6 +578,7 @@ export async function removeReaction(
 }
 
 export async function signRelayEvent(input: {
+  expectedScope?: PublicationScope;
   kind: number;
   content: string;
   createdAt?: number;
