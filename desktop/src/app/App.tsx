@@ -63,6 +63,12 @@ import { setAvatarProfileSyncQueryClient } from "@/features/profile/avatarProfil
 import { seedProjectSnapshot } from "@/features/projects/projectSnapshot";
 import { EncryptedBackupProvider } from "@/features/settings/EncryptedBackupProvider";
 import { createBuzzQueryClient } from "@/shared/api/queryClient";
+import {
+  queryCacheScopeKey,
+  scopedQueryCache,
+} from "@/shared/api/scopedQueryCache";
+import { subscribeLiveQueryCache } from "@/shared/api/liveQueryCacheSubscriptions";
+import { relayClient } from "@/shared/api/relayClient";
 import { hydrateChannelHeads } from "@/features/messages/lib/channelHeadCache";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { isSharedIdentity as isSharedIdentityCmd } from "@/shared/api/tauri";
@@ -239,6 +245,30 @@ function CommunityQueryProvider({
     }
     return client;
   });
+
+  useEffect(() => {
+    if (!pubkey || !relayUrl) return;
+    let active = true;
+    let stopLive: (() => void) | undefined;
+    const cache = scopedQueryCache.attach(
+      queryClient,
+      queryCacheScopeKey(relayUrl, pubkey),
+    );
+    void cache.ready.then(() => {
+      if (!active || !scopedQueryCache.isAttached(queryClient)) return;
+      stopLive = subscribeLiveQueryCache(
+        queryClient,
+        relayClient,
+        pubkey,
+        () => active && scopedQueryCache.isAttached(queryClient),
+      );
+    });
+    return () => {
+      active = false;
+      stopLive?.();
+      cache.stop();
+    };
+  }, [queryClient, pubkey, relayUrl]);
 
   useEffect(() => setAvatarProfileSyncQueryClient(queryClient), [queryClient]);
 

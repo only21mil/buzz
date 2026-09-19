@@ -174,12 +174,19 @@ test("fixture anchors match relay admission, scope isolation and d-only fallback
     req,
     /let channel_id = extract_channel_id_from_filters\(&filters\)/,
   );
-  assert.match(req, /if !resolve_request_local_access\(/);
+  assert.match(
+    req,
+    /resolve_request_local_access\(\s*&mut accessible_channels/,
+  );
+  assert.match(
+    req,
+    /filter\(\|channel_id\| accessible_channels.contains\(channel_id\)\)/,
+  );
   assert.match(req, /allowed\.contains\(&ch_id\)/);
   assert.match(req, /Some\(existing\) if existing != id =>/);
   assert.match(
     read("crates/buzz-relay/src/subscription.rs"),
-    /\*sub_channel_id == event\.channel_id\s*&& filters_match/,
+    /scope\.matches_channel\(event\.channel_id\)\s*&& filters_match/,
   );
   const filter = read("crates/buzz-core/src/filter.rs");
   assert.match(filter, /if !has_match && tag_key_str == "h"/);
@@ -202,8 +209,12 @@ test("fixture anchors match relay admission, scope isolation and d-only fallback
     /is_member_cached\(community_id, channel_id, &pubkey\)/,
   );
   assert.match(
+    read("desktop/src/features/communities/useCommunityInit.ts"),
+    /scopedQueryCache\.invalidate\(\);\s*relayClient\.disconnect/,
+  );
+  assert.match(
     read("desktop/src/app/App.tsx"),
-    /return subscribeLiveQueryCache\(queryClient, relayClient, pubkey/,
+    /stopLive = subscribeLiveQueryCache\(queryClient, relayClient, pubkey/,
   );
 });
 
