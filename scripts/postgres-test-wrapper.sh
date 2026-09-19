@@ -45,18 +45,30 @@ identity="${NEXTEST_RUN_ID}:${NEXTEST_BINARY_ID}:${NEXTEST_TEST_NAME}:${NEXTEST_
 database_hash="$(printf '%s' "$identity" | sha256_hex)"
 database_hash="${database_hash:0:24}"
 database="buzz_nt_${database_hash}"
-schema_mode="desired"
+# Use the same exact admission ledger as the isolated Python runner. Nextest
+# names library binaries by package and integration binaries as package::target.
+workspace_root="${NEXTEST_WORKSPACE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
+schema_mode="$(python3 - "$workspace_root" <<'PY_MODE'
+import os
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts'))
+from postgres_test_inventory import read_inventory
+identity = os.environ['NEXTEST_BINARY_ID']
+package, separator, target = identity.partition('::')
+binary = target if separator else package.replace('-', '_')
+rows = [row for row in read_inventory(Path(sys.argv[1]))
+        if row['package'] == package and row['binary'] == binary
+        and row['test'] == os.environ['NEXTEST_TEST_NAME']]
+if len(rows) != 1 or rows[0]['mode'] == 'external':
+    raise SystemExit('refusing unknown, ambiguous or external PostgreSQL test')
+print(rows[0]['mode'])
+PY_MODE
+)"
 source_database="$BUZZ_POSTGRES_DESIRED_TEMPLATE"
-
-# A leading separator lets the same patterns cover root and nested test paths.
-qualified_test_name="::$NEXTEST_TEST_NAME"
-# These tests own the migration lifecycle and intentionally begin empty.
-case "$qualified_test_name" in
-  *::migration::postgres_tests::* | *::migration_schema_*)
-    schema_mode="migration"
-    source_database="template0"
-    ;;
-esac
+if [[ "$schema_mode" == migration ]]; then
+  source_database="template0"
+fi
 
 cleanup() {
   local attempt
