@@ -35,7 +35,7 @@ cd mobile && flutter run --dart-define=BUZZ_PUSH_GATEWAY_URL=https://push.exampl
 
 Debug builds produced from a git worktree get a unique app identifier keyed
 to the **worktree directory name**
-(`xyz.block.buzz.dogfood.mobile.<slug>` on iOS,
+(`com.buzz.buzzMobile.<slug>` on iOS,
 `xyz.block.buzz.mobile.<slug>` on Android) plus a display-only branch label
 in the app name (`Buzz (my-branch)`, or a short SHA when the worktree is
 detached). Because the identifier follows the directory rather than the
@@ -140,26 +140,24 @@ For local physical-device development, override the identity and sandbox
 environments in the gitignored `mobile/ios/Flutter/AppOverrides.xcconfig`:
 
 ```xcconfig
-BUNDLE_IDENTIFIER = xyz.block.buzz.mobile
-BUZZ_DEVELOPMENT_TEAM = EYF346PHUG
+BUNDLE_IDENTIFIER = com.buzz.buzzMobile
+BUZZ_DEVELOPMENT_TEAM = YOUR_APPROVED_TEAM_ID
 BUZZ_IOS_PUSH_ENVIRONMENT = development
 BUZZ_APP_ATTEST_ENVIRONMENT = development
 BUZZ_PUSH_GATEWAY_URL = https:/$()/push.example
 ```
 
-This exercises the client, extension, relay, and gateway integration without
-requiring a dogfood development signing identity. It uses the canonical
-gateway's server-owned App Store profile configured for sandbox in the local
-development gateway; it does not validate the internally distributed dogfood
-artifact or enable the App Store profile in production. Validate dogfood APNs
-end to end by cutting an internal release, waiting for it to reach Mobile
-Releases/Comp Portal, and installing that signed artifact on a physical device.
+Use an approved team and a development gateway whose server-owned App Attest
+app ID and APNs topic match `com.buzz.buzzMobile`. The tracked configuration
+does not select a signing team. Source and unit checks do not validate a signed
+artifact; APNs end-to-end validation requires an approved signed artifact on a
+physical device. See the gateway deployment guide for that procedure.
 
 Parent app identifiers require Apple's Communication
 Notifications capability and a regenerated app provisioning profile. The
 Notification Service Extension profile does not require that capability.
 Enable it on the personal development App ID for local rich-presentation
-validation. Enabling it on the Block dogfood and eventual App Store App IDs is
+validation. Enabling it on the fork's distribution App ID is
 a release follow-up and is not performed by this repository change. Without a
 matching parent profile, source and unit validation still work, but the app
 cannot be signed for a physical device.

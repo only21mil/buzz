@@ -49,7 +49,13 @@ class PushSourceContracts(unittest.TestCase):
     def test_bootstrap_and_native_enrollment_are_connected(self):
         main = read('mobile/lib/main.dart')
         self.assertIn('installBuzzPushMethodHandler()', main)
-        self.assertIn('BuzzPushBootstrap(child: app)', main)
+        # The upstream age gate owns push activation and restriction cleanup.
+        # A second bootstrap in main would bypass that boundary.
+        self.assertIn('AgeSignalPushBootstrap(child: app)', main)
+        self.assertNotIn('BuzzPushBootstrap(child: app)', main)
+        bootstrap = read('mobile/lib/features/age_gate/age_signal_push_bootstrap.dart')
+        self.assertIn('AgeSignalState.restricted => _AgeRestrictedPushCleanup(child: child)', bootstrap)
+        self.assertIn('_ => BuzzPushBootstrap(child: child)', bootstrap)
         delegate = read('mobile/ios/Runner/AppDelegate.swift')
         for symbol in ('APNsRegistrationBuffer()', 'BuzzPushSnapshotBridge(', 'BuzzDevPushEnrollmentDriver', 'didRegisterForRemoteNotificationsWithDeviceToken', 'packageVoiceNoteForUpload', 'HuddleMediaPlugin(messenger: messenger)'):
             self.assertIn(symbol, delegate)
