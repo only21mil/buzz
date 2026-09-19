@@ -84,12 +84,12 @@ class DiscoveryTests(unittest.TestCase):
         }
         rows = inventory.read_inventory()
         actual = {r['test'].split('::')[-1] for r in rows
-                  if r['test'].startswith('workflow_resume::tests::') and r['mode'] == 'migration'}
+                  if r['test'].startswith('workflow_resume::tests_postgres_tests::') and r['mode'] == 'migration'}
         self.assertEqual(actual, expected)
         for name in expected:
-            self.assertEqual(inventory.classify('workflow_resume::tests::' + name, 'buzz_relay-123abc'), 'migration')
+            self.assertEqual(inventory.classify('workflow_resume::tests_postgres_tests::' + name, 'buzz_relay-123abc'), 'migration')
         with self.assertRaisesRegex(ValueError, 'unknown'):
-            inventory.classify('workflow_resume::tests::new_unreviewed_fixture', 'buzz_relay-123abc')
+            inventory.classify('workflow_resume::tests_postgres_tests::new_unreviewed_fixture', 'buzz_relay-123abc')
 
     def test_source_lexer_rejects_unknown_bare_and_raw_ignore(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -147,12 +147,12 @@ mod tests {
         self.assertEqual(len(selected), 1)
         self.assertEqual(selected[0]['mode'], 'desired')
         selected = [r for r in rows if r['test'].startswith(
-            'runtime::migration::workflow_approval_contract::')]
+            'runtime::migration::workflow_approval_contract_postgres_tests::')]
         self.assertGreater(len(selected), 20)
         self.assertTrue(all(r['binary'] == 'buzz_db' and r['mode'] == 'migration'
                             for r in selected))
-        for binary in ('ci_grants_contract', 'workflow_state_contract',
-                       'workflow_enabled_persistence', 'ci_ingest_storage'):
+        for binary in ('ci_grants_contract', 'postgres_workflow_state_contract',
+                       'postgres_workflow_enabled_persistence', 'postgres_ci_ingest_storage'):
             selected = [r for r in rows if r['binary'] == binary]
             self.assertTrue(selected, binary)
             self.assertTrue(all(r['mode'] == 'migration' for r in selected))
