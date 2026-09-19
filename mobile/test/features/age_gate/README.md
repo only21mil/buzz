@@ -22,10 +22,10 @@ actual OS prompts, signing, and account behavior will be checked in dogfood.
 - Notification restriction leaves saved snapshots, signing keys, preferences,
   and remote leases intact. Only the confirming app process holds restriction
   authority; a later launch does not need storage restoration to allow access.
-- Swift and Kotlin adapter tests: platform-specific bounds are normalized
-  conservatively, including contradictory ranges and extreme integers. Android
-  SDK task tests exercise shared access, minor response delivery, both failure
-  stages, and retired callbacks through the production request coordinator.
+- Swift adapter tests normalize platform-specific bounds conservatively,
+  including contradictory ranges and extreme integers. Android channel tests
+  verify that the Google-free provider always reports `unavailable` and rejects
+  unknown methods without a Play SDK. Dart handling and iOS remain unchanged.
 - iOS simulator RunnerTests: the production method handlers deliver minor/error
   callbacks, allow notification restoration without app-group storage, and
   preserve snapshots through restriction, cleanup failure, and restoration.
