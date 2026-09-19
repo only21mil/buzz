@@ -3,6 +3,7 @@ import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import type { MessageComposerEditTarget } from "../ui/MessageComposer.types";
 import { buildEditMentionState } from "./draftMentionRefs";
 import { imetaMediaFromTags } from "./imetaMediaMarkdown";
+import { isThreadReply } from "./threading";
 
 /** Preserve original exact recipient authority when opening an existing message for edit. */
 export function buildMessageEditTarget(
@@ -18,7 +19,7 @@ export function buildMessageEditTarget(
         author: message.author,
         body: message.body,
         id: message.id,
-        isThreadReply: Boolean(message.parentId),
+        isThreadReply: isThreadReply(message.tags ?? []),
         imetaMedia: imetaMediaFromTags(message.tags),
       }
     : null;
