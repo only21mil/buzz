@@ -1,10 +1,13 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-
+import { projectCollectionMutationOptions } from "./projectCollectionMutation";
+import type { ProjectCollectionScope } from "./projectCollectionScope";
+import { useProjectCollectionScope } from "./useProjectCollectionScope";
 import {
-  type Project,
-  projectsQueryKey,
-  type Repository,
-} from "@/features/projects/hooks";
+  type QueryClient,
+  useMutation,
+  useQueryClient,
+} from "@tanstack/react-query";
+
+import type { Project, Repository } from "@/features/projects/hooks";
 import { publishOwnedAgentProjectAnnouncements } from "@/features/projects/projectOwnerControl";
 import { addRepositoryToProject } from "@/features/projects/projectModels";
 import { buildProjectPatchTemplate } from "@/features/projects/projectRepositoryCreation";
@@ -105,24 +108,31 @@ async function attachProjectRepository({
   };
 }
 
+/** Updates the collection captured before repository publication begins. */
+export function attachProjectRepositoryMutationOptions(
+  queryClient: QueryClient,
+  scope: ProjectCollectionScope | null,
+  mutationFn: (
+    input: AttachProjectRepositoryInput,
+  ) => ReturnType<typeof attachProjectRepository> = attachProjectRepository,
+) {
+  return projectCollectionMutationOptions(
+    queryClient,
+    scope,
+    mutationFn,
+    (current, { previousProjectId, project }) => {
+      markProjectDataAuthoritative(project, "local-write");
+      return current.map((candidate) =>
+        candidate.id === previousProjectId ? project : candidate,
+      );
+    },
+  );
+}
+
 export function useAttachProjectRepositoryMutation() {
   const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: attachProjectRepository,
-    onSuccess: ({ previousProjectId, project }) => {
-      markProjectDataAuthoritative(project, "local-write");
-      if (previousProjectId !== project.id) {
-        queryClient.removeQueries({
-          exact: true,
-          queryKey: ["project", previousProjectId],
-        });
-      }
-      queryClient.setQueryData<Project[]>(projectsQueryKey, (current = []) =>
-        current.map((candidate) =>
-          candidate.id === previousProjectId ? project : candidate,
-        ),
-      );
-      void queryClient.invalidateQueries({ queryKey: projectsQueryKey });
-    },
-  });
+  const scope = useProjectCollectionScope();
+  return useMutation(
+    attachProjectRepositoryMutationOptions(queryClient, scope),
+  );
 }

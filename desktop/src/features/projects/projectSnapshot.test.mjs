@@ -1,3 +1,4 @@
+import { projectCollectionQueryKey } from "./projectCollectionQuery.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -79,9 +80,21 @@ test("seedProjectSnapshot paints stale data into a fresh query client", () => {
   const reader = new QueryClient();
   seedProjectSnapshot(reader, { pubkey: OWNER, relayUrl: RELAY });
 
-  assert.deepEqual(reader.getQueryData(["projects"]), [PROJECT]);
-  assert.equal(reader.getQueryState(["projects"])?.dataUpdatedAt, 0);
-  const snapshotProject = reader.getQueryData(["projects"])[0];
+  assert.deepEqual(
+    reader.getQueryData(
+      projectCollectionQueryKey({ relayOrigin: RELAY, pubkey: OWNER }),
+    ),
+    [PROJECT],
+  );
+  assert.equal(
+    reader.getQueryState(
+      projectCollectionQueryKey({ relayOrigin: RELAY, pubkey: OWNER }),
+    )?.dataUpdatedAt,
+    0,
+  );
+  const snapshotProject = reader.getQueryData(
+    projectCollectionQueryKey({ relayOrigin: RELAY, pubkey: OWNER }),
+  )[0];
   assert.equal(isProjectDataAuthoritative(snapshotProject), false);
   assert.equal(isProjectCollectionAuthoritative(reader), false);
 
@@ -89,12 +102,16 @@ test("seedProjectSnapshot paints stale data into a fresh query client", () => {
     { ...PROJECT, id: `${PROJECT.id}:local` },
     "local-write",
   );
-  reader.setQueryData(["projects"], (current = []) => [
-    ...current,
-    locallyWrittenProject,
-  ]);
+  reader.setQueryData(
+    projectCollectionQueryKey({ relayOrigin: RELAY, pubkey: OWNER }),
+    (current = []) => [...current, locallyWrittenProject],
+  );
 
-  assert.ok((reader.getQueryState(["projects"])?.dataUpdatedAt ?? 0) > 0);
+  assert.ok(
+    (reader.getQueryState(
+      projectCollectionQueryKey({ relayOrigin: RELAY, pubkey: OWNER }),
+    )?.dataUpdatedAt ?? 0) > 0,
+  );
   assert.equal(isProjectCollectionAuthoritative(reader), false);
   assert.equal(isProjectDataAuthoritative(snapshotProject), false);
   assert.equal(isProjectDataAuthoritative(locallyWrittenProject), true);
@@ -112,7 +129,10 @@ test("seedProjectSnapshot paints stale data into a fresh query client", () => {
 test("successful relay data is authoritative", () => {
   const client = new QueryClient();
   const relayProject = markProjectDataAuthoritative({ ...PROJECT }, "relay");
-  client.setQueryData(["projects"], [relayProject]);
+  client.setQueryData(
+    projectCollectionQueryKey({ relayOrigin: RELAY, pubkey: OWNER }),
+    [relayProject],
+  );
   markProjectCollectionAuthoritative(client);
 
   assert.equal(isProjectDataAuthoritative(relayProject), true);
@@ -135,11 +155,13 @@ test("equal relay data replaces snapshot objects and preserves provenance", asyn
 
   const reader = new QueryClient();
   seedProjectSnapshot(reader, { pubkey: OWNER, relayUrl: RELAY });
-  const snapshotProject = reader.getQueryData(["projects"])[0];
+  const snapshotProject = reader.getQueryData(
+    projectCollectionQueryKey({ relayOrigin: RELAY, pubkey: OWNER }),
+  )[0];
   const liveProject = markProjectDataAuthoritative({ ...PROJECT }, "relay");
 
   await reader.fetchQuery({
-    queryKey: ["projects"],
+    queryKey: projectCollectionQueryKey({ relayOrigin: RELAY, pubkey: OWNER }),
     queryFn: async () => {
       markProjectCollectionAuthoritative(reader);
       return [liveProject];
@@ -147,9 +169,28 @@ test("equal relay data replaces snapshot objects and preserves provenance", asyn
     structuralSharing: PROJECT_QUERY_STRUCTURAL_SHARING,
   });
 
-  const cachedProject = reader.getQueryData(["projects"])[0];
+  const cachedProject = reader.getQueryData(
+    projectCollectionQueryKey({ relayOrigin: RELAY, pubkey: OWNER }),
+  )[0];
   assert.notEqual(cachedProject, snapshotProject);
   assert.equal(cachedProject, liveProject);
   assert.equal(isProjectRelayValidated(cachedProject), true);
   assert.equal(isProjectCollectionAuthoritative(reader), true);
+});
+
+test("HTTP collection refresh persists under the startup WebSocket snapshot key", () => {
+  const writer = new QueryClient();
+  seedProjectSnapshot(writer, { pubkey: OWNER, relayUrl: RELAY });
+  persistProjectSnapshot(writer, [PROJECT], {
+    pubkey: OWNER,
+    relayOrigin: "https://relay.example.com",
+  });
+  assert.deepEqual(readProjectSnapshot(RELAY, OWNER), [PROJECT]);
+  assert.equal(
+    projectSnapshotKey(RELAY, OWNER),
+    projectSnapshotKey("https://relay.example.com", OWNER),
+  );
+  removeProjectSnapshotForRelay(RELAY);
+  assert.equal(readProjectSnapshot("https://relay.example.com", OWNER), null);
+  writer.clear();
 });

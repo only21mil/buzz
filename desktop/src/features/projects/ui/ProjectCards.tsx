@@ -1,3 +1,4 @@
+import { isTauri } from "@tauri-apps/api/core";
 import {
   CircleAlert,
   CircleDot,
@@ -323,7 +324,15 @@ export function EmptyState({
           Projects published to this relay will appear here.
         </p>
       </div>
-      <Button onClick={onCreateProject} size="sm" type="button">
+      <Button
+        disabled={!isTauri()}
+        title={
+          !isTauri() ? "Project creation requires the desktop app" : undefined
+        }
+        onClick={onCreateProject}
+        size="sm"
+        type="button"
+      >
         <Plus className="h-4 w-4" />
         Create project
       </Button>

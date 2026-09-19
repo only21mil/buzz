@@ -581,6 +581,10 @@ export function ProjectsView() {
   const withProjectCreationDialog = (content: React.ReactNode) => (
     <>
       <ProjectCreationDialog
+        onCreated={() => {
+          handleRepositoryScopeChange("all");
+          handleFilterChange("projects");
+        }}
         onOpenChange={setCreateProjectOpen}
         open={createProjectOpen}
       />

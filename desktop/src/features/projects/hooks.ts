@@ -1,3 +1,4 @@
+import { useProjectCollectionScope } from "./useProjectCollectionScope";
 import { projectCollectionQueryOptions } from "./projectCollectionQuery";
 import { isTauri } from "@tauri-apps/api/core";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -610,13 +611,14 @@ export const PROJECT_ACTIVITY_STALE_TIME_MS = 2 * 60_000;
 export const PROJECT_LOCAL_REPOS_STALE_TIME_MS = 2 * 60_000;
 
 export function useProjectsQuery(enabled = true) {
+  const scope = useProjectCollectionScope();
   const queryClient = useQueryClient();
   return useQuery({
-    ...projectCollectionQueryOptions(queryClient),
+    ...projectCollectionQueryOptions(queryClient, undefined, scope),
     staleTime: PROJECTS_STALE_TIME_MS,
     gcTime: PROJECTS_GC_TIME_MS,
     structuralSharing: PROJECT_QUERY_STRUCTURAL_SHARING,
-    enabled,
+    enabled: enabled && !!scope,
   });
 }
 
@@ -634,9 +636,10 @@ export function useProjectHomeForChannelQuery(
 }
 
 export function useProjectQuery(projectId: string) {
+  const scope = useProjectCollectionScope();
   const queryClient = useQueryClient();
   return useQuery({
-    ...projectCollectionQueryOptions(queryClient),
+    ...projectCollectionQueryOptions(queryClient, undefined, scope),
     select: (projects) =>
       projects.find((project) => projectMatchesRouteId(project, projectId)) ??
       null,
@@ -947,5 +950,6 @@ export function useProjectActivitySummariesQuery(projects: Project[]) {
 export function useDeleteProjectMutation() {
   const queryClient = useQueryClient();
 
-  return useMutation(projectDeletionMutationOptions(queryClient));
+  const scope = useProjectCollectionScope();
+  return useMutation(projectDeletionMutationOptions(queryClient, scope));
 }

@@ -1,3 +1,7 @@
+import {
+  projectCollectionQueryKey,
+  type ProjectCollectionScope,
+} from "./projectCollectionScope";
 import type { QueryClient } from "@tanstack/react-query";
 
 import { normalizeRelayUrl } from "@/features/profile/lib/selfProfileStorage";
@@ -25,7 +29,23 @@ type StoredProjectSnapshot = {
 };
 
 const snapshotScopes = new WeakMap<QueryClient, ProjectSnapshotScope>();
-const authoritativeProjectCollections = new WeakSet<QueryClient>();
+const authoritativeProjectCollections = new WeakMap<QueryClient, Set<string>>();
+
+/** Returns the community scope registered when its snapshot was seeded. */
+export function getProjectSnapshotScope(
+  queryClient: QueryClient,
+): ProjectCollectionScope | undefined {
+  const scope = snapshotScopes.get(queryClient);
+  return scope
+    ? { pubkey: scope.pubkey, relayOrigin: scope.relayUrl }
+    : undefined;
+}
+
+function scopeId(scope: ProjectCollectionScope | undefined) {
+  return JSON.stringify(
+    scope ? projectCollectionQueryKey(scope) : PROJECTS_QUERY_KEY,
+  );
+}
 
 /** Marks one project's origin without upgrading sibling snapshot rows. */
 export function markProjectDataAuthoritative<T extends Project>(
@@ -81,15 +101,23 @@ export function inheritProjectDataProvenance<T extends Project>(
 /** Records that exhaustive relay enumeration completed for this query client. */
 export function markProjectCollectionAuthoritative(
   queryClient: QueryClient,
+  scope = getProjectSnapshotScope(queryClient),
 ): void {
-  authoritativeProjectCollections.add(queryClient);
+  const scopes =
+    authoritativeProjectCollections.get(queryClient) ?? new Set<string>();
+  scopes.add(scopeId(scope));
+  authoritativeProjectCollections.set(queryClient, scopes);
 }
 
 /** Returns whether exhaustive relay enumeration completed for this client. */
 export function isProjectCollectionAuthoritative(
   queryClient: QueryClient,
+  scope = getProjectSnapshotScope(queryClient),
 ): boolean {
-  return authoritativeProjectCollections.has(queryClient);
+  return (
+    authoritativeProjectCollections.get(queryClient)?.has(scopeId(scope)) ??
+    false
+  );
 }
 
 /** Keeps the active-channel fast path live while only a snapshot is present. */
@@ -110,7 +138,10 @@ export function shouldUseScopedProjectHomeLookup({
 }
 
 function projectSnapshotRelayPrefix(relayUrl: string): string {
-  return `${STORAGE_KEY_PREFIX}:${normalizeRelayUrl(relayUrl)}:`;
+  const url = new URL(normalizeRelayUrl(relayUrl));
+  if (url.protocol === "https:") url.protocol = "wss:";
+  if (url.protocol === "http:") url.protocol = "ws:";
+  return `${STORAGE_KEY_PREFIX}:${url.origin}:`;
 }
 
 export function projectSnapshotKey(
@@ -189,7 +220,14 @@ export function seedProjectSnapshot(
   snapshotScopes.set(queryClient, scope);
   const projects = readProjectSnapshot(scope.relayUrl, scope.pubkey);
   if (projects) {
-    queryClient.setQueryData(PROJECTS_QUERY_KEY, projects, { updatedAt: 0 });
+    queryClient.setQueryData(
+      projectCollectionQueryKey({
+        pubkey: scope.pubkey,
+        relayOrigin: scope.relayUrl,
+      }),
+      projects,
+      { updatedAt: 0 },
+    );
   }
 }
 
@@ -197,8 +235,11 @@ export function seedProjectSnapshot(
 export function persistProjectSnapshot(
   queryClient: QueryClient,
   projects: Project[],
+  collectionScope = getProjectSnapshotScope(queryClient),
 ): void {
-  const scope = snapshotScopes.get(queryClient);
+  const scope = collectionScope
+    ? { pubkey: collectionScope.pubkey, relayUrl: collectionScope.relayOrigin }
+    : undefined;
   if (!scope) return;
   try {
     const snapshot: StoredProjectSnapshot = {

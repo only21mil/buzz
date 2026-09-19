@@ -1,3 +1,6 @@
+import type { Project } from "./projectModels";
+import { projectCollectionMutationOptions } from "./projectCollectionMutation";
+import { useProjectCollectionScope } from "./useProjectCollectionScope";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import {
@@ -6,7 +9,7 @@ import {
   useCreateChannelMutation,
 } from "@/features/channels/hooks";
 import { useApplyTemplate } from "@/features/channel-templates/useApplyTemplate";
-import { type Project, projectsQueryKey } from "@/features/projects/hooks";
+
 import { isUnsupportedProjectKindError } from "@/features/projects/projectCreation";
 import { buildProjectRelatedChannelPatchTemplate } from "@/features/projects/projectChannelCreation";
 import { addRelatedChannelToProject } from "@/features/projects/projectModels";
@@ -176,24 +179,31 @@ export function useAddProjectChannelMutation() {
   const createChannelMutation = useCreateChannelMutation();
   const { applyAgents, applyCanvas } = useApplyTemplate();
 
-  return useMutation({
-    mutationFn: (input: AddProjectChannelInput) =>
+  const scope = useProjectCollectionScope();
+  const options = projectCollectionMutationOptions(
+    queryClient,
+    scope,
+    (input: AddProjectChannelInput) =>
       addProjectChannel(input, {
         applyAgents,
         applyCanvas,
         createChannel: createChannelMutation.mutateAsync,
       }),
-    onSuccess: ({ channel, project }) => {
+    (current, { project }) => {
       markProjectDataAuthoritative(project, "local-write");
-      queryClient.setQueryData<Project[]>(projectsQueryKey, (current = []) =>
-        current.map((candidate) =>
-          candidate.id === project.id ? project : candidate,
-        ),
+      return current.map((candidate) =>
+        candidate.id === project.id ? project : candidate,
       );
+    },
+  );
+  return useMutation({
+    ...options,
+    onSuccess: (result, input, key) => {
+      options.onSuccess(result, input, key);
+      const { channel } = result;
       queryClient.setQueryData<Channel[]>(channelsQueryKey, (current) =>
         upsertCachedChannel(current, channel),
       );
-      void queryClient.invalidateQueries({ queryKey: projectsQueryKey });
       void queryClient.invalidateQueries({
         queryKey: channelsQueryKey,
         refetchType: "none",
