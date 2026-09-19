@@ -21,7 +21,7 @@ jobs:
   changes:
     name: Detect Changed Paths
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 8
     permissions:
       contents: read
       pull-requests: read
@@ -164,6 +164,12 @@ jobs:
         run: scripts/test-check-branch-skew.sh
       - name: Workflow fork-guard contract
         run: scripts/test-workflow-fork-guards.sh
+      - name: Local deploy contract
+        timeout-minutes: 5
+        run: bash deploy/compose/tests/deploy-local-test.sh
+      - name: Isolated relay preflight contract
+        timeout-minutes: 1
+        run: bash scripts/test-isolated-test-relay-preflight.sh
 
       - name: Capture successful qualification inputs
         env:
