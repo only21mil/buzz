@@ -9,7 +9,10 @@ import {
   parseEntityLink,
   type ParsedEntityLink,
 } from "@/shared/lib/entityLink";
-import { parseSupportedLinkPreview } from "@/shared/lib/linkPreview";
+import {
+  type SupportedLinkPreview,
+  parseSupportedLinkPreview,
+} from "@/shared/lib/linkPreview";
 
 import {
   loadBuzzEntityMetadata,
@@ -196,6 +199,27 @@ export function useOpenEntityLink(): (link: ParsedEntityLink) => void {
  * preview parser normalizes onto `buzz://repo` only when the URL origin
  * matches the active relay origin).
  */
+/**
+ * In-app open handlers for `buzz://` entity preview cards, keyed by href.
+ * External cards get no handler and keep their OS-opened anchor.
+ */
+export function useEntityCardOpenHandlers(
+  previews: SupportedLinkPreview[],
+  onOpenEntityLink: (link: ParsedEntityLink) => void,
+): Map<string, () => void> {
+  return React.useMemo(() => {
+    const handlers = new Map<string, () => void>();
+    for (const preview of previews) {
+      if (!isEntityLink(preview.href)) continue;
+      const parsed = parseEntityLink(preview.href);
+      if (parsed.ok) {
+        handlers.set(preview.href, () => onOpenEntityLink(parsed.value));
+      }
+    }
+    return handlers;
+  }, [onOpenEntityLink, previews]);
+}
+
 function resolveEntityHref(
   href: string,
   relayOrigin: string | null,

@@ -1,3 +1,5 @@
+import { invokeTauri } from "@/shared/api/tauri";
+import { toast } from "sonner";
 import type { ComponentType } from "react";
 import { useRef, useState } from "react";
 
@@ -19,6 +21,8 @@ type ImageZoomOverlayProps = {
   galleryIndex?: number;
   galleryItems?: ImageGalleryItem[];
   onClose: () => void;
+  onCopy: (src: string | undefined) => void;
+  onDownload: (src: string | undefined) => void;
   resolvedSrc: string;
   sourceBox: ImageLightboxBox;
   sourceCornerRadii: ImageLightboxCornerRadii;
@@ -97,6 +101,27 @@ export function createLinkPreviewImageLightbox(
         </button>
         {lightboxState ? (
           <ImageZoomOverlay
+            onCopy={(url) => {
+              if (url)
+                void invokeTauri("copy_image_to_clipboard", { url })
+                  .then(() => toast.success("Copied to clipboard"))
+                  .catch((error: unknown) =>
+                    toast.error(
+                      error instanceof Error ? error.message : "Copy failed",
+                    ),
+                  );
+            }}
+            onDownload={(url) => {
+              if (url)
+                void invokeTauri("download_image", { url }).catch(
+                  (error: unknown) =>
+                    toast.error(
+                      error instanceof Error
+                        ? error.message
+                        : "Download failed",
+                    ),
+                );
+            }}
             alt={alt}
             galleryIndex={lightboxState.galleryIndex}
             galleryItems={lightboxState.galleryItems}

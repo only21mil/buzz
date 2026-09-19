@@ -3,6 +3,13 @@ import type { MessageComposerProps } from "@/features/messages/ui/MessageCompose
 import type { PublicationScope } from "@/shared/api/publicationScope";
 import type { VideoReviewComment } from "./VideoPlayer";
 
+type VideoComposerSend = (
+  ...args: [
+    ...Parameters<MessageComposerProps["onSend"]>,
+    publicationScope?: PublicationScope,
+  ]
+) => Promise<void>;
+
 /** Preserve composer publication authority through the video-comment adapter. */
 export function useVideoComposerSend(
   post: (
@@ -17,8 +24,8 @@ export function useVideoComposerSend(
   ) => Promise<void>,
   replyTarget: RefObject<{ comment: VideoReviewComment } | null>,
   postAtCurrentFrame: RefObject<boolean>,
-): MessageComposerProps["onSend"] {
-  return useCallback<MessageComposerProps["onSend"]>(
+): VideoComposerSend {
+  return useCallback<VideoComposerSend>(
     async (
       content,
       mentionPubkeys,

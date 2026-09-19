@@ -1290,6 +1290,7 @@ export function createMarkdownComponents(
       imetaByUrl,
       onOpenEntityLink,
       onOpenMessageLink,
+      onOpenChannel,
       onImportSnapshotFromUrl,
       relayOrigin,
       snapshotSharedBy,
@@ -1377,6 +1378,7 @@ export function createMarkdownComponents(
               interactive={interactive}
               link={messageLinkTarget.link}
               onOpenMessageLink={onOpenMessageLink}
+              onOpenChannel={onOpenChannel}
             />
           );
         }
@@ -1402,7 +1404,6 @@ export function createMarkdownComponents(
     // `buzz://pr|issue|repo?…` entity links navigate in-app; malformed ones
     // fall through to the default anchor.
     const entityAnchor = renderEntityLinkAnchor({
-      anchorProps: props,
       children,
       href,
       onOpenEntityLink,
@@ -1674,7 +1675,8 @@ export function createMarkdownComponents(
     }: {
       children?: React.ReactNode;
     }) {
-      const { channels, onOpenMessageLink } = useMarkdownRuntime();
+      const { channels, onOpenMessageLink, onOpenChannel } =
+        useMarkdownRuntime();
       const href = String(children ?? "");
       const parsed = parseMessageLink(href);
       if (!parsed.ok) {
@@ -1690,6 +1692,7 @@ export function createMarkdownComponents(
           interactive={interactive}
           link={parsed.value}
           onOpenMessageLink={onOpenMessageLink}
+          onOpenChannel={onOpenChannel}
         />
       );
     },
