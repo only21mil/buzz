@@ -67,7 +67,7 @@ impl std::fmt::Display for SessionPolicy {
 /// This is the canonical key for provider sessions, queue partitions, in-flight
 /// tracking, and context gathering. The channel remains the authorization and
 /// collaboration boundary; the scope is the default *execution* boundary.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SessionScope {
     /// The whole channel is one session. Used for DMs always, and for every
     /// channel event under [`SessionPolicy::Channel`].
@@ -78,6 +78,12 @@ pub enum SessionScope {
         channel_id: Uuid,
         root_event_id: String,
     },
+}
+
+impl std::fmt::Display for SessionScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.telemetry_label())
+    }
 }
 
 impl SessionScope {

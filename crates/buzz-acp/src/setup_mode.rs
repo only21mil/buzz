@@ -671,6 +671,7 @@ async fn publish_setup_nudge(
         &[effective_author], // p-tag the authorized asker
         false,
         &[],
+        &[],
     )
     .map_err(|e| anyhow::anyhow!("failed to build setup nudge: {e}"))?;
 
@@ -715,8 +716,10 @@ mod tests {
             )]),
             server.rest.clone(),
         );
-        let build =
-            || buzz_sdk::build_message(channel, "completion", None, &[&agent], false, &[]).unwrap();
+        let build = || {
+            buzz_sdk::build_message(channel, "completion", None, &[&agent], false, &[], &[])
+                .unwrap()
+        };
         let event = crate::relay::BuzzEvent {
             event: build()
                 .tags([nostr::Tag::parse(["wake", "self"]).unwrap()])
