@@ -330,7 +330,14 @@ pub async fn update_managed_agent(
         // Publish the edit to the relay. After-save, inside the lock, before
         // any .await. The retention upsert hashes the opt-IN projection, so an
         // update that touched only runtime/local fields is a no-op publish.
-        super::super::agents::retain_managed_agent_pending(&app, &state, record);
+        if let Err(error) = super::super::agents::retain_managed_agent_pending(&app, &state, record)
+        {
+            let rollback = AgentUpdateRollback::new(previous_record, record, access_policy_changed);
+            drop(runtimes);
+            drop(_store_guard);
+            rollback_failed_agent_update(&app, &state, &input.pubkey, rollback)?;
+            return Err(error);
+        }
 
         let sync_params = if name_changed {
             let agent_keys = Keys::parse(&record.private_key_nsec)

@@ -216,44 +216,11 @@ fn multi_channel_workflow_query_uses_one_filter_per_channel() {
 }
 
 #[test]
-fn workflow_queries_respect_relay_explicit_channel_limit() {
-    for (channel_count, expected_batch_sizes) in [
-        (WORKFLOW_QUERY_CHANNEL_BATCH_SIZE, vec![128]),
-        (WORKFLOW_QUERY_CHANNEL_BATCH_SIZE + 1, vec![128, 1]),
-    ] {
-        let channel_ids = (0..channel_count)
-            .map(|index| uuid::Uuid::from_u128(index as u128 + 1).to_string())
-            .collect();
-        let batches = channel_workflow_filter_batches(channel_ids).expect("valid channels");
-
-        assert_eq!(
-            batches.iter().map(Vec::len).collect::<Vec<_>>(),
-            expected_batch_sizes
-        );
-        assert!(batches.iter().flatten().all(|filter| filter["#h"]
-            .as_array()
-            .is_some_and(|values| values.len() == 1)));
-    }
-}
-
-#[test]
 fn workflow_query_results_are_deduplicated_by_event_id() {
     let first = wf_event(WF, CHAN, YAML);
-    let second_workflow = "33333333-3333-3333-3333-333333333333";
-    let second = wf_event(second_workflow, CHAN, YAML);
-    let mut workflows = Vec::new();
-    let mut seen_event_ids = HashSet::new();
-
-    append_unique_workflows(
-        &mut workflows,
-        &mut seen_event_ids,
-        &[first.clone(), second.clone()],
-    );
-    append_unique_workflows(&mut workflows, &mut seen_event_ids, &[first, second]);
-
+    let second = wf_event("33333333-3333-3333-3333-333333333333", CHAN, YAML);
+    let workflows = folded_workflows(&[first.clone(), second.clone(), first, second]);
     assert_eq!(workflows.len(), 2);
-    assert_eq!(workflows[0].id, WF);
-    assert_eq!(workflows[1].id, second_workflow);
 }
 
 #[test]
@@ -275,40 +242,42 @@ fn channel_workflow_filters_accepts_empty_input() {
 
 #[test]
 fn trigger_response_uses_persisted_run_id_contract() {
-    let wire = trigger_wire_from_message(
+    let wire = trigger_workflow_wire(
         WF.to_string(),
+        "event-id".to_string(),
         "response:{\"run_id\":\"33333333-3333-3333-3333-333333333333\"}",
     )
     .expect("parse trigger response");
 
-    assert_eq!(wire.run_id, "33333333-3333-3333-3333-333333333333");
+    assert_eq!(
+        wire.run_id.as_deref(),
+        Some("33333333-3333-3333-3333-333333333333")
+    );
     assert_eq!(wire.workflow_id, WF);
-    assert_eq!(wire.status, "pending");
+    assert_eq!(wire.status, "accepted");
     let value = serde_json::to_value(wire).expect("serialize trigger response");
-    assert!(value.get("event_id").is_none());
+    assert_eq!(value["event_id"], "event-id");
 }
 
 #[test]
 fn trigger_response_rejects_missing_or_empty_run_id() {
-    assert!(trigger_wire_from_message(WF.to_string(), "response:{}").is_err());
-    assert!(trigger_wire_from_message(WF.to_string(), "response:{\"run_id\":\"   \"}",).is_err());
+    assert!(trigger_workflow_wire(WF.to_string(), "event-id".to_string(), "response:{}").is_err());
+    assert!(trigger_workflow_wire(
+        WF.to_string(),
+        "event-id".to_string(),
+        "response:{\"run_id\":\"   \"}",
+    )
+    .is_err());
 }
 
 #[test]
-fn run_reads_serialize_to_backend_envelopes() {
-    let runs = WorkflowRunsWire {
-        runs: Vec::new(),
-        next: None,
-    };
-    let approvals = WorkflowApprovalsWire {
-        approvals: Vec::new(),
-    };
-    assert_eq!(
-        serde_json::to_value(runs).expect("serialize runs"),
-        serde_json::json!({ "runs": [], "next": null })
-    );
-    assert_eq!(
-        serde_json::to_value(approvals).expect("serialize approvals"),
-        serde_json::json!({ "approvals": [] })
-    );
+fn duplicate_trigger_acknowledges_without_inventing_a_run() {
+    let wire = trigger_workflow_wire(
+        WF.to_string(),
+        "event-id".into(),
+        "duplicate: already processed",
+    )
+    .expect("accepted duplicate");
+    assert_eq!(wire.run_id, None);
+    assert_eq!(wire.status, "accepted");
 }

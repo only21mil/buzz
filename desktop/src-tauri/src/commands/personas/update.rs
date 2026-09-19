@@ -153,9 +153,9 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
     use tauri::Manager;
 
     // Phase 1: synchronous save (persona record + linked agent avatar updates)
-    let (result, retained, profile_sync_params) = tokio::task::spawn_blocking({
+    let (result, retained, profile_sync_params, retention_error) = tokio::task::spawn_blocking({
         let app = app.clone();
-        move || -> Result<(AgentDefinition, R, ProfileSyncParams), String> {
+        move || -> Result<(AgentDefinition, R, ProfileSyncParams, Option<String>), String> {
             let state = app.state::<AppState>();
             let display_name = trim_required(&input.display_name, "Display name")?;
             let system_prompt = input.system_prompt.clone();
@@ -219,8 +219,8 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
             // propagate to linked agent records and collect relay profile sync
             // params for the async phase. An about-only change touches no
             // record bytes but still republishes each linked kind:0 profile.
-            let sync_params: ProfileSyncParams = if avatar_changed || name_changed || about_changed
-            {
+            let mut retention_error = None;
+            let sync_params: ProfileSyncParams = {
                 let mut records = load_managed_agents(&app)?;
                 let mut params: ProfileSyncParams = Vec::new();
                 let mut agents_modified = false;
@@ -281,17 +281,22 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
                     // the stale name→pubkey binding until the next boot reconcile.
                     // Avatar-only edits are excluded — the avatar is not in the
                     // projection, so retaining would be a guaranteed no-op.
-                    for record in records.iter().filter(|r| renamed.contains(&r.pubkey)) {
-                        crate::commands::agents::retain_managed_agent_pending(&app, &state, record);
+                }
+                for record in records
+                    .iter()
+                    .filter(|r| r.persona_id.as_deref() == Some(&result.id))
+                {
+                    if let Err(error) =
+                        crate::commands::agents::retain_managed_agent_pending(&app, &state, record)
+                    {
+                        retention_error.get_or_insert(error);
                     }
                 }
 
                 params
-            } else {
-                Vec::new()
             };
 
-            Ok((result, retained, sync_params))
+            Ok((result, retained, sync_params, retention_error))
         }
     })
     .await
@@ -323,5 +328,8 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
         }
     }
 
+    if let Some(error) = retention_error {
+        return Err(error);
+    }
     Ok((result, retained))
 }
