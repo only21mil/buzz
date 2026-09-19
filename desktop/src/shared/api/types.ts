@@ -806,6 +806,8 @@ export type {
   WorkflowApprovalStatus,
   WorkflowRun,
   WorkflowRunStatus,
+  WorkflowRunsCursor,
+  WorkflowRunsPage,
   WorkflowSaveResult,
   WorkflowStatus,
   TraceEntry,

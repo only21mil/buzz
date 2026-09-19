@@ -53,7 +53,8 @@ export type WorkflowApprovalStatus =
   | "pending"
   | "granted"
   | "denied"
-  | "expired";
+  | "expired"
+  | "unsatisfiable";
 
 export type WorkflowApproval = {
   /** Opaque, non-actionable identifier for display/correlation only. */
@@ -71,9 +72,10 @@ export type WorkflowApproval = {
 };
 
 export type TriggerWorkflowResponse = {
-  runId: string;
+  eventId: string;
+  runId: string | null;
   workflowId: string;
-  status: string;
+  status: "accepted";
 };
 
 export type ApprovalActionResponse = {
@@ -81,4 +83,11 @@ export type ApprovalActionResponse = {
   status: string;
   runId: string;
   workflowId: string;
+};
+
+/** Opaque keyset returned by the relay; preserve timestamp precision. */
+export type WorkflowRunsCursor = { before: string; before_id: string };
+export type WorkflowRunsPage = {
+  runs: WorkflowRun[];
+  next: WorkflowRunsCursor | null;
 };
