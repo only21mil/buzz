@@ -6711,6 +6711,7 @@ mod author_gate_tests {
                 relay::ChannelInfo {
                     name: "dm".into(),
                     channel_type: "dm".into(),
+                    description: None,
                 },
             ),
             (
@@ -6718,6 +6719,7 @@ mod author_gate_tests {
                 relay::ChannelInfo {
                     name: "stream".into(),
                     channel_type: "stream".into(),
+                    description: None,
                 },
             ),
         ]);
@@ -6734,6 +6736,7 @@ mod author_gate_tests {
             relay::ChannelInfo {
                 name: "unknown".into(),
                 channel_type: "unknown".into(),
+                description: None,
             },
         )]);
         assert!(
@@ -6810,6 +6813,7 @@ mod author_gate_tests {
         let info = |channel_type: &str| relay::ChannelInfo {
             name: "x".into(),
             channel_type: channel_type.into(),
+            description: None,
         };
         let map: HashMap<Uuid, relay::ChannelInfo> = [
             (unknown, info("unknown")),

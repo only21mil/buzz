@@ -306,10 +306,22 @@ Tests naming these contracts include
 `stop_after_a_steer_took_control_discards_the_returning_batch`, and
 `self_wake_keeps_policy_rules_dedup_and_normal_queue_scheduling`.
 Upstream's wholesale pool/queue/lib admission and dispatch layout, its
-channel-description/huddle prompt additions, and its `NewSessionChannelContext`
+huddle prompt additions, and its `NewSessionChannelContext`
 caller reshaping are not adopted here. Replacing the fork paths would require
 re-proving those contracts; the accepted merge does not claim those differences
 are resolved.
+
+The final fixes port activates `relay/recovery.rs` and both recovery test files,
+including targeted replay scheduling, capacity wakes and per-subscription retry
+fairness. Rate-limited EVENT acknowledgements requeue only the refused observer
+frame. Channel discovery now retains the `about` description. Channel descriptions also flow through the fork channel resolver into prompt
+context. Huddle context still belongs to the unadopted pool layout.
+`PermissionMode::Auto`, the 1500-second idle timeout, missing-binary setup nudges,
+and the incoming-turn prompt contract are ported. The existing fork setup listener
+keeps its tested workflow-effective-author gate and DM fail-closed behavior.
+`--idle-pool-sleep` and its config fields are explicitly not adopted: the fork
+pool lifecycle has no idle re-sleep consumer, so accepting the flag would advertise
+an inert feature. Existing replay-floor and startup-effort implementations remain.
 
 For a future full port, exact comparisons against pinned upstream `5511b56fc`
 are saved outside the repository under

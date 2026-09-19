@@ -151,6 +151,7 @@ done"#
             crate::relay::ChannelInfo {
                 name: "test-dm".into(),
                 channel_type: "dm".into(),
+                description: None,
             },
         )]),
         ctx.rest_client.clone(),
