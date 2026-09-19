@@ -83,3 +83,9 @@ export function subscribeOpenEditAgent(
     window.removeEventListener(OPEN_EDIT_AGENT_EVENT, handleEvent);
   };
 }
+
+/** Clear community-owned UI state before switching communities. */
+export function resetPendingOpenEditAgent(): void {
+  pendingEditAgentPubkey = null;
+  pendingEditAgentFocus = undefined;
+}

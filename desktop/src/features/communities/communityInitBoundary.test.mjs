@@ -35,3 +35,28 @@ test("community teardown releases stable profile feed snapshots", () => {
     /resetProfileActivityFeedScopes\(\);/,
   );
 });
+
+test("community teardown calls resetTerminalPanel", () => {
+  assert.match(functionBody("resetCommunityState"), /resetTerminalPanel\(\);/);
+});
+
+test("community teardown calls resetPendingOpenCreateAgent", () => {
+  assert.match(
+    functionBody("resetCommunityState"),
+    /resetPendingOpenCreateAgent\(\);/,
+  );
+});
+
+test("community teardown calls resetPendingOpenEditAgent", () => {
+  assert.match(
+    functionBody("resetCommunityState"),
+    /resetPendingOpenEditAgent\(\);/,
+  );
+});
+
+test("community teardown calls resetPendingSnapshotImport", () => {
+  assert.match(
+    functionBody("resetCommunityState"),
+    /resetPendingSnapshotImport\(\);/,
+  );
+});

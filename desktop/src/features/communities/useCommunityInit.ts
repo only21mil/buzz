@@ -1,3 +1,7 @@
+import { resetPendingSnapshotImport } from "@/features/agents/openSnapshotImportFromUrlEvent";
+import { resetPendingOpenEditAgent } from "@/features/agents/openEditAgentEvent";
+import { resetPendingOpenCreateAgent } from "@/features/agents/openCreateAgentEvent";
+import { resetTerminalPanel } from "@/features/terminal/terminalPanelStore";
 import { resetDetachedToastScope } from "@/features/messages/lib/detachedToastScope";
 import { resetAudioMediaLoadScheduler } from "@/features/messages/lib/audioMediaLoadScheduler";
 import { resetPersistentAgentAudienceStore } from "@/features/messages/lib/persistentAgentAudience";
@@ -69,6 +73,10 @@ function resetCommunityState({
   resetActiveAgentTurnsStore();
   resetAgentWorkingSignal();
   resetCardMintStore();
+  resetPendingSnapshotImport();
+  resetPendingOpenEditAgent();
+  resetPendingOpenCreateAgent();
+  resetTerminalPanel();
   resetProfileActivityFeedScopes();
   if (isTauri() && isMacPlatform()) {
     void clearTrayAgentActivity();
