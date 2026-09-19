@@ -22,45 +22,7 @@ import {
   playNotificationSound,
   resolveSlotSound,
 } from "@/features/notifications/lib/sound";
-import { getStorageItem, setStorageItem } from "@/shared/lib/safeStorage";
-
-const WATERMARK_STORAGE_PREFIX = "buzz:lastReminderCheck:";
-const sessionWatermarks = new Map<string, number>();
-
-function watermarkStorageKey(pubkey: string): string {
-  return `${WATERMARK_STORAGE_PREFIX}${pubkey.trim().toLowerCase()}`;
-}
-
-/**
- * Read the persisted watermark, seeding it to `now` on first-ever launch.
- * Seeding to `now` (not 0) is deliberate: a 0 seed would replay the user's
- * entire reminder history as toasts. A reminder already due at first launch
- * fails the strict `notBefore > watermark` test and surfaces only in the
- * panel/badge, never as a toast — see the plan's behavioral note.
- */
-function readWatermark(pubkey: string): number {
-  const key = watermarkStorageKey(pubkey);
-  const stored = getStorageItem(key);
-  if (stored !== null) {
-    const parsed = Number(stored);
-    if (Number.isFinite(parsed)) {
-      sessionWatermarks.set(key, parsed);
-      return parsed;
-    }
-  }
-  const sessionWatermark = sessionWatermarks.get(key);
-  if (sessionWatermark !== undefined) return sessionWatermark;
-  const now = Math.floor(Date.now() / 1_000);
-  sessionWatermarks.set(key, now);
-  setStorageItem(key, String(now));
-  return now;
-}
-
-function writeWatermark(pubkey: string, watermark: number): void {
-  const key = watermarkStorageKey(pubkey);
-  sessionWatermarks.set(key, watermark);
-  setStorageItem(key, String(watermark));
-}
+import { readWatermark, writeWatermark } from "./lib/reminderWatermarks";
 
 /**
  * App-level fire-on-due detection. On launch and every {@link POLL_INTERVAL_MS}
@@ -70,6 +32,7 @@ function writeWatermark(pubkey: string, watermark: number): void {
  * alert slot. This hook is the sole detector — mount it once at app level.
  */
 export function useReminderNotifications(
+  communityScope: string,
   pubkey: string | undefined,
   settings: NotificationSettings,
   channels: ReadonlyArray<{ id: string; name?: string | null }>,
@@ -139,7 +102,7 @@ export function useReminderNotifications(
       if (remindersRef.current.length === 0 && !queryResolvedRef.current)
         return;
 
-      const watermark = readWatermark(pubkey);
+      const watermark = readWatermark(communityScope, pubkey);
       const now = Math.floor(Date.now() / 1_000);
       const due = dueSince(remindersRef.current, watermark, now);
       fire(due);
@@ -147,7 +110,7 @@ export function useReminderNotifications(
       // (notifications off or needs_action slot muted). Re-enabling later must
       // not backlog-replay reminders that came due while muted — same no-replay
       // rationale as seed-to-now. Suppressed reminders still show in panel/badge.
-      writeWatermark(pubkey, now);
+      writeWatermark(communityScope, pubkey, now);
       // Liveness tick: re-render every countDue consumer (inbox nav badge,
       // HomeView filter, panel) so a reminder that crossed notBefore while the
       // app sat idle surfaces within the poll interval. Safe to run after the
@@ -159,5 +122,5 @@ export function useReminderNotifications(
     };
 
     return startReminderNotificationPoll(check);
-  }, [pubkey, queryClient]);
+  }, [communityScope, pubkey, queryClient]);
 }

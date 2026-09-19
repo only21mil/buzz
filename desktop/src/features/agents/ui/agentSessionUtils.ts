@@ -32,16 +32,6 @@ export function getToolStringList(
   return [];
 }
 
-export function getResultArray(
-  resultValue: unknown,
-  resultRecord: Record<string, unknown>,
-  key: string,
-) {
-  if (Array.isArray(resultValue)) return resultValue;
-  const value = resultRecord[key];
-  return Array.isArray(value) ? value : null;
-}
-
 export function formatCodeValue(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) return value;
@@ -230,12 +220,6 @@ export function shorten(value: string) {
     : value;
 }
 
-export function shortenMiddle(value: string, maxLength: number) {
-  if (value.length <= maxLength) return value;
-  const edgeLength = Math.max(4, Math.floor((maxLength - 3) / 2));
-  return `${value.slice(0, edgeLength)}...${value.slice(-edgeLength)}`;
-}
-
 const transcriptTimeFormat = new Intl.DateTimeFormat("en-US", {
   hour: "numeric",
   hour12: true,
@@ -266,10 +250,7 @@ export function formatTranscriptTimestampTitle(
   return transcriptTitleTimeFormat.format(date);
 }
 
-export function formatDuration(
-  startIso: string,
-  endIso: string,
-): string | null {
+function formatDuration(startIso: string, endIso: string): string | null {
   if (!startIso || !endIso) return null;
   const start = new Date(startIso).getTime();
   const end = new Date(endIso).getTime();

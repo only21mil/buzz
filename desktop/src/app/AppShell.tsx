@@ -236,6 +236,7 @@ export function AppShell() {
   const channelsQuery = useChannelsQuery();
   const channels = channelsQuery.data ?? [];
   useReminderNotifications(
+    communitiesHook.activeCommunity?.id ?? "none",
     identityQuery.data?.pubkey,
     notificationSettings.settings,
     channels,

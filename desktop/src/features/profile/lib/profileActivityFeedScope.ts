@@ -29,6 +29,11 @@ export type ProfileActivityFeedScope = {
 
 const cachedScopes = new Map<string, ProfileActivityFeedScope>();
 
+/** Release stable profile snapshots at the community boundary. */
+export function resetProfileActivityFeedScopes(): void {
+  cachedScopes.clear();
+}
+
 function channelIdsEqual(
   left: readonly string[],
   right: readonly string[],

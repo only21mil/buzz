@@ -12,7 +12,7 @@ const startupModules = [
   "../features/notifications/hooks.ts",
   "../features/onboarding/hooks.ts",
   "../features/presence/hooks.ts",
-  "../features/reminders/useReminderNotifications.ts",
+  "../features/reminders/lib/reminderWatermarks.ts",
   "../features/agents/usePreventSleep.ts",
   "../features/channels/readState/readStateManager.ts",
   "../features/channels/readState/readStateStorage.ts",

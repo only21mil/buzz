@@ -53,3 +53,8 @@ export function resetTerminalPanelForTests() {
 export function getTerminalPanelSnapshotForTests() {
   return snapshot;
 }
+
+/** Clear community-owned UI state before switching communities. */
+export function resetTerminalPanel(): void {
+  publish({ mode: "closed", sessionChannelIds: new Set() });
+}

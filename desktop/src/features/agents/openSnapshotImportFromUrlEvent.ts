@@ -63,3 +63,8 @@ export function subscribeSnapshotImport(
     window.removeEventListener(OPEN_SNAPSHOT_IMPORT_EVENT, handleEvent);
   };
 }
+
+/** Clear community-owned UI state before switching communities. */
+export function resetPendingSnapshotImport(): void {
+  pendingImport = null;
+}

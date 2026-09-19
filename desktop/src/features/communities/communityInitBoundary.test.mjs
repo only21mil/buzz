@@ -28,3 +28,42 @@ test("community teardown clears card mint state and pending completions", () => 
   assert.match(source, /import \{ resetCardMintStore \} from/);
   assert.match(functionBody("resetCommunityState"), /resetCardMintStore\(\);/);
 });
+
+test("community teardown releases stable profile feed snapshots", () => {
+  assert.match(
+    functionBody("resetCommunityState"),
+    /resetProfileActivityFeedScopes\(\);/,
+  );
+});
+
+test("community teardown calls resetTerminalPanel", () => {
+  assert.match(functionBody("resetCommunityState"), /resetTerminalPanel\(\);/);
+});
+
+test("community teardown calls resetPendingOpenCreateAgent", () => {
+  assert.match(
+    functionBody("resetCommunityState"),
+    /resetPendingOpenCreateAgent\(\);/,
+  );
+});
+
+test("community teardown calls resetPendingOpenEditAgent", () => {
+  assert.match(
+    functionBody("resetCommunityState"),
+    /resetPendingOpenEditAgent\(\);/,
+  );
+});
+
+test("community teardown calls resetPendingSnapshotImport", () => {
+  assert.match(
+    functionBody("resetCommunityState"),
+    /resetPendingSnapshotImport\(\);/,
+  );
+});
+
+test("community teardown releases reminder watermark fallbacks", () => {
+  assert.match(
+    functionBody("resetCommunityState"),
+    /resetReminderWatermarks\(\);/,
+  );
+});

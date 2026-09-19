@@ -40,3 +40,8 @@ export function subscribeOpenCreateAgent(
     window.removeEventListener(OPEN_CREATE_AGENT_EVENT, handleOpenCreateAgent);
   };
 }
+
+/** Clear community-owned UI state before switching communities. */
+export function resetPendingOpenCreateAgent(): void {
+  pendingOpenCreateAgent = null;
+}

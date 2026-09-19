@@ -1,3 +1,8 @@
+import { resetReminderWatermarks } from "@/features/reminders/lib/reminderWatermarks";
+import { resetPendingSnapshotImport } from "@/features/agents/openSnapshotImportFromUrlEvent";
+import { resetPendingOpenEditAgent } from "@/features/agents/openEditAgentEvent";
+import { resetPendingOpenCreateAgent } from "@/features/agents/openCreateAgentEvent";
+import { resetTerminalPanel } from "@/features/terminal/terminalPanelStore";
 import { resetDetachedToastScope } from "@/features/messages/lib/detachedToastScope";
 import { resetAudioMediaLoadScheduler } from "@/features/messages/lib/audioMediaLoadScheduler";
 import { resetPersistentAgentAudienceStore } from "@/features/messages/lib/persistentAgentAudience";
@@ -31,6 +36,7 @@ import {
   restoreActiveAgentTurnsForCommunity,
 } from "@/features/agents/activeAgentTurnsStore";
 import { resetAgentWorkingSignal } from "@/features/agents/agentWorkingSignal";
+import { resetProfileActivityFeedScopes } from "@/features/profile/lib/profileActivityFeedScope";
 import { resetCardMintStore } from "@/features/agents/cardMintStore";
 import { resetAgentObserverStore } from "@/features/agents/observerRelayStore";
 import { resetAvatarPresentations } from "@/features/profile/avatarPresentationStore";
@@ -68,6 +74,12 @@ function resetCommunityState({
   resetActiveAgentTurnsStore();
   resetAgentWorkingSignal();
   resetCardMintStore();
+  resetReminderWatermarks();
+  resetPendingSnapshotImport();
+  resetPendingOpenEditAgent();
+  resetPendingOpenCreateAgent();
+  resetTerminalPanel();
+  resetProfileActivityFeedScopes();
   if (isTauri() && isMacPlatform()) {
     void clearTrayAgentActivity();
   }

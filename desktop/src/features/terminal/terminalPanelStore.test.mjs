@@ -3,6 +3,7 @@ import { beforeEach, test } from "node:test";
 
 import {
   resetTerminalPanelForTests,
+  resetTerminalPanel,
   setTerminalPanelMode,
   setTerminalSessionChannels,
   toggleTerminalPanel,
@@ -30,4 +31,12 @@ test("session channel identities are de-duplicated", () => {
     [...getTerminalPanelSnapshotForTests().sessionChannelIds],
     ["one", "two"],
   );
+});
+
+test("community reset closes the panel and drops old channel identities", () => {
+  setTerminalPanelMode("maximized");
+  setTerminalSessionChannels(["old-channel"]);
+  resetTerminalPanel();
+  assert.equal(getTerminalPanelSnapshotForTests().mode, "closed");
+  assert.equal(getTerminalPanelSnapshotForTests().sessionChannelIds.size, 0);
 });

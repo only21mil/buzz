@@ -522,24 +522,35 @@ class instances, cached promises) survive across remounts. Every community-scope
 singleton needs a reset function wired into `resetCommunityState()` in
 `desktop/src/features/communities/useCommunityInit.ts`.
 
-Current singletons that are reset on relay boundary changes (same-relay
-reconnects preserve pending avatar verification work):
+Current singletons reset by `resetCommunityState()` on every community
+switch, including same-relay reconnects (the two avatar resets run only when
+the relay changes, so a same-relay reconnect preserves pending avatar
+verification work):
 - `relayClient.disconnect()` — WebSocket teardown + promise rejection
+- `resetDetachedToastScope()` — detached agent start toast scope
 - `resetRateLimitGate()` — clears any active rate-limit window from the old relay
 - `clearTimeoutState()` — clears the old community's process-wide moderation timeout
 - `clearAllDrafts()` — message draft cache
+- `resetPersistentAgentAudienceStore()` — persistent agent audience store
 - `resetAgentObserverStore()` — agent observer relay store
 - `resetActiveAgentTurnsStore()` — active agent turn timers
 - `resetAgentWorkingSignal()` — agent working indicator signal
-- `resetAvatarProfileSync()` — pending verified-avatar profile writes
-- `resetAvatarPresentations()` — avatar probes, previews, and Retry toasts
+- `resetCardMintStore()` — card mint jobs, viewer, gallery, and late-callback generation guard
+- `resetReminderWatermarks()` — in-memory reminder watermark fallback (persisted keys are community-scoped)
+- `resetPendingSnapshotImport()`, `resetPendingOpenEditAgent()`, `resetPendingOpenCreateAgent()` — queued agent UI intents
+- `resetTerminalPanel()` — terminal panel session channel ids
+- `resetProfileActivityFeedScopes()` — profile activity feed scope snapshot cache
+- `resetAvatarProfileSync()` — pending verified-avatar profile writes (relay change only)
+- `resetAvatarPresentations()` — avatar probes, previews, and Retry toasts (relay change only)
 - `resetSidebarRelayConnectionCardState()` — sidebar relay card dismiss state
 - `resetMediaCaches()` — proxy port and relay origin caches
+- `resetAudioMediaLoadScheduler()` — audio attachment load queue
+- `resetLinkPreviewMetadataCache()` — link preview metadata cache (Buzz entity titles come from relay events)
 - `resetVideoPlayerState()` — video player singleton
 - `resetRenderScopedReactionHydration()` — reaction hydration cache
+- `resetBackgroundMediaUploads()` — background media upload tracking
 - `clearSearchHitEventCache()` — search result event cache
 - `clearMarkdownNodeCache()` — markdown parse-node cache
-- `resetLinkPreviewTitleCache()` — link preview title cache (Buzz entity titles come from relay events)
 
 **If you add a new module-level cache, Map, or class instance that holds
 community-scoped data, you must add its reset to `resetCommunityState()`.**
