@@ -15,6 +15,12 @@ const MAX_ZOOM_FACTOR = 1.5;
 const ZOOM_STEP = 0.1;
 const TEXT_SCALE_STORAGE_KEY = "buzz:text-scale";
 
+import {
+  getStorageItem,
+  removeStorageItem,
+  setStorageItem,
+} from "@/shared/lib/safeStorage";
+
 type ZoomAction = "increase" | "decrease" | "reset";
 
 function roundZoomFactor(zoomFactor: number) {
@@ -67,7 +73,7 @@ function getNextZoomFactor(action: ZoomAction, zoomFactor: number) {
 }
 
 function readStoredZoomFactor() {
-  const raw = window.localStorage.getItem(TEXT_SCALE_STORAGE_KEY);
+  const raw = getStorageItem(TEXT_SCALE_STORAGE_KEY);
   if (!raw) {
     return DEFAULT_ZOOM_FACTOR;
   }
@@ -90,11 +96,11 @@ function applyRootZoom(zoomFactor: number) {
 function applyTextScale(zoomFactor: number) {
   applyRootZoom(zoomFactor);
   if (zoomFactor === DEFAULT_ZOOM_FACTOR) {
-    window.localStorage.removeItem(TEXT_SCALE_STORAGE_KEY);
+    removeStorageItem(TEXT_SCALE_STORAGE_KEY);
     return;
   }
 
-  window.localStorage.setItem(TEXT_SCALE_STORAGE_KEY, String(zoomFactor));
+  setStorageItem(TEXT_SCALE_STORAGE_KEY, String(zoomFactor));
 }
 
 export function useWebviewZoomShortcuts() {

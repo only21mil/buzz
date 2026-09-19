@@ -1,4 +1,8 @@
 import {
+  removeMessageSnapshotsForIdentity,
+  removeMessageSnapshotsForCommunities,
+} from "@/features/messages/lib/messageSnapshot";
+import {
   createContext,
   useCallback,
   useContext,
@@ -139,8 +143,8 @@ export type UseCommunitiesReturn = {
   reinitKey: number;
   /** Add a community, deduplicating by relayUrl. Returns the final ID in the list. */
   addCommunity: (community: Community) => string;
-  clearCommunities: () => void;
-  removeCommunity: (id: string) => void;
+  clearCommunities: (signerPubkey?: string | null) => void;
+  removeCommunity: (id: string, signerPubkey?: string | null) => void;
   switchCommunity: (id: string) => void;
   /** Force the active community to re-init (e.g. after a deep-link reconnect). */
   reconnectCommunity: () => void;
@@ -216,7 +220,13 @@ function useCommunitiesInternal(): UseCommunitiesReturn {
     return resolvedId;
   }, []);
 
-  const clearCommunities = useCallback(() => {
+  const clearCommunities = useCallback((signerPubkey?: string | null) => {
+    removeMessageSnapshotsForCommunities(
+      communitiesRef.current.map((community) => community.relayUrl),
+      signerPubkey,
+    );
+    for (const community of communitiesRef.current)
+      removeProjectSnapshotForRelay(community.relayUrl);
     clearCommunityStorage();
     clearCommunityDestinations();
     setCommunitiesState([]);
@@ -224,7 +234,7 @@ function useCommunitiesInternal(): UseCommunitiesReturn {
   }, []);
 
   const removeCommunity = useCallback(
-    (id: string) => {
+    (id: string, signerPubkey?: string | null) => {
       const removed = communitiesRef.current.find(
         (community) => community.id === id,
       );
@@ -237,6 +247,7 @@ function useCommunitiesInternal(): UseCommunitiesReturn {
       removeUserLabelCacheForRelay(removed.relayUrl);
       removeChannelSnapshotForRelay(removed.relayUrl);
       removeProjectSnapshotForRelay(removed.relayUrl);
+      removeMessageSnapshotsForIdentity(removed.relayUrl, signerPubkey ?? "");
       void getIdentity()
         .then((identity) =>
           clearChannelHeadCache({

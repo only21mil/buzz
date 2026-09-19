@@ -7,6 +7,7 @@ import {
 import { Spinner } from "@/shared/ui/spinner";
 
 type SidebarRelayConnectionCardProps = {
+  errorMessage?: string;
   isActionDisabled?: boolean;
   actionTestId?: string;
   className?: string;
@@ -22,6 +23,7 @@ type SidebarRelayConnectionCardProps = {
 
 export function SidebarRelayConnectionCard({
   actionTestId,
+  errorMessage,
   className,
   isActionDisabled = false,
   isConnected = false,
@@ -35,6 +37,7 @@ export function SidebarRelayConnectionCard({
     <SidebarRelayConnectionCompactCard
       actionTestId={actionTestId ?? "sidebar-reconnect"}
       className={className}
+      errorMessage={errorMessage}
       isActionDisabled={isActionDisabled}
       isConnected={isConnected}
       isReconnectPending={isReconnectPending}
@@ -49,6 +52,7 @@ export function SidebarRelayConnectionCard({
 
 export function SidebarRelayConnectionCompactCard({
   actionTestId,
+  errorMessage,
   className,
   dismissClassName,
   isActionDisabled = false,
@@ -77,7 +81,7 @@ export function SidebarRelayConnectionCompactCard({
           ? undefined
           : isReconnectPending
             ? reconnectDescription
-            : "Click to connect"
+            : (errorMessage ?? "Click to connect")
       }
       dismissClassName={dismissClassName}
       dismissLabel="Dismiss relay notification"

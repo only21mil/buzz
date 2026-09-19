@@ -508,7 +508,6 @@ function CommunityApp({
       id: crypto.randomUUID(),
       name: transaction.communityName,
       relayUrl: transaction.relayUrl,
-      token: transaction.token,
       reposDir: transaction.reposDir,
       pubkey: currentPubkey ?? undefined,
       addedAt: new Date().toISOString(),
@@ -546,15 +545,16 @@ function CommunityApp({
       if (transaction.source === "first-community") {
         setResumeFirstCommunityPage(transaction.firstCommunityPage ?? "join");
       }
-      clearCommunities();
+      clearCommunities(currentPubkey);
       return;
     }
     if (transaction.previousCommunityId) {
       await transitionCommunity(transaction.previousCommunityId);
     }
-    removeCommunity(transaction.communityId);
+    removeCommunity(transaction.communityId, currentPubkey);
   }, [
     clearCommunities,
+    currentPubkey,
     communities.length,
     communityOnboarding,
     removeCommunity,
