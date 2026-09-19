@@ -73,7 +73,7 @@ class ChannelStarsManager {
 
     await _fetchAndMerge();
     await _startLiveSubscription();
-    _onChanged();
+    if (!_disposed) _onChanged();
   }
 
   void dispose({bool flushPending = true}) {
@@ -145,9 +145,9 @@ class ChannelStarsManager {
   }
 
   Future<void> _startLiveSubscription() async {
-    if (_relaySession == null) return;
+    if (_disposed || _relaySession == null) return;
     try {
-      _unsubscribe = await _relaySession.subscribe(
+      final unsubscribe = await _relaySession.subscribe(
         NostrFilter(
           kinds: const [EventKind.readState],
           authors: [pubkey],
@@ -158,6 +158,11 @@ class ChannelStarsManager {
         ),
         _handleIncomingEvent,
       );
+      if (_disposed) {
+        unsubscribe();
+        return;
+      }
+      _unsubscribe = unsubscribe;
     } catch (_) {
       // Non-fatal — local state and history still work.
     }

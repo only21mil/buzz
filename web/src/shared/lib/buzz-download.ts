@@ -124,7 +124,7 @@ function assetPattern(platform: BuzzDownloadPlatform): RegExp | undefined {
   }
 }
 
-export function selectBuzzDownloadUrl(
+function selectBuzzDownloadUrl(
   releases: GitHubRelease[],
   platform: BuzzDownloadPlatform,
 ): string | undefined {
@@ -186,10 +186,4 @@ export async function resolveBuzzDownloadUrlForPlatform(
   } catch {
     return BUZZ_RELEASES_URL;
   }
-}
-
-export async function resolveBuzzDownloadUrl(): Promise<string> {
-  return resolveBuzzDownloadUrlForPlatform(
-    await detectBuzzDownloadPlatform(navigator),
-  );
 }

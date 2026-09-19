@@ -28,12 +28,12 @@ import { relayHttpBaseUrl } from "@/shared/lib/relay-url";
 import { gitReadAuthOptions } from "./git-read-auth-policy";
 
 /** Get a repo-specific LightningFS instance backed by IndexedDB. */
-export function getFs(owner: string, repoName: string): LightningFS {
+function getFs(owner: string, repoName: string): LightningFS {
   return new LightningFS(`buzz-git-${owner}-${repoName}`);
 }
 
 /** Working directory inside the virtual FS. */
-export function getDir(owner: string, repoName: string): string {
+function getDir(owner: string, repoName: string): string {
   return `/${owner}/${repoName}`;
 }
 
@@ -160,13 +160,13 @@ export async function readTreeEntries(
   }));
 }
 
-export interface FileContent {
+interface FileContent {
   content: string;
   isBinary: boolean;
 }
 
 /** Read a blob and decode as text. Detects binary by checking for NUL bytes. */
-export async function readFileContent(
+async function readFileContent(
   fs: LightningFS,
   dir: string,
   oid: string,
@@ -194,8 +194,8 @@ export async function readFileContent(
  *
  * The clone in IndexedDB always holds full bytes; these are display caps only.
  */
-export const TEXT_PREVIEW_LIMIT_BYTES = 1 * 1024 * 1024;
-export const IMAGE_PREVIEW_LIMIT_BYTES = 10 * 1024 * 1024;
+const TEXT_PREVIEW_LIMIT_BYTES = 1 * 1024 * 1024;
+const IMAGE_PREVIEW_LIMIT_BYTES = 10 * 1024 * 1024;
 
 /**
  * Discriminated view of a blob, suitable for rendering. The viewer component

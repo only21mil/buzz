@@ -17,7 +17,7 @@ export interface Repo {
 }
 
 /** Extract the first value for a given tag name from a Nostr event. */
-export function getTag(event: NostrEvent, name: string): string | undefined {
+function getTag(event: NostrEvent, name: string): string | undefined {
   return event.tags.find((t) => t[0] === name)?.[1];
 }
 
@@ -51,7 +51,7 @@ function eventToRepo(event: NostrEvent): Repo {
 }
 
 /** Deduplicate NIP-33 parameterized replaceable events, keeping the latest per (pubkey, kind, d-tag). */
-export function dedup(events: NostrEvent[]): NostrEvent[] {
+function dedup(events: NostrEvent[]): NostrEvent[] {
   const best = new Map<string, NostrEvent>();
   for (const e of events) {
     const d = getTag(e, "d") ?? "";
@@ -65,7 +65,10 @@ export function dedup(events: NostrEvent[]): NostrEvent[] {
 }
 
 async function fetchRepos(): Promise<Repo[]> {
-  const events = await queryEvents(relayWsUrl(), { kinds: [30617] });
+  const events = await queryEvents(relayWsUrl(), {
+    kinds: [30617],
+    limit: 1000,
+  });
   return dedup(events)
     .map(eventToRepo)
     .sort((a, b) => b.createdAt - a.createdAt);

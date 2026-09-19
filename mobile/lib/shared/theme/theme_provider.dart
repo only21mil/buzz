@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import 'accent_colors.dart';
 import 'adaptive_theme.dart';
 import 'buzz_theme.dart';
 import 'color_scheme.dart';
@@ -10,8 +9,6 @@ import 'theme_catalog.dart';
 import 'theme_pairs.dart';
 
 const _themeModeKey = 'buzz_theme_mode';
-const _accentKey = 'buzz_accent_color';
-const _schemeKey = 'buzz_color_scheme';
 
 /// Buzz ships as the default: the first-party pair, so a fresh install gets the
 /// branded top-section gradient without picking a theme first.
@@ -44,70 +41,6 @@ class ThemeNotifier extends Notifier<ThemeMode> {
 
 final themeProvider = NotifierProvider<ThemeNotifier, ThemeMode>(
   ThemeNotifier.new,
-);
-
-/// Tracks the selected accent color index.
-class AccentNotifier extends Notifier<int> {
-  @override
-  int build() {
-    final prefs = ref.read(savedPrefsProvider);
-    final stored = prefs.getInt(_accentKey);
-    if (stored == legacyDefaultAccentIndex) {
-      prefs.setInt(_accentKey, defaultAccentIndex);
-      return defaultAccentIndex;
-    }
-    if (stored == null || stored < 0 || stored >= accentColors.length) {
-      return defaultAccentIndex;
-    }
-    return stored;
-  }
-
-  void setAccent(int index) {
-    state = index;
-    ref.read(savedPrefsProvider).setInt(_accentKey, index);
-  }
-}
-
-final accentProvider = NotifierProvider<AccentNotifier, int>(
-  AccentNotifier.new,
-);
-
-/// Tracks the selected color scheme name.
-/// null means "use default" ([defaultSchemeDisplayName]).
-class SchemeNotifier extends Notifier<String?> {
-  @override
-  String? build() {
-    final prefs = ref.read(savedPrefsProvider);
-    final stored = prefs.getString(_schemeKey);
-    final compatible = schemeForAppearanceMode(
-      stored,
-      ref.watch(themeProvider),
-    );
-
-    if (compatible != stored) {
-      if (compatible == null) {
-        prefs.remove(_schemeKey);
-      } else {
-        prefs.setString(_schemeKey, compatible);
-      }
-    }
-
-    return compatible;
-  }
-
-  void setScheme(String? name) {
-    state = name;
-    final prefs = ref.read(savedPrefsProvider);
-    if (name == null) {
-      prefs.remove(_schemeKey);
-    } else {
-      prefs.setString(_schemeKey, name);
-    }
-  }
-}
-
-final schemeProvider = NotifierProvider<SchemeNotifier, String?>(
-  SchemeNotifier.new,
 );
 
 /// Returns a scheme that can honor [mode] without silently pinning brightness.

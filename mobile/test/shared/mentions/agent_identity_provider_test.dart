@@ -98,29 +98,35 @@ void main() {
     expect(relaySession.unsubscribeCount, 1);
   });
 
-  test(
-    'does not retain a live role subscription through working bots',
-    () async {
-      final relaySession = _MembershipRelaySessionNotifier([
-        _membershipEvent(role: 'bot'),
-      ]);
-      final container = ProviderContainer(
-        overrides: [relaySessionProvider.overrideWith(() => relaySession)],
-      );
-      addTearDown(container.dispose);
-      final keepAlive = container.listen(
-        workingBotPubkeysProvider(_channelId),
-        (_, _) {},
-        fireImmediately: true,
-      );
+  test('working bots releases both role and typing subscriptions', () async {
+    final relaySession = _MembershipRelaySessionNotifier([
+      _membershipEvent(role: 'bot'),
+    ]);
+    final container = ProviderContainer(
+      overrides: [relaySessionProvider.overrideWith(() => relaySession)],
+    );
+    addTearDown(container.dispose);
+    final keepAlive = container.listen(
+      workingBotPubkeysProvider(_channelId),
+      (_, _) {},
+      fireImmediately: true,
+    );
 
-      await relaySession.subscribed;
-      keepAlive.close();
-      await container.pump();
+    await relaySession.subscribed;
+    await _pumpEventQueue();
+    expect(
+      relaySession.liveFilters.map((filter) => filter.kinds.single),
+      unorderedEquals([39002, EventKind.typingIndicator]),
+    );
+    keepAlive.close();
+    await container.pump();
 
-      expect(relaySession.unsubscribeCount, 1);
-    },
-  );
+    expect(
+      relaySession.unsubscribedKinds,
+      unorderedEquals([39002, EventKind.typingIndicator]),
+    );
+    expect(relaySession.activeSubscriptionCount, 0);
+  });
 
   test('blank profile labels defer to the directory label', () {
     const pubkey = 'deadbeef0123456789';
@@ -165,7 +171,9 @@ class _MembershipRelaySessionNotifier extends RelaySessionNotifier {
   final List<NostrFilter> liveFilters = [];
   final List<_LiveSubscription> _subscriptions = [];
   final Completer<void> _subscribed = Completer<void>();
-  var unsubscribeCount = 0;
+  final List<int> unsubscribedKinds = [];
+  int get unsubscribeCount => unsubscribedKinds.length;
+  int get activeSubscriptionCount => _subscriptions.length;
   var _membershipIndex = 0;
 
   _MembershipRelaySessionNotifier(this._memberships);
@@ -194,7 +202,7 @@ class _MembershipRelaySessionNotifier extends RelaySessionNotifier {
     _subscriptions.add(subscription);
     if (!_subscribed.isCompleted) _subscribed.complete();
     return () {
-      unsubscribeCount++;
+      unsubscribedKinds.add(filter.kinds.single);
       _subscriptions.remove(subscription);
     };
   }

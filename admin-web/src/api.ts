@@ -14,16 +14,6 @@ export class ApiFailure extends Error {
 /// `nip98` (fail-secure; NIP-98 is the only authenticated mode).
 export type AuthMode = "nip98" | "disabled";
 
-/// Shape of the relay probe response. `role`/`source` are present only for
-/// authenticated NIP-98 callers; the discovery probe reads the status code.
-export interface ProbeResponse {
-  auth: AuthMode;
-  role?: string;
-  source?: string;
-  canAct: boolean;
-  canStaff: boolean;
-}
-
 interface Nostr98 {
   signEvent(event: {
     kind: number;
@@ -126,24 +116,6 @@ async function send(
 
 export async function request<T>(path: string, authMode: AuthMode): Promise<T> {
   const response = await send(path, "application/json", authMode);
-  return response.json() as Promise<T>;
-}
-
-/// Send a body-bearing mutation and parse the JSON response. The body is
-/// serialized once and signed over those exact bytes so the NIP-98
-/// `payload` tag matches what the relay verifies.
-export async function mutate<T>(
-  path: string,
-  method: string,
-  body: unknown,
-  authMode: AuthMode,
-): Promise<T> {
-  const bytes = new TextEncoder().encode(JSON.stringify(body));
-  const response = await send(path, "application/json", authMode, {
-    method,
-    body: bytes,
-    contentType: "application/json",
-  });
   return response.json() as Promise<T>;
 }
 

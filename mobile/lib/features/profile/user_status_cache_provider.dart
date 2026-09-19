@@ -27,6 +27,7 @@ class UserStatusCacheNotifier extends Notifier<Map<String, UserStatus?>> {
     final sessionState = ref.watch(relaySessionProvider);
 
     ref.onDispose(() {
+      _subscriptionVersion++;
       _batchTimer?.cancel();
       _batchTimer = null;
       _refreshTimer?.cancel();
@@ -80,7 +81,9 @@ class UserStatusCacheNotifier extends Notifier<Map<String, UserStatus?>> {
           },
           limit: 0,
         ),
-        _handleStatusEvent,
+        (event) {
+          if (version == _subscriptionVersion) _handleStatusEvent(event);
+        },
       );
       if (version != _subscriptionVersion) {
         unsub();

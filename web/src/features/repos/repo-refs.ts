@@ -26,7 +26,11 @@ export function refsFilter(
   repoId: string,
   relaySelf: string | null,
 ): NostrFilter {
-  const filter: NostrFilter = { kinds: [REPO_STATE_KIND], "#d": [repoId] };
+  const filter: NostrFilter = {
+    kinds: [REPO_STATE_KIND],
+    "#d": [repoId],
+    limit: 1,
+  };
   if (relaySelf) {
     filter.authors = [relaySelf];
   }
