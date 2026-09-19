@@ -41,6 +41,7 @@ export type Project = {
   status: string;
   projectAddress: string;
   primaryRepositoryAddress: string | null;
+  homeRepositoryAddress?: string | null;
   repositoryAddresses: string[];
   repositoryRelayHints?: Record<string, string>;
   repositories: Repository[];
@@ -345,6 +346,15 @@ export function eventToExplicitProject(
       repositoryRelayHints[repositoryAddress] = membershipTag[2];
     }
   }
+  const homeRepositoryAddress =
+    repositoryAddresses.find((address) => {
+      const repo = visibleRepositoriesByAddress.get(address);
+      return (
+        repo?.channelId &&
+        (repo.owner === event.pubkey.toLowerCase() ||
+          repo.maintainers?.includes(event.pubkey.toLowerCase()))
+      );
+    }) ?? null;
   repositoryAddresses.sort();
   const primaryRepositoryAddress =
     repositoryAddresses.find(
@@ -384,6 +394,7 @@ export function eventToExplicitProject(
     status: visibility === "listed" ? "active" : "unlisted",
     projectAddress,
     primaryRepositoryAddress,
+    homeRepositoryAddress,
     repositoryAddresses,
     repositoryRelayHints,
     repositories: repositoryAddresses.flatMap((address) => {
@@ -541,7 +552,8 @@ export function selectProjectRepository(
   return (
     project.repositories.find(
       (repository) =>
-        repository.repoAddress === project.primaryRepositoryAddress,
+        repository.repoAddress ===
+        (project.homeRepositoryAddress ?? project.primaryRepositoryAddress),
     ) ??
     project.repositories[0] ??
     null

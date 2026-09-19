@@ -26,6 +26,7 @@
 /// overridable; those have dedicated UI fields but power users may want
 /// to bypass them.
 pub(crate) const RESERVED_ENV_KEYS: &[&str] = &[
+    "PI_ACP_PI_COMMAND",
     // Identity / secrets.
     "BUZZ_PRIVATE_KEY",
     "NOSTR_PRIVATE_KEY",

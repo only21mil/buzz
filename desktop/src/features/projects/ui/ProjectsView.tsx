@@ -41,9 +41,10 @@ import { CreatePullRequestDialog } from "@/features/projects/ui/CreatePullReques
 import { ProjectsCreateMenu } from "@/features/projects/ui/ProjectsCreateMenu";
 import { ProjectsIssuesList } from "@/features/projects/ui/ProjectsIssuesList";
 import { ProjectsOverviewPanel } from "@/features/projects/ui/ProjectsOverviewPanel";
-import { ProjectsOverviewRail } from "@/features/projects/ui/ProjectsOverviewRail";
 import { ProjectsPullRequestsList } from "@/features/projects/ui/ProjectsPullRequestsList";
 import { ProjectsWorkItemsLoadNotice } from "@/features/projects/ui/ProjectsWorkItemsLoadNotice";
+import { ProjectsListScopeDropdown } from "./ProjectsListScopeDropdown";
+import { ProjectsSortSelect } from "./ProjectsListHeaderBar";
 import { ProjectsListHeaderBar } from "@/features/projects/ui/ProjectsListHeaderBar";
 import { ProjectsToolbar } from "@/features/projects/ui/ProjectsToolbar";
 import {
@@ -580,11 +581,6 @@ export function ProjectsView() {
   const withProjectCreationDialog = (content: React.ReactNode) => (
     <>
       <ProjectCreationDialog
-        onCreated={() => {
-          // Keep the fork's complete-list landing after either entry point.
-          handleRepositoryScopeChange("all");
-          handleFilterChange("projects");
-        }}
         onOpenChange={setCreateProjectOpen}
         open={createProjectOpen}
       />
@@ -646,7 +642,6 @@ export function ProjectsView() {
       >
         {visibleProjects.slice(0, projectMountCount).map((project) => {
           const summary = activitySummariesQuery.data?.[project.id];
-          const repoSnapshot = repoSnapshotsQuery.data?.snapshots?.[project.id];
           return (
             <ProjectGridCard
               canDelete={
@@ -663,7 +658,6 @@ export function ProjectsView() {
               people={projectPeople(project, summary)}
               profiles={profiles}
               project={project}
-              repoSnapshot={repoSnapshot}
               repositoryUnavailableReason={repositoryUnavailableReasonFor(
                 project,
               )}
@@ -679,7 +673,6 @@ export function ProjectsView() {
       >
         {visibleProjects.slice(0, projectMountCount).map((project) => {
           const summary = activitySummariesQuery.data?.[project.id];
-          const repoSnapshot = repoSnapshotsQuery.data?.snapshots?.[project.id];
           return (
             <ProjectListRow
               canDelete={
@@ -696,7 +689,6 @@ export function ProjectsView() {
               people={projectPeople(project, summary)}
               profiles={profiles}
               project={project}
-              repoSnapshot={repoSnapshot}
               repositoryUnavailableReason={repositoryUnavailableReasonFor(
                 project,
               )}
@@ -751,20 +743,48 @@ export function ProjectsView() {
     );
 
   const listHeaderBar = (
-    <ProjectsListHeaderBar
-      filter={filter}
-      variant={viewMode === "list" ? "row" : "bar"}
-      issueScope={issueScope}
-      onIssueScopeChange={handleIssueScopeChange}
-      onPullRequestScopeChange={handlePullRequestScopeChange}
-      onRepositoryScopeChange={handleRepositoryScopeChange}
-      onSortChange={handleSortChange}
-      onViewModeChange={handleViewModeChange}
-      pullRequestScope={pullRequestScope}
-      repositoryScope={repositoryScope}
-      sort={sort}
-      viewMode={viewMode}
-    />
+    <div className="flex items-center gap-2">
+      {filter === "issues" ? (
+        <ProjectsListScopeDropdown
+          label="Tasks"
+          value={issueScope}
+          onChange={handleIssueScopeChange}
+          options={[
+            { value: "mine", label: "Mine" },
+            { value: "all", label: "All" },
+          ]}
+        />
+      ) : null}
+      {filter === "prs" ? (
+        <ProjectsListScopeDropdown
+          label="Reviews"
+          value={pullRequestScope}
+          onChange={handlePullRequestScopeChange}
+          options={[
+            { value: "mine", label: "Mine" },
+            { value: "all", label: "All" },
+          ]}
+        />
+      ) : null}
+      <ProjectsListScopeDropdown
+        label="Repositories"
+        value={repositoryScope}
+        onChange={handleRepositoryScopeChange}
+        options={[
+          { value: "all", label: "All" },
+          { value: "local", label: "Local" },
+          { value: "mine", label: "Mine" },
+          { value: "accessible", label: "Accessible" },
+          { value: "buzz", label: "Buzz" },
+          { value: "linked", label: "Linked" },
+        ]}
+      />
+      <ProjectsSortSelect sort={sort} onChange={handleSortChange} />
+      <ProjectsListHeaderBar
+        onViewModeChange={handleViewModeChange}
+        viewMode={viewMode}
+      />
+    </div>
   );
 
   const workItemFailedSections = [
@@ -899,20 +919,7 @@ export function ProjectsView() {
           <div className="mx-auto w-full max-w-6xl">
             <div className="w-full min-w-0 pb-4 pt-4">
               {filter === "all" ? (
-                <ProjectsOverviewPanel
-                  metadata={
-                    <ProjectsOverviewRail
-                      profiles={profiles}
-                      projects={projects}
-                      summaries={activitySummariesQuery.data}
-                    />
-                  }
-                  onSelectSection={(section) => {
-                    handleFilterChange(section);
-                  }}
-                  projects={projects}
-                  summaries={activitySummariesQuery.data}
-                >
+                <ProjectsOverviewPanel>
                   <section className="space-y-3">{activityFeed}</section>
                 </ProjectsOverviewPanel>
               ) : (

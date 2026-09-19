@@ -1,3 +1,7 @@
+mod profile_join;
+use crate::channel_member_profiles::ChannelMemberProfileCacheEntry;
+use crate::relay::query_relay_at;
+use profile_join::query_member_profiles;
 use tauri::State;
 
 use crate::{
@@ -143,13 +147,85 @@ fn profile_join_pubkeys(members: &[crate::models::ChannelMemberInfo], limit: usi
         .collect()
 }
 
+fn enrich_channel_members_from_profile_events<E>(
+    response: &mut ChannelMembersResponse,
+    profile_events: Result<&[nostr::Event], E>,
+    relay_scope: &str,
+    request_id: u64,
+    profile_cache: &mut std::collections::HashMap<(String, String), ChannelMemberProfileCacheEntry>,
+) {
+    let mut latest_profiles = std::collections::HashMap::new();
+    if let Ok(events) = profile_events {
+        for event in events {
+            let pubkey = event.pubkey.to_hex();
+            let replace = latest_profiles
+                .get(&pubkey)
+                .is_none_or(|current: &&nostr::Event| event.created_at > current.created_at);
+            if replace {
+                latest_profiles.insert(pubkey, event);
+            }
+        }
+    }
+
+    for member in &mut response.members {
+        let role_is_agent = member.role == "bot";
+        let cache_key = (relay_scope.to_string(), member.pubkey.clone());
+        if let Some(event) = latest_profiles.get(&member.pubkey) {
+            let display_name = nostr_convert::profile_info_from_event(event)
+                .ok()
+                .and_then(|profile| profile.display_name)
+                .or_else(|| {
+                    profile_cache
+                        .get(&cache_key)
+                        .filter(|entry| entry.is_agent)
+                        .and_then(|entry| entry.display_name.clone())
+                });
+
+            if let Some(entry) = profile_cache
+                .get(&cache_key)
+                .filter(|entry| entry.request_id > request_id)
+            {
+                if member.display_name.is_none() && entry.is_agent {
+                    member.display_name = entry.display_name.clone();
+                }
+                member.is_agent = role_is_agent || entry.is_agent;
+                continue;
+            }
+
+            let is_agent = nostr_convert::profile_has_valid_oa_owner(event);
+            profile_cache.insert(
+                cache_key,
+                ChannelMemberProfileCacheEntry {
+                    request_id,
+                    is_agent,
+                    display_name: if is_agent { display_name.clone() } else { None },
+                },
+            );
+            if member.display_name.is_none() {
+                member.display_name = display_name;
+            }
+            member.is_agent = role_is_agent || is_agent;
+        } else if let Some(entry) = profile_cache.get(&cache_key).filter(|entry| entry.is_agent) {
+            if member.display_name.is_none() {
+                member.display_name = entry.display_name.clone();
+            }
+            member.is_agent = true;
+        } else {
+            member.is_agent = role_is_agent;
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn get_channel_members(
     channel_id: String,
     state: State<'_, AppState>,
 ) -> Result<ChannelMembersResponse, String> {
-    let events = query_relay(
+    let relay_scope = relay_api_base_url_with_override(&state);
+    let request_id = state.channel_member_profile_cache.next_request_id();
+    let events = query_relay_at(
         &state,
+        &relay_scope,
         &[serde_json::json!({
             "kinds": [39002],
             "#d": [channel_id],
@@ -164,49 +240,23 @@ pub async fn get_channel_members(
         .transpose()?
         .ok_or_else(|| "channel members not found".to_string())?;
 
-    // Batch-fetch kind:0 profiles to populate display names, capped so the
-    // query cost is bounded on large rosters (see MEMBER_PROFILE_JOIN_LIMIT).
-    let pubkeys = profile_join_pubkeys(&response.members, MEMBER_PROFILE_JOIN_LIMIT);
-    if !pubkeys.is_empty() {
-        let profile_events = query_relay(
-            &state,
-            &[serde_json::json!({
-                "kinds": [0],
-                "authors": pubkeys,
-                "limit": pubkeys.len()
-            })],
-        )
-        .await
-        .unwrap_or_default();
-
-        // Build pubkey → profile display metadata from kind:0 events.
-        let mut profile_map = std::collections::HashMap::new();
-        for ev in &profile_events {
-            let pk = ev.pubkey.to_hex();
-            if let Ok(profile) = nostr_convert::profile_info_from_event(ev) {
-                profile_map.insert(
-                    pk,
-                    (
-                        profile.display_name,
-                        nostr_convert::profile_has_valid_oa_owner(ev),
-                    ),
-                );
-            }
-        }
-
-        // Populate profile-derived fields on each member.
-        for member in &mut response.members {
-            if member.role == "bot" {
-                member.is_agent = true;
-            }
-            if let Some((display_name, is_agent)) = profile_map.get(&member.pubkey) {
-                if member.display_name.is_none() {
-                    member.display_name = display_name.clone();
-                }
-                member.is_agent = member.is_agent || *is_agent;
-            }
-        }
-    }
+    let profile_events = query_member_profiles(&response.members, |filter| {
+        let relay_scope = &relay_scope;
+        let state = &state;
+        async move { query_relay_at(state, relay_scope, &[filter]).await }
+    })
+    .await;
+    let mut profile_cache = state
+        .channel_member_profile_cache
+        .lock()
+        .map_err(|_| "channel member profile cache lock poisoned".to_string())?;
+    enrich_channel_members_from_profile_events(
+        &mut response,
+        Ok::<_, String>(&profile_events),
+        &relay_scope,
+        request_id,
+        &mut profile_cache,
+    );
 
     Ok(response)
 }

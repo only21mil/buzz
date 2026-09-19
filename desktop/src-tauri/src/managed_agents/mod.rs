@@ -46,6 +46,8 @@ pub(crate) mod team_catalog;
 pub(crate) mod team_events;
 mod team_repair;
 pub(crate) use team_repair::team_persona_key;
+#[cfg(test)]
+mod poll_read_probe;
 mod teams;
 mod types;
 

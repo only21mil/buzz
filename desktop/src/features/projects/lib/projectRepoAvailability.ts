@@ -73,6 +73,12 @@ export function projectRepoUnavailableReason(
 
   if (!message) return "missing";
   if (
+    /no channel binding|no access channel|no buzz-channel|bind.*channel|unbound/.test(
+      message,
+    )
+  )
+    return "unbound";
+  if (
     /\b(?:401|403)\b|authenticat|authoriz|permission denied|access denied/.test(
       message,
     )
@@ -87,7 +93,7 @@ export function projectRepoUnavailableReason(
     return "missing";
   }
   if (
-    /remote branch .* not found|could not resolve the requested repository ref|couldn't find remote ref/.test(
+    /remote branch .* not found|could not resolve the requested repository ref|couldn't find remote ref|requested ref.*not found|requested repository ref changed/.test(
       message,
     )
   ) {

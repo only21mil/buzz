@@ -8,7 +8,7 @@ use std::{
 };
 
 use nostr::{Keys, ToBech32};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::huddle::HuddleState;
@@ -16,7 +16,10 @@ pub(crate) use crate::identity_storage::{IdentityStorage, RecoveryState, Resolve
 use crate::managed_agents::config_bridge::SessionConfigCache;
 use crate::managed_agents::{ManagedAgentPairRuntime, ManagedAgentRuntimeKey};
 
+use crate::channel_member_profiles::ChannelMemberProfileCache;
+
 pub struct AppState {
+    pub(crate) channel_member_profile_cache: ChannelMemberProfileCache,
     pub keys: Mutex<Keys>,
     pub(crate) publication_epoch: Arc<Mutex<u64>>,
     /// Durable backend holding `keys`. Updated after the key write and before
@@ -188,119 +191,14 @@ pub fn build_media_fetch_client() -> reqwest::Result<reqwest::Client> {
         .build()
 }
 
-pub fn build_app_state() -> AppState {
-    // Env var takes precedence (dev/CI). If absent, resolve_persisted_identity()
-    // in setup() will replace the ephemeral placeholder with a persisted key.
-    let (keys, identity_storage) = match identity_from_env() {
-        Some(keys) => {
-            eprintln!(
-                "buzz-desktop: configured identity pubkey {}",
-                keys.public_key().to_hex()
-            );
-            (keys, IdentityStorage::Environment)
-        }
-        None => (Keys::generate(), IdentityStorage::Ephemeral),
-    };
-
-    AppState {
-        keys: Mutex::new(keys),
-        publication_epoch: Arc::new(Mutex::new(0)),
-        identity_storage: AtomicU8::new(identity_storage as u8),
-        http_client: reqwest::Client::builder()
-            .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
-            .pool_idle_timeout(std::time::Duration::from_secs(300))
-            .pool_max_idle_per_host(2)
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new()),
-        media_fetch_client: build_media_fetch_client().expect(
-            "media_fetch_client must build with redirect::Policy::none(); a \
-             redirect-following fallback would forward the minted media auth \
-             header across origins (redirect-hop SSRF)",
-        ),
-        relay_url_override: Mutex::new(None),
-        agent_avatar_communities: Mutex::new(Vec::new()),
-        workspace_apply_lock: Arc::new(AsyncMutex::new(())),
-        workspace_apply_generation: AtomicU64::new(0),
-        managed_agent_restore_pending: AtomicBool::new(false),
-        managed_agent_experiments: crate::managed_agents::ManagedAgentExperimentState::default(),
-        shutdown_started: AtomicBool::new(false),
-        managed_agent_runtime_transition: Mutex::new(()),
-        identity_mutation: Mutex::new(()),
-        managed_agents_store_lock: Mutex::new(()),
-        channel_templates_store_lock: Mutex::new(()),
-        managed_agent_processes: Mutex::new(HashMap::new()),
-        provider_deploy_locks: Mutex::new(HashMap::new()),
-        session_config_cache: Mutex::new(HashMap::new()),
-        huddle_state: Mutex::new(HuddleState::default()),
-        huddle_audio: Default::default(),
-        app_handle: Mutex::new(None),
-        media_proxy_port: AtomicU16::new(0),
-        prevent_sleep: Default::default(),
-        keyring_locked: AtomicBool::new(false),
-        identity_lost: AtomicBool::new(false),
-        reset_failed: AtomicBool::new(false),
-        #[cfg(feature = "mesh-llm")]
-        mesh_llm_runtime: AsyncMutex::new(None),
-        #[cfg(feature = "mesh-llm")]
-        mesh_recovery: crate::mesh_llm::MeshRecoveryState::default(),
-        #[cfg(feature = "mesh-llm")]
-        mesh_coordinator: AsyncMutex::new(None),
-        pending_owned_channels: Mutex::new(std::collections::HashSet::new()),
-        relay_self_cache: Mutex::new(HashMap::new()),
-        archive_db: crate::archive::ArchiveDb::default(),
-    }
-}
+#[path = "app_state_startup.rs"]
+mod startup;
+#[cfg(all(test, unix, not(feature = "system-keyring")))]
+pub(crate) use startup::build_ephemeral_test_app_state;
+pub use startup::{build_app_state, resolve_persisted_identity};
 
 #[path = "app_state_accessors.rs"]
 mod accessors;
-
-/// Resolve the user's identity key from the app data directory and wire
-/// the resulting [`RecoveryState`] into `AppState`.
-///
-/// Priority: `BUZZ_PRIVATE_KEY` env var (already handled in `build_app_state`)
-/// → keyring → `{app_data_dir}/identity.key` file → generate + save.
-///
-/// On success, writes the resolved keys into `state.keys` (with the mutex)
-/// before storing the recovery flags (Release), so any thread that reads
-/// either flag as `false` with Acquire is guaranteed to see the updated keys.
-///
-/// Sets `state.identity_lost` on `RecoveryState::Lost` (keyring empty after
-/// migration — key gone externally) and `state.keyring_locked` on
-/// `RecoveryState::KeyringLocked` (keyring unreachable — key still in keyring
-/// but inaccessible this boot). Both states boot with an ephemeral key; the
-/// frontend shows different recovery screens for each.
-pub fn resolve_persisted_identity(app: &AppHandle, state: &AppState) -> Result<(), String> {
-    // Only skip file-based resolution if the env var was present AND parsed
-    // successfully. A malformed env var should fall through to the persisted
-    // key rather than leaving the app on an ephemeral identity.
-    if identity_from_env().is_some() {
-        return Ok(());
-    }
-
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("app data dir: {e}"))?;
-    std::fs::create_dir_all(&data_dir).map_err(|e| format!("create app data dir: {e}"))?;
-
-    let resolved = load_or_create_identity(&data_dir)?;
-    // Write keys and storage before setting the recovery flags (Release) so
-    // any thread that reads a flag as false with Acquire sees consistent data.
-    {
-        let mut active_keys = state.keys.lock().map_err(|e| e.to_string())?;
-        *active_keys = resolved.keys;
-        state.set_identity_storage(resolved.storage);
-    }
-    state.identity_lost.store(
-        resolved.recovery == RecoveryState::Lost,
-        std::sync::atomic::Ordering::Release,
-    );
-    state.keyring_locked.store(
-        resolved.recovery == RecoveryState::KeyringLocked,
-        std::sync::atomic::Ordering::Release,
-    );
-    Ok(())
-}
 
 #[path = "app_state_keyring.rs"]
 mod keyring_config;
@@ -386,9 +284,17 @@ fn resolve_identity_with_store(
     legacy_path: &std::path::Path,
     data_dir: &std::path::Path,
 ) -> Result<ResolvedIdentity, String> {
-    use crate::secret_store::KeyringProbe;
+    resolve_identity_from_probe(store, legacy_path, data_dir, store.probe(IDENTITY_KEY_NAME))
+}
 
-    match store.probe(IDENTITY_KEY_NAME) {
+fn resolve_identity_from_probe(
+    store: &impl IdentityKeyStore,
+    legacy_path: &std::path::Path,
+    data_dir: &std::path::Path,
+    completed: crate::secret_store::KeyringProbe,
+) -> Result<ResolvedIdentity, String> {
+    use crate::secret_store::KeyringProbe;
+    match completed {
         KeyringProbe::Present => {
             if let Some(nsec) = store.load(IDENTITY_KEY_NAME)? {
                 match Keys::parse(nsec.trim()) {

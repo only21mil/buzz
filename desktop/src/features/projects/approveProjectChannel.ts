@@ -33,9 +33,18 @@ export async function approveProjectChannel(
     throw new Error("Project channel creation requires the desktop app.");
   const origin = deps.getRelayOrigin();
   const identity = await deps.getIdentity();
+  const projects = await deps.fetchProjects();
+  if (
+    projects.filter(
+      (candidate) =>
+        candidate.projectChannelId === request.request.homeChannelId,
+    ).length !== 1
+  ) {
+    throw new Error("Project channel ownership is ambiguous or unavailable.");
+  }
   const project = findProjectHomeByChannelId(
     request.request.homeChannelId,
-    await deps.fetchProjects(),
+    projects,
   );
   if (
     !project ||
