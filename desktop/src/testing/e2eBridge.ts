@@ -11453,9 +11453,7 @@ export function maybeInstallE2eTauriMocks() {
   resetMockPendingEntityDeepLinks(config);
   initializeMockHuddle(config.mock?.huddle, config);
   mockWebsocketSendMutexWedged = false;
-  if (config.mock?.windowLabel) {
-    (window as Window & { isTauri?: boolean }).isTauri = true;
-  }
+  (window as Window & { isTauri?: boolean }).isTauri = true;
   mockWindows(config.mock?.windowLabel ?? "main");
   window.__BUZZ_E2E_COMMANDS__ = [];
   window.__BUZZ_E2E_COMMAND_PAYLOADS__ = [];
