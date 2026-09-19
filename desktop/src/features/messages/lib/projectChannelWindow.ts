@@ -1,13 +1,78 @@
 import type { QueryClient } from "@tanstack/react-query";
 
 import type { RelayEvent } from "@/shared/api/types";
+import {
+  CHANNEL_AUX_EVENT_KINDS,
+  CHANNEL_TIMELINE_CONTENT_KINDS,
+} from "@/shared/constants/kinds";
 import { channelMessagesKey, channelWindowKey } from "./messageQueryKeys";
 import {
   emptyChannelWindowStore,
+  mergeHeadTransactionChannelWindowEvent,
+  mergeLiveChannelWindowEvent,
+  mergeLiveThreadSummary,
   type ChannelWindowStore,
+  type LiveThreadSummary,
 } from "./channelWindowStore";
 import { reconcileChannelWindowMessages } from "./channelWindowReconciliation";
 import { channelHeadHydration } from "./channelHeadCache";
+
+const TIMELINE_KINDS: ReadonlySet<number> = new Set(
+  CHANNEL_TIMELINE_CONTENT_KINDS,
+);
+const AUX_KINDS: ReadonlySet<number> = new Set(CHANNEL_AUX_EVENT_KINDS);
+
+/** Merge bounded timeline/aux events through the store's existing live paths. */
+export function mergeChannelWindowOverlayEvents(
+  store: ChannelWindowStore,
+  events: RelayEvent[],
+): ChannelWindowStore {
+  return events.reduce((current, event) => {
+    if (TIMELINE_KINDS.has(event.kind)) {
+      return mergeLiveChannelWindowEvent(current, event);
+    }
+    if (AUX_KINDS.has(event.kind)) {
+      return mergeLiveChannelWindowEvent(current, event, false);
+    }
+    return current;
+  }, store);
+}
+
+/** Replay only events captured during the exact active head transaction. */
+export function mergeHeadTransactionChannelWindowEvents(
+  store: ChannelWindowStore,
+  events: RelayEvent[],
+): ChannelWindowStore {
+  return events.reduce((current, event) => {
+    if (TIMELINE_KINDS.has(event.kind)) {
+      return mergeHeadTransactionChannelWindowEvent(current, event);
+    }
+    if (AUX_KINDS.has(event.kind)) {
+      return mergeHeadTransactionChannelWindowEvent(current, event, false);
+    }
+    return current;
+  }, store);
+}
+
+/** Carry only summaries that changed after the authoritative head read began. */
+export function mergeHeadTransactionLiveSummaries(
+  store: ChannelWindowStore,
+  baseline: Record<string, LiveThreadSummary>,
+  latest: Record<string, LiveThreadSummary>,
+): ChannelWindowStore {
+  return Object.entries(latest).reduce((current, [rootId, summary]) => {
+    return baseline[rootId]?.eventId === summary.eventId
+      ? current
+      : mergeLiveThreadSummary(current, rootId, summary);
+  }, store);
+}
+
+/** Seed an unresolved channel window from a bounded durable snapshot. */
+export function seedChannelWindowStoreFromSnapshot(
+  events: RelayEvent[],
+): ChannelWindowStore {
+  return mergeChannelWindowOverlayEvents(emptyChannelWindowStore(), events);
+}
 
 /** Keep the rendered timeline cache aligned with its authoritative window. */
 export function projectChannelWindowMessages(
@@ -26,6 +91,7 @@ export function projectChannelWindowMessages(
 export async function refreshChannelWindowMessages(
   queryClient: QueryClient,
   channelId: string,
+  isCurrent: () => boolean = () => true,
 ) {
   const queryKey = channelMessagesKey(channelId);
   // Sequence behind persisted-head hydration. While the channel query is parked
@@ -49,5 +115,6 @@ export async function refreshChannelWindowMessages(
     { queryKey, exact: true, refetchType: "active" },
     { cancelRefetch: !seeded, throwOnError: true },
   );
+  if (!isCurrent()) return;
   projectChannelWindowMessages(queryClient, channelId);
 }

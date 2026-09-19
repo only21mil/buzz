@@ -1,3 +1,4 @@
+import { setLocalStorageItemWithRecovery } from "@/shared/lib/localStorageQuota";
 import { nip44EncryptToSelf, signRelayEvent } from "@/shared/api/tauri";
 import type { RelayClient } from "@/shared/api/relayClientSession";
 import type { RelayEvent } from "@/shared/api/types";
@@ -10,71 +11,29 @@ import {
   READ_STATE_MAX_SLOTS,
   MSG_PREFIX,
   THREAD_PREFIX,
-  localExtraSlotIdsKey,
   type ReadStateBlob,
 } from "@/features/channels/readState/readStateFormat";
 import { parseReadStateEvent } from "@/features/channels/readState/readStateSnapshot";
 import {
+  clientIdKey,
+  generateHex,
+  getOrCreatePersisted,
+  loadExtraSlotIds,
+  saveExtraSlotIds,
+  slotIdKey,
+} from "@/features/channels/readState/readStateIdentity";
+import {
   readStoredReadState,
   writeStoredReadState,
 } from "@/features/channels/readState/readStateStorage";
-import { setLocalStorageItemWithRecovery } from "@/shared/lib/localStorageQuota";
 import { truncatePubkey } from "@/shared/lib/pubkey";
-import { getStorageItem } from "@/shared/lib/safeStorage";
 
-const CLIENT_ID_KEY_PREFIX = "buzz.nip-rs.client-id";
-const SLOT_ID_KEY_PREFIX = "buzz.nip-rs.slot-id";
+const PUBLISH_DEBOUNCE_MS = 5_000;
+const LOCAL_PERSIST_MAX_WAIT_MS = 1_000;
+/** How many of our own just-published event ids to remember so the live
+ * subscription can drop their relay echoes before the nip44 decrypt. A
+ * publish cycle emits at most a handful of slot events; 64 is generous. */
 const PUBLISHED_ID_MEMORY = 64;
-const DEBOUNCE_MS = 5_000;
-const sessionPersistedValues = new Map<string, string>();
-
-function generateHex(bytes: number): string {
-  const arr = new Uint8Array(bytes);
-  crypto.getRandomValues(arr);
-  return Array.from(arr, (b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-function getOrCreatePersisted(key: string, generator: () => string): string {
-  let value = getStorageItem(key) ?? sessionPersistedValues.get(key) ?? null;
-  if (value) {
-    sessionPersistedValues.set(key, value);
-    return value;
-  }
-
-  value = generator();
-  sessionPersistedValues.set(key, value);
-  setLocalStorageItemWithRecovery(key, value);
-  return value;
-}
-
-function clientIdKey(pubkey: string): string {
-  return `${CLIENT_ID_KEY_PREFIX}:${pubkey}`;
-}
-
-function slotIdKey(pubkey: string): string {
-  return `${SLOT_ID_KEY_PREFIX}:${pubkey}`;
-}
-
-function loadExtraSlotIds(pubkey: string): string[] {
-  try {
-    const raw = getStorageItem(localExtraSlotIdsKey(pubkey));
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(
-      (v): v is string => typeof v === "string" && v.length > 0,
-    );
-  } catch {
-    return [];
-  }
-}
-
-function saveExtraSlotIds(pubkey: string, ids: string[]): void {
-  setLocalStorageItemWithRecovery(
-    localExtraSlotIdsKey(pubkey),
-    JSON.stringify(ids),
-  );
-}
 
 export type ApplyRemoteContextResult = "unchanged" | "advanced";
 
@@ -319,6 +278,7 @@ export class ReadStateManager {
   private publishableContextIds = new Set<string>();
   private lastPublishedContexts: Record<string, number> = {};
   private debounceTimer: number | null = null;
+  private localPersistTimer: number | null = null;
   private listeners = new Set<() => void>();
   private unsubscribeLive: (() => void) | null = null;
   private initialized = false;
@@ -326,8 +286,9 @@ export class ReadStateManager {
   private contextSourceCreatedAt = new Map<string, number>();
   private pendingSyncedAdvances = new Set<string>();
   private destroyed = false;
-  private recentlyPublishedIds = new Set<string>();
   private parentResolver: ContextParentResolver | null = null;
+  /** Event ids we published ourselves; used to skip decrypting their echoes. */
+  private recentlyPublishedIds = new Set<string>();
 
   constructor(pubkey: string, relayClient: RelayClient) {
     this.pubkey = pubkey;
@@ -339,6 +300,8 @@ export class ReadStateManager {
       generateHex(16),
     );
     this.extraSlotIds = loadExtraSlotIds(pubkey);
+    window.addEventListener("pagehide", this.flushLocalState);
+    document.addEventListener("visibilitychange", this.handleVisibilityChange);
   }
 
   async initialize(): Promise<void> {
@@ -385,6 +348,7 @@ export class ReadStateManager {
     unixTimestamp: number,
     options: { publishable: boolean },
   ): void {
+    if (this.destroyed) return;
     const current = this.effectiveState.get(contextId) ?? 0;
     if (unixTimestamp <= current) {
       if (!options.publishable || this.publishableContextIds.has(contextId)) {
@@ -446,7 +410,14 @@ export class ReadStateManager {
 
   destroy(): void {
     this.destroyed = true;
-    // Flush any pending writes immediately
+    window.removeEventListener("pagehide", this.flushLocalState);
+    document.removeEventListener(
+      "visibilitychange",
+      this.handleVisibilityChange,
+    );
+    this.flushLocalState();
+
+    // Flush any pending relay publish immediately
     if (this.debounceTimer !== null) {
       window.clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
@@ -483,6 +454,7 @@ export class ReadStateManager {
   }
 
   private async mergeEvents(events: RelayEvent[]): Promise<void> {
+    if (this.destroyed) return;
     // Collect all own blobs (keyed by slot d-tag) to union them all.
     // NIP-RS: multiple own-slot blobs must be max-merged, not winner-takes-all.
     const ownBlobsBySlot = new Map<
@@ -492,6 +464,7 @@ export class ReadStateManager {
 
     for (const event of events) {
       const parsed = await this.parseEvent(event);
+      if (this.destroyed) return;
       if (!parsed) continue;
 
       this.maxFetchedCreatedAt = Math.max(
@@ -528,6 +501,7 @@ export class ReadStateManager {
     // d-tag coordinate. If so, rotate our slotId to avoid clobbering.
     for (const event of events) {
       const parsed = await this.parseEvent(event);
+      if (this.destroyed) return;
       if (!parsed || parsed.dTag !== `read-state:${this.slotId}`) continue;
       if (parsed.blob.client_id !== this.clientId) {
         this.slotId = generateHex(16);
@@ -580,10 +554,20 @@ export class ReadStateManager {
   }
 
   private async handleIncomingEvent(event: RelayEvent): Promise<void> {
-    if (event.pubkey !== this.pubkey) return;
-    if (this.destroyed) return;
-    // Consume live echoes before decrypting. Replays still take the normal path.
-    if (this.recentlyPublishedIds.delete(event.id)) return;
+    if (this.destroyed || event.pubkey !== this.pubkey) return;
+
+    // Echo drop: the live subscription (authors=[us]) receives every event we
+    // publish right back from the relay. Decrypting and re-parsing our own
+    // blob is pure waste — with hundreds of channels a single blob runs tens
+    // of KB, so on an actively-reading client the echo was a large recurring
+    // nip44-decrypt + JSON.parse for information we already hold.
+    if (this.recentlyPublishedIds.delete(event.id)) {
+      console.debug(
+        `[ReadStateManager] dropped self-echo event=${event.id.substring(0, 8)}…`,
+      );
+      return;
+    }
+
     console.debug(
       `[ReadStateManager] incoming event=${event.id.substring(0, 8)}… created_at=${event.created_at}`,
     );
@@ -631,10 +615,14 @@ export class ReadStateManager {
     }
   }
 
+  /** Seam over `parseReadStateEvent` so tests can count/stub decrypts
+   * (see readStateManager.test.mjs echo-drop tests). */
   private parseEvent(event: RelayEvent) {
     return parseReadStateEvent(event, this.pubkey);
   }
 
+  /** Record an id we just published, capped so failed publishes can't grow
+   * the set unboundedly. Set preserves insertion order, so eviction is FIFO. */
   private rememberPublishedId(id: string): void {
     this.recentlyPublishedIds.add(id);
     if (this.recentlyPublishedIds.size > PUBLISHED_ID_MEMORY) {
@@ -644,18 +632,21 @@ export class ReadStateManager {
   }
 
   private schedulePublish(): void {
+    if (this.destroyed) return;
     if (this.debounceTimer !== null) {
       window.clearTimeout(this.debounceTimer);
     }
     this.debounceTimer = window.setTimeout(() => {
       this.debounceTimer = null;
       void this.publish();
-    }, DEBOUNCE_MS);
+    }, PUBLISH_DEBOUNCE_MS);
   }
 
   private async publish(): Promise<void> {
     console.debug(`[ReadStateManager] publish starting slotId=${this.slotId}`);
     await this.fetchOwnBlobBeforePublish();
+    if (this.destroyed) return;
+    this.flushLocalState();
 
     // Build blob from contexts this client is allowed to publish.
     const contexts = this.currentContexts();
@@ -718,7 +709,9 @@ export class ReadStateManager {
         tags,
       });
 
-      // Relay delivery can precede the publish acknowledgement.
+      // Remember the id BEFORE publishing: the relay may fan the event out to
+      // our own live subscription before the publish OK resolves. A failed
+      // publish leaves a never-echoed id in the set; the size cap evicts it.
       this.rememberPublishedId(event.id);
       await this.relayClient.publishEvent(
         event,
@@ -951,10 +944,33 @@ export class ReadStateManager {
     for (const [contextId, createdAt] of stored.contextSourceCreatedAt) {
       this.contextSourceCreatedAt.set(contextId, createdAt);
     }
-    this.persistLocalState();
+    this.writeLocalState();
   }
 
   private persistLocalState(): void {
+    if (this.destroyed || this.localPersistTimer !== null) return;
+
+    this.localPersistTimer = window.setTimeout(() => {
+      this.localPersistTimer = null;
+      this.writeLocalState();
+    }, LOCAL_PERSIST_MAX_WAIT_MS);
+  }
+
+  private readonly flushLocalState = (): void => {
+    if (this.localPersistTimer === null) return;
+
+    window.clearTimeout(this.localPersistTimer);
+    this.localPersistTimer = null;
+    this.writeLocalState();
+  };
+
+  private readonly handleVisibilityChange = (): void => {
+    if (document.visibilityState === "hidden") {
+      this.flushLocalState();
+    }
+  };
+
+  private writeLocalState(): void {
     writeStoredReadState(
       this.pubkey,
       this.effectiveState,
