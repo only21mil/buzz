@@ -8,6 +8,8 @@
 #![forbid(unsafe_code)]
 
 mod closed_response;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub mod activation;
 #[cfg(target_os = "linux")]
