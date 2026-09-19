@@ -129,23 +129,29 @@ mod tests {
 
     def test_compiled_inventory_cannot_drop_or_add_a_case(self):
         rows = inventory.read_inventory()
-        names = [r['test'] for r in rows if r['binary'] == 'workflow_approval_contract']
+        names = [r['test'] for r in rows if r['binary'] == 'buzz_db']
         self.assertGreater(len(names), 20)
-        inventory.reconcile('workflow_approval_contract-abc123', names, rows)
+        inventory.reconcile('buzz_db-abc123', names, rows)
         for changed in (names[:-1], names + ['unclassified'], names + names[:1]):
             with self.assertRaisesRegex(ValueError, 'compiled discovery mismatch'):
-                inventory.reconcile('workflow_approval_contract-abc123', changed, rows)
+                inventory.reconcile('buzz_db-abc123', changed, rows)
 
     def test_existing_ci_selections_still_admitted(self):
         rows = inventory.read_inventory()
-        for module in ('relay_invite::tests::', 'api::invites::tests::', 'handlers::relay_admin::tests::'):
+        for module in ('store::relay_invite::postgres_tests::', 'api::invites::postgres_tests::',
+                       'handlers::relay_admin::postgres_tests::'):
             selected = [r for r in rows if r['test'].startswith(module)]
             self.assertTrue(selected, module)
             self.assertTrue(all(r['mode'] == 'desired' for r in selected))
         selected = [r for r in rows if 'coordinate_delete_spares_head_newer_than_the_deletion' in r['test']]
         self.assertEqual(len(selected), 1)
         self.assertEqual(selected[0]['mode'], 'desired')
-        for binary in ('ci_grants_contract', 'workflow_approval_contract', 'workflow_state_contract',
+        selected = [r for r in rows if r['test'].startswith(
+            'runtime::migration::workflow_approval_contract::')]
+        self.assertGreater(len(selected), 20)
+        self.assertTrue(all(r['binary'] == 'buzz_db' and r['mode'] == 'migration'
+                            for r in selected))
+        for binary in ('ci_grants_contract', 'workflow_state_contract',
                        'workflow_enabled_persistence', 'ci_ingest_storage'):
             selected = [r for r in rows if r['binary'] == binary]
             self.assertTrue(selected, binary)
