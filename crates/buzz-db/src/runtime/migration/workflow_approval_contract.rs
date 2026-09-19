@@ -8,6 +8,7 @@
 //! membership invalidation, publishing, and resume workers belong to later
 //! slices.
 
+use crate as buzz_db;
 use buzz_core::CommunityId;
 use buzz_db::workflow_approval::{
     create_workflow_approval_gate, decide_workflow_approval_gate, ApprovalActionSummary,
@@ -19,15 +20,12 @@ use buzz_db::workflow_approval::{
 use buzz_db::{WorkflowEffectClaimOutcome, WorkflowEffectMarkOutcome};
 use chrono::{DateTime, Duration, Utc};
 use serde_json::{json, Value};
-use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use uuid::Uuid;
 
-const PRE_APPROVAL_MIGRATION_VERSION: i64 = 30;
+const PRE_APPROVAL_MIGRATION_VERSION: i64 = 1030;
 const DEFINITION_SECRET: &str = "definition-secret-must-not-enter-request-outbox";
 const OUTPUT_SECRET: &str = "raw-step-output-must-not-enter-request-outbox";
-
-static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 
 #[derive(Clone, Debug)]
 struct GateSpec {
@@ -502,8 +500,7 @@ async fn populated_migration_preserves_legacy_approval_and_backfills_resume_stat
         .execute(&pool)
         .await
         .expect("create public schema");
-    MIGRATOR
-        .run_to(PRE_APPROVAL_MIGRATION_VERSION, &pool)
+    super::run_migrations_through(&pool, PRE_APPROVAL_MIGRATION_VERSION)
         .await
         .expect("apply migrations through the pinned state-slice base");
 
@@ -569,8 +566,7 @@ async fn populated_migration_preserves_legacy_approval_and_backfills_resume_stat
     .await
     .expect("insert populated pending approval");
 
-    MIGRATOR
-        .run(&pool)
+    super::run_migrations(&pool)
         .await
         .expect("upgrade populated database through approval slice");
 
@@ -2314,9 +2310,11 @@ async fn history_reads_durable_gate_and_legacy_evidence_without_authority_tokens
 
 #[tokio::test]
 #[ignore = "requires Postgres"]
-async fn history_error_code_upgrade_preserves_populated_fork35_evidence() {
+async fn fork_tail_upgrade_preserves_populated_workflow_evidence() {
     let pool = connect_pool().await;
-    MIGRATOR.run_to(35, &pool).await.expect("fork35 base");
+    super::run_migrations_through(&pool, 1035)
+        .await
+        .expect("fork1035 base");
     let fixture = Fixture::insert(pool, FixtureIds::random(), 0x71).await;
     let spec = fixture.gate_spec();
     create_gate(&fixture.pool, &spec)
@@ -2350,7 +2348,8 @@ async fn history_error_code_upgrade_preserves_populated_fork35_evidence() {
     sqlx::query("INSERT INTO workflow_state (community_id, workflow_id, state_key, value, expires_at) VALUES ($1,$2,'key','state',now()+interval '1 hour')").bind(fixture.ids.community_id).bind(fixture.ids.workflow_id).execute(&fixture.pool).await.expect("state");
     sqlx::query("INSERT INTO ci_grants (community_id, channel_id, target_repo_a, signer_pubkey, granted_by) VALUES ($1,$2,'repo','signer','owner')").bind(fixture.ids.community_id).bind(fixture.ids.channel_id).execute(&fixture.pool).await.expect("grant");
     sqlx::query("INSERT INTO workflow_effect_claims (community_id, run_id, step_id, effect_index, effect_kind, effect_spec, effect_payload) VALUES ($1,$2,'notify',0,'send_message','{}','{}')").bind(fixture.ids.community_id).bind(fixture.ids.run_id).execute(&fixture.pool).await.expect("claim");
-    // A failed sibling supplies legacy diagnostic classification without altering the waiting gate.
+    // Error-code migration 0031 precedes the fork tail. Preserve a classified
+    // failure as the remaining fork migrations apply, without altering the gate.
     let failed = buzz_db::workflow::create_workflow_run(
         &fixture.pool,
         fixture.community_id,
@@ -2362,7 +2361,7 @@ async fn history_error_code_upgrade_preserves_populated_fork35_evidence() {
     )
     .await
     .expect("failed run");
-    sqlx::query("UPDATE workflow_runs SET status='failed', error_message='retained detail' WHERE community_id=$1 AND id=$2").bind(fixture.ids.community_id).bind(failed).execute(&fixture.pool).await.expect("legacy failure");
+    sqlx::query("UPDATE workflow_runs SET status='failed', error_code='legacy_unclassified', error_message='retained detail' WHERE community_id=$1 AND id=$2").bind(fixture.ids.community_id).bind(failed).execute(&fixture.pool).await.expect("legacy failure");
     let tables = [
         "workflow_runs",
         "workflow_approvals",
@@ -2384,7 +2383,7 @@ async fn history_error_code_upgrade_preserves_populated_fork35_evidence() {
     }
     buzz_db::migration::run_migrations(&fixture.pool)
         .await
-        .expect("upgrade36");
+        .expect("upgrade remaining fork tail");
     for (table, snapshot) in tables.into_iter().zip(snapshots) {
         let query = history_snapshot_query(table);
         assert_eq!(
