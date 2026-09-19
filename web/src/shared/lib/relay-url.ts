@@ -1,5 +1,5 @@
 /** Convert a WebSocket relay URL to its HTTP equivalent. */
-export function relayHttpUrl(wsUrl: string): string {
+function relayHttpUrl(wsUrl: string): string {
   if (wsUrl.startsWith("wss://")) {
     return `https://${wsUrl.slice(6)}`;
   }

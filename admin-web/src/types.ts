@@ -12,7 +12,7 @@ export interface Report {
   createdAt: string;
 }
 
-export interface ReportedMessage {
+interface ReportedMessage {
   authorPubkey: string;
   content: string;
   createdAt: string;
