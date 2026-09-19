@@ -22,7 +22,7 @@ import {
   HUE_BUCKETS,
   WORDMARK_PERIOD_SECONDS,
   WORDMARK_WAVE,
-  buildBannerColorTable,
+  buildBannerColorTable as createBannerColorTable,
   cyclicRampPosition,
   makeCellHue,
   phaseAt,
@@ -84,6 +84,14 @@ async function palettes() {
   return out;
 }
 const THEMES = await palettes();
+// Palettes are immutable fixtures. Reuse their production-generated tables
+// across the independent full-theme sweeps instead of rebuilding each time.
+const colorTables = new Map();
+function buildBannerColorTable(palette) {
+  if (!colorTables.has(palette))
+    colorTables.set(palette, createBannerColorTable(palette));
+  return colorTables.get(palette);
+}
 
 /**
  * PERCEPTUAL colour distance, CIEDE2000 — the metric every smoothness gate below
@@ -95,7 +103,12 @@ const THEMES = await palettes();
  * a brightness cliff, and this animation is almost entirely hue rotation. See the
  * adjacent-cell gate for the measured 20-of-62 vs 2-of-62 reversal.
  */
-const perceptualStep = (a, b) => de00(lab(a), lab(b));
+const labValues = new Map();
+function cachedLab(color) {
+  if (!labValues.has(color)) labValues.set(color, lab(color));
+  return labValues.get(color);
+}
+const perceptualStep = (a, b) => de00(cachedLab(a), cachedLab(b));
 
 /** One just-noticeable difference in dE00. The conventional threshold for "a
  *  careful observer can tell these apart at all". */
@@ -284,7 +297,8 @@ const fitTranslation = (fieldAt, phase, delta, geometry, bound) => {
       best = d;
     }
   }
-  for (let d = best - 0.5; d <= best + 0.5; d += 0.01) {
+  const coarseBest = best;
+  for (let d = coarseBest - 0.5; d <= coarseBest + 0.5; d += 0.01) {
     const residual = score(d);
     if (residual < bestResidual) {
       bestResidual = residual;
