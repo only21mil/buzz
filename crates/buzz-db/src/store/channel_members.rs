@@ -3212,7 +3212,6 @@ mod postgres_tests {
 }
 
 /// Read community-scoped membership data using the fork compatibility API.
-
 pub async fn get_members_paged(
     pool: &PgPool,
     community_id: CommunityId,
@@ -3264,7 +3263,6 @@ impl Db {
 }
 
 /// Read community-scoped membership data using the fork compatibility API.
-
 pub async fn get_agent_pubkeys(pool: &PgPool, community_id: CommunityId) -> Result<Vec<Vec<u8>>> {
     sqlx::query_scalar(
         r#"

@@ -1681,6 +1681,10 @@ impl Db {
 
 impl Db {
     /// Create a new workflow.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Matches the underlying store API"
+    )]
     #[datastore_span(name = "create_workflow", system = "postgresql")]
     pub async fn create_workflow(
         &self,
@@ -3288,8 +3292,6 @@ mod postgres_tests {
 
 impl Db {
     /// Restored fork workflow persistence operation.
-
-    /// Restored fork workflow persistence operation.
     pub async fn update_workflow_run_with_failure(
         &self,
         community_id: CommunityId,
@@ -3314,6 +3316,10 @@ impl Db {
         .await
     }
     /// Restored fork workflow persistence operation.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Matches the underlying store API"
+    )]
     pub async fn claim_workflow_effect(
         &self,
         community_id: CommunityId,
@@ -3342,6 +3348,10 @@ impl Db {
         .await
     }
     /// Restored fork workflow persistence operation.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Matches the underlying store API"
+    )]
     pub async fn load_workflow_effect_claim(
         &self,
         community_id: CommunityId,
@@ -3570,6 +3580,10 @@ impl Db {
         async { workflow_state::purge_expired_workflow_state(&self.pool, limit).await }.await
     }
     /// Restored fork workflow persistence operation.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Matches the underlying store API"
+    )]
     pub async fn write_workflow_state(
         &self,
         community_id: CommunityId,

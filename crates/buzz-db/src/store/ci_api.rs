@@ -22,6 +22,10 @@ impl Db {
         .await
     }
     /// Restored fork CI persistence operation.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Matches the underlying store API"
+    )]
     pub async fn find_merge_gate_allow(
         &self,
         community_id: CommunityId,
@@ -240,6 +244,10 @@ impl Db {
             .await
     }
     /// Restored fork CI persistence operation.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Matches the underlying store API"
+    )]
     pub async fn upsert_ci_grant(
         &self,
         community_id: CommunityId,
