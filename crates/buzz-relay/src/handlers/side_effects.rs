@@ -187,6 +187,10 @@ pub async fn evict_all_channel_subscriptions(
 }
 
 /// Dispatch side effects for a stored event.
+///
+/// The sole caller, `ingest_event_inner`, validates admin events before storage.
+/// Revalidating here duplicates database reads and can reject an already stored
+/// command if authorization state changes between validation and dispatch.
 pub(crate) async fn handle_side_effects(
     tenant: &TenantContext,
     kind: u32,
@@ -194,9 +198,6 @@ pub(crate) async fn handle_side_effects(
     state: &Arc<AppState>,
     admin_grant: &ChannelAdminGrantCell,
 ) -> anyhow::Result<()> {
-    if matches!(kind, 9000 | 9001 | 9002 | 9005 | 9008) {
-        validate_admin_event(tenant, kind, event, state, admin_grant).await?;
-    }
     match kind {
         0 => handle_kind0_profile(tenant, event, state).await,
         5 => handle_standard_deletion_event(tenant, event, state).await,

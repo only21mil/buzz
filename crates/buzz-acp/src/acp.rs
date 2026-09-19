@@ -689,7 +689,7 @@ impl AcpClient {
     /// Send `session/new` and return only the `sessionId` string.
     ///
     /// Convenience wrapper around [`session_new_full`].
-    #[allow(dead_code)] // Public API — callers outside the harness may use this.
+    #[cfg(test)]
     pub async fn session_new(
         &mut self,
         cwd: &str,
@@ -1252,38 +1252,6 @@ impl AcpClient {
         {
             Ok(result) => result,
             Err(_) => Err(AcpError::Timeout(timeout)),
-        }
-    }
-
-    /// Drain any buffered lines from the agent's stdout without blocking.
-    ///
-    /// After a [`AcpError::Timeout`] from [`send_request`], the agent may
-    /// eventually send the late response. That stale message will sit in the
-    /// `BufReader` buffer and be silently skipped by the next `read_until_response`
-    /// call (ID mismatch). However, if the caller wants a clean slate — e.g.
-    /// before retrying the same method — they can call this to consume any
-    /// buffered data with a short deadline.
-    ///
-    /// This is a best-effort drain: it reads until the buffer is empty or
-    /// `drain_timeout` elapses, whichever comes first. Errors are ignored.
-    #[allow(dead_code)] // Scaffolding for future model-switch timeout cleanup; not yet wired.
-    pub async fn drain_stale_responses(&mut self, drain_timeout: std::time::Duration) {
-        let deadline = tokio::time::Instant::now() + drain_timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            let read_result = tokio::time::timeout(remaining, self.reader.next()).await;
-            match read_result {
-                // Timeout or stream ended — buffer is empty or agent exited.
-                Err(_) | Ok(None) => break,
-                Ok(Some(Ok(_))) => {
-                    // Consumed one buffered line; loop to drain more.
-                    tracing::debug!(target: "acp::wire", "drained stale buffered line");
-                }
-                Ok(Some(Err(_))) => break,
-            }
         }
     }
 

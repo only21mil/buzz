@@ -26,8 +26,6 @@ use tempfile::TempDir;
 #[derive(Deserialize)]
 struct TokenForm {
     grant_type: String,
-    #[allow(dead_code)]
-    refresh_token: Option<String>,
 }
 
 /// Boot a stub OIDC server that:

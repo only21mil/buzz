@@ -26,6 +26,9 @@ use buzz_pubsub::EventTopic;
 /// Maximum time a new socket may hold a connection slot without completing NIP-42 auth.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Allow close/control frames to flush, then release a stalled socket writer.
+const WRITER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Shared mutable subscription map for a single WebSocket connection.
 pub(crate) type ConnectionSubscriptions = Arc<Mutex<HashMap<String, Vec<Filter>>>>;
 
@@ -269,7 +272,7 @@ async fn handle_active_connection(
     .await;
 
     cancel.cancel();
-    let _ = send_task.await;
+    finish_writer(send_task).await;
     let _ = heartbeat_task.await;
     let _ = auth_timeout_task.await;
 
@@ -296,6 +299,19 @@ async fn handle_active_connection(
     info!(conn_id = %conn_id, addr = %addr, "WebSocket connection closed");
 
     drop(permit);
+}
+
+async fn finish_writer(mut task: tokio::task::JoinHandle<()>) {
+    // The send loop can be inside a socket write when cancellation arrives.
+    // Retain the handle on timeout: dropping it would detach the stalled task
+    // and keep its socket alive even after connection cleanup completes.
+    if tokio::time::timeout(WRITER_SHUTDOWN_TIMEOUT, &mut task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        let _ = task.await;
+    }
 }
 
 /// Outbound send loop with control-frame priority.
@@ -720,6 +736,7 @@ mod tests {
         messages: Vec<WsMessage>,
         flush_count: usize,
         fail_after_flushes: Option<usize>,
+        stall_flush: bool,
     }
 
     #[derive(Debug, Clone)]
@@ -767,6 +784,9 @@ mod tests {
         ) -> std::task::Poll<Result<(), Self::Error>> {
             let mut state = self.state.lock().expect("mock sink poisoned");
             state.flush_count += 1;
+            if state.stall_flush {
+                return std::task::Poll::Pending;
+            }
             if state
                 .fail_after_flushes
                 .is_some_and(|limit| state.flush_count >= limit)
@@ -969,5 +989,50 @@ mod tests {
             matches!(state.messages[1], WsMessage::Close(_)),
             "Close is sent only after the reason frame is flushed"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_shutdown_aborts_and_joins_a_stalled_flush() {
+        let (data_tx, data_rx) = mpsc::channel(1);
+        let (_ctrl_tx, ctrl_rx) = mpsc::channel(1);
+        let (_restart_tx, restart_rx) = mpsc::channel(1);
+        data_tx.send(WsMessage::Text("data".into())).await.unwrap();
+        let (sink, state) = MockSink::new(None);
+        state.lock().unwrap().stall_flush = true;
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(send_loop_inner(
+            sink,
+            data_rx,
+            ctrl_rx,
+            restart_rx,
+            cancel.clone(),
+        ));
+        tokio::task::yield_now().await;
+        assert_eq!(state.lock().unwrap().flush_count, 1);
+        cancel.cancel();
+        let started = tokio::time::Instant::now();
+        finish_writer(task).await;
+        assert_eq!(started.elapsed(), WRITER_SHUTDOWN_TIMEOUT);
+        assert_eq!(Arc::strong_count(&state), 1, "writer must drop its sink");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn writer_shutdown_allows_a_ready_close_to_flush() {
+        let (_data_tx, data_rx) = mpsc::channel(1);
+        let (_ctrl_tx, ctrl_rx) = mpsc::channel(1);
+        let (_restart_tx, restart_rx) = mpsc::channel(1);
+        let (sink, state) = MockSink::new(None);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let task = tokio::spawn(send_loop_inner(sink, data_rx, ctrl_rx, restart_rx, cancel));
+        let started = tokio::time::Instant::now();
+        finish_writer(task).await;
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        let state = state.lock().unwrap();
+        assert_eq!(state.flush_count, 1);
+        assert!(matches!(
+            state.messages.as_slice(),
+            [WsMessage::Close(None)]
+        ));
     }
 }

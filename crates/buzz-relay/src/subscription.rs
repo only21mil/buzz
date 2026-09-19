@@ -470,83 +470,70 @@ impl SubscriptionRegistry {
     ) {
         if let Some(ch_id) = channel_id {
             match extract_kinds_from_filters(filters) {
-                // None = wildcard (at least one filter had no kinds constraint).
-                None => {
-                    // Was in wildcard index.
-                    if let Some(mut entries) =
-                        self.channel_wildcard_index.get_mut(&(community_id, ch_id))
-                    {
-                        entries.retain(|(cid, sid)| !(*cid == conn_id && sid == sub_id));
-                        if entries.is_empty() {
-                            drop(entries);
-                            self.channel_wildcard_index.remove(&(community_id, ch_id));
-                        }
-                    }
-                }
-                Some(kinds) if kinds.is_empty() => {
-                    // `kinds: []` subscriptions are never indexed (they match nothing),
-                    // so there is nothing to remove here.
-                }
+                None => remove_index_subscription(
+                    &self.channel_wildcard_index,
+                    (community_id, ch_id),
+                    conn_id,
+                    sub_id,
+                ),
                 Some(kinds) => {
-                    // Was in kind-specific index.
                     for kind in kinds {
-                        let key = IndexKey {
-                            channel_id: ch_id,
-                            kind,
-                        };
-                        if let Some(mut entries) = self
-                            .channel_kind_index
-                            .get_mut(&(community_id, key.clone()))
-                        {
-                            entries.retain(|(cid, sid)| !(*cid == conn_id && sid == sub_id));
-                            if entries.is_empty() {
-                                drop(entries);
-                                self.channel_kind_index.remove(&(community_id, key));
-                            }
-                        }
+                        remove_index_subscription(
+                            &self.channel_kind_index,
+                            (
+                                community_id,
+                                IndexKey {
+                                    channel_id: ch_id,
+                                    kind,
+                                },
+                            ),
+                            conn_id,
+                            sub_id,
+                        );
                     }
                 }
+            }
+        } else if let Some(keys) = extract_global_p_kind_index_keys(community_id, filters) {
+            for key in keys {
+                remove_index_subscription(&self.global_p_kind_index, key, conn_id, sub_id);
             }
         } else {
-            // Global subscription — remove from the same global index chosen at registration.
-            if let Some(keys) = extract_global_p_kind_index_keys(community_id, filters) {
-                for key in keys {
-                    if let Some(mut entries) = self.global_p_kind_index.get_mut(&key) {
-                        entries.retain(|(cid, sid)| !(*cid == conn_id && sid == sub_id));
-                        if entries.is_empty() {
-                            drop(entries);
-                            self.global_p_kind_index.remove(&key);
-                        }
-                    }
-                }
-            } else {
-                match extract_kinds_from_filters(filters) {
-                    None => {
-                        if let Some(mut entries) = self.global_wildcard_index.get_mut(&community_id)
-                        {
-                            entries.retain(|(cid, sid)| !(*cid == conn_id && sid == sub_id));
-                            if entries.is_empty() {
-                                drop(entries);
-                                self.global_wildcard_index.remove(&community_id);
-                            }
-                        }
-                    }
-                    Some(kinds) if kinds.is_empty() => {}
-                    Some(kinds) => {
-                        for kind in kinds {
-                            if let Some(mut entries) =
-                                self.global_kind_index.get_mut(&(community_id, kind))
-                            {
-                                entries.retain(|(cid, sid)| !(*cid == conn_id && sid == sub_id));
-                                if entries.is_empty() {
-                                    drop(entries);
-                                    self.global_kind_index.remove(&(community_id, kind));
-                                }
-                            }
-                        }
+            match extract_kinds_from_filters(filters) {
+                None => remove_index_subscription(
+                    &self.global_wildcard_index,
+                    community_id,
+                    conn_id,
+                    sub_id,
+                ),
+                Some(kinds) => {
+                    for kind in kinds {
+                        remove_index_subscription(
+                            &self.global_kind_index,
+                            (community_id, kind),
+                            conn_id,
+                            sub_id,
+                        );
                     }
                 }
             }
+        }
+    }
+}
+
+/// Prune a subscription and its empty bucket while holding the same shard lock.
+/// Releasing the lock before removing the bucket can erase a new subscriber.
+fn remove_index_subscription<K: Eq + std::hash::Hash>(
+    index: &DashMap<K, Vec<(ConnId, SubId)>>,
+    key: K,
+    conn_id: ConnId,
+    sub_id: &str,
+) {
+    if let dashmap::mapref::entry::Entry::Occupied(mut entry) = index.entry(key) {
+        entry
+            .get_mut()
+            .retain(|(cid, sid)| !(*cid == conn_id && sid == sub_id));
+        if entry.get().is_empty() {
+            entry.remove();
         }
     }
 }
@@ -684,6 +671,41 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].0, conn_id);
         assert_eq!(matches[0].1, sub_id);
+    }
+
+    #[test]
+    fn concurrent_disconnect_preserves_other_connection_subscription() {
+        // Exercise every index shape with distinct connection IDs: their
+        // authoritative subscription locks do not serialize index updates.
+        for channel_id in [None, Some(Uuid::new_v4())] {
+            for filter in [
+                Filter::new(),
+                Filter::new().kind(Kind::TextNote),
+                Filter::new()
+                    .kind(Kind::TextNote)
+                    .custom_tag(SingleLetterTag::lowercase(Alphabet::P), "recipient"),
+            ] {
+                for _ in 0..100 {
+                    let registry = Arc::new(SubscriptionRegistry::new());
+                    let old = Uuid::new_v4();
+                    let new = Uuid::new_v4();
+                    registry.register(old, "old".into(), vec![filter.clone()], channel_id);
+                    let barrier = Arc::new(std::sync::Barrier::new(2));
+                    std::thread::scope(|scope| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            registry.remove_connection(old);
+                        });
+                        barrier.wait();
+                        registry.register(new, "new".into(), vec![filter.clone()], channel_id);
+                    });
+                    let event = make_stored_event_with_p(Kind::TextNote, "recipient", channel_id);
+                    assert_eq!(registry.fan_out(&event), vec![(new, "new".into())]);
+                    registry.remove_connection(new);
+                    assert!(registry.fan_out(&event).is_empty());
+                }
+            }
+        }
     }
 
     #[test]

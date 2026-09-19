@@ -27,7 +27,6 @@ pub(crate) fn internal_error(msg: &str) -> (StatusCode, Json<serde_json::Value>)
     api_error(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
 }
 
-#[allow(dead_code)]
 pub(crate) fn not_found(msg: &str) -> (StatusCode, Json<serde_json::Value>) {
     api_error(StatusCode::NOT_FOUND, msg)
 }

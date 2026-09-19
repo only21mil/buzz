@@ -1003,20 +1003,6 @@ impl HarnessRelay {
         self.event_rx.recv().await.flatten()
     }
 
-    /// Publish a signed event to the relay via the background WebSocket task.
-    ///
-    /// Blocks until the command channel has capacity. For ephemeral events
-    /// (typing indicators) prefer [`try_publish_event`] which never blocks.
-    #[allow(dead_code)] // Public API — callers outside the harness may use this
-    pub async fn publish_event(&self, event: Event) -> Result<(), RelayError> {
-        self.cmd_tx
-            .send(RelayCommand::PublishEvent {
-                event: Box::new(event),
-            })
-            .await
-            .map_err(|_| RelayError::ConnectionClosed)
-    }
-
     /// Fire-and-forget publish — uses `try_send` so it never blocks the caller.
     ///
     /// Suitable for ephemeral commands like typing indicators where dropping

@@ -871,36 +871,6 @@ impl BuzzClient {
         .await
     }
 
-    /// Execute a one-shot count via the HTTP bridge.
-    /// Returns the count as a JSON string.
-    #[allow(dead_code)]
-    pub async fn count(&self, filter: &serde_json::Value) -> Result<String, CliError> {
-        let url = format!("{}/count", self.relay_url);
-        let body = bytes::Bytes::from(
-            serde_json::to_vec(&[filter])
-                .map_err(|e| CliError::Other(format!("filter serialization failed: {e}")))?,
-        );
-        self.with_retry_body(|| {
-            let body = body.clone();
-            let url = url.clone();
-            async move {
-                let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
-                let resp = self
-                    .with_auth_tag(
-                        self.http
-                            .post(&url)
-                            .header("Authorization", auth)
-                            .header("Content-Type", "application/json")
-                            .body(body),
-                    )
-                    .send()
-                    .await?;
-                self.handle_response(resp).await
-            }
-        })
-        .await
-    }
-
     /// GET an authed relay endpoint (NIP-98), returning the raw JSON body.
     ///
     /// `path` is a root-relative path incl. any query string, e.g.
