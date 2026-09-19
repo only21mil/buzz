@@ -414,6 +414,11 @@ unless the following explicit fork-design acceptance governs the path.
   fork feature despite upstream deletion. Migration guards moved into the
   active runtime module; the obsolete root module is retired.
 
+### Accepted fork divergences
+
+- Android age signals use a no-SDK provider returning `unavailable`, preserving the fork's Google-free build and unchanged SDK guard.
+- Upstream age-signal Dart handling and tests, and the iOS implementation, remain unchanged; the Android Play SDK and its transitive dependencies are omitted.
+
 ### Accepted upstream code
 
 The `unsafe` blocks in desktop native managed-agent discovery are unchanged
