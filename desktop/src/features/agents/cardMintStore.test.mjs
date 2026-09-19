@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { beforeEach, describe, it } from "node:test";
+import { toast } from "sonner";
 
 // cardMintStore drives the non-blocking mint flow: the dialog dispatches a
 // job and closes; the composer chip, completion toast, and viewer all read
@@ -37,6 +38,46 @@ describe("cardMintStore", () => {
   beforeEach(() => {
     resetCardMintStore();
   });
+
+  it("reset clears cards, viewer and gallery from the previous community", async () => {
+    await runCardMintJob(INPUT, () => Promise.resolve(CARD));
+    openCardViewer({ card: CARD, agentName: "Eva", remint: INPUT });
+    setCardGalleryOpen(true);
+    resetCardMintStore();
+    assert.deepEqual(getCardMintJobs(), []);
+    assert.equal(getCardViewerState(), null);
+    assert.equal(getCardGalleryOpen(), false);
+  });
+
+  for (const outcome of ["success", "failure"]) {
+    it(`ignores a previous community's late mint ${outcome}`, async (t) => {
+      const success = t.mock.method(toast, "success", () => undefined);
+      const error = t.mock.method(toast, "error", () => undefined);
+      let settle;
+      const run = runCardMintJob(
+        INPUT,
+        () =>
+          new Promise((resolve, reject) => {
+            settle = () =>
+              outcome === "success"
+                ? resolve(CARD)
+                : reject(new Error("old community failed"));
+          }),
+      );
+      resetCardMintStore();
+      await runCardMintJob({ agentId: "new-agent", agentName: "New" }, () =>
+        Promise.resolve(CARD),
+      );
+      const currentJobs = getCardMintJobs();
+      settle();
+      await run;
+      assert.equal(getCardMintJobs(), currentJobs);
+      assert.equal(currentJobs[0].input.agentId, "new-agent");
+      assert.equal(success.mock.callCount(), 1);
+      assert.equal(error.mock.callCount(), 0);
+      assert.equal(getCardViewerState(), null);
+    });
+  }
 
   it("forwards the mint input — including memoryLevel — to mintFn", async () => {
     const seen = [];
