@@ -1,3 +1,4 @@
+import { getStorageItem } from "@/shared/lib/safeStorage";
 import { localExtraSlotIdsKey } from "@/features/channels/readState/readStateFormat";
 import { setLocalStorageItemWithRecovery } from "@/shared/lib/localStorageQuota";
 
@@ -6,6 +7,8 @@ import { setLocalStorageItemWithRecovery } from "@/shared/lib/localStorageQuota"
  * client id, this client's slot id, and any extra slot ids allocated when the
  * blob outgrows the single-slot budget (NIP-RS multi-slot mode).
  */
+
+const sessionPersistedValues = new Map<string, string>();
 
 const CLIENT_ID_KEY_PREFIX = "buzz.nip-rs.client-id";
 const SLOT_ID_KEY_PREFIX = "buzz.nip-rs.slot-id";
@@ -20,11 +23,12 @@ export function getOrCreatePersisted(
   key: string,
   generator: () => string,
 ): string {
-  let value = localStorage.getItem(key);
+  let value = getStorageItem(key) ?? sessionPersistedValues.get(key) ?? null;
   if (!value) {
     value = generator();
     setLocalStorageItemWithRecovery(key, value);
   }
+  sessionPersistedValues.set(key, value);
   return value;
 }
 
@@ -38,7 +42,7 @@ export function slotIdKey(pubkey: string): string {
 
 export function loadExtraSlotIds(pubkey: string): string[] {
   try {
-    const raw = localStorage.getItem(localExtraSlotIdsKey(pubkey));
+    const raw = getStorageItem(localExtraSlotIdsKey(pubkey));
     if (!raw) return [];
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
