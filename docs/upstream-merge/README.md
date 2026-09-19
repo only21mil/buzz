@@ -318,3 +318,52 @@ are saved outside the repository under
 `um9e-queue-remaining.patch`. These `*remaining.patch` files include intentional
 fork differences, not just missing features. The decision and check receipt is
 `/home/victor/work/buzz_upstream/reports/rust_acp_workflow.md`.
+
+## Status at polish
+
+The polish lane starts at integration head `b169a9186` and merges fork main
+`e67434d1d` with a two-parent merge, `fe09953a1`. The one-shot fleet directories
+remain removed. Native-CI discovery retains main's simplification and the
+root-CI Bash-version guard. The PostgreSQL test inventory follows the merged
+source layout, including the `store`, `runtime`, and `postgres_tests` modules;
+the two Justfile admin exclusions use their current names.
+
+Fresh checks on this head passed Rust workspace formatting and clippy with
+warnings denied, mobile analysis, the configured Flutter suite with 2,416
+passing and four skipped tests, and the separate unconfigured-push test.
+Web typecheck, lint, and all 24 unit tests passed. Admin-web typecheck, lint,
+and its test command passed; that command found no unit tests. PostgreSQL
+discovery's seven contract tests and the native-CI Python batch passed. The
+initial Rust unit run exhausted the required scope's 300-task limit. Its
+bounded retry passed core/auth, auth doctests, voice, CLI, CI control-plane,
+ACP, DB, and the selected media regression before this time-capped call
+stopped during the next compilation. The exact recipe remains incomplete;
+resume it with `NEXTEST_TEST_THREADS=4`, `TOKIO_WORKER_THREADS=4`, and
+`CARGO_BUILD_JOBS=4`. The Rust gate is not yet complete.
+
+Compiled discovery remains blocked. Thirteen inventory rows describe tests
+in orphaned source files: twelve across the root buzz-db `channel_members.rs`,
+`observability.rs`, and `session_policy.rs`, plus the ACP Pi prompt test.
+Reconcile their retained fork behavior with the active modules before removing
+obsolete copies. The relay main test also needs an admitted executable target
+identity distinct from the library; the current runner accepts only library
+and integration-test artifacts. Source inventory validation alone does not
+prove compiled coverage. Two review findings were repaired: scratch database
+URLs retain the owned socket options, and three real-Redis presence tests are
+explicitly classified as external.
+
+Desktop remains with its workers: finish desktop TypeScript and unit tests,
+resolve cancelled or stalled tests, complete Tauri test compilation and native
+regressions, and verify message publication, huddle admission, project checkout,
+and workflow approval behavior. This lane does not claim desktop checks or
+app builds passed. The parent still owns the whole-branch review and merging
+this pushed lane into the integration branch.
+
+Production remains Victor's decision under
+[the migration-lineage runbook](../../deploy/migration-lineage/README.md).
+Rehearse the exact candidate against an isolated backup restore and an empty
+database, compare schemas and fences, and time migration 0033. Production
+requires the approved ledger readback, a fresh backup, the reviewed forward
+ledger rewrite, deployment through the migration count gate, and verification
+of 59 successful migrations ending at 1044 plus healthy relay probes. Neither
+the SQL cutover nor deployment was run by this lane.
