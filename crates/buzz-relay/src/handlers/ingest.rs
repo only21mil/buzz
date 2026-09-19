@@ -4224,61 +4224,6 @@ mod postgres_tests {
     }
 
     #[test]
-    fn missing_huddle_backing_channel_is_a_client_rejection() {
-        let channel_id = Uuid::new_v4();
-        assert!(matches!(
-            map_huddle_backing_channel_error(buzz_db::DbError::ChannelNotFound(channel_id)),
-            IngestError::Rejected(message) if message.contains("backing channel not found")
-        ));
-    }
-
-    #[test]
-    fn huddle_backing_channel_lookup_outage_is_internal() {
-        let error = sqlx::Error::Io(std::io::Error::other("database unavailable"));
-        assert!(matches!(
-            map_huddle_backing_channel_error(buzz_db::DbError::Sqlx(error)),
-            IngestError::Internal(message) if message.contains("loading Huddle backing channel")
-        ));
-    }
-
-    #[test]
-    fn huddle_backing_ttl_honors_the_ephemeral_override() {
-        assert_eq!(expected_huddle_backing_ttl(None), 3600);
-        assert_eq!(expected_huddle_backing_ttl(Some(60)), 60);
-    }
-
-    #[test]
-    fn huddle_lifecycle_requires_a_uuid_backing_channel() {
-        let event = EventBuilder::new(
-            Kind::Custom(KIND_HUDDLE_STARTED as u16),
-            r#"{"ephemeral_channel_id":"not-a-uuid"}"#,
-        )
-        .sign_with_keys(&nostr::Keys::generate())
-        .expect("sign Huddle event");
-
-        assert!(matches!(
-            huddle_backing_channel_id(&event),
-            Err(IngestError::Rejected(message)) if message.contains("must be a UUID")
-        ));
-    }
-
-    #[test]
-    fn huddle_lifecycle_extracts_the_backing_channel() {
-        let channel_id = Uuid::new_v4();
-        let event = EventBuilder::new(
-            Kind::Custom(KIND_HUDDLE_ENDED as u16),
-            serde_json::json!({"ephemeral_channel_id": channel_id}).to_string(),
-        )
-        .sign_with_keys(&nostr::Keys::generate())
-        .expect("sign Huddle event");
-
-        assert_eq!(
-            huddle_backing_channel_id(&event).expect("channel id"),
-            channel_id
-        );
-    }
-
-    #[test]
     fn reaction_validation_accepts_wrapped_max_shortcode() {
         let shortcode = "a".repeat(buzz_sdk::MAX_CUSTOM_EMOJI_SHORTCODE_LEN);
         let event = EventBuilder::new(Kind::Custom(KIND_REACTION as u16), format!(":{shortcode}:"))

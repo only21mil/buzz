@@ -4075,7 +4075,7 @@ jobs:
         let ids: std::collections::HashSet<_> =
             jobs.iter().map(|job| job.job_id.as_str()).collect();
 
-        assert_eq!(jobs.len(), 18);
+        assert_eq!(jobs.len(), 21);
         for expected in [
             "rust-lint",
             "desktop-smoke-e2e",

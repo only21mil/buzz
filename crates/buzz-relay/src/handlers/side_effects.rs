@@ -17,6 +17,7 @@ use buzz_core::kind::{
 use buzz_core::StoredEvent;
 use buzz_db::channel::{MemberRecord, MemberRole};
 
+use super::channel_authz::{self, ChannelAuthzError, RemoveOtherDecision};
 use super::event::dispatch_persistent_event;
 use super::moderation_authz::ChannelAdminGrantCell;
 use crate::protocol::RelayMessage;
@@ -118,20 +119,24 @@ async fn evict_conn_channel_subscriptions(
 
     if let Some(subscriptions) = state.conn_manager.subscriptions_for(conn_id) {
         let mut conn_subscriptions = subscriptions.lock().await;
-        for (sub_id, _) in &removed {
-            conn_subscriptions.remove(sub_id);
+        for update in &removed {
+            if update.removed {
+                conn_subscriptions.remove(&update.sub_id);
+            }
         }
     }
 
-    for (sub_id, removed_scope) in removed {
+    for update in removed {
         state
             .pubsub
-            .release_topic(tenant, topic_for_subscription(removed_scope.channel_id))
+            .release_topic(tenant, buzz_pubsub::EventTopic::Channel(channel_id))
             .await;
-        let _ = state.conn_manager.send_to(
-            conn_id,
-            RelayMessage::closed(&sub_id, "restricted: channel access revoked"),
-        );
+        if update.removed {
+            let _ = state.conn_manager.send_to(
+                conn_id,
+                RelayMessage::closed(&update.sub_id, "restricted: channel access revoked"),
+            );
+        }
     }
 }
 
@@ -145,7 +150,10 @@ async fn evict_non_member_channel_subscriptions(
     state: &Arc<AppState>,
     channel_id: Uuid,
 ) -> anyhow::Result<()> {
-    let members = state.db.get_members(tenant.community(), channel_id).await?;
+    let members = state
+        .db
+        .get_members_for_event_write(tenant.community(), channel_id)
+        .await?;
     let member_pubkeys: std::collections::HashSet<Vec<u8>> =
         members.into_iter().map(|m| m.pubkey).collect();
 
@@ -265,7 +273,7 @@ pub async fn validate_standard_deletion_event(
     for target_id in target_ids {
         let target_event = state
             .db
-            .get_event_by_id_including_deleted(tenant.community(), &target_id)
+            .get_event_by_id_including_deleted_for_event_write(tenant.community(), &target_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("target event not found"))?;
         if is_agent_draft_kind(event_kind_u32(&target_event.event)) {
@@ -443,7 +451,7 @@ pub(crate) async fn validate_admin_event(
     // (unarchive), which must be allowed through so the channel can be restored.
     let channel = state
         .db
-        .get_channel(tenant.community(), channel_id)
+        .get_channel_for_event_write(tenant.community(), channel_id)
         .await
         .map_err(|_| anyhow::anyhow!("channel not found"))?;
     let is_unarchive_request = kind == 9002
@@ -472,7 +480,10 @@ pub(crate) async fn validate_admin_event(
                 None => None,
             };
 
-            let members = state.db.get_members(tenant.community(), channel_id).await?;
+            let members = state
+                .db
+                .get_members_for_event_write(tenant.community(), channel_id)
+                .await?;
             let actor_role: Option<buzz_db::channel::MemberRole> = members
                 .iter()
                 .find(|m| m.pubkey == actor_bytes)
@@ -573,25 +584,19 @@ pub(crate) async fn validate_admin_event(
             // REMOVE_USER: self-remove allowed unless actor is the last owner; removing others requires owner/admin
             let target_pubkey =
                 extract_p_tag(event).ok_or_else(|| anyhow::anyhow!("missing p tag"))?;
+            let members = state
+                .db
+                .get_members_for_event_write(tenant.community(), channel_id)
+                .await?;
             if target_pubkey == actor_bytes {
                 // Self-removal: must be an active member, and cannot be the last owner.
-                let members = state.db.get_members(tenant.community(), channel_id).await?;
-                let actor_member = members.iter().find(|m| m.pubkey == actor_bytes);
-                match actor_member {
-                    None => {
-                        return Err(anyhow::anyhow!("actor is not an active member"));
-                    }
-                    Some(m) if m.role == "owner" => {
-                        let owner_count = members.iter().filter(|m| m.role == "owner").count();
-                        if owner_count <= 1 {
-                            return Err(anyhow::anyhow!("cannot remove the last owner"));
-                        }
-                    }
-                    _ => {}
-                }
+                channel_authz::decide_self_departure(&members, &actor_bytes)?;
                 Ok(())
             } else {
-                let members = state.db.get_members(tenant.community(), channel_id).await?;
+                let members = state
+                    .db
+                    .get_members_for_event_write(tenant.community(), channel_id)
+                    .await?;
                 if community_authorized {
                     if members
                         .iter()
@@ -602,10 +607,9 @@ pub(crate) async fn validate_admin_event(
                     }
                     return Ok(());
                 }
-                let actor_member = members.iter().find(|m| m.pubkey == actor_bytes);
-                match actor_member {
-                    Some(m) if m.role == "owner" || m.role == "admin" => Ok(()),
-                    Some(_) => {
+                match channel_authz::classify_remove_other(&members, &actor_bytes) {
+                    RemoveOtherDecision::Allow => Ok(()),
+                    RemoveOtherDecision::CheckAgentOwner => {
                         if state
                             .db
                             .is_agent_owner(tenant.community(), &target_pubkey, &actor_bytes)
@@ -613,13 +617,13 @@ pub(crate) async fn validate_admin_event(
                         {
                             Ok(())
                         } else {
-                            Err(anyhow::anyhow!("actor not authorized"))
+                            Err(ChannelAuthzError::ActorNotAuthorized.into())
                         }
                     }
                     // Non-members fall here. We intentionally do NOT check
                     // is_agent_owner for non-members — you must be in the channel
                     // to remove anyone, even your own bot.
-                    _ => Err(anyhow::anyhow!("actor not authorized")),
+                    RemoveOtherDecision::Deny => Err(ChannelAuthzError::ActorNotAuthorized.into()),
                 }
             }
         }
@@ -729,7 +733,10 @@ pub(crate) async fn validate_admin_event(
                 return Ok(());
             }
             if has_privileged_tag {
-                let members = state.db.get_members(tenant.community(), channel_id).await?;
+                let members = state
+                    .db
+                    .get_members_for_event_write(tenant.community(), channel_id)
+                    .await?;
                 let actor_member = members.iter().find(|m| m.pubkey == actor_bytes);
                 match actor_member {
                     Some(m) if m.role == "owner" || m.role == "admin" => Ok(()),
@@ -779,7 +786,7 @@ pub(crate) async fn validate_admin_event(
             // BEFORE storage. Fail closed: missing target → reject.
             let target_event = state
                 .db
-                .get_event_by_id(tenant.community(), &target_id)
+                .get_event_by_id_for_event_write(tenant.community(), &target_id)
                 .await
                 .map_err(|e| anyhow::anyhow!("db error looking up target: {e}"))?
                 .ok_or_else(|| anyhow::anyhow!("target event not found"))?;
@@ -818,7 +825,7 @@ pub(crate) async fn validate_admin_event(
                 }
                 let is_open = state
                     .db
-                    .get_channel(tenant.community(), channel_id)
+                    .get_channel_for_event_write(tenant.community(), channel_id)
                     .await
                     .map(|ch| ch.visibility == "open")
                     .unwrap_or(false);
@@ -859,7 +866,10 @@ pub(crate) async fn validate_admin_event(
                 return Ok(());
             }
             // DELETE_GROUP: owner only, or the owning human of the channel's agent-owner.
-            let members = state.db.get_members(tenant.community(), channel_id).await?;
+            let members = state
+                .db
+                .get_members_for_event_write(tenant.community(), channel_id)
+                .await?;
             let actor_member = members.iter().find(|m| m.pubkey == actor_bytes);
             match actor_member {
                 Some(m) if m.role == "owner" => Ok(()),
@@ -878,20 +888,12 @@ pub(crate) async fn validate_admin_event(
         }
         9022 => {
             // LEAVE_REQUEST: must be an active member, and cannot be the last owner.
-            let members = state.db.get_members(tenant.community(), channel_id).await?;
-            let actor_member = members.iter().find(|m| m.pubkey == actor_bytes);
-            match actor_member {
-                None => {
-                    return Err(anyhow::anyhow!("actor is not an active member"));
-                }
-                Some(m) if m.role == "owner" => {
-                    let owner_count = members.iter().filter(|m| m.role == "owner").count();
-                    if owner_count <= 1 {
-                        return Err(anyhow::anyhow!("cannot remove the last owner"));
-                    }
-                }
-                _ => {}
-            }
+            // Identical rule to kind:9001 self-removal, including its wording.
+            let members = state
+                .db
+                .get_members_for_event_write(tenant.community(), channel_id)
+                .await?;
+            channel_authz::decide_self_departure(&members, &actor_bytes)?;
             Ok(())
         }
         _ => Ok(()),
@@ -899,28 +901,38 @@ pub(crate) async fn validate_admin_event(
 }
 
 /// Emit a system message (kind 40099) signed by the relay keypair.
+///
+/// `idempotency_ts` is used as the event's `created_at`. Passing a stable
+/// timestamp (e.g. from the outbox row's `created_at`) makes re-tries produce
+/// the same Nostr event ID — the existing `ON CONFLICT DO NOTHING` in
+/// `insert_event` then provides DB-enforced delivery idempotency.
+///
+/// Returns `Err` if the event could not be durably inserted; fanout remains
+/// best-effort.
 pub async fn emit_system_message(
     tenant: &TenantContext,
     state: &Arc<AppState>,
     channel_id: Uuid,
     content: serde_json::Value,
+    idempotency_ts: chrono::DateTime<chrono::Utc>,
 ) -> anyhow::Result<()> {
     let channel_tag = Tag::parse(["h", &channel_id.to_string()])?;
 
+    let ts = nostr::Timestamp::from(idempotency_ts.timestamp() as u64);
     let event = EventBuilder::new(Kind::Custom(40099), content.to_string())
         .tags([channel_tag])
+        .custom_created_at(ts)
         .sign_with_keys(&state.relay_keypair)
         .map_err(|e| anyhow::anyhow!("failed to sign system message: {e}"))?;
 
-    if let Err(e) = state
+    // Durable insert is the completion boundary — propagate failure.
+    state
         .db
         .insert_event(tenant.community(), &event, Some(channel_id))
         .await
-    {
-        warn!(channel = %channel_id, error = %e, "system message insert failed");
-    }
+        .map_err(|e| anyhow::anyhow!("system message insert failed: {e}"))?;
 
-    // Fan out to subscribers
+    // Fan out to subscribers: best-effort, clients can retrieve the persisted event.
     if let Err(e) = state
         .pubsub
         .publish_event(tenant, EventTopic::Channel(channel_id), &event)
@@ -1144,7 +1156,7 @@ async fn emit_addressable_discovery_event(
     let min_ts = {
         let existing = state
             .db
-            .query_events(&buzz_db::event::EventQuery {
+            .query_events_for_event_write(&buzz_db::event::EventQuery {
                 kinds: Some(vec![kind as i32]),
                 channel_id: Some(channel_id),
                 limit: Some(1),
@@ -1222,6 +1234,69 @@ fn discovery_tags_match(event: &Event, desired_tags: &[Tag]) -> bool {
     existing == desired
 }
 
+async fn store_group_members_event(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    channel_id: Uuid,
+    member_snapshot: &mut buzz_db::channel::LockedMemberSnapshot,
+) -> anyhow::Result<Option<buzz_core::StoredEvent>> {
+    let group_id = channel_id.to_string();
+    let agent_pubkeys: HashSet<Vec<u8>> = state
+        .db
+        .get_agent_pubkeys(tenant.community())
+        .await?
+        .into_iter()
+        .collect();
+    let tags = group_member_tags(&group_id, &member_snapshot.members, &agent_pubkeys)?;
+    let relay_pubkey = state.relay_keypair.public_key().to_bytes();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let ts = member_snapshot
+        .latest_member_event_timestamp(tenant.community(), channel_id, &relay_pubkey)
+        .await?
+        .map(|timestamp| timestamp + 1)
+        .unwrap_or(now)
+        .max(now);
+    // A relay-signed roster of a channel the relay is itself a member of (the
+    // relay's moderation-DM key participates in the {relay, recipient} DM used
+    // for moderation notices) MUST retain the relay's own `p` tag. nostr's
+    // default `build_with_ctx` strips any `p` tag matching the signer, which
+    // would drop the relay from the snapshot and fail migration 0032's roster
+    // fence against the canonical two-member DM. `allow_self_tagging` keeps the
+    // snapshot faithful to `channel_members`.
+    let event = EventBuilder::new(Kind::Custom(KIND_NIP29_GROUP_MEMBERS as u16), "")
+        .tags(tags)
+        .allow_self_tagging()
+        .custom_created_at(nostr::Timestamp::from(ts))
+        .sign_with_keys(&state.relay_keypair)
+        .map_err(|error| anyhow::anyhow!("failed to sign member snapshot: {error}"))?;
+    let (stored, inserted) = member_snapshot
+        .replace_member_event(tenant.community(), channel_id, &event)
+        .await?;
+    Ok(inserted.then_some(stored))
+}
+
+async fn dispatch_group_members_event(
+    tenant: &TenantContext,
+    state: &Arc<AppState>,
+    stored: Option<buzz_core::StoredEvent>,
+    relay_pubkey_hex: &str,
+) {
+    if let Some(stored) = stored {
+        dispatch_persistent_event(
+            tenant,
+            state,
+            &stored,
+            KIND_NIP29_GROUP_MEMBERS,
+            relay_pubkey_hex,
+            None,
+        )
+        .await;
+    }
+}
+
 /// Emit NIP-29 group discovery events (39000, 39001, 39002) signed by the relay keypair.
 /// Called after group creation, metadata changes, or membership changes.
 /// Events are stored channel-scoped (`channel_id = Some(...)`) so that existing
@@ -1248,10 +1323,16 @@ async fn emit_group_discovery_events_with_agents(
     tenant: &TenantContext,
     state: &Arc<AppState>,
     channel_id: Uuid,
-    agent_pubkeys: &HashSet<Vec<u8>>,
+    _agent_pubkeys: &HashSet<Vec<u8>>,
 ) -> anyhow::Result<()> {
-    let channel = state.db.get_channel(tenant.community(), channel_id).await?;
-    let members = state.db.get_members(tenant.community(), channel_id).await?;
+    let channel = state
+        .db
+        .get_channel_for_event_write(tenant.community(), channel_id)
+        .await?;
+    let members = state
+        .db
+        .get_members_for_event_write(tenant.community(), channel_id)
+        .await?;
 
     let relay_pubkey_hex = hex::encode(state.relay_keypair.public_key().to_bytes());
     let group_id = channel_id.to_string();
@@ -1332,18 +1413,18 @@ async fn emit_group_discovery_events_with_agents(
         .await?;
     }
 
-    {
-        let tags = group_member_tags(&group_id, &members, agent_pubkeys)?;
-        emit_addressable_discovery_event(
-            tenant,
-            state,
-            channel_id,
-            KIND_NIP29_GROUP_MEMBERS,
-            tags,
-            &relay_pubkey_hex,
-        )
+    // Re-capture membership behind the writer lock immediately before the
+    // authoritative 39002 replacement. Metadata/admin snapshots retain their
+    // existing behavior; only membership publication needs this freshness fence.
+    let relay_pubkey = state.relay_keypair.public_key().to_bytes();
+    let mut member_snapshot = state
+        .db
+        .lock_member_snapshot(tenant.community(), channel_id, &relay_pubkey)
         .await?;
-    }
+    let stored_members =
+        store_group_members_event(tenant, state, channel_id, &mut member_snapshot).await?;
+    member_snapshot.release().await?;
+    dispatch_group_members_event(tenant, state, stored_members, &relay_pubkey_hex).await;
 
     Ok(())
 }
@@ -1482,7 +1563,10 @@ async fn handle_put_user(
     let channel_id =
         extract_h_tag_channel(event).ok_or_else(|| anyhow::anyhow!("missing h tag"))?;
     let target_pubkey = extract_p_tag(event).ok_or_else(|| anyhow::anyhow!("missing p tag"))?;
-    let members = state.db.get_members(tenant.community(), channel_id).await?;
+    let members = state
+        .db
+        .get_members_for_event_write(tenant.community(), channel_id)
+        .await?;
     // No role tag = no role change: preserve an existing member's current role and
     // fall back to Member only for a new member. Unconditionally defaulting to
     // Member let a bare PUT_USER silently demote an existing owner/admin.
@@ -1532,6 +1616,7 @@ async fn handle_put_user(
             "actor": actor_hex,
             "target": target_hex,
         }),
+        chrono::Utc::now(),
     )
     .await?;
 
@@ -1586,15 +1671,12 @@ async fn handle_remove_user(
 
     // Guard: prevent last-owner orphaning on self-removal (kind 9001).
     if target_pubkey == actor_bytes {
-        let members = state.db.get_members(tenant.community(), channel_id).await?;
-        let owner_count = members.iter().filter(|m| m.role == "owner").count();
-        let actor_is_owner = members
-            .iter()
-            .any(|m| m.pubkey == actor_bytes && m.role == "owner");
-        if actor_is_owner && owner_count <= 1 {
-            return Err(anyhow::anyhow!(
-                "cannot remove the last owner — transfer ownership first"
-            ));
+        let members = state
+            .db
+            .get_members_for_event_write(tenant.community(), channel_id)
+            .await?;
+        if channel_authz::is_sole_owner(&members, &actor_bytes) {
+            return Err(ChannelAuthzError::LastOwnerRemovalTransferFirst.into());
         }
     }
 
@@ -1627,6 +1709,7 @@ async fn handle_remove_user(
             "actor": actor_hex,
             "target": target_hex,
         }),
+        chrono::Utc::now(),
     )
     .await?;
 
@@ -1702,6 +1785,7 @@ async fn handle_edit_metadata(
                         serde_json::json!({
                             "type": "topic_changed", "actor": actor_hex, "topic": val
                         }),
+                        chrono::Utc::now(),
                     )
                     .await?;
                 }
@@ -1717,13 +1801,14 @@ async fn handle_edit_metadata(
                         serde_json::json!({
                             "type": "purpose_changed", "actor": actor_hex, "purpose": val
                         }),
+                        chrono::Utc::now(),
                     )
                     .await?;
                 }
                 "visibility" => {
                     let was_open = state
                         .db
-                        .get_channel(tenant.community(), channel_id)
+                        .get_channel_for_event_write(tenant.community(), channel_id)
                         .await
                         .map(|c| c.visibility == "open")
                         .unwrap_or(false);
@@ -1756,6 +1841,7 @@ async fn handle_edit_metadata(
                         serde_json::json!({
                             "type": "visibility_changed", "actor": actor_hex, "visibility": val
                         }),
+                        chrono::Utc::now(),
                     )
                     .await?;
                 }
@@ -1789,6 +1875,7 @@ async fn handle_edit_metadata(
                         serde_json::json!({
                             "type": "ttl_changed", "actor": actor_hex, "ttl_seconds": ttl_change
                         }),
+                        chrono::Utc::now(),
                     )
                     .await?;
                 }
@@ -1806,6 +1893,7 @@ async fn handle_edit_metadata(
                                 serde_json::json!({
                                     "type": "channel_archived", "actor": actor_hex
                                 }),
+                                chrono::Utc::now(),
                             )
                             .await?;
                         }
@@ -1821,6 +1909,7 @@ async fn handle_edit_metadata(
                                 serde_json::json!({
                                     "type": "channel_unarchived", "actor": actor_hex
                                 }),
+                                chrono::Utc::now(),
                             )
                             .await?;
 
@@ -1839,8 +1928,10 @@ async fn handle_edit_metadata(
                             // same channel by the same actor could collide ids and skip a fan-out.
                             // Not reachable in practice — unarchive has a single human-driven caller;
                             // the reaper only auto-archives — so we don't engineer around it.
-                            for member in
-                                state.db.get_members(tenant.community(), channel_id).await?
+                            for member in state
+                                .db
+                                .get_members_for_event_write(tenant.community(), channel_id)
+                                .await?
                             {
                                 if let Err(e) = emit_membership_notification(
                                     tenant,
@@ -1891,7 +1982,7 @@ async fn handle_delete_event_side_effect(
     // by sending h=A, e=<event-in-B>.
     if let Some(target_event) = state
         .db
-        .get_event_by_id_including_deleted(tenant.community(), &target_id)
+        .get_event_by_id_including_deleted_for_event_write(tenant.community(), &target_id)
         .await
         .map_err(|e| anyhow::anyhow!("get_event_by_id failed: {e}"))?
     {
@@ -1955,7 +2046,7 @@ async fn handle_delete_event_side_effect(
     copy_optional_string_field(event, &mut tombstone, "reason_code");
     copy_optional_string_field(event, &mut tombstone, "public_reason");
 
-    emit_system_message(tenant, state, channel_id, tombstone).await?;
+    emit_system_message(tenant, state, channel_id, tombstone, chrono::Utc::now()).await?;
 
     info!(target_event = %hex::encode(&target_id), "NIP-29 DELETE_EVENT processed");
     Ok(())
@@ -1996,7 +2087,11 @@ async fn handle_create_group(
     // no-h-tag path, ingest never creates the channel, so this is the sole
     // increment.
     let channel = if let Some(client_uuid) = extract_h_tag_channel(event) {
-        match state.db.get_channel(tenant.community(), client_uuid).await {
+        match state
+            .db
+            .get_channel_for_event_write(tenant.community(), client_uuid)
+            .await
+        {
             Ok(ch) => ch,
             Err(_) => {
                 // Channel not found — shouldn't happen (ingest_event pre-created it),
@@ -2060,6 +2155,7 @@ async fn handle_create_group(
         serde_json::json!({
             "type": "channel_created", "actor": actor_hex
         }),
+        chrono::Utc::now(),
     )
     .await?;
 
@@ -2129,6 +2225,7 @@ async fn handle_delete_group(
         serde_json::json!({
             "type": "channel_deleted", "actor": actor_hex
         }),
+        chrono::Utc::now(),
     )
     .await?;
 
@@ -2148,7 +2245,7 @@ async fn handle_join_request(
     // Only open channels allow self-join via kind:9021.
     let channel = state
         .db
-        .get_channel(tenant.community(), channel_id)
+        .get_channel_for_event_write(tenant.community(), channel_id)
         .await
         .map_err(|_| anyhow::anyhow!("channel not found"))?;
     if channel.visibility != "open" {
@@ -2190,6 +2287,7 @@ async fn handle_join_request(
             "actor": actor_hex,
             "target": actor_hex,
         }),
+        chrono::Utc::now(),
     )
     .await?;
 
@@ -2225,15 +2323,12 @@ async fn handle_leave_request(
     let actor_bytes = event.pubkey.to_bytes().to_vec();
 
     // Guard: prevent last-owner orphaning on leave.
-    let members = state.db.get_members(tenant.community(), channel_id).await?;
-    let owner_count = members.iter().filter(|m| m.role == "owner").count();
-    let actor_is_owner = members
-        .iter()
-        .any(|m| m.pubkey == actor_bytes && m.role == "owner");
-    if actor_is_owner && owner_count <= 1 {
-        return Err(anyhow::anyhow!(
-            "cannot remove the last owner — transfer ownership first"
-        ));
+    let members = state
+        .db
+        .get_members_for_event_write(tenant.community(), channel_id)
+        .await?;
+    if channel_authz::is_sole_owner(&members, &actor_bytes) {
+        return Err(ChannelAuthzError::LastOwnerRemovalTransferFirst.into());
     }
 
     state
@@ -2253,6 +2348,7 @@ async fn handle_leave_request(
             "type": "member_left",
             "actor": actor_hex,
         }),
+        chrono::Utc::now(),
     )
     .await?;
 
@@ -2440,7 +2536,7 @@ async fn handle_standard_deletion_event(
     for target_id in target_ids {
         let target_event = match state
             .db
-            .get_event_by_id_including_deleted(tenant.community(), &target_id)
+            .get_event_by_id_including_deleted_for_event_write(tenant.community(), &target_id)
             .await?
         {
             Some(target) => target,
@@ -2525,7 +2621,7 @@ async fn handle_standard_deletion_event(
                     if let Ok(react_target_id) = hex::decode(&react_target_hex) {
                         if let Ok(Some(react_target_event)) = state
                             .db
-                            .get_event_by_id(tenant.community(), &react_target_id)
+                            .get_event_by_id_for_event_write(tenant.community(), &react_target_id)
                             .await
                         {
                             let react_target_ts = chrono::DateTime::from_timestamp(
@@ -2755,6 +2851,31 @@ async fn handle_git_repo_announcement(
     event: &Event,
     state: &Arc<AppState>,
 ) -> anyhow::Result<()> {
+    handle_git_repo_announcement_inner(tenant, event, state, &GitRepoAnnouncementHooks::default())
+        .await
+}
+
+#[derive(Default)]
+pub(crate) struct GitRepoAnnouncementHooks {
+    #[cfg(test)]
+    pub(crate) post_lease_gate: Option<Arc<GitRepoAnnouncementGate>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct GitRepoAnnouncementGate {
+    pub(crate) reached: tokio::sync::Notify,
+    pub(crate) resume: tokio::sync::Notify,
+}
+
+pub(crate) async fn handle_git_repo_announcement_inner(
+    tenant: &TenantContext,
+    event: &Event,
+    state: &Arc<AppState>,
+    hooks: &GitRepoAnnouncementHooks,
+) -> anyhow::Result<()> {
+    #[cfg(not(test))]
+    let _ = hooks;
     // Extract repo identifier from d tag (required for NIP-33 parameterized replaceable events).
     let repo_id =
         extract_tag_value(event, "d").ok_or_else(|| anyhow::anyhow!("kind:30617 missing d tag"))?;
@@ -2853,6 +2974,32 @@ async fn handle_git_repo_announcement(
     // announcement is durably live before this handler runs.
     let reserved_by_this_attempt = matches!(outcome, ReserveOutcome::Reserved);
 
+    // The event row and name registry are ordinary database state: if deletion
+    // quiescing wins before they commit, the DB write fence rejects them; if
+    // they committed first, the destructive DB stage purges them. The manifest
+    // and pointer below are external S3 effects, so acquire the durable
+    // serving-write lease immediately before that sequence. Once acquired,
+    // deletion must drain this lease before it can freeze the final object list.
+    let serving_write = buzz_deletion::acquire_serving_write(
+        &state.db,
+        tenant.community(),
+        "git_repo_announcement",
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("repo announcement rejected by community deletion fence: {e}"))?;
+
+    #[cfg(test)]
+    if let Some(gate) = &hooks.post_lease_gate {
+        gate.reached.notify_one();
+        gate.resume.notified().await;
+    }
+
+    if let Err(error) = serving_write.verify().await {
+        return Err(anyhow::anyhow!(
+            "repo announcement lost community serving lease: {error}"
+        ));
+    }
+
     // Establish/confirm the manifest pointer, keeping the invariant
     // "repo announced ⟺ pointer exists" so the read path can rely on
     // pointer-absent meaning never-announced (keeping `info_refs`'s fail-closed
@@ -2867,7 +3014,7 @@ async fn handle_git_repo_announcement(
     //   re-announce must accept it untouched; only an absent pointer is
     //   repaired by seeding. Using the strict seed here would wrongly reject
     //   every re-announce after the first push.
-    let provisioning_result = async {
+    let provisioning_operation = async {
         if reserved_by_this_attempt {
             seed_manifest_pointer(state, tenant, &owner_hex, &repo_id).await?;
         } else {
@@ -2889,8 +3036,11 @@ async fn handle_git_repo_announcement(
         .ok_or_else(|| anyhow::anyhow!("manifest pointer absent after provisioning"))?;
 
         Ok::<(), anyhow::Error>(())
-    }
-    .await;
+    };
+    let provisioning_result = match serving_write.protect(provisioning_operation).await {
+        Ok(result) => result,
+        Err(error) => Err(error),
+    };
     if let Err(provisioning_err) = provisioning_result {
         // The announcement is already the durable live replaceable head when
         // side effects run. Keep even a fresh reservation on failure: releasing
@@ -2922,7 +3072,9 @@ async fn handle_git_repo_announcement(
     // initial empty signal is a one-time seeding notification, not something a
     // re-announce should replay.
     if reserved_by_this_attempt {
-        if let Err(e) = emit_initial_ref_state(tenant, state, &owner_hex, &repo_id).await {
+        if let Err(e) =
+            emit_initial_ref_state(tenant, state, serving_write.lease(), &owner_hex, &repo_id).await
+        {
             // Non-fatal: the manifest is the source of truth; this is just the
             // derived notification. A failure here means subscribers miss the
             // "repo now exists" event, but clone/push still works.
@@ -2935,6 +3087,9 @@ async fn handle_git_repo_announcement(
         }
     }
 
+    serving_write.finish().await.map_err(|e| {
+        anyhow::anyhow!("repo announcement lost community serving lease on release: {e}")
+    })?;
     Ok(())
 }
 
@@ -3076,6 +3231,7 @@ async fn ensure_manifest_pointer(
 async fn emit_initial_ref_state(
     tenant: &TenantContext,
     state: &Arc<AppState>,
+    lease: &buzz_db::deletion::ServingWriteLease,
     owner_hex: &str,
     repo_id: &str,
 ) -> anyhow::Result<()> {
@@ -3093,7 +3249,7 @@ async fn emit_initial_ref_state(
         .map_err(|e| anyhow::anyhow!("build_ref_state_event: {e}"))?;
     let (stored, was_inserted) = state
         .db
-        .insert_event(tenant.community(), &event, None)
+        .insert_event_with_serving_write_guard(lease, &event, None)
         .await
         .map_err(|e| anyhow::anyhow!("insert kind:30618: {e}"))?;
     if was_inserted {
@@ -3116,22 +3272,60 @@ async fn emit_initial_ref_state(
 /// safe to run at startup and periodically without producing an event stream
 /// when nothing changed. A failure in one community is logged and counted but
 /// does not prevent the remaining communities from being repaired.
+#[derive(Clone, Copy)]
+pub enum Nip43ReconciliationPurpose {
+    /// Before listener admission opens.
+    Bootstrap,
+    /// Periodic background repair after startup.
+    Maintenance,
+}
+
+/// Preserve the original maintenance reconciliation API for downstream callers.
+#[deprecated(note = "use reconcile_nip43_membership_snapshots_with_purpose")]
 pub async fn reconcile_nip43_membership_snapshots(state: &Arc<AppState>) -> anyhow::Result<usize> {
-    let communities = state.db.usage_community_hosts().await?;
+    reconcile_nip43_membership_snapshots_with_purpose(
+        state,
+        Nip43ReconciliationPurpose::Maintenance,
+    )
+    .await
+}
+
+/// Reconcile NIP-43 snapshots with explicit startup or maintenance attribution.
+pub async fn reconcile_nip43_membership_snapshots_with_purpose(
+    state: &Arc<AppState>,
+    purpose: Nip43ReconciliationPurpose,
+) -> anyhow::Result<usize> {
+    let communities = match purpose {
+        Nip43ReconciliationPurpose::Bootstrap => state.db.bootstrap_community_hosts().await?,
+        Nip43ReconciliationPurpose::Maintenance => state.db.usage_community_hosts().await?,
+    };
     let mut reconciled = 0usize;
 
     for community in communities {
         let community_id = buzz_core::CommunityId::from_uuid(community.id);
         let host = community.host;
         let result = async {
-            if !state
-                .db
-                .nip43_membership_snapshot_needs_reconciliation(
-                    community_id,
-                    &state.relay_keypair.public_key(),
-                )
-                .await?
-            {
+            let needs_reconciliation = match purpose {
+                Nip43ReconciliationPurpose::Bootstrap => {
+                    state
+                        .db
+                        .nip43_membership_snapshot_needs_reconciliation_for_bootstrap(
+                            community_id,
+                            &state.relay_keypair.public_key(),
+                        )
+                        .await?
+                }
+                Nip43ReconciliationPurpose::Maintenance => {
+                    state
+                        .db
+                        .nip43_membership_snapshot_needs_reconciliation_for_maintenance(
+                            community_id,
+                            &state.relay_keypair.public_key(),
+                        )
+                        .await?
+                }
+            };
+            if !needs_reconciliation {
                 return Ok::<bool, anyhow::Error>(false);
             }
 
@@ -3280,6 +3474,68 @@ pub async fn publish_nip43_member_removed(
     publish_nip43_delta(tenant, state, 8001, target_pubkey_hex, "member-removed").await
 }
 
+/// Repair legacy kind:39002 snapshots truncated by the former 1,000-member
+/// database cap.
+///
+/// The scan is deliberately limited to canonical rosters above that boundary,
+/// so normal-sized channels and already-correct large snapshots incur no
+/// rewrites. Community identity travels with every candidate; a shared relay
+/// never resolves a channel against a neighboring tenant.
+pub async fn reconcile_large_channel_member_snapshots(
+    state: &Arc<AppState>,
+) -> anyhow::Result<usize> {
+    const LEGACY_ROSTER_LIMIT: i64 = 1_000;
+
+    let relay_pubkey = state.relay_keypair.public_key();
+    let candidates = state
+        .db
+        .list_large_channel_rosters_needing_reconciliation(
+            LEGACY_ROSTER_LIMIT,
+            &relay_pubkey.to_bytes(),
+        )
+        .await?;
+    let relay_pubkey_hex = relay_pubkey.to_hex();
+    let mut reconciled = 0usize;
+
+    for candidate in candidates {
+        let result = async {
+            let channel_id = candidate.channel_id;
+            // Hold the membership-writer lock from roster capture through
+            // replacement. Otherwise a rolling deployment can publish stale
+            // roster A after another relay commits and publishes roster B.
+            let mut member_snapshot = state
+                .db
+                .lock_member_snapshot(candidate.community_id, channel_id, &relay_pubkey.to_bytes())
+                .await?;
+            let tenant = TenantContext::resolved(candidate.community_id, candidate.host.clone());
+            let stored_members =
+                store_group_members_event(&tenant, state, channel_id, &mut member_snapshot).await?;
+            member_snapshot.release().await?;
+            dispatch_group_members_event(&tenant, state, stored_members, &relay_pubkey_hex).await;
+            Ok::<bool, anyhow::Error>(true)
+        }
+        .await;
+
+        match result {
+            Ok(true) => reconciled += 1,
+            Ok(false) => {}
+            Err(error) => {
+                metrics::counter!("buzz_channel_roster_reconciliation_failures_total").increment(1);
+                warn!(
+                    community_id = %candidate.community_id,
+                    host = %candidate.host,
+                    channel_id = %candidate.channel_id,
+                    %error,
+                    "large channel roster reconciliation failed"
+                );
+            }
+        }
+    }
+
+    metrics::counter!("buzz_channel_roster_reconciliations_total").increment(reconciled as u64);
+    Ok(reconciled)
+}
+
 /// Reconcile channels whose stored discovery events are missing or stale.
 ///
 /// This handles the case where channels were created via direct SQL inserts
@@ -3295,7 +3551,10 @@ pub async fn reconcile_channel_events(
 ) -> anyhow::Result<u32> {
     use buzz_db::event::EventQuery;
 
-    let channels = state.db.list_channels(tenant.community(), None).await?;
+    let channels = state
+        .db
+        .list_channels_for_bootstrap(tenant.community(), None)
+        .await?;
     if channels.is_empty() {
         return Ok(0);
     }
@@ -3311,7 +3570,7 @@ pub async fn reconcile_channel_events(
         let channel_id_str = channel.id.to_string();
         let existing = match state
             .db
-            .query_events(&EventQuery {
+            .query_events_for_bootstrap(&EventQuery {
                 kinds: Some(vec![39000, 39002]),
                 d_tag: Some(channel_id_str.clone()),
                 // Only relay-signed heads count: a client-published event with a
@@ -3386,6 +3645,61 @@ pub async fn reconcile_channel_events(
     Ok(reconciled)
 }
 
+/// Test-only barrier hooks for [`publish_nipia_archival_list`]. Lets a test
+/// hold one publisher after it has read canonical archive state and before it
+/// replaces the head, making the stale-read/late-write race deterministic.
+/// Compiled only under `cfg(test)`; the production call site is `#[cfg(test)]`.
+///
+/// The gate is scoped to a `CommunityId`: only a publisher whose tenant matches
+/// the armed community is held. Publishers from other tenants — the rapid
+/// archive/unarchive or owner-archive regressions running in parallel under the
+/// Rust test runner — pass straight through and never consume the gate armed
+/// for the concurrent-publisher test's unique tenant.
+#[cfg(test)]
+pub(crate) mod publish_test_hooks {
+    use buzz_core::tenant::CommunityId;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::{oneshot, Notify};
+
+    struct Gate {
+        community: CommunityId,
+        arrived: oneshot::Sender<()>,
+        release: Arc<Notify>,
+    }
+
+    static GATE: Mutex<Option<Gate>> = Mutex::new(None);
+
+    /// Arm a one-shot barrier for `community`. Await the returned receiver to
+    /// learn when the held publisher has reached the hook (i.e. has read
+    /// canonical state); call `notify_one` on the returned handle to let it
+    /// proceed. Only the first publisher of the matching community to reach the
+    /// hook after arming is held; every other publisher passes.
+    pub(crate) fn arm(community: CommunityId) -> (oneshot::Receiver<()>, Arc<Notify>) {
+        let (tx, rx) = oneshot::channel();
+        let release = Arc::new(Notify::new());
+        *GATE.lock().unwrap() = Some(Gate {
+            community,
+            arrived: tx,
+            release: release.clone(),
+        });
+        (rx, release)
+    }
+
+    pub(super) async fn after_list_archived(community: CommunityId) {
+        let gate = {
+            let mut slot = GATE.lock().unwrap();
+            match slot.as_ref() {
+                Some(gate) if gate.community == community => slot.take(),
+                _ => None,
+            }
+        };
+        if let Some(gate) = gate {
+            let _ = gate.arrived.send(());
+            gate.release.notified().await;
+        }
+    }
+}
+
 /// Publish a kind:13535 archived identities list event (NIP-IA).
 ///
 /// Queries all current archived identities and emits a relay-signed,
@@ -3394,29 +3708,76 @@ pub async fn publish_nipia_archival_list(
     tenant: &TenantContext,
     state: &Arc<AppState>,
 ) -> anyhow::Result<()> {
-    let archived = state.db.list_archived(tenant.community()).await?;
-    let relay_pubkey_hex = state.relay_keypair.public_key().to_hex();
+    const MAX_REPLACEMENT_ATTEMPTS: usize = 8;
+    let relay_pubkey = state.relay_keypair.public_key();
+    let relay_pubkey_hex = relay_pubkey.to_hex();
 
-    let mut tags: Vec<Tag> = Vec::with_capacity(archived.len() + 1);
-    tags.push(Tag::parse(["-"]).map_err(|e| anyhow::anyhow!("failed to build '-' tag: {e}"))?);
+    // A concurrent archive mutation can race between reading the current head and
+    // replacing it. Rebuild from canonical state on rejection so an older snapshot
+    // can never strand the final archive set.
+    for _ in 0..MAX_REPLACEMENT_ATTEMPTS {
+        let archived = state.db.list_archived(tenant.community()).await?;
+        // Test-only barrier: lets a test hold a stale publisher here — after it
+        // has read canonical state, before it replaces the head — so the
+        // stale-read/late-write ordering the drift check must catch is
+        // deterministic, not scheduler-dependent. Inert in production.
+        #[cfg(test)]
+        publish_test_hooks::after_list_archived(tenant.community()).await;
+        let mut tags: Vec<Tag> = Vec::with_capacity(archived.len() + 1);
+        tags.push(Tag::parse(["-"]).map_err(|e| anyhow::anyhow!("failed to build '-' tag: {e}"))?);
 
-    for identity in &archived {
-        tags.push(
-            Tag::parse(["p", &identity.pubkey])
-                .map_err(|e| anyhow::anyhow!("failed to build p tag: {e}"))?,
-        );
-    }
+        for identity in &archived {
+            tags.push(
+                Tag::parse(["p", &identity.pubkey])
+                    .map_err(|e| anyhow::anyhow!("failed to build p tag: {e}"))?,
+            );
+        }
 
-    let event = EventBuilder::new(Kind::Custom(KIND_IA_ARCHIVED_LIST as u16), "")
-        .tags(tags)
-        .sign_with_keys(&state.relay_keypair)
-        .map_err(|e| anyhow::anyhow!("failed to sign kind:{KIND_IA_ARCHIVED_LIST}: {e}"))?;
+        // NIP-16 resolves same-second replacements by event id. Force this
+        // canonical snapshot strictly past the current head instead of letting a
+        // rapid archive→unarchive randomly preserve the stale archive state.
+        let now = nostr::Timestamp::now().as_secs();
+        let previous = state
+            .db
+            .query_events_for_event_write(&buzz_db::event::EventQuery {
+                kinds: Some(vec![KIND_IA_ARCHIVED_LIST as i32]),
+                pubkey: Some(relay_pubkey.to_bytes().to_vec()),
+                limit: Some(1),
+                global_only: true,
+                ..buzz_db::event::EventQuery::for_community(tenant.community())
+            })
+            .await?;
+        let created_at = previous
+            .first()
+            .map(|event| (event.event.created_at.as_secs() + 1).max(now))
+            .unwrap_or(now);
 
-    let (stored, was_inserted) = state
-        .db
-        .replace_addressable_event(tenant.community(), &event, None)
-        .await?;
-    if was_inserted {
+        let event = EventBuilder::new(Kind::Custom(KIND_IA_ARCHIVED_LIST as u16), "")
+            .tags(tags)
+            .custom_created_at(nostr::Timestamp::from(created_at))
+            .sign_with_keys(&state.relay_keypair)
+            .map_err(|e| anyhow::anyhow!("failed to sign kind:{KIND_IA_ARCHIVED_LIST}: {e}"))?;
+
+        let (stored, was_inserted) = state
+            .db
+            .replace_addressable_event(tenant.community(), &event, None)
+            .await?;
+        if !was_inserted {
+            continue;
+        }
+
+        let current_archived = state.db.list_archived(tenant.community()).await?;
+        let snapshot_is_current =
+            archived
+                .iter()
+                .map(|identity| identity.pubkey.as_str())
+                .eq(current_archived
+                    .iter()
+                    .map(|identity| identity.pubkey.as_str()));
+        if !snapshot_is_current {
+            continue;
+        }
+
         dispatch_persistent_event(
             tenant,
             state,
@@ -3426,13 +3787,16 @@ pub async fn publish_nipia_archival_list(
             None,
         )
         .await;
+        info!(
+            archived_count = archived.len(),
+            "NIP-IA archived identities list published"
+        );
+        return Ok(());
     }
 
-    info!(
-        archived_count = archived.len(),
-        "NIP-IA archived identities list published"
-    );
-    Ok(())
+    anyhow::bail!(
+        "failed to publish kind:{KIND_IA_ARCHIVED_LIST} after {MAX_REPLACEMENT_ATTEMPTS} concurrent replacements"
+    )
 }
 
 /// NIP-DV: publish the relay-signed, per-viewer DM visibility snapshot for
@@ -3478,7 +3842,7 @@ pub async fn publish_dm_visibility_snapshot(
     let ts = {
         let existing = state
             .db
-            .query_events(&buzz_db::event::EventQuery {
+            .query_events_for_event_write(&buzz_db::event::EventQuery {
                 kinds: Some(vec![KIND_DM_VISIBILITY as i32]),
                 pubkey: Some(state.relay_keypair.public_key().to_bytes().to_vec()),
                 d_tag: Some(viewer_hex.clone()),
@@ -3639,13 +4003,6 @@ pub async fn publish_nipia_unarchived(
         None,
     )
     .await
-}
-
-fn topic_for_subscription(channel_id: Option<Uuid>) -> EventTopic {
-    match channel_id {
-        Some(channel_id) => EventTopic::Channel(channel_id),
-        None => EventTopic::Global,
-    }
 }
 
 #[cfg(test)]
@@ -3868,6 +4225,53 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn standard_deletion_rejects_agent_draft_targets() {
+        let (state, pool, _git_storage) = discovery_test_state().await;
+        let keys = nostr::Keys::generate();
+        let host = format!("draft-deletion-{}.example", Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("community");
+        let tenant = TenantContext::resolved(community.id, host);
+        state
+            .db
+            .ensure_user(community.id, &keys.public_key().to_bytes())
+            .await
+            .expect("author");
+        for kind in [
+            KIND_AGENT_DRAFT,
+            KIND_AGENT_DRAFT_DECISION,
+            buzz_core::kind::KIND_STREAM_MESSAGE,
+        ] {
+            let target = EventBuilder::new(Kind::Custom(kind as u16), "durable history")
+                .sign_with_keys(&keys)
+                .expect("target");
+            state
+                .db
+                .insert_event(community.id, &target, None)
+                .await
+                .expect("persist target");
+            let deletion = EventBuilder::new(Kind::Custom(5), "")
+                .tags([Tag::parse(["e", target.id.to_hex().as_str()]).expect("target tag")])
+                .sign_with_keys(&keys)
+                .expect("deletion");
+            let result = validate_standard_deletion_event(&tenant, &deletion, &state).await;
+            if kind == buzz_core::kind::KIND_STREAM_MESSAGE {
+                result.expect("ordinary self deletion is allowed");
+            } else {
+                assert_eq!(
+                    result.expect_err("draft deletion must fail").to_string(),
+                    "draft events are immutable"
+                );
+            }
+        }
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn stale_discovery_member_head_reemits_once_then_is_idempotent() {
         use buzz_core::channel::{ChannelType, ChannelVisibility};
         use buzz_db::CreateCommunityWithOwnerResult;
@@ -4084,6 +4488,44 @@ mod tests {
             effective_message_author(&user_signed, &relay_keys.public_key()),
             user_keys.public_key().to_bytes().to_vec()
         );
+    }
+
+    #[test]
+    fn nip43_reconciliation_compatibility_alias_is_preserved() {
+        #[allow(deprecated)]
+        async fn call(state: &Arc<AppState>) -> anyhow::Result<usize> {
+            reconcile_nip43_membership_snapshots(state).await
+        }
+
+        let _ = call;
+    }
+
+    #[test]
+    fn group_members_snapshot_keeps_members_past_one_thousand() {
+        let channel_id = Uuid::new_v4();
+        let members: Vec<MemberRecord> = (0_u16..1_501)
+            .map(|index| MemberRecord {
+                channel_id,
+                pubkey: vec![(index >> 8) as u8, index as u8],
+                role: if index == 1_500 { "owner" } else { "member" }.to_string(),
+                joined_at: chrono::Utc::now(),
+                invited_by: None,
+                removed_at: None,
+            })
+            .collect();
+
+        let tags = group_member_tags(&channel_id.to_string(), &members, &HashSet::new())
+            .expect("build tags");
+        assert_eq!(tags.len(), 1_502, "d tag plus every member p tag");
+
+        let late_pubkey = hex::encode(&members[1_500].pubkey);
+        assert!(tags.iter().any(|tag| {
+            let fields = tag.as_slice();
+            fields.len() == 4
+                && fields[0] == "p"
+                && fields[1] == late_pubkey
+                && fields[3] == "owner"
+        }));
     }
 
     #[test]

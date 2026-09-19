@@ -266,13 +266,13 @@ impl ActionSink for RelayActionSink {
                 .map_err(|e| ActionSinkError::InvalidInput(format!("invalid UUID: {e}")))?;
             let members = state
                 .db
-                .get_members(community_id, channel_uuid)
+                .get_members_for_event_write(community_id, channel_uuid)
                 .await
                 .map_err(|e| ActionSinkError::Database(e.to_string()))?;
             let member_pubkeys: Vec<Vec<u8>> = members.iter().map(|m| m.pubkey.clone()).collect();
             let users = state
                 .db
-                .get_users_bulk(community_id, &member_pubkeys)
+                .get_users_bulk_for_event_write(community_id, &member_pubkeys)
                 .await
                 .map_err(|e| ActionSinkError::Database(e.to_string()))?;
             let named_members: Vec<(String, String)> = users
@@ -451,7 +451,7 @@ impl ActionSink for RelayActionSink {
 
             if state
                 .db
-                .get_event_by_id(community_id, &event_id_bytes)
+                .get_event_by_id_for_event_write(community_id, &event_id_bytes)
                 .await
                 .map_err(|e| ActionSinkError::Database(e.to_string()))?
                 .is_some()
@@ -473,7 +473,7 @@ impl ActionSink for RelayActionSink {
             let tenant = buzz_core::tenant::TenantContext::resolved(community_id, host);
             let channel = state
                 .db
-                .get_channel(tenant.community(), channel_uuid)
+                .get_channel_for_event_write(tenant.community(), channel_uuid)
                 .await
                 .map_err(|e| match &e {
                     buzz_db::DbError::ChannelNotFound(_) | buzz_db::DbError::NotFound(_) => {
@@ -509,7 +509,7 @@ impl ActionSink for RelayActionSink {
             );
 
             // 4. Persist event with thread metadata (matches REST handler path).
-            //    Workflow messages are always top-level: depth=0, no parent/root.
+            //    Reuse the durable thread choice; retries must not resolve ancestry again.
             let thread_meta = Some(buzz_db::event::ThreadMetadataParams {
                 event_id: &event_id_bytes,
                 event_created_at,
@@ -605,7 +605,7 @@ impl ActionSink for RelayActionSink {
             let event_id_hex = event.id.to_hex();
             if state
                 .db
-                .get_event_by_id(community_id, event.id.as_bytes())
+                .get_event_by_id_for_event_write(community_id, event.id.as_bytes())
                 .await
                 .map_err(|e| ActionSinkError::Database(e.to_string()))?
                 .is_some()
@@ -627,7 +627,7 @@ impl ActionSink for RelayActionSink {
 
             let target = state
                 .db
-                .get_event_by_id(tenant.community(), &target_id_bytes)
+                .get_event_by_id_for_event_write(tenant.community(), &target_id_bytes)
                 .await
                 .map_err(|e| ActionSinkError::Database(e.to_string()))?
                 .ok_or_else(|| ActionSinkError::TargetNotFound(target_event_id.clone()))?;
@@ -635,7 +635,7 @@ impl ActionSink for RelayActionSink {
 
             let channel = state
                 .db
-                .get_channel(tenant.community(), channel_uuid)
+                .get_channel_for_event_write(tenant.community(), channel_uuid)
                 .await
                 .map_err(|e| match &e {
                     buzz_db::DbError::ChannelNotFound(_) | buzz_db::DbError::NotFound(_) => {
@@ -1334,7 +1334,7 @@ mod integration_tests {
         assert_eq!(meta.depth, 2);
         assert_eq!(meta.root_event_id, Some(hex::decode(&root).unwrap()));
         assert_eq!(meta.parent_event_id, Some(hex::decode(&parent).unwrap()));
-        let mut tx = state.db.begin_transaction().await.unwrap();
+        let mut tx = state.db.begin_event_write_transaction().await.unwrap();
         sqlx::query("UPDATE events SET deleted_at = NOW() WHERE community_id = $1 AND id = $2")
             .bind(community.as_uuid())
             .bind(hex::decode(&parent).unwrap())

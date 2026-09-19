@@ -2013,7 +2013,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn writer_shutdown_aborts_and_joins_a_stalled_flush() {
+    async fn writer_shutdown_bounds_and_joins_a_stalled_flush() {
         let (data_tx, data_rx) = mpsc::channel(1);
         let (_ctrl_tx, ctrl_rx) = mpsc::channel(1);
         let (_restart_tx, restart_rx) = mpsc::channel(1);
@@ -2027,13 +2027,15 @@ pub(crate) mod tests {
             ctrl_rx,
             restart_rx,
             cancel.clone(),
+            watch::channel(None).1,
         ));
         tokio::task::yield_now().await;
         assert_eq!(state.lock().unwrap().flush_count, 1);
         cancel.cancel();
         let started = tokio::time::Instant::now();
         finish_writer(task).await;
-        assert_eq!(started.elapsed(), WRITER_SHUTDOWN_TIMEOUT);
+        assert_eq!(started.elapsed(), WS_TERMINAL_FLUSH_TIMEOUT);
+        assert!(started.elapsed() <= WRITER_SHUTDOWN_TIMEOUT);
         assert_eq!(Arc::strong_count(&state), 1, "writer must drop its sink");
     }
 
@@ -2045,7 +2047,14 @@ pub(crate) mod tests {
         let (sink, state) = MockSink::new(None);
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let task = tokio::spawn(send_loop_inner(sink, data_rx, ctrl_rx, restart_rx, cancel));
+        let task = tokio::spawn(send_loop_inner(
+            sink,
+            data_rx,
+            ctrl_rx,
+            restart_rx,
+            cancel,
+            watch::channel(None).1,
+        ));
         let started = tokio::time::Instant::now();
         finish_writer(task).await;
         assert_eq!(started.elapsed(), Duration::ZERO);
