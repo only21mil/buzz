@@ -58,6 +58,7 @@ use super::tts_playback::*;
 #[path = "tts_append.rs"]
 mod append;
 use append::*;
+pub(crate) use voice_transition::TtsTextSender;
 use voice_transition::*;
 #[path = "tts_startup.rs"]
 mod startup;

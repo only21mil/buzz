@@ -95,6 +95,37 @@ pub async fn fetch_media_bytes(
     result
 }
 
+/// Fetch relay media bytes with renderer-owned cancellation.
+#[tauri::command]
+pub async fn fetch_audio_bytes(
+    url: String,
+    request_id: Option<String>,
+    state: tauri::State<'_, AppState>,
+) -> Result<tauri::ipc::Response, String> {
+    let cancellation = begin_media_fetch(request_id.as_deref());
+    let result = async {
+        let relay_base = relay_api_base_url_with_override(&state);
+        validate_download_url(&url, &relay_base)?;
+        let bytes =
+            fetch_blob_bytes_with_cap(&url, &state, MAX_DOWNLOAD_BYTES, cancellation.as_ref())
+                .await?;
+        validate_audio_bytes(&bytes)?;
+        Ok(tauri::ipc::Response::new(bytes))
+    }
+    .await;
+    finish_media_fetch(request_id.as_deref());
+    result
+}
+
+fn validate_audio_bytes(bytes: &[u8]) -> Result<(), String> {
+    let mime = infer::get(bytes).map(|kind| kind.mime_type());
+    if mime.is_some_and(|mime| mime.starts_with("audio/") || mime == "video/mp4") {
+        Ok(())
+    } else {
+        Err("media is not a supported audio attachment".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

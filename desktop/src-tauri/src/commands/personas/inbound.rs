@@ -858,34 +858,3 @@ fn apply_inbound_team(teams: &mut Vec<TeamRecord>, d_tag: String, inbound: TeamE
         }),
     }
 }
-
-fn commit_inbound_team(
-    teams: &mut Vec<TeamRecord>,
-    d_tag: String,
-    inbound: TeamEventContent,
-    persist_teams: impl FnOnce(&[TeamRecord]) -> Result<(), String>,
-    load_agents: impl FnOnce() -> Result<Vec<ManagedAgentRecord>, String>,
-    save_agents: impl FnOnce(&[ManagedAgentRecord]) -> Result<(), String>,
-) -> Result<(), String> {
-    let team_id = d_tag.clone();
-    let previous_persona_ids = teams
-        .iter()
-        .find(|record| record.id == team_id)
-        .map(|record| record.persona_ids.clone())
-        .unwrap_or_default();
-    apply_inbound_team(teams, d_tag, inbound);
-    let current_persona_ids = teams
-        .iter()
-        .find(|record| record.id == team_id)
-        .map(|record| record.persona_ids.clone())
-        .unwrap_or_default();
-    persist_teams(teams)?;
-    crate::commands::teams::propagate_membership_best_effort(
-        &team_id,
-        &previous_persona_ids,
-        &current_persona_ids,
-        load_agents,
-        save_agents,
-    );
-    Ok(())
-}

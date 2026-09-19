@@ -990,6 +990,8 @@ mod catalog_source;
 pub use catalog_source::CatalogSource;
 mod relay_mesh;
 pub use relay_mesh::RelayMeshConfig;
+mod review_content;
+pub use review_content::PersonaReviewContent;
 mod requests;
 pub use requests::*;
 mod team_catalog_source;

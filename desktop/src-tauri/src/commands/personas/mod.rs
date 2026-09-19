@@ -58,7 +58,8 @@ mod description_normalization_tests {
     }
 }
 
-mod pending;
+pub(super) mod pending;
+pub(super) mod review_revision;
 pub(in crate::commands) use pending::retain_persona_pending;
 pub(in crate::commands) use pending::retain_persona_pending_at;
 pub(crate) use pending::tombstone_persona_at;

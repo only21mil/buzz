@@ -18,6 +18,7 @@ use crate::managed_agents::{ManagedAgentPairRuntime, ManagedAgentRuntimeKey};
 
 pub struct AppState {
     pub keys: Mutex<Keys>,
+    pub(crate) publication_epoch: Arc<Mutex<u64>>,
     /// Durable backend holding `keys`. Updated after the key write and before
     /// recovery flags are cleared so `get_identity` reports a consistent state.
     pub(crate) identity_storage: AtomicU8,
@@ -203,6 +204,7 @@ pub fn build_app_state() -> AppState {
 
     AppState {
         keys: Mutex::new(keys),
+        publication_epoch: Arc::new(Mutex::new(0)),
         identity_storage: AtomicU8::new(identity_storage as u8),
         http_client: reqwest::Client::builder()
             .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))

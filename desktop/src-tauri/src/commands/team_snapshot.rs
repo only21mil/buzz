@@ -560,7 +560,6 @@ pub async fn confirm_team_snapshot_import(
 
         // Build the ManagedAgentRecord for this member.
         let record = ManagedAgentRecord {
-            effort_level: None,
             pubkey: pubkey.clone(),
             name: display_name.clone(),
             display_name: None,
@@ -760,11 +759,7 @@ pub async fn confirm_team_snapshot_import(
 
         // All writes committed — safe to update in-memory state.
         for m in &minted {
-            if let Err(e) =
-                crate::commands::personas::retain_persona_pending(&app, &state, &m.definition)
-            {
-                eprintln!("buzz-desktop: persona-retain (snapshot): {e}");
-            }
+            crate::commands::personas::retain_persona_pending(&app, &state, &m.definition);
         }
         for m in &minted {
             retain_agent_pending(&app, &state, &m.record);
