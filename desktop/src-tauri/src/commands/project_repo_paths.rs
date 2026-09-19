@@ -381,5 +381,5 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "project_repo_paths/tests.rs"]
+#[path = "project_repo_paths_tests.rs"]
 mod branch_tests;
