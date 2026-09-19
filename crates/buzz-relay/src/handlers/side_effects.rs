@@ -4243,7 +4243,7 @@ mod tests {
         for kind in [
             KIND_AGENT_DRAFT,
             KIND_AGENT_DRAFT_DECISION,
-            KIND_STREAM_MESSAGE,
+            buzz_core::kind::KIND_STREAM_MESSAGE,
         ] {
             let target = EventBuilder::new(Kind::Custom(kind as u16), "durable history")
                 .sign_with_keys(&keys)
@@ -4258,7 +4258,7 @@ mod tests {
                 .sign_with_keys(&keys)
                 .expect("deletion");
             let result = validate_standard_deletion_event(&tenant, &deletion, &state).await;
-            if kind == KIND_STREAM_MESSAGE {
+            if kind == buzz_core::kind::KIND_STREAM_MESSAGE {
                 result.expect("ordinary self deletion is allowed");
             } else {
                 assert_eq!(

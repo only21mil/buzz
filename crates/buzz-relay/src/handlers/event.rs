@@ -2344,7 +2344,7 @@ mod tests {
             .await
             .expect_err("presence storage failure");
             assert!(
-                matches!(error, IngestError::Internal(message) if message == "error: presence persistence failed")
+                matches!(error, crate::handlers::ingest::IngestError::Internal(message) if message == "error: presence persistence failed")
             );
 
             assert!(
