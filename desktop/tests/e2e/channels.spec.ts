@@ -131,6 +131,15 @@ async function readOutgoingChannelId(
       ).__BUZZ_E2E_COMMAND_LOG__ ?? [];
 
     for (const entry of entries) {
+      if (entry.command === "send_channel_message") {
+        const payload = entry.payload as {
+          channelId?: string;
+          content?: string;
+        };
+        if (payload.content?.includes(expectedContent)) {
+          return payload.channelId ?? null;
+        }
+      }
       if (entry.command !== "plugin:websocket|send") {
         continue;
       }

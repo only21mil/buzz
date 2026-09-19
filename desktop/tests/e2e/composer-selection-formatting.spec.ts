@@ -483,9 +483,14 @@ test("selected hard-break lines stay newline-separated in one code block", async
         () =>
           (
             window as Window & {
-              __BUZZ_E2E_SIGNED_EVENTS__?: Array<{ content: string }>;
+              __BUZZ_E2E_COMMAND_LOG__?: Array<{
+                command: string;
+                payload: { content?: string };
+              }>;
             }
-          ).__BUZZ_E2E_SIGNED_EVENTS__?.at(-1)?.content,
+          ).__BUZZ_E2E_COMMAND_LOG__?.findLast(
+            (entry) => entry.command === "send_channel_message",
+          )?.payload.content,
       ),
     )
     .toBe("```\none\ntwo\nthree\n```");

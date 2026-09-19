@@ -1,3 +1,4 @@
+import { parseEntityLink } from "@/shared/lib/entityLink";
 import { parseChannelLink } from "@/features/messages/lib/channelLink";
 import {
   AuthoredDeepLinkAnchor,
@@ -56,7 +57,7 @@ import {
   SyntaxHighlightedCode,
 } from "./markdown/CodeBlock";
 import {
-  renderEntityLinkAnchor,
+  EntityLinkAnchor,
   useEntityCardOpenHandlers,
   useOpenEntityLink,
 } from "./markdown/entityLinks";
@@ -531,14 +532,25 @@ export function createMarkdownComponents(
 
     // `buzz://pr|issue|repo?…` entity links navigate in-app; malformed ones
     // fall through to the default anchor.
-    const entityAnchor = renderEntityLinkAnchor({
-      asChip: label === href,
-      children,
-      href,
-      onOpenEntityLink,
-      relayOrigin,
-    });
-    if (entityAnchor) return entityAnchor;
+    if (
+      href &&
+      (parseEntityLink(href).ok ||
+        parseSupportedLinkPreview(href, relayOrigin)?.href.startsWith(
+          "buzz://",
+        ))
+    ) {
+      return (
+        <EntityLinkAnchor
+          asChip={label === href}
+          href={href}
+          interactive={interactive}
+          onOpenEntityLink={onOpenEntityLink}
+          relayOrigin={relayOrigin}
+        >
+          {children}
+        </EntityLinkAnchor>
+      );
+    }
 
     const supportedLinkPreview = href
       ? parseSupportedLinkPreview(href, relayOrigin)
@@ -776,14 +788,16 @@ export function createMarkdownComponents(
     }) {
       const { onOpenEntityLink, relayOrigin } = useMarkdownRuntime();
       const href = String(children ?? "");
+      if (!parseEntityLink(href).ok) return <span>{children}</span>;
       return (
-        renderEntityLinkAnchor({
-          children,
-          href,
-          onOpenEntityLink,
-          relayOrigin,
-          interactive,
-        }) ?? <span>{children}</span>
+        <EntityLinkAnchor
+          href={href}
+          interactive={interactive}
+          onOpenEntityLink={onOpenEntityLink}
+          relayOrigin={relayOrigin}
+        >
+          {children}
+        </EntityLinkAnchor>
       );
     },
     "message-link": function MarkdownMessageLink({
