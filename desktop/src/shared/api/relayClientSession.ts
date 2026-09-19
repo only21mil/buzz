@@ -27,6 +27,7 @@ import {
   type PendingEvent,
   type RelaySubscription,
   type RelaySubscriptionFilter,
+  type RelayHistoryFilters,
   type SubscriptionEventBufferItem,
 } from "@/shared/api/relayClientShared";
 import {
@@ -221,7 +222,7 @@ export class RelayClient {
     );
   }
 
-  async fetchEvents(filter: RelaySubscriptionFilter): Promise<RelayEvent[]> {
+  async fetchEvents(filter: RelayHistoryFilters): Promise<RelayEvent[]> {
     return this.fetchHistory(filter);
   }
 
@@ -238,14 +239,12 @@ export class RelayClient {
     );
   }
 
-  private async fetchHistory(filter: RelaySubscriptionFilter) {
+  private async fetchHistory(filter: RelayHistoryFilters) {
     await this.ensureConnected();
     return this.requestHistory(filter);
   }
 
-  private requestHistory(
-    filter: RelaySubscriptionFilter,
-  ): Promise<RelayEvent[]> {
+  private requestHistory(filter: RelayHistoryFilters): Promise<RelayEvent[]> {
     return requestHistoryGated(
       this.subscriptions,
       (payload) => this.sendRaw(payload),

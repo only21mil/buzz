@@ -41,6 +41,7 @@ async function focusRefetchCount({ ageMs, policy }) {
 
   unsubscribe();
   queryClient.unmount();
+  queryClient.clear();
   return fetchCount;
 }
 

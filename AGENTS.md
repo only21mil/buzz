@@ -666,9 +666,11 @@ singleton needs a reset function wired into `resetCommunityState()` in
 
 Current singletons reset by `resetCommunityState()` on every community
 switch, including same-relay reconnects (the two avatar resets run only when
-the relay changes, so a same-relay reconnect preserves pending avatar
-verification work):
+the relay or signer changes, so a same-relay reconnect with the same signer
+preserves pending avatar verification work):
+- `scopedQueryCache.invalidate()` — invalidates outgoing cache delivery before asynchronous teardown
 - `relayClient.disconnect()` — WebSocket teardown + promise rejection
+- `resetNavigationDeepLinkDrain()` — awaits outgoing navigation teardown
 - `resetDetachedToastScope()` — detached agent start toast scope
 - `resetRateLimitGate()` — clears any active rate-limit window from the old relay
 - `clearTimeoutState()` — clears the old community's process-wide moderation timeout
@@ -682,8 +684,8 @@ verification work):
 - `resetPendingSnapshotImport()`, `resetPendingOpenEditAgent()`, `resetPendingOpenCreateAgent()` — queued agent UI intents
 - `resetTerminalPanel()` — terminal panel session channel ids
 - `resetProfileActivityFeedScopes()` — profile activity feed scope snapshot cache
-- `resetAvatarProfileSync()` — pending verified-avatar profile writes (relay change only)
-- `resetAvatarPresentations()` — avatar probes, previews, and Retry toasts (relay change only)
+- `resetAvatarProfileSync()` — pending verified-avatar profile writes (relay or signer change only)
+- `resetAvatarPresentations()` — avatar probes, previews, and Retry toasts (relay or signer change only)
 - `resetSidebarRelayConnectionCardState()` — sidebar relay card dismiss state
 - `resetMediaCaches()` — proxy port and relay origin caches
 - `resetAudioMediaLoadScheduler()` — audio attachment load queue
@@ -691,8 +693,10 @@ verification work):
 - `resetVideoPlayerState()` — video player singleton
 - `resetRenderScopedReactionHydration()` — reaction hydration cache
 - `resetBackgroundMediaUploads()` — background media upload tracking
+- `resetLinkPreviewPreparations()` — pending link preview work
 - `clearSearchHitEventCache()` — search result event cache
 - `clearMarkdownNodeCache()` — markdown parse-node cache
+- `resetMessageLinkMetadataCache()` — message link metadata
 
 **If you add a new module-level cache, Map, or class instance that holds
 community-scoped data, you must add its reset to `resetCommunityState()`.**
