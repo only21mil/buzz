@@ -21,6 +21,7 @@ test("existing Projects and Workflows experiments remain unchanged", () => {
       id: "projects",
       name: "Projects",
       description: "Git repository browser and collaboration",
+      defaultEnabled: true,
       platforms: ["desktop"],
     },
     workflows: {
