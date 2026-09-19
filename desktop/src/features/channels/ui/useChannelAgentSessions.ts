@@ -10,7 +10,7 @@ import type {
 import { usePanelReturnTarget } from "@/shared/hooks/usePanelReturnTarget";
 import { normalizePubkey, truncateNpub } from "@/shared/lib/pubkey";
 import {
-  channelBotMemberPubkeySet,
+  channelAgentMembers,
   channelMemberPubkeySet,
 } from "@/shared/lib/rosterDerivations";
 import {
@@ -21,7 +21,7 @@ import type { PanelValueSetter } from "./useChannelPanelHistoryState";
 
 export type ChannelAgentSessionAgent = Pick<ManagedAgent, "pubkey" | "name"> & {
   status: ManagedAgent["status"] | "unknown";
-  agentSource: "managed" | "member-bot" | "relay";
+  agentSource: "managed" | "member-agent" | "relay";
   canInterruptTurn: boolean;
   channelIds?: string[];
   channels?: string[];
@@ -94,7 +94,7 @@ export function buildChannelAgentSessionCandidates({
 
   for (const member of channelMembers ?? []) {
     const key = normalizePubkey(member.pubkey);
-    if (member.role !== "bot" || byPubkey.has(key)) {
+    if ((member.role !== "bot" && !member.isAgent) || byPubkey.has(key)) {
       continue;
     }
 
@@ -102,7 +102,7 @@ export function buildChannelAgentSessionCandidates({
       pubkey: member.pubkey,
       name: member.displayName ?? truncateNpub(member.pubkey),
       status: "deployed",
-      agentSource: "member-bot",
+      agentSource: "member-agent",
       canInterruptTurn: false,
     });
   }
@@ -131,8 +131,8 @@ export function getChannelAgentSessionAgents({
   const memberPubkeys = channelMembers
     ? channelMemberPubkeySet(channelMembers)
     : null;
-  const botMemberPubkeys = channelMembers
-    ? channelBotMemberPubkeySet(channelMembers)
+  const agentMemberPubkeys = channelMembers
+    ? channelMemberPubkeySet(channelAgentMembers(channelMembers))
     : null;
 
   return agents.filter((agent) => {
@@ -145,8 +145,10 @@ export function getChannelAgentSessionAgents({
       channelIds.includes(activeChannelId) ||
       channels.includes(activeChannel.name);
 
-    if (agent.agentSource === "member-bot") {
-      return botMemberPubkeys?.has(normalizedPubkey) ?? matchesDeclaredChannel;
+    if (agent.agentSource === "member-agent") {
+      return (
+        agentMemberPubkeys?.has(normalizedPubkey) ?? matchesDeclaredChannel
+      );
     }
 
     if (agent.agentSource === "managed") {
