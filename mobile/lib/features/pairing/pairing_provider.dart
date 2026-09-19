@@ -4,7 +4,6 @@ import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:http/http.dart' as http;
 import 'package:nostr/nostr.dart' as nostr;
 
 import '../../shared/auth/auth.dart';
@@ -13,13 +12,6 @@ import '../../shared/crypto/nip44.dart';
 import '../../shared/relay/relay.dart';
 import 'pairing_crypto.dart';
 import 'pairing_socket.dart';
-
-/// HTTP client used by [PairingNotifier] for the validation request.
-final pairingHttpClientProvider = Provider<http.Client>((ref) {
-  final client = http.Client();
-  ref.onDispose(client.close);
-  return client;
-});
 
 enum PairingStatus {
   idle,
