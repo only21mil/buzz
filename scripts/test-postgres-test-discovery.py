@@ -51,12 +51,10 @@ class DiscoveryTests(unittest.TestCase):
             env = dict(os.environ, PATH=directory, NATIVE_TRACE=str(trace))
             subprocess.run(['/bin/bash', str(helper)], env=env, check=True)
             calls = trace.read_text().splitlines()
-            excluded = {'scripts/mempool-genesis/activation/tests', 'scripts/mempool-genesis/tests',
-                        'scripts/roster-migration/tests'}
             on_disk = {str(f.parent.relative_to(inventory.ROOT))
                        for top in ('deploy/native-ci', 'scripts')
                        for f in (inventory.ROOT / top).rglob('test_*.py')
-                       if 'node_modules' not in f.parts} - excluded
+                       if 'node_modules' not in f.parts}
             ran = {c.removeprefix('-m unittest discover ').removesuffix(' -p test_*.py')
                    for c in calls if c.startswith('-m unittest discover ')}
             self.assertEqual(ran, on_disk)

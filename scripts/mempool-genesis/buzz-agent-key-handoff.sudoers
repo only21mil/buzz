@@ -1,2 +1,0 @@
-Cmnd_Alias BUZZ_AGENT_KEY_INSTALL = /usr/local/sbin/buzz-install-agent-key install --slug mempool, /usr/local/sbin/buzz-install-agent-key install --slug genesis
-victor ALL=(root) NOPASSWD: BUZZ_AGENT_KEY_INSTALL
