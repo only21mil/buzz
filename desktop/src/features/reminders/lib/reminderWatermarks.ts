@@ -24,6 +24,18 @@ export function readWatermark(scope: string, pubkey: string): number {
       return parsed;
     }
   }
+  // Preserve the missed-while-closed window across upgrades. Keep the legacy
+  // baseline for communities not visited yet, but only advance scoped keys.
+  const legacy = getStorageItem(
+    `${WATERMARK_STORAGE_PREFIX}${pubkey.trim().toLowerCase()}`,
+  );
+  if (legacy !== null && Number.isFinite(Number(legacy))) {
+    const watermark = Number(legacy);
+    const fallback = sessionWatermarks.get(key);
+    if (fallback !== undefined) return fallback;
+    writeWatermark(scope, pubkey, watermark);
+    return watermark;
+  }
   const sessionWatermark = sessionWatermarks.get(key);
   if (sessionWatermark !== undefined) return sessionWatermark;
   const now = Math.floor(Date.now() / 1_000);

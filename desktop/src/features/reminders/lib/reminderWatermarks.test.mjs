@@ -47,3 +47,23 @@ test("community reset clears fallback watermarks when storage is unavailable", (
   resetReminderWatermarks();
   assert.equal(readWatermark("A", "user"), 300);
 });
+
+test("legacy watermarks preserve reminders due while closed without coupling new polls", (t) => {
+  const previous = globalThis.window;
+  const stored = new Map([["buzz:lastReminderCheck:user", "100"]]);
+  globalThis.window = {
+    localStorage: {
+      getItem: (key) => stored.get(key) ?? null,
+      setItem: (key, value) => stored.set(key, value),
+    },
+  };
+  t.after(() => {
+    globalThis.window = previous;
+    resetReminderWatermarks();
+  });
+  assert.equal(readWatermark("A", "USER"), 100);
+  writeWatermark("A", "user", 200);
+  resetReminderWatermarks();
+  assert.equal(readWatermark("A", "user"), 200);
+  assert.equal(readWatermark("B", "user"), 100);
+});
