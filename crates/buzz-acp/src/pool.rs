@@ -1400,6 +1400,37 @@ impl AgentPool {
             .any(|agent| self.can_reuse_scope(agent, scope))
     }
 
+    /// Remove derived hold stamps for scopes that no longer have pending work.
+    pub(crate) fn retain_held_scopes(
+        &mut self,
+        mut has_pending_work: impl FnMut(&SessionScope) -> bool,
+    ) {
+        self.held_since.retain(|scope, _| has_pending_work(scope));
+    }
+
+    /// Earliest scheduled wake for a currently held scope that can claim a
+    /// worker. A worker return wakes the main loop independently, so arming an
+    /// already-expired timer while every slot is checked out would only spin.
+    pub(crate) fn next_hold_deadline(&self, timeout: Duration) -> Option<tokio::time::Instant> {
+        if !self.any_idle() {
+            return None;
+        }
+        self.held_since
+            .values()
+            .map(|held_since| tokio::time::Instant::from_std(*held_since + timeout))
+            .min()
+    }
+
+    /// Sleep until a held scope's scheduled wake, or remain pending when no
+    /// scope is held. This is the future polled directly by the main
+    /// `select!`, kept here so paused-time tests exercise the production seam.
+    pub(crate) async fn wait_for_hold_deadline(deadline: Option<tokio::time::Instant>) {
+        match deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending().await,
+        }
+    }
+
     /// Count of agents that are alive: idle OR checked out (have a task_map entry).
     ///
     /// Used to detect when all agents have exited so the caller can respawn.
@@ -1989,28 +2020,16 @@ async fn create_session_and_apply_model(
         false
     };
 
-    if let Some(effort) = ctx.startup_effort.as_deref() {
-        let updated = match agent
-            .acp
-            .session_set_startup_effort(&resp.session_id, &session_config, effort)
-            .await
-        {
-            Ok(updated) => updated,
-            Err(error @ AcpError::AgentError { .. }) => {
-                // This new session has not entered pool state; reject without leaking it.
-                agent
-                    .release_invalidated_session(
-                        resp.session_id.clone(),
-                        "startup_effort_rejected",
-                        true,
-                    )
-                    .await;
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        };
-        if let Some(options) = updated.get("configOptions") {
-            session_config["configOptions"] = options.clone();
+    if let Some(StartupEffortOutcome::Applied { config_id, value }) = apply_startup_effort(
+        agent,
+        &session_config,
+        &resp.session_id,
+        ctx.startup_effort.as_deref(),
+    )
+    .await?
+    {
+        if let Some(options) = session_config.get_mut("configOptions") {
+            patch_config_option_current_value(options, &config_id, &value);
         }
     }
 
@@ -2050,6 +2069,135 @@ async fn create_session_and_apply_model(
     }
 
     Ok(resp.session_id)
+}
+
+/// Outcome of applying a worker's spawn-scoped startup effort at session creation.
+///
+/// Drives truthful capture: only `Applied` patches the cached `currentValue`.
+/// `Rejected` (adapter refused) and the `None` return (model advertises no
+/// `thought_level` option, or no effort was configured) leave the session/new
+/// snapshot untouched so the panel reflects the session's real state.
+enum StartupEffortOutcome {
+    Applied { config_id: String, value: String },
+    Rejected,
+}
+
+/// Apply the worker's held `startup_effort` via `session/set_config_option`, if
+/// set and the current model advertises a `thought_level` option.
+///
+/// Returns `Ok(None)` when there is nothing to apply (no configured effort, or
+/// the model has no `thought_level` option) or `Ok(Some(_))` describing whether
+/// the adapter accepted the value. Transport-class errors propagate as `Err` so
+/// the caller respawns the worker rather than reuse a poisoned stream — mirroring
+/// [`apply_model_switch`]'s classification. Application-level rejection is
+/// non-fatal: the session proceeds on the model's default effort.
+async fn apply_startup_effort(
+    agent: &mut OwnedAgent,
+    session_new_result: &serde_json::Value,
+    session_id: &str,
+    startup_effort: Option<&str>,
+) -> Result<Option<StartupEffortOutcome>, AcpError> {
+    let Some(value) = startup_effort.map(str::to_owned) else {
+        return Ok(None);
+    };
+    let Some(config_id) = extract_thought_level_config_id(session_new_result) else {
+        tracing::info!(
+            target: "pool::effort",
+            "startup effort {value} configured but model advertises no thought_level option — leaving agent default"
+        );
+        return Ok(None);
+    };
+
+    let result = tokio::time::timeout(MODEL_SWITCH_TIMEOUT, async {
+        agent
+            .acp
+            .session_set_config_option(session_id, &config_id, &value)
+            .await
+    })
+    .await;
+
+    match result {
+        Ok(Ok(_)) => {
+            tracing::info!(
+                target: "pool::effort",
+                "applied startup effort {value} via configId={config_id} on session {session_id}"
+            );
+            Ok(Some(StartupEffortOutcome::Applied { config_id, value }))
+        }
+        // Transport-class errors may have corrupted the stdio stream — propagate
+        // so the caller can respawn the agent instead of reusing a poisoned one.
+        Ok(Err(e @ AcpError::Io(_)))
+        | Ok(Err(e @ AcpError::WriteTimeout(_)))
+        | Ok(Err(e @ AcpError::Timeout(_)))
+        | Ok(Err(e @ AcpError::Protocol(_)))
+        | Ok(Err(e @ AcpError::AgentExited)) => {
+            tracing::error!(
+                target: "pool::effort",
+                "fatal error applying startup effort {value} via configId={config_id}: {e}"
+            );
+            Err(e)
+        }
+        // Application-level rejection (e.g. Json) — agent is fine, uses default effort.
+        Ok(Err(e)) => {
+            tracing::warn!(
+                target: "pool::effort",
+                "adapter rejected startup effort {value} via configId={config_id}: {e} — proceeding with agent default"
+            );
+            Ok(Some(StartupEffortOutcome::Rejected))
+        }
+        Err(_) => {
+            // Outer timeout fired — the inner send_request may have left the
+            // stream in an unknown state. Treat as transport error.
+            tracing::error!(
+                target: "pool::effort",
+                "startup effort {value} via configId={config_id} timed out ({MODEL_SWITCH_TIMEOUT:?}) — treating as fatal"
+            );
+            Err(AcpError::Timeout(MODEL_SWITCH_TIMEOUT))
+        }
+    }
+}
+
+/// Patch the `currentValue` of the configOption whose `configId`/`id` matches
+/// `config_id` in a session/new `configOptions` array, in place.
+///
+/// Used by truthful capture: a successful `session/set_config_option` is not
+/// reflected in the original session/new snapshot, so the accepted value is
+/// written back before the snapshot is cached. A no-op when `options` is not an
+/// array or no entry matches (the id came from the same array, so a match is
+/// expected in practice).
+fn patch_config_option_current_value(
+    options: &mut serde_json::Value,
+    config_id: &str,
+    value: &str,
+) {
+    let Some(arr) = options.as_array_mut() else {
+        return;
+    };
+    for opt in arr {
+        let matches = opt
+            .get("configId")
+            .or_else(|| opt.get("id"))
+            .and_then(|v| v.as_str())
+            == Some(config_id);
+        if matches {
+            opt["currentValue"] = serde_json::Value::String(value.to_string());
+            return;
+        }
+    }
+}
+
+fn extract_thought_level_config_id(result: &serde_json::Value) -> Option<String> {
+    result
+        .get("configOptions")?
+        .as_array()?
+        .iter()
+        .find(|option| {
+            option.get("category").and_then(serde_json::Value::as_str) == Some("thought_level")
+        })
+        .and_then(|option| option.get("configId").or_else(|| option.get("id")))
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
 }
 
 fn mcp_servers_with_git_origin(
@@ -9479,6 +9627,47 @@ done"#
     /// Insert a `task_map` entry so `agent_index` reads as checked-out (busy)
     /// for the busy-owner predicate, mirroring an in-flight prompt task without
     /// spawning a real one. `busy_scope` is the turn the worker is running.
+    #[tokio::test(start_paused = true)]
+    async fn held_scope_deadline_wakes_a_quiet_dispatch_loop() {
+        let channel_id = Uuid::new_v4();
+        let scope = thread_scope(channel_id, &"a".repeat(64));
+        let idle_scope = thread_scope(channel_id, &"c".repeat(64));
+        let idle_agent = idle_agent_with_session(idle_scope).await;
+        let mut pool = AgentPool::from_slots(vec![Some(idle_agent)]);
+        pool.record_scope_owner(scope.clone(), 1);
+        mark_agent_busy(&mut pool, 1, thread_scope(channel_id, &"b".repeat(64)));
+
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            pool.hold_decision(&scope, started.into_std(), HOLD_BUSY_OWNER_TIMEOUT),
+            HoldDecision::Hold { .. }
+        ));
+        let deadline = pool
+            .next_hold_deadline(HOLD_BUSY_OWNER_TIMEOUT)
+            .expect("held scope schedules an independent wake");
+        let wake = AgentPool::wait_for_hold_deadline(Some(deadline));
+        tokio::pin!(wake);
+
+        tokio::time::advance(HOLD_BUSY_OWNER_TIMEOUT - Duration::from_millis(1)).await;
+        assert!(
+            tokio::time::timeout(Duration::ZERO, &mut wake)
+                .await
+                .is_err(),
+            "quiet loop stays asleep before deadline"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        wake.await;
+
+        assert!(matches!(
+            pool.hold_decision(
+                &scope,
+                tokio::time::Instant::now().into_std(),
+                HOLD_BUSY_OWNER_TIMEOUT
+            ),
+            HoldDecision::ForkAfterHold { .. }
+        ));
+    }
+
     fn mark_agent_busy(pool: &mut AgentPool, agent_index: usize, busy_scope: SessionScope) {
         let abort = pool.join_set.spawn(async {});
         pool.task_map_mut().insert(
@@ -11805,7 +11994,7 @@ for line in sys.stdin:
         );
     }
 
-    fn make_prompt_context_no_owner() -> PromptContext {
+    pub(super) fn make_prompt_context_no_owner() -> PromptContext {
         let agent_keys = nostr::Keys::generate();
         make_prompt_context_impl(&agent_keys, None)
     }
@@ -12689,5 +12878,212 @@ done"#
         assert!(wire.contains("follow-up mention"));
         assert!(wire.contains("truncated=\"true\""));
         assert!(wire.contains("buzz messages thread"));
+    }
+}
+
+#[cfg(test)]
+mod startup_effort_tests {
+    use super::*;
+    use crate::acp::AcpClient;
+    use tests::make_prompt_context_no_owner;
+
+    /// Build a protocol-v2, non-goose agent whose only ACP requests will be
+    /// `session/new` (id 0) then the startup-effort `session/set_config_option`
+    /// (id 1). `startup_effort` is the held spawn-scoped value under test.
+    fn effort_agent(acp: AcpClient) -> OwnedAgent {
+        OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "effort-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        }
+    }
+
+    /// Spawn a scripted ACP that answers `session/new` (request #1) with the
+    /// given configOptions, then replies to the effort `set_config_option`
+    /// (request #2) with `effort_reply` (a JSON-RPC `result`/`error` body, minus
+    /// the id which is filled in). Any later request gets `{"ok":true}`.
+    async fn spawn_effort_acp(session_new_config_options: &str, effort_reply: &str) -> AcpClient {
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  id=$((count - 1))
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"sessionId":"sess-1","configOptions":{session_new_config_options}}}}}'
+  elif [ "$count" -eq 2 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',{effort_reply}}}'
+  else
+    printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"ok":true}}}}'
+  fi
+done"#
+        );
+        AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn effort ACP script")
+    }
+
+    fn captured_config_options(obs: &observer::ObserverHandle) -> serde_json::Value {
+        obs.snapshot()
+            .into_iter()
+            .find(|e| e.kind == "session_config_captured")
+            .expect("session_config_captured emitted")
+            .payload["configOptions"]
+            .clone()
+    }
+
+    fn effort_current_value(options: &serde_json::Value) -> Option<String> {
+        options
+            .as_array()?
+            .iter()
+            .find(|o| o["category"] == "thought_level")
+            .and_then(|o| o["currentValue"].as_str())
+            .map(str::to_string)
+    }
+
+    const OPTS_WITH_EFFORT_DEFAULT_LOW: &str = r#"[{"configId":"effort","category":"thought_level","currentValue":"low","options":[{"value":"low"},{"value":"high"}]}]"#;
+
+    #[tokio::test]
+    async fn test_applied_effort_patches_captured_current_value_to_high() {
+        let acp = spawn_effort_acp(OPTS_WITH_EFFORT_DEFAULT_LOW, r#""result":{"ok":true}"#).await;
+        let mut agent = effort_agent(acp);
+        let obs = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(obs.clone()), 0);
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.startup_effort = Some("high".into());
+        create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None)
+            .await
+            .expect("session creation must succeed");
+
+        let opts = captured_config_options(&obs);
+        assert_eq!(
+            effort_current_value(&opts).as_deref(),
+            Some("high"),
+            "applied effort must overwrite the pre-set currentValue in the capture"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rejected_effort_retains_captured_current_value() {
+        // Adapter answers the effort set with a JSON-RPC error → AgentError →
+        // application-level rejection: non-fatal, capture keeps the default.
+        let acp = spawn_effort_acp(
+            OPTS_WITH_EFFORT_DEFAULT_LOW,
+            r#""error":{"code":-32602,"message":"unsupported effort value"}"#,
+        )
+        .await;
+        let mut agent = effort_agent(acp);
+        let obs = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(obs.clone()), 0);
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.startup_effort = Some("high".into());
+        create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None)
+            .await
+            .expect("rejection is non-fatal; session creation still succeeds");
+
+        let opts = captured_config_options(&obs);
+        assert_eq!(
+            effort_current_value(&opts).as_deref(),
+            Some("low"),
+            "a rejected effort must not falsify the capture — keep the running value"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_thought_level_model_leaves_capture_unpatched() {
+        // Model advertises only a `model` option — no thought_level. The held
+        // effort is silently ignored and no set_config_option is sent.
+        let opts_no_effort = r#"[{"configId":"model","category":"model","currentValue":"m-a","options":[{"value":"m-a"}]}]"#;
+        let acp = spawn_effort_acp(opts_no_effort, r#""result":{"ok":true}"#).await;
+        let mut agent = effort_agent(acp);
+        let obs = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(obs.clone()), 0);
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.startup_effort = Some("high".into());
+        create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None)
+            .await
+            .expect("session creation must succeed");
+
+        let opts = captured_config_options(&obs);
+        assert_eq!(
+            opts,
+            serde_json::from_str::<serde_json::Value>(opts_no_effort).unwrap(),
+            "no thought_level option → capture is the untouched session/new snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_startup_effort_leaves_capture_unpatched() {
+        // No held effort at all: the set_config_option is never sent and the
+        // default currentValue survives into the capture.
+        let acp = spawn_effort_acp(OPTS_WITH_EFFORT_DEFAULT_LOW, r#""result":{"ok":true}"#).await;
+        let mut agent = effort_agent(acp);
+        let obs = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(obs.clone()), 0);
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.startup_effort = None;
+        create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None)
+            .await
+            .expect("session creation must succeed");
+
+        let opts = captured_config_options(&obs);
+        assert_eq!(
+            effort_current_value(&opts).as_deref(),
+            Some("low"),
+            "with no configured effort the capture reflects the model default"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transport_error_on_effort_propagates_for_respawn() {
+        // Adapter exits after answering session/new but before the effort set →
+        // AgentExited (transport class) → Err so the caller respawns the worker
+        // instead of reusing a possibly-poisoned stream.
+        let script = format!(
+            r#"IFS= read -r _new
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"sessionId":"sess-1","configOptions":{OPTS_WITH_EFFORT_DEFAULT_LOW}}}}}'
+IFS= read -r _effort
+exit 0"#
+        );
+        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn transport-exit ACP script");
+        let mut agent = effort_agent(acp);
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.startup_effort = Some("high".into());
+        let err = create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None)
+            .await
+            .expect_err("transport-class effort failure must propagate as Err");
+        assert!(
+            matches!(err, AcpError::AgentExited | AcpError::Io(_)),
+            "process exit mid-effort is a transport error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_patch_config_option_current_value_matches_by_id_key() {
+        // The `id` key (claude-agent-acp) must also match, not just `configId`.
+        let mut opts = serde_json::json!([
+            { "id": "effort", "category": "thought_level", "currentValue": "low" }
+        ]);
+        patch_config_option_current_value(&mut opts, "effort", "high");
+        assert_eq!(opts[0]["currentValue"], "high");
+    }
+
+    #[test]
+    fn test_patch_config_option_current_value_noop_on_non_array() {
+        let mut opts = serde_json::Value::Null;
+        patch_config_option_current_value(&mut opts, "effort", "high");
+        assert!(opts.is_null(), "a null snapshot must stay null");
     }
 }
