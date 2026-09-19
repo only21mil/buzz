@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,6 +13,20 @@ import re
 import stat
 import sys
 import uuid
+
+NATIVE_CI_DIR = Path(__file__).resolve().parents[1]
+if str(NATIVE_CI_DIR) not in sys.path:
+    sys.path.insert(0, str(NATIVE_CI_DIR))
+
+from _common import (  # noqa: E402 - direct script execution needs the parent path
+    canonical_json as canonical_json,
+    sha256 as sha256,
+    mapped_id as mapped_id,
+    require_directory as require_directory,
+    require_package_tree as require_package_tree,
+    rooted as rooted,
+    validate_parent_chain as validate_parent_chain,
+)
 
 SCHEMA = "buzz-ci-runner-install-package-v2"
 RECEIPT_SCHEMA = "buzz-ci-runner-install-receipt-v2"
@@ -93,14 +106,6 @@ def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
-def canonical_json(value: object) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
-
-
-def sha256(payload: bytes) -> str:
-    return hashlib.sha256(payload).hexdigest()
-
-
 def read_fd(path: Path, max_bytes: int = 128 * 1024 * 1024) -> tuple[bytes, os.stat_result]:
     fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     try:
@@ -138,35 +143,6 @@ def u32(value: object, *, nonzero: bool = False) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= (1 << 32) - 1:
         raise ValueError("invalid numeric identity")
     return value
-
-
-def mapped_id(value: int, root: Path, *, group: bool = False) -> int:
-    if value != 0 or root == Path("/"):
-        return value
-    metadata = root.lstat()
-    return metadata.st_gid if group else metadata.st_uid
-
-
-def require_directory(path: Path, uid: int, gid: int, mode_value: int) -> None:
-    metadata = path.lstat()
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or metadata.st_uid != uid
-        or metadata.st_gid != gid
-        or stat.S_IMODE(metadata.st_mode) != mode_value
-    ):
-        raise ValueError(f"unsafe directory metadata: {path}")
-
-
-def require_package_tree(package: Path, root: Path) -> tuple[int, int]:
-    package = Path(os.path.abspath(package))
-    if Path(os.path.realpath(package)) != package:
-        raise ValueError("package root must not be a symbolic path")
-    root_uid = mapped_id(0, root)
-    root_gid = mapped_id(0, root, group=True)
-    require_directory(package, root_uid, root_gid, 0o700)
-    require_directory(package / "assets", root_uid, root_gid, 0o700)
-    return root_uid, root_gid
 
 
 def parse_manifest(package: Path, root: Path) -> tuple[dict[str, object], list[Entry]]:
@@ -387,27 +363,6 @@ def validate_host_identities(root: Path, manifest: dict[str, object]) -> None:
             raise ValueError(f"host {role} identity is malformed") from error
         if (user_uid, user_gid, group_gid) != (identity["uid"], identity["gid"], identity["gid"]):
             raise ValueError(f"host {role} identity does not match the package")
-
-
-def rooted(root: Path, target: str) -> Path:
-    if not target.startswith("/") or ".." in Path(target).parts:
-        raise ValueError("unsafe target path")
-    return root / target.removeprefix("/")
-
-
-def validate_parent_chain(root: Path, parent: Path) -> None:
-    root = Path(os.path.abspath(root))
-    if Path(os.path.realpath(root)) != root:
-        raise ValueError("install root must not be a symbolic path")
-    root_uid = mapped_id(0, root)
-    root_gid = mapped_id(0, root, group=True)
-    current = root
-    require_directory(current, root_uid, root_gid, stat.S_IMODE(current.lstat().st_mode))
-    for component in parent.relative_to(root).parts:
-        current /= component
-        metadata = current.lstat()
-        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != root_uid or metadata.st_gid != root_gid or metadata.st_mode & 0o022:
-            raise ValueError(f"unsafe target directory chain: {current}")
 
 
 def validate_target_parent(root: Path, parent: Path) -> None:
