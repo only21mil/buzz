@@ -23,6 +23,29 @@ pub async fn submit_signed_event_at_with_keys(
         return Err("signed event does not match the publishing identity".to_string());
     }
     crate::relay_admission::wait_for_rate_limit().await;
+    submit_signed_event_now(event, state, api_base_url, keys).await
+}
+
+/// Submit a retained event only while its captured publication scope is current.
+pub async fn submit_retained_event_in_scope(
+    event: &nostr::Event,
+    state: &AppState,
+    publication: MessagePublication,
+) -> Result<SubmitEventResponse, String> {
+    if event.pubkey != publication.keys.public_key() {
+        return Err("retained event does not match captured owner".into());
+    }
+    crate::relay_admission::wait_for_rate_limit().await;
+    publication.validate()?;
+    submit_signed_event_now(event, state, &publication.api_base_url, &publication.keys).await
+}
+
+async fn submit_signed_event_now(
+    event: &nostr::Event,
+    state: &AppState,
+    api_base_url: &str,
+    keys: &nostr::Keys,
+) -> Result<SubmitEventResponse, String> {
     let url = format!("{}/events", api_base_url.trim_end_matches('/'));
     let body_bytes = event.as_json().into_bytes();
     crate::egress_guard::assert_no_key_backup_bytes(&body_bytes, "relay event submit")?;

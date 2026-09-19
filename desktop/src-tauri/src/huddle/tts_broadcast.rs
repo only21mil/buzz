@@ -139,21 +139,26 @@ impl TtsBroadcasters {
             .is_some_and(|publisher| !publisher.is_closed())
     }
 
-    pub(super) fn register(
+    pub(super) fn register_if_current(
         &self,
         speaker_pubkey: &str,
         publisher: TtsAudioPublisher,
         speaker_generation: u64,
-    ) {
-        publisher.set_speaker_generation(speaker_generation);
-        let replaced = self
+        is_current: impl FnOnce() -> bool,
+    ) -> bool {
+        let mut publishers = self
             .publishers
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(speaker_pubkey.to_ascii_lowercase(), publisher);
+            .unwrap_or_else(|error| error.into_inner());
+        if !is_current() {
+            return false;
+        }
+        publisher.set_speaker_generation(speaker_generation);
+        let replaced = publishers.insert(speaker_pubkey.to_ascii_lowercase(), publisher);
         if let Some(replaced) = replaced {
             replaced.shutdown();
         }
+        true
     }
 
     pub(super) fn publish(

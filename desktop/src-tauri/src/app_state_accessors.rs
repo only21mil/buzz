@@ -10,6 +10,15 @@ use crate::managed_agents::config_bridge::SessionConfigCache;
 use crate::managed_agents::ManagedAgentRuntimeKey;
 
 impl AppState {
+    /// Read the identity recovery flags after startup resolution.
+    pub(crate) fn identity_recovery_flags(&self) -> (bool, bool) {
+        (
+            self.identity_lost
+                .load(std::sync::atomic::Ordering::Acquire),
+            self.keyring_locked
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
     /// Lock the huddle state mutex, converting a poisoned-lock error to a String.
     ///
     /// Convenience wrapper — replaces 15+ instances of

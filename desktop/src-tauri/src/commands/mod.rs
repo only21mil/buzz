@@ -1,3 +1,5 @@
+mod agent_drafts;
+pub use agent_drafts::*;
 mod agent_access;
 mod agent_auth;
 mod agent_config;

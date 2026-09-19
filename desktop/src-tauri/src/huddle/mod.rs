@@ -69,7 +69,7 @@ pub use window::{close_huddle_companion, open_huddle_window};
 
 // ── Imports ───────────────────────────────────────────────────────────────────
 
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::atomic::Ordering;
 use tauri::State;
 use uuid::Uuid;
 

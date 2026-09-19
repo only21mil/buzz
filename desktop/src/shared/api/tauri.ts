@@ -151,6 +151,7 @@ export type RawManagedAgent = {
   backend: ManagedAgentBackend;
   backend_agent_id: string | null;
   // Pre-feature fixtures may omit these; mapped to "owner-only"/[] in fromRawManagedAgent.
+  effort_level?: string | null;
   respond_to?: ManagedAgent["respondTo"];
   respond_to_allowlist?: string[];
 };
@@ -631,6 +632,7 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     systemPrompt: agent.system_prompt,
     avatarUrl: agent.avatar_url ?? null,
     model: agent.model,
+    effortLevel: agent.effort_level ?? null,
     modelSource: agent.model_source ?? null,
     provider: agent.provider ?? null,
     personaOutOfDate: agent.persona_out_of_date ?? false,

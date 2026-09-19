@@ -18,10 +18,8 @@ pub fn set_agent_managed_profiles(enabled: bool, state: State<'_, AppState>) {
 }
 
 #[tauri::command]
-pub fn set_thread_scoped_acp_sessions(enabled: bool, state: State<'_, AppState>) {
-    state
-        .thread_scoped_acp_sessions_enabled()
-        .store(enabled, Ordering::Release);
+pub fn set_thread_scoped_acp_sessions(_enabled: bool) -> Result<(), String> {
+    Err("Session policy is now configured per agent definition.".to_string())
 }
 
 #[tauri::command]

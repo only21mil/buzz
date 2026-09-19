@@ -194,6 +194,8 @@ fn apply_team_membership_delta(
     changed
 }
 
+mod inbound;
+pub(crate) use inbound::refresh_team_catalog_heads_for_inbound_persona;
 mod adopt;
 mod pending;
 mod sharing;
