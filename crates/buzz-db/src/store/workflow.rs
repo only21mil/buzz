@@ -7,6 +7,13 @@
 //! - Approval tokens are stored as SHA-256 hashes (never plaintext).
 //! - All list queries have a bounded LIMIT to prevent unbounded scans.
 
+use crate::{
+    workflow, workflow_approval, workflow_effect, workflow_run_transition, workflow_state,
+    WorkflowApprovalDecisionOutcome, WorkflowApprovalGateCreationOutcome,
+    WorkflowApprovalGateRecord, WorkflowEffectClaimOutcome, WorkflowEffectMarkOutcome,
+    WorkflowResumeCandidate, WorkflowRunTransitionOutcome, WorkflowStateEntry,
+    WorkflowStateWriteOutcome,
+};
 use std::fmt;
 use std::str::FromStr;
 
@@ -84,6 +91,8 @@ pub enum RunStatus {
     Running,
     /// Run is suspended waiting for an approval gate.
     WaitingApproval,
+    /// A durable worker may claim the approved run for continuation.
+    ResumePending,
     /// Run finished successfully.
     Completed,
     /// Run terminated with an error.
@@ -98,6 +107,7 @@ impl fmt::Display for RunStatus {
             RunStatus::Pending => write!(f, "pending"),
             RunStatus::Running => write!(f, "running"),
             RunStatus::WaitingApproval => write!(f, "waiting_approval"),
+            RunStatus::ResumePending => write!(f, "resume_pending"),
             RunStatus::Completed => write!(f, "completed"),
             RunStatus::Failed => write!(f, "failed"),
             RunStatus::Cancelled => write!(f, "cancelled"),
@@ -112,6 +122,7 @@ impl FromStr for RunStatus {
             "pending" => Ok(RunStatus::Pending),
             "running" => Ok(RunStatus::Running),
             "waiting_approval" => Ok(RunStatus::WaitingApproval),
+            "resume_pending" => Ok(RunStatus::ResumePending),
             "completed" => Ok(RunStatus::Completed),
             "failed" => Ok(RunStatus::Failed),
             "cancelled" => Ok(RunStatus::Cancelled),
@@ -203,6 +214,16 @@ pub struct WorkflowRunRecord {
     pub community_id: CommunityId,
     /// The workflow definition that was executed.
     pub workflow_id: Uuid,
+    /// Immutable canonical workflow definition captured when this run was created.
+    pub definition_snapshot: serde_json::Value,
+    /// SHA-256 hash of `definition_snapshot`.
+    pub definition_hash: Vec<u8>,
+    /// Optimistic transition fence for durable resume workers.
+    pub generation: i64,
+    /// First workflow step that has not completed durably.
+    pub next_step: i32,
+    /// Durable outputs keyed by completed step ID.
+    pub step_outputs: serde_json::Value,
     /// Current execution status of this run.
     pub status: RunStatus,
     /// Raw event ID bytes that triggered this run, if any.
@@ -274,10 +295,11 @@ pub struct ApprovalRecord {
 // -- Workflow CRUD ------------------------------------------------------------
 
 /// Insert a new workflow record. Returns the new workflow's UUID.
-/// New workflows start as `active` and `enabled = TRUE`.
+/// New workflows start as `active` and preserve the caller-supplied enabled state.
 ///
 /// NOTE: see the cache-invalidation note on [`update_workflow`]. The relay's
-/// creation path is [`upsert_workflow`] via event ingest. (No current callers.)
+/// creation path is [`upsert_workflow`] via event ingest. (No production callers.)
+#[allow(clippy::too_many_arguments)]
 pub async fn create_workflow(
     pool: &PgPool,
     community_id: CommunityId,
@@ -286,6 +308,7 @@ pub async fn create_workflow(
     name: &str,
     definition_json: &str,
     definition_hash: &[u8],
+    enabled: bool,
 ) -> Result<Uuid> {
     let id = Uuid::new_v4();
 
@@ -293,7 +316,7 @@ pub async fn create_workflow(
         r#"
         INSERT INTO workflows
             (id, community_id, name, owner_pubkey, channel_id, definition, definition_hash, status, enabled)
-        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'active', TRUE)
+        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'active', $8)
         "#,
     )
     .bind(id)
@@ -303,7 +326,8 @@ pub async fn create_workflow(
     .bind(channel_id)
     .bind(definition_json)
     .bind(definition_hash)
-    .execute(pool)
+    .bind(enabled)
+    .execute(&mut *crate::observability::acquire_writer(pool, crate::observability::WriterOperation::EventWrite).await?)
     .await?;
 
     Ok(id)
@@ -324,19 +348,22 @@ pub async fn upsert_workflow(
     name: &str,
     definition_json: &str,
     definition_hash: &[u8],
+    enabled: bool,
 ) -> Result<()> {
     let row = sqlx::query(
         r#"
         INSERT INTO workflows
             (community_id, id, name, owner_pubkey, channel_id, definition, definition_hash, status, enabled)
-        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'active', TRUE)
+        VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 'active', $8)
         ON CONFLICT (community_id, id) DO UPDATE
         SET name = EXCLUDED.name,
             definition = EXCLUDED.definition,
             definition_hash = EXCLUDED.definition_hash,
+            enabled = EXCLUDED.enabled,
             updated_at = NOW()
         WHERE workflows.owner_pubkey = EXCLUDED.owner_pubkey
           AND workflows.channel_id IS NOT DISTINCT FROM EXCLUDED.channel_id
+          AND workflows.deleted_at IS NULL
         RETURNING id
         "#,
     )
@@ -347,7 +374,8 @@ pub async fn upsert_workflow(
     .bind(channel_id)
     .bind(definition_json)
     .bind(definition_hash)
-    .fetch_optional(pool)
+    .bind(enabled)
+    .fetch_optional(&mut *crate::observability::acquire_writer(pool, crate::observability::WriterOperation::EventWrite).await?)
     .await?;
 
     if row.is_none() {
@@ -375,12 +403,18 @@ pub async fn get_workflow(
         SELECT id, community_id, name, owner_pubkey, channel_id, definition, definition_hash,
                status::text AS status, enabled, created_at, updated_at
         FROM workflows
-        WHERE community_id = $1 AND id = $2
+        WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL
         "#,
     )
     .bind(community_id.as_uuid())
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(
+        &mut *crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+    )
     .await?
     .ok_or_else(|| DbError::NotFound(format!("workflow {id}")))?;
 
@@ -406,7 +440,7 @@ pub async fn list_channel_workflows(
         SELECT id, community_id, name, owner_pubkey, channel_id, definition, definition_hash,
                status::text AS status, enabled, created_at, updated_at
         FROM workflows
-        WHERE community_id = $1 AND channel_id = $2
+        WHERE community_id = $1 AND channel_id = $2 AND deleted_at IS NULL
         ORDER BY created_at DESC
         LIMIT $3 OFFSET $4
         "#,
@@ -415,7 +449,13 @@ pub async fn list_channel_workflows(
     .bind(channel_id)
     .bind(limit)
     .bind(offset)
-    .fetch_all(pool)
+    .fetch_all(
+        &mut *crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+    )
     .await?;
 
     rows.into_iter().map(row_to_workflow_record).collect()
@@ -441,6 +481,7 @@ pub async fn list_enabled_channel_workflows(
           AND channel_id = $2
           AND status = 'active'
           AND enabled = TRUE
+          AND deleted_at IS NULL
         ORDER BY created_at DESC
         LIMIT $3
         "#,
@@ -448,7 +489,13 @@ pub async fn list_enabled_channel_workflows(
     .bind(community_id.as_uuid())
     .bind(channel_id)
     .bind(LIST_MAX_LIMIT)
-    .fetch_all(pool)
+    .fetch_all(
+        &mut *crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+    )
     .await?;
 
     rows.into_iter().map(row_to_workflow_record).collect()
@@ -468,6 +515,7 @@ pub async fn list_all_enabled_workflows(pool: &PgPool) -> Result<Vec<WorkflowRec
         JOIN communities c ON c.id = w.community_id
         WHERE w.status = 'active'
           AND w.enabled = TRUE
+          AND w.deleted_at IS NULL
           AND w.definition->'trigger'->>'on' = 'schedule'
           AND c.archived_at IS NULL
         ORDER BY w.created_at ASC
@@ -475,7 +523,7 @@ pub async fn list_all_enabled_workflows(pool: &PgPool) -> Result<Vec<WorkflowRec
         "#,
     )
     .bind(LIST_MAX_LIMIT)
-    .fetch_all(pool)
+    .fetch_all(&mut *crate::observability::acquire_writer(pool, crate::observability::WriterOperation::EventWrite).await?)
     .await?;
 
     rows.into_iter().map(row_to_workflow_record).collect()
@@ -509,7 +557,7 @@ pub async fn claim_scheduled_workflow_fire(
         INSERT INTO scheduled_workflow_fires (community_id, workflow_id, scheduled_for)
         SELECT w.community_id, w.id, $3
         FROM workflows w
-        WHERE w.community_id = $1 AND w.id = $2
+        WHERE w.community_id = $1 AND w.id = $2 AND w.deleted_at IS NULL
         ON CONFLICT (community_id, workflow_id, scheduled_for) DO NOTHING
         RETURNING community_id, workflow_id, scheduled_for, claimed_at
         "#,
@@ -517,7 +565,13 @@ pub async fn claim_scheduled_workflow_fire(
     .bind(community_id.as_uuid())
     .bind(workflow_id)
     .bind(scheduled_for)
-    .fetch_optional(pool)
+    .fetch_optional(
+        &mut *crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+    )
     .await?;
 
     row.map(|row| {
@@ -553,7 +607,13 @@ pub async fn latest_scheduled_workflow_fire(
     )
     .bind(community_id.as_uuid())
     .bind(workflow_id)
-    .fetch_one(pool)
+    .fetch_one(
+        &mut *crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+    )
     .await?;
 
     row.try_get("scheduled_for").map_err(Into::into)
@@ -586,7 +646,13 @@ pub async fn attach_scheduled_workflow_run(
     .bind(workflow_id)
     .bind(scheduled_for)
     .bind(workflow_run_id)
-    .execute(pool)
+    .execute(
+        &mut *crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+    )
     .await?;
 
     Ok(result.rows_affected() == 1)
@@ -611,7 +677,13 @@ pub async fn prune_scheduled_workflow_fires_before(
         "#,
     )
     .bind(older_than)
-    .execute(pool)
+    .execute(
+        &mut *crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+    )
     .await?;
 
     Ok(result.rows_affected())
@@ -635,7 +707,7 @@ pub async fn update_workflow(
         r#"
         UPDATE workflows
         SET name = $1, definition = $2::jsonb, definition_hash = $3
-        WHERE community_id = $4 AND id = $5
+        WHERE community_id = $4 AND id = $5 AND deleted_at IS NULL
         "#,
     )
     .bind(name)
@@ -643,7 +715,13 @@ pub async fn update_workflow(
     .bind(definition_hash)
     .bind(community_id.as_uuid())
     .bind(id)
-    .execute(pool)
+    .execute(
+        &mut *crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+    )
     .await?
     .rows_affected();
 
@@ -667,13 +745,19 @@ pub async fn update_workflow_status(
         r#"
         UPDATE workflows
         SET status = $1::workflow_status
-        WHERE community_id = $2 AND id = $3
+        WHERE community_id = $2 AND id = $3 AND deleted_at IS NULL
         "#,
     )
     .bind(status.to_string())
     .bind(community_id.as_uuid())
     .bind(id)
-    .execute(pool)
+    .execute(
+        &mut *crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+    )
     .await?
     .rows_affected();
 
@@ -697,13 +781,19 @@ pub async fn set_workflow_enabled(
         r#"
         UPDATE workflows
         SET enabled = $1
-        WHERE community_id = $2 AND id = $3
+        WHERE community_id = $2 AND id = $3 AND deleted_at IS NULL
         "#,
     )
     .bind(enabled)
     .bind(community_id.as_uuid())
     .bind(id)
-    .execute(pool)
+    .execute(
+        &mut *crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+    )
     .await?
     .rows_affected();
 
@@ -730,31 +820,51 @@ pub async fn disable_workflows_for_owner_in_channel(
         r#"
         UPDATE workflows
         SET enabled = FALSE
-        WHERE community_id = $1 AND channel_id = $2 AND owner_pubkey = $3 AND enabled = TRUE
+        WHERE community_id = $1
+          AND channel_id = $2
+          AND owner_pubkey = $3
+          AND enabled = TRUE
+          AND deleted_at IS NULL
         "#,
     )
     .bind(community_id.as_uuid())
     .bind(channel_id)
     .bind(owner_pubkey)
-    .execute(pool)
+    .execute(
+        &mut *crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+    )
     .await?
     .rows_affected();
 
     Ok(affected)
 }
 
-/// Delete a workflow and all its runs/approvals (CASCADE).
+/// Soft-delete a workflow while retaining its runs and approval history.
 ///
 /// NOTE: see the cache-invalidation note on [`update_workflow`]. The relay's
 /// deletion path uses [`delete_workflow_for_owner`], which returns the
 /// `channel_id` needed for invalidation. (No current callers.)
 pub async fn delete_workflow(pool: &PgPool, community_id: CommunityId, id: Uuid) -> Result<()> {
-    let affected = sqlx::query("DELETE FROM workflows WHERE community_id = $1 AND id = $2")
-        .bind(community_id.as_uuid())
-        .bind(id)
-        .execute(pool)
-        .await?
-        .rows_affected();
+    let affected = sqlx::query(
+        "UPDATE workflows \
+         SET enabled = FALSE, deleted_at = NOW(), updated_at = NOW() \
+         WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL",
+    )
+    .bind(community_id.as_uuid())
+    .bind(id)
+    .execute(
+        &mut *crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+    )
+    .await?
+    .rows_affected();
 
     if affected == 0 {
         return Err(DbError::NotFound(format!("workflow {id}")));
@@ -762,11 +872,11 @@ pub async fn delete_workflow(pool: &PgPool, community_id: CommunityId, id: Uuid)
     Ok(())
 }
 
-/// Delete a workflow only when it belongs to `owner_pubkey`.
+/// Soft-delete a workflow only when it belongs to `owner_pubkey`.
 ///
 /// Used by event-driven deletion paths where the workflow UUID is attacker
-/// controlled. Keeping the owner predicate in the DELETE statement avoids a
-/// check-then-delete race and ensures a caller cannot delete another user's
+/// controlled. Keeping the owner predicate in the UPDATE statement avoids a
+/// check-then-update race and ensures a caller cannot delete another user's
 /// workflow just by learning its UUID.
 ///
 /// Returns the deleted workflow's `channel_id` so the caller can invalidate
@@ -778,13 +888,21 @@ pub async fn delete_workflow_for_owner(
     owner_pubkey: &[u8],
 ) -> Result<Option<Uuid>> {
     let row = sqlx::query(
-        "DELETE FROM workflows WHERE community_id = $1 AND id = $2 AND owner_pubkey = $3 \
+        "UPDATE workflows \
+         SET enabled = FALSE, deleted_at = NOW(), updated_at = NOW() \
+         WHERE community_id = $1 AND id = $2 AND owner_pubkey = $3 AND deleted_at IS NULL \
          RETURNING channel_id",
     )
     .bind(community_id.as_uuid())
     .bind(id)
     .bind(owner_pubkey)
-    .fetch_optional(pool)
+    .fetch_optional(
+        &mut *crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+    )
     .await?;
 
     match row {
@@ -800,29 +918,51 @@ pub async fn delete_workflow_for_owner(
 /// `trigger_context` is the serialized `TriggerContext` for this run. It is stored
 /// so that post-approval resume steps can restore the original trigger data and
 /// correctly resolve `{{trigger.*}}` template variables.
+/// `definition_snapshot` and `definition_hash` must be the exact canonical
+/// definition and hash selected by the caller for this run.
 pub async fn create_workflow_run(
     pool: &PgPool,
     community_id: CommunityId,
     workflow_id: Uuid,
     trigger_event_id: Option<&[u8]>,
     trigger_context: Option<&serde_json::Value>,
+    definition_snapshot: &serde_json::Value,
+    definition_hash: &[u8],
 ) -> Result<Uuid> {
     let id = Uuid::new_v4();
 
-    sqlx::query(
+    let inserted = sqlx::query_scalar::<_, Uuid>(
         r#"
         INSERT INTO workflow_runs
-            (community_id, id, workflow_id, status, trigger_event_id, current_step, execution_trace, trigger_context)
-        VALUES ($1, $2, $3, 'pending', $4, 0, '[]', $5)
+            (community_id, id, workflow_id, definition_snapshot, definition_hash, generation,
+             status, trigger_event_id, current_step, execution_trace, trigger_context)
+        SELECT $1, $2, workflow.id, $4, $5, 1, 'pending', $6, 0, '[]', $7
+        FROM workflows AS workflow
+        WHERE workflow.community_id = $1
+          AND workflow.id = $3
+          AND workflow.deleted_at IS NULL
+        RETURNING id
         "#,
     )
     .bind(community_id.as_uuid())
     .bind(id)
     .bind(workflow_id)
+    .bind(definition_snapshot)
+    .bind(definition_hash)
     .bind(trigger_event_id)
     .bind(trigger_context)
-    .execute(pool)
+    .fetch_optional(
+        &mut *crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+    )
     .await?;
+
+    if inserted.is_none() {
+        return Err(DbError::NotFound(format!("workflow {workflow_id}")));
+    }
 
     Ok(id)
 }
@@ -835,15 +975,23 @@ pub async fn get_workflow_run(
 ) -> Result<WorkflowRunRecord> {
     let row = sqlx::query(
         r#"
-        SELECT community_id, id, workflow_id, status::text AS status, trigger_event_id, current_step,
-               execution_trace, trigger_context, started_at, completed_at, error_message, error_code, created_at
+        SELECT community_id, id, workflow_id, definition_snapshot, definition_hash, generation,
+               next_step, step_outputs,
+               status::text AS status, trigger_event_id, current_step, execution_trace,
+               trigger_context, started_at, completed_at, error_message, error_code, created_at
         FROM workflow_runs
         WHERE community_id = $1 AND id = $2
         "#,
     )
     .bind(community_id.as_uuid())
     .bind(id)
-    .fetch_optional(pool)
+    .fetch_optional(
+        &mut *crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+    )
     .await?
     .ok_or_else(|| DbError::NotFound(format!("workflow_run {id}")))?;
 
@@ -867,7 +1015,7 @@ pub async fn list_workflow_runs_page(
     let limit = limit.clamp(1, LIST_MAX_LIMIT);
     let rows = sqlx::query(
         r#"
-        SELECT community_id, id, workflow_id, status::text AS status, trigger_event_id, current_step,
+        SELECT community_id, id, workflow_id, definition_snapshot, definition_hash, generation, next_step, step_outputs, status::text AS status, trigger_event_id, current_step,
                execution_trace, trigger_context, started_at, completed_at, error_message, error_code, created_at
         FROM workflow_runs
         WHERE community_id = $1 AND workflow_id = $2
@@ -887,7 +1035,6 @@ pub async fn list_workflow_runs_page(
     .bind(limit)
     .fetch_all(pool)
     .await?;
-
     rows.into_iter().map(row_to_run_record).collect()
 }
 
@@ -963,6 +1110,9 @@ pub async fn update_workflow_run(
     Ok(())
 }
 
+/// Persist a structured workflow failure using the upstream update operation.
+pub use update_workflow_run as update_workflow_run_with_failure;
+
 // -- Approval CRUD ------------------------------------------------------------
 
 /// Parameters for creating a new approval request.
@@ -1017,7 +1167,7 @@ pub async fn create_approval(pool: &PgPool, params: CreateApprovalParams<'_>) ->
     .bind(step_index)
     .bind(approver_spec)
     .bind(expires_at)
-    .execute(pool)
+    .execute(&mut *crate::observability::acquire_writer(pool, crate::observability::WriterOperation::EventWrite).await?)
     .await?;
 
     Ok(())
@@ -1059,7 +1209,13 @@ pub async fn get_approval_by_stored_hash(
     )
     .bind(community_id.as_uuid())
     .bind(token_hash)
-    .fetch_optional(pool)
+    .fetch_optional(
+        &mut *crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+    )
     .await?
     .ok_or_else(|| DbError::NotFound("approval token (hashed)".to_string()))?;
 
@@ -1085,10 +1241,66 @@ pub async fn get_run_approvals(
     .bind(community_id.as_uuid())
     .bind(run_id)
     .bind(workflow_id)
-    .fetch_all(pool)
+    .fetch_all(
+        &mut *crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+    )
     .await?;
 
     rows.into_iter().map(row_to_approval_record).collect()
+}
+
+/// Read-only approval projection spanning legacy rows and durable signed gates.
+/// The reference is evidence identity, never a raw decision token.
+#[derive(Debug, sqlx::FromRow)]
+pub struct WorkflowApprovalHistoryRecord {
+    /// Durable UUID or legacy stored hash for display only.
+    pub approval_ref: String,
+    /// Owning workflow.
+    pub workflow_id: Uuid,
+    /// Owning run.
+    pub run_id: Uuid,
+    /// Frozen step identifier.
+    pub step_id: String,
+    /// Frozen step index.
+    pub step_index: i32,
+    /// Display form of the frozen approval policy.
+    pub approver_spec: String,
+    /// Persisted approval outcome, including unsatisfiable.
+    pub status: String,
+    /// Recorded decision signer, when present.
+    pub approver_pubkey: Option<String>,
+    /// Recorded decision note.
+    pub note: Option<String>,
+    /// Persisted expiry instant.
+    pub expires_at: DateTime<Utc>,
+    /// Creation instant.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Read all approval evidence for exactly one tenant/workflow/run binding.
+pub async fn get_workflow_approval_history(
+    pool: &PgPool,
+    community_id: CommunityId,
+    workflow_id: Uuid,
+    run_id: Uuid,
+) -> Result<Vec<WorkflowApprovalHistoryRecord>> {
+    Ok(sqlx::query_as::<_, WorkflowApprovalHistoryRecord>(r#"
+        SELECT id::text AS approval_ref, workflow_id, run_id, step_id::text, step_index,
+               policy_snapshot::text AS approver_spec, status,
+               encode(decision_actor_pubkey, 'hex') AS approver_pubkey, note, expires_at, created_at
+        FROM workflow_approval_gates
+        WHERE community_id = $1 AND workflow_id = $2 AND run_id = $3
+        UNION ALL
+        SELECT encode(token, 'hex') AS approval_ref, workflow_id, run_id, step_id::text, step_index,
+               approver_spec::text, status::text, encode(approver_pubkey, 'hex'), note, expires_at, created_at
+        FROM workflow_approvals
+        WHERE community_id = $1 AND workflow_id = $2 AND run_id = $3
+        ORDER BY step_index, created_at, approval_ref
+    "#).bind(community_id.as_uuid()).bind(workflow_id).bind(run_id).fetch_all(&mut *crate::observability::acquire_writer(pool, crate::observability::WriterOperation::EventWrite).await?).await?)
 }
 
 /// Update an approval's status, approver pubkey, and optional note.
@@ -1157,7 +1369,13 @@ pub async fn update_approval_by_stored_hash(
     .bind(&status_str) // for denied_at CASE
     .bind(community_id.as_uuid())
     .bind(token_hash)
-    .execute(pool)
+    .execute(
+        &mut *crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+    )
     .await?
     .rows_affected();
 
@@ -1204,6 +1422,11 @@ fn row_to_run_record(row: sqlx::postgres::PgRow) -> Result<WorkflowRunRecord> {
         id,
         community_id: CommunityId::from_uuid(community_id),
         workflow_id,
+        definition_snapshot: row.try_get("definition_snapshot")?,
+        definition_hash: row.try_get("definition_hash")?,
+        generation: row.try_get("generation")?,
+        next_step: row.try_get("next_step")?,
+        step_outputs: row.try_get("step_outputs")?,
         status,
         trigger_event_id: row.try_get("trigger_event_id")?,
         current_step: row.try_get("current_step")?,
@@ -1252,14 +1475,23 @@ pub async fn find_by_owner_and_name(
         SELECT id, community_id, name, owner_pubkey, channel_id, definition, definition_hash,
                status::text AS status, enabled, created_at, updated_at
         FROM workflows
-        WHERE community_id = $1 AND owner_pubkey = $2 AND name = $3
+        WHERE community_id = $1
+          AND owner_pubkey = $2
+          AND name = $3
+          AND deleted_at IS NULL
         LIMIT 1
         "#,
     )
     .bind(community_id.as_uuid())
     .bind(owner_pubkey)
     .bind(name)
-    .fetch_optional(pool)
+    .fetch_optional(
+        &mut *crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+    )
     .await?;
 
     match row {
@@ -1279,14 +1511,21 @@ impl Db {
         workflow_id: Uuid,
         trigger_event_id: Option<&[u8]>,
         trigger_context: Option<&serde_json::Value>,
+        definition_snapshot: &serde_json::Value,
+        definition_hash: &[u8],
     ) -> Result<Uuid> {
-        crate::workflow::create_workflow_run(
-            &self.pool,
-            community_id,
-            workflow_id,
-            trigger_event_id,
-            trigger_context,
-        )
+        async {
+            workflow::create_workflow_run(
+                &self.pool,
+                community_id,
+                workflow_id,
+                trigger_event_id,
+                trigger_context,
+                definition_snapshot,
+                definition_hash,
+            )
+            .await
+        }
         .await
     }
 
@@ -1451,6 +1690,7 @@ impl Db {
         name: &str,
         definition_json: &str,
         definition_hash: &[u8],
+        enabled: bool,
     ) -> Result<Uuid> {
         crate::workflow::create_workflow(
             &self.pool,
@@ -1460,6 +1700,7 @@ impl Db {
             name,
             definition_json,
             definition_hash,
+            enabled,
         )
         .await
     }
@@ -1476,17 +1717,22 @@ impl Db {
         name: &str,
         definition_json: &str,
         definition_hash: &[u8],
+        enabled: bool,
     ) -> Result<()> {
-        crate::workflow::upsert_workflow(
-            &self.pool,
-            community_id,
-            id,
-            channel_id,
-            owner_pubkey,
-            name,
-            definition_json,
-            definition_hash,
-        )
+        async {
+            workflow::upsert_workflow(
+                &self.pool,
+                community_id,
+                id,
+                channel_id,
+                owner_pubkey,
+                name,
+                definition_json,
+                definition_hash,
+                enabled,
+            )
+            .await
+        }
         .await
     }
 
@@ -1726,6 +1972,7 @@ mod postgres_tests {
         assert_eq!(RunStatus::Pending.to_string(), "pending");
         assert_eq!(RunStatus::Running.to_string(), "running");
         assert_eq!(RunStatus::WaitingApproval.to_string(), "waiting_approval");
+        assert_eq!(RunStatus::ResumePending.to_string(), "resume_pending");
         assert_eq!(RunStatus::Completed.to_string(), "completed");
         assert_eq!(RunStatus::Failed.to_string(), "failed");
         assert_eq!(RunStatus::Cancelled.to_string(), "cancelled");
@@ -1737,6 +1984,7 @@ mod postgres_tests {
             "pending",
             "running",
             "waiting_approval",
+            "resume_pending",
             "completed",
             "failed",
             "cancelled",
@@ -1922,6 +2170,11 @@ mod postgres_tests {
             id,
             community_id: CommunityId::from_uuid(Uuid::new_v4()),
             workflow_id,
+            definition_snapshot: serde_json::json!({ "steps": [] }),
+            definition_hash: vec![0x42; 32],
+            generation: 1,
+            next_step: 2,
+            step_outputs: serde_json::json!({"s1": {"ok": true}}),
             status: RunStatus::Running,
             trigger_event_id: Some(trigger_event_id.clone()),
             current_step: 2,
@@ -1931,13 +2184,21 @@ mod postgres_tests {
             trigger_context: None,
             started_at: Some(now),
             completed_at: None,
-            error_message: None,
             error_code: None,
+            error_message: None,
             created_at: now,
         };
 
         assert_eq!(record.id, id);
         assert_eq!(record.workflow_id, workflow_id);
+        assert_eq!(
+            record.definition_snapshot,
+            serde_json::json!({ "steps": [] })
+        );
+        assert_eq!(record.definition_hash, vec![0x42; 32]);
+        assert_eq!(record.generation, 1);
+        assert_eq!(record.next_step, 2);
+        assert_eq!(record.step_outputs, serde_json::json!({"s1": {"ok": true}}));
         assert_eq!(record.status, RunStatus::Running);
         assert_eq!(record.trigger_event_id, Some(trigger_event_id));
         assert_eq!(record.current_step, 2);
@@ -1953,6 +2214,11 @@ mod postgres_tests {
             id: Uuid::new_v4(),
             community_id: CommunityId::from_uuid(Uuid::new_v4()),
             workflow_id: Uuid::new_v4(),
+            definition_snapshot: serde_json::json!({}),
+            definition_hash: vec![0x42; 32],
+            generation: 1,
+            next_step: 0,
+            step_outputs: serde_json::json!({}),
             status: RunStatus::Pending,
             trigger_event_id: None,
             current_step: 0,
@@ -1960,8 +2226,8 @@ mod postgres_tests {
             trigger_context: None,
             started_at: None,
             completed_at: None,
-            error_message: None,
             error_code: None,
+            error_message: None,
             created_at: now,
         };
 
@@ -1977,6 +2243,11 @@ mod postgres_tests {
             id: Uuid::new_v4(),
             community_id: CommunityId::from_uuid(Uuid::new_v4()),
             workflow_id: Uuid::new_v4(),
+            definition_snapshot: serde_json::json!({}),
+            definition_hash: vec![0x42; 32],
+            generation: 1,
+            next_step: 3,
+            step_outputs: serde_json::json!({}),
             status: RunStatus::Failed,
             trigger_event_id: None,
             current_step: 1,
@@ -1984,8 +2255,8 @@ mod postgres_tests {
             trigger_context: None,
             started_at: Some(now),
             completed_at: Some(now),
+            error_code: None,
             error_message: Some("step timeout exceeded".to_owned()),
-            error_code: Some("step_timeout".to_owned()),
             created_at: now,
         };
 
@@ -2009,6 +2280,11 @@ mod postgres_tests {
             id: Uuid::new_v4(),
             community_id: CommunityId::from_uuid(Uuid::new_v4()),
             workflow_id: Uuid::new_v4(),
+            definition_snapshot: serde_json::json!({}),
+            definition_hash: vec![0x42; 32],
+            generation: 1,
+            next_step: 4,
+            step_outputs: serde_json::json!({}),
             status: RunStatus::Completed,
             trigger_event_id: None,
             current_step: 2,
@@ -2016,8 +2292,8 @@ mod postgres_tests {
             trigger_context: None,
             started_at: Some(now),
             completed_at: Some(now),
-            error_message: None,
             error_code: None,
+            error_message: None,
             created_at: now,
         };
 
@@ -2032,6 +2308,11 @@ mod postgres_tests {
             id: Uuid::new_v4(),
             community_id: CommunityId::from_uuid(Uuid::new_v4()),
             workflow_id: Uuid::new_v4(),
+            definition_snapshot: serde_json::json!({}),
+            definition_hash: vec![0x42; 32],
+            generation: 1,
+            next_step: 0,
+            step_outputs: serde_json::json!({}),
             status: RunStatus::Pending,
             trigger_event_id: None,
             current_step: 0,
@@ -2039,8 +2320,8 @@ mod postgres_tests {
             trigger_context: None,
             started_at: None,
             completed_at: None,
-            error_message: None,
             error_code: None,
+            error_message: None,
             created_at: now,
         };
 
@@ -2196,7 +2477,7 @@ mod postgres_tests {
     async fn setup_pool() -> PgPool {
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
-            .unwrap_or_else(|_| TEST_DB_URL.to_owned());
+            .expect("explicit isolated test database URL required");
 
         PgPool::connect(&database_url)
             .await
@@ -2252,6 +2533,7 @@ mod postgres_tests {
             "f1-attack-workflow",
             r#"{"trigger":{"on":"schedule"},"steps":[]}"#,
             &[0u8; 32],
+            true,
         )
         .await
         .expect("create workflow");
@@ -2380,9 +2662,19 @@ mod postgres_tests {
             .expect("claim wins");
 
         // Create the run the won claim is responsible for, then attach it.
-        let run_id = create_workflow_run(&pool, community, workflow_id, None, None)
-            .await
-            .expect("create run ok");
+        let definition_snapshot = serde_json::json!({});
+        let definition_hash = [0x42; 32];
+        let run_id = create_workflow_run(
+            &pool,
+            community,
+            workflow_id,
+            None,
+            None,
+            &definition_snapshot,
+            &definition_hash,
+        )
+        .await
+        .expect("create run ok");
 
         let attached =
             attach_scheduled_workflow_run(&pool, community, workflow_id, scheduled_for, run_id)
@@ -2409,9 +2701,17 @@ mod postgres_tests {
 
         // A second attach is a no-op: the `workflow_run_id IS NULL` guard means
         // an already-linked claim is never re-pointed to a different run.
-        let other_run = create_workflow_run(&pool, community, workflow_id, None, None)
-            .await
-            .expect("create second run ok");
+        let other_run = create_workflow_run(
+            &pool,
+            community,
+            workflow_id,
+            None,
+            None,
+            &definition_snapshot,
+            &definition_hash,
+        )
+        .await
+        .expect("create second run ok");
         let reattached =
             attach_scheduled_workflow_run(&pool, community, workflow_id, scheduled_for, other_run)
                 .await
@@ -2656,19 +2956,119 @@ mod postgres_tests {
             .await
             .expect("delete A's workflow");
 
-        // A's row is gone; B's identical-UUID row survives untouched.
+        // A's tombstone is hidden by public reads; B's identical-UUID row
+        // survives untouched.
         assert!(
             matches!(
                 get_workflow(&pool, community_a, shared_workflow_id).await,
                 Err(DbError::NotFound(_))
             ),
-            "A's workflow must be deleted"
+            "A's workflow tombstone must be hidden"
+        );
+        let tombstone: (bool, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT enabled, deleted_at FROM workflows \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community_a.as_uuid())
+        .bind(shared_workflow_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read A's workflow tombstone");
+        assert!(!tombstone.0, "A's deleted workflow must be disabled");
+        assert!(
+            tombstone.1.is_some(),
+            "A's deleted workflow must retain a tombstone timestamp"
+        );
+        assert!(
+            matches!(
+                delete_workflow(&pool, community_a, shared_workflow_id).await,
+                Err(DbError::NotFound(_))
+            ),
+            "an already deleted workflow must be NotFound"
+        );
+        let deleted_claim =
+            claim_scheduled_workflow_fire(&pool, community_a, shared_workflow_id, Utc::now())
+                .await
+                .expect("claim against deleted workflow must not error");
+        assert!(
+            deleted_claim.is_none(),
+            "a deleted workflow must not accept a scheduled claim"
+        );
+        assert!(
+            matches!(
+                create_workflow_run(
+                    &pool,
+                    community_a,
+                    shared_workflow_id,
+                    None,
+                    None,
+                    &serde_json::json!({}),
+                    &[0x42; 32],
+                )
+                .await,
+                Err(DbError::NotFound(_))
+            ),
+            "a deleted workflow must not accept a new run"
         );
         let surviving_b = get_workflow(&pool, community_b, shared_workflow_id)
             .await
             .expect("B's workflow must survive A's delete");
         assert_eq!(surviving_b.community_id, community_b);
         assert_eq!(surviving_b.name, "wf-B");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn owner_delete_is_atomic_and_returns_the_tombstoned_channel() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let workflow_id = Uuid::new_v4();
+        let channel_id = Uuid::new_v4();
+        let owner = vec![0xb2; 32];
+        insert_workflow_with_ids(&pool, community, workflow_id, channel_id, "owned").await;
+
+        assert!(
+            matches!(
+                delete_workflow_for_owner(&pool, community, workflow_id, &[0xc3; 32]).await,
+                Err(DbError::NotFound(_))
+            ),
+            "a non-owner cannot delete the workflow"
+        );
+        get_workflow(&pool, community, workflow_id)
+            .await
+            .expect("failed owner predicate must leave the workflow live");
+
+        let returned_channel =
+            delete_workflow_for_owner(&pool, community, workflow_id, owner.as_slice())
+                .await
+                .expect("owner soft delete");
+        assert_eq!(returned_channel, Some(channel_id));
+        assert!(
+            matches!(
+                get_workflow(&pool, community, workflow_id).await,
+                Err(DbError::NotFound(_))
+            ),
+            "public reads must hide the owner-deleted workflow"
+        );
+
+        let tombstone: (bool, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT enabled, deleted_at FROM workflows \
+             WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community.as_uuid())
+        .bind(workflow_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read owner-deleted tombstone");
+        assert!(!tombstone.0);
+        assert!(tombstone.1.is_some());
+        assert!(
+            matches!(
+                delete_workflow_for_owner(&pool, community, workflow_id, owner.as_slice()).await,
+                Err(DbError::NotFound(_))
+            ),
+            "an already owner-deleted workflow must be NotFound"
+        );
     }
 
     /// Issue 4 (approval path): the same approval token can hash to the same
@@ -2689,13 +3089,31 @@ mod postgres_tests {
         let channel_id = Uuid::new_v4();
         insert_workflow_with_ids(&pool, community_a, workflow_id, channel_id, "wf-A").await;
         insert_workflow_with_ids(&pool, community_b, workflow_id, Uuid::new_v4(), "wf-B").await;
+        let definition_snapshot = serde_json::json!({});
+        let definition_hash = [0x42; 32];
 
-        let run_a = create_workflow_run(&pool, community_a, workflow_id, None, None)
-            .await
-            .expect("run A");
-        let run_b = create_workflow_run(&pool, community_b, workflow_id, None, None)
-            .await
-            .expect("run B");
+        let run_a = create_workflow_run(
+            &pool,
+            community_a,
+            workflow_id,
+            None,
+            None,
+            &definition_snapshot,
+            &definition_hash,
+        )
+        .await
+        .expect("run A");
+        let run_b = create_workflow_run(
+            &pool,
+            community_b,
+            workflow_id,
+            None,
+            None,
+            &definition_snapshot,
+            &definition_hash,
+        )
+        .await
+        .expect("run B");
 
         let token = "shared-approval-token";
         let expires = Utc::now() + chrono::Duration::hours(1);
@@ -2801,6 +3219,7 @@ mod postgres_tests {
             "departing-a",
             def,
             &[0u8; 32],
+            true,
         )
         .await
         .expect("wf departing a");
@@ -2812,6 +3231,7 @@ mod postgres_tests {
             "departing-b",
             def,
             &[0u8; 32],
+            true,
         )
         .await
         .expect("wf departing b");
@@ -2823,6 +3243,7 @@ mod postgres_tests {
             "staying-a",
             def,
             &[0u8; 32],
+            true,
         )
         .await
         .expect("wf staying a");
@@ -2862,5 +3283,355 @@ mod postgres_tests {
             enabled_b.iter().any(|w| w.id == wf_departing_b),
             "same owner's workflow in a different channel must be untouched"
         );
+    }
+}
+
+impl Db {
+    /// Restored fork workflow persistence operation.
+
+    /// Restored fork workflow persistence operation.
+    pub async fn update_workflow_run_with_failure(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        status: workflow::RunStatus,
+        current_step: i32,
+        trace: &serde_json::Value,
+        failure: Option<workflow::WorkflowRunFailure<'_>>,
+    ) -> Result<()> {
+        async {
+            workflow::update_workflow_run_with_failure(
+                &self.pool,
+                community_id,
+                id,
+                status,
+                current_step,
+                trace,
+                failure,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn claim_workflow_effect(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        expected_generation: i64,
+        step_id: &str,
+        effect_index: i16,
+        effect_kind: &str,
+        effect_spec: &serde_json::Value,
+        effect_payload: &serde_json::Value,
+    ) -> Result<WorkflowEffectClaimOutcome> {
+        async {
+            workflow_effect::claim_workflow_effect_with_payload(
+                &self.pool,
+                community_id,
+                run_id,
+                expected_generation,
+                step_id,
+                effect_index,
+                effect_kind,
+                effect_spec,
+                effect_payload,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn load_workflow_effect_claim(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        expected_generation: i64,
+        step_id: &str,
+        effect_index: i16,
+        effect_kind: &str,
+        effect_spec: &serde_json::Value,
+    ) -> Result<Option<WorkflowEffectClaimOutcome>> {
+        async {
+            workflow_effect::load_workflow_effect_claim(
+                &self.pool,
+                community_id,
+                run_id,
+                expected_generation,
+                step_id,
+                effect_index,
+                effect_kind,
+                effect_spec,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn mark_workflow_effect_fired(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        expected_generation: i64,
+        step_id: &str,
+        effect_index: i16,
+        output: &serde_json::Value,
+    ) -> Result<WorkflowEffectMarkOutcome> {
+        async {
+            workflow_effect::mark_workflow_effect_fired(
+                &self.pool,
+                community_id,
+                run_id,
+                expected_generation,
+                step_id,
+                effect_index,
+                output,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn transition_workflow_run(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        expected_status: workflow::RunStatus,
+        expected_generation: i64,
+        next_status: workflow::RunStatus,
+    ) -> Result<WorkflowRunTransitionOutcome> {
+        async {
+            workflow_run_transition::transition_workflow_run(
+                &self.pool,
+                community_id,
+                id,
+                expected_status,
+                expected_generation,
+                next_status,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn list_recoverable_workflow_resumes(
+        &self,
+        resume_pending_age_secs: i64,
+        limit: i64,
+    ) -> Result<Vec<WorkflowResumeCandidate>> {
+        async {
+            workflow_run_transition::list_recoverable_workflow_resumes(
+                &self.pool,
+                resume_pending_age_secs,
+                limit,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn claim_workflow_resume(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        expected_status: workflow::RunStatus,
+        expected_generation: i64,
+        lease_secs: i64,
+    ) -> Result<WorkflowRunTransitionOutcome> {
+        async {
+            workflow_run_transition::claim_workflow_resume(
+                &self.pool,
+                community_id,
+                id,
+                expected_status,
+                expected_generation,
+                lease_secs,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn renew_workflow_resume_lease(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        expected_generation: i64,
+        lease_secs: i64,
+    ) -> Result<bool> {
+        async {
+            workflow_run_transition::renew_workflow_resume_lease(
+                &self.pool,
+                community_id,
+                id,
+                expected_generation,
+                lease_secs,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn complete_running_workflow_run(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        expected_generation: i64,
+        current_step: i32,
+        trace: &serde_json::Value,
+    ) -> Result<WorkflowRunTransitionOutcome> {
+        async {
+            workflow_run_transition::complete_running_workflow_run(
+                &self.pool,
+                community_id,
+                id,
+                expected_generation,
+                current_step,
+                trace,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn fail_running_workflow_run_with_failure(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        expected_generation: i64,
+        current_step: i32,
+        trace: &serde_json::Value,
+        failure: workflow::WorkflowRunFailure<'_>,
+    ) -> Result<WorkflowRunTransitionOutcome> {
+        async {
+            workflow_run_transition::fail_running_workflow_run_with_failure(
+                &self.pool,
+                community_id,
+                id,
+                expected_generation,
+                current_step,
+                trace,
+                failure,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn fail_running_workflow_run(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        expected_generation: i64,
+        current_step: i32,
+        trace: &serde_json::Value,
+        error: &str,
+    ) -> Result<WorkflowRunTransitionOutcome> {
+        async {
+            workflow_run_transition::fail_running_workflow_run(
+                &self.pool,
+                community_id,
+                id,
+                expected_generation,
+                current_step,
+                trace,
+                error,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn read_workflow_state(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        key: &str,
+    ) -> Result<Option<WorkflowStateEntry>> {
+        async {
+            workflow_state::read_workflow_state(&self.pool, community_id, workflow_id, key).await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn read_workflow_state_for_run(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        key: &str,
+    ) -> Result<Option<WorkflowStateEntry>> {
+        async {
+            workflow_state::read_workflow_state_for_run(&self.pool, community_id, run_id, key).await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn purge_expired_workflow_state(&self, limit: u32) -> Result<u64> {
+        async { workflow_state::purge_expired_workflow_state(&self.pool, limit).await }.await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn write_workflow_state(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        step_id: &str,
+        key: &str,
+        value: &str,
+        expires_in_secs: i64,
+        expected_revision: Option<&str>,
+    ) -> Result<WorkflowStateWriteOutcome> {
+        async {
+            workflow_state::write_workflow_state(
+                &self.pool,
+                community_id,
+                run_id,
+                step_id,
+                key,
+                value,
+                expires_in_secs,
+                expected_revision,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn create_workflow_approval_gate(
+        &self,
+        params: workflow_approval::CreateWorkflowApprovalGateParams<'_>,
+    ) -> Result<WorkflowApprovalGateCreationOutcome> {
+        async { workflow_approval::create_workflow_approval_gate(&self.pool, params).await }.await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn lookup_workflow_approval_gate(
+        &self,
+        community_id: CommunityId,
+        approval_id: Uuid,
+    ) -> Result<Option<WorkflowApprovalGateRecord>> {
+        async {
+            workflow_approval::lookup_workflow_approval_gate(&self.pool, community_id, approval_id)
+                .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn decide_workflow_approval_gate(
+        &self,
+        params: workflow_approval::DecideWorkflowApprovalGateParams<'_>,
+    ) -> Result<WorkflowApprovalDecisionOutcome> {
+        async { workflow_approval::decide_workflow_approval_gate(&self.pool, params).await }.await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn get_workflow_approval_history(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<Vec<workflow::WorkflowApprovalHistoryRecord>> {
+        async {
+            workflow::get_workflow_approval_history(&self.pool, community_id, workflow_id, run_id)
+                .await
+        }
+        .await
     }
 }

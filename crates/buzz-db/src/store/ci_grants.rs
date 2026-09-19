@@ -45,7 +45,7 @@ pub async fn upsert_ci_grant(
     .bind(valid_from)
     .bind(valid_until)
     .bind(granted_by)
-    .execute(&mut *crate::observability::acquire(pool, crate::observability::PoolRole::Writer, crate::observability::Operation::Ci).await?)
+    .execute(&mut *crate::observability::acquire_writer(pool, crate::observability::WriterOperation::EventWrite).await?)
     .await?;
     Ok(())
 }
@@ -74,10 +74,9 @@ pub async fn get_active_ci_signers(
     .bind(target_repo_a)
     .bind(now)
     .fetch_all(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Ci,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )

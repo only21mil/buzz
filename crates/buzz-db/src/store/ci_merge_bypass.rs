@@ -95,10 +95,9 @@ pub async fn insert_ci_merge_bypass(
     .bind(issued_at)
     .bind(expires_at)
     .execute(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Ci,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )
@@ -133,10 +132,9 @@ pub async fn list_ci_merge_bypasses(
     .bind(old_oid)
     .bind(new_oid)
     .fetch_all(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Ci,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )
@@ -180,10 +178,9 @@ pub async fn consume_ci_merge_bypass(
     .bind(event_id)
     .bind(decision_id)
     .execute(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Ci,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )

@@ -113,10 +113,9 @@ pub async fn list_ci_runs_for_tip(
     .bind(workflow_id)
     .bind(bounded_limit(limit))
     .fetch_all(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Ci,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )
@@ -169,10 +168,9 @@ pub async fn list_ci_run_checks(
     .bind(run_id)
     .bind(KIND_CI_CHECK as i32)
     .fetch_all(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Ci,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )
@@ -216,10 +214,9 @@ pub async fn list_merge_gate_decisions(
     .bind(old_oid)
     .bind(bounded_limit(limit))
     .fetch_all(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Ci,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )

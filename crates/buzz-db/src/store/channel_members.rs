@@ -3210,3 +3210,85 @@ mod postgres_tests {
         drop_scratch_db(&admin, pool, &scratch_name).await;
     }
 }
+
+/// Read community-scoped membership data using the fork compatibility API.
+
+pub async fn get_members_paged(
+    pool: &PgPool,
+    community_id: CommunityId,
+    channel_id: Uuid,
+    limit: u32,
+    offset: u64,
+) -> Result<Vec<MemberRecord>> {
+    let limit = limit.clamp(1, 1000) as i64;
+    let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+    let rows = sqlx::query(
+        r#"
+        SELECT cm.channel_id, cm.pubkey, cm.role::text AS role, cm.joined_at, cm.invited_by, cm.removed_at
+        FROM channel_members cm
+        JOIN channels c ON cm.community_id = c.community_id AND cm.channel_id = c.id AND c.deleted_at IS NULL
+        WHERE cm.community_id = $1 AND cm.channel_id = $2 AND cm.removed_at IS NULL
+        ORDER BY cm.joined_at ASC, cm.pubkey ASC
+        LIMIT $3 OFFSET $4
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(channel_id)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(&mut *crate::observability::acquire_writer(pool, crate::observability::WriterOperation::Authorization).await?)
+    .await?;
+    rows.into_iter().map(row_to_member_record).collect()
+}
+impl Db {
+    /// Read community-scoped membership data.
+    pub async fn get_members_paged(
+        &self,
+        community_id: CommunityId,
+        channel_id: Uuid,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<crate::channel_members::MemberRecord>> {
+        async {
+            crate::channel_members::get_members_paged(
+                &self.pool,
+                community_id,
+                channel_id,
+                limit,
+                offset,
+            )
+            .await
+        }
+        .await
+    }
+}
+
+/// Read community-scoped membership data using the fork compatibility API.
+
+pub async fn get_agent_pubkeys(pool: &PgPool, community_id: CommunityId) -> Result<Vec<Vec<u8>>> {
+    sqlx::query_scalar(
+        r#"
+        SELECT pubkey
+        FROM users
+        WHERE community_id = $1
+          AND (agent_type IS NOT NULL OR agent_owner_pubkey IS NOT NULL)
+        ORDER BY pubkey
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .fetch_all(
+        &mut *crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::Authorization,
+        )
+        .await?,
+    )
+    .await
+    .map_err(Into::into)
+}
+impl Db {
+    /// Read community-scoped membership data.
+    pub async fn get_agent_pubkeys(&self, community_id: CommunityId) -> Result<Vec<Vec<u8>>> {
+        async { crate::channel_members::get_agent_pubkeys(&self.pool, community_id).await }.await
+    }
+}
