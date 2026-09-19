@@ -30,6 +30,7 @@ class ChannelTypingNotifier extends Notifier<List<TypingEntry>> {
   final String channelId;
   void Function()? _unsubscribe;
   Timer? _pruneTimer;
+  int _subscriptionVersion = 0;
 
   ChannelTypingNotifier(this.channelId);
 
@@ -38,6 +39,7 @@ class ChannelTypingNotifier extends Notifier<List<TypingEntry>> {
     final sessionState = ref.watch(relaySessionProvider);
 
     ref.onDispose(() {
+      _subscriptionVersion++;
       _unsubscribe?.call();
       _unsubscribe = null;
       _pruneTimer?.cancel();
@@ -51,18 +53,30 @@ class ChannelTypingNotifier extends Notifier<List<TypingEntry>> {
     return [];
   }
 
-  void _subscribeLive() async {
+  Future<void> _subscribeLive() async {
+    final version = ++_subscriptionVersion;
     final session = ref.read(relaySessionProvider.notifier);
-    _unsubscribe = await session.subscribe(
-      NostrFilter(
-        kinds: [EventKind.typingIndicator],
-        tags: {
-          '#h': [channelId],
+    try {
+      final unsubscribe = await session.subscribe(
+        NostrFilter(
+          kinds: [EventKind.typingIndicator],
+          tags: {
+            '#h': [channelId],
+          },
+          limit: 10,
+        ),
+        (event) {
+          if (version == _subscriptionVersion) _handleTypingEvent(event);
         },
-        limit: 10,
-      ),
-      _handleTypingEvent,
-    );
+      );
+      if (version != _subscriptionVersion) {
+        unsubscribe();
+        return;
+      }
+      _unsubscribe = unsubscribe;
+    } catch (error) {
+      debugPrint('[ChannelTypingNotifier] subscription failed: $error');
+    }
   }
 
   void _handleTypingEvent(NostrEvent event) {
@@ -107,7 +121,7 @@ class ChannelTypingNotifier extends Notifier<List<TypingEntry>> {
   }
 }
 
-final channelTypingProvider =
-    NotifierProvider.family<ChannelTypingNotifier, List<TypingEntry>, String>(
+final channelTypingProvider = NotifierProvider.autoDispose
+    .family<ChannelTypingNotifier, List<TypingEntry>, String>(
       ChannelTypingNotifier.new,
     );

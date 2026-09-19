@@ -21,6 +21,7 @@ class PresenceCacheNotifier extends Notifier<Map<String, String>> {
     final sessionState = ref.watch(relaySessionProvider);
 
     ref.onDispose(() {
+      _subscriptionVersion++;
       _presenceUnsub?.call();
       _presenceUnsub = null;
     });
@@ -56,7 +57,9 @@ class PresenceCacheNotifier extends Notifier<Map<String, String>> {
     try {
       final unsub = await session.subscribe(
         const NostrFilter(kinds: [EventKind.presenceUpdate], limit: 0),
-        _handlePresenceEvent,
+        (event) {
+          if (version == _subscriptionVersion) _handlePresenceEvent(event);
+        },
       );
       // Guard: if build() re-fired while we were awaiting, discard this
       // subscription to avoid leaking it.
