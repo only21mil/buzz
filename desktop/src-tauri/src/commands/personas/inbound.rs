@@ -472,66 +472,6 @@ fn validate_inbound_managed_agent_definition(
     .map_err(|error| format!("Inbound managed-agent definition is unsafe: {error}"))
 }
 
-/// Retain an inbound kind:30178 catalog head as this device's publication
-/// witness — retention-only, never a local store write or a republish. Returns
-/// `true` when the event was a catalog head this fn handled (so the caller
-/// stops), `false` for any other kind (the caller falls through to its spine).
-///
-/// This is the single production routing decision for a catalog arrival: the
-/// blocking reconcile calls it on the shared arrival connection, and the
-/// `pending/tests.rs` cross-device regressions drive the SAME fn — so disabling
-/// the retention here (the `KIND_TEAM_CATALOG` arm) turns those tests RED. A
-/// test that retained through `retain_inbound_event` directly could not witness
-/// a regression in this routing.
-///
-/// The owner's own catalog heads are the worklist for two recovery paths on a
-/// second device: the boot reconcile (`event_sync::reconcile_team_catalog_heads`)
-/// enumerates retained 30178 rows, and the interactive
-/// `refresh_or_retract_shared_head_at` guard-returns `Noop` without one. Device
-/// B therefore never retains Device A's publication and both paths stay blind,
-/// so B's later edit or delete cannot supersede A's discoverable head.
-///
-/// Deliberately NOT symmetric with the persona/team upsert spine:
-/// - No local JSON store — a 30178 head is a pure relay projection with no
-///   `TeamRecord`/`AgentDefinition` counterpart on disk.
-/// - No refresh or publish triggered by the arrival. A 30178 arrival is either
-///   this device's own echo or the other device's publication; rebuilding and
-///   republishing on either would make two devices ping-pong identical heads.
-///   Retention advances the witness and stops.
-///
-/// Newest-wins resolution matches the other inbound arms: `retain_inbound_event`
-/// skips an event no newer than the retained row.
-pub(crate) fn retain_inbound_catalog_witness(
-    conn: &rusqlite::Connection,
-    inbound: &crate::managed_agents::retention::RetainedEvent,
-) -> Result<bool, String> {
-    use buzz_core_pkg::kind::KIND_TEAM_CATALOG;
-    if inbound.kind != KIND_TEAM_CATALOG {
-        return Ok(false);
-    }
-    crate::managed_agents::retention::retain_inbound_event(conn, inbound)?;
-    Ok(true)
-}
-
-fn validate_inbound_persona_definition(persona: &AgentDefinition) -> Result<(), String> {
-    crate::managed_agents::validate_agent_definition_text(
-        &persona.display_name,
-        &persona.system_prompt,
-    )
-    .map_err(|error| format!("Inbound persona definition is unsafe: {error}"))
-}
-
-fn validate_inbound_managed_agent_definition(
-    managed_agent: &ManagedAgentEventContent,
-) -> Result<(), String> {
-    crate::managed_agents::validate_managed_agent_definition_text(
-        &managed_agent.name,
-        managed_agent.persona_id.as_deref(),
-        managed_agent.system_prompt.as_deref(),
-    )
-    .map_err(|error| format!("Inbound managed-agent definition is unsafe: {error}"))
-}
-
 /// Parse an inbound wire event and enforce the signature gate. Everything
 /// downstream trusts `event.pubkey` (ownership routing, tombstone scoping,
 /// behavioral-quad application), so a forged pubkey must die here — the
