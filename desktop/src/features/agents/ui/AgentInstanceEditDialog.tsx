@@ -67,7 +67,6 @@ import {
   type RuntimeModelProviderSelection,
 } from "./runtimeModelProviderSelection";
 import { AgentCreationPreview } from "./AgentCreationPreview";
-import { useEffortDraft } from "./useEffortDraft";
 import { EffortPickerField } from "./EffortPickerField";
 import { OwnerOnlyAccessField } from "./OwnerOnlyAccessField";
 import type { EnvVarsValue } from "./EnvVarsEditor";
@@ -151,11 +150,6 @@ export function AgentInstanceEditDialog({
   const [provider, setProvider] = React.useState(agent.provider ?? "");
   const [isCustomProviderEditing, setIsCustomProviderEditing] =
     React.useState(false);
-  const effortDraft = useEffortDraft(
-    open,
-    agent.pubkey,
-    agent.effortLevel ?? null,
-  );
   const [envVars, setEnvVars] = React.useState<EnvVarsValue>(agent.envVars);
   const [autoRestartOnConfigChange, setAutoRestartOnConfigChange] =
     React.useState(agent.autoRestartOnConfigChange);
@@ -675,7 +669,6 @@ export function AgentInstanceEditDialog({
       const submitEnvVars = inheritedSubmission.envVars;
       const input: UpdateManagedAgentInput = {
         pubkey: agent.pubkey,
-        effortLevel: effortDraft.patch,
         name: name.trim() !== agent.name ? name.trim() : undefined,
         // relayUrl deliberately never submitted: the legacy per-record pin is
         // ignored (#2122) and the stored value is preserved as-is.
@@ -1002,13 +995,6 @@ export function AgentInstanceEditDialog({
               onModeChange={setRespondTo}
             />
             <RunOnSummarySection backend={agent.backend} />
-            <EffortPickerField
-              agent={agent}
-              config={configSurfaceQuery.data}
-              disabled={updateMutation.isPending || runtimeTouched.current}
-              value={effortDraft.value}
-              onChange={effortDraft.onChange}
-            />
 
             {/* Provider (runtime) */}
             <div className="space-y-1.5">
@@ -1112,10 +1098,12 @@ export function AgentInstanceEditDialog({
               }
               disabled={isSaving}
               value={
-                effortTouched.current
-                  ? effortLevel
-                  : (configSurfaceQuery.data?.normalized.thinkingEffort
-                      ?.value ?? null)
+                runtimeTouched.current
+                  ? null
+                  : effortTouched.current
+                    ? effortLevel
+                    : (configSurfaceQuery.data?.normalized.thinkingEffort
+                        ?.value ?? null)
               }
               onChange={(level) => {
                 effortTouched.current = true;
