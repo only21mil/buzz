@@ -342,15 +342,6 @@ function parseBuzzEntityPreview(href: string): SupportedLinkPreview | null {
       typeLabel: "project",
     };
   }
-  if (link.type === "project") {
-    return {
-      kind: "buzz-project",
-      href: buildProjectLink(link),
-      provider: "Buzz",
-      title,
-      typeLabel: "project",
-    };
-  }
   return {
     kind: "buzz-repository",
     href: buildRepoLink(link),

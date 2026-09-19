@@ -7,6 +7,7 @@ export type Workflow = {
   ownerPubkey: string;
   channelId: string | null;
   definition: Record<string, unknown>;
+  yamlDefinition?: string;
   status: WorkflowStatus;
   createdAt: number;
   updatedAt: number;
@@ -23,7 +24,8 @@ export type WorkflowRunStatus =
   | "completed"
   | "failed"
   | "cancelled"
-  | "waiting_approval";
+  | "waiting_approval"
+  | "resume_pending";
 
 export type TraceEntry = {
   stepId: string;

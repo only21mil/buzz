@@ -308,9 +308,6 @@ export function ProjectHomeWorkspaceSheet({
     case "issues":
       body = (
         <ProjectIssuesPanel
-          error={workItemsQuery.error}
-          isLoading={workItemsQuery.isLoading}
-          issueItems={issueItems}
           onSelectedIssueIdChange={setSelectedIssueId}
           profiles={people.profiles}
           project={selectedCommitRepository}

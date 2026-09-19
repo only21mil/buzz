@@ -6,6 +6,24 @@ export type WorkflowEditorPane =
 const STEP_PANE_PREFIX = "step:";
 const STEP_ID_PATTERN = /^[A-Za-z0-9_]{1,64}$/;
 
+type WorkflowEditorLocation = {
+  pathname: string;
+  search: Record<string, unknown>;
+};
+
+/** Pane changes and repeated pane selections keep the current editor draft. */
+export function staysInWorkflowEditor(
+  current: WorkflowEditorLocation,
+  next: WorkflowEditorLocation,
+): boolean {
+  return (
+    current.pathname === next.pathname &&
+    [...new Set([...Object.keys(current.search), ...Object.keys(next.search)])]
+      .filter((key) => key !== "pane")
+      .every((key) => current.search[key] === next.search[key])
+  );
+}
+
 export function parseWorkflowEditorPane(value: unknown): WorkflowEditorPane {
   if (value === "trigger") return { type: "trigger" };
   if (typeof value !== "string" || !value.startsWith(STEP_PANE_PREFIX)) {
