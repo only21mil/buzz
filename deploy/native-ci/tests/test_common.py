@@ -6,6 +6,7 @@ import importlib.util
 import os
 from pathlib import Path
 import tempfile
+from unittest import mock
 import unittest
 
 SPEC = importlib.util.spec_from_file_location(
@@ -62,3 +63,22 @@ class InstallerFilesystemTests(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "unsafe target"),
             ):
                 COMMON.rooted(root, target)
+
+
+class AssetWriterTests(unittest.TestCase):
+    def test_partial_writes_preserve_payload_and_exact_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "asset"
+            real_write = os.write
+            with mock.patch.object(COMMON.os, "write", side_effect=lambda fd, data: real_write(fd, data[:2])):
+                COMMON.write_asset(path, b"asset payload", 0o400)
+            self.assertEqual(path.read_bytes(), b"asset payload")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o400)
+            with self.assertRaises(FileExistsError):
+                COMMON.write_asset(path, b"replacement", 0o600)
+            self.assertEqual(path.read_bytes(), b"asset payload")
+            link = Path(directory) / "link"
+            link.symlink_to(path)
+            with self.assertRaises(FileExistsError):
+                COMMON.write_asset(link, b"replacement", 0o600)
+            self.assertEqual(path.read_bytes(), b"asset payload")

@@ -362,6 +362,9 @@ class ExecdPackageTests(unittest.TestCase):
             repository = root / "source"
             package_source = repository / "deploy/native-ci/execd"
             package_source.mkdir(parents=True)
+            (package_source.parent / "_common.py").write_bytes(
+                (EXECD_DIR.parent / "_common.py").read_bytes(),
+            )
             (package_source / "marker").write_text("tracked\n")
             subprocess.run(["git", "init", "-q", repository], check=True)
             subprocess.run(["git", "-C", repository, "config", "user.name", "Test"], check=True)
@@ -415,6 +418,9 @@ class ExecdPackageTests(unittest.TestCase):
             repository = root / "source"
             package_source = repository / "deploy/native-ci/execd"
             package_source.mkdir(parents=True)
+            (package_source.parent / "_common.py").write_bytes(
+                (EXECD_DIR.parent / "_common.py").read_bytes(),
+            )
             (package_source / "marker").write_text("tracked\n")
             subprocess.run(["git", "init", "-q", repository], check=True)
             subprocess.run(["git", "-C", repository, "config", "user.name", "Test"], check=True)

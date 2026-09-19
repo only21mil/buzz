@@ -80,7 +80,7 @@ if [[ -n "$BODY_FILE" ]]; then
     fi
   done
   if [[ ${#UNREFERENCED[@]} -gt 0 ]]; then
-    IFS=$'\n' SORTED=($(printf '%s\n' "${UNREFERENCED[@]}" | sort)); unset IFS
+    mapfile -t SORTED < <(printf '%s\n' "${UNREFERENCED[@]}" | sort)
     for NAME in "${SORTED[@]}"; do
       COMMENT_BODY+=$'\n\n'"![${NAME}](${IMAGE_URL_MAP[$NAME]})"
     done

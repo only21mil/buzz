@@ -7,7 +7,6 @@ import argparse
 import ctypes
 from dataclasses import dataclass
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +14,17 @@ import re
 import secrets
 import stat
 import sys
+
+NATIVE_CI_DIR = Path(__file__).resolve().parents[1]
+if str(NATIVE_CI_DIR) not in sys.path:
+    sys.path.insert(0, str(NATIVE_CI_DIR))
+
+from _common import (
+    canonical_json as canonical_json,
+    sha256 as sha256,
+    mapped_id as mapped_id,
+    parse_mode as _mode,
+)
 
 EXECD_DIR = Path(__file__).resolve().parent
 if str(EXECD_DIR) not in sys.path:
@@ -69,26 +79,11 @@ def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return value
 
 
-def canonical_json(value: object) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
-
-
-def sha256(payload: bytes) -> str:
-    return hashlib.sha256(payload).hexdigest()
-
-
 def rooted(root: Path, target: str) -> Path:
     path = Path(target)
     if not target.startswith("/") or ".." in path.parts:
         raise ValueError("unsafe target path")
     return root / target.removeprefix("/")
-
-
-def mapped_id(value: int, root: Path, *, group: bool = False) -> int:
-    if value != 0 or root == Path("/"):
-        return value
-    metadata = root.lstat()
-    return metadata.st_gid if group else metadata.st_uid
 
 
 def read_regular(path: Path, maximum: int = 128 * 1024 * 1024) -> tuple[bytes, os.stat_result]:
@@ -143,12 +138,6 @@ def _safe_root(root: Path) -> Path:
     ):
         raise ValueError("install root metadata is unsafe")
     return root
-
-
-def _mode(value: object) -> int:
-    if not isinstance(value, str) or not re.fullmatch(r"0[4567][0-7]{2}", value):
-        raise ValueError("invalid mode")
-    return int(value, 8)
 
 
 def parse_package(package: Path) -> tuple[dict[str, object], Entry]:

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,6 +17,11 @@ from urllib.parse import urlsplit
 NATIVE_CI_DIR = Path(__file__).resolve().parents[1]
 if str(NATIVE_CI_DIR) not in sys.path:
     sys.path.insert(0, str(NATIVE_CI_DIR))
+
+from _common import (
+    canonical_json as canonical_json,
+    sha256 as digest,
+)
 KEYHOLDER_DIR = Path(__file__).resolve().parent
 if str(KEYHOLDER_DIR) not in sys.path:
     sys.path.insert(0, str(KEYHOLDER_DIR))
@@ -65,14 +69,6 @@ PUBLIC_BINDING_KEYS = {
     "schema_version", "relay_url", "relay_http_origin", "acceptance_actor",
     "keyholder_public_spec",
 }
-
-
-def canonical_json(value: object) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
-
-
-def digest(payload: bytes) -> str:
-    return hashlib.sha256(payload).hexdigest()
 
 
 def _write(path: Path, payload: bytes, mode: int) -> None:

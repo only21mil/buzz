@@ -44,10 +44,19 @@ write_manifest '1.2.3-rc.1+build.42' 'runtime-cpu'
 bash "$FIXTURE/scripts/ensure-mesh-native-runtime.sh" cpu > "$TEMP/stdout"
 cmp "$TEMP/runtime/library" "$TEMP/cache/1.2.3-rc.1+build.42/runtime-cpu/library"
 [[ "$(cat "$TEMP/stdout")" == "$TEMP/cache" ]]
+# Upstream maps absent, null, and empty versions to the unknown cache bucket.
+for runtime in '{"mesh_version":null,"id":"runtime-cpu"}' '{"id":"runtime-cpu"}' '{"mesh_version":"","id":"runtime-cpu"}'; do
+  printf '{"runtime":%s}\n' "$runtime" > "$TEST_RUNTIME/manifest.json"
+  bash "$FIXTURE/scripts/ensure-mesh-native-runtime.sh" cpu > "$TEMP/stdout"
+  cmp "$TEMP/runtime/library" "$TEMP/cache/unknown/runtime-cpu/library"
+  [[ ! -e "$TEMP/cache/None" ]]
+  [[ "$(cat "$TEMP/stdout")" == "$TEMP/cache" ]]
+done
 mkdir -p "$TEMP/keep"
 printf 'do not remove\n' > "$TEMP/keep/sentinel"
 for bad in '..' '../keep' '/absolute' '' $'line\nbreak'; do
   for field in version id; do
+    [[ "$field" == version && -z "$bad" ]] && continue
     if [[ "$field" == version ]]; then
       write_manifest "$bad" 'runtime-cpu'
     else

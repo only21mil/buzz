@@ -4,20 +4,31 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
 import stat
-import subprocess
 import tempfile
+import sys
+
+NATIVE_CI_DIR = Path(__file__).resolve().parents[1]
+if str(NATIVE_CI_DIR) not in sys.path:
+    sys.path.insert(0, str(NATIVE_CI_DIR))
+
+from _common import (
+    canonical_json as canonical_json,
+    sha256 as sha256,
+    git_output as _git,
+    write_asset as _write,
+)
 
 SCHEMA = "buzz-ci-execd-install-package-v1"
 PREACTIVATION_SCHEMA = "buzz-ci-execd-preactivation-input-v1"
 PROVENANCE_SCHEMA = "buzz-ci-binary-provenance-v1"
 PACKAGE_RELATIVE = Path("deploy/native-ci/execd")
+INSTALLER_HELPER = Path("deploy/native-ci/_common.py")
 GIT_OID = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
 DEFAULT_STATE = {"enabled": False, "active": False, "capacity": 0}
@@ -56,14 +67,6 @@ INSTALL_RECEIPT = {
     "gid": 0,
 }
 DIRECTORIES = [{"target": "/usr/libexec", "mode": "0755", "uid": 0, "gid": 0}]
-
-
-def canonical_json(value: object) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
-
-
-def sha256(payload: bytes) -> str:
-    return hashlib.sha256(payload).hexdigest()
 
 
 def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -149,24 +152,17 @@ def parse_preactivation_input(raw: bytes) -> dict[str, object]:
     return value
 
 
-def _git(root: Path, *arguments: str) -> str:
-    return subprocess.run(
-        ["git", "-C", str(root), *arguments],
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    ).stdout.strip()
-
-
 def verify_source(root: Path, source_commit: str) -> Path:
     if not GIT_OID.fullmatch(source_commit):
         raise ValueError("source commit must be a full lowercase Git object id")
     root = Path(_git(root, "rev-parse", "--show-toplevel"))
     if _git(root, "rev-parse", "HEAD") != source_commit:
         raise ValueError("source checkout HEAD differs from source commit")
-    if _git(root, "status", "--porcelain", "--untracked-files=all", "--", str(PACKAGE_RELATIVE)):
+    bound_paths = (str(PACKAGE_RELATIVE), str(INSTALLER_HELPER))
+    _git(root, "ls-files", "--error-unmatch", str(INSTALLER_HELPER))
+    if _git(root, "status", "--porcelain", "--untracked-files=all", "--", *bound_paths):
         raise ValueError("execd package source is not clean")
+    _git(root, "diff", "--exit-code", source_commit, "--", *bound_paths)
     package = root / PACKAGE_RELATIVE
     if Path(os.path.realpath(package)) != package:
         raise ValueError("execd package source contains a symbolic path")
@@ -347,22 +343,6 @@ def activation_binding(
         "receipt_path": "/var/lib/buzzci/activation-controller/receipt-v1.json",
         "receipt_schema": "buzz-ci-capacity-one-activation-receipt-v1",
     }
-
-
-def _write(path: Path, payload: bytes, mode: int) -> None:
-    descriptor = os.open(
-        path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-        mode,
-    )
-    try:
-        os.fchmod(descriptor, mode)
-        view = memoryview(payload)
-        while view:
-            view = view[os.write(descriptor, view) :]
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
 
 
 def freeze_package(
