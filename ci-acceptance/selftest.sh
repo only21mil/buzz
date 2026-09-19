@@ -40,9 +40,11 @@ else
 fi
 
 mock_summary="$temp_dir/mock-summary.json"
+# The probe runner writes SUMMARY_FILE and also cats it to stdout. Keep the
+# two destinations distinct so cat never reads and writes the same file.
 mock_stderr="$temp_dir/mock-stderr.log"
 set +e
-BUZZ_CI_BIN="$ROOT/fixtures/mock-buzz" BUZZ_CI_SHA="$SHA" BUZZ_CI_RESULTS_FILE="$temp_dir/mock-results.jsonl" BUZZ_CI_SUMMARY_FILE="$mock_summary" "$ROOT/probes/run_probes.sh" >"$mock_summary" 2>"$mock_stderr"
+BUZZ_CI_BIN="$ROOT/fixtures/mock-buzz" BUZZ_CI_SHA="$SHA" BUZZ_CI_RESULTS_FILE="$temp_dir/mock-results.jsonl" BUZZ_CI_SUMMARY_FILE="$mock_summary" "$ROOT/probes/run_probes.sh" >"$temp_dir/mock-stdout.json" 2>"$mock_stderr"
 mock_rc=$?
 set -e
 if ((mock_rc == 0)) && jq -e '.all_pass == true' "$mock_summary" >/dev/null 2>&1; then
@@ -57,7 +59,7 @@ fi
 broken_summary="$temp_dir/broken-summary.json"
 broken_stderr="$temp_dir/broken-stderr.log"
 set +e
-BUZZ_CI_BIN="$ROOT/fixtures/mock-buzz-broken" BUZZ_CI_SHA="$SHA" BUZZ_CI_RESULTS_FILE="$temp_dir/broken-results.jsonl" BUZZ_CI_SUMMARY_FILE="$broken_summary" "$ROOT/probes/run_probes.sh" >"$broken_summary" 2>"$broken_stderr"
+BUZZ_CI_BIN="$ROOT/fixtures/mock-buzz-broken" BUZZ_CI_SHA="$SHA" BUZZ_CI_RESULTS_FILE="$temp_dir/broken-results.jsonl" BUZZ_CI_SUMMARY_FILE="$broken_summary" "$ROOT/probes/run_probes.sh" >"$temp_dir/broken-stdout.json" 2>"$broken_stderr"
 broken_rc=$?
 set -e
 if ((broken_rc != 0)) && jq -e '.all_pass == false' "$broken_summary" >/dev/null 2>&1; then
