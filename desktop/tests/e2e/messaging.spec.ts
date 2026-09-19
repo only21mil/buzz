@@ -2059,36 +2059,27 @@ test("relay GIF search selects content-only media and reports the share", async 
   await expect
     .poll(() =>
       page.evaluate((expectedUrl) => {
-        return Boolean(
-          (
-            window as Window & {
-              __BUZZ_E2E_SIGNED_EVENTS__?: Array<{
-                content?: string;
-                kind?: number;
-              }>;
-            }
-          ).__BUZZ_E2E_SIGNED_EVENTS__?.some(
-            (event) => event.kind === 9 && event.content?.includes(expectedUrl),
-          ),
+        return window.__BUZZ_E2E_COMMAND_LOG__?.some(
+          (entry) =>
+            entry.command === "send_channel_message" &&
+            (entry.payload as { content?: string }).content?.includes(
+              expectedUrl,
+            ),
         );
       }, gifUrl),
     )
     .toBe(true);
-  const matchingEvent = await page.evaluate((expectedUrl) => {
-    return (
-      window as Window & {
-        __BUZZ_E2E_SIGNED_EVENTS__?: Array<{
-          content?: string;
-          kind?: number;
-          tags?: string[][];
-        }>;
-      }
-    ).__BUZZ_E2E_SIGNED_EVENTS__?.find(
-      (event) => event.kind === 9 && event.content?.includes(expectedUrl),
-    );
+  const matchingMessage = await page.evaluate((expectedUrl) => {
+    return window.__BUZZ_E2E_COMMAND_LOG__
+      ?.filter((entry) => entry.command === "send_channel_message")
+      .map(
+        (entry) =>
+          entry.payload as { content?: string; mediaTags?: string[][] | null },
+      )
+      .find((payload) => payload.content?.includes(expectedUrl));
   }, gifUrl);
-  expect(matchingEvent?.content).toBe(`![image](${gifUrl})`);
-  expect(matchingEvent?.tags?.some((tag) => tag[0] === "imeta")).toBe(false);
+  expect(matchingMessage?.content?.trim()).toBe(`![image](${gifUrl})`);
+  expect(matchingMessage?.mediaTags ?? []).toEqual([]);
 });
 
 async function routeGifMocks(page: import("@playwright/test").Page) {
@@ -2480,21 +2471,23 @@ test("send message to DM channel p-tags the recipient", async ({ page }) => {
   await page.getByTestId("send-message").click();
 
   await expect(page.getByTestId("message-timeline")).toContainText(message);
-  await expect
-    .poll(() =>
-      page.evaluate((content) => {
-        const events = (
-          window as Window & {
-            __BUZZ_E2E_SIGNED_EVENTS__?: Array<{
-              content: string;
-              tags: string[][];
-            }>;
-          }
-        ).__BUZZ_E2E_SIGNED_EVENTS__;
-        return events?.find((event) => event.content === content)?.tags ?? [];
-      }, message),
-    )
-    .toContainEqual(["p", TEST_IDENTITIES.alice.pubkey]);
+  const row = page.getByTestId("message-row").filter({ hasText: message });
+  await expect(row).toHaveAttribute("data-message-id", /^[0-9a-f]{64}$/);
+  const eventId = await row.getAttribute("data-message-id");
+  expect(eventId).toBeTruthy();
+  const event = await page.evaluate(async (id) => {
+    const bridge = (
+      window as Window & {
+        __TAURI_INTERNALS__: {
+          invoke: (command: string, args: unknown) => Promise<string>;
+        };
+      }
+    ).__TAURI_INTERNALS__;
+    return JSON.parse(await bridge.invoke("get_event", { eventId: id })) as {
+      tags: string[][];
+    };
+  }, eventId);
+  expect(event.tags).toContainEqual(["p", TEST_IDENTITIES.alice.pubkey]);
 });
 
 test("sends a thread message to its parent channel with a root-thread link", async ({

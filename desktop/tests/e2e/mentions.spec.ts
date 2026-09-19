@@ -279,7 +279,7 @@ test("channel and Inbox composers offer the same owned agent member", async ({
         name: "nadia",
         ownerPubkey: MOCK_VIEWER_PUBKEY,
         channelIds: [AGENTS_CHANNEL_ID],
-        respondTo: "owner",
+        respondTo: "owner-only",
       },
     ],
   });
@@ -1445,6 +1445,7 @@ test("system add rows use plain names while remove rows retain agent mention sty
     ({ actorPubkey, kind, targetPubkey }) => {
       window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
         channelName: "general",
+        createdAt: Math.floor(Date.now() / 1000) + 7200,
         content: JSON.stringify({
           type: "member_joined",
           actor: actorPubkey,
@@ -1454,6 +1455,7 @@ test("system add rows use plain names while remove rows retain agent mention sty
       });
       window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
         channelName: "general",
+        createdAt: Math.floor(Date.now() / 1000) + 7200,
         content: JSON.stringify({
           type: "member_removed",
           actor: actorPubkey,
