@@ -174,9 +174,9 @@ test("direct workflow detail links close back to workflows", async ({
   await expect(
     dialog.getByRole("button", { name: "Trigger: Message Posted" }),
   ).toBeVisible();
-  await expect(dialog.getByRole("button", { name: "Run history" })).toHaveCount(
-    0,
-  );
+  await expect(
+    dialog.getByRole("button", { name: "Run history" }),
+  ).toBeVisible();
   await dialog.getByRole("button", { name: "Close", exact: true }).click();
 
   await expect(page).toHaveURL(/#\/workflows$/);

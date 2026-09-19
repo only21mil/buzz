@@ -1025,16 +1025,19 @@ for (const partial of [false, true]) {
         .poll(() =>
           page.evaluate(
             (marker) =>
-              (window.__BUZZ_E2E_SIGNED_EVENTS__ ?? [])
-                .filter(
-                  (event) =>
-                    event.kind === 9 && event.content.endsWith(marker.trim()),
+              (window.__BUZZ_E2E_COMMAND_LOG__ ?? [])
+                .filter((entry) => entry.command === "send_channel_message")
+                .map(
+                  (entry) =>
+                    entry.payload as {
+                      content: string;
+                      mentionPubkeys?: string[];
+                    },
                 )
-                .map((event) => ({
-                  content: event.content.replace(/\u00a0/g, " ").trim(),
-                  keys: event.tags
-                    .filter((tag) => tag[0] === "p")
-                    .map((tag) => tag[1]),
+                .filter((payload) => payload.content.endsWith(marker.trim()))
+                .map((payload) => ({
+                  content: payload.content.replace(/\u00a0/g, " ").trim(),
+                  keys: payload.mentionPubkeys ?? [],
                 })),
             marker,
           ),

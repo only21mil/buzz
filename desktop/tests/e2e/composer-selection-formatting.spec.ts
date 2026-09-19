@@ -531,9 +531,14 @@ test("selected list items become one multiline code block and keep neighbors", a
         () =>
           (
             window as Window & {
-              __BUZZ_E2E_SIGNED_EVENTS__?: Array<{ content: string }>;
+              __BUZZ_E2E_COMMAND_LOG__?: Array<{
+                command: string;
+                payload: { content?: string };
+              }>;
             }
-          ).__BUZZ_E2E_SIGNED_EVENTS__?.at(-1)?.content,
+          ).__BUZZ_E2E_COMMAND_LOG__?.findLast(
+            (entry) => entry.command === "send_channel_message",
+          )?.payload.content,
       ),
     )
     .toBe("- before\n\n```\none\ntwo\n```\n\n- after");
@@ -558,9 +563,14 @@ test("caret-only block formatting serializes the prior draft unchanged", async (
         () =>
           (
             window as Window & {
-              __BUZZ_E2E_SIGNED_EVENTS__?: Array<{ content: string }>;
+              __BUZZ_E2E_COMMAND_LOG__?: Array<{
+                command: string;
+                payload: { content?: string };
+              }>;
             }
-          ).__BUZZ_E2E_SIGNED_EVENTS__?.at(-1)?.content,
+          ).__BUZZ_E2E_COMMAND_LOG__?.findLast(
+            (entry) => entry.command === "send_channel_message",
+          )?.payload.content,
       ),
     )
     .toBe("before\n\n- item");
@@ -591,9 +601,14 @@ test("block formatting preserves the lines around a selected composer line", asy
         () =>
           (
             window as Window & {
-              __BUZZ_E2E_SIGNED_EVENTS__?: Array<{ content: string }>;
+              __BUZZ_E2E_COMMAND_LOG__?: Array<{
+                command: string;
+                payload: { content?: string };
+              }>;
             }
-          ).__BUZZ_E2E_SIGNED_EVENTS__?.at(-1)?.content,
+          ).__BUZZ_E2E_COMMAND_LOG__?.findLast(
+            (entry) => entry.command === "send_channel_message",
+          )?.payload.content,
       ),
     )
     .toBe("before\n\n- selected\n\nafter");

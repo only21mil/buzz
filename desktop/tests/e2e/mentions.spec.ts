@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { npubEncode } from "nostr-tools/nip19";
 import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 
 import {
@@ -88,6 +89,14 @@ async function readOutgoingMentionPubkeys(
       ).__BUZZ_E2E_COMMAND_LOG__ ?? [];
 
     for (const entry of entries) {
+      if (entry.command === "send_channel_message") {
+        const payload = entry.payload as {
+          content?: string;
+          mentionPubkeys?: string[];
+        };
+        if (payload.content === expectedContent)
+          return payload.mentionPubkeys ?? [];
+      }
       if (entry.command !== "plugin:websocket|send") continue;
       const data = (
         entry.payload as { message?: { data?: string } } | undefined
@@ -263,6 +272,17 @@ test("@ trigger prioritizes channel members before runnable personas and other m
 test("channel and Inbox composers offer the same owned agent member", async ({
   page,
 }) => {
+  await installMockBridge(page, {
+    relayAgents: [
+      {
+        pubkey: OWNED_RELAY_AGENT_PUBKEY,
+        name: "nadia",
+        ownerPubkey: MOCK_VIEWER_PUBKEY,
+        channelIds: [AGENTS_CHANNEL_ID],
+        respondTo: "owner",
+      },
+    ],
+  });
   await page.goto("/");
   await page.getByTestId("channel-agents").click();
   await expect(page.getByTestId("chat-title")).toHaveText("agents");
@@ -774,6 +794,9 @@ test("selecting a persona mention creates a channel agent and publishes before w
   );
   // Agent setup also publishes metadata. Match the exact chat event.
   const sendIndex = commandsAfterSend.findIndex((entry) => {
+    if (entry.command === "send_channel_message") {
+      return (entry.payload as { content?: string }).content === messageContent;
+    }
     if (entry.command !== "plugin:websocket|send") return false;
     const payload = entry.payload as { message?: { data?: string } };
     if (!payload.message?.data) return false;
@@ -1489,7 +1512,7 @@ test("groups contiguous arrival activity with hidden names in the standard toolt
 
   await page.evaluate(
     ({ actorPubkey, addedTargets, kind }) => {
-      const createdAt = Math.floor(Date.now() / 1_000);
+      const createdAt = Math.floor(Date.now() / 1_000) + 7200;
       for (const [index, target] of addedTargets.entries()) {
         window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
           channelName: "general",
@@ -1566,6 +1589,7 @@ test("system agent profile exposes owned agent actions", async ({ page }) => {
     ({ actorPubkey, kind, targetPubkey }) => {
       window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
         channelName: "general",
+        createdAt: Math.floor(Date.now() / 1000) + 7200,
         content: JSON.stringify({
           type: "member_joined",
           actor: actorPubkey,
@@ -1726,6 +1750,7 @@ test("system member-joined rows render the joined person as a plain profile name
     ({ kind, pubkey }) => {
       window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
         channelName: "general",
+        createdAt: Math.floor(Date.now() / 1000) + 7200,
         content: JSON.stringify({
           type: "member_joined",
           actor: pubkey,
@@ -2004,7 +2029,7 @@ test("clicking author name opens user profile panel", async ({ page }) => {
   // Click now opens the full profile panel instead of the popover
   const panel = page.getByTestId("user-profile-panel");
   await expect(panel).toBeVisible();
-  await expect(panel).toContainText("deadbeef");
+  await expect(panel).toContainText("npub1m6k…zuz0");
 });
 
 test("hovering avatar opens popover, clicking opens profile panel", async ({
@@ -2231,7 +2256,9 @@ test("agent profile popover falls back to the owner's pubkey", async ({
     profilePopover.getByTestId(
       `user-profile-popover-owner-${OWNED_AGENT_PROFILE_PUBKEY}`,
     ),
-  ).toHaveText("managed by 11111111…1111");
+  ).toHaveText(
+    `managed by ${npubEncode(CASEY_PROFILE_PUBKEY).slice(0, 8)}…${npubEncode(CASEY_PROFILE_PUBKEY).slice(-4)}`,
+  );
 });
 
 test("human profile popover does not show an owner", async ({ page }) => {
