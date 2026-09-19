@@ -36,6 +36,7 @@ export async function uploadMediaFile(
       bytes,
       {
         headers,
+        ...(!isTauri() ? { signal } : {}),
       },
     );
   } catch (error) {
