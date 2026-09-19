@@ -33,7 +33,7 @@ import { useDetachedAgentStart } from "./useDetachedAgentStart";
 import { useEnsureAgentMentionsReady } from "./useEnsureAgentMentionsReady";
 import { invokeTauri } from "@/shared/api/tauri";
 import type { AcpRuntime, ManagedAgent } from "@/shared/api/types";
-import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
+import { normalizePubkey, truncateNpub } from "@/shared/lib/pubkey";
 import { buildCustomEmojiTags } from "@/shared/lib/customEmojiTags";
 import {
   dedupeQueuedAgentWakes,
@@ -556,7 +556,10 @@ export function useMentionSendFlow({
           );
           if (!finalOutgoingTags || signal?.aborted || isSendCancelled())
             return restoreComposerAfterFailure();
-          // Revalidate exact recipients before every publish, including plain sends.
+          // The pass immediately before signing/publish is always fresh:
+          // mention authorization is re-validated here unconditionally,
+          // whatever did or did not separate it from the admission pass
+          // above (#5681).
           const revalidatedMentionPubkeys =
             await mentions.revalidateMentionPubkeys(
               mentionPubkeys,
@@ -918,7 +921,6 @@ export function useMentionSendFlow({
     },
     [
       completeSend,
-      mentions,
       effectiveDraftKey,
       sourceOwner,
       getComposerRevision,
@@ -926,6 +928,15 @@ export function useMentionSendFlow({
       createMentionedPersonaAgents,
       customEmoji,
       getManagedAgentsByPubkey,
+      mentions.extractMentionPersonas,
+      mentions.extractMentionPubkeys,
+      mentions.hasResolvedMembers,
+      mentions.isAgentPubkey,
+      mentions.isManagedAgentPubkey,
+      mentions.memberPubkeys,
+      mentions.getDraftMentionRefs,
+      mentions.settlePendingMentionBindings,
+      mentions.registerMentionPubkey,
       onPrepareSendChannel,
       activePreparedLinkPreviews,
     ],
@@ -934,7 +945,7 @@ export function useMentionSendFlow({
     if (!pendingNonMemberSend) return [];
     return pendingNonMemberSend.nonMemberPubkeys.map(
       (pubkey) =>
-        mentions.getMentionDisplayName(pubkey) ?? truncatePubkey(pubkey),
+        mentions.getMentionDisplayName(pubkey) ?? truncateNpub(pubkey),
     );
   }, [mentions.getMentionDisplayName, pendingNonMemberSend]);
   const invitation = useNonMemberInvite({

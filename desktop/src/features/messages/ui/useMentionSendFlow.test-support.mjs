@@ -1,3 +1,5 @@
+import * as publicationScope from "../../../shared/api/publicationScope.ts";
+import * as preparePublicationScope from "../../../shared/api/preparePublicationScope.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import vm from "node:vm";
@@ -89,6 +91,8 @@ export async function setup({ lifecycle = false } = {}) {
   };
   const stubs = {
     react: React,
+    "@/shared/api/publicationScope": publicationScope,
+    "@/shared/api/preparePublicationScope": preparePublicationScope,
     "@/features/messages/lib/useDrafts": draftStore,
     sonner: { toast: { error: (error) => calls.push(["error", error]) } },
     "@/features/agents/hooks": new Proxy(

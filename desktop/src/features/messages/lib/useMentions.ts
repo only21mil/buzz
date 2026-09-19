@@ -1,5 +1,3 @@
-import { useActiveAgentPubkeys } from "./useActiveAgentPubkeys";
-import { buildMentionCandidates } from "./buildMentionCandidates";
 import * as React from "react";
 import {
   useManagedAgentsQuery,
@@ -34,7 +32,7 @@ import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { detectPrefixQuery } from "@/shared/lib/detectPrefixQuery";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { trimMapToSize } from "@/shared/lib/trimMapToSize";
-
+import { useActiveAgentPubkeys } from "./useActiveAgentPubkeys";
 import { useDefaultAgentSuggestion } from "./useDefaultAgentSuggestion";
 import { flushMentionDebounce, isPlainSpace } from "./flushMentionDebounce";
 import { useAgentMentionRevalidation } from "./agentMentionRevalidation";
@@ -68,7 +66,7 @@ import {
   buildTeamMentionCandidates,
   formatTeamMention,
 } from "./mentionCandidates";
-
+import { buildMentionCandidates } from "./buildMentionCandidates";
 const MENTION_DEBOUNCE_MS = 120,
   MENTION_SUGGESTION_LIMIT = 50;
 type UseMentionsOptions = {
@@ -235,18 +233,6 @@ export function useMentions(
     () => new Set(activePersonas.map((persona) => persona.id)),
     [activePersonas],
   );
-  const directoryAgentPubkeys = React.useMemo(
-    () =>
-      new Set([
-        ...(managedAgentsQuery.data ?? []).map((agent) =>
-          normalizePubkey(agent.pubkey),
-        ),
-        ...(relayAgentsQuery.data ?? []).map((agent) =>
-          normalizePubkey(agent.pubkey),
-        ),
-      ]),
-    [managedAgentsQuery.data, relayAgentsQuery.data],
-  );
   const { candidateProfiles, memberPubkeys } = useCandidateProfiles(
     members,
     managedAgentsQuery.data,
@@ -273,43 +259,45 @@ export function useMentions(
         activeAgentPubkeys,
         activePersonaById,
         activePersonas,
-        candidateProfiles,
-        userSearchResults,
         canSearchGlobalUsers,
         currentPubkey,
-        directoryAgentPubkeys,
-        isArchivedDiscovery,
+        isArchived: isArchivedDiscovery,
+        managedAgentDirectoryReady,
         managedAgentNamesByPubkey,
         managedAgentPersonaIds,
         managedAgentPersonaIdsByPubkey,
-        managedAgentPubkeys,
         managedAgents: managedAgentsQuery.data,
         memberPubkeys,
         members,
+        mentionChannelId,
         mentionableAgentPubkeys,
         personaNameByPubkey,
+        profiles,
+        relayAgentDirectoryReady,
         relayAgentNamesByPubkey,
         relayAgents: relayAgentsQuery.data,
+        userSearchResults,
       }),
     [
-      activeAgentPubkeys,
       activePersonaById,
+      activeAgentPubkeys,
       activePersonas,
-      candidateProfiles,
       userSearchResults,
       canSearchGlobalUsers,
       currentPubkey,
-      directoryAgentPubkeys,
       isArchivedDiscovery,
+      managedAgentDirectoryReady,
       managedAgentNamesByPubkey,
       managedAgentPersonaIds,
       managedAgentPersonaIdsByPubkey,
-      managedAgentPubkeys,
       managedAgentsQuery.data,
       memberPubkeys,
       members,
+      mentionChannelId,
       mentionableAgentPubkeys,
       personaNameByPubkey,
+      profiles,
+      relayAgentDirectoryReady,
       relayAgentNamesByPubkey,
       relayAgentsQuery.data,
     ],

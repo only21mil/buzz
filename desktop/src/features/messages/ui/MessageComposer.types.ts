@@ -1,3 +1,4 @@
+import type { PublicationScope } from "@/shared/api/publicationScope";
 import type { ReactNode } from "react";
 
 import type { DraftMentionRef } from "@/features/messages/lib/useDrafts";
@@ -78,6 +79,7 @@ export type MessageComposerProps = {
     mentionPubkeys?: string[],
     /** Target captured when the edit was submitted; avoids a later ref swap. */
     eventId?: string,
+    publicationScope?: PublicationScope,
   ) => Promise<void>;
   /** Captures send context synchronously before awaits can change navigation. */
   onCaptureSendContext?: () => {
@@ -97,6 +99,7 @@ export type MessageComposerProps = {
     } | null,
     /** Route through the REST publisher even when best-effort enrichment settled empty. */
     forceRest?: boolean,
+    publicationScope?: PublicationScope,
   ) => Promise<void>;
   placeholder?: string;
   profiles?: UserProfileLookup;

@@ -68,6 +68,7 @@ import * as ownership from "./MessageComposerMediaOwnership";
 
 import { useAddressedAgentMentionRestore } from "./useAddressedAgentMentionRestore";
 import { scheduleSettleGatedAutoSubmit } from "./messageComposerAutoSubmit";
+import { prepareBackgroundLinkPreviews } from "@/features/messages/lib/linkPreviewPreparationStore";
 function MessageComposerImpl({
   audienceContext = null,
   channelId = null,
@@ -114,8 +115,9 @@ function MessageComposerImpl({
   const [previewContent, setPreviewContent] = React.useState("");
   const {
     previewList: composerLinkPreviews,
+    getLiveCandidates: getLiveLinkPreviewCandidates,
     getReadyTags: getReadyLinkPreviewTags,
-  } = useComposerLinkPreviews(previewContent);
+  } = useComposerLinkPreviews(previewContent, editTarget == null);
   const [isEmojiPickerOpen, setIsEmojiPickerOpen] = React.useState(false);
   const [isFormattingOpen, setIsFormattingOpen] = React.useState(false);
   const handleFormattingToggle = React.useCallback((pressed: boolean) => {
@@ -291,6 +293,7 @@ function MessageComposerImpl({
     mentionNames: mentions.knownNames,
     agentMentionNames: mentions.agentKnownNames,
     channelNames: channelLinks.knownChannelNames,
+    messageLinkChannels: channelLinks.channels,
     customEmoji,
     getMentionIdentities: mentions.getMentionIdentities,
     onSubmit: () => submitMessageRef.current(),
@@ -636,13 +639,19 @@ function MessageComposerImpl({
     setIsSubmitLocked(true);
     onPreparingMentionSendChange?.(true);
     try {
+      const preparedLinkPreviews = getReadyLinkPreviewTags().some(
+        (tag) => tag[1] === "none",
+      )
+        ? null
+        : prepareBackgroundLinkPreviews(getLiveLinkPreviewCandidates());
       await mentionSendFlow.sendMessageWithMentionFlow({
         addressedAgentPubkeys: persistentAudience.pubkeys,
         capturedChannelId: channelId,
         capturedThreadContext,
         pendingImeta: currentPendingImeta,
         queuedAttachments: currentQueuedAttachments,
-        linkPreviewTags: getReadyLinkPreviewTags(),
+        linkPreviewTags: preparedLinkPreviews ? [] : getReadyLinkPreviewTags(),
+        preparedLinkPreviews,
         sentDraftKey: resolveSentDraftKey(
           effectiveDraftKeyRef.current,
           drafts.loadDraft,
@@ -663,6 +672,7 @@ function MessageComposerImpl({
     customEmoji,
     drafts.loadDraft,
     emojiAutocomplete.clearEmojis,
+    getLiveLinkPreviewCandidates,
     getReadyLinkPreviewTags,
     media.clearQueuedAttachments,
     media.pendingImetaRef,
@@ -980,7 +990,7 @@ function MessageComposerImpl({
               onOpenMentionPicker={mentionPicker.openMentionSettings}
               onPaperclip={handlePaperclipClick}
               onFinishVoiceNote={() => void voiceNote.finish()}
-              onVoiceNote={voiceNote.supported ? voiceNote.toggle : undefined}
+              onVoiceNote={voiceNote.toggle}
               onRemoveAddressedAgent={removeAddressedAgent}
               pulseVersionByPubkey={addressPulse.pulseVersionByPubkey}
               sendDisabled={sendDisabled}
