@@ -10,9 +10,6 @@ fn owned_pi(acp: AcpClient, protocol_version: u32) -> OwnedAgent {
         desired_model: None,
         pending_model_ack: None,
         model_overridden: false,
-        desired_model_request_id: None,
-        desired_model_pending_ack: false,
-        startup_effort: None,
         agent_name: BUZZ_PI_ACP_NAME.into(),
         goose_system_prompt_supported: None,
         protocol_version,
@@ -71,13 +68,10 @@ async fn pi_composed_prompt_uses_meta_without_capability_negotiation() {
             &mut agent,
             &ctx,
             Some(core),
-            NewSessionChannelContext {
-                huddle_instructions: Some("BUZZ_HUDDLE"),
-                canvas: Some(canvas),
-                name: Some("channel"),
-                scope: None,
-                channel_type: None,
-            },
+            Some(canvas),
+            Some("channel"),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -95,7 +89,6 @@ async fn pi_composed_prompt_uses_meta_without_capability_negotiation() {
             system_prompt: ctx.system_prompt.as_deref(),
             team_instructions: ctx.team_instructions.as_deref(),
             agent_core: Some(core),
-            huddle_instructions: Some("BUZZ_HUDDLE"),
             agent_canvas: Some(canvas),
         };
         let user = prepend_standing_for_legacy(2, &standing, "EVENT");
@@ -104,7 +97,6 @@ async fn pi_composed_prompt_uses_meta_without_capability_negotiation() {
             "BUZZ_PERSONA",
             "BUZZ_TEAM",
             "BUZZ_CORE",
-            "BUZZ_HUDDLE",
             "BUZZ_CANVAS",
         ] {
             assert_eq!(
@@ -171,7 +163,7 @@ pwd -P > "$(dirname "$0")/cwd""#,
         tokio::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "pool::pi_prompt_tests::pi_launch_preserves_existing_skills_in_explicit_workspace",
+                "pool::pi_transport_tests::pi_launch_preserves_existing_skills_in_explicit_workspace",
                 "--nocapture",
             ])
             .kill_on_drop(true)
@@ -276,13 +268,10 @@ async fn real_pi_preserves_buzz_prompt_and_launch_skills_on_restore() {
         &mut agent,
         &ctx,
         Some("<core-memory>BUZZ_CORE</core-memory>"),
-        NewSessionChannelContext {
-            huddle_instructions: Some("BUZZ_HUDDLE"),
-            canvas: Some("<channel-canvas>BUZZ_CANVAS</channel-canvas>"),
-            name: None,
-            scope: None,
-            channel_type: None,
-        },
+        Some("<channel-canvas>BUZZ_CANVAS</channel-canvas>"),
+        None,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -354,7 +343,6 @@ async fn real_pi_preserves_buzz_prompt_and_launch_skills_on_restore() {
             "BUZZ_PERSONA",
             "BUZZ_TEAM",
             "BUZZ_CORE",
-            "BUZZ_HUDDLE",
             "BUZZ_CANVAS",
             "BUZZ_SKILL_MARKER",
         ] {

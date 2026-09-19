@@ -321,45 +321,47 @@ fork differences, not just missing features. The decision and check receipt is
 
 ## Status at polish
 
-The polish lane starts at integration head `b169a9186` and merges fork main
-`e67434d1d` with a two-parent merge, `fe09953a1`. The one-shot fleet directories
-remain removed. Native-CI discovery retains main's simplification and the
-root-CI Bash-version guard. The PostgreSQL test inventory follows the merged
-source layout, including the `store`, `runtime`, and `postgres_tests` modules;
-the two Justfile admin exclusions use their current names.
+The um-14b continuation starts at integration head `82e28e7d7`. The earlier
+fork-main merge and fleet-script removals remain intact. The accepted buzz-acp
+hybrid section above remains the integration decision.
 
-Fresh checks on this head passed Rust workspace formatting and clippy with
-warnings denied, mobile analysis, the configured Flutter suite with 2,416
-passing and four skipped tests, and the separate unconfigured-push test.
-Web typecheck, lint, and all 24 unit tests passed. Admin-web typecheck, lint,
-and its test command passed; that command found no unit tests. PostgreSQL
-discovery's seven contract tests and the native-CI Python batch passed. The
-initial Rust unit run exhausted the required scope's 300-task limit. Its
-bounded retry passed core/auth, auth doctests, voice, CLI, CI control-plane,
-ACP, DB, and the selected media regression before this time-capped call
-stopped during the next compilation. The exact recipe remains incomplete;
-resume it with `NEXTEST_TEST_THREADS=4`, `TOKIO_WORKER_THREADS=4`, and
-`CARGO_BUILD_JOBS=4`. The Rust gate is not yet complete.
+All thirteen orphaned ignored-test entries are reconciled. Twelve tests now
+compile in active database and ACP modules. The obsolete standalone writer
+isolation test is removed because
+`runtime::postgres_tests::writer_pool_rejects_non_read_committed_database_default`
+exercises the production constructor and its failure metrics. Four orphan files
+are deleted. Unique paging, pressure, session-policy, and Pi restore coverage
+survives. Three Pi transport/launch tests and the timeout-parser unit test pass.
+The obsolete separate huddle-input assertions cannot bind to the accepted
+hybrid API and are not claimed as retained coverage.
 
-Compiled discovery remains blocked. Thirteen inventory rows describe tests
-in orphaned source files: twelve across the root buzz-db `channel_members.rs`,
-`observability.rs`, and `session_policy.rs`, plus the ACP Pi prompt test.
-Reconcile their retained fork behavior with the active modules before removing
-obsolete copies. The relay main test also needs an admitted executable target
-identity distinct from the library; the current runner accepts only library
-and integration-test artifacts. Source inventory validation alone does not
-prove compiled coverage. Two review findings were repaired: scratch database
-URLs retain the owned socket options, and three real-Redis presence tests are
-explicitly classified as external.
+Reactivating these tests restored deterministic roster ordering, bounded timeout
+environment parsing, readiness query outcome/cancellation handling, and the Buzz
+Pi adapter's prompt and skill transport. The relay audit-pool helper and test
+now live together in the admitted library; main calls that tested helper.
+The existing runner reconciles its 155 ignored tests. Fresh workspace discovery
+matches all 854 source inventory rows to compiled ignored tests across 144
+Cargo targets. All seven PostgreSQL discovery contracts pass. Independent
+source review found no actionable defects.
 
-Desktop remains with its workers: finish desktop TypeScript and unit tests,
-resolve cancelled or stalled tests, complete Tauri test compilation and native
-regressions, and verify message publication, huddle admission, project checkout,
-and workflow approval behavior. This lane does not claim desktop checks or
-app builds passed. The parent still owns the whole-branch review and merging
-this pushed lane into the integration branch.
+The complete `just test-unit` recipe passes with 4,266 Rust nextest cases,
+three auth doctests, the native-CI Python batch, and its shell/inventory checks.
+The run used `CARGO_BUILD_JOBS=4`, `NEXTEST_TEST_THREADS=4`, and
+`TOKIO_WORKER_THREADS=4` inside the requested `TasksMax=600` user scope.
+The previous four CLI failures and executable-start failure passed their six
+focused rechecks and the full CLI suite. They were resource-exhaustion failures.
+Formatting also passes. Per-crate results and logs are recorded in
+`/home/victor/work/buzz_upstream/reports/polish.md`.
 
-Production remains Victor's decision under
+The earlier polish call passed mobile analysis, 2,416 Flutter tests with four
+skipped, the separate unconfigured-push test, web typecheck/lint and 24 tests,
+and admin-web typecheck/lint and its empty test command. Those checks were not
+rerun in this Rust-focused continuation. Desktop verification remains with its
+workers; this lane does not claim app builds or desktop checks passed. The
+parent owns integration and the whole-branch review. No PR is opened.
+
+Live PostgreSQL/Redis tests and the real Pi adapter restore test remain
+unexecuted. Production remains Victor's decision under
 [the migration-lineage runbook](../../deploy/migration-lineage/README.md).
 Rehearse the exact candidate against an isolated backup restore and an empty
 database, compare schemas and fences, and time migration 0033. Production

@@ -3,6 +3,8 @@
 //! NIP-01 WebSocket relay for Buzz private team communication.
 
 mod admission;
+/// Serving audit writer pool configuration.
+pub mod audit_pool;
 mod build_info;
 mod rejection;
 

@@ -577,21 +577,25 @@ impl DbConfig {
     /// This belongs in `buzz-db` so relay, admin, deletion, and audit writers
     /// share one policy. The separately deployed push gateway owns its own
     /// database and session policy.
-    pub fn with_session_timeouts_from_env(mut self) -> Self {
-        fn parse(key: &str) -> Option<u64> {
-            std::env::var(key)
-                .ok()
-                .and_then(|value| value.parse::<u64>().ok())
-        }
+    pub fn with_session_timeouts_from_env(self) -> Self {
+        self.with_session_timeout_values(|key| std::env::var(key).ok())
+    }
 
-        if let Some(value) = parse("BUZZ_DB_LOCK_TIMEOUT_MS") {
-            self.lock_timeout_ms = value;
-        }
-        if let Some(value) = parse("BUZZ_DB_IDLE_TXN_TIMEOUT_MS") {
-            self.idle_txn_timeout_ms = value;
-        }
-        if let Some(value) = parse("BUZZ_DB_STATEMENT_TIMEOUT_MS") {
-            self.statement_timeout_ms = value;
+    fn with_session_timeout_values(mut self, value: impl Fn(&str) -> Option<String>) -> Self {
+        for (key, target) in [
+            ("BUZZ_DB_LOCK_TIMEOUT_MS", &mut self.lock_timeout_ms),
+            ("BUZZ_DB_IDLE_TXN_TIMEOUT_MS", &mut self.idle_txn_timeout_ms),
+            (
+                "BUZZ_DB_STATEMENT_TIMEOUT_MS",
+                &mut self.statement_timeout_ms,
+            ),
+        ] {
+            if let Some(parsed) = value(key)
+                .and_then(|raw| raw.parse::<u64>().ok())
+                .filter(|ms| *ms <= i32::MAX as u64)
+            {
+                *target = parsed;
+            }
         }
         self
     }
@@ -1130,7 +1134,7 @@ impl Db {
         deadline: tokio::time::Instant,
         query: &'static str,
     ) -> DbReadinessOutcome {
-        let mut connection = match observability::acquire_writer_until(
+        let connection = match observability::acquire_writer_until(
             &self.pool,
             observability::WriterOperation::Readiness,
             deadline,
@@ -1145,14 +1149,33 @@ impl Db {
             Ok(connection) => connection,
         };
 
-        match tokio::time::timeout_at(deadline, sqlx::query(query).execute(&mut *connection)).await
+        let mut connection = ReadinessConnection {
+            connection,
+            completed: false,
+        };
+        let mut observation = observability::ReadinessQueryObservation::new();
+        match tokio::time::timeout_at(
+            deadline,
+            sqlx::query(query).execute(&mut *connection.connection),
+        )
+        .await
         {
-            Err(_) => DbReadinessOutcome::QueryTimeout,
-            Ok(Err(error)) => {
-                tracing::debug!(error = %error, "Postgres readiness query failed");
-                DbReadinessOutcome::QueryError
+            Err(_) => {
+                observation.finish_timeout();
+                DbReadinessOutcome::QueryTimeout
             }
-            Ok(Ok(_)) => DbReadinessOutcome::Success,
+            Ok(result) => {
+                connection.completed = true;
+                let timed_out = observation.finish(&result);
+                match result {
+                    Ok(_) => DbReadinessOutcome::Success,
+                    Err(_) if timed_out => DbReadinessOutcome::QueryTimeout,
+                    Err(error) => {
+                        tracing::debug!(error = %error, "Postgres readiness query failed");
+                        DbReadinessOutcome::QueryError
+                    }
+                }
+            }
         }
     }
 
@@ -1413,3 +1436,20 @@ mod pool_role_tests {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod postgres_tests;
+
+#[cfg(test)]
+mod pressure_postgres_tests;
+#[cfg(test)]
+mod session_policy_postgres_tests;
+
+struct ReadinessConnection {
+    connection: sqlx::pool::PoolConnection<sqlx::Postgres>,
+    completed: bool,
+}
+impl Drop for ReadinessConnection {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.connection.close_on_drop();
+        }
+    }
+}

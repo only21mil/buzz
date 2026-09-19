@@ -754,7 +754,7 @@ async fn get_members_with_operation(
         FROM channel_members cm
         JOIN channels c ON cm.community_id = c.community_id AND cm.channel_id = c.id AND c.deleted_at IS NULL
         WHERE cm.community_id = $1 AND cm.channel_id = $2 AND cm.removed_at IS NULL
-        ORDER BY cm.joined_at ASC
+        ORDER BY cm.joined_at ASC, cm.pubkey ASC
         "#,
     )
     .bind(community_id.as_uuid())
@@ -3288,5 +3288,106 @@ mod postgres_tests {
         assert_eq!(live_id, fresh.id.as_bytes().to_vec());
 
         drop_scratch_db(&admin, pool, &scratch_name).await;
+    }
+}
+
+#[cfg(test)]
+mod paging_postgres_tests {
+    use super::*;
+
+    async fn setup_pool() -> PgPool {
+        let database_url = crate::test_support::database_url();
+        PgPool::connect(&database_url)
+            .await
+            .expect("connect to test DB")
+    }
+
+    async fn make_test_community(pool: &PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        let host = format!("roster-test-{}.example", id.simple());
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(id)
+            .bind(host)
+            .execute(pool)
+            .await
+            .expect("insert test community");
+        id
+    }
+
+    async fn make_test_channel(pool: &PgPool, community_id: Uuid) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO channels (id, community_id, name, channel_type, visibility, created_by) \
+             VALUES ($1, $2, $3, 'stream', 'open', $4)",
+        )
+        .bind(id)
+        .bind(community_id)
+        .bind(format!("roster-channel-{}", id.simple()))
+        .bind(vec![0x11_u8; 32])
+        .execute(pool)
+        .await
+        .expect("insert test channel");
+        id
+    }
+
+    /// Bulk-insert `count` distinct members. `digest(.., 'sha256')` needs the
+    /// pgcrypto extension, which the base schema installs.
+    async fn seed_members(pool: &PgPool, community_id: Uuid, channel_id: Uuid, count: i32) {
+        sqlx::query(
+            "INSERT INTO channel_members (community_id, channel_id, pubkey, role) \
+             SELECT $1, $2, digest('roster-member-' || n::text, 'sha256'), 'member' \
+             FROM generate_series(1, $3) n",
+        )
+        .bind(community_id)
+        .bind(channel_id)
+        .bind(count)
+        .execute(pool)
+        .await
+        .expect("seed channel members");
+    }
+
+    /// UD-1: paging covers the same roster the unpaged read returns, with no
+    /// gaps and no overlap.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn get_members_paged_covers_roster_without_overlap() {
+        let pool = setup_pool().await;
+        let community_id = make_test_community(&pool).await;
+        let community = CommunityId::from_uuid(community_id);
+        let channel_id = make_test_channel(&pool, community_id).await;
+        seed_members(&pool, community_id, channel_id, 1_200).await;
+
+        let full = get_members(&pool, community, channel_id)
+            .await
+            .expect("load complete roster");
+        assert_eq!(full.len(), 1_200);
+
+        // Same-statement inserts share a timestamp, so the pubkey tiebreak is
+        // what keeps the order deterministic across pages.
+        let pubkeys: Vec<&[u8]> = full.iter().map(|m| m.pubkey.as_slice()).collect();
+        let mut sorted = pubkeys.clone();
+        sorted.sort_unstable();
+        assert_eq!(pubkeys, sorted);
+
+        let mut paged = Vec::with_capacity(1_200);
+        for (offset, expected) in [(0, 500), (500, 500), (1000, 200)] {
+            let page = get_members_paged(&pool, community, channel_id, 500, offset)
+                .await
+                .expect("load roster page");
+            assert_eq!(page.len(), expected);
+            paged.extend(page);
+        }
+
+        let full_keys: std::collections::HashSet<&[u8]> =
+            full.iter().map(|m| m.pubkey.as_slice()).collect();
+        let paged_keys: std::collections::HashSet<&[u8]> =
+            paged.iter().map(|m| m.pubkey.as_slice()).collect();
+        assert_eq!(paged_keys, full_keys);
+
+        // A zero limit clamps to one row rather than returning nothing.
+        let single = get_members_paged(&pool, community, channel_id, 0, 0)
+            .await
+            .expect("load clamped page");
+        assert_eq!(single.len(), 1);
     }
 }

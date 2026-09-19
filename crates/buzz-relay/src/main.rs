@@ -16,6 +16,7 @@ use buzz_db::{Db, DbConfig};
 use buzz_pubsub::PubSubManager;
 use buzz_search::SearchService;
 
+use buzz_relay::audit_pool::connect_audit_pool;
 use buzz_relay::config::{Config, MAX_DRAIN_JITTER_MS};
 use buzz_relay::lifecycle::{BootTracker, LifecycleReason, StartupPhase};
 use buzz_relay::metrics as relay_metrics;
@@ -33,18 +34,6 @@ fn buzz_auto_migrate_enabled(value: Option<&str>) -> bool {
             "true" | "1" | "yes" | "on"
         )
     })
-}
-
-async fn connect_audit_pool(config: &DbConfig) -> anyhow::Result<sqlx::PgPool> {
-    let audit_config = DbConfig {
-        read_database_url: None,
-        max_connections: 5,
-        min_connections: 1,
-        ..config.clone()
-    };
-    Db::connect_writer_pool(&audit_config)
-        .await
-        .map_err(Into::into)
 }
 
 fn relay_keypair_from_config(relay_private_key: Option<&str>) -> anyhow::Result<nostr::Keys> {
@@ -2195,11 +2184,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        buzz_auto_migrate_enabled, connect_audit_pool, dropped_in_memory_keys, idle_timeout_secs,
+        buzz_auto_migrate_enabled, dropped_in_memory_keys, idle_timeout_secs,
         refresh_legacy_active_gauge_recency, relay_keypair_from_config,
         run_periodic_until_cancelled, EmissionScope, InMemoryMetricKey,
     };
-    use buzz_db::DbConfig;
     use metrics::GaugeFn;
     use metrics_util::{
         debugging::DebugValue,
@@ -2229,73 +2217,6 @@ mod tests {
             .expect("loop must not wait for the next interval")
             .expect("loop task");
         assert!(tick_count.load(std::sync::atomic::Ordering::Relaxed) <= 1);
-    }
-
-    async fn audit_writer_pool_installs_timeouts_and_bounds_advisory_lock_waits() {
-        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
-        let pool = connect_audit_pool(&DbConfig {
-            database_url,
-            max_connections: 2,
-            min_connections: 0,
-            lock_timeout_ms: 500,
-            idle_txn_timeout_ms: 60_000,
-            statement_timeout_ms: 0,
-            ..DbConfig::default()
-        })
-        .await
-        .expect("connect audit writer pool");
-
-        let (lock, idle, statement): (String, String, String) = sqlx::query_as(
-            "SELECT current_setting('lock_timeout'), \
-                    current_setting('idle_in_transaction_session_timeout'), \
-                    current_setting('statement_timeout')",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("read effective audit writer GUCs");
-        assert_eq!(lock, "500ms");
-        assert_eq!(idle, "1min");
-        assert_eq!(statement, "0");
-
-        let lock_key = i64::from_be_bytes(
-            Uuid::new_v4().as_bytes()[..8]
-                .try_into()
-                .expect("eight UUID bytes"),
-        );
-        let mut holder = pool.acquire().await.expect("audit lock holder");
-        sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(lock_key)
-            .execute(&mut *holder)
-            .await
-            .expect("hold audit advisory lock");
-
-        let started = std::time::Instant::now();
-        let mut waiter = pool.acquire().await.expect("audit lock waiter");
-        let error = sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(lock_key)
-            .execute(&mut *waiter)
-            .await
-            .expect_err("audit advisory-lock waiter must time out");
-        let code = match &error {
-            sqlx::Error::Database(db_error) => db_error.code().map(|code| code.to_string()),
-            other => panic!("expected database error, got {other:?}"),
-        };
-        assert_eq!(code.as_deref(), Some("55P03"));
-        assert!(started.elapsed() < Duration::from_secs(5));
-
-        sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(lock_key)
-            .execute(&mut *holder)
-            .await
-            .expect("release audit advisory lock");
-    }
-
-    mod postgres_tests {
-        #[tokio::test]
-        #[ignore = "requires Postgres"]
-        async fn audit_writer_pool_installs_timeouts_and_bounds_advisory_lock_waits() {
-            super::audit_writer_pool_installs_timeouts_and_bounds_advisory_lock_waits().await;
-        }
     }
 
     #[test]

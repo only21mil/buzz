@@ -1,5 +1,5 @@
 package	binary	test	source	mode	reason
-buzz-acp	buzz_acp	pool::pi_prompt_tests::real_pi_preserves_buzz_prompt_and_launch_skills_on_restore	crates/buzz-acp/src/pool/pi_prompt_tests.rs	external	requires BUZZ_TEST_PI_ACP pointing to a built fork and Pi on PATH
+buzz-acp	buzz_acp	pool::pi_transport_tests::real_pi_preserves_buzz_prompt_and_launch_skills_on_restore	crates/buzz-acp/src/pool/pi_transport_tests.rs	external	requires BUZZ_TEST_PI_ACP pointing to a built fork and Pi on PATH
 buzz-agent	buzz_agent	model_capabilities::tests::regen_corpus_file	crates/buzz-agent/src/model_capabilities.rs	external	writer, not a check — run via `just regen-model-corpus`
 buzz-audit	buzz_audit	service::postgres_tests::chain_links_within_one_community	crates/buzz-audit/src/service.rs	desired	desired schema fixture
 buzz-audit	buzz_audit	service::postgres_tests::chains_are_independent_per_community	crates/buzz-audit/src/service.rs	desired	desired schema fixture
@@ -16,13 +16,6 @@ buzz-db	agent_drafts_persistence	identical_signed_retry_survives_reconnect_and_u
 buzz-db	agent_drafts_persistence	owner_pages_counts_ids_result_gate_and_search_keep_private_history	crates/buzz-db/tests/agent_drafts_persistence.rs	migration	disposable owner-scoped durable draft fixture
 buzz-db	agent_drafts_persistence	postgres_process_restart_retains_signed_pending_and_rejected_history	crates/buzz-db/tests/agent_drafts_persistence.rs	external	disposable owner-scoped durable draft fixture
 buzz-db	agent_drafts_persistence	rejected_tombstone_blocks_replay_and_newer_clock_approval	crates/buzz-db/tests/agent_drafts_persistence.rs	migration	disposable owner-scoped durable draft fixture
-buzz-db	buzz_db	channel_members::tests::get_members_paged_covers_roster_without_overlap	crates/buzz-db/src/channel_members.rs	desired	desired schema fixture
-buzz-db	buzz_db	observability::tests::postgres_query_cancellation_is_reported_separately	crates/buzz-db/src/observability.rs	desired	database observability packet fixture; explicit schema contract
-buzz-db	buzz_db	observability::tests::production_fork_operations_report_ci_and_workflow_acquisitions	crates/buzz-db/src/observability.rs	desired	database observability packet fixture; explicit schema contract
-buzz-db	buzz_db	observability::tests::readiness_distinguishes_query_error_timeout_and_cancelled_future	crates/buzz-db/src/observability.rs	desired	database observability packet fixture; explicit schema contract
-buzz-db	buzz_db	observability::tests::restricted_telemetry_catalog_failure_does_not_block_serving	crates/buzz-db/src/observability.rs	desired	database observability packet fixture; explicit schema contract
-buzz-db	buzz_db	observability::tests::saturated_acquisition_and_cancellation_drain_bounded_waiters	crates/buzz-db/src/observability.rs	desired	database observability packet fixture; explicit schema contract
-buzz-db	buzz_db	observability::tests::sql_statement_timeout_is_separate_from_acquisition_timeout	crates/buzz-db/src/observability.rs	desired	database observability packet fixture; explicit schema contract
 buzz-db	buzz_db	runtime::migration::postgres_tests::admin_schema_parity_between_desired_state_and_migrations	crates/buzz-db/src/runtime/migration.rs	migration	requires Postgres
 buzz-db	buzz_db	runtime::migration::postgres_tests::agent_draft_rows_soft_delete_but_never_rewrite_or_hard_delete	crates/buzz-db/src/runtime/migration.rs	migration	fixture applies migrations to empty database and verifies draft immutability
 buzz-db	buzz_db	runtime::migration::postgres_tests::cancelled_migration_cannot_expose_shared_lock_while_ddl_backend_lives	crates/buzz-db/src/runtime/migration.rs	migration	requires Postgres
@@ -97,16 +90,21 @@ buzz-db	buzz_db	runtime::postgres_tests::writer_pool_metrics_record_connection_c
 buzz-db	buzz_db	runtime::postgres_tests::writer_pool_metrics_record_every_initial_connection_ready	crates/buzz-db/src/runtime/tests.rs	desired	requires Postgres
 buzz-db	buzz_db	runtime::postgres_tests::writer_pool_metrics_stop_after_session_timeout_setup_failure	crates/buzz-db/src/runtime/tests.rs	desired	requires Postgres
 buzz-db	buzz_db	runtime::postgres_tests::writer_pool_rejects_non_read_committed_database_default	crates/buzz-db/src/runtime/tests.rs	desired	requires Postgres
+buzz-db	buzz_db	runtime::pressure_postgres_tests::cluster_global_restricted_telemetry_catalog_failure_does_not_block_serving	crates/buzz-db/src/runtime/pressure_postgres_tests.rs	desired	database observability packet fixture; explicit schema contract
+buzz-db	buzz_db	runtime::pressure_postgres_tests::postgres_query_cancellation_is_reported_separately	crates/buzz-db/src/runtime/pressure_postgres_tests.rs	desired	database observability packet fixture; explicit schema contract
+buzz-db	buzz_db	runtime::pressure_postgres_tests::production_fork_operations_report_ci_and_workflow_acquisitions	crates/buzz-db/src/runtime/pressure_postgres_tests.rs	desired	database observability packet fixture; explicit schema contract
+buzz-db	buzz_db	runtime::pressure_postgres_tests::readiness_distinguishes_query_error_timeout_and_cancelled_future	crates/buzz-db/src/runtime/pressure_postgres_tests.rs	desired	database observability packet fixture; explicit schema contract
+buzz-db	buzz_db	runtime::pressure_postgres_tests::saturated_acquisition_and_cancellation_drain_bounded_waiters	crates/buzz-db/src/runtime/pressure_postgres_tests.rs	desired	database observability packet fixture; explicit schema contract
+buzz-db	buzz_db	runtime::pressure_postgres_tests::sql_statement_timeout_is_separate_from_acquisition_timeout	crates/buzz-db/src/runtime/pressure_postgres_tests.rs	desired	database observability packet fixture; explicit schema contract
 buzz-db	buzz_db	runtime::replica_fence::postgres_tests::aurora_identity_probe_reports_false_on_plain_postgres	crates/buzz-db/src/runtime/replica_fence.rs	desired	desired schema fixture
 buzz-db	buzz_db	runtime::replica_fence::postgres_tests::cluster_global_probe_commits_tokens_and_sessions_prove_coverage	crates/buzz-db/src/runtime/replica_fence.rs	migration	requires Postgres
 buzz-db	buzz_db	runtime::replica_fence::postgres_tests::cluster_global_probe_rotates_epoch_on_same_epoch_token_regression	crates/buzz-db/src/runtime/replica_fence.rs	migration	requires Postgres
 buzz-db	buzz_db	runtime::replica_fence::postgres_tests::cluster_global_sample_writer_fails_closed_when_activity_is_masked	crates/buzz-db/src/runtime/replica_fence.rs	migration	requires Postgres
 buzz-db	buzz_db	runtime::replica_fence::postgres_tests::migration_schema_cluster_global_sample_writer_sees_open_transactions_and_ignores_idle	crates/buzz-db/src/runtime/replica_fence.rs	migration	requires Postgres
-buzz-db	buzz_db	session_policy::tests::explicit_zero_and_reader_sessions_keep_distinct_policy	crates/buzz-db/src/session_policy.rs	migration	database observability packet fixture; explicit schema contract
-buzz-db	buzz_db	session_policy::tests::idle_transaction_timeout_reaps_only_idle_transaction	crates/buzz-db/src/session_policy.rs	migration	database observability packet fixture; explicit schema contract
-buzz-db	buzz_db	session_policy::tests::migration_wait_and_cancellation_never_return_relaxed_session	crates/buzz-db/src/session_policy.rs	migration	database observability packet fixture; explicit schema contract
-buzz-db	buzz_db	session_policy::tests::writer_policy_bounds_waits_preserves_floor_and_recovers	crates/buzz-db/src/session_policy.rs	migration	database observability packet fixture; explicit schema contract
-buzz-db	buzz_db	session_policy::tests::writer_policy_rejects_non_read_committed_isolation	crates/buzz-db/src/session_policy.rs	migration	database observability packet fixture; explicit schema contract
+buzz-db	buzz_db	runtime::session_policy_postgres_tests::explicit_zero_and_reader_sessions_keep_distinct_policy	crates/buzz-db/src/runtime/session_policy_postgres_tests.rs	migration	database observability packet fixture; explicit schema contract
+buzz-db	buzz_db	runtime::session_policy_postgres_tests::idle_transaction_timeout_reaps_only_idle_transaction	crates/buzz-db/src/runtime/session_policy_postgres_tests.rs	migration	database observability packet fixture; explicit schema contract
+buzz-db	buzz_db	runtime::session_policy_postgres_tests::migration_schema_migration_wait_and_cancellation_never_return_relaxed_session	crates/buzz-db/src/runtime/session_policy_postgres_tests.rs	migration	database observability packet fixture; explicit schema contract
+buzz-db	buzz_db	runtime::session_policy_postgres_tests::writer_policy_bounds_waits_preserves_floor_and_recovers	crates/buzz-db/src/runtime/session_policy_postgres_tests.rs	migration	database observability packet fixture; explicit schema contract
 buzz-db	buzz_db	store::admin_moderation::postgres_tests::feedback_survives_community_purge_with_null_provenance_in_list_and_detail	crates/buzz-db/src/store/admin_moderation.rs	desired	requires Postgres
 buzz-db	buzz_db	store::admin_moderation::postgres_tests::report_detail_active_action_breaks_equal_timestamp_ties_by_id_desc	crates/buzz-db/src/store/admin_moderation.rs	desired	requires Postgres
 buzz-db	buzz_db	store::admin_moderation::postgres_tests::report_detail_active_action_excludes_reopen_audit_rows	crates/buzz-db/src/store/admin_moderation.rs	desired	requires Postgres
@@ -121,6 +119,7 @@ buzz-db	buzz_db	store::archived_identities::postgres_tests::archived_identity_st
 buzz-db	buzz_db	store::channel::postgres_tests::get_channel_is_scoped_when_channel_uuid_collides_across_communities	crates/buzz-db/src/store/channel.rs	desired	desired schema fixture
 buzz-db	buzz_db	store::channel::postgres_tests::reap_expired_ephemeral_channels_returns_row_community_and_host	crates/buzz-db/src/store/channel.rs	desired	desired schema fixture
 buzz-db	buzz_db	store::channel::postgres_tests::test_unarchive_expired_ephemeral_channel_renews_ttl_deadline	crates/buzz-db/src/store/channel.rs	desired	desired schema fixture
+buzz-db	buzz_db	store::channel_members::paging_postgres_tests::get_members_paged_covers_roster_without_overlap	crates/buzz-db/src/store/channel_members.rs	desired	desired schema fixture
 buzz-db	buzz_db	store::channel_members::postgres_tests::accessible_channel_ids_are_not_truncated_at_one_thousand	crates/buzz-db/src/store/channel_members.rs	desired	desired schema fixture
 buzz-db	buzz_db	store::channel_members::postgres_tests::channel_roster_fence_behavior_verification_detects_inert_function	crates/buzz-db/src/store/channel_members.rs	desired	requires Postgres
 buzz-db	buzz_db	store::channel_members::postgres_tests::channel_roster_fence_catalog_verification_fails_closed	crates/buzz-db/src/store/channel_members.rs	desired	requires Postgres
@@ -510,6 +509,7 @@ buzz-relay	buzz_relay	api::operator::postgres_tests::transfer_with_invalid_pubke
 buzz-relay	buzz_relay	api::operator::postgres_tests::unarchive_restores_admission_and_is_idempotent_without_changing_ownership	crates/buzz-relay/src/api/operator.rs	desired	desired schema fixture
 buzz-relay	buzz_relay	api::operator::postgres_tests::unmapped_management_host_can_check_availability	crates/buzz-relay/src/api/operator.rs	desired	desired schema fixture
 buzz-relay	buzz_relay	api::operator::postgres_tests::unmapped_management_host_can_list_owned_communities	crates/buzz-relay/src/api/operator.rs	desired	desired schema fixture
+buzz-relay	buzz_relay	audit_pool::postgres_tests::audit_writer_pool_installs_timeouts_and_bounds_advisory_lock_waits	crates/buzz-relay/src/audit_pool.rs	desired	requires Postgres
 buzz-relay	buzz_relay	handlers::command_executor::approval_decision_tests::canonical_grant_resumes_persisted_cursor_once_and_completes	crates/buzz-relay/src/handlers/command_executor.rs	migration	fixture applies migrations to empty database
 buzz-relay	buzz_relay	handlers::command_executor::postgres_tests::workflow_persistence_preserves_replays_and_rejects_dominated_cas_updates	crates/buzz-relay/src/handlers/command_executor.rs	migration	fixture applies migrations to empty database
 buzz-relay	buzz_relay	handlers::command_executor::postgres_tests::workflow_persistence_replays_legacy_malformed_revision_before_validation	crates/buzz-relay/src/handlers/command_executor.rs	desired	requires Postgres
@@ -532,7 +532,6 @@ buzz-relay	buzz_relay	rejection::quota_tests::ephemeral_events_leave_human_and_a
 buzz-relay	buzz_relay	rejection::quota_tests::http_quota_preserves_wire_error_and_reports_api_bucket	crates/buzz-relay/src/rejection/quota_tests.rs	external	requires explicit isolated BUZZ_TEST_REDIS_URL
 buzz-relay	buzz_relay	rejection::quota_tests::ws_flood_budget_is_shared_by_ephemeral_stored_req_and_count	crates/buzz-relay/src/rejection/quota_tests.rs	external	requires explicit isolated BUZZ_TEST_REDIS_URL
 buzz-relay	buzz_relay	state::tests::postgres_tests::audit_worker_retries_lock_timeout_until_original_entry_is_appended_once	crates/buzz-relay/src/state.rs	desired	requires Postgres
-buzz-relay	buzz_relay	tests::postgres_tests::audit_writer_pool_installs_timeouts_and_bounds_advisory_lock_waits	crates/buzz-relay/src/main.rs	desired	requires Postgres
 buzz-relay	buzz_relay	workflow_resume::tests::effect_recovery_fires_unfired_claim_once_with_same_identity	crates/buzz-relay/src/workflow_resume.rs	migration	fixture applies migrations to empty database
 buzz-relay	buzz_relay	workflow_resume::tests::effect_recovery_reclaimed_run_does_not_refire_prior_message	crates/buzz-relay/src/workflow_resume.rs	migration	fixture applies migrations to empty database
 buzz-relay	buzz_relay	workflow_resume::tests::effect_recovery_skips_fired_message_after_crash_before_finalize	crates/buzz-relay/src/workflow_resume.rs	migration	fixture applies migrations to empty database
