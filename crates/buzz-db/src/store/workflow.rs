@@ -1935,6 +1935,366 @@ impl Db {
 
 // -- Tests --------------------------------------------------------------------
 
+impl Db {
+    /// Restored fork workflow persistence operation.
+    pub async fn update_workflow_run_with_failure(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        status: workflow::RunStatus,
+        current_step: i32,
+        trace: &serde_json::Value,
+        failure: Option<workflow::WorkflowRunFailure<'_>>,
+    ) -> Result<()> {
+        async {
+            workflow::update_workflow_run_with_failure(
+                &self.pool,
+                community_id,
+                id,
+                status,
+                current_step,
+                trace,
+                failure,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Matches the underlying store API"
+    )]
+    pub async fn claim_workflow_effect(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        expected_generation: i64,
+        step_id: &str,
+        effect_index: i16,
+        effect_kind: &str,
+        effect_spec: &serde_json::Value,
+        effect_payload: &serde_json::Value,
+    ) -> Result<WorkflowEffectClaimOutcome> {
+        async {
+            workflow_effect::claim_workflow_effect_with_payload(
+                &self.pool,
+                community_id,
+                run_id,
+                expected_generation,
+                step_id,
+                effect_index,
+                effect_kind,
+                effect_spec,
+                effect_payload,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Matches the underlying store API"
+    )]
+    pub async fn load_workflow_effect_claim(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        expected_generation: i64,
+        step_id: &str,
+        effect_index: i16,
+        effect_kind: &str,
+        effect_spec: &serde_json::Value,
+    ) -> Result<Option<WorkflowEffectClaimOutcome>> {
+        async {
+            workflow_effect::load_workflow_effect_claim(
+                &self.pool,
+                community_id,
+                run_id,
+                expected_generation,
+                step_id,
+                effect_index,
+                effect_kind,
+                effect_spec,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn mark_workflow_effect_fired(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        expected_generation: i64,
+        step_id: &str,
+        effect_index: i16,
+        output: &serde_json::Value,
+    ) -> Result<WorkflowEffectMarkOutcome> {
+        async {
+            workflow_effect::mark_workflow_effect_fired(
+                &self.pool,
+                community_id,
+                run_id,
+                expected_generation,
+                step_id,
+                effect_index,
+                output,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn transition_workflow_run(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        expected_status: workflow::RunStatus,
+        expected_generation: i64,
+        next_status: workflow::RunStatus,
+    ) -> Result<WorkflowRunTransitionOutcome> {
+        async {
+            workflow_run_transition::transition_workflow_run(
+                &self.pool,
+                community_id,
+                id,
+                expected_status,
+                expected_generation,
+                next_status,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn list_recoverable_workflow_resumes(
+        &self,
+        resume_pending_age_secs: i64,
+        limit: i64,
+    ) -> Result<Vec<WorkflowResumeCandidate>> {
+        async {
+            workflow_run_transition::list_recoverable_workflow_resumes(
+                &self.pool,
+                resume_pending_age_secs,
+                limit,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn claim_workflow_resume(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        expected_status: workflow::RunStatus,
+        expected_generation: i64,
+        lease_secs: i64,
+    ) -> Result<WorkflowRunTransitionOutcome> {
+        async {
+            workflow_run_transition::claim_workflow_resume(
+                &self.pool,
+                community_id,
+                id,
+                expected_status,
+                expected_generation,
+                lease_secs,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn renew_workflow_resume_lease(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        expected_generation: i64,
+        lease_secs: i64,
+    ) -> Result<bool> {
+        async {
+            workflow_run_transition::renew_workflow_resume_lease(
+                &self.pool,
+                community_id,
+                id,
+                expected_generation,
+                lease_secs,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn complete_running_workflow_run(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        expected_generation: i64,
+        current_step: i32,
+        trace: &serde_json::Value,
+    ) -> Result<WorkflowRunTransitionOutcome> {
+        async {
+            workflow_run_transition::complete_running_workflow_run(
+                &self.pool,
+                community_id,
+                id,
+                expected_generation,
+                current_step,
+                trace,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn fail_running_workflow_run_with_failure(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        expected_generation: i64,
+        current_step: i32,
+        trace: &serde_json::Value,
+        failure: workflow::WorkflowRunFailure<'_>,
+    ) -> Result<WorkflowRunTransitionOutcome> {
+        async {
+            workflow_run_transition::fail_running_workflow_run_with_failure(
+                &self.pool,
+                community_id,
+                id,
+                expected_generation,
+                current_step,
+                trace,
+                failure,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn fail_running_workflow_run(
+        &self,
+        community_id: CommunityId,
+        id: Uuid,
+        expected_generation: i64,
+        current_step: i32,
+        trace: &serde_json::Value,
+        error: &str,
+    ) -> Result<WorkflowRunTransitionOutcome> {
+        async {
+            workflow_run_transition::fail_running_workflow_run(
+                &self.pool,
+                community_id,
+                id,
+                expected_generation,
+                current_step,
+                trace,
+                error,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn read_workflow_state(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        key: &str,
+    ) -> Result<Option<WorkflowStateEntry>> {
+        async {
+            workflow_state::read_workflow_state(&self.pool, community_id, workflow_id, key).await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn read_workflow_state_for_run(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        key: &str,
+    ) -> Result<Option<WorkflowStateEntry>> {
+        async {
+            workflow_state::read_workflow_state_for_run(&self.pool, community_id, run_id, key).await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn purge_expired_workflow_state(&self, limit: u32) -> Result<u64> {
+        async { workflow_state::purge_expired_workflow_state(&self.pool, limit).await }.await
+    }
+    /// Restored fork workflow persistence operation.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Matches the underlying store API"
+    )]
+    pub async fn write_workflow_state(
+        &self,
+        community_id: CommunityId,
+        run_id: Uuid,
+        step_id: &str,
+        key: &str,
+        value: &str,
+        expires_in_secs: i64,
+        expected_revision: Option<&str>,
+    ) -> Result<WorkflowStateWriteOutcome> {
+        async {
+            workflow_state::write_workflow_state(
+                &self.pool,
+                community_id,
+                run_id,
+                step_id,
+                key,
+                value,
+                expires_in_secs,
+                expected_revision,
+            )
+            .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn create_workflow_approval_gate(
+        &self,
+        params: workflow_approval::CreateWorkflowApprovalGateParams<'_>,
+    ) -> Result<WorkflowApprovalGateCreationOutcome> {
+        async { workflow_approval::create_workflow_approval_gate(&self.pool, params).await }.await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn lookup_workflow_approval_gate(
+        &self,
+        community_id: CommunityId,
+        approval_id: Uuid,
+    ) -> Result<Option<WorkflowApprovalGateRecord>> {
+        async {
+            workflow_approval::lookup_workflow_approval_gate(&self.pool, community_id, approval_id)
+                .await
+        }
+        .await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn decide_workflow_approval_gate(
+        &self,
+        params: workflow_approval::DecideWorkflowApprovalGateParams<'_>,
+    ) -> Result<WorkflowApprovalDecisionOutcome> {
+        async { workflow_approval::decide_workflow_approval_gate(&self.pool, params).await }.await
+    }
+    /// Restored fork workflow persistence operation.
+    pub async fn get_workflow_approval_history(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        run_id: Uuid,
+    ) -> Result<Vec<workflow::WorkflowApprovalHistoryRecord>> {
+        async {
+            workflow::get_workflow_approval_history(&self.pool, community_id, workflow_id, run_id)
+                .await
+        }
+        .await
+    }
+}
+
 #[cfg(test)]
 mod postgres_tests {
     use super::*;
@@ -3285,365 +3645,5 @@ mod postgres_tests {
             enabled_b.iter().any(|w| w.id == wf_departing_b),
             "same owner's workflow in a different channel must be untouched"
         );
-    }
-}
-
-impl Db {
-    /// Restored fork workflow persistence operation.
-    pub async fn update_workflow_run_with_failure(
-        &self,
-        community_id: CommunityId,
-        id: Uuid,
-        status: workflow::RunStatus,
-        current_step: i32,
-        trace: &serde_json::Value,
-        failure: Option<workflow::WorkflowRunFailure<'_>>,
-    ) -> Result<()> {
-        async {
-            workflow::update_workflow_run_with_failure(
-                &self.pool,
-                community_id,
-                id,
-                status,
-                current_step,
-                trace,
-                failure,
-            )
-            .await
-        }
-        .await
-    }
-    /// Restored fork workflow persistence operation.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "Matches the underlying store API"
-    )]
-    pub async fn claim_workflow_effect(
-        &self,
-        community_id: CommunityId,
-        run_id: Uuid,
-        expected_generation: i64,
-        step_id: &str,
-        effect_index: i16,
-        effect_kind: &str,
-        effect_spec: &serde_json::Value,
-        effect_payload: &serde_json::Value,
-    ) -> Result<WorkflowEffectClaimOutcome> {
-        async {
-            workflow_effect::claim_workflow_effect_with_payload(
-                &self.pool,
-                community_id,
-                run_id,
-                expected_generation,
-                step_id,
-                effect_index,
-                effect_kind,
-                effect_spec,
-                effect_payload,
-            )
-            .await
-        }
-        .await
-    }
-    /// Restored fork workflow persistence operation.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "Matches the underlying store API"
-    )]
-    pub async fn load_workflow_effect_claim(
-        &self,
-        community_id: CommunityId,
-        run_id: Uuid,
-        expected_generation: i64,
-        step_id: &str,
-        effect_index: i16,
-        effect_kind: &str,
-        effect_spec: &serde_json::Value,
-    ) -> Result<Option<WorkflowEffectClaimOutcome>> {
-        async {
-            workflow_effect::load_workflow_effect_claim(
-                &self.pool,
-                community_id,
-                run_id,
-                expected_generation,
-                step_id,
-                effect_index,
-                effect_kind,
-                effect_spec,
-            )
-            .await
-        }
-        .await
-    }
-    /// Restored fork workflow persistence operation.
-    pub async fn mark_workflow_effect_fired(
-        &self,
-        community_id: CommunityId,
-        run_id: Uuid,
-        expected_generation: i64,
-        step_id: &str,
-        effect_index: i16,
-        output: &serde_json::Value,
-    ) -> Result<WorkflowEffectMarkOutcome> {
-        async {
-            workflow_effect::mark_workflow_effect_fired(
-                &self.pool,
-                community_id,
-                run_id,
-                expected_generation,
-                step_id,
-                effect_index,
-                output,
-            )
-            .await
-        }
-        .await
-    }
-    /// Restored fork workflow persistence operation.
-    pub async fn transition_workflow_run(
-        &self,
-        community_id: CommunityId,
-        id: Uuid,
-        expected_status: workflow::RunStatus,
-        expected_generation: i64,
-        next_status: workflow::RunStatus,
-    ) -> Result<WorkflowRunTransitionOutcome> {
-        async {
-            workflow_run_transition::transition_workflow_run(
-                &self.pool,
-                community_id,
-                id,
-                expected_status,
-                expected_generation,
-                next_status,
-            )
-            .await
-        }
-        .await
-    }
-    /// Restored fork workflow persistence operation.
-    pub async fn list_recoverable_workflow_resumes(
-        &self,
-        resume_pending_age_secs: i64,
-        limit: i64,
-    ) -> Result<Vec<WorkflowResumeCandidate>> {
-        async {
-            workflow_run_transition::list_recoverable_workflow_resumes(
-                &self.pool,
-                resume_pending_age_secs,
-                limit,
-            )
-            .await
-        }
-        .await
-    }
-    /// Restored fork workflow persistence operation.
-    pub async fn claim_workflow_resume(
-        &self,
-        community_id: CommunityId,
-        id: Uuid,
-        expected_status: workflow::RunStatus,
-        expected_generation: i64,
-        lease_secs: i64,
-    ) -> Result<WorkflowRunTransitionOutcome> {
-        async {
-            workflow_run_transition::claim_workflow_resume(
-                &self.pool,
-                community_id,
-                id,
-                expected_status,
-                expected_generation,
-                lease_secs,
-            )
-            .await
-        }
-        .await
-    }
-    /// Restored fork workflow persistence operation.
-    pub async fn renew_workflow_resume_lease(
-        &self,
-        community_id: CommunityId,
-        id: Uuid,
-        expected_generation: i64,
-        lease_secs: i64,
-    ) -> Result<bool> {
-        async {
-            workflow_run_transition::renew_workflow_resume_lease(
-                &self.pool,
-                community_id,
-                id,
-                expected_generation,
-                lease_secs,
-            )
-            .await
-        }
-        .await
-    }
-    /// Restored fork workflow persistence operation.
-    pub async fn complete_running_workflow_run(
-        &self,
-        community_id: CommunityId,
-        id: Uuid,
-        expected_generation: i64,
-        current_step: i32,
-        trace: &serde_json::Value,
-    ) -> Result<WorkflowRunTransitionOutcome> {
-        async {
-            workflow_run_transition::complete_running_workflow_run(
-                &self.pool,
-                community_id,
-                id,
-                expected_generation,
-                current_step,
-                trace,
-            )
-            .await
-        }
-        .await
-    }
-    /// Restored fork workflow persistence operation.
-    pub async fn fail_running_workflow_run_with_failure(
-        &self,
-        community_id: CommunityId,
-        id: Uuid,
-        expected_generation: i64,
-        current_step: i32,
-        trace: &serde_json::Value,
-        failure: workflow::WorkflowRunFailure<'_>,
-    ) -> Result<WorkflowRunTransitionOutcome> {
-        async {
-            workflow_run_transition::fail_running_workflow_run_with_failure(
-                &self.pool,
-                community_id,
-                id,
-                expected_generation,
-                current_step,
-                trace,
-                failure,
-            )
-            .await
-        }
-        .await
-    }
-    /// Restored fork workflow persistence operation.
-    pub async fn fail_running_workflow_run(
-        &self,
-        community_id: CommunityId,
-        id: Uuid,
-        expected_generation: i64,
-        current_step: i32,
-        trace: &serde_json::Value,
-        error: &str,
-    ) -> Result<WorkflowRunTransitionOutcome> {
-        async {
-            workflow_run_transition::fail_running_workflow_run(
-                &self.pool,
-                community_id,
-                id,
-                expected_generation,
-                current_step,
-                trace,
-                error,
-            )
-            .await
-        }
-        .await
-    }
-    /// Restored fork workflow persistence operation.
-    pub async fn read_workflow_state(
-        &self,
-        community_id: CommunityId,
-        workflow_id: Uuid,
-        key: &str,
-    ) -> Result<Option<WorkflowStateEntry>> {
-        async {
-            workflow_state::read_workflow_state(&self.pool, community_id, workflow_id, key).await
-        }
-        .await
-    }
-    /// Restored fork workflow persistence operation.
-    pub async fn read_workflow_state_for_run(
-        &self,
-        community_id: CommunityId,
-        run_id: Uuid,
-        key: &str,
-    ) -> Result<Option<WorkflowStateEntry>> {
-        async {
-            workflow_state::read_workflow_state_for_run(&self.pool, community_id, run_id, key).await
-        }
-        .await
-    }
-    /// Restored fork workflow persistence operation.
-    pub async fn purge_expired_workflow_state(&self, limit: u32) -> Result<u64> {
-        async { workflow_state::purge_expired_workflow_state(&self.pool, limit).await }.await
-    }
-    /// Restored fork workflow persistence operation.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "Matches the underlying store API"
-    )]
-    pub async fn write_workflow_state(
-        &self,
-        community_id: CommunityId,
-        run_id: Uuid,
-        step_id: &str,
-        key: &str,
-        value: &str,
-        expires_in_secs: i64,
-        expected_revision: Option<&str>,
-    ) -> Result<WorkflowStateWriteOutcome> {
-        async {
-            workflow_state::write_workflow_state(
-                &self.pool,
-                community_id,
-                run_id,
-                step_id,
-                key,
-                value,
-                expires_in_secs,
-                expected_revision,
-            )
-            .await
-        }
-        .await
-    }
-    /// Restored fork workflow persistence operation.
-    pub async fn create_workflow_approval_gate(
-        &self,
-        params: workflow_approval::CreateWorkflowApprovalGateParams<'_>,
-    ) -> Result<WorkflowApprovalGateCreationOutcome> {
-        async { workflow_approval::create_workflow_approval_gate(&self.pool, params).await }.await
-    }
-    /// Restored fork workflow persistence operation.
-    pub async fn lookup_workflow_approval_gate(
-        &self,
-        community_id: CommunityId,
-        approval_id: Uuid,
-    ) -> Result<Option<WorkflowApprovalGateRecord>> {
-        async {
-            workflow_approval::lookup_workflow_approval_gate(&self.pool, community_id, approval_id)
-                .await
-        }
-        .await
-    }
-    /// Restored fork workflow persistence operation.
-    pub async fn decide_workflow_approval_gate(
-        &self,
-        params: workflow_approval::DecideWorkflowApprovalGateParams<'_>,
-    ) -> Result<WorkflowApprovalDecisionOutcome> {
-        async { workflow_approval::decide_workflow_approval_gate(&self.pool, params).await }.await
-    }
-    /// Restored fork workflow persistence operation.
-    pub async fn get_workflow_approval_history(
-        &self,
-        community_id: CommunityId,
-        workflow_id: Uuid,
-        run_id: Uuid,
-    ) -> Result<Vec<workflow::WorkflowApprovalHistoryRecord>> {
-        async {
-            workflow::get_workflow_approval_history(&self.pool, community_id, workflow_id, run_id)
-                .await
-        }
-        .await
     }
 }
