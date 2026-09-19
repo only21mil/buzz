@@ -32,6 +32,7 @@ test("scoped one-character search requests all 40 results and keyboard navigatio
     "@tanstack/react-query"
   );
   const { mockIPC, clearMocks } = await import("@tauri-apps/api/mocks");
+  const { resetMediaCaches } = await import("@/shared/lib/mediaUrl");
   const { useSearchResults } = await import("./useSearchResults.ts");
   const { useSearchMenuKeyboardNavigation } = await import(
     "./ui/useSearchMenuKeyboardNavigation.ts"
@@ -54,6 +55,8 @@ test("scoped one-character search requests all 40 results and keyboard navigatio
     scrolled.push(this.dataset.searchResultIndex);
   };
   mockIPC((command, args) => {
+    if (command === "get_relay_http_url") return "https://relay.example";
+    if (command === "get_media_proxy_port") return 12345;
     if (command !== "search_messages")
       throw new Error(`Unexpected relay call: ${command}`);
     calls.push(args);
@@ -171,7 +174,9 @@ test("scoped one-character search requests all 40 results and keyboard navigatio
     );
   } finally {
     cleanup();
+    await client.cancelQueries();
     client.clear();
+    resetMediaCaches();
     clearMocks();
     dom.window.close();
     keys.forEach((key, index) => {

@@ -379,6 +379,7 @@ test("empty Projects uses the shared creation flow and preserves desktop capabil
     assert.equal(view.getByTestId("create-project-name").value, "");
   } finally {
     cleanup();
+    await client.cancelQueries();
     await new Promise((resolve) => setTimeout(resolve, 100));
     client.clear();
     relayClient.fetchEvents = fetchEvents;

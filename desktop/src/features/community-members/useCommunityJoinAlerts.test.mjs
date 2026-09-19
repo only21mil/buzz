@@ -479,6 +479,8 @@ function mountHook({ role = "owner", enabled = true } = {}) {
       await act(async () => {
         root.unmount();
       });
+      await queryClient.cancelQueries();
+      queryClient.clear();
     },
   };
 }
@@ -486,7 +488,7 @@ function mountHook({ role = "owner", enabled = true } = {}) {
 async function settle(iterations = 4) {
   for (let i = 0; i < iterations; i++) {
     await act(async () => {
-      await new Promise((r) => setTimeout(r, 5));
+      mock.timers.tick(5);
     });
   }
 }
@@ -500,7 +502,7 @@ async function settle(iterations = 4) {
  */
 async function settleAfterRefreshDebounce() {
   await act(async () => {
-    await new Promise((r) => setTimeout(r, 600));
+    mock.timers.tick(600);
   });
   await settle();
 }
@@ -516,7 +518,7 @@ async function settleAfterRefreshDebounce() {
  */
 async function settleAfterNotifyWindow() {
   await act(async () => {
-    await new Promise((r) => setTimeout(r, 1_700));
+    mock.timers.tick(1_700);
   });
   await settle();
 }
@@ -566,6 +568,7 @@ function ledgerKeys() {
 
 describe("useCommunityJoinAlerts — mounted subscription behaviour", () => {
   beforeEach(() => {
+    mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
     storage.clear();
     storageFull = false;
     notifications.length = 0;
@@ -576,6 +579,7 @@ describe("useCommunityJoinAlerts — mounted subscription behaviour", () => {
 
   afterEach(() => {
     mock.restoreAll();
+    mock.timers.reset();
   });
 
   /**
@@ -2094,7 +2098,7 @@ describe("useCommunityJoinAlerts — mounted subscription behaviour", () => {
         }),
       );
       await act(async () => {
-        await new Promise((r) => setTimeout(r, 1_000));
+        mock.timers.tick(1_000);
       });
     }
 
