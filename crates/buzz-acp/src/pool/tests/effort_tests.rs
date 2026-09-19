@@ -32,6 +32,7 @@ for line in sys.stdin:
         state: SessionState::default(),
         model_capabilities: None,
         desired_model: Some("target".into()),
+        pending_model_ack: None,
         model_overridden: false,
         agent_name: "test".into(),
         goose_system_prompt_supported: None,

@@ -1570,7 +1570,13 @@ async fn handle_switch_model_control(
         if signal_in_flight_task(
             pool,
             channel_id,
-            ControlSignal::SwitchModel(model_id.to_string()),
+            ControlSignal::SwitchModel {
+                model_id: model_id.to_string(),
+                request_id: payload
+                    .get("requestId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            },
         ) {
             "sent"
         } else {
@@ -1578,9 +1584,19 @@ async fn handle_switch_model_control(
         }
     } else {
         // Idle path: only a fresh, non-empty catalog can reject before invalidation.
-        match pool.switch_idle_agent_model(channel_id, model_id).await {
+        match pool
+            .switch_idle_agent_model(
+                channel_id,
+                model_id,
+                payload
+                    .get("requestId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            )
+            .await
+        {
             IdleSwitchResult::AmbiguousTarget => "ambiguous_target",
-            IdleSwitchResult::Switched => "switched",
+            IdleSwitchResult::Switched => "sent",
             IdleSwitchResult::UnsupportedModel => "unsupported_model",
             IdleSwitchResult::NoIdleAgent => "no_active_turn",
         }
@@ -2688,6 +2704,7 @@ async fn tokio_main() -> Result<()> {
                         state: SessionState::default(),
                         model_capabilities: None,
                         desired_model: config.model.clone(),
+                        pending_model_ack: None,
                         model_overridden: false,
                         agent_name,
                         goose_system_prompt_supported: None,
@@ -5464,6 +5481,7 @@ async fn initialize_agent_pool(
                             state: SessionState::default(),
                             model_capabilities: None,
                             desired_model: startup.model.clone(),
+                            pending_model_ack: None,
                             model_overridden: false,
                             agent_name,
                             goose_system_prompt_supported: None,
@@ -6095,7 +6113,7 @@ mod owner_control_command_tests {
         pool.record_scope_owner(b, 1);
         pool.task_map_mut().clear();
         assert_eq!(
-            pool.switch_idle_agent_model(ch, "new-model").await,
+            pool.switch_idle_agent_model(ch, "new-model", None).await,
             IdleSwitchResult::AmbiguousTarget
         );
         assert!(!pool.channel_control_is_ambiguous(Uuid::new_v4()));
@@ -6105,7 +6123,10 @@ mod owner_control_command_tests {
     async fn observer_channel_controls_allow_one_scope_and_ignore_other_channels() {
         for signal in [
             ControlSignal::Cancel,
-            ControlSignal::SwitchModel("new-model".into()),
+            ControlSignal::SwitchModel {
+                model_id: "new-model".into(),
+                request_id: Some("pick-1".into()),
+            },
         ] {
             let mut pool = AgentPool::from_slots(vec![]);
             let ch = Uuid::new_v4();
@@ -6126,6 +6147,7 @@ mod owner_control_command_tests {
             }
             assert_eq!(rx.await.unwrap(), signal);
             assert_eq!(observer.snapshot()[0].payload["status"], "sent");
+            assert_eq!(observer.snapshot()[0].payload["requestId"], "pick-1");
         }
     }
 
@@ -8445,6 +8467,7 @@ mod error_outcome_emission_tests {
             state: Default::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,

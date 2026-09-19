@@ -470,6 +470,8 @@ pub struct OwnedAgent {
     /// desktop reader to distinguish a genuine runtime override from a stale
     /// session whose persona model was edited. Reset on spawn/restart.
     pub model_overridden: bool,
+    /// Unsettled live model pick, retained until the adapter applies or rejects it.
+    pub pending_model_ack: Option<(Option<String>, Uuid)>,
     /// Normalized agent name from initialize (`agentInfo.name`/`serverInfo.name`).
     pub agent_name: String,
     /// Whether Goose accepted its custom system-prompt method. `None` probes on
@@ -827,7 +829,7 @@ fn apply_completed_before_control_signal(
     // the fresh session applies the new model on its next creation.
     if matches!(
         control_signal,
-        ControlSignal::Rotate | ControlSignal::SwitchModel(_)
+        ControlSignal::Rotate | ControlSignal::SwitchModel { .. }
     ) {
         state.take_source_session(source)
     } else {
@@ -917,7 +919,12 @@ pub enum ControlSignal {
     /// setting `OwnedAgent::desired_model` before invalidation; the requeued
     /// turn re-creates the session and re-applies `desired_model`. Runtime-only
     /// — never persisted, gone on restart/respawn.
-    SwitchModel(String),
+    SwitchModel {
+        /// Requested adapter model identifier.
+        model_id: String,
+        /// Opaque desktop pick identifier, echoed in acknowledgements.
+        request_id: Option<String>,
+    },
 }
 
 /// Goose-native non-cancelling steer request, sent from the main loop to an
@@ -1368,6 +1375,7 @@ impl AgentPool {
                 "pending ACP session close exhausted on return; restarting adapter"
             );
             agent.state.invalidate_all();
+            emit_pending_model_ack(&mut agent, "failure");
             agent.acp.shutdown().await;
             self.session_owners.retain(|_, owner| *owner != idx);
             self.pending_scope_invalidations.remove(&idx);
@@ -1671,6 +1679,7 @@ impl AgentPool {
                         return 0;
                     };
                     agent.state.invalidate_all();
+                    emit_pending_model_ack(&mut agent, "failure");
                     agent.acp.shutdown().await;
                     self.session_owners.retain(|_, owner| *owner != index);
                     self.pending_scope_invalidations.remove(&index);
@@ -1730,6 +1739,7 @@ impl AgentPool {
         &mut self,
         channel_id: Uuid,
         model_id: &str,
+        request_id: Option<String>,
     ) -> IdleSwitchResult {
         if self.channel_control_is_ambiguous(channel_id) {
             return IdleSwitchResult::AmbiguousTarget;
@@ -1762,6 +1772,8 @@ impl AgentPool {
             }
         }
 
+        emit_pending_model_ack(agent, "failure");
+        agent.pending_model_ack = Some((request_id, channel_id));
         agent.desired_model = Some(model_id.to_string());
         agent.model_overridden = true;
         agent.invalidate_scope(&scope, "idle_model_switch").await;
@@ -1893,6 +1905,31 @@ async fn create_session_and_apply_model(
     session_scope: Option<&SessionScope>,
     channel_type: Option<&str>,
 ) -> Result<String, AcpError> {
+    let result = create_session_and_apply_model_inner(
+        agent,
+        ctx,
+        agent_core,
+        agent_canvas,
+        channel_name,
+        session_scope,
+        channel_type,
+    )
+    .await;
+    if result.is_err() {
+        emit_pending_model_ack(agent, "failure");
+    }
+    result
+}
+
+async fn create_session_and_apply_model_inner(
+    agent: &mut OwnedAgent,
+    ctx: &PromptContext,
+    agent_core: Option<&str>,
+    agent_canvas: Option<&str>,
+    channel_name: Option<&str>,
+    session_scope: Option<&SessionScope>,
+    channel_type: Option<&str>,
+) -> Result<String, AcpError> {
     if session_scope.is_some() {
         agent
             .make_room_for_channel_session(ctx.max_live_sessions)
@@ -1986,7 +2023,15 @@ async fn create_session_and_apply_model(
         match resolve_model_switch_method(&resp.raw, desired) {
             Some(method) => {
                 let switched =
-                    apply_model_switch(&mut agent.acp, &resp.session_id, desired, &method).await?;
+                    match apply_model_switch(&mut agent.acp, &resp.session_id, desired, &method)
+                        .await
+                    {
+                        Ok(switched) => switched,
+                        Err(error) => {
+                            emit_pending_model_ack(agent, "failure");
+                            return Err(error);
+                        }
+                    };
                 if let Some(ref updated) = switched {
                     // Capabilities and captured identity must describe the same
                     // post-switch model. An omitted snapshot is unknown, not
@@ -2010,6 +2055,14 @@ async fn create_session_and_apply_model(
                         }),
                     );
                 }
+                emit_pending_model_ack(
+                    agent,
+                    if switched.is_some() {
+                        "switched"
+                    } else {
+                        "failure"
+                    },
+                );
                 switched.is_some()
             }
             None => {
@@ -2029,6 +2082,7 @@ async fn create_session_and_apply_model(
                         "modelId": desired,
                     }),
                 );
+                emit_pending_model_ack(agent, "unsupported_model");
                 false
             }
         }
@@ -2085,6 +2139,27 @@ async fn create_session_and_apply_model(
     }
 
     Ok(resp.session_id)
+}
+
+/// Settle one live pick using its original channel, even if another scope runs next.
+fn emit_pending_model_ack(agent: &mut OwnedAgent, status: &str) {
+    let Some((request_id, channel_id)) = agent.pending_model_ack.take() else {
+        return;
+    };
+    if let Some(observer) = agent.acp.observer_handle() {
+        observer.emit(
+            "control_result",
+            agent.acp.observer_agent_index(),
+            &observer::ObserverContext {
+                channel_id: Some(channel_id.to_string()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "type": "switch_model", "status": status,
+                "modelId": agent.desired_model, "requestId": request_id,
+            }),
+        );
+    }
 }
 
 /// Outcome of applying a worker's spawn-scoped startup effort at session creation.
@@ -2644,6 +2719,15 @@ fn send_prompt_result(
     outcome: PromptOutcome,
     batch: Option<FlushBatch>,
 ) {
+    if matches!(
+        outcome,
+        PromptOutcome::Error(_)
+            | PromptOutcome::AgentExited
+            | PromptOutcome::Timeout(_)
+            | PromptOutcome::CancelDrainTimeout(_)
+    ) {
+        emit_pending_model_ack(&mut agent, "failure");
+    }
     agent.acp.clear_steer_rx();
     let _ = result_tx.send(PromptResult {
         agent,
@@ -3726,7 +3810,11 @@ pub async fn run_prompt_task(
                     // `desired_model` here means the fresh session created by the
                     // requeued turn (busy) or the next turn (already-completed)
                     // applies the new model. Runtime-only — never persisted.
-                    if let ControlSignal::SwitchModel(ref model_id) = control_signal {
+                    if let ControlSignal::SwitchModel { model_id, request_id } = &control_signal {
+                        emit_pending_model_ack(&mut agent, "failure");
+                        if let Some(channel_id) = observer_channel_id {
+                            agent.pending_model_ack = Some((request_id.clone(), channel_id));
+                        }
                         agent.desired_model = Some(model_id.clone());
                         agent.model_overridden = true;
                     }
@@ -3823,7 +3911,7 @@ pub async fn run_prompt_task(
                         // MUST send a PromptResult or the main loop deadlocks.
                         if matches!(
                             control_signal,
-                            ControlSignal::Rotate | ControlSignal::SwitchModel(_)
+                            ControlSignal::Rotate | ControlSignal::SwitchModel { .. }
                         ) {
                             tracing::debug!(
                                 target: "pool::prompt",
@@ -5312,7 +5400,7 @@ fn requeue_cancelled_batch(
 ) -> Option<FlushBatch> {
     let reason = match signal {
         ControlSignal::Steer => CancelReason::Steer,
-        ControlSignal::Interrupt | ControlSignal::SwitchModel(_) => CancelReason::Interrupt,
+        ControlSignal::Interrupt | ControlSignal::SwitchModel { .. } => CancelReason::Interrupt,
         // Cancel/Rotate discard the batch — no merged re-prompt.
         ControlSignal::Cancel | ControlSignal::Rotate => return None,
     };
@@ -5778,7 +5866,6 @@ async fn publish_agent_turn_metric(
     turn_id: &str,
     stop_reason: Option<buzz_core::agent_turn_metric::StopReason>,
 ) {
-    use buzz_core::agent_turn_metric::AgentTurnMetricPayload;
     use nostr::{EventBuilder, Kind, Tag};
 
     let (usage, owner_pk) = match (usage, ctx.agent_owner_pubkey.as_ref()) {
@@ -7509,6 +7596,7 @@ mod tests {
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name,
             goose_system_prompt_supported: None,
@@ -7638,6 +7726,7 @@ mod tests {
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name,
             goose_system_prompt_supported: None,
@@ -7713,6 +7802,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
@@ -7866,6 +7956,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
@@ -8027,6 +8118,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
@@ -8261,6 +8353,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
@@ -8453,6 +8546,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
@@ -8533,6 +8627,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
@@ -8839,6 +8934,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
@@ -9187,6 +9283,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "test".into(),
             goose_system_prompt_supported: None,
@@ -9262,6 +9359,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "test".into(),
             goose_system_prompt_supported: None,
@@ -9537,6 +9635,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "test".into(),
             goose_system_prompt_supported: None,
@@ -9745,6 +9844,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "test".into(),
             goose_system_prompt_supported: None,
@@ -9794,6 +9894,7 @@ for line in sys.stdin:
                 state: SessionState::default(),
                 model_capabilities: None,
                 desired_model: None,
+                pending_model_ack: None,
                 model_overridden: false,
                 agent_name: "test".into(),
                 goose_system_prompt_supported: None,
@@ -10503,7 +10604,10 @@ for line in sys.stdin:
         let _ = apply_completed_before_control_signal(
             &mut s,
             &PromptSource::Channel(SessionScope::Conversation { channel_id: ch_a }),
-            &ControlSignal::SwitchModel("gpt-5".into()),
+            &ControlSignal::SwitchModel {
+                model_id: "gpt-5".into(),
+                request_id: None,
+            },
         );
 
         assert!(!s.has_channel_state(&ch_a));
@@ -10544,7 +10648,10 @@ for line in sys.stdin:
             (ControlSignal::Steer, Some(CancelReason::Steer)),
             (ControlSignal::Interrupt, Some(CancelReason::Interrupt)),
             (
-                ControlSignal::SwitchModel("gpt-5".into()),
+                ControlSignal::SwitchModel {
+                    model_id: "gpt-5".into(),
+                    request_id: None,
+                },
                 Some(CancelReason::Interrupt),
             ),
             (ControlSignal::Cancel, None),
@@ -10661,7 +10768,10 @@ for line in sys.stdin:
             Case {
                 name: "CancelDrainTimeout + SwitchModel preserves batch with Interrupt reason",
                 error: || AcpError::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
-                signal: ControlSignal::SwitchModel("gpt-5".to_string()),
+                signal: ControlSignal::SwitchModel {
+                    model_id: "gpt-5".to_string(),
+                    request_id: None,
+                },
                 expected_outcome: "CancelDrainTimeout",
                 batch_preserved: true,
                 expected_reason: Some(CancelReason::Interrupt),
@@ -11078,6 +11188,7 @@ for line in sys.stdin:
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -11136,6 +11247,7 @@ for line in sys.stdin:
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -11207,6 +11319,7 @@ for line in sys.stdin:
             state,
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -11269,6 +11382,7 @@ for line in sys.stdin:
                 captured_at: Instant::now(),
             }),
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -11277,7 +11391,7 @@ for line in sys.stdin:
         let mut pool = AgentPool::from_slots(vec![Some(agent)]);
 
         let result = pool
-            .switch_idle_agent_model(channel_id, "recovered-model")
+            .switch_idle_agent_model(channel_id, "recovered-model", None)
             .await;
 
         assert_eq!(result, IdleSwitchResult::Switched);
@@ -11346,6 +11460,7 @@ for line in sys.stdin:
             state,
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -11400,6 +11515,7 @@ for line in sys.stdin:
             state,
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -11457,6 +11573,7 @@ for line in sys.stdin:
             state,
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -11502,6 +11619,7 @@ for line in sys.stdin:
             state,
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -11543,6 +11661,7 @@ for line in sys.stdin:
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -11609,6 +11728,7 @@ for line in sys.stdin:
             state,
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -11650,6 +11770,7 @@ for line in sys.stdin:
             state,
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -12852,6 +12973,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
@@ -12988,6 +13110,7 @@ mod startup_effort_tests {
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "effort-test-agent".into(),
             goose_system_prompt_supported: None,
@@ -13195,6 +13318,7 @@ mod model_switch_tests {
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: Some(desired_model.to_string()),
+            pending_model_ack: None,
             model_overridden: true,
             agent_name: "switch-test-agent".into(),
             goose_system_prompt_supported: None,
@@ -13327,6 +13451,69 @@ done"#
             "an applied switch must cache the target model, not the pre-switch model-a"
         );
     }
+    #[tokio::test]
+    async fn poisoned_switch_settles_before_agent_is_returned_for_respawn() {
+        let acp = spawn_switch_acp(OPTS_MODEL_A_AND_B, r#""result":{}"#).await;
+        let mut agent = switching_agent(acp, "model-b");
+        let channel = Uuid::new_v4();
+        agent.pending_model_ack = Some((Some("poisoned-pick".into()), channel));
+        let obs = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(obs.clone()), 0);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        send_prompt_result(
+            &tx,
+            "turn",
+            agent,
+            PromptSource::Heartbeat,
+            PromptOutcome::CancelDrainTimeout(Duration::from_secs(5)),
+            None,
+        );
+        assert!(rx.recv().await.unwrap().agent.pending_model_ack.is_none());
+        let frames = control_results(&obs);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["requestId"], "poisoned-pick");
+        assert_eq!(frames[0]["status"], "failure");
+    }
+
+    #[tokio::test]
+    async fn correlated_switch_terminal_is_consumed_once_on_success_and_failure() {
+        for (reply, status) in [
+            (r#""result":{"configOptions":[]}"#, "switched"),
+            (r#""error":{"code":-32602,"message":"rejected"}"#, "failure"),
+        ] {
+            let acp = spawn_switch_acp(OPTS_MODEL_A_AND_B, reply).await;
+            let mut agent = switching_agent(acp, "model-b");
+            let channel = Uuid::new_v4();
+            agent.pending_model_ack = Some((Some("pick-1".into()), channel));
+            let obs = observer::ObserverHandle::in_process();
+            agent.acp.set_observer(Some(obs.clone()), 0);
+            create_session_and_apply_model(
+                &mut agent,
+                &make_prompt_context_no_owner(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(agent.pending_model_ack.is_none());
+            emit_pending_model_ack(&mut agent, "failure");
+            let frames: Vec<_> = obs
+                .snapshot()
+                .into_iter()
+                .filter(|e| e.kind == "control_result" && e.payload["requestId"] == "pick-1")
+                .collect();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].payload["status"], status);
+            assert_eq!(
+                frames[0].channel_id.as_deref(),
+                Some(channel.to_string().as_str())
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_applied_switch_without_models_does_not_leak_pre_switch_model() {
         // session/new advertises model-a as current; the successful switch reply
