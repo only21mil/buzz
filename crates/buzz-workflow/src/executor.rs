@@ -862,6 +862,60 @@ async fn dispatch_action_with_generation(
     step_outputs: &HashMap<String, JsonValue>,
     claimed_generation: Option<i64>,
 ) -> Result<StepResult, WorkflowError> {
+    // Recovered effect delivery must observe the same community deletion fence
+    // as a new workflow action, even after the serving request has ended.
+    let serving_write =
+        buzz_deletion::acquire_serving_write(&engine.db, community_id, "workflow_action")
+            .await
+            .map_err(|error| {
+                WorkflowError::WebhookError(format!(
+                    "community write fence rejected workflow side effect: {error}"
+                ))
+            })?;
+    serving_write.verify().await.map_err(|error| {
+        WorkflowError::WebhookError(format!("community write lease lost: {error}"))
+    })?;
+    let result = serving_write
+        .protect(dispatch_fenced_action(
+            step_id,
+            action,
+            engine,
+            community_id,
+            run_id,
+            trigger_ctx,
+            step_outputs,
+            claimed_generation,
+        ))
+        .await
+        .map_err(|error| {
+            WorkflowError::WebhookError(format!("community write lease lost: {error}"))
+        })?;
+    let release = serving_write.finish().await.map_err(|error| {
+        WorkflowError::WebhookError(format!("community write lease release failed: {error}"))
+    });
+    match result {
+        Ok(value) => {
+            release?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = release;
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_fenced_action(
+    step_id: &str,
+    action: &ActionDef,
+    engine: &WorkflowEngine,
+    community_id: CommunityId,
+    run_id: Uuid,
+    trigger_ctx: &TriggerContext,
+    step_outputs: &HashMap<String, JsonValue>,
+    claimed_generation: Option<i64>,
+) -> Result<StepResult, WorkflowError> {
     use ActionDef::*;
 
     match action {
