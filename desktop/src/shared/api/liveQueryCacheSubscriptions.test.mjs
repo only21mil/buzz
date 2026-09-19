@@ -214,7 +214,7 @@ test("fixture anchors match relay admission, scope isolation and d-only fallback
   );
   assert.match(
     read("desktop/src/app/App.tsx"),
-    /stopLive = subscribeLiveQueryCache\(queryClient, relayClient, pubkey/,
+    /stopLive = subscribeLiveQueryCache\(\s*queryClient,\s*relayClient,\s*pubkey,/,
   );
 });
 
