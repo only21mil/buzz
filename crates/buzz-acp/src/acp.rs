@@ -472,8 +472,21 @@ impl AcpClient {
     ) -> Result<Self, AcpError> {
         use std::process::Stdio;
 
+        let mut launch_args = args.to_vec();
+        if crate::config::normalize_agent_command_identity(command) == "buzz-pi-acp" {
+            if !launch_args.iter().any(|arg| arg == "--") {
+                launch_args.push("--".to_owned());
+            }
+            launch_args.push("--skill".to_owned());
+            launch_args.push(
+                std::env::current_dir()?
+                    .join(".agents/skills")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
         let mut cmd = tokio::process::Command::new(command);
-        cmd.args(args)
+        cmd.args(&launch_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Inherit stderr so agent logs are visible in the harness terminal.
@@ -681,6 +694,9 @@ impl AcpClient {
             Some(SystemPromptTransport::ClaudeMeta(sp)) => {
                 // Merge into _meta so sessionTitle (set below) is not clobbered.
                 params["_meta"]["systemPrompt"] = serde_json::json!({ "append": sp });
+            }
+            Some(SystemPromptTransport::PiMeta(sp)) => {
+                params["_meta"]["systemPrompt"] = serde_json::Value::String(sp.to_owned());
             }
             None => {}
         }
@@ -2326,6 +2342,8 @@ pub enum SystemPromptTransport<'a> {
     Field(&'a str),
     /// Deliver as `_meta.systemPrompt: {"append": text}`.
     ClaudeMeta(&'a str),
+    /// Replace the Buzz Pi adapter system prompt through `_meta.systemPrompt`.
+    PiMeta(&'a str),
 }
 
 /// How to switch to a particular model on a session.

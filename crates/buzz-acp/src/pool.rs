@@ -487,6 +487,8 @@ pub struct OwnedAgent {
 /// on `session/new` — the feature landed in v0.6.0 (Oct 2025), before the
 /// `@zed-industries/claude-code-acp` → `@agentclientprotocol/claude-agent-acp`
 /// rename, so the new name is a reliable capability gate.
+const BUZZ_PI_ACP_NAME: &str = "buzz-pi-acp";
+
 const CLAUDE_AGENT_ACP_NAME: &str = "@agentclientprotocol/claude-agent-acp";
 
 fn has_system_prompt_support(
@@ -496,7 +498,7 @@ fn has_system_prompt_support(
 ) -> bool {
     if agent_name == "goose" {
         goose_system_prompt_supported == Some(true)
-    } else if agent_name == CLAUDE_AGENT_ACP_NAME {
+    } else if agent_name == CLAUDE_AGENT_ACP_NAME || agent_name == BUZZ_PI_ACP_NAME {
         true
     } else {
         protocol_version >= 2
@@ -509,8 +511,14 @@ fn session_new_system_prompt<'a>(
     agent_name: &str,
     prompt: Option<&'a str>,
 ) -> Option<SystemPromptTransport<'a>> {
-    if is_goose || (protocol_version < 2 && agent_name != CLAUDE_AGENT_ACP_NAME) {
+    if is_goose
+        || (protocol_version < 2
+            && agent_name != CLAUDE_AGENT_ACP_NAME
+            && agent_name != BUZZ_PI_ACP_NAME)
+    {
         None
+    } else if agent_name == BUZZ_PI_ACP_NAME {
+        prompt.map(SystemPromptTransport::PiMeta)
     } else if agent_name == CLAUDE_AGENT_ACP_NAME {
         prompt.map(SystemPromptTransport::ClaudeMeta)
     } else {
@@ -13537,3 +13545,7 @@ done"#
         );
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "pool/pi_transport_tests.rs"]
+mod pi_transport_tests;
