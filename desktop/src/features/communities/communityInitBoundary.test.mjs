@@ -28,3 +28,10 @@ test("community teardown clears card mint state and pending completions", () => 
   assert.match(source, /import \{ resetCardMintStore \} from/);
   assert.match(functionBody("resetCommunityState"), /resetCardMintStore\(\);/);
 });
+
+test("community teardown releases stable profile feed snapshots", () => {
+  assert.match(
+    functionBody("resetCommunityState"),
+    /resetProfileActivityFeedScopes\(\);/,
+  );
+});

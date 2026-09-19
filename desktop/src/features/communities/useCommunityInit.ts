@@ -31,6 +31,7 @@ import {
   restoreActiveAgentTurnsForCommunity,
 } from "@/features/agents/activeAgentTurnsStore";
 import { resetAgentWorkingSignal } from "@/features/agents/agentWorkingSignal";
+import { resetProfileActivityFeedScopes } from "@/features/profile/lib/profileActivityFeedScope";
 import { resetCardMintStore } from "@/features/agents/cardMintStore";
 import { resetAgentObserverStore } from "@/features/agents/observerRelayStore";
 import { resetAvatarPresentations } from "@/features/profile/avatarPresentationStore";
@@ -68,6 +69,7 @@ function resetCommunityState({
   resetActiveAgentTurnsStore();
   resetAgentWorkingSignal();
   resetCardMintStore();
+  resetProfileActivityFeedScopes();
   if (isTauri() && isMacPlatform()) {
     void clearTrayAgentActivity();
   }
