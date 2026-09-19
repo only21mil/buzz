@@ -67,6 +67,25 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(rows["publish.yml:windows"]["effects"], ["sign"])
         self.assertEqual(rows["publish.yml:windows"]["names"], ["windows"])
 
+    def test_dynamic_matrix_preserves_name_and_unknown_cost(self):
+        for matrix in ("pr_number: ${{ fromJSON(needs.prepare.outputs.pr_numbers) }}",
+                       "${{ fromJSON(needs.prepare.outputs.matrix) }}"):
+            with self.subTest(matrix=matrix), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "dynamic.yml"
+                path.write_text("on: push\njobs:\n  review:\n"
+                                "    name: Review ${{ matrix.pr_number }}\n"
+                                "    runs-on: ubuntu-latest\n    strategy:\n"
+                                "      matrix: " + ("\n        " if matrix.startswith("pr_number:") else "")
+                                + matrix + "\n")
+                row = inventory.parse_workflow(path)[0]
+                self.assertEqual(row["names"], ["Review ${{ matrix.pr_number }}"])
+                self.assertEqual(row["cost"], "dynamic")
+                self.assertTrue(row["dynamic_matrix"])
+                row.update(disposition="disabled-for-fork", required=[], native="",
+                           owner="", exit="", note="")
+                rendered = inventory.render([row], [], {})
+                self.assertIn("0 plus runtime expansion of 1 dynamic jobs", rendered)
+
     def test_undefined_matrix_reference_refuses(self):
         with self.assertRaises(inventory.InventoryError):
             inventory.expand("Job (${{ matrix.missing }})", {"shard": 1})
@@ -85,6 +104,16 @@ class AnnotateTests(unittest.TestCase):
         self.assertEqual(by_key["ci.yml:smoke"]["required"], [])
         self.assertEqual(by_key["ci.yml:smoke"]["note"], "two shards")
         self.assertEqual(by_key["ci.yml:mac"]["owner"], "apple")
+
+    def test_uncalled_helper_does_not_duplicate_required_check(self):
+        helper = copy.deepcopy(self.rows[0])
+        helper.update(workflow="_helper.yml", job_id="helper", names=["Lint"],
+                      triggers=["workflow_call"])
+        self.rows.append(helper)
+        self.dispositions["_helper.yml:helper"] = {"disposition": "disabled-for-fork"}
+        produced = inventory.annotate(self.rows, CHECKS, self.dispositions)
+        self.assertEqual(produced["Lint"], ["ci.yml:lint"])
+        self.assertEqual(helper["required"], [])
 
     def test_missing_disposition_refuses(self):
         dispositions = copy.deepcopy(self.dispositions)
