@@ -64,6 +64,8 @@ pub(crate) struct PendingEntityDeepLink {
 #[derive(Default)]
 pub(crate) struct PendingEntityDeepLinks(Mutex<VecDeque<PendingEntityDeepLink>>);
 
+const MAX_PENDING_ENTITY_DEEP_LINKS: usize = 64;
+
 impl PendingEntityDeepLinks {
     fn enqueue(&self, href: String) -> PendingEntityDeepLink {
         let mut queue = self
@@ -77,6 +79,11 @@ impl PendingEntityDeepLinks {
             id: uuid::Uuid::new_v4().to_string(),
             href,
         };
+        // Keep the most recent navigation intents while no renderer can drain
+        // the queue. Duplicate delivery above must not evict another intent.
+        if queue.len() >= MAX_PENDING_ENTITY_DEEP_LINKS {
+            queue.pop_front();
+        }
         queue.push_back(pending.clone());
         pending
     }
@@ -568,6 +575,7 @@ mod tests {
     use super::{
         parse_add_community_deep_link, parse_join_deep_link, parse_message_deep_link,
         parse_nostr_bind_deep_link, PendingCommunityDeepLink, PendingCommunityDeepLinks,
+        PendingEntityDeepLinks, MAX_PENDING_ENTITY_DEEP_LINKS,
     };
 
     fn pending(id: &str, relay_url: &str, code: Option<&str>) -> PendingCommunityDeepLink {
@@ -579,6 +587,39 @@ mod tests {
             policy_receipt: None,
             name: None,
         }
+    }
+
+    #[test]
+    fn pending_entity_links_keep_the_latest_bounded_fifo() {
+        let queue = PendingEntityDeepLinks::default();
+        let evicted = queue.enqueue("buzz://project?id=oldest".into());
+        let mut retained = Vec::new();
+        for index in 0..MAX_PENDING_ENTITY_DEEP_LINKS {
+            retained.push(queue.enqueue(format!("buzz://project?id={index}")));
+        }
+        assert!(!queue.acknowledge(&evicted.id));
+        for pending in retained {
+            assert_eq!(queue.first().unwrap().id, pending.id);
+            assert!(queue.acknowledge(&pending.id));
+        }
+        assert!(queue.first().is_none());
+    }
+
+    #[test]
+    fn pending_entity_duplicates_do_not_evict_or_reorder_full_queue() {
+        let queue = PendingEntityDeepLinks::default();
+        let mut retained = Vec::new();
+        for index in 0..MAX_PENDING_ENTITY_DEEP_LINKS {
+            retained.push(queue.enqueue(format!("buzz://project?id={index}")));
+        }
+        let last = retained.last().unwrap();
+        assert_eq!(queue.enqueue(last.href.clone()).id, last.id);
+        assert!(!queue.acknowledge(&last.id));
+        for pending in retained {
+            assert_eq!(queue.first().unwrap().id, pending.id);
+            assert!(queue.acknowledge(&pending.id));
+        }
+        assert!(queue.first().is_none());
     }
 
     #[test]
