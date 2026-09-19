@@ -70,9 +70,15 @@ grep -Fq 'contents: read' "$docker_validation"
   echo "Docker PR validation must build relay release, relay debug, and gateway images" >&2
   exit 1
 }
-if rg -q 'packages: write|id-token: write|attestations: write|docker/login-action@|cache-to:|push: true' "$docker_validation"; then
+if grep -E 'packages: write|id-token: write|attestations: write|docker/login-action@|cache-to:|push: true' "$docker_validation" >/dev/null; then
   echo "Docker PR validation gained registry-write or attestation authority" >&2
   exit 1
+else
+  status=$?
+  if [[ $status -ne 1 ]]; then
+    echo "workflow authority scan failed with status $status" >&2
+    exit 1
+  fi
 fi
 
 [[ "$(grep -Fxc "    if: github.repository == 'block/buzz' || vars.GHCR_IMAGE != ''" "$docker_publish")" -eq 2 ]] || {
@@ -83,9 +89,15 @@ fi
   echo "push-gateway build and manifest publication must remain canonical-only" >&2
   exit 1
 }
-if rg -q "github\.event_name != 'pull_request'|github\.event\.pull_request" "$docker_publish"; then
+if grep -E "github\.event_name != 'pull_request'|github\.event\.pull_request" "$docker_publish" >/dev/null; then
   echo "Docker publisher still mixes pull-request authority into publication jobs" >&2
   exit 1
+else
+  status=$?
+  if [[ $status -ne 1 ]]; then
+    echo "workflow authority scan failed with status $status" >&2
+    exit 1
+  fi
 fi
 [[ "$(grep -Fc 'push=true' "$docker_publish")" -eq 3 ]] || {
   echo "trusted Docker publication must push exactly three image variants" >&2
