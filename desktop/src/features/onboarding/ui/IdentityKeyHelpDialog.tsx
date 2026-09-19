@@ -1,3 +1,4 @@
+import { getStorageItem, setStorageItem } from "@/shared/lib/safeStorage";
 import * as React from "react";
 
 import { cn } from "@/shared/lib/cn";
@@ -18,9 +19,7 @@ const IDENTITY_KEY_HELP_DELAY_MS = 2_000;
 
 function hasSeenIdentityKeyHelp(): boolean {
   try {
-    return (
-      window.localStorage.getItem(IDENTITY_KEY_HELP_SEEN_STORAGE_KEY) === "true"
-    );
+    return getStorageItem(IDENTITY_KEY_HELP_SEEN_STORAGE_KEY) === "true";
   } catch {
     return false;
   }
@@ -28,7 +27,7 @@ function hasSeenIdentityKeyHelp(): boolean {
 
 function rememberIdentityKeyHelpSeen() {
   try {
-    window.localStorage.setItem(IDENTITY_KEY_HELP_SEEN_STORAGE_KEY, "true");
+    setStorageItem(IDENTITY_KEY_HELP_SEEN_STORAGE_KEY, "true");
   } catch {
     // The help remains available for this visit if storage is unavailable.
   }
