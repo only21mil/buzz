@@ -4888,9 +4888,22 @@ done"#,
             .permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&path, permissions).expect("chmod fake adapter");
-        let client = AcpClient::spawn(path.to_str().expect("utf8 path"), &[], &[], false)
-            .await
-            .expect("spawn named fake adapter");
+        // Parallel fake-agent tests can briefly inherit a writable executable
+        // descriptor across fork before CLOEXEC closes it. Linux reports
+        // ETXTBSY until that child execs; retry only this transient spawn error.
+        let mut attempts = 0;
+        let client = loop {
+            match AcpClient::spawn(path.to_str().expect("utf8 path"), &[], &[], false).await {
+                Ok(client) => break client,
+                Err(AcpError::Io(error))
+                    if error.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 10 =>
+                {
+                    attempts += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("spawn named fake adapter: {error}"),
+            }
+        };
         (client, dir)
     }
 
