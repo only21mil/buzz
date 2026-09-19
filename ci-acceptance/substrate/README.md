@@ -12,7 +12,9 @@ the control group.
 
 The former `/usr/libexec/buzz-ci-acceptance-ctl` launcher spoke broker
 protocol version 1, which production execd refuses, and its `qualification_v1`
-fixture lane has no server in the production composition. The manifest no
+fixture lane has no server in the production composition. The unused
+in-memory v1 activation dispatcher and runner client have also been removed.
+The execd self-check exercises the v2 codec. The manifest no
 longer installs it, and no sudoers rule is shipped. The only qualification
 client that production execd serves is `buzz-ci-production-qualification`
 (protocol version 2, `AdmitQualification`), which is built and invoked by the
@@ -22,7 +24,7 @@ activation package rather than by this substrate.
 
 There is one privileged executable: `/usr/libexec/buzz-ci-execd`. Durable
 authority loading, restart cleanup, DNS isolation, and seccomp installation are
-typed in-process modules composed behind `ActivationDispatch`. This deployment
+typed in-process modules composed behind `ProductionV2Dispatch`. This deployment
 adds no adapter executables, services, sockets, or sudo rules.
 
 The immutable configuration root is `/etc/buzzci/authority`, `root:root` mode
@@ -49,9 +51,10 @@ filesystems and `systemd-tmpfiles-setup.service`, requires mounts for every
 fixed root, makes authority and qualification inputs read-only, and narrows
 writes to the runtime, activation, lease, and seccomp roots. Execd must load
 and validate authority, recover durable controller state, reconcile cleanup,
-and obtain fresh DNS and seccomp readbacks before constructing
-`ActivationDispatch`. A missing, linked, stale, wrongly owned, wrongly moded,
-or malformed input keeps `ClosedDispatch` and capacity zero.
+and obtain fresh DNS and seccomp readbacks before serving. Canonical startup
+loads `ProductionV2Dispatch`; a missing, linked, stale, wrongly owned, wrongly
+moded, or malformed required input prevents serving. It has no legacy dispatch
+fallback.
 
 The rendered `/etc/buzzci/harness.env` keeps the two entrypoints distinct:
 

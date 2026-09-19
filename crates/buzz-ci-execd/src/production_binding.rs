@@ -1575,7 +1575,7 @@ where
         request: buzz_ci_broker_protocol::Request,
         now: u64,
     ) -> buzz_ci_broker_protocol::BrokerResponse {
-        crate::Broker::new().handle(header, request, now)
+        crate::control::ClosedDispatch::new().dispatch(header, request, now)
     }
 
     fn dispatch_v2(&mut self, header: FrameHeader, request: Request, now: u64) -> BrokerResponse {
