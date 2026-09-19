@@ -13,9 +13,7 @@ use thiserror::Error;
 use crate::production::{
     AcceptedRequestBinding, AttemptExecutor, AuthenticatedEvidenceExport, CiSigner, ControlStore,
     EvidenceReader, PollStep, ProductionError, ProductionHandler, RelayControl,
-    RunnerAttemptExecutor, RunnerAttemptPreparer,
 };
-use crate::runner_client::{RunnerClient, RunnerConnector};
 
 const STATUS_SCHEMA_VERSION: u32 = 2;
 const CAPACITY: u32 = 1;
@@ -124,44 +122,6 @@ pub enum ActivationError {
     MissingProvider,
     #[error("capacity-one controller provider configuration is invalid")]
     InvalidProvider,
-}
-
-/// Capacity-one controller using the frozen runner client and preparation
-/// bridge.
-pub type RunnerBackedCapacityOneController<R, S, C, A, P, O> =
-    CapacityOneController<R, S, RunnerAttemptExecutor<C, A>, P, O>;
-
-/// Compose the stable runner connector/client/attempt bridge and activate the
-/// controller in one fail-closed operation.
-pub fn activate_runner_backed<R, S, C, A, P, O>(
-    config: CapacityOneConfig,
-    relay: R,
-    signer: S,
-    connector: C,
-    preparer: A,
-    store: P,
-    output: O,
-) -> Result<RunnerBackedCapacityOneController<R, S, C, A, P, O>, ActivationError>
-where
-    R: RelayControl,
-    S: CiSigner,
-    C: RunnerConnector,
-    A: RunnerAttemptPreparer,
-    P: ControlStore,
-    O: EvidenceReader,
-{
-    let client = RunnerClient::new(connector, config.runner_transport_attempts())
-        .map_err(|_| ActivationError::InvalidProvider)?;
-    CapacityOneController::activate(
-        config,
-        CapacityOneProviderSlots::new(
-            Some(relay),
-            Some(signer),
-            Some(RunnerAttemptExecutor::new(client, preparer)),
-            Some(store),
-            Some(output),
-        ),
-    )
 }
 
 /// Machine-readable controller state.
