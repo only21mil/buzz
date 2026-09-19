@@ -1904,8 +1904,8 @@ fn format_context_hints(
     );
     let complete_conversation_context =
         conversation_context_status == ConversationContextStatus::Complete;
-    let conversation_context_had_delivered_events =
-        conversation_context_status == ConversationContextStatus::PreviouslyDelivered;
+    let conversation_context_had_session_events =
+        conversation_context_status == ConversationContextStatus::PreviouslyAvailable;
 
     // DM check comes first — a DM reply has both thread tags AND is_dm=true,
     // and the scope should be "dm" (not "thread") because the agent is in a DM.
@@ -1921,10 +1921,10 @@ fn format_context_hints(
             "Thread context included below. Use `buzz messages thread --channel <UUID> --event <ID>` for full history if truncated."
         } else if has_conversation_context {
             "Conversation context included below. Use `buzz messages get --channel <UUID>` for full history if truncated."
-        } else if conversation_context_had_delivered_events && is_reply {
-            "Earlier thread context was already delivered in this session. Use `buzz messages thread --channel <UUID> --event <ID>` to re-read the reply chain."
-        } else if conversation_context_had_delivered_events {
-            "Earlier conversation context was already delivered in this session. Use `buzz messages get --channel <UUID>` to re-read it."
+        } else if conversation_context_had_session_events && is_reply {
+            "Earlier thread context is already available in this session. Use `buzz messages thread --channel <UUID> --event <ID>` to re-read the reply chain."
+        } else if conversation_context_had_session_events {
+            "Earlier conversation context is already available in this session. Use `buzz messages get --channel <UUID>` to re-read it."
         } else if is_reply {
             "Use `buzz messages thread --channel <UUID> --event <ID>` to fetch the reply chain."
         } else {
@@ -1957,8 +1957,8 @@ fn format_context_hints(
             "Thread context included below."
         } else if has_conversation_context {
             "Thread context included below. Use `buzz messages thread --channel <UUID> --event <ID>` for full history if truncated."
-        } else if conversation_context_had_delivered_events {
-            "Earlier thread context was already delivered in this session. Use `buzz messages thread --channel <UUID> --event <ID>` to re-read it."
+        } else if conversation_context_had_session_events {
+            "Earlier thread context is already available in this session. Use `buzz messages thread --channel <UUID> --event <ID>` to re-read it."
         } else {
             "Use `buzz messages thread --channel <UUID> --event <ID>` to fetch thread context."
         };
@@ -1970,14 +1970,14 @@ fn format_context_hints(
         let mut s = format!(
             "Scope: thread\n\
              Session scope: {session_scope}\n\
-             Channel: {channel_display}\n\
-             Thread root: {root}"
+             Channel: {channel_display}"
         );
         crate::prompt_project::append_project_context(
             &mut s,
             channel_info.and_then(|info| info.project.as_ref()),
             channel_id,
         );
+        s.push_str(&format!("\nThread root: {root}"));
         if let Some(ref parent) = thread_tags.parent_event_id {
             if parent != root {
                 s.push_str(&format!("\nParent: {parent}"));
@@ -1996,13 +1996,15 @@ fn format_context_hints(
         let mut s = format!(
             "Scope: channel\n\
              Session scope: channel\n\
-             Channel: {channel_display}\n\
-             Hint: Use `buzz messages get --channel <UUID>` for recent messages if needed."
+             Channel: {channel_display}"
         );
         crate::prompt_project::append_project_context(
             &mut s,
             channel_info.and_then(|info| info.project.as_ref()),
             channel_id,
+        );
+        s.push_str(
+            "\nHint: Use `buzz messages get --channel <UUID>` for recent messages if needed.",
         );
         if let Some(event_id) = reply_anchor {
             append_new_thread_reply_instruction(&mut s, event_id);
@@ -2015,7 +2017,7 @@ fn format_context_hints(
 enum ConversationContextStatus {
     Complete,
     Included,
-    PreviouslyDelivered,
+    PreviouslyAvailable,
     Absent,
 }
 
@@ -2085,7 +2087,7 @@ fn conversation_context_status(
     } else if conversation_context.is_some() {
         ConversationContextStatus::Included
     } else if conversation_context_had_delivered_events {
-        ConversationContextStatus::PreviouslyDelivered
+        ConversationContextStatus::PreviouslyAvailable
     } else {
         ConversationContextStatus::Absent
     }
@@ -5042,7 +5044,7 @@ mod tests {
         )
         .join("\n\n");
 
-        assert!(prompt.contains("Earlier thread context was already delivered in this session"));
+        assert!(prompt.contains("Earlier thread context is already available in this session"));
         assert!(prompt.contains("buzz messages thread"));
         assert!(!prompt.contains("Thread context included below"));
         assert!(!prompt.contains("<thread-context"));
@@ -5090,7 +5092,7 @@ mod tests {
         .join("\n\n");
 
         assert!(
-            prompt.contains("Earlier conversation context was already delivered in this session")
+            prompt.contains("Earlier conversation context is already available in this session")
         );
         assert!(prompt.contains("buzz messages get"));
         assert!(!prompt.contains("Conversation context included below"));
