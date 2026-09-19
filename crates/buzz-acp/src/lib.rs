@@ -2703,6 +2703,10 @@ async fn tokio_main() -> Result<()> {
                 }
             }
         }
+        // Respawn results arrive through respawn_rx, but JoinSet retains the
+        // completed tasks until they are joined. Reap them without waiting so
+        // repeated crash recovery does not grow the task set indefinitely.
+        while respawn_tasks.join_next().now_or_never().flatten().is_some() {}
         // Flush requeued events that were waiting for a live agent. Without
         // this, batches requeued during crash recovery sit idle until the
         // next relay event arrives — which can be minutes on quiet channels.

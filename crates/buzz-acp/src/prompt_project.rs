@@ -269,35 +269,38 @@ mod tests {
     }
 }
 
-/// Append bounded identity as data in the existing fork Context framing.
+/// Append the resolved project home without letting metadata introduce fields.
 pub(crate) fn append_project_context(
-    text: &mut String,
+    s: &mut String,
     project: Option<&PromptProjectInfo>,
     channel_id: uuid::Uuid,
 ) {
     let Some(project) = project else {
         return;
     };
-    // JSON quoting keeps newlines, delimiters and control characters inside a
-    // single data value; never interpolate relay text into command syntax.
     let field = |value: &str, limit| {
-        serde_json::to_string(&value.chars().take(limit).collect::<String>()).unwrap_or_default()
+        let quoted = serde_json::to_string(&value.chars().take(limit).collect::<String>())
+            .unwrap_or_default();
+        crate::prompt_framing::escape_semantic_text(&quoted)
     };
-    text.push_str(&format!(
+    s.push_str(&format!(
         "\nProject name: {}\nProject slug: {}\nProject owner: {}\nProject coordinate: {}",
         field(&project.name, 256),
         field(&project.slug, 1024),
         field(&project.owner, 64),
-        field(&project.coordinate, 1100)
+        field(&project.coordinate, 1100),
     ));
-    if let (Some(owner), Some(id)) = (&project.default_repo_owner, &project.default_repo_id) {
-        text.push_str(&format!(
+    match (&project.default_repo_owner, &project.default_repo_id) {
+        (Some(owner), Some(id)) => s.push_str(&format!(
             "\nDefault repository owner: {}\nDefault repository ID: {}",
             field(owner, 64),
-            field(id, 1024)
-        ));
+            field(id, 1024),
+        )),
+        _ => s.push_str("\nDefault repository: none yet"),
     }
-    text.push_str(&format!("\nThis is the authoritative project home. Do not create a duplicate project. Use `buzz issues create --channel {channel_id} --title <title> --content <content>` for a task in its default repository."));
+    s.push_str(&format!(
+        "\nThis channel is that project's home. Tasks, repositories, and files created here belong to this project. Do not run `buzz projects create`. Create a repository with `buzz repos create --id <id> --name \"…\" --channel {channel_id}`. Create tasks with `buzz issues create --channel {channel_id} --subject \"…\" --content \"…\"`."
+    ));
 }
 
 #[cfg(test)]
