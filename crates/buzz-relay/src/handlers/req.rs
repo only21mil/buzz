@@ -1676,7 +1676,7 @@ pub(crate) fn author_only_filters_authorized(filters: &[Filter], authed_pubkey_h
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_postgres_tests {
     use super::*;
     use nostr::{Alphabet, Filter, SingleLetterTag};
 

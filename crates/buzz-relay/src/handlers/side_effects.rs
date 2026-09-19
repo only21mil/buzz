@@ -4006,7 +4006,7 @@ pub async fn publish_nipia_unarchived(
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_postgres_tests {
     use super::*;
 
     fn signed_event_with_tags(tags: Vec<Tag>) -> Event {

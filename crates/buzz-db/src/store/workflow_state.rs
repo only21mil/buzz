@@ -598,7 +598,7 @@ fn workflow_lock_key(community_id: CommunityId, workflow_id: Uuid) -> i64 {
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_postgres_tests {
     use super::*;
 
     #[test]

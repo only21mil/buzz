@@ -5107,4 +5107,4 @@ mod postgres_tests {
 
 #[cfg(test)]
 #[path = "workflow_history_tests.rs"]
-mod workflow_history_tests;
+mod workflow_history_tests_postgres_tests;

@@ -1828,7 +1828,7 @@ mod tests {
         }
     }
 
-    mod pubsub_fanout {
+    mod pubsub_fanout_postgres_tests {
         use std::collections::HashMap;
         use std::sync::atomic::AtomicU8;
         use std::sync::Arc;

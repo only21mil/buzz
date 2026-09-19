@@ -13,4 +13,5 @@ pub mod token;
 pub use http::{router, router_with_metrics, AppState};
 
 #[cfg(test)]
-mod migration_tests;
+#[path = "migration_tests.rs"]
+mod migration_tests_postgres_tests;

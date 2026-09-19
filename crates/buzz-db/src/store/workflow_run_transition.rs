@@ -399,7 +399,7 @@ pub async fn fail_running_workflow_run_with_failure(
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_postgres_tests {
     use super::*;
     use crate::user::ensure_user;
 

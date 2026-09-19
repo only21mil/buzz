@@ -357,7 +357,7 @@ fn enforce_request_auth_time_bounds(auth_tag_json: &str, created_at: u64) -> Res
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_postgres_tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag};
 

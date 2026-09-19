@@ -1278,4 +1278,4 @@ pub(crate) async fn consume_bypasses(
 
 #[cfg(test)]
 #[path = "merge_gate_tests.rs"]
-mod tests;
+mod tests_postgres_tests;
