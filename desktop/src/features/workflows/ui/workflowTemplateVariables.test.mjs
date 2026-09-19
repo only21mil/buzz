@@ -85,27 +85,3 @@ test("only offers values populated by the selected trigger", () => {
   );
   assert.deepEqual(variables, ["trigger.channel_id", "trigger.timestamp"]);
 });
-
-test("offers fork state, approval, and extraction outputs without unsafe matcher paths", () => {
-  const values = workflowTemplateVariables("message_posted", [
-    { id: "read", action: "read_state" },
-    { id: "write", action: "write_state" },
-    { id: "gate", action: "request_approval" },
-    {
-      id: "parse",
-      action: "extract",
-      matchers: { name: "(.*)", "bad.key": "(.*)" },
-    },
-  ]).map(({ value }) => value);
-  for (const value of [
-    "steps.read.output.found",
-    "steps.read.output.value",
-    "steps.read.output.revision",
-    "steps.write.output.written",
-    "steps.write.output.revision",
-    "steps.gate.output.approved",
-    "steps.parse.output.name",
-  ])
-    assert.ok(values.includes(value));
-  assert.ok(!values.includes("steps.parse.output.bad.key"));
-});

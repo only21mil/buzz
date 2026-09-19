@@ -51,6 +51,7 @@ class CommunityStorage {
         relayUrl: legacyUrl,
         pubkey: legacyPubkey,
         nsec: legacyNsec,
+        sensitiveActionPolicy: SensitiveActionPolicy.disabledByUser,
       );
 
       await _saveList([community]);
@@ -111,6 +112,10 @@ class CommunityStorage {
     all.removeWhere((w) => w.id == id);
     await _saveList(all);
   });
+
+  /// Replaces all communities in the same queue as saves and removals.
+  Future<void> saveAll(List<Community> communities) =>
+      _mutate(() => _saveList(communities));
 
   Future<String?> loadActiveId() async {
     return _secure.read(key: _keyActiveId);

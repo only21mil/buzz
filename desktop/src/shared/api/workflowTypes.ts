@@ -44,7 +44,7 @@ export type WorkflowRun = {
   executionTrace: TraceEntry[];
   startedAt: number | null;
   completedAt: number | null;
-  errorCode?: string | null;
+  errorCode: string | null;
   errorMessage: string | null;
   createdAt: number;
 };
@@ -57,7 +57,7 @@ export type WorkflowApprovalStatus =
   | "unsatisfiable";
 
 export type WorkflowApproval = {
-  /** Display reference only; never a signed decision token. */
+  /** Opaque, non-actionable identifier for display/correlation only. */
   approvalRef: string;
   workflowId: string;
   runId: string;

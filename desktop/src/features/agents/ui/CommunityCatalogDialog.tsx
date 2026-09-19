@@ -6,6 +6,7 @@ import * as React from "react";
 import { ChevronDown, Plus, Upload } from "lucide-react";
 
 import { isCatalogPersonaSelected } from "@/features/agents/lib/catalog";
+import { effectiveAgentDescription } from "@/features/agents/lib/agentDescription";
 import { isCatalogPersona } from "@/features/agents/lib/personaCatalogRelay";
 import type { CatalogTeam } from "@/features/agents/lib/teamCatalogRelay";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
@@ -380,6 +381,7 @@ export function CommunityCatalogDialog({
                       {personas.map((persona) => {
                         const key = personaKey(persona);
                         const isCurrent = key === selection;
+                        const description = effectiveAgentDescription(persona);
                         return (
                           <button
                             aria-current={isCurrent ? "true" : undefined}
@@ -403,8 +405,18 @@ export function CommunityCatalogDialog({
                               label={persona.displayName}
                               untrusted
                             />
-                            <span className="min-w-0 flex-1 truncate text-sm font-medium">
-                              {persona.displayName}
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate text-sm font-medium">
+                                {persona.displayName}
+                              </span>
+                              {description ? (
+                                <span
+                                  className="line-clamp-2 block break-all text-xs leading-4 text-sidebar-foreground/60"
+                                  data-testid={`community-catalog-agent-description-${persona.id}`}
+                                >
+                                  {description}
+                                </span>
+                              ) : null}
                             </span>
                           </button>
                         );
@@ -703,7 +715,11 @@ function CatalogListSkeleton() {
  * hides spoiler bodies, link destinations, and image sources, so the reviewed
  * text would differ from the system prompt sent to the agent.
  */
-function AgentInstructionReview({ instructions }: { instructions: string }) {
+export function AgentInstructionReview({
+  instructions,
+}: {
+  instructions: string;
+}) {
   return (
     <pre
       className="mt-3 w-full min-w-0 max-w-full whitespace-pre-wrap break-words font-sans text-sm leading-6 text-muted-foreground"
@@ -715,6 +731,7 @@ function AgentInstructionReview({ instructions }: { instructions: string }) {
 }
 
 function PersonaCatalogDetail({ persona }: { persona: AgentPersona }) {
+  const description = effectiveAgentDescription(persona);
   const isCommunityEntry =
     isCatalogPersona(persona) && !persona.catalogSource.isOwn;
   const ownerPubkey = isCommunityEntry
@@ -753,9 +770,19 @@ function PersonaCatalogDetail({ persona }: { persona: AgentPersona }) {
         </div>
       </div>
 
+      {description ? (
+        <p
+          className="min-w-0 max-w-prose break-all text-sm leading-6 text-muted-foreground"
+          data-testid="persona-catalog-description"
+        >
+          {description}
+        </p>
+      ) : null}
+
       <AgentDefinitionMetadata
         isBuiltIn={persona.isBuiltIn}
         model={persona.model}
+        provider={persona.provider}
         runtime={persona.runtime}
       />
 
@@ -872,6 +899,7 @@ function TeamCatalogMemberRow({ member }: TeamCatalogMemberRowProps) {
           <AgentDefinitionMetadata
             isBuiltIn={false}
             model={member.model}
+            provider={member.provider}
             runtime={member.runtime}
           />
           <div className="min-w-0 max-w-full">

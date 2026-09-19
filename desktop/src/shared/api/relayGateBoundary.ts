@@ -46,10 +46,12 @@ export async function requestHistoryGated(
 
     subscriptions.set(subId, {
       mode: "history",
+      filter: requestFilters[0],
       events: [],
       resolve,
       reject,
       timeout,
+      timeoutMs: historyTimeoutMs,
     });
 
     void sendRaw(["REQ", subId, ...requestFilters]).catch((error) => {

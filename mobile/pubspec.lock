@@ -85,10 +85,10 @@ packages:
     dependency: transitive
     description:
       name: archive
-      sha256: a96e8b390886ee8abb49b7bd3ac8df6f451c621619f52a26e815fdcf568959ff
+      sha256: be169cf6ac481e052c4538715d88841d567150dfe1df38aaec76461a4e7b39f2
       url: "https://pub.dev"
     source: hosted
-    version: "4.0.9"
+    version: "4.1.0"
   args:
     dependency: transitive
     description:
@@ -305,6 +305,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.0.2"
+  cupertino_icons:
+    dependency: "direct main"
+    description:
+      name: cupertino_icons
+      sha256: "41e005c33bd814be4d3096aff55b1908d419fde52ca656c8c47719ec745873cd"
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.0.9"
   custom_lint:
     dependency: "direct dev"
     description:
@@ -572,10 +580,10 @@ packages:
     dependency: "direct main"
     description:
       name: flutter_zxing
-      sha256: "6bf0cb0fde122455e73ae78214457c106fbde3c633af4624ce29567ac590ef21"
+      sha256: "2c1ed2d0b1eb70c95231da33e9dea80e5b2f8a4711974bdadf7d9c1813b7ad5e"
       url: "https://pub.dev"
     source: hosted
-    version: "2.3.0"
+    version: "2.4.0"
   freezed_annotation:
     dependency: transitive
     description:
@@ -604,10 +612,10 @@ packages:
     dependency: "direct main"
     description:
       name: gpt_markdown
-      sha256: "5c565a438e569b3b546023d0d4eccccf87e260a3289a17c4e241c41d5e7545df"
+      sha256: "42887afaf5c7a71348221048a6c1e34c9836703ee0e6b4865e789253fcaa204a"
       url: "https://pub.dev"
     source: hosted
-    version: "1.1.6"
+    version: "1.2.1"
   gtk:
     dependency: transitive
     description:
@@ -676,10 +684,10 @@ packages:
     dependency: "direct main"
     description:
       name: image
-      sha256: f9881ff4998044947ec38d098bc7c8316ae1186fa786eddffdb867b9bc94dfce
+      sha256: "1976370a4df3091bb0f72409c187ad1f9132a818bc6b95ca59c0bae1c75c688e"
       url: "https://pub.dev"
     source: hosted
-    version: "4.8.0"
+    version: "4.9.2"
   image_picker:
     dependency: "direct main"
     description:
@@ -840,6 +848,46 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "6.1.0"
+  local_auth:
+    dependency: "direct main"
+    description:
+      name: local_auth
+      sha256: ecf24edf2283c509ecd217e3595f6f71034b68888d28ad1dae6bfa0857b816ac
+      url: "https://pub.dev"
+    source: hosted
+    version: "3.0.2"
+  local_auth_android:
+    dependency: transitive
+    description:
+      name: local_auth_android
+      sha256: b201c006fa769c23386f89aa6837ec0eb8179fcfb212eadcf87b422b3f9a6a78
+      url: "https://pub.dev"
+    source: hosted
+    version: "2.0.8"
+  local_auth_darwin:
+    dependency: transitive
+    description:
+      name: local_auth_darwin
+      sha256: a8c3d4e17454111f7fd31ff72a31222359f6059f7fe956c2dcfe0f88f49826d4
+      url: "https://pub.dev"
+    source: hosted
+    version: "2.0.3"
+  local_auth_platform_interface:
+    dependency: transitive
+    description:
+      name: local_auth_platform_interface
+      sha256: f98b8e388588583d3f781f6806e4f4c9f9e189d898d27f0c249b93a1973dd122
+      url: "https://pub.dev"
+    source: hosted
+    version: "1.1.0"
+  local_auth_windows:
+    dependency: transitive
+    description:
+      name: local_auth_windows
+      sha256: be12c5b8ba5e64896983123655c5f67d2484ecfcc95e367952ad6e3bff94cb16
+      url: "https://pub.dev"
+    source: hosted
+    version: "2.0.1"
   logging:
     dependency: transitive
     description:

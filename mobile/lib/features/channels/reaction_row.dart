@@ -11,9 +11,9 @@ import '../../shared/emoji/emoji_burst.dart';
 import '../../shared/emoji/emoji_data_provider.dart';
 import '../../shared/emoji/native_emoji_glyph.dart';
 import '../../shared/emoji/positive_emoji.dart';
-import '../../shared/identity/npub.dart';
 import '../../shared/profile/user_cache_provider.dart';
 import '../../shared/profile/user_profile.dart';
+import '../../shared/utils/string_utils.dart';
 import 'channel_management_provider.dart';
 import 'emoji_picker.dart';
 import 'recent_emoji_provider.dart';
@@ -452,7 +452,7 @@ class _ReactorTile extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final displayName = profile?.label ?? truncateNpub(pubkey);
+    final displayName = profile?.label ?? shortPubkey(pubkey);
     final about = profile?.about;
 
     return ListTile(
@@ -461,6 +461,7 @@ class _ReactorTile extends StatelessWidget {
         initial:
             profile?.initial ??
             (pubkey.isNotEmpty ? pubkey[0].toUpperCase() : '?'),
+        isAgent: profile?.isAgent == true,
       ),
       title: Text(
         displayName,
@@ -487,8 +488,13 @@ class _ReactorTile extends StatelessWidget {
 class _ReactorAvatar extends StatelessWidget {
   final String? avatarUrl;
   final String initial;
+  final bool isAgent;
 
-  const _ReactorAvatar({required this.avatarUrl, required this.initial});
+  const _ReactorAvatar({
+    required this.avatarUrl,
+    required this.initial,
+    required this.isAgent,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -496,6 +502,7 @@ class _ReactorAvatar extends StatelessWidget {
       imageUrl: avatarUrl,
       radius: 20,
       fallback: Text(initial),
+      isAgent: isAgent,
     );
   }
 }

@@ -2,8 +2,8 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:typed_data';
 
-import 'package:buzz/shared/audio/microphone_capture.dart';
 import 'package:buzz/shared/huddle/huddle.dart';
+import 'package:buzz/features/age_gate/age_signal_provider.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
@@ -14,61 +14,45 @@ const _ephemeralChannelId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 
 void main() {
   test(
-    'Huddle admission waits for voice capture ownership to be released',
+    'confirmed restriction stops retained Huddle media and transport',
     () async {
+      final age = _MutableAgeNotifier();
       final media = _FakeMedia();
       final transport = _FakeTransport();
       final container = ProviderContainer(
         overrides: [
+          ageSignalProvider.overrideWith(() => age),
           huddleMediaFactoryProvider.overrideWithValue(() => media),
           huddleTransportFactoryProvider.overrideWithValue((_) => transport),
         ],
       );
       addTearDown(container.dispose);
-      final microphone = container.read(microphoneCaptureProvider);
-      final releaseVoiceNote = microphone.acquire()!;
+      final listener = container.listen(huddleSessionProvider, (_, _) {});
+      addTearDown(listener.close);
       final controller = container.read(huddleSessionProvider.notifier);
       await controller.join(_parameters());
-      expect(media.startCalls, 0);
-      expect(
-        container.read(huddleSessionProvider).error,
-        'Finish the voice note before joining a Huddle.',
-      );
-      releaseVoiceNote();
-      await controller.join(_parameters());
+      expect(container.read(huddleSessionProvider).isConnected, isTrue);
       expect(media.startCalls, 1);
-      expect(microphone.acquire(), isNull);
+      expect(media.disposeCalls, 0);
+      age.setState(AgeSignalState.restricted);
+      await Future<void>.delayed(Duration.zero);
+      expect(media.disposeCalls, 1);
+      expect(transport.disposeCalls, 1);
+      expect(
+        container.read(huddleSessionProvider).phase,
+        HuddleSessionPhase.idle,
+      );
+      await expectLater(controller.join(_parameters()), throwsStateError);
+      expect(media.startCalls, 1);
+      expect(transport.connectCalls, 1);
+      age.setState(AgeSignalState.allowed);
+      await Future<void>.delayed(Duration.zero);
+      await controller.join(_parameters());
+      expect(container.read(huddleSessionProvider).isConnected, isTrue);
+      expect(media.startCalls, 2);
       await controller.leave();
-      final release = microphone.acquire();
-      expect(release, isNotNull);
-      release!();
     },
   );
-
-  test('capture ownership survives delayed Huddle native disposal', () async {
-    final disposal = Completer<void>();
-    final media = _FakeMedia(disposeGate: disposal.future);
-    final container = ProviderContainer(
-      overrides: [
-        huddleMediaFactoryProvider.overrideWithValue(() => media),
-        huddleTransportFactoryProvider.overrideWithValue(
-          (_) => _FakeTransport(),
-        ),
-      ],
-    );
-    addTearDown(container.dispose);
-    final controller = container.read(huddleSessionProvider.notifier);
-    final microphone = container.read(microphoneCaptureProvider);
-    await controller.join(_parameters());
-    final leaving = controller.leave();
-    await Future<void>.delayed(Duration.zero);
-    expect(microphone.acquire(), isNull);
-    disposal.complete();
-    await leaving;
-    final release = microphone.acquire();
-    expect(release, isNotNull);
-    release!();
-  });
 
   test('joins unmuted and bridges remote and local Opus frames', () async {
     final media = _FakeMedia();
@@ -652,4 +636,8 @@ Future<void> _waitUntil(bool Function() predicate) async {
     await Future<void>.delayed(Duration.zero);
   }
   fail('Timed out waiting for asynchronous Huddle state');
+}
+
+class _MutableAgeNotifier extends AgeSignalNotifier {
+  void setState(AgeSignalState value) => state = value;
 }

@@ -9,7 +9,7 @@ import 'package:lucide_icons_flutter/lucide_icons.dart';
 import '../../shared/animated_avatar.dart';
 import '../../shared/relay/relay.dart';
 import '../../shared/theme/theme.dart';
-import '../../shared/identity/npub.dart';
+import '../../shared/utils/string_utils.dart';
 import '../../shared/widgets/avatar_image.dart';
 import '../../shared/widgets/buzz_action_tile.dart';
 import '../../shared/widgets/modal_presentation.dart';
@@ -83,7 +83,14 @@ class UserProfileSheet extends HookConsumerWidget {
     final copied = useState(false);
     final isOpeningDirectMessage = useState(false);
 
-    final npub = canonicalNpub(pubkey);
+    // Canonical npub for the copy action; null when [pubkey] is not a valid
+    // identity, in which case the copy tile is disabled — an invalid key is
+    // never placed on the clipboard.
+    final npub = fullNpub(pubkey);
+
+    // Routed through the shared label so a blank cached name (empty or
+    // whitespace-only, relay-valid) falls back to the compact npub instead
+    // of an empty heading.
     final displayName = profile?.label;
     final avatarUrl = profile?.avatarUrl;
     final nip05 = profile?.nip05Handle;
@@ -153,6 +160,7 @@ class UserProfileSheet extends HookConsumerWidget {
                               child: _ProfileAvatar(
                                 avatarUrl: avatarUrl,
                                 initial: initial,
+                                isAgent: profile?.isAgent == true,
                               ),
                             ),
                           ),
@@ -170,7 +178,7 @@ class UserProfileSheet extends HookConsumerWidget {
                     // Display name — centered, large
                     Center(
                       child: Text(
-                        displayName ?? truncateNpub(pubkey),
+                        displayName ?? shortPubkey(pubkey),
                         style: context.textTheme.headlineSmall?.copyWith(
                           fontWeight: FontWeight.w700,
                         ),
@@ -380,8 +388,13 @@ class _ProfilePresenceChip extends StatelessWidget {
 class _ProfileAvatar extends HookWidget {
   final String? avatarUrl;
   final String initial;
+  final bool isAgent;
 
-  const _ProfileAvatar({required this.avatarUrl, required this.initial});
+  const _ProfileAvatar({
+    required this.avatarUrl,
+    required this.initial,
+    required this.isAgent,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -401,17 +414,26 @@ class _ProfileAvatar extends HookWidget {
                   stoppedAnimationUrl.value == animatedAvatar.animationUrl
                   ? null
                   : animatedAvatar.animationUrl,
-        child: ClipOval(
-          child: isPlaying
-              ? ProgressiveAnimatedAvatar(
-                  key: ValueKey(animatedAvatar.animationUrl),
-                  descriptor: animatedAvatar,
-                  fallback: _AvatarFallback(initial: initial),
-                )
-              : AvatarImageContent(
-                  imageUrl: animatedAvatar?.posterUrl ?? avatarUrl,
-                  fallback: _AvatarFallback(initial: initial),
-                ),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final avatar = isPlaying
+                ? ProgressiveAnimatedAvatar(
+                    key: ValueKey(animatedAvatar.animationUrl),
+                    descriptor: animatedAvatar,
+                    fallback: _AvatarFallback(initial: initial),
+                  )
+                : AvatarImageContent(
+                    imageUrl: animatedAvatar?.posterUrl ?? avatarUrl,
+                    fallback: _AvatarFallback(initial: initial),
+                  );
+            if (!isAgent) return ClipOval(child: avatar);
+            return ClipRRect(
+              borderRadius: BorderRadius.circular(
+                constraints.biggest.shortestSide * 0.3,
+              ),
+              child: avatar,
+            );
+          },
         ),
       ),
     );

@@ -45,6 +45,30 @@ fn normalized_clone_url(value: &str) -> &str {
     value.trim().trim_end_matches('/').trim_end_matches(".git")
 }
 
+// Git escapes backslashes in local Windows origins and quotes values containing
+// comment delimiters. Compare the decoded value, not its config-file spelling.
+fn decode_git_config_value(value: &str) -> Option<String> {
+    let mut decoded = String::new();
+    let mut quoted = false;
+    let mut chars = value.trim().chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => quoted = !quoted,
+            '#' | ';' if !quoted => break,
+            '\\' => decoded.push(match chars.next()? {
+                '\\' => '\\',
+                '"' => '"',
+                'n' => '\n',
+                't' => '\t',
+                'b' => '\u{0008}',
+                _ => return None,
+            }),
+            _ => decoded.push(ch),
+        }
+    }
+    (!quoted).then_some(decoded)
+}
+
 fn checkout_git_dir(
     repo_dir: &std::path::Path,
     repos_root: &std::path::Path,
@@ -92,7 +116,9 @@ fn checkout_origin_matches(
         if in_origin {
             if let Some((key, value)) = line.split_once('=') {
                 if key.trim() == "url" {
-                    return normalized_clone_url(value) == normalized_clone_url(clone_url);
+                    return decode_git_config_value(value).is_some_and(|value| {
+                        normalized_clone_url(&value) == normalized_clone_url(clone_url)
+                    });
                 }
             }
         }
@@ -290,13 +316,26 @@ pub(crate) fn checkout_mismatch_message(checkout: &LocalProjectCheckout, branch:
 }
 
 pub(crate) fn default_repos_root_candidates() -> Vec<std::path::PathBuf> {
+    default_repos_root_candidates_for(
+        nest_dir(),
+        dirs::home_dir(),
+        crate::build_identity::is_demo_build(),
+    )
+}
+
+fn default_repos_root_candidates_for(
+    nest: Option<std::path::PathBuf>,
+    home: Option<std::path::PathBuf>,
+    is_demo_build: bool,
+) -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
-    candidates.extend(nest_dir().map(|path| path.join("REPOS")));
-    candidates.extend(
-        dirs::home_dir()
-            .map(|home| home.join(".buzz").join("REPOS"))
-            .filter(|path| !candidates.iter().any(|candidate| candidate == path)),
-    );
+    candidates.extend(nest.map(|path| path.join("REPOS")));
+    if !is_demo_build {
+        candidates.extend(
+            home.map(|home| home.join(".buzz").join("REPOS"))
+                .filter(|path| !candidates.iter().any(|candidate| candidate == path)),
+        );
+    }
     candidates
 }
 
@@ -337,5 +376,36 @@ pub(crate) fn canonical_repos_roots(
 }
 
 #[cfg(test)]
+mod tests {
+    use super::default_repos_root_candidates_for;
+    use std::path::PathBuf;
+
+    #[test]
+    fn production_keeps_the_legacy_repo_fallback() {
+        let home = PathBuf::from("/Users/example");
+        assert_eq!(
+            default_repos_root_candidates_for(
+                Some(home.join(".buzz-dev")),
+                Some(home.clone()),
+                false,
+            ),
+            vec![home.join(".buzz-dev/REPOS"), home.join(".buzz/REPOS")]
+        );
+    }
+
+    #[test]
+    fn named_demos_only_search_their_selected_nest() {
+        let home = PathBuf::from("/Users/example");
+        for slug in ["workstream-board", "second-demo"] {
+            let nest = home.join(format!(".buzz-demo-{slug}"));
+            assert_eq!(
+                default_repos_root_candidates_for(Some(nest.clone()), Some(home.clone()), true,),
+                vec![nest.join("REPOS")]
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 #[path = "project_repo_paths_tests.rs"]
-mod tests;
+mod branch_tests;

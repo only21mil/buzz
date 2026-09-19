@@ -58,6 +58,7 @@ function fromRawTeam(team: RawTeam): AgentTeam {
 }
 
 export async function listTeams(): Promise<AgentTeam[]> {
+  requireLocalTeamStorage();
   return (await invokeTauri<RawTeam[]>("list_teams")).map(fromRawTeam);
 }
 

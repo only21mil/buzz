@@ -85,8 +85,7 @@ extension _ChannelsNotifierLiveSubscriptions on ChannelsNotifier {
     final session = _lifecycleRef.read(relaySessionProvider.notifier);
     for (final chunk in desiredChunks) {
       final chunkKey = _liveChunkKey(chunk);
-      if ((!_replaceLiveSubscriptionsAfterReconnect &&
-              _liveSubscriptionsByChunk.containsKey(chunkKey)) ||
+      if (_liveSubscriptionsByChunk.containsKey(chunkKey) ||
           _terminallyClosedLiveChunks.contains(chunkKey)) {
         continue;
       }
@@ -94,7 +93,6 @@ extension _ChannelsNotifierLiveSubscriptions on ChannelsNotifier {
           SessionStatus.connected) {
         return;
       }
-      final previousSubscription = _liveSubscriptionsByChunk[chunkKey];
       final generation = ++_nextLiveChunkGeneration;
       final subscription = _LiveChunkSubscription(generation);
       _liveSubscriptionsByChunk[chunkKey] = subscription;
@@ -110,21 +108,11 @@ extension _ChannelsNotifierLiveSubscriptions on ChannelsNotifier {
             // Deliver only the current scope's still-desired channels; duplicate
             // events are already idempotent in the unread/timestamp stores.
             if (!_lifecycleRef.mounted ||
-                _liveSubscriptionsByChunk[chunkKey] != subscription ||
                 _refreshCoordinator.currentScope() != fence.scope ||
                 !_desiredLiveChannelIds.contains(event.channelId)) {
               return;
             }
-            // Local notifications are Android-only; skip the classifier and
-            // dedupe work on every other platform.
-            _handleLiveEvent(
-              event,
-              canNotify:
-                  defaultTargetPlatform == TargetPlatform.android &&
-                  subscription.notificationReady &&
-                  _lifecycleRef.read(relaySessionProvider).status ==
-                      SessionStatus.connected,
-            );
+            _handleLiveEvent(event);
           },
           onClosed: (message) =>
               _handleLiveChunkClosed(chunkKey, generation, message),
@@ -132,7 +120,6 @@ extension _ChannelsNotifierLiveSubscriptions on ChannelsNotifier {
         subscription.unsubscribe = unsubscribe;
         if (!_lifecycleRef.mounted || !fence.isCurrent) {
           _liveSubscriptionsByChunk.remove(chunkKey);
-          previousSubscription?.unsubscribe?.call();
           unsubscribe();
           if (!fence.isCurrent) throw const _StaleChannelRefresh();
           return;
@@ -144,26 +131,18 @@ extension _ChannelsNotifierLiveSubscriptions on ChannelsNotifier {
             _subscriptionRelayBaseUrl != relayBaseUrl ||
             !chunk.every(_desiredLiveChannelIds.contains)) {
           _liveSubscriptionsByChunk.remove(chunkKey);
-          previousSubscription?.unsubscribe?.call();
           unsubscribe();
           return;
         }
         if (_liveSubscriptionsByChunk[chunkKey] != subscription) {
-          previousSubscription?.unsubscribe?.call();
           unsubscribe();
           continue;
         }
-        // Replay callbacks finish before subscribe resolves at EOSE.
-        subscription.notificationReady = true;
-        previousSubscription?.unsubscribe?.call();
       } on _StaleChannelRefresh {
         rethrow;
       } catch (error) {
         if (_liveSubscriptionsByChunk[chunkKey] == subscription) {
           _liveSubscriptionsByChunk.remove(chunkKey);
-          if (previousSubscription != null) {
-            _liveSubscriptionsByChunk[chunkKey] = previousSubscription;
-          }
         }
         if (!_lifecycleRef.mounted) return;
         debugPrint(
@@ -181,8 +160,6 @@ extension _ChannelsNotifierLiveSubscriptions on ChannelsNotifier {
     }
 
     fence.ensureCurrent();
-    _replaceLiveSubscriptionsAfterReconnect = _liveSubscriptionsByChunk.values
-        .any((subscription) => !subscription.notificationReady);
     unawaited(_catchUpUnreadEvents(channels, fence, subscriptionVersion));
 
     _backstopTimer?.cancel();
@@ -260,7 +237,6 @@ extension _ChannelsNotifierLiveSubscriptions on ChannelsNotifier {
 
   void _clearLiveSubscriptions() {
     _subscriptionVersion++;
-    _replaceLiveSubscriptionsAfterReconnect = false;
     _desiredLiveChannelIds = const {};
     _terminallyClosedLiveChunks.clear();
     _clearRetainedLiveChunks();
@@ -295,5 +271,4 @@ class _LiveChunkSubscription {
 
   final int generation;
   void Function()? unsubscribe;
-  bool notificationReady = false;
 }

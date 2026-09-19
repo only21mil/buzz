@@ -23,10 +23,10 @@ fn workflow_history_rejects_malformed_and_partial_cursors() {
 
 #[test]
 fn workflow_history_legacy_array_and_precise_cursor_envelope() {
-    let mut first = tests::workflow_run_record(None, None, None);
+    let mut first = postgres_tests::workflow_run_record(None, None, None);
     first.created_at = "2026-09-06T10:00:00.123456Z".parse().unwrap();
     first.status = buzz_db::workflow::RunStatus::ResumePending;
-    let second = tests::workflow_run_record(None, None, None);
+    let second = postgres_tests::workflow_run_record(None, None, None);
     let legacy = workflow_runs_response(&mut vec![first.clone()], 20, false);
     assert!(legacy.is_array());
     assert_eq!(legacy[0]["status"], "resume_pending");

@@ -48,14 +48,22 @@ export function WorkflowDetailPanel({
     ? getWorkflowTriggerSummary(workflow.definition)
     : null;
   const workflowStatus = workflow ? getWorkflowDisplayStatus(workflow) : null;
+  const triggerError = errorMessage(
+    triggerMutation.error,
+    "The relay did not create a workflow run.",
+  );
+  const runsError = errorMessage(
+    runsQuery.error,
+    "Run history could not be loaded.",
+  );
+  const selectedRunIsPendingHistory =
+    selectedRunId !== null && !runs.some((run) => run.id === selectedRunId);
 
   async function handleTrigger() {
     try {
       const response = await triggerMutation.mutateAsync();
       await runsQuery.refetch();
-      if (response.runId !== null) {
-        setSelectedRunId(response.runId);
-      }
+      if (response.runId !== null) setSelectedRunId(response.runId);
     } catch {
       // React Query stores the error; keep the current selection unchanged.
     }
@@ -135,17 +143,14 @@ export function WorkflowDetailPanel({
       ) : null}
 
       {triggerMutation.isError ? (
-        <div className="border-b px-4 py-2 text-xs text-red-400">
-          Failed to trigger workflow
-        </div>
-      ) : null}
-      {triggerMutation.isSuccess &&
-      triggerMutation.data?.status === "accepted" ? (
         <div
-          className="border-b px-4 py-2 text-xs text-muted-foreground"
-          role="status"
+          className="border-b px-4 py-2 text-xs text-destructive"
+          role="alert"
         >
-          Trigger accepted. Run history is refreshing.
+          <p className="font-medium">Failed to trigger workflow</p>
+          <p className="mt-1 break-words text-muted-foreground">
+            {triggerError}
+          </p>
         </div>
       ) : null}
 
@@ -176,26 +181,46 @@ export function WorkflowDetailPanel({
                   Run History
                 </h4>
               ) : null}
-              {runsQuery.isPending ? (
-                <p className="text-sm text-muted-foreground">
-                  Loading run history...
-                </p>
-              ) : null}
               {runsQuery.isError ? (
-                <p className="text-sm text-destructive" role="alert">
-                  Failed to load run history.{" "}
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => void runsQuery.refetch()}
-                  >
-                    Retry
-                  </Button>
-                </p>
+                <div
+                  className="rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+                  role="alert"
+                >
+                  <p className="font-medium">Failed to load run history</p>
+                  <p className="mt-1 break-words">{runsError}</p>
+                </div>
               ) : null}
-              {!runsQuery.isPending &&
-              !runsQuery.isError &&
-              runs.length === 0 ? (
+              {runsQuery.isError && runs.length === 0 ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void runsQuery.refetch()}
+                >
+                  Retry
+                </Button>
+              ) : runsQuery.isLoading ? (
+                <div
+                  className="space-y-2"
+                  aria-label="Loading run history"
+                  role="status"
+                >
+                  <Skeleton className="h-16 w-full rounded-xl" />
+                </div>
+              ) : selectedRunIsPendingHistory ? (
+                <div
+                  className="rounded-lg border border-primary/30 bg-primary/10 px-3 py-2 text-xs"
+                  data-testid="workflow-run-created"
+                  role="status"
+                >
+                  <p className="font-medium">Run created</p>
+                  <p className="mt-1 break-all font-mono text-muted-foreground">
+                    {selectedRunId}
+                  </p>
+                  <p className="mt-1 text-muted-foreground">
+                    Waiting for its persisted trace…
+                  </p>
+                </div>
+              ) : runs.length === 0 ? (
                 <p className="text-sm text-muted-foreground">No runs yet.</p>
               ) : (
                 <div className="space-y-2">
@@ -204,6 +229,10 @@ export function WorkflowDetailPanel({
                     const duration = formatRunDuration(
                       run.startedAt,
                       run.completedAt,
+                    );
+                    const failureReason = workflowRunFailureReason(
+                      run.errorCode,
+                      run.errorMessage,
                     );
 
                     return (
@@ -235,7 +264,7 @@ export function WorkflowDetailPanel({
                                   <ChevronRight className="h-4 w-4 text-muted-foreground" />
                                 )}
                                 <span className="truncate font-mono text-xs font-medium">
-                                  {isSelected ? run.id : run.id.slice(0, 8)}
+                                  {run.id.slice(0, 8)}
                                 </span>
                                 <RunStatusBadge status={run.status} />
                               </div>
@@ -258,14 +287,9 @@ export function WorkflowDetailPanel({
                                   </span>
                                 ) : null}
                               </div>
-                              {run.errorCode ? (
-                                <p className="mt-2 pl-6 font-mono text-xs text-destructive">
-                                  {run.errorCode}
-                                </p>
-                              ) : null}
-                              {run.errorMessage ? (
+                              {failureReason ? (
                                 <p className="mt-2 break-words pl-6 text-xs text-destructive">
-                                  {run.errorMessage}
+                                  {failureReason}
                                 </p>
                               ) : null}
                             </div>
@@ -296,21 +320,21 @@ export function WorkflowDetailPanel({
                       </div>
                     );
                   })}
+                  {runsQuery.hasNextPage ? (
+                    <Button
+                      className="mt-3"
+                      size="sm"
+                      variant="outline"
+                      disabled={runsQuery.isFetchingNextPage}
+                      onClick={() => void runsQuery.fetchNextPage()}
+                    >
+                      {runsQuery.isFetchingNextPage
+                        ? "Loading..."
+                        : "Load older runs"}
+                    </Button>
+                  ) : null}
                 </div>
               )}
-              {runsQuery.hasNextPage ? (
-                <Button
-                  className="mt-3"
-                  size="sm"
-                  variant="outline"
-                  disabled={runsQuery.isFetchingNextPage}
-                  onClick={() => void runsQuery.fetchNextPage()}
-                >
-                  {runsQuery.isFetchingNextPage
-                    ? "Loading..."
-                    : "Load older runs"}
-                </Button>
-              ) : null}
             </div>
           </div>
         ) : workflowQuery.isError ? (
@@ -341,6 +365,30 @@ export function WorkflowDetailPanel({
   );
 }
 
+function workflowRunFailureReason(
+  errorCode: string | null,
+  diagnostic: string | null,
+) {
+  if (diagnostic?.trim()) return diagnostic;
+  if (!errorCode) return null;
+  const knownReasons: Record<string, string> = {
+    approval_denied: "Approval was denied.",
+    approval_expired: "Approval expired before the workflow could continue.",
+    external_outcome_unknown:
+      "The external action may have completed, but its outcome could not be confirmed.",
+    run_interrupted: "The run was interrupted before it could finish.",
+  };
+  return (
+    knownReasons[errorCode] ?? `Run failed (${errorCode.replace(/_/g, " ")}).`
+  );
+}
+
+function errorMessage(error: unknown, fallback: string) {
+  return error instanceof Error && error.message.trim().length > 0
+    ? error.message
+    : fallback;
+}
+
 function formatRunDuration(
   startedAt: number | null,
   completedAt: number | null,
@@ -366,7 +414,6 @@ function RunStatusBadge({ status }: { status: string }) {
     pending: "secondary",
     cancelled: "secondary",
     waiting_approval: "warning",
-    resume_pending: "info",
   };
 
   return (

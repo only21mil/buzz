@@ -33,6 +33,7 @@ export function ForumComposerAutocompletes({
   return (
     <>
       <ChannelAutocomplete
+        composerOwnsFocus={composerOwnsFocus}
         onSelect={onChannelSelect}
         position={position}
         selectedIndex={channelSelectedIndex}

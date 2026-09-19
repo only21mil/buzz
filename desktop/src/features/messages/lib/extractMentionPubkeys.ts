@@ -114,17 +114,14 @@ export function mentionMatchCandidates({
   return candidates;
 }
 
-/**
- * Extract recipients from the same exact occurrences used by draft routing.
- * Report each winning keyed label so callers need not reverse-map recipient keys.
- */
+/** Extract recipients from the same exact occurrences used by draft routing. */
 export function extractMentionPubkeys(options: {
+  onResolvedDisplayName?: (displayName: string) => void;
   text: string;
   selectedMentions: ReadonlyMap<string, string>;
   selectedDisplayNames?: Iterable<string>;
   competingDisplayNames?: Iterable<string>;
   memberCandidates: readonly MentionPubkeyCandidate[];
-  onResolvedDisplayName?: (displayName: string) => void;
 }): string[] {
   const { text, selectedMentions, memberCandidates } = options;
   const candidates = mentionMatchCandidates(options);

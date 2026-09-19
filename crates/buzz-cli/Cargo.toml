@@ -90,10 +90,13 @@ rand = { workspace = true }
 # Private temporary bare repositories for bounded main-ref sync operations
 tempfile = "3"
 
-# Effective UID for the caller-owned receipt directory rule (`ci landing`)
-nix = { version = "0.31", default-features = false, features = ["user"] }
-
 [dev-dependencies]
 # Minimal HTTP test server for retry/policy integration tests
 axum = { workspace = true }
 buzz-test-client = { path = "../buzz-test-client" }
+# `test-util` enables paused-time control for deterministic timeout tests
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+
+[target.'cfg(unix)'.dependencies]
+# Effective UID for the caller-owned receipt directory rule (`ci landing`)
+nix = { version = "0.31", default-features = false, features = ["user"] }

@@ -40,8 +40,7 @@ use super::wire::{parse_relay_frame, FLAG_DTX};
 /// considered silent.
 const SPEAKER_TICK_MS: u64 = 500;
 /// UI cadence for per-speaker waveform levels.
-const SPEAKER_LEVEL_TICK_MS: u64 = 100;
-const SPEAKER_LEVEL_BUCKETS: f32 = 20.0;
+const SPEAKER_LEVEL_TICK_MS: u64 = 50;
 /// Per-peer arrival window for the TTS interrupt frame counter.
 const FRAME_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 const REMOTE_RELEASE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(500);
@@ -131,54 +130,6 @@ fn release_expired_remote_floors(
         deadlines.remove(&peer);
         owners.remove(&peer);
         human_floor.leave_remote(peer);
-    }
-}
-
-fn speaker_level_bucket(level: f32) -> u8 {
-    (level.clamp(0.0, 1.0) * SPEAKER_LEVEL_BUCKETS).round() as u8
-}
-
-/// Last values published across the Tauri event bridge. Empty values are the
-/// initial state, so five seconds of silence produce no events. After speech,
-/// the first empty value is still published once to clear the UI.
-#[derive(Default)]
-struct SpeakerEmissionGate {
-    active_pubkeys: Vec<String>,
-    level_buckets: std::collections::HashMap<String, u8>,
-}
-
-impl SpeakerEmissionGate {
-    fn active_speakers(&mut self, mut pubkeys: Vec<String>) -> Option<Vec<String>> {
-        pubkeys.sort_unstable();
-        pubkeys.dedup();
-        if pubkeys == self.active_pubkeys {
-            return None;
-        }
-        self.active_pubkeys.clone_from(&pubkeys);
-        Some(pubkeys)
-    }
-
-    fn speaker_levels(
-        &mut self,
-        levels: std::collections::HashMap<String, f32>,
-    ) -> Option<std::collections::HashMap<String, f32>> {
-        let buckets: std::collections::HashMap<String, u8> = levels
-            .into_iter()
-            .filter_map(|(pubkey, level)| {
-                let bucket = speaker_level_bucket(level);
-                (bucket > 0).then_some((pubkey, bucket))
-            })
-            .collect();
-        if buckets == self.level_buckets {
-            return None;
-        }
-        self.level_buckets.clone_from(&buckets);
-        Some(
-            buckets
-                .into_iter()
-                .map(|(pubkey, bucket)| (pubkey, f32::from(bucket) / SPEAKER_LEVEL_BUCKETS))
-                .collect(),
-        )
     }
 }
 
@@ -359,7 +310,6 @@ pub(crate) async fn run_playout_recv_loop(
     let mut frame_counts: std::collections::HashMap<u8, u16> = std::collections::HashMap::new();
     let mut last_frame_reset = tokio::time::Instant::now();
 
-    let mut speaker_emissions = SpeakerEmissionGate::default();
     let mut speaker_tick = tokio::time::interval(std::time::Duration::from_millis(SPEAKER_TICK_MS));
     speaker_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut speaker_level_tick =
@@ -456,9 +406,7 @@ pub(crate) async fn run_playout_recv_loop(
                         .iter()
                         .filter_map(|idx| index_to_pubkey.get(idx).cloned())
                         .collect();
-                    if let Some(pubkeys) = speaker_emissions.active_speakers(pubkeys) {
-                        let _ = app.emit("huddle-active-speakers", &pubkeys);
-                    }
+                    let _ = app.emit("huddle-active-speakers", &pubkeys);
                 }
                 active_indices.clear();
             }
@@ -471,9 +419,7 @@ pub(crate) async fn run_playout_recv_loop(
                             index_to_pubkey.get(idx).cloned().map(|pubkey| (pubkey, *level))
                         })
                         .collect();
-                    if let Some(levels) = speaker_emissions.speaker_levels(levels) {
-                        let _ = app.emit("huddle-speaker-levels", &levels);
-                    }
+                    let _ = app.emit("huddle-speaker-levels", &levels);
                 }
                 for level in speaker_levels.values_mut() {
                     *level *= 0.55;
@@ -721,51 +667,6 @@ pub(crate) async fn run_playout_recv_loop(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn five_seconds_of_unchanged_silence_emit_no_speaker_events() {
-        let mut gate = SpeakerEmissionGate::default();
-        let mut level_events = 0;
-        let mut active_events = 0;
-
-        for _ in 0..(5_000 / SPEAKER_LEVEL_TICK_MS) {
-            level_events += usize::from(gate.speaker_levels(Default::default()).is_some());
-        }
-        for _ in 0..(5_000 / SPEAKER_TICK_MS) {
-            active_events += usize::from(gate.active_speakers(Vec::new()).is_some());
-        }
-
-        assert_eq!(level_events, 0);
-        assert_eq!(active_events, 0);
-    }
-
-    #[test]
-    fn five_seconds_of_steady_speech_emit_once_then_clear_once() {
-        let mut gate = SpeakerEmissionGate::default();
-        let mut level_events = 0;
-        let mut active_events = 0;
-
-        for _ in 0..(5_000 / SPEAKER_LEVEL_TICK_MS) {
-            level_events += usize::from(
-                gate.speaker_levels(std::collections::HashMap::from([(
-                    "speaker".to_string(),
-                    0.63,
-                )]))
-                .is_some(),
-            );
-        }
-        for _ in 0..(5_000 / SPEAKER_TICK_MS) {
-            active_events +=
-                usize::from(gate.active_speakers(vec!["speaker".to_string()]).is_some());
-        }
-
-        assert_eq!(level_events, 1);
-        assert_eq!(active_events, 1);
-        assert!(gate.speaker_levels(Default::default()).is_some());
-        assert!(gate.active_speakers(Vec::new()).is_some());
-        assert!(gate.speaker_levels(Default::default()).is_none());
-        assert!(gate.active_speakers(Vec::new()).is_none());
-    }
-
     use super::*;
 
     #[test]

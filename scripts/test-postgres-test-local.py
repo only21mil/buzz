@@ -110,7 +110,7 @@ class IsolationTests(unittest.TestCase):
             self.assertRegex(name, '^buzz_nt_[a-f0-9]{24}$')
 
     def test_destructive_legacy_migration_starts_empty(self):
-        self.assertEqual(runner.schema_mode('populated_migration_preserves_legacy_approval_and_backfills_resume_state'), 'migration')
+        self.assertEqual(runner.schema_mode('runtime::migration::workflow_approval_contract_postgres_tests::populated_migration_preserves_legacy_approval_and_backfills_resume_state'), 'migration')
         with self.assertRaisesRegex(ValueError, 'unknown or ambiguous'):
             runner.schema_mode('unknown_migration_fixture')
 
@@ -118,35 +118,35 @@ class IsolationTests(unittest.TestCase):
         from postgres_test_inventory import read_inventory
         for row in read_inventory():
             if row['binary'] in ('ci_grants_contract', 'workflow_approval_contract',
-                                 'workflow_enabled_persistence', 'workflow_state_contract'):
+                                 'postgres_workflow_enabled_persistence', 'postgres_workflow_state_contract'):
                 self.assertEqual(runner.schema_mode(row['test'], row['binary'] + '-1234'), 'migration')
 
     def test_self_migrating_library_fixtures_start_empty(self):
         names = [
-            'workflow_approval::tests::prior_trace_is_persisted_once_and_replay_does_not_append',
-            'push::tests::acceptance_constraint_failure_rolls_back_source_event',
-            'push::tests::source_event_collision_is_protocol_outcome_without_event_insert',
-            'push::tests::replacement_and_revoke_are_community_scoped_and_dual_ordered',
-            'push::tests::concurrent_enqueue_is_atomic_and_community_scoped',
-            'push::tests::setwise_enqueue_maps_outcomes_per_request',
-            'push::tests::send_revalidation_suppresses_rotated_claim_and_retry_preserves_id',
-            'push::tests::endpoint_invalidation_is_scoped_to_community_and_generation',
-            'push::tests::matcher_trigger_is_allowlisted_and_deleted_events_are_discarded',
-            'push::tests::matcher_load_error_preserves_claimed_job_for_recovery',
-            'push::tests::matcher_claim_is_exclusive_across_workers',
-            'push::tests::delivered_wake_is_retained_while_rematch_is_queued',
-            'push::tests::exhausted_match_job_is_reaped_and_cannot_pin_retention',
-            'push::tests::batch_claim_is_single_community_and_setwise_ops_honor_the_fence',
-            'push::tests::gate_orders_lease_activation_after_in_flight_event_and_backfills_it',
+            'runtime::replica_fence::postgres_tests::cluster_global_sample_writer_fails_closed_when_activity_is_masked',
+            'store::workflow_approval::tests_postgres_tests::prior_trace_is_persisted_once_and_replay_does_not_append',
+            'store::push::postgres_tests::acceptance_constraint_failure_rolls_back_source_event',
+            'store::push::postgres_tests::source_event_collision_is_protocol_outcome_without_event_insert',
+            'store::push::postgres_tests::replacement_and_revoke_are_community_scoped_and_dual_ordered',
+            'store::push::postgres_tests::concurrent_enqueue_is_atomic_and_community_scoped',
+            'store::push::postgres_tests::setwise_enqueue_maps_outcomes_per_request',
+            'store::push::postgres_tests::send_revalidation_suppresses_rotated_claim_and_retry_preserves_id',
+            'store::push::postgres_tests::endpoint_invalidation_is_scoped_to_community_and_generation',
+            'store::push::postgres_tests::matcher_trigger_is_allowlisted_and_deleted_events_are_discarded',
+            'store::push::postgres_tests::matcher_load_error_preserves_claimed_job_for_recovery',
+            'store::push::postgres_tests::matcher_claim_is_exclusive_across_workers',
+            'store::push::postgres_tests::delivered_wake_is_retained_while_rematch_is_queued',
+            'store::push::postgres_tests::exhausted_match_job_is_reaped_and_cannot_pin_retention',
+            'store::push::postgres_tests::batch_claim_is_single_community_and_setwise_ops_honor_the_fence',
+            'store::push::postgres_tests::gate_orders_lease_activation_after_in_flight_event_and_backfills_it',
         ]
         for name in names:
             with self.subTest(name=name):
                 self.assertEqual(runner.schema_mode(name, 'buzz_db-1234'), 'migration')
 
     def test_desired_schema_library_fixtures_remain_desired(self):
-        for name in ('tests::test_usage_metrics_lock_has_single_owner_and_releases_on_drop',
-                     'replica_fence::tests::sample_writer_fails_closed_when_activity_is_masked',
-                     'usage::tests::test_community_count_increases'):
+        for name in ('store::usage::postgres_tests::test_usage_metrics_lock_has_single_owner_and_releases_on_drop',
+                     'store::usage::postgres_tests::test_community_count_increases'):
             with self.subTest(name=name):
                 self.assertEqual(runner.schema_mode(name, 'buzz_db-1234'), 'desired')
 
@@ -162,6 +162,16 @@ class IsolationTests(unittest.TestCase):
             shutil.copy(frozen.ROOT / 'scripts/migrations-0036-0042.sha256', root / 'scripts')
             shutil.copy(frozen.ROOT / 'scripts/migrations-0043-0049.sha256', root / 'scripts')
             (root / 'migrations/0050_new.sql').write_text('-- new migration\n')
+            sql = (root / 'migrations/0050_new.sql').read_bytes()
+            operation_path = root / frozen.OPERATION_MAP
+            operations = json.loads(operation_path.read_text())
+            operations['fork'].append({
+                'version': 50, 'file': 'migrations/0050_new.sql', 'description': 'new',
+                'sha256': hashlib.sha256(sql).hexdigest(),
+                'sqlx_sha384': hashlib.sha384(sql).hexdigest(),
+                'prerequisites': [], 'operations': ['create-table:brand_new_table'],
+            })
+            operation_path.write_text(json.dumps(operations))
             ledger = root / 'map.json'
             tail_entries = json.loads(
                 (frozen.ROOT / 'migrations/admission-map.json').read_text()
@@ -220,6 +230,7 @@ class IsolationTests(unittest.TestCase):
             (root / 'scripts').mkdir()
             shutil.copy(frozen.ROOT / 'scripts/migrations-0001-0035.sha256', root / 'scripts')
             shutil.copy(frozen.ROOT / 'scripts/migrations-0036-0042.sha256', root / 'scripts')
+            shutil.copy(frozen.ROOT / 'scripts/migrations-0043-0049.sha256', root / 'scripts')
             frozen.check(root)
             original = next((root / 'migrations').glob('0001_*.sql'))
             data = original.read_bytes()

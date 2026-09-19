@@ -3,7 +3,6 @@ import { TerminalSquare } from "lucide-react";
 
 import type { AcpRuntimeCatalogEntry } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
-import { publicAssetUrl } from "@/shared/lib/publicAssetUrl";
 import { BuzzMark } from "@/shared/ui/buzz-logo/BuzzMark";
 import claudeLogoUrl from "../assets/harness-logos/claude.png?inline";
 import { RUNTIME_MARKS } from "./HarnessMarks";
@@ -15,18 +14,18 @@ const RUNTIME_LOGOS: Record<string, string> = {
   claude: claudeLogoUrl,
 };
 
-// Public-path logos for bundled presets, resolved under the active Vite base.
+// Public-path logos for bundled presets. Served from /harness-logos/ at runtime.
 // Keys match the preset `id` values emitted by the backend PRESET_HARNESSES.
 export const PRESET_LOGOS: Record<string, string> = {
-  devin: publicAssetUrl("harness-logos/devin.svg"),
-  omp: publicAssetUrl("harness-logos/omp.svg"),
-  grok: publicAssetUrl("harness-logos/grok.svg"),
-  opencode: publicAssetUrl("harness-logos/opencode.svg"),
-  kimi: publicAssetUrl("harness-logos/kimi.png"),
-  amp: publicAssetUrl("harness-logos/amp.png"),
-  hermes: publicAssetUrl("harness-logos/hermes.png"),
-  openclaw: publicAssetUrl("harness-logos/openclaw.svg"),
-  pi: publicAssetUrl("harness-logos/pi.svg"),
+  devin: "/harness-logos/devin.svg",
+  omp: "/harness-logos/omp.svg",
+  pi: "/harness-logos/pi.svg",
+  grok: "/harness-logos/grok.svg",
+  opencode: "/harness-logos/opencode.svg",
+  kimi: "/harness-logos/kimi.png",
+  amp: "/harness-logos/amp.png",
+  hermes: "/harness-logos/hermes.png",
+  openclaw: "/harness-logos/openclaw.svg",
 };
 
 function isBuzzRuntime(runtime: AcpRuntimeCatalogEntry): boolean {

@@ -222,6 +222,10 @@ void main() {
       );
       expect(auth.authenticatedCommunities.single.pubkey, keys.public);
       expect(auth.authenticatedCommunities.single.nsec, keys.nsec);
+      expect(
+        auth.authenticatedCommunities.single.sensitiveActionPolicy,
+        SensitiveActionPolicy.disabledByUser,
+      );
     },
   );
 

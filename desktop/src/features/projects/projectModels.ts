@@ -4,7 +4,6 @@ import {
   KIND_REPO_ANNOUNCEMENT,
 } from "@/shared/constants/kinds";
 import { effectiveCloneUrls } from "./lib/projectCloneUrl";
-import { preserveProjectSnapshotProvenance } from "./projectSnapshotProvenance";
 
 export type Repository = {
   id: string;
@@ -38,11 +37,10 @@ export type Project = {
    * `buzz-related-channel` tags. Client convention: NIP-MP treats the tag as
    * unrecognized metadata, so older readers ignore it.
    */
-  relatedChannelIds?: string[];
+  relatedChannelIds: string[];
   status: string;
   projectAddress: string;
   primaryRepositoryAddress: string | null;
-  /** First authoritative home member in the signed project tag order. */
   homeRepositoryAddress?: string | null;
   repositoryAddresses: string[];
   repositoryRelayHints?: Record<string, string>;
@@ -348,6 +346,15 @@ export function eventToExplicitProject(
       repositoryRelayHints[repositoryAddress] = membershipTag[2];
     }
   }
+  const homeRepositoryAddress =
+    repositoryAddresses.find((address) => {
+      const repo = visibleRepositoriesByAddress.get(address);
+      return (
+        repo?.channelId &&
+        (repo.owner === event.pubkey.toLowerCase() ||
+          repo.maintainers?.includes(event.pubkey.toLowerCase()))
+      );
+    }) ?? null;
   repositoryAddresses.sort();
   const primaryRepositoryAddress =
     repositoryAddresses.find(
@@ -367,20 +374,6 @@ export function eventToExplicitProject(
   const channel = getTag(event, "buzz-channel");
   const projectChannelId =
     channel && isValidProjectChannelId(channel) ? channel : null;
-  const homeRepositoryAddress = projectChannelId
-    ? (membershipTags
-        .map((tag) => tag[1])
-        .find((address) => {
-          const repository = visibleRepositoriesByAddress.get(address);
-          return (
-            repository?.channelId === projectChannelId &&
-            (repository.owner.toLowerCase() === owner ||
-              repository.maintainers?.some(
-                (maintainer) => maintainer.toLowerCase() === owner,
-              ))
-          );
-        }) ?? null)
-    : null;
   const relatedChannelIds = [
     ...new Set(
       getAllTags(event, PROJECT_RELATED_CHANNEL_TAG).filter(
@@ -439,27 +432,18 @@ function repositoryToLegacyProject(repository: Repository): Project {
 }
 
 /**
- * Builds the set of addressable coordinates that have been authoritatively
- * deleted per NIP-09 semantics: the deletion signer must equal the coordinate
- * owner, and the deletion's `created_at` must be ≥ the live head's timestamp.
- * Returns a `Map<coordinate, deletedAt>` for threshold comparison.
+ * Builds deletion thresholds from relay-accepted tombstones. The relay has
+ * already enforced that each signer controls the addressed coordinate,
+ * including Buzz's NIP-OA owner delegation for agent-authored events.
  */
 function buildDeletionThresholds(
   deletionEvents: RelayEvent[],
 ): Map<string, number> {
   const thresholds = new Map<string, number>();
   for (const event of deletionEvents) {
-    const signer = event.pubkey.toLowerCase();
     for (const tag of event.tags) {
       if (tag[0] !== "a" || !tag[1]) continue;
       const coordinate = tag[1];
-      // The signer must be the owner of the coordinate.
-      const firstColon = coordinate.indexOf(":");
-      const secondColon = coordinate.indexOf(":", firstColon + 1);
-      if (firstColon < 0 || secondColon < 0) continue;
-      const owner = coordinate.slice(firstColon + 1, secondColon).toLowerCase();
-      if (owner !== signer) continue;
-      // Keep the latest (most permissive) deletion threshold.
       const existing = thresholds.get(coordinate);
       if (existing === undefined || event.created_at > existing) {
         thresholds.set(coordinate, event.created_at);
@@ -567,11 +551,9 @@ export function selectProjectRepository(
 
   return (
     project.repositories.find(
-      (repository) => repository.repoAddress === project.homeRepositoryAddress,
-    ) ??
-    project.repositories.find(
       (repository) =>
-        repository.repoAddress === project.primaryRepositoryAddress,
+        repository.repoAddress ===
+        (project.homeRepositoryAddress ?? project.primaryRepositoryAddress),
     ) ??
     project.repositories[0] ??
     null
@@ -595,7 +577,7 @@ export function addRepositoryToProject(
     repository,
   ].sort((left, right) => left.repoAddress.localeCompare(right.repoAddress));
 
-  return preserveProjectSnapshotProvenance(project, {
+  return {
     ...project,
     id: projectAddress,
     createdAt,
@@ -612,7 +594,7 @@ export function addRepositoryToProject(
       project.unavailableRepositoryAddresses?.filter(
         (address) => address !== repository.repoAddress,
       ) ?? [],
-  });
+  };
 }
 
 /** Returns the optimistic read model after linking an extra project stream. */
@@ -626,9 +608,9 @@ export function addRelatedChannelToProject(
   ].filter(
     (id) => id !== project.projectChannelId && isValidProjectChannelId(id),
   );
-  return preserveProjectSnapshotProvenance(project, {
+  return {
     ...project,
     createdAt,
     relatedChannelIds: relatedChannelIds.slice(0, MAX_PROJECT_RELATED_CHANNELS),
-  });
+  };
 }

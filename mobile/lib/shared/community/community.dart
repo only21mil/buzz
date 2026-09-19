@@ -16,12 +16,15 @@ String _newPushLeaseInstallationId() {
   ).join();
 }
 
+enum SensitiveActionPolicy { enabled, disabledByUser }
+
 class Community {
   final String id;
   final String name;
   final String relayUrl;
   final String? pubkey;
   final String? nsec;
+  final SensitiveActionPolicy sensitiveActionPolicy;
   final bool pushNotificationsEnabled;
   final BuzzPushLeaseSubscriptionState pushSubscriptionState;
 
@@ -41,6 +44,7 @@ class Community {
     required this.relayUrl,
     this.pubkey,
     this.nsec,
+    this.sensitiveActionPolicy = SensitiveActionPolicy.disabledByUser,
     this.pushNotificationsEnabled = false,
     this.pushSubscriptionState = const BuzzPushLeaseSubscriptionState.desired(),
     this.pushLeaseInstallationId,
@@ -53,6 +57,8 @@ class Community {
     required String relayUrl,
     String? pubkey,
     String? nsec,
+    SensitiveActionPolicy sensitiveActionPolicy =
+        SensitiveActionPolicy.disabledByUser,
     bool starterSetupIncomplete = false,
   }) {
     return Community(
@@ -61,6 +67,7 @@ class Community {
       relayUrl: relayUrl,
       pubkey: pubkey,
       nsec: nsec,
+      sensitiveActionPolicy: sensitiveActionPolicy,
       pushLeaseInstallationId: _newPushLeaseInstallationId(),
       starterSetupIncomplete: starterSetupIncomplete,
       addedAt: DateTime.now(),
@@ -72,6 +79,7 @@ class Community {
     String? relayUrl,
     Object? pubkey = _sentinel,
     Object? nsec = _sentinel,
+    SensitiveActionPolicy? sensitiveActionPolicy,
     bool? pushNotificationsEnabled,
     BuzzPushLeaseSubscriptionState? pushSubscriptionState,
     Object? pushLeaseInstallationId = _sentinel,
@@ -83,6 +91,8 @@ class Community {
       relayUrl: relayUrl ?? this.relayUrl,
       pubkey: pubkey == _sentinel ? this.pubkey : pubkey as String?,
       nsec: nsec == _sentinel ? this.nsec : nsec as String?,
+      sensitiveActionPolicy:
+          sensitiveActionPolicy ?? this.sensitiveActionPolicy,
       pushNotificationsEnabled:
           pushNotificationsEnabled ?? this.pushNotificationsEnabled,
       pushSubscriptionState:
@@ -102,6 +112,7 @@ class Community {
     'relayUrl': relayUrl,
     if (pubkey != null) 'pubkey': pubkey,
     if (nsec != null) 'nsec': nsec,
+    'sensitiveActionPolicy': sensitiveActionPolicy.name,
     'pushNotificationsEnabled': pushNotificationsEnabled,
     'pushSubscriptionState': pushSubscriptionState.toJson(),
     if (pushLeaseInstallationId != null)
@@ -136,6 +147,10 @@ class Community {
       relayUrl: json['relayUrl'] as String,
       pubkey: json['pubkey'] as String?,
       nsec: json['nsec'] as String?,
+      sensitiveActionPolicy: SensitiveActionPolicy.values.firstWhere(
+        (value) => value.name == json['sensitiveActionPolicy'],
+        orElse: () => SensitiveActionPolicy.disabledByUser,
+      ),
       pushNotificationsEnabled: pushNotificationsEnabled,
       pushSubscriptionState: pushSubscriptionState,
       pushLeaseInstallationId: pushLeaseInstallationId,

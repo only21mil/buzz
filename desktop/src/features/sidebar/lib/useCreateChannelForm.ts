@@ -41,8 +41,6 @@ export type CreateChannelFormState = {
   setEphemeral: (value: boolean) => void;
   ttlSeconds: number;
   setTtlSeconds: (value: number) => void;
-  typePopoverOpen: boolean;
-  setTypePopoverOpen: (open: boolean) => void;
   errorMessage: string | null;
   selectedTemplateId: string | null;
   handleTemplateChange: (templateId: string) => void;
@@ -79,14 +77,8 @@ export function useCreateChannelForm({
   const [selectedTemplateId, setSelectedTemplateId] = React.useState<
     string | null
   >(null);
-  const [typePopoverOpen, setTypePopoverOpen] = React.useState(false);
-  const typePopoverOpenRef = React.useRef(typePopoverOpen);
   const nameInputRef = React.useRef<HTMLInputElement>(null);
   const visibilityTouchedRef = React.useRef(false);
-
-  React.useEffect(() => {
-    typePopoverOpenRef.current = typePopoverOpen;
-  }, [typePopoverOpen]);
 
   const templatesQuery = useChannelTemplatesQuery();
   const templates = templatesQuery.data ?? [];
@@ -102,15 +94,12 @@ export function useCreateChannelForm({
     setTtlSeconds(DEFAULT_EPHEMERAL_TTL_SECONDS);
     setErrorMessage(null);
     setSelectedTemplateId(null);
-    setTypePopoverOpen(false);
     visibilityTouchedRef.current = false;
 
     if (!autoFocusName) return;
 
     // Small delay to let the dialog animation start before focusing.
     const timerId = globalThis.setTimeout(() => {
-      // The type menu is portalled outside the form. Preserve its focus too.
-      if (typePopoverOpenRef.current) return;
       const activeElement = document.activeElement;
       if (
         activeElement instanceof HTMLElement &&
@@ -218,8 +207,6 @@ export function useCreateChannelForm({
     setEphemeral,
     ttlSeconds,
     setTtlSeconds,
-    typePopoverOpen,
-    setTypePopoverOpen,
     errorMessage,
     selectedTemplateId,
     handleTemplateChange,

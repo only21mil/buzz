@@ -1,13 +1,16 @@
-import type { QueryClient } from "@tanstack/react-query";
 import { projectCollectionMutationOptions } from "./projectCollectionMutation";
-import type { ProjectSnapshotScope } from "./projectSnapshot";
-import { preserveProjectSnapshotProvenance } from "./projectSnapshotProvenance";
+import type { ProjectCollectionScope } from "./projectCollectionScope";
 import { useProjectCollectionScope } from "./useProjectCollectionScope";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import {
+  type QueryClient,
+  useMutation,
+  useQueryClient,
+} from "@tanstack/react-query";
 
 import type { Repository } from "@/features/projects/hooks";
 import { eventToRepository } from "@/features/projects/projectModels";
 import { buildRepositoryChannelBindingTemplate } from "@/features/projects/projectRepositoryCreation";
+import { inheritProjectDataProvenance } from "@/features/projects/projectSnapshot";
 import { relayClient } from "@/shared/api/relayClient";
 import { signRelayEvent } from "@/shared/api/tauri";
 import { getIdentity } from "@/shared/api/tauriIdentity";
@@ -48,20 +51,10 @@ async function bindProjectRepositoryChannel({
   return updated;
 }
 
-export function useBindProjectRepositoryChannelMutation() {
-  const queryClient = useQueryClient();
-  return useMutation(
-    bindProjectRepositoryChannelMutationOptions(
-      queryClient,
-      useProjectCollectionScope(),
-    ),
-  );
-}
-
-/** Apply confirmed changes and uncertain-write refreshes to the starting scope. */
+/** Applies a binding to its captured collection without promoting snapshot rows. */
 export function bindProjectRepositoryChannelMutationOptions(
   queryClient: QueryClient,
-  scope: ProjectSnapshotScope | null,
+  scope: ProjectCollectionScope | null,
   mutationFn = bindProjectRepositoryChannel,
 ) {
   return projectCollectionMutationOptions(
@@ -69,21 +62,27 @@ export function bindProjectRepositoryChannelMutationOptions(
     scope,
     mutationFn,
     (current, repository) =>
-      current.map((project) => {
-        if (
-          !project.repositories.some(
-            (candidate) => candidate.repoAddress === repository.repoAddress,
-          )
+      current.map((project) =>
+        project.repositories.some(
+          (candidate) => candidate.repoAddress === repository.repoAddress,
         )
-          return project;
-        return preserveProjectSnapshotProvenance(project, {
-          ...project,
-          repositories: project.repositories.map((candidate) =>
-            candidate.repoAddress === repository.repoAddress
-              ? repository
-              : candidate,
-          ),
-        });
-      }),
+          ? inheritProjectDataProvenance(project, {
+              ...project,
+              repositories: project.repositories.map((candidate) =>
+                candidate.repoAddress === repository.repoAddress
+                  ? repository
+                  : candidate,
+              ),
+            })
+          : project,
+      ),
+  );
+}
+
+export function useBindProjectRepositoryChannelMutation() {
+  const queryClient = useQueryClient();
+  const scope = useProjectCollectionScope();
+  return useMutation(
+    bindProjectRepositoryChannelMutationOptions(queryClient, scope),
   );
 }

@@ -4,7 +4,7 @@ import {
   capturePublicationScope,
   type PublicationScope,
 } from "@/shared/api/publicationScope";
-import { editMessage } from "@/shared/api/tauri";
+import { editMessage } from "./lib/scopedMessageEdit";
 import type { Channel, RelayEvent } from "@/shared/api/types";
 import { splitOutgoingTags } from "./lib/imetaMediaMarkdown";
 import { applyEditTagOverlay } from "./lib/applyEditTagOverlay.mjs";

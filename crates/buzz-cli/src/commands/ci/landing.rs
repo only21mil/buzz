@@ -14,7 +14,9 @@
 //! `docs/delivery-lifecycle.md` makes it authoritative.
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::io::{Read as _, Seek as _, Write as _};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -49,6 +51,7 @@ pub const LANDING_SCHEMA_VERSION: u32 = 1;
 /// `BUZZ_MERGE_GATE_CHECK_MAX_AGE_SECONDS` default.
 pub const DEFAULT_MAX_AGE_SECONDS: u64 = 86_400;
 /// Upper bound on a receipt, as `protected-ci-receipt.py` enforces.
+#[cfg(unix)]
 pub const MAX_RECEIPT_BYTES: usize = 4 * 1024 * 1024;
 /// The ordinary CI workflow used by the protected merge gate.
 pub const WORKFLOW_PATH: &str = ".github/workflows/ci.yml";
@@ -1572,6 +1575,7 @@ fn parent_of(path: &Path) -> Result<&Path, CliError> {
         .ok_or_else(|| CliError::Usage("receipt path has no parent".into()))
 }
 
+#[cfg(unix)]
 fn check_private_parent(parent: &Path) -> Result<std::fs::Metadata, CliError> {
     let info = std::fs::symlink_metadata(parent)
         .map_err(|error| CliError::Usage(format!("cannot stat receipt parent: {error}")))?;
@@ -1600,6 +1604,7 @@ fn check_private_parent(parent: &Path) -> Result<std::fs::Metadata, CliError> {
 /// Publish a receipt create-only: a mode-0600 temporary in the mode-0700
 /// parent, fsync, byte read-back, then a hard link to the final name (which
 /// fails when the name exists) and removal of the temporary.
+#[cfg(unix)]
 pub fn publish_receipt(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
     let parent = parent_of(path)?;
     if bytes.len() > MAX_RECEIPT_BYTES {
@@ -1683,6 +1688,7 @@ pub fn publish_receipt(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
 
 /// Read a receipt under the same parent rule, refusing symlinks, foreign
 /// owners, extra links, and oversized files.
+#[cfg(unix)]
 pub fn read_receipt(path: &Path) -> Result<Vec<u8>, CliError> {
     let parent = parent_of(path)?;
     let parent_info = check_private_parent(parent)?;
@@ -1716,6 +1722,29 @@ pub fn read_receipt(path: &Path) -> Result<Vec<u8>, CliError> {
         return Err(CliError::Usage("receipt exceeds the size limit".into()));
     }
     Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn check_private_parent(_parent: &Path) -> Result<std::fs::Metadata, CliError> {
+    Err(CliError::Other(
+        "secure CI landing receipts are unsupported on this platform".into(),
+    ))
+}
+
+/// Refuse receipt publication on platforms without Unix ownership and mode checks.
+#[cfg(not(unix))]
+pub fn publish_receipt(_path: &Path, _bytes: &[u8]) -> Result<(), CliError> {
+    Err(CliError::Other(
+        "secure CI landing receipts are unsupported on this platform".into(),
+    ))
+}
+
+/// Refuse receipt reads on platforms without Unix ownership and mode checks.
+#[cfg(not(unix))]
+pub fn read_receipt(_path: &Path) -> Result<Vec<u8>, CliError> {
+    Err(CliError::Other(
+        "secure CI landing receipts are unsupported on this platform".into(),
+    ))
 }
 
 // ── Verify ──
@@ -2549,7 +2578,32 @@ async fn reverify_live(client: &BuzzClient, receipt: &LandingReceipt) -> Vec<Lan
     ledger.checks
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(unix)))]
+mod unsupported_platform_tests {
+    use super::*;
+
+    #[test]
+    fn receipt_operations_refuse_without_touching_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("receipt.json");
+        let error = publish_receipt(&path, b"{}").unwrap_err();
+        assert!(error.to_string().contains("unsupported on this platform"));
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        std::fs::write(&path, b"existing receipt").unwrap();
+        let error = read_receipt(&path).unwrap_err();
+        assert!(error.to_string().contains("unsupported on this platform"));
+        let error = publish_receipt(&path, b"replacement").unwrap_err();
+        assert!(error.to_string().contains("unsupported on this platform"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing receipt");
+
+        let error = check_private_parent(dir.path()).unwrap_err();
+        assert!(error.to_string().contains("unsupported on this platform"));
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use axum::body::Body;

@@ -222,7 +222,7 @@ async fn ensure_default_repo(
         None,
         &[],
         Some(channel),
-        &client.keys().public_key().to_hex(),
+        &caller,
         client.relay_url(),
     )?;
     let event = client.sign_event(builder)?;

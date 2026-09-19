@@ -3,10 +3,10 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
-import '../../shared/identity/npub.dart';
 import '../../shared/theme/theme.dart';
 import '../../shared/widgets/avatar_image.dart';
 import '../../shared/profile/user_cache_provider.dart';
+import '../../shared/utils/string_utils.dart';
 import 'note_card.dart';
 import 'pulse_models.dart';
 
@@ -28,7 +28,7 @@ class AgentActivityCard extends HookConsumerWidget {
     final profile =
         ref.watch(userCacheProvider.select((cache) => cache[group.pubkey])) ??
         ref.read(userCacheProvider.notifier).get(group.pubkey);
-    final name = profile?.label ?? truncateNpub(group.pubkey);
+    final name = profile?.label ?? shortPubkey(group.pubkey);
 
     return Column(
       children: [
@@ -48,6 +48,7 @@ class AgentActivityCard extends HookConsumerWidget {
                       radius: 18,
                       backgroundColor: context.colors.primaryContainer,
                       fallback: const Icon(LucideIcons.bot, size: 18),
+                      isAgent: true,
                     ),
                     Positioned(
                       right: 0,

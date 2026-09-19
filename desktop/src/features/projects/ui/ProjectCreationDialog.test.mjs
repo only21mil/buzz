@@ -136,6 +136,13 @@ test("empty Projects uses the shared creation flow and preserves desktop capabil
         id: String(writes.length),
         sig: "fixture",
       });
+    if (command === "create_channel")
+      return {
+        id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        name: args.name,
+        is_member: true,
+        visibility: "public",
+      };
     if (command === "get_channels") return client.getQueryData(["channels"]);
     return [];
   });
@@ -216,25 +223,12 @@ test("empty Projects uses the shared creation flow and preserves desktop capabil
     };
     await open();
     assert.equal(view.getByTestId("create-project-submit").disabled, true);
-    assert.deepEqual(
-      [...view.getByTestId("create-project-access-channel").options].map(
-        (option) => option.value,
-      ),
-      [
-        "",
-        "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-        "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-      ],
-    );
     fireEvent.change(view.getByTestId("create-project-name"), {
       target: { value: "Discard me" },
     });
     const draft = {
       name: "Discard me",
       description: "Keep this description",
-      "access-channel": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-      "clone-url": "https://example.com/project.git",
-      "web-url": "https://example.com/project",
     };
     for (const [field, value] of Object.entries(draft)) {
       fireEvent.change(view.getByTestId(`create-project-${field}`), {
@@ -303,12 +297,6 @@ test("empty Projects uses the shared creation flow and preserves desktop capabil
     await open();
     assert.equal(view.getByTestId("create-project-name").value, "");
     assert.equal(view.getByTestId("create-project-description").value, "");
-    assert.equal(view.getByTestId("create-project-clone-url").value, "");
-    assert.equal(view.getByTestId("create-project-web-url").value, "");
-    assert.equal(
-      view.getByTestId("create-project-access-channel").value,
-      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-    );
     fireEvent.change(view.getByTestId("create-project-name"), {
       target: { value: "First project" },
     });
@@ -377,7 +365,9 @@ test("empty Projects uses the shared creation flow and preserves desktop capabil
     await waitFor(() =>
       assert.equal(view.queryByTestId("create-project-dialog"), null),
     );
-    await waitFor(() => assert.ok(view.getByText("First project")));
+    await waitFor(() =>
+      assert.ok(view.getByTestId("project-card-first-project")),
+    );
     assert.equal(view.queryByText("No projects yet"), null);
     assert.equal(client.getQueryData(collectionKey).length, 1);
     // The populated menu opens the same form after first-run creation.
@@ -389,6 +379,7 @@ test("empty Projects uses the shared creation flow and preserves desktop capabil
     assert.equal(view.getByTestId("create-project-name").value, "");
   } finally {
     cleanup();
+    await client.cancelQueries();
     await new Promise((resolve) => setTimeout(resolve, 100));
     client.clear();
     relayClient.fetchEvents = fetchEvents;

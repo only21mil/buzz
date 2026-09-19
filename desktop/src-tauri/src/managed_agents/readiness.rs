@@ -51,6 +51,9 @@ use crate::managed_agents::{
     types::{AcpAvailabilityStatus, AgentDefinition, ManagedAgentRecord},
 };
 
+mod provider_requirements;
+use provider_requirements::{buzz_agent_requirements, goose_requirements};
+
 mod cli_login;
 pub(crate) mod cli_probe;
 
@@ -211,8 +214,93 @@ pub(crate) fn resolve_effective_agent_env(
     resolve_effective_agent_env_with_def(record, personas, runtime, global, harness_def)
 }
 
-mod launch_env;
-use launch_env::resolve_effective_agent_env_with_def;
+/// Inner implementation that accepts a pre-fetched `harness_def` to avoid a
+/// second registry lookup when the caller (e.g. `resolve_effective_harness_descriptor`)
+/// already has the definition in hand.
+fn resolve_effective_agent_env_with_def(
+    record: &ManagedAgentRecord,
+    personas: &[AgentDefinition],
+    runtime: Option<&KnownAcpRuntime>,
+    global: &GlobalAgentConfig,
+    harness_def: Option<std::sync::Arc<crate::managed_agents::custom_harnesses::HarnessDefinition>>,
+) -> EffectiveAgentEnv {
+    let effective_command = crate::managed_agents::record_agent_command(record, personas);
+
+    // Layer 1: baked build defaults (floor — internal builds only; OSS = empty).
+    let mut env = baked_build_env();
+
+    let (effective_model, effective_provider) =
+        super::global_config::resolve_effective_model_provider(record, personas, global);
+
+    if let Some(rt) = runtime {
+        for (key, value) in super::runtime::runtime_metadata_env_vars(
+            rt.model_env_var,
+            rt.provider_env_var,
+            rt.provider_locked,
+            effective_model.as_deref(),
+            effective_provider.as_deref(),
+        ) {
+            env.insert(key.to_string(), value.to_string());
+        }
+    }
+
+    // Layer 2b: definition env — the harness author's defaults (e.g. CURSOR_ACP=1).
+    // Applied as a floor below global so user env always wins on collision.
+    // Reserved keys are stripped by the shared `is_reserved_env_key` predicate.
+    if let Some(ref def) = harness_def {
+        for (key, value) in &def.env {
+            if !super::env_vars::is_reserved_env_key(key) {
+                env.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    // Layer 3a: global env vars — the lowest user-settable layer.
+    // Injected before persona/agent so per-agent values win on collision.
+    // `merged_user_env` with an empty "lower" map applies reserved/malformed-key
+    // filtering to the global map for free.
+    let global_env = merged_user_env(&BTreeMap::new(), &global.env_vars);
+    env.extend(global_env);
+
+    // Layer 3b: merged user env — live persona env under the record's own
+    // overrides (last-wins), after reserved/malformed-key filtering. Reading
+    // the persona live is what makes persona credential edits refresh on the
+    // next spawn instead of being frozen into the record.
+    let user_env = merged_user_env(
+        &super::env_vars::live_persona_env(personas, record.persona_id.as_deref()),
+        &record.env_vars,
+    );
+    env.extend(user_env);
+
+    // Single harness-agnostic effort authority (PR #4625): resolve effective
+    // effort over the canonical column AND all env tiers, emit one destination
+    // key. Runs AFTER the layer stack so launch, remote deploy, and the restart
+    // snapshot agree — no double authority, no foreign key, no badge disagreement.
+    super::config_bridge::effort::apply_launch_effort(
+        &mut env,
+        record,
+        runtime,
+        personas,
+        &global.env_vars,
+        harness_def.as_deref(),
+        &baked_build_env(),
+    );
+
+    // Buzz shared compute is a native Buzz provider. Translate it to buzz-agent's
+    // OpenAI-compatible transport only in the effective runtime environment.
+    #[cfg(feature = "mesh-llm")]
+    super::apply_relay_mesh_env(
+        &mut env,
+        effective_provider.as_deref(),
+        effective_model.as_deref(),
+    );
+
+    EffectiveAgentEnv {
+        env,
+        config_file_path: runtime.and_then(|r| r.config_file_path),
+        effective_command,
+    }
+}
 
 // ── Requirement types ─────────────────────────────────────────────────────────
 
@@ -372,211 +460,6 @@ fn collect_missing_requirements(
         "codex" => cli_login::requirements(&["codex", "login", "status"], "run `codex login`", rt),
         _ => vec![],
     }
-}
-
-/// Requirements for buzz-agent (provider + model + provider-specific creds).
-fn buzz_agent_requirements(effective: &EffectiveAgentEnv) -> Vec<Requirement> {
-    let mut missing = Vec::new();
-
-    #[cfg(windows)]
-    if !crate::managed_agents::git_bash_available(&effective.env) {
-        missing.push(Requirement::GitBash);
-    }
-
-    // Provider is required — maps to BUZZ_AGENT_PROVIDER in the effective env.
-    // An empty string is treated as absent: a key set to "" is not a valid
-    // provider and must not pass the readiness gate.
-    let provider = effective
-        .env
-        .get("BUZZ_AGENT_PROVIDER")
-        .filter(|v| !v.is_empty())
-        .map(String::as_str);
-    if provider.is_none() {
-        missing.push(Requirement::NormalizedField {
-            field: "provider".to_string(),
-        });
-    }
-
-    // Model is required — maps to BUZZ_AGENT_MODEL in the effective env.
-    // Same empty-string treatment as provider.
-    // Also accept provider-specific model fallback keys, matching buzz-agent's
-    // own config.rs `from_env()` resolution order (e.g. DATABRICKS_MODEL for
-    // databricks/databricks_v2, ANTHROPIC_MODEL for anthropic, etc.). The
-    // baked buzz-releases env sets DATABRICKS_MODEL but not BUZZ_AGENT_MODEL,
-    // so without this fallback agents baked from releases appear "not ready".
-    let provider_model_key = match provider {
-        Some("databricks") | Some("databricks_v2") | Some("databricks-v2") => {
-            Some("DATABRICKS_MODEL")
-        }
-        Some("anthropic") => Some("ANTHROPIC_MODEL"),
-        Some("openai") | Some("openai-compat") => Some("OPENAI_COMPAT_MODEL"),
-        Some("openrouter") => Some("OPENROUTER_MODEL"),
-        _ => None,
-    };
-    let model_present = effective
-        .env
-        .get("BUZZ_AGENT_MODEL")
-        .filter(|v| !v.is_empty())
-        .is_some()
-        || provider_model_key
-            .and_then(|k| effective.env.get(k))
-            .filter(|v| !v.is_empty())
-            .is_some();
-    if !model_present {
-        missing.push(Requirement::NormalizedField {
-            field: "model".to_string(),
-        });
-    }
-
-    // Provider-specific credential requirements.
-    // A key present with an empty value is treated as absent — matching the
-    // dialog's (envVars[key] ?? "").length === 0 emptiness check.
-    let env_key_missing = |key: &str| effective.env.get(key).is_none_or(|v| v.is_empty());
-    match provider {
-        Some("anthropic")
-            if env_key_missing("ANTHROPIC_API_KEY") => {
-                missing.push(Requirement::EnvKey {
-                    key: "ANTHROPIC_API_KEY".to_string(),
-                });
-            }
-        Some("openai")
-            if env_key_missing("OPENAI_COMPAT_API_KEY") => {
-                missing.push(Requirement::EnvKey {
-                    key: "OPENAI_COMPAT_API_KEY".to_string(),
-                });
-            }
-        Some("databricks") | Some("databricks_v2") | Some("databricks-v2")
-            // DATABRICKS_HOST is hard-required; DATABRICKS_TOKEN is optional
-            // (OAuth PKCE is the normal path — see buzz-agent/src/config.rs:143).
-            if env_key_missing("DATABRICKS_HOST") => {
-                missing.push(Requirement::EnvKey {
-                    key: "DATABRICKS_HOST".to_string(),
-                });
-            }
-        Some("openrouter")
-            if env_key_missing("OPENROUTER_API_KEY") => {
-                missing.push(Requirement::EnvKey {
-                    key: "OPENROUTER_API_KEY".to_string(),
-                });
-            }
-        _ => {
-            // Unknown provider or no provider yet — only the NormalizedField
-            // requirement above captures this gap.
-        }
-    }
-
-    missing
-}
-
-/// Requirements for goose (provider + model + provider-specific creds).
-///
-/// Mirrors buzz-agent requirements but uses GOOSE_PROVIDER / GOOSE_MODEL.
-///
-/// File-config tier: goose reads `~/.config/goose/config.yaml` at startup.
-/// Requirements already satisfied there are silenced — we don't need to
-/// require them from Buzz's env layer.  The file layer only *silences*
-/// requirements; it never injects values into the spawn env.
-///
-/// `file_cfg` is injected by the caller (read once at `collect_missing_requirements`)
-/// so this function is pure and unit-testable without touching disk.
-fn goose_requirements(
-    effective: &EffectiveAgentEnv,
-    file_cfg: Option<&crate::managed_agents::config_bridge::RuntimeFileConfig>,
-) -> Vec<Requirement> {
-    let mut missing = Vec::new();
-
-    // Empty string treated as absent — same as buzz_agent_requirements.
-    let provider = effective
-        .env
-        .get("GOOSE_PROVIDER")
-        .filter(|v| !v.is_empty())
-        .map(String::as_str);
-
-    // Effective provider for credential checking: prefer env layer, then file.
-    let effective_provider = provider.or_else(|| {
-        file_cfg
-            .as_ref()
-            .and_then(|c| c.provider.as_deref())
-            .filter(|v| !v.is_empty())
-    });
-
-    if provider.is_none() {
-        // Silenced if the file config provides a provider.
-        let file_provides_provider = file_cfg
-            .as_ref()
-            .and_then(|c| c.provider.as_deref())
-            .filter(|v| !v.is_empty())
-            .is_some();
-        if !file_provides_provider {
-            missing.push(Requirement::NormalizedField {
-                field: "provider".to_string(),
-            });
-        }
-    }
-
-    let model = effective
-        .env
-        .get("GOOSE_MODEL")
-        .filter(|v| !v.is_empty())
-        .map(String::as_str);
-    if model.is_none() {
-        // Silenced if the file config provides a model.
-        let file_provides_model = file_cfg
-            .as_ref()
-            .and_then(|c| c.model.as_deref())
-            .filter(|v| !v.is_empty())
-            .is_some();
-        if !file_provides_model {
-            missing.push(Requirement::NormalizedField {
-                field: "model".to_string(),
-            });
-        }
-    }
-
-    // Provider-specific credentials — same empty-string semantics as buzz-agent.
-    let env_key_missing = |key: &str| effective.env.get(key).is_none_or(|v| v.is_empty());
-    // A credential key is also satisfied when the file config's `extra` map
-    // contains it (e.g. DATABRICKS_HOST set in the goose config file).
-    let file_key_present = |key: &str| -> bool {
-        file_cfg
-            .as_ref()
-            .map(|c| c.extra.get(key).is_some_and(|v| !v.is_empty()))
-            .unwrap_or(false)
-    };
-    match effective_provider {
-        Some("anthropic")
-            if env_key_missing("ANTHROPIC_API_KEY") && !file_key_present("ANTHROPIC_API_KEY") =>
-        {
-            missing.push(Requirement::EnvKey {
-                key: "ANTHROPIC_API_KEY".to_string(),
-            });
-        }
-        Some("openai")
-            if env_key_missing("OPENAI_COMPAT_API_KEY")
-                && !file_key_present("OPENAI_COMPAT_API_KEY") =>
-        {
-            missing.push(Requirement::EnvKey {
-                key: "OPENAI_COMPAT_API_KEY".to_string(),
-            });
-        }
-        Some("databricks") | Some("databricks_v2") | Some("databricks-v2")
-            if env_key_missing("DATABRICKS_HOST") && !file_key_present("DATABRICKS_HOST") =>
-        {
-            missing.push(Requirement::EnvKey {
-                key: "DATABRICKS_HOST".to_string(),
-            });
-        }
-        Some("openrouter")
-            if env_key_missing("OPENROUTER_API_KEY") && !file_key_present("OPENROUTER_API_KEY") =>
-        {
-            missing.push(Requirement::EnvKey {
-                key: "OPENROUTER_API_KEY".to_string(),
-            });
-        }
-        _ => {}
-    }
-
-    missing
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1395,22 +1278,20 @@ mod tests {
     }
 
     // ── resolve_effective_agent_env ─────────────────────────────────────────
-
     #[test]
     fn resolve_effective_agent_env_user_env_wins_over_structured_fields() {
-        // A record whose env_vars explicitly set provider/model must win over
-        // any baked defaults. In OSS test builds the baked map is empty, so
-        // this test validates the user-env layer is present in the output.
+        // User env_vars must win over baked defaults; in OSS builds baked map is empty,
+        // so this validates the user-env layer is present in the output.
         let mut env_vars = BTreeMap::new();
         env_vars.insert("BUZZ_AGENT_PROVIDER".to_string(), "anthropic".to_string());
         env_vars.insert(
             "BUZZ_AGENT_MODEL".to_string(),
             "claude-opus-4-5".to_string(),
         );
-
         // Minimal record: only the fields resolve_effective_agent_env reads.
         let record = crate::managed_agents::types::ManagedAgentRecord {
-            effort_level: None,
+            session_policy: Default::default(),
+            description: None,
             pubkey: "test-pubkey".to_string(),
             name: "test-agent".to_string(),
             persona_id: None,
@@ -1437,6 +1318,7 @@ mod tests {
             runtime_pid: None,
             backend: Default::default(),
             backend_agent_id: None,
+            provider_policy_pending: false,
             provider_binary_path: None,
             team_id: None,
             persona_team_dir: None,
@@ -1465,6 +1347,7 @@ mod tests {
             definition_respond_to_allowlist: Vec::new(),
             definition_parallelism: None,
             relay_mesh: None,
+            effort_level: None,
         };
 
         let runtime = known_acp_runtime_exact("buzz-agent");
@@ -1480,8 +1363,6 @@ mod tests {
             Some("claude-opus-4-5")
         );
     }
-
-    // ── provider-specific model fallback tests ────────────────────────────
 
     #[test]
     fn buzz_agent_databricks_v2_with_databricks_model_but_no_buzz_agent_model_is_ready() {
@@ -1616,56 +1497,10 @@ mod tests {
             }));
     }
 
-    // ── OpenRouter readiness ─────────────────────────────────────────────
-
-    #[test]
-    fn buzz_agent_openrouter_with_all_fields_is_ready() {
-        let env = make_env(
-            "buzz-agent",
-            env_with(&[
-                ("BUZZ_AGENT_PROVIDER", "openrouter"),
-                ("BUZZ_AGENT_MODEL", "anthropic/claude-sonnet-4"),
-                ("OPENROUTER_API_KEY", "sk-or-test-key"),
-            ]),
-        );
-        let result = agent_readiness(&env);
-        assert!(
-            result.is_ready(),
-            "openrouter with all fields should be ready"
-        );
-    }
-
-    #[test]
-    fn buzz_agent_openrouter_missing_key_returns_not_ready() {
-        let env = make_env(
-            "buzz-agent",
-            env_with(&[
-                ("BUZZ_AGENT_PROVIDER", "openrouter"),
-                ("BUZZ_AGENT_MODEL", "anthropic/claude-sonnet-4"),
-            ]),
-        );
-        let result = agent_readiness(&env);
-        assert!(!result.is_ready());
-        assert!(result.requirements().contains(&Requirement::EnvKey {
-            key: "OPENROUTER_API_KEY".to_string()
-        }));
-    }
-    #[test]
-    fn buzz_agent_openrouter_with_provider_model_fallback_is_ready() {
-        let env = make_env(
-            "buzz-agent",
-            env_with(&[
-                ("BUZZ_AGENT_PROVIDER", "openrouter"),
-                ("OPENROUTER_MODEL", "google/gemini-2.5-flash"),
-                ("OPENROUTER_API_KEY", "sk-or-test-key"),
-            ]),
-        );
-        let result = agent_readiness(&env);
-        assert!(
-            result.is_ready(),
-            "OPENROUTER_MODEL fallback should satisfy model requirement"
-        );
-    }
+    // buzz-agent OpenRouter readiness tests live in a sibling file so this
+    // module stays under the desktop file-size ratchet.
+    #[path = "openrouter_tests.rs"]
+    mod openrouter_tests;
 }
 
 // Goose file-config-aware requirement tests live in a sibling file so this

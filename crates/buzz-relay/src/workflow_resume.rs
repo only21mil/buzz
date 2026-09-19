@@ -351,7 +351,7 @@ pub async fn run_workflow_resume_worker(
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_postgres_tests {
     use super::*;
     use buzz_core::channel::{ChannelType, ChannelVisibility};
     use buzz_db::{

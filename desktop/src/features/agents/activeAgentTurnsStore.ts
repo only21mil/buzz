@@ -5,6 +5,7 @@ import {
   subscribeAgentObserverEventBatches,
   getAgentObserverSnapshot,
   compareObserverEvents,
+  type AgentObserverStoreUpdate,
 } from "@/features/agents/observerRelayStore";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import type { ObserverEvent } from "./ui/agentSessionTypes";
@@ -441,17 +442,24 @@ function processEvent(
   return offsetChanged ? "changed" : "processed";
 }
 
-// Native tray consumers remain visible while the document is hidden.
-function ensurePruneInterval() {
+function startPruneInterval() {
   if (pruneInterval) return;
+  pruneExpired();
   pruneInterval = setInterval(pruneExpired, PRUNE_INTERVAL_MS);
 }
 
+function pausePruneInterval() {
+  if (!pruneInterval) return;
+  clearInterval(pruneInterval);
+  pruneInterval = null;
+}
+
+function ensurePruneInterval() {
+  startPruneInterval();
+}
+
 function stopPruneInterval() {
-  if (pruneInterval) {
-    clearInterval(pruneInterval);
-    pruneInterval = null;
-  }
+  pausePruneInterval();
 }
 
 export function subscribeActiveAgentTurns(listener: () => void) {
@@ -662,9 +670,32 @@ export function syncActiveAgentTurnsFromObserverBatch(
 }
 
 /**
- * Bridge hook: processes observer events into the active-turns store.
- * Should be called by a parent component that has access to the observer events.
+ * Build the steady-state observer listener once per agent-list revision. Observer
+ * publications carry only newly admitted events for one agent, so this callback
+ * does not revisit unrelated agents or their retained journals.
  */
+export function createActiveAgentTurnsObserverListener(
+  agents: readonly { pubkey: string; status: string }[],
+): (update?: AgentObserverStoreUpdate) => void {
+  const activeAgentPubkeys = new Set(
+    agents
+      .filter(
+        (agent) => agent.status === "running" || agent.status === "deployed",
+      )
+      .map((agent) => normalizePubkey(agent.pubkey)),
+  );
+
+  return (update?: AgentObserverStoreUpdate) => {
+    if (
+      !update ||
+      !activeAgentPubkeys.has(normalizePubkey(update.agentPubkey))
+    ) {
+      return;
+    }
+    syncAgentTurnsFromEvents(update.agentPubkey, [...update.events]);
+  };
+}
+
 export function useActiveAgentTurnsBridge(
   agents: readonly { pubkey: string; status: string }[],
 ) {

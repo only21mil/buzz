@@ -1,10 +1,11 @@
 //! Import-side helpers for `buzz-agent-snapshot v1`.
 //!
-//! Extracted from `snapshot.rs` to keep that file under the 1000-line gate.
-//! Preview and confirm commands are re-exported from `snapshot.rs` and registered
-//! in `lib.rs` through the same `personas::` path as the export commands.
+//! Extracted from `snapshot.rs` to keep that file under the 1500-line gate.
+//! The Tauri commands here (`preview_agent_snapshot_import`,
+//! `confirm_agent_snapshot_import`) are re-exported from `snapshot.rs` and
+//! registered in `lib.rs` through the same `personas::` path as the export
+//! commands.
 
-use super::super::retained_write::{save_and_retain, LocalWrite};
 use nostr::ToBech32;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
@@ -20,7 +21,7 @@ use crate::{
         load_managed_agents, load_personas, save_managed_agents, save_personas, AgentDefinition,
         ManagedAgentRecord, RespondTo,
     },
-    relay::{effective_agent_relay_url, relay_ws_url_with_override, sync_managed_agent_profile},
+    relay::{effective_agent_relay_url, relay_ws_url_with_override},
     util::now_iso,
 };
 
@@ -556,12 +557,14 @@ pub async fn confirm_agent_snapshot_import(
 
         let now = now_iso();
         let persona_id = uuid::Uuid::new_v4().to_string();
-
         // Build persona from snapshot definition.
         let persona = AgentDefinition {
             id: persona_id.clone(),
             display_name: display_name.clone(),
             avatar_url: effective_avatar.clone(),
+            description: crate::managed_agents::effective_agent_description(
+                snapshot.profile.about.as_deref(),
+            ),
             system_prompt: snapshot
                 .definition
                 .system_prompt
@@ -582,24 +585,26 @@ pub async fn confirm_agent_snapshot_import(
             respond_to: respond_to_wire.clone(),
             respond_to_allowlist: minted.respond_to_allowlist.clone(),
             parallelism: minted_parallelism,
+            session_policy: snapshot.definition.session_policy,
             created_at: now.clone(),
             updated_at: now.clone(),
         };
 
         personas.push(persona.clone());
-        save_and_retain(
-            LocalWrite::ImportedPersona(&persona.id),
-            || save_personas(&app, &personas),
-            || super::super::pending::retain_persona_pending(&app, &state, &persona),
-        )?;
+        save_personas(&app, &personas)?;
 
+        // Enqueue the kind:30175 persona event via the retention path.
+        super::super::pending::retain_persona_pending(&app, &state, &persona);
         // Build the managed agent record — no machine-local commands, no
         // secrets, no lineage from the snapshot.
         let record = ManagedAgentRecord {
-            effort_level: None,
             pubkey: pubkey.clone(),
             name: display_name.clone(),
             display_name: None,
+            // Linked definitions remain the sole description authority. Do
+            // not persist a second instance copy that can go stale after an
+            // edit or survive a later definition deletion.
+            description: None,
             slug: None,
             persona_id: Some(persona_id.clone()),
             private_key_nsec: private_key_nsec.clone(),
@@ -618,6 +623,7 @@ pub async fn confirm_agent_snapshot_import(
             max_turn_duration_seconds: snapshot.definition.max_turn_duration_seconds,
             parallelism: minted_parallelism
                 .unwrap_or(crate::managed_agents::DEFAULT_AGENT_PARALLELISM),
+            session_policy: snapshot.definition.session_policy,
             system_prompt: snapshot.definition.system_prompt.clone(),
             model: snapshot.definition.model.clone(),
             provider: snapshot.definition.provider.clone(),
@@ -628,6 +634,7 @@ pub async fn confirm_agent_snapshot_import(
             runtime_pid: None,
             backend: crate::managed_agents::BackendKind::Local,
             backend_agent_id: None,
+            provider_policy_pending: false,
             provider_binary_path: None,
             team_id: None,
             persona_team_dir: None,
@@ -655,19 +662,18 @@ pub async fn confirm_agent_snapshot_import(
             definition_respond_to_allowlist: minted.respond_to_allowlist.clone(),
             definition_parallelism: minted_parallelism,
             relay_mesh: None,
+            effort_level: None,
             runtime: snapshot.definition.runtime.clone(),
             name_pool: snapshot.definition.name_pool.clone(),
         };
 
         records.push(record.clone());
-        save_and_retain(
-            LocalWrite::ImportedAgent {
-                persona_id: &persona.id,
-                pubkey: &record.pubkey,
-            },
-            || save_managed_agents(&app, &records),
-            || retain_agent_pending(&app, &state, &record),
-        )?;
+        save_managed_agents(&app, &records)?;
+
+        // Enqueue the kind:30177 managed-agent event via retention.
+        // (Uses the same pattern as agents.rs::retain_managed_agent_pending
+        // inlined here to avoid cross-module private-fn access.)
+        retain_agent_pending(&app, &state, &record);
 
         crate::managed_agents::try_regenerate_nest(&app);
 
@@ -681,16 +687,16 @@ pub async fn confirm_agent_snapshot_import(
     // ── Phase 3b: publish kind:0 profile (async, outside lock) ───────────────
     let relay_url =
         effective_agent_relay_url(&record.relay_url, &relay_ws_url_with_override(&state));
-    let profile_sync_error = sync_managed_agent_profile(
+    let profile_sync_error = crate::commands::agents::publish_persona_profile(
         &state,
-        &relay_url,
+        &record.relay_url,
         &agent_keys,
         &display_name,
         effective_avatar.as_deref(),
+        &persona,
         auth_tag.as_deref(),
     )
-    .await
-    .err();
+    .await;
 
     // ── Phase 4: restore memory (async, outside lock) ─────────────────────────
     let memory_total = snapshot.memory.entries.len();
@@ -757,11 +763,7 @@ pub async fn confirm_agent_snapshot_import(
 /// Inline retention for the managed-agent kind:30177 event — mirrors
 /// `agents::retain_managed_agent_pending` without requiring cross-module
 /// private function access.
-fn retain_agent_pending(
-    app: &AppHandle,
-    state: &AppState,
-    record: &ManagedAgentRecord,
-) -> Result<(), String> {
+fn retain_agent_pending(app: &AppHandle, state: &AppState, record: &ManagedAgentRecord) {
     use crate::managed_agents::{
         agent_events::{agent_event_content, build_agent_event},
         persona_events::monotonic_created_at,
@@ -770,36 +772,41 @@ fn retain_agent_pending(
     use buzz_core_pkg::kind::KIND_MANAGED_AGENT;
     use nostr::JsonUtil;
 
-    let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
-    let conn = open_retention_db(&scope.db_path)?;
-    let content = serde_json::to_string(&agent_event_content(record))
-        .map_err(|e| format!("failed to serialize agent content: {e}"))?;
-    let (owner_pubkey, event) = {
-        let keys = &scope.owner_keys;
-        let owner_pubkey = keys.public_key().to_hex();
-        let existing =
-            get_retained_event(&conn, KIND_MANAGED_AGENT, &owner_pubkey, &record.pubkey)?;
-        if existing.as_ref().is_some_and(|row| row.content == content) {
-            return Ok(());
-        }
-        let event = build_agent_event(record)?
-            .custom_created_at(monotonic_created_at(existing.map(|row| row.created_at)))
-            .sign_with_keys(keys)
-            .map_err(|e| format!("failed to sign agent event: {e}"))?;
-        (owner_pubkey, event)
-    };
-    retain_event(
-        &conn,
-        &RetainedEvent {
-            kind: KIND_MANAGED_AGENT,
-            pubkey: owner_pubkey,
-            d_tag: record.pubkey.clone(),
-            content: event.content.to_string(),
-            created_at: event.created_at.as_secs() as i64,
-            raw_event: event.as_json(),
-            pending_sync: true,
-        },
-    )
+    let result = (|| -> Result<(), String> {
+        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+        let conn = open_retention_db(&scope.db_path)?;
+        let content = serde_json::to_string(&agent_event_content(record))
+            .map_err(|e| format!("failed to serialize agent content: {e}"))?;
+        let (owner_pubkey, event) = {
+            let keys = &scope.owner_keys;
+            let owner_pubkey = keys.public_key().to_hex();
+            let existing =
+                get_retained_event(&conn, KIND_MANAGED_AGENT, &owner_pubkey, &record.pubkey)?;
+            if existing.as_ref().is_some_and(|row| row.content == content) {
+                return Ok(());
+            }
+            let event = build_agent_event(record)?
+                .custom_created_at(monotonic_created_at(existing.map(|row| row.created_at)))
+                .sign_with_keys(keys)
+                .map_err(|e| format!("failed to sign agent event: {e}"))?;
+            (owner_pubkey, event)
+        };
+        retain_event(
+            &conn,
+            &RetainedEvent {
+                kind: KIND_MANAGED_AGENT,
+                pubkey: owner_pubkey,
+                d_tag: record.pubkey.clone(),
+                content: event.content.to_string(),
+                created_at: event.created_at.as_secs() as i64,
+                raw_event: event.as_json(),
+                pending_sync: true,
+            },
+        )
+    })();
+    if let Err(e) = result {
+        eprintln!("buzz-desktop: snapshot-import retain-agent: {e}");
+    }
 }
 
 /// POST a pre-built signed engram event to the relay, authenticating as the
@@ -890,4 +897,5 @@ mod egress_guard_tests {
 }
 
 #[cfg(test)]
+#[path = "import_avatar_tests.rs"]
 mod import_avatar_tests;

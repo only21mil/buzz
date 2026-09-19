@@ -13,7 +13,7 @@ const SHAREABLE_TAG_KINDS = new Set([
   "mention",
 ]);
 
-type SendToChannelSemantics = {
+export type SendToChannelSemantics = {
   mentionPubkeys: string[];
   semanticTags: string[][];
 };

@@ -250,6 +250,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { useCommunityJoinAlerts } from "@/features/community-members/useCommunityJoinAlerts.ts";
 import { joinAlertStorageKey } from "@/features/community-members/lib/joinAlerts.ts";
+import { truncateNpub } from "@/shared/lib/pubkey.ts";
 import { relayClient } from "@/shared/api/relayClient.ts";
 import { CommunitiesProvider } from "@/features/communities/useCommunities.tsx";
 import { useCommunities } from "@/features/communities/useCommunities.tsx";
@@ -478,6 +479,8 @@ function mountHook({ role = "owner", enabled = true } = {}) {
       await act(async () => {
         root.unmount();
       });
+      await queryClient.cancelQueries();
+      queryClient.clear();
     },
   };
 }
@@ -485,7 +488,7 @@ function mountHook({ role = "owner", enabled = true } = {}) {
 async function settle(iterations = 4) {
   for (let i = 0; i < iterations; i++) {
     await act(async () => {
-      await new Promise((r) => setTimeout(r, 5));
+      mock.timers.tick(5);
     });
   }
 }
@@ -499,7 +502,7 @@ async function settle(iterations = 4) {
  */
 async function settleAfterRefreshDebounce() {
   await act(async () => {
-    await new Promise((r) => setTimeout(r, 600));
+    mock.timers.tick(600);
   });
   await settle();
 }
@@ -515,7 +518,7 @@ async function settleAfterRefreshDebounce() {
  */
 async function settleAfterNotifyWindow() {
   await act(async () => {
-    await new Promise((r) => setTimeout(r, 1_700));
+    mock.timers.tick(1_700);
   });
   await settle();
 }
@@ -565,6 +568,7 @@ function ledgerKeys() {
 
 describe("useCommunityJoinAlerts — mounted subscription behaviour", () => {
   beforeEach(() => {
+    mock.timers.enable({ apis: ["setTimeout", "Date"], now: Date.now() });
     storage.clear();
     storageFull = false;
     notifications.length = 0;
@@ -575,6 +579,7 @@ describe("useCommunityJoinAlerts — mounted subscription behaviour", () => {
 
   afterEach(() => {
     mock.restoreAll();
+    mock.timers.reset();
   });
 
   /**
@@ -1715,7 +1720,7 @@ describe("useCommunityJoinAlerts — mounted subscription behaviour", () => {
       "a frame that predates the demotion must not re-open disclosure",
     );
     assert.ok(
-      !notifications.some((entry) => entry.body?.includes(BOB.slice(0, 8))),
+      !notifications.some((entry) => entry.body?.includes(truncateNpub(BOB))),
       "the demoted viewer must never learn the new member's identity",
     );
     assert.equal(
@@ -1982,11 +1987,11 @@ describe("useCommunityJoinAlerts — mounted subscription behaviour", () => {
       "a community switch clears the latch: the feature recovers without a reload",
     );
     assert.ok(
-      notifications.some((entry) => entry.body?.includes(BOB.slice(0, 8))),
+      notifications.some((entry) => entry.body?.includes(truncateNpub(BOB))),
       "the join suppressed by the latch is re-announced, not lost",
     );
     assert.ok(
-      notifications.some((entry) => entry.body?.includes(CAROL.slice(0, 8))),
+      notifications.some((entry) => entry.body?.includes(truncateNpub(CAROL))),
       "and the new join lands too",
     );
 
@@ -2093,7 +2098,7 @@ describe("useCommunityJoinAlerts — mounted subscription behaviour", () => {
         }),
       );
       await act(async () => {
-        await new Promise((r) => setTimeout(r, 1_000));
+        mock.timers.tick(1_000);
       });
     }
 

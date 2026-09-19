@@ -191,6 +191,11 @@ class _DmAvatar extends ConsumerWidget {
     }
 
     final avatarUrl = profile?.avatarUrl;
+    // Keyed to the hex public key when the counterpart is unnamed and the
+    // profile isn't cached — the compact-npub participant label would
+    // otherwise render `N` for every unnamed DM counterpart. Selection skips
+    // the current user like the row label does, so the initial always
+    // identifies the same counterpart the label names.
     final initial =
         profile?.initial ??
         dmAvatarInitial(channel, currentPubkey: currentPubkey);
@@ -212,6 +217,7 @@ class _DmAvatar extends ConsumerWidget {
                 fontWeight: FontWeight.w600,
               ),
             ),
+            isAgent: profile?.isAgent == true,
           ),
           Positioned(
             right: -1,

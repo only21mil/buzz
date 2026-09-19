@@ -104,7 +104,7 @@ test("two synthetic clients receive messages, edits, reactions and deletes befor
   ]) {
     for (const relay of relays) {
       const subId = [...relay.subscriptions.keys()][0];
-      relay.handleEvent(subId, incoming);
+      relay.handleEvent(subId, incoming, relay.connectionGeneration);
       clearTimeout(relay.flushTimeout);
       relay.flushEventBuffer();
     }
@@ -320,7 +320,7 @@ test("unrelated live events never enter persisted message caches", () => {
   );
 });
 
-test("60-second reconnect restores live delivery and fetches only the missed gap into cache", async () => {
+test("60-second reconnect restores live delivery and repairs the bounded gap into cache", async () => {
   const client = cache();
   seed(client);
   const requests = [],
@@ -347,18 +347,16 @@ test("60-second reconnect restores live delivery and fetches only the missed gap
     sendRaw: async (frame) => {
       requests.push(frame);
     },
-    requestHistoryPage: async (request) => {
+    requestRepair: async (request) => {
       pages.push(request);
-      return {
-        events: [event("offline", 9, [["h", "channel"]], "", 1030)],
-        nextCursor: null,
-      };
+      return [event("offline", 9, [["h", "channel"]], "", 1030)];
     },
   });
-  assert.equal(requests[0][2].limit, 0);
+  assert.equal(requests[0][2].limit, 1000);
   assert.equal(requests[0][2].since, 900);
-  assert.equal(pages[0].since, 995);
-  assert.equal(pages[0].until, 1060);
+  assert.equal(pages[0].since, 900);
+  // Native repair starts at relay head, avoiding renderer clock skew.
+  assert.equal(pages[0].until, undefined);
   assert.ok(
     client
       .getQueryData(["channel-messages", "channel"])
@@ -420,7 +418,7 @@ test("paged reconnect accepts a delayed pre-reconnect edit after backfill comple
     sendRaw: async (frame) => {
       liveFilter = frame[2];
     },
-    requestHistoryPage: async () => ({ events: [], nextCursor: null }),
+    requestRepair: async () => [],
   });
   const delayed = event(
     "late-edit",
@@ -440,7 +438,7 @@ test("paged reconnect accepts a delayed pre-reconnect edit after backfill comple
   ) {
     subscription.onEvent(delayed);
   }
-  assert.equal(liveFilter.limit, 0);
+  assert.equal(liveFilter.limit, 1000);
   assert.ok(
     client
       .getQueryData(["channel-messages", "channel"])

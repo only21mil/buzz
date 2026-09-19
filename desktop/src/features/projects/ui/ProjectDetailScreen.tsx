@@ -1,6 +1,10 @@
+import { buildProjectDetailCrumbs } from "./useProjectDetailCrumbs";
+import {
+  projectContributorActivityCounts,
+  signedProjectContributorPubkeys,
+} from "../lib/projectContributorMatching";
 import { Capability, useCapability } from "@/platform/web/capabilities";
 import { ProjectLoadState } from "./ProjectLoadState";
-import { findProjectHomeByChannelId } from "@/features/projects/lib/projectHomeChannel";
 import { ExternalLink, FolderGit2 } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
@@ -43,9 +47,6 @@ import {
   profilePanelViewFromSearch,
 } from "@/features/profile/ui/UserProfilePanelUtils";
 import { useIdentityQuery } from "@/shared/api/hooks";
-import { useMainInsetRef } from "@/shared/layout/MainInsetContext";
-import { channelContentTopPaddingMeasurement } from "@/shared/layout/chromeLayout";
-import { useMeasuredCssVariable } from "@/shared/layout/useMeasuredCssVariable";
 import { ProfilePanelProvider } from "@/shared/context/ProfilePanelContext";
 import { useHistorySearchState } from "@/shared/hooks/useHistorySearchState";
 import { useThreadPanelWidth } from "@/shared/hooks/useThreadPanelWidth";
@@ -79,7 +80,6 @@ import { ProjectDetailChrome } from "./ProjectDetailChrome";
 import { ProjectRepositoryManagement } from "./ProjectRepositoryManagement";
 import { UnavailableProjectRepositories } from "./UnavailableProjectRepositories";
 import {
-  PROJECT_TAB_CRUMB_LABELS,
   PROJECT_DETAIL_PANEL_SEARCH_KEYS,
   PROJECT_REPOSITORY_SEARCH_KEYS,
   type ProjectDetailScreenProps,
@@ -95,12 +95,6 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   const { commitHash, projectId, pullRequestId, issueId, repositoryId } = props;
   const { goChannel, goProject, goProjects } = useAppNavigation();
   const { activeCommunity } = useCommunities();
-  const mainInsetRef = useMainInsetRef();
-  const projectDetailHeaderChromeRef = useMeasuredCssVariable({
-    targetRef: mainInsetRef,
-    resetKey: projectId,
-    ...channelContentTopPaddingMeasurement,
-  });
   const projectQuery = useProjectQuery(projectId);
   const projectsQuery = useProjectsQuery();
   const project = projectQuery.data;
@@ -174,6 +168,14 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   // Bumped when breadcrumb navigation should land on the project Overview
   // tab; remounts WorkspaceTabs, which owns the selected-tab state.
   const [tabsResetKey, setTabsResetKey] = React.useState(0);
+  const [requestedTab, setRequestedTab] = React.useState<
+    ProjectDetailScreenProps["tab"]
+  >(props.tab);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: repeated entity links must reapply the requested tab.
+  React.useEffect(
+    () => setRequestedTab(props.tab),
+    [props.tab, props.entityNavigationId],
+  );
   // Mirror of the WorkspaceTabs selection so the breadcrumb can name the
   // active sub-tab. The Overview (readme) tab is "home" and gets no crumb.
   const [activeTab, setActiveTab] = React.useState("overview");
@@ -376,9 +378,6 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   const filesSourceControls: RepoSourceHeaderControls = {
     branch: activeBranch ?? "",
     branchOptions: branchOptionsWithLocal,
-    remoteBranches: managedBranches.map((branch) => branch.name),
-    localBranches: repoSyncStatusQuery.data?.localBranches ?? [],
-    localCheckouts: repoSyncStatusQuery.data?.localCheckouts ?? [],
     selectedTag,
     tagOptions: repoStateQuery.data?.tags ?? [],
     onBranchChange: handleBranchChange,
@@ -750,40 +749,18 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
       ) ?? null)
     : null;
 
-  // The active work item drives the breadcrumb trail: Projects › project ›
-  // sub-tab › title. `clear` steps back to the item's list tab. Categories
-  // match the workspace tab labels.
-  const activeWorkItemCrumb = selectedPullRequest
-    ? {
-        category: "Pull Request",
-        title: selectedPullRequest.title,
-        clear: () => setSelectedPullRequestId(null),
-      }
-    : selectedIssue
-      ? {
-          category: "Issues",
-          title: selectedIssue.title,
-          clear: () => setSelectedIssueId(null),
-        }
-      : selectedCommitHash
-        ? {
-            category: "Commits",
-            title: selectedCommit?.subject ?? selectedCommitHash.slice(0, 7),
-            clear: () => setSelectedCommitHash(null),
-          }
-        : null;
-  // Sub-tab crumb when no work item is open. Overview (readme) is home.
-  const activeTabCrumb = activeWorkItemCrumb
-    ? null
-    : (PROJECT_TAB_CRUMB_LABELS[activeTab] ?? null);
-  const handleGoToProjectHome = () => {
-    setSelectedPullRequestId(null);
-    setSelectedIssueId(null);
-    setSelectedCommitHash(null);
-    // Remount the workspace tabs so the project page opens on Overview
-    // instead of whatever tab the work item left behind.
-    setTabsResetKey((key) => key + 1);
-  };
+  const { activeTabCrumb, activeWorkItemCrumb, handleGoToProjectHome } =
+    buildProjectDetailCrumbs({
+      activeTab,
+      commit: selectedCommit,
+      issue: selectedIssue,
+      pullRequest: selectedPullRequest,
+      setRequestedTab,
+      setSelectedCommitHash,
+      setSelectedIssueId,
+      setSelectedPullRequestId,
+      setTabsResetKey,
+    });
   const handleRepositoryChange = (nextRepositoryId: string) => {
     applyRepositorySearch({
       repositoryId: nextRepositoryId,
@@ -806,7 +783,10 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
         activeBranchCommit={activeBranchCommit}
         existingBranches={branchOptionsWithLocal}
       />
-      <div className="flex min-h-0 min-w-0 flex-1 flex-row overflow-hidden">
+      <div
+        className="flex min-h-0 min-w-0 flex-1 flex-row overflow-hidden"
+        data-project-detail-screen
+      >
         <div className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
           {projectQuery.isError ? (
             <p
@@ -824,20 +804,24 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
             </p>
           ) : null}
           <ProjectDetailChrome
-            homeChannelId={
-              findProjectHomeByChannelId(
-                project.projectChannelId,
-                projectsQuery.data ?? [],
-              )?.id === project.id
-                ? project.projectChannelId
-                : null
+            repository={repository}
+            actions={
+              <Button
+                disabled={!terminalAvailable}
+                title={
+                  terminalAvailable
+                    ? projectTerminalLabel(hasLocalCheckout)
+                    : "Terminals require the desktop app"
+                }
+                onClick={() => void handleOpenTerminal()}
+                size="sm"
+                variant="ghost"
+              >
+                Terminal
+              </Button>
             }
             activeTabCrumb={activeTabCrumb}
             activeWorkItemCrumb={activeWorkItemCrumb}
-            chromeRef={projectDetailHeaderChromeRef}
-            onGoChannel={(channelId) => {
-              void goChannel(channelId);
-            }}
             onGoProjectHome={handleGoToProjectHome}
             onGoProjects={() => {
               void goProjects();
@@ -891,8 +875,26 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
               </section>
 
               <WorkspaceTabs
+                contributorActivityCounts={projectContributorActivityCounts({
+                  contributors: repository.contributors,
+                  owner: repository.owner,
+                  issues: issuesQuery.data ?? [],
+                  pullRequests: pullRequestsQuery.data ?? [],
+                })}
+                contributorPubkeys={signedProjectContributorPubkeys({
+                  contributors: repository.contributors,
+                  owner: repository.owner,
+                  issues: issuesQuery.data ?? [],
+                  pullRequests: pullRequestsQuery.data ?? [],
+                })}
+                selectedPullRequest={selectedPullRequest}
+                onBack={handleGoToProjectHome}
                 key={`${project.id}:${repository.id}:${tabsResetKey}:${props.entityNavigationId ?? ""}`}
-                initialTab={props.tab === "commits" ? "activity" : props.tab}
+                initialTab={
+                  requestedTab === "commits"
+                    ? "activity"
+                    : (requestedTab ?? "overview")
+                }
                 commitDiff={commitDiffQuery.data}
                 commitDiffError={commitDiffQuery.error}
                 commitDiffLoading={commitDiffQuery.isLoading}
@@ -921,23 +923,10 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
                 localSnapshot={localRepoSnapshotQuery.data}
                 localSnapshotError={localRepoSnapshotQuery.error}
                 localSnapshotLoading={localRepoSnapshotQuery.isLoading}
-                onBranchChange={handleBranchChange}
                 onOpenMergeRecoveryTerminal={
                   terminalAvailable
                     ? handleOpenMergeRecoveryTerminal
                     : undefined
-                }
-                onOpenTerminal={
-                  terminalAvailable
-                    ? () => {
-                        void handleOpenTerminal();
-                      }
-                    : undefined
-                }
-                terminalTitle={
-                  terminalAvailable
-                    ? projectTerminalLabel(hasLocalCheckout)
-                    : "Terminals require the desktop app"
                 }
                 onSelectedCommitHashChange={handleSelectedCommitHashChange}
                 onSelectedIssueIdChange={handleSelectedIssueIdChange}

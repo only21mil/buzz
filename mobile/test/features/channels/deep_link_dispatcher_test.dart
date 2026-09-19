@@ -1,4 +1,5 @@
 import 'dart:async';
+
 import 'package:buzz/features/channels/channel.dart';
 import 'package:buzz/features/channels/channels_provider.dart';
 import 'package:buzz/features/channels/deep_link_dispatcher.dart';
@@ -8,11 +9,81 @@ import 'package:buzz/shared/deeplink/deep_link.dart';
 import 'package:buzz/shared/deeplink/pending_deep_link_provider.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:nostr/nostr.dart' as nostr;
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../shared/community/community_storage_test.dart';
 
 void main() {
+  testWidgets('queues deep links in arrival order until acknowledged', (
+    tester,
+  ) async {
+    final controller = StreamController<Uri>();
+    PendingDeepLinkNotifier.debugUriStreamOverride = controller.stream;
+    addTearDown(() async {
+      PendingDeepLinkNotifier.debugUriStreamOverride = null;
+      await controller.close();
+    });
+    final container = ProviderContainer();
+    addTearDown(container.dispose);
+    container.read(pendingDeepLinkProvider);
+
+    const channelId = '580ca78b-9dae-46f3-8854-bd671853ba32';
+    final firstId = 'aa' * 32;
+    final secondId = 'bb' * 32;
+    controller
+      ..add(Uri.parse('buzz://message?channel=$channelId&id=$firstId'))
+      ..add(Uri.parse('buzz://message?channel=$channelId&id=$secondId'));
+    await tester.pump();
+
+    expect(
+      container.read(pendingDeepLinkProvider),
+      MessageDeepLink(channelId: channelId, messageId: firstId),
+    );
+    container.read(pendingDeepLinkProvider.notifier).consume();
+    expect(
+      container.read(pendingDeepLinkProvider),
+      MessageDeepLink(channelId: channelId, messageId: secondId),
+    );
+    container.read(pendingDeepLinkProvider.notifier).consume();
+    expect(container.read(pendingDeepLinkProvider), isNull);
+  });
+
+  testWidgets('drops a missing channel and dispatches the next queued link', (
+    tester,
+  ) async {
+    const missing = ChannelDeepLink(channelId: 'missing-channel');
+    const next = ChannelDeepLink(channelId: 'channel-1');
+    final pending = _QueuedPendingDeepLinkNotifier([missing, next]);
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          pendingDeepLinkProvider.overrideWith(() => pending),
+          channelsProvider.overrideWith(
+            () => _FakeChannelsNotifier(Future.value([_channel])),
+          ),
+        ],
+        child: MaterialApp(
+          home: DeepLinkDispatcher(
+            destinationBuilder: (channel, link) =>
+                _CapturedDestination(channel: channel, link: link),
+            child: const Scaffold(body: SizedBox()),
+          ),
+        ),
+      ),
+    );
+
+    await tester.pumpAndSettle();
+
+    expect(pending.consumeCalls, 2);
+    final destination = tester.widget<_CapturedDestination>(
+      find.byType(_CapturedDestination),
+    );
+    expect(destination.channel.id, 'channel-1');
+    expect(destination.link, same(next));
+  });
+
   testWidgets('dispatches a link that is already ready on mount', (
     tester,
   ) async {
@@ -47,9 +118,44 @@ void main() {
     final destination = tester.widget<_CapturedDestination>(
       find.byType(_CapturedDestination),
     );
+    final messageLink = destination.link as MessageDeepLink;
     expect(destination.channel.id, 'channel-1');
-    expect((destination.link as MessageDeepLink).messageId, 'message-2');
-    expect((destination.link as MessageDeepLink).threadRootId, 'message-1');
+    expect(messageLink.messageId, 'message-2');
+    expect(messageLink.threadRootId, 'message-1');
+  });
+
+  testWidgets('dispatches a channel-only link to the channel root', (
+    tester,
+  ) async {
+    const link = ChannelDeepLink(channelId: 'channel-1');
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          pendingDeepLinkProvider.overrideWith(
+            () => _FakePendingDeepLinkNotifier(link),
+          ),
+          channelsProvider.overrideWith(
+            () => _FakeChannelsNotifier(Future.value([_channel])),
+          ),
+        ],
+        child: MaterialApp(
+          home: DeepLinkDispatcher(
+            destinationBuilder: (channel, link) =>
+                _CapturedDestination(channel: channel, link: link),
+            child: const Scaffold(body: SizedBox()),
+          ),
+        ),
+      ),
+    );
+
+    await tester.pumpAndSettle();
+
+    final destination = tester.widget<_CapturedDestination>(
+      find.byType(_CapturedDestination),
+    );
+    expect(destination.channel.id, 'channel-1');
+    expect(destination.link, same(link));
   });
 
   testWidgets('switches to the notification community before dispatch', (
@@ -237,7 +343,7 @@ void main() {
           name: 'Relay',
           relayUrl: relayUrl,
           pubkey: 'pubkey',
-          nsec: 'nsec',
+          nsec: nostr.Keys.generate().nsec,
           addedAt: DateTime.utc(2026),
           starterSetupIncomplete: true,
         ),
@@ -311,7 +417,7 @@ void main() {
         name: 'Relay',
         relayUrl: relayUrl,
         pubkey: 'pubkey',
-        nsec: 'nsec',
+        nsec: nostr.Keys.generate().nsec,
         addedAt: DateTime.utc(2026),
         starterSetupIncomplete: true,
       ),
@@ -664,6 +770,27 @@ class _ThrowingCommunityStorage extends CommunityStorage {
   }
 }
 
+class _QueuedPendingDeepLinkNotifier extends PendingDeepLinkNotifier {
+  _QueuedPendingDeepLinkNotifier(List<BuzzDeepLink> links)
+    : _links = List.of(links);
+
+  final List<BuzzDeepLink> _links;
+  int consumeCalls = 0;
+
+  BuzzDeepLink? get _firstOrNull => _links.isEmpty ? null : _links.first;
+  BuzzDeepLink? get current => _firstOrNull;
+
+  @override
+  BuzzDeepLink? build() => _firstOrNull;
+
+  @override
+  void consume() {
+    consumeCalls++;
+    _links.removeAt(0);
+    state = _firstOrNull;
+  }
+}
+
 class _RecordingPendingDeepLinkNotifier extends PendingDeepLinkNotifier {
   _RecordingPendingDeepLinkNotifier(this.link);
 
@@ -721,25 +848,4 @@ class _CapturedDestination extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => const SizedBox();
-}
-
-class _QueuedPendingDeepLinkNotifier extends PendingDeepLinkNotifier {
-  _QueuedPendingDeepLinkNotifier(List<BuzzDeepLink> links)
-    : _links = List.of(links);
-
-  final List<BuzzDeepLink> _links;
-  int consumeCalls = 0;
-
-  BuzzDeepLink? get _firstOrNull => _links.isEmpty ? null : _links.first;
-  BuzzDeepLink? get current => _firstOrNull;
-
-  @override
-  BuzzDeepLink? build() => _firstOrNull;
-
-  @override
-  void consume() {
-    consumeCalls++;
-    _links.removeAt(0);
-    state = _firstOrNull;
-  }
 }

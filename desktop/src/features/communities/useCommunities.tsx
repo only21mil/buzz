@@ -1,4 +1,7 @@
-import { removeProjectSnapshotForRelay } from "@/features/projects/projectSnapshot";
+import {
+  removeMessageSnapshotsForIdentity,
+  removeMessageSnapshotsForCommunities,
+} from "@/features/messages/lib/messageSnapshot";
 import {
   createContext,
   useCallback,
@@ -20,10 +23,9 @@ import {
 import { removeSelfProfileCachesForRelay } from "@/features/profile/lib/selfProfileStorage";
 import { removeUserLabelCacheForRelay } from "@/features/profile/lib/userLabelStorage";
 import { removeChannelSnapshotForRelay } from "@/features/channels/channelSnapshot";
-import {
-  removeMessageSnapshotsForCommunities,
-  removeMessageSnapshotsForIdentity,
-} from "@/features/messages/lib/messageSnapshot";
+import { removeProjectSnapshotForRelay } from "@/features/projects/projectSnapshot";
+import { clearChannelHeadCache } from "@/shared/api/tauriChannelHeadCache";
+import { getIdentity } from "@/shared/api/tauriIdentity";
 import { clearSavedCommunitySnapshot } from "@/features/agents/activeAgentTurnsStore";
 import {
   clearCommunityDestinations,
@@ -46,7 +48,7 @@ export function resolveCommunityUpdateResult(
   activeId: string | null,
   id: string,
   updates: Partial<
-    Pick<Community, "name" | "relayUrl" | "pubkey" | "reposDir">
+    Pick<Community, "name" | "relayUrl" | "token" | "pubkey" | "reposDir">
   >,
 ): UpdateCommunityResult {
   const current = communities.find((w) => w.id === id);
@@ -63,6 +65,7 @@ export function resolveCommunityUpdateResult(
   const hasChange =
     (updates.name !== undefined && updates.name !== current.name) ||
     (updates.relayUrl !== undefined && updates.relayUrl !== current.relayUrl) ||
+    (updates.token !== undefined && updates.token !== current.token) ||
     (updates.pubkey !== undefined && updates.pubkey !== current.pubkey) ||
     (updates.reposDir !== undefined && updates.reposDir !== current.reposDir);
 
@@ -73,6 +76,7 @@ export function resolveCommunityUpdateResult(
     isActive &&
     ((updates.relayUrl !== undefined &&
       updates.relayUrl !== current.relayUrl) ||
+      (updates.token !== undefined && updates.token !== current.token) ||
       (updates.reposDir !== undefined &&
         updates.reposDir !== current.reposDir));
 
@@ -135,7 +139,7 @@ export function resolveCommunityRemoval(
 export type UseCommunitiesReturn = {
   communities: Community[];
   activeCommunity: Community | null;
-  /** Counter bumped when the active community's backend config changes. */
+  /** Counter bumped when the active community's config changes (relayUrl/token). */
   reinitKey: number;
   /** Add a community, deduplicating by relayUrl. Returns the final ID in the list. */
   addCommunity: (community: Community) => string;
@@ -147,7 +151,7 @@ export type UseCommunitiesReturn = {
   updateCommunity: (
     id: string,
     updates: Partial<
-      Pick<Community, "name" | "relayUrl" | "pubkey" | "reposDir">
+      Pick<Community, "name" | "relayUrl" | "token" | "pubkey" | "reposDir">
     >,
   ) => UpdateCommunityResult;
   /** Persist a new display order for the rail. IDs not in orderedIds keep their relative position at the end. */
@@ -202,6 +206,7 @@ function useCommunitiesInternal(): UseCommunitiesReturn {
             ? {
                 ...w,
                 name: community.name || w.name,
+                token: community.token ?? w.token,
                 pubkey: community.pubkey ?? w.pubkey,
               }
             : w,
@@ -216,13 +221,12 @@ function useCommunitiesInternal(): UseCommunitiesReturn {
   }, []);
 
   const clearCommunities = useCallback((signerPubkey?: string | null) => {
-    const removed = communitiesRef.current;
-    for (const community of removed)
-      removeProjectSnapshotForRelay(community.relayUrl);
     removeMessageSnapshotsForCommunities(
-      removed.map((community) => community.relayUrl),
+      communitiesRef.current.map((community) => community.relayUrl),
       signerPubkey,
     );
+    for (const community of communitiesRef.current)
+      removeProjectSnapshotForRelay(community.relayUrl);
     clearCommunityStorage();
     clearCommunityDestinations();
     setCommunitiesState([]);
@@ -244,6 +248,16 @@ function useCommunitiesInternal(): UseCommunitiesReturn {
       removeChannelSnapshotForRelay(removed.relayUrl);
       removeProjectSnapshotForRelay(removed.relayUrl);
       removeMessageSnapshotsForIdentity(removed.relayUrl, signerPubkey ?? "");
+      void getIdentity()
+        .then((identity) =>
+          clearChannelHeadCache({
+            pubkey: identity.pubkey,
+            relayUrl: removed.relayUrl,
+          }),
+        )
+        .catch((error) => {
+          console.warn("Failed to clear persisted channel heads", error);
+        });
       clearSavedCommunitySnapshot(id);
       removeCommunityDestination(id);
 
@@ -284,7 +298,7 @@ function useCommunitiesInternal(): UseCommunitiesReturn {
     (
       id: string,
       updates: Partial<
-        Pick<Community, "name" | "relayUrl" | "pubkey" | "reposDir">
+        Pick<Community, "name" | "relayUrl" | "token" | "pubkey" | "reposDir">
       >,
     ): UpdateCommunityResult => {
       const result = resolveCommunityUpdateResult(

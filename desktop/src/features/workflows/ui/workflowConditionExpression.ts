@@ -1,6 +1,6 @@
 import type { TriggerType } from "./workflowFormTypes";
 
-const CONDITION_OPERATORS = [
+export const CONDITION_OPERATORS = [
   "contains",
   "not_contains",
   "starts_with",
@@ -18,7 +18,7 @@ const EXACT_MATCH_OPERATORS = [
 ] as const satisfies readonly ConditionOperator[];
 const HEX_ID_PATTERN = /^[0-9a-fA-F]{64}$/;
 
-type ConditionField = { label: string; value: string };
+export type ConditionField = { label: string; value: string };
 export type ParsedConditionExpression = {
   field: string;
   operator: ConditionOperator;
@@ -59,6 +59,12 @@ export function conditionOperatorsForField(
     field.endsWith("_id")
     ? EXACT_MATCH_OPERATORS
     : CONDITION_OPERATORS;
+}
+
+export function defaultConditionOperatorForField(
+  field: string,
+): ConditionOperator {
+  return conditionOperatorsForField(field)[0];
 }
 
 export function conditionOperatorNeedsValue(
@@ -174,8 +180,6 @@ export function parseConditionExpression(
       value: unescapeEvalexprString(fn[4]),
       webhookField: "",
     };
-    // Basic edits rebuild every condition. Keep literals the builder would
-    // normalize or omit in Advanced so unrelated edits cannot change them.
     return conditionOperatorsForField(result.field).includes(result.operator) &&
       buildConditionExpression(result) === trimmed
       ? result

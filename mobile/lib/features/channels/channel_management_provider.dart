@@ -7,9 +7,10 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import '../../shared/auth/auth.dart';
 import '../../shared/custom_emoji/custom_emoji.dart';
 import '../../shared/custom_emoji/custom_emoji_provider.dart';
-import '../../shared/identity/npub.dart';
+import '../../shared/crypto/nip_oa.dart';
 import '../../shared/mentions/agent_identity_provider.dart';
 import '../../shared/relay/relay.dart';
+import '../../shared/utils/string_utils.dart';
 import '../profile/profile_provider.dart';
 import 'channel.dart';
 import 'channel_metadata_updates.dart';
@@ -35,7 +36,7 @@ class AddMembersException implements Exception {
   const AddMembersException(this.failures);
 
   String get message => failures.entries
-      .map((entry) => '${truncateNpub(entry.key)}: ${entry.value}')
+      .map((entry) => '${shortPubkey(entry.key)}: ${entry.value}')
       .join('; ');
 
   @override
@@ -68,7 +69,7 @@ class ChannelMember {
     if (displayName case final name? when name.trim().isNotEmpty) {
       return name.trim();
     }
-    return truncateNpub(pubkey);
+    return shortPubkey(pubkey);
   }
 }
 
@@ -172,7 +173,7 @@ class DirectoryUser {
     if (nip05 != null && nip05.isNotEmpty) {
       return nip05;
     }
-    return truncateNpub(pubkey);
+    return shortPubkey(pubkey);
   }
 
   String get secondaryLabel {
@@ -180,11 +181,15 @@ class DirectoryUser {
     if (nip05 != null && nip05.isNotEmpty && nip05 != label) {
       return nip05;
     }
+    // The primary label is already the compact key when no name or NIP-05
+    // exists; a second key-shaped line would only duplicate it.
     final display = displayName?.trim();
-    return display != null && display.isNotEmpty ? truncateNpub(pubkey) : '';
+    return display != null && display.isNotEmpty ? shortPubkey(pubkey) : '';
   }
 
-  /// Avatar initial keyed to the hex public key when unnamed.
+  /// Avatar initial — name-derived when available, otherwise keyed to the
+  /// hex public key so unnamed identities keep distinct initials (a compact
+  /// npub would render `N` for everyone).
   String get initial {
     final display = displayName?.trim();
     if (display != null && display.isNotEmpty) return display[0].toUpperCase();
@@ -320,6 +325,7 @@ List<DirectoryUser> directoryUsersFromProfileEvents(List<NostrEvent> events) {
           displayName: profile.displayName,
           avatarUrl: profile.avatarUrl,
           nip05Handle: profile.nip05,
+          isAgent: verifiedOaOwnerPubkey(event.tags, event.pubkey) != null,
         ),
   ]..sort((a, b) {
     final labelComparison = a.label.toLowerCase().compareTo(
@@ -388,6 +394,16 @@ final relayDirectoryUsersProvider =
                   displayName: profile.displayName,
                   avatarUrl: profile.avatarUrl,
                   nip05Handle: profile.nip05,
+                  isAgent:
+                      verifiedOaOwnerPubkey(
+                        profileEvents
+                            .firstWhere(
+                              (event) => event.pubkey.toLowerCase() == pubkey,
+                            )
+                            .tags,
+                        pubkey,
+                      ) !=
+                      null,
                 )
               else
                 DirectoryUser(pubkey: pubkey),
@@ -495,7 +511,11 @@ final channelDetailsProvider = FutureProvider.family<ChannelDetails, String>((
 /// Channel members from kind:39002 NIP-29 members event.
 final channelMembersProvider = FutureProvider.autoDispose
     .family<List<ChannelMember>, String>((ref, channelId) async {
-      ref.watch(channelMembershipUpdateProvider(channelId));
+      ref.watch(
+        channelMembershipUpdateProvider(
+          channelId,
+        ).select((update) => update.version),
+      );
       final relayBaseUrl = ref.watch(relayConfigProvider).baseUrl;
       final pubkey = ref.watch(myPubkeyProvider)?.toLowerCase();
       final snapshotCache = ref.read(_channelMembersSnapshotCacheProvider);

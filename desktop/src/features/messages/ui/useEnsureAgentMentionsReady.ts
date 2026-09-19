@@ -12,7 +12,7 @@ import {
 } from "./useMentionSendFlow.helpers";
 
 /** What the send path learned while making the mentioned agents ready. */
-type EnsureAgentMentionsReadyResult = {
+export type EnsureAgentMentionsReadyResult = {
   errors: string[];
   pubkeys: string[];
   /**
@@ -32,7 +32,7 @@ type EnsureAgentMentionsReadyResult = {
   agentsToWake: QueuedAgentWake[];
 };
 
-type EnsureAgentMentionsReady = (
+export type EnsureAgentMentionsReady = (
   mentionPubkeys: string[],
   capturedChannelId: string,
   preparedParticipantPubkeys?: string[],

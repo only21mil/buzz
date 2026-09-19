@@ -21,7 +21,8 @@ void main() {
               'priorityChannelEnabled': true,
               'activityChannelEnabled': false,
             },
-            'getInitialRoute' => 'buzz://message?channel=channel-1&id=initial',
+            'getInitialRoute' =>
+              'buzz://message?channel=00000000-0000-4000-8000-000000000001&id=1111111111111111111111111111111111111111111111111111111111111111',
             _ => null,
           };
         });
@@ -76,7 +77,8 @@ void main() {
       channel: 'priority',
       title: 'Sats',
       body: 'Ping',
-      route: 'buzz://message?channel=channel-1&id=abc',
+      route:
+          'buzz://message?channel=00000000-0000-4000-8000-000000000001&id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     );
 
     expect(calls.single.method, 'show');
@@ -85,14 +87,15 @@ void main() {
       'channel': 'priority',
       'title': 'Sats',
       'body': 'Ping',
-      'route': 'buzz://message?channel=channel-1&id=abc',
+      'route':
+          'buzz://message?channel=00000000-0000-4000-8000-000000000001&id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
     });
   });
 
   test('exposes initial and incoming tap routes', () async {
     expect(
       await bridge.getInitialRoute(),
-      'buzz://message?channel=channel-1&id=initial',
+      'buzz://message?channel=00000000-0000-4000-8000-000000000001&id=1111111111111111111111111111111111111111111111111111111111111111',
     );
 
     final tapped = bridge.notificationTaps.first;
@@ -102,7 +105,7 @@ void main() {
           const StandardMethodCodec().encodeMethodCall(
             const MethodCall(
               'notificationTapped',
-              'buzz://message?channel=channel-1&id=tapped',
+              'buzz://message?channel=00000000-0000-4000-8000-000000000001&id=2222222222222222222222222222222222222222222222222222222222222222',
             ),
           ),
           (_) {},
@@ -110,7 +113,7 @@ void main() {
 
     expect(
       await tapped.timeout(const Duration(seconds: 1)),
-      'buzz://message?channel=channel-1&id=tapped',
+      'buzz://message?channel=00000000-0000-4000-8000-000000000001&id=2222222222222222222222222222222222222222222222222222222222222222',
     );
   });
 
@@ -121,7 +124,8 @@ void main() {
         channel: 'priority',
         title: 'Sats',
         body: 'Ping',
-        route: 'https://example.com/message?id=abc',
+        route:
+            'https://example.com/message?id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
       ),
       throwsArgumentError,
     );

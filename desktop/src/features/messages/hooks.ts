@@ -1,3 +1,4 @@
+import { sendChannelMessage } from "./lib/scopedChannelMessage";
 import {
   assertPublicationScope,
   capturePublicationScope,
@@ -40,6 +41,12 @@ import { reconcileChannelWindowMessages } from "@/features/messages/lib/channelW
 import { appendChannelSubscriptionEvent } from "@/features/messages/lib/channelSubscriptionEvent";
 import { removeChannelWindowMessage } from "@/features/messages/lib/messageMutationProjection";
 import {
+  channelHeadCacheScope,
+  channelHeadHydration,
+  consumeHydratedChannel,
+} from "@/features/messages/lib/channelHeadCache";
+import { storeChannelHeadCache } from "@/shared/api/tauriChannelHeadCache";
+import {
   mergeMessages,
   mergeTimelineCacheMessages,
 } from "@/features/messages/lib/messageMerge";
@@ -47,6 +54,7 @@ import {
 export { mergeMessages, mergeTimelineCacheMessages };
 import { splitOutgoingTags } from "@/features/messages/lib/imetaMediaMarkdown";
 import { messageMentionPubkeys } from "@/features/messages/lib/messageMentionPubkeys";
+import { buildSentFromThreadTag } from "@/features/messages/lib/sentFromThread";
 import {
   clearTimeoutState,
   recordTimeoutFromRejection,
@@ -56,12 +64,7 @@ import { customEmojiQueryKey } from "@/features/custom-emoji/hooks";
 import { channelsQueryKey } from "@/features/channels/hooks";
 import { reactionEmojiUrl } from "@/shared/api/customEmoji";
 import type { CustomEmoji } from "@/shared/lib/remarkCustomEmoji";
-import {
-  addReaction,
-  deleteMessage,
-  removeReaction,
-  sendChannelMessage,
-} from "@/shared/api/tauri";
+import { addReaction, deleteMessage, removeReaction } from "@/shared/api/tauri";
 import { getChannelWindowEvents } from "@/shared/api/channelWindow";
 import type { Channel, Identity, RelayEvent } from "@/shared/api/types";
 import {
@@ -164,6 +167,8 @@ export function createOptimisticMessage(
   mentionPubkeys: string[] = [],
   parentEventId: string | null = null,
   mediaTags: string[][] = [],
+  sentFromThreadRootId: string | null = null,
+  sentFromThreadRootExcerpt: string | null = null,
 ): RelayEvent {
   const localKey = `optimistic-${crypto.randomUUID()}`;
   const tags: string[][] = [];
@@ -191,6 +196,11 @@ export function createOptimisticMessage(
 
   for (const tag of mediaTags) {
     tags.push(tag);
+  }
+  if (sentFromThreadRootId) {
+    tags.push(
+      buildSentFromThreadTag(sentFromThreadRootId, sentFromThreadRootExcerpt),
+    );
   }
 
   return {
@@ -303,10 +313,37 @@ export function useChannelWindowQuery(channel: Channel | null) {
   });
 }
 
+export function reconcileFetchedChannelWindow(
+  queryClient: QueryClient,
+  channelId: string,
+  events: Awaited<ReturnType<typeof getChannelWindowEvents>>,
+  previousMessages: RelayEvent[],
+  signal: AbortSignal,
+): RelayEvent[] {
+  // Tauri invokes cannot be canceled after dispatch. A replacement refetch can
+  // therefore win while this older request is still in flight. Never let that
+  // canceled request commit its stale page into the authoritative window.
+  signal.throwIfAborted();
+  const windowKey = channelWindowKey(channelId);
+  const page = parseChannelWindowResponse(events, channelId, null);
+  const current =
+    queryClient.getQueryData<ChannelWindowStore>(windowKey) ??
+    emptyChannelWindowStore();
+  const next = replaceNewestChannelWindow(current, page);
+  queryClient.setQueryData(windowKey, next);
+  const scope = channelHeadCacheScope(queryClient);
+  if (scope) {
+    void storeChannelHeadCache(scope, channelId, events).catch((error) => {
+      console.warn("Failed to persist channel head", channelId, error);
+    });
+  }
+  return reconcileChannelWindowMessages(next, previousMessages);
+}
+
 export function useChannelMessagesQuery(
   channel: Channel | null,
-  subscriptionGeneration: ChannelSubscriptionGeneration | true | null,
-  snapshotContext: { relayUrl: string; signerPubkey: string } | null,
+  subscriptionGeneration: ChannelSubscriptionGeneration | true | null = true,
+  snapshotContext: { relayUrl: string; signerPubkey: string } | null = null,
 ) {
   const queryClient = useQueryClient();
   const snapshotChannelId = channel?.id ?? null;
@@ -334,6 +371,7 @@ export function useChannelMessagesQuery(
       channel !== null &&
       channel.channelType !== "forum",
     queryKey,
+    meta: { subscriptionGated: subscriptionGeneration !== true },
     queryFn: async ({ signal }) => {
       if (!channel) throw new Error("No channel selected.");
       const generationToken =
@@ -359,7 +397,13 @@ export function useChannelMessagesQuery(
       );
 
       try {
+        await channelHeadHydration(queryClient);
         headTransaction.requireCurrent();
+        const hydrated = consumeHydratedChannel(queryClient, channel.id);
+        // Explicit subscription generations must fetch to close the live gap.
+        if (hydrated && subscriptionGeneration === true) {
+          return queryClient.getQueryData<RelayEvent[]>(queryKey) ?? [];
+        }
 
         const snapshot = snapshotScope
           ? readMessageSnapshot(snapshotScope)
@@ -391,6 +435,14 @@ export function useChannelMessagesQuery(
           queryClient.getQueryData<RelayEvent[]>(queryKey) ?? [],
         );
         headTransaction.requireCurrent();
+        const headScope = channelHeadCacheScope(queryClient);
+        if (headScope) {
+          void storeChannelHeadCache(headScope, channel.id, events).catch(
+            (error) => {
+              console.warn("Failed to persist channel head", channel.id, error);
+            },
+          );
+        }
         queryClient.setQueryData(windowKey, freshWindow);
         queryClient.setQueryData(queryKey, freshMessages);
 
@@ -565,6 +617,30 @@ export function useChannelSubscription(channel: Channel | null) {
 
         cleanup = dispose;
         const historyQueryKey = channelMessagesKey(channelId);
+        const query = queryClient
+          .getQueryCache()
+          .find({ queryKey: historyQueryKey, exact: true });
+        if (query?.meta?.subscriptionGated !== true) {
+          await refreshChannelWindowMessages(
+            queryClient,
+            channelId,
+            () => generationToken.guard.current,
+          ).catch((error) => {
+            // A history outage must not retire an established live stream.
+            // The failed query remains retryable, including on reconnect.
+            if (!isDisposed && generationToken.guard.current) {
+              console.error(
+                "Failed to refresh subscribed channel",
+                channelId,
+                error,
+              );
+            }
+          });
+          if (isDisposed || !generationToken.guard.current) return;
+          isReady = true;
+          setReadySubscription(generationToken);
+          return;
+        }
         await queryClient.cancelQueries({
           queryKey: historyQueryKey,
           exact: true,
@@ -589,6 +665,22 @@ export function useChannelSubscription(channel: Channel | null) {
         disposeSubscription();
         if (!isDisposed && generationToken.guard.current) {
           console.error("Failed to subscribe to channel", channelId, error);
+          const query = queryClient
+            .getQueryCache()
+            .find({ queryKey: channelMessagesKey(channelId), exact: true });
+          if (query?.meta?.subscriptionGated !== true) {
+            void refreshChannelWindowMessages(
+              queryClient,
+              channelId,
+              () => generationToken.guard.current,
+            ).catch((refreshError) => {
+              console.error(
+                "Failed to refresh channel after subscription failure",
+                channelId,
+                refreshError,
+              );
+            });
+          }
         }
       });
 
@@ -641,6 +733,10 @@ export function useSendMessageMutation(
       mentionPubkeys?: string[];
       parentEventId?: string | null;
       mediaTags?: string[][];
+      forceRest?: boolean;
+      sentFromThreadRootId?: string | null;
+      sentFromThreadRootExcerpt?: string | null;
+      transport?: "auto" | "http";
     },
     MessageQueryContext | undefined
   >({
@@ -652,6 +748,10 @@ export function useSendMessageMutation(
       mentionPubkeys,
       parentEventId,
       mediaTags,
+      forceRest,
+      sentFromThreadRootId,
+      sentFromThreadRootExcerpt,
+      transport = "auto",
     }) => {
       assertPublicationScope(publicationScope);
       // Prefer a channel captured by the caller at compose time. Otherwise,
@@ -695,11 +795,28 @@ export function useSendMessageMutation(
         identity.pubkey,
         mentionPubkeys,
       );
+      if (sentFromThreadRootId && parentEventId) {
+        throw new Error(
+          "A thread message can only be sent as a top-level message.",
+        );
+      }
 
+      const sentFromThreadTag = sentFromThreadRootId
+        ? buildSentFromThreadTag(
+            sentFromThreadRootId,
+            sentFromThreadRootExcerpt,
+          )
+        : undefined;
+
+      // Captured sends use the native epoch fence until the shared WebSocket
+      // publisher accepts publicationScope again.
       // Messages carrying media OR custom-emoji tags MUST go through REST so
       // the relay's tag validation runs. The WebSocket path emits no extra
       // tags, so emoji-only messages would otherwise lose their emoji tag.
       if (
+        publicationScope !== undefined ||
+        forceRest ||
+        transport === "http" ||
         parentEventId ||
         imetaTags.length > 0 ||
         emojiTags.length > 0 ||
@@ -731,6 +848,7 @@ export function useSendMessageMutation(
           mentionTags,
           linkPreviewTags,
           suppliedRootEventId,
+          sentFromThreadTag,
           publicationScope,
         );
 
@@ -770,6 +888,7 @@ export function useSendMessageMutation(
             ...emojiTags,
             ...mentionTags,
             ...linkPreviewTags,
+            ...(sentFromThreadTag ? [sentFromThreadTag] : []),
           ],
           content: content.trim(),
           sig: "",
@@ -780,8 +899,7 @@ export function useSendMessageMutation(
         effectiveChannel.id,
         content,
         recipientPubkeys,
-        mentionTags,
-        publicationScope,
+        [...mentionTags, ...(sentFromThreadTag ? [sentFromThreadTag] : [])],
       );
     },
     onMutate: async ({
@@ -791,6 +909,8 @@ export function useSendMessageMutation(
       mentionPubkeys,
       parentEventId,
       mediaTags,
+      sentFromThreadRootId,
+      sentFromThreadRootExcerpt,
     }) => {
       // Mirror mutationFn's target resolution so the optimistic message lands
       // in the cache for the same channel as the real send. A caller-supplied
@@ -811,11 +931,17 @@ export function useSendMessageMutation(
       }
 
       const queryKey = channelMessagesKey(effectiveChannel.id);
-      await queryClient.cancelQueries({ queryKey });
+      const windowKey = channelWindowKey(effectiveChannel.id);
+      // The rendered timeline is projected from the channel-window cache. Cancel
+      // both reads before snapshotting either cache so an older window response
+      // cannot replace the optimistic row between onMutate and onSuccess.
+      await Promise.all([
+        queryClient.cancelQueries({ queryKey }),
+        queryClient.cancelQueries({ queryKey: windowKey }),
+      ]);
 
       const currentMessages =
         queryClient.getQueryData<RelayEvent[]>(queryKey) ?? [];
-      const windowKey = channelWindowKey(effectiveChannel.id);
       const currentWindow =
         queryClient.getQueryData<ChannelWindowStore>(windowKey);
       const optimisticMessage = createOptimisticMessage(
@@ -826,6 +952,8 @@ export function useSendMessageMutation(
         mentionPubkeys ?? [],
         parentEventId ?? null,
         mediaTags ?? [],
+        sentFromThreadRootId ?? null,
+        sentFromThreadRootExcerpt ?? null,
       );
 
       const nextWindow = mergeLiveChannelWindowEvent(

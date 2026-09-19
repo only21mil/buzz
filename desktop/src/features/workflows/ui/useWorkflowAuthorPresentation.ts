@@ -1,4 +1,3 @@
-import { safeWorkflowProfiles } from "./workflowAuthorCandidates";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
 import { resolveUserLabel } from "@/features/profile/lib/identity";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -11,6 +10,7 @@ const FULL_HEX_PUBKEY = /^[0-9a-f]{64}$/i;
 export type WorkflowAuthorPresentation = {
   avatarUrl: string | null;
   description: string;
+  isAgent: boolean;
   label: string | null;
   loading: boolean;
   pubkey: string | null;
@@ -34,14 +34,13 @@ export function useWorkflowAuthorPresentation(
   const identityQuery = useIdentityQuery();
   const pubkey = workflowTriggerAuthorPubkey(trigger);
   const profilesQuery = useUsersBatchQuery(pubkey ? [pubkey] : []);
-  const profiles = safeWorkflowProfiles(profilesQuery.data?.profiles);
-  const profile = pubkey ? profiles[pubkey] : undefined;
+  const profile = pubkey ? profilesQuery.data?.profiles[pubkey] : undefined;
   const loading = Boolean(pubkey && !profile && profilesQuery.isPending);
   const label =
     pubkey && !loading
       ? resolveUserLabel({
           currentPubkey: identityQuery.data?.pubkey,
-          profiles,
+          profiles: profilesQuery.data?.profiles,
           pubkey,
         })
       : null;
@@ -52,6 +51,7 @@ export function useWorkflowAuthorPresentation(
       authorLabel: label ?? undefined,
       authorLoading: loading,
     }),
+    isAgent: profile?.isAgent === true,
     label,
     loading,
     pubkey,

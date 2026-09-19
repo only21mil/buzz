@@ -93,7 +93,7 @@ test.describe("profile active turn indicator", () => {
     const panel = page.getByTestId("user-profile-panel");
     await expect(panel).toBeVisible();
     await expect(
-      panel.getByRole("heading", { name: "Charlie", exact: true }),
+      panel.getByRole("heading", { name: "Edit Charlie", exact: true }),
     ).toBeVisible();
     const liveActivity = panel.getByTestId(
       `user-profile-live-activity-${AGENT_PUBKEY}`,
@@ -120,7 +120,7 @@ test.describe("profile active turn indicator", () => {
     const panel = page.getByTestId("user-profile-panel");
     await expect(panel).toBeVisible();
     await expect(
-      panel.getByRole("heading", { name: "Charlie", exact: true }),
+      panel.getByRole("heading", { name: "Edit Charlie", exact: true }),
     ).toBeVisible();
     const liveActivity = panel.getByTestId(
       `user-profile-live-activity-${AGENT_PUBKEY}`,

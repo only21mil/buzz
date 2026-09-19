@@ -83,33 +83,6 @@ pub(super) fn build_sentence_append_buffer(
     buffer
 }
 
-pub(super) fn group_sentences_into_chunks(sentences: &[String], max_chars: usize) -> Vec<String> {
-    let mut chunks: Vec<String> = Vec::new();
-    for (index, sentence) in sentences.iter().enumerate() {
-        let sentence = sentence.trim();
-        if sentence.is_empty() {
-            continue;
-        }
-        if index == 0 || chunks.is_empty() {
-            chunks.push(sentence.to_string());
-            continue;
-        }
-        let can_merge = chunks.len() > 1
-            && chunks
-                .last()
-                .is_some_and(|chunk| chunk.len() + 1 + sentence.len() <= max_chars);
-        if can_merge {
-            if let Some(last) = chunks.last_mut() {
-                last.push(' ');
-                last.push_str(sentence);
-            }
-        } else {
-            chunks.push(sentence.to_string());
-        }
-    }
-    chunks
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

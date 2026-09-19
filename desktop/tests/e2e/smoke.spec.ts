@@ -247,6 +247,18 @@ test("create agent supports parallelism and system prompt overrides", async ({
     .evaluate((el) => el.scrollIntoView({ block: "nearest" }));
   await expect(page.locator("#persona-parallelism")).toBeVisible();
   await page.locator("#persona-parallelism").fill("3");
+  const sessionPolicy = page.locator("#persona-session-policy");
+  await expect(sessionPolicy).toHaveAttribute(
+    "aria-describedby",
+    "persona-session-policy-description",
+  );
+  await expect(
+    page.locator("#persona-session-policy-description"),
+  ).toBeVisible();
+  await sessionPolicy.click();
+  await page
+    .getByRole("menuitemradio", { exact: true, name: "Each thread" })
+    .click();
 
   // Submitting mints a running instance whose behavioral quad resolves from
   // the definition (agents always start after creation).
@@ -258,6 +270,19 @@ test("create agent supports parallelism and system prompt overrides", async ({
   await expect(createdToast).toBeVisible({ timeout: 10_000 });
   await expect(createdToast).toHaveCount(1);
   await expect(page.getByRole("dialog")).toHaveCount(0);
+
+  const createPersonaPayload = await page.evaluate(() => {
+    const log = (
+      window as Window & {
+        __BUZZ_E2E_COMMAND_LOG__?: Array<{
+          command: string;
+          payload: { input?: { behavior?: { sessionPolicy?: string } } };
+        }>;
+      }
+    ).__BUZZ_E2E_COMMAND_LOG__;
+    return log?.find((entry) => entry.command === "create_persona")?.payload;
+  });
+  expect(createPersonaPayload?.input?.behavior?.sessionPolicy).toBe("thread");
 
   await expect(page.getByTestId("agents-library-personas")).toContainText(
     agentName,
@@ -602,7 +627,7 @@ test("global search offers an optional current-channel scope", async ({
   const firstScopedResult = page
     .locator('[data-search-section="messages"] .search-result-row')
     .first();
-  await expect(page.getByText("Welcome to #general")).toBeVisible();
+  await expect(page.getByText("Welcome to general")).toBeVisible();
   await expect(page.getByText(/Searching messages in/)).toHaveCount(0);
   await expect(relevantHeader).toBeVisible();
   await expect(firstScopedResult).toBeVisible();
@@ -921,7 +946,7 @@ test("replaces the channel pane when switching channels", async ({ page }) => {
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
   await expect(page.getByTestId("message-timeline")).toContainText(
-    "Welcome to #general",
+    "Welcome to general",
   );
 
   await page.getByTestId("channel-random").click();
@@ -931,7 +956,7 @@ test("replaces the channel pane when switching channels", async ({ page }) => {
     "This is the beginning of the regular channel.",
   );
   await expect(page.getByTestId("message-timeline")).not.toContainText(
-    "Welcome to #general",
+    "Welcome to general",
   );
   await expect(page.getByTestId("message-timeline")).toHaveCount(1);
   await expect(page.getByTestId("message-timeline-day-divider")).toHaveCount(0);
@@ -1056,4 +1081,56 @@ test("does not shift the timeline when the composer grows", async ({
   expect(after.clientHeight).toBeLessThanOrEqual(before.clientHeight);
   expect(Math.abs(after.scrollTop - before.scrollTop)).toBeLessThanOrEqual(2);
   expect(after.distanceFromBottom).toBeGreaterThan(160);
+});
+
+test("lifts Jump to latest when the composer grows", async ({ page }) => {
+  const input = page.getByTestId("message-input");
+
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+
+  await ensureTimelineScrollable(page, `Jump pill growth ${Date.now()}`);
+  await page.waitForTimeout(400);
+  const timeline = page.getByTestId("message-timeline");
+  await timeline.evaluate((element) => {
+    element.dispatchEvent(new WheelEvent("wheel", { deltaY: -100 }));
+    element.scrollTop = 0;
+    element.dispatchEvent(new Event("scroll", { bubbles: true }));
+  });
+
+  const jumpToLatest = page.getByTestId("message-scroll-to-latest");
+  const composer = page.getByTestId("message-composer");
+  await expect(jumpToLatest).toBeVisible();
+  const initialPillBox = await jumpToLatest.boundingBox();
+  const initialComposerBox = await composer.boundingBox();
+
+  await input.fill(
+    [
+      "Composer growth line one",
+      "Composer growth line two",
+      "Composer growth line three",
+      "Composer growth line four",
+    ].join("\n"),
+  );
+
+  await expect
+    .poll(async () => (await composer.boundingBox())?.height ?? 0)
+    .toBeGreaterThan((initialComposerBox?.height ?? 0) + 40);
+  await page.waitForTimeout(250);
+
+  const expandedPillBox = await jumpToLatest.boundingBox();
+  const expandedComposerBox = await composer.boundingBox();
+  expect(initialPillBox).not.toBeNull();
+  expect(initialComposerBox).not.toBeNull();
+  expect(expandedPillBox).not.toBeNull();
+  expect(expandedComposerBox).not.toBeNull();
+
+  const composerGrowth =
+    (expandedComposerBox?.height ?? 0) - (initialComposerBox?.height ?? 0);
+  const pillLift = (initialPillBox?.y ?? 0) - (expandedPillBox?.y ?? 0);
+  expect(pillLift).toBeGreaterThanOrEqual(composerGrowth - 2);
+  expect(
+    (expandedPillBox?.y ?? 0) + (expandedPillBox?.height ?? 0),
+  ).toBeLessThanOrEqual(expandedComposerBox?.y ?? 0);
 });

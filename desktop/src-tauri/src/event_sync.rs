@@ -13,9 +13,20 @@ use std::path::Path;
 /// `sync_team_personas` wrote in [`crate::migration::run_boot_migrations`]
 /// (see its `# Ordering` guard). Event signing needs the resolved owner keys,
 /// so this runs after identity resolution, not in the boot migrations.
-pub fn run_event_sync(app: &tauri::AppHandle, owner_keys: &nostr::Keys, db_path: &Path) {
+pub fn run_event_sync(
+    app: &tauri::AppHandle,
+    owner_keys: &nostr::Keys,
+    db_path: &Path,
+) -> Result<(), String> {
+    // Persona and agent legs stay best-effort: they log and swallow, and their
+    // failure does not undo the boot team-membership repair. The team leg is
+    // fatal — it establishes the superseding local head (a monotonic
+    // `created_at`) that lets `retain_inbound_event`'s equal/older guard reject
+    // a stale relay roster. If it fails, the caller must not let the frontend
+    // expose the community and start inbound replay against an un-superseded
+    // disk state.
     migrate_personas_to_events(app, owner_keys, db_path);
-    migrate_teams_to_events(app, owner_keys, db_path);
+    migrate_teams_to_events(app, owner_keys, db_path)?;
     reconcile_team_catalog_heads(app, owner_keys, db_path);
     crate::managed_agents::reconcile::reconcile_agents_to_events(app, owner_keys, db_path);
     // Negative-side backstop: retract any retained head whose disk record is
@@ -23,28 +34,29 @@ pub fn run_event_sync(app: &tauri::AppHandle, owner_keys: &nostr::Keys, db_path:
     // Runs LAST so the positive legs' just-retained live heads are matched and
     // skipped; only genuine orphans remain.
     reconcile_deleted_heads(app, owner_keys, db_path);
+    Ok(())
 }
 
-/// Spawn the best-effort event reconcile off the synchronous Tauri setup path.
+/// Run the scoped event reconcile to completion on the blocking pool.
 ///
-/// The owner keys are cloned before spawning so the task never touches the
-/// `AppState::keys` mutex. The reconcile itself is still synchronous JSON,
-/// SQLite, and signing work, so it runs on the blocking pool rather than an
-/// async worker.
-pub fn spawn_event_sync(
+/// Callers that must not let downstream work observe a not-yet-retained disk
+/// state (e.g. `apply_workspace` before the frontend can start inbound history
+/// replay) await this so the repaired local heads are durably retained — with a
+/// superseding `monotonic_created_at` — before an old relay head can race in.
+/// The owner keys are moved in so the task never touches the `AppState::keys`
+/// mutex; the reconcile itself is synchronous JSON/SQLite/signing work, so it
+/// runs on the blocking pool rather than an async worker.
+///
+/// Returns `Err` if the task fails to join or the fatal team leg errors, so the
+/// caller can withhold community exposure until the superseding head is durable.
+pub async fn run_event_sync_blocking(
     app: tauri::AppHandle,
     owner_keys: nostr::Keys,
     db_path: std::path::PathBuf,
-) {
-    tauri::async_runtime::spawn(async move {
-        if let Err(e) = tauri::async_runtime::spawn_blocking(move || {
-            run_event_sync(&app, &owner_keys, &db_path);
-        })
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || run_event_sync(&app, &owner_keys, &db_path))
         .await
-        {
-            eprintln!("buzz-desktop: event-sync: spawn_blocking failed: {e}");
-        }
-    });
+        .map_err(|e| format!("event-sync: spawn_blocking failed: {e}"))?
 }
 
 /// Reconcile `personas.json` into the persona-event retention store.
@@ -202,21 +214,23 @@ fn migrate_personas_in_dir_at(
 ///
 /// Must run after the persisted identity is resolved (it signs each event with
 /// the owner's keys).
-pub fn migrate_teams_to_events(app: &tauri::AppHandle, keys: &nostr::Keys, db_path: &Path) {
+pub fn migrate_teams_to_events(
+    app: &tauri::AppHandle,
+    keys: &nostr::Keys,
+    db_path: &Path,
+) -> Result<(), String> {
     use crate::managed_agents::managed_agents_base_dir;
 
-    let Ok(base_dir) = managed_agents_base_dir(app) else {
-        return;
-    };
+    let base_dir = managed_agents_base_dir(app)
+        .map_err(|e| format!("team-event-migration: base dir unavailable: {e}"))?;
 
     match migrate_teams_in_dir_at(&base_dir, keys, db_path) {
-        Ok(0) => {}
+        Ok(0) => Ok(()),
         Ok(migrated) => {
             eprintln!("buzz-desktop: team-event-migration: {migrated} teams migrated to retention");
+            Ok(())
         }
-        Err(e) => {
-            eprintln!("buzz-desktop: team-event-migration: {e}");
-        }
+        Err(e) => Err(format!("team-event-migration: {e}")),
     }
 }
 
@@ -324,13 +338,11 @@ fn migrate_teams_in_dir_at(
 /// published. This seam catches that drift, over currently-shared heads only —
 /// an unshared head is not discoverable, so nothing is stale to correct.
 ///
-/// Missing members may still be hydrating from the relay, including after a
-/// restart or community switch. Preserve their retained witness until they
-/// arrive; explicit local edits and signed deletions handle member retraction.
+/// Two outcomes, both keeping the published catalog truthful:
 ///
 /// - Still projects, bytes changed → republish a newer shared head.
-/// - Fully resolved but violates the projection contract → **purge + tombstone**
-///   (I4). An unshared stale body is not a
+/// - Can no longer be projected (a member was deleted, or it outgrew the size
+///   contract) → **purge + tombstone** (I4). An unshared stale body is not a
 ///   true retraction — it leaves the coordinate live with no opt-in tag, so
 ///   the team must fully disappear. A typed `team-catalog-auto-retracted`
 ///   notice names the team and reason so the owner knows why the toggle
@@ -468,16 +480,14 @@ fn reconcile_team_catalog_heads_core(
             continue;
         }
 
-        // An inbound team can be durable before its members arrive. Startup
-        // has no deletion evidence from absence alone, so preserve its witness
-        // just as the inbound refresh does. Later arrivals retry the projection.
-        let Ok(members) = resolve_team_members(team, &personas) else {
-            continue;
-        };
-
-        // With every member present, a projection failure is a retraction
-        // trigger: purge + tombstone the coordinate and notify the owner.
-        let builder = match build_team_catalog_event(team, &members, true) {
+        // Reproject from the current on-disk team and members. A failure is
+        // the retraction trigger: purge + tombstone the coordinate and notify
+        // the owner via a typed event. A stale-body "retraction" was rejected
+        // because an unshared-but-retained coordinate leaves the event live on
+        // the relay with no opt-in tag.
+        let rebuilt = resolve_team_members(team, &personas)
+            .and_then(|members| build_team_catalog_event(team, &members, true));
+        let builder = match rebuilt {
             Ok(builder) => builder,
             Err(reason) => {
                 eprintln!(

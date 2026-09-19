@@ -17,6 +17,11 @@ pub struct AgentDefinition {
     pub id: String,
     pub display_name: String,
     pub avatar_url: Option<String>,
+    /// Optional short, PUBLIC description (max 280 chars), shown on the
+    /// agent's card/profile and carried on the public kind:30175 persona
+    /// event. EXCLUDED from `persona_content_hash` (no restart badge).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub system_prompt: String,
     /// Preferred ACP runtime ID (e.g., 'goose', 'claude', 'codex'). Determines which agent binary
     /// Buzz spawns. When deploying from this persona, this runtime is pre-selected in the UI.
@@ -94,6 +99,11 @@ pub struct AgentDefinition {
     pub respond_to_allowlist: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parallelism: Option<u32>,
+    /// ACP conversation boundary for instances launched from this definition.
+    /// Channel preserves the historical behavior for definitions written by
+    /// older clients and is omitted from storage/public events for stable bytes.
+    #[serde(default, skip_serializing_if = "super::AcpSessionPolicy::is_channel")]
+    pub session_policy: super::AcpSessionPolicy,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -105,7 +115,6 @@ impl AgentDefinition {
     /// event coordinate (`d_tag = slug`) across the fold.
     pub fn into_agent_record(self) -> ManagedAgentRecord {
         ManagedAgentRecord {
-            effort_level: None,
             pubkey: String::new(),
             name: self.display_name.clone(),
             persona_id: None,
@@ -122,6 +131,7 @@ impl AgentDefinition {
             idle_timeout_seconds: None,
             max_turn_duration_seconds: None,
             parallelism: default_agent_parallelism(),
+            session_policy: self.session_policy,
             system_prompt: (!self.system_prompt.is_empty()).then_some(self.system_prompt),
             model: self.model,
             provider: self.provider,
@@ -132,6 +142,7 @@ impl AgentDefinition {
             runtime_pid: None,
             backend: BackendKind::default(),
             backend_agent_id: None,
+            provider_policy_pending: false,
             provider_binary_path: None,
             team_id: None,
             persona_team_dir: None,
@@ -146,6 +157,7 @@ impl AgentDefinition {
             respond_to: RespondTo::default(),
             respond_to_allowlist: Vec::new(),
             display_name: Some(self.display_name),
+            description: self.description,
             slug: Some(self.id),
             runtime: self.runtime,
             name_pool: self.name_pool,
@@ -161,6 +173,7 @@ impl AgentDefinition {
             definition_respond_to_allowlist: self.respond_to_allowlist,
             definition_parallelism: self.parallelism,
             relay_mesh: None,
+            effort_level: None,
         }
     }
 }
@@ -179,6 +192,7 @@ impl ManagedAgentRecord {
                 .clone()
                 .unwrap_or_else(|| self.name.clone()),
             avatar_url: self.avatar_url.clone(),
+            description: self.description.clone(),
             system_prompt: self.system_prompt.clone().unwrap_or_default(),
             runtime: self.runtime.clone(),
             model: self.model.clone(),
@@ -196,6 +210,7 @@ impl ManagedAgentRecord {
             respond_to: self.definition_respond_to.clone(),
             respond_to_allowlist: self.definition_respond_to_allowlist.clone(),
             parallelism: self.definition_parallelism,
+            session_policy: self.session_policy,
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
         })
@@ -205,7 +220,6 @@ impl ManagedAgentRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayAgentInfo {
     pub pubkey: String,
-    /// Owner authenticated by the agent's signed NIP-OA profile and owner policy.
     #[serde(default)]
     pub owner_pubkey: Option<String>,
     pub name: String,
@@ -257,13 +271,9 @@ pub struct ManagedAgentRecord {
     pub avatar_url: Option<String>,
     pub acp_command: String,
     pub agent_command: String,
-    /// Explicit per-instance harness pin. `None` (the default) means inherit
-    /// the harness from the linked persona's `runtime`, so persona harness
-    /// edits propagate on the next spawn — mirroring the opt-in `model`
-    /// override. `Some` is set only when the user deliberately picks a harness
-    /// that diverges from the persona. Resolved via `effective_agent_command`;
-    /// `agent_command` above is the create-time snapshot kept for avatar/legacy
-    /// derivations and is not authoritative for spawn.
+    /// Explicit per-instance harness pin; `None` inherits the persona runtime.
+    /// The effective command is resolved at spawn; `agent_command` is a legacy
+    /// create-time snapshot.
     #[serde(default)]
     pub agent_command_override: Option<String>,
     pub agent_args: Vec<String>,
@@ -287,6 +297,11 @@ pub struct ManagedAgentRecord {
     pub max_turn_duration_seconds: Option<u64>,
     #[serde(default = "default_agent_parallelism")]
     pub parallelism: u32,
+    /// ACP conversation boundary last applied to this record. Linked agents
+    /// are re-pinned from their definition at restart; definition records use
+    /// this same field as their durable value.
+    #[serde(default, skip_serializing_if = "super::AcpSessionPolicy::is_channel")]
+    pub session_policy: super::AcpSessionPolicy,
     pub system_prompt: Option<String>,
     /// Desired LLM model ID. Matches AgentModelInfo.id from discovery.
     /// The harness re-discovers the correct ACP switching metadata at session
@@ -306,9 +321,6 @@ pub struct ManagedAgentRecord {
     /// first load.
     #[serde(default)]
     pub provider: Option<String>,
-    /// Saved thinking effort, projected for the effective harness at process start.
-    #[serde(default)]
-    pub effort_level: Option<String>,
     /// Content hash of the persona at the time this agent was created — the
     /// `persona_content_hash` of the snapshot in `system_prompt` / `model` /
     /// `provider` / `env_vars`. The Agents menu compares it against the linked
@@ -335,6 +347,8 @@ pub struct ManagedAgentRecord {
     pub backend: BackendKind,
     #[serde(default)]
     pub backend_agent_id: Option<String>,
+    #[serde(default)]
+    pub provider_policy_pending: bool,
     #[serde(default)]
     pub provider_binary_path: Option<String>,
     /// Installed team directory path (absolute). Set when agent was created from a team persona.
@@ -371,6 +385,13 @@ pub struct ManagedAgentRecord {
     /// from `AgentDefinition.display_name` (unified agent model, Phase 1A).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// Optional short, PUBLIC agent description. Keyless definition records
+    /// carry the authored value; persona-linked instances leave it absent and
+    /// resolve through their definition so a second copy cannot drift.
+    /// Display metadata only (never spawn-relevant, never part of the persona
+    /// content hash).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Stable definition slug — the former `AgentDefinition.id`. Key-less
     /// records (definitions not yet instantiated) publish kind:30175 at
     /// `d_tag = slug`, preserving the pre-merge event coordinates. `None` for
@@ -457,24 +478,16 @@ pub struct ManagedAgentRecord {
     /// deserialize as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay_mesh: Option<RelayMeshConfig>,
-}
-
-/// Typed relay-mesh configuration carried on a [`ManagedAgentRecord`].
-///
-/// Feature-independent on purpose: the field is always present in the record
-/// schema so saved agents round-trip identically whether or not the `mesh-llm`
-/// feature is compiled in.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RelayMeshConfig {
-    /// The served model id this agent routes to (e.g. "Qwen3").
-    ///
-    /// `alias` because this struct crosses two boundaries with different
-    /// casing conventions: the TS create request sends camelCase
-    /// (`relayMesh: { modelRef }` — `rename_all` on the request does not
-    /// recurse into nested structs), while persisted records use snake_case.
-    /// Serialization stays `model_ref` so saved records are stable.
-    #[serde(alias = "modelRef")]
-    pub model_ref: String,
+    /// Canonical, harness-agnostic startup effort level. This is the single
+    /// persisted effort authority: at spawn the launch projection
+    /// (`config_bridge::effort`) resolves the effective value over this column
+    /// and all env tiers, then emits it under the destination runtime's native
+    /// key — `GOOSE_THINKING_EFFORT` for Goose, `BUZZ_AGENT_THINKING_EFFORT` for
+    /// buzz-agent, or the `BUZZ_ACP_EFFORT_LEVEL` startup sentinel for
+    /// Claude/Codex and keyless/unknown adapters. Preserved across runtime
+    /// switches (invalid values skip-as-absent at projection time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_level: Option<String>,
 }
 
 #[derive(Debug)]
@@ -537,6 +550,8 @@ pub struct ManagedAgentSummary {
     pub idle_timeout_seconds: Option<u64>,
     pub max_turn_duration_seconds: Option<u64>,
     pub parallelism: u32,
+    /// Effective definition-owned ACP conversation boundary.
+    pub session_policy: super::AcpSessionPolicy,
     pub system_prompt: Option<String>,
     pub avatar_url: Option<String>,
     pub model: Option<String>,
@@ -546,7 +561,6 @@ pub struct ManagedAgentSummary {
     /// (definition → global for linked instances; instance → global for
     /// definition-less instances). `None` for an orphaned instance.
     pub provider: Option<String>,
-    pub effort_level: Option<String>,
     /// `true` when the linked persona has been edited since this agent was
     /// created — the running agent uses the older pinned snapshot. The UI
     /// flags it and tells the user to delete + respawn to pick up the edit.
@@ -646,8 +660,64 @@ pub enum HarnessSource {
     Custom,
 }
 
-mod runtime_catalog;
-pub use runtime_catalog::AcpRuntimeCatalogEntry;
+#[derive(Debug, Clone, Serialize)]
+pub struct AcpRuntimeCatalogEntry {
+    pub id: String,
+    pub label: String,
+    pub avatar_url: String,
+    pub availability: AcpAvailabilityStatus,
+    pub command: Option<String>,
+    pub binary_path: Option<String>,
+    pub default_args: Vec<String>,
+    pub mcp_command: Option<String>,
+    /// Environment variable used to apply the initial model, when supported.
+    pub model_env_var: Option<String>,
+    /// Environment variable used to apply the selected LLM provider, when supported.
+    pub provider_env_var: Option<String>,
+    /// Environment variable used to apply thinking effort, when supported.
+    pub thinking_env_var: Option<String>,
+    /// Canonical accepted effort values for this runtime, in display order.
+    /// Serialized from `KnownAcpRuntime::effort_normalization.canonical` for
+    /// runtimes with a static finite vocabulary (e.g. Goose). `None` for
+    /// runtimes with no canonicalization contract (buzz-agent uses a
+    /// provider/model catalog; Claude/Codex/unknown runtimes accept any string).
+    ///
+    /// The renderer uses this to drive choices and validation, replacing the
+    /// TS-side `GOOSE_EFFORT_CANONICAL_VALUES` duplicate. When non-null, the
+    /// `harnessNative` effort field uses this list exclusively — `off` and all
+    /// other valid Goose values are always present when this is Goose, so
+    /// `useEffortAutoClear` never incorrectly deletes a valid saved value.
+    pub effort_canonical_values: Option<Vec<String>>,
+    pub max_tokens_env_var: Option<String>,
+    pub context_limit_env_var: Option<String>,
+    pub max_rounds_env_var: Option<String>,
+    pub install_hint: String,
+    pub install_instructions_url: String,
+    /// true when at least one automated install step is available
+    pub can_auto_install: bool,
+    /// true when this runtime depends on a separately installed vendor CLI.
+    pub requires_external_cli: bool,
+    pub underlying_cli_path: Option<String>,
+    /// true when an npm adapter step is pending but Node.js / npm is absent.
+    /// The UI hides the Install button and shows a Node.js install callout.
+    pub node_required: bool,
+    /// Login/authentication status for CLI-based runtimes.
+    pub auth_status: AuthStatus,
+    /// Hint for completing authentication, shown when `auth_status` is not `logged_in`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login_hint: Option<String>,
+    /// Whether this entry came from the compiled-in catalog or a user-supplied
+    /// JSON file in `custom_harnesses/`. The UI uses this to decide editability.
+    pub source: HarnessSource,
+    /// Definition-level env vars for `source: custom` entries; populated from
+    /// `HarnessDefinition.env` so saves don't silently erase existing vars.
+    /// Absent for builtin/preset entries. Skipped when empty in serialization.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub definition_env: BTreeMap<String, String>,
+    /// Spawn-time parallelism cap; absent for uncapped harnesses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_parallelism: Option<u32>,
+}
 
 /// Result of a single install step (CLI or adapter).
 #[derive(Debug, Clone, Serialize)]
@@ -918,9 +988,10 @@ pub fn resolve_mint_behavioral_defaults(
 
 mod catalog_source;
 pub use catalog_source::CatalogSource;
+mod relay_mesh;
+pub use relay_mesh::RelayMeshConfig;
 mod review_content;
 pub use review_content::PersonaReviewContent;
-
 mod requests;
 pub use requests::*;
 mod team_catalog_source;

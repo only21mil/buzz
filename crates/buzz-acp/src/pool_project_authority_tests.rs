@@ -29,6 +29,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
@@ -127,6 +128,7 @@ done"#
         state: SessionState::default(),
         model_capabilities: None,
         desired_model: None,
+        pending_model_ack: None,
         model_overridden: false,
         agent_name: "legacy-test-agent".into(),
         goose_system_prompt_supported: None,
@@ -149,6 +151,7 @@ done"#
             crate::relay::ChannelInfo {
                 name: "test-dm".into(),
                 channel_type: "dm".into(),
+                description: None,
             },
         )]),
         ctx.rest_client.clone(),

@@ -12,18 +12,15 @@ function encodeRawIpcHeader(value: string): string {
     .replace(/=+$/, "");
 }
 
-/** Upload a File through the platform's raw-byte transport without JSON expansion. */
+/** Transfer a browser File to Rust as a raw IPC body, avoiding JSON expansion. */
 export async function uploadMediaFile(
   file: File,
   progressId?: string,
   signal?: AbortSignal,
+  onDispatch?: () => void,
 ): Promise<BlobDescriptor> {
-  const native = isTauri();
   const headers: Record<string, string> = {
     "x-buzz-filename": encodeRawIpcHeader(file.name),
-    "x-buzz-content-type": encodeRawIpcHeader(
-      file.type || "application/octet-stream",
-    ),
   };
   if (progressId) {
     headers["x-buzz-progress-id"] = encodeRawIpcHeader(progressId);
@@ -32,13 +29,15 @@ export async function uploadMediaFile(
   if (signal?.aborted) throw new Error("upload cancelled");
   const bytes = new Uint8Array(await file.arrayBuffer());
   if (signal?.aborted) throw new Error("upload cancelled");
-  // The browser PAL accepts the signal directly; native IPC keeps its contract.
-  const options = { headers, ...(!native && signal ? { signal } : {}) };
+  onDispatch?.();
   try {
     return await invokeTauriRaw<BlobDescriptor>(
       "upload_media_bytes_raw",
       bytes,
-      options,
+      {
+        headers,
+        ...(!isTauri() ? { signal } : {}),
+      },
     );
   } catch (error) {
     if (error instanceof Error) throw error;
@@ -61,6 +60,11 @@ export async function cancelMediaUpload(progressId: string): Promise<void> {
   await invokeTauri("cancel_media_upload", { progressId });
 }
 
+/** Release the renderer's cancellation ownership after an upload settles. */
+export async function releaseMediaUpload(progressId: string): Promise<void> {
+  await invokeTauri("release_media_upload", { progressId });
+}
+
 /**
  * Open a native single-file picker constrained to images and upload the
  * chosen file. Non-image files are rejected in Rust (via MIME sniffing)
@@ -79,6 +83,50 @@ export async function pickAndUploadImage(): Promise<BlobDescriptor | null> {
  * proxy needs no special headers. The Rust side enforces the same URL
  * validation and size cap as the download commands.
  */
+export async function fetchMediaBytes(
+  url: string,
+  signal?: AbortSignal,
+): Promise<Uint8Array<ArrayBuffer>> {
+  if (signal?.aborted) {
+    throw new DOMException("Media fetch cancelled", "AbortError");
+  }
+
+  const requestId = signal ? crypto.randomUUID() : undefined;
+  // The Rust command replies with `tauri::ipc::Response`, so the bytes
+  // arrive as a raw ArrayBuffer rather than a JSON number array.
+  const request = invokeTauri<ArrayBuffer>("fetch_media_bytes", {
+    requestId,
+    url,
+  });
+  if (!signal || !requestId) return new Uint8Array(await request);
+
+  let rejectCancellation: ((reason?: unknown) => void) | undefined;
+  const cancellation = new Promise<never>((_resolve, reject) => {
+    rejectCancellation = reject;
+  });
+  const onAbort = () => {
+    void invokeTauri("cancel_media_fetch", { requestId })
+      .catch(() => undefined)
+      .finally(() => {
+        rejectCancellation?.(
+          new DOMException("Media fetch cancelled", "AbortError"),
+        );
+      });
+  };
+  signal.addEventListener("abort", onAbort, { once: true });
+
+  try {
+    const bytes = await Promise.race([request, cancellation]);
+    return new Uint8Array(bytes);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    await invokeTauri("release_media_fetch", { requestId }).catch(
+      () => undefined,
+    );
+  }
+}
+
+/** Fetch audio bytes while retaining native cancellation ownership until completion. */
 export async function fetchAudioBytes(
   url: string,
   signal?: AbortSignal,
@@ -175,13 +223,4 @@ export async function fetchSnapshotBytes(args: {
     expectedSize: args.expectedSize,
   });
   return Array.from(new Uint8Array(buffer));
-}
-
-/** Fetch a validated image for the editor without widening its native content policy. */
-export async function fetchMediaBytes(
-  url: string,
-): Promise<Uint8Array<ArrayBuffer>> {
-  return new Uint8Array(
-    await invokeTauri<ArrayBuffer>("fetch_media_bytes", { url }),
-  );
 }

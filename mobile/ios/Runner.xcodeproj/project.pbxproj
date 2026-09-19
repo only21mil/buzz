@@ -19,10 +19,19 @@
 		4A71C0052F40300100A17E01 /* NativeAttachmentPopoverCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C0062F40300100A17E01 /* NativeAttachmentPopoverCoordinator.swift */; };
 		4A71C0072F40400100A17E01 /* ConcentricSheetSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C0082F40400100A17E01 /* ConcentricSheetSurface.swift */; };
 		4A71C0092F40500100A17E01 /* JumpToLatestGlassButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C00A2F40500100A17E01 /* JumpToLatestGlassButton.swift */; };
-		4A71C0192F40D00100A17E01 /* NativeProfileTextEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C01A2F40D00100A17E01 /* NativeProfileTextEditor.swift */; };
-		4A71C01B2F40E00100A17E01 /* NativeSkinToneControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C01C2F40E00100A17E01 /* NativeSkinToneControl.swift */; };
+		4A71C00B2F40600100A17E01 /* StickyDateGlassHeader.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C00C2F40600100A17E01 /* StickyDateGlassHeader.swift */; };
+		4A71C00D2F40700100A17E01 /* NativeEmojiPicker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C00E2F40700100A17E01 /* NativeEmojiPicker.swift */; };
+		4A71C00F2F40800100A17E01 /* NativeEmojiPickerModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C0102F40800100A17E01 /* NativeEmojiPickerModel.swift */; };
+		4A71C0112F40900100A17E01 /* NativeEmojiPickerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C0122F40900100A17E01 /* NativeEmojiPickerView.swift */; };
+		4A71C0132F40A00100A17E01 /* NativeMessageActionSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C0142F40A00100A17E01 /* NativeMessageActionSurface.swift */; };
 		4A71C0152F40B00100A17E01 /* HuddleMediaPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C0162F40B00100A17E01 /* HuddleMediaPlugin.swift */; };
 		4A71C0172F40C00100A17E01 /* HuddleAudioEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C0182F40C00100A17E01 /* HuddleAudioEngine.swift */; };
+		4A71C0192F40D00100A17E01 /* NativeProfileTextEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C01A2F40D00100A17E01 /* NativeProfileTextEditor.swift */; };
+		4A71C01B2F40E00100A17E01 /* NativeSkinToneControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C01C2F40E00100A17E01 /* NativeSkinToneControl.swift */; };
+		4A71C01D2F40F00100A17E01 /* ThemePaginationGlassControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C01E2F40F00100A17E01 /* ThemePaginationGlassControl.swift */; };
+		4A71C01F2F4100100A17E01 /* VoiceNotePackager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C0202F4100100A17E01 /* VoiceNotePackager.swift */; };
+		4A71C0212F4110100A17E01 /* MP4Canonicalizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C0222F4110100A17E01 /* MP4Canonicalizer.swift */; };
+		4A71C0232F4120100A17E01 /* NativeAttachmentPopoverMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C0242F4120100A17E01 /* NativeAttachmentPopoverMenu.swift */; };
 		331C809D294A63AB00263BE5 /* UIKitEncoded.png in Resources */ = {isa = PBXBuildFile; fileRef = 331C809C294A618700263BE5 /* UIKitEncoded.png */; };
 		331C809F294A63AB00263BE5 /* UIKitEncoded.jpg in Resources */ = {isa = PBXBuildFile; fileRef = 331C809E294A618700263BE5 /* UIKitEncoded.jpg */; };
 		33ADD70AB275E0EC81295559 /* Pods_Runner.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8906419FB4E98B4B12B7A56F /* Pods_Runner.framework */; };
@@ -37,9 +46,6 @@
 		97C146FC1CF9000F007C117D /* Main.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FA1CF9000F007C117D /* Main.storyboard */; };
 		97C146FE1CF9000F007C117D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FD1CF9000F007C117D /* Assets.xcassets */; };
 		97C147011CF9000F007C117D /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FF1CF9000F007C117D /* LaunchScreen.storyboard */; };
-		4A71C01F2F4100100A17E01 /* VoiceNotePackager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C0202F4100100A17E01 /* VoiceNotePackager.swift */; };
-		4A71C0212F4110100A17E01 /* MP4Canonicalizer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C0222F4110100A17E01 /* MP4Canonicalizer.swift */; };
-		4A71C0232F4120100A17E01 /* NativeAttachmentPopoverMenu.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A71C0242F4120100A17E01 /* NativeAttachmentPopoverMenu.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -92,10 +98,19 @@
 		4A71C0062F40300100A17E01 /* NativeAttachmentPopoverCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeAttachmentPopoverCoordinator.swift; sourceTree = "<group>"; };
 		4A71C0082F40400100A17E01 /* ConcentricSheetSurface.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConcentricSheetSurface.swift; sourceTree = "<group>"; };
 		4A71C00A2F40500100A17E01 /* JumpToLatestGlassButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JumpToLatestGlassButton.swift; sourceTree = "<group>"; };
-		4A71C01A2F40D00100A17E01 /* NativeProfileTextEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeProfileTextEditor.swift; sourceTree = "<group>"; };
-		4A71C01C2F40E00100A17E01 /* NativeSkinToneControl.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeSkinToneControl.swift; sourceTree = "<group>"; };
+		4A71C00C2F40600100A17E01 /* StickyDateGlassHeader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StickyDateGlassHeader.swift; sourceTree = "<group>"; };
+		4A71C00E2F40700100A17E01 /* NativeEmojiPicker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeEmojiPicker.swift; sourceTree = "<group>"; };
+		4A71C0102F40800100A17E01 /* NativeEmojiPickerModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeEmojiPickerModel.swift; sourceTree = "<group>"; };
+		4A71C0122F40900100A17E01 /* NativeEmojiPickerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeEmojiPickerView.swift; sourceTree = "<group>"; };
+		4A71C0142F40A00100A17E01 /* NativeMessageActionSurface.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeMessageActionSurface.swift; sourceTree = "<group>"; };
 		4A71C0162F40B00100A17E01 /* HuddleMediaPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HuddleMediaPlugin.swift; sourceTree = "<group>"; };
 		4A71C0182F40C00100A17E01 /* HuddleAudioEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HuddleAudioEngine.swift; sourceTree = "<group>"; };
+		4A71C01A2F40D00100A17E01 /* NativeProfileTextEditor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeProfileTextEditor.swift; sourceTree = "<group>"; };
+		4A71C01C2F40E00100A17E01 /* NativeSkinToneControl.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeSkinToneControl.swift; sourceTree = "<group>"; };
+		4A71C01E2F40F00100A17E01 /* ThemePaginationGlassControl.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThemePaginationGlassControl.swift; sourceTree = "<group>"; };
+		4A71C0202F4100100A17E01 /* VoiceNotePackager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceNotePackager.swift; sourceTree = "<group>"; };
+		4A71C0222F4110100A17E01 /* MP4Canonicalizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MP4Canonicalizer.swift; sourceTree = "<group>"; };
+		4A71C0242F4120100A17E01 /* NativeAttachmentPopoverMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeAttachmentPopoverMenu.swift; sourceTree = "<group>"; };
 		331C809C294A618700263BE5 /* UIKitEncoded.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = UIKitEncoded.png; sourceTree = "<group>"; };
 		331C809E294A618700263BE5 /* UIKitEncoded.jpg */ = {isa = PBXFileReference; lastKnownFileType = image.jpeg; path = UIKitEncoded.jpg; sourceTree = "<group>"; };
 		331C8081294A63A400263BE5 /* RunnerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = RunnerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -122,9 +137,6 @@
 		97C147001CF9000F007C117D /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/LaunchScreen.storyboard; sourceTree = "<group>"; };
 		97C147021CF9000F007C117D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		CD6B899582D0416ADBD8A68F /* Pods_RunnerTests.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_RunnerTests.framework; sourceTree = BUILT_PRODUCTS_DIR; };
-		4A71C0202F4100100A17E01 /* VoiceNotePackager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceNotePackager.swift; sourceTree = "<group>"; };
-		4A71C0222F4110100A17E01 /* MP4Canonicalizer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MP4Canonicalizer.swift; sourceTree = "<group>"; };
-		4A71C0242F4120100A17E01 /* NativeAttachmentPopoverMenu.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeAttachmentPopoverMenu.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -243,10 +255,16 @@
 				4A71C0062F40300100A17E01 /* NativeAttachmentPopoverCoordinator.swift */,
 				4A71C0082F40400100A17E01 /* ConcentricSheetSurface.swift */,
 				4A71C00A2F40500100A17E01 /* JumpToLatestGlassButton.swift */,
-				4A71C01A2F40D00100A17E01 /* NativeProfileTextEditor.swift */,
-				4A71C01C2F40E00100A17E01 /* NativeSkinToneControl.swift */,
+				4A71C00C2F40600100A17E01 /* StickyDateGlassHeader.swift */,
+				4A71C00E2F40700100A17E01 /* NativeEmojiPicker.swift */,
+				4A71C0102F40800100A17E01 /* NativeEmojiPickerModel.swift */,
+				4A71C0122F40900100A17E01 /* NativeEmojiPickerView.swift */,
+				4A71C0142F40A00100A17E01 /* NativeMessageActionSurface.swift */,
 				4A71C0162F40B00100A17E01 /* HuddleMediaPlugin.swift */,
 				4A71C0182F40C00100A17E01 /* HuddleAudioEngine.swift */,
+				4A71C01A2F40D00100A17E01 /* NativeProfileTextEditor.swift */,
+				4A71C01C2F40E00100A17E01 /* NativeSkinToneControl.swift */,
+				4A71C01E2F40F00100A17E01 /* ThemePaginationGlassControl.swift */,
 				4A71C0202F4100100A17E01 /* VoiceNotePackager.swift */,
 				4A71C0222F4110100A17E01 /* MP4Canonicalizer.swift */,
 				4A71C0242F4120100A17E01 /* NativeAttachmentPopoverMenu.swift */,
@@ -310,6 +328,7 @@
 				BZZ00000000000000000004 /* Embed App Extensions */,
 				3B06AD1E1E4923F5004D2608 /* Thin Binary */,
 				E0B5862D106D142B580309AF /* [CP] Embed Pods Frameworks */,
+				ED5DDC1D42A9D342928222CC /* [CP] Copy Pods Resources */,
 			);
 			buildRules = (
 			);
@@ -493,7 +512,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "/bin/sh \"$FLUTTER_ROOT/packages/flutter_tools/bin/xcode_backend.sh\" build";
+			shellScript = "set -e\n. \"$SRCROOT/../scripts/require-push-gateway-origin.sh\"\n/bin/sh \"$FLUTTER_ROOT/packages/flutter_tools/bin/xcode_backend.sh\" build";
 		};
 		E0B5862D106D142B580309AF /* [CP] Embed Pods Frameworks */ = {
 			isa = PBXShellScriptBuildPhase;
@@ -510,6 +529,23 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-Runner/Pods-Runner-frameworks.sh\"\n";
+			showEnvVarsInLog = 0;
+		};
+		ED5DDC1D42A9D342928222CC /* [CP] Copy Pods Resources */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-Runner/Pods-Runner-resources-${CONFIGURATION}-input-files.xcfilelist",
+			);
+			name = "[CP] Copy Pods Resources";
+			outputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-Runner/Pods-Runner-resources-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-Runner/Pods-Runner-resources.sh\"\n";
 			showEnvVarsInLog = 0;
 		};
 /* End PBXShellScriptBuildPhase section */
@@ -546,14 +582,20 @@
 				4A71C0052F40300100A17E01 /* NativeAttachmentPopoverCoordinator.swift in Sources */,
 				4A71C0072F40400100A17E01 /* ConcentricSheetSurface.swift in Sources */,
 				4A71C0092F40500100A17E01 /* JumpToLatestGlassButton.swift in Sources */,
-				4A71C0192F40D00100A17E01 /* NativeProfileTextEditor.swift in Sources */,
-				4A71C01B2F40E00100A17E01 /* NativeSkinToneControl.swift in Sources */,
+				4A71C00B2F40600100A17E01 /* StickyDateGlassHeader.swift in Sources */,
+				4A71C00D2F40700100A17E01 /* NativeEmojiPicker.swift in Sources */,
+				4A71C00F2F40800100A17E01 /* NativeEmojiPickerModel.swift in Sources */,
+				4A71C0112F40900100A17E01 /* NativeEmojiPickerView.swift in Sources */,
+				4A71C0132F40A00100A17E01 /* NativeMessageActionSurface.swift in Sources */,
 				4A71C0152F40B00100A17E01 /* HuddleMediaPlugin.swift in Sources */,
 				4A71C0172F40C00100A17E01 /* HuddleAudioEngine.swift in Sources */,
-				1498D2341E8E89220040F4C2 /* GeneratedPluginRegistrant.m in Sources */,
+				4A71C0192F40D00100A17E01 /* NativeProfileTextEditor.swift in Sources */,
+				4A71C01B2F40E00100A17E01 /* NativeSkinToneControl.swift in Sources */,
+				4A71C01D2F40F00100A17E01 /* ThemePaginationGlassControl.swift in Sources */,
 				4A71C01F2F4100100A17E01 /* VoiceNotePackager.swift in Sources */,
 				4A71C0212F4110100A17E01 /* MP4Canonicalizer.swift in Sources */,
 				4A71C0232F4120100A17E01 /* NativeAttachmentPopoverMenu.swift in Sources */,
+				1498D2341E8E89220040F4C2 /* GeneratedPluginRegistrant.m in Sources */,
 				7884E8682EC3CC0700C636F2 /* SceneDelegate.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

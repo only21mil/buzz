@@ -14,6 +14,7 @@ import {
   Trash2,
 } from "lucide-react";
 import * as React from "react";
+import { toast } from "sonner";
 
 import { buildMessageLink } from "@/features/messages/lib/messageLink";
 import { EmojiPicker } from "@/features/custom-emoji/ui/EmojiPicker";
@@ -39,6 +40,7 @@ import { emojiDisplayName } from "@/shared/lib/emojiName";
 import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
 import { KIND_HUDDLE_STARTED } from "@/shared/constants/kinds";
 import { Button } from "@/shared/ui/button";
+import { HashArrowIn } from "@/shared/ui/icons";
 import { DeleteMessageConfirmDialog } from "./DeleteMessageConfirmDialog";
 import {
   DropdownMenu,
@@ -50,9 +52,36 @@ import {
 import { isPositiveEmojiParticle } from "@/shared/ui/EmojiBurstProvider";
 import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
+import { ProtectedMessageAction } from "@protected-feature-components";
 
 const ACTION_BUTTON_CLASS = "h-8 w-8 rounded-full p-0";
 const ACTION_ICON_CLASS = "!h-4 !w-4";
+
+/** Copying a message link is offered from both the hover action bar and the
+ *  More menu; both paths share this exact link-building + toast behavior. */
+function copyMessageLink(channelId: string, message: TimelineMessage) {
+  const { rootId } = getThreadReference(message.tags ?? []);
+  const link = buildMessageLink({
+    channelId,
+    messageId: message.id,
+    threadRootId: rootId,
+  });
+  copyTextToClipboard(link, "Link copied to clipboard");
+}
+
+/** Gate shared by every copy-link surface: pending sends have no delivered
+ *  event to link to, huddle system rows aren't linkable, and callers without
+ *  a channelId (e.g. inbox preview rows) can't build the link. */
+function canCopyMessageLink(
+  message: TimelineMessage,
+  channelId: string | null | undefined,
+): channelId is string {
+  return (
+    !message.pending &&
+    message.kind !== KIND_HUDDLE_STARTED &&
+    Boolean(channelId)
+  );
+}
 
 function MoreActionsMenu({
   channelId,
@@ -64,6 +93,7 @@ function MoreActionsMenu({
   onMarkRead,
   onOpenChange,
   onRemindLater,
+  onSendToChannel,
   onUnfollowThread,
   open,
   isFollowingThread,
@@ -83,6 +113,7 @@ function MoreActionsMenu({
   onMarkRead?: (message: TimelineMessage) => void;
   onOpenChange: (open: boolean) => void;
   onRemindLater?: (message: TimelineMessage) => void;
+  onSendToChannel?: (message: TimelineMessage) => Promise<void>;
   onUnfollowThread?: (message: TimelineMessage) => void;
   open: boolean;
   isFollowingThread?: boolean;
@@ -224,17 +255,36 @@ function MoreActionsMenu({
             </DropdownMenuItem>
           ) : null}
 
-          {hasCopyActions && channelId ? (
+          {onSendToChannel ? (
+            <DropdownMenuItem
+              aria-label="Send to channel"
+              data-testid={`send-to-channel-${message.id}`}
+              onClick={() => {
+                void onSendToChannel(message)
+                  .then(() => toast.success("Sent to channel"))
+                  .catch((error) => {
+                    console.error(
+                      "Failed to send thread message to channel",
+                      error,
+                    );
+                    toast.error("Couldn't send to channel");
+                  });
+              }}
+            >
+              <HashArrowIn
+                aria-hidden="true"
+                className="h-4 w-4"
+                data-testid="send-to-channel-icon"
+              />
+              Send to channel
+            </DropdownMenuItem>
+          ) : null}
+
+          {canCopyMessageLink(message, channelId) ? (
             <DropdownMenuItem
               data-testid={`copy-message-link-${message.id}`}
               onClick={() => {
-                const { rootId } = getThreadReference(message.tags ?? []);
-                const link = buildMessageLink({
-                  channelId,
-                  messageId: message.id,
-                  threadRootId: rootId,
-                });
-                copyTextToClipboard(link, "Link copied to clipboard");
+                copyMessageLink(channelId, message);
               }}
             >
               <Link2 className="h-4 w-4" />
@@ -346,6 +396,7 @@ function isCustomEmojiShortcode(emoji: string) {
 export const MessageActionBar = React.memo(function MessageActionBar({
   channelId,
   message,
+  ref,
   onDelete,
   onEdit,
   onFollowThread,
@@ -355,6 +406,7 @@ export const MessageActionBar = React.memo(function MessageActionBar({
   onReactionSelect,
   onRemindLater,
   onReply,
+  onSendToChannel,
   onUnfollowThread,
   reactionErrorMessage = null,
   reactions,
@@ -366,6 +418,9 @@ export const MessageActionBar = React.memo(function MessageActionBar({
    *  action is hidden (callers like the home inbox that lack the context). */
   channelId?: string | null;
   message: TimelineMessage;
+  /** Attached to the root element so hosts can measure the rail's rendered
+   *  footprint (e.g. to reserve its width in the message-header layout). */
+  ref?: React.Ref<HTMLDivElement>;
   onDelete?: (message: TimelineMessage) => void;
   onEdit?: (message: TimelineMessage) => void;
   onFollowThread?: (message: TimelineMessage) => void;
@@ -375,6 +430,7 @@ export const MessageActionBar = React.memo(function MessageActionBar({
   onReactionSelect?: (emoji: string) => Promise<void>;
   onRemindLater?: (message: TimelineMessage) => void;
   onReply?: (message: TimelineMessage) => void;
+  onSendToChannel?: (message: TimelineMessage) => Promise<void>;
   onUnfollowThread?: (message: TimelineMessage) => void;
   reactionErrorMessage?: string | null;
   reactions: TimelineReaction[];
@@ -388,7 +444,7 @@ export const MessageActionBar = React.memo(function MessageActionBar({
   const [isReactionPickerOpen, setIsReactionPickerOpen] = React.useState(false);
   const [isDropdownOpen, setIsDropdownOpen] = React.useState(false);
   const customEmoji = useCustomEmoji();
-  const quickReactionEmojis = useQuickReactionEmojis(4, customEmoji);
+  const quickReactionEmojis = useQuickReactionEmojis(3, customEmoji);
   const quickReactionItems = React.useMemo(
     () =>
       quickReactionEmojis
@@ -412,6 +468,7 @@ export const MessageActionBar = React.memo(function MessageActionBar({
     Boolean(onFollowThread) ||
     Boolean(onUnfollowThread) ||
     Boolean(onRemindLater) ||
+    Boolean(onSendToChannel) ||
     !message.pending;
 
   const wouldAddReaction = React.useCallback(
@@ -461,23 +518,21 @@ export const MessageActionBar = React.memo(function MessageActionBar({
           : "",
       )}
       data-testid={`message-action-bar-${message.id}`}
+      ref={ref}
     >
       <div className="overflow-hidden rounded-full border border-border/70 bg-background/95 shadow-xs backdrop-blur-sm supports-[backdrop-filter]:bg-background/85">
         <div className="flex items-center gap-0.5 p-1">
           {hasReactionAction && quickReactionItems.length > 0 ? (
-            <>
-              <div className="hidden items-center gap-0.5 sm:flex">
-                {quickReactionItems.map(({ customEmojiUrl, emoji }) => (
-                  <QuickReactionButton
-                    customEmojiUrl={customEmojiUrl}
-                    emoji={emoji}
-                    key={emoji}
-                    onSelect={handleReactionSelection}
-                  />
-                ))}
-              </div>
-              <div className="mx-0.5 hidden h-4 w-px bg-border/70 sm:block" />
-            </>
+            <div className="hidden items-center gap-0.5 sm:flex">
+              {quickReactionItems.map(({ customEmojiUrl, emoji }) => (
+                <QuickReactionButton
+                  customEmojiUrl={customEmojiUrl}
+                  emoji={emoji}
+                  key={emoji}
+                  onSelect={handleReactionSelection}
+                />
+              ))}
+            </div>
           ) : null}
 
           {hasReactionAction ? (
@@ -527,6 +582,16 @@ export const MessageActionBar = React.memo(function MessageActionBar({
             </Popover>
           ) : null}
 
+          <ProtectedMessageAction channelId={channelId} message={message} />
+
+          {hasReactionAction && quickReactionItems.length > 0 ? (
+            <div
+              aria-hidden="true"
+              className="mx-0.5 hidden h-4 w-px bg-border/70 sm:block"
+              data-testid="message-action-divider"
+            />
+          ) : null}
+
           {hasReplyAction ? (
             <Tooltip>
               <TooltipTrigger asChild>
@@ -548,6 +613,27 @@ export const MessageActionBar = React.memo(function MessageActionBar({
             </Tooltip>
           ) : null}
 
+          {canCopyMessageLink(message, channelId) ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  aria-label="Copy link"
+                  className={ACTION_BUTTON_CLASS}
+                  data-testid={`copy-link-message-${message.id}`}
+                  onClick={() => {
+                    copyMessageLink(channelId, message);
+                  }}
+                  size="sm"
+                  type="button"
+                  variant="ghost"
+                >
+                  <Link2 className={ACTION_ICON_CLASS} />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Copy link</TooltipContent>
+            </Tooltip>
+          ) : null}
+
           {hasMoreMenuActions ? (
             <MoreActionsMenu
               channelId={channelId}
@@ -559,6 +645,7 @@ export const MessageActionBar = React.memo(function MessageActionBar({
               onMarkRead={onMarkRead}
               onOpenChange={setIsDropdownOpen}
               onRemindLater={onRemindLater}
+              onSendToChannel={onSendToChannel}
               onUnfollowThread={onUnfollowThread}
               open={isDropdownOpen}
               isFollowingThread={isFollowingThread}

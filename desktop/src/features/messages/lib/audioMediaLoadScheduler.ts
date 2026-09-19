@@ -1,5 +1,4 @@
 export const MAX_CONCURRENT_AUDIO_MEDIA_LOADS = 3;
-export const MAX_QUEUED_AUDIO_MEDIA_LOADS = 128;
 
 type InternalTask = {
   controller: AbortController;
@@ -10,7 +9,7 @@ type InternalTask = {
   started: boolean;
 };
 
-type AudioMediaLoadHandle<T> = {
+export type AudioMediaLoadHandle<T> = {
   cancel: () => void;
   promise: Promise<T>;
 };
@@ -65,16 +64,6 @@ function pumpAudioMediaLoads(): void {
 export function scheduleAudioMediaLoad<T>(
   run: (signal: AbortSignal) => Promise<T>,
 ): AudioMediaLoadHandle<T> {
-  if (queuedTasks.length >= MAX_QUEUED_AUDIO_MEDIA_LOADS) {
-    return {
-      cancel: () => {},
-      promise: Promise.reject(
-        new Error(
-          "Too many audio attachments are loading. Retry playback shortly.",
-        ),
-      ),
-    };
-  }
   let resolvePromise: (value: T) => void = () => {};
   let rejectPromise: (reason?: unknown) => void = () => {};
   const promise = new Promise<T>((resolve, reject) => {

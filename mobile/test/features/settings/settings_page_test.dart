@@ -1,20 +1,81 @@
-import 'package:flutter/foundation.dart';
 import 'package:buzz/features/settings/settings_page.dart';
 import 'package:buzz/shared/community/community_membership_provider.dart';
 import 'package:buzz/shared/community/community.dart';
 import 'package:buzz/shared/community/community_provider.dart';
-import 'package:buzz/shared/relay/relay.dart';
 import 'package:buzz/shared/theme/theme.dart';
 import 'package:buzz/shared/push/push_bridge.dart';
+import 'package:buzz/shared/relay/app_lifecycle_provider.dart';
 import 'package:buzz/shared/widgets/app_list.dart';
 import 'package:buzz/shared/widgets/app_list_card.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:nostr/nostr.dart' as nostr;
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
+  setUp(() {
+    PackageInfo.setMockInitialValues(
+      appName: 'Buzz',
+      packageName: 'xyz.block.buzz',
+      version: '0.16.0',
+      buildNumber: '432',
+      buildSignature: '',
+    );
+  });
+
+  for (final buildNumber in ['432', '', '2147483647']) {
+    testWidgets('shows version with build number "$buildNumber"', (
+      tester,
+    ) async {
+      tester.view.physicalSize = const Size(320, 700);
+      tester.view.devicePixelRatio = 1;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      PackageInfo.setMockInitialValues(
+        appName: 'Buzz',
+        packageName: 'xyz.block.buzz',
+        version: '0.16.0',
+        buildNumber: buildNumber,
+        buildSignature: '',
+      );
+      SharedPreferences.setMockInitialValues({});
+      final prefs = await SharedPreferences.getInstance();
+      await tester.pumpWidget(
+        ProviderScope(
+          overrides: [
+            savedPrefsProvider.overrideWithValue(prefs),
+            currentCommunityRoleProvider.overrideWithValue(
+              const AsyncData<CommunityMemberRole?>(CommunityMemberRole.admin),
+            ),
+          ],
+          child: MaterialApp(
+            theme: AppTheme.light(),
+            builder: (context, child) => MediaQuery(
+              data: MediaQuery.of(
+                context,
+              ).copyWith(textScaler: TextScaler.linear(2)),
+              child: child!,
+            ),
+            home: SettingsPage(
+              profileHeader: const SizedBox.shrink(),
+              invitePageBuilder: (_) => const SizedBox.shrink(),
+              identityRecoveryPageBuilder: (_) => const SizedBox.shrink(),
+            ),
+          ),
+        ),
+      );
+      expect(find.text('Invite to community'), findsOneWidget);
+      await tester.pumpAndSettle();
+      expect(
+        find.text(buildNumber.isEmpty ? 'v0.16.0' : 'v0.16.0 ($buildNumber)'),
+        findsOneWidget,
+      );
+      expect(tester.takeException(), isNull);
+    });
+  }
+
   testWidgets('shows the persisted per-community push opt-in on iOS', (
     tester,
   ) async {
@@ -262,6 +323,44 @@ void main() {
     expect(opened, ['name', 'description']);
   });
 
+  testWidgets('places Theme second in the Community section', (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final prefs = await SharedPreferences.getInstance();
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          savedPrefsProvider.overrideWithValue(prefs),
+          currentCommunityRoleProvider.overrideWithValue(
+            const AsyncData<CommunityMemberRole?>(CommunityMemberRole.admin),
+          ),
+        ],
+        child: MaterialApp(
+          theme: AppTheme.light(),
+          home: SettingsPage(
+            profileHeader: const SizedBox.shrink(),
+            invitePageBuilder: (_) => const SizedBox.shrink(),
+            identityRecoveryPageBuilder: (_) => const SizedBox.shrink(),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Theme'), findsOneWidget);
+    expect(
+      tester.getTopLeft(find.text('Theme')).dy,
+      greaterThan(tester.getTopLeft(find.text('Invite to community')).dy),
+    );
+    expect(find.byKey(const ValueKey('community-theme-row')), findsOneWidget);
+    expect(find.text('Appearance'), findsNothing);
+    expect(find.text('Style · This community'), findsNothing);
+
+    await tester.tap(find.byKey(const ValueKey('community-theme-row')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('theme-preview-pages')), findsOneWidget);
+  });
+
   testWidgets('uses the native glass close control on iOS', (tester) async {
     debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
     addTearDown(() => debugDefaultTargetPlatformOverride = null);
@@ -436,63 +535,9 @@ void main() {
       isTrue,
     );
   });
-
-  testWidgets('identity row copies the public key, never the nsec', (
-    tester,
-  ) async {
-    SharedPreferences.setMockInitialValues({});
-    final prefs = await SharedPreferences.getInstance();
-    final nsec = nostr.Keys.generate().nsec;
-    final pubkey = pubkeyFromNsec(nsec)!;
-
-    await tester.pumpWidget(
-      ProviderScope(
-        overrides: [
-          savedPrefsProvider.overrideWithValue(prefs),
-          relayConfigProvider.overrideWith(() => _NsecRelayConfig(nsec: nsec)),
-          appLifecycleProvider.overrideWith(_SettingsLifecycleNotifier.new),
-        ],
-        child: MaterialApp(
-          theme: AppTheme.light(),
-          home: SettingsPage(
-            profileHeader: const SizedBox.shrink(),
-            invitePageBuilder: (_) => const SizedBox.shrink(),
-            identityRecoveryPageBuilder: (_) => const SizedBox.shrink(),
-          ),
-        ),
-      ),
-    );
-    await tester.pumpAndSettle();
-
-    // The connection group sits below the fold; bring it into view.
-    await tester.scrollUntilVisible(find.text('Identity (pubkey)'), 300);
-    await tester.pumpAndSettle();
-
-    // The public key is copyable; the secret never renders as text.
-    expect(find.text('Identity (pubkey)'), findsOneWidget);
-    expect(find.textContaining(nsec), findsNothing);
-    expect(
-      find.bySemanticsLabel(RegExp('Copy identity public key')),
-      findsOneWidget,
-    );
-    expect(find.textContaining(pubkey.substring(0, 8)), findsNothing);
-    // The recovery row opens the pairing page; the key gate itself runs
-    // at publish time in the pairing provider, not on navigation.
-    expect(find.text('Send identity to desktop'), findsOneWidget);
-  });
 }
 
 class _SettingsLifecycleNotifier extends AppLifecycleNotifier {
   @override
   AppLifecycleState build() => AppLifecycleState.resumed;
-}
-
-class _NsecRelayConfig extends RelayConfigNotifier {
-  _NsecRelayConfig({required String nsec}) : _nsec = nsec;
-
-  final String _nsec;
-
-  @override
-  RelayConfig build() =>
-      RelayConfig(baseUrl: 'https://relay.example', nsec: _nsec);
 }

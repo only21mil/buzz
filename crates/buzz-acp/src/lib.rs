@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use acp::{AcpClient, EnvVar, McpServer};
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use buzz_core::kind::{
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
     KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
@@ -78,6 +78,22 @@ const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for `buzz-acp authenticate`. Browser-based vendor auth can require
 /// human interaction, so it must not share the short probe timeout.
 const AUTHENTICATE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Resolve the process working directory for ACP session metadata and prompts.
+///
+/// `std::env::current_dir()` returns an absolute path on every supported
+/// platform. Keep the explicit invariant check so a future source cannot
+/// silently introduce a relative path, and surface resolution failures instead
+/// of substituting a misleading Unix-specific fallback.
+fn current_working_directory() -> Result<String> {
+    let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
+    ensure!(
+        cwd.is_absolute(),
+        "current working directory is not absolute: {}",
+        cwd.display()
+    );
+    Ok(cwd.to_string_lossy().into_owned())
+}
 
 /// Publish a kind:20001 presence update event via the WebSocket connection.
 ///
@@ -1554,7 +1570,13 @@ async fn handle_switch_model_control(
         if signal_in_flight_task(
             pool,
             channel_id,
-            ControlSignal::SwitchModel(model_id.to_string()),
+            ControlSignal::SwitchModel {
+                model_id: model_id.to_string(),
+                request_id: payload
+                    .get("requestId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            },
         ) {
             "sent"
         } else {
@@ -1562,9 +1584,19 @@ async fn handle_switch_model_control(
         }
     } else {
         // Idle path: only a fresh, non-empty catalog can reject before invalidation.
-        match pool.switch_idle_agent_model(channel_id, model_id).await {
+        match pool
+            .switch_idle_agent_model(
+                channel_id,
+                model_id,
+                payload
+                    .get("requestId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            )
+            .await
+        {
             IdleSwitchResult::AmbiguousTarget => "ambiguous_target",
-            IdleSwitchResult::Switched => "switched",
+            IdleSwitchResult::Switched => "sent",
             IdleSwitchResult::UnsupportedModel => "unsupported_model",
             IdleSwitchResult::NoIdleAgent => "no_active_turn",
         }
@@ -1936,8 +1968,7 @@ async fn tokio_main() -> Result<()> {
 
     tracing::info!("buzz-acp starting: {}", config.summary());
 
-    let cwd = std::env::current_dir().context("failed to resolve agent working directory")?;
-    let cwd = cwd.to_string_lossy().into_owned();
+    let cwd = current_working_directory()?;
     let base_prompt_content = config.base_prompt_content.take();
     let base_prompt = if config.no_base_prompt {
         None
@@ -2558,6 +2589,7 @@ async fn tokio_main() -> Result<()> {
     // fields (result_rx vs join_set). We use `rx_and_join_set()` to split the
     // borrow, yielding a typed enum so the outer code can dispatch cleanly.
     enum PoolEvent {
+        HoldDeadline,
         Result(Box<PromptResult>),
         Panic(tokio::task::JoinError),
         SteerAck(SteerAckEvent),
@@ -2672,6 +2704,7 @@ async fn tokio_main() -> Result<()> {
                         state: SessionState::default(),
                         model_capabilities: None,
                         desired_model: config.model.clone(),
+                        pending_model_ack: None,
                         model_overridden: false,
                         agent_name,
                         goose_system_prompt_supported: None,
@@ -2687,6 +2720,10 @@ async fn tokio_main() -> Result<()> {
                 }
             }
         }
+        // Respawn results arrive through respawn_rx, but JoinSet retains the
+        // completed tasks until they are joined. Reap them without waiting so
+        // repeated crash recovery does not grow the task set indefinitely.
+        while respawn_tasks.join_next().now_or_never().flatten().is_some() {}
         // Flush requeued events that were waiting for a live agent. Without
         // this, batches requeued during crash recovery sit idle until the
         // next relay event arrives — which can be minutes on quiet channels.
@@ -2703,6 +2740,9 @@ async fn tokio_main() -> Result<()> {
                 typing_channels.insert(scope, thread_tags);
             }
         }
+
+        pool.retain_held_scopes(|scope| queue.has_pending_scope(scope));
+        let hold_deadline = pool.next_hold_deadline(pool::HOLD_BUSY_OWNER_TIMEOUT);
 
         // Borrow result_rx and join_set simultaneously via split-borrow helper.
         let pool_event: Option<PoolEvent> = {
@@ -2732,6 +2772,9 @@ async fn tokio_main() -> Result<()> {
                 Some(ack_event) = steer_ack_rx.recv() => {
                     Some(PoolEvent::SteerAck(ack_event))
                 }
+                _ = pool::AgentPool::wait_for_hold_deadline(hold_deadline), if pool_ready => {
+                    Some(PoolEvent::HoldDeadline)
+                },
                 Some((attempt, result)) = wake_rx.recv(), if config.lazy_pool && !pool_ready => {
                     Some(PoolEvent::Wake(attempt, result))
                 }
@@ -3827,6 +3870,23 @@ async fn tokio_main() -> Result<()> {
                     }
                 }
             }
+            Some(PoolEvent::HoldDeadline) => {
+                // A held thread must make progress even when every unrelated
+                // relay/timer source is quiet. The deadline is derived from
+                // the pool's first-held stamp, so this dispatch observes
+                // `ForkAfterHold` and claims an idle worker immediately.
+                for (scope, thread_tags) in dispatch_pending(
+                    &mut pool,
+                    &mut queue,
+                    &ctx,
+                    &mut last_activity,
+                    observer.as_ref(),
+                )
+                .await
+                {
+                    typing_channels.insert(scope, thread_tags);
+                }
+            }
             None => {} // relay/heartbeat/shutdown branches handled inline above
         }
     }
@@ -4441,7 +4501,9 @@ fn is_model_availability_error(error: &acp::AcpError) -> bool {
     let acp::AcpError::AgentError { message, .. } = error else {
         return false;
     };
-    if is_auth_error(error) {
+    if is_auth_error(error)
+        || matches!(error, acp::AcpError::AgentError { code: -32002, message } if message.contains("model not found"))
+    {
         return false;
     }
     let message = message.to_ascii_lowercase();
@@ -4639,6 +4701,24 @@ async fn handle_prompt_result(
                     hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
                     inbox_events_terminal = false;
                 }
+            } else if matches!(
+                &result.outcome,
+                PromptOutcome::Error(acp::AcpError::AgentError { code: -32002, message })
+                    if message.contains("model not found")
+            ) {
+                // Retrying the same missing model cannot repair its configuration.
+                tracing::warn!(
+                    channel_id = %batch.channel_id,
+                    events = batch.events.len(),
+                    "dead-lettering batch immediately — model not found"
+                );
+                let content = "⚠️ I couldn't process the last request: the configured model \
+                    wasn't found at the provider's endpoint. Open agent settings, select a \
+                    different model from the dropdown, and save your changes. Restart the agent \
+                    to apply the new configuration, then re-send your request."
+                    .to_string();
+                spawn_failure_notice(rest_client, &batch, content);
+                inbox_events_terminal = true;
             } else if matches!(&result.outcome, PromptOutcome::Error(e) if is_auth_error(e)) {
                 // Auth errors are non-retryable: the token won't self-repair
                 // between retries, so requeueing only wastes attempt slots and
@@ -5401,6 +5481,7 @@ async fn initialize_agent_pool(
                             state: SessionState::default(),
                             model_capabilities: None,
                             desired_model: startup.model.clone(),
+                            pending_model_ack: None,
                             model_overridden: false,
                             agent_name,
                             goose_system_prompt_supported: None,
@@ -5609,10 +5690,7 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
     use acp::{extract_model_config_options, extract_model_state};
 
     let agent_args = config::normalize_agent_args(&args.agent.agent_command, args.agent.agent_args);
-    let cwd = std::env::current_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("/"))
-        .to_string_lossy()
-        .to_string();
+    let cwd = current_working_directory()?;
 
     // Spawn outside the timeout so we always own the child for cleanup.
     // `models` subcommand doesn't use persona packs — no extra env, no codex config.
@@ -6035,7 +6113,7 @@ mod owner_control_command_tests {
         pool.record_scope_owner(b, 1);
         pool.task_map_mut().clear();
         assert_eq!(
-            pool.switch_idle_agent_model(ch, "new-model").await,
+            pool.switch_idle_agent_model(ch, "new-model", None).await,
             IdleSwitchResult::AmbiguousTarget
         );
         assert!(!pool.channel_control_is_ambiguous(Uuid::new_v4()));
@@ -6045,7 +6123,10 @@ mod owner_control_command_tests {
     async fn observer_channel_controls_allow_one_scope_and_ignore_other_channels() {
         for signal in [
             ControlSignal::Cancel,
-            ControlSignal::SwitchModel("new-model".into()),
+            ControlSignal::SwitchModel {
+                model_id: "new-model".into(),
+                request_id: Some("pick-1".into()),
+            },
         ] {
             let mut pool = AgentPool::from_slots(vec![]);
             let ch = Uuid::new_v4();
@@ -6066,12 +6147,62 @@ mod owner_control_command_tests {
             }
             assert_eq!(rx.await.unwrap(), signal);
             assert_eq!(observer.snapshot()[0].payload["status"], "sent");
+            assert_eq!(observer.snapshot()[0].payload["requestId"], "pick-1");
         }
     }
 
     // Fix #2: mid-turn steer/interrupt must target the exact thread scope, not
     // “the first task in the channel” — two threads in one channel must not
     // interrupt each other.
+    #[tokio::test]
+    async fn queue_cap_eviction_prunes_orphaned_hold_deadline() {
+        let mut pool = AgentPool::from_slots(vec![]);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let channel_id = Uuid::new_v4();
+        let held_scope = thread_scope(channel_id, &"a".repeat(64));
+        let surviving_scope = thread_scope(channel_id, &"b".repeat(64));
+
+        pool.record_scope_owner(held_scope.clone(), 0);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        insert_task_meta(&mut pool, 0, surviving_scope.clone(), tx);
+        assert!(matches!(
+            pool.hold_decision(
+                &held_scope,
+                std::time::Instant::now(),
+                pool::HOLD_BUSY_OWNER_TIMEOUT
+            ),
+            pool::HoldDecision::Hold { .. }
+        ));
+
+        let oldest = std::time::Instant::now() - Duration::from_secs(1);
+        queue.push(queue::QueuedEvent {
+            channel_id,
+            scope: held_scope.clone(),
+            event: make_event(KIND_STREAM_MESSAGE, "held", None),
+            received_at: oldest,
+            prompt_tag: "test".into(),
+        });
+        for i in 0..500 {
+            queue.push(queue::QueuedEvent {
+                channel_id,
+                scope: surviving_scope.clone(),
+                event: make_event(KIND_STREAM_MESSAGE, &format!("new-{i}"), None),
+                received_at: std::time::Instant::now(),
+                prompt_tag: "test".into(),
+            });
+        }
+
+        assert!(
+            !queue.has_pending_scope(&held_scope),
+            "aggregate cap evicts the globally oldest scope"
+        );
+        pool.retain_held_scopes(|scope| queue.has_pending_scope(scope));
+        assert!(
+            !pool.held_since_contains(&held_scope),
+            "evicted scope cannot leave an immediately-ready deadline behind"
+        );
+    }
+
     #[tokio::test]
     async fn signal_in_flight_task_for_scope_targets_only_matching_thread() {
         let mut pool = AgentPool::from_slots(vec![]);
@@ -6580,6 +6711,7 @@ mod author_gate_tests {
                 relay::ChannelInfo {
                     name: "dm".into(),
                     channel_type: "dm".into(),
+                    description: None,
                 },
             ),
             (
@@ -6587,6 +6719,7 @@ mod author_gate_tests {
                 relay::ChannelInfo {
                     name: "stream".into(),
                     channel_type: "stream".into(),
+                    description: None,
                 },
             ),
         ]);
@@ -6603,6 +6736,7 @@ mod author_gate_tests {
             relay::ChannelInfo {
                 name: "unknown".into(),
                 channel_type: "unknown".into(),
+                description: None,
             },
         )]);
         assert!(
@@ -6679,6 +6813,7 @@ mod author_gate_tests {
         let info = |channel_type: &str| relay::ChannelInfo {
             name: "x".into(),
             channel_type: channel_type.into(),
+            description: None,
         };
         let map: HashMap<Uuid, relay::ChannelInfo> = [
             (unknown, info("unknown")),
@@ -8336,6 +8471,7 @@ mod error_outcome_emission_tests {
             state: Default::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -10186,6 +10322,174 @@ mod error_outcome_emission_tests {
 
     /// A non-auth application error (e.g. usage credits) must still follow the
     /// standard requeue path so today's behavior is unchanged.
+    #[tokio::test]
+    async fn model_not_found_posts_recovery_notice_without_retrying() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        };
+        let keys = Keys::generate();
+        let root = nostr::EventId::from_byte_array([0xaa; 32]);
+        let parent = nostr::EventId::from_byte_array([0xbb; 32]);
+        let event = EventBuilder::new(Kind::Custom(9), "test")
+            .tags([
+                nostr::Tag::parse(["e", &root.to_hex(), "", "root"]).unwrap(),
+                nostr::Tag::parse(["e", &parent.to_hex(), "", "reply"]).unwrap(),
+            ])
+            .sign_with_keys(&keys)
+            .unwrap();
+        let channel_id = uuid::Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope::SessionScope::Conversation { channel_id },
+            events: vec![BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+
+        let raw_error = r#"llm model not found: (gpt-6-astra) 404 Not Found: {"error_code":"NOT_FOUND","message":"'gpt-6-astra' does not exist."}"#;
+        let model_error = AcpError::AgentError {
+            code: -32002,
+            message: raw_error.to_string(),
+        };
+        let expected_error = model_error.to_string();
+        let observer = ObserverHandle::in_process();
+
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                scope: None,
+                turn_id: "test-turn-id".to_string(),
+                started_at: 0,
+                recoverable_batch: Some(batch.clone()),
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = std::collections::HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(scope::SessionScope::Conversation { channel_id }),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::Error(model_error),
+            batch: Some(batch),
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            Some(observer.clone()),
+            Some(&rest),
+            None,
+        )
+        .await;
+
+        // The batch must not be requeued: pending_channels returns 0.
+        assert_eq!(
+            queue.pending_channels(),
+            0,
+            "model-not-found must stop immediately — batch must not be requeued"
+        );
+        assert_eq!(
+            queue.queued_event_count(channel_id),
+            0,
+            "model-not-found must stop immediately — no events should be pending"
+        );
+
+        assert!(
+            pool.agents_mut()[0].is_some(),
+            "healthy process remains reusable"
+        );
+        assert!(respawn_tasks.is_empty());
+        let errors: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|event| event.kind == "turn_error")
+            .collect();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].payload["code"], -32002);
+        assert_eq!(errors[0].payload["error"], expected_error);
+
+        // Capture the real signed notice sent by handle_prompt_result, without a live relay.
+        let notice: nostr::Event = tokio::time::timeout(Duration::from_secs(3), async {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(socket);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "POST /events HTTP/1.1\r\n");
+            let mut content_length = None;
+            for _ in 0..64 {
+                line.clear();
+                assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = Some(value.trim().parse::<usize>().unwrap());
+                }
+            }
+            let size = content_length.expect("request Content-Length");
+            assert!(size < 65536);
+            let mut body = vec![0; size];
+            reader.read_exact(&mut body).await.unwrap();
+            reader
+                .get_mut()
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+            serde_json::from_slice(&body).unwrap()
+        })
+        .await
+        .expect("failure notice must be posted on the first failure");
+        notice.verify().unwrap();
+        assert_eq!(notice.pubkey, rest.keys.public_key());
+        assert_eq!(notice.kind, Kind::Custom(9));
+        assert_eq!(
+            notice.content,
+            "⚠️ I couldn't process the last request: the configured model wasn't found at the provider's endpoint. Open agent settings, select a different model from the dropdown, and save your changes. Restart the agent to apply the new configuration, then re-send your request."
+        );
+        let tags = serde_json::to_value(&notice.tags).unwrap();
+        assert!(tags
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tag| tag[0] == "h" && tag[1] == channel_id.to_string()));
+        let threading = queue::parse_thread_tags(&notice);
+        assert_eq!(threading.root_event_id, Some(root.to_hex()));
+        assert_eq!(threading.parent_event_id, Some(parent.to_hex()));
+    }
+
     #[tokio::test]
     async fn non_auth_application_error_is_requeued() {
         let keys = nostr::Keys::generate();

@@ -325,6 +325,8 @@ fn edited_persona(
             id: target.into(),
             display_name: i.display_name,
             avatar_url: i.avatar_url,
+            description: i.description,
+            session_policy: Default::default(),
             system_prompt: i.system_prompt,
             runtime: i.runtime,
             model: i.model,

@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:buzz/shared/community/community.dart';
 import 'package:buzz/shared/deeplink/deep_link.dart';
 import 'package:buzz/shared/push/push_bridge.dart';
 import 'package:buzz/shared/relay/relay_provider.dart';
@@ -58,6 +59,52 @@ void main() {
       await startBuzzPushRegistration();
     },
   );
+
+  test('strict age-gate snapshot requires a native handler', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(_channel, null);
+
+    await expectLater(
+      registerBuzzPushCommunitySnapshotStrict(const [], settleFence: false),
+      throwsA(isA<MissingPluginException>()),
+    );
+  });
+
+  test(
+    'strict age-gate snapshot uses the acknowledged native method',
+    () async {
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(_channel, (call) async {
+            expect(call.method, 'syncAgeGatePushSnapshot');
+            expect(call.arguments, {
+              'section': 'communities',
+              'communities': <Object?>[],
+              'signingKeys': <String, String>{},
+              'settleFence': true,
+            });
+            return null;
+          });
+
+      await registerBuzzPushCommunitySnapshotStrict(
+        const [],
+        settleFence: true,
+      );
+    },
+  );
+
+  test('purges notifications delivered before age restriction', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(_channel, (call) async {
+          expect(call.method, 'purgeAgeRestrictedNotifications');
+          expect(call.arguments, isNull);
+          return null;
+        });
+
+    await purgeAgeRestrictedBuzzNotifications();
+  });
 
   test('reads native notification authorization status', () async {
     debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
@@ -144,6 +191,7 @@ void main() {
         TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger;
     messenger.setMockMethodCallHandler(_channel, (call) async {
       expect(call.method, 'endpointGrants');
+      expect(call.arguments, {'gatewayUrl': Env.pushGatewayUrl});
       return [_grantMap('opaque-grant')];
     });
 
@@ -195,6 +243,16 @@ void main() {
       final secondGrant = await enrollBuzzPush(
         'wss://relay.example/',
         'https://gateway-two.example/',
+        communitiesForSnapshotRefresh: [
+          Community(
+            id: 'community-id',
+            name: 'Community',
+            relayUrl: 'wss://relay.example/',
+            pubkey: 'd' * 64,
+            pushNotificationsEnabled: true,
+            addedAt: DateTime.fromMillisecondsSinceEpoch(0),
+          ),
+        ],
       );
 
       expect(firstGrant.endpointGrant, 'new-grant');
@@ -214,8 +272,24 @@ void main() {
         'endpointGrants',
         'enrollPush',
         'endpointGrants',
+        'syncPushSnapshot',
       ]);
-      expect(snapshotArguments, isEmpty);
+      expect(snapshotArguments, [
+        {
+          'section': 'communities',
+          'communities': [
+            {
+              'id': 'community-id',
+              'name': 'Community',
+              'relayUrl': 'wss://relay.example/',
+              'pubkey': 'd' * 64,
+              'policies': <Object?>[],
+            },
+          ],
+          'signingKeys': <String, String>{},
+        },
+      ]);
+      expect(pushEndpointGrants.value.single.endpointGrant, 'new-grant');
     },
   );
 

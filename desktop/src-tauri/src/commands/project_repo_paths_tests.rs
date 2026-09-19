@@ -38,6 +38,34 @@ fn init(root: &Path, name: &str, origin: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn discovers_origins_with_git_config_escaping() {
+    for origin in [
+        r"C:\Users\Buzz Test\repo.git",
+        r"\\server\share\repo.git",
+        "https://relay.example/git/repo#one.git",
+        "https://relay.example/git/repo;two.git",
+        "https://relay.example/git/repo\"three.git",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let main = init(root.path(), "checkout", origin);
+        assert_eq!(git(&main, &["config", "remote.origin.url"]).trim(), origin);
+        let selected =
+            find_local_repo_for_branch(root.path().to_str(), "repo", Some(origin), Some("main"))
+                .unwrap()
+                .expect("discover the origin written by Git");
+        assert_eq!(selected.path, main.canonicalize().unwrap());
+        assert!(find_local_repo_for_branch(
+            root.path().to_str(),
+            "repo",
+            Some("https://other.example/repo.git"),
+            Some("main"),
+        )
+        .unwrap()
+        .is_none());
+    }
+}
+
+#[test]
 fn discovers_two_worktrees_and_matches_origin_instead_of_directory_name() {
     let root = tempfile::tempdir().expect("root");
     let outside = tempfile::tempdir().expect("linked worktrees");
@@ -61,6 +89,8 @@ fn discovers_two_worktrees_and_matches_origin_instead_of_directory_name() {
     );
     let checkouts =
         local_project_checkouts(root.path().to_str(), Some(("repo", Some(url)))).unwrap();
+    let main = main.canonicalize().unwrap();
+    let feature = feature.canonicalize().unwrap();
     assert_eq!(checkouts.len(), 2);
     assert!(checkouts
         .iter()
@@ -130,7 +160,7 @@ fn mismatched_and_dirty_checkouts_are_preserved_and_command_creates_separate_wor
     )
     .unwrap()
     .unwrap();
-    assert_ne!(selected.path, main);
+    assert_ne!(selected.path, main.canonicalize().unwrap());
     assert_eq!(selected.branch.as_deref(), Some("feature/a"));
 }
 
@@ -196,7 +226,7 @@ fn suggested_command_creates_remote_only_branch_without_switching_existing_check
     .unwrap()
     .unwrap();
     assert_eq!(selected.branch.as_deref(), Some("feature/remote"));
-    assert_ne!(selected.path, main);
+    assert_ne!(selected.path, main.canonicalize().unwrap());
 }
 
 #[test]

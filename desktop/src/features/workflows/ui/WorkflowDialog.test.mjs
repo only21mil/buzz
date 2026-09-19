@@ -39,7 +39,7 @@ test("clicking Run history opens the existing run panel and approval trace", asy
             ? dom.window.getComputedStyle.bind(dom.window)
             : dom.window[key],
     });
-  const { createElement: h } = await import("react");
+  const { createElement: h, act } = await import("react");
   const { render, fireEvent, cleanup } = await import("@testing-library/react");
   const { QueryClient, QueryClientProvider } = await import(
     "@tanstack/react-query"
@@ -157,6 +157,21 @@ test("clicking Run history opens the existing run panel and approval trace", asy
     fireEvent.click(panel.querySelector("button[aria-expanded]"));
     assert.match(panel.textContent, /Approval: granted/);
     assert.match(panel.textContent, /Approved fixture/);
+    await act(async () => {
+      client
+        .getQueryCache()
+        .find({ queryKey: ["workflow-runs", "workflow"], exact: true })
+        .setState({
+          status: "error",
+          error: new Error("Older history unavailable"),
+          fetchStatus: "idle",
+          fetchMeta: { fetchMore: { direction: "forward" } },
+        });
+    });
+    await view.findByText("Older history unavailable");
+    assert.match(panel.textContent, /Older history unavailable/);
+    assert.match(panel.textContent, /Approved fixture/);
+    assert.ok(view.getByRole("button", { name: "Load older runs" }));
   } finally {
     cleanup();
     client.clear();

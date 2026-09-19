@@ -119,16 +119,9 @@ fn fd_real_path(_file: &std::fs::File) -> Result<std::path::PathBuf, String> {
 
 /// MIME types blocked from upload — mirrors the server's generic-file deny-list.
 ///
-/// Selected active-content types and native executables. HTML is a generic
-/// attachment, accepted only for explicit download. Everything else (images,
-/// video, documents, archives, audio, text, data) is accepted; un-sniffable
-/// files fall back to `application/octet-stream` and are served as downloads.
-/// Decode ceiling for metadata stripping: the relay's `MAX_IMAGE_DECODE_BYTES`
-/// (100 MP at 16-bit RGBA). buzz-media is a dev-dependency only, so the number
-/// is repeated here; `decode_ceiling_matches_relay` below pins it to the real
-/// constant.
-const MAX_IMAGE_DECODE_BYTES: u64 = 800_000_000;
-
+/// Active-content XSS carriers (JS, SVG) and native executables. Other types,
+/// including HTML, are accepted as downloads; un-sniffable files fall back to
+/// `application/octet-stream`. XHTML remains blocked in lockstep with the relay.
 const BLOCKED_MIME: &[&str] = &[
     "application/xhtml+xml",
     "image/svg+xml",
@@ -271,12 +264,8 @@ pub(crate) fn sanitize_image_for_upload(body: Vec<u8>, mime: &str) -> Result<Vec
     let mut decoder = reader
         .into_decoder()
         .map_err(|_| "failed to decode image for metadata removal".to_string())?;
-    // Match the relay's decode ceiling so the client never refuses an image
-    // the relay would accept; the image crate default (512 MiB) stops short.
-    let mut limits = image::Limits::default();
-    limits.max_alloc = Some(MAX_IMAGE_DECODE_BYTES);
     decoder
-        .set_limits(limits)
+        .set_limits(image::Limits::default())
         .map_err(|_| "image exceeds safe decoding limits".to_string())?;
     let orientation = decoder
         .orientation()
@@ -370,7 +359,7 @@ pub(crate) fn mint_media_get_auth(state: &AppState, base_url: &str) -> Option<St
     }
 }
 
-fn sign_blossom_upload_auth(
+pub(crate) fn sign_blossom_upload_auth(
     keys: &Keys,
     sha256: &str,
     expiry_secs: u64,
@@ -807,14 +796,6 @@ pub(super) async fn upload_media_bytes_inner(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn decode_ceiling_matches_relay() {
-        assert_eq!(
-            super::MAX_IMAGE_DECODE_BYTES,
-            buzz_media_pkg::MAX_IMAGE_DECODE_BYTES
-        );
-    }
-
     use super::*;
 
     #[test]
@@ -910,9 +891,29 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_and_validate_mime_accepts_html() {
+    fn test_detect_and_validate_mime_accepts_html_as_inert_download() {
         let html = b"<!DOCTYPE html><html><body><script>alert(1)</script></body></html>";
         assert_eq!(detect_and_validate_mime(html).unwrap(), "text/html");
+    }
+
+    #[test]
+    fn test_detect_and_validate_mime_still_rejects_executable() {
+        let elf = [b"\x7fELF".as_slice(), &[0u8; 60]].concat();
+        assert!(detect_and_validate_mime(&elf).is_err());
+    }
+
+    #[test]
+    fn test_blocked_mime_keeps_active_content_and_executables() {
+        for kept in [
+            "image/svg+xml",
+            "application/xhtml+xml",
+            "application/javascript",
+            "text/javascript",
+            "application/x-executable",
+            "application/x-mach-binary",
+        ] {
+            assert!(BLOCKED_MIME.contains(&kept), "{kept} must stay blocked");
+        }
     }
 
     #[test]

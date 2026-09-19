@@ -1,104 +1,170 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+
 import { buildMentionCandidates } from "./buildMentionCandidates.ts";
-import { getMentionableAgentPubkeys } from "../../agents/lib/agentAutocompleteEligibility.ts";
-const key = "bb".repeat(32);
-const owner = "aa".repeat(32);
-function options(managed = true, relay = false) {
-  const managedAgentPubkeys = new Set(managed ? [key] : []);
-  const relayAgents = relay
-    ? [
-        {
-          pubkey: key,
-          name: "Relay name",
-          ownerPubkey: owner,
-          respondTo: "nobody",
-          respondToAllowlist: [],
-          channelIds: ["channel"],
-        },
-      ]
-    : [];
+
+const MEMBER_PUBKEY = "a".repeat(64);
+const AGENT_PUBKEY = "b".repeat(64);
+const ARCHIVED_PUBKEY = "c".repeat(64);
+const SEARCHED_PUBKEY = "d".repeat(64);
+
+function input(overrides = {}) {
   return {
     activeAgentPubkeys: new Set(),
     activePersonaById: new Map(),
     activePersonas: [],
-    candidateProfiles: {},
-    userSearchResults: [],
     canSearchGlobalUsers: false,
-    currentPubkey: owner,
-    directoryAgentPubkeys: new Set(relay ? [key] : []),
-    isArchivedDiscovery: () => false,
-    managedAgentNamesByPubkey: new Map(managed ? [[key, "Renamed Scout"]] : []),
+    currentPubkey: null,
+    isArchived: () => false,
+    managedAgentDirectoryReady: true,
+    managedAgentNamesByPubkey: new Map(),
     managedAgentPersonaIds: new Set(),
     managedAgentPersonaIdsByPubkey: new Map(),
-    managedAgentPubkeys,
-    managedAgents: managed
-      ? [
-          {
-            pubkey: key.toUpperCase(),
-            name: "Renamed Scout",
-            respondTo: "nobody",
-          },
-        ]
-      : [],
-    memberPubkeys: new Set([key]),
-    members: [{ pubkey: key, role: "admin", isAgent: true }],
-    mentionableAgentPubkeys: getMentionableAgentPubkeys({
-      currentPubkey: owner,
-      eligibilityScope: { type: "channel", channelId: "channel" },
-      managedAgentPubkeys,
-      relayAgents,
-      sharedChannelIds: new Set(["channel"]),
-    }),
+    managedAgents: [],
+    memberPubkeys: new Set(),
+    members: [],
+    mentionChannelId: null,
+    mentionableAgentPubkeys: new Set(),
     personaNameByPubkey: new Map(),
+    profiles: undefined,
+    relayAgentDirectoryReady: true,
     relayAgentNamesByPubkey: new Map(),
-    relayAgents,
+    relayAgents: [],
+    userSearchResults: [],
+    ...overrides,
   };
 }
-test("managed nobody mention needs no relay row and preserves roster authority and renamed identity", () => {
-  for (const relay of [false, true]) {
-    const candidates = buildMentionCandidates(options(true, relay));
-    assert.equal(candidates.length, 1);
-    assert.equal(candidates[0].pubkey, key);
-    assert.equal(candidates[0].displayName, "Renamed Scout");
-    assert.equal(candidates[0].role, "admin");
-    assert.equal(candidates[0].isManagedAgent, true);
-  }
+
+test("a roster entry and its relay agent record coalesce into one candidate", () => {
+  const candidates = buildMentionCandidates(
+    input({
+      members: [
+        { pubkey: AGENT_PUBKEY, displayName: null, isAgent: true, role: "bot" },
+      ],
+      mentionableAgentPubkeys: new Set([AGENT_PUBKEY]),
+      relayAgents: [
+        {
+          pubkey: AGENT_PUBKEY,
+          name: "Scout",
+          ownerPubkey: null,
+          status: "online",
+        },
+      ],
+    }),
+  );
+
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].pubkey, AGENT_PUBKEY);
+  // The roster contributes membership, the directory contributes the name.
+  assert.equal(candidates[0].isMember, true);
+  assert.equal(candidates[0].displayName, "Scout");
+  assert.equal(candidates[0].isActiveAgent, true);
 });
-test("relay-only nobody remains hidden and archived local identities stay excluded", () => {
-  assert.deepEqual(buildMentionCandidates(options(false, true)), []);
+
+test("archived identities never become candidates", () => {
+  const candidates = buildMentionCandidates(
+    input({
+      isArchived: (pubkey) => pubkey === ARCHIVED_PUBKEY,
+      members: [
+        { pubkey: MEMBER_PUBKEY, displayName: "Ada", isAgent: false },
+        { pubkey: ARCHIVED_PUBKEY, displayName: "Gone", isAgent: false },
+      ],
+    }),
+  );
+
   assert.deepEqual(
-    buildMentionCandidates({ ...options(), isArchivedDiscovery: () => true }),
+    candidates.map((candidate) => candidate.pubkey),
+    [MEMBER_PUBKEY],
+  );
+});
+
+test("an agent outside the mentionable set is hidden once its directory is ready", () => {
+  const relayAgents = [
+    { pubkey: AGENT_PUBKEY, name: "Scout", ownerPubkey: null, status: "away" },
+  ];
+
+  assert.deepEqual(buildMentionCandidates(input({ relayAgents })), []);
+  assert.equal(
+    buildMentionCandidates(
+      input({ mentionableAgentPubkeys: new Set([AGENT_PUBKEY]), relayAgents }),
+    ).length,
+    1,
+  );
+});
+
+test("active personas join unless a managed agent already carries them", () => {
+  const activePersonas = [
+    { id: "planner", displayName: "Planner", avatarUrl: null, isActive: true },
+  ];
+
+  const standalone = buildMentionCandidates(input({ activePersonas }));
+  assert.equal(standalone.length, 1);
+  assert.equal(standalone[0].kind, "persona");
+  assert.equal(standalone[0].personaId, "planner");
+
+  assert.deepEqual(
+    buildMentionCandidates(
+      input({ activePersonas, managedAgentPersonaIds: new Set(["planner"]) }),
+    ),
     [],
   );
 });
 
-test("foreign relay agents retain mentions in owner, admin and guest roles only when channel policy admits the viewer", () => {
-  for (const role of ["owner", "admin", "guest"]) {
-    for (const allowed of [true, false]) {
-      const input = options(false, true);
-      input.members = [{ pubkey: key, role, isAgent: true }];
-      input.relayAgents[0].ownerPubkey = "dd".repeat(32);
-      input.relayAgents[0].respondTo = "allowlist";
-      input.relayAgents[0].respondToAllowlist = allowed ? [owner] : [];
-      const discover = () =>
-        getMentionableAgentPubkeys({
-          currentPubkey: owner,
-          eligibilityScope: { type: "channel", channelId: "channel" },
-          managedAgentPubkeys: input.managedAgentPubkeys,
-          relayAgents: input.relayAgents,
-          sharedChannelIds: new Set(["channel"]),
-        });
-      input.mentionableAgentPubkeys = discover();
-      const candidates = buildMentionCandidates(input);
-      assert.equal(candidates.length, allowed ? 1 : 0);
-      if (allowed) {
-        assert.equal(candidates[0].pubkey, key);
-        assert.equal(candidates[0].role, role);
-      }
-      input.relayAgents[0].channelIds = ["other-channel"];
-      input.mentionableAgentPubkeys = discover();
-      assert.deepEqual(buildMentionCandidates(input), []);
-    }
-  }
+test("global search results join only while global search is enabled", () => {
+  const userSearchResults = [
+    {
+      pubkey: SEARCHED_PUBKEY,
+      displayName: "Dana",
+      isAgent: false,
+      nip05Handle: null,
+      ownerPubkey: null,
+    },
+  ];
+
+  assert.deepEqual(buildMentionCandidates(input({ userSearchResults })), []);
+
+  const searched = buildMentionCandidates(
+    input({ canSearchGlobalUsers: true, userSearchResults }),
+  );
+  assert.equal(searched.length, 1);
+  assert.equal(searched[0].displayName, "Dana");
+  assert.equal(searched[0].isGlobalSearchResult, true);
 });
+
+test("policy-only discovery stays selectable without claiming active presence", () => {
+  const [candidate] = buildMentionCandidates(
+    input({
+      mentionableAgentPubkeys: new Set([AGENT_PUBKEY]),
+      relayAgents: [
+        {
+          pubkey: AGENT_PUBKEY,
+          name: "Scout",
+          ownerPubkey: MEMBER_PUBKEY,
+          status: "unknown",
+        },
+      ],
+    }),
+  );
+  assert.equal(candidate.pubkey, AGENT_PUBKEY);
+  assert.equal(candidate.isActiveAgent, false);
+  assert.equal(candidate.ownerPubkey, MEMBER_PUBKEY);
+});
+
+for (const locallyManaged of [true, false]) {
+  test(`roster candidate preserves exact local management: ${locallyManaged}`, () => {
+    const [candidate] = buildMentionCandidates(
+      input({
+        members: [{ pubkey: AGENT_PUBKEY, displayName: "Scout", role: "bot" }],
+        managedAgentNamesByPubkey: new Map(
+          locallyManaged ? [[AGENT_PUBKEY, "Scout"]] : [],
+        ),
+        managedAgents: locallyManaged
+          ? [{ pubkey: AGENT_PUBKEY, name: "Scout", status: "deployed" }]
+          : [],
+        mentionableAgentPubkeys: new Set([AGENT_PUBKEY]),
+      }),
+    );
+    assert.equal(candidate.isMember, true);
+    assert.equal(Boolean(candidate.isManagedAgent), locallyManaged);
+  });
+}

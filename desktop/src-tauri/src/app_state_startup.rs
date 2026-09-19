@@ -28,13 +28,14 @@ pub(crate) fn build_ephemeral_test_app_state() -> AppState {
 
 fn app_state_with_identity(keys: Keys, identity_storage: IdentityStorage) -> AppState {
     AppState {
+        channel_member_profile_cache: ChannelMemberProfileCache::default(),
         keys: Mutex::new(keys),
         publication_epoch: Arc::new(Mutex::new(0)),
         identity_storage: AtomicU8::new(identity_storage as u8),
         http_client: reqwest::Client::builder()
             .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
-            .pool_idle_timeout(std::time::Duration::from_secs(10))
-            .pool_max_idle_per_host(1)
+            .pool_idle_timeout(std::time::Duration::from_secs(300))
+            .pool_max_idle_per_host(2)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new()),
         media_fetch_client: build_media_fetch_client().expect(
@@ -43,6 +44,9 @@ fn app_state_with_identity(keys: Keys, identity_storage: IdentityStorage) -> App
              header across origins (redirect-hop SSRF)",
         ),
         relay_url_override: Mutex::new(None),
+        agent_avatar_communities: Mutex::new(Vec::new()),
+        workspace_apply_lock: Arc::new(AsyncMutex::new(())),
+        workspace_apply_generation: AtomicU64::new(0),
         managed_agent_restore_pending: AtomicBool::new(false),
         managed_agent_experiments: crate::managed_agents::ManagedAgentExperimentState::default(),
         shutdown_started: AtomicBool::new(false),
@@ -51,15 +55,13 @@ fn app_state_with_identity(keys: Keys, identity_storage: IdentityStorage) -> App
         managed_agents_store_lock: Mutex::new(()),
         channel_templates_store_lock: Mutex::new(()),
         managed_agent_processes: Mutex::new(HashMap::new()),
+        provider_deploy_locks: Mutex::new(HashMap::new()),
         session_config_cache: Mutex::new(HashMap::new()),
-        channel_member_profile_cache: ChannelMemberProfileCache::default(),
         huddle_state: Mutex::new(HuddleState::default()),
         huddle_audio: Default::default(),
         app_handle: Mutex::new(None),
         media_proxy_port: AtomicU16::new(0),
-        prevent_sleep: Arc::new(Mutex::new(
-            crate::prevent_sleep::PreventSleepState::default(),
-        )),
+        prevent_sleep: Default::default(),
         keyring_locked: AtomicBool::new(false),
         identity_lost: AtomicBool::new(false),
         reset_failed: AtomicBool::new(false),
@@ -70,19 +72,8 @@ fn app_state_with_identity(keys: Keys, identity_storage: IdentityStorage) -> App
         #[cfg(feature = "mesh-llm")]
         mesh_coordinator: AsyncMutex::new(None),
         pending_owned_channels: Mutex::new(std::collections::HashSet::new()),
-    }
-}
-
-impl AppState {
-    /// Read recovery flags after identity resolution, preserving its Release/Acquire ordering.
-    pub(crate) fn identity_recovery_flags(&self) -> (bool, bool) {
-        let identity_lost = self
-            .identity_lost
-            .load(std::sync::atomic::Ordering::Acquire);
-        let keyring_locked = self
-            .keyring_locked
-            .load(std::sync::atomic::Ordering::Acquire);
-        (identity_lost, keyring_locked)
+        relay_self_cache: Mutex::new(HashMap::new()),
+        archive_db: crate::archive::ArchiveDb::default(),
     }
 }
 

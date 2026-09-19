@@ -1,16 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
-import {
-  clearMarkdownNodeCache,
-  getMarkdownNodeCacheSizeForTests,
-  getMarkdownNodeCacheWeightForTests,
-  getMarkdownNodeCacheWeightLimitForTests,
-  getMarkdownParseCount,
-  renderCachedMarkdown,
-} from "./nodeCache.ts";
+import { clearMarkdownNodeCache, renderCachedMarkdown } from "./nodeCache.ts";
 
 // The whole point of the cache is element-identity reuse across the message
 // timeline's per-channel-switch remount: same parse inputs must return the
@@ -88,6 +82,103 @@ test("render variants do not collide", () => {
   assert.notEqual(interactive, nonInteractive);
 });
 
+test("leading inline content is inserted into the first prose-capable block", () => {
+  const components = {
+    span: ({ children, node: _node, ...props }) =>
+      "data-leading-inline-content" in props
+        ? React.createElement(
+            "button",
+            { "data-chip": "", type: "button" },
+            "00:01",
+          )
+        : React.createElement("span", props, children),
+  };
+
+  for (const [content, pattern] of [
+    ["plain note", /<p><button[^>]*>00:01<\/button>plain note<\/p>/],
+    ["> quoted note", /<blockquote>\s*<p><button[^>]*>00:01<\/button>quoted/],
+    ["- list note", /<li><button[^>]*>00:01<\/button>list note<\/li>/],
+    ["# heading", /<h1><button[^>]*>00:01<\/button>heading<\/h1>/],
+  ]) {
+    const node = renderCachedMarkdown({
+      ...BASE,
+      components,
+      content,
+      leadingInlineContent: true,
+      variant: "leading",
+    });
+    assert.match(renderToStaticMarkup(node), pattern);
+  }
+});
+
+test("leading inline content falls back before code and media blocks", () => {
+  const components = {
+    span: ({ children, node: _node, ...props }) =>
+      "data-leading-inline-content" in props
+        ? React.createElement(
+            "button",
+            { "data-chip": "", type: "button" },
+            "00:01",
+          )
+        : React.createElement("span", props, children),
+  };
+
+  for (const [content, blockPattern] of [
+    ["```js\nconst answer = 42;\n```", "<pre"],
+    ["![](https://example.com/review.png)", "<img"],
+    ["```js\nconst answer = 42;\n```\n\nlater note", "<pre"],
+    ["![](https://example.com/review.png)\n\nlater note", "<img"],
+    ["> ```js\nconst answer = 42;\n```\n\n> later note", "<pre"],
+    ["> ![](https://example.com/review.png)\n\n> later note", "<img"],
+  ]) {
+    const node = renderCachedMarkdown({
+      ...BASE,
+      components,
+      content,
+      leadingInlineContent: true,
+      variant: "leading-fallback",
+    });
+    const html = renderToStaticMarkup(node);
+    assert.match(html, /<p><button[^>]*>00:01<\/button><\/p>/);
+    assert.ok(html.indexOf("<button") < html.indexOf(blockPattern));
+  }
+});
+
+test("leading inline content stays on the outer tight-list item", () => {
+  const components = {
+    span: ({ children, node: _node, ...props }) =>
+      "data-leading-inline-content" in props
+        ? React.createElement(
+            "button",
+            { "data-chip": "", type: "button" },
+            "00:01",
+          )
+        : React.createElement("span", props, children),
+  };
+  const node = renderCachedMarkdown({
+    ...BASE,
+    components,
+    content: "- parent\n  - child",
+    leadingInlineContent: true,
+    variant: "leading-tight-nested-list",
+  });
+
+  assert.match(
+    renderToStaticMarkup(node),
+    /<li><button[^>]*>00:01<\/button>parent\s*<ul>\s*<li>child<\/li>/,
+  );
+});
+
+test("leading inline content participates in the cache key", () => {
+  clearMarkdownNodeCache();
+  const withoutLeading = renderCachedMarkdown({ ...BASE });
+  const withLeading = renderCachedMarkdown({
+    ...BASE,
+    leadingInlineContent: true,
+  });
+  assert.notEqual(withoutLeading, withLeading);
+});
+
 test("crafted values cannot forge key-segment boundaries", () => {
   clearMarkdownNodeCache();
   // Length-prefixed segments: a single name containing arbitrary bytes must
@@ -108,137 +199,40 @@ test("crafted values cannot forge key-segment boundaries", () => {
   assert.notEqual(inMentions, inChannels);
 });
 
-test("cache holds exactly 1000 entries and evicts the least recently used", () => {
+test("oversized content bypasses the cache", () => {
   clearMarkdownNodeCache();
-  const entries = Array.from({ length: 1000 }, (_, index) =>
-    renderCachedMarkdown({ ...BASE, content: `entry-${index}` }),
-  );
-  assert.equal(getMarkdownNodeCacheSizeForTests(), 1000);
-
-  // Refresh entry 0. Entry 1 is now the least recently used entry.
-  assert.equal(
-    renderCachedMarkdown({ ...BASE, content: "entry-0" }),
-    entries[0],
-  );
-
-  renderCachedMarkdown({ ...BASE, content: "entry-1000" });
-  assert.equal(getMarkdownNodeCacheSizeForTests(), 1000);
-  assert.equal(
-    renderCachedMarkdown({ ...BASE, content: "entry-0" }),
-    entries[0],
-    "a cache hit must refresh recency",
-  );
-  assert.notEqual(
-    renderCachedMarkdown({ ...BASE, content: "entry-1" }),
-    entries[1],
-    "the untouched least-recently-used entry must be evicted",
-  );
-  assert.equal(getMarkdownNodeCacheSizeForTests(), 1000);
-});
-
-test("cache evicts large parses by retained weight before the count ceiling", () => {
-  clearMarkdownNodeCache();
-  const entries = Array.from({ length: 40 }, (_, index) =>
-    renderCachedMarkdown({
-      ...BASE,
-      content: `${index}:`.padEnd(31_000, "x"),
-    }),
-  );
-
-  assert.ok(
-    getMarkdownNodeCacheSizeForTests() < entries.length,
-    "large entries must hit the weight ceiling before the 1000-entry ceiling",
-  );
-  assert.ok(
-    getMarkdownNodeCacheWeightForTests() <=
-      getMarkdownNodeCacheWeightLimitForTests(),
-    "retained weight must never exceed its configured budget",
-  );
-
-  const weightBeforeHit = getMarkdownNodeCacheWeightForTests();
-  assert.equal(
-    renderCachedMarkdown({
-      ...BASE,
-      content: "39:".padEnd(31_000, "x"),
-    }),
-    entries[39],
-    "the newest large entry must remain cached",
-  );
-  assert.equal(
-    getMarkdownNodeCacheWeightForTests(),
-    weightBeforeHit,
-    "refreshing LRU recency must not change retained-weight accounting",
-  );
-  assert.notEqual(
-    renderCachedMarkdown({
-      ...BASE,
-      content: "0:".padEnd(31_000, "x"),
-    }),
-    entries[0],
-    "the oldest large entry must be evicted by retained weight",
-  );
-  assert.ok(
-    getMarkdownNodeCacheWeightForTests() <=
-      getMarkdownNodeCacheWeightLimitForTests(),
-  );
-
-  clearMarkdownNodeCache();
-  assert.equal(getMarkdownNodeCacheSizeForTests(), 0);
-  assert.equal(
-    getMarkdownNodeCacheWeightForTests(),
-    0,
-    "clearing the cache must reset retained-weight accounting exactly",
-  );
-});
-
-test("oversized content and active searches parse fresh without entering the cache", () => {
-  clearMarkdownNodeCache();
-  const sentinel = renderCachedMarkdown({ ...BASE, content: "sentinel" });
-  const sizeBefore = getMarkdownNodeCacheSizeForTests();
-  const weightBefore = getMarkdownNodeCacheWeightForTests();
-  const parseCountBefore = getMarkdownParseCount();
-
   const huge = { ...BASE, content: "a".repeat(40_000) };
-  const hugeFirst = renderCachedMarkdown(huge);
-  const hugeSecond = renderCachedMarkdown(huge);
-  assert.notEqual(hugeFirst, hugeSecond);
+  const first = renderCachedMarkdown(huge);
+  const second = renderCachedMarkdown(huge);
+  assert.notEqual(first, second);
+});
 
-  const searchFirst = renderCachedMarkdown({ ...BASE, searchQuery: "bold" });
-  const searchSecond = renderCachedMarkdown({ ...BASE, searchQuery: "bold" });
-  assert.notEqual(searchFirst, searchSecond);
-
-  assert.equal(
-    getMarkdownParseCount() - parseCountBefore,
-    4,
-    "every bypassed render must perform a fresh parse",
-  );
-  assert.equal(
-    getMarkdownNodeCacheSizeForTests(),
-    sizeBefore,
-    "non-cacheable parses must not consume cache capacity",
-  );
-  assert.equal(
-    getMarkdownNodeCacheWeightForTests(),
-    weightBefore,
-    "non-cacheable parses must not consume retained-weight capacity",
-  );
-  assert.equal(
-    renderCachedMarkdown({ ...BASE, content: "sentinel" }),
-    sentinel,
-    "non-cacheable parses must not evict an existing cache entry",
-  );
+test("hardLineBreaks changes the parse and the cache key", () => {
+  clearMarkdownNodeCache();
+  const content = "hello\nworld";
+  const withBreaks = renderCachedMarkdown({ ...BASE, content });
+  const withoutBreaks = renderCachedMarkdown({
+    ...BASE,
+    content,
+    hardLineBreaks: false,
+  });
+  assert.notEqual(withBreaks, withoutBreaks);
+  assert.match(renderToStaticMarkup(withBreaks), /<br/i);
+  assert.doesNotMatch(renderToStaticMarkup(withoutBreaks), /<br/i);
+  const withoutBreaksAgain = renderCachedMarkdown({
+    ...BASE,
+    content,
+    hardLineBreaks: false,
+  });
+  assert.equal(withoutBreaks, withoutBreaksAgain);
 });
 
 test("single-character scoped search stays on lexeme boundaries", () => {
-  const count = getMarkdownNodeCacheSizeForTests();
-  const weight = getMarkdownNodeCacheWeightForTests();
   const html = renderToStaticMarkup(
     renderCachedMarkdown({ ...BASE, content: "A plan", searchQuery: "a" }),
   );
 
   assert.equal((html.match(/data-search-match="true"/g) ?? []).length, 1);
-  assert.equal(getMarkdownNodeCacheSizeForTests(), count);
-  assert.equal(getMarkdownNodeCacheWeightForTests(), weight);
 });
 
 test("active search queries bypass the cache and highlight every match", () => {

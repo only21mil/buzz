@@ -88,7 +88,6 @@ type UseMediaUploadOptions = {
 export function useMediaUpload({
   deferUploadsUntilSend = false,
 }: UseMediaUploadOptions = {}) {
-  const openFilePicker = useFilePicker();
   // Synchronous intent changes revoke pending edits before React renders.
   const intentRevisionRef = React.useRef(0);
   const getIntentRevision = React.useCallback(
@@ -602,6 +601,8 @@ export function useMediaUpload({
       uploadPreviewFile,
     ],
   );
+
+  const openFilePicker = useFilePicker();
 
   const handlePaperclip = React.useCallback(async () => {
     if (queueUntilSend) {

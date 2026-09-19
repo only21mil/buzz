@@ -1,4 +1,3 @@
-import { isTauri } from "@tauri-apps/api/core";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import * as React from "react";
 
@@ -60,8 +59,6 @@ async function writeProjectIssueAssignment({
   operation: IssueAssignmentOperation;
   project: Project;
 }): Promise<void> {
-  if (!isTauri())
-    throw new Error("Issue assignment is available in the desktop app.");
   if (assignees.length === 0) {
     throw new Error("Select at least one assignee.");
   }
@@ -77,8 +74,8 @@ async function writeProjectIssueAssignment({
   );
   const isAssignment = operation === "assign";
   const content = isAssignment
-    ? `Assigned this issue to ${normalizedLabel}`
-    : `Unassigned ${normalizedLabel} from this issue`;
+    ? `Assigned this task to ${normalizedLabel}`
+    : `Unassigned ${normalizedLabel} from this task`;
   const label = isAssignment
     ? ISSUE_ASSIGNMENT_LABEL
     : ISSUE_UNASSIGNMENT_LABEL;
@@ -116,12 +113,14 @@ async function writeProjectIssueAssignment({
 
   await relayClient.publishEvent(
     event,
-    `Timed out ${operation}ing issue.`,
-    `Failed to ${operation} issue.`,
+    `Timed out ${operation}ing task.`,
+    `Failed to ${operation} task.`,
   );
 }
 
-function useProjectIssueWriteInvalidation(project: Project | null | undefined) {
+export function useProjectIssueWriteInvalidation(
+  project: Project | null | undefined,
+) {
   const queryClient = useQueryClient();
   return React.useCallback(() => {
     void queryClient.invalidateQueries({

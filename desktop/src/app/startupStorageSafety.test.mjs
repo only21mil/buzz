@@ -16,6 +16,8 @@ const startupModules = [
   "../features/agents/usePreventSleep.ts",
   "../features/channels/readState/readStateManager.ts",
   "../features/channels/readState/readStateStorage.ts",
+  "../features/channels/readState/readStateIdentity.ts",
+  "../features/onboarding/ui/IdentityKeyHelpDialog.tsx",
   "../shared/ui/sidebar.tsx",
 ];
 
@@ -29,8 +31,8 @@ test("app-shell startup storage uses throw-safe accessors", () => {
     );
     assert.match(
       source,
-      /@\/shared\/lib\/safeStorage/,
-      `${relativePath} must use safeStorage`,
+      /@\/shared\/lib\/(?:safeStorage|localStorageQuota)/,
+      `${relativePath} must use a throw-safe storage wrapper`,
     );
   }
 });

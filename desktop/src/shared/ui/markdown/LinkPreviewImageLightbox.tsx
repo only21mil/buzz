@@ -1,3 +1,5 @@
+import { invokeTauri } from "@/shared/api/tauri";
+import { toast } from "sonner";
 import type { ComponentType } from "react";
 import { useRef, useState } from "react";
 
@@ -10,6 +12,7 @@ import {
   type ImageLightboxCornerRadii,
   imageLightboxBoxFromRect,
   imageLightboxCornerRadiiFromElement,
+  imageLightboxSourceScopeForTrigger,
   visibleImageGalleryForTrigger,
 } from "./imageLightbox";
 
@@ -26,8 +29,6 @@ type ImageZoomOverlayProps = {
   sourceScope?: Element | null;
   src: string | undefined;
 };
-
-const ignoreUnavailableImageAction = () => undefined;
 
 export function createLinkPreviewImageLightbox(
   ImageZoomOverlay: ComponentType<ImageZoomOverlayProps>,
@@ -52,7 +53,7 @@ export function createLinkPreviewImageLightbox(
 
       const sourceBox = imageLightboxBoxFromRect(rect);
       const sourceCornerRadii = imageLightboxCornerRadiiFromElement(image);
-      const sourceScope = trigger.closest("[data-link-preview-list]");
+      const sourceScope = imageLightboxSourceScopeForTrigger(trigger);
       const dim =
         image.naturalWidth > 0 && image.naturalHeight > 0
           ? `${image.naturalWidth}x${image.naturalHeight}`
@@ -62,6 +63,7 @@ export function createLinkPreviewImageLightbox(
         {
           alt,
           dim,
+          trigger,
           resolvedSrc: src,
           src: undefined,
           thumbnailBox: sourceBox,
@@ -99,12 +101,31 @@ export function createLinkPreviewImageLightbox(
         </button>
         {lightboxState ? (
           <ImageZoomOverlay
+            onCopy={(url) => {
+              if (url)
+                void invokeTauri("copy_image_to_clipboard", { url })
+                  .then(() => toast.success("Copied to clipboard"))
+                  .catch((error: unknown) =>
+                    toast.error(
+                      error instanceof Error ? error.message : "Copy failed",
+                    ),
+                  );
+            }}
+            onDownload={(url) => {
+              if (url)
+                void invokeTauri("download_image", { url }).catch(
+                  (error: unknown) =>
+                    toast.error(
+                      error instanceof Error
+                        ? error.message
+                        : "Download failed",
+                    ),
+                );
+            }}
             alt={alt}
             galleryIndex={lightboxState.galleryIndex}
             galleryItems={lightboxState.galleryItems}
             onClose={() => setLightboxState(null)}
-            onCopy={ignoreUnavailableImageAction}
-            onDownload={ignoreUnavailableImageAction}
             resolvedSrc={src}
             sourceBox={lightboxState.sourceBox}
             sourceCornerRadii={lightboxState.sourceCornerRadii}

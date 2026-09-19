@@ -71,22 +71,26 @@ export function channelMemberPubkeySet(
   return set;
 }
 
-const agentMemberPubkeySets = new WeakMap<
+const botMemberPubkeySets = new WeakMap<
   readonly RosterMember[],
   ReadonlySet<string>
 >();
 
-/** Normalized pubkeys for role-bot or profile-verified agent members. */
-export function channelAgentMemberPubkeySet(
+/**
+ * Normalized pubkeys of role-`bot` members only. Deliberately narrower than
+ * {@link channelAgentMembers}: the agent-session filter treats the membership
+ * role as authoritative and ignores profile-derived agent flags.
+ */
+export function channelBotMemberPubkeySet(
   members: readonly RosterMember[],
 ): ReadonlySet<string> {
-  const cached = agentMemberPubkeySets.get(members);
+  const cached = botMemberPubkeySets.get(members);
   if (cached) return cached;
   const set = new Set(
     members
-      .filter((member) => member.role === "bot" || member.isAgent)
+      .filter((member) => member.role === "bot")
       .map((member) => normalizePubkey(member.pubkey)),
   );
-  agentMemberPubkeySets.set(members, set);
+  botMemberPubkeySets.set(members, set);
   return set;
 }

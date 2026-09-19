@@ -11,6 +11,7 @@ import 'package:buzz/shared/push/push_subscription.dart';
 /// in-memory logic.
 class FakeSecureStorage extends Fake implements FlutterSecureStorage {
   final Map<String, String> _data = {};
+  final Map<String, int> _writeCounts = {};
 
   @override
   Future<String?> read({
@@ -34,6 +35,7 @@ class FakeSecureStorage extends Fake implements FlutterSecureStorage {
     AppleOptions? mOptions,
     WindowsOptions? wOptions,
   }) async {
+    _writeCounts[key] = (_writeCounts[key] ?? 0) + 1;
     if (value != null) {
       _data[key] = value;
     } else {
@@ -86,6 +88,7 @@ class FakeSecureStorage extends Fake implements FlutterSecureStorage {
   // Convenience for setting up test data.
   String? operator [](String key) => _data[key];
   void operator []=(String key, String value) => _data[key] = value;
+  int writeCount(String key) => _writeCounts[key] ?? 0;
 }
 
 void main() {
@@ -320,6 +323,10 @@ void main() {
         expect(loaded.first.pubkey, 'legacy_pub');
         expect(loaded.first.nsec, 'legacy_nsec');
         expect(loaded.first.name, isNotEmpty);
+        expect(
+          loaded.first.sensitiveActionPolicy,
+          SensitiveActionPolicy.disabledByUser,
+        );
 
         // Legacy keys should be deleted.
         expect(fakeSecure['buzz_relay_url'], isNull);

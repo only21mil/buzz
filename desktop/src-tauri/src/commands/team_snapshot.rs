@@ -122,6 +122,9 @@ fn definition_from_snapshot(
         id: Uuid::new_v4().to_string(),
         display_name: member.profile.display_name.trim().to_string(),
         avatar_url: effective_avatar(member),
+        description: crate::managed_agents::effective_agent_description(
+            member.profile.about.as_deref(),
+        ),
         system_prompt: member.definition.system_prompt.clone().unwrap_or_default(),
         runtime: member.definition.runtime.clone(),
         model: member.definition.model.clone(),
@@ -138,6 +141,7 @@ fn definition_from_snapshot(
         respond_to,
         respond_to_allowlist: behavior.respond_to_allowlist,
         parallelism: behavior.parallelism,
+        session_policy: member.definition.session_policy,
         created_at: now.to_string(),
         updated_at: now.to_string(),
     })
@@ -556,10 +560,13 @@ pub async fn confirm_team_snapshot_import(
 
         // Build the ManagedAgentRecord for this member.
         let record = ManagedAgentRecord {
-            effort_level: None,
             pubkey: pubkey.clone(),
             name: display_name.clone(),
             display_name: None,
+            // Linked definitions remain the sole description authority. Do
+            // not persist a second instance copy that can go stale after an
+            // edit or survive a later definition deletion.
+            description: None,
             slug: None,
             persona_id: Some(definition.id.clone()),
             private_key_nsec: private_key_nsec.clone(),
@@ -576,6 +583,7 @@ pub async fn confirm_team_snapshot_import(
             max_turn_duration_seconds: member.definition.max_turn_duration_seconds,
             parallelism: minted_parallelism
                 .unwrap_or(crate::managed_agents::DEFAULT_AGENT_PARALLELISM),
+            session_policy: member.definition.session_policy,
             system_prompt: member.definition.system_prompt.clone(),
             model: member.definition.model.clone(),
             provider: member.definition.provider.clone(),
@@ -586,6 +594,7 @@ pub async fn confirm_team_snapshot_import(
             runtime_pid: None,
             backend: crate::managed_agents::BackendKind::Local,
             backend_agent_id: None,
+            provider_policy_pending: false,
             provider_binary_path: None,
             team_id: Some(imported_team.id.clone()),
             persona_team_dir: None,
@@ -617,6 +626,7 @@ pub async fn confirm_team_snapshot_import(
             definition_respond_to_allowlist: definition.respond_to_allowlist.clone(),
             definition_parallelism: minted_parallelism,
             relay_mesh: None,
+            effort_level: None,
             runtime: member.definition.runtime.clone(),
             name_pool: member.definition.name_pool.clone(),
         };
@@ -749,11 +759,7 @@ pub async fn confirm_team_snapshot_import(
 
         // All writes committed — safe to update in-memory state.
         for m in &minted {
-            if let Err(e) =
-                crate::commands::personas::retain_persona_pending(&app, &state, &m.definition)
-            {
-                eprintln!("buzz-desktop: persona-retain (snapshot): {e}");
-            }
+            crate::commands::personas::retain_persona_pending(&app, &state, &m.definition);
         }
         for m in &minted {
             retain_agent_pending(&app, &state, &m.record);
@@ -774,12 +780,15 @@ pub async fn confirm_team_snapshot_import(
         let relay_url = effective_agent_relay_url(&m.record.relay_url, &relay_ws);
 
         // Phase 4: profile sync (best-effort).
+        let profile_about =
+            crate::managed_agents::effective_agent_description(m.definition.description.as_deref());
         let profile_sync_error = sync_managed_agent_profile(
             &state,
             &relay_url,
             &m.agent_keys,
             &m.display_name,
             m.effective_avatar.as_deref(),
+            profile_about.as_deref(),
             m.auth_tag.as_deref(),
         )
         .await

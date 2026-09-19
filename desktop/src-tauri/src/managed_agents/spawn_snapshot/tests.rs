@@ -5,12 +5,13 @@ use std::collections::BTreeMap;
 /// Canonical projection of a prospective snapshot — the exact value the drift
 /// comparison reads, so these tests assert on drift itself rather than on a
 /// proxy for it.
-fn snapshot(
+fn snapshot_with_policy(
     record: &ManagedAgentRecord,
     personas: &[AgentDefinition],
     teams: &[TeamRecord],
     workspace_relay: &str,
     global: &GlobalAgentConfig,
+    enforced_owner_only: bool,
 ) -> serde_json::Value {
     prospective_spawn_config_snapshot(
         record,
@@ -18,14 +19,31 @@ fn snapshot(
         teams,
         workspace_relay,
         global,
-        super::AcpSessionPolicy::Channel,
+        enforced_owner_only,
     )
     .canonical()
 }
 
+fn snapshot(
+    record: &ManagedAgentRecord,
+    personas: &[AgentDefinition],
+    teams: &[TeamRecord],
+    workspace_relay: &str,
+    global: &GlobalAgentConfig,
+) -> serde_json::Value {
+    snapshot_with_policy(record, personas, teams, workspace_relay, global, false)
+}
+
+/// `snapshot` with the fixed no-persona/no-team/default-global shape the effort
+/// tests share, so their call sites read as `snap(&record)` instead of wrapping.
+fn snap(record: &ManagedAgentRecord) -> serde_json::Value {
+    snapshot(record, &[], &[], "wss://ws.example", &Default::default())
+}
+
 fn record() -> ManagedAgentRecord {
     ManagedAgentRecord {
-        effort_level: None,
+        session_policy: Default::default(),
+        description: None,
         pubkey: "p".repeat(64),
         name: "agent".into(),
         persona_id: None,
@@ -52,6 +70,7 @@ fn record() -> ManagedAgentRecord {
         runtime_pid: None,
         backend: Default::default(),
         backend_agent_id: None,
+        provider_policy_pending: false,
         provider_binary_path: None,
         team_id: None,
         persona_team_dir: None,
@@ -80,11 +99,14 @@ fn record() -> ManagedAgentRecord {
         definition_respond_to_allowlist: Vec::new(),
         definition_parallelism: None,
         relay_mesh: None,
+        effort_level: None,
     }
 }
 
 fn persona(id: &str, runtime: Option<&str>, prompt: &str) -> AgentDefinition {
     AgentDefinition {
+        session_policy: Default::default(),
+        description: None,
         id: id.into(),
         display_name: id.into(),
         avatar_url: None,
@@ -233,6 +255,84 @@ fn stored_record_relay_does_not_affect_snapshot() {
         snapshot(&a, &[], &[], "wss://ws.example", &Default::default()),
         snapshot(&b, &[], &[], "wss://ws.example", &Default::default())
     );
+}
+
+#[test]
+fn owner_only_mode_and_allowlist_edits_do_not_change_effective_snapshot() {
+    let mut before = record();
+    before.respond_to = RespondTo::Allowlist;
+    before.respond_to_allowlist = vec!["a".repeat(64)];
+
+    let mut mode_edited = before.clone();
+    mode_edited.respond_to = RespondTo::Anyone;
+
+    let mut allowlist_edited = before.clone();
+    allowlist_edited.respond_to_allowlist = vec!["b".repeat(64)];
+
+    let effective_before = snapshot_with_policy(
+        &before,
+        &[],
+        &[],
+        "wss://ws.example",
+        &Default::default(),
+        true,
+    );
+    for (label, edited) in [
+        ("respond-to mode", mode_edited),
+        ("respond-to allowlist", allowlist_edited),
+    ] {
+        assert_eq!(
+            effective_before,
+            snapshot_with_policy(
+                &edited,
+                &[],
+                &[],
+                "wss://ws.example",
+                &Default::default(),
+                true,
+            ),
+            "portable {label} edit must not create restart drift when both spawns enforce owner-only",
+        );
+    }
+}
+
+#[test]
+fn oss_mode_and_allowlist_edits_change_effective_snapshot() {
+    let mut before = record();
+    before.respond_to = RespondTo::Allowlist;
+    before.respond_to_allowlist = vec!["a".repeat(64)];
+
+    let mut mode_edited = before.clone();
+    mode_edited.respond_to = RespondTo::Anyone;
+
+    let mut allowlist_edited = before.clone();
+    allowlist_edited.respond_to_allowlist = vec!["b".repeat(64)];
+
+    let effective_before = snapshot_with_policy(
+        &before,
+        &[],
+        &[],
+        "wss://ws.example",
+        &Default::default(),
+        false,
+    );
+    for (label, edited) in [
+        ("respond-to mode", mode_edited),
+        ("respond-to allowlist", allowlist_edited),
+    ] {
+        assert_ne!(
+            effective_before,
+            snapshot_with_policy(
+                &edited,
+                &[],
+                &[],
+                "wss://ws.example",
+                &Default::default(),
+                false,
+            ),
+            "OSS spawn must retain restart drift for effective {label} edits",
+        );
+    }
 }
 
 #[test]
@@ -839,27 +939,6 @@ fn openclaw_cap_crossing_parallelism_snapshots_differ() {
     );
 }
 
-#[test]
-fn effort_projection_has_one_snapshot_leaf_and_clear_restores_inheritance() {
-    let mut record = record();
-    record.persona_id = None;
-    record.agent_command = "goose".into();
-    record.runtime = Some("goose".into());
-    record.effort_level = Some("xhigh".into());
-    let global = GlobalAgentConfig {
-        env_vars: BTreeMap::from([("GOOSE_THINKING_EFFORT".into(), "low".into())]),
-        ..Default::default()
-    };
-    let selected = snapshot(&record, &[], &[], "wss://relay", &global);
-    assert_eq!(selected["effort_level"], "max");
-    assert!(selected["env"].get("GOOSE_THINKING_EFFORT").is_none());
-    record.effort_level = Some("max".into());
-    assert_eq!(
-        selected,
-        snapshot(&record, &[], &[], "wss://relay", &global)
-    );
-    record.effort_level = None;
-    let inherited = snapshot(&record, &[], &[], "wss://relay", &global);
-    assert_eq!(inherited["effort_level"], "low");
-    assert_ne!(selected, inherited);
-}
+#[cfg(test)]
+#[path = "tests_ext.rs"]
+mod ext;

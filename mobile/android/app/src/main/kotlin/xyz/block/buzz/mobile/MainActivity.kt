@@ -1,5 +1,6 @@
 package xyz.block.buzz.mobile
 
+
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -78,30 +79,22 @@ internal object AndroidImageProcessor {
     }
 }
 
-// Device-auth adoption (P05 / upstream #5116) needs a FragmentActivity host
-// while this activity keeps owning the fork notification bridge, the media
-// upload channel, and the huddle permission callbacks. FlutterFragmentActivity
-// is that host: every override below is preserved across the switch.
 class MainActivity : FlutterFragmentActivity() {
     private var mediaUploadChannel: MethodChannel? = null
-    private var huddleMediaPlugin: HuddleMediaPlugin? = null
+    private var ageSignalChannel: MethodChannel? = null
     private var notificationBridge: AndroidNotificationBridge? = null
-    private var deviceAuthBridge: DeviceAuthBridge? = null
+    private var huddleMediaPlugin: HuddleMediaPlugin? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        huddleMediaPlugin?.dispose()
-        huddleMediaPlugin = HuddleMediaPlugin(this, flutterEngine.dartExecutor.binaryMessenger)
+        huddleMediaPlugin = HuddleMediaPlugin(
+            this,
+            flutterEngine.dartExecutor.binaryMessenger,
+        )
 
         notificationBridge?.dispose()
         notificationBridge = AndroidNotificationBridge(
-            activity = this,
-            binaryMessenger = flutterEngine.dartExecutor.binaryMessenger,
-        )
-
-        deviceAuthBridge?.dispose()
-        deviceAuthBridge = DeviceAuthBridge(
             activity = this,
             binaryMessenger = flutterEngine.dartExecutor.binaryMessenger,
         )
@@ -134,6 +127,13 @@ class MainActivity : FlutterFragmentActivity() {
                 }
             }
         }
+
+        ageSignalChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            AGE_SIGNAL_CHANNEL,
+        ).also { channel ->
+            channel.setMethodCallHandler(AgeSignalRequest)
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -156,23 +156,12 @@ class MainActivity : FlutterFragmentActivity() {
         huddleMediaPlugin?.onRequestPermissionsResult(requestCode, permissions, grantResults)
     }
 
-    override fun onActivityResult(
-        requestCode: Int,
-        resultCode: Int,
-        data: Intent?,
-    ) {
-        super.onActivityResult(requestCode, resultCode, data)
-        deviceAuthBridge?.handleActivityResult(requestCode, resultCode)
-    }
-
-    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
-        huddleMediaPlugin?.dispose()
-        huddleMediaPlugin = null
+    override fun onDestroy() {
         notificationBridge?.dispose()
         notificationBridge = null
-        deviceAuthBridge?.dispose()
-        deviceAuthBridge = null
-        super.cleanUpFlutterEngine(flutterEngine)
+        huddleMediaPlugin?.dispose()
+        huddleMediaPlugin = null
+        super.onDestroy()
     }
 
     private fun handleSanitizeImageForUpload(
@@ -429,6 +418,7 @@ class MainActivity : FlutterFragmentActivity() {
 
     companion object {
         private const val MEDIA_UPLOAD_CHANNEL = "buzz/media_upload"
+        private const val AGE_SIGNAL_CHANNEL = "buzz/age_signal"
         private const val SANITIZE_IMAGE_FOR_UPLOAD_METHOD = "sanitizeImageForUpload"
         private const val TRANSCODE_IMAGE_TO_JPEG_METHOD = "transcodeImageToJpeg"
         private const val TRANSCODE_VIDEO_TO_MP4_METHOD = "transcodeVideoToMp4"

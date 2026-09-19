@@ -255,6 +255,10 @@ test("timeline agent send remains one-shot and returns to the placeholder", asyn
   await input.press("Enter");
 
   await expect(input).toHaveText("", { timeout: 500 });
+  // Native sends keep the composer disabled until acknowledgement. The empty
+  // placeholder and focus return when editing is enabled again.
+  await expect(input).toHaveAttribute("contenteditable", "false");
+  await expect(input).toHaveAttribute("contenteditable", "true");
   await expect(input.locator("[data-placeholder]").first()).toHaveAttribute(
     "data-placeholder",
     "Message #general",
@@ -1343,7 +1347,7 @@ test("a root agent mention is explicit for one message and never becomes retaine
   await input.fill("@cla");
   await expect(composer.getByTestId("mention-autocomplete")).toBeVisible();
   await input.press("Tab");
-  await input.pressSequentially(" one time");
+  await input.pressSequentially("one time");
   await expect(input).toHaveText(firstRootMessage);
   await expect(
     composer.getByTestId(`composer-address-lock-${AGENT_A}`),
@@ -1352,20 +1356,8 @@ test("a root agent mention is explicit for one message and never becomes retaine
 
   await expect(input).toHaveText("");
   await expect
-    .poll(() =>
-      page.evaluate(
-        (pubkey) =>
-          Boolean(
-            window.__BUZZ_E2E_SIGNED_EVENTS__?.some((event) =>
-              (event.tags ?? []).some(
-                (tag) => tag[0] === "p" && tag[1] === pubkey,
-              ),
-            ),
-          ),
-        AGENT_A,
-      ),
-    )
-    .toBe(true);
+    .poll(() => readOutgoingMentionPubkeys(page, firstRootMessage))
+    .toEqual([AGENT_A]);
   await input.fill("next root message");
   await input.press("Enter");
   await expect

@@ -548,7 +548,10 @@ pub fn generate_hook_hmac(
 }
 
 #[cfg(test)]
-pub(in crate::api::git) mod tests {
+pub(in crate::api::git) use tests_postgres_tests as tests;
+
+#[cfg(test)]
+pub(in crate::api::git) mod tests_postgres_tests {
     use super::*;
 
     fn make_request() -> HookCallbackRequest {

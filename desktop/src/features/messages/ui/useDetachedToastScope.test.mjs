@@ -167,3 +167,19 @@ test("late startup failure after shell unmount cannot surface a warning", async 
   await act(async () => h.pending[0].reject(new Error("private old failure")));
   assert.deepEqual(h.errors, []);
 });
+
+test("production shell owns the warning scope with its current signer", () => {
+  const shell = fs.readFileSync(
+    new URL("../../../app/AppShell.tsx", import.meta.url),
+    "utf8",
+  );
+  const init = fs.readFileSync(
+    new URL("../../communities/useCommunityInit.ts", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    shell,
+    /useDetachedToastScope\(\s*communitiesHook.activeCommunity\?\.relayUrl,\s*identityQuery.data\?\.pubkey/,
+  );
+  assert.doesNotMatch(init, /\bsetDetachedToastScope\s*\(/);
+});

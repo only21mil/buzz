@@ -7,7 +7,7 @@ import { relayClient } from "@/shared/api/relayClient.ts";
 import { useTtsSubscription } from "./useTtsSubscription.ts";
 
 const self = { current: "self" };
-test("hidden huddle refresh fails closed and recovers without stopping its live subscription", async () => {
+test("hidden huddle pauses polling and visible refresh fails closed then recovers", async () => {
   const dom = new JSDOM("<div id='root'></div>");
   const previous = {
     window: globalThis.window,
@@ -75,8 +75,15 @@ test("hidden huddle refresh fails closed and recovers without stopping its live 
     unavailable = true;
     visible = "hidden";
     document.dispatchEvent(new window.Event("visibilitychange"));
+    const loadsBeforeHidden = membershipLoads;
     await act(async () => mock.timers.tick(60_000));
-    assert.ok(membershipLoads >= 3);
+    assert.equal(membershipLoads, loadsBeforeHidden);
+    assert.equal(unsubscribed, false);
+    visible = "visible";
+    await act(async () =>
+      document.dispatchEvent(new window.Event("visibilitychange")),
+    );
+    assert.ok(membershipLoads > loadsBeforeHidden);
     await act(async () => deliver(message("failed", "failed")));
     assert.deepEqual(spoken, ["first"]);
     assert.equal(unsubscribed, false);

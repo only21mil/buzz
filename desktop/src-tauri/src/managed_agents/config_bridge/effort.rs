@@ -39,7 +39,7 @@ use crate::managed_agents::types::{AgentDefinition, ManagedAgentRecord};
 
 /// The retained ACP-startup transport key. Claude, Codex, keyless ACP adapters,
 /// and any unknown/custom runtime route the effective effort through this key
-/// (the harness reads it into `PromptContext.startup_effort`). It is *transport*,
+/// (the harness reads it into `PoolStartup.startup_effort`). It is *transport*,
 /// never a value-authority tier: a user-supplied entry is suppressed and
 /// overwritten by the projected effective value.
 pub(crate) const ACP_STARTUP_EFFORT_KEY: &str = "BUZZ_ACP_EFFORT_LEVEL";
@@ -195,7 +195,7 @@ pub(crate) fn effort_tier_alias(
 ///   Goose `off`) is rejected so it is never emitted as
 ///   `BUZZ_AGENT_THINKING_EFFORT=off`, which crashes the child at config init.
 /// - both absent (Claude/Codex, unknown/custom): raw passthrough — the value
-///   rides `BUZZ_ACP_EFFORT_LEVEL` to ACP startup validation against the advertised options.
+///   rides `BUZZ_ACP_EFFORT_LEVEL` to an adapter that accepts any string.
 pub(crate) fn normalize_effort(
     contract: Option<&EffortNormalization>,
     accepted: Option<&[&str]>,
@@ -235,6 +235,75 @@ pub(crate) fn effort_suppress_keys() -> Vec<&'static str> {
         keys.push(LEGACY_THINKING_EFFORT_KEY);
     }
     keys
+}
+
+/// Strip every known effort key from a [`std::process::Command`] before the
+/// descriptor overlay is written.
+///
+/// Only used in tests to verify tombstone assertions on individual keys.
+/// Production stripping runs inside `apply_effort_launch_to_command`
+/// (the loop over `launch.suppress`) which is exercised by the
+/// production-sequence tests.
+#[cfg(test)]
+pub(crate) fn strip_effort_keys_from_command(cmd: &mut std::process::Command) {
+    for key in effort_suppress_keys() {
+        cmd.env_remove(key);
+        // Belt-and-suspenders for Unix inherited env with non-canonical casing
+        // (e.g. a shell export of `goose_thinking_effort`). Our own cmd.env()
+        // calls always use UPPER_SNAKE_CASE; only ambient inherited keys can
+        // arrive in non-standard case on Unix.
+        let lower = key.to_ascii_lowercase();
+        if lower != key {
+            cmd.env_remove(&lower);
+        }
+    }
+}
+
+/// Strip effort keys and emit the projected effort value to a
+/// [`std::process::Command`].
+///
+/// This is the production command-boundary seam: call after
+/// `build_buzz_agent_provider_defaults` (which writes raw baked env) and
+/// before the `descriptor.env` loop (which overlays the projected key).
+/// Extracting both steps into one call lets tests exercise the full
+/// baked-write → strip → emit sequence and inspect the child's effective
+/// environment, making the test fail if either step is removed or misordered
+/// in production.
+///
+/// Strip policy follows `launch.suppress`: for known runtimes that is the full
+/// effort vocabulary; for unknown/custom runtimes it is only the ACP sentinel,
+/// leaving foreign effort keys (e.g. a wrapper's own `GOOSE_THINKING_EFFORT`)
+/// untouched. Each key is stripped in canonical and lowercase form so ambient
+/// inherited env with non-canonical casing is swept on Unix.
+///
+/// When `launch.preserve_passthrough` is set and `launch.value` is `None`
+/// (unknown runtime, no authoritative column), the suppress set is skipped
+/// entirely: the inherited process env carries the user's hand-set sentinel,
+/// and stripping it here without a re-emit would silently drop it. Known
+/// runtimes always have a resolved `value` or do not set `preserve_passthrough`.
+pub(crate) fn apply_effort_launch_to_command(
+    cmd: &mut std::process::Command,
+    launch: &EffortLaunch,
+) {
+    // For unknown/custom runtimes with no resolved value the suppress set is
+    // only the ACP sentinel, and stripping it without re-emitting would destroy
+    // the user's ambient pass-through config. Skip the strip entirely and let
+    // the inherited env carry it through unchanged.
+    // MUTATION: removing this guard strips the sentinel and breaks
+    // `production_sequence_custom_inherited_acp_sentinel_survives`.
+    if launch.preserve_passthrough && launch.value.is_none() {
+        return;
+    }
+    for key in &launch.suppress {
+        cmd.env_remove(key);
+        let lower = key.to_ascii_lowercase();
+        if lower.as_str() != *key {
+            cmd.env_remove(&lower);
+        }
+    }
+    if let Some(ref value) = launch.value {
+        cmd.env(launch.key, value);
+    }
 }
 
 /// The effort keys the restart snapshot must strip from its captured launch env
@@ -408,98 +477,30 @@ fn resolve_effective_effort(
     None
 }
 
+/// Combined spawn seam: baked-env write + effort strip + emit.
+///
+/// Called by `apply_effort_to_spawn_command` in `runtime.rs` (production path)
+/// and by `effort_cmd_tests` (test seam). Deleting `build_buzz_agent_provider_defaults`
+/// or `apply_effort_launch_to_command` inside turns the production-sequence tests RED.
+/// Deleting the outer `apply_effort_to_spawn_command` call from `spawn_agent_child`
+/// is a compile error — `spawn_with_effort_proof` consumes the returned `EffortApplied`
+/// token, so removing the binding leaves `effort` undefined at the spawn site.
+pub(crate) fn apply_spawn_effort_env(
+    cmd: &mut std::process::Command,
+    record: &ManagedAgentRecord,
+    runtime: Option<&KnownAcpRuntime>,
+    personas: &[AgentDefinition],
+    persona_id: Option<&str>,
+    global_env: &BTreeMap<String, String>,
+    baked_env: &BTreeMap<String, String>,
+) {
+    crate::managed_agents::agent_env::build_buzz_agent_provider_defaults(cmd);
+    let launch = effort_launch_projection(
+        record, runtime, personas, persona_id, global_env, None, baked_env,
+    );
+    apply_effort_launch_to_command(cmd, &launch);
+}
+
 #[cfg(test)]
 #[path = "effort_tests.rs"]
 mod tests;
-
-/// Suppress ambient and baked aliases before the projected descriptor is applied.
-pub(crate) fn prepare_inherited_effort_env(
-    command: &mut std::process::Command,
-    runtime: Option<&KnownAcpRuntime>,
-    projected: &BTreeMap<String, String>,
-) {
-    if runtime.is_none() && !projected.contains_key(ACP_STARTUP_EFFORT_KEY) {
-        return;
-    }
-    let suppress = if runtime.is_some() {
-        effort_suppress_keys()
-    } else {
-        vec![ACP_STARTUP_EFFORT_KEY]
-    };
-    let keys: Vec<_> = std::env::vars_os()
-        .map(|(key, _)| key)
-        .chain(command.get_envs().map(|(key, _)| key.to_owned()))
-        .collect();
-    for key in keys {
-        if suppress
-            .iter()
-            .any(|candidate| key.to_string_lossy().eq_ignore_ascii_case(candidate))
-        {
-            command.env_remove(key);
-        }
-    }
-    for key in suppress {
-        command.env_remove(key);
-    }
-}
-
-/// Explicit Save owns the canonical column and removes old per-instance aliases.
-/// Missing patches never call this function; null restores inherited tiers.
-pub(crate) fn update_saved_effort(
-    record: &mut ManagedAgentRecord,
-    runtime: Option<&KnownAcpRuntime>,
-    requested: Option<String>,
-) -> Result<(), String> {
-    let value = requested
-        .map(|raw| {
-            let raw = raw.trim();
-            if raw.is_empty() || raw.len() > 128 || raw.chars().any(char::is_control) {
-                return Err("effort must be a nonempty option of at most 128 bytes".to_string());
-            }
-            normalize_effort(
-                runtime.and_then(|r| r.effort_normalization),
-                runtime.and_then(|r| r.effort_accepted_values),
-                raw,
-            )
-            .ok_or_else(|| "effort is not supported by this runtime".to_string())
-        })
-        .transpose()?;
-    let keys = snapshot_suppress_keys(runtime);
-    record.env_vars.retain(|key, _| {
-        !keys
-            .iter()
-            .any(|candidate| key.eq_ignore_ascii_case(candidate))
-    });
-    record.effort_level = value;
-    Ok(())
-}
-
-pub(crate) fn apply_saved_effort_patch(
-    app: &tauri::AppHandle,
-    record: &mut ManagedAgentRecord,
-    patch: Option<Option<String>>,
-    inherit_harness: bool,
-) -> Result<(), String> {
-    if let Some(effort) = effort_patch_after_harness_selection(patch, inherit_harness) {
-        let personas = crate::managed_agents::load_personas(app)?;
-        let command = crate::managed_agents::record_agent_command(record, &personas);
-        update_saved_effort(
-            record,
-            crate::managed_agents::known_acp_runtime(&command),
-            effort,
-        )?;
-    }
-    Ok(())
-}
-
-/// Inherit is authoritative even when the same Save carries an older picker draft.
-pub(crate) fn effort_patch_after_harness_selection(
-    patch: Option<Option<String>>,
-    inherit: bool,
-) -> Option<Option<String>> {
-    if inherit {
-        Some(None)
-    } else {
-        patch
-    }
-}

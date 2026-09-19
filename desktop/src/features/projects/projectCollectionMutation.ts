@@ -1,12 +1,12 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { projectCollectionQueryKey } from "./projectCollectionQuery";
 import type { Project } from "./projectModels";
-import type { ProjectSnapshotScope } from "./projectSnapshot";
+import type { ProjectCollectionScope } from "./projectCollectionScope";
 
 /** Capture the collection at mutation start, including across hook rerenders. */
 export function projectCollectionMutationOptions<Data, Variables>(
   queryClient: QueryClient,
-  scope: ProjectSnapshotScope | null,
+  scope: ProjectCollectionScope | null,
   mutationFn: (variables: Variables) => Promise<Data>,
   update: (current: Project[], data: Data, variables: Variables) => Project[],
 ) {

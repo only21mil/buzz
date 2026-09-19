@@ -96,9 +96,9 @@ export function PullRequestReviewCard({
           status === "draft"
             ? "Converted to draft."
             : status === "closed"
-              ? "Pull request closed."
+              ? "Review closed."
               : pullRequest.status === "Closed"
-                ? "Pull request reopened."
+                ? "Review reopened."
                 : "Marked as ready for review.",
         );
       } catch (error) {
@@ -151,7 +151,7 @@ export function PullRequestReviewCard({
   const handleApprove = React.useCallback(async () => {
     const approved = await runReviewDecision(
       approvePullRequest,
-      "Pull request approved.",
+      "Review approved.",
       "Failed to approve.",
       approvalSummary,
     );
@@ -238,14 +238,14 @@ export function PullRequestReviewCard({
               variant="secondary"
             >
               <RotateCcw className="h-3.5 w-3.5" />
-              Reopen pull request
+              Reopen review
             </Button>
           ) : null}
           {hasOverflowAction ? (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button
-                  aria-label="More pull request actions"
+                  aria-label="More review actions"
                   className="ml-auto h-8 w-8"
                   disabled={!isTauri() || isUpdatingStatus}
                   size="icon-xs"
@@ -274,7 +274,7 @@ export function PullRequestReviewCard({
                     }}
                   >
                     <X className="h-4 w-4" />
-                    Close pull request
+                    Close review
                   </DropdownMenuItem>
                 ) : null}
               </DropdownMenuContent>
@@ -292,7 +292,7 @@ export function PullRequestReviewCard({
       >
         <DialogContent className="max-w-md">
           <DialogHeader>
-            <DialogTitle>Approve pull request</DialogTitle>
+            <DialogTitle>Approve review</DialogTitle>
             <DialogDescription>
               Add an optional summary for the author and other reviewers.
             </DialogDescription>

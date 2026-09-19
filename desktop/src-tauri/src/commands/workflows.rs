@@ -1,4 +1,3 @@
-use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::State;
@@ -6,10 +5,7 @@ use tauri::State;
 use crate::{
     app_state::AppState,
     events,
-    relay::{
-        build_nip98_auth_header, parse_command_response, parse_json_response, query_relay,
-        relay_api_base_url_with_override, relay_error_message, submit_event,
-    },
+    relay::{parse_command_response, query_relay, submit_event},
 };
 
 // ── Wire shapes (snake_case, consumed by tauriWorkflows.ts) ──────────────────
@@ -80,6 +76,7 @@ const WORKFLOW_QUERY_PAGE_SIZE: usize = 1_000;
 #[cfg(test)]
 const WORKFLOW_QUERY_PAGE_SIZE: usize = 2;
 const WORKFLOW_QUERY_MAX_PAGES: usize = 20;
+const WORKFLOW_QUERY_CHANNEL_BATCH_SIZE: usize = 128;
 
 fn advance_workflow_cursor(filter: &mut Value, page: &[nostr::Event]) -> Result<(), String> {
     let last = page
@@ -140,12 +137,7 @@ pub async fn get_channel_workflows(
     )
     .await?;
 
-    Ok(
-        buzz_sdk_pkg::workflow_fold::fold_workflow_definitions(&events)
-            .into_iter()
-            .map(workflow_from_event)
-            .collect(),
-    )
+    Ok(folded_workflows(&events))
 }
 
 /// Fetch definitions with single-channel filters for older relays, paging each
@@ -156,34 +148,46 @@ pub async fn get_channels_workflows(
     state: State<'_, AppState>,
 ) -> Result<Vec<WorkflowWire>, String> {
     use futures_util::{StreamExt, TryStreamExt};
-    let filters = workflow_channel_filters(channel_ids);
+    let filters = channel_workflow_filters(channel_ids)?;
     if filters.is_empty() {
         return Ok(Vec::new());
     }
     let state_ref = &*state;
     let mut events: Vec<nostr::Event> = futures_util::stream::iter(filters)
         .map(|filter| async move { query_workflow_events(state_ref, [filter]).await })
-        .buffered(128)
+        .buffered(WORKFLOW_QUERY_CHANNEL_BATCH_SIZE)
         .try_collect::<Vec<Vec<nostr::Event>>>()
         .await?
         .into_iter()
         .flatten()
         .collect();
     events.extend(query_workflow_events(state_ref, [serde_json::json!({"kinds": [5]})]).await?);
-    Ok(
-        buzz_sdk_pkg::workflow_fold::fold_workflow_definitions(&events)
-            .into_iter()
-            .map(workflow_from_event)
-            .collect(),
-    )
+    Ok(folded_workflows(&events))
 }
 
-fn workflow_channel_filters(channel_ids: Vec<String>) -> Vec<Value> {
+fn channel_workflow_filters(channel_ids: Vec<String>) -> Result<Vec<Value>, String> {
     let mut seen = std::collections::HashSet::new();
     channel_ids
         .into_iter()
-        .filter(|id| seen.insert(id.clone()))
-        .map(|id| serde_json::json!({"kinds": [30620], "#h": [id]}))
+        .map(|id| {
+            uuid::Uuid::parse_str(&id).map_err(|_| "invalid channel id".to_string())?;
+            Ok(id)
+        })
+        .collect::<Result<Vec<_>, String>>()
+        .map(|ids| {
+            ids.into_iter()
+                .filter(|id| seen.insert(id.clone()))
+                .map(|id| serde_json::json!({"kinds": [30620], "#h": [id]}))
+                .collect()
+        })
+}
+
+fn folded_workflows(events: &[nostr::Event]) -> Vec<WorkflowWire> {
+    let mut seen = std::collections::HashSet::new();
+    buzz_sdk_pkg::workflow_fold::fold_workflow_definitions(events)
+        .into_iter()
+        .filter(|event| seen.insert(event.id))
+        .map(workflow_from_event)
         .collect()
 }
 
@@ -263,20 +267,7 @@ fn workflow_history_path(
 }
 
 async fn read_workflow_history(state: &AppState, path: &str) -> Result<Value, String> {
-    let url = format!("{}{}", relay_api_base_url_with_override(state), path);
-    crate::relay_admission::wait_for_rate_limit().await;
-    let auth = build_nip98_auth_header(&Method::GET, &url, &[], state)?;
-    let response = state
-        .http_client
-        .get(&url)
-        .header("Authorization", auth)
-        .send()
-        .await
-        .map_err(|error| crate::relay::classify_request_error(&error))?;
-    if !response.status().is_success() {
-        return Err(relay_error_message(response).await);
-    }
-    parse_json_response(response).await
+    crate::relay::get_relay_json(state, path).await
 }
 
 // ── Writes ───────────────────────────────────────────────────────────────────
