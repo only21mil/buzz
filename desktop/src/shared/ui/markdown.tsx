@@ -753,7 +753,7 @@ export function createMarkdownComponents(
       </td>
     ),
     th: ({ children }) => (
-      <th className="bg-muted/60 px-3 py-2 font-semibold text-foreground">
+      <th className="min-w-24 bg-muted/60 px-3 py-2 align-top font-semibold text-foreground">
         {children}
       </th>
     ),
