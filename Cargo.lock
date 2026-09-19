@@ -913,6 +913,8 @@ dependencies = [
  "anyhow",
  "buzz-core",
  "buzz-db",
+ "buzz-deletion",
+ "buzz-media",
  "buzz-pubsub",
  "clap",
  "deadpool-redis",
@@ -920,8 +922,10 @@ dependencies = [
  "nostr 0.44.7",
  "rustls",
  "serde_json",
+ "sqlx",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -1009,6 +1013,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "url",
  "uuid",
 ]
@@ -1468,6 +1473,7 @@ dependencies = [
  "minicbor",
  "nostr 0.44.7",
  "proptest",
+ "rand 0.10.1",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
