@@ -85,4 +85,40 @@ done <"$repo_root/scripts/postgres-tests.tsv"
 run_case buzz-db unknown_postgres_test refused unused
 run_case wrong-package::ci_grants_contract unknown_postgres_test refused unused
 
+# An optional fresh nextest JSON inventory verifies the real profile selection,
+# in addition to the mocked database provisioning checks above.
+python3 - "$repo_root" "${1:-}" <<'PY_PROFILE'
+import csv
+import json
+from pathlib import Path
+import re
+import sys
+root = Path(sys.argv[1])
+config = (root / '.config/nextest.toml').read_text()
+default = re.search(r'default-filter = """(.*?)"""', config, re.S).group(1)
+script = re.search(r'filter = """(.*?)"""', config[config.index('[[profile.postgres-ci.scripts]]'):], re.S).group(1)
+assert default.split() == script.split(), 'setup/wrapper and default selection differ'
+with (root / 'scripts/postgres-tests.tsv').open() as stream:
+    rows = list(csv.DictReader(stream, delimiter='\t'))
+external = {r['test'] for r in rows if r['mode'] == 'external'
+            and ('postgres_tests::' in r['test'] or r['binary'].startswith('postgres_'))
+            and not re.search(r'(^|::)external_infra[^:]*::', r['test'])}
+assert set(re.findall(r'and not test\(=([^)]*)\)', default)) == external
+if sys.argv[2]:
+    selected = 0
+    suites = json.loads(Path(sys.argv[2]).read_text())['rust-suites']
+    for identity, suite in suites.items():
+        package, separator, target = identity.partition('::')
+        binary = target if separator else package.replace('-', '_')
+        for name, case in suite['testcases'].items():
+            if not case['ignored'] or case['filter-match']['status'] != 'matches':
+                continue
+            matches = [r for r in rows if r['package'] == package
+                       and r['binary'] == binary and r['test'] == name]
+            assert len(matches) == 1 and matches[0]['mode'] != 'external', (identity, name)
+            selected += 1
+    assert selected > 0, 'supply a fresh ignored-only nextest inventory'
+    print(f'Profile admits {selected} ignored cases with exact runnable TSV modes')
+PY_PROFILE
+
 echo "PostgreSQL wrapper schema-mode and admission checks passed"
