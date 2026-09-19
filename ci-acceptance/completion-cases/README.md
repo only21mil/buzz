@@ -17,8 +17,26 @@ lease generation, service-authenticated signer result, advisory conclusion, and
 root-receipt-set digest. These cases must never be sent over an admission,
 cancel, lookup, or qualification frame.
 
-`anchors.sha256` freezes the two v1.4 contract anchors. `relay-kinds.tsv` freezes
+`anchors.sha256` freezes the two contract documents. `relay-kinds.tsv` freezes
 the allocated CI relay kinds. Completion work must not alter either surface.
+
+The original v1.4 anchors from `06a37cb7c` were refreshed against `27a7b558a`
+after accounting for every landed change to the documents and CI kind list:
+
+| Commit | Contract change |
+| --- | --- |
+| `904595a45` | Authenticated log reads, byte ranges, size bounds, and redirect refusal. |
+| `c1425b199` | Durable watch ordering and a fixed watch deadline. |
+| `e76548344` | Protected GitHub delivery authority and gap-free request/event promotion evidence. |
+| `8f3737973` | Rerun lineage, final-request provenance, and narrower acceptance-adapter log reads. |
+| `7972bdc69` | Stable preflight failure stage and cause. |
+| `c8151fdb2` | Terminal check contract and allocation of `KIND_CI_CHECK`, 46108. |
+| `6f7b3fc34` | Native macOS workflow registration from a fixed trusted-base path. |
+| `602c3b550` | Allocation of `KIND_CI_MERGE_BYPASS`, 46109. |
+
+The completion fixtures and their refusal/quarantine decisions are unchanged.
+Future anchor updates must explain the intervening landed contract changes;
+matching the current hashes alone is not sufficient.
 
 Run the deterministic checks with:
 
