@@ -25,6 +25,7 @@ test("refsFilter constrains authors to the relay pubkey", () => {
   assert.deepEqual(refsFilter("buzz", RELAY), {
     kinds: [REPO_STATE_KIND],
     "#d": ["buzz"],
+    limit: 1,
     authors: [RELAY],
   });
 });
@@ -33,6 +34,7 @@ test("refsFilter omits authors when the relay pubkey is unknown", () => {
   assert.deepEqual(refsFilter("buzz", null), {
     kinds: [REPO_STATE_KIND],
     "#d": ["buzz"],
+    limit: 1,
   });
 });
 
