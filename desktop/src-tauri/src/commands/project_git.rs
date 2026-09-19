@@ -1,6 +1,6 @@
 use super::project_git_exec::{
-    build_git_auth_config, clean_branch, clean_target_ref, run_git, validate_workspace_clone_url,
-    GitAuthConfig,
+    build_git_auth_config, clean_branch, clean_target_ref, count_commits, run_git,
+    validate_workspace_clone_url, GitAuthConfig,
 };
 use super::project_git_file_content::{checkout_project_repo, read_preview_content};
 use super::project_git_push::push_project_local_repository_blocking;
@@ -9,7 +9,7 @@ pub use super::project_git_types::{
     ProjectRepoContributorInfo, ProjectRepoFileInfo, ProjectRepoPullResult, ProjectRepoPushResult,
     ProjectRepoSnapshotInfo, ProjectRepoSyncStatusInfo,
 };
-use super::project_repo_paths::{canonical_repos_roots, find_local_repo_dir};
+use super::project_repo_paths::{find_local_repo_dir, local_project_checkouts};
 use crate::app_state::AppState;
 use std::time::UNIX_EPOCH;
 use tauri::{AppHandle, State};
@@ -317,7 +317,9 @@ fn snapshot_from_repo(
         Vec::new()
     };
 
+    let commit_count = count_commits(repo_dir, auth, branch_activity_ref, latest_commit.is_some());
     ProjectRepoSnapshotInfo {
+        commit_count,
         latest_commit,
         commits,
         files,
@@ -392,7 +394,9 @@ fn snapshot_from_worktree(
     .map(|output| parse_worktree_files(repo_dir, &output, &latest_commit_by_path))
     .unwrap_or_default();
 
+    let commit_count = count_commits(repo_dir, auth, branch_activity_ref, latest_commit.is_some());
     ProjectRepoSnapshotInfo {
+        commit_count,
         latest_commit,
         commits,
         files,
@@ -691,34 +695,14 @@ pub async fn list_project_local_repositories(
     repos_dir: Option<String>,
 ) -> Result<Vec<ProjectLocalRepoInfo>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let repos_roots = canonical_repos_roots(repos_dir.as_deref())?;
-        let mut seen_paths = std::collections::HashSet::new();
-        let mut repos = Vec::new();
-        for repos_root in repos_roots {
-            let entries = std::fs::read_dir(&repos_root)
-                .map_err(|error| format!("read reposDir: {error}"))?;
-            for entry in entries.filter_map(Result::ok) {
-                let Some(file_type) = entry.file_type().ok() else {
-                    continue;
-                };
-                if !file_type.is_dir() && !file_type.is_symlink() {
-                    continue;
-                }
-                let Ok(path) = entry.path().canonicalize() else {
-                    continue;
-                };
-                if !path.starts_with(&repos_root) || !path.is_dir() || !path.join(".git").exists() {
-                    continue;
-                }
-                if !seen_paths.insert(path.clone()) {
-                    continue;
-                }
-                repos.push(ProjectLocalRepoInfo {
-                    name: entry.file_name().to_string_lossy().to_string(),
-                    path: path.display().to_string(),
-                });
-            }
-        }
+        let mut repos: Vec<_> = local_project_checkouts(repos_dir.as_deref(), None)?
+            .into_iter()
+            .map(|checkout| ProjectLocalRepoInfo {
+                name: checkout.name(),
+                path: checkout.path.display().to_string(),
+                branch: checkout.branch,
+            })
+            .collect();
         repos.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(repos)
     })

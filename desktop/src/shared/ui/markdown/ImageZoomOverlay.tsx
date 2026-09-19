@@ -1,12 +1,6 @@
 import * as React from "react";
 import { createPortal } from "react-dom";
-import {
-  ChevronLeft,
-  ChevronRight,
-  Download,
-  ZoomIn,
-  ZoomOut,
-} from "lucide-react";
+import { ChevronLeft, ChevronRight, Download } from "lucide-react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { cn } from "@/shared/lib/cn";
 import { useSmoothCorners } from "@/shared/ui/smoothCorners";
@@ -16,7 +10,6 @@ import {
   useDismissMediaContextMenu,
 } from "./MediaContextMenu";
 import {
-  clampImageLightboxZoom,
   type ImageGalleryDirection,
   type ImageGalleryItem,
   type ImageLightboxBox,
@@ -32,13 +25,11 @@ import {
   IMAGE_LIGHTBOX_GALLERY_EASE,
   IMAGE_LIGHTBOX_GALLERY_SLIDE_DISTANCE_PX,
   IMAGE_LIGHTBOX_GALLERY_SLIDE_MS,
-  IMAGE_LIGHTBOX_MAX_ZOOM,
   IMAGE_LIGHTBOX_MIN_ZOOM,
   IMAGE_LIGHTBOX_REDUCED_MOTION_MS,
   IMAGE_LIGHTBOX_TRACKPAD_ZOOM_IDLE_MS,
   IMAGE_LIGHTBOX_WHEEL_ZOOM_MAX_DELTA,
   IMAGE_LIGHTBOX_WHEEL_ZOOM_SPEED,
-  IMAGE_LIGHTBOX_ZOOM_STEP,
   IMAGE_LIGHTBOX_ZOOM_TRANSITION_MS,
   imageLightboxBasisBoxForItem,
   imageLightboxCornerRadiiStyle,
@@ -48,8 +39,13 @@ import {
   imageLightboxTargetBox,
   imageLightboxTransform,
   imageLightboxZoomBox,
+  imageLightboxZoomStateAtPoint,
+  imageLightboxZoomStateAtZoom,
   normalizedWheelDeltaY,
 } from "./imageLightbox";
+
+import { ImageGalleryStatus } from "./ImageGalleryStatus";
+import { ImageLightboxZoomControls } from "./ImageLightboxZoomControls";
 
 type WebKitGestureLikeEvent = Event & {
   scale?: number;
@@ -144,7 +140,10 @@ export function ImageZoomOverlay({
   const [returnBox, setReturnBox] = React.useState(sourceBox);
   const [returnCornerRadii, setReturnCornerRadii] =
     React.useState(sourceCornerRadii);
-  const [zoom, setZoom] = React.useState(IMAGE_LIGHTBOX_MIN_ZOOM);
+  const [{ zoom, zoomOffset }, setZoomState] = React.useState(() => ({
+    zoom: IMAGE_LIGHTBOX_MIN_ZOOM,
+    zoomOffset: { x: 0, y: 0 },
+  }));
   const controlPointerDownRef = React.useRef(false);
   const fadeTimerRef = React.useRef<number | null>(null);
   const galleryTransitionTimerRef = React.useRef<number | null>(null);
@@ -207,11 +206,13 @@ export function ImageZoomOverlay({
   }, []);
 
   const setClampedZoom = React.useCallback((nextZoom: number) => {
-    setZoom(clampImageLightboxZoom(nextZoom));
+    setZoomState((current) => imageLightboxZoomStateAtZoom(current, nextZoom));
   }, []);
 
   const updateZoom = React.useCallback((updater: (zoom: number) => number) => {
-    setZoom((currentZoom) => clampImageLightboxZoom(updater(currentZoom)));
+    setZoomState((current) =>
+      imageLightboxZoomStateAtZoom(current, updater(current.zoom)),
+    );
   }, []);
 
   const close = React.useCallback(() => {
@@ -277,7 +278,10 @@ export function ImageZoomOverlay({
         galleryTransitionTimerRef.current = null;
       }, IMAGE_LIGHTBOX_GALLERY_SLIDE_MS);
       setIsAdjustingZoom(false);
-      setZoom(IMAGE_LIGHTBOX_MIN_ZOOM);
+      setZoomState({
+        zoom: IMAGE_LIGHTBOX_MIN_ZOOM,
+        zoomOffset: { x: 0, y: 0 },
+      });
       setCurrentIndex(nextIndex);
     },
     [currentIndex, items.length, markControlGesture, prefersReducedMotion],
@@ -564,7 +568,7 @@ export function ImageZoomOverlay({
   const isClosing = phase === "closing";
   const isOpen = phase === "open";
   const isFading = phase === "fading";
-  const displayBox = imageLightboxZoomBox(targetBox, zoom);
+  const displayBox = imageLightboxZoomBox(targetBox, zoom, zoomOffset);
   const frameBox = isReturning ? returnBox : targetBox;
   const frameCornerRadii = isReturning
     ? returnCornerRadii
@@ -603,11 +607,22 @@ export function ImageZoomOverlay({
     : isFading
       ? IMAGE_LIGHTBOX_FADE_EXIT_MS
       : IMAGE_LIGHTBOX_FADE_ENTER_MS;
-  const zoomFillPercent =
-    ((zoom - IMAGE_LIGHTBOX_MIN_ZOOM) /
-      (IMAGE_LIGHTBOX_MAX_ZOOM - IMAGE_LIGHTBOX_MIN_ZOOM)) *
-    100;
   const label = currentItem.alt?.trim() || "Image preview";
+  const handleImageClick = React.useCallback(
+    (event: React.MouseEvent<HTMLImageElement>) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!isOpen || isReturning) return;
+      setIsAdjustingZoom(false);
+      setZoomState((current) =>
+        imageLightboxZoomStateAtPoint(targetBox, current, {
+          x: event.clientX,
+          y: event.clientY,
+        }),
+      );
+    },
+    [isOpen, isReturning, targetBox],
+  );
   const handleImageContextMenu = React.useCallback(
     (event: React.MouseEvent<HTMLImageElement>) => {
       event.preventDefault();
@@ -769,6 +784,7 @@ export function ImageZoomOverlay({
                   ease: IMAGE_LIGHTBOX_GALLERY_EASE,
                 }}
                 variants={galleryImageVariants}
+                onClick={handleImageClick}
                 onContextMenuCapture={handleImageContextMenu}
               />
             </AnimatePresence>
@@ -845,39 +861,17 @@ export function ImageZoomOverlay({
             aria-hidden="true"
             className="h-5 w-px shrink-0 bg-muted-foreground/15"
           />
-          <ZoomOut aria-hidden="true" className="h-4 w-4 shrink-0 opacity-80" />
-          <input
-            aria-label="Image zoom"
-            className="image-zoom-slider h-3 w-32 cursor-pointer sm:w-44"
-            max={IMAGE_LIGHTBOX_MAX_ZOOM}
-            min={IMAGE_LIGHTBOX_MIN_ZOOM}
-            step={IMAGE_LIGHTBOX_ZOOM_STEP}
-            style={
-              {
-                "--image-zoom-fill": `${zoomFillPercent}%`,
-              } as React.CSSProperties
-            }
-            type="range"
-            value={zoom}
-            onBlur={() => setIsAdjustingZoom(false)}
-            onChange={(event) => {
-              markControlGesture();
-              setClampedZoom(Number(event.target.value));
-            }}
-            onPointerCancel={() => setIsAdjustingZoom(false)}
-            onPointerDown={() => {
-              markControlGesture();
-              setIsAdjustingZoom(true);
-            }}
-            onPointerUp={() => {
-              markControlGesture();
-              setIsAdjustingZoom(false);
-            }}
+          <ImageLightboxZoomControls
+            markControlGesture={markControlGesture}
+            setClampedZoom={setClampedZoom}
+            setIsAdjustingZoom={setIsAdjustingZoom}
+            updateZoom={updateZoom}
+            zoom={zoom}
           />
-          <ZoomIn aria-hidden="true" className="h-4 w-4 shrink-0 opacity-80" />
-          <span className="min-w-10 text-right text-xs font-medium tabular-nums text-muted-foreground">
-            {Math.round(zoom * 100)}%
-          </span>
+          <ImageGalleryStatus
+            currentIndex={currentIndex}
+            itemCount={items.length}
+          />
         </div>
       </div>
       {menu && canActOnCurrentImage ? (
