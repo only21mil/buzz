@@ -755,6 +755,8 @@ test("the mention button opens settings and can undo an address", async ({
 
   const composer = threadComposer(page);
   await automaticallyMention(composer, "Morgarita");
+  const addressBadge = composer.getByTestId(`composer-address-lock-${AGENT_A}`);
+  await expect(addressBadge).toBeVisible();
   const input = composer.getByTestId("message-input");
   const ingress = composer.getByRole("button", {
     name: "Manage mentions",
@@ -814,15 +816,22 @@ test("the mention button opens settings and can undo an address", async ({
   await expect(
     composer.getByRole("button", { name: "Mention someone" }),
   ).toBeVisible();
+  // An explicitly unpinned agent stays manual, including after reselection.
+  // Wait for its exiting badge to leave the DOM before checking that contract.
+  await expect(addressBadge).toHaveCount(0);
   await input.fill("");
+  await expect(input).toHaveText("");
+  // Clearing the editor closes autocomplete after its debounced query update.
+  // Reopen it only after that update so the selection uses the cleared cursor.
+  await expect(menu).toHaveCount(0);
+  await composer.getByRole("button", { name: "Mention someone" }).click();
+  await expect(menu).toBeVisible();
 
   await menu
     .getByRole("button", { name: "Mention Morgarita", exact: true })
     .click();
   await expect(input).toHaveText("@Morgarita ");
-  await expect(
-    composer.getByTestId(`composer-address-lock-${AGENT_A}`),
-  ).toBeVisible();
+  await expect(addressBadge).toHaveCount(0);
 
   await input.type("later");
   await input.press("Enter");
