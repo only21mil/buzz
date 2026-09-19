@@ -2300,7 +2300,6 @@ mod tests {
             // was never persisted. `test_state` points Redis at an unroutable
             // port, so every presence write fails here.
             use crate::connection::{AuthState, ConnectionState};
-            use tokio::sync::RwLock;
 
             let state = test_state().await;
             let (_conn_id, mut rx) = register_presence_sub(&state, "presence");
@@ -2309,22 +2308,23 @@ mod tests {
             let event = EventBuilder::new(Kind::Custom(KIND_PRESENCE_UPDATE as u16), "online")
                 .sign_with_keys(&author)
                 .expect("sign presence");
-            let event_id_hex = event.id.to_hex();
 
             let community = buzz_core::tenant::CommunityId::from_uuid(Uuid::nil());
-            let (tx, mut sender_rx) = mpsc::channel(10);
+            let (tx, _sender_rx) = mpsc::channel(10);
             let (ctrl_tx, _ctrl_rx) = mpsc::channel(10);
             let conn = Arc::new(ConnectionState {
                 conn_id: Uuid::new_v4(),
                 tenant: buzz_core::tenant::TenantContext::resolved(community, "test.invalid"),
                 remote_addr: "127.0.0.1:0".parse().expect("loopback addr"),
-                auth_state: RwLock::new(AuthState::Authenticated(buzz_auth::AuthContext {
-                    pubkey: author.public_key(),
-                    scopes: vec![],
-                    channel_ids: None,
-                    auth_method: buzz_auth::AuthMethod::Nip42,
-                    agent_owner_pubkey: None,
-                })),
+                auth_state: std::sync::Mutex::new(AuthState::Authenticated(
+                    buzz_auth::AuthContext {
+                        pubkey: author.public_key(),
+                        scopes: vec![],
+                        channel_ids: None,
+                        auth_method: buzz_auth::AuthMethod::Nip42,
+                        agent_owner_pubkey: None,
+                    },
+                )),
                 subscriptions: Arc::new(Mutex::new(HashMap::new())),
                 send_tx: tx,
                 ctrl_tx,
@@ -2333,26 +2333,19 @@ mod tests {
                 grace_limit: 3,
             });
 
-            super::super::handle_ephemeral_event(
+            let error = super::super::handle_ephemeral_event(
                 event,
                 conn.conn_id,
-                &event_id_hex,
                 author.public_key().to_bytes().to_vec(),
                 author.public_key(),
                 conn,
                 state,
             )
-            .await;
-
-            let msg = sender_rx.try_recv().expect("sender gets an OK");
-            let Message::Text(text) = msg else {
-                panic!("expected text OK frame");
-            };
-            let frame: serde_json::Value = serde_json::from_str(&text).expect("OK frame JSON");
-            assert_eq!(frame[0], "OK");
-            assert_eq!(frame[1], event_id_hex);
-            assert_eq!(frame[2], false);
-            assert_eq!(frame[3], "error: presence persistence failed");
+            .await
+            .expect_err("presence storage failure");
+            assert!(
+                matches!(error, IngestError::Internal(message) if message == "error: presence persistence failed")
+            );
 
             assert!(
                 rx.try_recv().is_err(),

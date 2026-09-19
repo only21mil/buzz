@@ -1334,7 +1334,7 @@ mod integration_tests {
         assert_eq!(meta.depth, 2);
         assert_eq!(meta.root_event_id, Some(hex::decode(&root).unwrap()));
         assert_eq!(meta.parent_event_id, Some(hex::decode(&parent).unwrap()));
-        let mut tx = state.db.begin_transaction().await.unwrap();
+        let mut tx = state.db.begin_event_write_transaction().await.unwrap();
         sqlx::query("UPDATE events SET deleted_at = NOW() WHERE community_id = $1 AND id = $2")
             .bind(community.as_uuid())
             .bind(hex::decode(&parent).unwrap())
