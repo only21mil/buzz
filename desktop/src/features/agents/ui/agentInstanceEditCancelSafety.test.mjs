@@ -499,6 +499,11 @@ test("inherit toggle then Save dispatches the agentCommand:'' inherit sentinel",
 // whose visible label matches `label`. Mirrors a real user pick — the seam the
 // pure resolveEffortSubmission unit tests never touch.
 async function selectEffort(label) {
+  assert.equal(
+    dom.window.document.querySelectorAll("#edit-agent-effort").length,
+    1,
+    "the dialog must expose exactly one effort control and save path",
+  );
   const trigger = dom.window.document.getElementById("edit-agent-effort");
   assert.ok(
     trigger,
@@ -931,8 +936,8 @@ test("runtime switch clears touched effort — no effortLevel dispatched after s
   // The picker must disappear once runtimeTouched is set — its config surface
   // is only valid for the running session, not the prospective runtime.
   assert.equal(
-    dom.window.document.getElementById("edit-agent-effort"),
-    null,
+    Boolean(dom.window.document.getElementById("edit-agent-effort")),
+    false,
     "effort picker must be hidden after a runtime switch — its options are unknown for the prospective runtime",
   );
 
