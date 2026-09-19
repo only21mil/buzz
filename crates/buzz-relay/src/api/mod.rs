@@ -5,12 +5,14 @@ pub mod bridge;
 /// CI preflight HTTP handler (`POST /ci/preflight`, NIP-98 auth).
 pub mod ci;
 pub mod events;
+pub mod gifs;
 pub mod git;
 pub mod invites;
 pub mod media;
 pub mod mesh_demo;
 pub mod nip05;
 pub mod operator;
+pub mod workflows;
 
 // Re-export imeta helpers used by ingest pipeline.
 pub use crate::handlers::imeta::{validate_imeta_tags, verify_imeta_blobs};
@@ -226,7 +228,7 @@ pub mod relay_members {
         for (role, pubkey) in [("agent", agent), ("owner", owner)] {
             match state
                 .db
-                .ensure_user(tenant.community(), pubkey.as_bytes())
+                .ensure_user_for_authorization(tenant.community(), pubkey.as_bytes())
                 .await
             {
                 Ok(true) => {
@@ -246,7 +248,11 @@ pub mod relay_members {
 
         let materialized = match state
             .db
-            .set_agent_owner(tenant.community(), agent.as_bytes(), owner.as_bytes())
+            .set_agent_owner_for_authorization(
+                tenant.community(),
+                agent.as_bytes(),
+                owner.as_bytes(),
+            )
             .await
         {
             Ok(true) => true,

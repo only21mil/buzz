@@ -25,7 +25,7 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use nostr::{EventBuilder, Kind, Tag};
 use serde::Deserialize;
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -38,7 +38,7 @@ use buzz_core::StoredEvent;
 use buzz_pubsub::EventTopic;
 
 use crate::audio::room::PeerCtrl;
-use crate::state::{run_registered_community_connection, AppState};
+use crate::state::{run_registered_community_connection, AppState, CommunityConnectionControl};
 
 /// Maximum binary frame size: 4 KB is generous for a single Opus packet.
 const MAX_AUDIO_FRAME_BYTES: usize = 4096;
@@ -121,7 +121,7 @@ fn limit_audio_websocket<F>(ws: WebSocketUpgrade<F>) -> WebSocketUpgrade<F> {
 /// Highest huddle audio protocol version this relay understands. Clients are
 /// allowed to negotiate any version in `1..=CURRENT_PROTOCOL_VERSION`; older
 /// versions stay supported indefinitely for staged rollouts.
-const CURRENT_PROTOCOL_VERSION: u8 = 2;
+const CURRENT_PROTOCOL_VERSION: u8 = 3;
 
 #[derive(Deserialize)]
 struct AuthMsg {
@@ -149,6 +149,7 @@ async fn handle_audio_connection(
     _permit: OwnedSemaphorePermit,
 ) {
     let cancel = CancellationToken::new();
+    let control = CommunityConnectionControl::new(cancel);
     let community_id = tenant.community();
     let registry = Arc::clone(&state.community_connections);
     let check_state = Arc::clone(&state);
@@ -157,9 +158,11 @@ async fn handle_audio_connection(
         &registry,
         Uuid::new_v4(),
         community_id,
-        cancel.clone(),
+        control,
         move || async move { check_state.db.is_community_active(community_id).await },
-        move || handle_active_audio_connection(socket, run_state, tenant, channel_id, cancel),
+        move |control| {
+            handle_active_audio_connection(socket, run_state, tenant, channel_id, control)
+        },
     )
     .await;
 }
@@ -169,8 +172,10 @@ async fn handle_active_audio_connection(
     state: Arc<AppState>,
     tenant: TenantContext,
     channel_id: Uuid,
-    cancel: CancellationToken,
+    control: CommunityConnectionControl,
 ) {
+    let cancel = control.cancellation_token();
+    let disconnect_reason = control.disconnect_reason();
     let (mut ws_send, mut ws_recv) = socket.split();
 
     let challenge = generate_challenge();
@@ -377,6 +382,11 @@ async fn handle_active_audio_connection(
             }
         }
     }
+
+    let lifecycle_generation = pending_remote
+        .as_ref()
+        .map(|outcome| outcome.generation().to_string())
+        .unwrap_or_else(|| state.huddle_liveness_generation.to_string());
 
     let room = state
         .audio_rooms
@@ -704,6 +714,7 @@ async fn handle_active_audio_connection(
             participant_pubkey: &pubkey_hex,
             roster_revision: Some(lifecycle_revision),
             admission_id: Some(peer_id),
+            generation: &lifecycle_generation,
         },
     )
     .await;
@@ -716,7 +727,13 @@ async fn handle_active_audio_connection(
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<WsMessage>(8);
 
     let send_cancel = cancel.child_token();
-    let send_task = tokio::spawn(send_loop(ws_send, data_rx, ctrl_rx, send_cancel));
+    let send_task = tokio::spawn(send_loop(
+        ws_send,
+        data_rx,
+        ctrl_rx,
+        send_cancel,
+        disconnect_reason,
+    ));
 
     let hb_cancel = cancel.clone();
     let hb_missed = Arc::clone(&missed_pongs);
@@ -903,6 +920,7 @@ async fn handle_active_audio_connection(
             participant_pubkey: &pubkey_hex,
             roster_revision: removal_revision,
             admission_id: Some(peer_id),
+            generation: &lifecycle_generation,
         },
     )
     .await;
@@ -936,6 +954,7 @@ async fn handle_active_audio_connection(
                         participant_pubkey: &pubkey_hex,
                         roster_revision: None,
                         admission_id: None,
+                        generation: &lifecycle_generation,
                     },
                 )
                 .await;
@@ -1138,12 +1157,15 @@ async fn recv_loop(
 ///
 /// Control frames (Ping, Pong, Close, control JSON) are drained first on every
 /// iteration, so heartbeat pings are never starved by audio backpressure.
-async fn send_loop(
-    mut ws_send: futures_util::stream::SplitSink<WebSocket, WsMessage>,
+async fn send_loop<S>(
+    mut ws_send: S,
     mut data_rx: mpsc::Receiver<WsMessage>,
     mut ctrl_rx: mpsc::Receiver<WsMessage>,
     cancel: CancellationToken,
-) {
+    disconnect_reason: watch::Receiver<Option<crate::state::CommunityDisconnectReason>>,
+) where
+    S: futures_util::Sink<WsMessage> + Unpin,
+{
     loop {
         // Priority: drain all pending control frames before data.
         while let Ok(ctrl_msg) = ctrl_rx.try_recv() {
@@ -1155,7 +1177,10 @@ async fn send_loop(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                let _ = ws_send.send(WsMessage::Close(None)).await;
+                let close = disconnect_reason
+                    .borrow()
+                    .map_or(WsMessage::Close(None), |reason| reason.close_message());
+                let _ = ws_send.send(close).await;
                 break;
             }
             Some(ctrl_msg) = ctrl_rx.recv() => {
@@ -1332,6 +1357,7 @@ struct ParticipantLifecycle<'a> {
     participant_pubkey: &'a str,
     roster_revision: Option<u64>,
     admission_id: Option<Uuid>,
+    generation: &'a str,
 }
 
 async fn emit_participant_event(
@@ -1346,22 +1372,29 @@ async fn emit_participant_event(
         participant_pubkey,
         roster_revision,
         admission_id,
+        generation,
     } = lifecycle;
     let content = match (roster_revision, admission_id) {
         (Some(revision), Some(admission_id)) => serde_json::json!({
             "ephemeral_channel_id": channel_id.to_string(),
             "roster_revision": revision,
             "admission_id": admission_id.to_string(),
+            "generation": generation,
         }),
         (Some(revision), None) => serde_json::json!({
             "ephemeral_channel_id": channel_id.to_string(),
             "roster_revision": revision,
+            "generation": generation,
         }),
         (None, Some(admission_id)) => serde_json::json!({
             "ephemeral_channel_id": channel_id.to_string(),
             "admission_id": admission_id.to_string(),
+            "generation": generation,
         }),
-        (None, None) => serde_json::json!({"ephemeral_channel_id": channel_id.to_string()}),
+        (None, None) => serde_json::json!({
+            "ephemeral_channel_id": channel_id.to_string(),
+            "generation": generation,
+        }),
     }
     .to_string();
 
@@ -1595,6 +1628,74 @@ mod tests {
             connection_cancel.is_cancelled(),
             "lost control state must tear down the WebSocket for a fresh roster"
         );
+    }
+
+    #[tokio::test]
+    async fn audio_send_loop_sends_policy_close_when_community_is_deleted() {
+        use futures_util::Sink;
+
+        struct MockSink {
+            messages: Arc<Mutex<Vec<WsMessage>>>,
+        }
+
+        impl Sink<WsMessage> for MockSink {
+            type Error = std::io::Error;
+
+            fn poll_ready(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn start_send(
+                self: std::pin::Pin<&mut Self>,
+                item: WsMessage,
+            ) -> Result<(), Self::Error> {
+                self.messages.lock().expect("mock sink poisoned").push(item);
+                Ok(())
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                std::task::Poll::Ready(Ok(()))
+            }
+
+            fn poll_close(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Result<(), Self::Error>> {
+                self.poll_flush(cx)
+            }
+        }
+
+        let (_data_tx, data_rx) = mpsc::channel(1);
+        let (_ctrl_tx, ctrl_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
+        let control = CommunityConnectionControl::new(cancel.clone());
+        let disconnect_reason = control.disconnect_reason();
+        let registry = crate::state::CommunityConnectionRegistry::new();
+        let community = buzz_core::CommunityId::from_uuid(Uuid::new_v4());
+        let _guard = registry.register(Uuid::new_v4(), community, control);
+        assert_eq!(registry.disconnect_community(community), 1);
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let sink = MockSink {
+            messages: Arc::clone(&messages),
+        };
+
+        send_loop(sink, data_rx, ctrl_rx, cancel, disconnect_reason).await;
+
+        let messages = messages.lock().expect("mock sink poisoned");
+        assert_eq!(messages.len(), 1);
+        match &messages[0] {
+            WsMessage::Close(Some(close)) => {
+                assert_eq!(close.code, axum::extract::ws::close_code::POLICY);
+                assert_eq!(close.reason.as_str(), "community deleted");
+            }
+            other => panic!("expected one 1008 deletion close, got {other:?}"),
+        }
     }
 
     #[tokio::test]
