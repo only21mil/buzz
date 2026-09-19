@@ -56,7 +56,7 @@ class PushSourceContracts(unittest.TestCase):
 
     def test_migration_ledgers_are_separate_and_content_addressed(self):
         relay = json.loads(read('docs/mobile-push-migration-map.json'))
-        self.assertEqual([Path(row['fork_path']).name[:4] for row in relay], ['0037', '0038'])
+        self.assertEqual([Path(row['fork_path']).name[:4] for row in relay], ['0040', '0043'])
         gateway = json.loads(read('docs/mobile-push-gateway-migrations.json'))
         self.assertEqual([Path(row['fork_path']).name[:4] for row in gateway], ['0001', '0002', '0003', '0004', '0005'])
         for row in relay + gateway:
@@ -64,7 +64,7 @@ class PushSourceContracts(unittest.TestCase):
             self.assertEqual(hashlib.sha256(content).hexdigest(), row['fork_sha256'])
             self.assertEqual(hashlib.sha384(content).hexdigest(), row['fork_sqlx_sha384'])
         self.assertIn("CHECK (app_profile = 'buzz-ios-dogfood')", read('schema/schema.sql'))
-        self.assertIn("CHECK (app_profile = 'buzz-ios-dogfood')", read('migrations/0038_push_gateway_dogfood_profile.sql'))
+        self.assertIn("CHECK (app_profile = 'buzz-ios-dogfood')", read('migrations/0043_push_gateway_dogfood_profile.sql'))
 
     def test_unsigned_ci_waits_for_explicit_runner_admission(self):
         ci = read('.github/workflows/ci.yml')

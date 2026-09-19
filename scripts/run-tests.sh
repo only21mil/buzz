@@ -76,6 +76,8 @@ ensure_infra() {
 # ---- Unit tests (no infra needed) -------------------------------------------
 
 run_unit_tests() {
+  run_test_step "native CI Python contracts" bash scripts/test-native-ci-python.sh
+
   section "Unit Tests (no infra required)"
 
   run_test_step "buzz-core tests" \
