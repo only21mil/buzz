@@ -73,6 +73,13 @@ The relay evaluates terminal checks only when `BUZZ_MERGE_GATE_MODE` is
 (`policy.rs` line 320), so the announcement can carry it before the relay
 deploys. The owner declares refs, workflow, and jobs; the operator decides.
 
+Operator setup: the default is `BUZZ_MERGE_GATE_MODE=off`. Accepting a
+`require-check` tag does not enable check enforcement. Set
+`BUZZ_MERGE_GATE_MODE=enforce` on the relay to reject pushes whose required
+checks do not pass. `shadow` evaluates and records decisions but does not
+reject pushes for failed checks. The implied `no-delete` protection applies
+in all three modes.
+
 ### 1.3 Candidate and what the gate requires
 
 For every gated ref update the gate classifies the push:
