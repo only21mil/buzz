@@ -1,3 +1,4 @@
+import { requireLocalTeamStorage } from "./teamStorageCapability";
 import { invokeTauri } from "@/shared/api/tauri";
 import type { AgentTeam } from "@/shared/api/types";
 
@@ -60,9 +61,10 @@ export type CatalogTeam = TeamCatalogPublication & {
  * are native; this boundary intentionally accepts no caller-supplied relay or
  * identity.
  */
-export function fetchTeamCatalogPublications(): Promise<
+export async function fetchTeamCatalogPublications(): Promise<
   TeamCatalogPublication[]
 > {
+  requireLocalTeamStorage();
   return invokeTauri<TeamCatalogPublication[]>("fetch_team_catalog");
 }
 

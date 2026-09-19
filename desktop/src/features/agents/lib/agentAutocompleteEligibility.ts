@@ -142,27 +142,6 @@ export function getMentionableAgentPubkeys({
   return pubkeys;
 }
 
-export function isAgentIdentityInManagedList(
-  candidate: {
-    isAgent?: boolean;
-    isMember?: boolean;
-    pubkey: string;
-    ownerPubkey?: string | null;
-  },
-  managedAgentPubkeys: ReadonlySet<string>,
-  currentPubkey?: string | null,
-) {
-  const isOwnedByCurrentUser = Boolean(
-    candidate.isMember === true &&
-      isAgentIdentityOwnedByCurrentUser(candidate, currentPubkey),
-  );
-  return (
-    candidate.isAgent !== true ||
-    managedAgentPubkeys.has(normalizePubkey(candidate.pubkey)) ||
-    isOwnedByCurrentUser
-  );
-}
-
 export function isAgentIdentityInAllowedList(
   candidate: { isAgent?: boolean; pubkey: string },
   allowedAgentPubkeys: ReadonlySet<string>,
@@ -173,19 +152,25 @@ export function isAgentIdentityInAllowedList(
   );
 }
 
-export function isAgentIdentityOwnedByCurrentUser(
-  candidate: {
-    isAgent?: boolean;
-    ownerPubkey?: string | null;
-  },
-  currentPubkey?: string | null,
-) {
-  return Boolean(
-    candidate.isAgent === true &&
-      candidate.ownerPubkey &&
-      currentPubkey &&
-      normalizePubkey(candidate.ownerPubkey) === normalizePubkey(currentPubkey),
-  );
+export type AgentMentionAdmission = "allow" | "deny" | "unknown";
+
+export function getAgentMentionAdmission({
+  isAgent,
+  pubkey,
+  mentionableAgentPubkeys,
+  directoryReady,
+}: {
+  isAgent: boolean;
+  pubkey: string;
+  mentionableAgentPubkeys: ReadonlySet<string>;
+  directoryReady: boolean;
+}): AgentMentionAdmission {
+  if (!isAgent) return "allow";
+  if (!directoryReady) return "unknown";
+
+  return mentionableAgentPubkeys.has(normalizePubkey(pubkey))
+    ? "allow"
+    : "deny";
 }
 
 export function shouldHideAgentFromMentions({
@@ -247,6 +232,73 @@ export function shouldHideAgentFromMentions({
   // mentionability is still loading could be hidden prematurely — keep the
   // two sets derived from the same query.
   return directoryAgentPubkeys.has(normalized);
+}
+
+export function getAgentIdentityPubkeys({
+  managedAgentPubkeys,
+  relayAgents,
+  members,
+  profileIsAgent,
+}: {
+  managedAgentPubkeys: ReadonlySet<string>;
+  relayAgents: readonly { pubkey: string }[];
+  members: readonly {
+    pubkey: string;
+    isAgent?: boolean;
+    role?: string | null;
+  }[];
+  profileIsAgent: (pubkey: string) => boolean;
+}) {
+  return new Set([
+    ...managedAgentPubkeys,
+    ...relayAgents.map(({ pubkey }) => normalizePubkey(pubkey)),
+    ...members
+      .filter(
+        (member) =>
+          member.isAgent === true ||
+          member.role === "bot" ||
+          profileIsAgent(normalizePubkey(member.pubkey)),
+      )
+      .map(({ pubkey }) => normalizePubkey(pubkey)),
+  ]);
+}
+
+export function getAdmittedAgentPubkeys(
+  candidates: readonly { pubkey?: string; isAgent?: boolean }[],
+) {
+  return new Set(
+    candidates.flatMap((candidate) =>
+      candidate.isAgent && candidate.pubkey
+        ? [normalizePubkey(candidate.pubkey)]
+        : [],
+    ),
+  );
+}
+
+export function rememberSelectedAgentPubkeys(
+  target: Set<string>,
+  selected: readonly { pubkey?: string; isAgent?: boolean }[],
+  selectionIsAgent: boolean,
+) {
+  for (const candidate of selected) {
+    if (candidate.pubkey && (selectionIsAgent || candidate.isAgent === true)) {
+      target.add(normalizePubkey(candidate.pubkey));
+    }
+  }
+}
+
+export function filterAdmittedMentionPubkeys(
+  pubkeys: readonly string[],
+  agentIdentityPubkeys: ReadonlySet<string>,
+  admittedAgentPubkeys: ReadonlySet<string>,
+) {
+  return pubkeys.filter((pubkey) => {
+    const normalized = normalizePubkey(pubkey);
+    return (
+      !agentIdentityPubkeys.has(normalized) ||
+      admittedAgentPubkeys.has(normalized)
+    );
+  });
 }
 
 export function isAgentMentionChannelType(type?: string | null) {
@@ -419,64 +471,38 @@ export function coalesceAgentAutocompleteCandidates<
   return output;
 }
 
-export function getAgentMentionAdmission({
-  isAgent,
-  pubkey,
-  mentionableAgentPubkeys,
-  directoryReady,
-}: {
-  isAgent: boolean;
-  pubkey: string;
-  mentionableAgentPubkeys: ReadonlySet<string>;
-  directoryReady: boolean;
-}): AgentMentionAdmission {
-  if (!isAgent) return "allow";
-  if (!directoryReady) return "unknown";
-
-  return mentionableAgentPubkeys.has(normalizePubkey(pubkey))
-    ? "allow"
-    : "deny";
-}
-
-export function getAgentIdentityPubkeys({
-  managedAgentPubkeys,
-  relayAgents,
-  members,
-  profileIsAgent,
-}: {
-  managedAgentPubkeys: ReadonlySet<string>;
-  relayAgents: readonly { pubkey: string }[];
-  members: readonly {
-    pubkey: string;
+export function isAgentIdentityOwnedByCurrentUser(
+  candidate: {
     isAgent?: boolean;
-    role?: string | null;
-  }[];
-  profileIsAgent: (pubkey: string) => boolean;
-}) {
-  return new Set([
-    ...managedAgentPubkeys,
-    ...relayAgents.map(({ pubkey }) => normalizePubkey(pubkey)),
-    ...members
-      .filter(
-        (member) =>
-          member.isAgent === true ||
-          member.role === "bot" ||
-          profileIsAgent(normalizePubkey(member.pubkey)),
-      )
-      .map(({ pubkey }) => normalizePubkey(pubkey)),
-  ]);
-}
-
-export function rememberSelectedAgentPubkeys(
-  target: Set<string>,
-  selected: readonly { pubkey?: string; isAgent?: boolean }[],
-  selectionIsAgent: boolean,
+    ownerPubkey?: string | null;
+  },
+  currentPubkey?: string | null,
 ) {
-  for (const candidate of selected) {
-    if (candidate.pubkey && (selectionIsAgent || candidate.isAgent === true)) {
-      target.add(normalizePubkey(candidate.pubkey));
-    }
-  }
+  return Boolean(
+    candidate.isAgent === true &&
+      candidate.ownerPubkey &&
+      currentPubkey &&
+      normalizePubkey(candidate.ownerPubkey) === normalizePubkey(currentPubkey),
+  );
 }
 
-export type AgentMentionAdmission = "allow" | "deny" | "unknown";
+export function isAgentIdentityInManagedList(
+  candidate: {
+    isAgent?: boolean;
+    isMember?: boolean;
+    pubkey: string;
+    ownerPubkey?: string | null;
+  },
+  managedAgentPubkeys: ReadonlySet<string>,
+  currentPubkey?: string | null,
+) {
+  const isOwnedByCurrentUser = Boolean(
+    candidate.isMember === true &&
+      isAgentIdentityOwnedByCurrentUser(candidate, currentPubkey),
+  );
+  return (
+    candidate.isAgent !== true ||
+    managedAgentPubkeys.has(normalizePubkey(candidate.pubkey)) ||
+    isOwnedByCurrentUser
+  );
+}

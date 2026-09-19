@@ -3,6 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 
 import {
   createInputFromRequest,
+  updateInputFromRequest,
   requestTargetsEditablePersona,
   type AgentManagementRequest,
 } from "./agentManagement";
@@ -46,29 +47,7 @@ import {
   assertAgentManagementUpdateTarget,
 } from "./agentManagementReview";
 
-export function updateInputFromRequest(
-  request: Extract<AgentManagementRequest, { action: "update" }>,
-  current: UpdatePersonaInput,
-): UpdatePersonaInput {
-  const changes = request.request;
-  return {
-    ...current,
-    displayName: changes.displayName ?? current.displayName,
-    systemPrompt: changes.systemPrompt ?? current.systemPrompt,
-    runtime: changes.runtime ?? current.runtime,
-    provider: changes.provider ?? current.provider,
-    model: changes.model ?? current.model,
-    ...(changes.respondTo
-      ? {
-          behavior: {
-            respondTo: changes.respondTo,
-            respondToAllowlist: [],
-            parallelism: current.behavior?.parallelism,
-          },
-        }
-      : {}),
-  };
-}
+export { updateInputFromRequest } from "./agentManagement";
 
 export function useAgentManagement() {
   const queryClient = useQueryClient();

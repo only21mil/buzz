@@ -36,6 +36,7 @@ export function draftPersonaForInstance(
   return {
     id: requestId,
     displayName: input.displayName,
+    description: input.description ?? null,
     systemPrompt: input.systemPrompt,
     avatarUrl: input.avatarUrl ?? null,
     runtime: input.runtime ?? null,
