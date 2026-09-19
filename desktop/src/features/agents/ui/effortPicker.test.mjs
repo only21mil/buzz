@@ -44,7 +44,7 @@ test("effort picker is hidden for a local backend without a discovered configId"
   assert.equal(state.visible, false);
 });
 
-test("options lead with the adapter-default sentinel then adapter values", () => {
+test("options lead with the inherit sentinel then adapter values", () => {
   const state = effortPickerState({
     backend: localBackend,
     effortConfigId: "thought_level",
@@ -52,7 +52,7 @@ test("options lead with the adapter-default sentinel then adapter values", () =>
     currentEffort: null,
   });
   assert.deepEqual(state.options, [
-    { label: "Adapter default", value: EFFORT_DEFAULT_DROPDOWN_VALUE },
+    { label: "Inherit effort", value: EFFORT_DEFAULT_DROPDOWN_VALUE },
     { label: "Low", value: "low" },
     { label: "High", value: "high" },
   ]);
@@ -78,14 +78,15 @@ test("current effort preselects the matching option", () => {
   assert.equal(state.selectValue, "high");
 });
 
-test("an unknown current effort falls back to the adapter-default sentinel", () => {
+test("an unknown saved effort stays selected until explicitly cleared", () => {
   const state = effortPickerState({
     backend: localBackend,
     effortConfigId: "thought_level",
     effortOptions: options,
     currentEffort: "extreme",
   });
-  assert.equal(state.selectValue, EFFORT_DEFAULT_DROPDOWN_VALUE);
+  assert.equal(state.selectValue, "extreme");
+  assert.equal(state.options.at(-1).disabled, true);
 });
 
 test("a null current effort selects the adapter-default sentinel", () => {

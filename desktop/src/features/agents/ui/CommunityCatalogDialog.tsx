@@ -1,3 +1,7 @@
+import {
+  hasLocalTeamStorage,
+  TEAM_STORAGE_UNAVAILABLE,
+} from "../lib/teamStorageCapability";
 import * as React from "react";
 import { ChevronDown, Plus, Upload } from "lucide-react";
 
@@ -421,6 +425,11 @@ export function CommunityCatalogDialog({
                   </div>
                 ) : null}
 
+                {!hasLocalTeamStorage() ? (
+                  <p className="px-4 py-3 text-sm text-muted-foreground">
+                    {TEAM_STORAGE_UNAVAILABLE}
+                  </p>
+                ) : null}
                 {teamsLoading ? <CatalogListSkeleton /> : null}
 
                 {!teamsLoading && teams.length > 0 ? (
@@ -514,7 +523,7 @@ export function CommunityCatalogDialog({
                           ? "Added to My Agents"
                           : "Add agent"}
                       </Button>
-                    ) : selectedTeam ? (
+                    ) : selectedTeam && hasLocalTeamStorage() ? (
                       <Button
                         aria-label={
                           selectedTeamIsAdded

@@ -14,12 +14,13 @@ import {
   listManagedAgents,
   updateManagedAgent,
 } from "@/shared/api/tauri";
+import { listPersonas } from "@/shared/api/tauriPersonas";
 import { startManagedAgent } from "@/shared/api/tauriManagedAgents";
 import type {
   AcpRuntime,
   AgentPersona,
-  CreateManagedAgentInput,
   ChannelRole,
+  CreateManagedAgentInput,
   ManagedAgent,
   ManagedAgentBackend,
   RespondToMode,
@@ -34,7 +35,15 @@ export type AttachManagedAgentToChannelInput = {
   agent: ManagedAgent;
   role?: Exclude<ChannelRole, "owner">;
   ensureRunning?: boolean;
-  /** Queue the start until the caller has published its triggering message. */
+  /**
+   * When set, a needed start/deploy is handed to this callback instead of
+   * being awaited: the attach resolves as soon as the membership write lands
+   * and the callback owns the start, including surfacing its failure. The
+   * message-send path passes a queue collector here — the wake it records is
+   * flushed fire-and-forget only after the relay accepts the publish, with a
+   * replay floor stamped at queue time, so the spawned harness replays the
+   * published message and an aborted send leaves no orphan wake.
+   */
   detachedStart?: (agent: ManagedAgent) => void;
 };
 
@@ -80,7 +89,10 @@ export type CreateChannelManagedAgentInput = {
   /** Queue the start until the caller has published its triggering message. */
   detachedStart?: (agent: ManagedAgent) => void;
   backend?: ManagedAgentBackend;
-  /** Inbound author gate mode. Omitted = server default ("owner-only"). */
+  /**
+   * Inbound author gate mode. Omitted = linked persona default, then
+   * `"owner-only"` when the persona leaves it unset or no persona is linked.
+   */
   respondTo?: RespondToMode;
   /** Hex pubkeys for allowlist mode. */
   respondToAllowlist?: string[];
@@ -110,6 +122,15 @@ export type CreateChannelManagedAgentBatchFailure = {
 export type CreateChannelManagedAgentsResult = {
   successes: CreateChannelManagedAgentResult[];
   failures: CreateChannelManagedAgentBatchFailure[];
+};
+
+type ChannelAgentReuseContext = {
+  managedAgents: ManagedAgent[];
+  channelMemberPubkeys: ReadonlySet<string>;
+  personas: readonly Pick<
+    AgentPersona,
+    "id" | "respondTo" | "respondToAllowlist"
+  >[];
 };
 
 export async function attachManagedAgentToChannel(
@@ -147,19 +168,13 @@ export async function attachManagedAgentToChannel(
     // pair — so this ensures the pair the caller is attaching to, never
     // another community's.
     const isRemote = input.agent.backend.type === "provider";
-    if (isRemote && input.agent.status !== "deployed") {
-      if (input.detachedStart) input.detachedStart(agent);
-      else {
-        agent = await startManagedAgent(input.agent.pubkey);
-        started = true;
-      }
-    } else if (
-      !isRemote &&
-      input.agent.status !== "running" &&
-      input.agent.status !== "deployed"
-    ) {
-      if (input.detachedStart) input.detachedStart(agent);
-      else {
+    const needsStart = isRemote
+      ? input.agent.status !== "deployed"
+      : input.agent.status !== "running" && input.agent.status !== "deployed";
+    if (needsStart) {
+      if (input.detachedStart) {
+        input.detachedStart(input.agent);
+      } else {
         agent = await startManagedAgent(input.agent.pubkey);
         started = true;
       }
@@ -268,10 +283,7 @@ export async function ensureChannelAgentPresetInChannel(
 
 export async function provisionChannelManagedAgent(
   input: CreateChannelManagedAgentInput,
-  context?: {
-    managedAgents?: ManagedAgent[];
-    channelMemberPubkeys?: ReadonlySet<string>;
-  },
+  context?: ChannelAgentReuseContext,
 ): Promise<ProvisionChannelManagedAgentResult> {
   const trimmedName = input.name.trim();
 
@@ -293,22 +305,14 @@ export async function provisionChannelManagedAgent(
       context.channelMemberPubkeys,
     );
     if (reusable) {
-      // Apply the caller's respondTo settings so the user's permission
-      // choice in the dialog is always honored, even when reusing.
-      const needsRespondToUpdate =
-        input.respondTo && input.respondTo !== "owner-only";
-      const updatedAgent = needsRespondToUpdate
-        ? (
-            await updateManagedAgent({
-              pubkey: reusable.pubkey,
-              respondTo: input.respondTo,
-              respondToAllowlist:
-                input.respondTo === "allowlist"
-                  ? input.respondToAllowlist
-                  : undefined,
-            })
-          ).agent
-        : reusable;
+      const definition = context.personas.find(
+        (persona) => persona.id === input.personaId,
+      );
+      const { agent: updatedAgent } = await applyReusableAgentAccessPolicy(
+        reusable,
+        input,
+        definition,
+      );
 
       return {
         agent: updatedAgent,
@@ -333,20 +337,10 @@ export async function provisionChannelManagedAgent(
       context.channelMemberPubkeys,
     );
     if (reusable) {
-      const needsRespondToUpdate =
-        input.respondTo && input.respondTo !== "owner-only";
-      const updatedAgent = needsRespondToUpdate
-        ? (
-            await updateManagedAgent({
-              pubkey: reusable.pubkey,
-              respondTo: input.respondTo,
-              respondToAllowlist:
-                input.respondTo === "allowlist"
-                  ? input.respondToAllowlist
-                  : undefined,
-            })
-          ).agent
-        : reusable;
+      const { agent: updatedAgent } = await applyReusableAgentAccessPolicy(
+        reusable,
+        input,
+      );
 
       return {
         agent: updatedAgent,
@@ -401,10 +395,7 @@ export async function provisionChannelManagedAgent(
 export async function createChannelManagedAgent(
   channelId: string,
   input: CreateChannelManagedAgentInput,
-  context?: {
-    managedAgents?: ManagedAgent[];
-    channelMemberPubkeys?: ReadonlySet<string>;
-  },
+  context?: ChannelAgentReuseContext,
 ): Promise<CreateChannelManagedAgentResult> {
   const provisioned = await provisionChannelManagedAgent(input, context);
   const attached = await attachManagedAgentToChannel(channelId, {
@@ -426,14 +417,21 @@ export async function createChannelManagedAgents(
   inputs: readonly CreateChannelManagedAgentInput[],
 ): Promise<CreateChannelManagedAgentsResult> {
   // Fetch managed agents and channel members once for smart reuse checks.
-  const [managedAgents, members] = await Promise.all([
+  const needsPersonaPolicy = inputs.some(
+    (input) =>
+      Boolean(input.personaId) &&
+      !input.forceNewInstance &&
+      input.respondTo === undefined,
+  );
+  const [managedAgents, members, personas] = await Promise.all([
     listManagedAgents(),
     getChannelMembers(channelId),
+    needsPersonaPolicy ? listPersonas() : Promise.resolve([]),
   ]);
   const channelMemberPubkeys = new Set(
     members.map((m) => normalizePubkey(m.pubkey)),
   );
-  const context = { managedAgents, channelMemberPubkeys };
+  const context = { managedAgents, channelMemberPubkeys, personas };
 
   // Sequential loop: each agent must be fully created and its relay membership
   // written before the next starts. Concurrent writes to the replaceable
