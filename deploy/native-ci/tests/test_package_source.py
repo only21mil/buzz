@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 NATIVE_CI_DIR = Path(__file__).resolve().parents[1]
-COMPONENTS = ("controld", "keyholder", "runner")
+COMPONENTS = ("controld", "keyholder", "runner", "execd")
 
 
 def load(name: str, path: Path):
@@ -68,6 +68,28 @@ class PackageSourceTests(unittest.TestCase):
                 git_mode = PACKAGE_SOURCE._git_file_mode(checkout, source)
                 materialized = stat.S_IMODE((checkout / source).lstat().st_mode)
                 self.assertEqual(materialized, 0o700 if git_mode == 0o100755 else 0o600)
+
+    def test_shared_helper_dirty_or_missing_refused_for_all_components(self) -> None:
+        for change in ("dirty", "missing", "staged"):
+            checkout = self.private_checkout(change)
+            helper = checkout / "deploy/native-ci/_common.py"
+            if change == "missing":
+                helper.unlink()
+            else:
+                helper.write_bytes(helper.read_bytes() + b"\n# changed helper\n")
+                if change == "staged":
+                    subprocess.run(["git", "-C", str(checkout), "add", str(helper)], check=True)
+            for component in COMPONENTS:
+                with self.subTest(change=change, component=component):
+                    with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+                        PACKAGE_SOURCE.verify_checkout(
+                            checkout, self.commit, Path("deploy/native-ci") / component,
+                        )
+            # execd has its own source verifier, used by both prepare and freeze.
+            freezer = load("execd_freezer_source_test", NATIVE_CI_DIR / "execd/freeze_package.py")
+            with self.subTest(change=change, component="execd-direct"):
+                with self.assertRaises((ValueError, subprocess.CalledProcessError)):
+                    freezer.verify_source(checkout, self.commit)
 
     def test_unsafe_and_ambiguous_materialized_modes_are_rejected(self) -> None:
         cases = (

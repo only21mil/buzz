@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,8 +12,21 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import sys
 
 import render_runner_config
+
+NATIVE_CI_DIR = Path(__file__).resolve().parents[1]
+if str(NATIVE_CI_DIR) not in sys.path:
+    sys.path.insert(0, str(NATIVE_CI_DIR))
+
+from _common import (
+    canonical_json as canonical_json,
+    sha256 as sha256,
+    git_output as git_output,
+    entry as entry,
+    write_asset as write_asset,
+)
 
 SCHEMA = "buzz-ci-runner-install-package-v2"
 PROVENANCE_SCHEMA = "buzz-ci-binary-provenance-v1"
@@ -57,14 +69,6 @@ STATIC_ASSETS = (
 )
 
 
-def canonical_json(value: object) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
-
-
-def sha256(payload: bytes) -> str:
-    return hashlib.sha256(payload).hexdigest()
-
-
 def read_regular(
     path: Path,
     mode: int | frozenset[int] | None = None,
@@ -105,16 +109,6 @@ def load_provenance(path: Path) -> tuple[dict[str, object], bytes]:
     return value, raw
 
 
-def git_output(root: Path, *arguments: str) -> str:
-    return subprocess.run(
-        ["git", "-C", str(root), *arguments],
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    ).stdout.strip()
-
-
 def verify_source(root: Path, source_commit: str) -> Path:
     if not GIT_OID.fullmatch(source_commit):
         raise ValueError("source commit must be a full lowercase Git object id")
@@ -147,31 +141,6 @@ def verify_source(root: Path, source_commit: str) -> Path:
             stderr=subprocess.DEVNULL,
         )
     return root
-
-
-def write_asset(path: Path, payload: bytes, mode: int) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW, mode)
-    try:
-        os.fchmod(fd, mode)
-        view = memoryview(payload)
-        while view:
-            view = view[os.write(fd, view) :]
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def entry(role: str, source: str, target: str, source_mode: int, install_mode: int, uid: int, gid: int, payload: bytes) -> dict[str, object]:
-    return {
-        "role": role,
-        "source": f"assets/{source}",
-        "target": target,
-        "source_mode": f"{source_mode:04o}",
-        "install_mode": f"{install_mode:04o}",
-        "uid": uid,
-        "gid": gid,
-        "sha256": sha256(payload),
-    }
 
 
 def _freeze_package(

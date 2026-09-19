@@ -8,7 +8,6 @@ import ctypes
 from dataclasses import dataclass
 import errno
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -16,6 +15,20 @@ import re
 import stat
 import sys
 import uuid
+
+NATIVE_CI_DIR = Path(__file__).resolve().parents[1]
+if str(NATIVE_CI_DIR) not in sys.path:
+    sys.path.insert(0, str(NATIVE_CI_DIR))
+
+from _common import (
+    reject_duplicates as reject_duplicates,
+
+    canonical_json as canonical_json,
+    sha256 as sha256,
+    mapped_id as mapped_id,
+    rooted as rooted,
+    parse_mode as _mode,
+)
 
 KEYHOLDER_DIR = Path(__file__).resolve().parent
 if str(KEYHOLDER_DIR) not in sys.path:
@@ -64,36 +77,6 @@ class Entry:
     sha256: str
     size: int
     payload: bytes
-
-
-def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate JSON key")
-        result[key] = value
-    return result
-
-
-def canonical_json(value: object) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
-
-
-def sha256(payload: bytes) -> str:
-    return hashlib.sha256(payload).hexdigest()
-
-
-def rooted(root: Path, target: str) -> Path:
-    if not target.startswith("/") or ".." in Path(target).parts:
-        raise ValueError("unsafe target path")
-    return root / target.removeprefix("/")
-
-
-def mapped_id(value: int, root: Path, *, group: bool = False) -> int:
-    if value != 0 or root == Path("/"):
-        return value
-    metadata = root.lstat()
-    return metadata.st_gid if group else metadata.st_uid
 
 
 def _safe_root(root: Path) -> Path:
@@ -152,12 +135,6 @@ def _json(raw: bytes) -> dict[str, object]:
 def parse_json(path: Path) -> tuple[dict[str, object], bytes, os.stat_result]:
     raw, metadata = read_regular(path, MAX_JSON_BYTES)
     return _json(raw), raw, metadata
-
-
-def _mode(value: object) -> int:
-    if not isinstance(value, str) or not re.fullmatch(r"0[4567][0-7]{2}", value):
-        raise ValueError("invalid mode")
-    return int(value, 8)
 
 
 def _u32(value: object, *, nonzero: bool = True) -> int:

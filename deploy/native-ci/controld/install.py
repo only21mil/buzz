@@ -18,7 +18,14 @@ NATIVE_CI_DIR = Path(__file__).resolve().parents[1]
 if str(NATIVE_CI_DIR) not in sys.path:
     sys.path.insert(0, str(NATIVE_CI_DIR))
 
-from _common import (  # noqa: E402 - direct script execution needs the parent path
+from _common import (
+    ensure_private_tree as _ensure_private_tree,
+    validate_target_parent as _validate_target_parent,
+    reject_duplicates as reject_duplicates,
+    parse_mode as mode,
+    u32 as u32,
+    backup_root_path as backup_root_path,
+  # noqa: E402 - direct script execution needs the parent path
     canonical_json as canonical_json,
     sha256 as sha256,
     mapped_id as mapped_id,
@@ -100,15 +107,6 @@ class Entry:
     sha256: str
 
 
-def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate JSON key")
-        result[key] = value
-    return result
-
-
 def read_fd(path: Path, max_bytes: int = 128 * 1024 * 1024) -> tuple[bytes, os.stat_result]:
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
     try:
@@ -137,19 +135,6 @@ def parse_json_file(path: Path) -> tuple[dict[str, object], bytes, os.stat_resul
     if not isinstance(value, dict):
         raise ValueError(f"JSON root must be an object: {path}")
     return value, raw, metadata
-
-
-def mode(value: object) -> int:
-    if not isinstance(value, str) or not re.fullmatch(r"0[4567][0-7]{2}", value):
-        raise ValueError("invalid mode")
-    return int(value, 8)
-
-
-def u32(value: object, *, nonzero: bool = False) -> int:
-    minimum = 1 if nonzero else 0
-    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= (1 << 32) - 1:
-        raise ValueError("invalid numeric identity")
-    return value
 
 
 def parse_manifest(package: Path, root: Path) -> tuple[dict[str, object], list[Entry]]:
@@ -347,13 +332,7 @@ def validate_host_identities(root: Path, manifest: dict[str, object]) -> None:
 
 
 def validate_target_parent(root: Path, parent: Path) -> None:
-    if parent.exists():
-        validate_parent_chain(root, parent)
-        return
-    logical = "/" + str(parent.relative_to(root))
-    if logical not in EXPECTED_DIRECTORIES or parent.is_symlink():
-        raise ValueError(f"target parent is unavailable: {parent}")
-    validate_parent_chain(root, parent.parent)
+    _validate_target_parent(root, parent, EXPECTED_DIRECTORIES)
 
 
 def target_state(root: Path, entry: Entry) -> dict[str, object] | None:
@@ -464,49 +443,11 @@ def unlink_file(path: Path) -> None:
         os.close(parent_fd)
 
 
-def backup_root_path(root: Path, backup_root: Path) -> Path:
-    if root == Path("/"):
-        return backup_root
-    return rooted(root, str(backup_root))
-
-
 def ensure_private_tree(root: Path, path: Path) -> None:
-    root_uid = mapped_id(0, root)
-    root_gid = mapped_id(0, root, group=True)
-    default_path = backup_root_path(root, DEFAULT_BACKUP_ROOT)
-    exact_modes = {
-        rooted(root, str(SHARED_STATE_ROOT)): 0o711,
-        rooted(root, str(INSTALL_BACKUPS_ROOT)): 0o700,
-        default_path: 0o700,
-    } if path == default_path else {path: 0o700}
-    current = root
-    for component in path.relative_to(root).parts:
-        current /= component
-        created = not current.exists() and not current.is_symlink()
-        if created:
-            parent = current.parent
-            current.mkdir(mode=0o700)
-            descriptor = os.open(
-                current, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-            )
-            try:
-                os.fchown(descriptor, root_uid, root_gid)
-                os.fchmod(descriptor, exact_modes.get(current, 0o700))
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-            fsync_directory(parent)
-        metadata = current.lstat()
-        expected_mode = exact_modes.get(current)
-        if (
-            not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != root_uid
-            or metadata.st_gid != root_gid
-            or (expected_mode is not None and stat.S_IMODE(metadata.st_mode) != expected_mode)
-            or (expected_mode is None and metadata.st_mode & 0o022)
-        ):
-            raise ValueError(f"unsafe backup directory chain: {current}")
-    require_directory(path, root_uid, root_gid, 0o700)
+    _ensure_private_tree(
+        root, path, DEFAULT_BACKUP_ROOT, SHARED_STATE_ROOT,
+        INSTALL_BACKUPS_ROOT, fsync_directory,
+    )
 
 
 def secure_json(path: Path, root: Path) -> dict[str, object]:

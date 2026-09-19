@@ -4,20 +4,25 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
 import stat
-import subprocess
 import sys
 import tempfile
 
 NATIVE_CI_DIR = Path(__file__).resolve().parents[1]
 if str(NATIVE_CI_DIR) not in sys.path:
     sys.path.insert(0, str(NATIVE_CI_DIR))
+
+from _common import (
+    canonical_json as canonical_json,
+    sha256 as sha256,
+    git_output as git_output,
+    entry as entry,
+)
 
 import package_source
 import render_controld_config
@@ -45,14 +50,6 @@ STATIC_ASSETS = (
     ("tmpfiles", "templates/buzzci-controld.tmpfiles", "buzzci-controld.conf", "/usr/lib/tmpfiles.d/buzzci-controld.conf", 0o400, 0o644, 0, 0),
     ("documentation", "README.md", "README.md", "/usr/share/doc/buzz-ci-controld/README.md", 0o400, 0o644, 0, 0),
 )
-
-
-def canonical_json(value: object) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
-
-
-def sha256(payload: bytes) -> str:
-    return hashlib.sha256(payload).hexdigest()
 
 
 def read_regular(path: Path, expected_mode: int | None = None, max_bytes: int = 128 * 1024 * 1024) -> tuple[bytes, os.stat_result]:
@@ -89,10 +86,6 @@ def load_provenance(path: Path) -> tuple[dict[str, object], bytes]:
     return value, raw
 
 
-def git_output(root: Path, *arguments: str) -> str:
-    return subprocess.run(["git", "-C", str(root), *arguments], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout.strip()
-
-
 def verify_source(root: Path, source_commit: str) -> Path:
     return package_source.verify_checkout(root, source_commit, PACKAGE_RELATIVE)
 
@@ -115,10 +108,6 @@ def write_asset(path: Path, payload: bytes, file_mode: int) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
-
-
-def entry(role: str, source: str, target: str, source_mode: int, install_mode: int, uid: int, gid: int, payload: bytes) -> dict[str, object]:
-    return {"role": role, "source": f"assets/{source}", "target": target, "source_mode": f"{source_mode:04o}", "install_mode": f"{install_mode:04o}", "uid": uid, "gid": gid, "sha256": sha256(payload)}
 
 
 def freeze_package(source_root: Path, source_commit: str, binary: Path, provenance_path: Path, output: Path, controld_uid: int, controld_gid: int) -> dict[str, object]:

@@ -131,6 +131,7 @@ def verify_checkout(source_root: Path, source_commit: str, package_relative: Pat
     bound_paths = {str(package_relative), str(SHARED_HELPER)}
     if package_relative in {
         Path("deploy/native-ci/controld"), Path("deploy/native-ci/runner"),
+        Path("deploy/native-ci/keyholder"), Path("deploy/native-ci/execd"),
     }:
         tracked_payload(source_root, INSTALLER_HELPER, 0o100644, 1024 * 1024)
         bound_paths.add(str(INSTALLER_HELPER))
