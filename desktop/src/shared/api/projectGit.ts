@@ -51,6 +51,7 @@ type RawProjectRepoContributor = {
 
 type RawProjectRepoSnapshot = {
   latest_commit: RawProjectRepoCommit | null;
+  commit_count?: number | null;
   commits?: RawProjectRepoCommit[];
   files: RawProjectRepoFile[];
   contributors?: RawProjectRepoContributor[];
@@ -64,12 +65,14 @@ type RawProjectLocalRepoSnapshot = {
 type RawProjectLocalRepository = {
   name: string;
   path: string;
+  branch: string | null;
 };
 
 type RawProjectRepoSyncStatus = {
   local_path: string | null;
   local_branch: string | null;
   local_branches: string[];
+  local_checkouts?: Array<{ path: string; branch: string | null }>;
   local_head: string | null;
   local_short_head: string | null;
   remote_branch: string | null;
@@ -84,6 +87,8 @@ type RawProjectRepoSyncStatus = {
   push_block_reason: string | null;
   can_pull: boolean;
   pull_block_reason: string | null;
+  fetch_failed?: boolean | null;
+  fetch_error?: string | null;
 };
 
 type RawProjectRepoPushResult = {
@@ -127,6 +132,7 @@ function fromRawProjectRepoSnapshot(
     latestCommit: snapshot.latest_commit
       ? fromRawProjectRepoCommit(snapshot.latest_commit)
       : null,
+    commitCount: snapshot.commit_count ?? null,
     commits: (snapshot.commits ?? []).map(fromRawProjectRepoCommit),
     files: snapshot.files.map((file) => ({
       path: file.path,
@@ -307,6 +313,7 @@ export async function listProjectLocalRepositories(input: {
   return repositories.map((repository) => ({
     name: repository.name,
     path: repository.path,
+    branch: repository.branch,
   }));
 }
 
@@ -317,6 +324,7 @@ function fromRawProjectRepoSyncStatus(
     localPath: status.local_path,
     localBranch: status.local_branch,
     localBranches: status.local_branches,
+    localCheckouts: status.local_checkouts ?? [],
     localHead: status.local_head,
     localShortHead: status.local_short_head,
     remoteBranch: status.remote_branch,
@@ -331,6 +339,8 @@ function fromRawProjectRepoSyncStatus(
     pushBlockReason: status.push_block_reason,
     canPull: status.can_pull,
     pullBlockReason: status.pull_block_reason,
+    fetchFailed: status.fetch_failed ?? false,
+    fetchError: status.fetch_error ?? null,
   };
 }
 
@@ -369,6 +379,8 @@ export async function openProjectRepositoryFolder(input: {
 type RawProjectTerminalResult = {
   path: string;
   cloned: boolean;
+  mismatch: string | null;
+  worktree_command: string | null;
 };
 
 export async function openProjectTerminal(input: {
@@ -376,7 +388,12 @@ export async function openProjectTerminal(input: {
   projectDtag: string;
   cloneUrl?: string | null;
   defaultBranch?: string | null;
-}): Promise<{ path: string; cloned: boolean }> {
+}): Promise<{
+  path: string;
+  cloned: boolean;
+  mismatch: string | null;
+  worktreeCommand: string | null;
+}> {
   const result = await invokeTauri<RawProjectTerminalResult>(
     "open_project_terminal",
     {
@@ -389,6 +406,8 @@ export async function openProjectTerminal(input: {
   return {
     path: result.path,
     cloned: result.cloned,
+    mismatch: result.mismatch,
+    worktreeCommand: result.worktree_command,
   };
 }
 

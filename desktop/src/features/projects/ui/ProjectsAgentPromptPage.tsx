@@ -24,8 +24,7 @@ import { useChannelsQuery, useOpenDmMutation } from "@/features/channels/hooks";
 import { normalizeRelayUrl } from "@/features/communities/communityStorage";
 import { useCommunities } from "@/features/communities/useCommunities";
 import {
-  useChannelMessagesQuery,
-  useChannelSubscription,
+  useSubscribedMessages,
   useToggleReactionMutation,
 } from "@/features/messages/hooks";
 import { formatTimelineMessages } from "@/features/messages/lib/formatTimelineMessages";
@@ -233,8 +232,13 @@ export function ConversationThread({
   selfAvatarUrl: string | null;
   opener: ProjectsConversationOpener;
 }) {
-  useChannelSubscription(channel);
-  const messagesQuery = useChannelMessagesQuery(channel);
+  const { activeCommunity } = useCommunities();
+  const messagesQuery = useSubscribedMessages(
+    channel,
+    activeCommunity?.relayUrl && currentPubkey
+      ? { relayUrl: activeCommunity.relayUrl, signerPubkey: currentPubkey }
+      : null,
+  );
   const threadRootIds = React.useMemo(
     () =>
       (messagesQuery.data ?? [])

@@ -1,4 +1,3 @@
-use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::State;
@@ -6,10 +5,7 @@ use tauri::State;
 use crate::{
     app_state::AppState,
     events,
-    relay::{
-        build_nip98_auth_header, parse_command_response, parse_json_response, query_relay,
-        relay_api_base_url_with_override, relay_error_message, submit_event,
-    },
+    relay::{parse_command_response, query_relay, submit_event},
 };
 
 // ── Wire shapes (snake_case, consumed by tauriWorkflows.ts) ──────────────────
@@ -263,20 +259,7 @@ fn workflow_history_path(
 }
 
 async fn read_workflow_history(state: &AppState, path: &str) -> Result<Value, String> {
-    let url = format!("{}{}", relay_api_base_url_with_override(state), path);
-    crate::relay_admission::wait_for_rate_limit().await;
-    let auth = build_nip98_auth_header(&Method::GET, &url, &[], state)?;
-    let response = state
-        .http_client
-        .get(&url)
-        .header("Authorization", auth)
-        .send()
-        .await
-        .map_err(|error| crate::relay::classify_request_error(&error))?;
-    if !response.status().is_success() {
-        return Err(relay_error_message(response).await);
-    }
-    parse_json_response(response).await
+    crate::relay::get_relay_json(state, path).await
 }
 
 // ── Writes ───────────────────────────────────────────────────────────────────

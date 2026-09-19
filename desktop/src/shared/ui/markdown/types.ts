@@ -69,7 +69,6 @@ export type MarkdownRuntime = {
 };
 
 export type MarkdownProps = {
-  leadingInlineContent?: React.ReactNode;
   channelNames?: string[];
   className?: string;
   content: string;

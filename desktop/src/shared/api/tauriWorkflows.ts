@@ -18,6 +18,7 @@ type RawWorkflow = {
   owner_pubkey: string;
   channel_id: string | null;
   definition: Record<string, unknown>;
+  yaml_definition?: string;
   status: Workflow["status"];
   created_at: number;
   updated_at: number;
@@ -100,6 +101,7 @@ function fromRawWorkflow(raw: RawWorkflow): Workflow {
     ownerPubkey: raw.owner_pubkey,
     channelId: raw.channel_id,
     definition: raw.definition,
+    yamlDefinition: raw.yaml_definition,
     status: raw.status,
     createdAt: raw.created_at,
     updatedAt: raw.updated_at,
