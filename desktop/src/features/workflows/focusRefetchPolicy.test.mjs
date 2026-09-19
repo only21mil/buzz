@@ -202,3 +202,23 @@ test("foreground refresh query contract includes only stale active targets", asy
   for (const unsubscribe of unsubscribers) unsubscribe();
   queryClient.clear();
 });
+
+test("paged workflow history foreground refresh honors active resumed runs", async () => {
+  const { shouldRefreshQueryOnForeground } = await import("./hooks.ts");
+  for (const status of ["running", "waiting_approval", "resume_pending"]) {
+    assert.equal(
+      shouldRefreshQueryOnForeground(["workflow-runs", "w"], {
+        pages: [{ runs: [{ status }], next: null }],
+        pageParams: [null],
+      }),
+      false,
+    );
+  }
+  assert.equal(
+    shouldRefreshQueryOnForeground(["workflow-runs", "w"], {
+      pages: [{ runs: [{ status: "completed" }], next: null }],
+      pageParams: [null],
+    }),
+    true,
+  );
+});

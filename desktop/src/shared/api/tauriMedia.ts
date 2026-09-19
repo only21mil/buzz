@@ -126,6 +126,54 @@ export async function fetchMediaBytes(
   }
 }
 
+/** Fetch audio bytes while retaining native cancellation ownership until completion. */
+export async function fetchAudioBytes(
+  url: string,
+  signal?: AbortSignal,
+): Promise<Uint8Array<ArrayBuffer>> {
+  if (signal?.aborted) {
+    throw new DOMException("Media fetch cancelled", "AbortError");
+  }
+
+  const requestId = signal ? crypto.randomUUID() : undefined;
+  // The Rust command replies with `tauri::ipc::Response`, so the bytes
+  // arrive as a raw ArrayBuffer rather than a JSON number array.
+  const request = invokeTauri<ArrayBuffer>("fetch_audio_bytes", {
+    requestId,
+    url,
+  });
+  if (!signal || !requestId) return new Uint8Array(await request);
+
+  let cancellation: Promise<unknown> | undefined;
+  const onAbort = () => {
+    cancellation ??= invokeTauri("cancel_media_fetch", { requestId }).catch(
+      () => undefined,
+    );
+  };
+  signal.addEventListener("abort", onAbort, { once: true });
+  if (signal.aborted) onAbort();
+
+  try {
+    // Keep the scheduler slot and the cancel-before-begin token until the
+    // original IPC settles. An abort race must not release native ownership.
+    const bytes = await request;
+    if (signal.aborted)
+      throw new DOMException("Media fetch cancelled", "AbortError");
+    return new Uint8Array(bytes);
+  } catch (error) {
+    if (signal.aborted)
+      throw new DOMException("Media fetch cancelled", "AbortError");
+    throw error;
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    // A late cancel acknowledgement can recreate a token after native finish.
+    await cancellation;
+    await invokeTauri("release_media_fetch", { requestId }).catch(
+      () => undefined,
+    );
+  }
+}
+
 /** Read plain text without depending on embedded-webview clipboard grants. */
 export async function readTextFromSystemClipboard(): Promise<string> {
   // E2E installs Tauri's mocked IPC surface in a browser page, where the SDK's

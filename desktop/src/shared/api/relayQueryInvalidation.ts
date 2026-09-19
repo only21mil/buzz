@@ -37,6 +37,7 @@ const RELAY_QUERY_ROOTS = new Set<string>([
 
 const RELAY_PROJECT_QUERY_PARTS = new Set<string>([
   "activity-summaries",
+  "collection",
   "home-channel",
   "issues",
   "pull-requests",

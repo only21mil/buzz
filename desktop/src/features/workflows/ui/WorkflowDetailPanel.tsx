@@ -39,7 +39,7 @@ export function WorkflowDetailPanel({
   const [selectedRunId, setSelectedRunId] = React.useState<string | null>(null);
 
   const workflow = workflowQuery.data;
-  const runs = runsQuery.data ?? [];
+  const runs = runsQuery.data?.pages.flatMap((page) => page.runs) ?? [];
   const approvalsQuery = useRunApprovalsQuery(workflowId, selectedRunId);
   const workflowDescription = workflow
     ? getWorkflowDescription(workflow.definition)
@@ -62,7 +62,8 @@ export function WorkflowDetailPanel({
   async function handleTrigger() {
     try {
       const response = await triggerMutation.mutateAsync();
-      setSelectedRunId(response.runId);
+      await runsQuery.refetch();
+      if (response.runId !== null) setSelectedRunId(response.runId);
     } catch {
       // React Query stores the error; keep the current selection unchanged.
     }
@@ -188,6 +189,15 @@ export function WorkflowDetailPanel({
                   <p className="font-medium">Failed to load run history</p>
                   <p className="mt-1 break-words">{runsError}</p>
                 </div>
+              ) : null}
+              {runsQuery.isError && runs.length === 0 ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void runsQuery.refetch()}
+                >
+                  Retry
+                </Button>
               ) : runsQuery.isLoading ? (
                 <div
                   className="space-y-2"
@@ -310,6 +320,19 @@ export function WorkflowDetailPanel({
                       </div>
                     );
                   })}
+                  {runsQuery.hasNextPage ? (
+                    <Button
+                      className="mt-3"
+                      size="sm"
+                      variant="outline"
+                      disabled={runsQuery.isFetchingNextPage}
+                      onClick={() => void runsQuery.fetchNextPage()}
+                    >
+                      {runsQuery.isFetchingNextPage
+                        ? "Loading..."
+                        : "Load older runs"}
+                    </Button>
+                  ) : null}
                 </div>
               )}
             </div>

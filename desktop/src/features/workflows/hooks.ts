@@ -1,7 +1,17 @@
 import * as React from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 
-import type { WorkflowRun, WorkflowRunStatus } from "@/shared/api/types";
+import type {
+  WorkflowRun,
+  WorkflowRunsCursor,
+  WorkflowRunsPage,
+  WorkflowRunStatus,
+} from "@/shared/api/types";
 import {
   useAppFocused,
   useFocusedRefetchInterval,
@@ -13,7 +23,7 @@ import {
   getChannelWorkflows,
   getRunApprovals,
   getWorkflow,
-  getWorkflowRuns,
+  getWorkflowRunsPage,
   grantApproval,
   triggerWorkflow,
   updateWorkflow,
@@ -66,7 +76,11 @@ export function shouldRefreshQueryOnForeground(
   if (family === "workflows" || family === "workflows-all") return true;
   if (family === "project" && queryKey[2] === "repo-sync-status") return true;
   if (family !== "workflow-runs") return false;
-  const runs = data as WorkflowRun[] | undefined;
+  const runs = Array.isArray(data)
+    ? (data as WorkflowRun[])
+    : (data as { pages?: WorkflowRunsPage[] } | undefined)?.pages?.flatMap(
+        (page) => page.runs,
+      );
   return !runs?.some((run) => isActiveWorkflowRunStatus(run.status));
 }
 
@@ -113,7 +127,8 @@ function isActiveWorkflowRunStatus(status: WorkflowRunStatus) {
   return (
     status === "pending" ||
     status === "running" ||
-    status === "waiting_approval"
+    status === "waiting_approval" ||
+    status === "resume_pending"
   );
 }
 
@@ -139,14 +154,16 @@ export function useWorkflowQuery(workflowId: string | null) {
 
 export function useWorkflowRunsQuery(workflowId: string | null) {
   const appFocused = useAppFocused();
-  return useQuery({
+  return useInfiniteQuery({
     queryKey: workflowRunsQueryKey(workflowId ?? ""),
-    queryFn: ({ queryKey: [, resolvedWorkflowId] }) =>
-      getWorkflowRuns(resolvedWorkflowId),
+    initialPageParam: null as WorkflowRunsCursor | null,
+    queryFn: ({ queryKey: [, resolvedWorkflowId], pageParam }) =>
+      getWorkflowRunsPage(resolvedWorkflowId, pageParam),
+    getNextPageParam: (lastPage) => lastPage.next ?? undefined,
     enabled: workflowId !== null,
     refetchInterval: (query) => {
       if (!appFocused) return false;
-      const runs = query.state.data as WorkflowRun[] | undefined;
+      const runs = query.state.data?.pages.flatMap((page) => page.runs);
       return runs?.some((run) => isActiveWorkflowRunStatus(run.status))
         ? 1_000
         : false;

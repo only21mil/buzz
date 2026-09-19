@@ -798,7 +798,7 @@ test("relayClientSession wires closeSubscription into handleRelayClosed", async 
   // The handleRelayClosed call must pass a closeSubscription callback.
   assert.match(
     source,
-    /handleRelayClosed\(\{[^}]*closeSubscription[^}]*\}\)/,
+    /this\.liveEvents\.handleClosed\(\{[^}]*closeSubscription[^}]*\}\)/,
     "relayClientSession.ts must pass closeSubscription to handleRelayClosed",
   );
   // The callback must reach this.closeSubscription so it sends a real CLOSE.
