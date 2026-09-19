@@ -2,6 +2,8 @@
 
 /// Explicit deployment-global admin report reads.
 pub mod admin_moderation;
+/// Fork agent drafts persistence.
+pub mod agent_drafts;
 /// Community-scoped authentication allowlist persistence.
 pub mod allowlist;
 /// API token storage and lookup.
@@ -12,6 +14,15 @@ pub mod archived_identities;
 pub mod channel;
 /// Channel membership and roster persistence.
 pub mod channel_members;
+/// Fork ci persistence.
+pub mod ci;
+mod ci_api;
+/// Fork ci grants persistence.
+pub mod ci_grants;
+/// Fork ci landing persistence.
+pub mod ci_landing;
+/// Fork ci merge bypass persistence.
+pub mod ci_merge_bypass;
 /// Community lifecycle and host-map persistence.
 pub mod community;
 /// Durable whole-community deletion lifecycle and PostgreSQL adapter.
@@ -22,6 +33,8 @@ pub mod dm;
 pub mod event;
 /// Home feed queries.
 pub mod feed;
+/// Fork git merge gate persistence.
+pub mod git_merge_gate;
 /// Git repository name registry (NIP-34 kind:30617).
 pub mod git_repo;
 /// Community moderation: reports, bans/timeouts, audit actions.
@@ -56,3 +69,11 @@ pub mod usage;
 pub mod user;
 /// Workflow, run, and approval persistence.
 pub mod workflow;
+/// Fork workflow approval persistence.
+pub mod workflow_approval;
+/// Fork workflow effect persistence.
+pub mod workflow_effect;
+/// Fork workflow run transition persistence.
+pub mod workflow_run_transition;
+/// Fork workflow state persistence.
+pub mod workflow_state;

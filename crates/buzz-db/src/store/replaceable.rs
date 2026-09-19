@@ -7,7 +7,7 @@ use sqlx::{Acquire, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::observability::{self, LockType, TransactionOperation};
-use crate::{Db, DbError, Result};
+use crate::{event, Db, DbError, Result};
 
 /// Result category for a parameterized-replaceable event write.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1758,5 +1758,213 @@ mod postgres_tests {
             .expect("read GUC after transaction");
             assert_ne!(leaked.as_deref(), Some("on"));
         }
+    }
+}
+
+/// Result of atomically storing a repository deletion tombstone and applying it
+/// to the current kind-30617 announcement head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoDeletionOutcome {
+    /// A live announcement at or before the tombstone timestamp was deleted.
+    Deleted,
+    /// The tombstone was an exact replay and no live announcement remains.
+    AlreadyAbsent,
+    /// A new tombstone named no live announcement, so the tombstone was rolled back.
+    NotFound,
+    /// The live announcement is newer than the tombstone, so no change was committed.
+    StaleHead,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RepoDeletionTarget {
+    pub(crate) owner_pubkey: Vec<u8>,
+    pub(crate) repo_id: String,
+}
+
+pub(crate) fn repo_deletion_target(tombstone: &nostr::Event) -> Result<RepoDeletionTarget> {
+    const REPO_ANNOUNCEMENT_KIND: &str = "30617";
+
+    if buzz_core::kind::event_kind_i32(tombstone) != 5 {
+        return Err(DbError::InvalidData(format!(
+            "repository deletion tombstone must be kind 5, got {}",
+            buzz_core::kind::event_kind_i32(tombstone)
+        )));
+    }
+
+    let mut coordinate: Option<&str> = None;
+    for tag in tombstone.tags.iter() {
+        let parts = tag.as_slice();
+        match parts.first().map(String::as_str) {
+            Some("a") => {
+                if coordinate.is_some() || parts.len() != 2 {
+                    return Err(DbError::InvalidData(
+                        "repository deletion tombstone must contain exactly one canonical a tag"
+                            .into(),
+                    ));
+                }
+                coordinate = Some(parts[1].as_str());
+            }
+            Some("e") => {
+                return Err(DbError::InvalidData(
+                    "repository deletion tombstone must not contain e tags".into(),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let coordinate = coordinate.ok_or_else(|| {
+        DbError::InvalidData(
+            "repository deletion tombstone must contain exactly one canonical a tag".into(),
+        )
+    })?;
+    let mut parts = coordinate.splitn(3, ':');
+    let (Some(kind), Some(owner_hex), Some(repo_id)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return Err(DbError::InvalidData(
+            "repository deletion target must be 30617:<lowercase-owner-hex>:<repo-id>".into(),
+        ));
+    };
+    if kind != REPO_ANNOUNCEMENT_KIND
+        || owner_hex.len() != 64
+        || owner_hex
+            .bytes()
+            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+        || repo_id.is_empty()
+        || repo_id.len() > event::D_TAG_MAX_LEN
+    {
+        return Err(DbError::InvalidData(
+            "repository deletion target must be 30617:<lowercase-owner-hex>:<repo-id>".into(),
+        ));
+    }
+    let owner = nostr::PublicKey::from_hex(owner_hex).map_err(|error| {
+        DbError::InvalidData(format!(
+            "repository deletion target contains an invalid owner pubkey: {error}"
+        ))
+    })?;
+
+    Ok(RepoDeletionTarget {
+        owner_pubkey: owner.to_bytes().to_vec(),
+        repo_id: repo_id.to_owned(),
+    })
+}
+
+impl Db {
+    /// The transaction takes the exact same advisory lock as
+    /// [`Self::replace_parameterized_event`] for the target kind-30617 coordinate.
+    /// This prevents a replacement and deletion from observing half of each
+    /// other's work. Exact tombstone replays still execute the delete, repairing
+    /// a legacy state where the tombstone committed before its side effect.
+    ///
+    /// A new tombstone is committed only when it deletes a live head. Missing
+    /// targets and heads newer than the tombstone roll the insertion back. An
+    /// exact replay after a successful deletion returns
+    /// [`RepoDeletionOutcome::AlreadyAbsent`].
+    pub async fn store_repo_deletion_tombstone(
+        &self,
+        community_id: CommunityId,
+        tombstone: &nostr::Event,
+        channel_id: Option<Uuid>,
+    ) -> Result<(StoredEvent, RepoDeletionOutcome)> {
+        async {
+        const REPO_ANNOUNCEMENT_KIND: i32 = 30_617;
+
+        let target = repo_deletion_target(tombstone)?;
+        let owner_pubkey = target.owner_pubkey.as_slice();
+        let repo_id = target.repo_id.as_str();
+        let tombstone_kind = buzz_core::kind::event_kind_i32(tombstone);
+
+        let tombstone_created_at_secs = tombstone.created_at.as_secs() as i64;
+        let tombstone_created_at = chrono::DateTime::from_timestamp(tombstone_created_at_secs, 0)
+            .ok_or(DbError::InvalidTimestamp(tombstone_created_at_secs))?;
+        let lock_key = event_replacement_lock_key(
+            community_id,
+            REPO_ANNOUNCEMENT_KIND,
+            owner_pubkey,
+            Some(repo_id.as_bytes()),
+        );
+
+        let mut tx = sqlx::Transaction::begin(crate::observability::acquire_writer(&self.pool, crate::observability::WriterOperation::EventWrite).await?, None).await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *tx)
+            .await?;
+
+        let received_at = chrono::Utc::now();
+        let tags_json = serde_json::to_value(&tombstone.tags)?;
+        let sig_bytes = tombstone.sig.serialize();
+        let insert_result = sqlx::query(
+            "INSERT INTO events (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id, d_tag, not_before) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(community_id.as_uuid())
+        .bind(tombstone.id.as_bytes().as_slice())
+        .bind(tombstone.pubkey.to_bytes().as_slice())
+        .bind(tombstone_created_at)
+        .bind(tombstone_kind)
+        .bind(&tags_json)
+        .bind(&tombstone.content)
+        .bind(sig_bytes.as_slice())
+        .bind(received_at)
+        .bind(channel_id)
+        .bind(event::extract_not_before(tombstone))
+        .execute(&mut *tx)
+        .await?;
+        let tombstone_inserted = insert_result.rows_affected() > 0;
+
+        let live_head: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT created_at FROM events \
+             WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4 \
+               AND deleted_at IS NULL \
+             ORDER BY created_at DESC, id ASC LIMIT 1",
+        )
+        .bind(community_id.as_uuid())
+        .bind(REPO_ANNOUNCEMENT_KIND)
+        .bind(owner_pubkey)
+        .bind(repo_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let stored = |was_inserted| {
+            StoredEvent::with_received_at(tombstone.clone(), received_at, channel_id, was_inserted)
+        };
+
+        let Some(head_created_at) = live_head else {
+            tx.rollback().await?;
+            let outcome = if tombstone_inserted {
+                RepoDeletionOutcome::NotFound
+            } else {
+                RepoDeletionOutcome::AlreadyAbsent
+            };
+            return Ok((stored(false), outcome));
+        };
+
+        if head_created_at > tombstone_created_at {
+            tx.rollback().await?;
+            return Ok((stored(false), RepoDeletionOutcome::StaleHead));
+        }
+
+        let delete_result = sqlx::query(
+            "UPDATE events SET deleted_at = NOW() \
+             WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4 \
+               AND deleted_at IS NULL AND created_at <= $5",
+        )
+        .bind(community_id.as_uuid())
+        .bind(REPO_ANNOUNCEMENT_KIND)
+        .bind(owner_pubkey)
+        .bind(repo_id)
+        .bind(tombstone_created_at)
+        .execute(&mut *tx)
+        .await?;
+        debug_assert!(delete_result.rows_affected() > 0);
+
+        if tombstone_inserted {
+            crate::insert_mentions_in_transaction(&mut tx, community_id, tombstone, channel_id).await?;
+        }
+        tx.commit().await?;
+
+        Ok((stored(tombstone_inserted), RepoDeletionOutcome::Deleted))
+        }.await
     }
 }

@@ -83,10 +83,9 @@ pub async fn get_ci_run_member_channel(
     .bind(run_id)
     .bind(pubkey)
     .fetch_optional(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Ci,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )
@@ -220,7 +219,15 @@ pub async fn store_ci_event(
         ));
     }
 
-    let mut tx = crate::observability::begin(pool, crate::observability::Operation::Ci).await?;
+    let mut tx = sqlx::Transaction::begin(
+        crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+        None,
+    )
+    .await?;
     let (stored_event, inserted) = event::insert_event_with_thread_metadata_tx(
         &mut tx,
         community_id,
@@ -334,10 +341,9 @@ pub async fn get_ci_run_request(
     .bind(run_id)
     .bind(KIND_CI_REQUEST as i32)
     .fetch_optional(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Ci,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )
@@ -382,10 +388,9 @@ pub async fn list_ci_run_events(
     .bind(after_cursor)
     .bind(i64::from(limit.clamp(1, 1_000)))
     .fetch_all(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Ci,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )
@@ -432,10 +437,9 @@ pub async fn load_ci_check(
     .bind(check_event_id)
     .bind(KIND_CI_CHECK as i32)
     .fetch_optional(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Ci,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )
@@ -474,10 +478,9 @@ pub async fn load_ci_reducer_events(
     .bind(KIND_CI_JOB_STATUS as i32)
     .bind(MAX_REDUCER_EVENTS + 1)
     .fetch_all(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Ci,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )

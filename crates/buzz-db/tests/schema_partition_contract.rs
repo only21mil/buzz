@@ -2,7 +2,7 @@
 
 use sqlx::{AssertSqlSafe, PgPool};
 
-const ATTACH: &str = include_str!("../../../scripts/attach-schema-partitions.sql");
+const ATTACH: &str = include_str!("../../../scripts/reconcile-schema-after-pgschema.sql");
 
 async fn trigger_catalog(pool: &PgPool) -> Vec<(i64, String, String, bool, String)> {
     sqlx::query_as(

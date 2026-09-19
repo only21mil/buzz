@@ -94,10 +94,9 @@ pub async fn transition_workflow_run(
     .bind(expected_status.to_string())
     .bind(expected_generation)
     .fetch_optional(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Workflow,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )
@@ -152,10 +151,9 @@ pub async fn list_recoverable_workflow_resumes(
     .bind(resume_pending_age_secs)
     .bind(limit)
     .fetch_all(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Workflow,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )
@@ -216,10 +214,9 @@ pub async fn claim_workflow_resume(
     .bind(expected_status.to_string())
     .bind(expected_generation)
     .fetch_optional(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Workflow,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )
@@ -258,10 +255,9 @@ pub async fn renew_workflow_resume_lease(
     .bind(id)
     .bind(expected_generation)
     .execute(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Workflow,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )
@@ -303,10 +299,9 @@ pub async fn complete_running_workflow_run(
     .bind(id)
     .bind(expected_generation)
     .fetch_optional(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Workflow,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )
@@ -387,10 +382,9 @@ pub async fn fail_running_workflow_run_with_failure(
     .bind(expected_generation)
     .bind(failure.code)
     .fetch_optional(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Workflow,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )

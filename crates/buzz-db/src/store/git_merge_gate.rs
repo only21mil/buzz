@@ -129,10 +129,9 @@ pub async fn insert_merge_gate_decision(
     .bind(&insert.pusher)
     .bind(&insert.bypass_event_id)
     .fetch_one(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Ci,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )
@@ -168,10 +167,9 @@ pub async fn find_merge_gate_allow(
     .bind(pusher)
     .bind(not_before)
     .fetch_optional(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Ci,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )

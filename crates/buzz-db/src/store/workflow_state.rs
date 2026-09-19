@@ -171,10 +171,9 @@ pub async fn read_workflow_state(
     .bind(workflow_id)
     .bind(key)
     .fetch_optional(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Workflow,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )
@@ -203,10 +202,9 @@ pub async fn read_workflow_state_for_run(
     .bind(run_id)
     .bind(key)
     .fetch_optional(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Workflow,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )
@@ -250,10 +248,9 @@ pub async fn purge_expired_workflow_state(pool: &PgPool, limit: u32) -> Result<u
     )
     .bind(limit)
     .execute(
-        &mut *crate::observability::acquire(
+        &mut *crate::observability::acquire_writer(
             pool,
-            crate::observability::PoolRole::Writer,
-            crate::observability::Operation::Workflow,
+            crate::observability::WriterOperation::EventWrite,
         )
         .await?,
     )
@@ -296,8 +293,15 @@ pub async fn write_workflow_state(
         expected_revision,
     )?;
 
-    let mut tx =
-        crate::observability::begin(pool, crate::observability::Operation::Workflow).await?;
+    let mut tx = sqlx::Transaction::begin(
+        crate::observability::acquire_writer(
+            pool,
+            crate::observability::WriterOperation::EventWrite,
+        )
+        .await?,
+        None,
+    )
+    .await?;
     let workflow_id: Uuid =
         sqlx::query_scalar("SELECT workflow_id FROM workflow_runs WHERE community_id=$1 AND id=$2")
             .bind(community_id.as_uuid())
