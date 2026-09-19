@@ -1044,6 +1044,7 @@ dependencies = [
  "fs2",
  "getrandom 0.4.3",
  "hex",
+ "image",
  "nix 0.31.3",
  "reqwest 0.13.4",
  "rmcp",
@@ -1222,7 +1223,6 @@ version = "0.1.0"
 dependencies = [
  "buzz-core",
  "nostr 0.44.7",
- "serde",
  "serde_json",
  "thiserror 2.0.18",
  "uuid",

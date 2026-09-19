@@ -40,7 +40,6 @@ export type MarkdownRuntime = {
   channels: Channel[];
   imetaByUrl?: ImetaLookup;
   /** Inline content supplied to the first prose-capable Markdown block. */
-  leadingInlineContent?: React.ReactNode;
   mentionPubkeysByName?: Record<string, string>;
   onOpenChannel: (channelId: string) => void;
   /** Navigate to a Buzz git entity (`buzz://pr|issue|repo` deep link). */

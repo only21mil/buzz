@@ -1,3 +1,4 @@
+import type { PersonaReviewContent } from "./personaReviewContent";
 // Persona (agent definition) wire types, split out of `types.ts` to keep that
 // file inside the repo-wide size ratchet. Consumers import these through
 // `@/shared/api/types`, which re-exports everything here.
@@ -86,6 +87,12 @@ export type CreatePersonaInput = {
 };
 
 export type UpdatePersonaInput = {
+  /** Reject updates when the reviewed version has changed. */
+  expectedUpdatedAt?: string;
+  /** Content approved by the reviewer for optimistic concurrency. */
+  expectedContent?: PersonaReviewContent;
+  /** Shared state approved by the reviewer. */
+  expectedShared?: boolean;
   id: string;
   displayName: string;
   avatarUrl?: string;

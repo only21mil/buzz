@@ -329,59 +329,6 @@ export function listenForEntityDeepLinks(
   });
 }
 
-/**
- * Register a listener for `deep-link-entity` events — the `buzz://` share
- * links for projects, repositories, issues, and pull requests. The payload is
- * the raw URL; callers parse it with `parseEntityLink` before navigating.
- */
-export function listenForEntityDeepLinks(
-  onOpen: (href: string) => boolean,
-): Promise<UnlistenFn> {
-  let drainRunning = false;
-  let drainRequested = false;
-  const drain = () => {
-    drainRequested = true;
-    if (drainRunning) return;
-    drainRunning = true;
-    void (async () => {
-      try {
-        while (drainRequested) {
-          drainRequested = false;
-          while (true) {
-            const pending = await invoke<PendingEntityDeepLink | null>(
-              "take_pending_entity_deep_link",
-            );
-            if (!pending) break;
-            if (!onOpen(pending.href)) return;
-            const acknowledged = await invoke<boolean>(
-              "acknowledge_pending_entity_deep_link",
-              { id: pending.id },
-            );
-            if (!acknowledged) break;
-          }
-        }
-      } catch (error: unknown) {
-        console.warn("Failed to drain pending entity deep links", error);
-      } finally {
-        drainRunning = false;
-        if (drainRequested) drain();
-      }
-    })();
-  };
-
-  return listen<PendingEntityDeepLink | string>("deep-link-entity", (event) => {
-    // String payloads are retained for older backends and E2E bridge calls.
-    if (typeof event.payload === "string") {
-      onOpen(event.payload);
-    } else {
-      drain();
-    }
-  }).then((unlisten) => {
-    drain();
-    return unlisten;
-  });
-}
-
 export function listenForNostrBindDeepLinks(
   onOpen: (payload: NostrBindDeepLinkPayload) => void,
 ): Promise<UnlistenFn> {
