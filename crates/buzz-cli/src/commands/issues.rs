@@ -601,6 +601,7 @@ pub async fn dispatch(cmd: crate::IssuesCmd, client: &BuzzClient) -> Result<(), 
         IssuesCmd::Create {
             repo_owner,
             repo_id,
+            channel,
             title,
             content,
             label,
@@ -612,7 +613,7 @@ pub async fn dispatch(cmd: crate::IssuesCmd, client: &BuzzClient) -> Result<(), 
                 client,
                 repo_owner.as_deref(),
                 repo_id.as_deref(),
-                channel_id.as_deref(),
+                channel.as_deref().or(channel_id.as_deref()),
             )
             .await?;
             cmd_create_issue(
