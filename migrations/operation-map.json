@@ -1,16 +1,33 @@
 {
   "schema": "buzz-migration-operation-map/1",
-  "forked_from_note": "Fork 0001-0028 are byte-identical to upstream; 0029+ diverged by number and content.",
-  "fork_head": "1e05fce27c658bf09a2c45fbebd1d8388d33bb15",
-  "upstream_pin": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
+  "forked_from_note": "Candidate A: upstream 0001-0046 verbatim; fork-only history at version + 1000; new fork work starts at 1045. The legacy fork key enumerates the complete merged lineage.",
+  "fork_head": "1a8a614ea",
+  "upstream_pin": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd",
   "upstream_remote": "https://github.com/block/buzz",
   "frozen_prefix": {
-    "first": 1,
-    "last": 42,
+    "upstream_first": 1,
+    "upstream_last": 46,
+    "fork_versions": [
+      1029,
+      1030,
+      1031,
+      1032,
+      1033,
+      1034,
+      1035,
+      1039,
+      1040,
+      1041,
+      1042,
+      1043,
+      1044
+    ],
     "manifests": [
       "scripts/migrations-0001-0035.sha256",
-      "scripts/migrations-0036-0042.sha256"
-    ]
+      "scripts/migrations-0036-0042.sha256",
+      "scripts/migrations-0043-0049.sha256"
+    ],
+    "note": "Third ledger retains its historical filename; it now pins upstream 0043-0046 and the fork block."
   },
   "checksum_note": "sha256 covers raw file bytes. sqlx_sha384 is the SQLx 0.9 recorded checksum (SHA-384 of the same bytes); both are pinned so a byte change fails before migration execution.",
   "fork": [
@@ -21,7 +38,7 @@
       "sha256": "6acb496695f650e49c7e44404894899a04fc971d8c2c4f7862bd62797c23799d",
       "sqlx_sha384": "dbc16fbf139a47d526975a727e6349aa9800a8ffec0a9f040a7f4e545d413e50a32160171d4cb112bf3671823eea7075",
       "fork_origin_commit": "2300248d3b40359da7d92b6665041a70b5520047",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "create-table:_operator_global_tables",
         "create-table:api_tokens",
@@ -112,8 +129,9 @@
         "create-type:workflow_status"
       ],
       "prerequisites": [],
-      "status": "applied-frozen",
-      "notes": "Consolidated multi-tenant base. Byte-identical to upstream pin."
+      "status": "frozen",
+      "notes": "Consolidated multi-tenant base. Byte-identical to upstream pin.",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 2,
@@ -122,7 +140,7 @@
       "sha256": "372f91f3c3caf7e95594f7c077fa12a4aa68e06b5ecaaa43414b2db02fc8177a",
       "sqlx_sha384": "49c1e203577698af725d2db237e25da3cf928ba19b5a07cf14f2bcd1d22d486a3b53263f025040273e393be16145e270",
       "fork_origin_commit": "e5aa4a21327438c02fb25baea4d0849a498c9059",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "create-table:git_repo_names",
         "create-index:idx_git_repo_names_owner"
@@ -130,8 +148,9 @@
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 3,
@@ -140,15 +159,16 @@
       "sha256": "06728e95689a18c5b501f1d35d0e7e98d5033b2cc08d82d68ed4e2158282da53",
       "sqlx_sha384": "d0953a3ac68d2c7c7305c91b0c3ac122bbdc7cc25de0a28f30462d2632d9ccf26256dfea031c0ff690f9e1b5c0dae17d",
       "fork_origin_commit": "5bfd5ca2700483498e83224a40a5628a29cf2e9e",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "alter-table:communities"
       ],
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 4,
@@ -157,15 +177,16 @@
       "sha256": "75b22e3d30817c49a7832a58f70a893f7dcdf1316730cd5412ae5290970534f2",
       "sqlx_sha384": "5c5108f23d2866cd30e10d15d10b9fa75383ac86985d1be0757f32e3dead6f7caecce30c499eea3221b4d114cd99df6a",
       "fork_origin_commit": "33886e3dec4130e512d8242207adfe2811a92579",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "create-index:idx_events_tags_gin"
       ],
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 5,
@@ -174,7 +195,7 @@
       "sha256": "1ca2dbf526b604c6a413b693fd381177652f3c91ea0f376813a656f85af2046e",
       "sqlx_sha384": "84cf1c768d80480a07bea5b43b83b83d2ff0c3809d2011dcfb751be6a34177c7aab67a9cc2ae8968f50a513edd7d8e83",
       "fork_origin_commit": "71265ca36105dbf62453a99c998c3f3dd134a304",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "alter-table:events",
         "create-index:idx_events_search_tsv"
@@ -182,8 +203,9 @@
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 6,
@@ -192,7 +214,7 @@
       "sha256": "ba7d84d711d788c5786a8a11f7d6bb7d9fa00e290bb3abea4d5f70b22833ffdb",
       "sqlx_sha384": "9e5bbfa7469aefc0158f9f67208bdbd54c5eb3c821ae64f33fcbc2b38680afae47ab80d1fb5fda53f59cd8d68422c0d2",
       "fork_origin_commit": "863aeb79f35a43222bd5de3901ab06220948fb9d",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "create-table:community_bans",
         "create-table:moderation_actions",
@@ -208,8 +230,9 @@
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 7,
@@ -218,7 +241,7 @@
       "sha256": "6fab8f418f8e3c0c5bc7db6cfe0b1d4013de6cab1cdae80ea68f0fd2716f11f8",
       "sqlx_sha384": "939ac3ebe69d9db5dfe2e59ed1c9251270a27559fc74ad36aecf9761994c32e808f77220489322d37ce557c3de56cfca",
       "fork_origin_commit": "1b4703021dbfd37dc31845223dba9ba182e4647f",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "create-table:parameterized_event_watermarks",
         "create-index:idx_event_mentions_community_event"
@@ -226,8 +249,9 @@
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 8,
@@ -236,7 +260,7 @@
       "sha256": "11bf4a341c64144b25e020c739be139ab30496cfb25c37b662a40b5c2d22180d",
       "sqlx_sha384": "f182146b6470c11c78bd4f6a285e078df6072958eb9f264d0432dd47b9e2889dd36287ca730100759542017f1786ed67",
       "fork_origin_commit": "1b4703021dbfd37dc31845223dba9ba182e4647f",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "alter-table:events",
         "create-index:idx_events_search_tsv"
@@ -244,8 +268,9 @@
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 9,
@@ -254,7 +279,7 @@
       "sha256": "980f6c024d700ce12f98699ad4ee306295b5c6139e5a9171cf6cafdf97684646",
       "sqlx_sha384": "5797443ecc13ce7bd4cfd5707d8ce44a37e104b0fab0355b7c4d620667943ee357141610cf95bb5cb27f6a3d3020022f",
       "fork_origin_commit": "1b4703021dbfd37dc31845223dba9ba182e4647f",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "define-function:guard_event_mention_live",
         "define-function:guard_nip_rs_watermark",
@@ -266,8 +291,9 @@
       "prerequisites": [
         7
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 10,
@@ -276,15 +302,16 @@
       "sha256": "fff1c7856bb1b61b39816d77f0a9ccd7b9c7f39bf6753aee38c7a44247bd7f75",
       "sqlx_sha384": "84748c2160148d3674f4e15325aedc19a8f7300b1f465b64d06ef0c43cb4c96412b41a99dab4a28db8247dc18072e383",
       "fork_origin_commit": "1b4703021dbfd37dc31845223dba9ba182e4647f",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "define-function:guard_nip_rs_watermark"
       ],
       "prerequisites": [
         9
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 11,
@@ -293,7 +320,7 @@
       "sha256": "43e83b89ef20fb7ed34eaa9dcd31a1a8c8fa8b5591756dda1925a14408429189",
       "sqlx_sha384": "d6fcbfe79e22e7c73caee36cba13c7feb5daf690fdc6957264c897f25678deb8dd220a4b422030570d475fe14d63f342",
       "fork_origin_commit": "1b4703021dbfd37dc31845223dba9ba182e4647f",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "define-function:guard_nip_rs_hard_delete",
         "define-function:guard_nip_rs_watermark",
@@ -304,8 +331,9 @@
         9,
         10
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 12,
@@ -314,7 +342,7 @@
       "sha256": "9ba5e433b5af5810af9e275049d67cc8a6de310f314f24afc84ab7509e7fb47f",
       "sqlx_sha384": "b95c2e08388d1f698f62a3cce948ec108300fb3b4b2b719803ecbc4af4f8cc07d5ad75b61d7287d1a91aa020938b1d35",
       "fork_origin_commit": "1c006822e4484d68e33fce14f9139c2f70ce9d66",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "create-table:push_leases",
         "create-table:push_wake_outbox",
@@ -326,8 +354,9 @@
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 13,
@@ -336,15 +365,16 @@
       "sha256": "4ccb516e68116e0ea76719cc06adecbebbcb2078c14f8418bb825da31f5020c5",
       "sqlx_sha384": "6db1b972e28884665c49c5c926fb5464f104db853df311c97613e339b7ed82b847e120487c12719229be48ecb3635fc7",
       "fork_origin_commit": "1c006822e4484d68e33fce14f9139c2f70ce9d66",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "alter-table:push_leases"
       ],
       "prerequisites": [
         12
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 14,
@@ -353,7 +383,7 @@
       "sha256": "c7c091b85d66515b575ec66e794b73466ee06949f740167e37e6d4a5abc1af35",
       "sqlx_sha384": "08755814a36a4f8494f7f48bce6d37a429b710a1902d0ed3569d5533b460cfd355098a3dad662320f9dd5cdec37ff0c2",
       "fork_origin_commit": "1c006822e4484d68e33fce14f9139c2f70ce9d66",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "alter-table:events",
         "create-index:idx_events_search_tsv"
@@ -361,8 +391,9 @@
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 15,
@@ -371,7 +402,7 @@
       "sha256": "0ff0f41d58ba21bf2d44cc7dba6c3a702058de3081afbff0e2bb7620f63b64b3",
       "sqlx_sha384": "74c3b952090efe211d08da10a474de0e1ec9b02e2c22e6503210e45aff07de1667afc95cf0e10eb6b4bafe2f0864d906",
       "fork_origin_commit": "1c006822e4484d68e33fce14f9139c2f70ce9d66",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "create-table:push_gateway_challenges",
         "create-table:push_gateway_delegations",
@@ -389,8 +420,9 @@
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 16,
@@ -399,15 +431,16 @@
       "sha256": "917c18dbaaf909be56a6c1d076e6925fa7dff34117b67c1dfb9bf89aed8fd5a8",
       "sqlx_sha384": "39de24bdf7c26f172af58972993c379a50c81d8755187f23deabd9919ddba11c47faff3d69d2bdd42bf9096ca2441c81",
       "fork_origin_commit": "2b15a726750dbd7437711050cd3241b679dff317",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "alter-table:communities"
       ],
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 17,
@@ -416,7 +449,7 @@
       "sha256": "8a38f6f31b0a58e92418a8f2bb7be0fa800885389a57577b88a16690ec38e54f",
       "sqlx_sha384": "2788f2b8bf2347ccaea0d15bd602b863e1be721b2cc292d433bf64ca66cdbbb9fa87739e22eab94da03e4d34e7be426d",
       "fork_origin_commit": "08ad38a07f0c49bb3f20b775b8f534f1cfa529c3",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "create-table:product_feedback",
         "create-index:idx_product_feedback_community_received",
@@ -425,8 +458,9 @@
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 18,
@@ -435,7 +469,7 @@
       "sha256": "7e069726d5dcd0de22eb0e8ad94ad1ba1576d3f15acc34c2d28b5e0f9f089ff4",
       "sqlx_sha384": "f6a16ba98bf84174088684d19cc33b0efc436635723823f69429fafe1389b60e9432ceb7107afdc53900b46ffc4e47c9",
       "fork_origin_commit": "bffbc5f22cc80e9a07dedc622798347d598a215c",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "create-table:push_match_queue",
         "create-index:push_match_queue_due",
@@ -446,8 +480,9 @@
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 19,
@@ -456,7 +491,7 @@
       "sha256": "63e025bf9469e0917fb7a3f6e29cc414c1467e3027737523a5bb9e0478d2dd49",
       "sqlx_sha384": "a9c2b378c0650bcaa9004f2f34a96b4eb41e02cdf6fc0797b128d706ce07bfa51725a66af63d9f5084d61e9a731c1049",
       "fork_origin_commit": "54638ff4bb5af2d3d3759b44118b43052f814bb1",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "define-function:purge_soft_deleted_buzz_mesh_status",
         "create-trigger:trg_events_purge_soft_deleted_buzz_mesh_status"
@@ -465,8 +500,9 @@
         1,
         7
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 20,
@@ -475,15 +511,16 @@
       "sha256": "7dae44bc421cc3f8c1326d16674eedf0fff354890bab739140f3d6c493b5f5f7",
       "sqlx_sha384": "06409e8657ce06941e1aca68049405d48beb23be83ac971fd6aee358e5eac119f579730d0e0904409abb43ce146124d8",
       "fork_origin_commit": "6c2d667575cbc372ba42d26134448660fb1d2ee9",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "create-table:join_policy_acceptances"
       ],
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 21,
@@ -492,7 +529,7 @@
       "sha256": "9116ae4090abe81800359204536bd5845d76c86101e1f1d894a6816834c86128",
       "sqlx_sha384": "37d7ff757ecd2e6eda79830a80725efe81ca76eb46291891ebe0380ad3717dc58e9c1d203b656812dfda7d8ed2e9f2f2",
       "fork_origin_commit": "29c48883d30e6feed75e33490571ca96082c6282",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "define-function:events_created_at_floor_guard",
         "create-trigger:events_created_at_floor"
@@ -500,8 +537,9 @@
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 22,
@@ -510,7 +548,7 @@
       "sha256": "7e2aa5de4b7bff03dae8184c6aef78ebb6b92c306fae8d97c1ce83752e1ba60f",
       "sqlx_sha384": "82a015291aa8b9a50dbc8d7308a865b63140d39a5581694428b7d038086da8cceba7f6709db270fa8aac3d546e32da0f",
       "fork_origin_commit": "2e936d439ce29182b48086f9f8a7a3ffe3b9b345",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "define-function:refresh_channel_ttl_after_event_insert",
         "create-trigger:events_refresh_channel_ttl"
@@ -518,8 +556,9 @@
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 23,
@@ -528,15 +567,16 @@
       "sha256": "5a32c41759ee19ce7f304b17acce2d7d9551912aa7256bcc73340807e0d81e9b",
       "sqlx_sha384": "fb1876d1af9738342bc24b3e0ad8de73e45900786f15283e338d59c81f05548cef2734ffb2e243120aff23957310e0bc",
       "fork_origin_commit": "e43b2d5aac0d1f2b6b623b04f7af5a51f77da8c6",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "define-function:enqueue_push_match_job"
       ],
       "prerequisites": [
         18
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 24,
@@ -545,15 +585,16 @@
       "sha256": "bdba4330fdd39061cf3d10d34362a7b56c544453a0c129e5be08c4c478d0554b",
       "sqlx_sha384": "aaf2084176d409cb63015acce2d4d13a730d3f8ca060d0fb262b6d1805b0c33c36a07528691af2240be76e2ea4fe61f3",
       "fork_origin_commit": "e43b2d5aac0d1f2b6b623b04f7af5a51f77da8c6",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "define-function:refresh_channel_ttl_after_event_insert"
       ],
       "prerequisites": [
         22
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 25,
@@ -562,7 +603,7 @@
       "sha256": "62af2672cfc72c50ef619b96adbb64caeb21cec1c5db8f344973ab59fdc6ebbb",
       "sqlx_sha384": "d4fdfc8bc8c9d75f7b812f40d533af80de1053fdd0d95c99b6ff6376e7d7090a8b514ef4e0e9d31aba258e6e7833b1c5",
       "fork_origin_commit": "d500c2d5cf5d9aabe0ca4ebebfcafdbe5f5b7fd3",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "create-table:relay_invites",
         "create-index:relay_invites_expires_at_idx"
@@ -570,8 +611,9 @@
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 26,
@@ -580,15 +622,16 @@
       "sha256": "41c132ac6eb802c79d084518374214dc00c948d32b0d2b2de5d982741ba7d707",
       "sqlx_sha384": "d08e2f660ed70d11a765c710d8c6cb448f6e151b3aa46b75ddd47be88f4df0f355e923794c25be2aa5d566a51a04059e",
       "fork_origin_commit": "63496cc1d4c6f1b7c613801bdcc694169dcf391a",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "create-table:replica_heartbeat"
       ],
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 27,
@@ -597,15 +640,16 @@
       "sha256": "5338d6dd3c2adec2725be6d0810cf127a2d37fcefcc45c06abe8572c0e04a0d0",
       "sqlx_sha384": "a0d196710d689af3f5b9d0257aee31aa2f435a06b8663c206a4d5cf819c979e3f36740d192901785e013a56e99447d9b",
       "fork_origin_commit": "bc9e6528a7ba6007c5a25f6a0aca9c05d72e9d2c",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "create-index:idx_channels_id_live"
       ],
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 28,
@@ -614,19 +658,337 @@
       "sha256": "7801606ad357301d6358f5fb8c5121b457b11626eb87af3a1d5bd249127dc084",
       "sqlx_sha384": "32ac3a3abf13343683edc353a361feee1d6b8ebb2d997805188599a0bde9b0a4aa18a99d61f47df41f5a1778bb9a261e",
       "fork_origin_commit": "2ea9385015fb922de2adf0a53e86fc5a21d07b90",
-      "origin_class": "shared-byte-identical",
+      "origin_class": "upstream-verbatim",
       "operations": [
         "alter-table:reactions"
       ],
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
-      "notes": ""
+      "status": "frozen",
+      "notes": "",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
     },
     {
       "version": 29,
-      "file": "migrations/0029_workflow_run_snapshots.sql",
+      "file": "migrations/0029_community_deletion.sql",
+      "description": "community deletion",
+      "sha256": "eeb1eace076fe9764b5b00fcf77b140e1be5fe2b3d2ea0f20d366fed339b3348",
+      "sqlx_sha384": "320ece7f93d14e6b49e17598c2bfa1cbedbd1c6ef4430a0e704cd4e01678cff54ecafd2393be6371f74b2f8f143d7101",
+      "origin_class": "upstream-verbatim",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd",
+      "status": "frozen",
+      "prerequisites": [
+        1
+      ],
+      "operations": [
+        "create-table:community_deletion_requests",
+        "create-table:community_deletion_approvals",
+        "create-table:community_deletion_checkpoints",
+        "create-table:community_deletion_manifest_keys",
+        "create-table:storage_taxonomy_sweeps",
+        "create-table:community_serving_write_leases",
+        "create-table:community_deletion_executor_heartbeats"
+      ]
+    },
+    {
+      "version": 30,
+      "file": "migrations/0030_community_deletion_recovery.sql",
+      "description": "community deletion recovery",
+      "sha256": "afd099b6fd4d9afbbee09d960e12b6e72e9c5232bad74ef766f1fe93c4a67cf1",
+      "sqlx_sha384": "78a91c971a73aeff0dd1b8e3cb189008f8ae75a32eae51daa203ce0aa4bc22d202baccc0ea8f45b0176c1cc9e41e3b02",
+      "origin_class": "upstream-verbatim",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd",
+      "status": "frozen",
+      "prerequisites": [
+        29,
+        17
+      ],
+      "operations": [
+        "upstream-migration:0030"
+      ]
+    },
+    {
+      "version": 31,
+      "file": "migrations/0031_workflow_run_error_codes.sql",
+      "description": "workflow run error codes",
+      "sha256": "1b113cf222340208814e0b77f631fcc05e07a592952cf87bdabf701683824dc7",
+      "sqlx_sha384": "28a5aac2e1a6a4b7c7de4c61d760f5e132e511f085b4a952539df22d0835689d72b6231be2ffaa44e154d987646a40ff",
+      "origin_class": "upstream-verbatim",
+      "operations": [
+        "alter-table:workflow_runs"
+      ],
+      "prerequisites": [
+        1
+      ],
+      "status": "frozen",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
+    },
+    {
+      "version": 32,
+      "file": "migrations/0032_channel_roster_snapshot_fence.sql",
+      "description": "channel roster snapshot fence",
+      "sha256": "e0291a5fde08e7cfdd6e723009c896d8a0d1c381a943365d0227db3b423441e3",
+      "sqlx_sha384": "0f52d4406f730870bc6331419943e5cfe6fe7f71e13cb294bcf9c2a41157689828ed2ae93ee2b3a9a88e2eef71b9cd93",
+      "origin_class": "upstream-verbatim",
+      "operations": [
+        "define-function:guard_channel_roster_snapshot",
+        "create-trigger:trg_events_guard_channel_roster_snapshot"
+      ],
+      "prerequisites": [
+        1
+      ],
+      "status": "frozen",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
+    },
+    {
+      "version": 33,
+      "file": "migrations/0033_private_managed_agent_fts.sql",
+      "description": "private managed agent fts",
+      "sha256": "581a09dd9e549ee777aa00d2af5a905eed08e5c121b1025853de51d377d9650d",
+      "sqlx_sha384": "fee74f5b49e6257a44203b4b1605e63bd7bd833e9263217356a78bcd7dbde19dc6b1523cdbb716ade6a2ad8b4f1d722d",
+      "origin_class": "upstream-verbatim",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd",
+      "status": "frozen",
+      "prerequisites": [
+        1
+      ],
+      "operations": [
+        "upstream-migration:0033"
+      ]
+    },
+    {
+      "version": 34,
+      "file": "migrations/0034_replica_heartbeat_vacuum_truncate.sql",
+      "description": "replica heartbeat vacuum truncate",
+      "sha256": "bfdccc3686a8f52a4717853f336440a7c4ca8f00512c499caeef71c14b984085",
+      "sqlx_sha384": "e05fa0759bfa36a1127cc92fd573e67071c26ceca6601b4e50d6fbb9b097bd1213a5d48f925f58ba2bf7781edff3a318",
+      "origin_class": "upstream-verbatim",
+      "operations": [
+        "alter-table:replica_heartbeat:vacuum_truncate"
+      ],
+      "prerequisites": [
+        26
+      ],
+      "status": "frozen",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
+    },
+    {
+      "version": 35,
+      "file": "migrations/0035_relay_operators.sql",
+      "description": "relay operators",
+      "sha256": "b0c6f97c5b0fb1e1eeef51c050ad24cef0946bb0a6a118d795aceacc294a445a",
+      "sqlx_sha384": "cd52840f42f04ea71d04064e9d789f9efd280ba3e105caf12c864b8792d4b82ae0ab672a5e492e005f5467abb33b6031",
+      "origin_class": "upstream-verbatim",
+      "operations": [
+        "create-table:relay_operators",
+        "alter-table:moderation_actions:actor_authority",
+        "alter-table:moderation_reports:admin_processing",
+        "alter-table:product_feedback:status"
+      ],
+      "prerequisites": [
+        6,
+        17
+      ],
+      "status": "frozen",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
+    },
+    {
+      "version": 36,
+      "file": "migrations/0036_relay_admin_actions.sql",
+      "description": "relay admin actions",
+      "sha256": "ddb9258a3eac3c128a580fa895a6dd7b03f88a83f8d87eb35ff31d045fa8e5ae",
+      "sqlx_sha384": "c40f33b75db83d49b43e1bc215cbe0b96bd02f1db5084edfa4fc3289539d912658ce5ec3c3dfb2e3d79d045aa1e358ce",
+      "origin_class": "upstream-verbatim",
+      "operations": [
+        "create-table:relay_admin_actions",
+        "create-table:relay_admin_outbox"
+      ],
+      "prerequisites": [
+        35
+      ],
+      "status": "frozen",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
+    },
+    {
+      "version": 37,
+      "file": "migrations/0037_relay_admin_action_lease.sql",
+      "description": "relay admin action lease",
+      "sha256": "61e80c9a2aa48a99a352458f627e587c55d12b216d39e5d5ee3917a8346bf277",
+      "sqlx_sha384": "305693f62f0d76cc107c4872c4e8526791581f827c09ab30e1b5be0ff94e6efa2f906af6e93e64d2c8d2c70c958b083d",
+      "origin_class": "upstream-verbatim",
+      "operations": [
+        "alter-table:relay_admin_actions:lease",
+        "alter-table:relay_admin_outbox:retry"
+      ],
+      "prerequisites": [
+        36
+      ],
+      "status": "frozen",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
+    },
+    {
+      "version": 38,
+      "file": "migrations/0038_relay_admin_outbox_claim_token.sql",
+      "description": "relay admin outbox claim token",
+      "sha256": "340edc00a0cdee7063d00dfed247ba2ff6a8c6afa6013e26d93bfadccb961df7",
+      "sqlx_sha384": "410d3e2075bdfe0c98c7472c9b23802759dfba12f9b452767e154baf4045362e6cd4998db72e6a7d35c05f26ca004f78",
+      "origin_class": "upstream-verbatim",
+      "operations": [
+        "alter-table:relay_admin_outbox:claim_token"
+      ],
+      "prerequisites": [
+        37
+      ],
+      "status": "frozen",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
+    },
+    {
+      "version": 39,
+      "file": "migrations/0039_relay_operator_audit.sql",
+      "description": "relay operator audit",
+      "sha256": "9e307c41c82fc487d1e541aa828e6e90bd5f2f0ebad35dc908cd385c6c855cbc",
+      "sqlx_sha384": "cc24b0187f3b73f7dde23c4d683d9c7e23c220fc9fd38236f905b42ae656eae5c659319785c24016b5ee55ad97f146cf",
+      "origin_class": "upstream-verbatim",
+      "operations": [
+        "create-table:relay_operator_audit"
+      ],
+      "prerequisites": [
+        35
+      ],
+      "status": "frozen",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
+    },
+    {
+      "version": 40,
+      "file": "migrations/0040_push_message_kinds.sql",
+      "description": "push message kinds",
+      "sha256": "cc094648d73cf34ae6772e15359668e340d995344eb9b99f12cde1235ea60fe8",
+      "sqlx_sha384": "d2247d99141ee99c5da55a973d9810c68e2a2566abd0b1e894312deb9e5ccad7d5b393f2c1d4b2736f3a7e0980252c6f",
+      "origin_class": "upstream-verbatim",
+      "operations": [
+        "define-function:enqueue_push_match_job"
+      ],
+      "prerequisites": [
+        12
+      ],
+      "status": "frozen",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
+    },
+    {
+      "version": 41,
+      "file": "migrations/0041_nip_fi_identity_foundation.sql",
+      "description": "nip fi identity foundation",
+      "sha256": "41103784c95e251c019fb20c11081fccc355e9e139d22ed07f3004cfb760491d",
+      "sqlx_sha384": "ad6359d4b86fc85d028f8921cbd2afc20c79acace320cd0eb7a79019b5e0ee44d0fab1e60a710527cd391126f43a2d6f",
+      "origin_class": "upstream-verbatim",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd",
+      "status": "frozen",
+      "prerequisites": [
+        29
+      ],
+      "operations": [
+        "create-table:authorization_operation_receipts",
+        "create-table:identity_enrollment_policies",
+        "create-table:identity_bindings",
+        "create-table:identity_lifecycle_history",
+        "create-table:identity_lifecycle_selectors"
+      ]
+    },
+    {
+      "version": 42,
+      "file": "migrations/0042_nip_fi_authorization_foundation.sql",
+      "description": "nip fi authorization foundation",
+      "sha256": "3edf20500782b151a94565a9460bd4a8561a61bd4a8e3c8288c3970ca8314f18",
+      "sqlx_sha384": "702326df04517e53c7fbf5a7720f6b96681dd3f664ed7c493a77d3c2fc57b672e6ebabf377fcd9ac7eacf6285663cfb9",
+      "origin_class": "upstream-verbatim",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd",
+      "status": "frozen",
+      "prerequisites": [
+        41
+      ],
+      "operations": [
+        "create-table:authorization_invalidation_domains",
+        "create-table:authorization_invalidation_floors",
+        "create-table:authorization_authority_epochs",
+        "create-table:protected_object_authority",
+        "create-table:authorization_event_capacity",
+        "create-table:authorization_events",
+        "create-table:authorization_authentication_denial_attempts",
+        "create-table:authorization_operation_version_delta_manifests",
+        "create-table:authorization_operation_version_deltas",
+        "create-table:authorization_admission_results"
+      ]
+    },
+    {
+      "version": 43,
+      "file": "migrations/0043_push_gateway_dogfood_profile.sql",
+      "description": "push gateway dogfood profile",
+      "sha256": "c28dd8d54f9c2c17967ab771f24fe7b7dee29168e7891b412ece94388f50b111",
+      "sqlx_sha384": "ed55cbda5e3de7e5306b84481399e62b01ff88798f1b708d2d1614d4d9296f5babec17082339944f3eb7b9d8e26e5e7c",
+      "origin_class": "upstream-verbatim",
+      "operations": [
+        "alter-table:push_gateway_installations"
+      ],
+      "prerequisites": [
+        15
+      ],
+      "status": "frozen",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd"
+    },
+    {
+      "version": 44,
+      "file": "migrations/0044_drop_nip_fi_ledger.sql",
+      "description": "drop nip fi ledger",
+      "sha256": "e65299c563b7fb2fa93e2ec77861c479c0b6c39d90a8cf1a52e88111b3be4e79",
+      "sqlx_sha384": "a852862896862d0cf3ecd4f62c9af4036ceec2ca78ff4f6a9054cf601767ad37c5a03ac2b04d56911e9d4611d4070ec7",
+      "origin_class": "upstream-verbatim",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd",
+      "status": "frozen",
+      "prerequisites": [
+        41,
+        42
+      ],
+      "operations": [
+        "upstream-migration:0044"
+      ]
+    },
+    {
+      "version": 45,
+      "file": "migrations/0045_retain_push_revocation_tombstones.sql",
+      "description": "retain push revocation tombstones",
+      "sha256": "2b0b8dfa53dc5634fa847b8720d14df1c07d77531e6e2d99d6f64ed5bfa63a3e",
+      "sqlx_sha384": "7c8c13d6e6e7dec23edc20d489f5efcf3e41988cda0034bdd168f09099237077db609706c46e24550a0132d5abf54f39",
+      "origin_class": "upstream-verbatim",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd",
+      "status": "frozen",
+      "prerequisites": [
+        15,
+        43
+      ],
+      "operations": [
+        "upstream-migration:0045"
+      ]
+    },
+    {
+      "version": 46,
+      "file": "migrations/0046_storage_accounting_snapshots.sql",
+      "description": "storage accounting snapshots",
+      "sha256": "f1db08701267d0da2c71a18f6b01f30521209db105d54748be2c575222d2c5f7",
+      "sqlx_sha384": "e02ae303449874411dcc3024c3bd9fc727dc3336804a8e2b17785a6016b1c3b73d40792f4711ec50b90cc13f6470f74c",
+      "origin_class": "upstream-verbatim",
+      "upstream_origin_commit": "5511b56fcf0047f9d0d4887dc75125b6933a6bbd",
+      "status": "frozen",
+      "prerequisites": [
+        1
+      ],
+      "operations": [
+        "create-table:storage_accounting_snapshots"
+      ]
+    },
+    {
+      "version": 1029,
+      "file": "migrations/1029_workflow_run_snapshots.sql",
       "description": "workflow run snapshots",
       "sha256": "1e0b74f32c3f0257fe2d182f1b364b4207b3aca41ba65e5fbfb59d507d8afd2f",
       "sqlx_sha384": "b6dbaff039468e45d73c271837ab101cd9159ef7beb0a7d62b49e962936e47919f5846c3075f9acb4ecf35a9de754608",
@@ -638,12 +1000,12 @@
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
+      "status": "frozen",
       "notes": ""
     },
     {
-      "version": 30,
-      "file": "migrations/0030_workflow_state.sql",
+      "version": 1030,
+      "file": "migrations/1030_workflow_state.sql",
       "description": "workflow state",
       "sha256": "e89cb10d8e11d174c6620a47c4ea6a4c09b5cdb5291d90dab5abf3c16ccc785b",
       "sqlx_sha384": "dcead8897d24e149f49204e50d5288128ec5a85824e5e2f03f0e29639b1df3660b23ace520416c833c4b20789ff13052",
@@ -657,14 +1019,14 @@
         "create-trigger:workflow_state_receipt_immutable"
       ],
       "prerequisites": [
-        29
+        1029
       ],
-      "status": "applied-frozen",
+      "status": "frozen",
       "notes": ""
     },
     {
-      "version": 31,
-      "file": "migrations/0031_workflow_approval_foundations.sql",
+      "version": 1031,
+      "file": "migrations/1031_workflow_approval_foundations.sql",
       "description": "workflow approval foundations",
       "sha256": "1e33e3165d32940680fc246fb70749861730186c79ad67fb3b69bb09d0dda5e9",
       "sqlx_sha384": "d0387fe23f3ce73b265b292d2c316b792ad91ad5519ccd7cb7614a0823fda35f7f2250134fb8250e548089f391d67292",
@@ -687,15 +1049,15 @@
         "create-trigger:workflow_approval_outbox_identity_immutable"
       ],
       "prerequisites": [
-        29,
-        30
+        1029,
+        1030
       ],
-      "status": "applied-frozen",
+      "status": "frozen",
       "notes": ""
     },
     {
-      "version": 32,
-      "file": "migrations/0032_ci_event_storage.sql",
+      "version": 1032,
+      "file": "migrations/1032_ci_event_storage.sql",
       "description": "ci event storage",
       "sha256": "1f6bdbd6bc889c1b7d25608ff26a614f49833da5ef0dc651c232edcc14e74238",
       "sqlx_sha384": "0312074fb427b702a5c5f370e7b06ad15ec51c6488f040d545e64f5f6b7a6ed11f9ba84395b2ba963d6d83aa5f1faeaf",
@@ -718,12 +1080,12 @@
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
+      "status": "frozen",
       "notes": ""
     },
     {
-      "version": 33,
-      "file": "migrations/0033_workflow_resume_recovery.sql",
+      "version": 1033,
+      "file": "migrations/1033_workflow_resume_recovery.sql",
       "description": "workflow resume recovery",
       "sha256": "4079f722d553a41c864145473c2bfadd2050694ab3d3fe0cb38134b00d9e94c3",
       "sqlx_sha384": "c43fd9e80d84ceb16bbbacb27a037d2feab87919f0c2097405c848a201084fbadc01cfe2b9a741a71072060dd84da5aa",
@@ -735,15 +1097,15 @@
         "create-index:idx_workflow_runs_resume_lease_recovery"
       ],
       "prerequisites": [
-        29,
-        31
+        1029,
+        1031
       ],
-      "status": "applied-frozen",
+      "status": "frozen",
       "notes": ""
     },
     {
-      "version": 34,
-      "file": "migrations/0034_workflow_effect_claims.sql",
+      "version": 1034,
+      "file": "migrations/1034_workflow_effect_claims.sql",
       "description": "workflow effect claims",
       "sha256": "e16aee5f52772ca9dab0cd5f24a4cb3628081e98717e03df154bac6bc1d70d08",
       "sqlx_sha384": "98c1b5b0d5432b298afa00f83f50a0d27902e929955702a3426e6774c6a7331744885ecbec8a3d188e2baae7eef0d831",
@@ -755,14 +1117,14 @@
         "create-trigger:workflow_effect_claim_identity_immutable"
       ],
       "prerequisites": [
-        29
+        1029
       ],
-      "status": "applied-frozen",
+      "status": "frozen",
       "notes": ""
     },
     {
-      "version": 35,
-      "file": "migrations/0035_ci_grants.sql",
+      "version": 1035,
+      "file": "migrations/1035_ci_grants.sql",
       "description": "ci grants",
       "sha256": "907d7d0643f96bd7befe181130073a489d2229ec2bda9bc1640f97529178a251",
       "sqlx_sha384": "09467f5a17e44e8931088c2b2eda81e963ceeebd3ba588940ab8f910df9a2a385bc867a2c4cd8ba4fadd3165276bb08d",
@@ -775,64 +1137,12 @@
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
+      "status": "frozen",
       "notes": ""
     },
     {
-      "version": 36,
-      "file": "migrations/0036_workflow_run_error_codes.sql",
-      "description": "workflow run error codes",
-      "sha256": "1b113cf222340208814e0b77f631fcc05e07a592952cf87bdabf701683824dc7",
-      "sqlx_sha384": "28a5aac2e1a6a4b7c7de4c61d760f5e132e511f085b4a952539df22d0835689d72b6231be2ffaa44e154d987646a40ff",
-      "fork_origin_commit": "a7d63bc91160ccefb6d6e78654bfb3435d4937e4",
-      "origin_class": "adopted-byte-identical-from-upstream-0031",
-      "operations": [
-        "alter-table:workflow_runs"
-      ],
-      "prerequisites": [
-        29
-      ],
-      "status": "applied-frozen",
-      "notes": "Adopted byte-identical from upstream 0031_workflow_run_error_codes.sql; executes once under fork number 36."
-    },
-    {
-      "version": 37,
-      "file": "migrations/0037_push_message_kinds.sql",
-      "description": "push message kinds",
-      "sha256": "cc094648d73cf34ae6772e15359668e340d995344eb9b99f12cde1235ea60fe8",
-      "sqlx_sha384": "d2247d99141ee99c5da55a973d9810c68e2a2566abd0b1e894312deb9e5ccad7d5b393f2c1d4b2736f3a7e0980252c6f",
-      "fork_origin_commit": "37f27cd1f70f4036b53381085a858822af2d7ddc",
-      "origin_class": "adopted-byte-identical-from-upstream-0040",
-      "operations": [
-        "define-function:enqueue_push_match_job"
-      ],
-      "prerequisites": [
-        18,
-        23
-      ],
-      "status": "applied-frozen",
-      "notes": "Adopted byte-identical from upstream 0040_push_message_kinds.sql; executes once under fork number 37."
-    },
-    {
-      "version": 38,
-      "file": "migrations/0038_push_gateway_dogfood_profile.sql",
-      "description": "push gateway dogfood profile",
-      "sha256": "c28dd8d54f9c2c17967ab771f24fe7b7dee29168e7891b412ece94388f50b111",
-      "sqlx_sha384": "ed55cbda5e3de7e5306b84481399e62b01ff88798f1b708d2d1614d4d9296f5babec17082339944f3eb7b9d8e26e5e7c",
-      "fork_origin_commit": "2e225af1f170a0f76fa25e04687b57b8e4b153e8",
-      "origin_class": "adopted-byte-identical-from-upstream-0043",
-      "operations": [
-        "alter-table:push_gateway_installations"
-      ],
-      "prerequisites": [
-        15
-      ],
-      "status": "applied-frozen",
-      "notes": "Adopted byte-identical from upstream 0043_push_gateway_dogfood_profile.sql; executes once under fork number 38."
-    },
-    {
-      "version": 39,
-      "file": "migrations/0039_channel_admin_audit_actions.sql",
+      "version": 1039,
+      "file": "migrations/1039_channel_admin_audit_actions.sql",
       "description": "channel admin audit actions",
       "sha256": "e7a74b4be74c33f00d3d2257d555bbd482a0d1ca196709a244bd38dce59851d6",
       "sqlx_sha384": "2eb0a56da293cc9d85c246abf18601ecc5d64a8471a38e77ff1c10ab6f769ab8ff69bb1399d99dedd352070dcfaef30e",
@@ -844,12 +1154,12 @@
       "prerequisites": [
         6
       ],
-      "status": "applied-frozen",
+      "status": "frozen",
       "notes": "Fork-original audit vocabulary. Upstream 0035 touches the same moderation tables; P08 must order any adopted admin ALTERs after this and preserve its CHECK vocabulary."
     },
     {
-      "version": 40,
-      "file": "migrations/0040_agent_drafts.sql",
+      "version": 1040,
+      "file": "migrations/1040_agent_drafts.sql",
       "description": "agent drafts",
       "sha256": "c727a6dd74c1d17622ee64570b4a1a8321b407a56b9ff80ac1d8883d3bd8c8e0",
       "sqlx_sha384": "af619357f88765157a151571825319af5218860d4a51d9a733ff0cee518def67910fda7a7d1f426e0ddab1fd0d5b543f",
@@ -865,12 +1175,12 @@
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
+      "status": "frozen",
       "notes": "CORRECTED DEPENDENCY: file header comment claims a 0039 dependency; the SQL only needs the 0001 events/communities base. Header bytes stay frozen; this map is the correction."
     },
     {
-      "version": 41,
-      "file": "migrations/0041_ci_check_storage.sql",
+      "version": 1041,
+      "file": "migrations/1041_ci_check_storage.sql",
       "description": "ci check storage",
       "sha256": "ced5dab0c6e4aaecc54e730916f3a605ab7d6e51f5852de545627374c7fb4f58",
       "sqlx_sha384": "fbc4fed76e4f67365b90c87017e04c05f03fec16b4e7912db5df7ae2fb7f83e599b5aa87d5f09366f722fe3c462849fd",
@@ -881,14 +1191,14 @@
         "create-index:idx_ci_run_events_check"
       ],
       "prerequisites": [
-        32
+        1032
       ],
-      "status": "applied-frozen",
+      "status": "frozen",
       "notes": ""
     },
     {
-      "version": 42,
-      "file": "migrations/0042_ci_merge_gate.sql",
+      "version": 1042,
+      "file": "migrations/1042_ci_merge_gate.sql",
       "description": "ci merge gate",
       "sha256": "5f89a8ecde8fd5be2f3cf5dd7cc7ae4d7dad53ee69389d983ff6ee9f60111fe6",
       "sqlx_sha384": "953c4b11335c54b6dcd44aff642518f2f75bdb6bc2466e1690e8fb2451302b8a634b9c9d99fd5650f48e8d4ac749aa90",
@@ -906,134 +1216,63 @@
       "prerequisites": [
         1
       ],
-      "status": "applied-frozen",
+      "status": "frozen",
       "notes": ""
     },
     {
-      "version": 43,
-      "file": "migrations/0043_channel_roster_snapshot_fence.sql",
-      "description": "channel roster snapshot fence",
-      "sha256": "e0291a5fde08e7cfdd6e723009c896d8a0d1c381a943365d0227db3b423441e3",
-      "sqlx_sha384": "0f52d4406f730870bc6331419943e5cfe6fe7f71e13cb294bcf9c2a41157689828ed2ae93ee2b3a9a88e2eef71b9cd93",
-      "fork_origin_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
-      "origin_class": "adopted-byte-identical-from-upstream-0032",
-      "operations": [
-        "define-function:guard_channel_roster_snapshot",
-        "create-trigger:trg_events_guard_channel_roster_snapshot"
-      ],
+      "version": 1043,
+      "file": "migrations/1043_attach_community_write_fences.sql",
+      "description": "attach community write fences",
+      "sha256": "be6627aef4b1e031e05e0e4138cfe6b7bf040d47cdbe146cb294ca823abf90d5",
+      "sqlx_sha384": "574f28c4ff08a281868aeb038e08811fe94e0f1e5db3a12bb52440491da925dd7759286b61ca478c3c086c5dec039257",
       "prerequisites": [
-        29
+        29,
+        30,
+        44,
+        1030,
+        1031,
+        1032,
+        1034,
+        1035,
+        1040,
+        1042
       ],
-      "status": "applied-tail",
-      "notes": "P08 tail: upstream 0032 under fork 0043."
+      "status": "frozen",
+      "origin_class": "fork-original",
+      "operations": [
+        "create-trigger:community_write_fence_workflow_state",
+        "create-trigger:community_write_fence_workflow_state_receipts",
+        "create-trigger:community_write_fence_workflow_approval_gates",
+        "create-trigger:community_write_fence_workflow_approval_outbox",
+        "create-trigger:community_write_fence_ci_runs",
+        "create-trigger:community_write_fence_ci_run_events",
+        "create-trigger:community_write_fence_workflow_effect_claims",
+        "create-trigger:community_write_fence_ci_grants",
+        "create-trigger:community_write_fence_agent_drafts",
+        "create-trigger:community_write_fence_ci_merge_bypasses",
+        "create-trigger:community_write_fence_git_merge_gate_decisions"
+      ],
+      "notes": "Converges fresh and production fence coverage after the fork block."
     },
     {
-      "version": 44,
-      "file": "migrations/0044_replica_heartbeat_vacuum_truncate.sql",
-      "description": "replica heartbeat vacuum truncate",
-      "sha256": "bfdccc3686a8f52a4717853f336440a7c4ca8f00512c499caeef71c14b984085",
-      "sqlx_sha384": "e05fa0759bfa36a1127cc92fd573e67071c26ceca6601b4e50d6fbb9b097bd1213a5d48f925f58ba2bf7781edff3a318",
-      "fork_origin_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
-      "origin_class": "adopted-byte-identical-from-upstream-0034",
-      "operations": [
-        "alter-table:replica_heartbeat:vacuum_truncate"
-      ],
+      "version": 1044,
+      "file": "migrations/1044_agent_drafts_soft_delete.sql",
+      "description": "agent drafts soft delete",
+      "sha256": "da441a11deb992f58842cf2eb40daa610439b6f207de398502087931bc25fb9f",
+      "sqlx_sha384": "13c7b4d5d34b6c1522359d5db70b0aa993a84fee63c09ef366a1b3646ad66ff75b66889ec08122c5fb75e1edefaf6e30",
       "prerequisites": [
-        26
+        1040
       ],
-      "status": "applied-tail",
-      "notes": "P08 tail: upstream 0034 under fork 0044."
-    },
-    {
-      "version": 45,
-      "file": "migrations/0045_relay_operators.sql",
-      "description": "relay operators",
-      "sha256": "8f9dcf710b733f6dd5d058e2d639efa5428a92c7a6167429208ffc5508ba4d33",
-      "sqlx_sha384": "ed2708922752e61ccb9e07dbb51a5165e82022406c2710d154294d0dfc066a54468d50a15e3f8796d7162ea3e9fb6d09",
-      "fork_origin_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
-      "origin_class": "adapted-from-upstream-0035",
+      "status": "frozen",
+      "fork_origin_commit": "0e64d397bd2f071752a98a3d62063335e0626f4a",
+      "origin_class": "fork-original",
       "operations": [
-        "create-table:relay_operators",
-        "alter-table:moderation_actions:actor_authority",
-        "alter-table:moderation_reports:admin_processing",
-        "alter-table:product_feedback:status",
-        "alter-table:moderation_actions:fork-audit-vocabulary"
+        "define-function:preserve_agent_draft_history:soft_delete"
       ],
-      "prerequisites": [
-        39
+      "supersedes": [
+        "define-function:preserve_agent_draft_history"
       ],
-      "status": "applied-tail",
-      "notes": "P08 tail: upstream 0035 under fork 0045."
-    },
-    {
-      "version": 46,
-      "file": "migrations/0046_relay_admin_actions.sql",
-      "description": "relay admin actions",
-      "sha256": "ddb9258a3eac3c128a580fa895a6dd7b03f88a83f8d87eb35ff31d045fa8e5ae",
-      "sqlx_sha384": "c40f33b75db83d49b43e1bc215cbe0b96bd02f1db5084edfa4fc3289539d912658ce5ec3c3dfb2e3d79d045aa1e358ce",
-      "fork_origin_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
-      "origin_class": "adopted-byte-identical-from-upstream-0036",
-      "operations": [
-        "create-table:relay_admin_actions",
-        "create-table:relay_admin_outbox"
-      ],
-      "prerequisites": [
-        45
-      ],
-      "status": "applied-tail",
-      "notes": "P08 tail: upstream 0036 under fork 0046."
-    },
-    {
-      "version": 47,
-      "file": "migrations/0047_relay_admin_action_lease.sql",
-      "description": "relay admin action lease",
-      "sha256": "61e80c9a2aa48a99a352458f627e587c55d12b216d39e5d5ee3917a8346bf277",
-      "sqlx_sha384": "305693f62f0d76cc107c4872c4e8526791581f827c09ab30e1b5be0ff94e6efa2f906af6e93e64d2c8d2c70c958b083d",
-      "fork_origin_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
-      "origin_class": "adopted-byte-identical-from-upstream-0037",
-      "operations": [
-        "alter-table:relay_admin_actions:lease",
-        "alter-table:relay_admin_outbox:retry"
-      ],
-      "prerequisites": [
-        46
-      ],
-      "status": "applied-tail",
-      "notes": "P08 tail: upstream 0037 under fork 0047."
-    },
-    {
-      "version": 48,
-      "file": "migrations/0048_relay_admin_outbox_claim_token.sql",
-      "description": "relay admin outbox claim token",
-      "sha256": "340edc00a0cdee7063d00dfed247ba2ff6a8c6afa6013e26d93bfadccb961df7",
-      "sqlx_sha384": "410d3e2075bdfe0c98c7472c9b23802759dfba12f9b452767e154baf4045362e6cd4998db72e6a7d35c05f26ca004f78",
-      "fork_origin_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
-      "origin_class": "adopted-byte-identical-from-upstream-0038",
-      "operations": [
-        "alter-table:relay_admin_outbox:claim_token"
-      ],
-      "prerequisites": [
-        47
-      ],
-      "status": "applied-tail",
-      "notes": "P08 tail: upstream 0038 under fork 0048."
-    },
-    {
-      "version": 49,
-      "file": "migrations/0049_relay_operator_audit.sql",
-      "description": "relay operator audit",
-      "sha256": "9e307c41c82fc487d1e541aa828e6e90bd5f2f0ebad35dc908cd385c6c855cbc",
-      "sqlx_sha384": "cc24b0187f3b73f7dde23c4d683d9c7e23c220fc9fd38236f905b42ae656eae5c659319785c24016b5ee55ad97f146cf",
-      "fork_origin_commit": "4cd82f513214aad11c2b742ce7cc7c681e8e32a0",
-      "origin_class": "adopted-byte-identical-from-upstream-0039",
-      "operations": [
-        "create-table:relay_operator_audit"
-      ],
-      "prerequisites": [
-        45
-      ],
-      "status": "applied-tail",
-      "notes": "P08 tail: upstream 0039 under fork 0049."
+      "notes": "Pending fork 0050 adopted as 1044; only header references changed to 1040."
     }
   ],
   "upstream_only": [
@@ -1043,9 +1282,9 @@
       "sha256": "eeb1eace076fe9764b5b00fcf77b140e1be5fe2b3d2ea0f20d366fed339b3348",
       "sqlx_sha384": "320ece7f93d14e6b49e17598c2bfa1cbedbd1c6ef4430a0e704cd4e01678cff54ecafd2393be6371f74b2f8f143d7101",
       "summary": "CLI-only whole-community deletion control plane with universal write fences",
-      "disposition": "deferred",
+      "disposition": "adopted",
       "owner": "product/P08",
-      "reason": "Feature absent from fork. Revisit only on a product decision to ship community deletion; needs the full fence set as one atomic append."
+      "reason": "Executed verbatim at its upstream number under candidate A."
     },
     {
       "upstream_version": 30,
@@ -1053,9 +1292,9 @@
       "sha256": "afd099b6fd4d9afbbee09d960e12b6e72e9c5232bad74ef766f1fe93c4a67cf1",
       "sqlx_sha384": "78a91c971a73aeff0dd1b8e3cb189008f8ae75a32eae51daa203ce0aa4bc22d202baccc0ea8f45b0176c1cc9e41e3b02",
       "summary": "Terminal recovery for deletion requests plus product_feedback provenance change",
-      "disposition": "deferred",
+      "disposition": "adopted",
       "owner": "product/P08",
-      "reason": "Paired with upstream 0029; same trigger."
+      "reason": "Executed verbatim at its upstream number under candidate A."
     },
     {
       "upstream_version": 32,
@@ -1063,9 +1302,9 @@
       "sha256": "e0291a5fde08e7cfdd6e723009c896d8a0d1c381a943365d0227db3b423441e3",
       "sqlx_sha384": "0f52d4406f730870bc6331419943e5cfe6fe7f71e13cb294bcf9c2a41157689828ed2ae93ee2b3a9a88e2eef71b9cd93",
       "summary": "Trigger guarding kind 39002 snapshots against stale mixed-version writers",
-      "disposition": "adopted-at-fork-0043",
+      "disposition": "adopted",
       "owner": "P08",
-      "reason": "Adopted byte-identical as fork 0043."
+      "reason": "Executed verbatim at its upstream number under candidate A."
     },
     {
       "upstream_version": 33,
@@ -1073,9 +1312,9 @@
       "sha256": "581a09dd9e549ee777aa00d2af5a905eed08e5c121b1025853de51d377d9650d",
       "sqlx_sha384": "fee74f5b49e6257a44203b4b1605e63bd7bd833e9263217356a78bcd7dbde19dc6b1523cdbb716ade6a2ad8b4f1d722d",
       "summary": "Exclude kind 30179 managed-agent ciphertext from brownfield FTS",
-      "disposition": "inapplicable-unless-30179-lands",
+      "disposition": "adopted",
       "owner": "P06",
-      "reason": "Fork has no kind 30179 producer; fork agent drafts use kinds 14201/14202 excluded by fork 0040. Revisit if 30179 is adopted."
+      "reason": "Executed verbatim at its upstream number under candidate A."
     },
     {
       "upstream_version": 34,
@@ -1083,9 +1322,9 @@
       "sha256": "bfdccc3686a8f52a4717853f336440a7c4ca8f00512c499caeef71c14b984085",
       "sqlx_sha384": "e05fa0759bfa36a1127cc92fd573e67071c26ceca6601b4e50d6fbb9b097bd1213a5d48f925f58ba2bf7781edff3a318",
       "summary": "Disable vacuum truncation on the single-row replica_heartbeat table",
-      "disposition": "adopted-at-fork-0044",
+      "disposition": "adopted",
       "owner": "P08",
-      "reason": "Adopted byte-identical as fork 0044."
+      "reason": "Executed verbatim at its upstream number under candidate A."
     },
     {
       "upstream_version": 35,
@@ -1093,9 +1332,9 @@
       "sha256": "b0c6f97c5b0fb1e1eeef51c050ad24cef0946bb0a6a118d795aceacc294a445a",
       "sqlx_sha384": "cd52840f42f04ea71d04064e9d789f9efd280ba3e105caf12c864b8792d4b82ae0ab672a5e492e005f5467abb33b6031",
       "summary": "Deployment-global operator/moderator roster plus moderation column amendments",
-      "disposition": "adopted-at-fork-0045-adapted",
+      "disposition": "adopted",
       "owner": "P08",
-      "reason": "Adapted as fork 0045; preserves fork 0039 moderation_actions CHECK vocabulary."
+      "reason": "Executed verbatim at its upstream number under candidate A."
     },
     {
       "upstream_version": 36,
@@ -1103,9 +1342,9 @@
       "sha256": "ddb9258a3eac3c128a580fa895a6dd7b03f88a83f8d87eb35ff31d045fa8e5ae",
       "sqlx_sha384": "c40f33b75db83d49b43e1bc215cbe0b96bd02f1db5084edfa4fc3289539d912658ce5ec3c3dfb2e3d79d045aa1e358ce",
       "summary": "relay_admin_actions enforcement state machine plus relay_admin_outbox queue",
-      "disposition": "adopted-at-fork-0046",
+      "disposition": "adopted",
       "owner": "P08",
-      "reason": "Adopted byte-identical as fork 0046."
+      "reason": "Executed verbatim at its upstream number under candidate A."
     },
     {
       "upstream_version": 37,
@@ -1113,9 +1352,9 @@
       "sha256": "61e80c9a2aa48a99a352458f627e587c55d12b216d39e5d5ee3917a8346bf277",
       "sqlx_sha384": "305693f62f0d76cc107c4872c4e8526791581f827c09ab30e1b5be0ff94e6efa2f906af6e93e64d2c8d2c70c958b083d",
       "summary": "Exclusive action leases plus outbox retry columns",
-      "disposition": "adopted-at-fork-0047",
+      "disposition": "adopted",
       "owner": "P08",
-      "reason": "Adopted byte-identical as fork 0047."
+      "reason": "Executed verbatim at its upstream number under candidate A."
     },
     {
       "upstream_version": 38,
@@ -1123,9 +1362,9 @@
       "sha256": "340edc00a0cdee7063d00dfed247ba2ff6a8c6afa6013e26d93bfadccb961df7",
       "sqlx_sha384": "410d3e2075bdfe0c98c7472c9b23802759dfba12f9b452767e154baf4045362e6cd4998db72e6a7d35c05f26ca004f78",
       "summary": "Per-claim opaque token fencing outbox delivery completion",
-      "disposition": "adopted-at-fork-0048",
+      "disposition": "adopted",
       "owner": "P08",
-      "reason": "Adopted byte-identical as fork 0048."
+      "reason": "Executed verbatim at its upstream number under candidate A."
     },
     {
       "upstream_version": 39,
@@ -1133,9 +1372,9 @@
       "sha256": "9e307c41c82fc487d1e541aa828e6e90bd5f2f0ebad35dc908cd385c6c855cbc",
       "sqlx_sha384": "cc24b0187f3b73f7dde23c4d683d9c7e23c220fc9fd38236f905b42ae656eae5c659319785c24016b5ee55ad97f146cf",
       "summary": "Append-only audit trail for operator roster mutations",
-      "disposition": "adopted-at-fork-0049",
+      "disposition": "adopted",
       "owner": "P08",
-      "reason": "Adopted byte-identical as fork 0049."
+      "reason": "Executed verbatim at its upstream number under candidate A."
     },
     {
       "upstream_version": 41,
@@ -1143,9 +1382,9 @@
       "sha256": "41103784c95e251c019fb20c11081fccc355e9e139d22ed07f3004cfb760491d",
       "sqlx_sha384": "ad6359d4b86fc85d028f8921cbd2afc20c79acace320cd0eb7a79019b5e0ee44d0fab1e60a710527cd391126f43a2d6f",
       "summary": "NIP-FI core identity ledger tables",
-      "disposition": "excluded-upstream-retracted",
+      "disposition": "adopted",
       "owner": "P03",
-      "reason": "Upstream retracted this itself in 0044 (stateless identity decision). Fork never had it; do not adopt."
+      "reason": "Executed verbatim at its upstream number under candidate A."
     },
     {
       "upstream_version": 42,
@@ -1153,9 +1392,9 @@
       "sha256": "3edf20500782b151a94565a9460bd4a8561a61bd4a8e3c8288c3970ca8314f18",
       "sqlx_sha384": "702326df04517e53c7fbf5a7720f6b96681dd3f664ed7c493a77d3c2fc57b672e6ebabf377fcd9ac7eacf6285663cfb9",
       "summary": "NIP-FI authorization/audit/fencing ledger tables",
-      "disposition": "excluded-upstream-retracted",
+      "disposition": "adopted",
       "owner": "P03",
-      "reason": "Upstream retracted this itself in 0044. Fork never had it; do not adopt."
+      "reason": "Executed verbatim at its upstream number under candidate A."
     },
     {
       "upstream_version": 44,
@@ -1163,9 +1402,25 @@
       "sha256": "e65299c563b7fb2fa93e2ec77861c479c0b6c39d90a8cf1a52e88111b3be4e79",
       "sqlx_sha384": "a852862896862d0cf3ecd4f62c9af4036ceec2ca78ff4f6a9054cf601767ad37c5a03ac2b04d56911e9d4611d4070ec7",
       "summary": "Drops the NIP-FI ledger tables from upstream 0041/0042",
-      "disposition": "excluded-upstream-retracted",
+      "disposition": "adopted",
       "owner": "P03",
-      "reason": "Retraction of tables the fork never created; nothing to drop. Recorded so a future merge never mistakes 0041/0042 absence for a gap."
+      "reason": "Executed verbatim at its upstream number under candidate A."
+    },
+    {
+      "upstream_version": 45,
+      "file": "migrations/0045_retain_push_revocation_tombstones.sql",
+      "sha256": "2b0b8dfa53dc5634fa847b8720d14df1c07d77531e6e2d99d6f64ed5bfa63a3e",
+      "sqlx_sha384": "7c8c13d6e6e7dec23edc20d489f5efcf3e41988cda0034bdd168f09099237077db609706c46e24550a0132d5abf54f39",
+      "disposition": "adopted",
+      "reason": "Executed verbatim at its upstream number under candidate A."
+    },
+    {
+      "upstream_version": 46,
+      "file": "migrations/0046_storage_accounting_snapshots.sql",
+      "sha256": "f1db08701267d0da2c71a18f6b01f30521209db105d54748be2c575222d2c5f7",
+      "sqlx_sha384": "e02ae303449874411dcc3024c3bd9fc727dc3336804a8e2b17785a6016b1c3b73d40792f4711ec50b90cc13f6470f74c",
+      "disposition": "adopted",
+      "reason": "Executed verbatim at its upstream number under candidate A."
     }
   ],
   "tail_manifest": "scripts/migrations-0043-0049.sha256"
