@@ -145,7 +145,6 @@ fn file_mime_to_ext(mime: &str) -> Option<&'static str> {
         "text/csv" => "csv",
         "text/html" => "html",
         "text/plain" => "txt",
-        "text/html" => "html",
         _ => return None,
     };
     Some(ext)

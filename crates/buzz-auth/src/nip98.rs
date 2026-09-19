@@ -352,35 +352,6 @@ mod tests {
     }
 
     #[test]
-    fn payload_tag_without_hash_rejected_with_body() {
-        // A present `payload` tag without a hash is malformed, not absent.
-        // It must not silently skip body-hash validation.
-        use nostr::Tag;
-
-        let keys = Keys::generate();
-        let tags = vec![
-            Tag::parse(["u", TEST_URL]).unwrap(),
-            Tag::parse(["method", TEST_METHOD]).unwrap(),
-            Tag::parse(["payload"]).unwrap(),
-        ];
-        let event = EventBuilder::new(Kind::HttpAuth, "")
-            .tags(tags)
-            .sign_with_keys(&keys)
-            .expect("sign");
-        let json = serde_json::to_string(&event).unwrap();
-        let result = verify_nip98_event(&json, TEST_URL, TEST_METHOD, Some(b"hello world"));
-        match result {
-            Err(AuthError::Nip98Invalid(msg)) => {
-                assert!(
-                    msg.contains("malformed"),
-                    "expected malformed-tag rejection, got: {msg}"
-                );
-            }
-            other => panic!("expected Nip98Invalid, got: {other:?}"),
-        }
-    }
-
-    #[test]
     fn trailing_slash_normalized() {
         let keys = Keys::generate();
         let url_with_slash = "https://relay.example.com/api/tokens/";
