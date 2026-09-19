@@ -176,3 +176,39 @@ for (const failingUpdate of [0, 1]) {
     assert.equal(pendingTrust.length, failingUpdate + 1);
   });
 }
+
+test("a queued workspace apply waits for trust edits made while queued", async (t) => {
+  const { communityApplyQueue } = await import("./communityApplyQueue.ts");
+  let releaseQueue;
+  const blocked = communityApplyQueue.run(
+    () =>
+      new Promise((resolve) => {
+        releaseQueue = resolve;
+      }),
+  );
+  t.after(async () => {
+    releaseQueue?.();
+    for (const deferred of pendingTrust) deferred.resolve();
+    await blocked;
+  });
+  const { result, rerender } = mount([a, b]);
+  await act(async () => {});
+  holdTrust = true;
+  rerender([b]);
+  await waitFor(() => assert.equal(pendingTrust.length, 1));
+  await act(async () => {
+    releaseQueue();
+    await blocked;
+  });
+  assert.equal(
+    calls.filter(([command]) => command === "apply_workspace").length,
+    0,
+  );
+  assert.equal(result.current.isReady, false);
+  await act(async () => pendingTrust[0].resolve());
+  await waitFor(() => assert.equal(result.current.isReady, true));
+  assert.equal(
+    calls.filter(([command]) => command === "apply_workspace").length,
+    1,
+  );
+});

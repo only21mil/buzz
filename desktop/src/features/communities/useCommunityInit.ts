@@ -1,3 +1,12 @@
+import { clearTimeoutState } from "@/features/moderation/lib/timeoutStore";
+import { resetCardMintStore } from "@/features/agents/cardMintStore";
+import { resetReminderWatermarks } from "@/features/reminders/lib/reminderWatermarks";
+import { resetPendingSnapshotImport } from "@/features/agents/openSnapshotImportFromUrlEvent";
+import { resetPendingOpenEditAgent } from "@/features/agents/openEditAgentEvent";
+import { resetPendingOpenCreateAgent } from "@/features/agents/openCreateAgentEvent";
+import { resetTerminalPanel } from "@/features/terminal/terminalPanelStore";
+import { resetProfileActivityFeedScopes } from "@/features/profile/lib/profileActivityFeedScope";
+import { communityApplyQueue } from "./communityApplyQueue";
 import { scopedQueryCache } from "@/shared/api/scopedQueryCache";
 import { useEffect, useRef, useState } from "react";
 import { isTauri } from "@tauri-apps/api/core";
@@ -67,6 +76,15 @@ async function resetCommunityState({
   relayClient.disconnect();
   await resetNavigationDeepLinkDrain();
   resetRateLimitGate();
+  clearTimeoutState();
+  resetCardMintStore();
+  resetReminderWatermarks();
+  resetPendingSnapshotImport();
+  resetPendingOpenEditAgent();
+  resetPendingOpenCreateAgent();
+  resetTerminalPanel();
+  resetProfileActivityFeedScopes();
+
   clearAllDrafts();
   resetAgentObserverStore();
   resetActiveAgentTurnsStore();
@@ -335,21 +353,23 @@ export function useCommunityInit(
       // imported key. `loadCommunities()` strips lingering `nsec` fields from
       // legacy entries; this site refuses to apply one even if present.
       try {
-        // A list edit can replace the promise while startup is awaiting it.
-        // Only the latest completed allowlist may release agent restoration.
-        let trustUpdate: Promise<void>;
-        do {
-          trustUpdate = avatarTrustUpdateRef.current;
-          await trustUpdate;
+        await communityApplyQueue.run(async () => {
+          // The trust list can change while this apply waits in the queue.
+          let trustUpdate: Promise<void>;
+          do {
+            trustUpdate = avatarTrustUpdateRef.current;
+            await trustUpdate;
+            if (cancelled) return;
+          } while (trustUpdate !== avatarTrustUpdateRef.current);
           if (cancelled) return;
-        } while (trustUpdate !== avatarTrustUpdateRef.current);
-        await applyCommunity(
-          activeCommunity.relayUrl,
-          undefined,
-          activeCommunity.token,
-          activeCommunity.reposDir,
-          getOverrides().agentManagedProfiles === true,
-        );
+          await applyCommunity(
+            activeCommunity.relayUrl,
+            undefined,
+            activeCommunity.token,
+            activeCommunity.reposDir,
+            getOverrides().agentManagedProfiles === true,
+          );
+        });
       } catch (error) {
         // A bad `repos_dir` no longer reaches here — `apply_workspace` treats
         // it as non-fatal (relay/keys apply, bad value not persisted, REPOS
