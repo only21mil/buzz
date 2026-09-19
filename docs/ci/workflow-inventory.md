@@ -10,9 +10,9 @@ Part of the native CI cutover, GitHub issue #184 (Buzz root
 
 ## Summary
 
-- Workflows: 30; jobs: 96; job executions after matrix expansion: 114 plus runtime expansion of 1 dynamic jobs.
+- Workflows: 24; jobs: 71; job executions after matrix expansion: 84 plus runtime expansion of 1 dynamic jobs.
 - Required checks on protected `main`: 15, produced by 15 jobs, 3 workflows.
-- Dispositions: native 15, retained-github 30, disabled-for-fork 51.
+- Dispositions: native 15, retained-github 30, disabled-for-fork 26.
 - Required-check snapshot: `docs/ci/workflow-inventory.required-checks.json`, sha256 `9c061bec3ae2d7ea10654b1e4fa9d52f8f79eec899ac4bea4524ca6486686966`.
 
 ## Required checks on main
@@ -49,104 +49,6 @@ x matrix size; S <= 15, M <= 60, L <= 300, XL above; `self-hosted` when labels c
 from `vars`. `permissions` lists write scopes only. `required` names the main
 ruleset contexts this job produces.
 Dynamic matrices retain expression placeholders; their execution counts and costs are unknown offline.
-
-### _ci-clients.yml (CI / Clients)
-
-Triggers: workflow_call. Concurrency: `-`.
-
-| Job | Names | Runners | Gate | Needs | Timeout | Permissions | Secrets | Effects | Cost | Required | Disposition | Native job | Owner | Exit condition |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `web` | Web | ubuntu-latest | conditional | - | 15 | read-only | - | none | S/15 | - | disabled-for-fork | - | - | - |
-| `mobile` | Mobile | ubuntu-latest | conditional | - | 30 | read-only | - | none | M/30 | - | disabled-for-fork | - | - | - |
-| `mobile-swift` | Mobile Swift | macos-latest | conditional | - | 30 | read-only | - | none | L/300 | - | disabled-for-fork | - | - | - |
-| `results` | Results | ubuntu-latest | conditional | web, mobile, mobile-swift | 5 | read-only | - | none | S/5 | - | disabled-for-fork | - | - | - |
-
-- `web`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-- `mobile`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-- `mobile-swift`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-- `results`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-
-### _ci-desktop-macos.yml (CI / Desktop macOS)
-
-Triggers: workflow_call. Concurrency: `-`.
-
-| Job | Names | Runners | Gate | Needs | Timeout | Permissions | Secrets | Effects | Cost | Required | Disposition | Native job | Owner | Exit condition |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `desktop-build-macos` | Desktop Build (macOS) | macos-latest | conditional | - | 45 | read-only | - | none | XL/450 | - | disabled-for-fork | - | - | - |
-| `results` | Results | ubuntu-latest | conditional | desktop-build-macos | 5 | read-only | - | none | S/5 | - | disabled-for-fork | - | - | - |
-
-- `desktop-build-macos`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-- `results`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-
-### _ci-desktop.yml (CI / Desktop)
-
-Triggers: workflow_call. Concurrency: `-`.
-
-| Job | Names | Runners | Gate | Needs | Timeout | Permissions | Secrets | Effects | Cost | Required | Disposition | Native job | Owner | Exit condition |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `desktop-core` | Desktop Core | ubuntu-latest | conditional | - | 60 | read-only | - | none | M/60 | - | disabled-for-fork | - | - | - |
-| `desktop-smoke-e2e` | Desktop Smoke E2E (1), Desktop Smoke E2E (2), Desktop Smoke E2E (3), Desktop Smoke E2E (4) | ubuntu-latest | conditional | - | 30 | read-only | - | none | L/120 | - | disabled-for-fork | - | - | - |
-| `desktop` | Desktop | ubuntu-latest | conditional | desktop-core, desktop-smoke-e2e, desktop-windows-build | 5 | read-only | - | none | S/5 | - | disabled-for-fork | - | - | - |
-| `desktop-windows-build` | Desktop Windows Build | windows-latest | conditional | - | 20 | read-only | - | none | M/40 | - | disabled-for-fork | - | - | - |
-| `results` | Results | ubuntu-latest | conditional | desktop | 5 | read-only | - | none | S/5 | - | disabled-for-fork | - | - | - |
-
-- `desktop-core`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-- `desktop-smoke-e2e`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-- `desktop`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-- `desktop-windows-build`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-- `results`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-
-### _ci-relay.yml (CI / Relay and PostgreSQL)
-
-Triggers: workflow_call. Concurrency: `-`.
-
-| Job | Names | Runners | Gate | Needs | Timeout | Permissions | Secrets | Effects | Cost | Required | Disposition | Native job | Owner | Exit condition |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `desktop-e2e-relay` | Desktop E2E Relay | ubuntu-latest | conditional | - | 45 | read-only | - | none | M/45 | - | disabled-for-fork | - | - | - |
-| `postgres-tests` | PostgreSQL Tests | ubuntu-latest | conditional | - | 10 | read-only | - | none | S/10 | - | disabled-for-fork | - | - | - |
-| `desktop-e2e-integration-shard` | Desktop E2E Integration (1/2), Desktop E2E Integration (2/2) | ubuntu-latest | conditional | - | 20 | read-only | - | none | M/40 | - | disabled-for-fork | - | - | - |
-| `desktop-e2e-integration` | Desktop E2E Integration | ubuntu-latest | conditional | desktop-e2e-integration-shard | 5 | read-only | - | none | S/5 | - | disabled-for-fork | - | - | - |
-| `backend-integration` | Backend Integration (relay e2e) | ubuntu-latest | conditional | - | 20 | read-only | - | none | M/20 | - | disabled-for-fork | - | - | - |
-| `relay-e2e` | Relay E2E | ubuntu-latest | conditional | - | 20 | read-only | - | none | M/20 | - | disabled-for-fork | - | - | - |
-| `results` | Results | ubuntu-latest | conditional | desktop-e2e-relay, postgres-tests, desktop-e2e-integration, backend-integration, relay-e2e | 5 | read-only | - | none | S/5 | - | disabled-for-fork | - | - | - |
-
-- `desktop-e2e-relay`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-- `postgres-tests`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-- `desktop-e2e-integration-shard`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-- `desktop-e2e-integration`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-- `backend-integration`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-- `relay-e2e`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-- `results`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-
-### _ci-rust.yml (CI / Rust)
-
-Triggers: workflow_call. Concurrency: `-`.
-
-| Job | Names | Runners | Gate | Needs | Timeout | Permissions | Secrets | Effects | Cost | Required | Disposition | Native job | Owner | Exit condition |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `rust-lint` | Rust Lint | ubuntu-latest | conditional | - | 30 | read-only | - | none | M/30 | - | disabled-for-fork | - | - | - |
-| `unit-tests` | Unit Tests | ubuntu-latest | conditional | - | 30 | read-only | - | none | M/30 | - | disabled-for-fork | - | - | - |
-| `server-cross-compile` | Server Cross-Compile, Server Cross-Compile | ubuntu-latest | conditional | - | 30 | read-only | - | none | M/60 | - | disabled-for-fork | - | - | - |
-| `windows-rust` | Windows Rust (x86_64-pc-windows-msvc) | windows-latest | conditional | - | 45 | read-only | - | none | L/90 | - | disabled-for-fork | - | - | - |
-| `results` | Results | ubuntu-latest | conditional | rust-lint, unit-tests, server-cross-compile, windows-rust | 5 | read-only | - | none | S/5 | - | disabled-for-fork | - | - | - |
-
-- `rust-lint`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-- `unit-tests`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-- `server-cross-compile`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-- `windows-rust`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-- `results`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-
-### _ci-security.yml (CI / Security)
-
-Triggers: workflow_call. Concurrency: `-`.
-
-| Job | Names | Runners | Gate | Needs | Timeout | Permissions | Secrets | Effects | Cost | Required | Disposition | Native job | Owner | Exit condition |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `security` | Security | ubuntu-latest | conditional | - | 20 | read-only | - | none | M/20 | - | disabled-for-fork | - | - | - |
-| `results` | Results | ubuntu-latest | conditional | security | 5 | read-only | - | none | S/5 | - | disabled-for-fork | - | - | - |
-
-- `security`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
-- `results`: Upstream workflow_call helper has no caller in the fork; ci.yml retains inline jobs.
 
 ### android-fork-release-apk.yml (Build only21mil Android Release APK)
 
@@ -227,7 +129,7 @@ Triggers: pull_request, push[branches=release], workflow_dispatch. Concurrency: 
 
 ### codex-security-review.yml (Codex Security Review)
 
-Triggers: issue_comment[types=created], pull_request_target[branches=main; types=opened,reopened,ready_for_review,synchronize], push[branches=main], repository_dispatch[types=codex-security-review-reconcile]. Concurrency: `-`.
+Triggers: issue_comment[types=created], pull_request_target[branches=main; types=opened,reopened,ready_for_review,synchronize], repository_dispatch[types=codex-security-review-reconcile]. Concurrency: `-`.
 
 | Job | Names | Runners | Gate | Needs | Timeout | Permissions | Secrets | Effects | Cost | Required | Disposition | Native job | Owner | Exit condition |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
