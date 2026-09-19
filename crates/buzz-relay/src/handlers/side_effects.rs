@@ -4225,6 +4225,53 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn standard_deletion_rejects_agent_draft_targets() {
+        let (state, pool, _git_storage) = discovery_test_state().await;
+        let keys = nostr::Keys::generate();
+        let host = format!("draft-deletion-{}.example", Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("community");
+        let tenant = TenantContext::resolved(community.id, host);
+        state
+            .db
+            .ensure_user(community.id, &keys.public_key().to_bytes())
+            .await
+            .expect("author");
+        for kind in [
+            KIND_AGENT_DRAFT,
+            KIND_AGENT_DRAFT_DECISION,
+            KIND_STREAM_MESSAGE,
+        ] {
+            let target = EventBuilder::new(Kind::Custom(kind as u16), "durable history")
+                .sign_with_keys(&keys)
+                .expect("target");
+            state
+                .db
+                .insert_event(community.id, &target, None)
+                .await
+                .expect("persist target");
+            let deletion = EventBuilder::new(Kind::Custom(5), "")
+                .tags([Tag::parse(["e", target.id.to_hex().as_str()]).expect("target tag")])
+                .sign_with_keys(&keys)
+                .expect("deletion");
+            let result = validate_standard_deletion_event(&tenant, &deletion, &state).await;
+            if kind == KIND_STREAM_MESSAGE {
+                result.expect("ordinary self deletion is allowed");
+            } else {
+                assert_eq!(
+                    result.expect_err("draft deletion must fail").to_string(),
+                    "draft events are immutable"
+                );
+            }
+        }
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn stale_discovery_member_head_reemits_once_then_is_idempotent() {
         use buzz_core::channel::{ChannelType, ChannelVisibility};
         use buzz_db::CreateCommunityWithOwnerResult;
