@@ -250,10 +250,7 @@ export function formatTranscriptTimestampTitle(
   return transcriptTitleTimeFormat.format(date);
 }
 
-function formatDuration(
-  startIso: string,
-  endIso: string,
-): string | null {
+function formatDuration(startIso: string, endIso: string): string | null {
   if (!startIso || !endIso) return null;
   const start = new Date(startIso).getTime();
   const end = new Date(endIso).getTime();
