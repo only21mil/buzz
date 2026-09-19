@@ -15,7 +15,7 @@ import { Switch } from "@/shared/ui/switch";
 import { Toggle } from "@/shared/ui/toggle";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import { safeNpub } from "@/shared/lib/nostrUtils";
-import { truncatePubkey } from "@/shared/lib/pubkey";
+import { truncateNpub } from "@/shared/lib/pubkey";
 import { getPlatformKeysById } from "@/shared/lib/keyboard-shortcuts";
 
 export type MentionSuggestion = {
@@ -313,6 +313,11 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                     <UserAvatar
                       avatarUrl={suggestion.avatarUrl ?? null}
                       displayName={suggestion.displayName}
+                      shape={
+                        suggestion.isAgent || suggestion.kind === "persona"
+                          ? "squircle"
+                          : "circle"
+                      }
                       size="xs"
                       testId="mention-suggestion-avatar"
                     />
@@ -382,7 +387,7 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                             data-testid="mention-collision-npub"
                             title={collisionNpub}
                           >
-                            {truncatePubkey(collisionNpub)}
+                            {truncateNpub(collisionNpub)}
                           </span>
                         ) : null}
                       </span>

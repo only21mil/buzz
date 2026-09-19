@@ -7,6 +7,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useReducer,
   useRef,
   useState,
 } from "react";
@@ -20,6 +21,7 @@ import { deriveShellRoute } from "@/app/AppShell.helpers";
 import { ThemeGrainientBackground } from "@/app/ThemeGrainientBackground";
 import { CommunityThemeController } from "@/shared/theme/CommunityThemeController";
 import { useReloadShortcut } from "@/app/useReloadShortcut";
+import { useCloseWindowShortcut } from "@/app/useCloseWindowShortcut";
 import { KnownAgentPubkeysProvider } from "@/features/agents/useKnownAgentPubkeys";
 import { huddleWindowChannelId } from "@/features/huddle/lib/huddleWindow";
 import { useAppOnboardingState } from "@/features/onboarding/hooks";
@@ -35,7 +37,6 @@ import { CommunityOnboardingFlow } from "@/features/onboarding/ui/CommunityOnboa
 import {
   MachineOnboardingFlow,
   type MachineOnboardingPage,
-  type PostOnboardingNavigation,
 } from "@/features/onboarding/ui/MachineOnboardingFlow";
 import { OnboardingFlow } from "@/features/onboarding/ui/OnboardingFlow";
 import { PendingInviteGate } from "@/features/onboarding/ui/PendingInviteGate";
@@ -59,14 +60,11 @@ import { WelcomeSetup } from "@/features/communities/ui/WelcomeSetup";
 import { CommunityApplyErrorScreen } from "@/features/communities/ui/CommunityApplyErrorScreen";
 import { CommunityChangeOverlay } from "@/features/communities/ui/CommunityChangeOverlay";
 import { setAvatarProfileSyncQueryClient } from "@/features/profile/avatarProfileSync";
+import { seedProjectSnapshot } from "@/features/projects/projectSnapshot";
 import { EncryptedBackupProvider } from "@/features/settings/EncryptedBackupProvider";
 import { createBuzzQueryClient } from "@/shared/api/queryClient";
-import {
-  queryCacheScopeKey,
-  scopedQueryCache,
-} from "@/shared/api/scopedQueryCache";
-import { subscribeLiveQueryCache } from "@/shared/api/liveQueryCacheSubscriptions";
-import { relayClient } from "@/shared/api/relayClient";
+import { hydrateChannelHeads } from "@/features/messages/lib/channelHeadCache";
+import { useIdentityQuery } from "@/shared/api/hooks";
 import { isSharedIdentity as isSharedIdentityCmd } from "@/shared/api/tauri";
 import { getProfile } from "@/shared/api/tauriProfiles";
 import {
@@ -218,36 +216,29 @@ function CommunitySwitchGate() {
 
 function CommunityQueryProvider({
   children,
-  relayUrl,
   pubkey,
+  relayUrl,
 }: {
   children: ReactNode;
-  relayUrl: string;
-  pubkey: string;
+  pubkey: string | null;
+  relayUrl: string | null;
 }) {
-  const [queryClient] = useState(createBuzzQueryClient);
-  const [cacheReady, setCacheReady] = useState(false);
-  useEffect(() => {
-    let active = true;
-    const cache = scopedQueryCache.attach(
-      queryClient,
-      queryCacheScopeKey(relayUrl, pubkey),
-    );
-    void cache.ready.then(() => {
-      if (active) setCacheReady(true);
-    });
-    return () => {
-      active = false;
-      cache.stop();
-    };
-  }, [queryClient, relayUrl, pubkey]);
-
-  useEffect(() => {
-    if (!cacheReady) return;
-    return subscribeLiveQueryCache(queryClient, relayClient, pubkey, () =>
-      scopedQueryCache.isAttached(queryClient),
-    );
-  }, [cacheReady, queryClient, pubkey]);
+  // Seeding persisted channel heads is part of constructing the client, not a
+  // gate in front of the app: the splash, AppReady, and relay preconnect mount
+  // immediately, and only the channel query waits on the cache load (see
+  // channelHeadHydration). It must start here rather than in an effect —
+  // React Query fires a child's queryFn when it subscribes, before any parent
+  // effect runs — and StrictMode's dev-only double initializer just issues one
+  // redundant read on a discarded client. The provider is keyed on the
+  // community, so one client maps to one {pubkey, relayUrl} scope.
+  const [queryClient] = useState(() => {
+    const client = createBuzzQueryClient();
+    if (pubkey && relayUrl) {
+      seedProjectSnapshot(client, { pubkey, relayUrl });
+      void hydrateChannelHeads(client, { pubkey, relayUrl });
+    }
+    return client;
+  });
 
   useEffect(() => setAvatarProfileSyncQueryClient(queryClient), [queryClient]);
 
@@ -269,16 +260,49 @@ function CommunityQueryProvider({
   }, [queryClient]);
 
   return (
-    <QueryClientProvider client={queryClient}>
-      {cacheReady ? children : <AppLoadingGate />}
-    </QueryClientProvider>
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
   );
 }
 
+/**
+ * Watches the community-scoped identity query and fires once the active
+ * pubkey changes after mount — i.e. an in-app key import through the
+ * relay-scoped onboarding flow, which writes the new identity to the
+ * community query client only. The parent uses the signal to rebuild the
+ * entire community boundary (query client, AppReady subtree, module
+ * singletons via useCommunityInit) so a replacement identity never inherits
+ * the previous identity's cached queries or draft-store bucket.
+ */
+function CommunityIdentityReplacementSentinel({
+  onIdentityReplaced,
+}: {
+  onIdentityReplaced: () => void;
+}) {
+  const identityQuery = useIdentityQuery();
+  const pubkey = identityQuery.data?.pubkey ?? null;
+  const baselinePubkeyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!pubkey) return;
+    if (baselinePubkeyRef.current === null) {
+      baselinePubkeyRef.current = pubkey;
+      return;
+    }
+    if (baselinePubkeyRef.current !== pubkey) {
+      baselinePubkeyRef.current = pubkey;
+      onIdentityReplaced();
+    }
+  }, [pubkey, onIdentityReplaced]);
+
+  return null;
+}
+
 function AppReady({
+  continueOnboarding,
   isSharedIdentity,
   isCommunitySwitch,
 }: {
+  continueOnboarding: boolean;
   isSharedIdentity: boolean;
   isCommunitySwitch: boolean;
 }) {
@@ -296,12 +320,18 @@ function AppReady({
     return <RelaunchRequiredScreen />;
   }
 
-  if (onboarding.stage === "onboarding") {
+  if (
+    onboarding.stage === "onboarding" ||
+    (continueOnboarding && onboarding.stage === "blocking")
+  ) {
     return (
       <OnboardingFlow
         actions={onboarding.flow.actions}
         identityLost={onboarding.identityLost}
         initialProfile={onboarding.flow.initialProfile}
+        initialProfileDecisionSettled={
+          onboarding.flow.initialProfileDecisionSettled
+        }
         key={onboarding.currentPubkey ?? "anonymous"}
       />
     );
@@ -328,10 +358,12 @@ function AppReady({
 }
 
 function CommunityApp({
+  continueOnboarding,
   currentPubkey,
   onBackToMachineConfig,
   sharedIdentity,
 }: {
+  continueOnboarding: boolean;
   currentPubkey: string | null;
   onBackToMachineConfig: () => void;
   sharedIdentity: boolean;
@@ -367,9 +399,21 @@ function CommunityApp({
   // ahead of the first apply_workspace call.
   useNestNotifications();
 
-  // Composite key: changes when community ID changes OR when
-  // the active community's relay config is updated.
-  const communityKey = `${activeCommunity?.id ?? "none"}-${reinitKey}`;
+  // Increments when the community-scoped identity is replaced in-app (key
+  // import through the relay onboarding flow). Machine-level identity changes
+  // already reach this component through the currentPubkey prop; this covers
+  // imports that only the community query client observes.
+  const [signerEpoch, bumpSignerEpoch] = useReducer(
+    (epoch: number) => epoch + 1,
+    0,
+  );
+
+  // Composite key: changes when the community ID changes, when the active
+  // community's config is updated (relayUrl/token), or when the signing
+  // identity is replaced. Keying CommunityQueryProvider and AppReady on the
+  // signer guarantees a replacement identity never sees the previous
+  // identity's query cache, React state, or draft-store bucket.
+  const communityKey = `${activeCommunity?.id ?? "none"}-${reinitKey}-${currentPubkey ?? "anonymous"}-${signerEpoch}`;
 
   // Latch once the community key deviates from its cold-boot value: from then
   // on, loading phases are in-app switches and get the quiet gate instead of
@@ -380,12 +424,14 @@ function CommunityApp({
     hasSwitchedCommunityRef.current = true;
   }
   const isCommunitySwitch = hasSwitchedCommunityRef.current;
+  const isContinuingOnboarding = continueOnboarding && !isCommunitySwitch;
 
   const community = useCommunityInit(
     activeCommunity,
     communityKey,
     sharedIdentity,
     isFindingCommunityAfterLeave,
+    communities,
   );
 
   const transitionCommunity = useCallback(
@@ -432,6 +478,7 @@ function CommunityApp({
       id: crypto.randomUUID(),
       name: transaction.communityName,
       relayUrl: transaction.relayUrl,
+      token: transaction.token,
       reposDir: transaction.reposDir,
       pubkey: currentPubkey ?? undefined,
       addedAt: new Date().toISOString(),
@@ -469,18 +516,17 @@ function CommunityApp({
       if (transaction.source === "first-community") {
         setResumeFirstCommunityPage(transaction.firstCommunityPage ?? "join");
       }
-      clearCommunities(currentPubkey);
+      clearCommunities();
       return;
     }
     if (transaction.previousCommunityId) {
       await transitionCommunity(transaction.previousCommunityId);
     }
-    removeCommunity(transaction.communityId, currentPubkey);
+    removeCommunity(transaction.communityId);
   }, [
     clearCommunities,
     communities.length,
     communityOnboarding,
-    currentPubkey,
     removeCommunity,
     transitionCommunity,
   ]);
@@ -546,7 +592,7 @@ function CommunityApp({
   // overlay just keeps the bee on screen long enough to be seen, then fades.
   // Community switches keep their quiet gate.
   const showBootSplashOverlay =
-    bootSplashPhase !== "done" && !isCommunitySwitch;
+    bootSplashPhase !== "done" && !isCommunitySwitch && !isContinuingOnboarding;
 
   let appContent: ReactNode = null;
   if (!transaction) {
@@ -590,38 +636,41 @@ function CommunityApp({
     }
   }, [communityApplied]);
   if (appContent === null && (!transaction || isEnteringCurtain)) {
-    appContent =
-      communityApplied && currentPubkey && activeCommunity ? (
-        <CommunityQueryProvider
-          key={`${communityKey}:${currentPubkey}`}
-          relayUrl={activeCommunity.relayUrl}
-          pubkey={currentPubkey}
-        >
-          <CommunityThemeController />
-          <AppReady
-            isCommunitySwitch={isCommunitySwitch}
-            key={communityKey}
-            isSharedIdentity={sharedIdentity}
-          />
-          {showBootSplashOverlay ? (
-            <div
-              aria-hidden="true"
-              className={cn(
-                "fixed inset-0 z-50 transition-opacity",
-                bootSplashPhase === "fading" ? "opacity-0" : "opacity-100",
-              )}
-              data-testid="boot-splash-overlay"
-              style={{ transitionDuration: `${BOOT_SPLASH_FADE_MS}ms` }}
-            >
-              <AppLoadingGate />
-            </div>
-          ) : null}
-        </CommunityQueryProvider>
-      ) : isCommunitySwitch ? (
-        <CommunitySwitchGate />
-      ) : (
-        <AppLoadingGate />
-      );
+    appContent = communityApplied ? (
+      <CommunityQueryProvider
+        key={communityKey}
+        pubkey={community.identityPubkey}
+        relayUrl={activeCommunity?.relayUrl ?? null}
+      >
+        <CommunityIdentityReplacementSentinel
+          onIdentityReplaced={bumpSignerEpoch}
+        />
+        <CommunityThemeController />
+        <AppReady
+          continueOnboarding={isContinuingOnboarding}
+          isCommunitySwitch={isCommunitySwitch}
+          key={communityKey}
+          isSharedIdentity={sharedIdentity}
+        />
+        {showBootSplashOverlay ? (
+          <div
+            aria-hidden="true"
+            className={cn(
+              "fixed inset-0 z-50 transition-opacity",
+              bootSplashPhase === "fading" ? "opacity-0" : "opacity-100",
+            )}
+            data-testid="boot-splash-overlay"
+            style={{ transitionDuration: `${BOOT_SPLASH_FADE_MS}ms` }}
+          >
+            <AppLoadingGate />
+          </div>
+        ) : null}
+      </CommunityQueryProvider>
+    ) : isCommunitySwitch || isContinuingOnboarding ? (
+      <CommunitySwitchGate />
+    ) : (
+      <AppLoadingGate />
+    );
   }
 
   return (
@@ -655,42 +704,22 @@ function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
   });
   const [machineInitialPage, setMachineInitialPage] =
     useState<MachineOnboardingPage>();
-  const [postOnboardingNav, setPostOnboardingNav] =
-    useState<PostOnboardingNavigation | null>(null);
+  const [continueOnboarding, setContinueOnboarding] = useState(false);
 
   const reopenMachineConfig = useCallback(() => {
+    setContinueOnboarding(false);
     setMachineInitialPage("config");
     machine.reopen();
   }, [machine.reopen]);
 
   const completeMachineOnboarding = useCallback(
-    (pubkey?: string) => {
+    (pubkey?: string, options?: { continueToProfile?: boolean }) => {
+      setContinueOnboarding(options?.continueToProfile === true);
       setMachineInitialPage(undefined);
       machine.complete(pubkey);
     },
     [machine.complete],
   );
-
-  const navigateAfterOnboarding = useCallback(
-    (nav: PostOnboardingNavigation) => {
-      setPostOnboardingNav(nav);
-    },
-    [],
-  );
-
-  // Execute the pending navigation once the RouterProvider is mounted (i.e.
-  // machine.stage transitions to "ready").  We wait for the ready stage rather
-  // than using setTimeout(0) so the router is guaranteed to exist before we call
-  // router.navigate().
-  useEffect(() => {
-    if (machine.stage === "ready" && postOnboardingNav) {
-      void router.navigate({
-        to: postOnboardingNav.to,
-        search: postOnboardingNav.search ?? {},
-      });
-      setPostOnboardingNav(null);
-    }
-  }, [machine.stage, postOnboardingNav]);
 
   const openAddCommunity = useCallback(
     (payload: AddCommunityDeepLinkPayload & { requestId: string }) =>
@@ -728,6 +757,7 @@ function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
   if (machine.stage === "ready") {
     return (
       <CommunityApp
+        continueOnboarding={continueOnboarding}
         currentPubkey={machine.currentPubkey}
         onBackToMachineConfig={reopenMachineConfig}
         sharedIdentity={sharedIdentity}
@@ -752,7 +782,6 @@ function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
         continueWithRecoveredIdentity={machine.continueWithRecoveredIdentity}
         identityLost={machine.identityLost}
         initialPage={machineInitialPage}
-        navigateAfterComplete={navigateAfterOnboarding}
         queryClient={machine.queryClient}
       />
       {shouldAcknowledgeDeepLink ? <PendingInviteGate /> : null}
@@ -762,6 +791,7 @@ function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
 
 export function App() {
   useReloadShortcut();
+  useCloseWindowShortcut();
   useInitialRenderReady();
   const [sharedIdentity, setSharedIdentity] = useState<boolean | null>(null);
   const [queryClient] = useState(createBuzzQueryClient);

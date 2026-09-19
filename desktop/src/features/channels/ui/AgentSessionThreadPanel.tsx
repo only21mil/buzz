@@ -9,7 +9,6 @@ import {
 import { toast } from "sonner";
 
 import { useAgentWorking } from "@/features/agents/agentWorkingSignal";
-import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
 import {
   mergeObserverEventWindows,
   observerEventScrollId,
@@ -25,9 +24,12 @@ import {
 import { useAnchoredScroll } from "@/features/messages/ui/useAnchoredScroll";
 import { useStableArrayShallow } from "@/shared/hooks/useStableReference";
 import { cancelManagedAgentTurn } from "@/shared/api/agentControl";
+import { awaitCancelTurnOutcome } from "@/features/agents/lib/cancelTurnOutcome";
+import { subscribeControlResults } from "@/features/agents/observerRelayStore";
 import type { Channel } from "@/shared/api/types";
 import { useEscapeKey } from "@/shared/hooks/useEscapeKey";
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
+import { useNow } from "@/shared/lib/useNow";
 import { AuxiliaryPanel } from "@/shared/layout/AuxiliaryPanel";
 import { AuxiliaryPanelBody } from "@/shared/layout/AuxiliaryPanel";
 import {
@@ -59,8 +61,7 @@ import {
 import { useLoadArchivedObserverEvents } from "@/features/agents/ui/useObserverEvents";
 import { useLoadOlderOnScroll } from "@/features/messages/ui/useLoadOlderOnScroll";
 import type { ChannelAgentSessionAgent } from "./useChannelAgentSessions";
-import { useChannelsQuery } from "@/features/channels/hooks";
-import { AgentSessionRecencyLabel } from "./AgentSessionRecencyLabel";
+import { useChannelReference } from "@/features/channels/openChannelDirectory";
 
 type AgentSessionThreadPanelProps = {
   agent: ChannelAgentSessionAgent;
@@ -96,7 +97,7 @@ export function AgentSessionThreadPanel({
   widthPx,
   transparentChrome = false,
 }: AgentSessionThreadPanelProps) {
-  const isLive = isManagedAgentActive(agent);
+  const isLive = agent.status === "running" || agent.status === "deployed";
   const isOverlay = useIsThreadPanelOverlay();
   const sessionChannelId = channelId ?? channel?.id ?? null;
   // Unified working signal, scoped to this panel's channel (or all channels
@@ -105,12 +106,14 @@ export function AgentSessionThreadPanel({
     agent.pubkey,
     sessionChannelId,
   );
-  const canStopCurrentTurn = isWorking && canInterruptTurn;
+  const canStopCurrentTurn =
+    Boolean(sessionChannelId) && isWorking && canInterruptTurn;
   useEscapeKey(onClose, isOverlay || isSinglePanelView);
 
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const contentRef = React.useRef<HTMLDivElement>(null);
   const topSentinelRef = React.useRef<HTMLDivElement>(null);
+  const now = useNow(1000);
   const { connectionState, events } = useObserverEvents(isLive, agent.pubkey);
   const scopedEvents = React.useMemo(
     () => scopeByChannel(events, sessionChannelId),
@@ -131,6 +134,12 @@ export function AgentSessionThreadPanel({
     () => getLatestActivityTimestamp(combinedHeaderEvents),
     [combinedHeaderEvents],
   );
+  const lastUpdatedLabel = formatLastUpdatedLabel(latestActivityAt, now);
+  const lastUpdatedTitle =
+    latestActivityAt === null
+      ? undefined
+      : `Last updated ${new Date(latestActivityAt).toLocaleString()}`;
+
   const { fetchOlderArchived, hasOlderArchived } =
     useLoadArchivedObserverEvents(
       // Archive history must load regardless of live status — an idle agent's
@@ -211,22 +220,12 @@ export function AgentSessionThreadPanel({
   });
   // Scope label input: prefer the passed channel's name; when the pane is
   // channel-scoped without a full Channel object (#1380's channelId prop),
-  // resolve the name from the channels cache.
-  const channelsQuery = useChannelsQuery({
-    enabled: Boolean(sessionChannelId),
-  });
-  const scopeChannelName = React.useMemo(() => {
-    if (!sessionChannelId) {
-      return null;
-    }
-    if (channel && channel.id === sessionChannelId) {
-      return channel.name;
-    }
-    return (
-      channelsQuery.data?.find((entry) => entry.id === sessionChannelId)
-        ?.name ?? null
-    );
-  }, [channel, channelsQuery.data, sessionChannelId]);
+  // resolve that one id through the bounded reference query.
+  const referencedChannel = useChannelReference(sessionChannelId);
+  const scopeChannelName =
+    channel && channel.id === sessionChannelId
+      ? channel.name
+      : (referencedChannel?.name ?? null);
   const scopeLabel = sessionChannelId
     ? scopeChannelName
       ? `#${scopeChannelName}`
@@ -244,12 +243,38 @@ export function AgentSessionThreadPanel({
   const animateActivity = useTranscriptAnimationEnabled();
   const showTimestamps = useTranscriptTimestampsEnabled();
   async function handleInterruptTurn() {
-    if (!channel) {
+    if (!sessionChannelId) {
       return;
     }
 
     try {
-      await cancelManagedAgentTurn(agent.pubkey, channel.id);
+      const requestId = crypto.randomUUID();
+      const outcome = await awaitCancelTurnOutcome({
+        requestId,
+        channelId: sessionChannelId,
+        subscribe: (listener) =>
+          subscribeControlResults(agent.pubkey, listener),
+        sendCancel: () =>
+          cancelManagedAgentTurn(agent.pubkey, sessionChannelId, requestId),
+        scheduleTimeout: (onTimeout) => {
+          const timeout = window.setTimeout(onTimeout, 8_000);
+          return () => window.clearTimeout(timeout);
+        },
+      });
+      if (outcome === "ambiguous_target") {
+        toast.error(
+          "This channel has multiple agent sessions. Stopping a specific thread isn't available here yet.",
+        );
+        return;
+      }
+      if (outcome === "no_active_turn") {
+        toast.info("No active turn to stop.");
+        return;
+      }
+      if (outcome === "unconfirmed") {
+        toast.info("Stop requested, but the agent hasn't confirmed it.");
+        return;
+      }
       toast.success(
         `Stop signal sent to ${agent.name}. It may take a moment to respond.`,
       );
@@ -388,9 +413,11 @@ export function AgentSessionThreadPanel({
               title={
                 canStopCurrentTurn
                   ? "Interrupt the current ACP turn without stopping the agent process."
-                  : isWorking
-                    ? "Only locally managed agents can be interrupted from this community."
-                    : "Available while the agent is working."
+                  : !sessionChannelId
+                    ? "Open activity for a channel to stop its current turn."
+                    : isWorking
+                      ? "Only locally managed agents can be interrupted from this community."
+                      : "Available while the agent is working."
               }
             >
               <Octagon className="mt-0.5 h-4 w-4 text-muted-foreground" />
@@ -400,9 +427,11 @@ export function AgentSessionThreadPanel({
                 </span>
                 {!canStopCurrentTurn ? (
                   <span className="mt-0.5 block text-xs text-muted-foreground">
-                    {isWorking
-                      ? "Only available for locally managed agents."
-                      : "Available while the agent is working."}
+                    {!sessionChannelId
+                      ? "Open activity for a channel to stop its current turn."
+                      : isWorking
+                        ? "Only available for locally managed agents."
+                        : "Available while the agent is working."}
                   </span>
                 ) : null}
               </span>
@@ -425,6 +454,7 @@ export function AgentSessionThreadPanel({
           avatarUrl={agentProfile?.avatarUrl ?? null}
           className="size-9"
           label={agentLabel}
+          shape="squircle"
           testId="agent-session-agent-avatar"
         />
         <div className="min-w-0 flex-1">
@@ -445,7 +475,13 @@ export function AgentSessionThreadPanel({
             <span aria-hidden="true" className="shrink-0">
               ·
             </span>
-            <AgentSessionRecencyLabel latestActivityAt={latestActivityAt} />
+            <span
+              className="shrink-0"
+              data-testid="agent-session-recency-label"
+              title={lastUpdatedTitle}
+            >
+              {lastUpdatedLabel}
+            </span>
           </div>
         </div>
       </AuxiliaryPanelHeaderGroup>
@@ -520,4 +556,39 @@ function getLatestActivityTimestamp(
   }
 
   return latest;
+}
+
+function formatLastUpdatedLabel(timestamp: number | null, now: number): string {
+  if (timestamp === null) {
+    return "No updates yet";
+  }
+
+  return `Last updated ${formatRelativeActivityTime(timestamp, now)}`;
+}
+
+function formatRelativeActivityTime(timestamp: number, now: number): string {
+  const elapsedMs = Math.max(0, now - timestamp);
+  const totalSeconds = Math.floor(elapsedMs / 1_000);
+
+  if (totalSeconds < 60) {
+    return "just now";
+  }
+
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 60) {
+    return `${totalMinutes}m ago`;
+  }
+
+  const totalHours = Math.floor(totalMinutes / 60);
+  if (totalHours < 24) {
+    return `${totalHours}h ago`;
+  }
+
+  const totalDays = Math.floor(totalHours / 24);
+  if (totalDays < 7) {
+    return `${totalDays}d ago`;
+  }
+
+  const totalWeeks = Math.floor(totalDays / 7);
+  return `${totalWeeks}w ago`;
 }

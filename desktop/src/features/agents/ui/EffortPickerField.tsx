@@ -6,7 +6,23 @@ import {
 } from "./effortPicker";
 import { PersonaDropdownField } from "./PersonaDropdownField";
 
-/** Controlled draft selection; persistence belongs to the dialog Save. */
+/**
+ * Thinking-effort write control for the edit dialog.
+ *
+ * Local-only by construction: the Rust backend rejects effort writes for
+ * non-local backends (remote effort is set at deploy time via `policy_env`). So the
+ * control renders only for a local backend AND once the adapter has advertised
+ * a `thought_level` configId (discovered from the running session — absent
+ * pre-first-session and for runtimes/models without effort support). The
+ * read-only configured-vs-running two-facts display lives in `AgentConfigPanel`;
+ * this is the write control.
+ *
+ * Save-gated, not direct-write: the control is fully controlled by the parent
+ * dialog (`value`/`onChange`) and owns no mutation. The dialog persists the
+ * selection by embedding `effortLevel` in the locked `update_managed_agent`
+ * call (PR #4625), so the effort write is atomic with any access-policy change
+ * and can never race or survive a Cancel/failed Save.
+ */
 export function EffortPickerField({
   agent,
   config,
@@ -48,11 +64,11 @@ export function EffortPickerField({
           onChange(effortSelectionToPersistedValue(next))
         }
         options={options}
-        placeholder="Inherit effort"
+        placeholder="Adapter default"
         value={selectValue}
       />
       <p className="text-xs text-muted-foreground">
-        Restart required to apply.
+        Applied at the next session start.
       </p>
     </div>
   );

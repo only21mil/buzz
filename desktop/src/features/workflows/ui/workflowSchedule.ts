@@ -10,7 +10,7 @@ export const SCHEDULE_FREQUENCIES = [
   "custom_cron",
 ] as const;
 
-type ScheduleFrequency = (typeof SCHEDULE_FREQUENCIES)[number];
+export type ScheduleFrequency = (typeof SCHEDULE_FREQUENCIES)[number];
 type ScheduleFormFrequency = ScheduleFrequency | "custom_interval";
 
 export type ScheduleFormState = {
@@ -45,9 +45,7 @@ const FREQUENCY_INTERVALS: Partial<Record<ScheduleFrequency, string>> = {
 };
 
 const DEFAULT_TIME = "09:00";
-// cron 0.16 uses Sunday=1 through Saturday=7. Default to Monday.
-const DEFAULT_WEEKDAY = "2";
-const WEEKDAY_NAMES = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+const DEFAULT_WEEKDAY = "1";
 const DEFAULT_MONTH_DAY = "1";
 
 type ParsedCommonCron = {
@@ -59,17 +57,13 @@ type ParsedCommonCron = {
 
 export function scheduleWeekdaysFromCronField(field: string): string[] {
   const weekdays = new Set<number>();
-  for (const rawSegment of field.split(",")) {
-    const segment = rawSegment.toUpperCase().replace(/[A-Z]+/g, (name) => {
-      const index = WEEKDAY_NAMES.indexOf(name);
-      return index < 0 ? name : String(index + 1);
-    });
-    if (/^[1-7]$/.test(segment)) {
+  for (const segment of field.split(",")) {
+    if (/^[0-6]$/.test(segment)) {
       weekdays.add(Number(segment));
       continue;
     }
 
-    const range = /^([1-7])-([1-7])$/.exec(segment);
+    const range = /^([0-6])-([0-6])$/.exec(segment);
     if (!range || Number(range[1]) > Number(range[2])) return [];
     for (let day = Number(range[1]); day <= Number(range[2]); day += 1) {
       weekdays.add(day);

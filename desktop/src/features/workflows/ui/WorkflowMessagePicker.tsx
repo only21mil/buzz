@@ -87,6 +87,7 @@ export function WorkflowMessagePicker({
     channelId: channelId ?? undefined,
     enabled: Boolean(channelId && normalizedQuery && !directId),
     limit: 30,
+    minimumQueryLength: 1,
   });
   const exactQuery = useQuery({
     enabled: Boolean(channelId && lookupId),
@@ -443,6 +444,7 @@ function MessageOption({
         <UserAvatar
           avatarUrl={profile?.avatarUrl ?? null}
           displayName={author}
+          shape={profile?.isAgent === true ? "squircle" : "circle"}
           size="sm"
         />
       ) : null}

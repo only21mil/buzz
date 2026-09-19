@@ -9,6 +9,7 @@ import 'package:flutter/semantics.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:google_mlkit_selfie_segmentation/google_mlkit_selfie_segmentation.dart';
 import 'package:image/image.dart' as image;
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:path_provider/path_provider.dart';
@@ -339,7 +340,7 @@ class AnimatedAvatarCapture extends HookConsumerWidget {
         await releaseCamera();
         // Cut out only the frames each device captured, then resample the
         // three-second window so Android and iOS use the same playback cadence.
-        final cutouts = captured;
+        final cutouts = await _removeBackgrounds(captured);
         if (captureEpoch.value != currentCapture || !context.mounted) return;
         final processed = List<Uint8List>.unmodifiable(
           _resampleCapturedFrames(cutouts, _captureFrameCount),
@@ -638,7 +639,7 @@ class AnimatedAvatarCapture extends HookConsumerWidget {
           isRecording.value
               ? 'Recording…'
               : isPreparingFrames.value
-              ? 'Preparing your animation…'
+              ? 'Cutting you out of the background…'
               : 'Line up your shot.',
           textAlign: TextAlign.center,
           style: context.textTheme.bodyMedium?.copyWith(

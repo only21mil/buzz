@@ -9,6 +9,7 @@ import type {
   ProjectRepoPushResult,
   ProjectRepoSnapshot,
   ProjectRepoSyncStatus,
+  RelayEvent,
 } from "@/shared/api/types";
 import { invokeTauri, TauriInvokeError } from "@/shared/api/tauri";
 
@@ -50,7 +51,6 @@ type RawProjectRepoContributor = {
 
 type RawProjectRepoSnapshot = {
   latest_commit: RawProjectRepoCommit | null;
-  commit_count?: number | null;
   commits?: RawProjectRepoCommit[];
   files: RawProjectRepoFile[];
   contributors?: RawProjectRepoContributor[];
@@ -64,14 +64,12 @@ type RawProjectLocalRepoSnapshot = {
 type RawProjectLocalRepository = {
   name: string;
   path: string;
-  branch: string | null;
 };
 
 type RawProjectRepoSyncStatus = {
   local_path: string | null;
   local_branch: string | null;
   local_branches: string[];
-  local_checkouts?: Array<{ path: string; branch: string | null }>;
   local_head: string | null;
   local_short_head: string | null;
   remote_branch: string | null;
@@ -86,8 +84,6 @@ type RawProjectRepoSyncStatus = {
   push_block_reason: string | null;
   can_pull: boolean;
   pull_block_reason: string | null;
-  fetch_failed?: boolean | null;
-  fetch_error?: string | null;
 };
 
 type RawProjectRepoPushResult = {
@@ -131,7 +127,6 @@ function fromRawProjectRepoSnapshot(
     latestCommit: snapshot.latest_commit
       ? fromRawProjectRepoCommit(snapshot.latest_commit)
       : null,
-    commitCount: snapshot.commit_count ?? null,
     commits: (snapshot.commits ?? []).map(fromRawProjectRepoCommit),
     files: snapshot.files.map((file) => ({
       path: file.path,
@@ -180,6 +175,22 @@ export async function getProjectRepoSnapshot(input: {
     },
   );
   return fromRawProjectRepoSnapshot(snapshot);
+}
+
+export async function getProjectRepoFileContent(input: {
+  cloneUrl: string;
+  defaultBranch?: string | null;
+  targetRef?: string | null;
+  targetCommit?: string | null;
+  path: string;
+}): Promise<string | null> {
+  return invokeTauri<string | null>("get_project_repo_file_content", {
+    cloneUrl: input.cloneUrl,
+    defaultBranch: input.defaultBranch ?? null,
+    targetRef: input.targetRef ?? null,
+    targetCommit: input.targetCommit ?? null,
+    path: input.path,
+  });
 }
 
 export async function getProjectRepoDiff(input: {
@@ -270,6 +281,20 @@ export async function getProjectLocalRepoSnapshot(input: {
   };
 }
 
+export async function getProjectLocalRepoFileContent(input: {
+  reposDir?: string | null;
+  projectDtag: string;
+  cloneUrl?: string | null;
+  path: string;
+}): Promise<string | null> {
+  return invokeTauri<string | null>("get_project_local_repo_file_content", {
+    reposDir: input.reposDir ?? null,
+    projectDtag: input.projectDtag,
+    cloneUrl: input.cloneUrl ?? null,
+    path: input.path,
+  });
+}
+
 export async function listProjectLocalRepositories(input: {
   reposDir?: string | null;
 }): Promise<ProjectLocalRepository[]> {
@@ -282,7 +307,6 @@ export async function listProjectLocalRepositories(input: {
   return repositories.map((repository) => ({
     name: repository.name,
     path: repository.path,
-    branch: repository.branch,
   }));
 }
 
@@ -293,7 +317,6 @@ function fromRawProjectRepoSyncStatus(
     localPath: status.local_path,
     localBranch: status.local_branch,
     localBranches: status.local_branches,
-    localCheckouts: status.local_checkouts ?? [],
     localHead: status.local_head,
     localShortHead: status.local_short_head,
     remoteBranch: status.remote_branch,
@@ -308,8 +331,6 @@ function fromRawProjectRepoSyncStatus(
     pushBlockReason: status.push_block_reason,
     canPull: status.can_pull,
     pullBlockReason: status.pull_block_reason,
-    fetchFailed: status.fetch_failed ?? false,
-    fetchError: status.fetch_error ?? null,
   };
 }
 
@@ -333,11 +354,21 @@ export async function getProjectRepoSyncStatus(input: {
   return fromRawProjectRepoSyncStatus(status);
 }
 
+export async function openProjectRepositoryFolder(input: {
+  reposDir?: string | null;
+  projectDtag: string;
+  cloneUrl: string;
+}): Promise<void> {
+  await invokeTauri("open_project_repository_folder", {
+    reposDir: input.reposDir ?? null,
+    projectDtag: input.projectDtag,
+    cloneUrl: input.cloneUrl,
+  });
+}
+
 type RawProjectTerminalResult = {
   path: string;
   cloned: boolean;
-  mismatch: string | null;
-  worktree_command: string | null;
 };
 
 export async function openProjectTerminal(input: {
@@ -345,12 +376,7 @@ export async function openProjectTerminal(input: {
   projectDtag: string;
   cloneUrl?: string | null;
   defaultBranch?: string | null;
-}): Promise<{
-  path: string;
-  cloned: boolean;
-  mismatch: string | null;
-  worktreeCommand: string | null;
-}> {
+}): Promise<{ path: string; cloned: boolean }> {
   const result = await invokeTauri<RawProjectTerminalResult>(
     "open_project_terminal",
     {
@@ -363,8 +389,6 @@ export async function openProjectTerminal(input: {
   return {
     path: result.path,
     cloned: result.cloned,
-    mismatch: result.mismatch,
-    worktreeCommand: result.worktree_command,
   };
 }
 
@@ -615,6 +639,23 @@ export async function signProjectPullRequestReviewRequest(input: {
   await invokeTauri<void>("sign_project_pull_request_review_request", {
     input,
   });
+}
+
+export async function publishProjectOwnerAnnouncement(input: {
+  targetOwner: string;
+  kind: number;
+  content: string;
+  createdAt?: number;
+  tags: string[][];
+}): Promise<{ event: RelayEvent; publicationError: string | null }> {
+  const result = await invokeTauri<{
+    event: string;
+    publication_error: string | null;
+  }>("publish_project_owner_announcement", { input });
+  return {
+    event: JSON.parse(result.event) as RelayEvent,
+    publicationError: result.publication_error,
+  };
 }
 
 export async function signProjectIssueAssignment(input: {

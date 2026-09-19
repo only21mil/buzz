@@ -11,14 +11,15 @@ import '../push/push_bridge.dart';
 
 enum DeepLinkCommunityPreparation { ready, switched, unavailable, failed }
 
-/// Holds the most recent supported deep link that has not been
-/// dispatched yet.
+/// Holds supported deep links until they can be dispatched.
 ///
-/// Listens to [AppLinks.uriLinkStream], which delivers both the cold-start
-/// link (the URL that launched the app) and links received while running.
-/// Navigation cannot always happen the moment a link arrives — the user may
-/// not be authenticated yet, or channels may still be loading — so the parsed
-/// link is parked here and consumed by the dispatcher once the app is ready.
+/// Links are queued in arrival order. Navigation cannot always happen the
+/// moment a link arrives — the user may not be authenticated yet, channels may
+/// still be loading, or another link may already be dispatching. Keeping a FIFO
+/// prevents a later app-link event from silently replacing an earlier one.
+///
+/// Listens to [AppLinks.uriLinkStream], which delivers both the cold-start link
+/// (the URL that launched the app) and links received while running.
 class PendingDeepLinkNotifier extends Notifier<BuzzDeepLink?> {
   @visibleForTesting
   static Stream<Uri>? debugUriStreamOverride;
@@ -29,8 +30,9 @@ class PendingDeepLinkNotifier extends Notifier<BuzzDeepLink?> {
 
   @override
   BuzzDeepLink? build() {
+    _waiting.clear();
     final stream = debugUriStreamOverride ?? AppLinks().uriLinkStream;
-    _subscription = stream.listen(handleUri);
+    _subscription = stream.listen(open);
     _pushNotificationListener = () {
       final link = pendingPushNotificationLink.value;
       if (link != null) _enqueue(link);
@@ -48,7 +50,7 @@ class PendingDeepLinkNotifier extends Notifier<BuzzDeepLink?> {
   }
 
   /// Parse and park an incoming URI. Unsupported links are ignored loudly.
-  void handleUri(Uri uri) {
+  void open(Uri uri) {
     final link = parseBuzzDeepLink(uri);
     if (link == null) {
       debugPrint('deep-link: ignoring unsupported link: $uri');

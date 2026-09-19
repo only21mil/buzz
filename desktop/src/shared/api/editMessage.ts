@@ -1,9 +1,3 @@
-import { preparePublicationScope } from "./preparePublicationScope";
-import {
-  assertPublicationScope,
-  capturePublicationScope,
-  type PublicationScope,
-} from "./publicationScope";
 import { invokeTauri } from "@/shared/api/tauri";
 
 export async function editMessage(
@@ -15,13 +9,9 @@ export async function editMessage(
   mentionPubkeys?: string[],
   suppressLinkPreviews?: boolean,
   mentionTags?: string[][],
-  expectedScope: PublicationScope = capturePublicationScope(),
 ): Promise<void> {
-  expectedScope = await preparePublicationScope(expectedScope);
-  assertPublicationScope(expectedScope);
   await invokeTauri("edit_message", {
     input: {
-      expectedScope,
       channelId,
       eventId,
       content,

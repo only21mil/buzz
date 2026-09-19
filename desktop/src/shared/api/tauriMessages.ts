@@ -1,19 +1,6 @@
-import { preparePublicationScope } from "./preparePublicationScope";
-import {
-  assertPublicationScope,
-  capturePublicationScope,
-  type PublicationScope,
-} from "./publicationScope";
 import { invokeTauri } from "@/shared/api/tauri";
+import type { RawSendChannelMessageResult } from "@/shared/api/tauriMessageTypes";
 import type { SendChannelMessageResult } from "@/shared/api/types";
-
-type RawSendChannelMessageResult = {
-  event_id: string;
-  parent_event_id: string | null;
-  root_event_id: string | null;
-  depth: number;
-  created_at: number;
-};
 
 export async function sendChannelMessage(
   channelId: string,
@@ -25,15 +12,14 @@ export async function sendChannelMessage(
   emojiTags?: string[][],
   mentionTags?: string[][],
   linkPreviewTags?: string[][],
+  sentFromThreadTag?: string[],
+  expectedRelayUrl?: string,
+  expectedSignerPubkey?: string,
   rootEventId?: string | null,
-  expectedScope: PublicationScope = capturePublicationScope(),
 ): Promise<SendChannelMessageResult> {
-  expectedScope = await preparePublicationScope(expectedScope);
-  assertPublicationScope(expectedScope);
   const response = await invokeTauri<RawSendChannelMessageResult>(
     "send_channel_message",
     {
-      expectedScope,
       channelId,
       content,
       parentEventId,
@@ -42,11 +28,18 @@ export async function sendChannelMessage(
       emojiTags: emojiTags ?? null,
       mentionTags: mentionTags ?? null,
       linkPreviewTags,
+      sentFromThreadTag: sentFromThreadTag ?? null,
       mentionPubkeys: mentionPubkeys ?? null,
       kind: kind ?? null,
+      // Tenant scope captured by the caller before its first await; the
+      // backend fails closed when the active community no longer matches.
+      expectedRelayUrl: expectedRelayUrl ?? null,
+      // Signer identity captured with the relay scope; the backend fails
+      // closed when the active identity no longer matches, so a community
+      // switch cannot re-sign the captured tenant's content as the new one.
+      expectedSignerPubkey: expectedSignerPubkey ?? null,
     },
   );
-
   return {
     eventId: response.event_id,
     parentEventId: response.parent_event_id,

@@ -1,4 +1,3 @@
-import { safeWorkflowProfiles } from "./workflowAuthorCandidates";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
 import { resolveUserLabel } from "@/features/profile/lib/identity";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -37,20 +36,20 @@ export function useWorkflowListAuthorPresentations(
   const pubkeys = [...new Set(lookups.map(({ pubkey }) => pubkey))];
   const profilesQuery = useUsersBatchQuery(pubkeys);
 
-  const profiles = safeWorkflowProfiles(profilesQuery.data?.profiles);
   return new Map(
     lookups.map(({ pubkey, workflowId }) => {
-      const profile = profiles[pubkey];
+      const profile = profilesQuery.data?.profiles[pubkey];
       const loading = !profile && profilesQuery.isPending;
       return [
         workflowId,
         {
           avatarUrl: profile?.avatarUrl ?? null,
+          isAgent: profile?.isAgent === true,
           label: loading
             ? null
             : resolveUserLabel({
                 currentPubkey: identityQuery.data?.pubkey,
-                profiles,
+                profiles: profilesQuery.data?.profiles,
                 pubkey,
               }),
           loading,

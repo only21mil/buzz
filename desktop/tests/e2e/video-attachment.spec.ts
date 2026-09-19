@@ -1,11 +1,12 @@
-import { expect, type Locator, type Page, test } from "@playwright/test";
+import { expect, type Page, test } from "@playwright/test";
 
 import { installMockBridge } from "../helpers/bridge";
 import { expectCornerRadiusPx, expectSmoothCorners } from "../helpers/css";
-import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
 
 const VIDEO_SHA = "b".repeat(64);
 const VIDEO_URL = `http://localhost:3000/media/${VIDEO_SHA}.mp4`;
+const EXTENSIONLESS_VIDEO_URL = `http://localhost:3000/media/${VIDEO_SHA}`;
+const GENERAL_CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
 const PORTRAIT_VIDEO_SHA = "c".repeat(64);
 const PORTRAIT_VIDEO_URL = `http://localhost:3000/media/${PORTRAIT_VIDEO_SHA}.mp4`;
 const CONSTRAINED_LANDSCAPE_VIDEO_SHA = "d".repeat(64);
@@ -31,6 +32,33 @@ const VIDEO_REVIEW_INDIGO_FOREGROUND_RGB = "rgb(141, 143, 245)";
 const VIDEO_REVIEW_NEUTRAL_DARK_RGB = "rgb(250, 250, 250)";
 const POSTER_DATA_URL =
   "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxNjAgODAiPjxyZWN0IHdpZHRoPSIxNjAiIGhlaWdodD0iODAiIGZpbGw9IiMyNjQ2NTMiLz48Y2lyY2xlIGN4PSI1NCIgY3k9IjQwIiByPSIyMiIgZmlsbD0iI2YyYzE0ZSIvPjxwYXRoIGQ9Ik05MiAyNGg0NHYzMkg5MnoiIGZpbGw9IiNmNzgxNTQiLz48L3N2Zz4=";
+
+type MockFeedMessage = {
+  content: string;
+  created_at: number;
+  id: string;
+  kind: number;
+  pubkey: string;
+  tags: string[][];
+};
+
+async function waitForMockLiveSubscription(page: Page, channelName: string) {
+  await expect
+    .poll(async () => {
+      return page.evaluate((channelName) => {
+        return (
+          (
+            window as Window & {
+              __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
+                channelName: string;
+              }) => boolean;
+            }
+          ).__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({ channelName }) ?? false
+        );
+      }, channelName);
+    })
+    .toBe(true);
+}
 
 function emitMockMessage(
   page: Page,
@@ -61,6 +89,43 @@ function emitMockMessage(
       extraTags: options.extraTags,
       parentEventId: options.parentEventId,
     },
+  );
+}
+
+function pushMockFeedItems(page: Page, messages: MockFeedMessage[]) {
+  return page.evaluate(
+    ({ channelId, messages }) => {
+      const pushFeedItem = (
+        window as Window & {
+          __BUZZ_E2E_PUSH_MOCK_FEED_ITEM__?: (item: {
+            category: "mention";
+            channel_id: string;
+            channel_name: string;
+            content: string;
+            created_at: number;
+            id: string;
+            kind: number;
+            pubkey: string;
+            tags: string[][];
+          }) => unknown;
+        }
+      ).__BUZZ_E2E_PUSH_MOCK_FEED_ITEM__;
+      if (!pushFeedItem) throw new Error("Mock feed helper is unavailable.");
+      for (const message of messages) {
+        pushFeedItem({
+          category: "mention",
+          channel_id: channelId,
+          channel_name: "general",
+          content: message.content,
+          created_at: message.created_at,
+          id: message.id,
+          kind: message.kind,
+          pubkey: message.pubkey,
+          tags: message.tags,
+        });
+      }
+    },
+    { channelId: GENERAL_CHANNEL_ID, messages },
   );
 }
 
@@ -168,7 +233,9 @@ async function openReviewWithPostedTimecode(
 
   await page.getByRole("button", { name: "Attach file" }).click();
   await expect(
-    page.getByTestId("message-composer").getByAltText("Video attachment bbbb"),
+    page
+      .getByTestId("message-composer")
+      .getByRole("button", { name: "Video attachment bbbb", exact: true }),
   ).toBeVisible();
   await page.getByTestId("send-message").click();
   await expect(page.getByText("Sending")).toHaveCount(0);
@@ -224,8 +291,12 @@ test("video upload previews use poster frames and inline videos open review mode
   await page.getByRole("button", { name: "Attach file" }).click();
 
   const composer = page.getByTestId("message-composer");
-  const composerPoster = composer.getByAltText("Video attachment bbbb");
-  await expect(composerPoster).toBeVisible();
+  const composerTrigger = composer.getByRole("button", {
+    name: "Video attachment bbbb",
+    exact: true,
+  });
+  await expect(composerTrigger).toBeVisible();
+  const composerPoster = composerTrigger.locator("img");
   await expect(composerPoster).toHaveAttribute("src", POSTER_DATA_URL);
 
   const box = await composerPoster.boundingBox();
@@ -780,30 +851,23 @@ test("inline video hover reveals a timeline without a second play control", asyn
   await expect(page.getByTestId("chat-title")).toHaveText("general");
   await waitForMockLiveSubscription(page, "general");
 
-  const emitted = (await emitMockMessage(
-    page,
-    "general",
-    `![video](${VIDEO_URL})`,
-    {
-      extraTags: [
-        [
-          "imeta",
-          `url ${VIDEO_URL}`,
-          "m video/mp4",
-          `x ${VIDEO_SHA}`,
-          "size 987654",
-          "dim 160x80",
-          "duration 12.5",
-          `image ${POSTER_DATA_URL}`,
-          "filename launch-demo.mp4",
-        ],
+  await emitMockMessage(page, "general", `![video](${VIDEO_URL})`, {
+    extraTags: [
+      [
+        "imeta",
+        `url ${VIDEO_URL}`,
+        "m video/mp4",
+        `x ${VIDEO_SHA}`,
+        "size 987654",
+        "dim 160x80",
+        "duration 12.5",
+        `image ${POSTER_DATA_URL}`,
+        "filename launch-demo.mp4",
       ],
-    },
-  )) as { id: string };
+    ],
+  });
 
-  const player = page
-    .locator(`[data-message-id="${emitted.id}"]`)
-    .getByTestId("video-player");
+  const player = page.getByTestId("video-player").last();
   const video = player.locator("video");
   const surface = video.locator("..");
   const centerPlayback = player.getByTestId("video-inline-center-playback");
@@ -831,32 +895,19 @@ test("inline video hover reveals a timeline without a second play control", asyn
     )
     .toBe("50%");
 
-  // Measure within the same player in one layout snapshot. Timeline anchoring
-  // may move the whole player while hover must not move its controls.
-  const controlsGeometry = () =>
-    surface.evaluate((element) => {
-      const controls = element.querySelector(
-        '[data-testid="video-inline-controls"]',
-      );
-      if (!controls) throw new Error("Inline video controls are missing");
-      const surfaceY = element.getBoundingClientRect().y;
-      const controlsY = controls.getBoundingClientRect().y;
-      return { surfaceY, controlsY, offset: controlsY - surfaceY };
-    });
-  await expect(surface).toBeInViewport();
-  const resting = await controlsGeometry();
+  const restingControlsBox = await controls.boundingBox();
   const restingIconTransform = await centerIcon.evaluate(
     (element) => window.getComputedStyle(element).transform,
   );
+  expect(restingControlsBox).not.toBeNull();
   await expect(controls).toHaveCSS("opacity", "0");
   await surface.hover();
   await expect(controls).toHaveCSS("opacity", "1");
-  const hovered = await controlsGeometry();
-  await test.info().attach("inline-controls-geometry", {
-    body: JSON.stringify({ resting, hovered }),
-    contentType: "application/json",
-  });
-  expect(Math.abs(hovered.offset - resting.offset)).toBeLessThan(0.5);
+  const hoveredControlsBox = await controls.boundingBox();
+  expect(hoveredControlsBox).not.toBeNull();
+  expect(
+    Math.abs((hoveredControlsBox?.y ?? 0) - (restingControlsBox?.y ?? 0)),
+  ).toBeLessThan(0.5);
   await expect
     .poll(() =>
       centerIcon.evaluate(
@@ -962,16 +1013,16 @@ test("video replies in threads open the review comments view", async ({
     page,
     "general",
     "Can you review this cut?",
-  )) as { id: string };
+  )) as MockFeedMessage;
   const videoReply = (await emitMockMessage(
     page,
     "general",
-    `![video](${VIDEO_URL})`,
+    `![video](${EXTENSIONLESS_VIDEO_URL})`,
     {
       extraTags: [
         [
           "imeta",
-          `url ${VIDEO_URL}`,
+          `url ${EXTENSIONLESS_VIDEO_URL}`,
           "m video/mp4",
           `x ${VIDEO_SHA}`,
           "size 987654",
@@ -984,9 +1035,13 @@ test("video replies in threads open the review comments view", async ({
       parentEventId: root.id,
     },
   )) as { id: string };
-  await emitMockMessage(page, "general", "[00:01] Tighten this transition.", {
-    parentEventId: videoReply.id,
-  });
+  const reviewComment = (await emitMockMessage(
+    page,
+    "general",
+    "[00:01] > Tighten this transition.",
+    { parentEventId: videoReply.id },
+  )) as MockFeedMessage;
+  await pushMockFeedItems(page, [videoReply, reviewComment]);
 
   const threadSummary = page.locator(`[data-thread-head-id="${root.id}"]`);
   await expect(threadSummary).toBeVisible();
@@ -1015,6 +1070,12 @@ test("video replies in threads open the review comments view", async ({
     "data-testid",
     "video-review-comment-timecode",
   );
+  await expect(outsideTimecode.locator("xpath=ancestor::p")).toContainText(
+    "Tighten this transition.",
+  );
+  await expect(
+    outsideTimecode.locator("xpath=ancestor::blockquote"),
+  ).toBeVisible();
   const outsideTimecodeStyles = await outsideTimecode.evaluate((element) => {
     const styles = window.getComputedStyle(element);
     return {
@@ -1072,6 +1133,108 @@ test("video replies in threads open the review comments view", async ({
   await expect(reviewDialog.getByTestId("video-review-comments")).toContainText(
     "Tighten this transition.",
   );
+
+  await page
+    .getByTestId("video-review-backdrop")
+    .click({ position: { x: 4, y: 4 } });
+  await page.getByRole("button", { name: "Inbox", exact: true }).click();
+  const inboxRow = page.getByTestId(`home-inbox-item-${reviewComment.id}`);
+  await expect(inboxRow).toBeVisible();
+  const inboxPreviewTimecode = inboxRow.getByTestId(
+    "video-review-comment-timecode",
+  );
+  await expect(inboxPreviewTimecode.locator("xpath=ancestor::p")).toContainText(
+    "Tighten this transition.",
+  );
+  await expect(
+    inboxPreviewTimecode.locator("xpath=ancestor::blockquote"),
+  ).toBeVisible();
+  await inboxRow.click();
+
+  const inboxDetail = page.getByTestId("home-inbox-detail");
+  const inboxDetailTimecode = inboxDetail.getByRole("button", {
+    name: "Jump to 00:01",
+  });
+  await expect(inboxDetailTimecode).toBeVisible();
+  await expect(inboxDetailTimecode.locator("xpath=ancestor::p")).toContainText(
+    "Tighten this transition.",
+  );
+  await expect(
+    inboxDetailTimecode.locator("xpath=ancestor::blockquote"),
+  ).toBeVisible();
+  await inboxDetailTimecode.click();
+  await expect(page.getByTestId("video-review-dialog")).toBeVisible();
+});
+
+test("Inbox preserves bracketed timestamps without video evidence", async ({
+  page,
+}) => {
+  await installVideoReviewHarness(page);
+
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await waitForMockLiveSubscription(page, "general");
+
+  const root = (await emitMockMessage(page, "general", "Planning note")) as {
+    id: string;
+  };
+  const reply = (await emitMockMessage(
+    page,
+    "general",
+    "[12:30] Meeting starts",
+    { parentEventId: root.id },
+  )) as MockFeedMessage;
+  await pushMockFeedItems(page, [reply]);
+
+  await page.getByRole("button", { name: "Inbox", exact: true }).click();
+  const inboxRow = page.getByTestId(`home-inbox-item-${reply.id}`);
+  await expect(inboxRow).toContainText("[12:30] Meeting starts");
+  await expect(
+    inboxRow.getByTestId("video-review-comment-timecode"),
+  ).toHaveCount(0);
+});
+
+test("Inbox recognizes reference-style video ancestors with custom alt text", async ({
+  page,
+}) => {
+  await installVideoReviewHarness(page);
+
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await waitForMockLiveSubscription(page, "general");
+
+  const root = (await emitMockMessage(
+    page,
+    "general",
+    "Can you review this cut?",
+  )) as { id: string };
+  const video = (await emitMockMessage(
+    page,
+    "general",
+    `![Launch demo][cut]\n\n[cut]: ${VIDEO_URL}`,
+    { parentEventId: root.id },
+  )) as MockFeedMessage;
+  const comment = (await emitMockMessage(
+    page,
+    "general",
+    "[00:01] Tighten this transition.",
+    { parentEventId: video.id },
+  )) as MockFeedMessage;
+  await pushMockFeedItems(page, [video, comment]);
+
+  await page.getByRole("button", { name: "Inbox", exact: true }).click();
+  const inboxRow = page.getByTestId(`home-inbox-item-${comment.id}`);
+  await expect(
+    inboxRow.getByTestId("video-review-comment-timecode"),
+  ).toBeVisible();
+  await inboxRow.click();
+  await page
+    .getByTestId("home-inbox-detail")
+    .getByRole("button", { name: "Jump to 00:01" })
+    .click();
+  await expect(page.getByTestId("video-review-dialog")).toBeVisible();
 });
 
 test("message timecodes deterministically open the first attached video", async ({
@@ -1303,38 +1466,6 @@ function emitVideoMessage(
   });
 }
 
-// Buzz issue 812e1460094f19e22650ea34289acea9e45fd33de703640617fdcbb36c33b1aa:
-// the right-click probes located `getByTestId("video-player").last()` and
-// forced a positional right-click on it. A freshly emitted row can still be
-// buffered below the viewport or shifting while the timeline anchors, so
-// `.last()` could resolve to the previous player and the forced click could
-// land on a row that had moved. The menu then never opened, or belonged to the
-// wrong video (an off-relay probe that offered Download). Scope the player to
-// its message id, release the buffered tail, and dispatch the contextmenu
-// event on the surface itself, as the link probe already does.
-async function revealVideoPlayer(page: Page, messageId: string) {
-  const player = page
-    .locator(`[data-message-id="${messageId}"]`)
-    .getByTestId("video-player");
-  const latest = page.getByTestId("message-scroll-to-latest");
-  await expect(player.or(latest).first()).toBeVisible();
-  if (await latest.isVisible()) await latest.click();
-  await expect(player).toBeVisible();
-  await player.scrollIntoViewIfNeeded();
-  await expect(player).toBeInViewport();
-  return player;
-}
-
-async function openVideoContextMenu(player: Locator) {
-  await player
-    .locator("video")
-    .evaluate((element) =>
-      element.dispatchEvent(
-        new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
-      ),
-    );
-}
-
 test("right-click menus expose distinct selectors for links, relay video, and off-relay video", async ({
   page,
 }) => {
@@ -1382,15 +1513,17 @@ test("right-click menus expose distinct selectors for links, relay video, and of
 
   // ── Relay video menu: Download video + Copy link, appearing only once the
   // relay origin resolves (the reactivity fix) ─────────────────────────────
-  const relayEmitted = (await emitVideoMessage(page, {
+  await emitVideoMessage(page, {
     url: MENU_RELAY_VIDEO_URL,
     sha: MENU_RELAY_VIDEO_SHA,
     filename: "relay-clip.mp4",
-  })) as { id: string };
-  const relayPlayer = await revealVideoPlayer(page, relayEmitted.id);
-  // The Play-button overlay sits above the video, but the contextmenu event
-  // still capture-bubbles to the surface handler that opens the menu.
-  await openVideoContextMenu(relayPlayer);
+  });
+  const relayPlayer = page.getByTestId("video-player").last();
+  await expect(relayPlayer).toBeVisible();
+  // Right-click the player surface. `force` skips the actionability guard: the
+  // Play-button overlay sits above the video, but the contextmenu event still
+  // capture-bubbles to the surface handler that opens the menu.
+  await relayPlayer.click({ button: "right", force: true });
 
   const videoMenu = page.locator("[data-video-context-menu]");
   await expect(videoMenu).toBeVisible();
@@ -1426,13 +1559,14 @@ test("right-click menus expose distinct selectors for links, relay video, and of
   await expect(page.locator("[data-video-context-menu]")).toHaveCount(0);
 
   // ── Off-relay video control: renders and offers Copy link, never Download ─
-  const offRelayEmitted = (await emitVideoMessage(page, {
+  await emitVideoMessage(page, {
     url: MENU_OFF_RELAY_VIDEO_URL,
     sha: MENU_OFF_RELAY_VIDEO_SHA,
     filename: "external-clip.mp4",
-  })) as { id: string };
-  const offRelayPlayer = await revealVideoPlayer(page, offRelayEmitted.id);
-  await openVideoContextMenu(offRelayPlayer);
+  });
+  const offRelayPlayer = page.getByTestId("video-player").last();
+  await expect(offRelayPlayer).toBeVisible();
+  await offRelayPlayer.click({ button: "right", force: true });
 
   const offRelayMenu = page.locator("[data-video-context-menu]");
   await expect(offRelayMenu).toBeVisible();
@@ -1480,13 +1614,7 @@ test("playback speed persists across videos and reloads", async ({ page }) => {
     const player = page
       .locator(`[data-message-id="${emitted.id}"]`)
       .getByTestId("video-player");
-    // Playing the first video can freeze the live tail. Release buffered
-    // messages through the reader's action before locating the new player.
-    const latest = page.getByTestId("message-scroll-to-latest");
-    await expect(player.or(latest).first()).toBeVisible();
-    if (await latest.isVisible()) await latest.click();
     await expect(player).toBeVisible();
-    await expect(player).toBeInViewport();
     await player.getByRole("button", { name: "Play video" }).click();
     return player;
   };

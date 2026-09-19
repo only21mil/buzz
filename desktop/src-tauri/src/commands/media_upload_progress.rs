@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     sync::{LazyLock, Mutex},
-    time::{Duration, Instant},
 };
 
 use tauri::Emitter;
@@ -9,45 +8,45 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{app_state::AppState, relay::classify_request_error};
 
-static MEDIA_UPLOAD_CANCELLATIONS: LazyLock<Mutex<HashMap<String, CancellationToken>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-const MEDIA_UPLOAD_PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
-
 #[derive(Default)]
-struct UploadProgressCadence {
-    last_emitted_at: Option<Instant>,
+struct MediaUploadCancellations {
+    tokens: HashMap<String, CancellationToken>,
 }
 
-impl UploadProgressCadence {
-    fn should_emit(&mut self, sent: u64, total: u64, now: Instant) -> bool {
-        let is_final = sent >= total;
-        let interval_elapsed = self.last_emitted_at.is_none_or(|last| {
-            now.saturating_duration_since(last) >= MEDIA_UPLOAD_PROGRESS_INTERVAL
-        });
-        if !is_final && !interval_elapsed {
-            return false;
+impl MediaUploadCancellations {
+    fn begin(&mut self, progress_id: &str) -> CancellationToken {
+        if let Some(cancel) = self.tokens.get(progress_id).cloned() {
+            return cancel;
         }
+        let cancel = CancellationToken::new();
+        self.tokens.insert(progress_id.to_string(), cancel.clone());
+        cancel
+    }
 
-        self.last_emitted_at = Some(now);
-        true
+    fn cancel(&mut self, progress_id: &str) {
+        let cancel = self.tokens.entry(progress_id.to_string()).or_default();
+        cancel.cancel();
+    }
+
+    fn finish(&mut self, progress_id: &str) {
+        self.tokens.remove(progress_id);
     }
 }
+
+static MEDIA_UPLOAD_CANCELLATIONS: LazyLock<Mutex<MediaUploadCancellations>> =
+    LazyLock::new(|| Mutex::new(MediaUploadCancellations::default()));
 
 pub(super) fn begin_media_upload(progress_id: Option<&str>) -> Option<CancellationToken> {
     let progress_id = progress_id?;
-    let cancel = CancellationToken::new();
-    if let Ok(mut uploads) = MEDIA_UPLOAD_CANCELLATIONS.lock() {
-        uploads.insert(progress_id.to_string(), cancel.clone());
-    }
-    Some(cancel)
+    MEDIA_UPLOAD_CANCELLATIONS
+        .lock()
+        .ok()
+        .map(|mut uploads| uploads.begin(progress_id))
 }
 
 pub(super) fn cancel_media_upload(progress_id: &str) {
-    if let Ok(uploads) = MEDIA_UPLOAD_CANCELLATIONS.lock() {
-        if let Some(cancel) = uploads.get(progress_id) {
-            cancel.cancel();
-        }
+    if let Ok(mut uploads) = MEDIA_UPLOAD_CANCELLATIONS.lock() {
+        uploads.cancel(progress_id);
     }
 }
 
@@ -56,7 +55,7 @@ pub(super) fn finish_media_upload(progress_id: Option<&str>) {
         return;
     };
     if let Ok(mut uploads) = MEDIA_UPLOAD_CANCELLATIONS.lock() {
-        uploads.remove(progress_id);
+        uploads.finish(progress_id);
     }
 }
 
@@ -97,18 +96,15 @@ pub(super) async fn send_upload_attempt(
         let chunk_size = 64 * 1024;
         let chunk_count = body.len().div_ceil(chunk_size);
         let mut sent: u64 = 0;
-        let mut progress_cadence = UploadProgressCadence::default();
         let stream = futures_util::stream::iter((0..chunk_count).map(move |i| {
             let start = i * chunk_size;
             let end = usize::min(start + chunk_size, body.len());
             let chunk = body.slice(start..end);
             sent += chunk.len() as u64;
-            if progress_cadence.should_emit(sent, total, Instant::now()) {
-                let _ = app.emit(
-                    "media-upload-progress",
-                    serde_json::json!({ "id": progress_id, "sent": sent, "total": total }),
-                );
-            }
+            let _ = app.emit(
+                "media-upload-progress",
+                serde_json::json!({ "id": progress_id, "sent": sent, "total": total }),
+            );
             Ok::<bytes::Bytes, std::io::Error>(chunk)
         }));
         let request = req
@@ -156,31 +152,79 @@ mod tests {
     use super::*;
 
     #[test]
-    fn progress_cadence_bounds_intermediate_updates_and_keeps_final_update() {
-        let started_at = Instant::now();
-        let total = 1_000;
-        let mut cadence = UploadProgressCadence::default();
-        let mut emitted = Vec::new();
+    fn cancellation_before_begin_is_retained() {
+        let progress_id = format!("cancel-before-begin-{}", uuid::Uuid::new_v4());
 
-        for sent in 1..=total {
-            let now = started_at + Duration::from_millis(sent - 1);
-            if cadence.should_emit(sent, total, now) {
-                emitted.push(sent);
-            }
-        }
+        cancel_media_upload(&progress_id);
+        let cancellation = begin_media_upload(Some(&progress_id)).expect("cancellation token");
 
-        assert_eq!(emitted.first(), Some(&1));
-        assert_eq!(emitted.last(), Some(&total));
-        assert!(emitted.len() <= 11, "emitted {emitted:?}");
+        assert!(cancellation.is_cancelled());
+        finish_media_upload(Some(&progress_id));
     }
 
     #[test]
-    fn final_update_bypasses_the_cadence_window() {
-        let started_at = Instant::now();
-        let mut cadence = UploadProgressCadence::default();
+    fn cancellation_after_begin_reaches_registered_token() {
+        let progress_id = format!("cancel-after-begin-{}", uuid::Uuid::new_v4());
+        let cancellation = begin_media_upload(Some(&progress_id)).expect("cancellation token");
 
-        assert!(cadence.should_emit(64, 128, started_at));
-        assert!(!cadence.should_emit(96, 128, started_at + Duration::from_millis(1)));
-        assert!(cadence.should_emit(128, 128, started_at + Duration::from_millis(2)));
+        cancel_media_upload(&progress_id);
+
+        assert!(cancellation.is_cancelled());
+        finish_media_upload(Some(&progress_id));
+    }
+
+    #[test]
+    fn late_cancellation_after_native_finish_is_removed_on_release() {
+        let mut uploads = MediaUploadCancellations::default();
+        let id = "late-cancel";
+
+        uploads.begin(id);
+        uploads.finish(id);
+        uploads.cancel(id);
+        assert!(uploads.tokens.contains_key(id));
+
+        uploads.finish(id);
+        assert!(!uploads.tokens.contains_key(id));
+    }
+
+    #[test]
+    fn repeated_concurrent_cycles_leave_no_registry_entries() {
+        let mut uploads = MediaUploadCancellations::default();
+        let ids = (0..256)
+            .map(|index| format!("cycle-{index}"))
+            .collect::<Vec<_>>();
+
+        for id in &ids {
+            uploads.begin(id);
+        }
+        for id in &ids {
+            uploads.cancel(id);
+        }
+        for id in &ids {
+            uploads.finish(id);
+        }
+
+        assert!(uploads.tokens.is_empty());
+    }
+
+    #[test]
+    fn dispatched_cancellations_are_not_evicted_before_begin() {
+        let mut uploads = MediaUploadCancellations::default();
+        let ids = (0..129)
+            .map(|index| format!("dispatched-{index}"))
+            .collect::<Vec<_>>();
+
+        for id in &ids {
+            uploads.cancel(id);
+        }
+
+        let oldest = uploads.begin(&ids[0]);
+        assert!(oldest.is_cancelled());
+        assert_eq!(uploads.tokens.len(), ids.len());
+
+        for id in &ids {
+            uploads.finish(id);
+        }
+        assert!(uploads.tokens.is_empty());
     }
 }

@@ -1,10 +1,8 @@
-import {
-  setAgentManagedProfiles,
-  setThreadScopedAcpSessions,
-} from "@/shared/api/tauri";
+import { setAgentManagedProfiles } from "@/shared/api/tauriWorkspace";
 import { desktopFeatures, useFeatureToggle } from "@/shared/features";
 import type { FeatureDefinition } from "@/shared/features";
 import { Switch } from "@/shared/ui/switch";
+import { SettingsOptionGroup, SettingsOptionRow } from "./SettingsOptionGroup";
 import { SettingsSectionHeader } from "./SettingsSectionHeader";
 
 function FeatureRow({ feature }: { feature: FeatureDefinition }) {
@@ -12,12 +10,14 @@ function FeatureRow({ feature }: { feature: FeatureDefinition }) {
   const switchId = `feature-toggle-${feature.id}`;
 
   return (
-    <div className="flex items-center justify-between gap-3 rounded-lg border border-border/70 bg-background/70 px-4 py-3">
+    <SettingsOptionRow>
       <div className="min-w-0 flex-1">
         <p className="text-sm font-medium" id={`${switchId}-label`}>
           {feature.name}
         </p>
-        <p className="text-xs text-muted-foreground">{feature.description}</p>
+        <p className="text-xs text-muted-foreground/70" data-settings-subcopy>
+          {feature.description}
+        </p>
       </div>
       <Switch
         aria-labelledby={`${switchId}-label`}
@@ -33,17 +33,9 @@ function FeatureRow({ feature }: { feature: FeatureDefinition }) {
               );
             });
           }
-          if (feature.id === "threadScopedAcpSessions") {
-            void setThreadScopedAcpSessions(value).catch((error) => {
-              console.error(
-                "Failed to apply thread-scoped ACP sessions setting:",
-                error,
-              );
-            });
-          }
         }}
       />
-    </div>
+    </SettingsOptionRow>
   );
 }
 
@@ -64,11 +56,11 @@ export function ExperimentalFeaturesCard() {
         }
       />
 
-      <div className="flex flex-col gap-2">
+      <SettingsOptionGroup title="Features">
         {previewFeatures.map((f) => (
           <FeatureRow feature={f} key={f.id} />
         ))}
-      </div>
+      </SettingsOptionGroup>
     </section>
   );
 }

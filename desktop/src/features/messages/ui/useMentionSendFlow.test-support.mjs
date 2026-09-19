@@ -1,4 +1,3 @@
-import * as publicationScope from "../../../shared/api/publicationScope.ts";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import vm from "node:vm";
@@ -8,6 +7,7 @@ import * as React from "react";
 import ts from "typescript";
 import * as helpers from "./useMentionSendFlow.helpers.ts";
 import * as draftStore from "../lib/useDrafts.ts";
+
 // Execute the product hooks with real React effects/renders; only external
 // query/mutation/media dependencies are mocked. Deferred promises isolate the
 // user-intent boundary independently of successful authorization.
@@ -88,10 +88,6 @@ export async function setup({ lifecycle = false } = {}) {
     },
   };
   const stubs = {
-    "@/shared/api/preparePublicationScope": {
-      preparePublicationScope: async (scope) => scope,
-    },
-    "@/shared/api/publicationScope": publicationScope,
     react: React,
     "@/features/messages/lib/useDrafts": draftStore,
     sonner: { toast: { error: (error) => calls.push(["error", error]) } },
@@ -164,6 +160,9 @@ export async function setup({ lifecycle = false } = {}) {
     "@/shared/lib/pubkey": {
       normalizePubkey: (key) => key.toLowerCase(),
       truncatePubkey: (key) => key,
+      // Compact-identity seam stubbed alongside its sibling: these suites
+      // render display names, never key-form labels.
+      truncateNpub: (key) => key,
     },
     "@/shared/lib/customEmojiTags": { buildCustomEmojiTags: () => [] },
     "./useMentionSendFlow.helpers": helpers,

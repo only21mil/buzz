@@ -20,7 +20,8 @@ use std::collections::BTreeMap;
 /// persona_id.
 fn make_definition(slug: &str) -> ManagedAgentRecord {
     ManagedAgentRecord {
-        effort_level: None,
+        session_policy: Default::default(),
+        description: None,
         pubkey: String::new(),
         slug: Some(slug.to_string()),
         name: slug.to_string(),
@@ -49,6 +50,7 @@ fn make_definition(slug: &str) -> ManagedAgentRecord {
         runtime_pid: None,
         backend: BackendKind::Local,
         backend_agent_id: None,
+        provider_policy_pending: false,
         provider_binary_path: None,
         team_id: None,
         persona_team_dir: None,
@@ -75,6 +77,7 @@ fn make_definition(slug: &str) -> ManagedAgentRecord {
         definition_respond_to_allowlist: vec![],
         definition_parallelism: None,
         relay_mesh: None,
+        effort_level: None,
     }
 }
 
@@ -82,12 +85,23 @@ fn make_definition(slug: &str) -> ManagedAgentRecord {
 /// have `slug: None` and link to their definition via `persona_id`.
 fn make_instance(pubkey: &str, persona_id: &str) -> ManagedAgentRecord {
     ManagedAgentRecord {
-        effort_level: None,
+        session_policy: Default::default(),
         pubkey: pubkey.to_string(),
         slug: None,
         persona_id: Some(persona_id.to_string()),
         ..make_definition("")
     }
+}
+
+#[test]
+fn linked_instance_snapshot_materializes_the_definition_description() {
+    let mut definition = make_definition("reviewer");
+    definition.description = Some("Reviews changes.".to_string());
+    let mut instance = make_instance("agent-pubkey", "reviewer");
+
+    materialize_snapshot_description(&mut instance, false, std::slice::from_ref(&definition));
+
+    assert_eq!(instance.description, definition.description);
 }
 
 /// Build a minimal valid AgentSnapshot for import tests.
@@ -99,6 +113,7 @@ fn make_snapshot(
         format: FORMAT_DISCRIMINATOR.to_string(),
         version: FORMAT_VERSION,
         definition: AgentSnapshotDefinition {
+            session_policy: Default::default(),
             name: "Test Agent".to_string(),
             source_is_builtin: false,
             system_prompt: Some("You are helpful.".to_string()),

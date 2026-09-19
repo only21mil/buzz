@@ -8,9 +8,9 @@ import type {
   RelayAgent,
 } from "@/shared/api/types";
 import { usePanelReturnTarget } from "@/shared/hooks/usePanelReturnTarget";
-import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
+import { normalizePubkey, truncateNpub } from "@/shared/lib/pubkey";
 import {
-  channelAgentMemberPubkeySet,
+  channelBotMemberPubkeySet,
   channelMemberPubkeySet,
 } from "@/shared/lib/rosterDerivations";
 import {
@@ -21,7 +21,7 @@ import type { PanelValueSetter } from "./useChannelPanelHistoryState";
 
 export type ChannelAgentSessionAgent = Pick<ManagedAgent, "pubkey" | "name"> & {
   status: ManagedAgent["status"] | "unknown";
-  agentSource: "managed" | "member-agent" | "relay";
+  agentSource: "managed" | "member-bot" | "relay";
   canInterruptTurn: boolean;
   channelIds?: string[];
   channels?: string[];
@@ -37,6 +37,7 @@ type UseChannelAgentSessionsOptions = {
   openAgentSessionPubkey: string | null;
   openThreadHeadId: string | null;
   profilePanelPubkey?: string | null;
+  requireThreadEditResolution: () => boolean;
   setChannelManagementOpen: (open: boolean) => void;
   setExpandedThreadReplyIds: (value: Set<string>) => void;
   setOpenAgentSessionChannelId: PanelValueSetter;
@@ -93,15 +94,15 @@ export function buildChannelAgentSessionCandidates({
 
   for (const member of channelMembers ?? []) {
     const key = normalizePubkey(member.pubkey);
-    if ((member.role !== "bot" && !member.isAgent) || byPubkey.has(key)) {
+    if (member.role !== "bot" || byPubkey.has(key)) {
       continue;
     }
 
     byPubkey.set(key, {
       pubkey: member.pubkey,
-      name: member.displayName ?? truncatePubkey(member.pubkey),
+      name: member.displayName ?? truncateNpub(member.pubkey),
       status: "deployed",
-      agentSource: "member-agent",
+      agentSource: "member-bot",
       canInterruptTurn: false,
     });
   }
@@ -130,8 +131,8 @@ export function getChannelAgentSessionAgents({
   const memberPubkeys = channelMembers
     ? channelMemberPubkeySet(channelMembers)
     : null;
-  const agentMemberPubkeys = channelMembers
-    ? channelAgentMemberPubkeySet(channelMembers)
+  const botMemberPubkeys = channelMembers
+    ? channelBotMemberPubkeySet(channelMembers)
     : null;
 
   return agents.filter((agent) => {
@@ -144,10 +145,8 @@ export function getChannelAgentSessionAgents({
       channelIds.includes(activeChannelId) ||
       channels.includes(activeChannel.name);
 
-    if (agent.agentSource === "member-agent") {
-      return (
-        agentMemberPubkeys?.has(normalizedPubkey) ?? matchesDeclaredChannel
-      );
+    if (agent.agentSource === "member-bot") {
+      return botMemberPubkeys?.has(normalizedPubkey) ?? matchesDeclaredChannel;
     }
 
     if (agent.agentSource === "managed") {
@@ -174,6 +173,7 @@ export function useChannelAgentSessions({
   openAgentSessionPubkey,
   openThreadHeadId,
   profilePanelPubkey = null,
+  requireThreadEditResolution,
   setChannelManagementOpen,
   setExpandedThreadReplyIds,
   setOpenAgentSessionChannelId,
@@ -210,6 +210,7 @@ export function useChannelAgentSessions({
 
   const openAgentSession = React.useCallback(
     (pubkey: string, channelId?: string | null) => {
+      if (!requireThreadEditResolution()) return;
       if (!isAgentSessionOpen) {
         returnTarget.capture(
           resolveAgentSessionReturnTarget({
@@ -235,6 +236,7 @@ export function useChannelAgentSessions({
       isAgentSessionOpen,
       openThreadHeadId,
       profilePanelPubkey,
+      requireThreadEditResolution,
       returnTarget,
       setChannelManagementOpen,
       setExpandedThreadReplyIds,

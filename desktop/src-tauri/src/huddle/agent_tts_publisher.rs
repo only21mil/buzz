@@ -2,17 +2,17 @@
 
 use std::sync::Arc;
 
-use super::{agent_tts_admission::SpeechAdmission, relay_api, tts::TtsAudioPublisher};
+use super::{relay_api, tts};
 use crate::app_state::AppState;
 
 pub(super) async fn ensure(
     app: &tauri::AppHandle,
     state: &AppState,
-    admission: &SpeechAdmission,
-) -> Result<Option<TtsAudioPublisher>, String> {
-    let speaker_pubkey = &admission.speaker_pubkey;
-    if admission.pipeline.has_audio_publisher(speaker_pubkey) {
-        return Ok(None);
+    pipeline: &tts::TtsPipeline,
+    speaker_pubkey: &str,
+) -> Result<bool, String> {
+    if pipeline.has_audio_publisher(speaker_pubkey) {
+        return Ok(true);
     }
 
     let app_for_load = app.clone();
@@ -28,7 +28,7 @@ pub(super) async fn ensure(
     .await
     .map_err(|error| format!("managed-agent identity task failed: {error}"))??;
     let Some(record) = record else {
-        return Ok(None);
+        return Ok(false);
     };
 
     let keys = nostr::Keys::parse(record.private_key_nsec.trim())
@@ -40,13 +40,19 @@ pub(super) async fn ensure(
     {
         return Err("managed-agent identity does not match the Huddle speaker".to_string());
     }
-    let ephemeral_channel_id = &admission.ephemeral_channel_id;
-    let parent_channel_id = &admission.parent_channel_id;
-    if !admission.is_current(&*state.huddle()?) {
-        return Ok(None);
-    }
+    let (ephemeral_channel_id, parent_channel_id, local_tts_publishers) = {
+        let huddle = state.huddle()?;
+        (
+            huddle
+                .ephemeral_channel_id
+                .clone()
+                .ok_or("active Huddle has no backing channel")?,
+            huddle.parent_channel_id.clone(),
+            Arc::clone(&huddle.local_tts_publishers),
+        )
+    };
     let has_bot_membership =
-        relay_api::fetch_channel_members_with_roles(ephemeral_channel_id, state)
+        relay_api::fetch_channel_members_with_roles(&ephemeral_channel_id, state)
             .await?
             .into_iter()
             .any(|(pubkey, role)| {
@@ -55,17 +61,15 @@ pub(super) async fn ensure(
     if !has_bot_membership {
         return Err("agent is not an active bot member of the Huddle".to_string());
     }
-    if !admission.is_current(&*state.huddle()?) {
-        return Ok(None);
-    }
     let publisher = relay_api::connect_tts_audio_publisher(
-        ephemeral_channel_id,
+        &ephemeral_channel_id,
         parent_channel_id.as_deref(),
         state,
         &keys,
         record.auth_tag.as_deref(),
-        Arc::clone(&admission.local_tts_publishers),
+        local_tts_publishers,
     )
     .await?;
-    Ok(Some(publisher))
+    pipeline.register_audio_publisher(speaker_pubkey, publisher);
+    Ok(true)
 }

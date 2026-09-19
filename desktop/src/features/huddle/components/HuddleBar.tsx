@@ -27,13 +27,13 @@ import { Button } from "@/shared/ui/button";
 import { useEmojiBurst } from "@/shared/ui/EmojiBurstProvider";
 import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
-import { useHuddle } from "../HuddleContext";
+import { useHuddle, useHuddleLevels } from "../HuddleContext";
 import { useHuddleParticipantRoster } from "../hooks/useHuddleParticipantRoster";
 import { AddAgentDialog, type AgentAddResult } from "./AddAgentDialog";
 import type { HuddleAgentVoiceSettings } from "./AgentVoiceMenu";
 import { MicControls, SpeakerControls } from "./MicControls";
 import { HuddleParticipantsControl } from "./ParticipantList";
-import { truncatePubkey } from "@/shared/lib/pubkey";
+import { truncateNpub } from "@/shared/lib/pubkey";
 
 // Mirrors HuddleState in src-tauri/src/huddle/mod.rs.
 type HuddleState = {
@@ -98,7 +98,7 @@ function clampReactionName(name: string): string {
 }
 
 function fallbackNameForPubkey(pubkey?: string | null): string {
-  return pubkey ? `Participant ${truncatePubkey(pubkey)}` : "Someone";
+  return pubkey ? `Participant ${truncateNpub(pubkey)}` : "Someone";
 }
 
 function parseHuddleReactionEvent(event: RelayEvent) {
@@ -158,11 +158,8 @@ export function HuddleBar({
     micConnected,
     isMuted,
     toggleMute,
-    micLevel,
     voiceInputMode,
     setVoiceInputMode,
-    activeSpeakers,
-    speakerLevels,
     huddleError,
     clearHuddleError,
     audioDevices,
@@ -174,6 +171,7 @@ export function HuddleBar({
     selectedOutputDevice,
     setSelectedOutputDevice,
   } = useHuddle();
+  const { activeSpeakers, micLevel, speakerLevels } = useHuddleLevels();
   const customEmoji = useCustomEmoji();
   const identityQuery = useIdentityQuery();
   const profileQuery = useProfileQuery();

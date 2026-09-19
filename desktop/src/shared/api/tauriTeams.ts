@@ -1,4 +1,3 @@
-import { requireLocalTeamStorage } from "@/features/agents/lib/teamStorageCapability";
 import { invokeTauri } from "@/shared/api/tauri";
 import type {
   AgentTeam,
@@ -62,7 +61,6 @@ export async function listTeams(): Promise<AgentTeam[]> {
 }
 
 export async function createTeam(input: CreateTeamInput): Promise<AgentTeam> {
-  requireLocalTeamStorage();
   return fromRawTeam(
     await invokeTauri<RawTeam>("create_team", {
       input: {
@@ -76,7 +74,6 @@ export async function createTeam(input: CreateTeamInput): Promise<AgentTeam> {
 }
 
 export async function updateTeam(input: UpdateTeamInput): Promise<AgentTeam> {
-  requireLocalTeamStorage();
   return fromRawTeam(
     await invokeTauri<RawTeam>("update_team", {
       input: {
@@ -91,7 +88,6 @@ export async function updateTeam(input: UpdateTeamInput): Promise<AgentTeam> {
 }
 
 export async function deleteTeam(id: string): Promise<void> {
-  requireLocalTeamStorage();
   await invokeTauri("delete_team", { id });
 }
 
@@ -114,7 +110,6 @@ export async function setTeamShared(
   id: string,
   shared: boolean,
 ): Promise<TeamSharePublicationResult> {
-  requireLocalTeamStorage();
   const raw = await invokeTauri<RawTeamSharePublicationResult>(
     "set_team_shared",
     { id, shared },
@@ -148,7 +143,6 @@ type RawAddTeamFromCatalogResult = {
 export async function addTeamFromCatalog(
   source: TeamCatalogSourceCoordinate & { eventId: string },
 ): Promise<AddTeamFromCatalogResult> {
-  requireLocalTeamStorage();
   const raw = await invokeTauri<RawAddTeamFromCatalogResult>(
     "add_team_from_catalog",
     {
@@ -224,7 +218,6 @@ export async function exportTeamSnapshot(
   memoryLevel: SnapshotMemoryLevel,
   format: SnapshotFormat,
 ): Promise<boolean> {
-  requireLocalTeamStorage();
   return invokeTauri<boolean>("export_team_snapshot", {
     id,
     memoryLevel,
@@ -237,7 +230,6 @@ export async function encodeTeamSnapshotForSend(
   memoryLevel: SnapshotMemoryLevel,
   format: SnapshotFormat,
 ): Promise<EncodedTeamSnapshotPayload> {
-  requireLocalTeamStorage();
   return invokeTauri<EncodedTeamSnapshotPayload>(
     "encode_team_snapshot_for_send",
     {
@@ -252,7 +244,6 @@ export async function previewTeamSnapshotImport(
   fileBytes: number[],
   fileName: string,
 ): Promise<TeamSnapshotImportPreview> {
-  requireLocalTeamStorage();
   return invokeTauri<TeamSnapshotImportPreview>(
     "preview_team_snapshot_import",
     {
@@ -265,7 +256,6 @@ export async function previewTeamSnapshotImport(
 export async function confirmTeamSnapshotImport(
   input: TeamSnapshotImportConfirm,
 ): Promise<TeamSnapshotImportResult> {
-  requireLocalTeamStorage();
   const raw = await invokeTauri<RawTeamSnapshotImportResult>(
     "confirm_team_snapshot_import",
     { input },

@@ -1,4 +1,5 @@
 import { sortEvents } from "../../shared/api/relayClientShared.ts";
+import { projectTaskCategoryFromLabels } from "./projectTaskCategories.ts";
 
 // Issue assignment mirrors PR review requests (projectPullRequests.mjs):
 // a kind:1 comment labeled with this `t` tag whose `p` tags are the
@@ -21,32 +22,6 @@ function isNonEmptyString(value) {
   return typeof value === "string" && value.length > 0;
 }
 
-function hasControlCharacter(value) {
-  for (const character of value) {
-    const codePoint = character.codePointAt(0);
-    if (
-      codePoint !== undefined &&
-      (codePoint <= 0x1f || (codePoint >= 0x7f && codePoint <= 0x9f))
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function normalizeAdvisoryId(value) {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  if (
-    trimmed.length === 0 ||
-    trimmed.length > 256 ||
-    hasControlCharacter(trimmed)
-  ) {
-    return null;
-  }
-  return trimmed;
-}
-
 export function getTag(event, name) {
   const value = event.tags.find((tag) => tag[0] === name)?.[1];
   return isNonEmptyString(value) ? value : undefined;
@@ -60,26 +35,6 @@ export function getAllTags(event, name) {
 
 export function getImetaTags(event) {
   return event.tags.filter((tag) => tag[0] === "imeta");
-}
-
-/** Advisory transport-origin identifier. It is display metadata only and must
- * never be used as authority for lifecycle changes. */
-export function getExternalId(event) {
-  for (const tag of event.tags) {
-    if (tag[0] !== "i") continue;
-    const value = normalizeAdvisoryId(tag[1]);
-    if (value) return value;
-  }
-  return null;
-}
-
-export function getAdvisoryLink(event, name) {
-  for (const tag of event.tags) {
-    if (tag[0] !== name) continue;
-    const value = normalizeAdvisoryId(tag[1]);
-    if (value) return value;
-  }
-  return null;
 }
 
 function repoOwnerFromAddress(repoAddress) {
@@ -236,10 +191,9 @@ export function eventToProjectIssue(
   );
   const comments = commentsForIssue(issueCommentEvents);
   const assignmentState = assignmentStateForIssue(issue, issueCommentEvents);
+  const labels = getAllTags(issue, "t");
   const title =
-    getTag(issue, "subject") ||
-    issue.content.split("\n")[0] ||
-    "Untitled issue";
+    getTag(issue, "subject") || issue.content.split("\n")[0] || "Untitled task";
 
   return {
     id: issue.id,
@@ -249,10 +203,10 @@ export function eventToProjectIssue(
     author: issue.pubkey,
     createdAt: issue.created_at,
     repoAddress: getTag(issue, "a") ?? null,
-    channelId: getAdvisoryLink(issue, "h"),
-    externalId: getExternalId(issue),
+    channelId: getTag(issue, "h") ?? null,
     originAgentName: getTag(issue, "buzz-origin-agent") ?? null,
-    labels: getAllTags(issue, "t"),
+    labels,
+    category: projectTaskCategoryFromLabels(labels),
     recipients: getAllTags(issue, "p"),
     assignees: assignmentState.assignees,
     assigneeOperationHeads: assignmentState.heads,
@@ -296,17 +250,17 @@ export function buildGitIssueTags({
   labels = [],
 }) {
   if (!repoAddress.startsWith("30617:")) {
-    throw new Error("Issue repo address must reference a kind:30617 repo.");
+    throw new Error("Task repo address must reference a kind:30617 repo.");
   }
   if (!/^[a-fA-F0-9]{64}$/.test(repoOwner)) {
     throw new Error("Repo owner must be 64 hex characters.");
   }
   const subject = title.trim();
   if (!subject) {
-    throw new Error("Issue title is required.");
+    throw new Error("Task title is required.");
   }
   if (subject.length > 256) {
-    throw new Error("Issue title must be 256 characters or fewer.");
+    throw new Error("Task title must be 256 characters or fewer.");
   }
 
   const tags = [
@@ -325,7 +279,7 @@ export function buildGitIssueTags({
 
 export function buildGitStatusTags({ issueId, repoAddress, repoOwner }) {
   if (!/^[a-fA-F0-9]{64}$/.test(issueId)) {
-    throw new Error("Issue ID must be 64 hex characters.");
+    throw new Error("Task ID must be 64 hex characters.");
   }
   const tags = [["e", issueId, "", "root"]];
   if (repoAddress) tags.push(["a", repoAddress]);

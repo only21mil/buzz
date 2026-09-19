@@ -921,7 +921,7 @@ fn idle_playback_gets_an_onset_cushion() {
 #[test]
 fn tts_worker_uses_distinct_playback_and_model_splitters() {
     let source = include_str!("tts.rs");
-    let playback_calls = source.matches("group_sentences_into_chunks(").count();
+    let playback_calls = source.matches("engine.split_text_for_playback(").count();
     let model_calls = source.matches("engine.split_text_into_chunks(").count();
 
     assert_eq!(
@@ -934,7 +934,7 @@ fn tts_worker_uses_distinct_playback_and_model_splitters() {
     // (1, 1) while the outer split stops isolating sentence one, which delays
     // first audio by a whole generation. Pin the ORDER too.
     let playback_at = source
-        .find("group_sentences_into_chunks(")
+        .find("engine.split_text_for_playback(")
         .expect("outer playback split exists");
     let model_at = source
         .find("engine.split_text_into_chunks(")

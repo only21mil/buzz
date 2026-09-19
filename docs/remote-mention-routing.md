@@ -15,17 +15,15 @@ existing path; remote identities never gain synthetic local management records.
 
 Chat offers explicit Invite or reference-only send without inviting. Failed adds,
 revoked policy, failed final authorization and cancellation preserve recoverable
-drafts. Standalone forum sends use the same exact recipient and source-visit contract,
-including invitation and recoverable draft ownership.
+drafts. Standalone forum sends report authorization failures, but standalone
+forum invitation is a subsequent change reusing this phase contract.
 
-Native discovery and publication revalidation depend on the reviewed remote
-authority and deferred-wake prerequisite packets.
-Focused regression coverage: `agentAutocompleteEligibility.test.mjs`,
+Native discovery prerequisite: `docs/owned-agent-discovery.md` (PR6).
+Regression coverage: `agentAutocompleteEligibility.test.mjs`,
 `agentMentionRevalidation.test.mjs`, `useMentionSendFlow.helpers.test.mjs`,
-`submitMessageEdit.test.mjs`, and the composer/forum draft lifecycle suites.
-Upstream `remote-owned-mentions.spec.ts` was not ported or run in this adoption;
-`mentions.spec.ts` was not run. Native GUI and live relay behavior remain release
-validation gaps.
+`submitMessageEdit.test.mjs`, `mentions.spec.ts`, and
+`remote-owned-mentions.spec.ts`. The new remote browser fixtures use a single-word
+name deliberately: mention separator behavior belongs to the independent PR1.
 
 NIP-OA establishes ownership, not physical hosting, availability, or lifecycle
 control. Final native queries do not provide an atomic relay transaction with
@@ -47,8 +45,8 @@ buttons. Cancellation after optimistic clearing restores the captured draft and
 exact mention refs without overwriting newer edits.
 
 `useMentionSendFlow.cancellation.test.mjs` drives the actual hooks with React
-StrictMode and deferred dependencies. Visible pending, Escape/retry and route
-navigation have not been checked with browser E2E or native GUI automation.
+StrictMode and deferred dependencies; `remote-owned-mentions.spec.ts` covers
+visible pending, Escape/retry and route navigation at deferred IPC boundaries.
 
 ### Source draft ownership
 
@@ -84,5 +82,6 @@ intent. Explicit inbox deletion and replacement do; scope reset invalidates old
 handles. This is same-window authority for live continuations, not cross-window
 synchronization or a versioned storage protocol. Reload destroys continuations;
 authored deletion has already removed the durable value. Final membership/policy reads are not atomic with send,
-and cancellation cannot retract an already dispatched publication. Native compatibility and live relay publication remain independent review and
-release validation boundaries.
+and cancellation cannot retract an already dispatched publication. Standalone
+forum transport-failure binding recovery and native compatibility remain separate
+review/follow-up boundaries.

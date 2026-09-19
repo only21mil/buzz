@@ -1,13 +1,14 @@
 import 'dart:async';
 
 import 'package:app_badge_plus/app_badge_plus.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:uuid/uuid.dart';
 
+import 'features/age_gate/age_restriction_page.dart';
+import 'features/age_gate/age_signal_provider.dart';
 import 'features/activity/activity_provider.dart';
 import 'features/activity/inbox_local_state_provider.dart';
 import 'features/activity/inbox_read_state.dart';
@@ -19,6 +20,7 @@ import 'features/home/home_page.dart';
 import 'features/invites/invite_create_page.dart';
 import 'features/invites/invite_join_provider.dart';
 import 'features/pairing/pairing_page.dart';
+import 'features/pairing/pairing_provider.dart';
 import 'features/channels/agent_activity/observer_subscription.dart';
 import 'features/channels/channel_detail_page.dart';
 import 'features/channels/deep_link_dispatcher.dart';
@@ -31,7 +33,6 @@ import 'features/settings/settings_page.dart';
 import 'shared/auth/auth.dart';
 import 'shared/deeplink/pending_deep_link_provider.dart';
 import 'shared/emoji/emoji_burst.dart';
-import 'shared/notifications/notifications.dart';
 import 'shared/push/push_subscription_provider.dart';
 import 'shared/push/push_relay_capability_provider.dart';
 import 'shared/relay/relay.dart';
@@ -48,6 +49,30 @@ const _starterChannels = [
     description: 'Say hi, ask a question, or share what brought you here.',
   ),
 ];
+
+final _inviteRelayConnectedProvider = FutureProvider.family<void, String>((
+  ref,
+  expectedRelayUrl,
+) async {
+  final currentConfig = ref.read(relayConfigProvider);
+  if (currentConfig.baseUrl != expectedRelayUrl) {
+    throw StateError('Active community changed before invite recovery');
+  }
+  if (ref.read(relaySessionProvider).status == SessionStatus.connected) return;
+
+  final connected = Completer<void>();
+  ref.listen(relaySessionProvider, (_, next) {
+    if (connected.isCompleted) return;
+    if (ref.read(relayConfigProvider).baseUrl != expectedRelayUrl) {
+      connected.completeError(
+        StateError('Active community changed during invite recovery'),
+      );
+    } else if (next.status == SessionStatus.connected) {
+      connected.complete();
+    }
+  });
+  await connected.future;
+});
 
 /// App-level bridge from invite joining to the channels feature.
 class MobileInviteJoinRecovery implements InviteJoinRecovery {
@@ -120,7 +145,11 @@ class MobileInviteJoinRecovery implements InviteJoinRecovery {
           _ensureScopeCurrent();
           channels = await _loadChannels();
           _ensureScopeCurrent();
-          channel = _findStarterChannel(channels, starter.slug);
+          channel =
+              _findStarterChannel(channels, starter.slug) ??
+              channels
+                  .where((candidate) => candidate.id == channelId)
+                  .firstOrNull;
           if (channel == null) rethrow;
         }
       }
@@ -200,49 +229,14 @@ InviteJoinRecovery buildMobileInviteJoinRecovery(
     }
   }
 
-  Future<void> waitForConnection() async {
-    ensureScopeCurrent();
-    if (ref.read(relaySessionProvider).status == SessionStatus.connected) {
-      return;
-    }
-
-    // Each attempt owns its wait. A timeout or scope change must not leave a
-    // cached failure (or a cached connection) for the next Retry setup.
-    final connected = Completer<void>();
-    void checkConnection() {
-      if (connected.isCompleted) return;
-      if (!isScopeCurrent()) {
-        connected.completeError(
-          StateError('Active community changed during invite recovery'),
-        );
-      } else if (ref.read(relaySessionProvider).status ==
-          SessionStatus.connected) {
-        connected.complete();
-      }
-    }
-
-    final configSubscription = ref.listen(
-      relayConfigProvider,
-      (_, _) => checkConnection(),
-    );
-    final sessionSubscription = ref.listen(
-      relaySessionProvider,
-      (_, _) => checkConnection(),
-    );
-    try {
-      await connected.future.timeout(const Duration(seconds: 15));
-    } finally {
-      configSubscription.close();
-      sessionSubscription.close();
-    }
-  }
-
   return MobileInviteJoinRecovery(
     loadChannels: () async {
       ensureScopeCurrent();
       await ref.read(activeCommunityProvider.future);
       ensureScopeCurrent();
-      await waitForConnection();
+      await ref
+          .read(_inviteRelayConnectedProvider(scope.relayHttpOrigin).future)
+          .timeout(const Duration(seconds: 15));
       ensureScopeCurrent();
       await ref.read(channelsProvider.notifier).refresh(fetchDirectory: true);
       ensureScopeCurrent();
@@ -301,7 +295,15 @@ class App extends HookConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final communityTheme = ref.watch(communityThemeProvider);
+    final ageSignalState = ref.watch(ageSignalProvider);
+    ref.listen(ageSignalProvider, (_, next) {
+      if (next == AgeSignalState.restricted) {
+        ref.read(pairingProvider.notifier).reset();
+      }
+    });
+    final communityTheme = ageSignalState != AgeSignalState.restricted
+        ? ref.watch(communityThemeProvider)
+        : defaultCommunityTheme;
     final themeMode = communityTheme.mode;
     final accentIndex = effectiveAccentIndex(
       communityTheme.theme,
@@ -309,6 +311,13 @@ class App extends HookConsumerWidget {
     );
     final schemeName = communityTheme.theme;
     final authState = ref.watch(authProvider);
+
+    useEffect(() {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        unawaited(ref.read(ageSignalProvider.notifier).request());
+      });
+      return null;
+    }, const []);
 
     final resolved = resolveSchemes(schemeName, themeMode);
     final lightScheme = applyAccent(resolved.light, accentIndex);
@@ -332,7 +341,8 @@ class App extends HookConsumerWidget {
     // Eagerly initialize websocket session and lifecycle observer when
     // authenticated. These providers connect and manage the websocket.
     var hasUnreadInbox = false;
-    if (authState.value?.status == AuthStatus.authenticated) {
+    if (ageSignalState != AgeSignalState.restricted &&
+        authState.value?.status == AuthStatus.authenticated) {
       ref.watch(relaySessionProvider);
       ref.watch(observerRelayProvider);
       ref.watch(appLifecycleProvider);
@@ -348,34 +358,6 @@ class App extends HookConsumerWidget {
     // Start listening for buzz:// links immediately (even pre-auth) so a
     // cold-start link survives until the authenticated UI can dispatch it.
     ref.watch(pendingDeepLinkProvider);
-    final notificationBridge =
-        !kIsWeb && defaultTargetPlatform == TargetPlatform.android
-        ? ref.watch(androidNotificationBridgeProvider)
-        : null;
-    useEffect(() {
-      final bridge = notificationBridge;
-      if (bridge == null) return null;
-
-      void dispatchRoute(String route) {
-        final uri = Uri.tryParse(route);
-        if (uri == null) {
-          debugPrint('notification: ignoring invalid route: $route');
-          return;
-        }
-        ref.read(pendingDeepLinkProvider.notifier).handleUri(uri);
-      }
-
-      final subscription = bridge.notificationTaps.listen(dispatchRoute);
-      unawaited(() async {
-        try {
-          final route = await bridge.getInitialRoute();
-          if (route != null) dispatchRoute(route);
-        } catch (error) {
-          debugPrint('notification: initial route unavailable: $error');
-        }
-      }());
-      return subscription.cancel;
-    }, [notificationBridge]);
 
     void applyBadge(UnreadBadgeState state) {
       if (state.highPriorityCount > 0) {
@@ -388,12 +370,18 @@ class App extends HookConsumerWidget {
     }
 
     useEffect(() {
-      applyBadge(ref.read(unreadBadgeProvider));
+      if (ageSignalState != AgeSignalState.restricted) {
+        applyBadge(ref.read(unreadBadgeProvider));
+      } else {
+        AppBadgePlus.updateBadge(0);
+      }
       return null;
-    }, const []);
-    ref.listen<UnreadBadgeState>(unreadBadgeProvider, (_, next) {
-      applyBadge(next);
-    });
+    }, [ageSignalState]);
+    if (ageSignalState != AgeSignalState.restricted) {
+      ref.listen<UnreadBadgeState>(unreadBadgeProvider, (_, next) {
+        applyBadge(next);
+      });
+    }
 
     return MaterialApp(
       navigatorKey: _mobileRootNavigatorKey,
@@ -408,13 +396,17 @@ class App extends HookConsumerWidget {
         topSectionGradient: buzzDarkGradient,
       ),
       themeMode: effectiveMode,
-      // Above the navigator, so a burst keeps playing over a pushed thread page
-      // or a modal sheet — the same reason desktop pins its canvas to the
-      // viewport rather than to the message row.
-      builder: (context, child) => MobileHuddleShell(
-        navigatorKey: _mobileRootNavigatorKey,
-        child: EmojiBurstOverlay(child: child ?? const SizedBox.shrink()),
-      ),
+      // Above the navigator, so an age restriction cannot be bypassed by a
+      // route that was pushed while the store signal request was in flight.
+      builder: (context, child) => switch (ageSignalState) {
+        AgeSignalState.restricted => const AgeRestrictionPage(),
+        _ => AppMarkdownTheme(
+          child: MobileHuddleShell(
+            navigatorKey: _mobileRootNavigatorKey,
+            child: EmojiBurstOverlay(child: child ?? const SizedBox.shrink()),
+          ),
+        ),
+      },
       home: authState.when(
         loading: () => const _SplashScreen(),
         error: (_, _) => const PairingPage(),
@@ -435,16 +427,25 @@ class App extends HookConsumerWidget {
   }
 }
 
-Widget _buildSettingsPage(BuildContext context) => SettingsPage(
-  profileHeader: const SettingsProfileHeader(),
-  profileEditPageBuilder: (_) =>
-      const ProfileEditPage(startInPhotoEditor: true),
-  onEditDisplayName: showProfileDisplayNameEditor,
-  onEditProfileDescription: showProfileDescriptionEditor,
-  invitePageBuilder: (_) => const CommunityInvitePage(),
-  identityRecoveryPageBuilder: (_) =>
-      const PairingPage(addingCommunity: true, identityRecoveryOnly: true),
-);
+Widget _buildSettingsPage(BuildContext context) => const _SettingsPageContent();
+
+class _SettingsPageContent extends ConsumerWidget {
+  const _SettingsPageContent();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    return SettingsPage(
+      profileHeader: const SettingsProfileHeader(),
+      profileEditPageBuilder: (_) =>
+          const ProfileEditPage(startInPhotoEditor: true),
+      onEditDisplayName: showProfileDisplayNameEditor,
+      onEditProfileDescription: showProfileDescriptionEditor,
+      invitePageBuilder: (_) => const CommunityInvitePage(),
+      identityRecoveryPageBuilder: (_) =>
+          const PairingPage(addingCommunity: true, identityRecoveryOnly: true),
+    );
+  }
+}
 
 class _SplashScreen extends StatelessWidget {
   const _SplashScreen();

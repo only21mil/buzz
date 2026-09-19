@@ -66,7 +66,7 @@ class _AnimatedReviewNav extends StatelessWidget {
         child: AvatarEditorOptionButton(
           icon: LucideIcons.palette,
           iosIcon: IosGlassNavigationIcon.palette,
-          label: 'Frame color',
+          label: 'Background',
           selected: selected == _AnimatedReviewSection.color,
           onTap: () => onSelected(_AnimatedReviewSection.color),
         ),

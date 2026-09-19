@@ -1,3 +1,9 @@
+import {
+  coalesceAgentAutocompleteCandidates,
+  coalesceAutocompleteCandidatesByKey,
+  shouldHideAgentFromMentions,
+} from "@/features/agents/lib/agentAutocompleteEligibility";
+import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import type {
   AgentPersona,
   ChannelMember,
@@ -5,93 +11,86 @@ import type {
   RelayAgent,
   UserSearchResult,
 } from "@/shared/api/types";
-import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { normalizePubkey } from "@/shared/lib/pubkey";
-import {
-  coalesceAgentAutocompleteCandidates,
-  coalesceAutocompleteCandidatesByKey,
-  isAgentIdentityInAllowedList,
-  isAgentIdentityInManagedList as isManagedIdentity,
-  shouldHideAgentFromMentions,
-} from "@/features/agents/lib/agentAutocompleteEligibility";
 import {
   formatSearchUserDisplayName,
   formatSearchUserSecondaryLabel,
-} from "./mentionUserLabels";
-import {
   globalSearchIdentityKey,
-  mentionCandidateLabel,
   type MentionCandidate,
+  mentionCandidateLabel,
 } from "./mentionCandidates";
 
-type Options = {
+/** Directories and rosters the mention picker merges into one candidate list. */
+export type BuildMentionCandidatesInput = {
   activeAgentPubkeys: ReadonlySet<string>;
   activePersonaById: ReadonlyMap<string, AgentPersona>;
-  activePersonas: AgentPersona[];
-  candidateProfiles: UserProfileLookup;
-  userSearchResults: UserSearchResult[];
+  /** Already narrowed to `isActive` personas. */
+  activePersonas: readonly AgentPersona[];
   canSearchGlobalUsers: boolean;
   currentPubkey: string | null;
-  directoryAgentPubkeys: ReadonlySet<string>;
-  isArchivedDiscovery: (pubkey: string) => boolean;
+  isArchived: (pubkey: string) => boolean;
+  managedAgentDirectoryReady: boolean;
   managedAgentNamesByPubkey: ReadonlyMap<string, string>;
   managedAgentPersonaIds: ReadonlySet<string>;
   managedAgentPersonaIdsByPubkey: ReadonlyMap<string, string>;
-  managedAgentPubkeys: ReadonlySet<string>;
-  managedAgents: ManagedAgent[] | undefined;
+  managedAgents: readonly ManagedAgent[] | undefined;
   memberPubkeys: ReadonlySet<string>;
-  members: ChannelMember[] | undefined;
+  members: readonly ChannelMember[] | undefined;
+  mentionChannelId: string | null;
   mentionableAgentPubkeys: ReadonlySet<string>;
   personaNameByPubkey: ReadonlyMap<string, string>;
+  profiles: UserProfileLookup | undefined;
+  relayAgentDirectoryReady: boolean;
   relayAgentNamesByPubkey: ReadonlyMap<string, string>;
-  relayAgents: RelayAgent[] | undefined;
+  relayAgents: readonly RelayAgent[] | undefined;
+  userSearchResults: readonly UserSearchResult[];
 };
 
-/** Merge roster, hydrated profiles and owner-eligible discovery without losing identity. */
+/**
+ * Merge the channel roster, agent directories, global people search, and
+ * standalone personas into the deduplicated candidate list the mention
+ * autocomplete ranks. Archived identities and agents the viewer may not
+ * mention are dropped; identities appearing in several sources are coalesced
+ * into a single entry that keeps the richest field from each.
+ */
 export function buildMentionCandidates({
   activeAgentPubkeys,
   activePersonaById,
   activePersonas,
-  candidateProfiles,
-  userSearchResults,
   canSearchGlobalUsers,
   currentPubkey,
-  directoryAgentPubkeys,
-  isArchivedDiscovery,
+  isArchived,
+  managedAgentDirectoryReady,
   managedAgentNamesByPubkey,
   managedAgentPersonaIds,
   managedAgentPersonaIdsByPubkey,
-  managedAgentPubkeys,
   managedAgents,
   memberPubkeys,
   members,
+  mentionChannelId,
   mentionableAgentPubkeys,
   personaNameByPubkey,
+  profiles,
+  relayAgentDirectoryReady,
   relayAgentNamesByPubkey,
   relayAgents,
-}: Options): MentionCandidate[] {
+  userSearchResults,
+}: BuildMentionCandidatesInput): MentionCandidate[] {
   const candidatesByPubkey = new Map<string, MentionCandidate>();
-
   const addCandidate = (candidate: MentionCandidate & { pubkey: string }) => {
     const pubkey = normalizePubkey(candidate.pubkey);
-    if (isArchivedDiscovery(pubkey)) {
-      return;
-    }
-    if (
-      !isManagedIdentity(candidate, managedAgentPubkeys, currentPubkey) &&
-      !isAgentIdentityInAllowedList(candidate, mentionableAgentPubkeys)
-    ) {
+    if (isArchived(pubkey)) {
       return;
     }
     if (
       shouldHideAgentFromMentions({
-        ...candidate,
+        isAgent: candidate.isAgent === true,
         pubkey,
-        currentPubkey,
-        relayAgents,
-        managedAgentPubkeys,
         mentionableAgentPubkeys,
-        directoryAgentPubkeys,
+        directoryReady:
+          candidate.isManagedAgent === true
+            ? managedAgentDirectoryReady
+            : relayAgentDirectoryReady,
       })
     ) {
       return;
@@ -101,7 +100,6 @@ export function buildMentionCandidates({
       candidatesByPubkey.set(pubkey, { ...candidate, pubkey });
       return;
     }
-
     candidatesByPubkey.set(pubkey, {
       ...current,
       avatarUrl: current.avatarUrl ?? candidate.avatarUrl ?? null,
@@ -123,7 +121,7 @@ export function buildMentionCandidates({
         current.ownerPubkey ??
         candidate.ownerPubkey ??
         (candidate.isAgent && candidate.pubkey
-          ? candidateProfiles[pubkey]?.ownerPubkey
+          ? profiles?.[pubkey]?.ownerPubkey
           : null) ??
         null,
       isManagedAgent: current.isManagedAgent || candidate.isManagedAgent,
@@ -136,7 +134,7 @@ export function buildMentionCandidates({
       managedAgentNamesByPubkey.get(pubkey) ??
       relayAgentNamesByPubkey.get(pubkey) ??
       null;
-    const profile = candidateProfiles[pubkey] ?? null;
+    const profile = profiles?.[pubkey] ?? null;
     addCandidate({
       kind: "identity",
       pubkey,
@@ -148,7 +146,6 @@ export function buildMentionCandidates({
         null,
       avatarUrl: profile?.avatarUrl ?? null,
       isMember: true,
-      isActiveAgent: activeAgentPubkeys.has(pubkey),
       personaId: managedAgentPersonaIdsByPubkey.get(pubkey) ?? linkedPersonaId,
       isAgent:
         member.isAgent === true ||
@@ -156,6 +153,8 @@ export function buildMentionCandidates({
         member.role === "bot" ||
         managedAgentNamesByPubkey.has(pubkey) ||
         relayAgentNamesByPubkey.has(pubkey),
+      isActiveAgent: activeAgentPubkeys.has(pubkey),
+      isManagedAgent: managedAgentNamesByPubkey.has(pubkey),
       ownerPubkey: profile?.ownerPubkey ?? null,
       personaName: personaNameByPubkey.get(pubkey) ?? null,
       role: member.role,
@@ -165,31 +164,36 @@ export function buildMentionCandidates({
           : null,
     });
   }
-
   for (const agent of relayAgents ?? []) {
     const pubkey = normalizePubkey(agent.pubkey);
     addCandidate({
       kind: "identity",
       pubkey,
       displayName: agent.name,
-      isMember: false,
-      isActiveAgent: activeAgentPubkeys.has(normalizePubkey(agent.pubkey)),
+      // Prefer the active channel's signed roster. The relay-agent directory
+      // is filtered by access policy, so its channel ids can legitimately omit
+      // a room where this identity is already a member.
+      isMember:
+        memberPubkeys.has(pubkey) ||
+        (mentionChannelId !== null &&
+          agent.channelIds.includes(mentionChannelId)),
       personaId:
         managedAgentPersonaIdsByPubkey.get(pubkey) ??
         (activePersonaById.has(pubkey) ? pubkey : undefined),
-      ownerPubkey: agent.ownerPubkey ?? null,
+      ownerPubkey: agent.ownerPubkey,
       isAgent: true,
+      isActiveAgent: agent.status === "online" || agent.status === "away",
     });
   }
-
   for (const agent of managedAgents ?? []) {
+    const pubkey = normalizePubkey(agent.pubkey);
     addCandidate({
       kind: "identity",
-      pubkey: agent.pubkey,
+      pubkey,
       displayName: agent.name,
-      isMember: false,
-      isActiveAgent: activeAgentPubkeys.has(normalizePubkey(agent.pubkey)),
+      isMember: memberPubkeys.has(pubkey),
       isAgent: true,
+      isActiveAgent: agent.status === "running" || agent.status === "deployed",
       isManagedAgent: true,
       personaId: agent.personaId ?? undefined,
       personaName:
@@ -197,7 +201,6 @@ export function buildMentionCandidates({
       ownerPubkey: currentPubkey,
     });
   }
-
   if (canSearchGlobalUsers) {
     for (const user of userSearchResults) {
       const pubkey = normalizePubkey(user.pubkey);
@@ -222,7 +225,6 @@ export function buildMentionCandidates({
       });
     }
   }
-
   const personaCandidates: MentionCandidate[] = activePersonas
     .filter((persona) => !managedAgentPersonaIds.has(persona.id))
     .map((persona) => ({
@@ -234,7 +236,6 @@ export function buildMentionCandidates({
       isAgent: true,
     }))
     .filter((candidate) => candidate.displayName.trim().length > 0);
-
   return coalesceAgentAutocompleteCandidates(
     coalesceAutocompleteCandidatesByKey(
       [...candidatesByPubkey.values(), ...personaCandidates],

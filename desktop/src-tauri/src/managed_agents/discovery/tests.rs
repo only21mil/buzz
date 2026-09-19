@@ -1,15 +1,16 @@
+use std::path::PathBuf;
+
 use super::overrides::{divergent_agent_command_override, update_time_agent_command_override};
 use super::{
-    apply_agent_command_update, classify_runtime, codex_adapter_availability,
-    codex_adapter_is_outdated, create_time_agent_command_override, default_agent_command,
-    effective_agent_command, find_nvm_default_bin, find_via_login_shell,
+    apply_agent_command_update, apply_env_vars_then_effort_transition, classify_runtime,
+    codex_adapter_availability, codex_adapter_is_outdated, create_time_agent_command_override,
+    default_agent_command, effective_agent_command, find_nvm_default_bin,
     is_login_shell_path_uninit, is_safe_nvm_tag, managed_agent_avatar_url, normalize_agent_args,
     parse_semver_tag, probe_codex_acp_version, record_agent_command, refresh_login_shell_path,
-    try_record_agent_command, BUZZ_AGENT_AVATAR_URL, CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL,
-    GOOSE_AVATAR_URL,
+    remove_record_effort_aliases, try_record_agent_command, BUZZ_AGENT_AVATAR_URL,
+    CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL, GOOSE_AVATAR_URL,
 };
 use crate::managed_agents::AcpAvailabilityStatus;
-use std::path::PathBuf;
 
 #[test]
 fn resolves_known_avatar_for_bare_command() {
@@ -93,24 +94,6 @@ fn normalizes_buzz_agent_args_to_empty() {
     );
 }
 
-#[test]
-fn login_shell_lookup_treats_command_as_data() {
-    let marker =
-        std::env::temp_dir().join(format!("buzz-discovery-marker-{}", uuid::Uuid::new_v4()));
-    let payload = format!("doesnotexist; touch {} #", marker.display());
-
-    let resolved = find_via_login_shell(&payload);
-
-    assert!(
-        resolved.is_none(),
-        "payload should not resolve to a command"
-    );
-    assert!(
-        !marker.exists(),
-        "shell lookup must not execute injected commands"
-    );
-}
-
 #[cfg(unix)]
 #[test]
 fn explicit_path_resolution_ignores_non_executable_files() {
@@ -173,7 +156,6 @@ fn classifies_not_installed_when_no_underlying_cli() {
     assert!(cmd.is_none());
     assert!(path.is_none());
 }
-
 #[test]
 fn classifies_cli_missing_when_adapter_found_but_cli_absent() {
     let (status, cmd, path) = classify_runtime(
@@ -185,9 +167,10 @@ fn classifies_cli_missing_when_adapter_found_but_cli_absent() {
     assert_eq!(cmd.as_deref(), Some("codex-acp"));
     assert_eq!(path.as_deref(), Some("/opt/homebrew/bin/codex-acp"));
 }
-
 fn persona_with_runtime(id: &str, runtime: Option<&str>) -> crate::managed_agents::AgentDefinition {
     crate::managed_agents::AgentDefinition {
+        session_policy: Default::default(),
+        description: None,
         id: id.to_string(),
         display_name: id.to_string(),
         avatar_url: None,
@@ -221,16 +204,15 @@ fn effective_agent_command_explicit_override_wins() {
         "codex-acp"
     );
 }
-
-/// Minimal record for `record_agent_command` tests. Only the resolution
-/// inputs (runtime / persona_id / agent_command_override) vary.
+/// Minimal record for `record_agent_command` tests; only resolution inputs vary.
 fn record_with(
     runtime: Option<&str>,
     persona_id: Option<&str>,
     override_cmd: Option<&str>,
 ) -> crate::managed_agents::types::ManagedAgentRecord {
     crate::managed_agents::types::ManagedAgentRecord {
-        effort_level: None,
+        session_policy: Default::default(),
+        description: None,
         pubkey: String::new(),
         name: "r".to_string(),
         persona_id: persona_id.map(str::to_string),
@@ -256,6 +238,7 @@ fn record_with(
         runtime_pid: None,
         backend: Default::default(),
         backend_agent_id: None,
+        provider_policy_pending: false,
         provider_binary_path: None,
         team_id: None,
         persona_team_dir: None,
@@ -285,13 +268,13 @@ fn record_with(
         definition_respond_to_allowlist: Vec::new(),
         definition_parallelism: None,
         relay_mesh: None,
+        effort_level: None,
     }
 }
 
 #[test]
 fn record_agent_command_own_runtime_wins_over_persona() {
-    // A record with its own materialized runtime never consults the
-    // persona list — the unified-model resolution.
+    // A record with its own runtime never consults the persona list.
     let personas = vec![persona_with_runtime("p1", Some("goose"))];
     let record = record_with(Some("claude"), Some("p1"), None);
     assert_eq!(record_agent_command(&record, &personas), "claude-agent-acp");
@@ -317,8 +300,6 @@ fn record_agent_command_bare_record_defaults() {
     let record = record_with(None, None, None);
     assert_eq!(record_agent_command(&record, &[]), default_agent_command());
 }
-
-// ── try_record_agent_command ─────────────────────────────────────────────────
 
 /// When the record carries a dangling (unknown) runtime id, `try_record_agent_command`
 /// must return `Err` containing "DANGLING_HARNESS_ID" — NEVER the buzz-agent default.
@@ -626,53 +607,11 @@ fn update_time_override_preserves_pin_for_persona_less_agent() {
     );
 }
 
-#[test]
-fn apply_agent_command_update_inherit_sentinel_clears_pin_and_runtime() {
-    // Choosing Inherit on a persona-linked record clears BOTH the explicit
-    // pin and the materialized runtime, so resolution falls through to the
-    // live definition immediately — not on the next spawn.
-    let personas = vec![persona_with_runtime("p1", Some("goose"))];
-    let mut record = record_with(Some("claude"), Some("p1"), Some("codex-acp"));
-
-    apply_agent_command_update(&mut record, &personas, "", false);
-
-    assert_eq!(record.agent_command_override, None);
-    assert_eq!(record.runtime, None);
-    assert_eq!(record_agent_command(&record, &personas), "goose");
-}
-
-#[test]
-fn apply_agent_command_update_sentinel_keeps_runtime_for_definition_less_record() {
-    // For a record with no persona link the materialized runtime is the only
-    // harness source left once the pin is cleared — a stray empty
-    // agent_command must not change what the agent runs.
-    let mut record = record_with(Some("claude"), None, Some("codex-acp"));
-
-    apply_agent_command_update(&mut record, &[], "", false);
-
-    assert_eq!(record.agent_command_override, None);
-    assert_eq!(record.runtime.as_deref(), Some("claude"));
-    assert_eq!(record_agent_command(&record, &[]), "claude-agent-acp");
-}
-
-#[test]
-fn apply_agent_command_update_concrete_pin_keeps_materialized_runtime() {
-    // A concrete pick only sets the pin; the materialized runtime is left for
-    // the next snapshot apply. The pin shadows it in resolution either way.
-    let personas = vec![persona_with_runtime("p1", Some("goose"))];
-    let mut record = record_with(Some("claude"), Some("p1"), None);
-
-    apply_agent_command_update(&mut record, &personas, "codex-acp", true);
-
-    assert_eq!(record.agent_command_override.as_deref(), Some("codex-acp"));
-    assert_eq!(record.runtime.as_deref(), Some("claude"));
-    assert_eq!(record_agent_command(&record, &personas), "codex-acp");
-}
-
 // ── probe_codex_acp_version ───────────────────────────────────────────────────
 
+mod effort_clear;
+mod forced_discovery;
 mod managed_path_resolution;
-
 #[cfg(unix)]
 #[test]
 fn probe_codex_acp_version_parses_full_semver_output() {
@@ -1667,7 +1606,7 @@ fn custom_catalog_entry_carries_definition_env_for_edit_roundtrip() {
     )
     .unwrap();
 
-    let entries = discover_acp_runtimes_from(Some(dir.path()));
+    let entries = discover_acp_runtimes_from(Some(dir.path()), true);
     let entry = entries
         .iter()
         .find(|e| e.id == "env-harness")
@@ -1697,7 +1636,7 @@ fn builtin_catalog_entry_has_empty_definition_env() {
     // publishes to the global registry.
     let _path_guard = crate::managed_agents::lock_path_mutex();
     let _lock = registry_test_lock();
-    let entries = discover_acp_runtimes_from(None);
+    let entries = discover_acp_runtimes_from(None, true);
     // Find any builtin entry (e.g. "goose" or "claude").
     let builtin = entries
         .iter()
@@ -1777,7 +1716,7 @@ fn discovery_publish_path_survives_mid_flight_save() {
         assert!(lookup_loaded_harness_by_id("mid-flight-save").is_some());
     }));
 
-    let _entries = discover_acp_runtimes_from(Some(dir.path()));
+    let _entries = discover_acp_runtimes_from(Some(dir.path()), true);
 
     assert!(
         lookup_loaded_harness_by_id("mid-flight-save").is_some(),
@@ -1809,7 +1748,7 @@ fn discovery_publish_path_drops_mid_flight_delete() {
         assert!(lookup_loaded_harness_by_id("mid-flight-delete").is_none());
     }));
 
-    let _entries = discover_acp_runtimes_from(Some(dir.path()));
+    let _entries = discover_acp_runtimes_from(Some(dir.path()), true);
 
     assert!(
         lookup_loaded_harness_by_id("mid-flight-delete").is_none(),

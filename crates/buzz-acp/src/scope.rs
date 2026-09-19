@@ -23,6 +23,8 @@
 use nostr::Event;
 use uuid::Uuid;
 
+use crate::queue::parse_thread_tags;
+
 /// Operator policy controlling how ACP provider sessions are scoped.
 ///
 /// Selected via `--session-policy` / `BUZZ_ACP_SESSION_POLICY`. Defaults to
@@ -65,7 +67,7 @@ impl std::fmt::Display for SessionPolicy {
 /// This is the canonical key for provider sessions, queue partitions, in-flight
 /// tracking, and context gathering. The channel remains the authorization and
 /// collaboration boundary; the scope is the default *execution* boundary.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SessionScope {
     /// The whole channel is one session. Used for DMs always, and for every
     /// channel event under [`SessionPolicy::Channel`].
@@ -76,12 +78,6 @@ pub enum SessionScope {
         channel_id: Uuid,
         root_event_id: String,
     },
-}
-
-impl std::fmt::Display for SessionScope {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.telemetry_label())
-    }
 }
 
 impl SessionScope {
@@ -119,8 +115,10 @@ impl SessionScope {
     ///    tag scopes to that canonical root; a top-level mention (no thread
     ///    tags) opens a new thread rooted at the triggering event id.
     ///
-    /// Match the relay ingress marker rules: IDs must be 64 ASCII hex
-    /// characters, and a lone root marker without a reply is top-level.
+    /// Thread roots are resolved with [`parse_thread_tags`], i.e. Buzz's shared
+    /// [`buzz_core::nip10`] canonical-root rules — a malformed marker id is
+    /// ignored (treated as top-level), and a lone `root` marker with no `reply`
+    /// is top-level, matching relay ingest.
     ///
     /// The root id is normalized to lowercase before it becomes the scope key.
     /// The shared NIP-10 parser accepts and preserves uppercase ASCII hex
@@ -135,26 +133,9 @@ impl SessionScope {
             return Self::Conversation { channel_id };
         }
 
-        let mut root = None;
-        let mut reply = None;
-        for tag in event.tags.iter() {
-            let parts = tag.as_slice();
-            if parts.len() >= 4
-                && parts[0] == "e"
-                && parts[1].len() == 64
-                && parts[1].bytes().all(|byte| byte.is_ascii_hexdigit())
-            {
-                match parts[3].as_str() {
-                    "root" => root = Some(parts[1].clone()),
-                    "reply" => reply = Some(parts[1].clone()),
-                    _ => {}
-                }
-            }
-        }
-        let root_event_id = match (root, reply) {
-            (Some(root), Some(_)) => root,
-            (None, Some(reply)) => reply,
-            _ => event.id.to_hex(),
+        let root_event_id = match parse_thread_tags(event).root_event_id {
+            Some(root) => root,
+            None => event.id.to_hex(),
         };
         Self::Thread {
             channel_id,

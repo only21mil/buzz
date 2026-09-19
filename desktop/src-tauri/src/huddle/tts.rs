@@ -50,7 +50,7 @@ use super::human_floor::HumanFloor;
 use super::pocket::{
     load_text_to_speech, load_voice_style, DEFAULT_VOICE, SAMPLE_RATE, VOICE_FILE_EXT,
 };
-use super::preprocessing::{preprocess_for_tts, split_sentences};
+use super::preprocessing::preprocess_for_tts;
 
 #[path = "tts_voice_transition.rs"]
 mod voice_transition;
@@ -58,7 +58,6 @@ use super::tts_playback::*;
 #[path = "tts_append.rs"]
 mod append;
 use append::*;
-pub(crate) use voice_transition::TtsTextSender;
 use voice_transition::*;
 #[path = "tts_startup.rs"]
 mod startup;
@@ -74,6 +73,9 @@ mod pipeline_controls;
 #[path = "tts_speaker_cancellation.rs"]
 mod speaker_cancellation;
 use speaker_cancellation::*;
+#[path = "tts_streaming.rs"]
+mod streaming;
+use streaming::*;
 #[path = "tts_broadcast.rs"]
 mod broadcast;
 use broadcast::TtsBroadcasters;
@@ -483,7 +485,9 @@ fn tts_worker(
     // `tts_active` lifecycle: set on the first append while idle, cleared
     // whenever the player has fully drained — either in the idle timeout
     // arm or on item receipt before synthesis begins.
-
+    // EXPERIMENTAL (latency bench): `Some(emit_frames)` = stream PCM deltas
+    // out of Pocket as they are generated (see tts_streaming.rs).
+    let tts_streaming = streaming_emit_frames();
     let mut last_route_id = 0;
     let mut deferred_text = VecDeque::new();
     let append_context = TtsAppendContext {
@@ -721,10 +725,20 @@ fn tts_worker(
             continue;
         }
 
-        // Preserve the fork's first-sentence playback boundary; Pocket still
-        // applies its token limit inside each playback chunk below.
-        let sentences = split_sentences(&text);
-        let chunks = group_sentences_into_chunks(&sentences, 200);
+        // Let Pocket's tokenizer-aware splitter isolate the first sentence for
+        // minimum time-to-first-audio, then pack later sentences into the
+        // largest natural units within the model's exact 50-token limit. Once
+        // each unit is appended, generation of the next proceeds while rodio
+        // plays the already-queued audio.
+        let chunks = match engine.split_text_for_playback(&text) {
+            Ok(chunks) => chunks,
+            Err(_) => {
+                eprintln!(
+                    "buzz-desktop: tts stage=synthesis status=failed reason=chunking route_id={route_id}"
+                );
+                continue;
+            }
+        };
         if chunks.is_empty() {
             eprintln!(
                 "buzz-desktop: tts stage=synthesis status=empty reason=no_chunks route_id={route_id}"
@@ -758,6 +772,41 @@ fn tts_worker(
 
             let text = chunk.trim();
             if text.is_empty() {
+                continue;
+            }
+
+            // EXPERIMENTAL (latency bench): streaming synthesis path — see
+            // tts_streaming.rs for the mechanics and exactness constraints.
+            if let Some(emit_frames) = tts_streaming {
+                let outcome = synthesize_streaming(
+                    &engine,
+                    text,
+                    &style,
+                    emit_frames,
+                    (&cancel, &voice_cancel, &shutdown),
+                    StreamingPlayback {
+                        playback: &playback,
+                        route_id,
+                    },
+                    &mut |prepared| {
+                        if !append_audio(
+                            prepared,
+                            route_id,
+                            speaker_pubkey.as_deref(),
+                            speaker_generation,
+                            floor_epoch,
+                        ) {
+                            return false;
+                        }
+                        appended_audio = true;
+                        last_route_id = route_id;
+                        true
+                    },
+                );
+                if let Some(outcome) = outcome {
+                    synthesis_outcome = outcome;
+                    break 'playback_chunks;
+                }
                 continue;
             }
 
@@ -902,7 +951,3 @@ mod tests;
 #[cfg(test)]
 #[path = "tts_voice_selection_tests.rs"]
 mod voice_selection_tests;
-
-#[cfg(test)]
-#[path = "tts_admission_tests.rs"]
-mod admission_tests;

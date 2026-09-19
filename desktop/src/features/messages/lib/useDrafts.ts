@@ -1,4 +1,3 @@
-import { setPublicationScope } from "@/shared/api/publicationScope";
 import * as React from "react";
 
 import { discardQueuedAttachmentsForDraft } from "@/features/messages/lib/backgroundMediaUploadStore";
@@ -188,7 +187,6 @@ export function initDraftStore(pubkey: string, relayUrl = ""): void {
     _memCache = null;
     resetDraftAuthorities();
   }
-  setPublicationScope(pubkey, relayScope);
   currentPubkey = pubkey;
   currentRelayScope = relayScope;
   // Eagerly load to surface corruption errors in console at startup rather
@@ -201,7 +199,6 @@ export function initDraftStore(pubkey: string, relayUrl = ""): void {
  * Replaces the old `clearAllDrafts()`.
  */
 export function clearAllDrafts(): void {
-  setPublicationScope("", "", true);
   resetDraftAuthorities();
   currentPubkey = "";
   currentRelayScope = "";

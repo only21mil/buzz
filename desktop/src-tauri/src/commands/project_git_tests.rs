@@ -1,145 +1,111 @@
-use super::{compare_local_remote_status, snapshot_from_worktree};
-use crate::commands::project_git_exec::{build_test_git_auth_config, run_git};
+use super::super::project_git_file_content::validate_repo_file_path;
+use super::*;
 
 #[test]
-fn snapshot_reports_exact_commit_count_beyond_preview_limit() {
-    let auth = build_test_git_auth_config().expect("build test git config");
-    let root = tempfile::tempdir().expect("create test directory");
-    let repo = root.path();
-
-    run_git(&["init", "--initial-branch=main"], Some(repo), &auth).expect("initialize repository");
-    run_git(&["config", "user.name", "Buzz Test"], Some(repo), &auth).expect("configure user name");
-    run_git(
-        &["config", "user.email", "buzz-test@example.com"],
-        Some(repo),
-        &auth,
+fn parse_ls_tree_keeps_paths_after_eager_preview_limit() {
+    let repo_dir = tempfile::tempdir().expect("create temporary repository");
+    std::fs::create_dir(repo_dir.path().join("src")).expect("create source directory");
+    std::fs::write(repo_dir.path().join("README.md"), "# Deferred README")
+        .expect("write deferred README");
+    std::fs::write(
+        repo_dir.path().join("src/application.rs"),
+        "fn deferred() {}",
     )
-    .expect("configure user email");
+    .expect("write deferred source file");
+    let hidden_entries = (0..MAX_EAGER_FILE_PREVIEWS)
+        .map(|index| {
+            format!(
+                "100644 blob {} 1\t.agents/generated-{index:03}.txt",
+                "a".repeat(40)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let output = format!(
+        "{hidden_entries}\n100644 blob {} 17\tREADME.md\n100644 blob {} 16\tsrc/application.rs",
+        "b".repeat(40),
+        "c".repeat(40)
+    );
 
-    for index in 0..51 {
-        run_git(
-            &["commit", "--allow-empty", "-m", &format!("commit {index}")],
-            Some(repo),
-            &auth,
-        )
-        .expect("create commit");
-    }
+    let files = parse_ls_tree(repo_dir.path(), &output, &std::collections::HashMap::new());
 
-    let snapshot = snapshot_from_worktree(repo, &auth, Some("main"), Some("main"));
-
-    assert_eq!(snapshot.commits.len(), 50);
-    assert_eq!(snapshot.commit_count, Some(51));
+    assert_eq!(files.len(), MAX_EAGER_FILE_PREVIEWS + 2);
+    let readme = files
+        .iter()
+        .find(|file| file.path == "README.md")
+        .expect("README metadata remains visible");
+    assert_eq!(readme.preview_content, None);
+    assert_eq!(
+        read_preview_content(repo_dir.path(), &readme.path, readme.size).as_deref(),
+        Some("# Deferred README")
+    );
+    assert_eq!(
+        files.last().map(|file| file.path.as_str()),
+        Some("src/application.rs")
+    );
+    let source = files.last().expect("source metadata remains visible");
+    assert_eq!(source.preview_content, None);
+    assert_eq!(
+        read_preview_content(repo_dir.path(), &source.path, source.size).as_deref(),
+        Some("fn deferred() {}")
+    );
 }
 
 #[test]
-fn selected_branch_filters_non_branch_and_invalid_refs() {
-    for branch in [
-        "refs/tags/v1",
-        "refs/remotes/origin/main",
-        "feature//a",
-        "feature/.hidden",
-        "feature.lock",
-        "--help",
-    ] {
-        assert_eq!(
-            super::normalize_branch_option(Some(branch)),
-            None,
-            "{branch}"
-        );
-    }
+fn repo_file_paths_reject_traversal_and_absolute_paths() {
+    assert!(validate_repo_file_path("src/application.rs").is_ok());
+    assert!(validate_repo_file_path("../outside.txt").is_err());
+    assert!(validate_repo_file_path("src/../outside.txt").is_err());
+    assert!(validate_repo_file_path("/absolute.txt").is_err());
+}
+
+#[test]
+fn parse_ls_tree_counts_only_blobs_toward_eager_preview_limit() {
+    let repo_dir = tempfile::tempdir().expect("create temporary repository");
+    std::fs::write(repo_dir.path().join("application.rs"), "fn main() {}")
+        .expect("write preview file");
+    let non_blob_entries = (0..MAX_EAGER_FILE_PREVIEWS)
+        .map(|index| {
+            format!(
+                "160000 commit {} -\tvendor/dependency-{index:03}",
+                "a".repeat(40)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let output = format!(
+        "{non_blob_entries}\n100644 blob {} 12\tapplication.rs",
+        "b".repeat(40)
+    );
+
+    let files = parse_ls_tree(repo_dir.path(), &output, &std::collections::HashMap::new());
+
     assert_eq!(
-        super::normalize_branch_option(Some("refs/heads/feature/a")),
-        Some("feature/a".to_string())
+        files
+            .last()
+            .and_then(|file| file.preview_content.as_deref()),
+        Some("fn main() {}")
     );
 }
 
 #[test]
-fn sync_status_reports_stale_instead_of_up_to_date_when_fetch_fails() {
-    let auth = build_test_git_auth_config().expect("build test git config");
-    let root = tempfile::tempdir().expect("create test directory");
+fn parse_worktree_files_counts_only_files_toward_eager_preview_limit() {
+    let repo_dir = tempfile::tempdir().expect("create temporary repository");
+    std::fs::create_dir(repo_dir.path().join("directory")).expect("create directory");
+    let paths = (0..MAX_EAGER_FILE_PREVIEWS)
+        .map(|index| {
+            let path = format!("file-{index:03}.txt");
+            std::fs::write(repo_dir.path().join(&path), "preview").expect("write preview file");
+            path
+        })
+        .collect::<Vec<_>>();
+    let output = std::iter::once("directory")
+        .chain(paths.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join("\0");
 
-    // Seed a bare origin with one commit on main.
-    let origin = root.path().join("origin.git");
-    let origin_url = origin.to_str().expect("utf8 path").to_string();
-    run_git(&["init", "--bare", origin_url.as_str()], None, &auth).expect("initialize bare origin");
-    let seed = root.path().join("seed");
-    std::fs::create_dir_all(&seed).expect("create seed dir");
-    run_git(&["init", "--initial-branch=main"], Some(&seed), &auth).expect("initialize seed");
-    run_git(&["config", "user.name", "Buzz Test"], Some(&seed), &auth)
-        .expect("configure user name");
-    run_git(
-        &["config", "user.email", "buzz-test@example.com"],
-        Some(&seed),
-        &auth,
-    )
-    .expect("configure user email");
-    run_git(
-        &["commit", "--allow-empty", "-m", "seed"],
-        Some(&seed),
-        &auth,
-    )
-    .expect("create seed commit");
-    run_git(
-        &["remote", "add", "origin", origin_url.as_str()],
-        Some(&seed),
-        &auth,
-    )
-    .expect("add seed remote");
-    run_git(&["push", "origin", "main"], Some(&seed), &auth).expect("push seed");
-    run_git(
-        &[
-            "--git-dir",
-            origin_url.as_str(),
-            "symbolic-ref",
-            "HEAD",
-            "refs/heads/main",
-        ],
-        None,
-        &auth,
-    )
-    .expect("point origin HEAD at main");
+    let files = parse_worktree_files(repo_dir.path(), &output, &std::collections::HashMap::new());
 
-    // Clone, then break the remote URL so the status poll's fetch fails
-    // while the tracking ref stays cached.
-    let local = root.path().join("local");
-    let local_str = local.to_str().expect("utf8 path").to_string();
-    run_git(
-        &["clone", origin_url.as_str(), local_str.as_str()],
-        None,
-        &auth,
-    )
-    .expect("clone origin");
-    let missing = root.path().join("missing-origin.git");
-    let missing_url = missing.to_str().expect("utf8 path").to_string();
-    run_git(
-        &["remote", "set-url", "origin", missing_url.as_str()],
-        Some(&local),
-        &auth,
-    )
-    .expect("break origin url");
-
-    let status = compare_local_remote_status(&local, &missing_url, Some("main"), None, &auth);
-
-    assert!(
-        status.fetch_failed,
-        "broken origin must fail the poll fetch"
-    );
-    assert!(
-        status.fetch_error.is_some(),
-        "fetch failure must carry its message"
-    );
-    assert_eq!(status.ahead_count, 0);
-    assert_eq!(status.behind_count, 0);
-    assert_eq!(
-        status.pull_block_reason.as_deref(),
-        Some("Remote state may be stale. The last fetch failed."),
-        "stale tracking refs must not be called up to date",
-    );
-    assert_eq!(
-        status.push_block_reason.as_deref(),
-        Some("Remote state may be stale. The last fetch failed."),
-        "stale tracking refs must not be called already pushed",
-    );
-    assert!(!status.can_pull);
-    assert!(!status.can_push);
+    assert_eq!(files.len(), MAX_EAGER_FILE_PREVIEWS);
+    assert!(files.iter().all(|file| file.preview_content.is_some()));
 }

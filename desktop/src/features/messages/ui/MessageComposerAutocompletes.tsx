@@ -64,6 +64,7 @@ export function MessageComposerAutocompletes({
   return (
     <>
       <EmojiAutocomplete
+        composerOwnsFocus={composerOwnsFocus}
         onSelect={onEmojiSelect}
         selectedIndex={emojiAutocomplete.emojiSelectedIndex}
         suggestions={
@@ -73,6 +74,7 @@ export function MessageComposerAutocompletes({
         }
       />
       <ChannelAutocomplete
+        composerOwnsFocus={composerOwnsFocus}
         onSelect={onChannelSelect}
         selectedIndex={channelLinks.channelSelectedIndex}
         suggestions={

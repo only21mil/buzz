@@ -42,10 +42,10 @@ impl ApiError {
         }
     }
 
-    pub fn unavailable(message: &str) -> Self {
+    pub fn unprocessable(message: &str) -> Self {
         Self {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "roster_unavailable",
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "enforcement_failed",
             message: message.to_owned(),
         }
     }
@@ -104,8 +104,9 @@ impl IntoResponse for ApiError {
             }),
         )
             .into_response();
-        // Every 401 carries a challenge naming the only scheme this API
-        // accepts, so clients know what to present.
+        // RFC 9110 requires a challenge on every 401 so clients know which
+        // scheme to present. The admin API authenticates only via NIP-98, so
+        // the challenge is always `Nostr`.
         if self.status == StatusCode::UNAUTHORIZED {
             response.headers_mut().insert(
                 axum::http::header::WWW_AUTHENTICATE,
@@ -119,16 +120,5 @@ impl IntoResponse for ApiError {
 impl From<buzz_db::DbError> for ApiError {
     fn from(_: buzz_db::DbError) -> Self {
         Self::internal()
-    }
-}
-
-impl From<super::roster::RosterError> for ApiError {
-    fn from(error: super::roster::RosterError) -> Self {
-        match error {
-            // The roster migration has not landed: a deployment fact, not a
-            // client error and never an auth decision.
-            super::roster::RosterError::Unavailable(message) => Self::unavailable(message),
-            super::roster::RosterError::Internal(_) => Self::internal(),
-        }
     }
 }

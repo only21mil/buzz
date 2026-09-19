@@ -14,15 +14,6 @@ use serde_json::{json, Value};
 
 use crate::models::*;
 
-mod agent_directory;
-pub use agent_directory::{
-    managed_agent_pubkeys_from_events, member_agent_channel_ids_for_viewer,
-    relay_agents_from_directory_events, verified_agent_owners_from_profiles,
-};
-#[cfg(test)]
-use agent_directory::{
-    member_agent_channel_ids_from_events, relay_agents_from_managed_agent_events,
-};
 mod user_search;
 pub use user_search::{
     list_user_search_results, rank_user_search_results, search_users_from_events,
@@ -466,43 +457,11 @@ pub fn search_response_from_events(events: &[Event]) -> SearchResponse {
 
 /// Convert kind:10100 agent profile events to the agent discovery format.
 ///
-/// Policy-only records are not directory profiles. If historical duplicate
-/// replaceable events are returned, choose each author's newest event before
-/// deciding whether its content describes an agent.
-pub(super) fn event_has_agent_identity(event: &Event) -> bool {
-    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&event.content) else {
-        return false;
-    };
-    ["name", "display_name"].iter().any(|field| {
-        object
-            .get(*field)
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-    })
-}
-
+/// Returns a JSON array of `{pubkey, name, ...}` objects parsed from each
+/// event's content.
 pub fn agents_from_events(events: &[Event]) -> Value {
-    let mut latest: Vec<(usize, &Event)> = Vec::new();
-    for (index, event) in events.iter().enumerate() {
-        if let Some((_, previous)) = latest
-            .iter_mut()
-            .find(|(_, previous)| previous.pubkey == event.pubkey)
-        {
-            if event.created_at > previous.created_at
-                || (event.created_at == previous.created_at && event.id < previous.id)
-            {
-                *previous = event;
-            }
-        } else {
-            latest.push((index, event));
-        }
-    }
-    latest.sort_by_key(|(index, _)| *index);
-
-    let arr: Vec<Value> = latest
-        .into_iter()
-        .map(|(_, event)| event)
-        .filter(|event| event_has_agent_identity(event))
+    let arr: Vec<Value> = events
+        .iter()
         .map(|ev| {
             let mut v: Value = serde_json::from_str(&ev.content).unwrap_or_else(|_| json!({}));
             let pubkey = ev.pubkey.to_hex();
@@ -524,21 +483,14 @@ pub fn agents_from_events(events: &[Event]) -> Value {
                 if !obj.get("agent_type").is_some_and(Value::is_string) {
                     obj.insert("agent_type".to_string(), json!("agent"));
                 }
-                // These descriptive arrays must not poison typed directory
-                // decoding. Keep policy fields on their strict decode path.
-                for field in ["channels", "channel_ids", "capabilities"] {
-                    let strings = obj
-                        .get(field)
-                        .and_then(Value::as_array)
-                        .map(|values| {
-                            values
-                                .iter()
-                                .filter(|value| value.is_string())
-                                .cloned()
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    obj.insert(field.to_string(), Value::Array(strings));
+                if !obj.get("channels").is_some_and(Value::is_array) {
+                    obj.insert("channels".to_string(), json!([]));
+                }
+                if !obj.get("channel_ids").is_some_and(Value::is_array) {
+                    obj.insert("channel_ids".to_string(), json!([]));
+                }
+                if !obj.get("capabilities").is_some_and(Value::is_array) {
+                    obj.insert("capabilities".to_string(), json!([]));
                 }
                 if !obj.get("status").is_some_and(Value::is_string) {
                     obj.insert("status".to_string(), json!("offline"));
@@ -559,6 +511,15 @@ pub fn agents_from_events(events: &[Event]) -> Value {
         .collect();
     json!({ "agents": arr })
 }
+
+// ── kind:0 + kind:30177 managed-agent directory ────────────────────────────
+
+mod agent_directory;
+pub use agent_directory::{
+    managed_agent_pubkeys_from_events, member_agent_channel_ids_from_events,
+    relay_agents_from_directory_events, relay_agents_from_managed_agent_events,
+    verified_agent_owners_from_profiles,
+};
 
 // ── kind:13534 (relay membership list) ──────────────────────────────────────
 
@@ -645,7 +606,5 @@ fn days_to_ymd(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
-mod agent_directory_tests;
 #[cfg(test)]
 mod oa_profile_tests;

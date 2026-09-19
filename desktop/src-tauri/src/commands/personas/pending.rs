@@ -24,9 +24,10 @@ pub(super) struct PreparedPersonaPublication {
 /// The event is signed with the owner keys at call time, so its `created_at`
 /// is `now` — newer than any prior retained row, clearing the upsert's
 /// newer-or-equal guard. `pending_sync = 1` enqueues it for the flush loop,
-/// which is the sole publisher. The explicit catalog toggle uses
-/// [`prepare_persona_publication`] directly so its durable enqueue failure
-/// reaches the UI.
+/// which is the sole publisher. Best-effort: a failure here is logged and
+/// swallowed so a retention hiccup never blocks the disk-authoritative write.
+/// The explicit catalog toggle uses [`prepare_persona_publication`] directly
+/// so its durable enqueue failure reaches the UI.
 ///
 /// Unlike `retain_managed_agent_pending`, this has no projection-equality
 /// short-circuit: personas have no start/stop runtime churn, so a republish
@@ -35,20 +36,14 @@ pub(super) struct PreparedPersonaPublication {
 /// never republishes, while `set_persona_shared` must retain because the tag is
 /// relay-authoritative). A byte-identical user-save republish is harmlessly
 /// NIP-33-replaced. The guard is intentionally omitted.
-///
-/// Returns `Err` when the retention write fails (recovery mode / identity lost
-/// / keyring locked / disk unopenable). The caller MUST surface this to the
-/// user so they know the edit is local-only and not yet synced — a silent
-/// swallow here leaves `personas.json` holding the new prompt while the
-/// retention store has no row, so the next inbound `kind:30175` with an older
-/// `created_at` reverts the local edit (`retain_inbound_event` returns
-/// `Applied` when no local row exists). See issue f8fce672.
-pub(in crate::commands) fn retain_persona_pending<R: tauri::Runtime>(
-    app: &AppHandle<R>,
+pub(in crate::commands) fn retain_persona_pending(
+    app: &AppHandle,
     state: &AppState,
     persona: &AgentDefinition,
-) -> Result<(), String> {
-    prepare_persona_publication(app, state, persona, None).map(|_| ())
+) {
+    if let Err(e) = prepare_persona_publication(app, state, persona, None) {
+        eprintln!("buzz-desktop: persona-retain: {e}");
+    }
 }
 
 /// Scope-level persona retention: sign and durably enqueue a persona head in an
@@ -69,8 +64,8 @@ pub(in crate::commands) fn retain_persona_pending_at(
 /// exact share tag. The explicit share toggle passes `Some(shared)`. Returning
 /// the retained event lets that command immediately await relay acceptance
 /// without rebuilding or re-signing a different NIP-33 head.
-pub(super) fn prepare_persona_publication<R: tauri::Runtime>(
-    app: &AppHandle<R>,
+pub(super) fn prepare_persona_publication(
+    app: &AppHandle,
     state: &AppState,
     persona: &AgentDefinition,
     shared_override: Option<bool>,
@@ -109,7 +104,7 @@ fn retained_persona_is_shared(row: Option<&RetainedEvent>) -> bool {
 /// never present an unshared persona as published. The durable share state
 /// lives in the retention head, so nothing is lost: the true value reappears
 /// once the identity is signable again.
-pub(in crate::commands) fn project_active_persona_sharing(
+pub(super) fn project_active_persona_sharing(
     app: &AppHandle,
     state: &AppState,
     personas: &mut [AgentDefinition],
@@ -181,13 +176,13 @@ pub(super) fn prepare_persona_publication_at(
     let mut scoped_persona = persona.clone();
     scoped_persona.shared =
         shared_override.unwrap_or_else(|| retained_persona_is_shared(existing.as_ref()));
-    // Validate the authoritative outgoing share state, including ordinary
-    // edits to an already-shared head, before signing or retaining it. An
-    // explicit unshare must remain possible for an invalid legacy definition.
     if scoped_persona.shared {
         crate::managed_agents::validate_agent_definition_text(
             &scoped_persona.display_name,
             &scoped_persona.system_prompt,
+        )?;
+        crate::managed_agents::validate_agent_description_text(
+            scoped_persona.description.as_deref(),
         )?;
     }
     let event = build_persona_event(&scoped_persona)?
@@ -315,6 +310,8 @@ mod tests {
 
     fn persona() -> AgentDefinition {
         AgentDefinition {
+            session_policy: Default::default(),
+            description: None,
             id: "catalog-reviewer".to_string(),
             display_name: "Catalog Reviewer".to_string(),
             avatar_url: None,
@@ -471,59 +468,6 @@ mod tests {
             .expect_err("sharing must reject an invisible instruction character");
 
         assert!(error.contains("U+200B"));
-        let conn = open_retention_db(&db_path).unwrap();
-        assert!(get_retained_event(
-            &conn,
-            KIND_PERSONA,
-            &keys.public_key().to_hex(),
-            "catalog-reviewer",
-        )
-        .unwrap()
-        .is_none());
-    }
-
-    #[test]
-    fn shared_definition_edit_rejects_invisible_text_without_replacing_head() {
-        let dir = tempfile::tempdir().unwrap();
-        let keys = nostr::Keys::generate();
-        let db_path = dir.path().join("retention.sqlite3");
-        let (_, original, _) =
-            prepare_persona_publication_at(&db_path, &keys, &persona(), Some(true)).unwrap();
-        let mut unsafe_persona = persona();
-        // The local flag is false; the retained scope is the authority.
-        unsafe_persona.display_name = "Catalog\u{200B} Reviewer".to_string();
-
-        let error = prepare_persona_publication_at(&db_path, &keys, &unsafe_persona, None)
-            .expect_err("an ordinary edit must validate the retained shared state");
-        assert!(error.contains("U+200B"));
-        let conn = open_retention_db(&db_path).unwrap();
-        let retained = get_retained_event(
-            &conn,
-            KIND_PERSONA,
-            &keys.public_key().to_hex(),
-            "catalog-reviewer",
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(retained.raw_event, original.raw_event);
-    }
-
-    #[test]
-    fn unshare_allows_revoking_an_invisible_legacy_definition() {
-        let dir = tempfile::tempdir().unwrap();
-        let keys = nostr::Keys::generate();
-        let db_path = dir.path().join("retention.sqlite3");
-        prepare_persona_publication_at(&db_path, &keys, &persona(), Some(true)).unwrap();
-        let mut unsafe_persona = persona();
-        unsafe_persona.shared = true;
-        unsafe_persona.system_prompt = "Review\u{200B} the catalog.".to_string();
-
-        let (event, retained, unshared) =
-            prepare_persona_publication_at(&db_path, &keys, &unsafe_persona, Some(false))
-                .expect("validation must not prevent revoking catalog visibility");
-        assert!(!buzz_core_pkg::kind::event_is_shared(&event));
-        assert!(!unshared.shared);
-        assert!(retained.pending_sync);
     }
 
     /// Seed a retained 30175 persona head dated `created_at` seconds since

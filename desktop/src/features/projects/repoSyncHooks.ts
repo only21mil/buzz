@@ -1,5 +1,3 @@
-import { useFocusedRefetchInterval } from "@/shared/lib/useDocumentVisible";
-import { isTauri } from "@tauri-apps/api/core";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
@@ -13,6 +11,7 @@ import type {
   Repository as Project,
 } from "@/features/projects/hooks";
 import { useProjectRepoHost } from "@/features/projects/useProjectRepoHost";
+import { useFocusedRefetchInterval } from "@/shared/lib/useDocumentVisible";
 import { publishProjectPullRequestUpdate } from "./pullRequestMutations";
 
 /** Local-vs-remote git sync status for a project checkout (ahead/behind
@@ -25,14 +24,13 @@ export function useProjectRepoSyncStatusQuery(
   branchName?: string | null,
   baseBranch?: string | null,
 ) {
-  const refetchInterval = useFocusedRefetchInterval(60_000);
   const selectedBranch = branchName ?? project?.defaultBranch ?? null;
+  const refetchInterval = useFocusedRefetchInterval(60_000);
   const selectedBaseBranch = baseBranch ?? project?.defaultBranch ?? null;
   const host = useProjectRepoHost(project);
 
   return useQuery({
-    enabled:
-      isTauri() && Boolean(host.kind === "buzz" && project?.cloneUrls[0]),
+    enabled: Boolean(host.kind === "buzz" && project?.cloneUrls[0]),
     queryKey: [
       "project",
       project?.id ?? "none",
@@ -53,7 +51,7 @@ export function useProjectRepoSyncStatusQuery(
     },
     staleTime: 10_000,
     refetchInterval,
-    refetchOnWindowFocus: true,
+    refetchOnWindowFocus: false,
     retry: 1,
   });
 }
@@ -101,7 +99,7 @@ export function usePushProjectLocalRepositoryMutation(
             error:
               error instanceof Error
                 ? error.message
-                : "The pull request update could not be published.",
+                : "The review update could not be published.",
           };
         }
       }
@@ -120,7 +118,6 @@ export function usePushProjectLocalRepositoryMutation(
 export function useCloneProjectRepositoryMutation(
   project: Project | null | undefined,
   reposDir?: string | null,
-  branchName?: string | null,
 ) {
   const queryClient = useQueryClient();
   return useMutation({
@@ -130,7 +127,7 @@ export function useCloneProjectRepositoryMutation(
         reposDir,
         projectDtag: project.dtag,
         cloneUrl: project.cloneUrls[0],
-        defaultBranch: branchName ?? project.defaultBranch,
+        defaultBranch: project.defaultBranch,
       });
     },
     onSuccess: async () => {

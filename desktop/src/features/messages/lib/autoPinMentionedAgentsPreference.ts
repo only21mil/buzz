@@ -4,7 +4,7 @@ import { resetPersistentAgentAudienceStore } from "./persistentAgentAudience";
 
 export const KEEP_MENTIONED_AGENTS_PINNED_STORAGE_KEY =
   "buzz.messages.keepMentionedAgentsPinned";
-const DEFAULT_KEEP_MENTIONED_AGENTS_PINNED = false;
+export const DEFAULT_KEEP_MENTIONED_AGENTS_PINNED = false;
 
 const listeners = new Set<() => void>();
 let keepMentionedAgentsPinned = readStoredPreference();

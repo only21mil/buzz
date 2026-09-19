@@ -1,4 +1,3 @@
-import { hasLocalTeamStorage } from "./teamStorageCapability";
 import * as React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
@@ -23,13 +22,13 @@ import { KIND_TEAM_CATALOG } from "@/shared/constants/kinds";
  * personas as well as teams, so it invalidates both stores.
  */
 
-function teamCatalogQueryKey(communityId: string | null) {
+export function teamCatalogQueryKey(communityId: string | null) {
   return ["team-catalog", communityId] as const;
 }
 
 export function useTeamCatalogQuery(communityId: string | null) {
   return useQuery<TeamCatalogPublication[]>({
-    enabled: communityId !== null && hasLocalTeamStorage(),
+    enabled: communityId !== null,
     queryKey: teamCatalogQueryKey(communityId),
     queryFn: fetchTeamCatalogPublications,
     staleTime: 30_000,
@@ -41,7 +40,7 @@ export function useTeamCatalogLiveUpdates(communityId: string | null): void {
   const queryClient = useQueryClient();
 
   React.useEffect(() => {
-    if (!communityId || !hasLocalTeamStorage()) return;
+    if (!communityId) return;
     let disposed = false;
     let dispose: (() => Promise<void>) | null = null;
 

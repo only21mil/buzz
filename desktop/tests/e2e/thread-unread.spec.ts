@@ -773,7 +773,7 @@ test.describe("thread unread indicator", () => {
     await expect(page.getByTestId("chat-title")).toHaveText("all-replies");
 
     // The crux: leave the channel. Its unopened thread reply should still keep
-    // a channel sidebar dot until the thread itself is read.
+    // a channel sidebar unread indicator until the thread itself is read.
     await page.getByTestId("channel-general").click();
     await expect(page.getByTestId("chat-title")).toHaveText("general");
     await expect(page.getByTestId("channel-all-replies")).toHaveCSS(

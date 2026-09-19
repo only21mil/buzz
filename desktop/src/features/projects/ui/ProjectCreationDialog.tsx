@@ -1,22 +1,19 @@
-import { isTauri } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 
+import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useCreateProjectMutation } from "@/features/projects/useCreateProject";
 import { CreateProjectDialog } from "@/features/projects/ui/CreateProjectDialog";
 
-/** Shared creation flow for the populated and first-run project views. */
+/** Shared project-creation flow for populated and first-run project views. */
 export function ProjectCreationDialog({
-  onCreated,
   onOpenChange,
   open,
 }: {
-  onCreated: () => void;
   onOpenChange: (open: boolean) => void;
   open: boolean;
 }) {
+  const { goProject } = useAppNavigation();
   const createProjectMutation = useCreateProjectMutation();
-
-  if (!isTauri()) return null;
 
   return (
     <CreateProjectDialog
@@ -30,7 +27,7 @@ export function ProjectCreationDialog({
         } else {
           toast.success(`Project "${result.project.name}" created.`);
         }
-        onCreated();
+        await goProject(result.project.id);
       }}
       onOpenChange={onOpenChange}
       open={open}

@@ -7,7 +7,6 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
-import '../../shared/audio/microphone_capture.dart';
 import '../../shared/relay/app_lifecycle_provider.dart';
 import '../../shared/theme/theme.dart';
 import 'voice_note_recording.dart';
@@ -36,7 +35,6 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final recorder = useMemoized(ref.read(voiceNoteRecorderFactoryProvider));
-    final microphoneCapture = ref.read(microphoneCaptureProvider);
     final samples = useState<List<double>>(const []);
     final sampleSequence = useState(0);
     final elapsed = useState(Duration.zero);
@@ -44,20 +42,9 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
     final isStarted = useState(false);
     final isStopping = useState(false);
     final startedAt = useRef<DateTime?>(null);
-    final cancelled = useRef(false);
-    void cancel() {
-      cancelled.value = true;
-      unawaited(
-        recorder.cancel().catchError((Object _) {
-          // Unmount cleanup still attempts native disposal after cancel fails.
-        }),
-      );
-      if (context.mounted) onCancel();
-    }
-
     final routeAware = useMemoized(
       () => _VoiceNoteRouteAware(() {
-        cancel();
+        if (context.mounted) onCancel();
       }),
       [onCancel],
     );
@@ -71,7 +58,8 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
             next != AppLifecycleState.detached) {
           return;
         }
-        cancel();
+        unawaited(recorder.cancel());
+        if (context.mounted) onCancel();
       });
       return subscription.close;
     }, [recorder, onCancel]);
@@ -88,13 +76,13 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
       unawaited(HapticFeedback.mediumImpact());
       try {
         final recording = await recorder.stop();
-        if (context.mounted && !cancelled.value) {
+        if (context.mounted) {
           onRecorded(recording);
         } else {
           await deleteDroppedVoiceNoteRecording(recording.file.path);
         }
       } catch (_) {
-        if (context.mounted && !cancelled.value) {
+        if (context.mounted) {
           error.value = 'Buzz could not finish the voice note.';
           isStopping.value = false;
         }
@@ -103,7 +91,6 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
 
     useEffect(() {
       var active = true;
-      final releaseMicrophone = microphoneCapture.acquire();
       final levelSubscription = recorder.levels.listen((level) {
         if (!active) return;
         final nextSamples = [...samples.value, level];
@@ -120,9 +107,6 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
       });
       unawaited(() async {
         try {
-          if (releaseMicrophone == null) {
-            throw StateError('Finish the current microphone session first.');
-          }
           await recorder.start();
           if (active) {
             startedAt.value = DateTime.now();
@@ -139,25 +123,14 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
       }());
       return () {
         active = false;
-        cancelled.value = true;
         timer.cancel();
         unawaited(levelSubscription.cancel());
         unawaited(() async {
-          try {
-            await recorder.cancel();
-          } catch (_) {
-            // Native disposal below remains responsible for releasing capture.
-          }
-          try {
-            await recorder.dispose();
-          } catch (_) {
-            // Keep capture owned when native release fails.
-            return;
-          }
-          releaseMicrophone?.call();
+          await recorder.cancel();
+          await recorder.dispose();
         }());
       };
-    }, [recorder, microphoneCapture]);
+    }, [recorder]);
 
     final reducedMotion = MediaQuery.disableAnimationsOf(context);
     return Row(
@@ -169,7 +142,7 @@ class VoiceNoteComposerRecorder extends HookConsumerWidget {
           icon: LucideIcons.x,
           foreground: context.colors.onSurfaceVariant,
           background: context.colors.surface,
-          onPressed: isStopping.value ? null : cancel,
+          onPressed: isStopping.value ? null : onCancel,
         ),
         const SizedBox(width: Grid.half),
         if (error.value case final message?)

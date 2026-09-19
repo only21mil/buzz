@@ -1,5 +1,5 @@
-import type { PublicationScope } from "@/shared/api/publicationScope";
 import * as React from "react";
+import { toast } from "sonner";
 
 import type {
   useDeleteMessageMutation,
@@ -8,7 +8,10 @@ import type {
   useToggleReactionMutation,
 } from "@/features/messages/hooks";
 import { resolveThreadReplyTarget } from "@/features/messages/hooks";
+import { getSendToChannelSemantics } from "@/features/messages/lib/sendToChannelSemantics";
+import { summarizeThreadRoot } from "@/features/messages/lib/sentFromThread";
 import type { TimelineMessage } from "@/features/messages/types";
+import type { UserProfileLookup } from "@/features/profile/lib/identity";
 
 /**
  * Stable callback references for ChannelPane so that keystroke-driven
@@ -22,10 +25,12 @@ export function useChannelPaneHandlers({
   deleteMessageMutation,
   editMessageMutation,
   editTargetId,
+  editTargetIsThreadReply,
   expandedThreadReplyIds,
   getFirstReplyIdForMessage,
   getReplyDescendantIdsForMessage,
   markRevealedRepliesRead,
+  profiles,
   recordThreadInteraction,
   onOptimisticOpenThreadHeadIdChange,
   onRequestEmptyEditDelete,
@@ -42,10 +47,12 @@ export function useChannelPaneHandlers({
   deleteMessageMutation: ReturnType<typeof useDeleteMessageMutation>;
   editMessageMutation: ReturnType<typeof useEditMessageMutation>;
   editTargetId: string | null;
+  editTargetIsThreadReply: boolean;
   expandedThreadReplyIds: ReadonlySet<string>;
   getFirstReplyIdForMessage: (messageId: string) => string | null;
   getReplyDescendantIdsForMessage: (messageId: string) => string[];
   markRevealedRepliesRead: (messageId: string) => void;
+  profiles: UserProfileLookup | undefined;
   recordThreadInteraction: (rootId: string) => void;
   onOptimisticOpenThreadHeadIdChange: React.Dispatch<
     React.SetStateAction<string | null | undefined>
@@ -70,9 +77,14 @@ export function useChannelPaneHandlers({
 
   const editTargetIdRef = React.useRef(editTargetId);
   editTargetIdRef.current = editTargetId;
+  const editTargetIsThreadReplyRef = React.useRef(editTargetIsThreadReply);
+  editTargetIsThreadReplyRef.current = editTargetIsThreadReply;
 
   const expandedThreadReplyIdsRef = React.useRef(expandedThreadReplyIds);
   expandedThreadReplyIdsRef.current = expandedThreadReplyIds;
+
+  const profilesRef = React.useRef(profiles);
+  profilesRef.current = profiles;
 
   const sendMutateRef = React.useRef(sendMessageMutation.mutateAsync);
   sendMutateRef.current = sendMessageMutation.mutateAsync;
@@ -110,7 +122,16 @@ export function useChannelPaneHandlers({
     setThreadReplyTargetId(openThreadHeadIdRef.current);
   }, [setThreadReplyTargetId]);
 
+  const requireThreadEditResolution = React.useCallback(() => {
+    if (!editTargetIsThreadReplyRef.current) return true;
+    toast.info("Finish or cancel your edit before leaving the thread.");
+    return false;
+  }, []);
+
   const handleCloseThread = React.useCallback(() => {
+    if (!requireThreadEditResolution()) {
+      return;
+    }
     deferPanelState(() => {
       onOptimisticOpenThreadHeadIdChange(null);
       setOpenThreadHeadId(null);
@@ -121,6 +142,7 @@ export function useChannelPaneHandlers({
   }, [
     deferPanelState,
     onOptimisticOpenThreadHeadIdChange,
+    requireThreadEditResolution,
     setExpandedThreadReplyIds,
     setOpenThreadHeadId,
     setThreadReplyTargetId,
@@ -128,6 +150,8 @@ export function useChannelPaneHandlers({
   ]);
 
   const handleCancelEdit = React.useCallback(() => {
+    editTargetIdRef.current = null;
+    editTargetIsThreadReplyRef.current = false;
     setEditTargetId(null);
   }, [setEditTargetId]);
 
@@ -152,7 +176,6 @@ export function useChannelPaneHandlers({
       mediaTags?: string[][],
       mentionPubkeys?: string[],
       capturedEventId?: string,
-      publicationScope?: PublicationScope,
     ) => {
       const eventId = capturedEventId ?? editTargetIdRef.current;
       if (!eventId) {
@@ -176,7 +199,6 @@ export function useChannelPaneHandlers({
       }
 
       await editMessageMutation.mutateAsync({
-        publicationScope,
         eventId,
         content,
         mediaTags,
@@ -193,6 +215,7 @@ export function useChannelPaneHandlers({
 
   const handleOpenThread = React.useCallback(
     (message: { id: string }) => {
+      if (!requireThreadEditResolution()) return;
       if (openThreadHeadIdRef.current === message.id) {
         deferPanelState(() => {
           onOptimisticOpenThreadHeadIdChange(null);
@@ -217,6 +240,7 @@ export function useChannelPaneHandlers({
     [
       deferPanelState,
       onOptimisticOpenThreadHeadIdChange,
+      requireThreadEditResolution,
       setEditTargetId,
       setExpandedThreadReplyIds,
       setOpenThreadHeadId,
@@ -283,15 +307,36 @@ export function useChannelPaneHandlers({
         parentEventId: string | null;
         threadHeadId: string | null;
       } | null,
-      _forceRest?: boolean,
-      publicationScope?: PublicationScope,
+      forceRest?: boolean,
     ) => {
       await sendMutateRef.current({
         content,
         mentionPubkeys,
         mediaTags,
         channelId: channelId ?? undefined,
-        publicationScope,
+        forceRest,
+      });
+    },
+    [],
+  );
+
+  const handleSendToChannel = React.useCallback(
+    async (
+      message: TimelineMessage,
+      threadRoot: TimelineMessage,
+      channelId: string,
+    ) => {
+      const { mentionPubkeys, semanticTags } = getSendToChannelSemantics(
+        message,
+        profilesRef.current,
+      );
+      await sendMutateRef.current({
+        channelId,
+        content: message.body,
+        mediaTags: semanticTags,
+        mentionPubkeys,
+        sentFromThreadRootExcerpt: summarizeThreadRoot(threadRoot.body),
+        sentFromThreadRootId: threadRoot.id,
       });
     },
     [],
@@ -307,8 +352,7 @@ export function useChannelPaneHandlers({
         parentEventId: string | null;
         threadHeadId: string | null;
       } | null,
-      _forceRest?: boolean,
-      publicationScope?: PublicationScope,
+      forceRest?: boolean,
     ) => {
       // Resolve target using captured submit-time context (race-free) or live
       // refs (legacy path). When threadContext is supplied, no live-ref reads
@@ -341,7 +385,7 @@ export function useChannelPaneHandlers({
         parentEventId,
         mediaTags,
         channelId: channelId ?? undefined,
-        publicationScope,
+        forceRest,
       });
 
       // Only update thread UI state if the user is still viewing the same
@@ -388,7 +432,9 @@ export function useChannelPaneHandlers({
     handleEditSave,
     handleExpandThreadReplies,
     handleOpenThread,
+    requireThreadEditResolution,
     handleSendMessage,
+    handleSendToChannel,
     handleSendThreadReply,
     handleSelectThreadReplyTarget,
     handleToggleReaction,

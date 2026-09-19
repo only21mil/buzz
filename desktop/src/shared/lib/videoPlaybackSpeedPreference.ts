@@ -13,14 +13,14 @@ export const VIDEO_PLAYBACK_SPEEDS = [
 ] as const;
 
 /** Playback speed used when no valid saved preference exists. */
-const DEFAULT_VIDEO_PLAYBACK_SPEED = 1;
+export const DEFAULT_VIDEO_PLAYBACK_SPEED = 1;
 
 const listeners = new Set<() => void>();
 let videoPlaybackSpeed: number | null = null;
 let listeningForStorageChanges = false;
 
 /** True for speeds the control can actually represent. */
-function isVideoPlaybackSpeed(speed: number): boolean {
+export function isVideoPlaybackSpeed(speed: number): boolean {
   return VIDEO_PLAYBACK_SPEEDS.some((option) => option === speed);
 }
 

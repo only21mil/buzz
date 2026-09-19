@@ -19,6 +19,7 @@ import 'package:buzz/features/channels/unread_badge/observed_unread_event.dart';
 import 'package:buzz/features/profile/profile_avatar.dart';
 import 'package:buzz/features/profile/profile_provider.dart';
 import 'package:buzz/shared/profile/user_profile.dart';
+import 'package:buzz/shared/utils/string_utils.dart';
 import 'package:buzz/shared/auth/auth.dart';
 import 'package:buzz/shared/community/community_icon_provider.dart';
 import 'package:buzz/shared/relay/relay.dart';
@@ -42,11 +43,14 @@ void main() {
     Gradient? topSectionGradient,
     ValueChanged<double>? onSettingsTransitionProgress,
     ValueListenable<int>? tabReselection,
+    _FakeProfileNotifier? profile,
   }) {
     return ProviderScope(
       overrides: [
-        // Provide a fake profile and presence so the avatar doesn't hit the network.
-        profileProvider.overrideWith(() => _FakeProfileNotifier()),
+        // Provide a fake profile and presence so the avatar doesn't hit the
+        // network. [profile] swaps the current user for tests keyed to a
+        // different identity (the page reads its pubkey from profileProvider).
+        profileProvider.overrideWith(() => profile ?? _FakeProfileNotifier()),
         presenceProvider.overrideWith(() => _FakePresenceNotifier()),
         communityIconProvider.overrideWith((ref, relayUrl) async {
           onCommunityIconLoad?.call(relayUrl);
@@ -124,17 +128,51 @@ void main() {
       createdBy: 'abc',
       createdAt: DateTime(2025),
       memberCount: 2,
-      participants: const ['Test', 'Alice'],
-      participantPubkeys: const ['aabb', 'alice'],
+      participants: const ['Alice', 'Test'],
+      participantPubkeys: const ['alice', 'aabb'],
       isMember: true,
     ),
   ];
 
   testWidgets('shows grouped channel list when data loads', (tester) async {
+    // Valid fixture keys whose npub encodings were verified against the
+    // NIP-19 codec independently of the code under test.
+    const a11ce =
+        'a11ce00000000000000000000000000000000000000000000000000000000000';
+    const b0b =
+        'b0b0000000000000000000000000000000000000000000000000000000000000';
+    final unnamedDm = Channel(
+      id: 'dm-unnamed',
+      name: 'DM',
+      channelType: 'dm',
+      visibility: 'open',
+      description: 'Direct message',
+      createdBy: 'aabb',
+      createdAt: DateTime(2025),
+      memberCount: 2,
+      participants: [shortPubkey(a11ce), 'Test'],
+      participantPubkeys: const [a11ce, 'aabb'],
+      isMember: true,
+    );
+    final groupDm = Channel(
+      id: 'dm-group',
+      name: 'Group DM',
+      channelType: 'dm',
+      visibility: 'open',
+      description: 'Direct message',
+      createdBy: 'aabb',
+      createdAt: DateTime(2025),
+      memberCount: 3,
+      participants: [shortPubkey(a11ce), shortPubkey(b0b), 'Test'],
+      participantPubkeys: const [a11ce, b0b, 'aabb'],
+      isMember: true,
+    );
     await tester.pumpWidget(
       buildTestable(
         overrides: [
-          channelsProvider.overrideWith(() => _FakeNotifier(testChannels)),
+          channelsProvider.overrideWith(
+            () => _FakeNotifier([...testChannels, unnamedDm, groupDm]),
+          ),
         ],
       ),
     );
@@ -152,6 +190,26 @@ void main() {
     expect(find.byIcon(LucideIcons.ellipsisVertical), findsWidgets);
     expect(find.byIcon(LucideIcons.arrowUpDown), findsNothing);
     expect(find.byTooltip('DMs options'), findsOneWidget);
+
+    // DM identity display: the unnamed counterpart tile renders its
+    // compact npub label, but its avatar initial stays keyed to the hex
+    // public key — never the `N` the npub label starts with. The named
+    // tile keeps its authored initial from the positional participant
+    // label even without a cached profile.
+    expect(find.text(shortPubkey(a11ce)), findsOneWidget);
+    expect(_dmTileAvatarInitial(tester, shortPubkey(a11ce)), 'A');
+    expect(_dmTileAvatarInitial(tester, 'Alice'), 'A');
+    // A multi-counterpart DM still takes the group count badge — the
+    // single-counterpart avatar above is not shared with it.
+    final groupTile = _dmTileFor('${shortPubkey(a11ce)}, ${shortPubkey(b0b)}');
+    expect(
+      find.descendant(of: groupTile, matching: find.byType(AvatarImage)),
+      findsNothing,
+    );
+    expect(
+      find.descendant(of: groupTile, matching: find.text('2')),
+      findsOneWidget,
+    );
 
     await tester.tap(find.byTooltip('Channels options'));
     await tester.pumpAndSettle();
@@ -195,6 +253,103 @@ void main() {
     expect(sectionTitle.style?.fontWeight, FontWeight.w600);
   });
 
+  testWidgets('keys DM tile fallback avatars to the non-self counterpart', (
+    tester,
+  ) async {
+    // Valid fixture keys whose npub encodings were verified against the
+    // NIP-19 codec independently of the code under test. The current user
+    // (aabb, from the fake profile) is listed FIRST — member order does
+    // not guarantee the counterpart is first — so an avatar that keys off
+    // the first participant would identify the current user while the
+    // label beside it identifies the counterpart.
+    const b0b =
+        'b0b0000000000000000000000000000000000000000000000000000000000000';
+    final selfFirstUnnamedDm = Channel(
+      id: 'dm-self-first-unnamed',
+      name: 'DM',
+      channelType: 'dm',
+      visibility: 'open',
+      description: 'Direct message',
+      createdBy: 'aabb',
+      createdAt: DateTime(2025),
+      memberCount: 2,
+      participants: ['Test', shortPubkey(b0b)],
+      participantPubkeys: const ['aabb', b0b],
+      isMember: true,
+    );
+    final selfFirstNamedDm = Channel(
+      id: 'dm-self-first-named',
+      name: 'DM',
+      channelType: 'dm',
+      visibility: 'open',
+      description: 'Direct message',
+      createdBy: 'aabb',
+      createdAt: DateTime(2025),
+      memberCount: 2,
+      participants: const ['Test', 'Dana'],
+      participantPubkeys: const ['aabb', b0b],
+      isMember: true,
+    );
+    await tester.pumpWidget(
+      buildTestable(
+        overrides: [
+          channelsProvider.overrideWith(
+            () => _FakeNotifier([selfFirstUnnamedDm, selfFirstNamedDm]),
+          ),
+        ],
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    // Label and avatar agree on the counterpart's key: the compact npub
+    // names the unnamed counterpart, and the avatar initial is keyed to
+    // that same hex key — never the current user's `A`.
+    expect(find.text(shortPubkey(b0b)), findsOneWidget);
+    expect(_dmTileAvatarInitial(tester, shortPubkey(b0b)), 'B');
+    // A named counterpart listed second keeps its authored initial too —
+    // `D`, not its key's `B`, proves the name is the initial's source.
+    expect(_dmTileAvatarInitial(tester, 'Dana'), 'D');
+  });
+
+  testWidgets('keys the self-DM tile avatar to the current user key', (
+    tester,
+  ) async {
+    // A self-DM lists only the current user, so the tile label falls back
+    // to the sole participant — the compact npub of the current user's
+    // own key.
+    const b0b =
+        'b0b0000000000000000000000000000000000000000000000000000000000000';
+    final selfDm = Channel(
+      id: 'dm-self',
+      name: 'DM',
+      channelType: 'dm',
+      visibility: 'open',
+      description: 'Direct message',
+      createdBy: b0b,
+      createdAt: DateTime(2025),
+      memberCount: 1,
+      participants: [shortPubkey(b0b)],
+      participantPubkeys: const [b0b],
+      isMember: true,
+    );
+    await tester.pumpWidget(
+      buildTestable(
+        // The tile reads the current user's pubkey from profileProvider, so
+        // the self-DM needs the fake profile keyed to the same participant.
+        profile: _FakeProfileNotifier(pubkey: b0b),
+        overrides: [
+          channelsProvider.overrideWith(() => _FakeNotifier([selfDm])),
+        ],
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    // The compact-npub label and its avatar identify the same key: the
+    // hex-key initial `B`, never the `N` the npub label starts with.
+    expect(find.text(shortPubkey(b0b)), findsOneWidget);
+    expect(_dmTileAvatarInitial(tester, shortPubkey(b0b)), 'B');
+  });
+
   testWidgets('sizes the community header for accessible text', (tester) async {
     await tester.pumpWidget(
       buildTestable(
@@ -231,6 +386,55 @@ void main() {
       ),
     );
     expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('interrupts a ballistic scroll from a transparent list gap', (
+    tester,
+  ) async {
+    tester.view.physicalSize = const Size(320, 480);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+    final channels = List.generate(
+      40,
+      (index) => Channel(
+        id: 'channel-$index',
+        name: 'channel-$index',
+        channelType: 'stream',
+        visibility: 'open',
+        description: 'Channel $index',
+        createdBy: 'abc',
+        createdAt: DateTime(2025),
+        memberCount: 10,
+        isMember: true,
+      ),
+    );
+    await tester.pumpWidget(
+      buildTestable(
+        overrides: [
+          channelsProvider.overrideWith(() => _FakeNotifier(channels)),
+        ],
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final scrollView = find.byType(CustomScrollView);
+    final scrollable = tester.state<ScrollableState>(
+      find.descendant(of: scrollView, matching: find.byType(Scrollable)).first,
+    );
+    await tester.fling(scrollView, const Offset(0, -300), 2400);
+    await tester.pump(const Duration(milliseconds: 32));
+    final ballisticOffset = scrollable.position.pixels;
+    await tester.pump(const Duration(milliseconds: 32));
+    expect(scrollable.position.pixels, greaterThan(ballisticOffset));
+
+    // x=1 is inside the scroll viewport but outside the padded section rows.
+    // A drag beginning here must still enter the scrollable's gesture arena.
+    final interruptingDrag = await tester.startGesture(const Offset(1, 300));
+    await interruptingDrag.moveBy(const Offset(0, 80));
+    await tester.pump();
+
+    expect(scrollable.position.pixels, lessThan(ballisticOffset));
+    await interruptingDrag.up();
   });
 
   testWidgets('keeps the last channel above the floating tab bar', (
@@ -555,7 +759,7 @@ void main() {
     expect(skeletonSectionLabelX, sectionLabelX);
   });
 
-  testWidgets('matches the community and profile avatar circle sizes', (
+  testWidgets('centers the smaller profile avatar beside the community', (
     tester,
   ) async {
     await tester.pumpWidget(
@@ -578,7 +782,15 @@ void main() {
     );
 
     expect(tester.getSize(communityAvatar), const Size.square(40));
-    expect(tester.getSize(profileAvatar), const Size.square(40));
+    expect(tester.getSize(profileAvatar), const Size.square(36));
+    expect(
+      tester.widget<MaskedAvatarBadge>(profileAvatar).badge,
+      isNull,
+      reason: 'The current user does not need an online dot on Home.',
+    );
+    final communityRect = tester.getRect(communityAvatar);
+    final profileRect = tester.getRect(profileAvatar);
+    expect(profileRect.center.dy, communityRect.center.dy);
   });
 
   testWidgets('reveals channel content from same-slot reconnect skeletons', (
@@ -2460,9 +2672,15 @@ class _ReconnectingRelaySession extends RelaySessionNotifier {
 }
 
 class _FakeProfileNotifier extends ProfileNotifier {
+  _FakeProfileNotifier({this.pubkey = 'aabb'});
+
+  /// Current-user pubkey; the default keeps the historical 'aabb' fake used
+  /// by the other tile tests. The display name stays 'Test'.
+  final String pubkey;
+
   @override
   Future<UserProfile?> build() async =>
-      const UserProfile(pubkey: 'aabb', displayName: 'Test');
+      UserProfile(pubkey: pubkey, displayName: 'Test');
 }
 
 class _FakePresenceNotifier extends PresenceNotifier {
@@ -2521,3 +2739,20 @@ ObservedUnreadEvent _observed({
   channelType: 'stream',
   isThreadedReply: isThreadedReply,
 );
+
+/// The channel tile (its `InkWell`) that renders [labelText] as its row
+/// label.
+Finder _dmTileFor(String labelText) => find
+    .ancestor(of: find.text(labelText), matching: find.byType(InkWell))
+    .first;
+
+/// Avatar fallback initial for the DM tile rendering [labelText] — asserts at
+/// the production seam (the tile's `_DmAvatar`), not the label helper.
+String _dmTileAvatarInitial(WidgetTester tester, String labelText) {
+  final tile = _dmTileFor(labelText);
+  final avatar = find.descendant(of: tile, matching: find.byType(AvatarImage));
+  final initial = tester.widget<Text>(
+    find.descendant(of: avatar, matching: find.byType(Text)),
+  );
+  return initial.data!;
+}

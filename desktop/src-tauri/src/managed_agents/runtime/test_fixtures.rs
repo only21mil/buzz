@@ -36,7 +36,8 @@ pub(super) fn fixture(
     auth_tag: Option<String>,
 ) -> ManagedAgentRecord {
     ManagedAgentRecord {
-        effort_level: None,
+        session_policy: Default::default(),
+        description: None,
         pubkey: "p".into(),
         name: "n".into(),
         persona_id: None,
@@ -63,6 +64,7 @@ pub(super) fn fixture(
         runtime_pid: None,
         backend: Default::default(),
         backend_agent_id: None,
+        provider_policy_pending: false,
         provider_binary_path: None,
         team_id: None,
         persona_team_dir: None,
@@ -91,5 +93,6 @@ pub(super) fn fixture(
         definition_respond_to_allowlist: Vec::new(),
         definition_parallelism: None,
         relay_mesh: None,
+        effort_level: None,
     }
 }

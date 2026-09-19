@@ -1,5 +1,4 @@
 import type { Project, Repository } from "@/features/projects/projectModels";
-import { preserveProjectSnapshotProvenance } from "../projectSnapshotProvenance";
 
 function withAbsorbedRepository(
   project: Project,
@@ -8,13 +7,16 @@ function withAbsorbedRepository(
   if (project.repositoryAddresses.includes(repository.repoAddress)) {
     return project;
   }
-  return preserveProjectSnapshotProvenance(project, {
+  return {
     ...project,
+    primaryRepositoryAddress:
+      project.primaryRepositoryAddress ?? repository.repoAddress,
     repositories: [...project.repositories, repository],
-    // Presentation grouping never manufactures a signed project membership.
-    // Only a subsequently verified project a-tag can add this address.
-    repositoryAddresses: project.repositoryAddresses,
-  });
+    repositoryAddresses: [
+      ...project.repositoryAddresses,
+      repository.repoAddress,
+    ],
+  };
 }
 
 function repositoryAuthorizesProjectOwner(

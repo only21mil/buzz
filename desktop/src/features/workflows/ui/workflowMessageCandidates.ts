@@ -17,21 +17,20 @@ export type WorkflowMessageCandidate = {
   createdAt: number | null;
 };
 
-type WorkflowMessageCandidateInput = {
+export type WorkflowMessageCandidateInput = {
   id: string;
   pubkey?: string | null;
   content?: string | null;
   createdAt?: number | null;
 };
 
-type WorkflowMessageEventValidation = {
+export type WorkflowMessageEventValidation = {
   channelId: string;
   requestedId?: string | null;
 };
 
 /** Normalize an event ID without accepting alternate encodings. */
-export function normalizeMessageEventId(eventId: unknown): string | null {
-  if (typeof eventId !== "string") return null;
+export function normalizeMessageEventId(eventId: string): string | null {
   const normalized = eventId.trim().toLowerCase();
   return HEX_EVENT_ID.test(normalized) ? normalized : null;
 }
@@ -69,12 +68,6 @@ export function isPickableWorkflowMessageEvent(
   channelId: string,
 ): boolean {
   return (
-    typeof event.kind === "number" &&
-    Array.isArray(event.tags) &&
-    event.tags.every(
-      (tag) =>
-        Array.isArray(tag) && tag.every((field) => typeof field === "string"),
-    ) &&
     PICKABLE_MESSAGE_KINDS.has(event.kind) &&
     event.tags.filter((tag) => tag[0] === "h").length === 1 &&
     event.tags.find((tag) => tag[0] === "h")?.[1] === channelId
@@ -100,16 +93,13 @@ export function validatedWorkflowMessageCandidate(
   }
   return {
     id: eventId,
-    pubkey: typeof event.pubkey === "string" ? event.pubkey : null,
-    content: typeof event.content === "string" ? event.content : null,
-    createdAt:
-      typeof event.created_at === "number" && Number.isFinite(event.created_at)
-        ? event.created_at
-        : null,
+    pubkey: event.pubkey,
+    content: event.content,
+    createdAt: event.created_at,
   };
 }
 
-type WorkflowMessageSearchResult = {
+export type WorkflowMessageSearchResult = {
   requestedId: string;
   event: RelayEvent | null | undefined;
 };

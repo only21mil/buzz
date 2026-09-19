@@ -1,20 +1,19 @@
 part of '../compose_bar.dart';
 
-/// Rich compose bar with @mention autocomplete and a markdown formatting
-/// toolbar. Used in both channel and thread views — the caller provides an
-/// [onSend] callback that handles actual message submission.
-typedef ComposeBarOnSend =
-    Future<void> Function(
-      String content,
-      List<String> mentionPubkeys, {
-      List<List<String>> mediaTags,
-    });
-
 class ComposeBar extends HookConsumerWidget {
   final String channelId;
   final String channelName;
   final String? hintText;
   final ComposeBarOnSend onSend;
+
+  /// Lets a parent prepare its layout before the editor requests focus.
+  final VoidCallback? onFocusRequested;
+
+  /// Parent-owned if set; otherwise internally created and disposed.
+  final FocusNode? focusNode;
+
+  /// Receives a restorer which becomes a no-op after replacement/unmount.
+  final ValueChanged<VoidCallback>? onFocusRestorerChanged;
 
   /// Optional thread IDs for thread-scoped typing indicators.
   final String? threadHeadId;
@@ -26,34 +25,36 @@ class ComposeBar extends HookConsumerWidget {
     this.hintText,
     this.threadHeadId,
     this.rootId,
+    this.focusNode,
+    this.onFocusRestorerChanged,
+    this.onFocusRequested,
     required this.onSend,
   });
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final controller = useMemoized(_MarkdownEditingController.new);
-    useListenable(controller);
+    final composerText = useListenableSelector(
+      controller,
+      () => controller.text,
+    );
     useEffect(() => controller.dispose, [controller]);
-    // Restore and persist unsent text as a local draft so the Activity
-    // inbox Drafts filter reflects real composer state.
-    //
-    // The effect is additionally keyed on the active relay + pubkey identity:
-    // provider-level namespacing alone cannot protect a composer that stays
-    // mounted through an in-place community/account switch — the controller
-    // would retain the old identity's text and the next edit would persist it
-    // into the new identity's store. On identity change we replace the
-    // controller content with the new identity's own saved draft (or clear).
     final draftKey = composeDraftKey(channelId, threadHeadId: threadHeadId);
     final draftRevision = useRef(0);
-    final draftIdentity =
-        '${ref.watch(relayConfigProvider).baseUrl}'
-        ':${ref.watch(myPubkeyProvider) ?? 'anon'}';
-    final focusNode = useFocusNode();
+    final draftIdentity = _composerDraftIdentity(ref);
+    final isComposerExpanded = useState(false);
+    final androidImeTransitionStarted = useState(
+      defaultTargetPlatform != TargetPlatform.android,
+    );
+    final androidImeFallbackTimer = useRef<Timer?>(null);
+    final ownedFocusNode = useFocusNode();
+    final focusNode = this.focusNode ?? ownedFocusNode;
     useEffect(
-      () =>
-          () => _dismissComposerKeyboard(focusNode),
+      () => () {
+        androidImeFallbackTimer.value?.cancel();
+        _dismissComposerKeyboard(focusNode);
+      },
       [focusNode],
     );
-    final isComposerExpanded = useState(false);
     final isEmojiPickerOpen = useState(false);
     final attachmentSurface = useState(_AttachmentSurface.closed);
     final iosAttachmentPopover = useMemoized(
@@ -85,9 +86,6 @@ class ComposeBar extends HookConsumerWidget {
       attachments: attachments,
     );
     final voiceNoteRef = useRef(voiceNote)..value = voiceNote;
-    // Map of displayName → selected mention candidate built as the user selects
-    // mentions. Declared before the draft lifecycle so restored drafts can
-    // hydrate it, and so every send resolves against the same bindings.
     final mentionMap = useRef(<String, MentionCandidate>{});
     _useComposeDraftLifecycle(
       mentionMap: mentionMap,
@@ -116,10 +114,6 @@ class ComposeBar extends HookConsumerWidget {
       initialValue: 0,
       upperBound: 1.05,
     );
-    final composerExpansionValue = useAnimation(composerExpansionController);
-    final composerExpansionProgress = composerExpansionValue
-        .clamp(0.0, 1.0)
-        .toDouble();
 
     void collapseComposer() {
       if (!isComposerExpanded.value) return;
@@ -142,7 +136,15 @@ class ComposeBar extends HookConsumerWidget {
     useEffect(() {
       final observer = _ComposerKeyboardMetricsObserver(
         view: appView,
+        onKeyboardShown: () {
+          androidImeFallbackTimer.value?.cancel();
+          androidImeTransitionStarted.value = true;
+        },
         onKeyboardHidden: () {
+          androidImeFallbackTimer.value?.cancel();
+          if (defaultTargetPlatform == TargetPlatform.android) {
+            androidImeTransitionStarted.value = false;
+          }
           voiceNote.onKeyboardHidden();
           collapseComposer();
           focusNode.unfocus();
@@ -154,26 +156,36 @@ class ComposeBar extends HookConsumerWidget {
     final resolvedHint =
         hintText ??
         (channelName.isNotEmpty ? 'Message #$channelName' : 'Message\u2026');
-    useEffect(() {
-      final target = isComposerExpanded.value ? 1.0 : 0.0;
-      if (reducedMotion) {
-        composerExpansionController.value = target;
-      } else if ((composerExpansionController.value - target).abs() > 0.001) {
-        composerExpansionController.animateWith(
-          SpringSimulation(
-            SpringDescription.withDurationAndBounce(
-              duration: const Duration(milliseconds: 220),
-              bounce: 0.08,
+    useEffect(
+      () {
+        final target =
+            isComposerExpanded.value && androidImeTransitionStarted.value
+            ? 1.0
+            : 0.0;
+        if (reducedMotion) {
+          composerExpansionController.value = target;
+        } else if ((composerExpansionController.value - target).abs() > 0.001) {
+          composerExpansionController.animateWith(
+            SpringSimulation(
+              SpringDescription.withDurationAndBounce(
+                duration: const Duration(milliseconds: 220),
+                bounce: 0.08,
+              ),
+              composerExpansionController.value,
+              target,
+              0,
+              snapToEnd: true,
             ),
-            composerExpansionController.value,
-            target,
-            0,
-            snapToEnd: true,
-          ),
-        );
-      }
-      return null;
-    }, [isComposerExpanded.value, reducedMotion]);
+          );
+        }
+        return null;
+      },
+      [
+        isComposerExpanded.value,
+        androidImeTransitionStarted.value,
+        reducedMotion,
+      ],
+    );
     useEffect(() {
       if (defaultTargetPlatform != TargetPlatform.iOS) return null;
 
@@ -206,13 +218,23 @@ class ComposeBar extends HookConsumerWidget {
     // Mention state --------------------------------------------------------
     final mentionQuery = useState<String?>(null);
     final mentionStartIdx = useState(-1);
+    // Map of displayName → selected mention candidate built as the user selects
+    // mentions. Used to pass resolved pubkeys directly to onSend and to attach
+    // selected non-member agents before the message is published.
 
     // Channel autocomplete state ----------------------------------------------
     final channelQuery = useState<String?>(null);
     final channelStartIdx = useState(-1);
     final channelsAsync = ref.watch(channelsProvider);
+    _useComposerChannelNames(controller, channelsAsync);
 
     final membersAsync = ref.watch(channelMembersProvider(channelId));
+    final sessionStatus = ref.watch(relaySessionProvider).status;
+    final cachedMembers = channelsAsync.asData == null
+        ? const <ChannelMember>[]
+        : ref
+              .read(channelsProvider.notifier)
+              .cachedMembersForChannel(channelId);
     final currentPubkey = ref.watch(currentPubkeyProvider);
     final userCache = ref.watch(userCacheProvider);
     final isDmChannel =
@@ -233,11 +255,13 @@ class ComposeBar extends HookConsumerWidget {
     }, [controller, agentMentionLabelsKey]);
     useEffect(
       () {
-        final memberList = membersAsync.asData?.value ?? <ChannelMember>[];
+        final memberList = channelMembersForAutocomplete(
+          membersAsync: membersAsync,
+          sessionStatus: sessionStatus,
+          cachedMembers: cachedMembers,
+        );
         final pubkeys = [
           ...memberList.map((m) => m.pubkey),
-          // Restored draft identities need profile preloads too, so the
-          // mention picker can revalidate them against current state.
           ...mentionMap.value.values
               .where((c) => c.requiresRevalidation && c.pubkey.isNotEmpty)
               .map((c) => c.pubkey),
@@ -253,6 +277,7 @@ class ComposeBar extends HookConsumerWidget {
         draftIdentity,
         draftKey,
         membersAsync.asData?.value.length,
+        cachedMembers.length,
         relayAgents?.length,
         agentOwners?.length,
       ],
@@ -261,16 +286,22 @@ class ComposeBar extends HookConsumerWidget {
     // Typing indicator broadcast — throttled to one event per 3 seconds.
     final lastTypingSentMs = useRef(0);
     final isModifyingText = useRef(false);
+    final lastObservedEditingValue = useRef(controller.value);
 
     // Detect @mention query and broadcast typing on text / selection change.
     useEffect(() {
+      lastObservedEditingValue.value = controller.value;
       void listener() {
-        if (isModifyingText.value) return;
-        final text = controller.text;
-        final sel = controller.selection;
+        final editingValue = controller.value;
+        final previousValue = lastObservedEditingValue.value;
+        lastObservedEditingValue.value = editingValue;
+        if (isModifyingText.value || editingValue == previousValue) return;
+        final text = editingValue.text;
+        final sel = editingValue.selection;
+        final textChanged = text != previousValue.text;
 
         // Broadcast typing indicator (throttled).
-        if (text.isNotEmpty) {
+        if (textChanged && text.isNotEmpty) {
           final now = DateTime.now().millisecondsSinceEpoch;
           if (now - lastTypingSentMs.value > _typingThrottleMs) {
             lastTypingSentMs.value = now;
@@ -355,8 +386,6 @@ class ComposeBar extends HookConsumerWidget {
 
     // Insert a selected mention into the text field.
     void insertMention(MentionCandidate candidate) {
-      // Same-name picks keep their own recipient: the second Scout gets a
-      // qualified label instead of overwriting the first selection.
       final name = selectedMentionLabel(candidate.label, candidate.pubkey, {
         for (final entry in mentionMap.value.entries)
           entry.key: entry.value.pubkey,
@@ -366,24 +395,34 @@ class ComposeBar extends HookConsumerWidget {
       mentionMap.value[name] = candidate;
 
       final start = mentionStartIdx.value.clamp(0, controller.text.length);
-      spliceAndMoveCursor(
-        controller,
-        focusNode,
-        start: start,
-        replacement: '@$name ',
-      );
+      isModifyingText.value = true;
+      try {
+        spliceAndMoveCursor(
+          controller,
+          focusNode,
+          start: start,
+          replacement: '@$name ',
+        );
+      } finally {
+        isModifyingText.value = false;
+      }
       mentionQuery.value = null;
     }
 
     // Insert a selected channel into the text field.
     void insertChannel(Channel channel) {
       final start = channelStartIdx.value.clamp(0, controller.text.length);
-      spliceAndMoveCursor(
-        controller,
-        focusNode,
-        start: start,
-        replacement: '#${channel.name} ',
-      );
+      isModifyingText.value = true;
+      try {
+        spliceAndMoveCursor(
+          controller,
+          focusNode,
+          start: start,
+          replacement: '#${channel.name} ',
+        );
+      } finally {
+        isModifyingText.value = false;
+      }
       channelQuery.value = null;
     }
 
@@ -407,49 +446,215 @@ class ComposeBar extends HookConsumerWidget {
       focusNode.requestFocus();
     }
 
-    void clearComposer() => _clearComposeBar(
-      draftRevision: draftRevision,
-      controller: controller,
-      attachments: attachments,
-      mentionMap: mentionMap,
-      mentionQuery: mentionQuery,
-      channelQuery: channelQuery,
-      attachmentSurface: attachmentSurface,
-      showFormatting: showFormatting,
-      uploadError: uploadError,
-      focusNode: focusNode,
-    );
+    void clearComposer() {
+      draftRevision.value += 1;
+      controller.clear();
+      attachments.value = [];
+      mentionMap.value.clear();
+      mentionQuery.value = null;
+      channelQuery.value = null;
+      attachmentSurface.value = _AttachmentSurface.closed;
+      showFormatting.value = false;
+      uploadError.value = null;
+      focusNode.requestFocus();
+    }
 
     void removeAttachment(int id) {
       _removePendingAttachment(attachments, draftRevision, id);
     }
 
-    Future<void> send() => _sendComposeBarMessage(
-      context: context,
-      ref: ref,
-      channelId: channelId,
-      onSend: onSend,
-      controller: controller,
-      attachments: attachments,
-      mentionMap: mentionMap,
-      isSending: isSending,
-      uploadingCount: uploadingCount,
-      uploadProgress: uploadProgress,
-      uploadGeneration: uploadGeneration,
-      activeUploadCancellation: activeUploadCancellation,
-      draftRevision: draftRevision,
-      uploadError: uploadError,
-      focusNode: focusNode,
-      hasAttachments: hasAttachments,
-      membersAsync: membersAsync,
-      relayAgents: relayAgents,
-      agentOwners: agentOwners,
-      channels: channels,
-      userCache: userCache,
-      currentPubkey: currentPubkey,
-      customEmoji: customEmoji,
-      clearComposer: clearComposer,
-    );
+    // Send the message.
+    Future<void> send() async {
+      final text = controller.text.trim();
+      if ((text.isEmpty && !hasAttachments) ||
+          isSending.value ||
+          uploadingCount.value > 0) {
+        return;
+      }
+      final submittedDraftRevision = draftRevision.value;
+      // Resolved before any await: see
+      // `_reportSendCancelledByCommunitySwitch`.
+      final messenger = ScaffoldMessenger.maybeOf(context);
+
+      // Extract pubkeys for mentions present in the final text.
+      List<MentionCandidate> selectedMentions;
+      try {
+        selectedMentions = _resolveComposerMentions(
+          text,
+          mentionMap.value,
+          buildMentionCandidates(
+            members: channelMembersForAutocomplete(
+              membersAsync: membersAsync,
+              sessionStatus: sessionStatus,
+              cachedMembers: cachedMembers,
+            ),
+            relayAgents: const [],
+            sharedChannelIds: const {},
+            userCache: userCache,
+            ownerByAgentPubkey: agentOwners ?? const {},
+          ),
+          buildMentionCandidates(
+            members: membersAsync.asData?.value ?? const [],
+            relayAgents: relayAgents ?? const [],
+            sharedChannelIds: {
+              for (final c in channels)
+                if (c.isMember && !c.isArchived) c.id,
+            },
+            userCache: userCache,
+            ownerByAgentPubkey: agentOwners ?? const {},
+            currentPubkey: currentPubkey,
+            // Reuse ordinary search-result classification, not membership as
+            // permission. Persisted keys/flags themselves prove no role.
+            searchResults: [
+              for (final c in mentionMap.value.values)
+                if (c.requiresRevalidation && userCache[c.pubkey] != null)
+                  userCache[c.pubkey]!,
+            ],
+          ),
+        );
+      } on FormatException catch (error) {
+        messenger?.showSnackBar(SnackBar(content: Text(error.message)));
+        return;
+      }
+      final outgoing = _OutgoingMentions(selectedMentions);
+      final scan = await _scanNonMemberMentions(
+        ref,
+        channelId: channelId,
+        selectedMentions: selectedMentions,
+        currentPubkey: currentPubkey,
+      );
+
+      // Mentioning humans outside the channel prompts "Invite" / "Do
+      // nothing" (send without inviting) — mirrors desktop's
+      // NonMemberMentionDialog. Agents keep the existing silent auto-add.
+      if (scan.humans.isNotEmpty) {
+        if (!context.mounted) return;
+        final choice = await _promptNonMemberMention(
+          context,
+          names: [for (final candidate in scan.humans) candidate.label],
+          canInvite: scan.canAddMembers,
+        );
+        if (choice == null) return; // Dismissed — keep the draft, send nothing.
+        outgoing.resolveHumanChoice(choice, scan.humans);
+      }
+
+      final queuedAttachments = List<_PendingAttachment>.of(attachments.value);
+      final channelActions = ref.read(channelActionsProvider);
+
+      // An add that was refused doesn't block the message: it is reported and
+      // the un-added mentions are demoted to reference tags so the send lands.
+      Future<void> addMentionedNonMembers() => outgoing.addNonMembers(
+        channelActions,
+        scan: scan,
+        messenger: messenger,
+      );
+
+      isSending.value = true;
+      try {
+        if (queuedAttachments.isEmpty) {
+          if (!context.mounted) return;
+          await _sendTextOnlyDraft(
+            context: context,
+            controller: controller,
+            mentionMap: mentionMap,
+            draftRevision: draftRevision,
+            submittedDraftRevision: submittedDraftRevision,
+            focusNode: focusNode,
+            clearComposer: clearComposer,
+            addMentionedNonMembers: addMentionedNonMembers,
+            payload: _ComposeDraftPayload.fromDraft(
+              text: text,
+              attachments: const [],
+              customEmoji: customEmoji,
+            ),
+            outgoing: outgoing,
+            onSend: onSend,
+            messenger: messenger,
+          );
+          return;
+        }
+
+        final draftText = controller.value;
+        final draftAttachments = List<_PendingAttachment>.of(attachments.value);
+        final draftMentions = Map<String, MentionCandidate>.of(
+          mentionMap.value,
+        );
+        clearComposer();
+        final clearedDraftRevision = draftRevision.value;
+        uploadingCount.value += 1;
+        uploadProgress.value = 0;
+        isSending.value = false;
+        final queueGeneration = uploadGeneration.value;
+        final cancellation = UploadCancellationToken();
+        final uploadService = ref.read(mediaUploadServiceProvider);
+        activeUploadCancellation.value = cancellation;
+        final delivery = onSend;
+        unawaited(() async {
+          var retainedForRetry = false;
+          try {
+            final uploaded = <BlobDescriptor>[];
+            for (var index = 0; index < queuedAttachments.length; index++) {
+              final attachment = queuedAttachments[index];
+              final descriptor = await _uploadPendingAttachment(
+                uploadService,
+                attachment,
+                onProgress: (progress) {
+                  if (context.mounted) {
+                    uploadProgress.value =
+                        (index + progress) / queuedAttachments.length;
+                  }
+                },
+                cancellationToken: cancellation,
+              );
+              if (queueGeneration != uploadGeneration.value) return;
+              uploaded.add(descriptor);
+              if (context.mounted) {
+                uploadProgress.value = (index + 1) / queuedAttachments.length;
+              }
+            }
+            final payload = _ComposeDraftPayload.fromDraft(
+              text: text,
+              attachments: uploaded,
+              customEmoji: customEmoji,
+            );
+            if (queueGeneration != uploadGeneration.value) return;
+            await addMentionedNonMembers();
+            if (queueGeneration != uploadGeneration.value) return;
+            await delivery(
+              payload.content,
+              outgoing.pubkeys,
+              mediaTags: [...payload.mediaTags, ...outgoing.referenceTags],
+            );
+          } catch (error) {
+            if (cancellation.isCancelled) return;
+            if (context.mounted) uploadError.value = _formatUploadError(error);
+            if (context.mounted &&
+                queueGeneration == uploadGeneration.value &&
+                draftRevision.value == clearedDraftRevision) {
+              attachments.value = draftAttachments;
+              retainedForRetry = true;
+              mentionMap.value
+                ..clear()
+                ..addAll(draftMentions);
+              controller.value = draftText;
+              focusNode.requestFocus();
+            }
+          } finally {
+            if (!retainedForRetry) {
+              await _deleteOwnedAttachments(queuedAttachments);
+            }
+            if (activeUploadCancellation.value == cancellation) {
+              activeUploadCancellation.value = null;
+            }
+            if (context.mounted && queueGeneration == uploadGeneration.value) {
+              uploadingCount.value = math.max(0, uploadingCount.value - 1);
+            }
+          }
+        }());
+      } finally {
+        if (context.mounted && isSending.value) isSending.value = false;
+      }
+    }
 
     final queueAttachment = useCallback(
       (
@@ -496,32 +701,104 @@ class ComposeBar extends HookConsumerWidget {
     Future<void> retainAndQueueImages(List<XFile> images) =>
         _retainAndQueueImages(context, images, queueImages);
 
-    Widget buildContextMenu(
-      BuildContext context,
-      EditableTextState editableTextState,
-    ) => _buildComposeBarContextMenu(
+    final pasteClipboardImage = useCallback(() {
+      ContextMenuController.removeAny();
+      unawaited(() async {
+        try {
+          final image = await ref
+              .read(mediaUploadServiceProvider)
+              .readClipboardImage();
+          if (image != null && context.mounted) {
+            queueAttachment(image, _PendingAttachmentKind.image);
+          } else if (context.mounted) {
+            uploadError.value = 'Unable to read pasted image';
+          }
+        } catch (error) {
+          if (context.mounted) uploadError.value = _formatUploadError(error);
+        }
+      }());
+    }, [context, ref, queueAttachment, uploadError]);
+
+    final buildContextMenu = useCallback<EditableTextContextMenuBuilder>((
       context,
-      ref,
       editableTextState,
-      clipboardHasImage: clipboardHasImage,
-      uploadError: uploadError,
-      queueAttachment: queueAttachment,
-    );
-
-    void uploadPastedImage(KeyboardInsertedContent content) =>
-        _uploadComposeBarPastedImage(
-          content,
-          uploadError: uploadError,
-          queueAttachment: queueAttachment,
+    ) {
+      if (defaultTargetPlatform == TargetPlatform.iOS &&
+          SystemContextMenu.isSupportedByField(editableTextState)) {
+        return SystemContextMenu.editableText(
+          editableTextState: editableTextState,
+          items: [
+            if (clipboardHasImage.value)
+              IOSSystemContextMenuItemCustom(
+                title: 'Paste Image',
+                onPressed: pasteClipboardImage,
+              ),
+            ...SystemContextMenu.getDefaultItems(editableTextState),
+          ],
         );
+      }
 
-    void applyFormat(String prefix, [String? suffix]) => _applyComposeBarFormat(
-      controller,
-      focusNode,
-      isModifyingText,
-      prefix,
-      suffix,
-    );
+      final buttonItems = [...editableTextState.contextMenuButtonItems];
+      if (defaultTargetPlatform == TargetPlatform.iOS &&
+          clipboardHasImage.value) {
+        buttonItems.insert(
+          0,
+          ContextMenuButtonItem(
+            label: 'Paste Image',
+            onPressed: pasteClipboardImage,
+          ),
+        );
+      }
+      return AdaptiveTextSelectionToolbar.buttonItems(
+        anchors: editableTextState.contextMenuAnchors,
+        buttonItems: buttonItems,
+      );
+    }, [clipboardHasImage, pasteClipboardImage]);
+
+    void uploadPastedImage(KeyboardInsertedContent content) {
+      final bytes = content.data;
+      if (bytes == null || bytes.isEmpty) {
+        uploadError.value = 'Unable to read pasted image';
+        return;
+      }
+
+      queueAttachment(
+        XFile.fromData(bytes, name: 'Pasted image'),
+        _PendingAttachmentKind.image,
+      );
+    }
+
+    // Wrap (or insert) markdown formatting around the current selection.
+    void applyFormat(String prefix, [String? suffix]) {
+      suffix ??= prefix;
+      final text = controller.text;
+      final sel = controller.selection;
+      if (!sel.isValid) return;
+
+      isModifyingText.value = true;
+      try {
+        if (sel.isCollapsed) {
+          final offset = sel.baseOffset;
+          final updated =
+              '${text.substring(0, offset)}$prefix$suffix${text.substring(offset)}';
+          controller.text = updated;
+          controller.selection = TextSelection.collapsed(
+            offset: offset + prefix.length,
+          );
+        } else {
+          final selected = text.substring(sel.start, sel.end);
+          final updated =
+              '${text.substring(0, sel.start)}$prefix$selected$suffix${text.substring(sel.end)}';
+          controller.text = updated;
+          controller.selection = TextSelection.collapsed(
+            offset: sel.start + prefix.length + selected.length + suffix.length,
+          );
+        }
+      } finally {
+        isModifyingText.value = false;
+      }
+      focusNode.requestFocus();
+    }
 
     void chooseAttachment(
       Future<void> Function() choose, {
@@ -546,33 +823,61 @@ class ComposeBar extends HookConsumerWidget {
     }
 
     void handleAttachmentTap(BuildContext triggerContext) {
+      if (defaultTargetPlatform != TargetPlatform.iOS ||
+          attachmentSurface.value != _AttachmentSurface.closed) {
+        toggleAttachments();
+        return;
+      }
+
       unawaited(
-        _handleComposeBarAttachmentTap(
-          context: context,
-          triggerContext: triggerContext,
-          ref: ref,
-          focusNode: focusNode,
-          attachmentSurface: attachmentSurface,
-          iosAttachmentPopover: iosAttachmentPopover,
-          voiceNote: voiceNote,
-          retainAndQueueImages: retainAndQueueImages,
-          queueImages: queueImages,
-          pickThenQueue: pickThenQueue,
-          chooseAttachment: chooseAttachment,
-          toggleAttachments: toggleAttachments,
-        ),
+        iosAttachmentPopover
+            .present(
+              sourceContext: triggerContext,
+              onCapture: (image) => retainAndQueueImages([image]),
+              onChoosePhotos: retainAndQueueImages,
+              onAllPhotos: () => chooseAttachment(() async {
+                final photos = await ref
+                    .read(mediaUploadServiceProvider)
+                    .pickGalleryImages();
+                queueImages(photos);
+              }, errorMessage: 'Unable to open your photo library.'),
+              onVideo: () => chooseAttachment(() {
+                final service = ref.read(mediaUploadServiceProvider);
+                return pickThenQueue(
+                  pick: service.pickGalleryVideo,
+                  kind: _PendingAttachmentKind.video,
+                );
+              }),
+              onVoiceNote: voiceNote.start,
+              onFiles: () => chooseAttachment(() {
+                final service = ref.read(mediaUploadServiceProvider);
+                return pickThenQueue(
+                  pick: service.pickAttachmentFile,
+                  kind: _PendingAttachmentKind.file,
+                );
+              }),
+            )
+            .then((didPresent) {
+              if (!didPresent && context.mounted) {
+                focusNode.unfocus();
+                toggleAttachments();
+              }
+            }),
       );
     }
 
-    final motionDuration = reducedMotion
+    void openCamera() {
+      focusNode.unfocus();
+      attachmentSurface.value = _AttachmentSurface.camera;
+    }
+
+    final motionDuration = _composerMotionDuration(
+      reducedMotion,
+      attachmentSurface.value,
+    );
+    final resizeDuration = reducedMotion
         ? Duration.zero
-        : Duration(
-            milliseconds:
-                attachmentSurface.value == _AttachmentSurface.camera ||
-                    attachmentSurface.value == _AttachmentSurface.photos
-                ? 320
-                : 250,
-          );
+        : const Duration(milliseconds: 140);
     final suggestionOverlayController = useMemoized(
       OverlayPortalController.new,
     );
@@ -584,51 +889,75 @@ class ComposeBar extends HookConsumerWidget {
       return null;
     }, [suggestionOverlayController]);
 
-    void expandComposer() {
-      if (isComposerExpanded.value) return;
-      attachmentSurface.value = _AttachmentSurface.closed;
-      isComposerExpanded.value = true;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (context.mounted) focusNode.requestFocus();
-      });
+    void expandComposer() => _expandComposer(
+      context: context,
+      isExpanded: isComposerExpanded,
+      attachmentSurface: attachmentSurface,
+      onFocusRequested: onFocusRequested,
+      focusNode: focusNode,
+      view: appView,
+      androidImeTransitionStarted: androidImeTransitionStarted,
+      androidImeFallbackTimer: androidImeFallbackTimer,
+    );
+
+    _useComposerFocusRestorer(
+      onChanged: onFocusRestorerChanged,
+      isExpanded: isComposerExpanded,
+      focusNode: focusNode,
+      expand: expandComposer,
+    );
+
+    final suggestionPanel = _composerSuggestionPanel(
+      channelSuggestions: channelSuggestions,
+      mentionSuggestions: suggestions,
+      userCache: userCache,
+      currentPubkey: currentPubkey,
+      isDmChannel: isDmChannel,
+      onChannelSelect: insertChannel,
+      onMentionSelect: insertMention,
+    );
+    Widget buildOverlayPanel(_AttachmentSurface surface) {
+      return _composerAttachmentPanel(
+        surface: surface,
+        suggestionPanel: suggestionPanel,
+        onBack: () => attachmentSurface.value = _AttachmentSurface.menu,
+        onCamera: openCamera,
+        onPhotos: () {
+          focusNode.unfocus();
+          attachmentSurface.value = _AttachmentSurface.photos;
+        },
+        onVideo: () => chooseAttachment(() {
+          final service = ref.read(mediaUploadServiceProvider);
+          return pickThenQueue(
+            pick: service.pickGalleryVideo,
+            kind: _PendingAttachmentKind.video,
+          );
+        }),
+        onVoiceNote: voiceNote.start,
+        onFiles: () => chooseAttachment(() {
+          final service = ref.read(mediaUploadServiceProvider);
+          return pickThenQueue(
+            pick: service.pickAttachmentFile,
+            kind: _PendingAttachmentKind.file,
+          );
+        }),
+        onCapture: (image) async {
+          attachmentSurface.value = _AttachmentSurface.closed;
+          await retainAndQueueImages([image]);
+        },
+        onPickAllPhotos: ref.read(mediaUploadServiceProvider).pickGalleryImages,
+        onChoosePhotos: (photos) async {
+          attachmentSurface.value = _AttachmentSurface.closed;
+          await retainAndQueueImages(photos);
+        },
+        onChooseAllPhotos: (photos) async {
+          attachmentSurface.value = _AttachmentSurface.closed;
+          queueImages(photos);
+        },
+      );
     }
 
-    final suggestionPanel = channelSuggestions.isNotEmpty
-        ? KeyedSubtree(
-            key: const ValueKey('channel-suggestions'),
-            child: _ChannelSuggestions(
-              suggestions: channelSuggestions,
-              onSelect: insertChannel,
-            ),
-          )
-        : suggestions.isNotEmpty
-        ? KeyedSubtree(
-            key: const ValueKey('mention-suggestions'),
-            child: _MentionSuggestions(
-              suggestions: suggestions,
-              userCache: userCache,
-              currentPubkey: currentPubkey,
-              isDmChannel: isDmChannel,
-              onSelect: insertMention,
-            ),
-          )
-        : const SizedBox.shrink(key: ValueKey('no-suggestions'));
-    Widget buildOverlayPanel(_AttachmentSurface surface) =>
-        _buildComposeBarOverlayPanel(
-          surface: surface,
-          suggestionPanel: suggestionPanel,
-          attachmentSurface: attachmentSurface,
-          focusNode: focusNode,
-          voiceNote: voiceNote,
-          ref: ref,
-          retainAndQueueImages: retainAndQueueImages,
-          queueImages: queueImages,
-          pickThenQueue: pickThenQueue,
-          chooseAttachment: chooseAttachment,
-        );
-
-    // Suggestions and attachments live in the overlay so showing them cannot
-    // reflow the composer. Both stay anchored just above the capsule.
+    // Suggestions and attachments live in the overlay.
     final hasPendingUploads = uploadingCount.value > 0;
     return _ComposerDockFrame(
       expansionAnimation: composerExpansionController,
@@ -670,11 +999,11 @@ class ComposeBar extends HookConsumerWidget {
               attachmentSurface: attachmentSurface.value,
               onAttachmentTap: handleAttachmentTap,
               onExpand: expandComposer,
-              expansionValue: composerExpansionValue,
-              expansionProgress: composerExpansionProgress,
+              expansionAnimation: composerExpansionController,
               formattingOpen: showFormatting.value,
               onCloseFormatting: () => showFormatting.value = false,
               motionDuration: motionDuration,
+              resizeDuration: resizeDuration,
               onFormat: applyFormat,
               onMention: () {
                 attachmentSurface.value = _AttachmentSurface.closed;
@@ -698,7 +1027,7 @@ class ComposeBar extends HookConsumerWidget {
                 showFormatting.value = true;
               },
               hasPendingUploads: hasPendingUploads,
-              canSend: controller.text.trim().isNotEmpty || hasAttachments,
+              canSend: composerText.trim().isNotEmpty || hasAttachments,
               isSending: isSending.value,
             ),
           ),

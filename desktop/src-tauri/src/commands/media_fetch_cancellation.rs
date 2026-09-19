@@ -6,13 +6,11 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 use crate::app_state::AppState;
+use crate::commands::media::detect_and_validate_mime;
 use crate::commands::media_download::{
     fetch_blob_bytes_with_cap, validate_download_url, MAX_DOWNLOAD_BYTES,
 };
 use crate::relay::relay_api_base_url_with_override;
-
-const MAX_MEDIA_FETCH_OWNERS: usize = 256;
-const MAX_MEDIA_FETCH_ID_BYTES: usize = 128;
 
 #[derive(Default)]
 struct MediaFetchCancellations {
@@ -25,23 +23,11 @@ impl MediaFetchCancellations {
             return cancel;
         }
         let cancel = CancellationToken::new();
-        if request_id.len() > MAX_MEDIA_FETCH_ID_BYTES
-            || self.tokens.len() >= MAX_MEDIA_FETCH_OWNERS
-        {
-            cancel.cancel();
-            return cancel;
-        }
         self.tokens.insert(request_id.to_string(), cancel.clone());
         cancel
     }
 
     fn cancel(&mut self, request_id: &str) {
-        if request_id.len() > MAX_MEDIA_FETCH_ID_BYTES
-            || (!self.tokens.contains_key(request_id)
-                && self.tokens.len() >= MAX_MEDIA_FETCH_OWNERS)
-        {
-            return;
-        }
         self.tokens
             .entry(request_id.to_string())
             .or_default()
@@ -89,7 +75,7 @@ pub fn release_media_fetch(request_id: String) {
 
 /// Fetch relay media bytes with renderer-owned cancellation.
 #[tauri::command]
-pub async fn fetch_audio_bytes(
+pub async fn fetch_media_bytes(
     url: String,
     request_id: Option<String>,
     state: tauri::State<'_, AppState>,
@@ -101,21 +87,12 @@ pub async fn fetch_audio_bytes(
         let bytes =
             fetch_blob_bytes_with_cap(&url, &state, MAX_DOWNLOAD_BYTES, cancellation.as_ref())
                 .await?;
-        validate_audio_bytes(&bytes)?;
+        detect_and_validate_mime(&bytes)?;
         Ok(tauri::ipc::Response::new(bytes))
     }
     .await;
     finish_media_fetch(request_id.as_deref());
     result
-}
-
-fn validate_audio_bytes(bytes: &[u8]) -> Result<(), String> {
-    let mime = infer::get(bytes).map(|kind| kind.mime_type());
-    if mime.is_some_and(|mime| mime.starts_with("audio/") || mime == "video/mp4") {
-        Ok(())
-    } else {
-        Err("media is not a supported audio attachment".into())
-    }
 }
 
 #[cfg(test)]
@@ -144,28 +121,5 @@ mod tests {
         assert!(cancellation.is_cancelled());
         fetches.finish("active-fetch");
         assert!(fetches.tokens.is_empty());
-    }
-    #[test]
-    fn audio_fetch_rejects_document_and_image_payloads() {
-        assert!(validate_audio_bytes(b"<!doctype html><script>alert(1)</script>").is_err());
-        assert!(validate_audio_bytes(&[0xff, 0xd8, 0xff, 0xe0]).is_err());
-        assert!(validate_audio_bytes(b"OggS\x00\x02").is_ok());
-    }
-
-    #[test]
-    fn abandoned_owners_and_oversized_ids_are_bounded() {
-        let mut fetches = MediaFetchCancellations::default();
-        for index in 0..MAX_MEDIA_FETCH_OWNERS {
-            fetches.cancel(&index.to_string());
-        }
-        assert_eq!(fetches.tokens.len(), MAX_MEDIA_FETCH_OWNERS);
-        assert!(fetches.begin("overflow").is_cancelled());
-        fetches.cancel("overflow");
-        assert_eq!(fetches.tokens.len(), MAX_MEDIA_FETCH_OWNERS);
-        fetches.finish("0");
-        assert!(!fetches.begin("next").is_cancelled());
-        assert!(fetches
-            .begin(&"x".repeat(MAX_MEDIA_FETCH_ID_BYTES + 1))
-            .is_cancelled());
     }
 }

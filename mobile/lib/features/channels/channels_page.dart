@@ -87,7 +87,8 @@ const double _kChannelLabelInset =
 /// sections while the labels stay on [_kChannelLabelInset].
 const double _kDmAvatarSize = _kChannelIconSize;
 
-const double _kTopSectionAvatarSize = 40.0;
+const double _kTopSectionCommunityAvatarSize = 40.0;
+const double _kTopSectionProfileAvatarSize = 36.0;
 const double _kTopSectionBottomPadding = Grid.xxs;
 
 /// The top section's avatars are 40dp circles, which fill their box edge to
@@ -346,7 +347,8 @@ class ChannelsPage extends HookConsumerWidget {
             height: Grid.xl,
             child: Center(
               child: ProfileAvatar(
-                size: _kTopSectionAvatarSize,
+                size: _kTopSectionProfileAvatarSize,
+                showPresence: false,
                 onTap: () {
                   unawaited(HapticFeedback.lightImpact());
                   final route = _SettingsPageRoute(

@@ -10,7 +10,7 @@ import type {
 } from "@/features/messages/lib/useRichTextEditor";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { detectPrefixQuery } from "@/shared/lib/detectPrefixQuery";
-import { normalizePubkey, truncatePubkey } from "@/shared/lib/pubkey";
+import { normalizePubkey, truncateNpub } from "@/shared/lib/pubkey";
 import type { ComposerAddressAgent } from "./ComposerAddressControls";
 import type { MentionSuggestion } from "./MentionAutocomplete";
 
@@ -87,7 +87,7 @@ export function useAgentAddressLockPicker({
           displayName:
             resolvedDisplayName ??
             lockedAgentNamesRef.current.get(normalized) ??
-            truncatePubkey(normalized),
+            truncateNpub(normalized),
           avatarUrl: profile?.avatarUrl ?? null,
         };
       }),
@@ -159,7 +159,8 @@ export function useAgentAddressLockPicker({
         mentions.getDraftMentionRefs(text),
       )[0];
       if (
-        first?.start !== 0 ||
+        !first ||
+        first.start !== 0 ||
         !first.candidates.every(
           (ref) => normalizePubkey(ref.pubkey) === normalized,
         )
@@ -368,7 +369,7 @@ export function useAgentAddressLockPicker({
             profile?.nip05Handle?.trim() ||
             mentions.getMentionDisplayName(pubkey)?.trim() ||
             lockedAgentNamesRef.current.get(pubkey) ||
-            truncatePubkey(pubkey);
+            truncateNpub(pubkey);
           return { pubkey, displayName };
         });
       const { text } = richText.getPlainTextAndCursor();

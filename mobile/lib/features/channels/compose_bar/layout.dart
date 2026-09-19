@@ -15,11 +15,11 @@ class _ComposeBarLayout extends HookWidget {
   final _AttachmentSurface attachmentSurface;
   final ValueChanged<BuildContext> onAttachmentTap;
   final VoidCallback onExpand;
-  final double expansionValue;
-  final double expansionProgress;
+  final Animation<double> expansionAnimation;
   final bool formattingOpen;
   final VoidCallback onCloseFormatting;
   final Duration motionDuration;
+  final Duration resizeDuration;
   final void Function(String prefix, [String? suffix]) onFormat;
   final VoidCallback onMention;
   final VoidCallback onChannel;
@@ -44,11 +44,11 @@ class _ComposeBarLayout extends HookWidget {
     required this.attachmentSurface,
     required this.onAttachmentTap,
     required this.onExpand,
-    required this.expansionValue,
-    required this.expansionProgress,
+    required this.expansionAnimation,
     required this.formattingOpen,
     required this.onCloseFormatting,
     required this.motionDuration,
+    required this.resizeDuration,
     required this.onFormat,
     required this.onMention,
     required this.onChannel,
@@ -122,34 +122,18 @@ class _ComposeBarLayout extends HookWidget {
         // Keep the default state out of the focus system entirely so
         // restored native focus cannot expand a newly opened channel.
         if (isExpanded)
-          TextField(
-            controller: controller,
-            focusNode: focusNode,
-            textInputAction: TextInputAction.send,
-            contextMenuBuilder: contextMenuBuilder,
-            contentInsertionConfiguration: ContentInsertionConfiguration(
-              allowedMimeTypes: _pastedImageMimeTypes,
-              onContentInserted: onContentInserted,
-            ),
-            onSubmitted: (_) => onSend(),
-            minLines: 1,
-            maxLines: 5,
-            style: context.textTheme.bodyLarge,
-            decoration: InputDecoration(
-              hintText: resolvedHint,
-              hintStyle: context.textTheme.bodyLarge?.copyWith(
-                color: context.colors.onSurfaceVariant,
-              ),
-              border: InputBorder.none,
-              enabledBorder: InputBorder.none,
-              focusedBorder: InputBorder.none,
-              contentPadding: const EdgeInsets.symmetric(
-                horizontal: Grid.half,
-                vertical: Grid.half,
-              ),
-              isDense: true,
-            ),
-          )
+          resizeDuration == Duration.zero
+              ? KeyedSubtree(
+                  key: const ValueKey('composer-text-height-motion'),
+                  child: _buildTextField(context),
+                )
+              : AnimatedSize(
+                  key: const ValueKey('composer-text-height-motion'),
+                  alignment: Alignment.topCenter,
+                  duration: resizeDuration,
+                  curve: Curves.easeOutCubic,
+                  child: _buildTextField(context),
+                )
         else
           Row(
             children: [
@@ -193,85 +177,69 @@ class _ComposeBarLayout extends HookWidget {
               ),
             ],
           ),
-        ClipRect(
-          child: Align(
-            alignment: Alignment.topCenter,
-            heightFactor: expansionValue,
-            child: IgnorePointer(
-              ignoring: !isExpanded,
-              child: Opacity(
-                opacity: expansionProgress,
-                child: Transform.translate(
-                  offset: Offset(0, Grid.xxs * (1 - expansionProgress)),
-                  child: Column(
-                    children: [
-                      const SizedBox(height: Grid.xxs),
-                      Row(
-                        children: [
-                          _AttachmentTrigger(
-                            surface: attachmentSurface,
-                            formattingOpen: formattingOpen,
-                            onTap: (triggerContext) {
-                              if (formattingOpen) {
-                                onCloseFormatting();
-                              } else {
-                                onAttachmentTap(triggerContext);
-                              }
-                            },
-                          ),
-                          const SizedBox(width: Grid.half),
-                          Expanded(
-                            child: AnimatedSwitcher(
-                              duration: motionDuration,
-                              switchInCurve: Curves.easeOutCubic,
-                              switchOutCurve: Curves.easeInCubic,
-                              layoutBuilder: (currentChild, previousChildren) =>
-                                  Stack(
-                                    alignment: Alignment.centerLeft,
-                                    children: [
-                                      ...previousChildren,
-                                      ?currentChild,
-                                    ],
-                                  ),
-                              child: formattingOpen
-                                  ? _FormattingToolbar(onFormat: onFormat)
-                                  : Row(
-                                      key: const ValueKey('standard-actions'),
-                                      children: [
-                                        _ComposeAction(
-                                          icon: LucideIcons.atSign,
-                                          onTap: onMention,
-                                        ),
-                                        _ComposeAction(
-                                          icon: LucideIcons.hash,
-                                          onTap: onChannel,
-                                        ),
-                                        _ComposeAction(
-                                          icon: LucideIcons.smilePlus,
-                                          onTap: onEmoji,
-                                        ),
-                                        _ComposeAction(
-                                          icon: LucideIcons.aLargeSmall,
-                                          onTap: onOpenFormatting,
-                                        ),
-                                        const Spacer(),
-                                        _SendButton(
-                                          isDisabled:
-                                              !canSend || hasPendingUploads,
-                                          isSending: isSending,
-                                          onTap: onSend,
-                                        ),
-                                      ],
-                                    ),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
+        _ExpandedComposerActionsMotion(
+          animation: expansionAnimation,
+          isExpanded: isExpanded,
+          child: Column(
+            children: [
+              const SizedBox(height: Grid.xxs),
+              Row(
+                children: [
+                  _AttachmentTrigger(
+                    surface: attachmentSurface,
+                    formattingOpen: formattingOpen,
+                    onTap: (triggerContext) {
+                      if (formattingOpen) {
+                        onCloseFormatting();
+                      } else {
+                        onAttachmentTap(triggerContext);
+                      }
+                    },
                   ),
-                ),
+                  const SizedBox(width: Grid.half),
+                  Expanded(
+                    child: AnimatedSwitcher(
+                      duration: motionDuration,
+                      switchInCurve: Curves.easeOutCubic,
+                      switchOutCurve: Curves.easeInCubic,
+                      layoutBuilder: (currentChild, previousChildren) => Stack(
+                        alignment: Alignment.centerLeft,
+                        children: [...previousChildren, ?currentChild],
+                      ),
+                      child: formattingOpen
+                          ? _FormattingToolbar(onFormat: onFormat)
+                          : Row(
+                              key: const ValueKey('standard-actions'),
+                              children: [
+                                _ComposeAction(
+                                  icon: LucideIcons.atSign,
+                                  onTap: onMention,
+                                ),
+                                _ComposeAction(
+                                  icon: LucideIcons.hash,
+                                  onTap: onChannel,
+                                ),
+                                _ComposeAction(
+                                  icon: LucideIcons.smilePlus,
+                                  onTap: onEmoji,
+                                ),
+                                _ComposeAction(
+                                  icon: LucideIcons.aLargeSmall,
+                                  onTap: onOpenFormatting,
+                                ),
+                                const Spacer(),
+                                _SendButton(
+                                  isDisabled: !canSend || hasPendingUploads,
+                                  isSending: isSending,
+                                  onTap: onSend,
+                                ),
+                              ],
+                            ),
+                    ),
+                  ),
+                ],
               ),
-            ),
+            ],
           ),
         ),
       ],
@@ -306,10 +274,10 @@ class _ComposeBarLayout extends HookWidget {
       ),
     );
     return AnimatedBuilder(
-      animation: recordingTransition,
+      animation: Listenable.merge([expansionAnimation, recordingTransition]),
       child: content,
       builder: (context, child) {
-        final progress = expansionProgress;
+        final progress = expansionAnimation.value.clamp(0.0, 1.0).toDouble();
         final composerRadius = Radii.dialog + Grid.quarter * (1 - progress);
         final radius = BorderRadius.lerp(
           BorderRadius.circular(composerRadius),
@@ -349,6 +317,83 @@ class _ComposeBarLayout extends HookWidget {
           minimumRadius: radius.topLeft.x,
           contentClipRadius: radius.topLeft.x,
           child: composer,
+        );
+      },
+    );
+  }
+
+  Widget _buildTextField(BuildContext context) {
+    return TextField(
+      controller: controller,
+      focusNode: focusNode,
+      keyboardType: TextInputType.multiline,
+      textInputAction: TextInputAction.newline,
+      contextMenuBuilder: contextMenuBuilder,
+      // Flutter's Cupertino magnifier rebuilds its overlay on every
+      // selection-handle update. Keep the iOS handles and native edit menu,
+      // but let the handles track the finger directly here.
+      magnifierConfiguration: defaultTargetPlatform == TargetPlatform.iOS
+          ? TextMagnifierConfiguration.disabled
+          : null,
+      contentInsertionConfiguration: ContentInsertionConfiguration(
+        allowedMimeTypes: _pastedImageMimeTypes,
+        onContentInserted: onContentInserted,
+      ),
+      minLines: 1,
+      maxLines: 5,
+      style: context.textTheme.bodyLarge,
+      decoration: InputDecoration(
+        hintText: resolvedHint,
+        hintStyle: context.textTheme.bodyLarge?.copyWith(
+          color: context.colors.onSurfaceVariant,
+        ),
+        border: InputBorder.none,
+        enabledBorder: InputBorder.none,
+        focusedBorder: InputBorder.none,
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: Grid.half,
+          vertical: Grid.half,
+        ),
+        isDense: true,
+      ),
+    );
+  }
+}
+
+class _ExpandedComposerActionsMotion extends StatelessWidget {
+  final Animation<double> animation;
+  final bool isExpanded;
+  final Widget child;
+
+  const _ExpandedComposerActionsMotion({
+    required this.animation,
+    required this.isExpanded,
+    required this.child,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: animation,
+      child: child,
+      builder: (context, child) {
+        final value = animation.value;
+        final progress = value.clamp(0.0, 1.0).toDouble();
+        return ClipRect(
+          child: Align(
+            alignment: Alignment.topCenter,
+            heightFactor: value,
+            child: IgnorePointer(
+              ignoring: !isExpanded,
+              child: Opacity(
+                opacity: progress,
+                child: Transform.translate(
+                  offset: Offset(0, Grid.xxs * (1 - progress)),
+                  child: child,
+                ),
+              ),
+            ),
+          ),
         );
       },
     );

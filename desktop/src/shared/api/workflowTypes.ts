@@ -7,7 +7,6 @@ export type Workflow = {
   ownerPubkey: string;
   channelId: string | null;
   definition: Record<string, unknown>;
-  yamlDefinition?: string;
   status: WorkflowStatus;
   createdAt: number;
   updatedAt: number;
@@ -24,8 +23,7 @@ export type WorkflowRunStatus =
   | "completed"
   | "failed"
   | "cancelled"
-  | "waiting_approval"
-  | "resume_pending";
+  | "waiting_approval";
 
 export type TraceEntry = {
   stepId: string;
@@ -44,7 +42,7 @@ export type WorkflowRun = {
   executionTrace: TraceEntry[];
   startedAt: number | null;
   completedAt: number | null;
-  errorCode?: string | null;
+  errorCode: string | null;
   errorMessage: string | null;
   createdAt: number;
 };
@@ -53,11 +51,10 @@ export type WorkflowApprovalStatus =
   | "pending"
   | "granted"
   | "denied"
-  | "expired"
-  | "unsatisfiable";
+  | "expired";
 
 export type WorkflowApproval = {
-  /** Display reference only; never a signed decision token. */
+  /** Opaque, non-actionable identifier for display/correlation only. */
   approvalRef: string;
   workflowId: string;
   runId: string;
@@ -72,10 +69,9 @@ export type WorkflowApproval = {
 };
 
 export type TriggerWorkflowResponse = {
-  eventId: string;
-  runId: string | null;
+  runId: string;
   workflowId: string;
-  status: "accepted";
+  status: string;
 };
 
 export type ApprovalActionResponse = {
@@ -83,11 +79,4 @@ export type ApprovalActionResponse = {
   status: string;
   runId: string;
   workflowId: string;
-};
-
-/** Opaque keyset returned by the relay; preserve timestamp precision. */
-export type WorkflowRunsCursor = { before: string; before_id: string };
-export type WorkflowRunsPage = {
-  runs: WorkflowRun[];
-  next: WorkflowRunsCursor | null;
 };

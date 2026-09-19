@@ -241,6 +241,7 @@ class InviteJoinNotifier extends Notifier<InviteJoinState> {
         relayUrl: invite.relayUrl,
         pubkey: keys.public,
         nsec: keys.nsec,
+        sensitiveActionPolicy: SensitiveActionPolicy.disabledByUser,
         starterSetupIncomplete: true,
       );
       await ref
@@ -331,22 +332,14 @@ class InviteJoinNotifier extends Notifier<InviteJoinState> {
   Future<void> _saveStarterSetupState(
     Community community, {
     required bool incomplete,
-  }) async {
-    await ref.read(communityStorageProvider).updateExisting(community.id, (
-      saved,
-    ) {
-      if (saved.relayUrl != community.relayUrl ||
-          saved.pubkey != community.pubkey ||
-          saved.nsec != community.nsec) {
-        throw StateError('Community changed during invite recovery');
-      }
-      // Preserve edits made while setup was pending and never recreate a
-      // community removed before this queued marker update.
-      return saved.copyWith(starterSetupIncomplete: incomplete);
+  }) {
+    return ref.read(communityTransitionProvider).runExclusive(() async {
+      final updated = community.copyWith(starterSetupIncomplete: incomplete);
+      await ref.read(communityStorageProvider).save(updated);
+      ref.invalidate(communityListProvider);
+      ref.invalidate(activeCommunityProvider);
+      ref.invalidate(authProvider);
     });
-    ref.invalidate(communityListProvider);
-    ref.invalidate(activeCommunityProvider);
-    ref.invalidate(authProvider);
   }
 
   void reset() {

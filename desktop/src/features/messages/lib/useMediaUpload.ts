@@ -8,11 +8,9 @@ import {
 import { uploadMediaFile } from "@/shared/api/tauriMedia";
 import type { QueuedMediaAttachment } from "./backgroundMediaUploadStore";
 import { applyImetaUpdate, compactImetaSlots } from "./imetaSlots";
-import { releaseObjectUrl } from "./objectUrlLifecycle";
 import { isVoiceNoteFile } from "./audioAttachment";
-import { isVideoFile, videoMimeForFile } from "./videoFileType";
-import { captureVideoPosterFrame } from "./videoPosterFrame";
 import { useFilePicker } from "./useFilePicker";
+import { isVideoFile, videoMimeForFile } from "./videoFileType";
 
 /**
  * First 4 hex chars of the sha256 — used as a short display name.
@@ -53,31 +51,106 @@ function uploadProgressId(previewId: number): string {
   return `composer-upload-${previewId}`;
 }
 
-export function applyUploadingPreviewProgress(
-  current: UploadingAttachmentPreview[],
-  payload: { id: string; sent: number; total: number },
-): UploadingAttachmentPreview[] {
-  if (payload.total <= 0) return current;
-
-  const matchingIndex = current.findIndex(
-    (preview) => uploadProgressId(preview.id) === payload.id,
-  );
-  if (matchingIndex === -1) return current;
-
-  const progress = Math.min(
-    100,
-    Math.round((payload.sent / payload.total) * 100),
-  );
-  if (current[matchingIndex]?.progress === progress) return current;
-
-  return current.map((preview, index) =>
-    index === matchingIndex ? { ...preview, progress } : preview,
-  );
-}
-
 /** True when the drag payload contains files (not plain text or URLs). */
 function isFileDrag(event: React.DragEvent<HTMLElement>): boolean {
   return event.dataTransfer?.types.includes("Files") ?? false;
+}
+
+function waitForMediaEvent(
+  element: HTMLMediaElement,
+  eventName: string,
+  timeoutMs: number,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timeoutId = window.setTimeout(() => {
+      cleanup();
+      reject(new Error(`Timed out waiting for ${eventName}`));
+    }, timeoutMs);
+
+    function cleanup() {
+      window.clearTimeout(timeoutId);
+      element.removeEventListener(eventName, onEvent);
+      element.removeEventListener("error", onError);
+    }
+
+    function onEvent() {
+      cleanup();
+      resolve();
+    }
+
+    function onError() {
+      cleanup();
+      reject(new Error(`Could not load media for ${eventName}`));
+    }
+
+    element.addEventListener(eventName, onEvent, { once: true });
+    element.addEventListener("error", onError, { once: true });
+  });
+}
+
+type CapturedVideoPoster = {
+  dim: string;
+  posterUrl: string;
+};
+
+async function captureVideoPosterFrame(
+  file: File,
+): Promise<CapturedVideoPoster | null> {
+  const videoMime = videoMimeForFile(file);
+  if (!videoMime) return null;
+
+  // A blob URL inherits the File's own MIME type, so a video whose type is
+  // empty or `application/octet-stream` would be rejected by the <video>
+  // element and yield no poster. Re-type the bytes with the MIME we derived
+  // from the extension; `slice` wraps the same bytes without copying them.
+  const objectUrl = URL.createObjectURL(
+    file.type === videoMime ? file : file.slice(0, file.size, videoMime),
+  );
+  const video = document.createElement("video");
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = "metadata";
+
+  try {
+    video.src = objectUrl;
+    await waitForMediaEvent(video, "loadedmetadata", 3_000);
+
+    const duration = Number.isFinite(video.duration) ? video.duration : 0;
+    const seekTime = duration > 0.2 ? 0.1 : 0;
+    if (seekTime > 0) {
+      const seeked = waitForMediaEvent(video, "seeked", 2_000);
+      video.currentTime = seekTime;
+      await seeked.catch(() => undefined);
+    } else if (video.readyState < 2) {
+      await waitForMediaEvent(video, "loadeddata", 2_000).catch(
+        () => undefined,
+      );
+    }
+
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+
+    if (video.videoWidth === 0 || video.videoHeight === 0) return null;
+
+    const maxWidth = 640;
+    const scale = Math.min(1, maxWidth / video.videoWidth);
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(video.videoWidth * scale));
+    canvas.height = Math.max(1, Math.round(video.videoHeight * scale));
+
+    const context = canvas.getContext("2d");
+    if (!context) return null;
+    context.drawImage(video, 0, 0, canvas.width, canvas.height);
+    return {
+      dim: `${video.videoWidth}x${video.videoHeight}`,
+      posterUrl: canvas.toDataURL("image/jpeg", 0.82),
+    };
+  } catch {
+    return null;
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+    video.removeAttribute("src");
+    video.load();
+  }
 }
 
 type UseMediaUploadOptions = {
@@ -88,16 +161,6 @@ type UseMediaUploadOptions = {
 export function useMediaUpload({
   deferUploadsUntilSend = false,
 }: UseMediaUploadOptions = {}) {
-  const openFilePicker = useFilePicker();
-  // Synchronous intent changes revoke pending edits before React renders.
-  const intentRevisionRef = React.useRef(0);
-  const getIntentRevision = React.useCallback(
-    () => intentRevisionRef.current,
-    [],
-  );
-  const markIntentChanged = React.useCallback(() => {
-    intentRevisionRef.current += 1;
-  }, []);
   const e2eConfig = (
     window as Window & {
       __BUZZ_E2E__?: { mock?: { deferredComposerUploads?: boolean } };
@@ -126,9 +189,6 @@ export function useMediaUpload({
   >([]);
   const queuedAttachmentsRef = React.useRef(queuedAttachments);
   queuedAttachmentsRef.current = queuedAttachments;
-  const releasedPreviewUrlsRef = React.useRef(new Set<string>());
-  const ownedPreviewUrlsRef = React.useRef(new Map<number, string>());
-  const activeQueuedIdsRef = React.useRef(new Set<number>());
   React.useEffect(() => {
     let unlisten: (() => void) | null = null;
     let cancelled = false;
@@ -140,8 +200,15 @@ export function useMediaUpload({
           sent: number;
           total: number;
         }>("media-upload-progress", (event) => {
+          const { id, sent, total } = event.payload;
+          if (total <= 0) return;
+          const progress = Math.min(100, Math.round((sent / total) * 100));
           setUploadingPreviews((current) =>
-            applyUploadingPreviewProgress(current, event.payload),
+            current.map((preview) =>
+              uploadProgressId(preview.id) === id
+                ? { ...preview, progress }
+                : preview,
+            ),
           );
         });
         if (cancelled) {
@@ -160,31 +227,6 @@ export function useMediaUpload({
   }, []);
   const activeUploadingPreviewIdsRef = React.useRef(new Set<number>());
   const canceledUploadingPreviewIdsRef = React.useRef(new Set<number>());
-  const fileUploadControllersRef = React.useRef(
-    new Map<number, AbortController>(),
-  );
-  React.useEffect(() => {
-    const controllers = fileUploadControllersRef.current;
-    return () => {
-      for (const controller of controllers.values()) controller.abort();
-    };
-  }, []);
-  const uploadPreviewFile = React.useCallback(
-    async (file: File, previewId: number) => {
-      const controller = new AbortController();
-      fileUploadControllersRef.current.set(previewId, controller);
-      try {
-        return await uploadMediaFile(
-          file,
-          uploadProgressId(previewId),
-          controller.signal,
-        );
-      } finally {
-        fileUploadControllersRef.current.delete(previewId);
-      }
-    },
-    [],
-  );
   /**
    * Incremented whenever the composer's attachment set is replaced wholesale
    * (draft/channel switch, post-send clear, edit restore). Uploads capture the
@@ -262,15 +304,6 @@ export function useMediaUpload({
 
   const updateQueuedVideoPoster = React.useCallback(
     (id: number, posterUrl: string) => {
-      if (!activeQueuedIdsRef.current.has(id)) {
-        releaseObjectUrl(posterUrl, releasedPreviewUrlsRef.current);
-        return;
-      }
-      releaseObjectUrl(
-        ownedPreviewUrlsRef.current.get(id),
-        releasedPreviewUrlsRef.current,
-      );
-      ownedPreviewUrlsRef.current.set(id, posterUrl);
       setQueuedAttachmentsState((current) =>
         current.map((attachment) =>
           attachment.id === id
@@ -285,7 +318,6 @@ export function useMediaUpload({
   const queueFiles = React.useCallback(
     (files: File[]) => {
       if (files.length === 0) return;
-      intentRevisionRef.current += 1;
 
       const attachments = files.map((file) => {
         const id = nextQueuedAttachmentIdRef.current;
@@ -294,8 +326,6 @@ export function useMediaUpload({
           file.type.startsWith("image/") || file.type.startsWith("audio/")
             ? URL.createObjectURL(file)
             : undefined;
-        activeQueuedIdsRef.current.add(id);
-        if (previewUrl) ownedPreviewUrlsRef.current.set(id, previewUrl);
         if (isVideoFile(file)) {
           void captureVideoPosterFrame(file).then((poster) => {
             if (poster) updateQueuedVideoPoster(id, poster.posterUrl);
@@ -310,26 +340,24 @@ export function useMediaUpload({
   );
 
   const removeQueuedAttachment = React.useCallback((id: number) => {
-    intentRevisionRef.current += 1;
-    activeQueuedIdsRef.current.delete(id);
-    releaseObjectUrl(
-      ownedPreviewUrlsRef.current.get(id),
-      releasedPreviewUrlsRef.current,
-    );
-    ownedPreviewUrlsRef.current.delete(id);
     setQueuedAttachmentsState((current) => {
+      const removed = current.find((attachment) => attachment.id === id);
+      if (removed?.previewUrl?.startsWith("blob:")) {
+        URL.revokeObjectURL(removed.previewUrl);
+      }
       return current.filter((attachment) => attachment.id !== id);
     });
   }, []);
 
   const clearQueuedAttachments = React.useCallback(() => {
-    intentRevisionRef.current += 1;
-    for (const previewUrl of ownedPreviewUrlsRef.current.values()) {
-      releaseObjectUrl(previewUrl, releasedPreviewUrlsRef.current);
-    }
-    ownedPreviewUrlsRef.current.clear();
-    activeQueuedIdsRef.current.clear();
-    setQueuedAttachmentsState(() => []);
+    setQueuedAttachmentsState((current) => {
+      for (const attachment of current) {
+        if (attachment.previewUrl?.startsWith("blob:")) {
+          URL.revokeObjectURL(attachment.previewUrl);
+        }
+      }
+      return [];
+    });
   }, []);
 
   const restoreQueuedAttachments = React.useCallback(
@@ -347,7 +375,6 @@ export function useMediaUpload({
   );
 
   const toggleQueuedAttachmentSpoiler = React.useCallback((id: number) => {
-    intentRevisionRef.current += 1;
     setQueuedAttachmentsState((current) =>
       current.map((attachment) =>
         attachment.id === id
@@ -359,11 +386,11 @@ export function useMediaUpload({
 
   React.useEffect(
     () => () => {
-      for (const previewUrl of ownedPreviewUrlsRef.current.values()) {
-        releaseObjectUrl(previewUrl, releasedPreviewUrlsRef.current);
+      for (const attachment of queuedAttachmentsRef.current) {
+        if (attachment.previewUrl?.startsWith("blob:")) {
+          URL.revokeObjectURL(attachment.previewUrl);
+        }
       }
-      ownedPreviewUrlsRef.current.clear();
-      activeQueuedIdsRef.current.clear();
     },
     [],
   );
@@ -381,7 +408,6 @@ export function useMediaUpload({
 
   const reserveUploadingPreview = React.useCallback(
     (file?: File, slotIndex?: number): number => {
-      intentRevisionRef.current += 1;
       const id = nextUploadingPreviewIdRef.current;
       nextUploadingPreviewIdRef.current += 1;
       activeUploadingPreviewIdsRef.current.add(id);
@@ -455,7 +481,6 @@ export function useMediaUpload({
     activeIds.clear();
     for (const id of retiredIds) {
       canceledUploadingPreviewIdsRef.current.add(id);
-      fileUploadControllersRef.current.get(id)?.abort();
     }
     setUploadingPreviews((prev) =>
       prev.filter((preview) => !retiredIds.has(preview.id)),
@@ -465,9 +490,7 @@ export function useMediaUpload({
 
   const cancelUpload = React.useCallback(
     (previewId: number) => {
-      intentRevisionRef.current += 1;
       canceledUploadingPreviewIdsRef.current.add(previewId);
-      fileUploadControllersRef.current.get(previewId)?.abort();
       const preview = uploadingPreviewsRef.current.find(
         (candidate) => candidate.id === previewId,
       );
@@ -529,7 +552,6 @@ export function useMediaUpload({
         finishUpload(previewId);
         return;
       }
-      intentRevisionRef.current += 1;
       setImetaSlots((prev) => {
         const next = [...prev];
         next[index] = descriptor;
@@ -552,7 +574,6 @@ export function useMediaUpload({
         finishUpload(previewId);
         return;
       }
-      intentRevisionRef.current += 1;
       nextSlotRef.current += 1;
       setImetaSlots((prev) => [...prev, descriptor]);
       finishUpload(previewId);
@@ -586,7 +607,10 @@ export function useMediaUpload({
         // Fire-and-forget each upload concurrently — slot preserves order.
         void (async () => {
           try {
-            const descriptor = await uploadPreviewFile(file, previewId);
+            const descriptor = await uploadMediaFile(
+              file,
+              uploadProgressId(previewId),
+            );
             fillSlot(slotIndex, descriptor, previewId, epoch);
           } catch (err) {
             onUploadError(err, previewId);
@@ -594,21 +618,14 @@ export function useMediaUpload({
         })();
       }
     },
-    [
-      fillSlot,
-      onUploadError,
-      reserveSlots,
-      reserveUploadingPreview,
-      uploadPreviewFile,
-    ],
+    [fillSlot, onUploadError, reserveSlots, reserveUploadingPreview],
   );
+
+  const openFilePicker = useFilePicker();
 
   const handlePaperclip = React.useCallback(async () => {
     if (queueUntilSend) {
-      intentRevisionRef.current += 1;
-      const epoch = uploadEpochRef.current;
-      openFilePicker({ multiple: true, ownershipEpoch: epoch }, (files) => {
-        if (isUploadStale(epoch)) return;
+      openFilePicker({ multiple: true }, (files) => {
         queueFiles(files.filter(shouldQueueFile));
         uploadFiles(files.filter((file) => !shouldQueueFile(file)));
       });
@@ -627,7 +644,6 @@ export function useMediaUpload({
       if (isUploadCanceled(previewId)) return;
       finishUpload(previewId);
       if (isUploadStale(epoch)) return;
-      if (descriptors.length) intentRevisionRef.current += 1;
       for (const descriptor of descriptors) {
         nextSlotRef.current += 1;
         setImetaSlots((prev) => [...prev, descriptor]);
@@ -749,7 +765,10 @@ export function useMediaUpload({
       setUploadingCount((c) => c + 1);
       const epoch = uploadEpochRef.current;
       try {
-        const descriptor = await uploadPreviewFile(file, previewId);
+        const descriptor = await uploadMediaFile(
+          file,
+          uploadProgressId(previewId),
+        );
         onUploaded(descriptor, previewId, epoch);
       } catch (err) {
         onUploadError(err, previewId);
@@ -761,7 +780,6 @@ export function useMediaUpload({
       queueFiles,
       reserveUploadingPreview,
       shouldQueueFile,
-      uploadPreviewFile,
     ],
   );
 
@@ -799,7 +817,6 @@ export function useMediaUpload({
         );
         if (isUploadCanceled(previewId)) return null;
         finishUpload(previewId);
-        intentRevisionRef.current += 1;
         setImetaSlots((prev) =>
           prev.map((d) => (d?.url === oldUrl ? descriptor : d)),
         );
@@ -829,7 +846,6 @@ export function useMediaUpload({
     (url: string): BlobDescriptor | null => {
       const original = originalsByUrlRef.current.get(url);
       if (!original) return null;
-      intentRevisionRef.current += 1;
       setImetaSlots((prev) => prev.map((d) => (d?.url === url ? original : d)));
       setOriginalsByUrl((prev) => {
         const next = new Map(prev);
@@ -842,14 +858,12 @@ export function useMediaUpload({
   );
 
   const removeAttachment = React.useCallback((url: string) => {
-    intentRevisionRef.current += 1;
     setImetaSlots((prev) => prev.map((d) => (d?.url === url ? null : d)));
   }, []);
 
   /** Public setter — replaces all slots (used by MessageComposer to clear/restore). */
   const setPendingImeta = React.useCallback(
     (action: React.SetStateAction<BlobDescriptor[]>) => {
-      intentRevisionRef.current += 1;
       // A wholesale replacement means the composer's contents were swapped out
       // from under any in-flight upload: draft/channel switch, post-send clear,
       // or edit-target restore. Bump the epoch so those uploads discard their
@@ -899,8 +913,6 @@ export function useMediaUpload({
     () => ({
       cancelUpload,
       clearQueuedAttachments,
-      getIntentRevision,
-      markIntentChanged,
       handleDragEnter,
       handleDragLeave,
       handleDragOver,
@@ -931,8 +943,6 @@ export function useMediaUpload({
     [
       cancelUpload,
       clearQueuedAttachments,
-      getIntentRevision,
-      markIntentChanged,
       handleDragEnter,
       handleDragLeave,
       handleDragOver,

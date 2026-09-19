@@ -1,6 +1,6 @@
 //! Unit tests for `managed_agents/teams.rs`.
 //!
-//! Kept in a sibling file so `teams.rs` stays under the 1000-line gate;
+//! Kept in a sibling file so `teams.rs` stays under the 1500-line gate;
 //! `#[path]`-included from there.
 
 use super::{
@@ -167,7 +167,8 @@ fn validate_team_deletion_rejects_built_ins() {
 
 fn managed_agent(name: &str) -> ManagedAgentRecord {
     ManagedAgentRecord {
-        effort_level: None,
+        session_policy: Default::default(),
+        description: None,
         pubkey: name.to_string(),
         name: name.to_string(),
         persona_id: None,
@@ -195,6 +196,7 @@ fn managed_agent(name: &str) -> ManagedAgentRecord {
         runtime_pid: None,
         backend: crate::managed_agents::BackendKind::Local,
         backend_agent_id: None,
+        provider_policy_pending: false,
         provider_binary_path: None,
         persona_team_dir: None,
         persona_name_in_team: None,
@@ -219,6 +221,7 @@ fn managed_agent(name: &str) -> ManagedAgentRecord {
         catalog_source: None,
         team_catalog_source: None,
         relay_mesh: None,
+        effort_level: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: vec![],
         definition_parallelism: None,
@@ -452,8 +455,10 @@ const D_TAG: &str = "my-team";
 
 fn catalog_copy(id: &str, owner: &str, d_tag: &str) -> AgentDefinition {
     AgentDefinition {
+        session_policy: Default::default(),
         id: id.to_string(),
         display_name: id.to_string(),
+        description: None,
         avatar_url: None,
         system_prompt: String::new(),
         runtime: None,
@@ -691,8 +696,10 @@ fn test_ref_check_preserves_copy_used_by_a_standalone_managed_agent() {
 
 fn catalog_persona(id: &str, owner: &str, d_tag: &str) -> AgentDefinition {
     AgentDefinition {
+        session_policy: Default::default(),
         id: id.to_string(),
         display_name: id.to_string(),
+        description: None,
         avatar_url: None,
         system_prompt: "Do the work.".to_string(),
         runtime: None,

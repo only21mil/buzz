@@ -211,8 +211,93 @@ pub(crate) fn resolve_effective_agent_env(
     resolve_effective_agent_env_with_def(record, personas, runtime, global, harness_def)
 }
 
-mod launch_env;
-use launch_env::resolve_effective_agent_env_with_def;
+/// Inner implementation that accepts a pre-fetched `harness_def` to avoid a
+/// second registry lookup when the caller (e.g. `resolve_effective_harness_descriptor`)
+/// already has the definition in hand.
+fn resolve_effective_agent_env_with_def(
+    record: &ManagedAgentRecord,
+    personas: &[AgentDefinition],
+    runtime: Option<&KnownAcpRuntime>,
+    global: &GlobalAgentConfig,
+    harness_def: Option<std::sync::Arc<crate::managed_agents::custom_harnesses::HarnessDefinition>>,
+) -> EffectiveAgentEnv {
+    let effective_command = crate::managed_agents::record_agent_command(record, personas);
+
+    // Layer 1: baked build defaults (floor — internal builds only; OSS = empty).
+    let mut env = baked_build_env();
+
+    let (effective_model, effective_provider) =
+        super::global_config::resolve_effective_model_provider(record, personas, global);
+
+    if let Some(rt) = runtime {
+        for (key, value) in super::runtime::runtime_metadata_env_vars(
+            rt.model_env_var,
+            rt.provider_env_var,
+            rt.provider_locked,
+            effective_model.as_deref(),
+            effective_provider.as_deref(),
+        ) {
+            env.insert(key.to_string(), value.to_string());
+        }
+    }
+
+    // Layer 2b: definition env — the harness author's defaults (e.g. CURSOR_ACP=1).
+    // Applied as a floor below global so user env always wins on collision.
+    // Reserved keys are stripped by the shared `is_reserved_env_key` predicate.
+    if let Some(ref def) = harness_def {
+        for (key, value) in &def.env {
+            if !super::env_vars::is_reserved_env_key(key) {
+                env.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    // Layer 3a: global env vars — the lowest user-settable layer.
+    // Injected before persona/agent so per-agent values win on collision.
+    // `merged_user_env` with an empty "lower" map applies reserved/malformed-key
+    // filtering to the global map for free.
+    let global_env = merged_user_env(&BTreeMap::new(), &global.env_vars);
+    env.extend(global_env);
+
+    // Layer 3b: merged user env — live persona env under the record's own
+    // overrides (last-wins), after reserved/malformed-key filtering. Reading
+    // the persona live is what makes persona credential edits refresh on the
+    // next spawn instead of being frozen into the record.
+    let user_env = merged_user_env(
+        &super::env_vars::live_persona_env(personas, record.persona_id.as_deref()),
+        &record.env_vars,
+    );
+    env.extend(user_env);
+
+    // Single harness-agnostic effort authority (PR #4625): resolve effective
+    // effort over the canonical column AND all env tiers, emit one destination
+    // key. Runs AFTER the layer stack so launch, remote deploy, and the restart
+    // snapshot agree — no double authority, no foreign key, no badge disagreement.
+    super::config_bridge::effort::apply_launch_effort(
+        &mut env,
+        record,
+        runtime,
+        personas,
+        &global.env_vars,
+        harness_def.as_deref(),
+        &baked_build_env(),
+    );
+
+    // Buzz shared compute is a native Buzz provider. Translate it to buzz-agent's
+    // OpenAI-compatible transport only in the effective runtime environment.
+    #[cfg(feature = "mesh-llm")]
+    super::apply_relay_mesh_env(
+        &mut env,
+        effective_provider.as_deref(),
+        effective_model.as_deref(),
+    );
+
+    EffectiveAgentEnv {
+        env,
+        config_file_path: runtime.and_then(|r| r.config_file_path),
+        effective_command,
+    }
+}
 
 // ── Requirement types ─────────────────────────────────────────────────────────
 
@@ -1395,22 +1480,20 @@ mod tests {
     }
 
     // ── resolve_effective_agent_env ─────────────────────────────────────────
-
     #[test]
     fn resolve_effective_agent_env_user_env_wins_over_structured_fields() {
-        // A record whose env_vars explicitly set provider/model must win over
-        // any baked defaults. In OSS test builds the baked map is empty, so
-        // this test validates the user-env layer is present in the output.
+        // User env_vars must win over baked defaults; in OSS builds baked map is empty,
+        // so this validates the user-env layer is present in the output.
         let mut env_vars = BTreeMap::new();
         env_vars.insert("BUZZ_AGENT_PROVIDER".to_string(), "anthropic".to_string());
         env_vars.insert(
             "BUZZ_AGENT_MODEL".to_string(),
             "claude-opus-4-5".to_string(),
         );
-
         // Minimal record: only the fields resolve_effective_agent_env reads.
         let record = crate::managed_agents::types::ManagedAgentRecord {
-            effort_level: None,
+            session_policy: Default::default(),
+            description: None,
             pubkey: "test-pubkey".to_string(),
             name: "test-agent".to_string(),
             persona_id: None,
@@ -1437,6 +1520,7 @@ mod tests {
             runtime_pid: None,
             backend: Default::default(),
             backend_agent_id: None,
+            provider_policy_pending: false,
             provider_binary_path: None,
             team_id: None,
             persona_team_dir: None,
@@ -1465,6 +1549,7 @@ mod tests {
             definition_respond_to_allowlist: Vec::new(),
             definition_parallelism: None,
             relay_mesh: None,
+            effort_level: None,
         };
 
         let runtime = known_acp_runtime_exact("buzz-agent");
@@ -1480,8 +1565,6 @@ mod tests {
             Some("claude-opus-4-5")
         );
     }
-
-    // ── provider-specific model fallback tests ────────────────────────────
 
     #[test]
     fn buzz_agent_databricks_v2_with_databricks_model_but_no_buzz_agent_model_is_ready() {
@@ -1616,56 +1699,10 @@ mod tests {
             }));
     }
 
-    // ── OpenRouter readiness ─────────────────────────────────────────────
-
-    #[test]
-    fn buzz_agent_openrouter_with_all_fields_is_ready() {
-        let env = make_env(
-            "buzz-agent",
-            env_with(&[
-                ("BUZZ_AGENT_PROVIDER", "openrouter"),
-                ("BUZZ_AGENT_MODEL", "anthropic/claude-sonnet-4"),
-                ("OPENROUTER_API_KEY", "sk-or-test-key"),
-            ]),
-        );
-        let result = agent_readiness(&env);
-        assert!(
-            result.is_ready(),
-            "openrouter with all fields should be ready"
-        );
-    }
-
-    #[test]
-    fn buzz_agent_openrouter_missing_key_returns_not_ready() {
-        let env = make_env(
-            "buzz-agent",
-            env_with(&[
-                ("BUZZ_AGENT_PROVIDER", "openrouter"),
-                ("BUZZ_AGENT_MODEL", "anthropic/claude-sonnet-4"),
-            ]),
-        );
-        let result = agent_readiness(&env);
-        assert!(!result.is_ready());
-        assert!(result.requirements().contains(&Requirement::EnvKey {
-            key: "OPENROUTER_API_KEY".to_string()
-        }));
-    }
-    #[test]
-    fn buzz_agent_openrouter_with_provider_model_fallback_is_ready() {
-        let env = make_env(
-            "buzz-agent",
-            env_with(&[
-                ("BUZZ_AGENT_PROVIDER", "openrouter"),
-                ("OPENROUTER_MODEL", "google/gemini-2.5-flash"),
-                ("OPENROUTER_API_KEY", "sk-or-test-key"),
-            ]),
-        );
-        let result = agent_readiness(&env);
-        assert!(
-            result.is_ready(),
-            "OPENROUTER_MODEL fallback should satisfy model requirement"
-        );
-    }
+    // buzz-agent OpenRouter readiness tests live in a sibling file so this
+    // module stays under the desktop file-size ratchet.
+    #[path = "openrouter_tests.rs"]
+    mod openrouter_tests;
 }
 
 // Goose file-config-aware requirement tests live in a sibling file so this

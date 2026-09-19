@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { QueryClient, QueryObserver } from "@tanstack/react-query";
 
+import { reconcileFetchedChannelWindow } from "../hooks.ts";
 import { channelMessagesKey, channelWindowKey } from "./messageQueryKeys.ts";
 import {
   appendOlderChannelWindow,
@@ -11,10 +12,8 @@ import {
   replaceNewestChannelWindow,
 } from "./channelWindowStore.ts";
 import {
-  mergeChannelWindowOverlayEvents,
   projectChannelWindowMessages,
   refreshChannelWindowMessages,
-  seedChannelWindowStoreFromSnapshot,
 } from "./projectChannelWindow.ts";
 import { reconcileChannelWindowMessages } from "./channelWindowReconciliation.ts";
 
@@ -28,6 +27,18 @@ function event(id, createdAt) {
     content: id,
     sig: "b".repeat(128),
   };
+}
+
+function wirePage(rows) {
+  return [
+    ...rows,
+    {
+      ...event("bounds", 0),
+      kind: 39006,
+      tags: [["d", "channel:head"]],
+      content: JSON.stringify({ has_more: false, next_cursor: null }),
+    },
+  ];
 }
 
 function newestPage(rows) {
@@ -276,68 +287,203 @@ test("test_live_projection_retains_pending_send_and_non_broadcast_thread_reply",
   ]);
 });
 
-test("snapshot seed uses live overlays and ignores window metadata", () => {
-  const message = event("snapshot-message", 100);
-  const reaction = { ...event("snapshot-reaction", 101), kind: 7 };
-  const deletion = { ...event("snapshot-deletion", 102), kind: 9005 };
-  const metadata = { ...event("snapshot-bounds", 103), kind: 39006 };
-
-  const store = seedChannelWindowStoreFromSnapshot([
-    reaction,
-    metadata,
-    message,
-    deletion,
-  ]);
-
-  assert.deepEqual(store.pages, []);
-  assert.deepEqual(store.liveOverlay, [message]);
-  assert.deepEqual(store.liveAux, [reaction, deletion]);
-  assert.deepEqual(
-    flattenChannelWindowEvents(store).map((item) => item.id),
-    [message.id, reaction.id, deletion.id],
-  );
-});
-test("aux backfill merges into a snapshot seed without duplicate ids", () => {
-  const message = event("snapshot-message", 100);
-  const edit = {
-    ...event("snapshot-edit", 101),
-    kind: 40003,
-    content: "edited",
-  };
-  const seeded = seedChannelWindowStoreFromSnapshot([message, edit]);
-  const merged = mergeChannelWindowOverlayEvents(seeded, [edit]);
-
-  assert.equal(merged, seeded);
-  assert.equal(
-    flattenChannelWindowEvents(merged).filter((item) => item.id === edit.id)
-      .length,
-    1,
-  );
-});
-
-test("newest and older pages absorb snapshot rows without rendered duplicates", () => {
-  const newest = event("snapshot-newest", 110);
-  const older = event("snapshot-older", 100);
-  const snapshot = seedChannelWindowStoreFromSnapshot([newest, older]);
-  const nextCursor = { createdAt: newest.created_at, eventId: newest.id };
-  const withHead = replaceNewestChannelWindow(snapshot, {
-    startCursor: null,
-    rows: [{ event: newest, thread: null }],
-    aux: [],
-    nextCursor,
-    hasMore: true,
+test("test_canceled_stale_fetch_cannot_overwrite_catch_up_window", async () => {
+  const harness = createHarness();
+  const requests = [];
+  let resolveRequestStarted;
+  let requestStarted = new Promise((resolve) => {
+    resolveRequestStarted = resolve;
   });
-  const complete = appendOlderChannelWindow(withHead, {
-    startCursor: nextCursor,
-    rows: [{ event: older, thread: null }],
-    aux: [],
-    nextCursor: null,
-    hasMore: false,
+  const observer = new QueryObserver(harness.client, {
+    queryKey: harness.messagesKey,
+    queryFn: async ({ signal }) => {
+      const previousMessages = harness.client.getQueryData(harness.messagesKey);
+      let resolveFetch;
+      const fetch = new Promise((resolve) => {
+        resolveFetch = resolve;
+      });
+      requests.push({ resolveFetch, signal });
+      resolveRequestStarted();
+      const events = await fetch;
+      return reconcileFetchedChannelWindow(
+        harness.client,
+        harness.channelId,
+        events,
+        previousMessages,
+        signal,
+      );
+    },
   });
+  const unsubscribe = observer.subscribe(() => {});
 
-  assert.deepEqual(complete.liveOverlay, []);
-  assert.deepEqual(
-    flattenChannelWindowEvents(complete).map((item) => item.id),
-    [older.id, newest.id],
+  await requestStarted;
+  requestStarted = new Promise((resolve) => {
+    resolveRequestStarted = resolve;
+  });
+  const catchUp = refreshChannelWindowMessages(
+    harness.client,
+    harness.channelId,
   );
+  await requestStarted;
+
+  assert.equal(requests[0].signal.aborted, true);
+  requests[1].resolveFetch(
+    wirePage([event("gap", 110), event("initial", 100)]),
+  );
+  await catchUp;
+  assert.deepEqual(contents(harness), ["initial", "gap"]);
+
+  requests[0].resolveFetch(wirePage([event("initial", 100)]));
+  await new Promise((resolve) => setImmediate(resolve));
+  appendLiveEvent(harness, event("live", 120));
+
+  assert.deepEqual(contents(harness), ["initial", "gap", "live"]);
+  assert.deepEqual(
+    flattenChannelWindowEvents(
+      harness.client.getQueryData(harness.windowKey),
+    ).map((item) => item.content),
+    ["initial", "gap", "live"],
+  );
+  unsubscribe();
+});
+
+test("test_pageless_live_projection_preserves_cached_timeline", () => {
+  const harness = createHarness();
+  const cached = harness.client.getQueryData(harness.messagesKey);
+  const pageless = emptyChannelWindowStore();
+  harness.client.setQueryData(harness.windowKey, pageless);
+
+  const next = mergeLiveChannelWindowEvent(
+    harness.client.getQueryData(harness.windowKey),
+    event("live", 110),
+  );
+  harness.client.setQueryData(harness.windowKey, next);
+  projectChannelWindowMessages(harness.client, harness.channelId);
+
+  assert.deepEqual(contents(harness), ["initial", "live"]);
+  assert.equal(harness.client.getQueryData(harness.messagesKey)[0], cached[0]);
+});
+
+test("test_concurrent_refreshes_after_seeded_snapshot_share_one_authoritative_fetch", async () => {
+  // Subscribe settlement and a reconnect can both call the helper while the
+  // channel query is still parked on its hydration-seeded snapshot. Both wake
+  // on the same promise; the second invalidation must join the first
+  // authoritative fetch, not cancel and replace it (Max/Wren, #6572 review).
+  const harness = createHarness();
+  const seeded = event("seeded", 100);
+  harness.client.setQueryData(harness.messagesKey, [seeded], { updatedAt: 0 });
+  const requests = [];
+  const observer = new QueryObserver(harness.client, {
+    queryKey: harness.messagesKey,
+    queryFn: async ({ signal }) => {
+      const previousMessages = harness.client.getQueryData(harness.messagesKey);
+      let resolveFetch;
+      const fetch = new Promise((resolve) => {
+        resolveFetch = resolve;
+      });
+      requests.push({ resolveFetch, signal });
+      const events = await fetch;
+      return reconcileFetchedChannelWindow(
+        harness.client,
+        harness.channelId,
+        events,
+        previousMessages,
+        signal,
+      );
+    },
+  });
+  const unsubscribe = observer.subscribe(() => {});
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(requests.length, 1);
+    const first = refreshChannelWindowMessages(
+      harness.client,
+      harness.channelId,
+    );
+    const second = refreshChannelWindowMessages(
+      harness.client,
+      harness.channelId,
+    );
+    requests[0].resolveFetch(wirePage([seeded]));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(requests.length, 2);
+    requests[1].resolveFetch(wirePage([event("gap", 110), seeded]));
+    await Promise.all([first, second]);
+    assert.equal(requests.length, 2);
+    assert.equal(requests[1].signal.aborted, false);
+    assert.deepEqual(contents(harness), ["seeded", "gap"]);
+  } finally {
+    unsubscribe();
+  }
+});
+
+test("test_subscription_refresh_preserves_cold_history_error", async () => {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  const channelId = "cold-failure";
+  const queryKey = channelMessagesKey(channelId);
+  const observer = new QueryObserver(client, {
+    queryKey,
+    queryFn: async () => {
+      throw new Error("history unavailable");
+    },
+  });
+  const unsubscribe = observer.subscribe(() => {});
+
+  try {
+    await observer.refetch();
+    assert.equal(observer.getCurrentResult().status, "error");
+    assert.equal(observer.getCurrentResult().data, undefined);
+
+    await assert.rejects(
+      refreshChannelWindowMessages(client, channelId),
+      /history unavailable/,
+    );
+    assert.equal(observer.getCurrentResult().status, "error");
+    assert.equal(observer.getCurrentResult().data, undefined);
+  } finally {
+    unsubscribe();
+  }
+});
+
+test("test_refresh_failure_retains_cached_rows_and_success_clears_error", async () => {
+  const harness = createHarness();
+  let shouldFail = true;
+  const refreshed = event("refreshed", 110);
+  const observer = new QueryObserver(harness.client, {
+    queryKey: harness.messagesKey,
+    queryFn: async ({ signal }) => {
+      if (shouldFail) {
+        throw new Error("history unavailable");
+      }
+      const previousMessages =
+        harness.client.getQueryData(harness.messagesKey) ?? [];
+      return reconcileFetchedChannelWindow(
+        harness.client,
+        harness.channelId,
+        wirePage([refreshed, event("initial", 100)]),
+        previousMessages,
+        signal,
+      );
+    },
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+  const unsubscribe = observer.subscribe(() => {});
+
+  try {
+    await assert.rejects(
+      refreshChannelWindowMessages(harness.client, harness.channelId),
+      /history unavailable/,
+    );
+    assert.equal(observer.getCurrentResult().status, "error");
+    assert.deepEqual(contents(harness), ["initial"]);
+
+    shouldFail = false;
+    await refreshChannelWindowMessages(harness.client, harness.channelId);
+    assert.equal(observer.getCurrentResult().status, "success");
+    assert.deepEqual(contents(harness), ["initial", "refreshed"]);
+  } finally {
+    unsubscribe();
+  }
 });

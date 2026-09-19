@@ -6,11 +6,10 @@ import {
   QueryClient,
   QueryObserver,
 } from "@tanstack/react-query";
-import { projectDeletionMutationOptions } from "./projectDeletionMutation.ts";
-
-import { projectCollectionQueryKey } from "./projectCollectionQuery.ts";
-const scope = { relayOrigin: "https://relay.example", pubkey: "a".repeat(64) };
-const projectsQueryKey = projectCollectionQueryKey(scope);
+import {
+  projectDeletionMutationOptions,
+  projectsQueryKey,
+} from "./projectDeletionMutation.ts";
 
 const project = {
   id: "30621:owner:platform",
@@ -35,7 +34,7 @@ test("lost deletion acknowledgement refetches and removes the stale project", as
 
   const mutationObserver = new MutationObserver(
     queryClient,
-    projectDeletionMutationOptions(queryClient, scope, async () => {
+    projectDeletionMutationOptions(queryClient, async () => {
       throw new Error(
         "Could not confirm whether the project was deleted. Projects were refreshed.",
       );
@@ -53,10 +52,10 @@ test("successful deletion removes the project before refetch", async () => {
     defaultOptions: { mutations: { retry: false } },
   });
   queryClient.setQueryData(projectsQueryKey, [project]);
-  const options = projectDeletionMutationOptions(queryClient, scope);
-  // Isolate the real success callback from network publication.
-  options.mutationFn = async () => {};
-  const mutationObserver = new MutationObserver(queryClient, options);
+  const mutationObserver = new MutationObserver(
+    queryClient,
+    projectDeletionMutationOptions(queryClient, async () => {}),
+  );
 
   await mutationObserver.mutate(project);
 

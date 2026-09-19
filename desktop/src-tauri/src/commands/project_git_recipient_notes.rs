@@ -12,6 +12,17 @@ use nostr::{Event, EventBuilder, JsonUtil, Keys, Kind, Tag, Timestamp};
 use serde::Deserialize;
 use tauri::{AppHandle, State};
 
+/// Repository-scoped metadata for an agent-signed review request.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectPullRequestReviewRequestInput {
+    target_owner: String,
+    repo_address: String,
+    pull_request_id: String,
+    reviewers: Vec<String>,
+    reviewer_label: String,
+}
+
 /// Repository-scoped metadata for an agent-signed issue assignee operation.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -115,7 +126,6 @@ fn build_labeled_recipient_note_event(
         .map_err(|error| format!("sign {label} note: {error}"))
 }
 
-#[cfg(test)]
 fn build_review_request_event(
     keys: &Keys,
     repo_address: &str,
@@ -211,7 +221,30 @@ fn build_issue_assignee_operation_event(
     )
 }
 
-/// Sign and publish an issue assignment as the repository owner.
+#[tauri::command]
+pub async fn sign_project_pull_request_review_request(
+    input: ProjectPullRequestReviewRequestInput,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let target_owner = input.target_owner.trim().to_ascii_lowercase();
+    if normalize_event_id(&target_owner).is_none() {
+        return Err("Invalid target repository owner.".to_string());
+    }
+    let identity = project_owner_identity(&app, &state, &target_owner)?;
+    let event = Event::from_json(build_review_request_event(
+        &identity.keys,
+        &input.repo_address,
+        &input.pull_request_id,
+        &input.reviewers,
+        &input.reviewer_label,
+    )?)
+    .map_err(|error| format!("parse signed review request: {error}"))?;
+    submit_signed_event_with_keys(&event, &state, &identity.keys, identity.auth_tag.as_deref())
+        .await?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn sign_project_issue_assignment(
     input: ProjectIssueAssigneeOperationInput,
@@ -221,7 +254,6 @@ pub async fn sign_project_issue_assignment(
     sign_project_issue_assignee_operation(input, IssueAssigneeOperation::Assign, app, state).await
 }
 
-/// Sign and publish an issue unassignment as the repository owner.
 #[tauri::command]
 pub async fn sign_project_issue_unassignment(
     input: ProjectIssueAssigneeOperationInput,

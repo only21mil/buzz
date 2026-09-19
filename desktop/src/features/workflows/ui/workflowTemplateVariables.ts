@@ -1,4 +1,8 @@
-import type { ActionType, TriggerType } from "./workflowFormTypes";
+import type {
+  ActionType,
+  StepFormState,
+  TriggerType,
+} from "./workflowFormTypes";
 
 export type WorkflowTemplateVariable = {
   description: string;
@@ -35,26 +39,7 @@ const COMMON_EVENT_VARIABLES: WorkflowTemplateVariable[] = [
   },
 ];
 
-type TemplateStep = {
-  id: string;
-  action: ActionType | "extract" | "read_state" | "write_state";
-  matchers?: Record<string, string>;
-};
-
-const STEP_OUTPUTS: Partial<
-  Record<TemplateStep["action"], Record<string, string>>
-> = {
-  read_state: {
-    found: "Whether the key exists",
-    value: "Stored value",
-    revision: "State revision",
-  },
-  write_state: {
-    written: "Whether the write succeeded",
-    value: "Current value",
-    revision: "State revision",
-  },
-  request_approval: { approved: "Whether the gate was approved" },
+const STEP_OUTPUTS: Partial<Record<ActionType, Record<string, string>>> = {
   delay: { slept_secs: "Seconds elapsed" },
   send_message: {
     sent: "Whether the message was sent",
@@ -111,17 +96,10 @@ function triggerVariables(
 
 export function workflowTemplateVariables(
   triggerType: TriggerType,
-  previousSteps: TemplateStep[],
+  previousSteps: StepFormState[],
 ): WorkflowTemplateVariable[] {
   const priorOutputs = previousSteps.flatMap((step) => {
-    const outputs =
-      step.action === "extract"
-        ? Object.fromEntries(
-            Object.keys(step.matchers ?? {})
-              .filter((key) => /^[A-Za-z0-9_]+$/.test(key))
-              .map((key) => [key, "Extracted value"]),
-          )
-        : STEP_OUTPUTS[step.action];
+    const outputs = STEP_OUTPUTS[step.action];
     if (!outputs || !/^[A-Za-z0-9_]+$/.test(step.id)) return [];
     return Object.entries(outputs).map(([field, description]) => ({
       value: `steps.${step.id}.output.${field}`,

@@ -123,7 +123,6 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
   StreamSubscription<Amplitude>? _amplitudeSubscription;
   Future<void>? _startup;
   Future<void>? _terminalOperation;
-  Future<void>? _disposal;
   DateTime? _startedAt;
   String? _path;
   int _lifecycleGeneration = 0;
@@ -261,15 +260,10 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
   }
 
   @override
-  Future<void> dispose() {
-    final disposal = _disposal;
-    if (disposal != null) return disposal;
+  Future<void> dispose() async {
+    if (_disposed) return;
     _disposed = true;
     _lifecycleGeneration += 1;
-    return _disposal = _dispose();
-  }
-
-  Future<void> _dispose() async {
     final terminalOperation =
         _terminalOperation ?? (!_finished ? cancel() : null);
     if (terminalOperation != null) {
@@ -284,21 +278,13 @@ class DeviceVoiceNoteRecorder implements VoiceNoteRecorder {
     } catch (_) {
       // Startup may reject because disposal invalidated its generation.
     }
-    try {
-      await _amplitudeSubscription?.cancel();
-      if (_nativeStarted && !_nativeEnded) {
-        await _recorder.cancel();
-        _nativeEnded = true;
-      }
-    } catch (_) {
-      // Cancellation failure must not prevent the native release attempt.
-    }
-    try {
-      await _recorder.dispose();
+    await _amplitudeSubscription?.cancel();
+    if (_nativeStarted && !_nativeEnded) {
+      await _recorder.cancel();
       _nativeEnded = true;
-    } finally {
-      await _levels.close();
     }
+    await _recorder.dispose();
+    await _levels.close();
   }
 }
 

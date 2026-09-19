@@ -11,11 +11,11 @@ import 'package:package_info_plus/package_info_plus.dart';
 
 import '../../shared/auth/auth.dart';
 import '../../shared/clipboard_utils.dart';
-import '../../shared/identity/npub.dart';
-import '../../shared/notifications/notifications.dart';
 import '../../shared/community/community_membership_provider.dart';
 import '../../shared/push/push_bridge.dart';
 import '../../shared/relay/relay.dart';
+import '../../shared/utils/string_utils.dart';
+import '../pairing/pairing_provider.dart';
 import '../../shared/theme/theme.dart';
 import '../../shared/widgets/app_list.dart';
 import '../../shared/widgets/app_list_card.dart';
@@ -25,10 +25,8 @@ import '../../shared/widgets/ios_glass_navigation_button.dart';
 import '../../shared/widgets/ios_glass_navigation_action.dart';
 import '../../shared/widgets/immediate_page_route.dart';
 import '../../shared/widgets/modal_presentation.dart';
-import 'accent_picker_page.dart';
 import 'theme_picker_page.dart';
 
-part 'settings_page/appearance_section.dart';
 part 'settings_page/community_section.dart';
 part 'settings_page/connection_section.dart';
 part 'settings_page/notifications_section.dart';
@@ -146,7 +144,7 @@ class SettingsPage extends HookConsumerWidget {
     }
 
     return FrostedScaffold(
-      backgroundColor: context.colors.surface,
+      useUtilitySurfaceTheme: true,
       appBar: FrostedAppBar(
         automaticallyImplyLeading: false,
         horizontalInset: Grid.gutter,
@@ -218,11 +216,7 @@ class SettingsPage extends HookConsumerWidget {
               children: [
                 profileHeader,
                 _CommunitySection(invitePageBuilder: invitePageBuilder),
-                const _AppearanceSection(),
-                if (defaultTargetPlatform == TargetPlatform.android)
-                  const _NotificationSettingsSection(),
-                if (defaultTargetPlatform == TargetPlatform.iOS)
-                  const _NotificationsSection(),
+                const _NotificationsSection(),
                 _ConnectionSection(
                   identityRecoveryPageBuilder: identityRecoveryPageBuilder,
                 ),
@@ -231,134 +225,21 @@ class SettingsPage extends HookConsumerWidget {
             ),
           ),
           if (packageInfo.hasData)
-            _VersionFooter(version: packageInfo.data!.version),
+            _VersionFooter(
+              version: packageInfo.data!.version,
+              buildNumber: packageInfo.data!.buildNumber,
+            ),
         ],
       ),
     );
   }
 }
 
-class _NotificationSettingsSection extends ConsumerWidget {
-  const _NotificationSettingsSection();
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final settings = ref.watch(notificationSettingsProvider);
-    final sessionStatus = ref.watch(
-      relaySessionProvider.select((session) => session.status),
-    );
-    final isConnected = sessionStatus == SessionStatus.connected;
-    final isBlocked =
-        settings.permission == AndroidNotificationPermission.denied;
-    final selectedChannelDisabled =
-        (settings.priorityEnabled && !settings.priorityChannelEnabled) ||
-        (settings.activityEnabled && !settings.activityChannelEnabled);
-    final status = settings.isRequesting
-        ? 'Waiting for Android…'
-        : switch ((
-            settings.alertsEnabled,
-            isBlocked,
-            isConnected,
-            selectedChannelDisabled,
-          )) {
-            (_, true, _, _) => 'Blocked',
-            (false, _, _, _) => 'Off',
-            (true, _, false, _) => 'Paused',
-            (true, _, true, true) => 'Limited',
-            _ => 'On',
-          };
-
-    return AppListCard(
-      label: 'Notifications',
-      verticalPadding: Grid.twelve,
-      children: [
-        AppListRow(
-          icon: LucideIcons.bell,
-          title: 'Alerts',
-          subtitle: status == 'Waiting for Android…'
-              ? 'Waiting for Android…'
-              : status == 'Blocked'
-              ? 'Android has blocked Buzz notifications.'
-              : status == 'Paused'
-              ? 'Paused while Buzz reconnects.'
-              : status == 'Limited'
-              ? 'A notification category is disabled in Android settings.'
-              : 'Alerts require a live Buzz connection.',
-          value: status,
-          trailing: isBlocked
-              ? TextButton(
-                  onPressed: () => ref
-                      .read(notificationSettingsProvider.notifier)
-                      .openSettings(),
-                  child: const Text('Android settings'),
-                )
-              : Switch.adaptive(
-                  value: settings.alertsEnabled,
-                  onChanged: settings.isRequesting
-                      ? null
-                      : (enabled) => ref
-                            .read(notificationSettingsProvider.notifier)
-                            .setAlertsEnabled(enabled),
-                ),
-        ),
-        AppListRow(
-          icon: LucideIcons.circleAlert,
-          title: 'Mentions & direct messages',
-          subtitle:
-              'Alert when someone mentions you or sends you a direct message.',
-          trailing: Switch.adaptive(
-            value: settings.priorityEnabled,
-            onChanged: settings.alertsEnabled
-                ? (enabled) => ref
-                      .read(notificationSettingsProvider.notifier)
-                      .setPriorityEnabled(enabled)
-                : null,
-          ),
-        ),
-        AppListRow(
-          icon: LucideIcons.activity,
-          title: 'Channel activity',
-          subtitle: 'Alert for new top-level messages in unmuted channels.',
-          trailing: Switch.adaptive(
-            value: settings.activityEnabled,
-            onChanged: settings.alertsEnabled
-                ? (enabled) => ref
-                      .read(notificationSettingsProvider.notifier)
-                      .setActivityEnabled(enabled)
-                : null,
-          ),
-        ),
-        AppListRow(
-          icon: LucideIcons.eye,
-          title: 'Message previews',
-          subtitle: settings.previewsEnabled
-              ? 'Show sender, channel, and message text in notifications.'
-              : 'Hide sender, channel, and message text in notifications.',
-          trailing: Switch.adaptive(
-            value: settings.previewsEnabled,
-            onChanged: settings.alertsEnabled
-                ? (enabled) => ref
-                      .read(notificationSettingsProvider.notifier)
-                      .setPreviewsEnabled(enabled)
-                : null,
-          ),
-        ),
-        const AppListRow(
-          icon: LucideIcons.wifiOff,
-          title: 'Background alerts',
-          value: 'Not available',
-          subtitle:
-              'Buzz does not use Google services. Alerts require a live Buzz connection.',
-        ),
-      ],
-    );
-  }
-}
-
 class _VersionFooter extends StatelessWidget {
-  const _VersionFooter({required this.version});
+  const _VersionFooter({required this.version, required this.buildNumber});
 
   final String version;
+  final String buildNumber;
 
   @override
   Widget build(BuildContext context) {
@@ -368,7 +249,7 @@ class _VersionFooter extends StatelessWidget {
         padding: const EdgeInsets.only(bottom: Grid.xs, top: Grid.xxs),
         child: Center(
           child: Text(
-            'v$version',
+            buildNumber.isEmpty ? 'v$version' : 'v$version ($buildNumber)',
             style: context.textTheme.bodySmall?.copyWith(
               color: context.colors.onSurfaceVariant.withValues(alpha: 0.6),
             ),

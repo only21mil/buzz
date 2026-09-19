@@ -211,30 +211,4 @@ mod tests {
             vec!["supercalifragilistic", "x"]
         );
     }
-
-    // Fork-only groups have no upstream counterpart, so the shared
-    // assertions above cannot cover them. The tree is generated from the
-    // parser, but pin the fork groups explicitly so a bad merge that drops
-    // one fails here instead of silently shrinking agent discovery.
-    #[test]
-    fn long_help_includes_fork_only_groups() {
-        let help = build_command().render_long_help().to_string();
-
-        assert!(
-            help.contains("\n  ci                            Trigger and inspect CI runs\n"),
-            "fork-only ci group missing:\n{help}"
-        );
-        assert!(
-            help.contains("\n    status                      Show the current state of a CI run\n"),
-            "fork-only ci subcommand missing:\n{help}"
-        );
-        assert!(
-            help.contains("\n  events                        Fetch raw signed Nostr events\n"),
-            "fork-only events group missing:\n{help}"
-        );
-        assert!(
-            help.contains("\n  pack                          Persona pack operations (local, no relay connection needed)\n"),
-            "fork-only pack group missing:\n{help}"
-        );
-    }
 }

@@ -4,12 +4,14 @@
 use super::*;
 use std::collections::BTreeMap;
 
-const UUID: &str = "11111111-2222-3333-4444-555555555555";
+const UUID: &str = "11111111-2222-3333-4444-555555555555"; // sadscan:disable sq.pii.cc.visa -- fixed test UUID
 
 /// A local in-app persona: `source_team_persona_slug` is None, so its d-tag
 /// IS its UUID id. Carries env_vars + source_team that must survive a patch.
 fn local_in_app() -> AgentDefinition {
     AgentDefinition {
+        session_policy: Default::default(),
+        description: None,
         id: UUID.to_string(),
         display_name: "Local".to_string(),
         avatar_url: None,
@@ -38,6 +40,8 @@ fn local_in_app() -> AgentDefinition {
 /// slug = Some(d-tag), empty env_vars, source_team None.
 fn inbound_for(d_tag: &str, display_name: &str) -> AgentDefinition {
     AgentDefinition {
+        session_policy: Default::default(),
+        description: None,
         id: d_tag.to_string(),
         display_name: display_name.to_string(),
         avatar_url: Some("https://example.com/a.png".to_string()),
@@ -90,12 +94,14 @@ fn inbound_quad_edit_applies_to_existing_matched_record() {
     let mut local = local_in_app();
     local.respond_to = Some("owner-only".to_string());
     local.parallelism = Some(2);
+    local.session_policy = crate::managed_agents::AcpSessionPolicy::Channel;
     let mut personas = vec![local];
 
     let mut inbound = inbound_for(UUID, "Remote");
     inbound.respond_to = Some("allowlist".to_string());
     inbound.respond_to_allowlist = vec!["a".repeat(64)];
     inbound.parallelism = Some(8);
+    inbound.session_policy = crate::managed_agents::AcpSessionPolicy::Thread;
     apply_inbound_persona(&mut personas, inbound);
 
     assert_eq!(personas.len(), 1, "no duplicate row");
@@ -103,10 +109,20 @@ fn inbound_quad_edit_applies_to_existing_matched_record() {
     assert_eq!(p.respond_to, Some("allowlist".to_string()));
     assert_eq!(p.respond_to_allowlist, vec!["a".repeat(64)]);
     assert_eq!(p.parallelism, Some(8));
+    assert_eq!(
+        p.session_policy,
+        crate::managed_agents::AcpSessionPolicy::Thread
+    );
     // A quad-absent inbound also applies (clears), same as prompt/model.
     apply_inbound_persona(&mut personas, inbound_for(UUID, "Remote"));
     assert_eq!(personas[0].respond_to, None);
     assert_eq!(personas[0].parallelism, None);
+    // The default channel policy also represents an inbound event that omitted
+    // session_policy, so it must clear a previously stored thread policy.
+    assert_eq!(
+        personas[0].session_policy,
+        crate::managed_agents::AcpSessionPolicy::Channel
+    );
 }
 
 #[test]
@@ -161,7 +177,8 @@ const AGENT_PUBKEY: &str = "agentpubkeyhex00000000000000000000000000000000000000
 /// event must NEVER be able to overwrite.
 fn local_agent() -> ManagedAgentRecord {
     ManagedAgentRecord {
-        effort_level: None,
+        session_policy: Default::default(),
+        description: None,
         pubkey: AGENT_PUBKEY.to_string(),
         name: "Local Agent".to_string(),
         persona_id: Some("persona-local".to_string()),
@@ -191,6 +208,7 @@ fn local_agent() -> ManagedAgentRecord {
             config: serde_json::json!({ "api_key": "localproviderkey" }),
         },
         backend_agent_id: Some("local-remote-id".to_string()),
+        provider_policy_pending: false,
         provider_binary_path: Some("/local/bin".to_string()),
         team_id: None,
         persona_team_dir: None,
@@ -219,6 +237,7 @@ fn local_agent() -> ManagedAgentRecord {
         definition_respond_to_allowlist: Vec::new(),
         definition_parallelism: None,
         relay_mesh: None,
+        effort_level: None,
     }
 }
 
@@ -266,8 +285,13 @@ fn inbound_managed_agent_drops_injected_secrets_and_harness() {
     let content =
         crate::managed_agents::agent_events::managed_agent_content_from_event(&event).unwrap();
     let mut agents = vec![local_agent()];
-    apply_inbound_managed_agent(&mut agents, AGENT_PUBKEY, content);
+    let access_changed = apply_inbound_managed_agent(&mut agents, AGENT_PUBKEY, content);
 
+    assert_eq!(
+        access_changed,
+        !crate::managed_agents::owner_only_access_build(),
+        "only an effective access change may trigger a runtime refresh"
+    );
     let a = &agents[0];
     // Secrets / harness / runtime — every one preserved from the local record.
     assert_eq!(
@@ -401,7 +425,6 @@ fn local_team() -> TeamRecord {
         is_builtin: false,
         shared: false,
         catalog_source: None,
-
         source_dir: Some(std::path::PathBuf::from("/local/team/dir")),
         is_symlink: true,
         symlink_target: Some("/external".to_string()),
@@ -551,6 +574,176 @@ fn inbound_team_no_match_inserts_idempotently() {
     assert_eq!(teams.len(), 2, "re-receive of inserted team no-ops");
 }
 
+// ── Inbound team → membership propagation (commit_inbound_team wiring) ─────
+
+use std::cell::RefCell;
+
+/// A running instance of `persona_id`, optionally bound to a team.
+fn team_instance(seed: char, persona_id: &str, team_id: Option<&str>) -> ManagedAgentRecord {
+    let mut record = local_agent();
+    record.pubkey = seed.to_string().repeat(64);
+    record.name = persona_id.to_string();
+    record.persona_id = Some(persona_id.to_string());
+    record.team_id = team_id.map(str::to_string);
+    record
+}
+
+/// An inbound team edit that ADDS a persona must bind that persona's unbound
+/// running instances to the team — exactly like a local `update_team`. Without
+/// the propagation wiring the instance stays unbound (member in roster, not in
+/// behavior) until restart.
+#[test]
+fn inbound_team_add_binds_unbound_instance_through_wiring() {
+    let mut teams = vec![local_team()];
+    teams[0].persona_ids = vec!["p-existing".to_string()];
+    let existing = vec![
+        team_instance('a', "p-added", None),
+        team_instance('b', "p-existing", Some(TEAM_ID)),
+    ];
+    let saved = RefCell::new(None);
+
+    commit_inbound_team(
+        &mut teams,
+        TEAM_ID.to_string(),
+        TeamEventContent {
+            name: "Team".to_string(),
+            description: None,
+            instructions: None,
+            persona_ids: Some(vec!["p-existing".to_string(), "p-added".to_string()]),
+        },
+        |_| Ok(()),
+        || Ok(existing.clone()),
+        |records| {
+            *saved.borrow_mut() = Some(records.to_vec());
+            Ok(())
+        },
+    )
+    .expect("inbound add succeeds");
+
+    let saved = saved
+        .borrow()
+        .clone()
+        .expect("add must save the agent store");
+    assert_eq!(
+        saved[0].team_id.as_deref(),
+        Some(TEAM_ID),
+        "the added persona's unbound instance is bound to the team"
+    );
+    assert_eq!(
+        saved[1].team_id.as_deref(),
+        Some(TEAM_ID),
+        "an instance already on the team is untouched"
+    );
+}
+
+/// An inbound team edit that REMOVES a persona ("keep agents") must detach that
+/// persona's instances bound to this team, so a kept instance stops drawing the
+/// team's instructions at spawn.
+#[test]
+fn inbound_team_removal_detaches_instance_through_wiring() {
+    let mut teams = vec![local_team()];
+    teams[0].persona_ids = vec!["p-removed".to_string()];
+    let existing = vec![team_instance('a', "p-removed", Some(TEAM_ID))];
+    let saved = RefCell::new(None);
+
+    commit_inbound_team(
+        &mut teams,
+        TEAM_ID.to_string(),
+        TeamEventContent {
+            name: "Team".to_string(),
+            description: None,
+            instructions: None,
+            persona_ids: Some(vec![]),
+        },
+        |_| Ok(()),
+        || Ok(existing.clone()),
+        |records| {
+            *saved.borrow_mut() = Some(records.to_vec());
+            Ok(())
+        },
+    )
+    .expect("inbound removal succeeds");
+
+    let saved = saved
+        .borrow()
+        .clone()
+        .expect("removal must save the agent store");
+    assert_eq!(
+        saved[0].team_id, None,
+        "the removed persona's instance is detached from the team"
+    );
+}
+
+/// An inbound edit that omits `persona_ids` (a pre-always-publish client)
+/// preserves local membership, so the delta is empty and no instance is
+/// re-pointed — a metadata-only inbound edit must not disturb bindings.
+#[test]
+fn inbound_team_omitted_roster_leaves_bindings_untouched() {
+    let mut teams = vec![local_team()];
+    teams[0].persona_ids = vec!["p-a".to_string()];
+    let existing = vec![team_instance('a', "p-a", None)];
+    let saved = RefCell::new(None);
+
+    commit_inbound_team(
+        &mut teams,
+        TEAM_ID.to_string(),
+        team_content_omitting_optional_fields("Renamed"),
+        |_| Ok(()),
+        || Ok(existing.clone()),
+        |records| {
+            *saved.borrow_mut() = Some(records.to_vec());
+            Ok(())
+        },
+    )
+    .expect("inbound metadata-only edit succeeds");
+
+    assert!(
+        saved.borrow().is_none(),
+        "an empty membership delta writes nothing to the agent store"
+    );
+}
+
+/// A failing agent-store write after the authoritative `save_teams` is
+/// swallowed: the inbound reconcile still succeeds (boot repair is the retry),
+/// so a secondary-store hiccup never aborts an inbound event whose team write
+/// already landed.
+#[test]
+fn inbound_team_swallows_agent_store_failure() {
+    let mut teams = vec![local_team()];
+    teams[0].persona_ids = vec![];
+    commit_inbound_team(
+        &mut teams,
+        TEAM_ID.to_string(),
+        TeamEventContent {
+            name: "Team".to_string(),
+            description: None,
+            instructions: None,
+            persona_ids: Some(vec!["p-added".to_string()]),
+        },
+        |_| Ok(()),
+        || Err("agent store unreadable".to_string()),
+        |_| Ok(()),
+    )
+    .expect("inbound reconcile swallows secondary-store failure");
+}
+
+/// A `persist_teams` error propagates — the authoritative team write failing is
+/// a real reconcile failure, unlike best-effort agent IO.
+#[test]
+fn inbound_team_propagates_persist_teams_error() {
+    let mut teams = vec![local_team()];
+    let err = commit_inbound_team(
+        &mut teams,
+        TEAM_ID.to_string(),
+        team_content("Team"),
+        |_| Err("disk full".to_string()),
+        || Ok(vec![]),
+        |_| Ok(()),
+    )
+    .expect_err("a failed team persist must propagate");
+    assert_eq!(err, "disk full");
+}
+
 // ── Tombstone (kind:5) consume ────────────────────────────────────────────
 
 fn deletion_event(coord: &str) -> nostr::Event {
@@ -681,301 +874,62 @@ fn inbound_gate_accepts_validly_signed_event() {
     assert_eq!(parsed.pubkey, keys.public_key());
 }
 
-// ── Prompt-save round-trip (issue f8fce672) ────────────────────────────────
-//
-// After a successful local save of a new system_prompt (the retention row
-// lands with created_at = T), an inbound kind:30175 carrying the OLD
-// system_prompt at created_at < T must NOT revert the local prompt. The
-// retention row exists and is newer, so `retain_inbound_event` returns
-// `Skipped` and `apply_inbound_persona` is never called.
+#[test]
+fn inbound_persona_rejects_invisible_definition_text() {
+    let mut inbound = inbound_for("unsafe", "Remote");
+    inbound.system_prompt = "Review\u{200B} code.".to_string();
 
-/// Build a kind:30175 `nostr::Event` from `persona`, signed with `keys`, at a
-/// fixed `created_at` so the test can stage an OLDER inbound against a NEWER
-/// retained row. Mirrors the wire path `build_persona_event` + sign.
-fn persona_event_at(
-    persona: &AgentDefinition,
-    keys: &nostr::Keys,
-    created_at: u64,
-) -> nostr::Event {
-    use crate::managed_agents::persona_events::build_persona_event;
-    use nostr::JsonUtil;
-    let event = build_persona_event(persona)
-        .unwrap()
-        .custom_created_at(nostr::Timestamp::from_secs(created_at))
-        .sign_with_keys(keys)
-        .unwrap();
-    // Round-trip through JSON to mirror the wire path the reconcile command
-    // parses from.
-    nostr::Event::from_json(event.as_json()).unwrap()
+    let error = validate_inbound_persona_definition(&inbound)
+        .expect_err("relay sync must reject invisible instructions");
+
+    assert!(error.contains("U+200B"));
 }
 
-/// The save-then-older-inbound invariant: after a successful local save
-/// (retention row written at created_at = T, where T is `now`), an inbound
-/// kind:30175 with the OLD system_prompt at created_at < T does NOT revert
-/// the local prompt.
-///
-/// `retain_inbound_event` returns `Skipped` (the retained row is newer), so
-/// `apply_inbound_persona` is never called and the local prompt is untouched.
-/// This test passes both before and after the fix — the retention row protects
-/// the local edit. The fix's invariant is that the retain MUST succeed for
-/// this protection to hold; when it fails, the save path surfaces the error
-/// instead (see `retain_failure_surfaces_error_not_swallowed`).
-#[test]
-fn successful_save_protects_new_prompt_against_older_inbound() {
-    use crate::managed_agents::retention::{
-        open_retention_db, retain_inbound_event, InboundOutcome, RetainedEvent,
-    };
-    use nostr::JsonUtil;
-
-    let dir = tempfile::tempdir().unwrap();
-    let keys = nostr::Keys::generate();
-    let owner = keys.public_key().to_hex();
-    let db_path = crate::managed_agents::retention::scoped_retention_db_path(
-        dir.path(),
-        "wss://a.example",
-        &owner,
-    );
-    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
-
-    // Local save: a persona with the NEW prompt retained at created_at = now.
-    let mut saved = local_in_app();
-    saved.system_prompt = "new prompt".to_string();
-    let (_, retained, _) =
-        super::super::pending::prepare_persona_publication_at(&db_path, &keys, &saved, None)
-            .unwrap();
-    let retained_created_at = retained.created_at;
-    assert!(
-        retained_created_at > 1000,
-        "monotonic_created_at returns now, which is > 1000"
-    );
-
-    // Inbound: the OLD prompt at an OLDER created_at (1000 < retained).
-    let mut old_persona = local_in_app();
-    old_persona.system_prompt = "old prompt".to_string();
-    let old_event = persona_event_at(&old_persona, &keys, 1000);
-
-    let conn = open_retention_db(&db_path).unwrap();
-    let outcome = retain_inbound_event(
-        &conn,
-        &RetainedEvent {
-            kind: buzz_core_pkg::kind::KIND_PERSONA,
-            pubkey: old_event.pubkey.to_hex(),
-            d_tag: crate::managed_agents::persona_events::persona_d_tag(&old_persona),
-            content: old_event.content.to_string(),
-            created_at: 1000,
-            raw_event: old_event.as_json(),
-            pending_sync: false,
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        outcome,
-        InboundOutcome::Skipped,
-        "an older inbound must not overwrite a newer retained local edit"
-    );
-
-    // The local prompt is untouched — `apply_inbound_persona` was never called
-    // because the outcome was Skipped. Simulate the Applied branch to prove the
-    // guard: had the inbound been Applied, it would have overwritten the prompt.
-    let mut personas = vec![saved];
-    if outcome == InboundOutcome::Applied {
-        apply_inbound_persona(&mut personas, inbound_for(UUID, "Local"));
-    }
-    assert_eq!(
-        personas[0].system_prompt, "new prompt",
-        "the local new prompt must survive — the older inbound was skipped"
-    );
-}
-
-/// The revert hole the fix closes: when the retention write FAILS, the save
-/// path must surface the error to the caller rather than silently reporting
-/// success. This test calls `retain_persona_pending` itself — the wrapper
-/// whose body is the propagate-vs-swallow site — with an `AppState` in
-/// recovery mode (`identity_lost`), so `active_retention_scope` returns
-/// `Err("...recovery mode...")` from `signing_keys()` before the AppHandle's
-/// data dir is ever touched. The wrapper must return that `Err`, not swallow
-/// it into `eprintln!` and report `Ok(())`. Restore the pre-fix swallow
-/// inside `retain_persona_pending` and this test fails (the wrapper returns
-/// `Ok(())` instead of `Err`).
-#[test]
-fn retain_persona_pending_surfaces_recovery_mode_error() {
-    use tauri::test::mock_app;
-
-    let app = mock_app();
-    let state = crate::build_app_state();
-    state
-        .identity_lost
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-
-    let mut persona = local_in_app();
-    persona.system_prompt = "new prompt".to_string();
-
-    let error =
-        crate::commands::personas::pending::retain_persona_pending(app.handle(), &state, &persona)
-            .expect_err("recovery mode must surface as Err, not be swallowed into Ok");
-    assert!(
-        error.contains("recovery mode"),
-        "the recovery-mode failure must propagate: {error}"
-    );
-}
-
-/// The inner `_at` seam still surfaces an unopenable retention db. Kept
-/// because it covers the on-disk failure path (`create_dir_all` / `open_retention_db`)
-/// that the recovery-mode test does not reach, and asserts the failure string
-/// is actionable rather than a bare panic.
-#[test]
-fn retain_persona_publication_at_surfaces_unopenable_db() {
-    use crate::managed_agents::persona_events::persona_d_tag;
-
-    let dir = tempfile::tempdir().unwrap();
-    let keys = nostr::Keys::generate();
-
-    let mut persona = local_in_app();
-    persona.system_prompt = "new prompt".to_string();
-
-    let error =
-        super::super::pending::prepare_persona_publication_at(dir.path(), &keys, &persona, None)
-            .expect_err("an unopenable retention db must surface its failure");
-    assert!(
-        error.contains("failed to open retention db"),
-        "the retention failure must be surfaced, not swallowed: {error}"
-    );
-
-    let _ = persona_d_tag(&persona);
-}
-
-/// The managed-agent (kind:30177) twin: `retain_managed_agent_pending` must
-/// surface the recovery-mode error instead of swallowing it into `eprintln!`.
-/// Restore the pre-fix swallow inside `retain_managed_agent_pending` and this
-/// test fails.
-#[test]
-fn retain_managed_agent_pending_surfaces_recovery_mode_error() {
-    use tauri::test::mock_app;
-
-    let app = mock_app();
-    let state = crate::build_app_state();
-    state
-        .identity_lost
-        .store(true, std::sync::atomic::Ordering::Relaxed);
-
-    let record = ManagedAgentRecord {
-        effort_level: None,
-        pubkey: "a".repeat(64),
-        name: "Test".to_string(),
-        persona_id: None,
-        private_key_nsec: String::new(),
-        auth_tag: None,
-        relay_url: String::new(),
-        avatar_url: None,
-        acp_command: String::new(),
-        agent_command: String::new(),
-        agent_command_override: None,
-        agent_args: vec![],
-        mcp_command: String::new(),
-        turn_timeout_seconds: 0,
-        idle_timeout_seconds: None,
-        max_turn_duration_seconds: None,
-        parallelism: 1,
-        system_prompt: None,
+fn inbound_managed_agent_content(
+    name: &str,
+    persona_id: Option<&str>,
+    system_prompt: Option<&str>,
+) -> crate::managed_agents::agent_events::ManagedAgentEventContent {
+    crate::managed_agents::agent_events::ManagedAgentEventContent {
+        name: name.to_string(),
+        persona_id: persona_id.map(str::to_string),
+        system_prompt: system_prompt.map(str::to_string),
         model: None,
         provider: None,
         persona_source_version: None,
-        env_vars: std::collections::BTreeMap::new(),
-        start_on_app_launch: false,
-        auto_restart_on_config_change: true,
-        runtime_pid: None,
-        backend: Default::default(),
-        backend_agent_id: None,
-        provider_binary_path: None,
-        team_id: None,
-        persona_team_dir: None,
-        persona_name_in_team: None,
-        created_at: String::new(),
-        updated_at: String::new(),
-        last_started_at: None,
-        last_stopped_at: None,
-        last_exit_code: None,
-        last_error: None,
-        last_error_code: None,
-        respond_to: Default::default(),
+        parallelism: 1,
+        respond_to: crate::managed_agents::RespondTo::OwnerOnly,
         respond_to_allowlist: vec![],
-        display_name: None,
-        slug: None,
-        runtime: None,
-        name_pool: vec![],
-        is_builtin: false,
-        is_active: true,
-        shared: false,
-        source_team: None,
-        source_team_persona_slug: None,
-        catalog_source: None,
-
-        team_catalog_source: None,
-        definition_respond_to: None,
-        definition_respond_to_allowlist: vec![],
-        definition_parallelism: None,
-        relay_mesh: None,
-    };
-
-    let error =
-        crate::commands::agents::retain_managed_agent_pending(app.handle(), &state, &record)
-            .expect_err("recovery mode must surface as Err, not be swallowed into Ok");
-    assert!(
-        error.contains("recovery mode"),
-        "the recovery-mode failure must propagate: {error}"
-    );
+    }
 }
 
-/// The managed-agent (kind:30177) analog: a successful local save protects
-/// the new prompt against an older inbound. `retain_inbound_event` returns
-/// `Skipped` because the retained row is newer, so `apply_inbound_managed_agent`
-/// is never called and the local prompt is untouched.
 #[test]
-fn successful_managed_agent_save_protects_new_prompt_against_older_inbound() {
-    use crate::managed_agents::retention::{
-        open_retention_db, retain_event, retain_inbound_event, InboundOutcome, RetainedEvent,
-    };
+fn inbound_definition_less_agent_rejects_invisible_prompt() {
+    let inbound = inbound_managed_agent_content("Remote Agent", None, Some("Review\u{200B} code."));
 
-    let dir = tempfile::tempdir().unwrap();
-    let db_path = dir.path().join("retention.db");
-    let owner = "ownerpubkeyhex0000000000000000000000000000000000000000000000000000";
+    let error = validate_inbound_managed_agent_definition(&inbound)
+        .expect_err("definition-less sync must reject invisible instructions");
 
-    // Local save: a kind:30177 row retained at created_at = 2000 with the NEW
-    // prompt in its content.
-    let conn = open_retention_db(&db_path).unwrap();
-    retain_event(
-        &conn,
-        &RetainedEvent {
-            kind: buzz_core_pkg::kind::KIND_MANAGED_AGENT,
-            pubkey: owner.to_string(),
-            d_tag: AGENT_PUBKEY.to_string(),
-            content: r#"{"name":"Local","system_prompt":"new prompt"}"#.to_string(),
-            created_at: 2000,
-            raw_event: r#"{"id":"local"}"#.to_string(),
-            pending_sync: true,
-        },
-    )
-    .unwrap();
-
-    // Inbound: the OLD prompt at created_at = 1000 (< 2000).
-    let outcome = retain_inbound_event(
-        &conn,
-        &RetainedEvent {
-            kind: buzz_core_pkg::kind::KIND_MANAGED_AGENT,
-            pubkey: owner.to_string(),
-            d_tag: AGENT_PUBKEY.to_string(),
-            content: r#"{"name":"Local","system_prompt":"old prompt"}"#.to_string(),
-            created_at: 1000,
-            raw_event: r#"{"id":"old"}"#.to_string(),
-            pending_sync: false,
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        outcome,
-        InboundOutcome::Skipped,
-        "an older inbound must not overwrite a newer retained managed-agent edit"
-    );
+    assert!(error.contains("U+200B"));
 }
 
-mod review_content;
+#[test]
+fn inbound_managed_agent_rejects_bidirectional_name() {
+    let inbound = inbound_managed_agent_content("Remote\u{202E} Agent", None, None);
+
+    let error = validate_inbound_managed_agent_definition(&inbound)
+        .expect_err("managed-agent sync must reject bidirectional names");
+
+    assert!(error.contains("U+202E"));
+}
+
+#[test]
+fn inbound_definition_less_agent_accepts_visible_multiline_prompt() {
+    let inbound = inbound_managed_agent_content(
+        "Remote Agent",
+        None,
+        Some("Review code.\n\tCall out security risks."),
+    );
+
+    assert!(validate_inbound_managed_agent_definition(&inbound).is_ok());
+}

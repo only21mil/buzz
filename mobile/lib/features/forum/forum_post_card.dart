@@ -9,8 +9,8 @@ import '../../shared/theme/theme.dart';
 import '../../shared/widgets/avatar_image.dart';
 import '../../shared/widgets/modal_presentation.dart';
 import '../channels/message_content.dart';
-import '../../shared/identity/npub.dart';
 import '../../shared/profile/user_cache_provider.dart';
+import '../../shared/utils/string_utils.dart';
 import '../profile/user_profile_sheet.dart';
 import '../../shared/profile/user_profile.dart';
 import 'forum_models.dart';
@@ -54,7 +54,10 @@ class ForumPostCard extends HookConsumerWidget {
     final profile =
         ref.watch(userCacheProvider.select((cache) => cache[pk])) ??
         ref.read(userCacheProvider.notifier).get(pk);
-    final displayName = profile?.label ?? truncateNpub(post.pubkey);
+    final displayName = profile?.label ?? shortPubkey(post.pubkey);
+    final isAgent =
+        ref.watch(agentMentionPubkeysProvider(post.channelId)).contains(pk) ||
+        profile?.ownerPubkey != null;
     final profileMentionNames = ref.watch(
       userCacheProvider.select(
         (cache) => _buildMentionNames(post.mentionPubkeys, cache),
@@ -113,7 +116,11 @@ class ForumPostCard extends HookConsumerWidget {
                 GestureDetector(
                   behavior: HitTestBehavior.opaque,
                   onTap: () => showUserProfileSheet(context, post.pubkey),
-                  child: _PostAvatar(profile: profile, pubkey: post.pubkey),
+                  child: _PostAvatar(
+                    profile: profile,
+                    pubkey: post.pubkey,
+                    isAgent: isAgent,
+                  ),
                 ),
                 const SizedBox(width: Grid.xxs),
                 Expanded(
@@ -309,8 +316,13 @@ class ForumPostCard extends HookConsumerWidget {
 class _PostAvatar extends StatelessWidget {
   final UserProfile? profile;
   final String pubkey;
+  final bool isAgent;
 
-  const _PostAvatar({required this.profile, required this.pubkey});
+  const _PostAvatar({
+    required this.profile,
+    required this.pubkey,
+    required this.isAgent,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -329,6 +341,7 @@ class _PostAvatar extends StatelessWidget {
           fontWeight: FontWeight.w600,
         ),
       ),
+      isAgent: isAgent,
     );
   }
 }

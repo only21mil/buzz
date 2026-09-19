@@ -1,20 +1,24 @@
 import type { QueryClient } from "@tanstack/react-query";
+
 import type { Project } from "./projectModels";
 import { deleteProject } from "./projectDeletion";
-import { projectCollectionMutationOptions } from "./projectCollectionMutation";
-import type { ProjectSnapshotScope } from "./projectSnapshot";
 
-/** Refresh uncertain deletions and remove confirmed deletions from their scope. */
+export const projectsQueryKey = ["projects"] as const;
+
+/** Keep the shared project cache authoritative even when publish ACK is lost. */
 export function projectDeletionMutationOptions(
   queryClient: QueryClient,
-  scope: ProjectSnapshotScope | null,
   deleteProjectFn: (project: Project) => Promise<void> = deleteProject,
 ) {
-  return projectCollectionMutationOptions(
-    queryClient,
-    scope,
-    deleteProjectFn,
-    (current, _data, project) =>
-      current.filter((item) => item.id !== project.id),
-  );
+  type DeletionResult = Awaited<ReturnType<typeof deleteProjectFn>>;
+  return {
+    mutationFn: deleteProjectFn,
+    onSuccess: (_data: DeletionResult, project: Project) => {
+      queryClient.setQueryData<Project[]>(projectsQueryKey, (current = []) =>
+        current.filter((item) => item.id !== project.id),
+      );
+    },
+    onSettled: () =>
+      queryClient.invalidateQueries({ queryKey: projectsQueryKey }),
+  };
 }

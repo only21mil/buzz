@@ -1,4 +1,4 @@
-import { truncatePubkey } from "@/shared/lib/pubkey";
+import { truncateNpub, truncatePubkey } from "@/shared/lib/pubkey";
 import { parseConditionExpressions } from "./workflowConditionExpression";
 import { TRIGGER_LABELS } from "./workflowFormTypes";
 import type { ParsedConditionExpression } from "./workflowConditionExpression";
@@ -10,8 +10,8 @@ const EVENT_PHRASES = {
   reaction_added: "Reaction added",
 } as const;
 
-const TRIGGER_MESSAGE_LOADING_LABEL = "loading message";
-const TRIGGER_AUTHOR_LOADING_LABEL = "loading author";
+export const TRIGGER_MESSAGE_LOADING_LABEL = "loading message";
+export const TRIGGER_AUTHOR_LOADING_LABEL = "loading author";
 
 function authorReference(
   condition: ParsedConditionExpression,
@@ -19,7 +19,9 @@ function authorReference(
   authorLoading?: boolean,
 ): string {
   if (authorLoading) return TRIGGER_AUTHOR_LOADING_LABEL;
-  return authorLabel ?? truncatePubkey(condition.value);
+  // The trigger author is a pubkey identity; the unresolved fallback renders
+  // the npub compact, never raw hex.
+  return authorLabel ?? truncateNpub(condition.value);
 }
 
 function quotedValue(value: string): string {
@@ -35,6 +37,8 @@ function messageReference(
   messageLoading?: boolean,
 ): string {
   if (messageLoading) return TRIGGER_MESSAGE_LOADING_LABEL;
+  // The referenced message is an event id, not a pubkey identity: it keeps
+  // the generic hex truncation.
   return messageLabel
     ? quotedValue(messageLabel)
     : truncatePubkey(condition.value);
@@ -66,7 +70,7 @@ function textConditionDescription(
   }
 }
 
-type WorkflowAuthorDescriptionSegments = {
+export type WorkflowAuthorDescriptionSegments = {
   prefix: string;
   suffix: string;
 };

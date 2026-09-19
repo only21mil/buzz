@@ -56,7 +56,7 @@ const acceptedFixtures = [
   `name: Notify\ntrigger:\n  on: message_posted\nsteps:\n  - id: notify_1\n    action: send_message\n    text: hello\n`,
   `name: React\ndescription: React to a message\nenabled: false\ntrigger:\n  on: reaction_added\n  emoji: eyes\n  filter: trigger_message_id == "abc123"\nsteps:\n  - id: react\n    name: Add reaction\n    timeout_secs: 30\n    action: add_reaction\n    emoji: white_check_mark\n`,
   `name: Webhook\ntrigger:\n  on: webhook\nsteps:\n  - id: call\n    action: call_webhook\n    url: https://example.com/hook\n    method: PATCH\n    headers:\n      Authorization: secret\n      X-Trace: trace\n    body: '{"ok":true}'\n`,
-  `name: Legacy actions\ntrigger:\n  on: diff_posted\n  filter: str_contains(trigger_text, "deploy")\nsteps:\n  - id: dm\n    action: send_dm\n    to: abc123\n    text: hello\n  - id: approval\n    action: request_approval\n    from: owner\n    message: Approve?\n    timeout: 24h\n  - id: topic\n    action: set_channel_topic\n    topic: Deployed\n  - id: wait\n    action: delay\n    duration: 5m\n`,
+  `name: Legacy actions\ntrigger:\n  on: diff_posted\n  filter: str_contains(trigger_text, "deploy")\nsteps:\n  - id: dm\n    action: send_dm\n    to: abc123\n    text: hello\n  - id: approval\n    action: request_approval\n    from: manager\n    message: Approve?\n    timeout: 24h\n  - id: topic\n    action: set_channel_topic\n    topic: Deployed\n  - id: wait\n    action: delay\n    duration: 5m\n`,
   `name: Scheduled preset\ntrigger:\n  on: schedule\n  interval: 15m\nsteps:\n  - id: notify\n    action: send_message\n    text: hello\n`,
   `name: Scheduled custom\ntrigger:\n  on: schedule\n  cron: 0 */2 * * 1,3,5\nsteps:\n  - id: notify\n    action: send_message\n    text: hello\n`,
   `name: Scheduled legacy interval\ntrigger:\n  on: schedule\n  interval: 2h30m\nsteps:\n  - id: notify\n    action: send_message\n    text: hello\n`,
@@ -216,39 +216,6 @@ test("values the Form serializer would normalize are refused", () => {
   for (const yaml of fixtures) assert.equal(yamlToFormState(yaml).ok, false);
 });
 
-test("fork state and extraction actions remain in lossless YAML mode", () => {
-  for (const action of ["extract", "read_state", "write_state"]) {
-    const yaml = `# preserved comment\nname: Durable\ntrigger: {on: webhook}\nsteps:\n  - id: fork\n    action: ${action}\n    key: custom\n    future_field: [one, two]\n`;
-    const result = yamlToFormState(yaml);
-    assert.equal(result.ok, false);
-    assert.match(result.error, /YAML editor/);
-  }
-});
-
-test("approval Form policies match the fork authority contract", () => {
-  for (const from of [
-    "owner",
-    "admin",
-    "ab".repeat(32),
-    "{{trigger.author}}",
-  ]) {
-    assert.equal(
-      yamlToFormState(
-        `name: Gate\ntrigger: {on: webhook}\nsteps: [{id: gate, action: request_approval, from: '${from}', message: Approve?}]`,
-      ).ok,
-      true,
-    );
-  }
-  for (const from of ["manager", "@manager", "AB".repeat(32), "{{unfinished"]) {
-    assert.equal(
-      yamlToFormState(
-        `name: Gate\ntrigger: {on: webhook}\nsteps: [{id: gate, action: request_approval, from: '${from}', message: Approve?}]`,
-      ).ok,
-      false,
-    );
-  }
-});
-
 test("reply_in_thread is emitted only when the checkbox is on", () => {
   const withReply = formStateToYaml(sendMessageState({ replyInThread: true }));
   assert.match(withReply, /reply_in_thread: true/);
@@ -347,4 +314,75 @@ test("absent reply_in_thread parses as false", () => {
   const parsed = yamlToFormState(yaml);
   assert.equal(parsed.ok, true);
   assert.equal(parsed.state.steps[0].replyInThread, false);
+});
+
+// Handoff vectors, round-trip verified with nostr-tools nip19.
+const KEY_HEX =
+  "ea9b4d7a7a78a3e3729e5568b14d764d4962be0e1f20f749bcf8d9dbbf9a9328";
+const KEY_NPUB =
+  "npub1a2d567n60z37xu57245tzntkf4yk90swrus0wjdulrvah0u6jv5qusyp60";
+
+test("stored hex to/from keys display as npubs in the form", () => {
+  const parsed = yamlToFormState(
+    `name: Keys
+trigger: { on: message_posted }
+steps: [{ id: s1, action: send_dm, to: ${KEY_HEX}, text: hi }, { id: s2, action: request_approval, from: ${KEY_HEX}, message: ok }]
+`,
+  );
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.state.steps[0].to, KEY_NPUB);
+  assert.equal(parsed.state.steps[1].from, KEY_NPUB);
+});
+
+test("npub to/from keys serialize to canonical hex; other spellings pass through", () => {
+  const dm = formStateToYaml({
+    ...DEFAULT_FORM_STATE,
+    name: "Keys",
+    steps: [{ id: "s1", action: "send_dm", to: KEY_NPUB, text: "hi" }],
+  });
+  assert.match(dm, new RegExp(`to: ${KEY_HEX}`));
+  assert.doesNotMatch(dm, /npub1/);
+
+  const approval = formStateToYaml({
+    ...DEFAULT_FORM_STATE,
+    name: "Keys",
+    steps: [
+      { id: "s1", action: "request_approval", from: KEY_NPUB, message: "ok" },
+    ],
+  });
+  assert.match(approval, new RegExp(`from: ${KEY_HEX}`));
+
+  // A hex spelling serializes unchanged, and a corrupted-checksum npub is
+  // never bound as an identity — it stays exactly as the author wrote it
+  // for the YAML editor to surface.
+  const hexDm = formStateToYaml({
+    ...DEFAULT_FORM_STATE,
+    name: "Keys",
+    steps: [{ id: "s1", action: "send_dm", to: KEY_HEX, text: "hi" }],
+  });
+  assert.match(hexDm, new RegExp(`to: ${KEY_HEX}`));
+
+  const corrupt = `${KEY_NPUB.slice(0, -2)}qq`;
+  const corruptDm = formStateToYaml({
+    ...DEFAULT_FORM_STATE,
+    name: "Keys",
+    steps: [{ id: "s1", action: "send_dm", to: corrupt, text: "hi" }],
+  });
+  assert.match(corruptDm, new RegExp(`to: ${corrupt.replace(/\./g, "\\.")}`));
+});
+
+test("templates and roles pass through both directions untouched", () => {
+  const parsed = yamlToFormState(
+    `name: Keys
+trigger: { on: message_posted }
+steps: [{ id: s1, action: send_dm, to: "{{trigger.author}}", text: hi }, { id: s2, action: request_approval, from: manager, message: ok }]
+`,
+  );
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.state.steps[0].to, "{{trigger.author}}");
+  assert.equal(parsed.state.steps[1].from, "manager");
+
+  const reserialized = formStateToYaml(parsed.state);
+  assert.match(reserialized, /to: "\{\{trigger\.author\}\}"/);
+  assert.match(reserialized, /from: manager/);
 });

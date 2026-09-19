@@ -27,8 +27,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-"${SCRIPT_DIR}/require-relay-key.sh"
-export BUZZ_RELAY_PRIVATE_KEY
 cd "${REPO_ROOT}"
 
 CARGO_PROFILE="${CARGO_PROFILE:-ci}"
@@ -70,18 +68,6 @@ log() { echo -e "${BLUE}[isolated-relay]${NC} $*"; }
 ok()  { echo -e "${GREEN}[isolated-relay]${NC} $*"; }
 err() { echo -e "${RED}[isolated-relay]${NC} $*" >&2; }
 
-# Refuse an existing relay before starting services or resetting its database.
-if ! command -v lsof >/dev/null 2>&1; then
-  err "lsof is required to check port ${RELAY_MAIN} before changing backing services."
-  exit 1
-fi
-if lsof -nP -iTCP:"${RELAY_MAIN}" -sTCP:LISTEN >/dev/null 2>&1; then
-  err "Port ${RELAY_MAIN} is already in use; refusing to reset an active harness database."
-  err "For a previous harness, run the exact 'Stop relay:' command printed by that launch, then rerun."
-  lsof -nP -iTCP:"${RELAY_MAIN}" -sTCP:LISTEN >&2 || true
-  exit 1
-fi
-
 # ── Backing services (scoped to buzz-harness only) ───────────────────────────
 log "Bringing up backing services (project=${PROJECT})..."
 docker compose -p "${PROJECT}" -f "${COMPOSE_FILE}" up -d
@@ -112,7 +98,7 @@ export PGSCHEMA_PLAN_HOST=localhost PGSCHEMA_PLAN_PORT=${PG_PORT}
 export PGSCHEMA_PLAN_DB=buzz PGSCHEMA_PLAN_USER=buzz PGSCHEMA_PLAN_PASSWORD=buzz_dev
 export PGHOST=localhost PGPORT=${PG_PORT} PGUSER=buzz PGDATABASE=buzz
 ./bin/pgschema apply --file schema/schema.sql --auto-approve
-psql_h < scripts/attach-schema-partitions.sql
+psql_h < scripts/reconcile-schema-after-pgschema.sql
 ok "Schema applied"
 
 # ── Deployment community + channels + members ────────────────────────────────
@@ -147,10 +133,15 @@ ok "Relay built"
 # survives (same pattern the perf stack uses). Logs to ${RELAY_LOG}.
 RELAY_LOG="${RELAY_LOG:-/tmp/dawn-relay-run.log}"
 TMUX_SESSION="${TMUX_SESSION:-dawn-relay}"
-TMUX_SOCKET="${TMUX_SESSION}-$$"
-# A dedicated server inherits the exported identity without putting it in argv.
+RELAY_PRIVATE_KEY="$(openssl rand -hex 32)"
+tmux kill-session -t "${TMUX_SESSION}" 2>/dev/null || true
+if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"${RELAY_MAIN}" -sTCP:LISTEN >/dev/null 2>&1; then
+  err "Port ${RELAY_MAIN} is already in use; refusing to report a stale relay as this harness."
+  lsof -nP -iTCP:"${RELAY_MAIN}" -sTCP:LISTEN >&2 || true
+  exit 1
+fi
 log "Starting relay in tmux session '${TMUX_SESSION}' on :${RELAY_MAIN} (health :${RELAY_HEALTH}, metrics :${RELAY_METRICS})..."
-tmux -L "${TMUX_SOCKET}" new-session -d -s "${TMUX_SESSION}" "cd '${REPO_ROOT}' && env \
+tmux new-session -d -s "${TMUX_SESSION}" "cd '${REPO_ROOT}' && env \
   DATABASE_URL=postgres://buzz:buzz_dev@localhost:${PG_PORT}/buzz \
   REDIS_URL=redis://localhost:${REDIS_PORT} \
   RELAY_URL=ws://localhost:${RELAY_MAIN} \
@@ -161,6 +152,7 @@ tmux -L "${TMUX_SOCKET}" new-session -d -s "${TMUX_SESSION}" "cd '${REPO_ROOT}' 
   BUZZ_S3_ACCESS_KEY=buzz_dev \
   BUZZ_S3_SECRET_KEY=buzz_dev_secret \
   BUZZ_S3_BUCKET=buzz-media \
+  BUZZ_RELAY_PRIVATE_KEY=${RELAY_PRIVATE_KEY} \
   BUZZ_REQUIRE_AUTH_TOKEN=false \
   BUZZ_RECONCILE_CHANNELS=true \
   './target/${CARGO_TARGET_PROFILE}/buzz-relay' > '${RELAY_LOG}' 2>&1"
@@ -169,8 +161,8 @@ tmux -L "${TMUX_SOCKET}" new-session -d -s "${TMUX_SESSION}" "cd '${REPO_ROOT}' 
 for _ in $(seq 1 30); do
   if curl -s -o /dev/null "http://localhost:${RELAY_MAIN}/"; then
     ok "Relay live — BUZZ_E2E_RELAY_URL=http://localhost:${RELAY_MAIN}"
-    ok "Logs: ${RELAY_LOG}   Attach: tmux -L ${TMUX_SOCKET} attach -t ${TMUX_SESSION}"
-    ok "Stop relay: tmux -L ${TMUX_SOCKET} kill-session -t ${TMUX_SESSION}"
+    ok "Logs: ${RELAY_LOG}   Attach: tmux attach -t ${TMUX_SESSION}"
+    ok "Stop relay: tmux kill-session -t ${TMUX_SESSION}"
     ok "Full teardown: docker compose -p ${PROJECT} -f ${COMPOSE_FILE} down -v"
     exit 0
   fi

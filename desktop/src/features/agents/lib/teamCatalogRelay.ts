@@ -1,4 +1,3 @@
-import { requireLocalTeamStorage } from "@/features/agents/lib/teamStorageCapability";
 import { invokeTauri } from "@/shared/api/tauri";
 import type { AgentTeam } from "@/shared/api/types";
 
@@ -27,7 +26,7 @@ import type { AgentTeam } from "@/shared/api/types";
  */
 export type CatalogTeamShareLevel = "not-shared" | "none";
 
-type CatalogTeamMember = {
+export type CatalogTeamMember = {
   memberKey: string;
   displayName: string;
   systemPrompt: string;
@@ -61,10 +60,9 @@ export type CatalogTeam = TeamCatalogPublication & {
  * are native; this boundary intentionally accepts no caller-supplied relay or
  * identity.
  */
-export async function fetchTeamCatalogPublications(): Promise<
+export function fetchTeamCatalogPublications(): Promise<
   TeamCatalogPublication[]
 > {
-  requireLocalTeamStorage();
   return invokeTauri<TeamCatalogPublication[]>("fetch_team_catalog");
 }
 
@@ -77,7 +75,7 @@ export async function fetchTeamCatalogPublications(): Promise<
  * that coordinate is what stops the catalog from offering "Add" for an entry
  * the user already added, which would mint a second copy.
  */
-function findLocalTeamForCatalogEntry(
+export function findLocalTeamForCatalogEntry(
   localTeams: readonly AgentTeam[],
   publication: TeamCatalogPublication,
   isOwn: boolean,

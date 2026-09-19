@@ -19,7 +19,7 @@ import { getMentionOffsets } from "./hasMention";
  */
 
 /** One `@Label` run, in document coordinates. */
-type MentionTokenSpan = {
+export type MentionTokenSpan = {
   label: string;
   from: number;
   to: number;

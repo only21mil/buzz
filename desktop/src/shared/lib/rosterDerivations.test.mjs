@@ -3,7 +3,7 @@ import test from "node:test";
 
 import {
   channelAgentMembers,
-  channelAgentMemberPubkeySet,
+  channelBotMemberPubkeySet,
   channelMemberPubkeySet,
   channelRoleMap,
 } from "./rosterDerivations.ts";
@@ -35,16 +35,15 @@ test("channelAgentMembers keeps bot-role and agent-flagged members", () => {
   );
 });
 
-test("channelMemberPubkeySet normalizes; agent set includes verified profiles", () => {
+test("channelMemberPubkeySet normalizes; bot set is role-gated only", () => {
   const members = roster();
   assert.deepEqual(
     [...channelMemberPubkeySet(members)],
     [HUMAN.toLowerCase(), BOT_ROLE, FLAGGED_AGENT],
   );
-  assert.deepEqual(
-    [...channelAgentMemberPubkeySet(members)],
-    [BOT_ROLE, FLAGGED_AGENT],
-  );
+  // role === "bot" only — an isAgent flag without the role stays out, matching
+  // the agent-session filter this set feeds.
+  assert.deepEqual([...channelBotMemberPubkeySet(members)], [BOT_ROLE]);
 });
 
 test("derivations are cached on roster identity", () => {
@@ -56,8 +55,8 @@ test("derivations are cached on roster identity", () => {
     channelMemberPubkeySet(members),
   );
   assert.equal(
-    channelAgentMemberPubkeySet(members),
-    channelAgentMemberPubkeySet(members),
+    channelBotMemberPubkeySet(members),
+    channelBotMemberPubkeySet(members),
   );
 
   // A new array — even with equal content — recomputes: the cache is keyed on

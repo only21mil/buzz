@@ -5,7 +5,7 @@ export type AudioAttachmentImetaEntry = {
   size?: number;
 };
 
-type ResolvedAudioAttachment = {
+export type ResolvedAudioAttachment = {
   duration?: number;
   filename: string;
   href: string;
@@ -66,7 +66,7 @@ export function formatVoiceNoteDuration(seconds: number): string {
   return `${minutes}:${String(rounded % 60).padStart(2, "0")}`;
 }
 
-const VOICE_NOTE_PLAYBACK_RATES = [1, 1.5, 2, 0.5] as const;
+export const VOICE_NOTE_PLAYBACK_RATES = [1, 1.5, 2, 0.5] as const;
 
 export function nextVoiceNotePlaybackRate(currentRate: number): number {
   const currentIndex = VOICE_NOTE_PLAYBACK_RATES.indexOf(

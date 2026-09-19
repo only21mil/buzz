@@ -64,7 +64,8 @@ mod tests {
 
     fn record_with(runtime: Option<&str>, parallelism: u32) -> ManagedAgentRecord {
         ManagedAgentRecord {
-            effort_level: None,
+            session_policy: Default::default(),
+            description: None,
             pubkey: String::new(),
             name: "r".to_string(),
             persona_id: None,
@@ -90,6 +91,7 @@ mod tests {
             runtime_pid: None,
             backend: Default::default(),
             backend_agent_id: None,
+            provider_policy_pending: false,
             provider_binary_path: None,
             team_id: None,
             persona_team_dir: None,
@@ -119,6 +121,7 @@ mod tests {
             definition_respond_to_allowlist: Vec::new(),
             definition_parallelism: None,
             relay_mesh: None,
+            effort_level: None,
         }
     }
 
@@ -128,6 +131,8 @@ mod tests {
     ) -> crate::managed_agents::types::AgentDefinition {
         use crate::managed_agents::types::AgentDefinition;
         AgentDefinition {
+            session_policy: Default::default(),
+            description: None,
             id: id.to_string(),
             display_name: String::new(),
             avatar_url: None,

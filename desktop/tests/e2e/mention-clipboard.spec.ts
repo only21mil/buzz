@@ -1,175 +1,20 @@
 import { expect, test, type Page } from "@playwright/test";
+
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
-import { waitForMockLiveSubscription } from "../helpers/mockLiveSubscription";
-import {
-  copyBody,
-  expectPrivateIdentity,
-  LABEL,
-  NAMESAKE,
-  paste,
-  SELECTED,
-  sentEvents,
-} from "../helpers/mentionClipboard";
 
-for (const source of ["timeline", "thread", "forum", "composer"] as const) {
-  for (const destination of ["channel", "forum"] as const) {
-    test(`${source} copy to ${destination} sends only the selected same-name identity`, async ({
-      page,
-    }) => {
-      await installMockBridge(page, {
-        searchProfiles: [SELECTED, NAMESAKE].map((pubkey) => ({
-          pubkey,
-          displayName: LABEL,
-        })),
-      });
-      await page.goto("/");
-      await page.getByTestId("channel-general").click();
-      await expect
-        .poll(() =>
-          page.evaluate(() =>
-            window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
-              channelName: "general",
-            }),
-          ),
-        )
-        .toBe(true);
-      const content = `@${LABEL} ${source} to ${destination}`;
-      const event = await page.evaluate(
-        ({ source, content, selected, author }) => {
-          const emit = window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__;
-          if (!emit) throw new Error("Mock emitter missing");
-          return emit({
-            channelName: source === "forum" ? "watercooler" : "general",
-            content,
-            kind: source === "forum" ? 45001 : undefined,
-            mentionPubkeys: [selected],
-            pubkey: author,
-            parentEventId:
-              source === "thread" ? "mock-general-welcome" : undefined,
-          });
-        },
-        {
-          source,
-          content,
-          selected: SELECTED,
-          author: TEST_IDENTITIES.alice.pubkey,
-        },
-      );
-      if (source === "forum")
-        await page.getByTestId("channel-watercooler").click();
-      if (source === "thread") {
-        await page.getByTestId("message-thread-summary").first().click();
-        await expect(page.getByTestId("message-thread-panel")).toBeVisible();
-      }
-      let body =
-        source === "forum"
-          ? page
-              .locator(".message-markdown")
-              .filter({ hasText: `${source} to ${destination}` })
-          : page.locator(`[data-message-id="${event.id}"] .message-markdown`);
-      await expect(
-        body.locator(`[data-mention-pubkey="${SELECTED}"]`),
-      ).toHaveText(LABEL);
-      await expect(page.locator("[data-render-pending]")).toHaveCount(0);
-      if (source === "composer") {
-        const flavors = await copyBody(body);
-        expectPrivateIdentity(flavors);
-        const input = page.getByTestId("message-input");
-        await paste(input, flavors);
-        await expect(input.locator(".mention-chip")).toHaveText(LABEL);
-        await input.press("ControlOrMeta+A");
-        body = input;
-      }
-      const flavors = await copyBody(body);
-      expectPrivateIdentity(flavors);
-      expect(flavors.text.trim()).toBe(content);
-      if (source === "thread")
-        await page.getByTestId("auxiliary-panel-close").click();
-      // Switching away clears the source selection and uses a different composer.
-      await page
-        .getByTestId(
-          destination === "forum"
-            ? "channel-watercooler"
-            : "channel-engineering",
-        )
-        .click();
-      if (destination === "forum")
-        await page.getByRole("button", { name: "Start a new post..." }).click();
-      const input = page.getByTestId("message-input");
-      await paste(input, flavors);
-      await expect(input.locator(".mention-chip")).toHaveText(LABEL);
-      await page.getByTestId("send-message").click();
-      if (destination === "forum") await expect(input).toHaveCount(0);
-      else await expect(input).toHaveText("");
-      await expect
-        .poll(async () =>
-          (await sentEvents(page, content)).map((event) =>
-            event.tags.filter((tag) => tag[0] === "p").map((tag) => tag[1]),
-          ),
-        )
-        .toEqual([[SELECTED]]);
-    });
-  }
-}
+/**
+ * Copying a mention and pasting it back must preserve the identity.
+ *
+ * The reported failure is specific to a **multi-word, non-member** display
+ * name: the rendered chip drops the `@`, so a plain copy yields "John Smith",
+ * and nothing downstream can tell that from two ordinary words. These tests
+ * bind the production copy/paste seams — real `copy`/`cut`/`paste` DOM events
+ * against the timeline and the composer — and assert both clipboard flavors:
+ * a readable plain flavor with no pubkey in it, and an HTML sidecar that
+ * carries one.
+ */
 
-test("partial chip copy cannot acquire the whole mention identity", async ({
-  page,
-}) => {
-  await installMockBridge(page, {
-    searchProfiles: [{ pubkey: SELECTED, displayName: LABEL }],
-  });
-  await page.goto("/");
-  await page.getByTestId("channel-general").click();
-  await expect
-    .poll(() =>
-      page.evaluate(() =>
-        window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
-          channelName: "general",
-        }),
-      ),
-    )
-    .toBe(true);
-  await page.evaluate(
-    ({ selected, author }) =>
-      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
-        channelName: "general",
-        content: "@John Smith partial",
-        mentionPubkeys: [selected],
-        pubkey: author,
-      }),
-    { selected: SELECTED, author: TEST_IDENTITIES.alice.pubkey },
-  );
-  const body = page
-    .locator(".message-markdown")
-    .filter({ hasText: "John Smith partial" });
-  await expect(body.locator("[data-mention-pubkey]")).toHaveText(LABEL);
-  const flavors = await copyBody(body, true);
-  expect(flavors.text).toBe("John");
-  expect(flavors.html).not.toContain(SELECTED);
-  expect(flavors.text).not.toMatch(/[0-9a-f]{64}/i);
-  const input = page.getByTestId("message-input");
-  await paste(input, flavors);
-  await expect(input.locator(".mention-chip")).toHaveCount(0);
-  await page.getByTestId("send-message").click();
-  await expect
-    .poll(async () =>
-      (await sentEvents(page, "John")).map((event) =>
-        event.tags.filter((tag) => tag[0] === "p"),
-      ),
-    )
-    .toEqual([[]]);
-});
-
-// ── Restored upstream regression coverage ─────────────────────────────
-// Ports from block/buzz@4cd82f51 desktop/tests/e2e/mention-clipboard.spec.ts
-// (audit D3). Two mechanical adaptations: the fork dropped the message-body
-// testid, so seeds scope on .message-markdown (as the fork tests do), and each
-// test installs the default mock bridge (replacing the upstream beforeEach).
-// Not ported: timeline→channel selection copy and half-selected chip (covered
-// by the fork matrix/partial tests above), and the five unbound-send cases
-// (602/640/679/1084/1159) — upstream sends with no identity bound while the
-// fork contract blocks the send (covered by the ambiguous/foreign tests above).
-
+/** `mockDisplayNames` maps this to "John Smith"; it joins no mock channel. */
 const JOHN_SMITH_PUBKEY =
   "7c1f2ad0b4e93856a1d0c2f4e6b8093a5d7f1c3e5a79b1d3f5072a4c6e80931b";
 /**
@@ -192,6 +37,9 @@ const FORUM_REPLY_BODY = "Agreed, @John Smith should confirm";
 const GENERAL_CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
 /** A pubkey must never reach the flavor an external app pastes. */
 const ANY_64_HEX = /[0-9a-f]{64}/i;
+/** Nobody's key — what a crafted clipboard sidecar would name instead. */
+const IMPOSTOR_PUBKEY =
+  "1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f";
 /**
  * What a pasteboard round trip can swap a copied chip's spaces for.
  *
@@ -206,6 +54,26 @@ type ClipboardFlavors = {
   text: string;
 };
 
+test.beforeEach(async ({ page }) => {
+  await installMockBridge(page);
+});
+
+async function waitForMockLiveSubscription(page: Page, channelName: string) {
+  await expect
+    .poll(() =>
+      page.evaluate(
+        (currentChannelName) =>
+          window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
+            channelName: currentChannelName,
+          }) ?? false,
+        channelName,
+      ),
+    )
+    .toBe(true);
+}
+
+// The timeline renders off a `useDeferredValue` snapshot; the list wrapper
+// carries `data-render-pending` until that commit lands.
 async function waitForTimelineSettled(page: Page) {
   await expect(page.locator("[data-render-pending]")).toHaveCount(0);
 }
@@ -232,14 +100,19 @@ async function emitMentionMessage(page: Page, channelName: string) {
   // in the channel roster, so this waits on a profile round trip — give it
   // room beyond the default, since this is setup and not the assertion.
   const chip = page
-    .locator(".message-markdown")
-    .filter({ hasText: "John Smith fixed the bug" })
+    .getByTestId("message-body")
     .locator(`[data-mention-pubkey="${JOHN_SMITH_PUBKEY}"]`);
   await expect(chip).toHaveText("John Smith", { timeout: 15_000 });
   await waitForTimelineSettled(page);
   return event;
 }
 
+/**
+ * Copy a range of the rendered timeline through the real `copy` event.
+ *
+ * `selectChip` narrows the range to the first four characters *inside* the
+ * mention chip, which is how a user drags across half a name.
+ */
 async function copyFromTimeline(
   page: Page,
   { partialChip = false }: { partialChip?: boolean } = {},
@@ -249,7 +122,7 @@ async function copyFromTimeline(
       // Anchor on the chip, not on the first message body: `general` is seeded
       // with unrelated messages that would otherwise win the query.
       const chip = document.querySelector<HTMLElement>(
-        `.message-markdown [data-mention-pubkey="${pubkey}"]`,
+        `[data-testid="message-body"] [data-mention-pubkey="${pubkey}"]`,
       );
       if (!chip) throw new Error("Message body rendered no mention chip.");
       const body = chip.closest<HTMLElement>(".message-markdown");
@@ -289,6 +162,14 @@ async function copyFromTimeline(
   );
 }
 
+/**
+ * Seed the home inbox with a mention message and open it.
+ *
+ * The message mentions the viewer, which is what routes it to the inbox, and
+ * John Smith, whose identity every assertion here is about. The feed item is
+ * pushed separately: a live channel message alone does not enter the feed the
+ * home surface reads.
+ */
 async function openInboxMentionItem(page: Page) {
   const item = await page.evaluate(
     ({ channelId, content, mentionPubkey, pubkey, viewerPubkey }) => {
@@ -341,6 +222,11 @@ async function openInboxMentionItem(page: Page) {
   return item;
 }
 
+/**
+ * Copy a whole rendered forum body — post card or thread reply — through the
+ * real `copy` event. The event bubbles to the surface container, which is
+ * where the forum wires `handleTimelineMentionCopy`.
+ */
 async function copyFromForumMarkdown(
   page: Page,
   marker: string,
@@ -374,6 +260,13 @@ async function copyFromForumMarkdown(
   }, marker);
 }
 
+/**
+ * Copy the rendered body holding the mention chip inside `containerTestId`.
+ *
+ * The event is dispatched on the body and bubbles to that container, which is
+ * where a surface wires `handleTimelineMentionCopy` — so a missing wiring shows
+ * up as a declined copy rather than as a lookup failure.
+ */
 async function copyMentionBodyWithin(
   page: Page,
   containerTestId: string,
@@ -415,6 +308,7 @@ async function copyMentionBodyWithin(
   );
 }
 
+/** Copy or cut the composer's current selection through the real DOM event. */
 async function copyFromComposer(
   page: Page,
   type: "copy" | "cut",
@@ -455,6 +349,7 @@ async function pasteIntoComposer(
   }, flavors);
 }
 
+/** Paste at the end of whatever the composer already holds. */
 async function pasteAfterComposerText(
   page: Page,
   flavors: { html: string; text: string },
@@ -477,6 +372,7 @@ async function pasteAfterComposerText(
   }, flavors);
 }
 
+/** The flavors a Buzz copy of `body` writes for a "John Smith" chip. */
 function mentionFlavors(pubkey: string, body: string) {
   const at = body.indexOf(MENTION_SIGIL);
   if (at < 0) throw new Error(`Body names nobody: ${body}`);
@@ -492,6 +388,14 @@ function mentionFlavors(pubkey: string, body: string) {
   };
 }
 
+/**
+ * Pin every relay profile lookup open, or let the held ones through.
+ *
+ * The identity check behind a pasted mention is exactly such a lookup when the
+ * person is not a member of the channel being pasted into — the case the
+ * feature exists for. Holding it is what makes "the paste is still deciding" a
+ * state a test can act inside rather than race.
+ */
 async function holdRelayProfileLookups(page: Page, hold: boolean) {
   return page.evaluate(
     (next) => window.__BUZZ_E2E_HOLD_USERS_BATCH__?.(next) ?? 0,
@@ -499,6 +403,14 @@ async function holdRelayProfileLookups(page: Page, hold: boolean) {
   );
 }
 
+/**
+ * Select the first occurrence of `wanted` in the composer.
+ *
+ * The DOM range a mouse drag leaves behind, in one shot: ProseMirror adopts it
+ * exactly as it adopts a real drag, and whatever key is pressed next still
+ * goes through the editor's own keymap. A caret walked there with arrow keys
+ * silently lost presses between runs and deleted the wrong words.
+ */
 async function selectComposerRange(page: Page, wanted: string) {
   const selected = await page
     .getByTestId("message-input")
@@ -521,6 +433,7 @@ async function selectComposerRange(page: Page, wanted: string) {
   expect(selected).toBe(wanted);
 }
 
+/** Wait until a lookup naming `pubkey` is provably pinned open. */
 async function waitForHeldProfileLookup(page: Page, pubkey: string) {
   await expect.poll(() => askedRelayAboutProfile(page, pubkey)).toBe(true);
   await expect
@@ -530,6 +443,12 @@ async function waitForHeldProfileLookup(page: Page, pubkey: string) {
     .toBeGreaterThan(0);
 }
 
+/**
+ * The `p` tags of the outgoing message whose body is `content`.
+ *
+ * A DM is signed client-side and published over the socket rather than through
+ * `send_channel_message`, so read the event handed to the signer.
+ */
 async function readSentMentionPubkeys(page: Page, content: string) {
   return page.evaluate((expectedContent) => {
     for (const entry of window.__BUZZ_E2E_COMMAND_LOG__ ?? []) {
@@ -553,6 +472,7 @@ async function readSentMentionPubkeys(page: Page, content: string) {
   }, content);
 }
 
+/** Whether a profile lookup naming `pubkey` reached the backend. */
 async function askedRelayAboutProfile(page: Page, pubkey: string) {
   return page.evaluate(
     (wanted) =>
@@ -584,10 +504,43 @@ async function expectComposerChip(page: Page) {
   await expect(input.locator(".mention-chip")).toHaveText("John Smith");
 }
 
+test("timeline selection copy carries a multi-word mention into another channel", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await waitForMockLiveSubscription(page, "general");
+  await emitMentionMessage(page, "general");
+
+  const chip = page
+    .getByTestId("message-row")
+    .filter({ hasText: "John Smith fixed the bug" })
+    .locator("[data-mention]");
+  await expect(chip).toHaveAttribute("data-mention-pubkey", JOHN_SMITH_PUBKEY);
+  await expect(chip).toHaveText("John Smith");
+
+  const flavors = await copyFromTimeline(page);
+  expectCarriesJohnSmith(flavors);
+  expect(flavors.text.trim()).toBe(MESSAGE_BODY);
+
+  // A DM is the destination so the send is not intercepted by the non-member
+  // invite prompt — the assertion under test is the recovered `p` tag.
+  await page.getByTestId("channel-bob-tyler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
+  await pasteIntoComposer(page, flavors);
+  await expectComposerChip(page);
+
+  await page.getByTestId("send-message").click();
+  await expect(page.getByTestId("message-input")).toHaveText("");
+  await expect
+    .poll(() => readSentMentionPubkeys(page, MESSAGE_BODY))
+    .toContain(JOHN_SMITH_PUBKEY);
+});
+
 test("copy message writes the identity sidecar beside readable plain text", async ({
   page,
 }) => {
-  await installMockBridge(page);
   await page.goto("/");
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
@@ -622,7 +575,6 @@ test("copy message writes the identity sidecar beside readable plain text", asyn
 test("composer copy and cut round-trip the mention they were pasted with", async ({
   page,
 }) => {
-  await installMockBridge(page);
   await page.goto("/");
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
@@ -647,10 +599,133 @@ test("composer copy and cut round-trip the mention they were pasted with", async
   await expectComposerChip(page);
 });
 
+test("an identity the pasted content never shows binds no name", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-bob-tyler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
+
+  // Any copied page can carry this: an empty span claiming a real display
+  // name against a key of its choosing. A registration outlives its paste, so
+  // accepting one the user cannot see would rebind the name for the session.
+  await pasteIntoComposer(page, {
+    html:
+      '<span data-buzz-copy="markdown">' +
+      `<span data-mention="" data-mention-pubkey="${IMPOSTOR_PUBKEY}" ` +
+      'data-mention-label="John Smith"></span>look at this</span>',
+    text: "look at this",
+  });
+  const input = page.getByTestId("message-input");
+  await expect(input).toHaveText("look at this");
+
+  // The name that sidecar tried to claim, written afterwards by hand.
+  await input.press("ControlOrMeta+a");
+  await input.press("Backspace");
+  await expect(input).toHaveText("");
+  await pasteIntoComposer(page, { html: "", text: MESSAGE_BODY });
+  await expect(input).toHaveText(MESSAGE_BODY);
+  await expect(input.locator(".mention-chip")).toHaveCount(0);
+
+  await page.getByTestId("send-message").click();
+  await expect(input).toHaveText("");
+  await expect
+    .poll(() => readSentMentionPubkeys(page, MESSAGE_BODY))
+    .not.toBeNull();
+  expect(await readSentMentionPubkeys(page, MESSAGE_BODY)).not.toContain(
+    IMPOSTOR_PUBKEY,
+  );
+});
+
+test("an identity vouched for only by dropped markup binds no name", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-bob-tyler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
+
+  // The same claim as above, hidden where ProseMirror's parser throws it away
+  // rather than in an empty span. No `data-buzz-copy` marker, so this takes
+  // the rich HTML branch, where the gate reads the normalized markup's text.
+  const input = page.getByTestId("message-input");
+  await pasteIntoComposer(page, {
+    html:
+      "visible <style>@John Smith </style>" +
+      `<span data-mention="" data-mention-pubkey="${IMPOSTOR_PUBKEY}" ` +
+      'data-mention-label="John Smith"></span>',
+    text: "visible",
+  });
+  // The premise the gate has to share: `<style>` text is never inserted.
+  await expect(input).toHaveText("visible");
+
+  // The name that sidecar tried to claim, written afterwards by hand.
+  await input.press("ControlOrMeta+a");
+  await input.press("Backspace");
+  await expect(input).toHaveText("");
+  await pasteIntoComposer(page, { html: "", text: MESSAGE_BODY });
+  await expect(input).toHaveText(MESSAGE_BODY);
+  await expect(input.locator(".mention-chip")).toHaveCount(0);
+
+  await page.getByTestId("send-message").click();
+  await expect(input).toHaveText("");
+  await expect
+    .poll(() => readSentMentionPubkeys(page, MESSAGE_BODY))
+    .not.toBeNull();
+  expect(await readSentMentionPubkeys(page, MESSAGE_BODY)).not.toContain(
+    IMPOSTOR_PUBKEY,
+  );
+});
+
+test("a visible pair no trusted state vouches for binds no name", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-bob-tyler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
+
+  // Nothing is concealed this time. The record claims a real display name
+  // against a key of its choosing and writes that name where the paste puts
+  // it on screen, so the visibility gate has no objection. What the user sees
+  // is a plausible "@John Smith"; what nothing in this community says is that
+  // the key beside it is his.
+  const input = page.getByTestId("message-input");
+  await pasteIntoComposer(page, {
+    html:
+      '<span data-buzz-copy="markdown">' +
+      `<span data-mention="" data-mention-pubkey="${IMPOSTOR_PUBKEY}" ` +
+      'data-mention-label="John Smith">@John Smith</span> fixed the bug' +
+      "</span>",
+    text: MESSAGE_BODY,
+  });
+  await expect(input).toHaveText(MESSAGE_BODY);
+
+  // The paste did put the question: no local directory can speak for that
+  // key, so it cost a profile lookup. Waiting on it is also what gives an
+  // ungated build the time it needs to light the chip below.
+  await expect
+    .poll(() => askedRelayAboutProfile(page, IMPOSTOR_PUBKEY))
+    .toBe(true);
+  await expect(input.locator(".mention-chip")).toHaveCount(0);
+
+  await page.getByTestId("send-message").click();
+  await expect(input).toHaveText("");
+  await expect
+    .poll(() => readSentMentionPubkeys(page, MESSAGE_BODY))
+    .not.toBeNull();
+  expect(await readSentMentionPubkeys(page, MESSAGE_BODY)).not.toContain(
+    IMPOSTOR_PUBKEY,
+  );
+
+  // And the refusal does not outlive the paste in the other direction: the
+  // name stays unbound, so writing it by hand afterwards tags nobody either.
+  await pasteIntoComposer(page, { html: "", text: MESSAGE_BODY });
+  await expect(input).toHaveText(MESSAGE_BODY);
+  await expect(input.locator(".mention-chip")).toHaveCount(0);
+});
+
 test("forum post and reply selection copies carry the mention", async ({
   page,
 }) => {
-  await installMockBridge(page);
   await page.goto("/");
   await expect(page.getByTestId("channel-watercooler")).toBeVisible();
 
@@ -731,7 +806,6 @@ test("forum post and reply selection copies carry the mention", async ({
 test("home inbox copy message carries the mention out of the detail pane", async ({
   page,
 }) => {
-  await installMockBridge(page);
   await page.goto("/");
   await expect(page.getByTestId("home-inbox-list")).toBeVisible();
   const item = await openInboxMentionItem(page);
@@ -769,7 +843,6 @@ test("home inbox copy message carries the mention out of the detail pane", async
 test("home inbox selection copy carries the mention out of the detail pane", async ({
   page,
 }) => {
-  await installMockBridge(page);
   await page.goto("/");
   await expect(page.getByTestId("home-inbox-list")).toBeVisible();
   await openInboxMentionItem(page);
@@ -792,10 +865,26 @@ test("home inbox selection copy carries the mention out of the detail pane", asy
     .toContain(JOHN_SMITH_PUBKEY);
 });
 
+test("a half-selected chip copies as plain text with no identity attached", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await waitForMockLiveSubscription(page, "general");
+  await emitMentionMessage(page, "general");
+
+  // Selecting "John" out of "John Smith" must not invent "@John": registering
+  // a truncated label would bind the wrong name to a real pubkey.
+  const flavors = await copyFromTimeline(page, { partialChip: true });
+  expect(flavors.defaultPrevented).toBe(false);
+  expect(flavors.html).toBe("");
+  expect(flavors.text).toBe("");
+});
+
 test("a chip whose spaces became NBSP in transit still pastes as a mention", async ({
   page,
 }) => {
-  await installMockBridge(page);
   await page.goto("/");
   await page.getByTestId("channel-bob-tyler").click();
   await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
@@ -825,7 +914,6 @@ test("a chip whose spaces became NBSP in transit still pastes as a mention", asy
 test("a boundary-crossing default copy pastes its chip fragment without a sigil", async ({
   page,
 }) => {
-  await installMockBridge(page);
   await page.goto("/");
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
@@ -838,7 +926,7 @@ test("a boundary-crossing default copy pastes its chip fragment without a sigil"
   // identity attributes around only the covered slice of its text.
   const flavors = await page.evaluate((pubkey) => {
     const chip = document.querySelector<HTMLElement>(
-      `.message-markdown [data-mention-pubkey="${pubkey}"]`,
+      `[data-testid="message-body"] [data-mention-pubkey="${pubkey}"]`,
     );
     if (!chip) throw new Error("Message body rendered no mention chip.");
     const body = chip.closest<HTMLElement>(".message-markdown");
@@ -909,7 +997,6 @@ test("a boundary-crossing default copy pastes its chip fragment without a sigil"
 test("sending on top of a paste still being verified keeps its identity", async ({
   page,
 }) => {
-  await installMockBridge(page);
   await page.goto("/");
   await page.getByTestId("channel-bob-tyler").click();
   await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
@@ -944,7 +1031,7 @@ test("sending on top of a paste still being verified keeps its identity", async 
 test("a slow paste settling last does not take a newer paste's name", async ({
   page,
 }) => {
-  await installMockBridge(page); // Two accounts share "John Smith", so the label alone cannot say which key
+  // Two accounts share "John Smith", so the label alone cannot say which key
   // owns it. The namesake is seeded per-test, which needs its own install:
   // `mock` comes from the newest init script rather than merging.
   await installMockBridge(page, {
@@ -994,10 +1081,50 @@ test("a slow paste settling last does not take a newer paste's name", async ({
   );
 });
 
+test("retyping the pasted mention binds nothing to the typed words", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-bob-tyler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
+
+  await holdRelayProfileLookups(page, true);
+  await pasteIntoComposer(
+    page,
+    mentionFlavors(JOHN_SMITH_PUBKEY, SURROUNDED_MENTION_BODY),
+  );
+  const input = page.getByTestId("message-input");
+  await expect(input).toHaveText(SURROUNDED_MENTION_BODY);
+  await waitForHeldProfileLookup(page, JOHN_SMITH_PUBKEY);
+
+  // Second thoughts about the name specifically: select exactly the mention
+  // and write it out again. The edit is strictly inside the paste, so the
+  // sentence around it is untouched and the composer reads character for
+  // character as it did — but the name is now the user's own words, and their
+  // own candidates are what should decide who it means.
+  await selectComposerRange(page, MENTION_SIGIL);
+  await input.pressSequentially(MENTION_SIGIL);
+  // Hand-typing `@` opens the picker; nothing here selects from it.
+  await input.press("Escape");
+  await expect(input).toHaveText(SURROUNDED_MENTION_BODY);
+
+  expect(await holdRelayProfileLookups(page, false)).toBeGreaterThan(0);
+  await expect(input.locator(".mention-chip")).toHaveCount(0);
+
+  await page.getByTestId("send-message").click();
+  await expect(input).toHaveText("");
+  await expect
+    .poll(() => readSentMentionPubkeys(page, SURROUNDED_MENTION_BODY))
+    .not.toBeNull();
+  expect(
+    await readSentMentionPubkeys(page, SURROUNDED_MENTION_BODY),
+  ).not.toContain(JOHN_SMITH_PUBKEY);
+});
+
 test("editing a word beside a pasted mention keeps its identity", async ({
   page,
 }) => {
-  await installMockBridge(page); // The other side of the same fence. A lookup that crosses the network is
+  // The other side of the same fence. A lookup that crosses the network is
   // exactly the window a user has time to tidy the sentence in, and tidying it
   // must not silently cost the mention its pubkey — that is the non-member
   // case this whole feature exists for.
@@ -1027,4 +1154,43 @@ test("editing a word beside a pasted mention keeps its identity", async ({
   await expect
     .poll(() => readSentMentionPubkeys(page, edited))
     .toContain(JOHN_SMITH_PUBKEY);
+});
+
+test("a deleted paste binds nothing to the same name typed after it", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByTestId("channel-bob-tyler").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("bob-tyler");
+
+  await holdRelayProfileLookups(page, true);
+  await pasteIntoComposer(
+    page,
+    mentionFlavors(JOHN_SMITH_PUBKEY, MESSAGE_BODY),
+  );
+  const input = page.getByTestId("message-input");
+  await expect(input).toHaveText(MESSAGE_BODY);
+  await waitForHeldProfileLookup(page, JOHN_SMITH_PUBKEY);
+
+  // Second thoughts, mid-lookup: the paste goes away and the same sentence is
+  // written out by hand. Character for character the composer reads as it did,
+  // so "is this label somewhere in the composer?" still says yes — but not one
+  // word of it came off the clipboard, and its identity claim is over.
+  await input.press("ControlOrMeta+a");
+  await input.press("Backspace");
+  await expect(input).toHaveText("");
+  await pasteIntoComposer(page, { html: "", text: MESSAGE_BODY });
+  await expect(input).toHaveText(MESSAGE_BODY);
+
+  expect(await holdRelayProfileLookups(page, false)).toBeGreaterThan(0);
+  await expect(input.locator(".mention-chip")).toHaveCount(0);
+
+  await page.getByTestId("send-message").click();
+  await expect(input).toHaveText("");
+  await expect
+    .poll(() => readSentMentionPubkeys(page, MESSAGE_BODY))
+    .not.toBeNull();
+  expect(await readSentMentionPubkeys(page, MESSAGE_BODY)).not.toContain(
+    JOHN_SMITH_PUBKEY,
+  );
 });

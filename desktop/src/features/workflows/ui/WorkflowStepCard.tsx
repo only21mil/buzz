@@ -94,6 +94,13 @@ function BackendSupportHint({ action }: { action: StepFormState["action"] }) {
           this step.
         </p>
       );
+    case "request_approval":
+      return (
+        <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-1 text-xs text-amber-700">
+          Backend note: approval gates still stop runs with WF-08; approval
+          records are not persisted yet.
+        </p>
+      );
     default:
       return null;
   }
@@ -211,7 +218,7 @@ function StepConfigFields({
               onChange={(event) =>
                 onUpdate({ ...step, to: event.target.value })
               }
-              placeholder="e.g. {{trigger.author}} or hex pubkey"
+              placeholder="e.g. {{trigger.author}}, npub1…, or hex pubkey"
               value={step.to ?? ""}
             />
           </div>
@@ -304,7 +311,7 @@ function StepConfigFields({
               onChange={(event) =>
                 onUpdate({ ...step, from: event.target.value })
               }
-              placeholder="owner, admin, lowercase pubkey, or template"
+              placeholder="npub1…, hex pubkey, or role"
               value={step.from ?? ""}
             />
           </div>

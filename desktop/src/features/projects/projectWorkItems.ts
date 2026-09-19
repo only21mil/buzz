@@ -62,6 +62,13 @@ export type ProjectsWorkItemsResult<TProject extends ProjectReference> = {
   };
 };
 
+/** Includes every repository-bearing read model, including repository-only ones. */
+export function projectsWithWorkItemRepositories<
+  TProject extends ProjectReference,
+>(projects: readonly TProject[]): TProject[] {
+  return projects.filter((project) => project.repositories.length > 0);
+}
+
 function groupByRepoAddress(events: RelayEvent[]): Map<string, RelayEvent[]> {
   const grouped = new Map<string, RelayEvent[]>();
   for (const event of events) {
@@ -145,7 +152,7 @@ export async function fetchProjectsWorkItems<TProject extends ProjectReference>(
   if (rootResult.status === "rejected") {
     throw rootResult.reason instanceof Error
       ? rootResult.reason
-      : new Error("Could not load project issues and pull requests.");
+      : new Error("Could not load project tasks and reviews.");
   }
 
   const updateEvents =

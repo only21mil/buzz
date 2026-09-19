@@ -5,8 +5,6 @@ import type {
   Workflow,
   WorkflowApproval,
   WorkflowRun,
-  WorkflowRunsCursor,
-  WorkflowRunsPage,
   WorkflowSaveResult,
   TraceEntry,
 } from "@/shared/api/types";
@@ -20,7 +18,6 @@ type RawWorkflow = {
   owner_pubkey: string;
   channel_id: string | null;
   definition: Record<string, unknown>;
-  yaml_definition?: string;
   status: Workflow["status"];
   created_at: number;
   updated_at: number;
@@ -52,6 +49,16 @@ type RawWorkflowRun = {
   created_at: number;
 };
 
+type RawWorkflowRunCursor = {
+  before: string;
+  before_id: string;
+};
+
+type RawWorkflowRunsResponse = {
+  runs: RawWorkflowRun[];
+  next: RawWorkflowRunCursor | null;
+};
+
 type RawWorkflowApproval = {
   approval_ref: string;
   workflow_id: string;
@@ -66,61 +73,15 @@ type RawWorkflowApproval = {
   created_at: number;
 };
 
-type RawTriggerWorkflowResponse = {
-  event_id: string;
-  run_id: string | null;
-  workflow_id: string;
-  status: "accepted";
+type RawWorkflowApprovalsResponse = {
+  approvals: RawWorkflowApproval[];
 };
 
-/**
- * Validate the Rust trigger acknowledgement at the API boundary.
- *
- * `invokeTauri<T>` only provides a compile-time assertion. Keep this runtime
- * check here so a stale or malformed relay response cannot turn into an
- * object full of `undefined` fields in the UI.
- */
-export function parseRawTriggerWorkflowResponse(
-  value: unknown,
-): RawTriggerWorkflowResponse {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error("invalid trigger_workflow response");
-  }
-
-  const raw = value as Record<string, unknown>;
-  const eventId =
-    typeof raw.event_id === "string" && raw.event_id.length > 0
-      ? raw.event_id
-      : undefined;
-  const workflowId =
-    typeof raw.workflow_id === "string" && raw.workflow_id.length > 0
-      ? raw.workflow_id
-      : undefined;
-  const runId =
-    raw.run_id === null
-      ? null
-      : typeof raw.run_id === "string" && raw.run_id.length > 0
-        ? raw.run_id
-        : undefined;
-
-  if (
-    eventId === undefined ||
-    workflowId === undefined ||
-    runId === undefined
-  ) {
-    throw new Error("invalid trigger_workflow response");
-  }
-  if (raw.status !== "accepted") {
-    throw new Error("invalid trigger_workflow response status");
-  }
-
-  return {
-    event_id: eventId,
-    run_id: runId,
-    workflow_id: workflowId,
-    status: "accepted",
-  };
-}
+type RawTriggerWorkflowResponse = {
+  run_id: string;
+  workflow_id: string;
+  status: string;
+};
 
 type RawApprovalActionResponse = {
   token: string;
@@ -139,7 +100,6 @@ function fromRawWorkflow(raw: RawWorkflow): Workflow {
     ownerPubkey: raw.owner_pubkey,
     channelId: raw.channel_id,
     definition: raw.definition,
-    yamlDefinition: raw.yaml_definition,
     status: raw.status,
     createdAt: raw.created_at,
     updatedAt: raw.updated_at,
@@ -199,7 +159,6 @@ function fromRawTriggerResponse(
   raw: RawTriggerWorkflowResponse,
 ): TriggerWorkflowResponse {
   return {
-    eventId: raw.event_id,
     runId: raw.run_id,
     workflowId: raw.workflow_id,
     status: raw.status,
@@ -277,114 +236,37 @@ export async function deleteWorkflow(workflowId: string): Promise<void> {
   await invokeTauri("delete_workflow", { workflowId });
 }
 
-/** Accept both the legacy array and the additive page envelope. */
-export function parseWorkflowRunsPage(value: unknown): WorkflowRunsPage {
-  const envelope = Array.isArray(value) ? { runs: value, next: null } : value;
-  if (typeof envelope !== "object" || envelope === null)
-    throw new Error("invalid workflow runs response");
-  const raw = envelope as Record<string, unknown>;
-  if (
-    !Array.isArray(raw.runs) ||
-    !(
-      raw.next === null ||
-      (typeof raw.next === "object" &&
-        raw.next !== null &&
-        typeof (raw.next as Record<string, unknown>).before === "string" &&
-        typeof (raw.next as Record<string, unknown>).before_id === "string")
-    )
-  ) {
-    throw new Error("invalid workflow runs response");
-  }
-  for (const run of raw.runs) {
-    if (
-      typeof run !== "object" ||
-      run === null ||
-      typeof run.id !== "string" ||
-      typeof run.workflow_id !== "string" ||
-      ![
-        "pending",
-        "running",
-        "waiting_approval",
-        "resume_pending",
-        "completed",
-        "failed",
-        "cancelled",
-      ].includes(run.status) ||
-      !Array.isArray(run.execution_trace)
-    )
-      throw new Error("invalid workflow run response");
-  }
-  return {
-    runs: (raw.runs as RawWorkflowRun[]).map(fromRawWorkflowRun),
-    next: raw.next as WorkflowRunsCursor | null,
-  };
-}
-
 export async function getWorkflowRuns(
   workflowId: string,
   limit?: number,
 ): Promise<WorkflowRun[]> {
-  return parseWorkflowRunsPage(
-    await invokeTauri<unknown>("get_workflow_runs", {
-      workflowId,
-      limit: limit ?? null,
-    }),
-  ).runs;
-}
-
-export async function getWorkflowRunsPage(
-  workflowId: string,
-  cursor: WorkflowRunsCursor | null = null,
-  limit = 20,
-): Promise<WorkflowRunsPage> {
-  return parseWorkflowRunsPage(
-    await invokeTauri<unknown>("get_workflow_runs", {
-      workflowId,
-      limit,
-      page: true,
-      before: cursor?.before ?? null,
-      beforeId: cursor?.before_id ?? null,
-    }),
-  );
-}
-
-export function parseWorkflowApprovals(value: unknown): WorkflowApproval[] {
-  const rows = Array.isArray(value)
-    ? value
-    : typeof value === "object" && value !== null
-      ? (value as Record<string, unknown>).approvals
-      : null;
-  if (!Array.isArray(rows))
-    throw new Error("invalid workflow approvals response");
-  return rows.map((row) => {
-    if (
-      typeof row !== "object" ||
-      row === null ||
-      typeof row.approval_ref !== "string" ||
-      "token" in row
-    ) {
-      throw new Error("invalid workflow approval display reference");
-    }
-    return fromRawApproval(row as RawWorkflowApproval);
+  const raw = await invokeTauri<RawWorkflowRunsResponse>("get_workflow_runs", {
+    workflowId,
+    limit: limit ?? null,
   });
+  return raw.runs.map(fromRawWorkflowRun);
 }
 
 export async function getRunApprovals(
   workflowId: string,
   runId: string,
 ): Promise<WorkflowApproval[]> {
-  const raw = await invokeTauri<unknown>("get_run_approvals", {
-    workflowId,
-    runId,
-  });
-  return parseWorkflowApprovals(raw);
+  const raw = await invokeTauri<RawWorkflowApprovalsResponse>(
+    "get_run_approvals",
+    {
+      workflowId,
+      runId,
+    },
+  );
+  return raw.approvals.map(fromRawApproval);
 }
 
 export async function triggerWorkflow(
   workflowId: string,
 ): Promise<TriggerWorkflowResponse> {
-  const raw = parseRawTriggerWorkflowResponse(
-    await invokeTauri<unknown>("trigger_workflow", { workflowId }),
+  const raw = await invokeTauri<RawTriggerWorkflowResponse>(
+    "trigger_workflow",
+    { workflowId },
   );
   return fromRawTriggerResponse(raw);
 }

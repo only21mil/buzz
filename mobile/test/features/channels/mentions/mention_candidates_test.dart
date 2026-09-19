@@ -1,7 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:buzz/features/channels/channel_management_provider.dart';
 import 'package:buzz/features/channels/mentions/mention_candidates.dart';
-import 'package:buzz/shared/identity/npub.dart';
 import 'package:buzz/shared/profile/user_profile.dart';
 import 'package:buzz/shared/mentions/agent_identity_provider.dart';
 
@@ -21,14 +20,17 @@ ChannelMember member(String pubkey, {String role = 'member'}) {
 
 void main() {
   test('role-only agent mentions fall back to a compact npub label', () {
+    const pubkey =
+        'deadbeef00000000000000000000000000000000000000000000000000000000';
+
     expect(
       mentionNamesWithDirectoryLabels(
-        mentionPubkeys: [agentPubkey],
+        mentionPubkeys: const [pubkey],
         profileMentionNames: const {},
         directoryDisplayNames: const {},
-        agentMentionPubkeys: {agentPubkey},
+        agentMentionPubkeys: const {pubkey},
       ),
-      {agentPubkey: truncateNpub(agentPubkey)},
+      const {pubkey: 'npub1m6k\u20263kf3'},
     );
   });
 
@@ -67,7 +69,7 @@ void main() {
       expect(formatOwnerLabel(ownerPubkey, userPubkey, profiles), 'Wes');
       expect(
         formatOwnerLabel(ownerPubkey, userPubkey, const {}),
-        truncateNpub(ownerPubkey),
+        'npub1mhw\u2026dmpv',
       );
     });
 

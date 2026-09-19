@@ -1,5 +1,4 @@
 import * as React from "react";
-import { isTauri } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 
 import {
@@ -82,7 +81,6 @@ export function useComposerVoiceNote({
   }, [finish, recorder.elapsedSeconds, recorder.status]);
 
   const toggle = React.useCallback(() => {
-    if (!isTauri()) return;
     if (statusRef.current === "recording") {
       void finish();
       return;
@@ -92,11 +90,10 @@ export function useComposerVoiceNote({
       toast.error("A voice note must be the only attachment.");
       return;
     }
-    media.markIntentChanged();
     recordingContextRef.current = currentContextRef.current;
     onBeforeStartRef.current();
     void recorder.start();
-  }, [finish, recorder.start, media.markIntentChanged]);
+  }, [finish, recorder.start]);
 
   const cancel = recorder.cancel;
   const attachments = getAttachments();
@@ -146,7 +143,6 @@ export function useComposerVoiceNote({
 
   return {
     ...recorder,
-    supported: isTauri(),
     acceptsAttachment: recorder.status === "idle" && !hasAttachment,
     hasAttachment,
     hasAttachmentRef,

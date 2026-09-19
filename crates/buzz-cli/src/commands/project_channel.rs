@@ -222,8 +222,6 @@ async fn ensure_default_repo(
         None,
         &[],
         Some(channel),
-        &client.keys().public_key().to_hex(),
-        client.relay_url(),
     )?;
     let event = client.sign_event(builder)?;
     let raw = client.submit_event(event).await?;
@@ -446,8 +444,6 @@ mod tests {
             None,
             &[],
             Some(foreign),
-            &keys.public_key().to_hex(),
-            "https://buzz.example",
         )
         .unwrap()
         .sign_with_keys(&keys)

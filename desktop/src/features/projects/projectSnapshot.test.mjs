@@ -1,111 +1,155 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+
+import { QueryClient } from "@tanstack/react-query";
 import {
-  isProjectSnapshotRow,
+  isProjectCollectionAuthoritative,
+  isProjectDataAuthoritative,
+  isProjectRelayValidated,
+  markProjectCollectionAuthoritative,
+  markProjectDataAuthoritative,
+  persistProjectSnapshot,
+  PROJECT_QUERY_STRUCTURAL_SHARING,
   projectSnapshotKey,
   readProjectSnapshot,
   removeProjectSnapshotForRelay,
-  writeProjectSnapshot,
+  seedProjectSnapshot,
+  shouldUseScopedProjectHomeLookup,
 } from "./projectSnapshot.ts";
-import { hasAuthoritativeHomeBinding } from "./lib/projectHomeChannel.ts";
-const owner = "a".repeat(64);
-const home = "11111111-1111-4111-8111-111111111111";
-const scope = { relayOrigin: "https://relay.example", pubkey: owner };
-const event = (kind, tags, id) => ({
-  kind,
-  tags,
-  id: id.repeat(64),
-  pubkey: owner,
-  created_at: 1,
-  content: "",
-  sig: "0".repeat(128),
-});
-const events = [
-  event(
-    30621,
-    [
-      ["d", "app"],
-      ["name", "App"],
-      ["a", `30617:${owner}:app`],
-      ["buzz-channel", home],
-    ],
-    "1",
-  ),
-  event(
-    30617,
-    [
-      ["d", "app"],
-      ["name", "App"],
-      ["buzz-channel", home],
-    ],
-    "2",
-  ),
-];
-function storage() {
-  const map = new Map();
-  return {
-    get length() {
-      return map.size;
+
+if (typeof globalThis.window === "undefined") {
+  const storage = new Map();
+  globalThis.window = {
+    localStorage: {
+      get length() {
+        return storage.size;
+      },
+      key: (index) => [...storage.keys()][index] ?? null,
+      getItem: (key) => storage.get(key) ?? null,
+      setItem: (key, value) => storage.set(key, value),
+      removeItem: (key) => storage.delete(key),
     },
-    key: (n) => [...map.keys()][n] ?? null,
-    getItem: (key) => map.get(key) ?? null,
-    setItem: (key, val) => map.set(key, val),
-    removeItem: (key) => map.delete(key),
   };
 }
 
-test("raw scoped snapshots rebuild display rows without granting home authority", () => {
-  const store = storage();
-  writeProjectSnapshot(scope, events, store, 1000);
-  const rows = readProjectSnapshot(scope, store, 1100);
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].name, "App");
-  assert.equal(isProjectSnapshotRow(rows[0]), true);
-  assert.equal(hasAuthoritativeHomeBinding(rows[0]), false);
+const RELAY = "wss://relay.example.com";
+const OWNER = "a".repeat(64);
+const PROJECT = {
+  id: `30621:${OWNER}:relay`,
+  dtag: "relay",
+  name: "Relay",
+  description: "",
+  owner: OWNER,
+  createdAt: 100,
+  projectChannelId: "11111111-1111-4111-8111-111111111111",
+  relatedChannelIds: [],
+  status: "active",
+  projectAddress: `30621:${OWNER}:relay`,
+  primaryRepositoryAddress: null,
+  repositoryAddresses: [],
+  repositoryRelayHints: {},
+  repositories: [],
+  unavailableRepositoryAddresses: [],
+  visibility: "listed",
+  legacy: false,
+};
+
+test.beforeEach(() => {
+  removeProjectSnapshotForRelay(RELAY);
 });
-test("wrong identity/relay, copied payload and malformed events are rejected", () => {
-  const store = storage();
-  writeProjectSnapshot(scope, events, store, 1000);
-  const other = { ...scope, pubkey: "b".repeat(64) };
-  const wrongRelay = { ...scope, relayOrigin: "https://other.example" };
-  assert.equal(readProjectSnapshot(other, store, 1100), undefined);
-  assert.equal(readProjectSnapshot(wrongRelay, store, 1100), undefined);
-  store.setItem(
-    projectSnapshotKey(other),
-    store.getItem(projectSnapshotKey(scope)),
-  );
-  assert.equal(readProjectSnapshot(other, store, 1100), undefined);
-  const value = JSON.parse(store.getItem(projectSnapshotKey(scope)));
-  value.events[0].tags = [["name", {}]];
-  store.setItem(projectSnapshotKey(scope), JSON.stringify(value));
-  assert.equal(readProjectSnapshot(scope, store, 1100), undefined);
-});
-test("expired/future snapshots fail closed and community removal clears every identity", () => {
-  const store = storage();
-  writeProjectSnapshot(scope, events, store, 1000);
-  writeProjectSnapshot(
-    { ...scope, pubkey: "b".repeat(64) },
-    events,
-    store,
-    1000,
-  );
-  assert.equal(readProjectSnapshot(scope, store, 999), undefined);
+
+test("project snapshot is scoped by normalized relay and identity", () => {
+  const client = new QueryClient();
+  seedProjectSnapshot(client, { pubkey: OWNER, relayUrl: RELAY });
+  persistProjectSnapshot(client, [PROJECT]);
+
+  assert.deepEqual(readProjectSnapshot(RELAY, OWNER), [PROJECT]);
+  assert.equal(readProjectSnapshot(RELAY, "b".repeat(64)), null);
   assert.equal(
-    readProjectSnapshot(scope, store, 1000 + 24 * 60 * 60_000 + 1),
-    undefined,
+    projectSnapshotKey("WSS://Relay.Example.com/", OWNER.toUpperCase()),
+    projectSnapshotKey(RELAY, OWNER),
   );
-  removeProjectSnapshotForRelay("wss://relay.example", store);
-  assert.equal(store.length, 0);
 });
-test("storage failures never fail a live operation", () => {
-  const store = {
-    getItem() {
-      throw Error("denied");
+
+test("seedProjectSnapshot paints stale data into a fresh query client", () => {
+  const writer = new QueryClient();
+  seedProjectSnapshot(writer, { pubkey: OWNER, relayUrl: RELAY });
+  persistProjectSnapshot(writer, [PROJECT]);
+
+  const reader = new QueryClient();
+  seedProjectSnapshot(reader, { pubkey: OWNER, relayUrl: RELAY });
+
+  assert.deepEqual(reader.getQueryData(["projects"]), [PROJECT]);
+  assert.equal(reader.getQueryState(["projects"])?.dataUpdatedAt, 0);
+  const snapshotProject = reader.getQueryData(["projects"])[0];
+  assert.equal(isProjectDataAuthoritative(snapshotProject), false);
+  assert.equal(isProjectCollectionAuthoritative(reader), false);
+
+  const locallyWrittenProject = markProjectDataAuthoritative(
+    { ...PROJECT, id: `${PROJECT.id}:local` },
+    "local-write",
+  );
+  reader.setQueryData(["projects"], (current = []) => [
+    ...current,
+    locallyWrittenProject,
+  ]);
+
+  assert.ok((reader.getQueryState(["projects"])?.dataUpdatedAt ?? 0) > 0);
+  assert.equal(isProjectCollectionAuthoritative(reader), false);
+  assert.equal(isProjectDataAuthoritative(snapshotProject), false);
+  assert.equal(isProjectDataAuthoritative(locallyWrittenProject), true);
+  assert.equal(isProjectRelayValidated(locallyWrittenProject), false);
+  assert.equal(
+    shouldUseScopedProjectHomeLookup({
+      collectionIsAuthoritative: isProjectCollectionAuthoritative(reader),
+      hasEnumeratedProjectHome: false,
+      isHuddleTranscript: false,
+    }),
+    true,
+  );
+});
+
+test("successful relay data is authoritative", () => {
+  const client = new QueryClient();
+  const relayProject = markProjectDataAuthoritative({ ...PROJECT }, "relay");
+  client.setQueryData(["projects"], [relayProject]);
+  markProjectCollectionAuthoritative(client);
+
+  assert.equal(isProjectDataAuthoritative(relayProject), true);
+  assert.equal(isProjectRelayValidated(relayProject), true);
+  assert.equal(isProjectCollectionAuthoritative(client), true);
+  assert.equal(
+    shouldUseScopedProjectHomeLookup({
+      collectionIsAuthoritative: isProjectCollectionAuthoritative(client),
+      hasEnumeratedProjectHome: false,
+      isHuddleTranscript: false,
+    }),
+    false,
+  );
+});
+
+test("equal relay data replaces snapshot objects and preserves provenance", async () => {
+  const writer = new QueryClient();
+  seedProjectSnapshot(writer, { pubkey: OWNER, relayUrl: RELAY });
+  persistProjectSnapshot(writer, [PROJECT]);
+
+  const reader = new QueryClient();
+  seedProjectSnapshot(reader, { pubkey: OWNER, relayUrl: RELAY });
+  const snapshotProject = reader.getQueryData(["projects"])[0];
+  const liveProject = markProjectDataAuthoritative({ ...PROJECT }, "relay");
+
+  await reader.fetchQuery({
+    queryKey: ["projects"],
+    queryFn: async () => {
+      markProjectCollectionAuthoritative(reader);
+      return [liveProject];
     },
-    setItem() {
-      throw Error("quota");
-    },
-  };
-  assert.doesNotThrow(() => writeProjectSnapshot(scope, events, store));
-  assert.equal(readProjectSnapshot(scope, store), undefined);
+    structuralSharing: PROJECT_QUERY_STRUCTURAL_SHARING,
+  });
+
+  const cachedProject = reader.getQueryData(["projects"])[0];
+  assert.notEqual(cachedProject, snapshotProject);
+  assert.equal(cachedProject, liveProject);
+  assert.equal(isProjectRelayValidated(cachedProject), true);
+  assert.equal(isProjectCollectionAuthoritative(reader), true);
 });
