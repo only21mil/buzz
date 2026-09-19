@@ -50,10 +50,17 @@ class RunnerInstallTests(unittest.TestCase):
             copied,
             ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
         )
+        shutil.copy2(
+            RUNNER_DIR.parent / "_common.py",
+            self.source_root / "deploy/native-ci/_common.py",
+        )
         subprocess.run(["git", "init", "-q", str(self.source_root)], check=True)
         subprocess.run(["git", "-C", str(self.source_root), "config", "user.name", "Runner test"], check=True)
         subprocess.run(["git", "-C", str(self.source_root), "config", "user.email", "runner@test.invalid"], check=True)
-        subprocess.run(["git", "-C", str(self.source_root), "add", "deploy/native-ci/runner"], check=True)
+        subprocess.run([
+            "git", "-C", str(self.source_root), "add",
+            "deploy/native-ci/runner", "deploy/native-ci/_common.py",
+        ], check=True)
         subprocess.run(["git", "-C", str(self.source_root), "commit", "-qm", "fixture"], check=True)
         self.source_commit = FREEZER.git_output(self.source_root, "rev-parse", "HEAD")
         self.binary = self.base / "buzz-ci-runner"
@@ -80,6 +87,15 @@ class RunnerInstallTests(unittest.TestCase):
         self.runner_gid = os.getegid()
         self.controld_uid = self.runner_uid + 1
         self.controld_gid = self.runner_gid + 1
+
+    def test_freeze_refuses_changed_or_missing_shared_installer_helper(self) -> None:
+        helper = self.source_root / "deploy/native-ci/_common.py"
+        helper.write_bytes(helper.read_bytes() + b"\n# drift\n")
+        with self.assertRaises(ValueError):
+            self.freeze()
+        helper.unlink()
+        with self.assertRaises(ValueError):
+            self.freeze()
 
     def freeze(self) -> dict[str, object]:
         return FREEZER.freeze_package(

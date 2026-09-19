@@ -40,6 +40,9 @@ class PackageSourceTests(unittest.TestCase):
                 ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
             )
         shutil.copy2(NATIVE_CI_DIR / "package_source.py", self.seed / "deploy/native-ci/package_source.py")
+        shutil.copy2(
+            NATIVE_CI_DIR / "_common.py", self.seed / "deploy/native-ci/_common.py",
+        )
         subprocess.run(["git", "init", "-q", str(self.seed)], check=True)
         subprocess.run(["git", "-C", str(self.seed), "config", "user.name", "Package source test"], check=True)
         subprocess.run(["git", "-C", str(self.seed), "config", "user.email", "package-source@test.invalid"], check=True)

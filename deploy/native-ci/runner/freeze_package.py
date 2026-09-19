@@ -21,6 +21,7 @@ PROVENANCE_SCHEMA = "buzz-ci-binary-provenance-v1"
 GIT_OID = re.compile(r"^[0-9a-f]{40}$")
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
 PACKAGE_RELATIVE = Path("deploy/native-ci/runner")
+INSTALLER_HELPER = Path("deploy/native-ci/_common.py")
 DEFAULT_STATE = {
     "enabled": False,
     "active": False,
@@ -120,16 +121,20 @@ def verify_source(root: Path, source_commit: str) -> Path:
     root = Path(git_output(root, "rev-parse", "--show-toplevel"))
     if git_output(root, "rev-parse", "HEAD") != source_commit:
         raise ValueError("source checkout HEAD does not match the requested commit")
-    if git_output(root, "status", "--porcelain", "--untracked-files=all", "--", str(PACKAGE_RELATIVE)):
+    bound_paths = (str(PACKAGE_RELATIVE), str(INSTALLER_HELPER))
+    if git_output(
+        root, "status", "--porcelain", "--untracked-files=all", "--", *bound_paths,
+    ):
         raise ValueError("runner package source path is not clean")
     package_dir = root / PACKAGE_RELATIVE
     if Path(os.path.realpath(package_dir)) != package_dir:
         raise ValueError("runner package source directory must not contain symbolic links")
     subprocess.run(
-        ["git", "-C", str(root), "diff", "--quiet", source_commit, "--", str(PACKAGE_RELATIVE)],
+        ["git", "-C", str(root), "diff", "--quiet", source_commit, "--", *bound_paths],
         check=True,
     )
     for path in (
+        INSTALLER_HELPER,
         PACKAGE_RELATIVE / "README.md",
         PACKAGE_RELATIVE / "templates/buzz-ci-runner.service",
         PACKAGE_RELATIVE / "templates/buzz-ci-runner.socket",

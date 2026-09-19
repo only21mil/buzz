@@ -46,12 +46,17 @@ class ControldInstallTests(unittest.TestCase):
         copied.parent.mkdir(mode=0o700, parents=True)
         shutil.copytree(CONTROLD_DIR, copied, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
         shutil.copy2(CONTROLD_DIR.parent / "package_source.py", self.source_root / "deploy/native-ci/package_source.py")
+        shutil.copy2(
+            CONTROLD_DIR.parent / "_common.py",
+            self.source_root / "deploy/native-ci/_common.py",
+        )
         subprocess.run(["git", "init", "-q", str(self.source_root)], check=True)
         subprocess.run(["git", "-C", str(self.source_root), "config", "user.name", "Controld test"], check=True)
         subprocess.run(["git", "-C", str(self.source_root), "config", "user.email", "controld@test.invalid"], check=True)
         subprocess.run([
             "git", "-C", str(self.source_root), "add",
             "deploy/native-ci/controld", "deploy/native-ci/package_source.py",
+            "deploy/native-ci/_common.py",
         ], check=True)
         subprocess.run(["git", "-C", str(self.source_root), "commit", "-qm", "fixture"], check=True)
         self.source_commit = FREEZER.git_output(self.source_root, "rev-parse", "HEAD")
@@ -72,6 +77,15 @@ class ControldInstallTests(unittest.TestCase):
         self.controld_gid = os.getegid()
         if self.controld_uid == 0 or self.controld_gid == 0:
             self.skipTest("fake-root tests require a non-root invoking identity")
+
+    def test_freeze_refuses_changed_or_missing_shared_installer_helper(self) -> None:
+        helper = self.source_root / "deploy/native-ci/_common.py"
+        helper.write_bytes(helper.read_bytes() + b"\n# drift\n")
+        with self.assertRaises(ValueError):
+            self.freeze()
+        helper.unlink()
+        with self.assertRaises(ValueError):
+            self.freeze()
 
     def freeze(self, source_root: Path | None = None, package: Path | None = None) -> dict[str, object]:
         return FREEZER.freeze_package(
