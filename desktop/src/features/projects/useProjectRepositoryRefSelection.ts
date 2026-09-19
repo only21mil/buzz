@@ -42,7 +42,7 @@ export function useProjectRepositoryRefSelection(input: {
       return;
     }
     setSelectedBranch((currentBranch) => {
-      if (currentBranch && input.branchOptions.includes(currentBranch)) {
+      if (currentBranch) {
         return currentBranch;
       }
       return input.defaultBranch ?? input.branchOptions[0] ?? null;
