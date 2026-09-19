@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::http::header;
+use axum::http::HeaderValue;
 use axum::{
     extract::{FromRequestParts, Path, State},
     http::{request::Parts, HeaderMap, StatusCode},
@@ -389,6 +390,19 @@ async fn upload_attribution(
     })
 }
 
+fn serving_write_error(error: anyhow::Error) -> MediaError {
+    if buzz_deletion::ServingWriteGuard::acquisition_is_fenced(&error) {
+        MediaError::CommunityWriteFenced
+    } else {
+        MediaError::ServiceUnavailable
+    }
+}
+
+fn serving_lease_lost(error: anyhow::Error) -> MediaError {
+    tracing::warn!(%error, "media serving-write lease lost");
+    MediaError::ServiceUnavailable
+}
+
 /// PUT `/upload` or the temporary media-only `/media/upload` alias.
 ///
 /// Auth is validated via the [`AuthenticatedUpload`] extractor BEFORE the body
@@ -416,6 +430,11 @@ pub async fn upload_blob(
 ) -> Result<Json<BlobDescriptor>, MediaError> {
     let attribution = upload_attribution(&state, &auth, &headers).await;
 
+    let serving_write =
+        buzz_deletion::acquire_serving_write(&state.db, auth.tenant.community(), "media_upload")
+            .await
+            .map_err(serving_write_error)?;
+
     if auth.route_mode == UploadRouteMode::LegacyMedia {
         metrics::counter!("buzz_media_legacy_upload_route_total").increment(1);
     }
@@ -441,66 +460,82 @@ pub async fn upload_blob(
     }
     let replay = futures_util::stream::iter(replay_chunks.into_iter().map(Ok)).chain(source);
 
-    let mut descriptor = if should_stream_as_video(&sniff) {
-        // Video path: stream body directly to disk — never fully buffered in RAM.
-        buzz_media::process_video_upload(
-            &state.media_storage,
-            &state.config.media,
-            &auth.tenant,
-            &auth.auth_event,
-            replay,
-            content_length(&headers),
-            attribution,
-        )
-        .await?
-    } else {
-        // Non-video path: decide image-vs-generic from the sniffed prefix,
-        // then spool the body to disk under that type's cap. Images go
-        // through the thumbnailing pipeline; non-media attachments (docs,
-        // archives, text, data) take the generic file path and are served as
-        // downloads. Recognized audio/video cannot fall through it. The bytes
-        // enter RAM once, after the transfer, for the CPU-bound validate,
-        // hash and decode step, bounded by the cap that was just enforced.
-        let is_image = is_image_mime(infer::get(&sniff).map(|t| t.mime_type()));
-        if !is_image && auth.route_mode == UploadRouteMode::LegacyMedia {
-            let mime = infer::get(&sniff)
-                .map(|kind| kind.mime_type().to_string())
-                .unwrap_or_else(|| "application/octet-stream".to_string());
-            return Err(MediaError::DisallowedContentType(mime));
-        }
-        let cap = non_video_body_cap(&state.config.media, &sniff);
-        let spooled = spool_body_to_disk(replay, content_length(&headers), cap).await?;
-        tracing::debug!(
-            bytes = spooled.size,
-            cap,
-            is_image,
-            "non-video upload spooled"
-        );
-        let bytes = spooled.read_back().await?;
-        drop(spooled);
+    serving_write.verify().await.map_err(serving_lease_lost)?;
 
-        if is_image {
-            buzz_media::process_upload(
-                &state.media_storage,
-                &state.config.media,
-                &auth.tenant,
-                &auth.auth_event,
-                bytes,
-                attribution,
-            )
-            .await?
-        } else {
-            buzz_media::process_file_upload(
-                &state.media_storage,
-                &state.config.media,
-                &auth.tenant,
-                &auth.auth_event,
-                bytes,
-                attribution,
-            )
-            .await?
-        }
-    };
+    let mut descriptor = serving_write
+        .protect(async {
+            Ok(if should_stream_as_video(&sniff) {
+                // Video path: stream body directly to disk — never fully buffered in RAM.
+                buzz_media::process_video_upload(
+                    &state.media_storage,
+                    &state.config.media,
+                    &auth.tenant,
+                    &auth.auth_event,
+                    replay,
+                    content_length(&headers),
+                    attribution,
+                )
+                .await?
+            } else {
+                // Non-video path: decide image-vs-generic from the sniffed prefix,
+                // then spool the body to disk under that type's cap. Images go
+                // through the thumbnailing pipeline; non-media attachments (docs,
+                // archives, text, data) take the generic file path and are served as
+                // downloads. Recognized audio/video cannot fall through it. The bytes
+                // enter RAM once, after the transfer, for the CPU-bound validate,
+                // hash and decode step, bounded by the cap that was just enforced.
+                let is_image = is_image_mime(infer::get(&sniff).map(|t| t.mime_type()));
+                if !is_image && auth.route_mode == UploadRouteMode::LegacyMedia {
+                    let mime = infer::get(&sniff)
+                        .map(|kind| kind.mime_type().to_string())
+                        .unwrap_or_else(|| "application/octet-stream".to_string());
+                    return Err(MediaError::DisallowedContentType(mime));
+                }
+                let cap = non_video_body_cap(&state.config.media, &sniff);
+                let spooled = spool_body_to_disk(replay, content_length(&headers), cap).await?;
+                tracing::debug!(
+                    bytes = spooled.size,
+                    cap,
+                    is_image,
+                    "non-video upload spooled"
+                );
+                let bytes = spooled.read_back().await?;
+                drop(spooled);
+
+                if is_image {
+                    buzz_media::process_upload(
+                        &state.media_storage,
+                        &state.config.media,
+                        &auth.tenant,
+                        &auth.auth_event,
+                        bytes,
+                        attribution,
+                    )
+                    .await?
+                } else {
+                    buzz_media::process_file_upload(
+                        &state.media_storage,
+                        &state.config.media,
+                        &auth.tenant,
+                        &auth.auth_event,
+                        bytes,
+                        attribution,
+                    )
+                    .await?
+                }
+            })
+        })
+        .await
+        .map_err(|error| {
+            if buzz_deletion::ServingWriteGuard::is_lease_lost(&error) {
+                serving_lease_lost(error)
+            } else {
+                match error.downcast::<MediaError>() {
+                    Ok(error) => error,
+                    Err(_) => MediaError::Internal,
+                }
+            }
+        })??;
 
     rewrite_descriptor_urls_for_tenant(
         &mut descriptor,
@@ -544,6 +579,7 @@ pub async fn upload_blob(
         }
     }
 
+    serving_write.finish().await.map_err(serving_lease_lost)?;
     Ok(Json(descriptor))
 }
 
@@ -847,6 +883,77 @@ pub(crate) async fn serve_blob_for_tenant(
     }
 }
 
+/// Passive raster image formats safe to render inline in a browser, keyed by
+/// content sniff of the stored bytes. SVG is intentionally excluded: it is an
+/// active document that can execute script.
+fn verified_inline_image_type(bytes: &[u8]) -> Option<&'static str> {
+    match infer::get(bytes).map(|kind| kind.mime_type()) {
+        Some("image/png") => Some("image/png"),
+        Some("image/jpeg") => Some("image/jpeg"),
+        Some("image/gif") => Some("image/gif"),
+        Some("image/webp") => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// The browser-facing response policy for a feedback attachment, derived solely
+/// from a content sniff of the stored `prefix` bytes — never the reporter's
+/// `imeta` MIME. Returns the served `Content-Type` and `Content-Disposition`:
+/// verified passive raster renders `inline` with its sniffed type; every other
+/// payload is forced to `application/octet-stream` + `attachment` so the browser
+/// downloads it instead of running it. `X-Content-Type-Options: nosniff` is
+/// always applied by the caller so a forced attachment can never be sniffed back
+/// into an executable type. This is the load-bearing security seam.
+fn feedback_attachment_response_policy(prefix: &[u8]) -> (&'static str, &'static str) {
+    match verified_inline_image_type(prefix) {
+        Some(mime) => (mime, "inline"),
+        None => ("application/octet-stream", "attachment"),
+    }
+}
+
+/// Serve a feedback attachment to an admin operator without ever letting an
+/// attacker-controlled payload execute as a typed document.
+///
+/// Feedback attachment bytes, their `imeta` MIME, and filename are all supplied
+/// by untrusted reporters. The normal media route trusts the stored sidecar
+/// MIME to choose an inline disposition, so a hash-valid HTML or SVG payload
+/// mislabelled `image/*` would open as an executable document on the admin
+/// origin. This wrapper re-derives the served type from a content sniff of the
+/// stored bytes: only verified passive raster images render inline; every other
+/// payload is forced to `application/octet-stream` + `Content-Disposition:
+/// attachment` so the browser downloads it instead of running it. The normal
+/// `/media` route is unchanged.
+pub(crate) async fn serve_feedback_attachment(
+    state: &AppState,
+    tenant: &TenantContext,
+    sha256: &str,
+    req_headers: &HeaderMap,
+) -> Result<Response, MediaError> {
+    // infer needs only the leading magic bytes (webp reads through byte 11).
+    const SNIFF_PREFIX_LEN: u64 = 32;
+    let key = resolve_s3_key(&state.media_storage, tenant, sha256).await?;
+    let prefix = state
+        .media_storage
+        .get_range(&key, 0, SNIFF_PREFIX_LEN - 1)
+        .await
+        .unwrap_or_default();
+    let (content_type, disposition) = feedback_attachment_response_policy(&prefix);
+
+    let mut response = serve_blob_for_tenant(state, tenant, sha256, req_headers).await?;
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static(disposition),
+    );
+    // A forced attachment must never be sniffed back into an executable type.
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    Ok(response)
+}
+
 /// Parse a `Range: bytes=START-END` header value.
 ///
 /// Returns `Some((start, end))` for a valid absolute or suffix range.
@@ -1080,6 +1187,90 @@ mod tests {
                 headers.append("authorization", headers["authorization"].clone());
                 assert!(extract_blossom_auth(&headers).is_err());
             }
+        }
+    }
+
+    #[test]
+    fn serving_write_error_taxonomy_separates_fence_from_backend_failure() {
+        let fenced = anyhow::Error::from(buzz_db::DbError::AccessDenied("fenced".to_string()));
+        assert!(matches!(
+            serving_write_error(fenced),
+            MediaError::CommunityWriteFenced
+        ));
+        let backend = anyhow::Error::from(buzz_db::DbError::Sqlx(sqlx::Error::PoolTimedOut));
+        assert!(matches!(
+            serving_write_error(backend),
+            MediaError::ServiceUnavailable
+        ));
+    }
+
+    #[test]
+    fn feedback_inline_allows_only_sniffed_passive_raster_images() {
+        // Real magic bytes for the four verified passive raster formats.
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10, b'J', b'F', b'I', b'F'];
+        let gif = *b"GIF89a";
+        let mut webp = Vec::from(*b"RIFF");
+        webp.extend_from_slice(&[0, 0, 0, 0]);
+        webp.extend_from_slice(b"WEBP");
+        assert_eq!(verified_inline_image_type(&png), Some("image/png"));
+        assert_eq!(verified_inline_image_type(&jpeg), Some("image/jpeg"));
+        assert_eq!(verified_inline_image_type(&gif), Some("image/gif"));
+        assert_eq!(verified_inline_image_type(&webp), Some("image/webp"));
+
+        // Active documents and non-raster payloads never render inline — a
+        // reporter cannot smuggle script past the sniff, regardless of the
+        // imeta MIME they supplied.
+        assert_eq!(
+            verified_inline_image_type(b"<svg xmlns=\"...\"></svg>"),
+            None
+        );
+        assert_eq!(
+            verified_inline_image_type(b"<!DOCTYPE html><script>alert(1)</script>"),
+            None
+        );
+        assert_eq!(verified_inline_image_type(b"%PDF-1.7"), None);
+        assert_eq!(verified_inline_image_type(b""), None);
+    }
+
+    #[test]
+    fn feedback_attachment_response_policy_pins_browser_facing_contract() {
+        // Verified passive raster is the ONLY payload that serves inline, and it
+        // serves as its sniffed type — never a reporter-controlled MIME.
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        let jpeg = [0xFF, 0xD8, 0xFF, 0xE0, 0, 0x10, b'J', b'F', b'I', b'F'];
+        let gif = *b"GIF89a";
+        let mut webp = Vec::from(*b"RIFF");
+        webp.extend_from_slice(&[0, 0, 0, 0]);
+        webp.extend_from_slice(b"WEBP");
+        for (bytes, mime) in [
+            (&png[..], "image/png"),
+            (&jpeg[..], "image/jpeg"),
+            (&gif[..], "image/gif"),
+            (&webp[..], "image/webp"),
+        ] {
+            assert_eq!(
+                feedback_attachment_response_policy(bytes),
+                (mime, "inline"),
+                "verified raster must serve inline as its sniffed type"
+            );
+        }
+
+        // Every hostile or unrecognized payload is forced to a non-navigable
+        // download. This is the seam that keeps a hash-valid HTML/SVG feedback
+        // attachment from opening as an executing document on the admin origin.
+        for hostile in [
+            &b"<!DOCTYPE html><script>alert(1)</script>"[..],
+            &b"<svg xmlns=\"...\"><script>alert(1)</script></svg>"[..],
+            &b"%PDF-1.7"[..],
+            &b""[..],       // failed/empty sniff prefix — fail closed to download
+            &b"\x89PN"[..], // short/truncated prefix — not enough to verify
+        ] {
+            assert_eq!(
+                feedback_attachment_response_policy(hostile),
+                ("application/octet-stream", "attachment"),
+                "hostile/unrecognized bytes must force a download, never inline"
+            );
         }
     }
 
