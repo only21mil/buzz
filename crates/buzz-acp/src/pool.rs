@@ -5402,6 +5402,7 @@ async fn publish_agent_turn_metric(
     let payload = AgentTurnMetricPayload {
         harness: ctx.harness_name.clone(),
         model: usage.model.clone(),
+        pricing_identity: None,
         channel_id: channel_id.map(|id| id.to_string()),
         session_id: Some(usage.session_id.clone()),
         turn_id: Some(turn_id.to_string()),
@@ -5576,7 +5577,7 @@ pub(crate) async fn post_harness_notice(
     extra_tags: &[Vec<String>],
 ) -> Option<String> {
     let mut builder =
-        match buzz_sdk::build_message(channel_id, content, thread_ref, mentions, false, &[]) {
+        match buzz_sdk::build_message(channel_id, content, thread_ref, mentions, false, &[], &[]) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(channel = %channel_id, "harness notice: build failed: {e}");
