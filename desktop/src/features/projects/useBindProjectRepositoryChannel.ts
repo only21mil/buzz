@@ -1,10 +1,13 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-
+import { projectCollectionMutationOptions } from "./projectCollectionMutation";
+import type { ProjectCollectionScope } from "./projectCollectionScope";
+import { useProjectCollectionScope } from "./useProjectCollectionScope";
 import {
-  type Project,
-  projectsQueryKey,
-  type Repository,
-} from "@/features/projects/hooks";
+  type QueryClient,
+  useMutation,
+  useQueryClient,
+} from "@tanstack/react-query";
+
+import type { Repository } from "@/features/projects/hooks";
 import { eventToRepository } from "@/features/projects/projectModels";
 import { buildRepositoryChannelBindingTemplate } from "@/features/projects/projectRepositoryCreation";
 import { inheritProjectDataProvenance } from "@/features/projects/projectSnapshot";
@@ -48,32 +51,38 @@ async function bindProjectRepositoryChannel({
   return updated;
 }
 
+/** Applies a binding to its captured collection without promoting snapshot rows. */
+export function bindProjectRepositoryChannelMutationOptions(
+  queryClient: QueryClient,
+  scope: ProjectCollectionScope | null,
+  mutationFn = bindProjectRepositoryChannel,
+) {
+  return projectCollectionMutationOptions(
+    queryClient,
+    scope,
+    mutationFn,
+    (current, repository) =>
+      current.map((project) =>
+        project.repositories.some(
+          (candidate) => candidate.repoAddress === repository.repoAddress,
+        )
+          ? inheritProjectDataProvenance(project, {
+              ...project,
+              repositories: project.repositories.map((candidate) =>
+                candidate.repoAddress === repository.repoAddress
+                  ? repository
+                  : candidate,
+              ),
+            })
+          : project,
+      ),
+  );
+}
+
 export function useBindProjectRepositoryChannelMutation() {
   const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: bindProjectRepositoryChannel,
-    onSuccess: (repository) => {
-      queryClient.setQueryData<Project[]>(projectsQueryKey, (current = []) =>
-        current.map((project) => {
-          if (
-            !project.repositories.some(
-              (candidate) => candidate.repoAddress === repository.repoAddress,
-            )
-          ) {
-            return project;
-          }
-          const updatedProject = {
-            ...project,
-            repositories: project.repositories.map((candidate) =>
-              candidate.repoAddress === repository.repoAddress
-                ? repository
-                : candidate,
-            ),
-          };
-          return inheritProjectDataProvenance(project, updatedProject);
-        }),
-      );
-      void queryClient.invalidateQueries({ queryKey: projectsQueryKey });
-    },
-  });
+  const scope = useProjectCollectionScope();
+  return useMutation(
+    bindProjectRepositoryChannelMutationOptions(queryClient, scope),
+  );
 }

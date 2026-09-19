@@ -1,3 +1,4 @@
+import { isTauri } from "@tauri-apps/api/core";
 import { ArrowLeft } from "lucide-react";
 import * as React from "react";
 
@@ -53,7 +54,7 @@ export function CreateProjectFormContent({
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const trimmedName = name.trim();
-    if (!trimmedName) return;
+    if (!isTauri() || isCreating || !trimmedName) return;
 
     setErrorMessage(null);
     try {
@@ -83,7 +84,7 @@ export function CreateProjectFormContent({
         <div className="flex w-full items-center justify-end gap-3">
           <Button
             data-testid="create-project-submit"
-            disabled={isCreating || name.trim().length === 0}
+            disabled={!isTauri() || isCreating || name.trim().length === 0}
             form="create-project-form"
             type="submit"
           >

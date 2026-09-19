@@ -1,10 +1,10 @@
+import { projectCollectionQueryKey } from "./projectCollectionQuery.ts";
+const scope = { relayOrigin: "https://relay.example", pubkey: "a".repeat(64) };
+const projectsQueryKey = projectCollectionQueryKey(scope);
 import assert from "node:assert/strict";
 import test from "node:test";
 import { MutationObserver, QueryClient } from "@tanstack/react-query";
-import {
-  projectDeletionMutationOptions,
-  projectsQueryKey,
-} from "./projectDeletionMutation.ts";
+import { projectDeletionMutationOptions } from "./projectDeletionMutation.ts";
 import {
   inheritProjectDataProvenance,
   isProjectDataAuthoritative,
@@ -25,7 +25,7 @@ test("deletion updates only its captured community client and retains display-on
   });
   const mutation = new MutationObserver(
     previous,
-    projectDeletionMutationOptions(previous, () => pending),
+    projectDeletionMutationOptions(previous, scope, () => pending),
   );
   const write = mutation.mutate(deleted);
   await new Promise(setImmediate);

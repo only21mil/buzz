@@ -1,3 +1,4 @@
+import type { ProjectCollectionScope } from "./projectCollectionScope";
 import { getCachedRelayOrigin } from "@/shared/lib/mediaUrl";
 import { getIdentity } from "@/shared/api/tauriIdentity";
 import {
@@ -32,19 +33,22 @@ function readHiddenProjectCards(): string[] {
 export async function fetchProjects(
   fetchExhaustively?: FetchProjectEventsExhaustively,
   signal?: AbortSignal,
+  scope?: ProjectCollectionScope,
 ): Promise<Project[]> {
   // Delegates to `buildProjectsFromFetcher` in `projectEnumeration.ts`, which
   // is the pure, Tauri-free core of this operation. Its javadoc explains
   // fail-closed tombstones and NIP-OA owner-deletion suppression.
-  const viewerPubkey = await getIdentity()
-    .then((identity) => identity.pubkey)
-    .catch(() => undefined);
+  const viewerPubkey =
+    scope?.pubkey ??
+    (await getIdentity()
+      .then((identity) => identity.pubkey)
+      .catch(() => undefined));
   const fetcher: FetchProjectEventsExhaustively =
     fetchExhaustively ??
     ((kinds, extraFilter) =>
       fetchProjectEventsExhaustively(kinds, extraFilter, undefined, signal));
   const projects = await buildProjectsFromFetcher(fetcher, {
-    relayOrigin: getCachedRelayOrigin(),
+    relayOrigin: scope?.relayOrigin ?? getCachedRelayOrigin(),
     hiddenAddresses: new Set(readHiddenProjectCards()),
     viewerPubkey,
   });
