@@ -40,11 +40,11 @@ fi
 
 echo "Preparing MeshLLM native runtime ($BACKEND) for MeshLLM $MESH_VERSION..." >&2
 runtime_dir="$(cd "$MESH_ROOT" && scripts/ci-prepare-native-runtime.sh "$OUT_DIR" "$BACKEND")"
-version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"].get("mesh_version") or "unknown")' "$runtime_dir/manifest.json")"
+version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"].get("mesh_version", "unknown"))' "$runtime_dir/manifest.json")"
 id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"]["id"])' "$runtime_dir/manifest.json")"
 # Manifest values become directory names below, never relative paths.
 for component in "$version" "$id"; do
-  if [[ ! "$component" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  if [[ ! "$component" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
     printf 'Invalid native runtime path component: %q\n' "$component" >&2
     exit 1
   fi

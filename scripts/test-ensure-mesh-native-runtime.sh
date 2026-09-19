@@ -40,6 +40,10 @@ write_manifest '1.0' 'runtime-cpu'
 bash "$FIXTURE/scripts/ensure-mesh-native-runtime.sh" cpu > "$TEMP/stdout"
 cmp "$TEMP/runtime/library" "$TEMP/cache/1.0/runtime-cpu/library"
 [[ "$(cat "$TEMP/stdout")" == "$TEMP/cache" ]]
+write_manifest '1.2.3-rc.1+build.42' 'runtime-cpu'
+bash "$FIXTURE/scripts/ensure-mesh-native-runtime.sh" cpu > "$TEMP/stdout"
+cmp "$TEMP/runtime/library" "$TEMP/cache/1.2.3-rc.1+build.42/runtime-cpu/library"
+[[ "$(cat "$TEMP/stdout")" == "$TEMP/cache" ]]
 mkdir -p "$TEMP/keep"
 printf 'do not remove\n' > "$TEMP/keep/sentinel"
 for bad in '..' '../keep' '/absolute' '' $'line\nbreak'; do
@@ -49,8 +53,6 @@ for bad in '..' '../keep' '/absolute' '' $'line\nbreak'; do
     else
       write_manifest '1.0' "$bad"
     fi
-    # An empty version deliberately retains the existing "unknown" fallback.
-    [[ "$field" == version && -z "$bad" ]] && continue
     if bash "$FIXTURE/scripts/ensure-mesh-native-runtime.sh" cpu > "$TEMP/stdout" 2> "$TEMP/stderr"; then
       printf 'unexpectedly accepted %s=%q\n' "$field" "$bad" >&2
       exit 1
