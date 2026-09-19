@@ -35,6 +35,8 @@ export type SupportedLinkPreview = {
   typeLabel:
     | "PR"
     | "issue"
+    | "Review"
+    | "Task"
     | "repo"
     | "project"
     | "file"
@@ -274,9 +276,17 @@ function createPreview(
   typeLabel: SupportedLinkPreview["typeLabel"],
   title: string,
 ): SupportedLinkPreview {
+  // Strip the `#fragment` from the preview identity. A fragment is a
+  // client-only anchor into the page — the preview (and the signed snapshot's
+  // canonicalUrl) is of the page itself. Keeping it would fail the
+  // fragment-free snapshot-URL guard, so a link like `pull/3767#review-1`
+  // would silently get no preview at all. The message body keeps the raw URL,
+  // so click-through to the anchor is preserved.
+  const canonical = new URL(parsed.href);
+  canonical.hash = "";
   return {
     kind,
-    href: parsed.href,
+    href: canonical.href,
     provider,
     title,
     typeLabel,
@@ -311,7 +321,7 @@ function parseBuzzEntityPreview(href: string): SupportedLinkPreview | null {
       href: buildPullRequestLink(link),
       provider: "Buzz",
       title,
-      typeLabel: "PR",
+      typeLabel: "Review",
     };
   }
   if (link.type === "issue") {
@@ -320,7 +330,7 @@ function parseBuzzEntityPreview(href: string): SupportedLinkPreview | null {
       href: buildIssueLink(link),
       provider: "Buzz",
       title,
-      typeLabel: "issue",
+      typeLabel: "Task",
     };
   }
   if (link.type === "project") {
@@ -655,7 +665,17 @@ export function extractSupportedLinkPreviews(
   const relayOrigin = activeRelayOrigin ?? null;
   for (const candidate of candidates) {
     const preview = parseSupportedLinkPreview(candidate.href, relayOrigin);
-    if (!preview || seen.has(preview.href)) continue;
+    // Buzz-native links render as inline entity chips. Their relay-backed
+    // metadata is available from the chip on hover, so a second standalone
+    // preview would duplicate the same entity presentation. This also covers
+    // same-relay clone URLs, which parseSupportedLinkPreview normalizes to a
+    // buzz://repo href. External web links continue through the snapshot path.
+    if (
+      !preview ||
+      preview.href.startsWith("buzz://") ||
+      seen.has(preview.href)
+    )
+      continue;
 
     seen.add(preview.href);
     previews.push(

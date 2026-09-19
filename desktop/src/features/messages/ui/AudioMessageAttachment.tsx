@@ -1,5 +1,4 @@
 import * as React from "react";
-import { isTauri } from "@tauri-apps/api/core";
 import { AlertCircle, Download, Loader2, X } from "lucide-react";
 import { motion, useReducedMotion } from "motion/react";
 import { toast } from "sonner";
@@ -16,7 +15,7 @@ import {
 } from "@/features/messages/lib/audioAttachment";
 import { scheduleAudioMediaLoad } from "@/features/messages/lib/audioMediaLoadScheduler";
 import { invokeTauri } from "@/shared/api/tauri";
-import { fetchAudioBytes } from "@/shared/api/tauriMedia";
+import { fetchMediaBytes } from "@/shared/api/tauriMedia";
 import { cn } from "@/shared/lib/cn";
 import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
 import {
@@ -51,7 +50,6 @@ export function renderAudioMessageAttachment(
   label: string,
   downloadUrl?: string,
 ) {
-  if (!isTauri()) return null;
   const attachment = resolveAudioAttachment(entry, href, label);
   return attachment ? (
     <AudioMessageAttachment
@@ -204,7 +202,7 @@ export function AudioMessageAttachment({
     let objectUrl: string | undefined;
     setPlaybackHref(undefined);
     const load = scheduleAudioMediaLoad((signal) =>
-      fetchAudioBytes(href, signal),
+      fetchMediaBytes(href, signal),
     );
     void load.promise
       .then((bytes) => {

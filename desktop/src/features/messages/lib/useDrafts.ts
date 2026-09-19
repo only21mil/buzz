@@ -1,8 +1,8 @@
-import { setPublicationScope } from "@/shared/api/publicationScope";
 import * as React from "react";
 
 import { discardQueuedAttachmentsForDraft } from "@/features/messages/lib/backgroundMediaUploadStore";
 import type { ImetaMedia } from "@/features/messages/lib/imetaMediaMarkdown";
+import { setPublicationScope } from "@/shared/api/publicationScope";
 import { setLocalStorageItemWithRecovery } from "@/shared/lib/localStorageQuota";
 
 // ── Store reactivity ─────────────────────────────────────────────────────────

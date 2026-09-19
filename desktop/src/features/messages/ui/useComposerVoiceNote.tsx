@@ -1,5 +1,4 @@
 import * as React from "react";
-import { isTauri } from "@tauri-apps/api/core";
 import { toast } from "sonner";
 
 import {
@@ -82,7 +81,6 @@ export function useComposerVoiceNote({
   }, [finish, recorder.elapsedSeconds, recorder.status]);
 
   const toggle = React.useCallback(() => {
-    if (!isTauri()) return;
     if (statusRef.current === "recording") {
       void finish();
       return;
@@ -146,7 +144,6 @@ export function useComposerVoiceNote({
 
   return {
     ...recorder,
-    supported: isTauri(),
     acceptsAttachment: recorder.status === "idle" && !hasAttachment,
     hasAttachment,
     hasAttachmentRef,

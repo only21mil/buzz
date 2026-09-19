@@ -106,7 +106,10 @@ async fn repository_branches_inner(
     )
     .await
     {
-        Ok(channel_id) => channel_id,
+        Ok(announcement) => match super::binding::resolve_repo_binding(&announcement) {
+            super::binding::RepoBinding::Bound(channel_id) => channel_id,
+            _ => return (StatusCode::NOT_FOUND, "repository not found").into_response(),
+        },
         Err(response) => return response,
     };
 

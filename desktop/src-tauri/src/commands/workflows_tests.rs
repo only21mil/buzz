@@ -4,7 +4,7 @@
 // create/update record shaping.
 
 use super::*;
-use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
+use nostr::{EventBuilder, Keys, Kind, Tag};
 
 /// Build a signed kind:30620 workflow definition event with the given YAML
 /// content and d/h tags.
@@ -18,71 +18,6 @@ fn wf_event(d: &str, h: &str, yaml: &str) -> nostr::Event {
         .tags(tags)
         .sign_with_keys(&keys)
         .expect("sign")
-}
-
-fn workflow_definition(keys: &Keys, workflow_id: &str, created_at: u64) -> nostr::Event {
-    EventBuilder::new(Kind::Custom(30620), YAML)
-        .tags(vec![
-            Tag::parse(["d", workflow_id]).expect("d tag"),
-            Tag::parse(["h", CHAN]).expect("h tag"),
-        ])
-        .custom_created_at(Timestamp::from(created_at))
-        .sign_with_keys(keys)
-        .expect("sign workflow")
-}
-
-fn workflow_tombstone(keys: &Keys, workflow_id: &str, created_at: u64) -> nostr::Event {
-    let coordinate = format!("30620:{}:{workflow_id}", keys.public_key().to_hex());
-    EventBuilder::new(Kind::EventDeletion, "")
-        .tags(vec![Tag::parse(["a", coordinate.as_str()]).expect("a tag")])
-        .custom_created_at(Timestamp::from(created_at))
-        .sign_with_keys(keys)
-        .expect("sign workflow tombstone")
-}
-
-fn collect_paged_fixture(mut source: Vec<nostr::Event>) -> Vec<nostr::Event> {
-    source.sort_by(|left, right| {
-        right
-            .created_at
-            .cmp(&left.created_at)
-            .then_with(|| left.id.to_hex().cmp(&right.id.to_hex()))
-    });
-    let mut collected = Vec::new();
-
-    for kind in [30620, 5] {
-        let mut filter = serde_json::json!({"kinds": [kind]});
-        loop {
-            let until = filter.get("until").and_then(Value::as_u64);
-            let before_id = filter.get("before_id").and_then(Value::as_str);
-            let page: Vec<_> = source
-                .iter()
-                .filter(|event| event.kind.as_u16() == kind)
-                .filter(|event| match (until, before_id) {
-                    (Some(until), Some(before_id)) => {
-                        event.created_at.as_secs() < until
-                            || (event.created_at.as_secs() == until
-                                && event.id.to_hex().as_str() > before_id)
-                    }
-                    _ => true,
-                })
-                .take(WORKFLOW_QUERY_PAGE_SIZE)
-                .cloned()
-                .collect();
-            if page.is_empty() {
-                break;
-            }
-            let done = page.len() < WORKFLOW_QUERY_PAGE_SIZE;
-            if !done {
-                assert!(advance_workflow_cursor(&mut filter, &page).is_ok());
-            }
-            collected.extend(page);
-            if done {
-                break;
-            }
-        }
-    }
-
-    collected
 }
 
 const CHAN: &str = "11111111-1111-1111-1111-111111111111";
@@ -99,31 +34,6 @@ steps:
   - id: reply
     action: post_message
 ";
-
-#[test]
-fn paged_workflow_queries_keep_an_old_tombstone_in_the_fold() {
-    let owner = Keys::generate();
-    let live_id = "33333333-3333-3333-3333-333333333333";
-    let events = collect_paged_fixture(vec![
-        workflow_definition(&owner, live_id, 40),
-        workflow_definition(&owner, WF, 5),
-        workflow_tombstone(&owner, "55555555-5555-5555-5555-555555555555", 30),
-        workflow_tombstone(&owner, "44444444-4444-4444-4444-444444444444", 20),
-        workflow_tombstone(&owner, WF, 10),
-    ]);
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.kind == Kind::EventDeletion)
-            .count(),
-        3,
-        "the old tombstone must arrive from the second deletion page"
-    );
-
-    let folded = buzz_sdk_pkg::workflow_fold::fold_workflow_definitions(&events);
-    assert_eq!(folded.len(), 1);
-    assert_eq!(tag_value(folded[0], "d").as_deref(), Some(live_id));
-}
 
 #[test]
 fn workflow_from_event_maps_all_fields() {
@@ -283,91 +193,91 @@ fn workflow_wire_serializes_with_snake_case_keys() {
 }
 
 #[test]
-fn workflow_runs_path_defaults_and_caps_the_limit() {
-    let workflow_id = uuid::Uuid::parse_str(WF).expect("workflow UUID");
-    assert_eq!(
-        workflow_runs_path(workflow_id, None),
-        format!("/workflows/{WF}/runs?limit=20")
-    );
-    assert_eq!(
-        workflow_runs_path(workflow_id, Some(101)),
-        format!("/workflows/{WF}/runs?limit=100")
-    );
-}
+fn multi_channel_workflow_query_uses_one_filter_per_channel() {
+    let other_channel = "33333333-3333-3333-3333-333333333333";
+    let filters = channel_workflow_filters(vec![CHAN.to_string(), other_channel.to_string()])
+        .expect("valid channels");
 
-#[test]
-fn trigger_response_serializes_event_run_workflow_and_acceptance() {
-    let wire = trigger_workflow_wire(
-        WF.to_string(),
-        "trigger-event".to_string(),
-        "response:{\"run_id\":\"33333333-3333-3333-3333-333333333333\"}",
-    )
-    .expect("parse trigger response");
-
+    assert_eq!(filters.len(), 2);
     assert_eq!(
-        serde_json::to_value(wire).expect("serialize trigger response"),
+        filters[0],
         serde_json::json!({
-            "event_id": "trigger-event",
-            "workflow_id": WF,
-            "run_id": "33333333-3333-3333-3333-333333333333",
-            "status": "accepted",
+            "kinds": [30620],
+            "#h": [CHAN],
+        })
+    );
+    assert_eq!(
+        filters[1],
+        serde_json::json!({
+            "kinds": [30620],
+            "#h": [other_channel],
         })
     );
 }
 
 #[test]
-fn duplicate_trigger_response_keeps_missing_run_id_explicitly_null() {
-    let wire = trigger_workflow_wire(
-        WF.to_string(),
-        "trigger-event".to_string(),
-        "duplicate: already processed",
-    )
-    .expect("parse duplicate trigger response");
-
-    assert_eq!(wire.run_id, None);
-    assert_eq!(wire.status, "accepted");
+fn workflow_query_results_are_deduplicated_by_event_id() {
+    let first = wf_event(WF, CHAN, YAML);
+    let second = wf_event("33333333-3333-3333-3333-333333333333", CHAN, YAML);
+    let workflows = folded_workflows(&[first.clone(), second.clone(), first, second]);
+    assert_eq!(workflows.len(), 2);
 }
 
 #[test]
-fn history_cursor_pairs_are_encoded_without_losing_precision() {
-    let id = uuid::Uuid::new_v4();
-    let before = "2026-09-06T10:00:00.123456+00:00";
-    let path =
-        workflow_history_path(id, Some(101), true, Some(before), Some(&id.to_string())).unwrap();
-    let url = reqwest::Url::parse(&format!("http://localhost{path}")).unwrap();
-    let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
-    assert_eq!(params["before"], before);
-    assert_eq!(params["before_id"], id.to_string());
-    assert_eq!(params["page"], "true");
-    assert_eq!(params["limit"], "100");
-    assert!(workflow_history_path(id, None, true, Some(before), None).is_err());
-    assert!(workflow_history_path(id, None, true, Some("invalid"), Some(&id.to_string())).is_err());
-    assert_eq!(
-        workflow_history_path(id, None, false, None, None).unwrap(),
-        workflow_runs_path(id, None)
-    );
-}
-
-#[test]
-fn workflow_channel_filters_keep_exact_batch_boundaries_and_deduplicate() {
-    for count in [128, 129] {
-        let channels: Vec<_> = (0..count)
-            .map(|_| uuid::Uuid::new_v4().to_string())
-            .collect();
-        let filters =
-            workflow_channel_filters(channels.iter().chain(channels.iter()).cloned().collect());
-        assert_eq!(filters.len(), count);
-        for (filter, channel) in filters.iter().zip(channels) {
-            assert_eq!(filter["#h"], serde_json::json!([channel]));
-        }
+fn channel_workflow_filters_reject_malformed_or_blank_channel_ids() {
+    for channel_id in ["not-a-uuid", "", "   "] {
+        let error = channel_workflow_filters(vec![channel_id.to_string()])
+            .expect_err("malformed channel id must fail before querying the relay");
+        assert_eq!(error, "invalid channel id");
     }
 }
 
 #[test]
-fn workflow_wire_keeps_original_yaml_for_lossless_edits() {
-    let yaml = "# do not erase\nname: State\ntrigger: {on: webhook}\nsteps: [{id: read, action: read_state, key: count}]\n";
+fn channel_workflow_filters_accepts_empty_input() {
     assert_eq!(
-        workflow_from_event(&wf_event(WF, CHAN, yaml)).yaml_definition,
-        yaml
+        channel_workflow_filters(Vec::new()).expect("empty input is valid"),
+        Vec::<Value>::new()
     );
+}
+
+#[test]
+fn trigger_response_uses_persisted_run_id_contract() {
+    let wire = trigger_workflow_wire(
+        WF.to_string(),
+        "event-id".to_string(),
+        "response:{\"run_id\":\"33333333-3333-3333-3333-333333333333\"}",
+    )
+    .expect("parse trigger response");
+
+    assert_eq!(
+        wire.run_id.as_deref(),
+        Some("33333333-3333-3333-3333-333333333333")
+    );
+    assert_eq!(wire.workflow_id, WF);
+    assert_eq!(wire.status, "accepted");
+    let value = serde_json::to_value(wire).expect("serialize trigger response");
+    assert_eq!(value["event_id"], "event-id");
+}
+
+#[test]
+fn trigger_response_rejects_missing_or_empty_run_id() {
+    assert!(trigger_workflow_wire(WF.to_string(), "event-id".to_string(), "response:{}").is_err());
+    assert!(trigger_workflow_wire(
+        WF.to_string(),
+        "event-id".to_string(),
+        "response:{\"run_id\":\"   \"}",
+    )
+    .is_err());
+}
+
+#[test]
+fn duplicate_trigger_acknowledges_without_inventing_a_run() {
+    let wire = trigger_workflow_wire(
+        WF.to_string(),
+        "event-id".into(),
+        "duplicate: already processed",
+    )
+    .expect("accepted duplicate");
+    assert_eq!(wire.run_id, None);
+    assert_eq!(wire.status, "accepted");
 }

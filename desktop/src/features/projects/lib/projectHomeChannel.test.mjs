@@ -123,7 +123,7 @@ test("findProjectHomeByChannelId ignores an older unauthorized competitor", () =
   assert.equal(selected?.id, "authorized");
 });
 
-test("findProjectHomeByChannelId fails closed for multiple authoritative homes", () => {
+test("findProjectHomeByChannelId prefers the oldest listed authoritative home", () => {
   const base = {
     createdAt: 0,
     legacy: false,
@@ -137,5 +137,5 @@ test("findProjectHomeByChannelId fails closed for multiple authoritative homes",
     { ...base, createdAt: 50, id: "hidden", visibility: "unlisted" },
     { ...base, createdAt: 100, id: "original" },
   ]);
-  assert.equal(selected, null);
+  assert.equal(selected?.id, "original");
 });

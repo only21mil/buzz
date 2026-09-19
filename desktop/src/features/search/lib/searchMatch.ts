@@ -1,4 +1,4 @@
-type SearchMatchPart = {
+export type SearchMatchPart = {
   isMatch: boolean;
   key: string;
   text: string;
@@ -50,6 +50,15 @@ function getSearchHighlightMatchers(query: string): SearchHighlightTerm[] {
   return [...deduped.values()].sort(
     (left, right) => right.value.length - left.value.length,
   );
+}
+
+/**
+ * Lexemes used by desktop prefix search after punctuation normalization.
+ * Completed whitespace-delimited tokens match exactly; only lexemes from the
+ * trailing token match prefixes.
+ */
+export function getSearchHighlightTerms(query: string): string[] {
+  return getSearchHighlightMatchers(query).map((matcher) => matcher.value);
 }
 
 function getTextLexemes(text: string): TextLexeme[] {

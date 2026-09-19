@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import React from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { buildChannelAgentSessionCandidates } from "./useChannelAgentSessions.ts";
+import { useActiveAgentPubkeys } from "../../messages/lib/useActiveAgentPubkeys.ts";
 
 const relayAgents = ["unknown", "online", "away", "offline"].map((status) => ({
   pubkey: status,
@@ -21,11 +24,12 @@ test("session projection retains unknown rather than manufacturing deployed stat
   );
 });
 
-test("local managed evidence survives missing relay evidence", () => {
-  const [candidate] = buildChannelAgentSessionCandidates({
-    managedAgents: [{ pubkey: "local", name: "Local", status: "running" }],
-    relayAgents: [],
-  });
-  assert.equal(candidate.status, "running");
-  assert.equal(candidate.agentSource, "managed");
+test("active-agent lookup requires positive relay liveness evidence", () => {
+  let active;
+  function Probe() {
+    active = useActiveAgentPubkeys([], relayAgents);
+    return null;
+  }
+  renderToStaticMarkup(React.createElement(Probe));
+  assert.deepEqual([...active], ["online", "away"]);
 });

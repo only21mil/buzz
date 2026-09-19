@@ -28,6 +28,7 @@ fn buzz_agent() -> &'static KnownAcpRuntime {
 
 pub(super) fn record() -> ManagedAgentRecord {
     ManagedAgentRecord {
+        session_policy: Default::default(),
         pubkey: "test".to_string(),
         name: "Test Agent".to_string(),
         persona_id: None,
@@ -35,6 +36,7 @@ pub(super) fn record() -> ManagedAgentRecord {
         auth_tag: None,
         relay_url: "ws://localhost:3000".to_string(),
         avatar_url: None,
+        description: None,
         acp_command: "buzz-acp".to_string(),
         agent_command: "goose".to_string(),
         agent_args: vec![],
@@ -51,10 +53,12 @@ pub(super) fn record() -> ManagedAgentRecord {
         runtime_pid: None,
         backend: crate::managed_agents::types::BackendKind::Local,
         backend_agent_id: None,
+        provider_policy_pending: false,
         provider_binary_path: None,
         team_id: None,
         persona_team_dir: None,
         persona_name_in_team: None,
+        team_catalog_source: None,
         created_at: "".to_string(),
         updated_at: "".to_string(),
         last_started_at: None,
@@ -74,7 +78,6 @@ pub(super) fn record() -> ManagedAgentRecord {
         source_team: None,
         source_team_persona_slug: None,
         catalog_source: None,
-        team_catalog_source: None,
         definition_respond_to: None,
         definition_respond_to_allowlist: Vec::new(),
         definition_parallelism: None,
@@ -95,9 +98,11 @@ fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 
 fn persona(id: &str, env_vars: BTreeMap<String, String>) -> AgentDefinition {
     AgentDefinition {
+        session_policy: Default::default(),
         id: id.to_string(),
         display_name: "P".to_string(),
         avatar_url: None,
+        description: None,
         system_prompt: String::new(),
         runtime: None,
         model: None,

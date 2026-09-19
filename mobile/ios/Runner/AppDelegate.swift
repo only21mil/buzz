@@ -1,7 +1,7 @@
 import AVFoundation
 import BuzzPushKit
+import DeclaredAgeRange
 import Flutter
-import LocalAuthentication
 import UIKit
 import UserNotifications
 import os.log
@@ -17,7 +17,7 @@ import os.log
     accessGroup: Bundle.main.object(forInfoDictionaryKey: "BuzzKeychainAccessGroup") as? String
   )
   private var enrollmentTask: Task<Void, Never>?
-  private var appGroupIdentifier: String? {
+  var appGroupIdentifier: String? {
     Bundle.main.object(forInfoDictionaryKey: "BuzzAppGroupIdentifier") as? String
   }
   private var pushKeychainAccessGroup: String? {
@@ -29,17 +29,26 @@ import os.log
     keychainAccessGroup: pushKeychainAccessGroup
   )
   private var qrScannerChannel: FlutterMethodChannel?
-  private var deviceAuthChannel: FlutterMethodChannel?
   private var inlinePhotoPickerSupportChannel: FlutterMethodChannel?
+  private var ageSignalChannel: FlutterMethodChannel?
+  var requestPlatformAgeSignal: @MainActor (UIViewController) async throws -> [String: Any] =
+    AppDelegate.platformAgeSignal
+  private var ageSignalTask: Task<Void, Never>?
+  private var ageSignalRequestID: UUID?
+  private var ageSignalResult: FlutterResult?
   private var concentricSheetSurfaceChannel: FlutterMethodChannel?
   private var nativeAttachmentPopoverCoordinator: NativeAttachmentPopoverCoordinator?
+  private var nativeEmojiPickerCoordinator: NativeEmojiPickerCoordinator?
   private var nativeProfileTextEditorCoordinator: NativeProfileTextEditorCoordinator?
+  private var nativeMessageActionSurfaceSupportChannel: FlutterMethodChannel?
   private var huddleMediaPlugin: HuddleMediaPlugin?
 
   override func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
+    // Age checking and notification restoration run asynchronously from
+    // Flutter. No age-related storage or platform request may delay launch.
     UNUserNotificationCenter.current().delegate = self
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
@@ -72,16 +81,6 @@ import os.log
     qrScannerChannel?.setMethodCallHandler { call, result in
       Self.handleQrScannerMethodCall(call, result: result)
     }
-    // Fresh device-auth gate for private-key export (P05 / upstream #5116).
-    // LAContext device-owner policy accepts Face ID, Touch ID, or the device
-    // passcode, and fails closed when none is enrolled.
-    deviceAuthChannel = FlutterMethodChannel(
-      name: "buzz/device_auth",
-      binaryMessenger: messenger
-    )
-    deviceAuthChannel?.setMethodCallHandler { call, result in
-      Self.handleDeviceAuthMethodCall(call, result: result)
-    }
     inlinePhotoPickerSupportChannel = FlutterMethodChannel(
       name: "buzz/inline_photo_picker",
       binaryMessenger: messenger
@@ -96,6 +95,21 @@ import os.log
       } else {
         result(false)
       }
+    }
+
+    ageSignalChannel = FlutterMethodChannel(
+      name: "buzz/age_signal",
+      binaryMessenger: messenger
+    )
+    let ageSignalRegistrar = engineBridge.pluginRegistry.registrar(
+      forPlugin: "BuzzAgeSignal"
+    )
+    ageSignalChannel?.setMethodCallHandler { [weak self] call, result in
+      self?.handleAgeSignalMethodCall(
+        call,
+        viewController: ageSignalRegistrar?.viewController,
+        result: result
+      )
     }
 
     if let inlinePhotoPickerRegistrar = engineBridge.pluginRegistry.registrar(
@@ -170,12 +184,38 @@ import os.log
       )
     }
 
+    if let stickyDateGlassRegistrar = engineBridge.pluginRegistry.registrar(
+      forPlugin: "BuzzStickyDateGlassHeader"
+    ) {
+      stickyDateGlassRegistrar.register(
+        StickyDateGlassHeaderFactory(messenger: messenger),
+        withId: "buzz/sticky_date_glass"
+      )
+    }
+
+    if let themePaginationGlassRegistrar = engineBridge.pluginRegistry.registrar(
+      forPlugin: "BuzzThemePaginationGlassControl"
+    ) {
+      themePaginationGlassRegistrar.register(
+        ThemePaginationGlassControlFactory(messenger: messenger),
+        withId: "buzz/theme_pagination_glass"
+      )
+    }
+
     let nativeAttachmentRegistrar = engineBridge.pluginRegistry.registrar(
       forPlugin: "BuzzNativeAttachmentPopover"
     )
     nativeAttachmentPopoverCoordinator = NativeAttachmentPopoverCoordinator(
       messenger: messenger,
       parentViewController: nativeAttachmentRegistrar?.viewController
+    )
+
+    let nativeEmojiPickerRegistrar = engineBridge.pluginRegistry.registrar(
+      forPlugin: "BuzzNativeEmojiPicker"
+    )
+    nativeEmojiPickerCoordinator = NativeEmojiPickerCoordinator(
+      messenger: messenger,
+      parentViewController: nativeEmojiPickerRegistrar?.viewController
     )
 
     let nativeProfileTextEditorRegistrar = engineBridge.pluginRegistry.registrar(
@@ -185,7 +225,125 @@ import os.log
       messenger: messenger,
       parentViewController: nativeProfileTextEditorRegistrar?.viewController
     )
+    if #available(iOS 16.0, *),
+      let nativeMessageActionsRegistrar = engineBridge.pluginRegistry.registrar(
+        forPlugin: "BuzzNativeMessageActionSurface"
+      )
+    {
+      nativeMessageActionsRegistrar.register(
+        NativeMessageActionSurfaceFactory(messenger: messenger),
+        withId: "buzz/native_message_action_surface"
+      )
+      nativeMessageActionSurfaceSupportChannel = FlutterMethodChannel(
+        name: "buzz/native_message_action_surface",
+        binaryMessenger: messenger
+      )
+      nativeMessageActionSurfaceSupportChannel?.setMethodCallHandler { call, result in
+        guard call.method == "isSupported" else {
+          result(FlutterMethodNotImplemented)
+          return
+        }
+        result(true)
+      }
+    }
   }
+
+  func handleAgeSignalMethodCall(
+    _ call: FlutterMethodCall,
+    viewController: UIViewController?,
+    result: @escaping FlutterResult
+  ) {
+    // iOS can retire the request in process. The generation fence prevents
+    // a late result from the cancelled task from completing a fresh request.
+    if call.method == "cancelAgeSignalRequest" || call.method == "restartForAgeSignal" {
+      cancelAgeSignalRequest()
+      result(true)
+      return
+    }
+    guard call.method == "requestAgeSignal" else {
+      result(FlutterMethodNotImplemented)
+      return
+    }
+    guard #available(iOS 26.0, *) else {
+      result(Self.noAgeSignalResponse)
+      return
+    }
+    guard let viewController else {
+      result(
+        FlutterError(
+          code: "age_signal_unavailable",
+          message: "The age signal presenter is unavailable.",
+          details: nil
+        )
+      )
+      return
+    }
+
+    let requestID = UUID()
+    ageSignalRequestID = requestID
+    ageSignalResult = result
+    let request = requestPlatformAgeSignal
+    ageSignalTask = Task { @MainActor [weak self] in
+      do {
+        let payload = try await request(viewController)
+        self?.completeAgeSignalRequest(requestID, value: payload)
+      } catch {
+        self?.completeAgeSignalRequest(
+          requestID,
+          value:
+          FlutterError(
+            code: "age_signal_unavailable",
+            message: "The age signal request failed.",
+            details: String(describing: type(of: error))
+          )
+        )
+      }
+    }
+  }
+
+  @MainActor
+  private static func platformAgeSignal(_ viewController: UIViewController) async throws -> [String: Any] {
+    guard #available(iOS 26.0, *) else { return noAgeSignalResponse }
+    let response = try await AgeRangeService.shared.requestAgeRange(ageGates: 18, in: viewController)
+    switch response {
+    case .declinedSharing:
+      return noAgeSignalResponse
+    case .sharing(let range):
+      return BuzzAgeSignalPayload.sharing(
+        exclusiveUpperBound: range.upperBound, lowerBound: range.lowerBound)
+    @unknown default:
+      throw NSError(domain: "BuzzAgeSignal", code: 1,
+        userInfo: [NSLocalizedDescriptionKey: "Unsupported age signal response"])
+    }
+  }
+
+  private func completeAgeSignalRequest(_ requestID: UUID, value: Any?) {
+    guard ageSignalRequestID == requestID, let result = ageSignalResult else { return }
+    ageSignalRequestID = nil
+    ageSignalResult = nil
+    ageSignalTask = nil
+    result(value)
+  }
+
+  private func cancelAgeSignalRequest() {
+    let result = ageSignalResult
+    ageSignalRequestID = nil
+    ageSignalResult = nil
+    ageSignalTask?.cancel()
+    ageSignalTask = nil
+    result?(
+      FlutterError(
+        code: "age_signal_cancelled",
+        message: "The age signal request was cancelled.",
+        details: nil
+      )
+    )
+  }
+
+  private static let noAgeSignalResponse: [String: Any] = [
+    "status": "noSignal",
+    "ageUpper": NSNull(),
+  ]
 
   private static func handleQrScannerMethodCall(
     _ call: FlutterMethodCall,
@@ -235,89 +393,6 @@ import os.log
       .flatMap(\.windows)
       .first(where: \.isKeyWindow)?
       .safeAreaInsets.top ?? 0
-  }
-
-  /// Device-auth prompt for private-key export (P05 / upstream #5116).
-  ///
-  /// `canAuthenticate` reports whether device-owner authentication (Face ID,
-  /// Touch ID, or device passcode) can currently run. `authenticate` shows
-  /// the OS prompt with the caller-supplied reason and returns true only on
-  /// success. Cancellation, missing enrollment, and lockout all surface as
-  /// typed errors so Dart fails closed.
-  private static func handleDeviceAuthMethodCall(
-    _ call: FlutterMethodCall,
-    result: @escaping FlutterResult
-  ) {
-    switch call.method {
-    case "canAuthenticate":
-      guard call.arguments == nil else {
-        result(
-          FlutterError(
-            code: "invalid_arguments",
-            message: "canAuthenticate does not accept arguments.",
-            details: nil
-          )
-        )
-        return
-      }
-      result(LAContext().canEvaluatePolicy(.deviceOwnerAuthentication, error: nil))
-    case "authenticate":
-      guard let args = call.arguments as? [String: Any],
-        let reason = args["reason"] as? String,
-        !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-      else {
-        result(
-          FlutterError(
-            code: "invalid_arguments",
-            message: "authenticate requires a non-empty reason.",
-            details: nil
-          )
-        )
-        return
-      }
-      let context = LAContext()
-      var policyError: NSError?
-      guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &policyError) else {
-        result(
-          FlutterError(
-            code: "not_available",
-            message: "This phone has no Face ID, Touch ID, or passcode enrolled.",
-            details: nil
-          )
-        )
-        return
-      }
-      context.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { success, error in
-        DispatchQueue.main.async {
-          if success {
-            result(true)
-            return
-          }
-          let code: String
-          switch (error as? LAError)?.code {
-          case .userCancel, .appCancel, .systemCancel:
-            code = "cancelled"
-          case .biometryNotAvailable, .biometryNotEnrolled, .passcodeNotSet:
-            code = "not_available"
-          case .biometryLockout:
-            // Locked out for too many failures, but the device passcode
-            // path stays available through the same policy on retry.
-            code = "auth_failed"
-          default:
-            code = "auth_failed"
-          }
-          result(
-            FlutterError(
-              code: code,
-              message: error?.localizedDescription ?? "Device verification did not pass.",
-              details: nil
-            )
-          )
-        }
-      }
-    default:
-      result(FlutterMethodNotImplemented)
-    }
   }
 
   override func application(
@@ -404,7 +479,16 @@ import os.log
       openNotificationSettings(result: result)
     case "endpointGrants":
       do {
-        result(try endpointGrantStore.records().map(\.flutterArguments))
+        guard let arguments = call.arguments as? [String: Any],
+          let gatewayText = arguments["gatewayUrl"] as? String,
+          let gatewayURL = URL(string: gatewayText)
+        else { throw BuzzDevPushEnrollmentError.invalidGatewayURL }
+        let driver = try BuzzDevPushEnrollmentDriver(
+          gatewayBaseURL: gatewayURL,
+          store: endpointGrantStore,
+          appAttestKeychainAccessGroup: pushKeychainAccessGroup
+        )
+        result(try driver.endpointGrants().map(\.flutterArguments))
       } catch {
         result(
           FlutterError(

@@ -8,10 +8,14 @@ pub(crate) use access_policy::{owner_only, owner_only_access_build, projected_ac
 pub(crate) use agent_env::{
     baked_build_env, build_buzz_agent_provider_defaults, discovery_env_with_baked_floor,
 };
+mod agent_description;
+pub(crate) use agent_description::{effective_agent_description, record_effective_description};
 mod backend;
+pub(crate) mod bestie_assignment;
+pub(crate) mod claude_config;
 pub(crate) mod config_bridge;
 pub(crate) mod custom_harnesses;
-pub(crate) mod deferred_start;
+mod definition_validation;
 mod discovery;
 pub(crate) mod effective_config;
 mod env_vars;
@@ -41,22 +45,39 @@ pub(crate) mod storage;
 pub(crate) mod team_catalog;
 pub(crate) mod team_events;
 mod team_repair;
+pub(crate) use team_repair::team_persona_key;
+#[cfg(test)]
+mod poll_read_probe;
 mod teams;
 mod types;
 
-// Shared guard for tests that mutate or read process-global PATH.
+// Shared lock for tests that call `lock_path_mutex` or `lock_env_mutex`.
+// Both helpers delegate here so any two tests using either helper are mutually
+// exclusive with each other. Tests in other modules that maintain their own
+// independent locks (app_state_tests, agent_config_tests, reader_tests) are
+// NOT in this domain and are not covered by this mutex.
 #[cfg(test)]
-static PATH_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static PROCESS_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+// Acquires the shared process-env lock. Call from any test in this module that
+// reads, writes, or removes a process-global environment variable (including PATH).
 #[cfg(test)]
 pub(crate) fn lock_path_mutex() -> std::sync::MutexGuard<'static, ()> {
-    PATH_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+    PROCESS_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-mod definition_validation;
+// Delegates to the same lock as `lock_path_mutex`. Tests using either helper
+// are mutually exclusive with each other; PATH and env-key mutations that go
+// through these helpers cannot race.
+#[cfg(test)]
+pub(crate) fn lock_env_mutex() -> std::sync::MutexGuard<'static, ()> {
+    PROCESS_ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub use backend::*;
 pub(crate) use definition_validation::{
-    validate_agent_definition_text, validate_managed_agent_definition_text, validate_visible_text,
+    validate_agent_definition_text, validate_agent_description_text,
+    validate_managed_agent_definition_text, validate_visible_text,
 };
 pub use discovery::*;
 pub use env_vars::*;
@@ -87,7 +108,7 @@ pub use runtime::*;
 pub use runtime_commands::*;
 pub use runtime_types::*;
 pub(crate) use session_policy::{
-    acp_session_policy, apply_app_acp_session_policy_env, insert_acp_session_policy_env,
+    apply_acp_session_policy_env, effective_acp_session_policy, insert_acp_session_policy_env,
     AcpSessionPolicy, ManagedAgentExperimentState, ACP_SESSION_POLICY_ENV_VAR,
 };
 pub use storage::*;
@@ -128,6 +149,3 @@ pub fn default_agent_workdir() -> Option<std::path::PathBuf> {
 fn is_real_dir(path: &std::path::Path) -> bool {
     path.symlink_metadata().map(|m| m.is_dir()).unwrap_or(false)
 }
-
-#[cfg(test)]
-pub(crate) mod poll_read_probe;

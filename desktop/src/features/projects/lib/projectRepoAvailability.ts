@@ -5,12 +5,8 @@ export type ProjectRepoUnavailableReason =
   | "authentication"
   | "network"
   | "ref"
-  | "browser"
   | "unknown";
 
-/** Copy for the `browser` reason, shared by the files, activity and README surfaces. */
-export const BROWSER_REPOSITORY_UNAVAILABLE_MESSAGE =
-  "This repository operation is unavailable in the browser. Repository reads are available when the relay supports authenticated snapshots.";
 /** User-facing copy for a classified repository availability failure. */
 export type ProjectRepoUnavailablePresentation = {
   description: string;
@@ -21,10 +17,6 @@ const PROJECT_REPO_UNAVAILABLE_PRESENTATIONS: Record<
   ProjectRepoUnavailableReason,
   ProjectRepoUnavailablePresentation
 > = {
-  browser: {
-    title: "Operation unavailable",
-    description: BROWSER_REPOSITORY_UNAVAILABLE_MESSAGE,
-  },
   authentication: {
     description:
       "Buzz could not authenticate with this repository. Check your access and try again.",
@@ -80,13 +72,12 @@ export function projectRepoUnavailableReason(
         : "";
 
   if (!message) return "missing";
-  // The browser build has no git client yet; its PAL rejects repository
-  // snapshot reads with BrowserUnavailableError (see platform/web/desktopOnly).
-  if (/not available in the browser build/.test(message)) return "browser";
-  // The relay's author-only unbound-repository remediation ("run: buzz repos
-  // bind … has no channel binding, so the relay cannot authorize access") must
-  // win over the generic authentication match below.
-  if (/has no channel binding|buzz repos bind/.test(message)) return "unbound";
+  if (
+    /no channel binding|no access channel|no buzz-channel|bind.*channel|unbound/.test(
+      message,
+    )
+  )
+    return "unbound";
   if (
     /\b(?:401|403)\b|authenticat|authoriz|permission denied|access denied/.test(
       message,
@@ -102,18 +93,11 @@ export function projectRepoUnavailableReason(
     return "missing";
   }
   if (
-    /remote branch .* not found|could not resolve the requested repository ref|the requested repository ref changed|couldn't find remote ref/.test(
+    /remote branch .* not found|could not resolve the requested repository ref|couldn't find remote ref|requested ref.*not found|requested repository ref changed/.test(
       message,
     )
   ) {
     return "ref";
-  }
-  if (
-    /remote helper .* aborted session|error while loading shared libraries|version `openssl/.test(
-      message,
-    )
-  ) {
-    return "network";
   }
   if (
     /timed? out|could not resolve host|failed to connect|connection (?:refused|reset)|network is unreachable|offline/.test(

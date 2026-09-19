@@ -177,15 +177,11 @@ pub(super) fn assert_adoption_scope_unchanged(
     live_api_base_url: &str,
     live_signer_hex: &str,
 ) -> Result<(), String> {
-    if crate::relay::relay_http_base_url(&scope.relay_url).trim_end_matches('/')
-        != live_api_base_url.trim_end_matches('/')
-    {
-        return Err("active community changed during team adoption".to_string());
-    }
-    if scope.owner_keys.public_key().to_hex() != live_signer_hex {
-        return Err("active identity changed during team adoption".to_string());
-    }
-    Ok(())
+    crate::relay::assert_expected_relay_scope(Some(&scope.relay_url), live_api_base_url)?;
+    crate::relay::assert_expected_signer(
+        Some(&scope.owner_keys.public_key().to_hex()),
+        live_signer_hex,
+    )
 }
 
 /// The app-independent core of an adoption commit: skip on replay, otherwise
@@ -441,6 +437,9 @@ fn member_copy(
     Ok(AgentDefinition {
         id: Uuid::new_v4().to_string(),
         display_name: member.display_name.clone(),
+        // Team catalog members carry no public description; an adopted copy
+        // starts without one.
+        description: None,
         avatar_url: member.avatar_url.clone(),
         system_prompt: member.system_prompt.clone().unwrap_or_default(),
         runtime: member.runtime.clone(),
@@ -483,6 +482,7 @@ fn member_copy(
             .flatten(),
         respond_to_allowlist: Vec::new(),
         parallelism: member.parallelism,
+        session_policy: member.session_policy,
         created_at: now.to_string(),
         updated_at: now.to_string(),
     })

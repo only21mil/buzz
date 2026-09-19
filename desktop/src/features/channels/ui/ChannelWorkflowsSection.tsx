@@ -33,7 +33,7 @@ export function ChannelWorkflowsSection({
           </Button>
         </div>
       ) : workflows.length > 0 ? (
-        <FieldGroup>
+        <FieldGroup testId="channel-workflows-list">
           {workflows.map((workflow) => (
             <button
               className="flex min-h-16 w-full items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-muted/40 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"

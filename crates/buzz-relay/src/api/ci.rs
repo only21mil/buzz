@@ -2888,7 +2888,7 @@ const fn buzz_ci_controld_safe_cursor() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_postgres_tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{header, Request};
@@ -3814,53 +3814,6 @@ mod tests {
         std::env::var("BUZZ_TEST_DATABASE_URL").is_ok_and(|v| !v.is_empty())
     }
 
-    #[tokio::test]
-    #[ignore = "requires scratch Postgres and CI evidence storage"]
-    async fn route_log_read_uses_tenant_host_not_config_host() {
-        if !preflight_scratch_env_ready() {
-            return;
-        }
-        let harness = TestHarness::connect().await;
-        assert_ne!(
-            harness.host, "relay.example",
-            "tenant host must differ from config.relay_url"
-        );
-        let bytes = b"tenant-bound CI log";
-        let path = harness.seed_log_read(bytes).await;
-
-        let config_host_url = format!("https://relay.example{path}");
-        let rejected = ci_log_request(
-            harness.state.clone(),
-            &harness.host,
-            &harness.owner,
-            &path,
-            &config_host_url,
-        )
-        .await;
-        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
-
-        let tenant_url = format!("https://{}{path}", harness.host);
-        let accepted = ci_log_request(
-            harness.state.clone(),
-            &harness.host,
-            &harness.owner,
-            &path,
-            &tenant_url,
-        )
-        .await;
-        let accepted_status = accepted.status();
-        let body = axum::body::to_bytes(accepted.into_body(), 4096)
-            .await
-            .expect("read CI log body");
-        assert_eq!(
-            accepted_status,
-            StatusCode::OK,
-            "unexpected CI log response: {}",
-            String::from_utf8_lossy(&body)
-        );
-        assert_eq!(body.as_ref(), bytes);
-    }
-
     /// Route-bearing 404 contract: an unknown repo coordinate on a live route
     /// must be a 404 (C1 lands the "not found" resolution) — never a 500,
     /// never the old 501 stub. Fails while the B1 tree's stub is in place
@@ -4075,7 +4028,7 @@ jobs:
         let ids: std::collections::HashSet<_> =
             jobs.iter().map(|job| job.job_id.as_str()).collect();
 
-        assert_eq!(jobs.len(), 18);
+        assert_eq!(jobs.len(), 21);
         for expected in [
             "rust-lint",
             "desktop-smoke-e2e",
@@ -4956,155 +4909,6 @@ jobs:
             .unwrap_or_else(|_error| panic!("CI run body must be JSON ({status}): {body:?}"))
     }
 
-    #[tokio::test]
-    #[ignore = "requires scratch Postgres and CI evidence storage"]
-    async fn route_ci_run_request_exports_the_immutable_request() {
-        if !preflight_scratch_env_ready() {
-            return;
-        }
-        let harness = TestHarness::connect().await;
-        let (run_id, request_event_id) = harness.seed_run_history().await;
-
-        let response = ci_run_response(
-            harness.state.clone(),
-            &harness.host,
-            &harness.owner,
-            &format!("/ci/runs/{run_id}/request"),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let value = response_json(response).await;
-        assert_eq!(value["run_id"], run_id);
-        assert_eq!(value["request_event_id"], request_event_id);
-        assert_eq!(value["watch_cursor"], 1);
-        assert_eq!(value["event"]["id"], request_event_id);
-        assert!(value["accepted_at"].is_string());
-    }
-
-    #[tokio::test]
-    #[ignore = "requires scratch Postgres and CI evidence storage"]
-    async fn route_ci_run_events_pages_by_durable_cursor() {
-        if !preflight_scratch_env_ready() {
-            return;
-        }
-        let harness = TestHarness::connect().await;
-        let (run_id, request_event_id) = harness.seed_run_history().await;
-
-        let first = ci_run_response(
-            harness.state.clone(),
-            &harness.host,
-            &harness.owner,
-            &format!("/ci/runs/{run_id}/events?after=0&limit=2"),
-        )
-        .await;
-        assert_eq!(first.status(), StatusCode::OK);
-        let value = response_json(first).await;
-        assert_eq!(value["run_id"], run_id);
-        assert_eq!(value["request_event_id"], request_event_id);
-        assert_eq!(value["next_cursor"], 2);
-        assert_eq!(
-            value["events"]
-                .as_array()
-                .expect("events array")
-                .iter()
-                .map(|event| event["watch_cursor"].as_u64().expect("cursor"))
-                .collect::<Vec<_>>(),
-            vec![1, 2]
-        );
-        assert_eq!(value["events"][0]["event"]["id"], request_event_id);
-
-        let second = ci_run_response(
-            harness.state.clone(),
-            &harness.host,
-            &harness.owner,
-            &format!("/ci/runs/{run_id}/events?after=2&limit=1000"),
-        )
-        .await;
-        assert_eq!(second.status(), StatusCode::OK);
-        let value = response_json(second).await;
-        assert_eq!(value["events"].as_array().expect("events array").len(), 1);
-        assert_eq!(value["events"][0]["watch_cursor"], 3);
-        assert_eq!(value["next_cursor"], 3);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires scratch Postgres and CI evidence storage"]
-    async fn route_ci_run_reads_fail_closed_for_non_members_and_unknown_runs() {
-        if !preflight_scratch_env_ready() {
-            return;
-        }
-        let harness = TestHarness::connect().await;
-        let (run_id, _) = harness.seed_run_history().await;
-        let _stranger = nostr::Keys::generate();
-
-        // A non-member with valid authentication sees the same 404 as an
-        // unknown run — run existence stays hidden.
-        for path in [
-            format!("/ci/runs/{run_id}/request"),
-            format!("/ci/runs/{run_id}/events?after=0&limit=1"),
-        ] {
-            let response = ci_run_response(
-                harness.state.clone(),
-                &harness.host,
-                &nostr::Keys::generate(),
-                &path,
-            )
-            .await;
-            assert_eq!(response.status(), StatusCode::NOT_FOUND);
-            let value = response_json(response).await;
-            assert_eq!(value["error"], "CI run not found");
-        }
-
-        // A member asking for an unknown (but well-formed) run is also hidden.
-        for path in [
-            format!("/ci/runs/{}/request", uuid::Uuid::new_v4()),
-            format!("/ci/runs/{}/events?after=0&limit=1", uuid::Uuid::new_v4()),
-        ] {
-            let response =
-                ci_run_response(harness.state.clone(), &harness.host, &harness.owner, &path).await;
-            assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        }
-
-        // A malformed run ID never leaks run existence either.
-        let response = ci_run_response(
-            harness.state.clone(),
-            &harness.host,
-            &harness.owner,
-            "/ci/runs/not-a-uuid/request",
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires scratch Postgres and CI evidence storage"]
-    async fn route_ci_run_events_query_is_exact_and_bounded() {
-        if !preflight_scratch_env_ready() {
-            return;
-        }
-        let harness = TestHarness::connect().await;
-        let (run_id, _) = harness.seed_run_history().await;
-
-        for invalid in [
-            "after=0&limit=0",
-            "after=0&limit=1001",
-            "after=0&limit=1&repo=1",
-        ] {
-            let response = ci_run_response(
-                harness.state.clone(),
-                &harness.host,
-                &harness.owner,
-                &format!("/ci/runs/{run_id}/events?{invalid}"),
-            )
-            .await;
-            assert_eq!(
-                response.status(),
-                StatusCode::BAD_REQUEST,
-                "invalid query must fail closed: {invalid}"
-            );
-        }
-    }
-
     // ── landing verifier reads: /ci/checks and /ci/merge-gate/decisions ──
 
     #[test]
@@ -5244,180 +5048,382 @@ jobs:
         }
     }
 
-    #[tokio::test]
-    #[ignore = "requires scratch Postgres and CI evidence storage"]
-    async fn route_ci_checks_lists_runs_for_a_tip_newest_first() {
-        if !preflight_scratch_env_ready() {
-            return;
+    mod external_infra_tests {
+        use super::*;
+
+        #[tokio::test]
+        #[ignore = "requires scratch Postgres and CI evidence storage"]
+        async fn route_log_read_uses_tenant_host_not_config_host() {
+            if !preflight_scratch_env_ready() {
+                return;
+            }
+            let harness = TestHarness::connect().await;
+            assert_ne!(
+                harness.host, "relay.example",
+                "tenant host must differ from config.relay_url"
+            );
+            let bytes = b"tenant-bound CI log";
+            let path = harness.seed_log_read(bytes).await;
+
+            let config_host_url = format!("https://relay.example{path}");
+            let rejected = ci_log_request(
+                harness.state.clone(),
+                &harness.host,
+                &harness.owner,
+                &path,
+                &config_host_url,
+            )
+            .await;
+            assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+            let tenant_url = format!("https://{}{path}", harness.host);
+            let accepted = ci_log_request(
+                harness.state.clone(),
+                &harness.host,
+                &harness.owner,
+                &path,
+                &tenant_url,
+            )
+            .await;
+            let accepted_status = accepted.status();
+            let body = axum::body::to_bytes(accepted.into_body(), 4096)
+                .await
+                .expect("read CI log body");
+            assert_eq!(
+                accepted_status,
+                StatusCode::OK,
+                "unexpected CI log response: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(body.as_ref(), bytes);
         }
-        let harness = TestHarness::connect().await;
-        let (older_run, older_request) = harness.seed_run_history().await;
-        let (newer_run, newer_request) = harness.seed_run_history().await;
-        let repo = harness.repo_a();
-        let tip = "22".repeat(20);
 
-        let response = ci_run_response(
-            harness.state.clone(),
-            &harness.host,
-            &harness.owner,
-            &format!("/ci/checks?target_repo_a={repo}&tip_oid={tip}&workflow_id=ci"),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let value = response_json(response).await;
-        assert_eq!(value["target_repo_a"], repo);
-        assert_eq!(value["tip_oid"], tip);
-        let runs = value["runs"].as_array().expect("runs array");
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0]["run_id"], newer_run);
-        assert_eq!(runs[0]["request_event_id"], newer_request);
-        assert_eq!(runs[1]["run_id"], older_run);
-        assert_eq!(runs[1]["request_event_id"], older_request);
-        assert_eq!(runs[0]["workflow_id"], "ci");
-        assert_eq!(runs[0]["workflow_digest"], "44".repeat(32));
-        assert_eq!(runs[0]["base_oid"], "33".repeat(20));
-        assert!(runs[0]["created_at"].is_string());
-        // No check is stored for the seeded history yet.
-        assert_eq!(runs[0]["checks"].as_array().expect("checks").len(), 0);
+        #[tokio::test]
+        #[ignore = "requires scratch Postgres and CI evidence storage"]
+        async fn route_ci_run_request_exports_the_immutable_request() {
+            if !preflight_scratch_env_ready() {
+                return;
+            }
+            let harness = TestHarness::connect().await;
+            let (run_id, request_event_id) = harness.seed_run_history().await;
 
-        // Another workflow or tip lists nothing.
-        for query in [
-            format!("target_repo_a={repo}&tip_oid={tip}&workflow_id=release"),
-            format!("target_repo_a={repo}&tip_oid={}", "23".repeat(20)),
-        ] {
             let response = ci_run_response(
                 harness.state.clone(),
                 &harness.host,
                 &harness.owner,
-                &format!("/ci/checks?{query}"),
+                &format!("/ci/runs/{run_id}/request"),
             )
             .await;
             assert_eq!(response.status(), StatusCode::OK);
             let value = response_json(response).await;
-            assert_eq!(value["runs"].as_array().expect("runs").len(), 0);
+            assert_eq!(value["run_id"], run_id);
+            assert_eq!(value["request_event_id"], request_event_id);
+            assert_eq!(value["watch_cursor"], 1);
+            assert_eq!(value["event"]["id"], request_event_id);
+            assert!(value["accepted_at"].is_string());
         }
 
-        // A non-member is refused; an unknown repository is hidden.
-        let response = ci_run_response(
-            harness.state.clone(),
-            &harness.host,
-            &nostr::Keys::generate(),
-            &format!("/ci/checks?target_repo_a={repo}&tip_oid={tip}"),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let response = ci_run_response(
-            harness.state.clone(),
-            &harness.host,
-            &harness.owner,
-            &format!(
-                "/ci/checks?target_repo_a=30617:{}:missing&tip_oid={tip}",
-                harness.owner.public_key().to_hex()
-            ),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let response = ci_run_response(
-            harness.state.clone(),
-            &harness.host,
-            &harness.owner,
-            &format!("/ci/checks?target_repo_a={repo}&tip_oid={tip}&limit=1"),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
+        #[tokio::test]
+        #[ignore = "requires scratch Postgres and CI evidence storage"]
+        async fn route_ci_run_events_pages_by_durable_cursor() {
+            if !preflight_scratch_env_ready() {
+                return;
+            }
+            let harness = TestHarness::connect().await;
+            let (run_id, request_event_id) = harness.seed_run_history().await;
 
-    #[tokio::test]
-    #[ignore = "requires scratch Postgres and CI evidence storage"]
-    async fn route_merge_gate_decisions_are_owner_or_admin_only_and_newest_first() {
-        if !preflight_scratch_env_ready() {
-            return;
+            let first = ci_run_response(
+                harness.state.clone(),
+                &harness.host,
+                &harness.owner,
+                &format!("/ci/runs/{run_id}/events?after=0&limit=2"),
+            )
+            .await;
+            assert_eq!(first.status(), StatusCode::OK);
+            let value = response_json(first).await;
+            assert_eq!(value["run_id"], run_id);
+            assert_eq!(value["request_event_id"], request_event_id);
+            assert_eq!(value["next_cursor"], 2);
+            assert_eq!(
+                value["events"]
+                    .as_array()
+                    .expect("events array")
+                    .iter()
+                    .map(|event| event["watch_cursor"].as_u64().expect("cursor"))
+                    .collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+            assert_eq!(value["events"][0]["event"]["id"], request_event_id);
+
+            let second = ci_run_response(
+                harness.state.clone(),
+                &harness.host,
+                &harness.owner,
+                &format!("/ci/runs/{run_id}/events?after=2&limit=1000"),
+            )
+            .await;
+            assert_eq!(second.status(), StatusCode::OK);
+            let value = response_json(second).await;
+            assert_eq!(value["events"].as_array().expect("events array").len(), 1);
+            assert_eq!(value["events"][0]["watch_cursor"], 3);
+            assert_eq!(value["next_cursor"], 3);
         }
-        let harness = TestHarness::connect().await;
-        let repo = harness.repo_a();
-        let old = "33".repeat(20);
-        let new = "55".repeat(20);
-        harness
-            .seed_decision(&old, &new, "check_pending", "shadow")
-            .await;
-        harness.seed_decision(&old, &new, "allow", "shadow").await;
-        harness
-            .seed_decision(&"34".repeat(20), &new, "allow", "enforce")
-            .await;
 
-        let path = format!(
+        #[tokio::test]
+        #[ignore = "requires scratch Postgres and CI evidence storage"]
+        async fn route_ci_run_reads_fail_closed_for_non_members_and_unknown_runs() {
+            if !preflight_scratch_env_ready() {
+                return;
+            }
+            let harness = TestHarness::connect().await;
+            let (run_id, _) = harness.seed_run_history().await;
+            let _stranger = nostr::Keys::generate();
+
+            // A non-member with valid authentication sees the same 404 as an
+            // unknown run — run existence stays hidden.
+            for path in [
+                format!("/ci/runs/{run_id}/request"),
+                format!("/ci/runs/{run_id}/events?after=0&limit=1"),
+            ] {
+                let response = ci_run_response(
+                    harness.state.clone(),
+                    &harness.host,
+                    &nostr::Keys::generate(),
+                    &path,
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                let value = response_json(response).await;
+                assert_eq!(value["error"], "CI run not found");
+            }
+
+            // A member asking for an unknown (but well-formed) run is also hidden.
+            for path in [
+                format!("/ci/runs/{}/request", uuid::Uuid::new_v4()),
+                format!("/ci/runs/{}/events?after=0&limit=1", uuid::Uuid::new_v4()),
+            ] {
+                let response =
+                    ci_run_response(harness.state.clone(), &harness.host, &harness.owner, &path)
+                        .await;
+                assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            }
+
+            // A malformed run ID never leaks run existence either.
+            let response = ci_run_response(
+                harness.state.clone(),
+                &harness.host,
+                &harness.owner,
+                "/ci/runs/not-a-uuid/request",
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires scratch Postgres and CI evidence storage"]
+        async fn route_ci_run_events_query_is_exact_and_bounded() {
+            if !preflight_scratch_env_ready() {
+                return;
+            }
+            let harness = TestHarness::connect().await;
+            let (run_id, _) = harness.seed_run_history().await;
+
+            for invalid in [
+                "after=0&limit=0",
+                "after=0&limit=1001",
+                "after=0&limit=1&repo=1",
+            ] {
+                let response = ci_run_response(
+                    harness.state.clone(),
+                    &harness.host,
+                    &harness.owner,
+                    &format!("/ci/runs/{run_id}/events?{invalid}"),
+                )
+                .await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "invalid query must fail closed: {invalid}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "requires scratch Postgres and CI evidence storage"]
+        async fn route_ci_checks_lists_runs_for_a_tip_newest_first() {
+            if !preflight_scratch_env_ready() {
+                return;
+            }
+            let harness = TestHarness::connect().await;
+            let (older_run, older_request) = harness.seed_run_history().await;
+            let (newer_run, newer_request) = harness.seed_run_history().await;
+            let repo = harness.repo_a();
+            let tip = "22".repeat(20);
+
+            let response = ci_run_response(
+                harness.state.clone(),
+                &harness.host,
+                &harness.owner,
+                &format!("/ci/checks?target_repo_a={repo}&tip_oid={tip}&workflow_id=ci"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = response_json(response).await;
+            assert_eq!(value["target_repo_a"], repo);
+            assert_eq!(value["tip_oid"], tip);
+            let runs = value["runs"].as_array().expect("runs array");
+            assert_eq!(runs.len(), 2);
+            assert_eq!(runs[0]["run_id"], newer_run);
+            assert_eq!(runs[0]["request_event_id"], newer_request);
+            assert_eq!(runs[1]["run_id"], older_run);
+            assert_eq!(runs[1]["request_event_id"], older_request);
+            assert_eq!(runs[0]["workflow_id"], "ci");
+            assert_eq!(runs[0]["workflow_digest"], "44".repeat(32));
+            assert_eq!(runs[0]["base_oid"], "33".repeat(20));
+            assert!(runs[0]["created_at"].is_string());
+            // No check is stored for the seeded history yet.
+            assert_eq!(runs[0]["checks"].as_array().expect("checks").len(), 0);
+
+            // Another workflow or tip lists nothing.
+            for query in [
+                format!("target_repo_a={repo}&tip_oid={tip}&workflow_id=release"),
+                format!("target_repo_a={repo}&tip_oid={}", "23".repeat(20)),
+            ] {
+                let response = ci_run_response(
+                    harness.state.clone(),
+                    &harness.host,
+                    &harness.owner,
+                    &format!("/ci/checks?{query}"),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let value = response_json(response).await;
+                assert_eq!(value["runs"].as_array().expect("runs").len(), 0);
+            }
+
+            // A non-member is refused; an unknown repository is hidden.
+            let response = ci_run_response(
+                harness.state.clone(),
+                &harness.host,
+                &nostr::Keys::generate(),
+                &format!("/ci/checks?target_repo_a={repo}&tip_oid={tip}"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let response = ci_run_response(
+                harness.state.clone(),
+                &harness.host,
+                &harness.owner,
+                &format!(
+                    "/ci/checks?target_repo_a=30617:{}:missing&tip_oid={tip}",
+                    harness.owner.public_key().to_hex()
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let response = ci_run_response(
+                harness.state.clone(),
+                &harness.host,
+                &harness.owner,
+                &format!("/ci/checks?target_repo_a={repo}&tip_oid={tip}&limit=1"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires scratch Postgres and CI evidence storage"]
+        async fn route_merge_gate_decisions_are_owner_or_admin_only_and_newest_first() {
+            if !preflight_scratch_env_ready() {
+                return;
+            }
+            let harness = TestHarness::connect().await;
+            let repo = harness.repo_a();
+            let old = "33".repeat(20);
+            let new = "55".repeat(20);
+            harness
+                .seed_decision(&old, &new, "check_pending", "shadow")
+                .await;
+            harness.seed_decision(&old, &new, "allow", "shadow").await;
+            harness
+                .seed_decision(&"34".repeat(20), &new, "allow", "enforce")
+                .await;
+
+            let path = format!(
             "/ci/merge-gate/decisions?target_repo_a={repo}&ref=refs/heads/main&new_oid={new}&old_oid={old}"
         );
-        let response =
-            ci_run_response(harness.state.clone(), &harness.host, &harness.owner, &path).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let value = response_json(response).await;
-        assert_eq!(value["target_repo_a"], repo);
-        assert_eq!(value["ref"], "refs/heads/main");
-        assert_eq!(value["new_oid"], new);
-        assert_eq!(value["mode"], "off");
-        assert_eq!(value["check_max_age_seconds"], 86_400);
-        let decisions = value["decisions"].as_array().expect("decisions");
-        assert_eq!(
-            decisions.len(),
-            2,
-            "old_oid narrows to the two matching rows"
-        );
-        assert_eq!(decisions[0]["code"], "allow");
-        assert_eq!(decisions[0]["mode"], "shadow");
-        assert_eq!(decisions[1]["code"], "check_pending");
-        assert_eq!(decisions[0]["old_oid"], old);
-        assert_eq!(decisions[0]["candidate_oid"], "22".repeat(20));
-        assert_eq!(decisions[0]["pusher"], harness.owner.public_key().to_hex());
-        assert!(decisions[0]["decided_at"].is_string());
-        assert!(decisions[0].get("check_event_id").is_none());
+            let response =
+                ci_run_response(harness.state.clone(), &harness.host, &harness.owner, &path).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = response_json(response).await;
+            assert_eq!(value["target_repo_a"], repo);
+            assert_eq!(value["ref"], "refs/heads/main");
+            assert_eq!(value["new_oid"], new);
+            assert_eq!(value["mode"], "off");
+            assert_eq!(value["check_max_age_seconds"], 86_400);
+            let decisions = value["decisions"].as_array().expect("decisions");
+            assert_eq!(
+                decisions.len(),
+                2,
+                "old_oid narrows to the two matching rows"
+            );
+            assert_eq!(decisions[0]["code"], "allow");
+            assert_eq!(decisions[0]["mode"], "shadow");
+            assert_eq!(decisions[1]["code"], "check_pending");
+            assert_eq!(decisions[0]["old_oid"], old);
+            assert_eq!(decisions[0]["candidate_oid"], "22".repeat(20));
+            assert_eq!(decisions[0]["pusher"], harness.owner.public_key().to_hex());
+            assert!(decisions[0]["decided_at"].is_string());
+            assert!(decisions[0].get("check_event_id").is_none());
 
-        let unscoped = format!(
-            "/ci/merge-gate/decisions?target_repo_a={repo}&ref=refs/heads/main&new_oid={new}"
-        );
-        let response = ci_run_response(
-            harness.state.clone(),
-            &harness.host,
-            &harness.owner,
-            &unscoped,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let value = response_json(response).await;
-        assert_eq!(value["decisions"].as_array().expect("decisions").len(), 3);
+            let unscoped = format!(
+                "/ci/merge-gate/decisions?target_repo_a={repo}&ref=refs/heads/main&new_oid={new}"
+            );
+            let response = ci_run_response(
+                harness.state.clone(),
+                &harness.host,
+                &harness.owner,
+                &unscoped,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = response_json(response).await;
+            assert_eq!(value["decisions"].as_array().expect("decisions").len(), 3);
 
-        // A plain member may read runs and checks but not decisions.
-        let member = harness.seed_member().await;
-        let response = ci_run_response(harness.state.clone(), &harness.host, &member, &path).await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let response = ci_run_response(
-            harness.state.clone(),
-            &harness.host,
-            &member,
-            &format!(
-                "/ci/checks?target_repo_a={repo}&tip_oid={}",
-                "22".repeat(20)
-            ),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
+            // A plain member may read runs and checks but not decisions.
+            let member = harness.seed_member().await;
+            let response =
+                ci_run_response(harness.state.clone(), &harness.host, &member, &path).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let response = ci_run_response(
+                harness.state.clone(),
+                &harness.host,
+                &member,
+                &format!(
+                    "/ci/checks?target_repo_a={repo}&tip_oid={}",
+                    "22".repeat(20)
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
 
-        // A stranger is refused and a malformed query fails closed.
-        let response = ci_run_response(
-            harness.state.clone(),
-            &harness.host,
-            &nostr::Keys::generate(),
-            &path,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let response = ci_run_response(
-            harness.state.clone(),
-            &harness.host,
-            &harness.owner,
-            &format!("/ci/merge-gate/decisions?target_repo_a={repo}&ref=main&new_oid={new}"),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            // A stranger is refused and a malformed query fails closed.
+            let response = ci_run_response(
+                harness.state.clone(),
+                &harness.host,
+                &nostr::Keys::generate(),
+                &path,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            let response = ci_run_response(
+                harness.state.clone(),
+                &harness.host,
+                &harness.owner,
+                &format!("/ci/merge-gate/decisions?target_repo_a={repo}&ref=main&new_oid={new}"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
     }
 }

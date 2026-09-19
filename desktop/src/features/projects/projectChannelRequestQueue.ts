@@ -9,13 +9,13 @@ export type AcceptedProjectChannelRequest = {
   request: ProjectChannelRequest;
 };
 
-type ProjectChannelRequestQueue = {
+export type ProjectChannelRequestQueue = {
   activeRequestId: string | null;
   pending: AcceptedProjectChannelRequest[];
   seenRequestIds: Set<string>;
 };
 
-type EnqueueProjectChannelRequestResult =
+export type EnqueueProjectChannelRequestResult =
   | { status: "show"; candidate: AcceptedProjectChannelRequest }
   | { status: "queued" | "duplicate" | "overflow" };
 

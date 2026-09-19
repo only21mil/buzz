@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import {
+  activateDesktopNotificationTarget,
+  createDesktopNotificationActivationQueue,
+} from "../AppShell.helpers.ts";
+
 const { clearSearchHitEventCache, getCachedSearchHitEvent } = await import(
   "./searchHitEventCache.ts"
 );
@@ -120,6 +125,56 @@ test("cancelled search-hit navigation cannot repopulate cache or route", async (
     replyId: "comment",
   });
   await navigation;
+
+  assert.deepEqual(calls, []);
+  assert.equal(getCachedSearchHitEvent("comment"), null);
+});
+
+test("queue cancellation fences an in-flight forum-comment activation", async () => {
+  clearSearchHitEventCache();
+  let resolveLookup;
+  const destination = new Promise((resolve) => {
+    resolveLookup = resolve;
+  });
+  const calls = [];
+  const queue = createDesktopNotificationActivationQueue((target, signal) =>
+    activateDesktopNotificationTarget(
+      target,
+      {
+        goChannel: async () => calls.push("channel"),
+        goHome: async () => calls.push("home"),
+        openSearchHit: (hit, behavior) =>
+          openSearchHitWithNavigation(
+            hit,
+            {
+              force: behavior?.force,
+              goChannel: async () => calls.push("channel"),
+              goForumPost: async () => calls.push("forum"),
+              signal: behavior?.signal,
+            },
+            () => destination,
+          ),
+        revealWindow: async () => {},
+      },
+      signal,
+    ),
+  );
+
+  queue.enqueue({
+    channelId: "old-community-channel",
+    eventId: "comment",
+    kind: 45003,
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  queue.cancel();
+  clearSearchHitEventCache();
+  resolveLookup({
+    kind: "forum-post",
+    channelId: "old-community-channel",
+    postId: "old-community-post",
+    replyId: "comment",
+  });
+  await new Promise((resolve) => setImmediate(resolve));
 
   assert.deepEqual(calls, []);
   assert.equal(getCachedSearchHitEvent("comment"), null);

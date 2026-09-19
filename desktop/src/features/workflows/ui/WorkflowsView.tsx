@@ -1,4 +1,3 @@
-import { yamlWithWorkflowEnabled } from "./workflowYamlDocument";
 import { Plus, RefreshCw } from "lucide-react";
 import * as React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -7,6 +6,7 @@ import { toast } from "sonner";
 
 import {
   allWorkflowsQueryKey,
+  workflowListFocusRefetchPolicy,
   workflowQueryKey,
 } from "@/features/workflows/hooks";
 import { getWorkflowActivationWarning } from "@/features/workflows/ui/workflowActivationWarning";
@@ -144,8 +144,7 @@ export function WorkflowsView({
       return results;
     },
     enabled: memberChannels.length > 0,
-    staleTime: 30_000,
-    refetchOnWindowFocus: true,
+    ...workflowListFocusRefetchPolicy,
   });
 
   const allWorkflows = allWorkflowsQuery.data ?? [];
@@ -177,18 +176,12 @@ export function WorkflowsView({
     mutationFn: (workflow: Workflow) =>
       updateWorkflow(
         workflow.id,
-        (workflow.yamlDefinition !== undefined
-          ? yamlWithWorkflowEnabled(
-              workflow.yamlDefinition,
-              !getWorkflowEnabled(workflow.definition),
-            )
-          : null) ??
-          yamlStringify(
-            withWorkflowEnabled(
-              workflow.definition,
-              !getWorkflowEnabled(workflow.definition),
-            ),
+        yamlStringify(
+          withWorkflowEnabled(
+            workflow.definition,
+            !getWorkflowEnabled(workflow.definition),
           ),
+        ),
         workflow.revision,
       ),
     onError: (error) => {

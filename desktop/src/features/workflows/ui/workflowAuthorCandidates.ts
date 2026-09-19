@@ -12,7 +12,7 @@ export type WorkflowAuthorCandidate = {
   isAgent: boolean;
 };
 
-type WorkflowAuthorCandidateInput = {
+export type WorkflowAuthorCandidateInput = {
   pubkey: string;
   displayName?: string | null;
   avatarUrl?: string | null;
@@ -21,40 +21,8 @@ type WorkflowAuthorCandidateInput = {
   isAgent?: boolean;
 };
 
-function presentationText(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-/** Invalid profile presentation must never replace a deterministic identity. */
-export function safeWorkflowProfiles(
-  profiles: Readonly<Record<string, UserProfileSummary | undefined>> = {},
-): Record<string, UserProfileSummary> {
-  if (!profiles || typeof profiles !== "object" || Array.isArray(profiles))
-    return {};
-  return Object.fromEntries(
-    Object.entries(profiles).flatMap(([key, profile]) => {
-      const pubkey = normalizeAuthorPubkey(key);
-      if (!pubkey || !profile || typeof profile !== "object") return [];
-      return [
-        [
-          pubkey,
-          {
-            displayName: presentationText(profile.displayName),
-            name: presentationText(profile.name),
-            avatarUrl: presentationText(profile.avatarUrl),
-            nip05Handle: presentationText(profile.nip05Handle),
-            ownerPubkey: normalizeAuthorPubkey(profile.ownerPubkey),
-            isAgent: profile.isAgent === true,
-          },
-        ],
-      ];
-    }),
-  );
-}
-
 /** Normalize a candidate identity without accepting alternate encodings. */
-export function normalizeAuthorPubkey(pubkey: unknown): string | null {
-  if (typeof pubkey !== "string") return null;
+export function normalizeAuthorPubkey(pubkey: string): string | null {
   const normalized = pubkey.trim().toLowerCase();
   return HEX_PUBKEY.test(normalized) ? normalized : null;
 }
@@ -76,17 +44,16 @@ export function mergeAuthorCandidateSources(
 
   for (const source of sources) {
     for (const candidate of source) {
-      if (!candidate || typeof candidate !== "object") continue;
       const pubkey = normalizeAuthorPubkey(candidate.pubkey);
       if (!pubkey || seen.has(pubkey)) continue;
       seen.add(pubkey);
       merged.push({
         pubkey,
-        displayName: presentationText(candidate.displayName),
-        avatarUrl: presentationText(candidate.avatarUrl),
-        nip05Handle: presentationText(candidate.nip05Handle),
+        displayName: candidate.displayName ?? null,
+        avatarUrl: candidate.avatarUrl ?? null,
+        nip05Handle: candidate.nip05Handle ?? null,
         ownerPubkey: normalizeAuthorPubkey(candidate.ownerPubkey ?? ""),
-        isAgent: candidate.isAgent === true,
+        isAgent: candidate.isAgent ?? false,
       });
     }
   }
@@ -137,12 +104,10 @@ export function enrichAuthorCandidates(
   profiles: Readonly<Record<string, UserProfileSummary | undefined>>,
 ): WorkflowAuthorCandidate[] {
   const normalizedProfiles = new Map(
-    Object.entries(safeWorkflowProfiles(profiles)).flatMap(
-      ([pubkey, profile]) => {
-        const normalized = normalizeAuthorPubkey(pubkey);
-        return normalized && profile ? [[normalized, profile] as const] : [];
-      },
-    ),
+    Object.entries(profiles).flatMap(([pubkey, profile]) => {
+      const normalized = normalizeAuthorPubkey(pubkey);
+      return normalized && profile ? [[normalized, profile] as const] : [];
+    }),
   );
 
   return candidates.map((candidate) => {

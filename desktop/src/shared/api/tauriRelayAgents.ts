@@ -14,9 +14,6 @@ type RawRelayAgent = {
   respond_to_allowlist?: string[];
 };
 
-/** Fetch fresh signed relay evidence for exactly these keys and destination.
- * Rejects when native authority is unavailable; callers retain local evidence separately.
- */
 export async function revalidateRelayAgents(
   pubkeys: string[],
   channelId?: string,

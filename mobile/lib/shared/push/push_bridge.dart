@@ -140,7 +140,10 @@ Future<void> syncPendingBuzzPushNotificationResponse() async {
 /// requests. Display authorization is intentionally not returned or persisted:
 /// APNs registration and enrollment remain valid while display is denied.
 Future<void> startBuzzPushRegistration() async {
-  if (defaultTargetPlatform != TargetPlatform.iOS) return;
+  if (!Env.pushGatewayConfigured ||
+      defaultTargetPlatform != TargetPlatform.iOS) {
+    return;
+  }
   try {
     await _channel.invokeMethod<void>('startRegistration');
   } on MissingPluginException {
@@ -188,9 +191,14 @@ class BuzzPushEndpointGrant {
 }
 
 Future<List<BuzzPushEndpointGrant>> readBuzzPushEndpointGrants() async {
-  if (defaultTargetPlatform != TargetPlatform.iOS) return const [];
+  if (!Env.pushGatewayConfigured ||
+      defaultTargetPlatform != TargetPlatform.iOS) {
+    return const [];
+  }
   try {
-    final raw = await _channel.invokeListMethod<dynamic>('endpointGrants');
+    final raw = await _channel.invokeListMethod<dynamic>('endpointGrants', {
+      'gatewayUrl': Env.pushGatewayUrl,
+    });
     final grants = [
       for (final value in raw ?? const [])
         BuzzPushEndpointGrant.fromMap(value as Map<dynamic, dynamic>),
@@ -204,12 +212,15 @@ Future<List<BuzzPushEndpointGrant>> readBuzzPushEndpointGrants() async {
   }
 }
 
-/// Enrolls the endpoint. The community owner refreshes the NSE snapshot from
-/// current state after this asynchronous operation completes.
+/// Enrolls the endpoint and optionally rewrites the NSE snapshot afterward.
+///
+/// The rewrite propagates NIP-11 `self` rotations even when the opaque grant
+/// and accepted relay lease remain reusable and their generations do not move.
 Future<BuzzPushEndpointGrant> enrollBuzzPush(
   String relayUrl,
-  String gatewayUrl,
-) async {
+  String gatewayUrl, {
+  List<Community>? communitiesForSnapshotRefresh,
+}) async {
   final raw = await _channel.invokeMapMethod<dynamic, dynamic>('enrollPush', {
     'relayUrl': relayUrl,
     'gatewayUrl': gatewayUrl,
@@ -219,6 +230,14 @@ Future<BuzzPushEndpointGrant> enrollBuzzPush(
   }
   final grant = BuzzPushEndpointGrant.fromMap(raw);
   await readBuzzPushEndpointGrants();
+  if (communitiesForSnapshotRefresh != null) {
+    try {
+      await registerBuzzPushCommunitySnapshot(communitiesForSnapshotRefresh);
+      pushCommunitySnapshotError.value = null;
+    } catch (error, stackTrace) {
+      reportPushCommunitySnapshotError(error, stackTrace);
+    }
+  }
   return grant;
 }
 
@@ -240,9 +259,37 @@ void reportPushLeaseCleanupError(Object error, StackTrace stackTrace) {
   debugPrintStack(stackTrace: stackTrace);
 }
 
-Future<void> registerBuzzPushCommunitySnapshot(
-  List<Community> communities,
-) async {
+Future<void> registerBuzzPushCommunitySnapshot(List<Community> communities) =>
+    _registerBuzzPushCommunitySnapshot(communities, strict: false);
+
+/// Writes the age-gate snapshot through a native path that must acknowledge
+/// both the app-group store and signing-key update.
+Future<void> registerBuzzPushCommunitySnapshotStrict(
+  List<Community> communities, {
+  required bool settleFence,
+}) => _registerBuzzPushCommunitySnapshot(
+  communities,
+  strict: true,
+  settleFence: settleFence,
+);
+
+/// Restores notification presentation without reading community storage.
+Future<void> restoreAgeRestrictedBuzzNotifications() async {
+  if (defaultTargetPlatform != TargetPlatform.iOS) return;
+  await _channel.invokeMethod<void>('restoreAgeRestrictedNotifications');
+}
+
+/// Removes notifications rendered before a confirmed age restriction.
+Future<void> purgeAgeRestrictedBuzzNotifications() async {
+  if (defaultTargetPlatform != TargetPlatform.iOS) return;
+  await _channel.invokeMethod<void>('purgeAgeRestrictedNotifications');
+}
+
+Future<void> _registerBuzzPushCommunitySnapshot(
+  List<Community> communities, {
+  required bool strict,
+  bool settleFence = false,
+}) async {
   if (defaultTargetPlatform != TargetPlatform.iOS) return;
   try {
     final snapshots = [
@@ -272,12 +319,17 @@ Future<void> registerBuzzPushCommunitySnapshot(
         // Native storage is fail-closed; malformed keys are never exported.
       }
     }
-    await _channel.invokeMethod<void>('syncPushSnapshot', {
-      'section': 'communities',
-      'communities': [for (final snapshot in snapshots) snapshot.toJson()],
-      'signingKeys': signingKeys,
-    });
+    await _channel.invokeMethod<void>(
+      strict ? 'syncAgeGatePushSnapshot' : 'syncPushSnapshot',
+      {
+        'section': 'communities',
+        'communities': [for (final snapshot in snapshots) snapshot.toJson()],
+        'signingKeys': signingKeys,
+        if (strict) 'settleFence': settleFence,
+      },
+    );
   } on MissingPluginException {
+    if (strict) rethrow;
     // Flutter tests and non-Runner embeddings do not install the native bridge.
   }
 }

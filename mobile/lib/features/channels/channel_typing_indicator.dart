@@ -3,7 +3,7 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../shared/theme/theme.dart';
-import '../../shared/identity/npub.dart';
+import '../../shared/utils/string_utils.dart';
 import '../../shared/profile/user_cache_provider.dart';
 import 'channel_typing_provider.dart';
 import 'small_avatar.dart';
@@ -30,7 +30,7 @@ class ChannelTypingIndicator extends ConsumerWidget {
       final profile =
           profiles[entry.pubkey.toLowerCase()] ??
           ref.read(userCacheProvider.notifier).get(entry.pubkey.toLowerCase());
-      return profile?.label ?? truncateNpub(entry.pubkey);
+      return profile?.label ?? shortPubkey(entry.pubkey);
     }).toList();
     final text = switch (names.length) {
       1 => '${names[0]} is typing…',

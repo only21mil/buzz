@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""Verify the frozen Buzz migration prefix and unique version allocation.
+"""Verify the merged migration baseline and unique version allocation.
 
-The frozen prefix is 0001-0042, pinned by two checksum manifests that must
-both be present: the original 0001-0035 ledger (kept byte-identical) and the
-audited 0036-0042 extension. Applied migration bytes are never edited,
-renumbered, or re-checksummed; new work appends above the verified maximum
-through the admission map, which additionally guards against re-executing an
-already-applied semantic operation under a new number.
+Upstream 0001-0046 and the approved 1000 block are checksum-frozen.
+Future migrations use admission records; existing SQL bytes never change.
 """
 import argparse
 import hashlib
@@ -16,10 +12,12 @@ import re
 
 ROOT = Path(__file__).resolve().parents[1]
 FROZEN_FIRST = 1
-FROZEN_LAST = 42
+FROZEN_LAST = 1044
+FROZEN_VERSIONS = set(range(1, 47)) | set(range(1029, 1036)) | set(range(1039, 1045))
 FROZEN_LEDGERS = (
     'scripts/migrations-0001-0035.sha256',
     'scripts/migrations-0036-0042.sha256',
+    'scripts/migrations-0043-0049.sha256',
 )
 OPERATION_MAP = 'migrations/operation-map.json'
 
@@ -29,7 +27,7 @@ def frozen_operations(root):
     doc = json.loads((root / OPERATION_MAP).read_text())
     ops = {}
     for entry in doc['fork']:
-        if entry['version'] > FROZEN_LAST:
+        if entry['version'] not in FROZEN_VERSIONS:
             continue
         for op in entry['operations']:
             ops.setdefault(op, entry['version'])
@@ -43,10 +41,10 @@ def check(root=ROOT, admission_map=None):
         for line in ledger.read_text().splitlines():
             digest, path = line.split()
             frozen[path] = digest
-    if (len(frozen) != FROZEN_LAST
-            or {int(Path(p).name[:4]) for p in frozen} != set(range(FROZEN_FIRST, FROZEN_LAST + 1))):
+    if (len(frozen) != len(FROZEN_VERSIONS)
+            or {int(Path(p).name[:4]) for p in frozen} != FROZEN_VERSIONS):
         raise ValueError(
-            f'frozen ledger must contain exactly versions {FROZEN_FIRST:04}-{FROZEN_LAST:04}')
+            'frozen ledger must contain upstream 0001-0046 and the approved fork block')
     versions = set()
     for path in sorted((root / 'migrations').glob('*.sql')):
         match = re.fullmatch(r'(\d{4})_.+\.sql', path.name)
@@ -57,26 +55,41 @@ def check(root=ROOT, admission_map=None):
             raise ValueError(f'duplicate migration version: {version:04}')
         versions.add(version)
         name = path.relative_to(root).as_posix()
-        if version <= FROZEN_LAST and name not in frozen:
+        if version in FROZEN_VERSIONS and name not in frozen:
             raise ValueError(f'unrecorded historical migration: {name}')
     for name, digest in frozen.items():
         path = root / name
         if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
             raise ValueError(f'frozen migration changed or missing: {name}')
+    # The operation map is the operator-facing identity ledger used at cutover.
+    entries = json.loads((root / OPERATION_MAP).read_text())['fork']
+    if len(entries) != len(versions) or {e['version'] for e in entries} != versions:
+        raise ValueError('operation map must cover each migration exactly once')
+    for entry in entries:
+        path = root / entry['file']
+        if path.parent != root / 'migrations' or int(path.name[:4]) != entry['version']:
+            raise ValueError(f'invalid operation-map path: {path}')
+        raw = path.read_bytes()
+        if (hashlib.sha256(raw).hexdigest() != entry['sha256']
+                or hashlib.sha384(raw).hexdigest() != entry['sqlx_sha384']
+                or path.stem[5:].replace('_', ' ') != entry['description']):
+            raise ValueError(f'operation-map identity mismatch: {path.name}')
+        if any(v not in versions or v >= entry['version'] for v in entry['prerequisites']):
+            raise ValueError(f'invalid migration prerequisites: {path.name}')
     if admission_map is not None:
         targets = {}
         for entry in json.loads(Path(admission_map).read_text()):
             target = entry.get('proposed_target')
             if target is None:
                 continue
-            if not re.fullmatch(r'\d{4}_.+\.sql', target) or int(target[:4]) <= FROZEN_LAST:
+            if not re.fullmatch(r'\d{4}_.+\.sql', target) or int(target[:4]) in FROZEN_VERSIONS or int(target[:4]) < 47:
                 raise ValueError(f'unsafe admission target: {target}')
             if target in targets or any(name[:4] == target[:4] for name in targets):
                 raise ValueError(f'duplicate admission version: {target[:4]}')
             targets[target] = entry
         frozen_ops = frozen_operations(root)
         for path in (root / 'migrations').glob('*.sql'):
-            if int(path.name[:4]) <= FROZEN_LAST:
+            if int(path.name[:4]) in FROZEN_VERSIONS:
                 continue
             entry = targets.get(path.name)
             if entry is None:
@@ -102,7 +115,7 @@ def check(root=ROOT, admission_map=None):
                         f'duplicate semantic operation {op} from {frozen_ops[op]:04}: {path.name}')
             if hashlib.sha256(path.read_bytes()).hexdigest() != entry['adapted_sql_sha256']:
                 raise ValueError(f'admitted migration hash mismatch: {path.name}')
-    print(f'frozen migrations {FROZEN_FIRST:04}-{FROZEN_LAST:04} unchanged; '
+    print(f'frozen migrations: {len(FROZEN_VERSIONS)} files unchanged; '
           'migration versions unique')
 
 

@@ -41,11 +41,7 @@ export async function loadWorkflowMessagePresentations(
 
   const events = await fetchEvents(eventIds);
   const eventById = new Map(
-    events.flatMap((event) =>
-      typeof event?.id === "string"
-        ? [[event.id.toLowerCase(), event] as const]
-        : [],
-    ),
+    events.map((event) => [event.id.toLowerCase(), event]),
   );
   return new Map(
     lookups.map(({ channelId, messageId, workflowId }) => {

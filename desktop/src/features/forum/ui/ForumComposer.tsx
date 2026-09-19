@@ -154,6 +154,7 @@ function ForumComposerVisit({
     editable: !disabled && !isSubmissionPending,
     mentionNames: mentions.knownNames,
     channelNames: channelLinks.knownChannelNames,
+    messageLinkChannels: channelLinks.channels,
     getMentionIdentities: mentions.getMentionIdentities,
     onSubmit: () => submitMessageRef.current(),
     isAutocompleteOpen: isAutocompleteOpenRef,
@@ -754,6 +755,7 @@ function ForumComposerVisit({
                 ) : undefined
               }
               formattingDisabled={Boolean(disabled || isSubmissionPending)}
+              gifMediaController={media}
               isEmojiPickerOpen={isEmojiPickerOpen}
               isFormattingOpen={isFormattingOpen}
               isSending={Boolean(isSending || isSubmissionPending)}

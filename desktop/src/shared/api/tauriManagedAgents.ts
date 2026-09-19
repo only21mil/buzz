@@ -1,4 +1,3 @@
-import { assertManagedAgentPromptPersisted } from "./agentPromptPersistence";
 import {
   fromRawManagedAgent,
   invokeTauri,
@@ -7,23 +6,32 @@ import {
 import type {
   ManagedAgent,
   ManagedAgentRuntimeStatus,
-  UpdateManagedAgentInput,
 } from "@/shared/api/types";
 
-export type StartManagedAgentInput = {
-  pubkey: string;
-  expectedRelayUrl?: string;
-  expectedSignerPubkey?: string;
-  replayFloorUnix?: number;
-};
-
 export async function startManagedAgent(
-  input: string | StartManagedAgentInput,
+  pubkey: string,
+  options?: {
+    /** Tenant scope captured by the caller before its first await; the
+     * backend fails closed before any spawn/deploy side effect when the
+     * active community no longer matches. */
+    expectedRelayUrl?: string;
+    /** Signer identity captured with the relay scope; the backend fails
+     * closed when the active workspace identity no longer matches. */
+    expectedSignerPubkey?: string;
+    /** Unix-seconds replay floor for a publish-first mention send: the
+     * spawned harness's first REQ replays at least back to this moment, so
+     * the already-published triggering message lands in its window however
+     * long the spawn takes. Local spawns receive it as process env; provider
+     * deploys carry it in the payload's launch.policy_env. */
+    replayFloorUnix?: number;
+  },
 ): Promise<ManagedAgent> {
-  const response = await invokeTauri<RawManagedAgent>(
-    "start_managed_agent",
-    typeof input === "string" ? { pubkey: input } : input,
-  );
+  const response = await invokeTauri<RawManagedAgent>("start_managed_agent", {
+    pubkey,
+    expectedRelayUrl: options?.expectedRelayUrl ?? null,
+    expectedSignerPubkey: options?.expectedSignerPubkey ?? null,
+    replayFloorUnix: options?.replayFloorUnix ?? null,
+  });
   return fromRawManagedAgent(response);
 }
 
@@ -105,24 +113,4 @@ export async function reconcileManagedAgentRuntimes(
   communities: readonly { relayUrl: string }[],
 ): Promise<ManagedAgentRuntimeStatus[]> {
   return invokeTauri("reconcile_managed_agent_runtimes", { communities });
-}
-
-type RawUpdateManagedAgentResponse = {
-  agent: RawManagedAgent;
-  profile_sync_error: string | null;
-};
-
-export async function updateManagedAgent(
-  input: UpdateManagedAgentInput,
-): Promise<{ agent: ManagedAgent; profileSyncError: string | null }> {
-  const response = await invokeTauri<RawUpdateManagedAgentResponse>(
-    "update_managed_agent",
-    { input },
-  );
-  const agent = fromRawManagedAgent(response.agent);
-  assertManagedAgentPromptPersisted(input, agent);
-  return {
-    agent,
-    profileSyncError: response.profile_sync_error,
-  };
 }

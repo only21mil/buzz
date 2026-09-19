@@ -1,72 +1,43 @@
-import type { RelayEvent } from "@/shared/api/types";
+import type { QueryClient } from "@tanstack/react-query";
+import type { fetchProjects } from "./projectFetch";
+import { PROJECTS_QUERY_KEY, getProjectSnapshotScope } from "./projectSnapshot";
 import {
-  buildProjectsFromFetcher,
-  fetchProjectEventsExhaustively,
-  type FetchProjectEventsExhaustively,
-} from "./projectEnumeration";
+  projectCollectionQueryKey,
+  type ProjectCollectionScope,
+} from "./projectCollectionScope";
+export { projectCollectionQueryKey } from "./projectCollectionScope";
 import {
-  readProjectSnapshot,
-  writeProjectSnapshot,
-  type ProjectSnapshotScope,
+  markProjectCollectionAuthoritative,
+  persistProjectSnapshot,
+  PROJECT_QUERY_STRUCTURAL_SHARING,
 } from "./projectSnapshot";
 
-// Retain the fork's existing freshness interval until relay trials justify changing it.
-const PROJECTS_STALE_TIME_MS = 60_000;
-export function projectCollectionQueryKey(scope: ProjectSnapshotScope | null) {
-  return [
-    "projects",
-    "collection",
-    scope?.relayOrigin ?? "",
-    scope?.pubkey.toLowerCase() ?? "",
-  ] as const;
-}
-
+/** Shares a provenance-aware collection within the community query client. */
 export function projectCollectionQueryOptions(
-  scope: ProjectSnapshotScope | null,
-  deps: {
-    fetchExhaustively?: FetchProjectEventsExhaustively;
-    storage?: Storage;
-    hiddenAddresses?: Set<string>;
-  } = {},
+  queryClient: QueryClient,
+  fetchProjectsFn: typeof fetchProjects = async (...args) =>
+    (await import("./projectFetch")).fetchProjects(...args),
+  scope: ProjectCollectionScope | null | undefined = getProjectSnapshotScope(
+    queryClient,
+  ),
 ) {
   return {
-    enabled: !!scope,
-    queryKey: projectCollectionQueryKey(scope),
+    enabled: scope !== null,
+    queryKey:
+      scope === undefined
+        ? PROJECTS_QUERY_KEY
+        : projectCollectionQueryKey(scope),
     queryFn: async ({ signal }: { signal: AbortSignal }) => {
-      if (!scope) throw new Error("Project identity is not ready.");
-      const events = new Map<string, RelayEvent>();
-      const projects = await buildProjectsFromFetcher(
-        async (kinds, filter) => {
-          signal.throwIfAborted();
-          const rows = deps.fetchExhaustively
-            ? await deps.fetchExhaustively(kinds, filter)
-            : await fetchProjectEventsExhaustively(
-                kinds,
-                filter,
-                undefined,
-                signal,
-              );
-          for (const event of rows) events.set(event.id, event);
-          return rows;
-        },
-        {
-          relayOrigin: scope.relayOrigin,
-          hiddenAddresses: deps.hiddenAddresses,
-        },
-      );
+      if (scope === null) throw new Error("Project identity is not ready.");
+      const projects = await fetchProjectsFn(undefined, signal, scope);
       signal.throwIfAborted();
-      writeProjectSnapshot(scope, [...events.values()], deps.storage);
+      markProjectCollectionAuthoritative(queryClient, scope);
+      persistProjectSnapshot(queryClient, projects, scope);
       return projects;
     },
-    initialData: () =>
-      scope
-        ? readProjectSnapshot(scope, deps.storage)?.filter(
-            (project) => !deps.hiddenAddresses?.has(project.projectAddress),
-          )
-        : undefined,
-    initialDataUpdatedAt: 0,
-    // A live read must replace non-serialized snapshot provenance.
-    structuralSharing: false as const,
-    staleTime: PROJECTS_STALE_TIME_MS,
+    structuralSharing: PROJECT_QUERY_STRUCTURAL_SHARING,
+    staleTime: 5 * 60_000,
+    gcTime:
+      typeof window === "undefined" ? Number.POSITIVE_INFINITY : 30 * 60_000,
   };
 }

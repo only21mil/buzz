@@ -1,5 +1,6 @@
 package xyz.block.buzz.mobile
 
+
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -11,6 +12,11 @@ import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.os.Build
 import androidx.annotation.RequiresApi
+import com.google.android.play.agesignals.AgeSignalsException
+import com.google.android.play.agesignals.model.AgeSignalsErrorCode
+import com.google.android.play.agesignals.AgeSignalsAccessRequest
+import com.google.android.play.agesignals.AgeSignalsManagerFactory
+import com.google.android.play.agesignals.AgeSignalsRequest
 import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -18,6 +24,48 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.ByteBuffer
 import java.util.UUID
+
+internal fun ageSignalPayload(ageUpper: Int?, ageLower: Int? = null): Map<String, Any?> {
+    val validRange = (ageUpper == null || ageUpper >= 0) &&
+        (ageLower == null || (ageLower >= 0 && (ageUpper == null || ageLower <= ageUpper)))
+    return mapOf(
+        "status" to "signal",
+        "ageUpper" to if (validRange) ageUpper else null,
+    )
+}
+
+internal fun noAgeSignalPayload(): Map<String, Any?> {
+    return mapOf(
+        "status" to "noSignal",
+        "ageUpper" to null,
+    )
+}
+
+internal fun replyWithAgeSignalError(
+    result: MethodChannel.Result,
+    error: Exception,
+) {
+    // Missing/outdated Play installations and non-Play installs cannot supply
+    // a signal. Preserve Buzz's unsupported-environment no-signal policy.
+    // Other failures remain distinguishable; Flutter preserves access on errors.
+    if (error is AgeSignalsException && error.errorCode in setOf(
+            AgeSignalsErrorCode.API_NOT_AVAILABLE,
+            AgeSignalsErrorCode.PLAY_STORE_NOT_FOUND,
+            AgeSignalsErrorCode.PLAY_SERVICES_NOT_FOUND,
+            AgeSignalsErrorCode.PLAY_STORE_VERSION_OUTDATED,
+            AgeSignalsErrorCode.PLAY_SERVICES_VERSION_OUTDATED,
+            AgeSignalsErrorCode.APP_NOT_OWNED,
+        )
+    ) {
+        result.success(noAgeSignalPayload())
+        return
+    }
+    result.error(
+        "age_signal_unavailable",
+        "The age signal request failed.",
+        error.javaClass.simpleName,
+    )
+}
 
 internal object AndroidImageProcessor {
     fun decodeSrgbBitmap(bytes: ByteArray): Bitmap? {
@@ -78,30 +126,23 @@ internal object AndroidImageProcessor {
     }
 }
 
-// Device-auth adoption (P05 / upstream #5116) needs a FragmentActivity host
-// while this activity keeps owning the fork notification bridge, the media
-// upload channel, and the huddle permission callbacks. FlutterFragmentActivity
-// is that host: every override below is preserved across the switch.
 class MainActivity : FlutterFragmentActivity() {
     private var mediaUploadChannel: MethodChannel? = null
-    private var huddleMediaPlugin: HuddleMediaPlugin? = null
+    private var ageSignalChannel: MethodChannel? = null
+    private val ageSignalRequest = AgeSignalRequest()
     private var notificationBridge: AndroidNotificationBridge? = null
-    private var deviceAuthBridge: DeviceAuthBridge? = null
+    private var huddleMediaPlugin: HuddleMediaPlugin? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        huddleMediaPlugin?.dispose()
-        huddleMediaPlugin = HuddleMediaPlugin(this, flutterEngine.dartExecutor.binaryMessenger)
+        huddleMediaPlugin = HuddleMediaPlugin(
+            this,
+            flutterEngine.dartExecutor.binaryMessenger,
+        )
 
         notificationBridge?.dispose()
         notificationBridge = AndroidNotificationBridge(
-            activity = this,
-            binaryMessenger = flutterEngine.dartExecutor.binaryMessenger,
-        )
-
-        deviceAuthBridge?.dispose()
-        deviceAuthBridge = DeviceAuthBridge(
             activity = this,
             binaryMessenger = flutterEngine.dartExecutor.binaryMessenger,
         )
@@ -134,6 +175,29 @@ class MainActivity : FlutterFragmentActivity() {
                 }
             }
         }
+
+        ageSignalChannel = MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            AGE_SIGNAL_CHANNEL,
+        ).also { channel ->
+            channel.setMethodCallHandler { call, result ->
+                when (call.method) {
+                    REQUEST_AGE_SIGNAL_METHOD -> {
+                        val manager by lazy { AgeSignalsManagerFactory.create(applicationContext) }
+                        ageSignalRequest.start(
+                            result,
+                            requestAccess = {
+                                manager.requestAgeSignalsAccess(
+                                    AgeSignalsAccessRequest.builder().setActivity(this).build(),
+                                )
+                            },
+                            checkAge = { manager.checkAgeSignals(AgeSignalsRequest.builder().build()) },
+                        )
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -156,23 +220,13 @@ class MainActivity : FlutterFragmentActivity() {
         huddleMediaPlugin?.onRequestPermissionsResult(requestCode, permissions, grantResults)
     }
 
-    override fun onActivityResult(
-        requestCode: Int,
-        resultCode: Int,
-        data: Intent?,
-    ) {
-        super.onActivityResult(requestCode, resultCode, data)
-        deviceAuthBridge?.handleActivityResult(requestCode, resultCode)
-    }
-
-    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
-        huddleMediaPlugin?.dispose()
-        huddleMediaPlugin = null
+    override fun onDestroy() {
         notificationBridge?.dispose()
         notificationBridge = null
-        deviceAuthBridge?.dispose()
-        deviceAuthBridge = null
-        super.cleanUpFlutterEngine(flutterEngine)
+        ageSignalRequest.retire()
+        huddleMediaPlugin?.dispose()
+        huddleMediaPlugin = null
+        super.onDestroy()
     }
 
     private fun handleSanitizeImageForUpload(
@@ -429,6 +483,8 @@ class MainActivity : FlutterFragmentActivity() {
 
     companion object {
         private const val MEDIA_UPLOAD_CHANNEL = "buzz/media_upload"
+        private const val AGE_SIGNAL_CHANNEL = "buzz/age_signal"
+        private const val REQUEST_AGE_SIGNAL_METHOD = "requestAgeSignal"
         private const val SANITIZE_IMAGE_FOR_UPLOAD_METHOD = "sanitizeImageForUpload"
         private const val TRANSCODE_IMAGE_TO_JPEG_METHOD = "transcodeImageToJpeg"
         private const val TRANSCODE_VIDEO_TO_MP4_METHOD = "transcodeVideoToMp4"

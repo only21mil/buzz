@@ -241,7 +241,7 @@ async fn validate_huddle_lifecycle_event(
     let backing_channel_id = huddle_backing_channel_id(event)?;
     let backing = state
         .db
-        .get_channel(tenant.community(), backing_channel_id)
+        .get_channel_for_event_write(tenant.community(), backing_channel_id)
         .await
         .map_err(map_huddle_backing_channel_error)?;
     let signer = event.pubkey.to_bytes();
@@ -272,7 +272,7 @@ async fn validate_huddle_lifecycle_event(
         })?;
         let linked = state
             .db
-            .huddle_started_link_exists(
+            .huddle_started_link_exists_for_event_write(
                 tenant.community(),
                 parent_channel_id,
                 backing_channel_id,
@@ -582,6 +582,24 @@ fn repo_deletion_ingest_outcome(
     }
 }
 
+/// Map the durable community write-fence lookup onto the ingest error taxonomy.
+///
+/// An inactive community is an authorization decision and keeps the exact
+/// `restricted:` wire text the ephemeral path uses. A lookup outage is a
+/// server fault and fails closed as `error:`/500 — a Postgres blip can
+/// neither admit a write past the fence nor read as a client mistake.
+fn map_serving_fence_state(active: Result<bool, buzz_db::DbError>) -> Result<(), IngestError> {
+    match active {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(IngestError::Rejected(
+            "restricted: community writes are fenced".into(),
+        )),
+        Err(error) => Err(IngestError::Internal(format!(
+            "error: checking community write fence: {error}"
+        ))),
+    }
+}
+
 fn map_relay_admin_error(error: super::relay_admin::RelayAdminError) -> IngestError {
     use super::relay_admin::RelayAdminError;
     match error {
@@ -795,7 +813,10 @@ pub(crate) async fn derive_reaction_channel(
         _ => return ReactionChannelResult::NoTarget,
     };
 
-    match db.get_event_by_id(community_id, &id_bytes).await {
+    match db
+        .get_event_by_id_for_event_write(community_id, &id_bytes)
+        .await
+    {
         Ok(Some(target)) => match target.channel_id {
             Some(ch_id) => ReactionChannelResult::Channel(ch_id),
             None => ReactionChannelResult::NoChannel,
@@ -957,7 +978,7 @@ pub(crate) async fn check_channel_membership(
         Some(ch) => ch.visibility == "open",
         None => state
             .db
-            .get_channel(tenant.community(), ch_id)
+            .get_channel_for_event_write(tenant.community(), ch_id)
             .await
             .map(|ch| ch.visibility == "open")
             .unwrap_or(false),
@@ -1025,7 +1046,9 @@ pub(crate) async fn resolve_nip10_thread_meta(
         hex::decode(&parent_hex).map_err(|_| "invalid parent event ID hex".to_string())?;
 
     let (parent_event_result, parent_meta_result) = tokio::join!(
-        state.db.get_event_by_id(community_id, &parent_bytes),
+        state
+            .db
+            .get_event_by_id_for_event_write(community_id, &parent_bytes),
         state
             .db
             .get_thread_metadata_by_event(community_id, &parent_bytes),
@@ -1061,7 +1084,7 @@ pub(crate) async fn resolve_nip10_thread_meta(
             }
             let root_ts = if let Ok(Some(root_ev)) = state
                 .db
-                .get_event_by_id(community_id, &effective_root)
+                .get_event_by_id_for_event_write(community_id, &effective_root)
                 .await
             {
                 chrono::DateTime::from_timestamp(root_ev.event.created_at.as_secs() as i64, 0)
@@ -1145,13 +1168,16 @@ async fn derive_ancestry_from_parent_tags(
     if parent_root.as_slice() == parent_bytes {
         (parent_root, parent_created, 1)
     } else {
-        let root_created =
-            if let Ok(Some(root_ev)) = state.db.get_event_by_id(community_id, &parent_root).await {
-                chrono::DateTime::from_timestamp(root_ev.event.created_at.as_secs() as i64, 0)
-                    .unwrap_or(parent_created)
-            } else {
-                parent_created
-            };
+        let root_created = if let Ok(Some(root_ev)) = state
+            .db
+            .get_event_by_id_for_event_write(community_id, &parent_root)
+            .await
+        {
+            chrono::DateTime::from_timestamp(root_ev.event.created_at.as_secs() as i64, 0)
+                .unwrap_or(parent_created)
+        } else {
+            parent_created
+        };
         (parent_root, root_created, 2)
     }
 }
@@ -1200,7 +1226,9 @@ pub(crate) async fn resolve_relay_reply_thread_meta(
     }
 
     let (parent_event_result, parent_meta_result) = tokio::join!(
-        state.db.get_event_by_id(community_id, &parent_bytes),
+        state
+            .db
+            .get_event_by_id_for_event_write(community_id, &parent_bytes),
         state
             .db
             .get_thread_metadata_by_event(community_id, &parent_bytes),
@@ -1234,7 +1262,7 @@ pub(crate) async fn resolve_relay_reply_thread_meta(
                 parent_created
             } else if let Ok(Some(root_ev)) = state
                 .db
-                .get_event_by_id(community_id, &effective_root)
+                .get_event_by_id_for_event_write(community_id, &effective_root)
                 .await
             {
                 chrono::DateTime::from_timestamp(root_ev.event.created_at.as_secs() as i64, 0)
@@ -1344,7 +1372,7 @@ async fn validate_edit_ownership(
         hex::decode(&target_hex).map_err(|_| "invalid target event ID".to_string())?;
     let target_event = state
         .db
-        .get_event_by_id(community_id, &target_bytes)
+        .get_event_by_id_for_event_write(community_id, &target_bytes)
         .await
         .map_err(|e| format!("db error: {e}"))?
         .ok_or_else(|| "edit target event not found".to_string())?;
@@ -1374,7 +1402,7 @@ async fn validate_edit_ownership(
             if !is_member {
                 let is_open = state
                     .db
-                    .get_channel(community_id, ch_id)
+                    .get_channel_for_event_write(community_id, ch_id)
                     .await
                     .map(|ch| ch.visibility == "open")
                     .unwrap_or(false);
@@ -1425,7 +1453,7 @@ async fn validate_forum_vote_target(
         hex::decode(&target_hex).map_err(|_| "invalid target event ID".to_string())?;
     let target_event = state
         .db
-        .get_event_by_id(community_id, &target_bytes)
+        .get_event_by_id_for_event_write(community_id, &target_bytes)
         .await
         .map_err(|e| format!("db error: {e}"))?
         .ok_or_else(|| "vote target event not found".to_string())?;
@@ -2350,6 +2378,17 @@ async fn ingest_event_inner(
     // shared with the validator, the audit write and the side-effect handler.
     let admin_grant = crate::handlers::moderation_authz::ChannelAdminGrantCell::new();
 
+    // Durable community write fence: persistent ingest is a DB write the
+    // deletion engine cannot exclude via serving-write leases (those cover
+    // external side effects only), so the shared WS/HTTP seam must refuse
+    // writes once the community leaves the active lifecycle state. Row churn
+    // inside the remaining race window is swept by the destructive DB stage.
+    map_serving_fence_state(
+        buzz_deletion::store(&state.db)
+            .is_serving_active(tenant.community())
+            .await,
+    )?;
+
     if kind_u32 == KIND_AUTH {
         return Err(IngestError::Rejected(
             "invalid: AUTH events cannot be submitted".into(),
@@ -2604,7 +2643,7 @@ async fn ingest_event_inner(
                 })?;
                 match state
                     .db
-                    .get_event_by_id(tenant.community(), &target_bytes)
+                    .get_event_by_id_for_event_write(tenant.community(), &target_bytes)
                     .await
                 {
                     Ok(Some(target)) => target.channel_id,
@@ -2652,7 +2691,11 @@ async fn ingest_event_inner(
     // it later in this request); each gate keeps its existing missing-row
     // behavior.
     let channel_row = match channel_id {
-        Some(ch_id) => state.db.get_channel(tenant.community(), ch_id).await.ok(),
+        Some(ch_id) => state
+            .db
+            .get_channel_for_event_write(tenant.community(), ch_id)
+            .await
+            .ok(),
         None => None,
     };
     // E1 phase-2 (§4.8 phase-2 addendum): resolve the fan-out visibility once,
@@ -3636,24 +3679,29 @@ async fn ingest_event_inner(
         };
 
         let pubkey_hex = auth.pubkey().to_hex();
-        // Spec WriteInsert (line 514) / WriteDuplicate (line 606): emit
-        // the abstract write action. The persist API returns
-        // `was_inserted` (true → Insert, false → Duplicate). This branch
-        // is the reaction path; channel_id is always Some here, so
-        // WriteInsertGlobal does not apply.
+        // Spec WriteInsert (line 514) / WriteDuplicate (line 606) /
+        // WriteInsertGlobal (line 559): emit the abstract write action. The
+        // persist API returns `was_inserted` (true → Insert/Global, false →
+        // Duplicate). Reactions on project events (issue/PR roots and their
+        // comments) carry no `h` tag, so `channel_id` can be `None` here —
+        // mirror the message write's three-way split instead of asserting a
+        // channel, which panicked the ingest worker on those events.
         let claimed = claimed_community_from_event(&event);
-        let action = if was_inserted {
-            TraceAction::WriteInsert {
+        let action = match (channel_id, was_inserted) {
+            (Some(ch), true) => TraceAction::WriteInsert {
                 msg_id: msg_id_label(event.id.as_bytes()),
-                channel: channel_label(channel_id.expect("reaction path has channel")),
+                channel: channel_label(ch),
                 claimed_community: claimed,
-            }
-        } else {
-            TraceAction::WriteDuplicate {
+            },
+            (Some(ch), false) => TraceAction::WriteDuplicate {
                 msg_id: msg_id_label(event.id.as_bytes()),
-                channel: channel_label(channel_id.expect("reaction path has channel")),
+                channel: channel_label(ch),
                 claimed_community: claimed,
-            }
+            },
+            (None, _) => TraceAction::WriteInsertGlobal {
+                msg_id: msg_id_label(event.id.as_bytes()),
+                claimed_community: claimed,
+            },
         };
         emit(tracer, action, state_for_request(tenant, auth.pubkey()));
         dispatch_persistent_event(
@@ -3989,7 +4037,7 @@ fn enforce_required_side_effect(kind: u32, result: anyhow::Result<()>) -> Result
 }
 
 #[cfg(test)]
-mod tests {
+mod postgres_tests {
     use std::sync::Mutex;
 
     use super::*;
@@ -4286,6 +4334,125 @@ mod tests {
             other => {
                 panic!("restriction DB failure must map to Internal (HTTP 500), got {other:?}")
             }
+        }
+    }
+
+    /// An active community passes the durable write fence untouched.
+    #[test]
+    fn serving_fence_active_community_admits_write() {
+        assert!(map_serving_fence_state(Ok(true)).is_ok());
+    }
+
+    /// A fenced/tombstoned/archived community is an authorization decision:
+    /// `restricted:` and (via `bridge.rs`) HTTP 400 — with the exact wire text
+    /// the ephemeral WS path uses, so clients see one refusal vocabulary.
+    #[test]
+    fn serving_fence_inactive_community_maps_to_restricted() {
+        match map_serving_fence_state(Ok(false)) {
+            Err(IngestError::Rejected(msg)) => {
+                assert_eq!(msg, "restricted: community writes are fenced");
+            }
+            other => panic!("fenced community must map to Rejected, got {other:?}"),
+        }
+    }
+
+    /// A fence-lookup outage is a server fault and must fail closed as
+    /// `error:`/500 — a Postgres blip can neither admit a write past the
+    /// fence nor be reported to an innocent client as a bad request.
+    #[test]
+    fn serving_fence_lookup_outage_fails_closed_as_internal() {
+        let outage = buzz_db::DbError::Sqlx(sqlx::Error::PoolTimedOut);
+        match map_serving_fence_state(Err(outage)) {
+            Err(IngestError::Internal(msg)) => {
+                assert!(
+                    msg.starts_with("error: "),
+                    "fence outages need the `error:` NIP-01 prefix, got {msg:?}"
+                );
+            }
+            other => panic!("fence lookup failure must map to Internal, got {other:?}"),
+        }
+    }
+
+    /// Production-path regression: the exact predicate `ingest_event_inner`
+    /// consults must admit writes while a community is active and refuse them
+    /// once the community deletion lifecycle fences it.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn ingest_write_fence_follows_community_deletion_lifecycle() {
+        use buzz_db::deletion::{
+            FrozenInventory, KeyStreamDigest, PrefixManifest, StorageManifest,
+            DEFAULT_LEASE_DURATION,
+        };
+
+        let url = std::env::var("BUZZ_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string()); // sadscan:disable np.postgres.1
+        let pool = sqlx::PgPool::connect(&url).await.expect("connect test DB");
+        let db = buzz_db::Db::from_pool(pool);
+        if std::env::var("BUZZ_TEST_SCHEMA_MODE").as_deref() != Ok("desired") {
+            db.migrate().await.expect("migrate test DB");
+        }
+        let store = buzz_deletion::store(&db);
+
+        let host = format!("lane3-fence-{}.example", Uuid::new_v4().simple());
+        let community = db
+            .ensure_configured_community(&host)
+            .await
+            .expect("community")
+            .id;
+
+        assert!(
+            map_serving_fence_state(store.is_serving_active(community).await).is_ok(),
+            "active community must admit persistent ingest"
+        );
+
+        let submitted = store
+            .submit(
+                &host,
+                "test-operator",
+                Some("lane3 ingest fence regression"),
+            )
+            .await
+            .expect("submit");
+        let inventory = FrozenInventory {
+            schema: store
+                .inventory_schema(community)
+                .await
+                .expect("schema inventory"),
+            storage: StorageManifest {
+                version: 4,
+                prefixes: buzz_media::tenant_prefixes(*community.as_uuid())
+                    .into_iter()
+                    .map(|prefix| PrefixManifest {
+                        prefix,
+                        object_count: 0,
+                        total_bytes: 0,
+                        keys_digest: KeyStreamDigest::new().finish().0,
+                    })
+                    .collect(),
+            },
+        };
+        let request = store
+            .freeze_inventory(submitted.id, &inventory)
+            .await
+            .expect("freeze inventory");
+        store
+            .approve(request.id, "approver", None)
+            .await
+            .expect("approve");
+        let claim = store
+            .claim_specific(request.id, "executor", DEFAULT_LEASE_DURATION)
+            .await
+            .expect("claim")
+            .expect("won claim");
+        store.begin_quiescing(&claim.lease).await.expect("quiesce");
+        store.fence(&claim.lease).await.expect("fence");
+
+        match map_serving_fence_state(store.is_serving_active(community).await) {
+            Err(IngestError::Rejected(msg)) => {
+                assert_eq!(msg, "restricted: community writes are fenced");
+            }
+            other => panic!("fenced community must refuse persistent ingest, got {other:?}"),
         }
     }
 

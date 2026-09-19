@@ -30,8 +30,9 @@ fn trim_optional(value: Option<String>) -> Option<String> {
 /// instances, best-effort. Loads the agent store, applies the roster delta via
 /// [`apply_team_membership_delta`], and re-saves only when something changed;
 /// any load/save error is logged and swallowed. Called after the authoritative
-/// `save_teams` succeeds — the team already exists on disk, so a secondary-store
-/// hiccup must not fail a command whose team write already landed (a UI retry would
+/// `save_teams` succeeds — the team already exists on disk and boot repair is
+/// the designed retry for a stale/unset binding, so a secondary-store hiccup
+/// must not fail a command whose team write already landed (a UI retry would
 /// then mint a duplicate team).
 ///
 /// `load_agents`/`save_agents` are injected so the command wiring (prior-roster
@@ -65,8 +66,11 @@ pub(in crate::commands) fn propagate_membership_best_effort(
     }
 }
 
-/// Persist a newly created team authoritatively, then propagate its full roster
-/// to unbound instances best-effort. The command supplies real store callbacks.
+/// In-memory core of [`create_team`]: push the built team, persist teams
+/// authoritatively, then propagate its whole roster (no prior members ⇒ the
+/// whole roster is the added delta) to live instances best-effort. Decoupled
+/// from the `AppHandle` shell via injected persistence so the create wiring is
+/// unit-testable. A `persist_teams` error propagates; agent IO is best-effort.
 fn commit_team_create(
     teams: &mut Vec<TeamRecord>,
     team: TeamRecord,
@@ -190,6 +194,8 @@ fn apply_team_membership_delta(
     changed
 }
 
+mod inbound;
+pub(crate) use inbound::refresh_team_catalog_heads_for_inbound_persona;
 mod adopt;
 mod pending;
 mod sharing;
@@ -210,10 +216,21 @@ pub(crate) fn refresh_team_catalog_heads_for_persona<R: tauri::Runtime>(
     pending::refresh_shared_team_catalog_heads_for_persona(app, state, persona_id);
 }
 
-mod inbound;
-pub(crate) use inbound::{
-    refresh_team_catalog_head, refresh_team_catalog_heads_for_inbound_persona,
-};
+/// Refresh (or retract) one team's shared 30178 catalog head after an inbound
+/// 30176 team edit landed on this device.
+///
+/// `pub(crate)` so the inbound reconcile can converge the catalog without
+/// reaching into the private `commands::teams` module. Best-effort: failures
+/// are logged, not returned. The idempotency skip inside the refresh makes this
+/// a no-op when the editing device already published the identical head.
+pub(crate) fn refresh_team_catalog_head<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    team: &TeamRecord,
+    personas: &[AgentDefinition],
+) {
+    pending::refresh_shared_team_catalog_head_resolving(app, state, team, personas);
+}
 
 /// Purge and tombstone a team's 30178 catalog coordinate after an inbound
 /// 30176 team tombstone removed the team on this device.
@@ -241,11 +258,7 @@ pub(crate) fn tombstone_team_catalog_head<R: tauri::Runtime>(
 /// Unlike `retain_managed_agent_pending`, no projection-equality short-circuit:
 /// teams have no start/stop runtime churn, so a republish only happens on an
 /// actual user edit.
-pub(super) fn retain_team_pending<R: tauri::Runtime>(
-    app: &AppHandle<R>,
-    state: &AppState,
-    team: &TeamRecord,
-) {
+pub(super) fn retain_team_pending(app: &AppHandle, state: &AppState, team: &TeamRecord) {
     let result = (|| -> Result<(), String> {
         let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
         retain_team_pending_at(&scope, team)
@@ -407,10 +420,7 @@ pub async fn list_teams(app: AppHandle) -> Result<Vec<TeamRecord>, String> {
 }
 
 #[tauri::command]
-pub async fn create_team<R: tauri::Runtime>(
-    input: CreateTeamRequest,
-    app: AppHandle<R>,
-) -> Result<TeamRecord, String> {
+pub async fn create_team(input: CreateTeamRequest, app: AppHandle) -> Result<TeamRecord, String> {
     use tauri::Manager;
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -537,7 +547,3 @@ pub async fn delete_team(id: String, app: AppHandle) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests;
-
-// Real store IO without touching the OS keyring. Run with --no-default-features.
-#[cfg(all(test, not(feature = "system-keyring")))]
-mod create_command_tests;

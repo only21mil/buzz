@@ -37,6 +37,7 @@ import type { MentionIdentity } from "./mentionClipboard";
 import { CUSTOM_EMOJI_NODE_NAME } from "./customEmojiNode";
 import { useComposerCustomEmoji } from "./useComposerCustomEmoji";
 import { buildPlainTextProjection } from "./plainTextProjection";
+import { parseSnapshotClipboardHtml } from "./agentSnapshotClipboard";
 import { buildPreviewUpdate } from "./linkPreviewContent";
 import { createLinkInteractionExtension } from "./linkInteractionExtension";
 import { LinkPasteTrailingSpace } from "./linkPasteTrailingSpace";
@@ -46,6 +47,9 @@ import {
   insertNewlineInCodeBlock,
 } from "./codeBlockExtensions";
 import { SpoilerMark } from "./spoilerMark";
+import { createComposerLinkPasteHandler } from "./composerMessageLinkNode";
+import type { ComposerMessageLinkChannel } from "./useComposerMessageLinks";
+import { useComposerMessageLinks } from "./useComposerMessageLinks";
 
 /**
  * Plain-text edit descriptor returned by autocomplete hooks
@@ -77,6 +81,7 @@ export type RichTextEditorOptions = {
   mentionNames?: string[];
   agentMentionNames?: string[];
   channelNames?: string[];
+  messageLinkChannels?: readonly ComposerMessageLinkChannel[];
   /** Known custom-emoji set; used to render `:shortcode:` inline as images. */
   customEmoji?: CustomEmoji[];
   /**
@@ -144,6 +149,7 @@ export function useRichTextEditor({
   mentionNames,
   agentMentionNames,
   channelNames,
+  messageLinkChannels,
   customEmoji,
   getMentionIdentities,
   onSubmit,
@@ -177,6 +183,7 @@ export function useRichTextEditor({
   // Custom-emoji atom node wiring (config + src re-resolve). Kept in a sibling
   // hook so this file stays focused on generic editor setup.
   const customEmojiWiring = useComposerCustomEmoji(customEmoji);
+  const messageLinkWiring = useComposerMessageLinks(messageLinkChannels);
 
   const editor = useEditor(
     {
@@ -327,6 +334,7 @@ export function useRichTextEditor({
         // tell the text it inserted from whatever the user typed next.
         PastedMentionOccurrencesExtension,
         customEmojiWiring.extension,
+        messageLinkWiring.extension,
         Placeholder.configure({
           placeholder: () => placeholderRef.current ?? "Write a message…",
         }),
@@ -382,6 +390,15 @@ export function useRichTextEditor({
               isCut: true,
               view,
             }),
+          paste: (view, event) =>
+            parseSnapshotClipboardHtml(
+              (event as ClipboardEvent).clipboardData?.getData("text/html") ??
+                "",
+            )
+              ? false
+              : createComposerLinkPasteHandler(
+                  messageLinkWiring.resolveChannelName,
+                )(view, event as ClipboardEvent),
         },
         attributes: {
           autocapitalize: "none",
@@ -607,6 +624,11 @@ export function useRichTextEditor({
     if (!editor) return;
     customEmojiWiring.syncEmojiSrc(editor);
   }, [editor, customEmojiWiring.syncEmojiSrc]);
+
+  React.useEffect(() => {
+    if (!editor) return;
+    messageLinkWiring.syncChannelNames(editor);
+  }, [editor, messageLinkWiring.syncChannelNames]);
 
   const getMarkdown = React.useCallback((): string => {
     if (!editor) return "";

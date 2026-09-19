@@ -10,7 +10,7 @@ export const SCHEDULE_FREQUENCIES = [
   "custom_cron",
 ] as const;
 
-type ScheduleFrequency = (typeof SCHEDULE_FREQUENCIES)[number];
+export type ScheduleFrequency = (typeof SCHEDULE_FREQUENCIES)[number];
 type ScheduleFormFrequency = ScheduleFrequency | "custom_interval";
 
 export type ScheduleFormState = {

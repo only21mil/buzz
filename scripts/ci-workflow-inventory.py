@@ -93,10 +93,17 @@ def triggers(document):
 
 def matrix_combos(strategy):
     matrix = (strategy or {}).get("matrix")
+    if isinstance(matrix, str) and "${{" in matrix:
+        return [None]
     if not isinstance(matrix, dict):
         return [{}]
+    dynamic = {key: [f"${{{{ matrix.{key} }}}}"] for key, value in matrix.items()
+               if isinstance(value, str) and "${{" in value}
+    if any(key in dynamic for key in ("include", "exclude")):
+        return [None]
     lists = {key: value for key, value in matrix.items()
              if key not in ("include", "exclude") and isinstance(value, list)}
+    lists.update(dynamic)
     combos = [dict(zip(lists, values)) for values in itertools.product(*lists.values())] if lists else []
     for extra in matrix.get("include") or []:
         matched = [combo for combo in combos if all(combo.get(k) == v for k, v in extra.items() if k in combo)]
@@ -112,6 +119,8 @@ def matrix_combos(strategy):
 
 
 def expand(template, combo):
+    if combo is None:
+        return str(template)
     def replace(match):
         key = match.group(1)
         if key not in combo:
@@ -209,6 +218,8 @@ def parse_workflow(path):
         if "uses" in job:
             raise InventoryError(f"{path.name}:{job_id}: reusable workflow calls are not inventoried")
         combos = matrix_combos(job.get("strategy"))
+        dynamic = any(combo is None or any("${{" in str(value) for value in combo.values())
+                      for combo in combos)
         names, labels = [], []
         for combo in combos:
             names.append(expand(job.get("name") or job_id, combo))
@@ -237,7 +248,8 @@ def parse_workflow(path):
             "secrets": secrets,
             "effects": effects(perms, secrets, environment),
             "concurrency": concurrency or "-",
-            "cost": cost_class(minutes),
+            "cost": "dynamic" if dynamic else cost_class(minutes),
+            "dynamic_matrix": dynamic,
         })
     return rows
 
@@ -306,7 +318,10 @@ def annotate(rows, checks, dispositions):
     produced = {}
     for row in rows:
         key = f"{row['workflow']}:{row['job_id']}"
-        row["required"] = sorted(name for name in row["names"] if name in contexts)
+        # Workflow-call-only helpers cannot emit standalone checks. Calls are
+        # rejected by parse_workflow until caller-qualified names are supported.
+        row["required"] = (sorted(name for name in row["names"] if name in contexts)
+                           if row["triggers"] != ["workflow_call"] else [])
         for name in row["required"]:
             produced.setdefault(name, []).append(key)
         if key not in dispositions:
@@ -355,7 +370,9 @@ def render(rows, checks, produced):
         "## Summary",
         "",
         f"- Workflows: {len(workflows)}; jobs: {len(rows)}; job executions after matrix expansion: "
-        f"{sum(len(r['names']) for r in rows)}.",
+        f"{sum(len(r['names']) for r in rows if not r['dynamic_matrix'])}"
+        + (f" plus runtime expansion of {sum(r['dynamic_matrix'] for r in rows)} dynamic jobs."
+           if any(r["dynamic_matrix"] for r in rows) else "."),
         f"- Required checks on protected `main`: {len(checks)}, produced by {len(required_rows)} jobs, "
         f"{len({r['workflow'] for r in required_rows})} workflows.",
         f"- Dispositions: native {counts['native']}, retained-github {counts['retained-github']}, "
@@ -388,6 +405,7 @@ def render(rows, checks, produced):
         "x matrix size; S <= 15, M <= 60, L <= 300, XL above; `self-hosted` when labels come",
         "from `vars`. `permissions` lists write scopes only. `required` names the main",
         "ruleset contexts this job produces.",
+        "Dynamic matrices retain expression placeholders; their execution counts and costs are unknown offline.",
         "",
     ]
     for workflow in workflows:

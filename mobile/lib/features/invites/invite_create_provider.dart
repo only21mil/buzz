@@ -8,7 +8,7 @@ import 'package:nostr/nostr.dart' as nostr;
 import 'package:share_plus/share_plus.dart';
 
 import '../../shared/community/community_membership_provider.dart';
-import '../../shared/identity/npub.dart';
+import '../../shared/utils/string_utils.dart';
 import '../../shared/relay/relay.dart';
 
 /// The default lifetime of a newly minted community invite link.
@@ -113,18 +113,22 @@ class CommunityInviteDirectoryUser {
     if (display != null && display.isNotEmpty) return display;
     final nip05 = nip05Handle?.trim();
     if (nip05 != null && nip05.isNotEmpty) return nip05;
-    return truncateNpub(pubkey);
+    return shortPubkey(pubkey);
   }
 
   /// A supporting identity label distinct from [label].
   String get secondaryLabel {
     final nip05 = nip05Handle?.trim();
     if (nip05 != null && nip05.isNotEmpty && nip05 != label) return nip05;
+    // The primary label is already the compact key when no name or NIP-05
+    // exists; a second key-shaped line would only duplicate it.
     final display = displayName?.trim();
-    return display != null && display.isNotEmpty ? truncateNpub(pubkey) : '';
+    return display != null && display.isNotEmpty ? shortPubkey(pubkey) : '';
   }
 
-  /// Avatar initial keyed to the hex public key when unnamed.
+  /// Avatar initial — name-derived when available, otherwise keyed to the
+  /// hex public key so unnamed identities keep distinct initials (a compact
+  /// npub would render `N` for everyone).
   String get initial {
     final display = displayName?.trim();
     if (display != null && display.isNotEmpty) return display[0].toUpperCase();

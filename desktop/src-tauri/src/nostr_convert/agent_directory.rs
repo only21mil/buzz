@@ -174,7 +174,6 @@ fn relay_agent_from_managed_policy(agent_pubkey: &str, event: &Event) -> Option<
 /// Build the relay agent directory from owner-authenticated managed-agent
 /// records. A kind:30177 event is accepted only when its author matches the
 /// owner cryptographically declared by the agent's latest kind:0 NIP-OA tag.
-#[cfg(test)]
 pub fn relay_agents_from_managed_agent_events(
     managed_agent_events: &[Event],
     profile_events: &[Event],
@@ -189,40 +188,11 @@ pub fn relay_agents_from_managed_agent_events(
 
 /// Build a pubkey-to-channel-id candidate map from relay-signed membership
 /// events. Known agent identities need not have the cosmetic `bot` role;
-/// otherwise the relay's independent `bot` identity tags or legacy bot roles
-/// seed discovery. These tags grant no ownership or response permission.
-#[cfg(test)]
+/// otherwise only explicit bot tags seed discovery.
 pub fn member_agent_channel_ids_from_events(
     events: &[Event],
     relay_pubkey: &str,
     known_agent_pubkeys: &std::collections::HashSet<String>,
-) -> HashMap<String, Vec<String>> {
-    membership_channels(events, relay_pubkey, known_agent_pubkeys, None, None)
-}
-
-/// Verify membership for this viewer and destination, independently of relay filters.
-pub fn member_agent_channel_ids_for_viewer(
-    events: &[Event],
-    relay_pubkey: &str,
-    known_agent_pubkeys: &std::collections::HashSet<String>,
-    viewer_pubkey: &str,
-    channel_id: Option<&str>,
-) -> HashMap<String, Vec<String>> {
-    membership_channels(
-        events,
-        relay_pubkey,
-        known_agent_pubkeys,
-        Some(viewer_pubkey),
-        channel_id,
-    )
-}
-
-fn membership_channels(
-    events: &[Event],
-    relay_pubkey: &str,
-    known_agent_pubkeys: &std::collections::HashSet<String>,
-    viewer_pubkey: Option<&str>,
-    channel_id: Option<&str>,
 ) -> HashMap<String, Vec<String>> {
     let mut latest: HashMap<String, &Event> = HashMap::new();
     for event in events {
@@ -243,22 +213,7 @@ fn membership_channels(
         }
     }
     let mut channel_ids: HashMap<String, BTreeSet<String>> = HashMap::new();
-    for (member_channel_id, event) in latest {
-        if channel_id.is_some_and(|destination| destination != member_channel_id)
-            || viewer_pubkey.is_some_and(|viewer| {
-                !tags_named(event, "p").any(|tag| {
-                    tag.get(1)
-                        .is_some_and(|key| key.eq_ignore_ascii_case(viewer))
-                })
-            })
-        {
-            continue;
-        }
-        let relay_agent_pubkeys: std::collections::HashSet<_> = tags_named(event, "bot")
-            .filter_map(|tag| tag.get(1))
-            .filter_map(|key| nostr::PublicKey::from_hex(key).ok())
-            .map(|key| key.to_hex())
-            .collect();
+    for (channel_id, event) in latest {
         for tag in tags_named(event, "p") {
             let Some(pubkey) = tag
                 .get(1)
@@ -268,7 +223,6 @@ fn membership_channels(
             };
             let pubkey = pubkey.to_hex();
             if tag.get(3).map(String::as_str) != Some("bot")
-                && !relay_agent_pubkeys.contains(&pubkey)
                 && !known_agent_pubkeys.contains(&pubkey)
             {
                 continue;
@@ -276,7 +230,7 @@ fn membership_channels(
             channel_ids
                 .entry(pubkey)
                 .or_default()
-                .insert(member_channel_id.clone());
+                .insert(channel_id.to_string());
         }
     }
 

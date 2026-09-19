@@ -10,8 +10,8 @@ import '../../shared/widgets/avatar_image.dart';
 import '../channels/channel_detail_page.dart';
 import '../channels/channel_management_provider.dart';
 import '../channels/message_content.dart';
-import '../../shared/identity/npub.dart';
 import '../../shared/profile/user_cache_provider.dart';
+import '../../shared/utils/string_utils.dart';
 import '../profile/user_profile_sheet.dart';
 import 'compose_note_page.dart';
 import 'pulse_actions.dart';
@@ -44,7 +44,7 @@ class NoteCard extends HookConsumerWidget {
     final profile =
         ref.watch(userCacheProvider.select((cache) => cache[pubkey])) ??
         ref.read(userCacheProvider.notifier).get(pubkey);
-    final displayName = profile?.label ?? truncateNpub(pubkey);
+    final displayName = profile?.label ?? shortPubkey(pubkey);
     final effectiveUpvoted =
         pendingUpvote.value ?? reaction.reactedByCurrentUser;
     final effectiveCount = _effectiveCount(reaction, pendingUpvote.value);
@@ -71,12 +71,16 @@ class NoteCard extends HookConsumerWidget {
               radius: 18,
               backgroundColor: context.colors.primaryContainer,
               fallback: Text(
+                // Name-derived when the profile is cached; keyed to the hex
+                // public key when it isn't, so the compact-npub fallback
+                // label doesn't render `N` for every unnamed author.
                 profile?.initial ??
                     (pubkey.isNotEmpty ? pubkey[0].toUpperCase() : '?'),
                 style: context.textTheme.labelMedium?.copyWith(
                   color: context.colors.onPrimaryContainer,
                 ),
               ),
+              isAgent: profile?.ownerPubkey != null,
             ),
           ),
           const SizedBox(width: Grid.xs),
@@ -314,9 +318,12 @@ class _ActionButton extends StatelessWidget {
 String _shareUri(UserNote note) =>
     'nostr:${nostr.Nip19.encodeShareableIdentifiers(prefix: nostr.Nip19Prefix.nevent, data: note.id, author: note.pubkey, kind: 1)}';
 
+/// Compact label for a note's reply target: the parent author's public key
+/// (npub form) when known, otherwise the parent event id. Event ids are not
+/// public keys — they stay hex-truncated and out of the npub contract.
 String _replyTargetLabel(UserNote note) {
   final author = note.replyParentAuthor;
-  if (author != null) return truncateNpub(author);
+  if (author != null) return shortPubkey(author);
   final eventId = note.replyParentId!;
   return eventId.length <= 8 ? eventId : '${eventId.substring(0, 8)}…';
 }

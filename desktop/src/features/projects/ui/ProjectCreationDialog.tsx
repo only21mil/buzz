@@ -4,13 +4,13 @@ import { toast } from "sonner";
 import { useCreateProjectMutation } from "@/features/projects/useCreateProject";
 import { CreateProjectDialog } from "@/features/projects/ui/CreateProjectDialog";
 
-/** Shared creation flow for the populated and first-run project views. */
+/** Shared project-creation flow for populated and first-run project views. */
 export function ProjectCreationDialog({
   onCreated,
   onOpenChange,
   open,
 }: {
-  onCreated: () => void;
+  onCreated?: () => void;
   onOpenChange: (open: boolean) => void;
   open: boolean;
 }) {
@@ -23,6 +23,7 @@ export function ProjectCreationDialog({
       isCreating={createProjectMutation.isPending}
       onCreate={async (input) => {
         const result = await createProjectMutation.mutateAsync(input);
+        onCreated?.();
         if (result.compatibilityWarning) {
           toast.warning("Created as a standalone project", {
             description: result.compatibilityWarning,
@@ -30,7 +31,6 @@ export function ProjectCreationDialog({
         } else {
           toast.success(`Project "${result.project.name}" created.`);
         }
-        onCreated();
       }}
       onOpenChange={onOpenChange}
       open={open}

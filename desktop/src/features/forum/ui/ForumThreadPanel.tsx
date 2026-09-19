@@ -28,6 +28,7 @@ type ForumThreadPanelProps = {
   isLoading: boolean;
   isSendingReply: boolean;
   channelId: string;
+  postId: string;
   currentPubkey?: string;
   profiles?: UserProfileLookup;
   onBack: () => void;
@@ -77,6 +78,8 @@ function ReplyRow({
   });
   const replyAvatarUrl =
     profiles?.[reply.pubkey.toLowerCase()]?.avatarUrl ?? null;
+  const replyAuthorIsAgent =
+    profiles?.[reply.pubkey.toLowerCase()]?.isAgent === true;
   const showDelete = onDelete && canDeleteReply(reply, currentPubkey);
   const {
     mentionNames: replyMentionNames,
@@ -89,14 +92,19 @@ function ReplyRow({
       data-forum-event-id={reply.eventId}
     >
       <div className="flex items-center gap-2">
-        <UserProfilePopover pubkey={reply.pubkey}>
+        <UserProfilePopover
+          pubkey={reply.pubkey}
+          role={replyAuthorIsAgent ? "bot" : undefined}
+        >
           <button
             className="flex items-center gap-2 rounded-lg focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
             type="button"
           >
             <UserAvatar
+              accent={replyAuthorIsAgent}
               avatarUrl={replyAvatarUrl}
               displayName={replyAuthorLabel}
+              shape={replyAuthorIsAgent ? "squircle" : "circle"}
               size="sm"
             />
             <span className="text-sm font-medium text-foreground hover:underline">
@@ -139,6 +147,7 @@ export function ForumThreadPanel({
   isLoading,
   isSendingReply,
   channelId,
+  postId,
   currentPubkey,
   profiles,
   onBack,
@@ -212,6 +221,8 @@ export function ForumThreadPanel({
   });
   const postAvatarUrl =
     profiles?.[post.pubkey.toLowerCase()]?.avatarUrl ?? null;
+  const postAuthorIsAgent =
+    profiles?.[post.pubkey.toLowerCase()]?.isAgent === true;
 
   return (
     <div className={cn("flex h-full flex-col", channelChrome.contentPadding)}>
@@ -241,14 +252,19 @@ export function ForumThreadPanel({
           data-forum-event-id={post.eventId}
         >
           <div className="flex items-center gap-2">
-            <UserProfilePopover pubkey={post.pubkey}>
+            <UserProfilePopover
+              pubkey={post.pubkey}
+              role={postAuthorIsAgent ? "bot" : undefined}
+            >
               <button
                 className="flex items-center gap-2 rounded-xl focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
                 type="button"
               >
                 <UserAvatar
+                  accent={postAuthorIsAgent}
                   avatarUrl={postAvatarUrl}
                   displayName={postAuthorLabel}
+                  shape={postAuthorIsAgent ? "squircle" : "circle"}
                 />
                 <span className="text-sm font-semibold text-foreground hover:underline">
                   {postAuthorLabel}
@@ -320,6 +336,7 @@ export function ForumThreadPanel({
         <ForumComposer
           channelId={channelId}
           channelType="forum"
+          draftKey={`thread:${postId}`}
           isSending={isSendingReply}
           onSubmit={onReply}
           placeholder="Reply to this post..."

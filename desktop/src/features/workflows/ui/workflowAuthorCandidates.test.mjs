@@ -9,7 +9,6 @@ import {
   nextWorkflowAuthorIndex,
   normalizeAuthorPubkey,
   parseDirectAuthorInput,
-  safeWorkflowProfiles,
 } from "./workflowAuthorCandidates.ts";
 
 const A = "a".repeat(64);
@@ -144,29 +143,4 @@ test("profile enrichment updates matching presentation without reordering", () =
   assert.equal(enriched[1].ownerPubkey, B);
   assert.equal(enriched[1].isAgent, true);
   assert.strictEqual(enriched[2], candidates[2]);
-});
-
-test("malformed profile fields preserve canonical identities and useful discovery text", () => {
-  const candidates = mergeAuthorCandidateSources([
-    [null, { pubkey: 42 }, { pubkey: A, displayName: "Known A" }],
-  ]);
-  const profiles = {
-    [A]: {
-      displayName: 42,
-      name: {},
-      avatarUrl: false,
-      nip05Handle: [],
-      ownerPubkey: null,
-    },
-    [B]: null,
-  };
-  assert.deepEqual(safeWorkflowProfiles(null), {});
-  const safe = safeWorkflowProfiles(profiles);
-  assert.equal(safe[A].displayName, null);
-  assert.equal(safe[B], undefined);
-  assert.equal(
-    enrichAuthorCandidates(candidates, profiles)[0].displayName,
-    "Known A",
-  );
-  assert.equal(enrichAuthorCandidates(candidates, profiles)[0].pubkey, A);
 });

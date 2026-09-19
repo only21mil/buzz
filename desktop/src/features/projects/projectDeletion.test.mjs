@@ -34,19 +34,12 @@ test("project deletion capability rejects unrelated viewers", () => {
 
 test("project deletion tombstone targets only the container and dominates its head", () => {
   assert.deepEqual(
-    buildProjectDeletionTemplate(
-      project,
-      { id: "1".repeat(64), kind: 30621, created_at: 101 },
-      100,
-    ),
+    buildProjectDeletionTemplate(project, { created_at: 101 }, 100),
     {
       kind: 5,
       content: "Delete project Platform",
       createdAt: 102,
-      tags: [
-        ["e", "1".repeat(64)],
-        ["k", "30621"],
-      ],
+      tags: [["a", PROJECT_ADDRESS]],
     },
   );
 });

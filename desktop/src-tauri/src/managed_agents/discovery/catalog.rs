@@ -1,5 +1,13 @@
-//! Built-in runtime launch contracts.
-use super::*;
+//! The known-ACP-runtime catalog. Extracted from `discovery.rs` as pure data
+//! (mirroring `presets::PRESET_HARNESSES`) so the module stays under the
+//! file-size ratchet. The `windows_install_command!` macro is in textual scope
+//! here because this module is declared after `#[macro_use] mod windows_install`
+//! in the parent.
+
+use super::runtime_metadata::{
+    KnownAcpRuntime, BUZZ_AGENT_EFFORT_VALUES, GOOSE_EFFORT_NORMALIZATION,
+};
+use super::{BUZZ_AGENT_AVATAR_URL, CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL, GOOSE_AVATAR_URL};
 
 pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
     KnownAcpRuntime {
@@ -30,8 +38,8 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         config_file_format: Some("yaml"),
         supports_acp_native_config: true,
         thinking_env_var: Some("GOOSE_THINKING_EFFORT"),
-        effort_normalization: Some(&runtime_metadata::GOOSE_EFFORT_NORMALIZATION),
-        effort_accepted_values: None,
+        effort_normalization: Some(&GOOSE_EFFORT_NORMALIZATION),
+        effort_accepted_values: None, // goose: validated via effort_normalization
         max_tokens_env_var: Some("GOOSE_MAX_TOKENS"),
         context_limit_env_var: Some("GOOSE_CONTEXT_LIMIT"),
         max_rounds_env_var: None,
@@ -65,8 +73,8 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         config_file_format: Some("json"),
         supports_acp_native_config: false,
         thinking_env_var: None,
-        effort_normalization: None,
-        effort_accepted_values: None,
+        effort_normalization: None, // claude: canonical routes through BUZZ_ACP_EFFORT_LEVEL (ACP startup)
+        effort_accepted_values: None, // claude: adapter accepts any value over BUZZ_ACP_EFFORT_LEVEL
         max_tokens_env_var: None,
         context_limit_env_var: None,
         max_rounds_env_var: None,
@@ -100,8 +108,8 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         config_file_format: Some("toml"),
         supports_acp_native_config: false,
         thinking_env_var: None,
-        effort_normalization: None,
-        effort_accepted_values: None,
+        effort_normalization: None, // codex: canonical routes through BUZZ_ACP_EFFORT_LEVEL (ACP startup)
+        effort_accepted_values: None, // codex: adapter accepts any value over BUZZ_ACP_EFFORT_LEVEL
         max_tokens_env_var: None,
         context_limit_env_var: None,
         max_rounds_env_var: None,
@@ -136,8 +144,8 @@ pub(crate) const KNOWN_ACP_RUNTIMES: &[KnownAcpRuntime] = &[
         config_file_format: None,
         supports_acp_native_config: false,
         thinking_env_var: Some("BUZZ_AGENT_THINKING_EFFORT"),
-        effort_normalization: None,
-        effort_accepted_values: Some(runtime_metadata::BUZZ_AGENT_EFFORT_VALUES),
+        effort_normalization: None, // buzz-agent: per-model catalog; see getProviderEffortConfig() in TS
+        effort_accepted_values: Some(BUZZ_AGENT_EFFORT_VALUES), // buzz-agent: parse_thinking_effort's accepted set
         max_tokens_env_var: Some("BUZZ_AGENT_MAX_OUTPUT_TOKENS"),
         context_limit_env_var: Some("BUZZ_AGENT_MAX_CONTEXT_TOKENS"),
         max_rounds_env_var: Some("BUZZ_AGENT_MAX_ROUNDS"),

@@ -129,8 +129,8 @@ impl TtsPipeline {
     /// Signal the worker thread to stop.
     pub fn shutdown(&self) {
         eprintln!("buzz-desktop: tts stage=cancellation reason=shutdown route_id=0");
-        self.shutdown.store(true, Ordering::Release);
         self.broadcasters.shutdown();
+        self.shutdown.store(true, Ordering::Release);
     }
 
     /// Returns `true` if the worker thread has exited (init failure, crash, or normal exit).

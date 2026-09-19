@@ -20,10 +20,7 @@ import {
   useObserverEvents,
 } from "@/features/agents/ui/useObserverEvents.ts";
 import { resolveProfileActivityAgent } from "./profileActivityAgent.ts";
-import {
-  resetProfileActivityFeedScopes,
-  useProfileActivityFeedScope,
-} from "./profileActivityFeedScope.ts";
+import { useProfileActivityFeedScope } from "./profileActivityFeedScope.ts";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   url: "http://localhost",
@@ -250,17 +247,4 @@ test("idle session readers and profile scope share history without a live subscr
   assert.equal(result.current.observer.events.length, 2);
   assert.equal(result.current.transcript.length, 1);
   assert.equal(result.current.observer.connectionState, "idle");
-});
-
-test("community reset releases stable profile scope snapshots", () => {
-  const { result, rerender } = renderHook(() =>
-    useScope(resolveAgent("unknown")),
-  );
-  const previous = result.current;
-  rerender();
-  assert.equal(result.current, previous);
-  resetProfileActivityFeedScopes();
-  rerender();
-  assert.deepEqual(result.current, previous);
-  assert.notEqual(result.current, previous);
 });

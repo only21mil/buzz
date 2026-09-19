@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 
 fn make_definition(slug: &str) -> ManagedAgentRecord {
     ManagedAgentRecord {
-        effort_level: None,
+        session_policy: Default::default(),
+        description: None,
         pubkey: String::new(),
         slug: Some(slug.to_string()),
         name: slug.to_string(),
@@ -40,6 +41,7 @@ fn make_definition(slug: &str) -> ManagedAgentRecord {
         runtime_pid: None,
         backend: BackendKind::Local,
         backend_agent_id: None,
+        provider_policy_pending: false,
         provider_binary_path: None,
         team_id: None,
         persona_team_dir: None,
@@ -66,6 +68,7 @@ fn make_definition(slug: &str) -> ManagedAgentRecord {
         definition_respond_to_allowlist: vec![],
         definition_parallelism: None,
         relay_mesh: None,
+        effort_level: None,
     }
 }
 
@@ -78,6 +81,7 @@ fn make_snapshot(
         format: FORMAT_DISCRIMINATOR.to_string(),
         version: FORMAT_VERSION,
         definition: AgentSnapshotDefinition {
+            session_policy: Default::default(),
             name: "Test Agent".to_string(),
             source_is_builtin: false,
             system_prompt: Some("You are helpful.".to_string()),

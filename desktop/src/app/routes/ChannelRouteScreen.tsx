@@ -1,9 +1,11 @@
 import * as React from "react";
+import { useQueryClient } from "@tanstack/react-query";
 
 import type { SearchHighlightNavigation } from "@/app/navigation/searchHighlightNavigation";
 import { getCachedSearchHitEvent } from "@/app/navigation/searchHitEventCache";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useChannelsQuery } from "@/features/channels/hooks";
+import { useOpenChannelDirectoryQuery } from "@/features/channels/openChannelDirectory";
 import { ChannelScreen } from "@/features/channels/ui/ChannelScreen";
 import { HuddleStartingView } from "@/features/huddle/components/HuddleStartingView";
 import { huddleWindowChannelId } from "@/features/huddle/lib/huddleWindow";
@@ -12,6 +14,17 @@ import {
   isBroadcastReply,
 } from "@/features/messages/lib/threading";
 import { useProfileQuery } from "@/features/profile/hooks";
+import {
+  useProjectHomeForChannelQuery,
+  useProjectsQuery,
+} from "@/features/projects/hooks";
+import { findProjectHomeByChannelId } from "@/features/projects/lib/projectHomeChannel";
+import {
+  isProjectCollectionAuthoritative,
+  isProjectRelayValidated,
+  shouldUseScopedProjectHomeLookup,
+} from "@/features/projects/projectSnapshot";
+import { ProjectChannelHome } from "@/features/projects/ui/ProjectChannelHome";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { getEventById } from "@/shared/api/tauri";
 import type { RelayEvent } from "@/shared/api/types";
@@ -108,26 +121,50 @@ export function ChannelRouteScreen({
   targetThreadRootId,
 }: ChannelRouteScreenProps) {
   const isHuddleTranscript = huddleWindowChannelId() !== null;
+  const queryClient = useQueryClient();
   const { closeForumPost, goForumPost } = useAppNavigation();
   const channelsQuery = useChannelsQuery();
+  const projectsQuery = useProjectsQuery();
   const identityQuery = useIdentityQuery();
   const profileQuery = useProfileQuery();
   const channels = channelsQuery.data ?? [];
-  const activeChannel =
+  const memberChannel =
     channels.find((channel) => channel.id === channelId) ?? null;
+  // A deep link to a non-member open channel resolves nothing in the
+  // member-only poll list. Fall back to the discovery directory — but only for
+  // that case, so a normal in-membership route never triggers the all-open
+  // scan. React Query dedups the shared directory key across surfaces.
+  const needsDirectoryFallback =
+    !memberChannel && channelsQuery.isSuccess && !isHuddleTranscript;
+  const openDirectoryQuery = useOpenChannelDirectoryQuery({
+    enabled: needsDirectoryFallback,
+  });
+  const activeChannel =
+    memberChannel ??
+    openDirectoryQuery.data?.find((channel) => channel.id === channelId) ??
+    null;
+  const enumeratedProjectHome = findProjectHomeByChannelId(
+    channelId,
+    projectsQuery.data ?? [],
+  );
+  const projectCollectionIsAuthoritative =
+    isProjectCollectionAuthoritative(queryClient);
+  const projectHomeLookupQuery = useProjectHomeForChannelQuery(
+    channelId,
+    shouldUseScopedProjectHomeLookup({
+      collectionIsAuthoritative: projectCollectionIsAuthoritative,
+      hasEnumeratedProjectHome: Boolean(enumeratedProjectHome),
+      isHuddleTranscript,
+    }),
+  );
+  const projectHome =
+    enumeratedProjectHome ?? projectHomeLookupQuery.data ?? null;
   const [targetMessageEvents, setTargetMessageEvents] = React.useState<
     RelayEvent[]
   >(() => {
     const cachedTarget = getCachedSearchHitEvent(targetMessageId);
     return cachedTarget ? [cachedTarget] : [];
   });
-  // True while the deep-linked target is still being fetched. The hydrated
-  // per-channel query cache can settle the timeline before `getEventById`
-  // resolves, and the thread-target sync must not treat that window as "head
-  // message gone" and close the thread.
-  const [isTargetFetchPending, setIsTargetFetchPending] = React.useState(() =>
-    Boolean((targetMessageId || targetThreadRootId) && !selectedPostId),
-  );
   const [activeSearchHighlight, setActiveSearchHighlight] =
     React.useState<SearchHighlightNavigation | null>(searchHighlight ?? null);
   const appliedSearchActivationIdRef = React.useRef<string | null>(
@@ -200,13 +237,11 @@ export function ChannelRouteScreen({
     // param-clear blanks the timeline. Resetting on channel / forum-post change
     // is handled by the effect below; here we only fetch when there's a target.
     if ((!targetMessageId && !targetThreadRootId) || selectedPostId) {
-      setIsTargetFetchPending(false);
       return () => {
         isCancelled = true;
       };
     }
 
-    setIsTargetFetchPending(true);
     const cachedTarget = getCachedSearchHitEvent(targetMessageId);
     if (cachedTarget) {
       setTargetMessageEvents((currentEvents) =>
@@ -236,7 +271,6 @@ export function ChannelRouteScreen({
           }
           return Array.from(eventsById.values());
         });
-        setIsTargetFetchPending(false);
       }
     });
 
@@ -245,7 +279,11 @@ export function ChannelRouteScreen({
     };
   }, [selectedPostId, targetMessageId, targetThreadRootId]);
 
-  if (channelsQuery.isPending && !activeChannel) {
+  if (
+    !activeChannel &&
+    (channelsQuery.isPending ||
+      (needsDirectoryFallback && openDirectoryQuery.isPending))
+  ) {
     if (isHuddleTranscript) {
       return <HuddleStartingView />;
     }
@@ -253,6 +291,19 @@ export function ChannelRouteScreen({
       <ViewLoadingFallback
         includeHeader
         kind={selectedPostId ? "forum" : "channel"}
+      />
+    );
+  }
+
+  if (projectHome && !isHuddleTranscript) {
+    return (
+      <ProjectChannelHome
+        allowRepositoryHealing={isProjectRelayValidated(projectHome)}
+        autoSendDraftKey={autoSendDraftKey}
+        project={projectHome}
+        projects={projectsQuery.data ?? [projectHome]}
+        targetMessageEvents={targetMessageEvents}
+        targetMessageId={targetMessageId}
       />
     );
   }
@@ -272,7 +323,6 @@ export function ChannelRouteScreen({
       selectedForumPostId={selectedPostId}
       targetForumReplyId={targetReplyId}
       targetMessageEvents={targetMessageEvents}
-      targetMessageEventsPending={isTargetFetchPending}
       targetMessageId={targetMessageId}
       targetSearchMessageId={activeSearchHighlight?.messageId}
       targetSearchQuery={activeSearchHighlight?.query}

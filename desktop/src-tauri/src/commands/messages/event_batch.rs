@@ -39,11 +39,7 @@ pub async fn get_event(event_id: String, state: State<'_, AppState>) -> Result<S
     .await?;
 
     let event = events
-        .iter()
-        .find(|event| {
-            event.id.to_hex() == event_id
-                && GET_EVENT_KINDS.contains(&u32::from(event.kind.as_u16()))
-        })
+        .first()
         .ok_or_else(|| "event not found".to_string())?;
     serde_json::to_string(event).map_err(|error| format!("serialize event: {error}"))
 }
@@ -85,13 +81,7 @@ pub async fn get_events(
             })],
         )
         .await?;
-        let requested_ids: HashSet<_> = event_ids.into_iter().collect();
         for event in events {
-            if !requested_ids.contains(&event.id.to_hex())
-                || !GET_EVENT_KINDS.contains(&u32::from(event.kind.as_u16()))
-            {
-                continue;
-            }
             events_by_id.entry(event.id).or_insert(event);
         }
     }

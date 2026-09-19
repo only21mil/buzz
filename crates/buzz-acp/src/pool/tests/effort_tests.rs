@@ -15,6 +15,9 @@ for line in sys.stdin:
   assert p['value']=='target'
   result={'configOptions':[{'id':'model-reasoning','category':'thought_level','options':[{'value':'high'}]}]}
  elif m=='session/set_config_option':
+  if p['value']=='wrong':
+   print(json.dumps({'jsonrpc':'2.0','id':r['id'],'error':{'code':-32602,'message':'unsupported effort'}}),flush=True)
+   continue
   assert p=={'sessionId':'s','configId':'model-reasoning','value':'high'},p
   result={'configOptions':[{'id':'model-reasoning','category':'thought_level','currentValue':'high','options':[{'value':'high'}]}]}
  else: raise Exception(m)
@@ -29,6 +32,7 @@ for line in sys.stdin:
         state: SessionState::default(),
         model_capabilities: None,
         desired_model: Some("target".into()),
+        pending_model_ack: None,
         model_overridden: false,
         agent_name: "test".into(),
         goose_system_prompt_supported: None,
@@ -53,22 +57,23 @@ async fn startup_effort_uses_post_model_advertised_id_and_reapplies_per_session(
 }
 
 #[tokio::test]
-async fn unsupported_effort_rejects_and_clear_makes_no_effort_request() {
+async fn unsupported_effort_keeps_session_and_clear_makes_no_effort_request() {
     let mut agent = fake_agent().await;
     let mut ctx = make_prompt_context_no_owner();
     ctx.startup_effort = Some("wrong".into());
-    assert!(matches!(
-        create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None).await,
-        Err(AcpError::AgentError { code: -32602, .. })
-    ));
+    assert!(
+        create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None)
+            .await
+            .is_ok()
+    );
     let probe = agent
         .acp
         .session_new_full("/", vec![], None, None)
         .await
         .unwrap();
     assert_eq!(
-        probe.raw["cleanupCount"], 1,
-        "rejected unregistered session must be deleted"
+        probe.raw["cleanupCount"], 0,
+        "adapter effort rejection must keep the usable session"
     );
     ctx.startup_effort = None;
     assert!(

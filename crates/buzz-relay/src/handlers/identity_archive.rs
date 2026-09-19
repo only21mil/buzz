@@ -357,7 +357,7 @@ fn enforce_request_auth_time_bounds(auth_tag_json: &str, created_at: u64) -> Res
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_postgres_tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag};
 
@@ -516,6 +516,190 @@ mod tests {
             .await
             .expect("insert test community");
         TenantContext::resolved(CommunityId::from_uuid(id), host)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL via postgres-test-local.py"]
+    async fn archival_snapshot_advances_timestamp_for_rapid_state_replacement() {
+        let pool = test_pool().await;
+        if sqlx::query("SELECT 1 FROM archived_identities LIMIT 1")
+            .execute(&pool)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let (state, _git_storage) = test_state(pool.clone()).await;
+        let tenant = seed_test_community(&pool).await;
+        let target_hex = Keys::generate().public_key().to_hex();
+        let request_id = "a".repeat(64);
+
+        state
+            .db
+            .archive(
+                tenant.community(),
+                &target_hex,
+                "self",
+                &target_hex,
+                None,
+                None,
+                &request_id,
+            )
+            .await
+            .expect("archive identity");
+        publish_nipia_archival_list(&tenant, &state)
+            .await
+            .expect("publish archived snapshot");
+        let archived_snapshot = state
+            .db
+            .query_events(&EventQuery {
+                kinds: Some(vec![buzz_core::kind::KIND_IA_ARCHIVED_LIST as i32]),
+                pubkey: Some(state.relay_keypair.public_key().to_bytes().to_vec()),
+                global_only: true,
+                limit: Some(1),
+                ..EventQuery::for_community(tenant.community())
+            })
+            .await
+            .expect("query archived snapshot")
+            .into_iter()
+            .next()
+            .expect("archived snapshot exists");
+
+        state
+            .db
+            .unarchive(tenant.community(), &target_hex)
+            .await
+            .expect("unarchive identity");
+        publish_nipia_archival_list(&tenant, &state)
+            .await
+            .expect("publish unarchived snapshot");
+        let final_snapshot = state
+            .db
+            .query_events(&EventQuery {
+                kinds: Some(vec![buzz_core::kind::KIND_IA_ARCHIVED_LIST as i32]),
+                pubkey: Some(state.relay_keypair.public_key().to_bytes().to_vec()),
+                global_only: true,
+                limit: Some(1),
+                ..EventQuery::for_community(tenant.community())
+            })
+            .await
+            .expect("query final snapshot")
+            .into_iter()
+            .next()
+            .expect("final snapshot exists");
+
+        assert!(
+            final_snapshot.event.created_at > archived_snapshot.event.created_at,
+            "replacement snapshots must not rely on random same-second event-id ordering"
+        );
+        assert!(
+            !final_snapshot.event.tags.iter().any(|tag| {
+                let fields = tag.as_slice();
+                fields.first().map(String::as_str) == Some("p")
+                    && fields.get(1).map(String::as_str) == Some(target_hex.as_str())
+            }),
+            "final snapshot must reflect the canonical empty archive set"
+        );
+    }
+
+    /// Carl review 4954871389 test (b): a stale (pre-unarchive) publisher whose
+    /// canonical read predates the unarchive must not strand `target` in the
+    /// authoritative 13535. Deterministic via the `publish_test_hooks` barrier:
+    /// the stale publisher is held right after it reads `{target}`; the
+    /// unarchive and the compliant `{}` publish then run; only then is the stale
+    /// publisher released to attempt its write. Its post-insert
+    /// `snapshot_is_current` drift check sees canonical `{}` ≠ its `{target}`
+    /// snapshot, so it rebuilds and converges. RED-on-revert: replace that guard
+    /// with `let snapshot_is_current = true;` and the released stale publisher
+    /// commits `{target}` last, stranding the unarchived identity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires disposable PostgreSQL via postgres-test-local.py"]
+    async fn concurrent_archival_publishers_converge_on_canonical_state() {
+        let pool = test_pool().await;
+        if sqlx::query("SELECT 1 FROM archived_identities LIMIT 1")
+            .execute(&pool)
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let (state, _git_storage) = test_state(pool.clone()).await;
+        let tenant = seed_test_community(&pool).await;
+        let target_hex = Keys::generate().public_key().to_hex();
+        let request_id = "b".repeat(64);
+
+        // canonical -> {target}
+        state
+            .db
+            .archive(
+                tenant.community(),
+                &target_hex,
+                "self",
+                &target_hex,
+                None,
+                None,
+                &request_id,
+            )
+            .await
+            .expect("archive identity");
+
+        // Arm the barrier, then spawn the stale publisher. It reads the
+        // `{target}` view, reaches the hook, and blocks until released.
+        let (reached_hook, release) =
+            crate::handlers::side_effects::publish_test_hooks::arm(tenant.community());
+        let stale_tenant = tenant.clone();
+        let stale_state = state.clone();
+        let stale_publisher =
+            tokio::spawn(
+                async move { publish_nipia_archival_list(&stale_tenant, &stale_state).await },
+            );
+        // Deterministically wait until the stale publisher has read `{target}`.
+        reached_hook
+            .await
+            .expect("stale publisher reached the post-list_archived hook");
+
+        // canonical -> {} while the stale publisher holds its `{target}` view.
+        state
+            .db
+            .unarchive(tenant.community(), &target_hex)
+            .await
+            .expect("unarchive identity");
+        // Production publishes after every archive-state mutation; do the same.
+        publish_nipia_archival_list(&tenant, &state)
+            .await
+            .expect("publish after unarchive");
+
+        // Release the stale publisher: it must detect drift and converge on `{}`.
+        release.notify_one();
+        stale_publisher
+            .await
+            .expect("join stale publisher")
+            .expect("stale publisher converges without error");
+
+        let final_snapshot = state
+            .db
+            .query_events(&EventQuery {
+                kinds: Some(vec![buzz_core::kind::KIND_IA_ARCHIVED_LIST as i32]),
+                pubkey: Some(state.relay_keypair.public_key().to_bytes().to_vec()),
+                global_only: true,
+                limit: Some(1),
+                ..EventQuery::for_community(tenant.community())
+            })
+            .await
+            .expect("query final snapshot")
+            .into_iter()
+            .next()
+            .expect("final snapshot exists");
+
+        assert!(
+            !final_snapshot.event.tags.iter().any(|tag| {
+                let fields = tag.as_slice();
+                fields.first().map(String::as_str) == Some("p")
+                    && fields.get(1).map(String::as_str) == Some(target_hex.as_str())
+            }),
+            "a stale publisher must converge on the canonical empty set, never \
+             strand the unarchived identity in the authoritative 13535"
+        );
     }
 
     #[tokio::test]

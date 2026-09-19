@@ -11,7 +11,7 @@ export type MessageComposerEditTarget = {
   author: string;
   body: string;
   id: string;
-  isThreadReply?: boolean;
+  isThreadReply: boolean;
   /**
    * NIP-92 imeta attachments on the original event, in tag order. Loaded
    * into the composer's pending-imeta state on edit-open so the user sees

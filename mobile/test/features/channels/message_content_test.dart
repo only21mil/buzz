@@ -1,24 +1,29 @@
 import 'dart:async';
+
+import 'package:flutter/material.dart';
 import 'package:flutter/semantics.dart';
 import 'package:flutter/services.dart';
-import 'package:http/http.dart' as http;
-import 'package:just_audio/just_audio.dart' as audio;
-import 'package:buzz/features/channels/voice_note_attachment.dart';
-import 'package:buzz/features/channels/voice_note_waveform.dart';
-import 'package:buzz/features/channels/voice_note_recording.dart';
-import 'package:buzz/shared/widgets/buzz_loading_indicator.dart';
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:hooks_riverpod/misc.dart';
+import 'package:http/http.dart' as http;
+import 'package:just_audio/just_audio.dart' as audio;
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 import 'package:nostr/nostr.dart' as nostr;
+import 'package:buzz/features/channels/channel.dart';
+import 'package:buzz/features/channels/channels_provider.dart';
 import 'package:buzz/features/channels/message_content.dart';
 import 'package:buzz/features/channels/media_viewer_page.dart';
+import 'package:buzz/features/channels/voice_note_attachment.dart';
+import 'package:buzz/features/channels/voice_note_waveform.dart';
+import 'package:buzz/features/channels/voice_note_recording.dart';
+import 'package:buzz/shared/deeplink/deep_link.dart';
+import 'package:buzz/shared/deeplink/pending_deep_link_provider.dart';
 import 'package:buzz/shared/emoji/emoji_only.dart';
 import 'package:buzz/shared/relay/relay.dart';
 import 'package:buzz/shared/theme/theme.dart';
+import 'package:buzz/shared/widgets/buzz_loading_indicator.dart';
 
 Widget _testable(
   Widget child, {
@@ -40,7 +45,8 @@ Widget _testable(
           data: MediaQuery.of(
             context,
           ).copyWith(disableAnimations: disableAnimations),
-          child: Scaffold(body: child),
+          // The app states its code style here, above the navigator.
+          child: AppMarkdownTheme(child: Scaffold(body: child)),
         ),
       ),
     ),
@@ -313,19 +319,31 @@ bool _spanHasStyle(
   String text,
   bool Function(TextStyle) check,
 ) {
-  var found = false;
-  root.visitChildren((span) {
-    if (span is TextSpan &&
-        span.text != null &&
+  bool visit(InlineSpan span, TextStyle? inheritedStyle) {
+    if (span is! TextSpan) return false;
+    final effectiveStyle = inheritedStyle?.merge(span.style) ?? span.style;
+    if (span.text != null &&
         span.text!.contains(text) &&
-        span.style != null &&
-        check(span.style!)) {
-      found = true;
-      return false; // stop visiting
+        effectiveStyle != null &&
+        check(effectiveStyle)) {
+      return true;
     }
-    return true;
-  });
-  return found;
+    for (final child in span.children ?? const <InlineSpan>[]) {
+      if (visit(child, effectiveStyle)) return true;
+    }
+    return false;
+  }
+
+  return visit(root, null);
+}
+
+class _TestChannelsNotifier extends ChannelsNotifier {
+  _TestChannelsNotifier(this.channels);
+
+  final Future<List<Channel>> channels;
+
+  @override
+  Future<List<Channel>> build() => channels;
 }
 
 void main() {
@@ -454,46 +472,6 @@ void main() {
       expect(openedFilename, 'report.pdf');
       expect(openedHeaders?['Authorization'], startsWith('Nostr '));
     });
-
-    for (final filename in ['report.html', 'report.htm', 'REPORT.HTML']) {
-      testWidgets(
-        'HTML stays an explicit authenticated file action: $filename',
-        (tester) async {
-          final url = 'https://relay.example/media/${'a' * 64}.html';
-          var calls = 0;
-          final auth = MediaGetAuthService(
-            baseUrl: 'https://relay.example',
-            nsec: nostr.Keys.generate().nsec,
-          );
-          await tester.pumpWidget(
-            _testable(
-              MessageContent(content: '[$filename]($url)'),
-              overrides: [
-                mediaGetAuthServiceProvider.overrideWithValue(auth),
-                openDownloadedFileProvider.overrideWithValue((
-                  openedUrl,
-                  headers,
-                  name,
-                ) async {
-                  calls++;
-                  expect(openedUrl, url);
-                  expect(name, filename);
-                  expect(headers['Authorization'], startsWith('Nostr '));
-                  throw Exception('No external HTML handler');
-                }),
-              ],
-            ),
-          );
-          expect(calls, 0);
-          expect(find.byType(Image), findsNothing);
-          await tester.tap(find.text(filename));
-          await tester.pump();
-          expect(calls, 1);
-          expect(find.text('Could not open attachment'), findsOneWidget);
-          expect(find.byType(Image), findsNothing);
-        },
-      );
-    }
 
     test('buildImageViewerRoute uses modal-style page route builder', () {
       final route = buildImageViewerRoute(
@@ -714,6 +692,333 @@ void main() {
         expect(allText, isNot(contains('(https://example.com)')));
       });
 
+      testWidgets('renders and routes a buzz message link', (tester) async {
+        const url =
+            'buzz://message?channel=580ca78b-9dae-46f3-8854-bd671853ba32&id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb&thread=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd';
+
+        await tester.pumpWidget(
+          _testable(const MessageContent(content: '[Open message]($url)')),
+        );
+
+        expect(find.text('Open message'), findsOneWidget);
+        await tester.tap(find.text('Open message'));
+        await tester.pump();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const MessageDeepLink(
+            channelId: '580ca78b-9dae-46f3-8854-bd671853ba32',
+            messageId:
+                'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+            threadRootId:
+                'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+          ),
+        );
+      });
+
+      testWidgets('renders and routes bare Buzz message links', (tester) async {
+        const url =
+            'buzz://message?channel=580ca78b-9dae-46f3-8854-bd671853ba32&id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+
+        await tester.pumpWidget(
+          _testable(const MessageContent(content: 'See $url now')),
+        );
+
+        expect(find.byKey(ValueKey('buzz-link-chip:$url')), findsOneWidget);
+        await tester.tap(find.byKey(ValueKey('buzz-link-chip:$url')));
+        await tester.pump();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const MessageDeepLink(
+            channelId: '580ca78b-9dae-46f3-8854-bd671853ba32',
+            messageId:
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          ),
+        );
+      });
+
+      testWidgets('keeps Markdown delimiters outside bare Buzz links', (
+        tester,
+      ) async {
+        const url =
+            'buzz://message?channel=580ca78b-9dae-46f3-8854-bd671853ba32&id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+
+        await tester.pumpWidget(
+          _testable(const MessageContent(content: '**$url**. and _${url}_')),
+        );
+
+        expect(find.byKey(ValueKey('buzz-link-chip:$url')), findsNWidgets(2));
+
+        await tester.tap(find.byKey(ValueKey('buzz-link-chip:$url')).first);
+        await tester.pump();
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const MessageDeepLink(
+            channelId: '580ca78b-9dae-46f3-8854-bd671853ba32',
+            messageId:
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          ),
+        );
+      });
+
+      testWidgets('keeps non-adjacent Markdown delimiters outside links', (
+        tester,
+      ) async {
+        const url =
+            'buzz://message?channel=580ca78b-9dae-46f3-8854-bd671853ba32&id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+
+        await tester.pumpWidget(
+          _testable(
+            const MessageContent(
+              content:
+                  '*join $url* and **open $url** and '
+                  '~~visit $url~~ and **_${url}_**.',
+            ),
+          ),
+        );
+
+        expect(find.byKey(ValueKey('buzz-link-chip:$url')), findsNWidgets(4));
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        for (final link
+            in find.byKey(ValueKey('buzz-link-chip:$url')).evaluate()) {
+          await tester.tap(find.byWidget(link.widget));
+          await tester.pump();
+          expect(
+            container.read(pendingDeepLinkProvider),
+            const MessageDeepLink(
+              channelId: '580ca78b-9dae-46f3-8854-bd671853ba32',
+              messageId:
+                  'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+            ),
+          );
+          container.read(pendingDeepLinkProvider.notifier).state = null;
+        }
+      });
+
+      testWidgets('excludes sentence punctuation from bare Buzz links', (
+        tester,
+      ) async {
+        const messageUrl =
+            'buzz://message?channel=580ca78b-9dae-46f3-8854-bd671853ba32&id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+        const joinUrl =
+            'buzz://join?relay=wss%3A%2F%2Frelay.example.com&code=invite-1';
+
+        await tester.pumpWidget(
+          _testable(
+            const MessageContent(content: 'See $messageUrl. Then $joinUrl!'),
+          ),
+        );
+
+        expect(
+          find.byKey(ValueKey('buzz-link-chip:$messageUrl')),
+          findsOneWidget,
+        );
+        expect(find.text(joinUrl), findsOneWidget);
+        expect(_allRichText(tester), contains('See \u{FFFC}. Then \u{FFFC}!'));
+
+        await tester.tap(find.byKey(ValueKey('buzz-link-chip:$messageUrl')));
+        await tester.pump();
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const MessageDeepLink(
+            channelId: '580ca78b-9dae-46f3-8854-bd671853ba32',
+            messageId:
+                'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+          ),
+        );
+
+        container.read(pendingDeepLinkProvider.notifier).consume();
+        await tester.tap(find.text(joinUrl));
+        await tester.pump();
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const InviteDeepLink(
+            relayUrl: 'wss://relay.example.com',
+            code: 'invite-1',
+          ),
+        );
+      });
+
+      testWidgets('renders and routes autolinked Buzz thread links', (
+        tester,
+      ) async {
+        const url =
+            'buzz://message?channel=580ca78b-9dae-46f3-8854-bd671853ba32&id=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc&thread=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd';
+
+        await tester.pumpWidget(
+          _testable(const MessageContent(content: '<$url>')),
+        );
+
+        expect(find.byKey(ValueKey('buzz-link-chip:$url')), findsOneWidget);
+        await tester.tap(find.byKey(ValueKey('buzz-link-chip:$url')));
+        await tester.pump();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const MessageDeepLink(
+            channelId: '580ca78b-9dae-46f3-8854-bd671853ba32',
+            messageId:
+                'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+            threadRootId:
+                'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+          ),
+        );
+      });
+
+      testWidgets('renders and routes bare Buzz join links', (tester) async {
+        const url =
+            'buzz://join?relay=wss%3A%2F%2Frelay.example.com&code=invite-1';
+
+        await tester.pumpWidget(
+          _testable(const MessageContent(content: 'Join with $url')),
+        );
+
+        expect(find.text(url), findsOneWidget);
+        await tester.tap(find.text(url));
+        await tester.pump();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const InviteDeepLink(
+            relayUrl: 'wss://relay.example.com',
+            code: 'invite-1',
+          ),
+        );
+      });
+
+      testWidgets('renders and routes bare Buzz channel links', (tester) async {
+        const url = 'buzz://channel/580ca78b-9dae-46f3-8854-bd671853ba32';
+
+        await tester.pumpWidget(
+          _testable(const MessageContent(content: 'See $url now')),
+        );
+
+        expect(find.byKey(ValueKey('buzz-link-chip:$url')), findsOneWidget);
+        await tester.tap(find.byKey(ValueKey('buzz-link-chip:$url')));
+        await tester.pump();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const ChannelDeepLink(
+            channelId: '580ca78b-9dae-46f3-8854-bd671853ba32',
+          ),
+        );
+      });
+
+      testWidgets('renders and routes labeled Buzz channel links', (
+        tester,
+      ) async {
+        const url = 'buzz://channel/580ca78b-9dae-46f3-8854-bd671853ba32';
+
+        await tester.pumpWidget(
+          _testable(const MessageContent(content: '[Open channel]($url)')),
+        );
+
+        await tester.tap(find.text('Open channel'));
+        await tester.pump();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const ChannelDeepLink(
+            channelId: '580ca78b-9dae-46f3-8854-bd671853ba32',
+          ),
+        );
+      });
+
+      testWidgets('routes rendered Buzz channel links through callback', (
+        tester,
+      ) async {
+        const channelId = '580ca78b-9dae-46f3-8854-bd671853ba32';
+        const url = 'buzz://channel/$channelId';
+        String? tappedChannelId;
+
+        await tester.pumpWidget(
+          _testable(
+            MessageContent(
+              content: '[Open channel]($url)',
+              onChannelTap: (id) => tappedChannelId = id,
+            ),
+          ),
+        );
+
+        await tester.tap(find.text('Open channel'));
+        await tester.pump();
+
+        expect(tappedChannelId, channelId);
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(container.read(pendingDeepLinkProvider), isNull);
+      });
+
+      testWidgets('renders and routes autolinked Buzz channel links', (
+        tester,
+      ) async {
+        const url = 'buzz://channel/580ca78b-9dae-46f3-8854-bd671853ba32';
+
+        await tester.pumpWidget(
+          _testable(const MessageContent(content: '<$url>')),
+        );
+
+        await tester.tap(find.byKey(ValueKey('buzz-link-chip:$url')));
+        await tester.pump();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const ChannelDeepLink(
+            channelId: '580ca78b-9dae-46f3-8854-bd671853ba32',
+          ),
+        );
+      });
+
+      testWidgets('leaves malformed Buzz channel forms as plain text', (
+        tester,
+      ) async {
+        const url =
+            'buzz://channel?channel=580ca78b-9dae-46f3-8854-bd671853ba32';
+
+        await tester.pumpWidget(
+          _testable(const MessageContent(content: 'See $url now')),
+        );
+
+        expect(find.text(url), findsNothing);
+        expect(_allRichText(tester), contains(url));
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(container.read(pendingDeepLinkProvider), isNull);
+      });
+
       testWidgets('renders bare URL as link', (tester) async {
         await tester.pumpWidget(
           _testable(
@@ -723,8 +1028,11 @@ void main() {
 
         // The URL text should be rendered and tappable.
         expect(find.text('https://example.com'), findsOneWidget);
-        final urlWidget = tester.widget<Text>(find.text('https://example.com'));
-        expect(urlWidget.style?.decoration, TextDecoration.underline);
+        final linkText = tester.widget<Text>(find.text('https://example.com'));
+        expect(
+          linkText.style?.decoration ?? linkText.textSpan?.style?.decoration,
+          TextDecoration.underline,
+        );
       });
     });
 
@@ -2091,6 +2399,136 @@ Photos
       });
     });
 
+    group('Buzz permalink chips', () {
+      testWidgets('keeps authored Buzz labels as ordinary links', (
+        tester,
+      ) async {
+        final owner = 'ab' * 32;
+        final id = 'cd' * 32;
+        const channelId = '580ca78b-9dae-46f3-8854-bd671853ba32';
+        final links = {
+          'Open message': 'buzz://message?channel=$channelId&id=$id',
+          'Open channel': 'buzz://channel/$channelId',
+          'Release candidate': 'buzz://pr?id=$id&owner=$owner&d=buzz',
+        };
+
+        await tester.pumpWidget(
+          _testable(
+            MessageContent(
+              content: links.entries
+                  .map((entry) => '[${entry.key}](${entry.value})')
+                  .join(' '),
+            ),
+          ),
+        );
+        await tester.pump();
+
+        for (final entry in links.entries) {
+          expect(
+            find.byKey(ValueKey('buzz-link-chip:${entry.value}')),
+            findsNothing,
+          );
+          expect(find.text(entry.key), findsOneWidget);
+        }
+      });
+
+      testWidgets('preserves formatting in authored Buzz labels', (
+        tester,
+      ) async {
+        const channelId = '580ca78b-9dae-46f3-8854-bd671853ba32';
+        await tester.pumpWidget(
+          _testable(
+            const MessageContent(
+              content: '[**design discussion**](buzz://channel/$channelId)',
+            ),
+          ),
+        );
+        await tester.pump();
+
+        expect(_hasBoldSpan(tester, 'design discussion'), isTrue);
+      });
+
+      testWidgets(
+        'renders message, channel, repo, PR, and issue links as chips',
+        (tester) async {
+          final owner = 'ab' * 32;
+          final id = 'cd' * 32;
+          const channelId = '580ca78b-9dae-46f3-8854-bd671853ba32';
+          final urls = [
+            'buzz://message?channel=$channelId&id=$id',
+            'buzz://channel/$channelId',
+            'buzz://repo?owner=$owner&d=buzz',
+            'buzz://pr?id=$id&owner=$owner&d=buzz',
+            'buzz://issue?id=$id&owner=$owner&d=buzz',
+          ];
+          await tester.pumpWidget(
+            _testable(
+              MessageContent(
+                content: urls.join(' '),
+                channelNames: const {'engineering': channelId},
+              ),
+            ),
+          );
+          await tester.pump();
+
+          for (final url in urls) {
+            expect(find.byKey(ValueKey('buzz-link-chip:$url')), findsOneWidget);
+          }
+          expect(find.text('engineering · cdcdcdcd'), findsOneWidget);
+          expect(find.text('engineering'), findsOneWidget);
+          expect(find.text('buzz'), findsOneWidget);
+          expect(find.text('buzz · cdcdcdcd'), findsNWidgets(2));
+          expect(find.byIcon(LucideIcons.messageSquare), findsOneWidget);
+          expect(find.byIcon(LucideIcons.hash), findsOneWidget);
+          expect(find.byIcon(LucideIcons.folderGit2), findsOneWidget);
+          expect(find.byIcon(LucideIcons.gitPullRequest), findsOneWidget);
+          expect(find.byIcon(LucideIcons.circleDot), findsOneWidget);
+          expect(
+            find.bySemanticsLabel(
+              'Open message cdcdcdcd in channel engineering',
+            ),
+            findsOneWidget,
+          );
+          expect(
+            find.bySemanticsLabel('Pull request cdcdcdcd in repository buzz'),
+            findsOneWidget,
+          );
+          for (final url in urls.skip(2)) {
+            final chipKey = ValueKey('buzz-link-chip:$url');
+            final ignoredChip = find.ancestor(
+              of: find.byKey(chipKey),
+              matching: find.byWidgetPredicate(
+                (widget) => widget is IgnorePointer && widget.ignoring,
+              ),
+            );
+            expect(ignoredChip, findsOneWidget, reason: url);
+            expect(
+              tester.widget<IgnorePointer>(ignoredChip).ignoring,
+              isTrue,
+              reason: url,
+            );
+          }
+        },
+      );
+
+      testWidgets('uses shortened channel identifiers when names are missing', (
+        tester,
+      ) async {
+        final id = 'cd' * 32;
+        const channelId = '580ca78b-9dae-46f3-8854-bd671853ba32';
+        final messageUrl = 'buzz://message?channel=$channelId&id=$id';
+        const channelUrl = 'buzz://channel/$channelId';
+
+        await tester.pumpWidget(
+          _testable(MessageContent(content: '$messageUrl $channelUrl')),
+        );
+        await tester.pump();
+
+        expect(find.text('580ca78b · cdcdcdcd'), findsOneWidget);
+        expect(find.text('580ca78b'), findsOneWidget);
+      });
+    });
+
     group('@mentions', () {
       testWidgets('renders @mention with highlight', (tester) async {
         await tester.pumpWidget(
@@ -2253,7 +2691,9 @@ Photos
           ),
         );
 
-        expect(find.text('#general'), findsOneWidget);
+        expect(find.byIcon(LucideIcons.hash), findsOneWidget);
+        expect(find.text('general'), findsOneWidget);
+        expect(find.text('#general'), findsNothing);
       });
 
       testWidgets('channel tap callback fires', (tester) async {
@@ -2268,8 +2708,50 @@ Photos
           ),
         );
 
-        await tester.tap(find.text('#general'));
+        await tester.tap(find.text('general'));
         expect(tappedId, 'ch-id-1');
+      });
+
+      testWidgets('resolved #channel defaults to in-app navigation', (
+        tester,
+      ) async {
+        final channels = Future.value([
+          Channel(
+            id: '580ca78b-9dae-46f3-8854-bd671853ba32',
+            name: 'general',
+            channelType: 'stream',
+            visibility: 'open',
+            description: '',
+            createdBy: 'creator',
+            createdAt: DateTime(2026),
+            memberCount: 1,
+            isMember: true,
+          ),
+        ]);
+        await tester.pumpWidget(
+          _testable(
+            const MessageContent(content: 'See #general'),
+            overrides: [
+              channelsProvider.overrideWith(
+                () => _TestChannelsNotifier(channels),
+              ),
+            ],
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.tap(find.text('general'));
+        await tester.pump();
+
+        final container = ProviderScope.containerOf(
+          tester.element(find.byType(MessageContent)),
+        );
+        expect(
+          container.read(pendingDeepLinkProvider),
+          const ChannelDeepLink(
+            channelId: '580ca78b-9dae-46f3-8854-bd671853ba32',
+          ),
+        );
       });
 
       testWidgets('unknown channel renders without tap', (tester) async {
@@ -2279,7 +2761,9 @@ Photos
           ),
         );
 
-        expect(find.text('#unknown'), findsOneWidget);
+        expect(find.byIcon(LucideIcons.hash), findsOneWidget);
+        expect(find.text('unknown'), findsOneWidget);
+        expect(find.text('#unknown'), findsNothing);
       });
 
       testWidgets('does not treat URL fragments as channel links', (
@@ -2328,6 +2812,50 @@ Photos
         expect(find.text('@'), findsOneWidget);
         expect(find.text('Alice'), findsOneWidget);
         expect(_allRichText(tester), isNot(contains('**')));
+      });
+
+      testWidgets('renders inline code in the app code style', (tester) async {
+        // The message surfaces pass this style in; the widget's own fallback
+        // is the smaller `bodyMedium`, which would move the expected size.
+        await tester.pumpWidget(
+          _testable(
+            const MessageContent(
+              content: 'Run `just test` now',
+              baseStyle: messageBodyTextStyle,
+            ),
+          ),
+        );
+
+        // gpt_markdown tags inline code with a CodeTextSpan carrying both the
+        // resolved text style and the colours the chip behind it is painted
+        // with. It renders through BidiRichText, a RichText subclass, so
+        // find.byType(RichText) would miss it.
+        final codeSpans = <CodeTextSpan>[];
+        for (final rich in tester.widgetList<RichText>(
+          find.byWidgetPredicate((widget) => widget is RichText),
+        )) {
+          rich.text.visitChildren((span) {
+            if (span is CodeTextSpan && span.text == 'just test') {
+              codeSpans.add(span);
+            }
+            return true;
+          });
+        }
+
+        expect(codeSpans, hasLength(1));
+        final code = codeSpans.single;
+        const scheme = lightColorScheme;
+
+        // Face, size and ink — the values a fenced code block is drawn with,
+        // not the package's bundled mono at its own 0.94 of the body size.
+        expect(code.style?.fontFamily, CodeStyle.fontFamily);
+        expect(code.style?.fontSize, closeTo(CodeStyle.fontSize, 0.001));
+        expect(code.style?.color, scheme.onSurface);
+
+        // Chip fill and outline come from the app's code surface rather than
+        // the package's `onSurface` tints.
+        expect(code.codeStyle.backgroundColor, CodeStyle.background(scheme));
+        expect(code.codeStyle.borderColor, CodeStyle.border(scheme));
       });
 
       testWidgets('renders code block between paragraphs', (tester) async {

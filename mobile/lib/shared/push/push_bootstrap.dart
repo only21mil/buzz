@@ -8,7 +8,7 @@ import '../community/community.dart';
 import '../community/community_provider.dart';
 import '../relay/relay_provider.dart';
 import '../relay/relay_session.dart';
-import 'push_cohort_publication.dart';
+import '../relay/signed_event_relay.dart';
 import 'dev_push_lease.dart';
 import 'push_bridge.dart';
 import 'push_lease_revocation_outbox.dart';
@@ -22,25 +22,19 @@ class BuzzPushAttemptGate {
   BuzzPushAttemptGate({this.retryDelay = _pushBootstrapRetryDelay});
 
   final Duration retryDelay;
-  Object? _attempt;
-  Object? _owner;
-
-  Object get owner => _owner!;
+  String? _attempt;
   Timer? _retryTimer;
 
-  bool tryBegin(Object attempt) {
+  bool tryBegin(String attempt) {
     if (_attempt == attempt) return false;
     _retryTimer?.cancel();
     _retryTimer = null;
     _attempt = attempt;
-    _owner = Object();
     return true;
   }
 
-  void failed(Object attempt, {Object? owner, required VoidCallback retry}) {
-    if (_attempt != attempt || (owner != null && !identical(owner, _owner))) {
-      return;
-    }
+  void failed(String attempt, {required VoidCallback retry}) {
+    if (_attempt != attempt) return;
     _attempt = null;
     _retryTimer?.cancel();
     _retryTimer = Timer(retryDelay, () {
@@ -50,29 +44,22 @@ class BuzzPushAttemptGate {
   }
 
   void retryAfter(
-    Object attempt, {
-    Object? owner,
+    String attempt, {
     required Duration delay,
     required VoidCallback retry,
   }) {
-    if (_attempt != attempt || (owner != null && !identical(owner, _owner))) {
-      return;
-    }
+    if (_attempt != attempt) return;
     _retryTimer?.cancel();
     _retryTimer = Timer(delay, () {
       _retryTimer = null;
-      if (_attempt != attempt || (owner != null && !identical(owner, _owner))) {
-        return;
-      }
+      if (_attempt != attempt) return;
       _attempt = null;
       retry();
     });
   }
 
-  void complete(Object attempt, {Object? owner}) {
-    if (_attempt != attempt || (owner != null && !identical(owner, _owner))) {
-      return;
-    }
+  void complete(String attempt) {
+    if (_attempt != attempt) return;
     _retryTimer?.cancel();
     _retryTimer = null;
     _attempt = null;
@@ -101,17 +88,65 @@ String buzzPushPublicationAttemptKey({
 bool buzzPushLifecycleEnabled({
   required Community? community,
   required BuzzPushLeaseDescriptor? descriptor,
-}) => community?.pushNotificationsEnabled == true && descriptor != null;
+}) =>
+    Env.pushGatewayConfigured &&
+    community?.pushNotificationsEnabled == true &&
+    descriptor != null;
+
+/// Starts APNs registration when the active community opts in.
+@visibleForTesting
+class BuzzPushRegistrationBootstrap extends HookWidget {
+  const BuzzPushRegistrationBootstrap({
+    required this.shouldRegister,
+    required this.attemptKey,
+    required this.child,
+    this.startRegistration = startBuzzPushRegistration,
+    super.key,
+  });
+
+  final bool shouldRegister;
+  final String attemptKey;
+  final Widget child;
+  final Future<void> Function() startRegistration;
+
+  @override
+  Widget build(BuildContext context) {
+    final attemptGate = useMemoized(BuzzPushAttemptGate.new);
+    final retry = useState(0);
+    useEffect(() => attemptGate.dispose, const []);
+    useEffect(() {
+      if (!shouldRegister || !attemptGate.tryBegin(attemptKey)) return null;
+      unawaited(() async {
+        try {
+          await startRegistration();
+        } catch (error, stack) {
+          attemptGate.failed(
+            attemptKey,
+            retry: () {
+              if (context.mounted) retry.value += 1;
+            },
+          );
+          debugPrint('Push registration bootstrap failed: $error');
+          debugPrintStack(stackTrace: stack);
+        }
+      }());
+      return null;
+    }, [shouldRegister, attemptKey, retry.value]);
+    return child;
+  }
+}
 
 @visibleForTesting
 Future<int> publishBuzzPushLeaseRecoverably({
   required Future<int> Function() reserveGeneration,
   required Future<void> Function(int generation) publish,
-  required Future<void> Function(int generation) markAccepted,
+  required Future<bool> Function(int generation) markAccepted,
 }) async {
   final generation = await reserveGeneration();
   await publish(generation);
-  await markAccepted(generation);
+  if (!await markAccepted(generation)) {
+    throw StateError('A newer push lease superseded the published generation.');
+  }
   return generation;
 }
 
@@ -125,10 +160,8 @@ class BuzzPushBootstrap extends HookConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     useListenable(apnsDeviceToken);
-    final registrationAttempt = useMemoized(BuzzPushAttemptGate.new);
     final publicationAttempt = useMemoized(BuzzPushAttemptGate.new);
     final tombstoneAttempt = useMemoized(BuzzPushAttemptGate.new);
-    final registrationRetry = useState(0);
     final publicationRetry = useState(0);
     final tombstoneRetry = useState(0);
     final revocationOutbox = ref.watch(buzzPushLeaseRevocationOutboxProvider);
@@ -138,11 +171,6 @@ class BuzzPushBootstrap extends HookConsumerWidget {
     final community = ref.watch(activeCommunityProvider).value;
     final memberPubkey = ref.watch(myPubkeyProvider);
     final descriptor = ref.watch(currentRelayPushDescriptorProvider).value;
-    final communityLifecycle = community == null
-        ? null
-        : ref
-              .read(communityListProvider.notifier)
-              .capturePushLifecycle(community.id);
 
     useEffect(() {
       final listener = AppLifecycleListener(
@@ -161,7 +189,6 @@ class BuzzPushBootstrap extends HookConsumerWidget {
 
     useEffect(
       () => () {
-        registrationAttempt.dispose();
         publicationAttempt.dispose();
         tombstoneAttempt.dispose();
       },
@@ -227,55 +254,6 @@ class BuzzPushBootstrap extends HookConsumerWidget {
       ],
     );
 
-    useEffect(
-      () {
-        if (!_ready(session, config, community, memberPubkey) ||
-            !buzzPushLifecycleEnabled(
-              community: community,
-              descriptor: descriptor,
-            )) {
-          return null;
-        }
-        final activeCommunity = community!;
-        final activeDescriptor = descriptor!;
-        final lifecycle = ref
-            .read(communityListProvider.notifier)
-            .capturePushLifecycle(activeCommunity.id);
-        final attempt = ('${activeCommunity.id}|${config.baseUrl}', lifecycle);
-        if (!registrationAttempt.tryBegin(attempt)) return null;
-        final owner = registrationAttempt.owner;
-        unawaited(() async {
-          try {
-            await startBuzzPushRegistrationIfCapable(
-              activeDescriptor,
-              startRegistration: startBuzzPushRegistration,
-            );
-          } catch (error, stack) {
-            registrationAttempt.failed(
-              attempt,
-              owner: owner,
-              retry: () {
-                if (context.mounted) registrationRetry.value += 1;
-              },
-            );
-            debugPrint('Push registration bootstrap failed: $error');
-            debugPrintStack(stackTrace: stack);
-          }
-        }());
-        return null;
-      },
-      [
-        session.status,
-        config.baseUrl,
-        community?.id,
-        communityLifecycle,
-        community?.pushNotificationsEnabled,
-        memberPubkey,
-        descriptor,
-        registrationRetry.value,
-      ],
-    );
-
     final token = apnsDeviceToken.value;
     useEffect(
       () {
@@ -291,26 +269,26 @@ class BuzzPushBootstrap extends HookConsumerWidget {
         final activeDescriptor = descriptor!;
         final state = activeCommunity.pushSubscriptionState;
         if (state.desired.isEmpty) return null;
-        final notifier = ref.read(communityListProvider.notifier);
-        final attempt = (
-          buzzPushPublicationAttemptKey(
-            communityId: activeCommunity.id,
-            relayBaseUrl: config.baseUrl,
-            token: token,
-            descriptor: activeDescriptor,
-            subscriptions: state.desired,
-          ),
-          notifier.capturePushLifecycle(activeCommunity.id),
+        final attempt = buzzPushPublicationAttemptKey(
+          communityId: activeCommunity.id,
+          relayBaseUrl: config.baseUrl,
+          token: token,
+          descriptor: activeDescriptor,
+          subscriptions: state.desired,
         );
         if (!publicationAttempt.tryBegin(attempt)) return null;
-        final owner = publicationAttempt.owner;
+        final relay = SignedEventRelay(
+          session: ref.read(relaySessionProvider.notifier),
+          nsec: config.nsec!,
+        );
         unawaited(() async {
           try {
-            final grant = await publishBuzzPushCohort(
-              notifier: notifier,
-              communities: communities,
-              enroll: () => enrollBuzzPush(config.wsUrl, Env.pushGatewayUrl),
-              readGrants: readBuzzPushEndpointGrants,
+            final grant = await _publish(
+              ref,
+              config,
+              activeCommunity,
+              memberPubkey!,
+              relay,
             );
             final renewInMilliseconds =
                 grant.expiresAt * 1000 -
@@ -318,7 +296,6 @@ class BuzzPushBootstrap extends HookConsumerWidget {
                 const Duration(minutes: 5).inMilliseconds;
             publicationAttempt.retryAfter(
               attempt,
-              owner: owner,
               delay: Duration(
                 milliseconds: renewInMilliseconds > 1000
                     ? renewInMilliseconds
@@ -331,7 +308,6 @@ class BuzzPushBootstrap extends HookConsumerWidget {
           } catch (error, stack) {
             publicationAttempt.failed(
               attempt,
-              owner: owner,
               retry: () {
                 if (context.mounted) publicationRetry.value += 1;
               },
@@ -346,7 +322,7 @@ class BuzzPushBootstrap extends HookConsumerWidget {
         session.status,
         config.baseUrl,
         community?.id,
-        communityLifecycle,
+        community?.pushNotificationsEnabled,
         community?.pushSubscriptionState,
         memberPubkey,
         descriptor,
@@ -355,7 +331,16 @@ class BuzzPushBootstrap extends HookConsumerWidget {
       ],
     );
 
-    return child;
+    return BuzzPushRegistrationBootstrap(
+      shouldRegister:
+          _ready(session, config, community, memberPubkey) &&
+          buzzPushLifecycleEnabled(
+            community: community,
+            descriptor: descriptor,
+          ),
+      attemptKey: '${community?.id}|${config.baseUrl}',
+      child: child,
+    );
   }
 
   static bool _ready(
@@ -370,6 +355,48 @@ class BuzzPushBootstrap extends HookConsumerWidget {
       config.nsec!.isNotEmpty &&
       memberPubkey != null &&
       memberPubkey.isNotEmpty;
+
+  static Future<BuzzPushEndpointGrant> _publish(
+    WidgetRef ref,
+    RelayConfig config,
+    Community community,
+    String memberPubkey,
+    SignedEventRelay relay,
+  ) async {
+    final state = community.pushSubscriptionState;
+    final desired = state.desired;
+    final descriptor = await fetchBuzzPushLeaseDescriptor(config.baseUrl);
+    final grant = await enrollBuzzPush(
+      config.wsUrl,
+      Env.pushGatewayUrl,
+      communitiesForSnapshotRefresh:
+          ref.read(communityListProvider).value ?? [community],
+    );
+    // Relay lease replacement and gateway delegation are independent state
+    // machines. Subscription changes advance only the kind-30350 generation;
+    // the opaque grant remains reusable until its own authority changes.
+    final notifier = ref.read(communityListProvider.notifier);
+    await publishBuzzPushLeaseRecoverably(
+      reserveGeneration: () =>
+          notifier.reservePushLeaseGeneration(community.id),
+      publish: (leaseGeneration) => publishBuzzDevPushLeaseThroughRelay(
+        grant: grant,
+        leaseInstallationId: community.pushLeaseInstallationId,
+        leaseGeneration: leaseGeneration,
+        descriptor: descriptor,
+        nsec: config.nsec!,
+        memberPubkey: memberPubkey,
+        subscriptions: desired,
+        relay: relay,
+      ),
+      markAccepted: (leaseGeneration) => notifier.markPushLeaseAccepted(
+        community.id,
+        subscriptions: desired,
+        generation: leaseGeneration,
+      ),
+    );
+    return grant;
+  }
 }
 
 void _runRevocationOutbox(Future<void> Function() operation) {

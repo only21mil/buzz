@@ -1,11 +1,9 @@
 import 'dart:async';
 
-import 'package:buzz/shared/notifications/notifications.dart';
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:hooks_riverpod/misc.dart';
 import 'package:buzz/features/channels/channel_management_provider.dart';
 import 'package:buzz/features/channels/channels_provider.dart';
 import 'package:buzz/shared/relay/relay.dart';
@@ -26,9 +24,8 @@ part 'channels_provider_terminal_cases.dart';
 /// records [subscribe] calls so we can assert filter shapes and emit live
 /// events on demand.
 void main() {
-  TestWidgetsFlutterBinding.ensureInitialized();
-
   const myPk = 'me';
+
   test(
     'discovers open channels for a user with zero channel memberships',
     () async {
@@ -794,6 +791,71 @@ void main() {
     },
   );
 
+  test('a stale request\'s Huddle leg writes no member snapshot', () async {
+    final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    final session = _FakeRelaySession(
+      memberships: [_membership(_channelA, myPk)],
+      metadata: [_meta(id: _channelA, name: 'joined-a')],
+      huddleStarts: [
+        NostrEvent(
+          id: 'huddle-start',
+          pubkey: myPk,
+          createdAt: now,
+          kind: EventKind.huddleStarted,
+          tags: const [
+            ['h', _channelA],
+          ],
+          content: '{"ephemeral_channel_id":"$_channelB"}',
+          sig: 'sig',
+        ),
+      ],
+    );
+    final container = _buildContainer(session: session);
+    addTearDown(container.dispose);
+
+    await container.read(channelsProvider.future);
+    final notifier = container.read(channelsProvider.notifier);
+
+    // Park an older refresh on its Huddle-start query. Both of its membership
+    // fetches have already landed, so channel A is the list it is carrying.
+    session.pauseNextHuddleStartQuery();
+    final olderRefresh = notifier.refresh();
+    await session.nextHuddleStartQueryStarted;
+
+    // A newer refresh completes on a disjoint membership set.
+    session.memberships = [
+      _membership(_channelB, myPk, additionalPubkey: _otherPk),
+    ];
+    session.metadata = [_meta(id: _channelB, name: 'joined-b')];
+    await notifier.refresh();
+
+    // Release the older request. Its member-snapshot write sits AFTER the
+    // Huddle leg, so if that leg is unfenced the stale snapshot lands.
+    session.resumePausedHuddleStartQuery();
+    await olderRefresh;
+    await _settle();
+
+    expect(
+      container
+          .read(channelsProvider)
+          .requireValue
+          .map((channel) => channel.id),
+      [_channelB],
+      reason: 'a stale request installed its own channel list',
+    );
+    expect(
+      notifier.cachedMembersForChannel(_channelA),
+      isEmpty,
+      reason:
+          'a stale request wrote a member snapshot past the Huddle leg fence',
+    );
+    expect(
+      notifier.cachedMembersForChannel(_channelB).map((m) => m.pubkey),
+      containsAll([myPk, _otherPk]),
+      reason: 'the newer request\'s member snapshot was clobbered',
+    );
+  });
+
   test('community switch discards a parked unread catch-up', () async {
     final session = _FakeRelaySession(
       memberships: const [],
@@ -832,7 +894,6 @@ void main() {
     container
         .read(relayConfigProvider.notifier)
         .update(baseUrl: 'https://community-b.example');
-    await container.pump();
     await container.read(channelsProvider.future);
 
     session.resumePausedUnreadCatchUpQuery();
@@ -935,7 +996,6 @@ void main() {
     container
         .read(relayConfigProvider.notifier)
         .update(baseUrl: 'https://community-b.example');
-    await container.pump();
     await container.read(channelsProvider.future);
     // Let community B's own refresh and its own catch-up settle first, so the
     // emissions counted below can only come from the parked community A work.
@@ -1362,7 +1422,6 @@ void main() {
     container
         .read(relayConfigProvider.notifier)
         .update(baseUrl: 'https://community-b.example');
-    await container.pump();
     await container.read(channelsProvider.future);
     await _settle();
 
@@ -1572,92 +1631,6 @@ void main() {
     final channels = container.read(channelsProvider).value!;
     expect(channels.single.lastMessageAt?.millisecondsSinceEpoch, 20 * 1000);
   });
-
-  test('reconnect replay stays silent until the replacement EOSE', () async {
-    final session = _FakeRelaySession(
-      memberships: [_membership(_channelA, myPk)],
-      metadata: [_meta(id: _channelA, name: 'general')],
-    );
-    final bridge = _RecordingNotificationBridge();
-    final container = _buildContainer(
-      session: session,
-      overrides: [
-        notificationSettingsProvider.overrideWith(
-          () => _StaticNotificationSettings(),
-        ),
-        androidNotificationBridgeProvider.overrideWithValue(bridge),
-      ],
-    );
-    addTearDown(container.dispose);
-    addTearDown(bridge.dispose);
-    await container.read(channelsProvider.future);
-
-    await _settle();
-    session.emit(_messageEvent(id: 'before-reconnect', createdAt: 10));
-    await Future<void>.delayed(Duration.zero);
-    expect(bridge.eventIds, ['before-reconnect']);
-
-    final retiredCallback = session._subscriptions.values.single.$2;
-    session.setStatus(SessionStatus.reconnecting);
-    session.emit(_messageEvent(id: 'replayed-old-sub', createdAt: 11));
-    await Future<void>.delayed(Duration.zero);
-    expect(bridge.eventIds, ['before-reconnect']);
-
-    session.pauseNextSubscribe();
-    session.setStatus(SessionStatus.connected);
-    await session.nextSubscribeStarted;
-
-    session.emit(_messageEvent(id: 'before-eose', createdAt: 12));
-    await Future<void>.delayed(Duration.zero);
-    expect(bridge.eventIds, ['before-reconnect']);
-
-    session.resumePausedSubscribe();
-    await _waitUntil(() => session.unsubscribeCount >= 1);
-    await Future<void>.delayed(Duration.zero);
-    session.emit(_messageEvent(id: 'after-eose', createdAt: 13));
-    await Future<void>.delayed(Duration.zero);
-
-    retiredCallback(_messageEvent(id: 'late-retired-replay', createdAt: 14));
-    await _settle();
-    expect(bridge.eventIds, ['before-reconnect', 'after-eose']);
-  });
-  test(
-    'notification readiness recovers after a failed reconnect replacement',
-    () async {
-      final session = _FakeRelaySession(
-        memberships: [_membership(_channelA, myPk)],
-        metadata: [_meta(id: _channelA, name: 'general')],
-      );
-      final bridge = _RecordingNotificationBridge();
-      final container = _buildContainer(
-        session: session,
-        overrides: [
-          notificationSettingsProvider.overrideWith(
-            () => _StaticNotificationSettings(),
-          ),
-          androidNotificationBridgeProvider.overrideWithValue(bridge),
-        ],
-      );
-      addTearDown(container.dispose);
-      addTearDown(bridge.dispose);
-      await container.read(channelsProvider.future);
-      await _settle();
-      session.setStatus(SessionStatus.reconnecting);
-      session.subscribeFailures = 1;
-      session.setStatus(SessionStatus.connected);
-      await _settle();
-      session.emit(_messageEvent(id: 'old-replay', createdAt: 10));
-      await _settle();
-      expect(bridge.eventIds, isEmpty);
-      expect(session.activeSubscriptionCount, 1);
-      await container.read(channelsProvider.notifier).refresh();
-      await _settle();
-      session.emit(_messageEvent(id: 'recovered-live', createdAt: 11));
-      await _settle();
-      expect(bridge.eventIds, ['recovered-live']);
-      expect(session.activeSubscriptionCount, 1);
-    },
-  );
 
   test(
     'loads all channel timestamps through one batched relay query',
@@ -2200,7 +2173,7 @@ NostrEvent _meta({
     ['d', id],
     ['name', name],
     ['t', channelType],
-    if (visibility == 'private') ['private'] else ['public'],
+    [visibility == 'private' ? 'private' : 'public'],
     if (ttlSeconds != null) ['ttl', '$ttlSeconds'],
     if (archived) ['archived', 'true'],
   ],
@@ -2208,20 +2181,15 @@ NostrEvent _meta({
   sig: 'sig',
 );
 
-ProviderContainer _buildContainer({
-  required _FakeRelaySession session,
-  List<Override> overrides = const [],
-}) {
+ProviderContainer _buildContainer({required _FakeRelaySession session}) {
   return ProviderContainer(
     retry: (_, _) => null,
     overrides: [
       appLifecycleProvider.overrideWith(() => _FakeAppLifecycleNotifier()),
       relaySessionProvider.overrideWith(() => session),
-      relayConfigProvider.overrideWith(_TestRelayConfigNotifier.new),
       // Route the pubkey through a mutable notifier so tests can switch the
       // signing identity mid-flight the way an account change does at runtime.
       myPubkeyProvider.overrideWith((ref) => ref.watch(_testPubkeyProvider)),
-      ...overrides,
     ],
   );
 }
@@ -2323,17 +2291,12 @@ class _FakeRelaySession extends RelaySessionNotifier {
   int subscribeFailures = 0;
   int successfulSubscribesBeforeFailure = 0;
 
-  final Set<int> _pendingSubscriptionKeys = {};
-
   Set<String> get activeChannels => {
-    for (final entry in _subscriptions.entries)
-      if (!_pendingSubscriptionKeys.contains(entry.key))
-        ...entry.value.$1.tags['#h'] ?? const <String>[],
+    for (final (filter, _, _) in _subscriptions.values)
+      ...filter.tags['#h'] ?? const <String>[],
   };
 
-  int get activeSubscriptionCount => _subscriptions.keys
-      .where((key) => !_pendingSubscriptionKeys.contains(key))
-      .length;
+  int get activeSubscriptionCount => _subscriptions.length;
 
   Future<void> get nextSubscribeStarted async {
     final started = _subscribeStarted;
@@ -2553,6 +2516,16 @@ class _FakeRelaySession extends RelaySessionNotifier {
       return hiddenDmEvents;
     }
     if (filter.kinds.contains(EventKind.huddleStarted)) {
+      // Claim the parked slot so the newer refresh's own Huddle query runs
+      // unblocked: one shot, exactly like the hidden-DM and member-count hooks.
+      final paused = _pausedHuddleStarts;
+      if (paused != null) {
+        _claimedHuddleStarts = paused;
+        _pausedHuddleStarts = null;
+        _huddleStartsStarted!.complete();
+        _huddleStartsStarted = null;
+        await paused.future;
+      }
       return huddleStarts;
     }
     if (filter.kinds.contains(39000)) {
@@ -2691,11 +2664,6 @@ class _FakeRelaySession extends RelaySessionNotifier {
   }) async {
     totalSubscribeCount++;
     subscribeFilters.add(filter);
-    final subscriptionKey = ++_nextSubscriptionKey;
-    // RelaySession registers the callback before awaiting EOSE, so replayed
-    // events can be delivered while this fake subscription is paused.
-    _subscriptions[subscriptionKey] = (filter, onEvent, onClosed);
-    _pendingSubscriptionKeys.add(subscriptionKey);
     final paused = _pausedSubscribe;
     if (paused != null) {
       _subscribeStarted!.complete();
@@ -2703,16 +2671,16 @@ class _FakeRelaySession extends RelaySessionNotifier {
       _pausedSubscribe = null;
       _subscribeStarted = null;
     }
-    _pendingSubscriptionKeys.remove(subscriptionKey);
     if (subscribeFailures > 0 && successfulSubscribesBeforeFailure == 0) {
       subscribeFailures--;
       subscribeFilters.remove(filter);
-      _subscriptions.remove(subscriptionKey);
       throw StateError('live subscription failed');
     }
     if (successfulSubscribesBeforeFailure > 0) {
       successfulSubscribesBeforeFailure--;
     }
+    final subscriptionKey = ++_nextSubscriptionKey;
+    _subscriptions[subscriptionKey] = (filter, onEvent, onClosed);
     return () {
       final subscription = _subscriptions.remove(subscriptionKey);
       if (subscription == null) return;
@@ -2742,53 +2710,7 @@ class _FakeRelaySession extends RelaySessionNotifier {
   }
 }
 
-class _StaticNotificationSettings extends NotificationSettingsNotifier {
-  @override
-  NotificationSettingsState build() => const NotificationSettingsState(
-    alertsEnabled: true,
-    priorityEnabled: true,
-    activityEnabled: true,
-    permission: AndroidNotificationPermission.granted,
-    priorityChannelEnabled: true,
-    activityChannelEnabled: true,
-  );
-}
-
-class _RecordingNotificationBridge extends AndroidNotificationBridge {
-  final List<String> eventIds = [];
-
-  @override
-  Future<void> show({
-    required int id,
-    required String channel,
-    required String title,
-    required String body,
-    required String route,
-  }) async {
-    final parsed = Uri.parse(route);
-    eventIds.add(parsed.queryParameters['id']!);
-  }
-}
-
-NostrEvent _messageEvent({required String id, required int createdAt}) =>
-    NostrEvent(
-      id: id,
-      pubkey: 'alice',
-      createdAt: createdAt,
-      kind: EventKind.streamMessageV2,
-      tags: const [
-        ['h', _channelA],
-      ],
-      content: 'message',
-      sig: 'sig',
-    );
-
 class _FakeAppLifecycleNotifier extends AppLifecycleNotifier {
   @override
   AppLifecycleState build() => AppLifecycleState.resumed;
-}
-
-class _TestRelayConfigNotifier extends RelayConfigNotifier {
-  @override
-  RelayConfig build() => const RelayConfig(baseUrl: 'http://localhost:3000');
 }

@@ -21,6 +21,7 @@ use tauri::State;
 use crate::{
     app_state::AppState,
     managed_agents::team_catalog::{team_catalog_content_from_event, TeamCatalogContent},
+    native_relay_client::NativeRelayClient,
 };
 
 const CATALOG_PAGE_SIZE: usize = 500;
@@ -61,15 +62,14 @@ struct TeamCatalogMemberProjection {
 #[tauri::command]
 pub(crate) async fn fetch_team_catalog(
     state: State<'_, AppState>,
+    relay_client: State<'_, NativeRelayClient>,
 ) -> Result<Vec<TeamCatalogPublication>, String> {
     let keys = state.signing_keys()?;
     let owner = keys.public_key().to_hex();
     let relay_url = crate::relay::relay_ws_url_with_override(&state);
-    let api_base_url = crate::relay::relay_http_base_url(&relay_url);
+    let session = relay_client.session(relay_url.clone(), keys).await;
     let by_id = collect_verified_catalog(|until| {
-        let state = &state;
-        let keys = &keys;
-        let api_base_url = &api_base_url;
+        let session = &session;
         async move {
             let mut filter = serde_json::json!({
                 "kinds": [KIND_TEAM_CATALOG],
@@ -78,12 +78,7 @@ pub(crate) async fn fetch_team_catalog(
             if let Some(until) = until {
                 filter["until"] = serde_json::json!(until);
             }
-            let page = tokio::time::timeout(
-                PAGE_TIMEOUT,
-                crate::relay::query_relay_at_with_keys(state, api_base_url, &[filter], keys, None),
-            )
-            .await
-            .map_err(|_| "team catalog request timed out".to_string())??;
+            let page = session.fetch_events(filter, PAGE_TIMEOUT).await?;
             let page_len = page.len();
             // Schnorr verification is CPU-bound. Keep the complete page off the
             // async executor (and therefore off Tauri command scheduling).

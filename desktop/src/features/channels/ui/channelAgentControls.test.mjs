@@ -11,7 +11,8 @@ import {
   getOwnedAgentsToAdd,
 } from "../../agents/lib/ownedChannelAgents.ts";
 import { canAddChannelMembers } from "../lib/channelMemberAdmission.ts";
-import { normalizePubkey } from "../../../shared/lib/pubkey.ts";
+import { normalizePubkey, truncateNpub } from "../../../shared/lib/pubkey.ts";
+import { agentPresenceStartBlockReason } from "../../agents/lib/useAgentAvailability.ts";
 import { listRelayAgents } from "../../../shared/api/tauri.ts";
 import { registerRelayWorkflowsMembersCommands } from "../../../platform/web/desktopOnly/relayWorkflowsMembers.ts";
 import { directoryFixture } from "../../../platform/web/desktopOnly/relayAgentOwnership.fixtures.mjs";
@@ -72,11 +73,15 @@ const genericModule = new Proxy(
 );
 const { MembersSidebarMemberCard } = load("MembersSidebarMemberCard", {
   "lucide-react": genericModule,
+  "@/features/agents/lib/useAgentAvailability": {
+    agentPresenceStartBlockReason,
+  },
+  "@/features/agents/ui/OtherSetupAgentMarker": genericModule,
   "@/features/agents/lib/managedAgentControlActions": {},
   "@/features/profile/ui/ProfileAvatar": genericModule,
   "@/features/presence/ui/PresenceBadge": genericModule,
   "@/features/agents/managedAgentRuntimeStatus": {},
-  "@/shared/lib/pubkey": { truncatePubkey: (x) => x },
+  "@/shared/lib/pubkey": { truncateNpub },
   "@/shared/lib/cn": { cn: (...x) => x.join(" ") },
   "@/shared/ui/badge": genericModule,
   "@/shared/ui/dropdown-menu": new Proxy(
@@ -250,7 +255,9 @@ test("selected add excludes unchecked agents and revalidates revoked channel aut
     setup.calls.map((x) => x.pubkeys[0]),
     [other],
   );
-  setup.roster[0].role = "member";
+  // Upstream permits any private-channel member to invite. Losing membership
+  // revokes admission; an owner-to-member role change does not.
+  setup.roster.splice(0);
   fireEvent.click(view.getByRole("button", { name: /Add all my agents/ }));
   await waitFor(() =>
     assert.ok(view.getByText("You can no longer add agents to this channel.")),

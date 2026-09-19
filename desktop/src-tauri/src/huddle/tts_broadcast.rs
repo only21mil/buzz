@@ -123,12 +123,6 @@ impl TtsAudioPublisher {
     }
 }
 
-impl Drop for TtsAudioPublisher {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
 /// Thread-safe registry shared by the TTS worker, cancellation monitor, and
 /// async command path that establishes publishers before speech is queued.
 #[derive(Clone, Debug, Default)]

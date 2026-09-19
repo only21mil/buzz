@@ -3,8 +3,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
-
-import '../../shared/identity/npub.dart';
 import '../../shared/mentions/agent_identity_provider.dart';
 import '../../shared/mentions/mention_tags.dart';
 import '../../shared/theme/theme.dart';
@@ -29,8 +27,6 @@ import '../../shared/profile/user_profile.dart';
 import 'recent_searches_provider.dart';
 import 'search_provider.dart';
 
-part 'search_page/section_label.dart';
-
 enum _SearchFilter { all, messages, channels, people }
 
 const _searchFieldMinHeight = 36.0;
@@ -42,9 +38,7 @@ const _searchTitleReturnDuration = Duration(milliseconds: 80);
 const _searchCancelEnterDuration = Duration(milliseconds: 80);
 const _searchCancelExitDuration = Duration(milliseconds: 60);
 const _searchIdleFieldTopInset = Grid.half;
-const _searchActiveFieldTopOffset = 42.0;
-const _searchBottomOverlap =
-    _searchActiveFieldTopOffset + _searchIdleFieldTopInset;
+const _searchControlsToFiltersGap = Grid.xxs;
 const _searchFilterChipVerticalPadding = Grid.xxs;
 const _searchFilterBarVerticalPadding = Grid.xxs;
 const _searchHeaderFiltersMinHeight = Grid.xl;
@@ -133,15 +127,17 @@ class SearchPage extends HookConsumerWidget {
     final idleSearchFieldHeight = _idleSearchFieldHeight(context);
     final searchHeaderFiltersHeight = _searchHeaderFiltersHeight(context);
     final searchActiveFieldRightInset = _searchActiveFieldRightInset(context);
+    final searchBottomOverlap =
+        _searchIdleFieldTopInset +
+        compactSearchFieldHeight +
+        _searchControlsToFiltersGap;
     // Cancel remains an accessible target without giving the text action a
     // visual button treatment.
     final searchControlHeight = compactSearchFieldHeight > Grid.xl
         ? compactSearchFieldHeight
         : Grid.xl;
     final searchHeaderBottomHeight = isSearchEditing.value
-        ? _searchIdleFieldTopInset +
-              compactSearchFieldHeight +
-              searchHeaderFiltersHeight
+        ? searchHeaderFiltersHeight + _searchControlsToFiltersGap
         : idleSearchFieldHeight + _searchIdleFieldTopInset + Grid.xxs;
     final topSectionHeight = frostedAppBarHeight(
       context,
@@ -298,7 +294,7 @@ class SearchPage extends HookConsumerWidget {
           ),
         ],
         bottomHeight: searchHeaderBottomHeight,
-        bottomOverlap: _searchBottomOverlap,
+        bottomOverlap: searchBottomOverlap,
         bottom: Stack(
           clipBehavior: Clip.none,
           children: [
@@ -311,7 +307,7 @@ class SearchPage extends HookConsumerWidget {
                   : Grid.gutter,
               top: isSearchEditing.value
                   ? _searchIdleFieldTopInset
-                  : _searchBottomOverlap + _searchIdleFieldTopInset,
+                  : searchBottomOverlap + _searchIdleFieldTopInset,
               height: isSearchEditing.value
                   ? compactSearchFieldHeight
                   : idleSearchFieldHeight,
@@ -363,7 +359,7 @@ class SearchPage extends HookConsumerWidget {
                     ? Align(
                         alignment: Alignment.topCenter,
                         child: Padding(
-                          padding: EdgeInsets.only(top: _searchBottomOverlap),
+                          padding: EdgeInsets.only(top: searchBottomOverlap),
                           child: SizedBox(
                             key: const ValueKey('search-header-filters'),
                             height: searchHeaderFiltersHeight,
@@ -733,6 +729,7 @@ class _PeopleSection extends ConsumerWidget {
               imageUrl: user.avatarUrl,
               radius: 20,
               fallback: Text(user.initial),
+              isAgent: user.isAgent,
             ),
             title: Text(
               user.label,
@@ -827,7 +824,7 @@ class _MessageTile extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final authorName = authorProfile?.label ?? truncateNpub(hit.pubkey);
+    final authorName = authorProfile?.label ?? shortPubkey(hit.pubkey);
     final timeAgo = relativeTime(hit.createdAt);
     final channelName = hit.channelName?.trim().replaceFirst(RegExp(r'^#'), '');
     final hasChannelName = channelName != null && channelName.isNotEmpty;
@@ -965,4 +962,38 @@ class _MessageTile extends ConsumerWidget {
       );
     }
   }
+}
+
+class _SectionLabel extends StatelessWidget {
+  final String label;
+
+  const _SectionLabel({required this.label});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(
+        Grid.gutter,
+        Grid.xs,
+        Grid.gutter,
+        Grid.half,
+      ),
+      child: Text(
+        label,
+        key: ValueKey('search-section-${label.toLowerCase()}'),
+        style: activityContextTextStyle.copyWith(
+          color: context.colors.onSurfaceVariant,
+        ),
+      ),
+    );
+  }
+}
+
+extension on _SearchFilter {
+  String get label => switch (this) {
+    _SearchFilter.all => 'All',
+    _SearchFilter.messages => 'Messages',
+    _SearchFilter.channels => 'Channels',
+    _SearchFilter.people => 'People',
+  };
 }

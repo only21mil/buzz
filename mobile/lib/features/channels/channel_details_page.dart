@@ -249,12 +249,32 @@ class ChannelDetailsPage extends HookConsumerWidget {
     }
 
     final reducedMotion = MediaQuery.disableAnimationsOf(context);
+    final usesNativeIosGlassBackButton =
+        Navigator.canPop(context) &&
+        Theme.of(context).platform == TargetPlatform.iOS;
     return FrostedScaffold(
-      backgroundColor: context.colors.surface,
+      useUtilitySurfaceTheme: true,
       appBar: FrostedAppBar(
         centerTitle: true,
+        leading: usesNativeIosGlassBackButton
+            ? IosGlassNavigationButton(
+                key: const ValueKey('channel-details-ios-glass-back'),
+                icon: IosGlassNavigationIcon.back,
+                semanticLabel: 'Back',
+                onPressed: () => Navigator.of(context).maybePop(),
+                width: iosGlassChannelHeaderLeadingWidth,
+                buttonCenterX: iosGlassChannelHeaderButtonCenterX,
+              )
+            : null,
         iconColor: context.colors.primary,
-        actions: const [SizedBox.square(dimension: 48)],
+        actions: [
+          SizedBox(
+            width: usesNativeIosGlassBackButton
+                ? iosGlassChannelHeaderLeadingWidth
+                : 48,
+            height: 48,
+          ),
+        ],
         frosted: headerFrostProgress.value > 0,
         frostedSurfaceOpacity: 0.5 * headerFrostProgress.value,
         frostedBlurSigma:
@@ -303,8 +323,14 @@ class ChannelDetailsPage extends HookConsumerWidget {
                   Expanded(
                     child: BuzzActionTile(
                       key: const ValueKey('channel-details-star-action'),
-                      icon: isStarred ? LucideIcons.starOff : LucideIcons.star,
-                      label: isStarred ? 'Unstar' : 'Star channel',
+                      icon: null,
+                      iconWidget: LucideStarIcon(
+                        filled: isStarred,
+                        color: isStarred
+                            ? context.colors.primary
+                            : context.colors.onSurface,
+                      ),
+                      label: isStarred ? 'Unstar' : 'Star',
                       onTap: toggleStar,
                     ),
                   ),
@@ -313,7 +339,8 @@ class ChannelDetailsPage extends HookConsumerWidget {
                     child: BuzzActionTile(
                       key: const ValueKey('channel-details-mute-action'),
                       icon: isMuted ? LucideIcons.bell : LucideIcons.bellOff,
-                      label: isMuted ? 'Unmute' : 'Mute channel',
+                      iconColor: isMuted ? context.colors.primary : null,
+                      label: isMuted ? 'Unmute' : 'Mute',
                       onTap: toggleMute,
                     ),
                   ),
@@ -634,6 +661,9 @@ class _ChannelMemberPreviewRow extends StatelessWidget {
         : hasName
         ? displayName!.trim()
         : member.labelFor(currentPubkey);
+    // Self/named initials come from the visible label; unnamed members stay
+    // keyed to the hex public key so the compact-npub label doesn't render
+    // `N` for everyone.
     final initial = isSelf || hasName
         ? label[0].toUpperCase()
         : (member.pubkey.isNotEmpty ? member.pubkey[0].toUpperCase() : '?');
@@ -649,6 +679,7 @@ class _ChannelMemberPreviewRow extends StatelessWidget {
         radius: 20,
         backgroundColor: context.colors.primaryContainer,
         fallback: Text(initial),
+        isAgent: member.isBot,
       ),
       title: Text.rich(
         TextSpan(

@@ -50,14 +50,11 @@ _ComposerVoiceNote _useComposerVoiceNote({
 }) {
   final isPreparing = useState(false);
   final isRecording = useState(false);
-  final recordingGeneration = useRef(0);
-  final generation = recordingGeneration.value;
 
   final resetForDraftIdentityChange = useCallback(() {
-    recordingGeneration.value += 1;
     isPreparing.value = false;
     isRecording.value = false;
-  }, [isPreparing, isRecording, recordingGeneration]);
+  }, [isPreparing, isRecording]);
 
   void beginRecording() {
     if (!isPreparing.value) return;
@@ -80,16 +77,11 @@ _ComposerVoiceNote _useComposerVoiceNote({
     }
     uploadError.value = null;
     draftRevision.value += 1;
-    recordingGeneration.value += 1;
     isPreparing.value = true;
     if (View.of(context).viewInsets.bottom == 0) beginRecording();
   }
 
   void complete(VoiceNoteRecording recording) {
-    if (!isRecording.value || recordingGeneration.value != generation) {
-      unawaited(deleteDroppedVoiceNoteRecording(recording.file.path));
-      return;
-    }
     draftRevision.value += 1;
     uploadError.value = null;
     attachments.value = [

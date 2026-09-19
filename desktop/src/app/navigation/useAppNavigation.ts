@@ -8,6 +8,11 @@ import {
 
 import type { SearchHighlightNavigation } from "@/app/navigation/searchHighlightNavigation";
 import { openSearchHitWithNavigation } from "@/app/navigation/searchHitNavigation";
+import {
+  allowNavigation,
+  type GuardedNavigation,
+  traverseHistory,
+} from "@/app/navigation/navigationGuard";
 import type { SearchHit } from "@/shared/api/types";
 
 type NavigationBehavior = {
@@ -27,14 +32,15 @@ export function useAppNavigation() {
       next: {
         to: string;
         params?: Record<string, string>;
+        search?: Record<string, string | undefined>;
         state?:
           | Record<string, unknown>
           | ((
               previousState: Record<string, unknown>,
             ) => Record<string, unknown>);
-        search?: Record<string, string | undefined>;
       },
       behavior: NavigationBehavior = {},
+      guardedTarget?: GuardedNavigation,
     ) => {
       const nextLocation = router.buildLocation(next as never);
       const hasStateUpdate = next.state !== undefined;
@@ -43,6 +49,14 @@ export function useAppNavigation() {
         location.href === nextLocation.href &&
         !behavior.force &&
         !hasStateUpdate
+      ) {
+        return false;
+      }
+
+      if (
+        !allowNavigation(
+          guardedTarget ?? { kind: "route", href: nextLocation.href },
+        )
       ) {
         return false;
       }
@@ -118,6 +132,7 @@ export function useAppNavigation() {
       projectId: string,
       behavior?: NavigationBehavior & {
         commitHash?: string;
+        filePath?: string;
         pullRequestId?: string;
         issueId?: string;
         repositoryId?: string;
@@ -138,6 +153,7 @@ export function useAppNavigation() {
             ...(behavior?.commitHash
               ? { commitHash: behavior.commitHash }
               : {}),
+            ...(behavior?.filePath ? { filePath: behavior.filePath } : {}),
             ...(behavior?.pullRequestId
               ? { pullRequestId: behavior.pullRequestId }
               : {}),
@@ -256,18 +272,21 @@ export function useAppNavigation() {
          * firing. Used by the Drafts panel "Send message" confirm flow.
          */
         autoSend?: string;
+        /** Navigate even when the destination matches the current href.
+         * Used by desktop-notification activation so a click is never
+         * silently swallowed (block/buzz#3509). */
+        force?: boolean;
         messageId?: string;
         /** Preserve an active search highlight; ordinary navigation clears it. */
         preserveSearchHighlight?: boolean;
         searchHighlight?: SearchHighlightNavigation;
-        force?: boolean;
         replace?: boolean;
         /** Open this thread panel directly without waiting for a timeline row. */
         thread?: string;
         threadRootId?: string | null;
       },
-    ) =>
-      commitNavigation(
+    ) => {
+      return commitNavigation(
         {
           to: "/channels/$channelId",
           params: {
@@ -298,7 +317,16 @@ export function useAppNavigation() {
           replace: options?.replace,
           resetScroll: options?.messageId ? true : undefined,
         },
-      ),
+        options?.messageId
+          ? {
+              kind: "channel-message",
+              channelId,
+              messageId: options.messageId,
+              threadRootId: options.threadRootId ?? null,
+            }
+          : undefined,
+      );
+    },
     [commitNavigation],
   );
 
@@ -318,15 +346,16 @@ export function useAppNavigation() {
       channelId: string,
       postId: string,
       options?: {
+        /** Navigate even when the destination matches the current href. */
+        force?: boolean;
         replace?: boolean;
         replyId?: string;
         /** Preserve an active search highlight; ordinary navigation clears it. */
         preserveSearchHighlight?: boolean;
         searchHighlight?: SearchHighlightNavigation;
-        force?: boolean;
       },
-    ) =>
-      commitNavigation(
+    ) => {
+      return commitNavigation(
         {
           to: "/channels/$channelId/posts/$postId",
           params: {
@@ -348,7 +377,14 @@ export function useAppNavigation() {
           replace: options?.replace,
           resetScroll: false,
         },
-      ),
+        {
+          kind: "forum-post",
+          channelId,
+          postId,
+          replyId: options?.replyId ?? null,
+        },
+      );
+    },
     [commitNavigation],
   );
 
@@ -366,7 +402,7 @@ export function useAppNavigation() {
 
   const closeSettings = React.useCallback(() => {
     if (canGoBack) {
-      router.history.back();
+      traverseHistory(router.history, "back");
       return;
     }
 
@@ -375,7 +411,7 @@ export function useAppNavigation() {
 
   const closeWorkflowDetail = React.useCallback(() => {
     if (canGoBack) {
-      router.history.back();
+      traverseHistory(router.history, "back");
       return;
     }
 
@@ -385,7 +421,7 @@ export function useAppNavigation() {
   const closeForumPost = React.useCallback(
     (channelId: string) => {
       if (canGoBack) {
-        router.history.back();
+        traverseHistory(router.history, "back");
         return;
       }
 
@@ -397,9 +433,24 @@ export function useAppNavigation() {
   const openSearchHit = React.useCallback(
     async (
       hit: SearchHit,
-      behavior?: { force?: boolean; query?: string; signal?: AbortSignal },
+      behavior?: {
+        /** Navigate even when the destination matches the current href.
+         * Used by desktop-notification activation so a click is never
+         * silently swallowed (block/buzz#3509). */
+        force?: boolean;
+        /** Search text to highlight after opening this result. */
+        query?: string;
+        /** Stop notification-driven routing when its owning lifecycle ends. */
+        signal?: AbortSignal;
+      },
     ) =>
-      openSearchHitWithNavigation(hit, { ...behavior, goChannel, goForumPost }),
+      openSearchHitWithNavigation(hit, {
+        force: behavior?.force,
+        goChannel,
+        goForumPost,
+        query: behavior?.query,
+        signal: behavior?.signal,
+      }),
     [goChannel, goForumPost],
   );
 

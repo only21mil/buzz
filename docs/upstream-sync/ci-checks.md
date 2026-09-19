@@ -62,7 +62,10 @@ fork publisher or approved local route replaces them, never a deletion.
 signed-macos-canary.yml and the desktop candidate workflow depend on Block
 Apple signing OIDC roles a fork tag alone cannot satisfy. New
 codex-security-review.yml and staging-dev-relay-image.yml must stay disabled
-for the fork or gain repository guards before landing (CD-15). The changes job
+for the fork or gain repository guards before landing (CD-15). Keep the
+`block/buzz` guard on codex-security-review.yml and omit its upstream `main`
+push trigger to satisfy the fork's no-automatic-main-push landing contract.
+The changes job
 needs Hermit activation wherever adopted upstream scripts assume it (CD-14).
 
 ## Mirror authority

@@ -1,4 +1,5 @@
 import type * as React from "react";
+import { AgentManagementMarker } from "@/features/agents/ui/OtherSetupAgentMarker";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { cn } from "@/shared/lib/cn";
 import { formatMentionDisplayLabel } from "@/shared/lib/mentionDisplay";
@@ -66,6 +67,7 @@ export function createMarkdownMention(interactive: boolean) {
           {displayLabel.slice(0, leadingEnd)}
         </span>
         {displayLabel.slice(leadingEnd)}
+        {isAgentMention ? <AgentManagementMarker pubkey={pubkey} /> : null}
       </InlineChip>
     );
 
@@ -75,6 +77,7 @@ export function createMarkdownMention(interactive: boolean) {
         pubkey={pubkey}
         role={isAgentMention ? "bot" : undefined}
         triggerElement="span"
+        triggerClassName="inline"
       >
         {mentionNode}
       </UserProfilePopover>

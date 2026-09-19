@@ -3,7 +3,6 @@ import 'package:nostr/nostr.dart' as nostr;
 
 import '../community/community.dart';
 import '../community/community_provider.dart';
-import 'export_authorization.dart';
 
 enum AuthStatus { unknown, unauthenticated, authenticated }
 
@@ -77,15 +76,6 @@ class AuthNotifier extends AsyncNotifier<AuthState> {
 
   Future<void> signOut() {
     return () async {
-      // Export grants die with the session. A grant minted before logout
-      // must never authorize a key read after it.
-      try {
-        ref.read(exportAuthorizationProvider.notifier).invalidateAll();
-      } catch (_) {
-        // Fail closed toward logout: keep signing out even if the
-        // grant store is unavailable in this scope (e.g. tests that
-        // override auth without export authorization).
-      }
       final storage = ref.read(communityStorageProvider);
       await ref
           .read(communityListProvider.notifier)

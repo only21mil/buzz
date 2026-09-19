@@ -277,10 +277,6 @@ pub(crate) async fn post_connect_setup(
 ///
 /// Returns `Ok(true)` if the pipeline was started, `Ok(false)` if models are
 /// not ready (voice-only mode), or `Err` on a real failure.
-///
-/// Creates the shared `tts_active` flag and passes it to the STT pipeline
-/// for barge-in / echo gating. The same flag is later passed to the TTS
-/// pipeline so it can signal when audio is playing.
 pub(crate) async fn maybe_start_stt_pipeline(
     state: &AppState,
     ephemeral_channel_id: &str,
@@ -678,6 +674,7 @@ pub(crate) fn spawn_transcription_task(
                 &[],
                 &[],
                 &[],
+                None,
                 &crate::relay::relay_api_base_url(),
             ) {
                 Ok(b) => b,

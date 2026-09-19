@@ -1,10 +1,6 @@
 import type { PublicationScope } from "./publicationScope";
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import {
-  activateRateLimit,
-  parseRateLimitHint,
-} from "@/shared/api/relayRateLimitGate";
-import {
   fromRawInstallRuntimeResult,
   type RawInstallRuntimeResult,
 } from "@/shared/api/installTypes";
@@ -32,6 +28,7 @@ import type {
   ThreadRepliesResponse,
   CreateManagedAgentInput,
   AgentModelsResponse,
+  UpdateManagedAgentInput,
   AcpAvailabilityStatus,
   AcpRuntimeCatalogEntry,
   AuthStatus,
@@ -40,7 +37,6 @@ import type {
   GitBashPrerequisite,
   RuntimeConfigSurface,
 } from "@/shared/api/types";
-export { updateManagedAgent } from "@/shared/api/tauriManagedAgents";
 
 export * from "@/shared/api/tauriChannels";
 export { sendChannelMessage } from "@/shared/api/tauriMessages";
@@ -66,7 +62,7 @@ type RawFeedItem = {
   channel_name: string;
   channel_type: string | null;
   tags: string[][];
-  category: "mention" | "needs_action" | "activity" | "agent_activity";
+  category: HomeFeedResponse["feed"]["mentions"][number]["category"];
 };
 
 type RawHomeFeedResponse = {
@@ -111,7 +107,6 @@ type RawRelayAgent = {
   respond_to?: RelayAgent["respondTo"];
   respond_to_allowlist?: string[];
 };
-
 import type { RestartDiffEntry as RawRestartDiffEntry } from "./restartDiff";
 export type RawManagedAgent = {
   pubkey: string;
@@ -130,12 +125,12 @@ export type RawManagedAgent = {
   idle_timeout_seconds: number | null;
   max_turn_duration_seconds: number | null;
   parallelism: number;
+  session_policy?: ManagedAgent["sessionPolicy"];
   system_prompt: string | null;
   avatar_url?: string | null;
   model: string | null;
   model_source?: ManagedAgent["modelSource"];
   provider: string | null;
-  effort_level?: string | null;
   persona_out_of_date: boolean;
   persona_orphaned: boolean;
   needs_restart: boolean;
@@ -156,6 +151,7 @@ export type RawManagedAgent = {
   backend: ManagedAgentBackend;
   backend_agent_id: string | null;
   // Pre-feature fixtures may omit these; mapped to "owner-only"/[] in fromRawManagedAgent.
+  effort_level?: string | null;
   respond_to?: ManagedAgent["respondTo"];
   respond_to_allowlist?: string[];
 };
@@ -184,24 +180,22 @@ export type RawAcpRuntimeCatalogEntry = {
   model_env_var?: string | null;
   provider_env_var?: string | null;
   thinking_env_var?: string | null;
-  effort_canonical_values?: string[] | null;
   max_tokens_env_var?: string | null;
   context_limit_env_var?: string | null;
   max_rounds_env_var?: string | null;
   install_hint: string;
   install_instructions_url: string;
   can_auto_install: boolean;
-  /** Optional only for older E2E fixtures; the Rust catalog always supplies it. */
   requires_external_cli?: boolean;
   underlying_cli_path: string | null;
   node_required: boolean;
-  /** Tagged union with snake_case status values — same shape as `AuthStatus`. */
   auth_status: AuthStatus;
   login_hint?: string;
   source: "builtin" | "preset" | "custom";
   /** Definition-level env vars for `source: custom` entries; absent for builtin/preset. */
   definition_env?: Record<string, string>;
   max_parallelism?: number;
+  effort_canonical_values?: string[] | null;
 };
 
 export type {
@@ -285,18 +279,6 @@ function toTauriError(error: unknown): Error {
   }
 }
 
-/**
- * Inspect a Tauri error message and activate the shared rate-limit gate when
- * the Rust relay layer emitted an HTTP 429 response (`relay rate-limited:` prefix).
- *
- * Extracted so it can be unit-tested without mocking the Tauri invoke bridge.
- */
-export function applyTauriRateLimitIfNeeded(message: string): void {
-  if (message.startsWith("relay rate-limited:")) {
-    activateRateLimit(parseRateLimitHint(message));
-  }
-}
-
 export async function invokeTauri<T>(
   command: string,
   args?: Record<string, unknown>,
@@ -304,11 +286,9 @@ export async function invokeTauri<T>(
   try {
     return await tauriInvoke<T>(command, args);
   } catch (error) {
-    const err = toTauriError(error);
-    // Rust emits `relay rate-limited:` for HTTP 429 responses. Activate the
-    // shared gate so the TS relay client backs off for the same window.
-    applyTauriRateLimitIfNeeded(err.message);
-    throw err;
+    // HTTP backoff lives in Rust. Do not apply its separate ApiCalls quota
+    // to the WebSocket gate, but preserve the failure for the caller.
+    throw toTauriError(error);
   }
 }
 
@@ -476,7 +456,6 @@ type RawThreadCursor = {
 };
 
 type RawThreadRepliesResponse = {
-  aux_included?: boolean;
   events: RelayEvent[];
   next_cursor: RawThreadCursor | null;
 };
@@ -524,7 +503,6 @@ export async function getThreadReplies(
 
   return {
     events: response.events,
-    auxIncluded: response.aux_included === true,
     nextCursor: response.next_cursor
       ? {
           createdAt: response.next_cursor.created_at,
@@ -618,7 +596,6 @@ export async function createAuthEvent(input: {
   const eventJson = await invokeTauri<string>("create_auth_event", input);
   return JSON.parse(eventJson) as RelayEvent;
 }
-
 function fromRawRelayAgent(agent: RawRelayAgent): RelayAgent {
   return {
     pubkey: agent.pubkey,
@@ -651,12 +628,13 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     idleTimeoutSeconds: agent.idle_timeout_seconds,
     maxTurnDurationSeconds: agent.max_turn_duration_seconds,
     parallelism: agent.parallelism,
+    sessionPolicy: agent.session_policy ?? "channel",
     systemPrompt: agent.system_prompt,
     avatarUrl: agent.avatar_url ?? null,
     model: agent.model,
+    effortLevel: agent.effort_level ?? null,
     modelSource: agent.model_source ?? null,
     provider: agent.provider ?? null,
-    effortLevel: agent.effort_level ?? null,
     personaOutOfDate: agent.persona_out_of_date ?? false,
     personaOrphaned: agent.persona_orphaned ?? false,
     needsRestart: agent.needs_restart ?? false,
@@ -696,7 +674,6 @@ export function fromRawAcpRuntimeCatalogEntry(
     modelEnvVar: entry.model_env_var ?? null,
     providerEnvVar: entry.provider_env_var ?? null,
     thinkingEnvVar: entry.thinking_env_var ?? null,
-    effortCanonicalValues: entry.effort_canonical_values ?? null,
     maxTokensEnvVar: entry.max_tokens_env_var ?? null,
     contextLimitEnvVar: entry.context_limit_env_var ?? null,
     maxRoundsEnvVar: entry.max_rounds_env_var ?? null,
@@ -710,6 +687,7 @@ export function fromRawAcpRuntimeCatalogEntry(
     loginHint: entry.login_hint ?? null,
     source: entry.source,
     definitionEnv: entry.definition_env ?? {},
+    effortCanonicalValues: entry.effort_canonical_values ?? null,
     ...(entry.max_parallelism !== undefined && {
       maxParallelism: entry.max_parallelism,
     }),
@@ -869,12 +847,6 @@ export async function discoverGitBashPrerequisite(): Promise<GitBashPrerequisite
   );
 }
 
-export async function discoverAcpRuntimes(): Promise<AcpRuntimeCatalogEntry[]> {
-  return (
-    await invokeTauri<RawAcpRuntimeCatalogEntry[]>("discover_acp_providers")
-  ).map(fromRawAcpRuntimeCatalogEntry);
-}
-
 /** Input shape for creating or updating a custom harness. */
 export type HarnessDefinitionInput = {
   id: string;
@@ -1004,7 +976,7 @@ export async function getBakedBuildEnvKeys(): Promise<string[]> {
  *
  * The value is already masked in Rust for secret keys (keys not in the
  * explicit safe-to-reveal allowlist: `BUZZ_AGENT_PROVIDER`, `BUZZ_AGENT_MODEL`,
- * `DATABRICKS_HOST`, `DATABRICKS_MODEL`). Non-allowlisted keys have their
+ * `DATABRICKS_HOST`, `DATABRICKS_MODEL`, `DATABRICKS_MODEL_FILTER`). Non-allowlisted keys have their
  * values replaced with `••••••`. Non-secret values are shown as-is.
  * Empty-value keys are filtered out.
  */
@@ -1029,6 +1001,24 @@ export async function getBakedBuildEnv(): Promise<BakedEnvEntry[]> {
   return invokeTauri<BakedEnvEntry[]>("get_baked_build_env");
 }
 
+type RawUpdateManagedAgentResponse = {
+  agent: RawManagedAgent;
+  profile_sync_error: string | null;
+};
+
+export async function updateManagedAgent(
+  input: UpdateManagedAgentInput,
+): Promise<{ agent: ManagedAgent; profileSyncError: string | null }> {
+  const response = await invokeTauri<RawUpdateManagedAgentResponse>(
+    "update_managed_agent",
+    { input },
+  );
+  return {
+    agent: fromRawManagedAgent(response.agent),
+    profileSyncError: response.profile_sync_error,
+  };
+}
+
 // ── Backend provider discovery ────────────────────────────────────────────────
 
 export async function discoverBackendProviders(): Promise<
@@ -1044,6 +1034,8 @@ export async function probeBackendProvider(
     binaryPath,
   });
 }
+
+// ── NIP-44 encrypt-to-self ───────────────────────────────────────────────────
 
 export async function nip44EncryptToSelf(plaintext: string): Promise<string> {
   return invokeTauri<string>("nip44_encrypt_to_self", { plaintext });
@@ -1067,15 +1059,18 @@ export async function cancelPairing(): Promise<void> {
   await invokeTauri("cancel_pairing");
 }
 
-export {
-  applyCommunity,
-  setAgentManagedProfiles,
-  setThreadScopedAcpSessions,
-  setPreventSleepActive,
-  validateReposDir,
-} from "./tauriWorkspace";
+// Validate a candidate repos dir without mutating the filesystem. Rejects
+// with a human-readable reason; resolves for a valid or empty path.
+export async function validateReposDir(dir: string): Promise<void> {
+  await invokeTauri("validate_repos_dir", { dir });
+}
 
-/** Whether this install supports Tauri's binary updater. */
+export const setPreventSleepActive = (active: boolean) =>
+  invokeTauri("set_prevent_sleep_active", { active });
+
+/** Returns true on macOS, Windows, and Linux AppImage installs.
+ *  Returns false on Linux non-AppImage packages (e.g. .deb) where
+ *  Tauri's updater cannot swap the binary. */
 export function isAutoUpdateSupported(): Promise<boolean> {
   return invokeTauri<boolean>("is_auto_update_supported");
 }

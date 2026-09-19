@@ -1728,317 +1728,24 @@ mod harness {
 
     // Multi-threaded: the test thread blocks on `git push` while the relay
     // listener must keep serving on other workers.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "requires Postgres, MinIO and git"]
-    async fn off_mode_ignores_gated_refs() {
-        let h = Harness::start(|config| config.ci.merge_gate.mode = MergeGateMode::Off).await;
-        let main0 = h.main_oid_on_relay();
-        let candidate = h.candidate(&main0, "a.txt", "a\n", "candidate without a run");
-        h.push(&format!("{candidate}:refs/heads/main"))
-            .expect("off mode ignores the rule");
-        assert_eq!(h.main_oid_on_relay(), candidate);
-        assert!(h.decisions().await.is_empty(), "off evaluates nothing");
-    }
 
     // Multi-threaded: the test thread blocks on `git push` while the relay
     // listener must keep serving on other workers.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "requires Postgres, MinIO and git"]
-    async fn shadow_mode_allows_and_records() {
-        let h = Harness::start(|config| config.ci.merge_gate.mode = MergeGateMode::Shadow).await;
-        let main0 = h.main_oid_on_relay();
-        let no_run = h.candidate(&main0, "a.txt", "a\n", "no run");
-        h.push(&format!("{no_run}:refs/heads/main"))
-            .expect("shadow never refuses");
-        let (code, classification, _, _) = h.last_decision().await;
-        assert_eq!(
-            (code.as_str(), classification.as_str()),
-            ("no_check", "fast_forward")
-        );
-
-        let green = h.candidate(&no_run, "b.txt", "b\n", "green");
-        h.seed_run(PINNED, &green, &no_run, &digest(WORKFLOW_V1), Seed::Green)
-            .await;
-        h.push(&format!("{green}:refs/heads/main"))
-            .expect("shadow allows");
-        let (code, classification, bypass, _) = h.last_decision().await;
-        assert_eq!(
-            (code.as_str(), classification.as_str()),
-            ("allow", "fast_forward")
-        );
-        assert!(bypass.is_none());
-        assert_eq!(h.decisions().await.len(), 2);
-    }
 
     // Multi-threaded: the test thread blocks on `git push` while the relay
     // listener must keep serving on other workers.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "requires Postgres, MinIO and git"]
-    async fn enforce_refuses_each_refusal_code() {
-        let h = Harness::start(|config| config.ci.merge_gate.mode = MergeGateMode::Enforce).await;
-        let main0 = h.main_oid_on_relay();
-        let v1 = digest(WORKFLOW_V1);
-
-        // Ungated run: nothing seeded.
-        let no_run = h.candidate(&main0, "a.txt", "a\n", "no run");
-        assert_refused(h.push(&format!("{no_run}:refs/heads/main")), "no_check");
-        assert_eq!(h.last_decision().await.0, "no_check");
-
-        // Green over a subset of the pinned jobs.
-        let subset = h.candidate(&main0, "a.txt", "subset\n", "subset");
-        h.seed_run(&["lint"], &subset, &main0, &v1, Seed::Green)
-            .await;
-        assert_refused(
-            h.push(&format!("{subset}:refs/heads/main")),
-            "required_jobs_missing",
-        );
-        assert_eq!(h.last_decision().await.0, "required_jobs_missing");
-
-        // Green but tested against another base.
-        let wrong_base = h.candidate(&main0, "a.txt", "wrong base\n", "wrong base");
-        h.seed_run(PINNED, &wrong_base, &"7".repeat(40), &v1, Seed::Green)
-            .await;
-        assert_refused(
-            h.push(&format!("{wrong_base}:refs/heads/main")),
-            "base_moved",
-        );
-        assert_eq!(h.last_decision().await.0, "base_moved");
-
-        // Still running.
-        let pending = h.candidate(&main0, "a.txt", "pending\n", "pending");
-        h.seed_run(PINNED, &pending, &main0, &v1, Seed::Pending)
-            .await;
-        assert_refused(
-            h.push(&format!("{pending}:refs/heads/main")),
-            "check_pending",
-        );
-
-        // Expired by relay accepted_at, one second past the window.
-        let expired = h.candidate(&main0, "a.txt", "expired\n", "expired");
-        let (_, check_id) = h.seed_run(PINNED, &expired, &main0, &v1, Seed::Green).await;
-        let max_age = h.state.config.ci.merge_gate.check_max_age_seconds as i64;
-        h.backdate_acceptance(&check_id.expect("check"), max_age + 1)
-            .await;
-        assert_refused(
-            h.push(&format!("{expired}:refs/heads/main")),
-            "check_expired",
-        );
-        assert_eq!(h.last_decision().await.0, "check_expired");
-
-        // Land a green candidate so main moves, then build bad merges.
-        let landed = h.candidate(&main0, "a.txt", "landed\n", "landed");
-        h.seed_run(PINNED, &landed, &main0, &v1, Seed::Green).await;
-        h.push(&format!("{landed}:refs/heads/main"))
-            .expect("green lands");
-        assert_eq!(h.main_oid_on_relay(), landed);
-
-        // A candidate branched from the old main, merged with its own tree:
-        // the merge cannot prove it keeps `landed`.
-        let stale = h.candidate(&main0, "c.txt", "c\n", "stale candidate");
-        let stale_tree = h.rev_parse(&format!("{stale}^{{tree}}"));
-        let not_descendant = h.commit_tree(&stale_tree, &[&landed, &stale], "merge stale");
-        assert_refused(
-            h.push(&format!("{not_descendant}:refs/heads/main")),
-            "not_descendant",
-        );
-        assert_eq!(h.last_decision().await.0, "not_descendant");
-
-        // A candidate on top of main merged with a tree that is not its own
-        // (a conflict resolution).
-        let fresh = h.candidate(&landed, "d.txt", "d\n", "fresh candidate");
-        let landed_tree = h.rev_parse(&format!("{landed}^{{tree}}"));
-        let tree_mismatch = h.commit_tree(&landed_tree, &[&landed, &fresh], "merge with edits");
-        assert_refused(
-            h.push(&format!("{tree_mismatch}:refs/heads/main")),
-            "tree_mismatch",
-        );
-        assert_eq!(h.last_decision().await.0, "tree_mismatch");
-
-        // Nothing but the green candidate landed.
-        assert_eq!(h.main_oid_on_relay(), landed);
-    }
 
     // Multi-threaded: the test thread blocks on `git push` while the relay
     // listener must keep serving on other workers.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "requires Postgres, MinIO and git"]
-    async fn enforce_refuses_a_check_signed_outside_the_union() {
-        let outsider = Keys::generate().public_key().to_hex();
-        let h = Harness::start(|config| {
-            config.ci.merge_gate.mode = MergeGateMode::Enforce;
-            config.ci_status_signer_pubkeys = HashSet::from([outsider]);
-        })
-        .await;
-        let main0 = h.main_oid_on_relay();
-        let candidate = h.candidate(&main0, "a.txt", "a\n", "signed by a revoked key");
-        h.seed_run(
-            PINNED,
-            &candidate,
-            &main0,
-            &digest(WORKFLOW_V1),
-            Seed::Green,
-        )
-        .await;
-        assert_refused(
-            h.push(&format!("{candidate}:refs/heads/main")),
-            "signer_unauthorized",
-        );
-        assert_eq!(h.last_decision().await.0, "signer_unauthorized");
-    }
 
     // Multi-threaded: the test thread blocks on `git push` while the relay
     // listener must keep serving on other workers.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "requires Postgres, MinIO and git"]
-    async fn enforce_allows_a_green_run_by_fast_forward_and_by_merge() {
-        let h = Harness::start(|config| config.ci.merge_gate.mode = MergeGateMode::Enforce).await;
-        let main0 = h.main_oid_on_relay();
-        let v1 = digest(WORKFLOW_V1);
-
-        let ff = h.candidate(&main0, "a.txt", "a\n", "fast-forward candidate");
-        h.seed_run(PINNED, &ff, &main0, &v1, Seed::Green).await;
-        h.push(&format!("{ff}:refs/heads/main"))
-            .expect("fast-forward lands");
-        assert_eq!(h.main_oid_on_relay(), ff);
-        let (code, classification, _, _) = h.last_decision().await;
-        assert_eq!(
-            (code.as_str(), classification.as_str()),
-            ("allow", "fast_forward")
-        );
-
-        let candidate = h.candidate(&ff, "b.txt", "b\n", "merge candidate");
-        h.seed_run(PINNED, &candidate, &ff, &v1, Seed::Green).await;
-        let tree = h.rev_parse(&format!("{candidate}^{{tree}}"));
-        let merge = h.commit_tree(&tree, &[&ff, &candidate], "Merge pull request #1");
-        h.push(&format!("{merge}:refs/heads/main"))
-            .expect("merge landing lands");
-        assert_eq!(h.main_oid_on_relay(), merge);
-        let (code, classification, _, _) = h.last_decision().await;
-        assert_eq!((code.as_str(), classification.as_str()), ("allow", "merge"));
-    }
 
     // Multi-threaded: the test thread blocks on `git push` while the relay
     // listener must keep serving on other workers.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "requires Postgres, MinIO and git"]
-    async fn bypass_allows_once_and_survives_a_simulated_cas_loss() {
-        let h = Harness::start(|config| config.ci.merge_gate.mode = MergeGateMode::Enforce).await;
-        let main0 = h.main_oid_on_relay();
-        let now = Utc::now().timestamp();
-
-        // Finalize fence with no decision at all: refused before any CAS.
-        let orphan = h.candidate(&main0, "z.txt", "z\n", "orphan");
-        let (repo, parent_state) = h.hydrate_for_write().await;
-        h.install_candidate(repo.path(), &orphan);
-        let response = finalize_push(&h.state, h.push_context(repo, parent_state, &orphan)).await;
-        let (status, body) = crate::api::git::policy::tests::body_string(response).await;
-        assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
-        assert!(
-            body.contains("gate_misconfigured") && body.contains("no allow decision"),
-            "{body}"
-        );
-        assert_eq!(h.main_oid_on_relay(), main0);
-
-        // A bypass lands a candidate with no run, once.
-        let first = h.candidate(&main0, "a.txt", "a\n", "bypassed");
-        let bypass = h.insert_bypass(&main0, &first, now - 10, 600).await;
-        h.push(&format!("{first}:refs/heads/main"))
-            .expect("bypass allows");
-        assert_eq!(h.main_oid_on_relay(), first);
-        let (code, classification, decision_bypass, decision_id) = h.last_decision().await;
-        assert_eq!(
-            (code.as_str(), classification.as_str()),
-            ("allow", "bypass")
-        );
-        assert_eq!(decision_bypass.as_deref(), Some(bypass.as_slice()));
-        assert_eq!(
-            h.bypass_consumed_by(&bypass).await,
-            Some(decision_id),
-            "consumed after the CAS won"
-        );
-
-        // Reuse of the consumed bypass for the same update is bypass_invalid.
-        let denials = h.gate(h.facts(&main0, &first)).await;
-        assert_eq!(denials.len(), 1);
-        assert!(
-            denials[0].reason.starts_with("merge gate: bypass_invalid"),
-            "{}",
-            denials[0].reason
-        );
-        assert_eq!(h.last_decision().await.0, "bypass_invalid");
-
-        // Simulated CAS loss: a workspace hydrated at `first`, then main
-        // advances by another bypassed push, then the stale workspace
-        // finalizes with its own allowing bypass decision.
-        let stale_candidate = h.candidate(&first, "b.txt", "stale\n", "stale");
-        let (repo, stale_parent) = h.hydrate_for_write().await;
-        h.install_candidate(repo.path(), &stale_candidate);
-
-        let winner = h.candidate(&first, "c.txt", "winner\n", "winner");
-        let winner_bypass = h.insert_bypass(&first, &winner, now - 10, 600).await;
-        h.push(&format!("{winner}:refs/heads/main"))
-            .expect("winner lands");
-        assert_eq!(h.main_oid_on_relay(), winner);
-        assert!(h.bypass_consumed_by(&winner_bypass).await.is_some());
-
-        let loser_bypass = h
-            .insert_bypass(&first, &stale_candidate, now - 10, 600)
-            .await;
-        let denials = h.gate(h.facts(&first, &stale_candidate)).await;
-        assert!(denials.is_empty(), "{denials:?}");
-        assert_eq!(h.last_decision().await.0, "allow");
-        assert!(
-            h.bypass_consumed_by(&loser_bypass).await.is_none(),
-            "hook time consumes nothing"
-        );
-
-        let response = finalize_push(
-            &h.state,
-            h.push_context(repo, stale_parent, &stale_candidate),
-        )
-        .await;
-        let (status, body) = crate::api::git::policy::tests::body_string(response).await;
-        assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
-        assert!(
-            h.bypass_consumed_by(&loser_bypass).await.is_none(),
-            "a CAS loser leaves its bypass usable"
-        );
-        assert_eq!(h.main_oid_on_relay(), winner);
-    }
 
     // Multi-threaded: the test thread blocks on `git push` while the relay
     // listener must keep serving on other workers.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "requires Postgres, MinIO and git"]
-    async fn candidate_editing_the_workflow_lands_and_governs_the_next_candidate() {
-        let h = Harness::start(|config| config.ci.merge_gate.mode = MergeGateMode::Enforce).await;
-        let main0 = h.main_oid_on_relay();
-        let v1 = digest(WORKFLOW_V1);
-        let v2 = digest(WORKFLOW_V2);
-
-        // The edit is tested under the base's workflow (v1) and lands.
-        let edit = h.candidate(&main0, WORKFLOW_PATH, WORKFLOW_V2, "edit ci.yml");
-        h.seed_run(PINNED, &edit, &main0, &v1, Seed::Green).await;
-        h.push(&format!("{edit}:refs/heads/main"))
-            .expect("workflow edit lands under v1");
-        assert_eq!(h.main_oid_on_relay(), edit);
-
-        // The next candidate must be tested under v2: a v1 run is refused.
-        let next = h.candidate(&edit, "a.txt", "a\n", "next candidate");
-        h.seed_run(PINNED, &next, &edit, &v1, Seed::Green).await;
-        assert_refused(
-            h.push(&format!("{next}:refs/heads/main")),
-            "workflow_digest_mismatch",
-        );
-        assert_eq!(h.last_decision().await.0, "workflow_digest_mismatch");
-
-        // A newer v2 run for the same candidate decides.
-        h.seed_run(PINNED, &next, &edit, &v2, Seed::Green).await;
-        h.push(&format!("{next}:refs/heads/main"))
-            .expect("v2 run lands");
-        assert_eq!(h.main_oid_on_relay(), next);
-        assert_eq!(h.last_decision().await.0, "allow");
-    }
 
     impl Harness {
         async fn hydrate_for_write(&self) -> (HydratedRepo, ParentState) {
@@ -2105,6 +1812,316 @@ mod harness {
                 tenant: self.tenant.clone(),
                 repo_handle: repo,
             }
+        }
+    }
+
+    mod external_infra_tests {
+        use super::*;
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        #[ignore = "requires Postgres, MinIO and git"]
+        async fn off_mode_ignores_gated_refs() {
+            let h = Harness::start(|config| config.ci.merge_gate.mode = MergeGateMode::Off).await;
+            let main0 = h.main_oid_on_relay();
+            let candidate = h.candidate(&main0, "a.txt", "a\n", "candidate without a run");
+            h.push(&format!("{candidate}:refs/heads/main"))
+                .expect("off mode ignores the rule");
+            assert_eq!(h.main_oid_on_relay(), candidate);
+            assert!(h.decisions().await.is_empty(), "off evaluates nothing");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        #[ignore = "requires Postgres, MinIO and git"]
+        async fn shadow_mode_allows_and_records() {
+            let h =
+                Harness::start(|config| config.ci.merge_gate.mode = MergeGateMode::Shadow).await;
+            let main0 = h.main_oid_on_relay();
+            let no_run = h.candidate(&main0, "a.txt", "a\n", "no run");
+            h.push(&format!("{no_run}:refs/heads/main"))
+                .expect("shadow never refuses");
+            let (code, classification, _, _) = h.last_decision().await;
+            assert_eq!(
+                (code.as_str(), classification.as_str()),
+                ("no_check", "fast_forward")
+            );
+
+            let green = h.candidate(&no_run, "b.txt", "b\n", "green");
+            h.seed_run(PINNED, &green, &no_run, &digest(WORKFLOW_V1), Seed::Green)
+                .await;
+            h.push(&format!("{green}:refs/heads/main"))
+                .expect("shadow allows");
+            let (code, classification, bypass, _) = h.last_decision().await;
+            assert_eq!(
+                (code.as_str(), classification.as_str()),
+                ("allow", "fast_forward")
+            );
+            assert!(bypass.is_none());
+            assert_eq!(h.decisions().await.len(), 2);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        #[ignore = "requires Postgres, MinIO and git"]
+        async fn enforce_refuses_each_refusal_code() {
+            let h =
+                Harness::start(|config| config.ci.merge_gate.mode = MergeGateMode::Enforce).await;
+            let main0 = h.main_oid_on_relay();
+            let v1 = digest(WORKFLOW_V1);
+
+            // Ungated run: nothing seeded.
+            let no_run = h.candidate(&main0, "a.txt", "a\n", "no run");
+            assert_refused(h.push(&format!("{no_run}:refs/heads/main")), "no_check");
+            assert_eq!(h.last_decision().await.0, "no_check");
+
+            // Green over a subset of the pinned jobs.
+            let subset = h.candidate(&main0, "a.txt", "subset\n", "subset");
+            h.seed_run(&["lint"], &subset, &main0, &v1, Seed::Green)
+                .await;
+            assert_refused(
+                h.push(&format!("{subset}:refs/heads/main")),
+                "required_jobs_missing",
+            );
+            assert_eq!(h.last_decision().await.0, "required_jobs_missing");
+
+            // Green but tested against another base.
+            let wrong_base = h.candidate(&main0, "a.txt", "wrong base\n", "wrong base");
+            h.seed_run(PINNED, &wrong_base, &"7".repeat(40), &v1, Seed::Green)
+                .await;
+            assert_refused(
+                h.push(&format!("{wrong_base}:refs/heads/main")),
+                "base_moved",
+            );
+            assert_eq!(h.last_decision().await.0, "base_moved");
+
+            // Still running.
+            let pending = h.candidate(&main0, "a.txt", "pending\n", "pending");
+            h.seed_run(PINNED, &pending, &main0, &v1, Seed::Pending)
+                .await;
+            assert_refused(
+                h.push(&format!("{pending}:refs/heads/main")),
+                "check_pending",
+            );
+
+            // Expired by relay accepted_at, one second past the window.
+            let expired = h.candidate(&main0, "a.txt", "expired\n", "expired");
+            let (_, check_id) = h.seed_run(PINNED, &expired, &main0, &v1, Seed::Green).await;
+            let max_age = h.state.config.ci.merge_gate.check_max_age_seconds as i64;
+            h.backdate_acceptance(&check_id.expect("check"), max_age + 1)
+                .await;
+            assert_refused(
+                h.push(&format!("{expired}:refs/heads/main")),
+                "check_expired",
+            );
+            assert_eq!(h.last_decision().await.0, "check_expired");
+
+            // Land a green candidate so main moves, then build bad merges.
+            let landed = h.candidate(&main0, "a.txt", "landed\n", "landed");
+            h.seed_run(PINNED, &landed, &main0, &v1, Seed::Green).await;
+            h.push(&format!("{landed}:refs/heads/main"))
+                .expect("green lands");
+            assert_eq!(h.main_oid_on_relay(), landed);
+
+            // A candidate branched from the old main, merged with its own tree:
+            // the merge cannot prove it keeps `landed`.
+            let stale = h.candidate(&main0, "c.txt", "c\n", "stale candidate");
+            let stale_tree = h.rev_parse(&format!("{stale}^{{tree}}"));
+            let not_descendant = h.commit_tree(&stale_tree, &[&landed, &stale], "merge stale");
+            assert_refused(
+                h.push(&format!("{not_descendant}:refs/heads/main")),
+                "not_descendant",
+            );
+            assert_eq!(h.last_decision().await.0, "not_descendant");
+
+            // A candidate on top of main merged with a tree that is not its own
+            // (a conflict resolution).
+            let fresh = h.candidate(&landed, "d.txt", "d\n", "fresh candidate");
+            let landed_tree = h.rev_parse(&format!("{landed}^{{tree}}"));
+            let tree_mismatch = h.commit_tree(&landed_tree, &[&landed, &fresh], "merge with edits");
+            assert_refused(
+                h.push(&format!("{tree_mismatch}:refs/heads/main")),
+                "tree_mismatch",
+            );
+            assert_eq!(h.last_decision().await.0, "tree_mismatch");
+
+            // Nothing but the green candidate landed.
+            assert_eq!(h.main_oid_on_relay(), landed);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        #[ignore = "requires Postgres, MinIO and git"]
+        async fn enforce_refuses_a_check_signed_outside_the_union() {
+            let outsider = Keys::generate().public_key().to_hex();
+            let h = Harness::start(|config| {
+                config.ci.merge_gate.mode = MergeGateMode::Enforce;
+                config.ci_status_signer_pubkeys = HashSet::from([outsider]);
+            })
+            .await;
+            let main0 = h.main_oid_on_relay();
+            let candidate = h.candidate(&main0, "a.txt", "a\n", "signed by a revoked key");
+            h.seed_run(
+                PINNED,
+                &candidate,
+                &main0,
+                &digest(WORKFLOW_V1),
+                Seed::Green,
+            )
+            .await;
+            assert_refused(
+                h.push(&format!("{candidate}:refs/heads/main")),
+                "signer_unauthorized",
+            );
+            assert_eq!(h.last_decision().await.0, "signer_unauthorized");
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        #[ignore = "requires Postgres, MinIO and git"]
+        async fn enforce_allows_a_green_run_by_fast_forward_and_by_merge() {
+            let h =
+                Harness::start(|config| config.ci.merge_gate.mode = MergeGateMode::Enforce).await;
+            let main0 = h.main_oid_on_relay();
+            let v1 = digest(WORKFLOW_V1);
+
+            let ff = h.candidate(&main0, "a.txt", "a\n", "fast-forward candidate");
+            h.seed_run(PINNED, &ff, &main0, &v1, Seed::Green).await;
+            h.push(&format!("{ff}:refs/heads/main"))
+                .expect("fast-forward lands");
+            assert_eq!(h.main_oid_on_relay(), ff);
+            let (code, classification, _, _) = h.last_decision().await;
+            assert_eq!(
+                (code.as_str(), classification.as_str()),
+                ("allow", "fast_forward")
+            );
+
+            let candidate = h.candidate(&ff, "b.txt", "b\n", "merge candidate");
+            h.seed_run(PINNED, &candidate, &ff, &v1, Seed::Green).await;
+            let tree = h.rev_parse(&format!("{candidate}^{{tree}}"));
+            let merge = h.commit_tree(&tree, &[&ff, &candidate], "Merge pull request #1");
+            h.push(&format!("{merge}:refs/heads/main"))
+                .expect("merge landing lands");
+            assert_eq!(h.main_oid_on_relay(), merge);
+            let (code, classification, _, _) = h.last_decision().await;
+            assert_eq!((code.as_str(), classification.as_str()), ("allow", "merge"));
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        #[ignore = "requires Postgres, MinIO and git"]
+        async fn bypass_allows_once_and_survives_a_simulated_cas_loss() {
+            let h =
+                Harness::start(|config| config.ci.merge_gate.mode = MergeGateMode::Enforce).await;
+            let main0 = h.main_oid_on_relay();
+            let now = Utc::now().timestamp();
+
+            // Finalize fence with no decision at all: refused before any CAS.
+            let orphan = h.candidate(&main0, "z.txt", "z\n", "orphan");
+            let (repo, parent_state) = h.hydrate_for_write().await;
+            h.install_candidate(repo.path(), &orphan);
+            let response =
+                finalize_push(&h.state, h.push_context(repo, parent_state, &orphan)).await;
+            let (status, body) = crate::api::git::policy::tests::body_string(response).await;
+            assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
+            assert!(
+                body.contains("gate_misconfigured") && body.contains("no allow decision"),
+                "{body}"
+            );
+            assert_eq!(h.main_oid_on_relay(), main0);
+
+            // A bypass lands a candidate with no run, once.
+            let first = h.candidate(&main0, "a.txt", "a\n", "bypassed");
+            let bypass = h.insert_bypass(&main0, &first, now - 10, 600).await;
+            h.push(&format!("{first}:refs/heads/main"))
+                .expect("bypass allows");
+            assert_eq!(h.main_oid_on_relay(), first);
+            let (code, classification, decision_bypass, decision_id) = h.last_decision().await;
+            assert_eq!(
+                (code.as_str(), classification.as_str()),
+                ("allow", "bypass")
+            );
+            assert_eq!(decision_bypass.as_deref(), Some(bypass.as_slice()));
+            assert_eq!(
+                h.bypass_consumed_by(&bypass).await,
+                Some(decision_id),
+                "consumed after the CAS won"
+            );
+
+            // Reuse of the consumed bypass for the same update is bypass_invalid.
+            let denials = h.gate(h.facts(&main0, &first)).await;
+            assert_eq!(denials.len(), 1);
+            assert!(
+                denials[0].reason.starts_with("merge gate: bypass_invalid"),
+                "{}",
+                denials[0].reason
+            );
+            assert_eq!(h.last_decision().await.0, "bypass_invalid");
+
+            // Simulated CAS loss: a workspace hydrated at `first`, then main
+            // advances by another bypassed push, then the stale workspace
+            // finalizes with its own allowing bypass decision.
+            let stale_candidate = h.candidate(&first, "b.txt", "stale\n", "stale");
+            let (repo, stale_parent) = h.hydrate_for_write().await;
+            h.install_candidate(repo.path(), &stale_candidate);
+
+            let winner = h.candidate(&first, "c.txt", "winner\n", "winner");
+            let winner_bypass = h.insert_bypass(&first, &winner, now - 10, 600).await;
+            h.push(&format!("{winner}:refs/heads/main"))
+                .expect("winner lands");
+            assert_eq!(h.main_oid_on_relay(), winner);
+            assert!(h.bypass_consumed_by(&winner_bypass).await.is_some());
+
+            let loser_bypass = h
+                .insert_bypass(&first, &stale_candidate, now - 10, 600)
+                .await;
+            let denials = h.gate(h.facts(&first, &stale_candidate)).await;
+            assert!(denials.is_empty(), "{denials:?}");
+            assert_eq!(h.last_decision().await.0, "allow");
+            assert!(
+                h.bypass_consumed_by(&loser_bypass).await.is_none(),
+                "hook time consumes nothing"
+            );
+
+            let response = finalize_push(
+                &h.state,
+                h.push_context(repo, stale_parent, &stale_candidate),
+            )
+            .await;
+            let (status, body) = crate::api::git::policy::tests::body_string(response).await;
+            assert_eq!(status, axum::http::StatusCode::CONFLICT, "{body}");
+            assert!(
+                h.bypass_consumed_by(&loser_bypass).await.is_none(),
+                "a CAS loser leaves its bypass usable"
+            );
+            assert_eq!(h.main_oid_on_relay(), winner);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        #[ignore = "requires Postgres, MinIO and git"]
+        async fn candidate_editing_the_workflow_lands_and_governs_the_next_candidate() {
+            let h =
+                Harness::start(|config| config.ci.merge_gate.mode = MergeGateMode::Enforce).await;
+            let main0 = h.main_oid_on_relay();
+            let v1 = digest(WORKFLOW_V1);
+            let v2 = digest(WORKFLOW_V2);
+
+            // The edit is tested under the base's workflow (v1) and lands.
+            let edit = h.candidate(&main0, WORKFLOW_PATH, WORKFLOW_V2, "edit ci.yml");
+            h.seed_run(PINNED, &edit, &main0, &v1, Seed::Green).await;
+            h.push(&format!("{edit}:refs/heads/main"))
+                .expect("workflow edit lands under v1");
+            assert_eq!(h.main_oid_on_relay(), edit);
+
+            // The next candidate must be tested under v2: a v1 run is refused.
+            let next = h.candidate(&edit, "a.txt", "a\n", "next candidate");
+            h.seed_run(PINNED, &next, &edit, &v1, Seed::Green).await;
+            assert_refused(
+                h.push(&format!("{next}:refs/heads/main")),
+                "workflow_digest_mismatch",
+            );
+            assert_eq!(h.last_decision().await.0, "workflow_digest_mismatch");
+
+            // A newer v2 run for the same candidate decides.
+            h.seed_run(PINNED, &next, &edit, &v2, Seed::Green).await;
+            h.push(&format!("{next}:refs/heads/main"))
+                .expect("v2 run lands");
+            assert_eq!(h.main_oid_on_relay(), next);
+            assert_eq!(h.last_decision().await.0, "allow");
         }
     }
 }

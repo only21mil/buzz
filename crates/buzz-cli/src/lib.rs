@@ -231,6 +231,9 @@ enum Cmd {
     /// Fetch raw signed Nostr events
     #[command(subcommand)]
     Events(EventsCmd),
+    /// Search and share GIFs via the relay's KLIPY proxy
+    #[command(subcommand)]
+    Gifs(GifsCmd),
     /// List, open, and manage direct messages
     #[command(subcommand)]
     Dms(DmsCmd),
@@ -527,14 +530,20 @@ pub enum MessagesCmd {
         #[arg(long)]
         kinds: Option<String>,
     },
-    /// Get a message thread (replies to a root message)
+    /// Get the containing thread for a message or Buzz message link
+    #[command(
+        after_help = "Examples:\n  buzz messages thread --channel <UUID> --event <EVENT_ID>\n  buzz messages thread --link 'buzz://message?channel=<UUID>&id=<EVENT_ID>&thread=<ROOT_ID>'"
+    )]
     Thread {
-        /// Channel UUID
-        #[arg(long)]
-        channel: String,
-        /// Root message event ID (64-char hex)
-        #[arg(long)]
-        event: String,
+        /// Channel UUID; required unless --link is supplied
+        #[arg(long, required_unless_present = "link", conflicts_with = "link")]
+        channel: Option<String>,
+        /// Message event ID (64-char hex); required unless --link is supplied
+        #[arg(long, required_unless_present = "link", conflicts_with = "link")]
+        event: Option<String>,
+        /// Canonical buzz://message deep link; uses the configured relay and identity
+        #[arg(long, conflicts_with_all = ["channel", "event"])]
+        link: Option<String>,
         /// Maximum number of results to return
         #[arg(long)]
         limit: Option<u32>,
@@ -632,8 +641,9 @@ pub enum ChannelsCmd {
         /// Channel description
         #[arg(long)]
         description: Option<String>,
-        /// Make the channel ephemeral: lifetime in seconds. The relay archives
-        /// it once this many seconds pass without a new message.
+        /// Make the channel temporary/ephemeral: idle lifetime in seconds. If
+        /// omitted, the channel is permanent. The relay archives it once this
+        /// many seconds pass without a new message.
         #[arg(long, value_name = "SECONDS")]
         ttl: Option<i64>,
         /// Apply a desktop-local channel template by name (case-insensitive):
@@ -646,7 +656,10 @@ pub enum ChannelsCmd {
         #[arg(long, value_name = "PATH")]
         templates_file: Option<String>,
     },
-    /// Update channel name, description, or ephemeral TTL
+    /// Update channel name, description, visibility, or ephemeral TTL
+    #[command(
+        after_help = "Examples:\n  buzz channels update --channel <uuid> --name general\n  buzz channels update --channel <uuid> --visibility open\n  buzz channels update --channel <uuid> --visibility private"
+    )]
     Update {
         /// Channel UUID
         #[arg(long)]
@@ -657,6 +670,9 @@ pub enum ChannelsCmd {
         /// New channel description
         #[arg(long)]
         description: Option<String>,
+        /// New channel visibility
+        #[arg(long, value_enum)]
+        visibility: Option<ChannelVisibility>,
         /// Make the channel ephemeral (or change its lifetime): seconds until
         /// the relay archives it after the last message. Conflicts with --no-ttl.
         #[arg(long, value_name = "SECONDS", conflicts_with = "no_ttl")]
@@ -840,6 +856,31 @@ pub enum EmojiCmd {
         /// Print what would be published without writing
         #[arg(long, default_value_t = false)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum GifsCmd {
+    /// Search or browse trending GIFs via the relay's KLIPY proxy.
+    ///
+    /// Omitting --query returns trending GIFs. The output is a JSON array of
+    /// GIF objects; paste the `cdn_url` field directly into
+    /// `buzz messages send --content` to share a GIF.
+    Search {
+        /// Search text; omit or leave empty for trending
+        #[arg(long)]
+        query: Option<String>,
+        /// BCP 47 locale for provider results (default: $LANG or en_US)
+        #[arg(long)]
+        locale: Option<String>,
+    },
+    /// Report a selected GIF to the provider so it enters your Recents.
+    ///
+    /// The slug is the provider identifier in the search result objects.
+    Share {
+        /// Provider GIF slug from a search result
+        #[arg(long)]
+        slug: String,
     },
 }
 
@@ -1354,6 +1395,38 @@ pub enum ReposCmd {
     /// Manage branch and tag protection rules on one of your repositories.
     #[command(subcommand)]
     Protect(ReposProtectCmd),
+    /// Inspect or change the relay-hosted repository's default branch.
+    #[command(subcommand)]
+    DefaultBranch(ReposDefaultBranchCmd),
+}
+
+/// Commands for the authoritative Git default branch, not announcement metadata.
+#[derive(Subcommand)]
+pub enum ReposDefaultBranchCmd {
+    /// Read the default branch and observed manifest version.
+    Get {
+        /// Repository identifier.
+        #[arg(long)]
+        id: String,
+        /// Repository owner (64-char hex). Defaults to your signing identity.
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    /// Select an existing branch without moving or deleting any refs.
+    Set {
+        /// Repository identifier.
+        #[arg(long)]
+        id: String,
+        /// Repository owner (64-char hex). Defaults to your signing identity.
+        #[arg(long)]
+        owner: Option<String>,
+        /// Short branch name, e.g. main or release/v1 (not refs/heads/main).
+        #[arg(long)]
+        branch: String,
+        /// Manifest digest returned by get. Omit to read it before updating.
+        #[arg(long)]
+        expected_manifest: Option<String>,
+    },
 }
 
 /// Commands for inspecting and changing repository protection rules.
@@ -2251,6 +2324,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Events(sub) => match sub {
             EventsCmd::Get { id } => commands::events::cmd_get_event(&client, &id).await,
         },
+        Cmd::Gifs(sub) => commands::gifs::dispatch(sub, &client).await,
         Cmd::Dms(sub) => commands::dms::dispatch(sub, &client).await,
         Cmd::Users(sub) => commands::users::dispatch(sub, &client, &cli.format).await,
         Cmd::Workflows(sub) => commands::workflows::dispatch(sub, &client).await,
@@ -2782,6 +2856,7 @@ mod tests {
             "emoji",
             "events",
             "feed",
+            "gifs",
             "issues",
             "media",
             "mem",
@@ -2931,6 +3006,7 @@ mod tests {
                 "bind",
                 "branches",
                 "create",
+                "default-branch",
                 "get",
                 "import-main",
                 "list",
@@ -2946,6 +3022,7 @@ mod tests {
             .get_subcommands()
             .find(|subcommand| subcommand.get_name() == "repos")
             .expect("repos command");
+        assert_eq!(names(repos, "default-branch"), vec!["get", "set"]);
         let protect = repos
             .get_subcommands()
             .find(|subcommand| subcommand.get_name() == "protect")
@@ -3019,7 +3096,7 @@ mod tests {
             ("pr", 6),
             ("projects", 8),
             ("reactions", 3),
-            ("repos", 12),
+            ("repos", 13),
             ("social", 7),
             ("upload", 1),
             ("users", 5),

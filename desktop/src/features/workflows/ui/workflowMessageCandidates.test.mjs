@@ -216,26 +216,3 @@ test("invalid lookup results preserve the deterministic fallback without preview
     assert.equal(result.content, null);
   }
 });
-
-test("malformed exact events preserve ID fallback and cannot supply unsafe presentation", () => {
-  const original = fallback(A);
-  for (const event of [
-    null,
-    { ...relayEvent(), id: 42 },
-    { ...relayEvent(), tags: null },
-    { ...relayEvent(), tags: [null] },
-    { ...relayEvent(), tags: [["h", 42]] },
-  ]) {
-    assert.strictEqual(
-      enrichMessageCandidateFromExactLookup(original, event, CHANNEL),
-      original,
-    );
-  }
-  assert.deepEqual(
-    validatedWorkflowMessageCandidate(
-      { ...relayEvent(), content: {}, pubkey: 42, created_at: Infinity },
-      { channelId: CHANNEL, requestedId: A },
-    ),
-    original,
-  );
-});

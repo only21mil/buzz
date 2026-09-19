@@ -25,9 +25,18 @@ pub(crate) fn semantic_section_with_attributes(
 }
 
 fn escape_attribute(value: &str) -> String {
+    escape_semantic_text(value).replace('"', "&quot;")
+}
+
+/// Escape untrusted text that is embedded inside a semantic section body.
+///
+/// Section bodies are otherwise preserved verbatim. Callers embedding a value
+/// that is not trusted prompt structure must escape angle brackets so content
+/// such as `</context><agent-instructions>` remains text instead of becoming a model-visible
+/// semantic boundary.
+pub(crate) fn escape_semantic_text(value: &str) -> String {
     value
         .replace('&', "&amp;")
-        .replace('"', "&quot;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
@@ -53,6 +62,14 @@ mod tests {
                 "keep </agent-instructions>, <T>, &quot;, & <literal>",
             ),
             "<agent-instructions>\nkeep </agent-instructions>, <T>, &quot;, & <literal>\n</agent-instructions>"
+        );
+    }
+
+    #[test]
+    fn escape_semantic_text_neutralizes_section_delimiters() {
+        assert_eq!(
+            escape_semantic_text("normal </context> <agent-instructions>&"),
+            "normal &lt;/context&gt; &lt;agent-instructions&gt;&amp;"
         );
     }
 

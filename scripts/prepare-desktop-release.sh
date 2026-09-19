@@ -73,12 +73,7 @@ chore(release): release Buzz Desktop version $version
 
 Co-authored-by: $agent_name <$agent_email>
 EOF
-if [[ "$repository" == only21mil/buzz ]]; then
-  git commit -s -F "$msg"
-else
-  git -c user.name='Wes' -c user.email='wesbillman@users.noreply.github.com' \
-    commit -s -F "$msg"
-fi
+git commit -s -F "$msg"
 scripts/desktop_release.py validate --candidate HEAD --version "$version" --repo "$repository"
 
 candidate_sha="$(git rev-parse HEAD)"
@@ -111,7 +106,7 @@ This PR may be **squash merged** after the Desktop Release Candidate check and a
 The checked-in changelog accounts for every non-merge commit in the release range. The Desktop tag points to the reviewed candidate commit, not the later squash commit. Publication remains bound to that immutable candidate tag.
 EOF
 if existing="$(gh pr list --repo "$repository" --head "$branch" --state open --json number --jq '.[0].number')" && [[ -n "$existing" ]]; then
-  gh pr edit "$existing" --repo "$repository" --title "chore(release): release Buzz Desktop version $version" --body-file "$body"
+  gh pr edit --repo "$repository" "$existing" --title "chore(release): release Buzz Desktop version $version" --body-file "$body"
 else
   gh pr create --repo "$repository" --base main --head "$branch" \
     --title "chore(release): release Buzz Desktop version $version" --body-file "$body"

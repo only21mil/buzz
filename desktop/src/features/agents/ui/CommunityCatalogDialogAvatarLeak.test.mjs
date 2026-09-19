@@ -329,22 +329,3 @@ test("catalog browse fires no publisher image request across all three avatar si
   container.remove();
   client.clear();
 });
-
-test("browser catalog renders no enabled team adoption action", async () => {
-  globalThis.isTauri = false;
-  const { root, container, client } = await mountDialog();
-  await clickTestId(`community-catalog-team-${"b".repeat(64)}:crew`);
-  assert.equal(
-    dom.window.document.querySelector(
-      '[data-testid="community-catalog-add-team"]',
-    ),
-    null,
-  );
-  assert.match(
-    dom.window.document.body.textContent,
-    /Local team storage is unavailable in the browser/,
-  );
-  await act(async () => root.unmount());
-  container.remove();
-  client.clear();
-});

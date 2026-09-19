@@ -5,7 +5,7 @@ import type {
 import type { PersonaDropdownOption } from "./agentConfigOptions";
 
 /** Controlled draft selection; persistence belongs to the dialog Save. */
-const EFFORT_DEFAULT_DROPDOWN_VALUE = "__effort_default__";
+export const EFFORT_DEFAULT_DROPDOWN_VALUE = "__effort_default__";
 
 /** Offer only the observed local adapter capability. */
 export function effortPickerState({

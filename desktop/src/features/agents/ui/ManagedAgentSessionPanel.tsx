@@ -7,7 +7,6 @@ import {
   XCircle,
 } from "lucide-react";
 
-import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import type { ManagedAgent } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
@@ -80,7 +79,7 @@ export function ManagedAgentSessionPanel({
   rawEventsOverride,
   transcriptOverride,
 }: ManagedAgentSessionPanelProps) {
-  const hasObserver = isManagedAgentActive(agent);
+  const hasObserver = agent.status === "running" || agent.status === "deployed";
   // Always read from the store — archived frames are ingested regardless of
   // live status and must be renderable for idle agents with channel history.
   // The `hasObserver` flag still gates the relay subscription (via the

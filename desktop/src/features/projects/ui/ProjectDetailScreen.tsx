@@ -1,6 +1,9 @@
+import {
+  projectContributorActivityCounts,
+  signedProjectContributorPubkeys,
+} from "../lib/projectContributorMatching";
 import { Capability, useCapability } from "@/platform/web/capabilities";
 import { ProjectLoadState } from "./ProjectLoadState";
-import { findProjectHomeByChannelId } from "@/features/projects/lib/projectHomeChannel";
 import { ExternalLink, FolderGit2 } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
@@ -43,9 +46,6 @@ import {
   profilePanelViewFromSearch,
 } from "@/features/profile/ui/UserProfilePanelUtils";
 import { useIdentityQuery } from "@/shared/api/hooks";
-import { useMainInsetRef } from "@/shared/layout/MainInsetContext";
-import { channelContentTopPaddingMeasurement } from "@/shared/layout/chromeLayout";
-import { useMeasuredCssVariable } from "@/shared/layout/useMeasuredCssVariable";
 import { ProfilePanelProvider } from "@/shared/context/ProfilePanelContext";
 import { useHistorySearchState } from "@/shared/hooks/useHistorySearchState";
 import { useThreadPanelWidth } from "@/shared/hooks/useThreadPanelWidth";
@@ -95,12 +95,6 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   const { commitHash, projectId, pullRequestId, issueId, repositoryId } = props;
   const { goChannel, goProject, goProjects } = useAppNavigation();
   const { activeCommunity } = useCommunities();
-  const mainInsetRef = useMainInsetRef();
-  const projectDetailHeaderChromeRef = useMeasuredCssVariable({
-    targetRef: mainInsetRef,
-    resetKey: projectId,
-    ...channelContentTopPaddingMeasurement,
-  });
   const projectQuery = useProjectQuery(projectId);
   const projectsQuery = useProjectsQuery();
   const project = projectQuery.data;
@@ -376,9 +370,6 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
   const filesSourceControls: RepoSourceHeaderControls = {
     branch: activeBranch ?? "",
     branchOptions: branchOptionsWithLocal,
-    remoteBranches: managedBranches.map((branch) => branch.name),
-    localBranches: repoSyncStatusQuery.data?.localBranches ?? [],
-    localCheckouts: repoSyncStatusQuery.data?.localCheckouts ?? [],
     selectedTag,
     tagOptions: repoStateQuery.data?.tags ?? [],
     onBranchChange: handleBranchChange,
@@ -824,20 +815,24 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
             </p>
           ) : null}
           <ProjectDetailChrome
-            homeChannelId={
-              findProjectHomeByChannelId(
-                project.projectChannelId,
-                projectsQuery.data ?? [],
-              )?.id === project.id
-                ? project.projectChannelId
-                : null
+            repository={repository}
+            actions={
+              <Button
+                disabled={!terminalAvailable}
+                title={
+                  terminalAvailable
+                    ? projectTerminalLabel(hasLocalCheckout)
+                    : "Terminals require the desktop app"
+                }
+                onClick={() => void handleOpenTerminal()}
+                size="sm"
+                variant="ghost"
+              >
+                Terminal
+              </Button>
             }
             activeTabCrumb={activeTabCrumb}
             activeWorkItemCrumb={activeWorkItemCrumb}
-            chromeRef={projectDetailHeaderChromeRef}
-            onGoChannel={(channelId) => {
-              void goChannel(channelId);
-            }}
             onGoProjectHome={handleGoToProjectHome}
             onGoProjects={() => {
               void goProjects();
@@ -891,6 +886,20 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
               </section>
 
               <WorkspaceTabs
+                contributorActivityCounts={projectContributorActivityCounts({
+                  contributors: repository.contributors,
+                  owner: repository.owner,
+                  issues: issuesQuery.data ?? [],
+                  pullRequests: pullRequestsQuery.data ?? [],
+                })}
+                contributorPubkeys={signedProjectContributorPubkeys({
+                  contributors: repository.contributors,
+                  owner: repository.owner,
+                  issues: issuesQuery.data ?? [],
+                  pullRequests: pullRequestsQuery.data ?? [],
+                })}
+                selectedPullRequest={selectedPullRequest}
+                onBack={handleGoToProjectHome}
                 key={`${project.id}:${repository.id}:${tabsResetKey}:${props.entityNavigationId ?? ""}`}
                 initialTab={props.tab === "commits" ? "activity" : props.tab}
                 commitDiff={commitDiffQuery.data}
@@ -921,23 +930,10 @@ export function ProjectDetailScreen(props: ProjectDetailScreenProps) {
                 localSnapshot={localRepoSnapshotQuery.data}
                 localSnapshotError={localRepoSnapshotQuery.error}
                 localSnapshotLoading={localRepoSnapshotQuery.isLoading}
-                onBranchChange={handleBranchChange}
                 onOpenMergeRecoveryTerminal={
                   terminalAvailable
                     ? handleOpenMergeRecoveryTerminal
                     : undefined
-                }
-                onOpenTerminal={
-                  terminalAvailable
-                    ? () => {
-                        void handleOpenTerminal();
-                      }
-                    : undefined
-                }
-                terminalTitle={
-                  terminalAvailable
-                    ? projectTerminalLabel(hasLocalCheckout)
-                    : "Terminals require the desktop app"
                 }
                 onSelectedCommitHashChange={handleSelectedCommitHashChange}
                 onSelectedIssueIdChange={handleSelectedIssueIdChange}

@@ -4,7 +4,6 @@ import test from "node:test";
 import {
   getAudioMediaLoadSchedulerSnapshot,
   MAX_CONCURRENT_AUDIO_MEDIA_LOADS,
-  MAX_QUEUED_AUDIO_MEDIA_LOADS,
   resetAudioMediaLoadScheduler,
   scheduleAudioMediaLoad,
 } from "./audioMediaLoadScheduler.ts";
@@ -75,27 +74,6 @@ test("settled work promotes only enough queued work to refill the cap", async ()
     queued: 1,
   });
 
-  for (const handle of handles) handle.cancel();
-  await Promise.all(settlements);
-});
-
-test("bounds queued decodes and rejects overflow without retaining another task", async () => {
-  const handles = Array.from(
-    { length: MAX_CONCURRENT_AUDIO_MEDIA_LOADS + MAX_QUEUED_AUDIO_MEDIA_LOADS },
-    () => scheduleAudioMediaLoad(abortablePendingTask(() => {})),
-  );
-  const settlements = handles.map((handle) =>
-    handle.promise.catch((error) => error),
-  );
-  const overflow = scheduleAudioMediaLoad(async () =>
-    assert.fail("overflow must not run"),
-  );
-  await assert.rejects(overflow.promise, /Too many audio attachments/);
-  assert.equal(
-    getAudioMediaLoadSchedulerSnapshot().queued,
-    MAX_QUEUED_AUDIO_MEDIA_LOADS,
-  );
-  await new Promise((resolve) => setTimeout(resolve, 0));
   for (const handle of handles) handle.cancel();
   await Promise.all(settlements);
 });

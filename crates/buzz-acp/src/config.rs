@@ -20,11 +20,11 @@ use crate::filter::SubscriptionRule;
 ///
 /// Sized for slow turns where the agent may go silent on its outer ACP channel
 /// while running long sub-tools (e.g. a buzz-agent running another agent, or
-/// codex/claude doing multi-minute single tool calls). 900s gives 300s of
-/// breathing room above the 600s max shell timeout, so legitimate long-running
+/// codex/claude doing multi-minute single tool calls). 1500s gives 300s of
+/// breathing room above the 1200s max shell timeout, so legitimate long-running
 /// tool calls don't race the idle deadline.
 /// Override via `--idle-timeout` / `BUZZ_ACP_IDLE_TIMEOUT`.
-pub(crate) const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900;
+pub(crate) const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 1_500;
 
 /// Default absolute wall-clock cap per agent turn (2 hours).
 /// Override via `--max-turn-duration` / `BUZZ_ACP_MAX_TURN_DURATION`.
@@ -135,6 +135,11 @@ pub enum PermissionMode {
     /// Agent default — permission requests per tool call.
     #[value(alias = "default")]
     Default,
+    /// Auto mode — fully autonomous execution; model-gated (requires a model
+    /// that supports `supportsAutoMode`).  Degrades gracefully to `default`
+    /// when the session's active model does not support it.
+    #[value(alias = "auto")]
+    Auto,
     /// Auto-approve file edits, still ask for other tools.
     #[value(alias = "acceptEdits")]
     AcceptEdits,
@@ -155,6 +160,7 @@ impl PermissionMode {
     pub fn as_wire_str(&self) -> &'static str {
         match self {
             Self::Default => "default",
+            Self::Auto => "auto",
             Self::AcceptEdits => "acceptEdits",
             Self::BypassPermissions => "bypassPermissions",
             Self::DontAsk => "dontAsk",
@@ -2410,6 +2416,7 @@ channels = "ALL"
     #[test]
     fn test_permission_mode_wire_strings() {
         assert_eq!(PermissionMode::Default.as_wire_str(), "default");
+        assert_eq!(PermissionMode::Auto.as_wire_str(), "auto");
         assert_eq!(PermissionMode::AcceptEdits.as_wire_str(), "acceptEdits");
         assert_eq!(
             PermissionMode::BypassPermissions.as_wire_str(),
@@ -2422,10 +2429,22 @@ channels = "ALL"
     #[test]
     fn test_permission_mode_is_default() {
         assert!(PermissionMode::Default.is_default());
+        assert!(!PermissionMode::Auto.is_default());
         assert!(!PermissionMode::BypassPermissions.is_default());
         assert!(!PermissionMode::AcceptEdits.is_default());
         assert!(!PermissionMode::DontAsk.is_default());
         assert!(!PermissionMode::Plan.is_default());
+    }
+
+    #[test]
+    fn test_permission_mode_auto_degrades_to_default_when_unsupported() {
+        // The wire string is "auto" — the adapter handles graceful downgrade
+        // to "default" when the active model does not support Auto mode.
+        // Verify only that the wire string is correct and distinct from "default".
+        let auto = PermissionMode::Auto;
+        assert_eq!(auto.as_wire_str(), "auto");
+        assert_ne!(auto.as_wire_str(), "default");
+        assert!(!auto.is_default());
     }
 
     #[test]
@@ -2435,6 +2454,7 @@ channels = "ALL"
             "bypassPermissions"
         );
         assert_eq!(format!("{}", PermissionMode::Default), "default");
+        assert_eq!(format!("{}", PermissionMode::Auto), "auto");
     }
 
     #[test]
@@ -2472,6 +2492,7 @@ channels = "ALL"
         use clap::ValueEnum;
         let cases = [
             ("default", PermissionMode::Default),
+            ("auto", PermissionMode::Auto),
             ("accept-edits", PermissionMode::AcceptEdits),
             ("bypass-permissions", PermissionMode::BypassPermissions),
             ("dont-ask", PermissionMode::DontAsk),
@@ -2494,6 +2515,7 @@ channels = "ALL"
         use clap::ValueEnum;
         let cases = [
             ("default", PermissionMode::Default),
+            ("auto", PermissionMode::Auto),
             ("acceptEdits", PermissionMode::AcceptEdits),
             ("bypassPermissions", PermissionMode::BypassPermissions),
             ("dontAsk", PermissionMode::DontAsk),
@@ -2784,9 +2806,9 @@ channels = "ALL"
     // ── Idle timeout constant + guard (PR #935) ───────────────────────────────
 
     #[test]
-    fn default_idle_timeout_is_900_seconds() {
+    fn default_idle_timeout_is_1500_seconds() {
         // Lock the constant value so accidental changes are caught.
-        assert_eq!(DEFAULT_IDLE_TIMEOUT_SECS, 900);
+        assert_eq!(DEFAULT_IDLE_TIMEOUT_SECS, 1_500);
     }
 
     #[test]
@@ -2810,6 +2832,45 @@ channels = "ALL"
         // And the valid case (const assertion so clippy doesn't flag it):
         const {
             assert!(DEFAULT_IDLE_TIMEOUT_SECS < DEFAULT_MAX_TURN_DURATION_SECS);
+        }
+    }
+
+    #[test]
+    fn budget_ordering_invariant_shell_cap_plus_headroom_fits_within_idle_timeout() {
+        // Asserts the three-layer budget relationship introduced in PR #7185:
+        //   buzz-dev-mcp MAX_TIMEOUT_MS (1 200 000 ms = 1 200s)
+        //   ≤ buzz-agent BUZZ_AGENT_TOOL_TIMEOUT_SECS default (1 260s)
+        //   < buzz-acp DEFAULT_IDLE_TIMEOUT_SECS (1 500s)
+        //
+        // The idle deadline must strictly outlast the agent tool timeout so a
+        // legitimately long-running tool call is killed by buzz-agent first (at
+        // 1 260s) rather than the ACP idle watchdog. The 240s gap gives the agent
+        // time to handle the timeout, emit a response, and reset the idle clock
+        // before the ACP connection dies.
+        //
+        // If any of these constants change the compiler catches the inversion here.
+        // Cross-crate constants are mirrored as literals; grep for PR #7185 to
+        // find the authoritative source if you need to update them.
+        const SHELL_CAP_MS: u64 = 1_200_000; // buzz-dev-mcp MAX_TIMEOUT_MS
+        const SHELL_CAP_SECS: u64 = SHELL_CAP_MS / 1_000;
+        const AGENT_TOOL_TIMEOUT_SECS: u64 = 1_260; // buzz-agent BUZZ_AGENT_TOOL_TIMEOUT_SECS default
+
+        const {
+            // Shell cap must not exceed the agent's per-tool-call timeout.
+            assert!(
+                SHELL_CAP_SECS <= AGENT_TOOL_TIMEOUT_SECS,
+                "shell cap must be <= agent tool timeout"
+            );
+            // Agent tool timeout must be strictly less than the ACP idle deadline.
+            assert!(
+                AGENT_TOOL_TIMEOUT_SECS < DEFAULT_IDLE_TIMEOUT_SECS,
+                "agent tool timeout must be < ACP idle timeout"
+            );
+            // ACP idle timeout must remain below the max turn duration.
+            assert!(
+                DEFAULT_IDLE_TIMEOUT_SECS < DEFAULT_MAX_TURN_DURATION_SECS,
+                "ACP idle timeout must be < max turn duration"
+            );
         }
     }
 

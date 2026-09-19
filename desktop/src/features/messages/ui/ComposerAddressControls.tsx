@@ -1,3 +1,4 @@
+import { AgentManagementMarker } from "@/features/agents/ui/OtherSetupAgentMarker";
 import { ArrowUp, AtSign, Square, X } from "lucide-react";
 import {
   AnimatePresence,
@@ -69,6 +70,7 @@ function AddressedAgentAvatar({
         avatarUrl={agent.avatarUrl}
         className="h-4.5 w-4.5"
         displayName={agent.displayName}
+        shape="squircle"
         size="xs"
         testId="composer-address-lock-avatar"
       />
@@ -269,7 +271,7 @@ export function ComposerMentionButton({
                       </TooltipTrigger>
                       <TooltipContent>
                         Don't automatically mention {agent.displayName} in this
-                        thread
+                        thread <AgentManagementMarker pubkey={agent.pubkey} />
                       </TooltipContent>
                     </Tooltip>
                   ))}

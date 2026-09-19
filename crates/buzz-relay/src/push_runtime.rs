@@ -467,6 +467,24 @@ async fn deliver_one(
             return;
         }
     };
+    let serving_write = match buzz_deletion::acquire_serving_write(
+        &state.db,
+        outcome.community,
+        "push_delivery",
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            warn!(wake=%outcome.id, %error, "push delivery suppressed by community deletion fence");
+            let _ = state
+                .db
+                .fail_push_wake(outcome.community, outcome.id, outcome.claim_id)
+                .await;
+            record_delivery("suppressed");
+            return;
+        }
+    };
     let Some(url) = state.config.push_gateway_delivery_url.as_ref() else {
         record_delivery("configuration_error");
         return;
@@ -487,11 +505,26 @@ async fn deliver_one(
             return;
         }
     };
+    if let Err(error) = serving_write.verify().await {
+        warn!(wake=%outcome.id, %error, "push serving lease lost before delivery");
+        record_delivery("suppressed");
+        return;
+    }
     metrics::counter!("buzz_push_gateway_requests_total").increment(1);
     let gateway_started = Instant::now();
-    let response = send_gateway_request(http, url, body, auth).await;
+    let protected = serving_write
+        .protect(send_gateway_request(http, url, body, auth))
+        .await;
     metrics::histogram!("buzz_push_gateway_request_seconds")
         .record(gateway_started.elapsed().as_secs_f64());
+    let response = match protected {
+        Ok(response) => response,
+        Err(error) => {
+            warn!(wake=%outcome.id, %error, "push serving lease lost during delivery");
+            record_delivery("suppressed");
+            return;
+        }
+    };
     match response {
         Ok(r) if r.status().is_success() => match r.json::<DeliveryResponse>().await {
             Ok(DeliveryResponse::Accepted) => {
@@ -571,6 +604,9 @@ async fn deliver_one(
             record_delivery("failed");
         }
     }
+    if let Err(error) = serving_write.finish().await {
+        warn!(wake=%outcome.id, %error, "failed to release community serving lease after push delivery");
+    }
 }
 
 fn delivery_body(
@@ -646,14 +682,8 @@ fn nip98_header(keys: &nostr::Keys, url: &str, body: &[u8]) -> anyhow::Result<St
     ))
 }
 
-fn class_rank(class: &str) -> u8 {
-    match class {
-        "silent" => 0,
-        "default" => 1,
-        "time_sensitive" => 2,
-        "urgent" => 3,
-        _ => 0,
-    }
+fn class_rank(_: &str) -> u8 {
+    1
 }
 
 #[cfg(test)]

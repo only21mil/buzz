@@ -26,8 +26,10 @@ const TEAM_ID: &str = "team-seam";
 
 fn member(id: &str, display_name: &str) -> AgentDefinition {
     AgentDefinition {
+        session_policy: Default::default(),
         id: id.to_string(),
         display_name: display_name.to_string(),
+        description: None,
         avatar_url: None,
         system_prompt: "Do the work.".to_string(),
         runtime: None,
@@ -120,32 +122,12 @@ fn inbound_catalog_head_retains_arrival_witness_through_the_production_reconcile
         .expect("resolve managed agents base dir");
     let db_path = scoped_retention_db_path(&base_dir, RELAY, &owner);
 
-    reconcile_inbound_persona_event_blocking(
+    let refresh = reconcile_inbound_persona_event_blocking(
         event.as_json(),
         RELAY.to_string(),
         app.handle().clone(),
     )
     .expect("reconcile of a signed 30178 head must succeed");
-
-    let foreign_keys = nostr::Keys::generate();
-    let foreign = signed_catalog_head(&foreign_keys);
-    let rejected = reconcile_inbound_persona_event_blocking(
-        foreign.as_json(),
-        RELAY.to_string(),
-        app.handle().clone(),
-    )
-    .expect_err("another signer must not write the owner's local store");
-    assert!(rejected.contains("not the active owner"));
-    let conn = open_retention_db(&db_path).unwrap();
-    assert!(get_retained_event(
-        &conn,
-        KIND_TEAM_CATALOG,
-        &foreign_keys.public_key().to_hex(),
-        TEAM_ID
-    )
-    .unwrap()
-    .is_none());
-    drop(conn);
 
     std::env::remove_var("HOME");
     std::env::remove_var("XDG_DATA_HOME");
@@ -157,6 +139,11 @@ fn inbound_catalog_head_retains_arrival_witness_through_the_production_reconcile
         Some(v) => std::env::set_var("XDG_DATA_HOME", v),
         None => std::env::remove_var("XDG_DATA_HOME"),
     }
+
+    assert!(
+        refresh.is_none(),
+        "a catalog head carries no local record — reconcile must return no runtime refresh"
+    );
 
     let conn = open_retention_db(&db_path).unwrap();
     let witness = get_retained_event(&conn, KIND_TEAM_CATALOG, &owner, TEAM_ID)
@@ -176,5 +163,3 @@ fn inbound_catalog_head_retains_arrival_witness_through_the_production_reconcile
         "retaining an inbound catalog head must queue no outbound publication (no ping-pong)"
     );
 }
-
-mod hydration;

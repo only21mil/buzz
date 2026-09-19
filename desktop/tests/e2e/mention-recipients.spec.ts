@@ -1,103 +1,7 @@
 import { expect, test, type Page } from "@playwright/test";
+import { truncateNpub } from "../../src/shared/lib/pubkey";
+import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
-import { LABEL, paste, sentEvents } from "../helpers/mentionClipboard";
-
-for (const destination of ["channel", "forum"]) {
-  test(`ambiguous typed name preserves the ${destination} draft without sending`, async ({
-    page,
-  }) => {
-    const pubkeys =
-      destination === "forum"
-        ? ["a".repeat(64), "b".repeat(64)]
-        : [TEST_IDENTITIES.alice.pubkey, TEST_IDENTITIES.bob.pubkey];
-    await installMockBridge(page, {
-      managedAgents:
-        destination === "forum"
-          ? pubkeys.map((pubkey) => ({
-              pubkey,
-              name: "Scout",
-              status: "running",
-              channelNames: ["watercooler"],
-            }))
-          : [],
-      searchProfiles: pubkeys.map((pubkey) => ({
-        pubkey,
-        displayName: "Scout",
-      })),
-    });
-    await page.goto("/");
-    await page
-      .getByTestId(
-        destination === "forum" ? "channel-watercooler" : "channel-general",
-      )
-      .click();
-    if (destination === "forum")
-      await page.getByRole("button", { name: "Start a new post..." }).click();
-    const content = "@Scout ambiguous";
-    const input = page.getByTestId("message-input");
-    await input.fill(content);
-    await input.press("Escape");
-    await page.getByTestId("send-message").click();
-    await expect(
-      page.getByText("The mention @Scout is ambiguous.", { exact: false }),
-    ).toBeVisible();
-    await expect(input).toHaveText(content);
-    expect(await sentEvents(page, content)).toEqual([]);
-  });
-}
-
-// A pasted mention whose pubkey is not a member is verified against the relay.
-// D2 bind-and-send keeps the plain-text draft sendable without tagging the
-// unverified foreign key once lookup completes.
-test("foreign clipboard identity is verified and sends without tagging the foreign key", async ({
-  page,
-}) => {
-  await installMockBridge(page);
-  await page.goto("/");
-  await page.getByTestId("channel-general").click();
-  const input = page.getByTestId("message-input");
-  const content = `@${LABEL} foreign clipboard`;
-  const foreign = "1f".repeat(32);
-  await paste(input, {
-    text: content,
-    html: `<span data-buzz-copy="markdown"><span data-mention="" data-mention-pubkey="${foreign}" data-mention-label="${LABEL}">@${LABEL}</span> foreign clipboard</span>`,
-  });
-  await expect(input).toHaveText(content);
-  await expect
-    .poll(() =>
-      page.evaluate(
-        (selected) =>
-          (window.__BUZZ_E2E_COMMAND_LOG__ ?? []).some(
-            (entry) =>
-              entry.command === "get_users_batch" &&
-              (entry.payload as { pubkeys?: string[] }).pubkeys?.includes(
-                selected,
-              ),
-          ),
-        foreign,
-      ),
-    )
-    .toBe(true);
-  await expect(input.locator(".mention-chip")).toHaveCount(0);
-  await page.getByTestId("send-message").click();
-  await expect(input).toHaveText("");
-  const events = await sentEvents(page, content);
-  expect(events).toHaveLength(1);
-  expect(
-    events[0].tags.filter((tag) => tag[0] === "p").map((tag) => tag[1]),
-  ).not.toContain(foreign);
-});
-
-// ── Restored upstream regression coverage ─────────────────────────────
-// Ports from block/buzz@4cd82f51 desktop/tests/e2e/mention-recipients.spec.ts
-// (audit D3), verbatim. The ambiguous-draft cases above already cover the two
-// ambiguous typed-name tests. Not ported: duplicate-label reopen, longer-member
-// edit (fork edit_message payloads carry mentionPubkeys, not mentionTags),
-// narrow-composer chip-wrap styling, historical/absent-roster thread repair, and
-// qualified/abbreviated copy-paste — the fork renders hex qualifiers, not npub
-// (Scout (bb22a529…f260)), and D2 sends unbound paste mentions as plain text
-// without tagging unverified keys. Those are fork contract differences, not
-// missing coverage.
 
 const FIRST = TEST_IDENTITIES.alice.pubkey;
 const SECOND = TEST_IDENTITIES.bob.pubkey;
@@ -153,6 +57,25 @@ async function recipients(page: Page, content: string) {
       .filter((payload) => payload.content === content)
       .map((payload) => payload.mentionPubkeys ?? []);
   }, content);
+}
+
+for (const channel of ["general", "watercooler"]) {
+  test(`ambiguous typed name is visible and preserves ${channel === "general" ? "chat" : "standalone forum"} draft`, async ({
+    page,
+  }) => {
+    await install(page, channel);
+    const input = page.getByTestId("message-input");
+    await input.fill("@Scout hello");
+    await input.press("Escape");
+    await page.getByTestId("send-message").click();
+    await expect(page.getByText(AMBIGUOUS, { exact: false })).toBeVisible();
+    await expect(input).toHaveText("@Scout hello");
+    expect(await recipients(page, "@Scout hello")).toEqual([]);
+    await waitForAnimations(page);
+    await page.screenshot({
+      path: `test-results/mention-recipients/ambiguous-${channel}.png`,
+    });
+  });
 }
 
 test("two selected same-name members send both exact identities", async ({
@@ -312,6 +235,92 @@ for (const removal of ["delete", "audience-remove", "audience-unpin"]) {
   });
 }
 
+test("selected duplicate labels survive send, reopen, replacement and second reopen", async ({
+  page,
+}) => {
+  await install(page);
+  const input = page.getByTestId("message-input");
+  await input.fill("@Scout");
+  await page.getByTestId(`mention-suggestion-${FIRST}`).click();
+  await page.keyboard.type("@Scout");
+  await page.getByTestId(`mention-suggestion-${SECOND}`).click();
+  await page.keyboard.type("roundtrip");
+  const original = `@Scout @Scout (${SECOND}) roundtrip`;
+  await page.getByTestId("send-message").click();
+  await expect
+    .poll(() => recipients(page, original))
+    .toEqual([[FIRST, SECOND]]);
+  const row = page
+    .getByTestId("message-timeline")
+    .getByTestId("message-row")
+    .last();
+  const openEdit = async () => {
+    await waitForAnimations(page);
+    await row.hover();
+    await row.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("menuitem", { name: "Edit message" }).click();
+  };
+  await openEdit();
+  await expect(input).toHaveText(original);
+  await input.evaluate((element) => {
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    range.collapse(false);
+    window.getSelection()?.removeAllRanges();
+    window.getSelection()?.addRange(range);
+    element.focus();
+  });
+  await expect(input).toBeFocused();
+  await expect
+    .poll(() =>
+      input.evaluate((element) => {
+        const selection = window.getSelection();
+        return selection?.isCollapsed && element.contains(selection.anchorNode);
+      }),
+    )
+    .toBe(true);
+  await page.keyboard.type(" edited");
+  const replacement = `${original} edited`;
+  await expect(input).toHaveText(replacement);
+  await page.getByTestId("send-message").click();
+  // The mock bridge's edit_message path emits a mock event, not a signed-event
+  // capture. Assert the real composer's native command payload and reopened UI.
+  const editPayload = (content: string) =>
+    page.evaluate((content) => {
+      const call = window.__BUZZ_E2E_COMMAND_LOG__
+        ?.filter((call) => call.command === "edit_message")
+        .at(-1);
+      const input = (
+        call?.payload as {
+          input?: {
+            content: string;
+            mentionTags: string[][];
+            mentionPubkeys: string[];
+          };
+        }
+      )?.input;
+      return input?.content === content
+        ? {
+            references: input.mentionTags.map((t) => t[1]).sort(),
+            notifying: input.mentionPubkeys,
+          }
+        : null;
+    }, content);
+  await expect
+    .poll(() => editPayload(replacement))
+    .toEqual({ references: [FIRST, SECOND].sort(), notifying: [] });
+  await expect(row).toContainText("roundtrip edited");
+  await openEdit();
+  await expect(input).toHaveText(replacement);
+  // Delete the unqualified A, leaving the qualified B binding on the next edit.
+  const secondReplacement = `@Scout (${SECOND}) roundtrip edited twice`;
+  await input.fill(secondReplacement);
+  await page.getByTestId("send-message").click();
+  await expect
+    .poll(() => editPayload(secondReplacement))
+    .toEqual({ references: [SECOND], notifying: [] });
+});
+
 test("edit focus transfers after menu exit; Escape still restores the trigger", async ({
   page,
 }) => {
@@ -362,6 +371,424 @@ test("edit focus transfers after menu exit; Escape still restores the trigger", 
   await page.keyboard.type(" edited");
   await expect(input).toHaveText("menu focus handoff edited");
 });
+
+test("editing to a longer typed member drops the original shorter reference", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    searchProfiles: [
+      { pubkey: FIRST, displayName: "Scout" },
+      { pubkey: SECOND, displayName: "Scout Jones" },
+    ],
+  });
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  const input = page.getByTestId("message-input");
+  await input.fill("@Scout");
+  await page.getByTestId(`mention-suggestion-${FIRST}`).click();
+  await page.keyboard.type("hello");
+  await page.getByTestId("send-message").click();
+  await expect.poll(() => recipients(page, "@Scout hello")).toEqual([[FIRST]]);
+  const row = page
+    .getByTestId("message-timeline")
+    .getByTestId("message-row")
+    .last();
+  await expect(row).toContainText("Scout hello");
+  await waitForAnimations(page);
+  await row.hover();
+  await row.getByRole("button", { name: "More actions" }).click();
+  await page.getByRole("menuitem", { name: "Edit message" }).click();
+  await expect(input).toHaveText("@Scout hello");
+  await input.fill("@Scout Jones hello");
+  await page.getByTestId("send-message").click();
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const call = window.__BUZZ_E2E_COMMAND_LOG__
+          ?.filter((call) => call.command === "edit_message")
+          .at(-1);
+        const input = (
+          call?.payload as {
+            input?: {
+              content: string;
+              mentionTags?: string[][];
+              mentionPubkeys: string[];
+            };
+          }
+        )?.input;
+        return input?.content === "@Scout Jones hello"
+          ? {
+              references: input.mentionTags ?? [],
+              notifying: input.mentionPubkeys,
+            }
+          : null;
+      }),
+    )
+    .toEqual({ references: [["mention", SECOND]], notifying: [SECOND] });
+  await expect(row).toContainText("Scout Jones hello");
+});
+
+// The default relay directory knows FIRST as an agent; SECOND is a human.
+// The agent variant makes SECOND managed too, covering a qualified bot label.
+for (const { kind, scale } of [
+  { kind: "mixed", scale: 1 },
+  { kind: "mixed", scale: 1.5 },
+  { kind: "agent", scale: 1 },
+  { kind: "agent", scale: 1.5 },
+]) {
+  test(`exact-key ${kind} chips wrap in narrow composer, sent message and reopen at ${scale}x text`, async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize({ width: 800, height: 900 });
+    await install(page, "general", kind === "agent");
+    await page.evaluate((scale) => {
+      document.documentElement.style.fontSize = `${16 * scale}px`;
+    }, scale);
+    const input = page.getByTestId("message-input");
+    await input.fill("@Scout");
+    await page.getByTestId(`mention-suggestion-${FIRST}`).click();
+    await page.keyboard.type("@Scout");
+    await page.getByTestId(`mention-suggestion-${SECOND}`).click();
+    await page.keyboard.type("layout journey");
+    const content = `@Scout @Scout (${SECOND}) layout journey`;
+    const geometry = async (host: import("@playwright/test").Locator) =>
+      host.evaluate((element) => {
+        const bounds = element.getBoundingClientRect();
+        const chips = [...element.querySelectorAll(".mention-chip")];
+        return {
+          width: bounds.width,
+          scrollWidth: element.scrollWidth,
+          clientWidth: element.clientWidth,
+          chips: chips.map((chip) => ({
+            text: chip.textContent,
+            literalKey: chip.classList.contains("mention-literal-key"),
+            wrap: getComputedStyle(chip).overflowWrap,
+            iconDisplay: getComputedStyle(chip, "::before").display,
+            rects: [...chip.getClientRects()].map((r) => ({
+              left: r.left - bounds.left,
+              right: r.right - bounds.left,
+              width: r.width,
+            })),
+          })),
+        };
+      });
+    const assertFits = async (
+      host: import("@playwright/test").Locator,
+      stage: string,
+    ) => {
+      if (stage === "sent") {
+        await expect(host.locator("[data-mention]")).toHaveCount(2);
+        await expect(host.locator("[data-mention]").last()).toHaveAttribute(
+          "data-mention-kind",
+          kind === "agent" ? "agent" : "human",
+        );
+      }
+      const result = await geometry(host);
+      expect(result.chips.length).toBeGreaterThanOrEqual(2);
+      expect(result.scrollWidth).toBeLessThanOrEqual(result.clientWidth + 1);
+      for (const chip of result.chips) {
+        expect(chip.wrap).toBe("anywhere");
+        if (stage !== "sent") {
+          expect(chip.iconDisplay).toBe(
+            chip.literalKey ? "none" : "inline-block",
+          );
+        }
+        for (const rect of chip.rects) {
+          expect(rect.left).toBeGreaterThanOrEqual(-1);
+          expect(rect.right).toBeLessThanOrEqual(result.width + 1);
+        }
+      }
+      if (stage === "sent") {
+        for (const chip of await host.locator("[data-mention]").all()) {
+          const expectedKind =
+            kind === "agent" ||
+            (await chip.getAttribute("data-mention-pubkey")) === FIRST
+              ? "agent"
+              : "human";
+          await expect(chip).toHaveAttribute("data-mention-kind", expectedKind);
+          const leading = chip.locator(".inline-chip-leading-fragment");
+          await expect(leading).toHaveText("Scout");
+          expect(await leading.ariaSnapshot()).toContain("Scout");
+          const icon = await leading.evaluate((element) => {
+            const style = getComputedStyle(element, "::before");
+            return {
+              display: style.display,
+              mask: style.maskImage,
+              width: parseFloat(style.width),
+              height: parseFloat(style.height),
+            };
+          });
+          expect(icon.display).toBe("block");
+          expect(icon.mask).toContain("data:image/svg+xml");
+          expect(icon.width).toBeGreaterThan(0);
+          expect(icon.height).toBeGreaterThan(0);
+          await expect(leading).toHaveClass(
+            new RegExp(`inline-chip-icon-${expectedKind}`),
+          );
+        }
+      } else {
+        for (const prefix of await host
+          .locator(".mention-prefix-hidden")
+          .all()) {
+          const literalKey = await prefix.evaluate((element) =>
+            element.classList.contains("mention-literal-key"),
+          );
+          await expect(prefix).toHaveCSS("opacity", literalKey ? "1" : "0");
+          await expect(prefix).toHaveCSS(
+            "display",
+            literalKey ? "inline" : "inline-block",
+          );
+        }
+      }
+      await testInfo.attach(`${stage}-geometry`, {
+        body: JSON.stringify(result, null, 2),
+        contentType: "application/json",
+      });
+      await waitForAnimations(page);
+      await page.screenshot({
+        path: `test-results/mention-recipients/layout-${kind}-${scale}-${stage}.png`,
+      });
+    };
+    await expect(input).toHaveText(content);
+    await assertFits(input, "composer");
+    await page.getByTestId("send-message").click();
+    await expect
+      .poll(() => recipients(page, content))
+      .toEqual([[FIRST, SECOND]]);
+    const row = page
+      .getByTestId("message-timeline")
+      .getByTestId("message-row")
+      .last();
+    await expect(row).toContainText("layout journey");
+    const markdown = row
+      .locator(".message-markdown")
+      .filter({ hasText: "layout journey" })
+      .last();
+    await assertFits(markdown, "sent");
+    const qualifiedChip = row.locator("[data-mention]").last();
+    await expect(qualifiedChip).toHaveText(`Scout (${truncateNpub(SECOND)})`);
+    await expect(qualifiedChip).toHaveAttribute(
+      "data-mention-label",
+      `Scout (${SECOND})`,
+    );
+    await expect(qualifiedChip).toHaveAttribute("title", `Scout (${SECOND})`);
+    await expect(row.locator("[data-mention]").last()).toHaveAttribute(
+      "aria-label",
+      `Scout (${SECOND})`,
+    );
+    await row.hover();
+    await row.getByRole("button", { name: "More actions" }).click();
+    await page.getByRole("menuitem", { name: "Edit message" }).click();
+    await expect(input).toHaveText(content);
+    await assertFits(input, "reopen");
+  });
+}
+
+for (const replacement of [
+  "@Charlie repaired history",
+  "plain repaired history",
+]) {
+  test(`historical ambiguous thread edit to ${replacement} reopens and forwards without stale keys`, async ({
+    page,
+  }) => {
+    await installMockBridge(page, {
+      searchProfiles: [
+        { pubkey: FIRST, displayName: "Scout" },
+        { pubkey: SECOND, displayName: "Scout" },
+        { pubkey: TEST_IDENTITIES.charlie.pubkey, displayName: "Charlie" },
+      ],
+    });
+    await page.goto("/");
+    await page.getByTestId("channel-general").click();
+    await page.waitForFunction(() =>
+      window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
+        channelName: "general",
+      }),
+    );
+    const ids = await page.evaluate(
+      ({ first, second }) => {
+        const emit = window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__;
+        if (!emit) throw new Error("Missing emitter");
+        const root = emit({
+          channelName: "general",
+          content: "Historical edit source thread",
+          pubkey: first,
+        });
+        const reply = emit({
+          channelName: "general",
+          content: "@Scout historical ambiguity",
+          mentionPubkeys: [first, second],
+          parentEventId: root.id,
+        });
+        return { root: root.id, reply: reply.id };
+      },
+      { first: FIRST, second: SECOND },
+    );
+    await page
+      .locator(
+        `[data-testid="message-thread-summary"][data-thread-head-id="${ids.root}"]`,
+      )
+      .click();
+    const panel = page.getByTestId("message-thread-panel");
+    const row = panel.locator(`[data-message-id="${ids.reply}"]`);
+    const openMenu = async () => {
+      await waitForAnimations(page);
+      await row.hover();
+      await row.getByTestId(`more-actions-${ids.reply}`).click();
+    };
+    await expect(row).toContainText("historical ambiguity");
+    await openMenu();
+    await page.getByRole("menuitem", { name: "Edit message" }).click();
+    const input = panel.getByTestId("message-input");
+    // Edit starts after the menu exit lifecycle; do not send a new thread reply
+    // by filling the still-idle composer before the historical body is loaded.
+    await expect(panel.getByTestId("edit-target")).toBeVisible();
+    await expect(input).toHaveText("@Scout historical ambiguity");
+    await input.fill(replacement);
+    await panel.getByTestId("send-message").click();
+    await expect(row).toContainText("repaired history");
+    const expected = replacement.startsWith("@")
+      ? [TEST_IDENTITIES.charlie.pubkey]
+      : [];
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const call = window.__BUZZ_E2E_COMMAND_LOG__
+            ?.filter((call) => call.command === "edit_message")
+            .at(-1);
+          const args = (
+            call?.payload as {
+              input?: { mentionTags?: string[][]; mentionPubkeys?: string[] };
+            }
+          )?.input;
+          return {
+            refs: args?.mentionTags ?? [],
+            notifying: args?.mentionPubkeys ?? [],
+          };
+        }),
+      )
+      .toEqual({
+        refs: expected.map((key) => ["mention", key]),
+        notifying: expected,
+      });
+    await openMenu();
+    await page.getByRole("menuitem", { name: "Edit message" }).click();
+    await expect(input).toHaveText(replacement);
+    // Save the unchanged reopened snapshot, then forward through the actual menu.
+    await panel.getByTestId("send-message").click();
+    await expect(panel.getByTestId("edit-target")).toHaveCount(0);
+    await openMenu();
+    await page.getByRole("menuitem", { name: "Send to channel" }).click();
+    await expect.poll(() => recipients(page, replacement)).toEqual([expected]);
+    await waitForAnimations(page);
+    await page.screenshot({
+      path: `test-results/mention-recipients/history-${expected.length ? "replacement" : "removed"}-forwarded.png`,
+    });
+  });
+}
+
+for (const mixed of [false, true]) {
+  test(`absent-roster overlapping history (${mixed ? "mixed" : "ambiguous"}) saves, reopens and forwards only the longer alias`, async ({
+    page,
+  }, testInfo) => {
+    const short = (mixed ? ["1"] : ["1", "2"]).map((key) => key.repeat(64));
+    const long = ["3", "4"].map((key) => key.repeat(64));
+    const replacement = "@Scout Jones repaired history";
+    await installMockBridge(page, {
+      searchProfiles: [
+        ...short.map((pubkey) => ({ pubkey, displayName: "Scout" })),
+        ...long.map((pubkey) => ({ pubkey, displayName: "Scout Jones" })),
+      ],
+    });
+    await page.goto("/");
+    await page.getByTestId("channel-general").click();
+    await page.waitForFunction(() =>
+      window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
+        channelName: "general",
+      }),
+    );
+    const ids = await page.evaluate(
+      ({ delivered }) => {
+        const emit = window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__;
+        if (!emit) throw new Error("Missing emitter");
+        const root = emit({
+          channelName: "general",
+          content: "Historical edit source thread",
+        });
+        const reply = emit({
+          channelName: "general",
+          content: "@Scout and @Scout Jones historical ambiguity",
+          mentionPubkeys: delivered,
+          parentEventId: root.id,
+        });
+        return { root: root.id, reply: reply.id };
+      },
+      { delivered: [...short, ...long] },
+    );
+    await page
+      .locator(
+        `[data-testid="message-thread-summary"][data-thread-head-id="${ids.root}"]`,
+      )
+      .click();
+    const panel = page.getByTestId("message-thread-panel");
+    const row = panel.locator(`[data-message-id="${ids.reply}"]`);
+    const openMenu = async () => {
+      await waitForAnimations(page);
+      await row.hover();
+      await row.getByTestId(`more-actions-${ids.reply}`).click();
+    };
+    await expect(row).toContainText("historical ambiguity");
+    await openMenu();
+    await page.getByRole("menuitem", { name: "Edit message" }).click();
+    const input = panel.getByTestId("message-input");
+    // Edit starts after the menu exit lifecycle; do not send a new thread reply
+    // by filling the still-idle composer before the historical body is loaded.
+    await expect(panel.getByTestId("edit-target")).toBeVisible();
+    await expect(input).toHaveText(
+      "@Scout and @Scout Jones historical ambiguity",
+    );
+    await input.fill(replacement);
+    await panel.getByTestId("send-message").click();
+    await expect(row).toContainText("repaired history");
+    const expected = long;
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const call = window.__BUZZ_E2E_COMMAND_LOG__
+            ?.filter((call) => call.command === "edit_message")
+            .at(-1);
+          const args = (
+            call?.payload as {
+              input?: { mentionTags?: string[][]; mentionPubkeys?: string[] };
+            }
+          )?.input;
+          return {
+            refs: args?.mentionTags ?? [],
+            notifying: args?.mentionPubkeys ?? [],
+          };
+        }),
+      )
+      .toEqual({
+        refs: expected.map((key) => ["mention", key]),
+        notifying: [],
+      });
+    await openMenu();
+    await page.getByRole("menuitem", { name: "Edit message" }).click();
+    await expect(input).toHaveText(replacement);
+    // Save the unchanged reopened snapshot, then forward through the actual menu.
+    await panel.getByTestId("send-message").click();
+    await expect(panel.getByTestId("edit-target")).toHaveCount(0);
+    await openMenu();
+    await page.getByRole("menuitem", { name: "Send to channel" }).click();
+    await expect.poll(() => recipients(page, replacement)).toEqual([expected]);
+    await waitForAnimations(page);
+    await page.screenshot({
+      path: testInfo.outputPath(
+        `absent-roster-${mixed ? "mixed" : "ambiguous"}-forwarded.png`,
+      ),
+    });
+  });
+}
 
 for (const selection of ["picker", "automatic"]) {
   test(`qualified ${selection} selection retires a pending paste of the original label`, async ({
@@ -427,5 +854,192 @@ for (const selection of ["picker", "automatic"]) {
     await composer.getByTestId("send-message").click();
     await expect(input).toHaveText(`@Scout @Scout (${b}) `);
     await expect.poll(() => recipients(page, content)).toEqual([[a, b]]);
+  });
+}
+
+for (const mismatchedKey of [false, true]) {
+  test(`qualified chip copy/paste ${mismatchedKey ? "rejects a mismatched key" : "preserves its exact recipient"}`, async ({
+    page,
+  }) => {
+    await install(page);
+    const input = page.getByTestId("message-input");
+    await input.fill("@Scout");
+    await page.getByTestId(`mention-suggestion-${FIRST}`).click();
+    await page.keyboard.type("and @Scout");
+    await page.getByTestId(`mention-suggestion-${SECOND}`).click();
+    await page.keyboard.type("qualified clipboard roundtrip");
+    await page.getByTestId("send-message").click();
+    const chip = page
+      .getByTestId("message-row")
+      .filter({ hasText: "qualified clipboard roundtrip" })
+      .locator(`[data-mention-pubkey="${SECOND}"]`);
+    await expect(chip).toHaveText(`Scout (${truncateNpub(SECOND)})`);
+    const flavors = await chip.evaluate((element) => {
+      const range = document.createRange();
+      range.selectNode(element);
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      const clipboardData = new DataTransfer();
+      const event = new ClipboardEvent("copy", {
+        bubbles: true,
+        cancelable: true,
+        clipboardData,
+      });
+      element.dispatchEvent(event);
+      return {
+        handled: event.defaultPrevented,
+        text: clipboardData.getData("text/plain"),
+        html: clipboardData.getData("text/html"),
+      };
+    });
+    expect(flavors.handled).toBe(true);
+    expect(flavors.text.trim()).toBe(`@Scout (${SECOND})`);
+    expect(flavors.html).toContain(`data-mention-pubkey="${SECOND}"`);
+    if (mismatchedKey) {
+      // Both keys have the trusted alias Scout; the qualifier must ALSO agree.
+      flavors.html = flavors.html.replace(
+        `data-mention-pubkey="${SECOND}"`,
+        `data-mention-pubkey="${FIRST}"`,
+      );
+    }
+    // Remount to discard source-composer selections. A channel (not a DM)
+    // also avoids an automatic conversation p tag masking a lost mention.
+    await page.reload();
+    await page.getByTestId("channel-general").click();
+    await expect(page.getByTestId("chat-title")).toHaveText("general");
+    await input.focus();
+    await input.evaluate((element, { text, html }) => {
+      const clipboardData = new DataTransfer();
+      clipboardData.setData("text/plain", text);
+      clipboardData.setData("text/html", html);
+      element.dispatchEvent(
+        new ClipboardEvent("paste", {
+          bubbles: true,
+          cancelable: true,
+          clipboardData,
+        }),
+      );
+    }, flavors);
+    await expect(input).toHaveText(flavors.text);
+    await page.getByTestId("send-message").click();
+    await expect
+      .poll(() => recipients(page, flavors.text.trim()))
+      .toEqual([mismatchedKey ? [] : [SECOND]]);
+  });
+}
+
+for (const partial of [false, true]) {
+  test(`matching abbreviated keys ${partial ? "do not bind a partial copy" : "retain separate exact recipients through copy and paste"}`, async ({
+    page,
+  }) => {
+    const keys = ["a", "b"].map((middle) => `150b20bd${middle.repeat(52)}15dc`);
+    await installMockBridge(page, {
+      searchProfiles: keys.map((pubkey) => ({ pubkey, displayName: "Scout" })),
+    });
+    await page.goto("/");
+    await page.getByTestId("channel-general").click();
+    await page.waitForFunction(() =>
+      window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
+        channelName: "general",
+      }),
+    );
+    await page.evaluate((keys) => {
+      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
+        channelName: "general",
+        content: `@Scout (${keys[0]}) and @Scout (${keys[1]}) compact collision`,
+        mentionPubkeys: keys,
+      });
+    }, keys);
+    const row = page
+      .getByTestId("message-row")
+      .filter({ hasText: "compact collision" });
+    for (const key of keys) {
+      const chip = row.locator(`[data-mention-pubkey="${key}"]`);
+      await expect(chip).toHaveText(`Scout (${truncateNpub(key)})`);
+      await expect(chip).toHaveAttribute("title", `Scout (${key})`);
+      const flavors = await chip.evaluate((element, partial) => {
+        const range = document.createRange();
+        range.selectNode(element);
+        if (partial) {
+          const leadingText = document
+            .createTreeWalker(element, NodeFilter.SHOW_TEXT)
+            .nextNode();
+          if (!leadingText) throw new Error("Missing mention text");
+          range.setStart(leadingText, 0);
+          range.setEnd(leadingText, 5);
+        }
+        const selection = window.getSelection();
+        selection?.removeAllRanges();
+        selection?.addRange(range);
+        const clipboardData = new DataTransfer();
+        const event = new ClipboardEvent("copy", {
+          bubbles: true,
+          cancelable: true,
+          clipboardData,
+        });
+        element.dispatchEvent(event);
+        // Model the browser's default HTML serialization if our handler declines.
+        const fallback = document.createElement("div");
+        fallback.append(range.cloneContents());
+        return {
+          handled: event.defaultPrevented,
+          text: event.defaultPrevented
+            ? clipboardData.getData("text/plain")
+            : (selection?.toString() ?? ""),
+          html: event.defaultPrevented
+            ? clipboardData.getData("text/html")
+            : fallback.innerHTML,
+        };
+      }, partial);
+      expect(flavors.handled).toBe(!partial);
+      expect(flavors.text.trim()).toBe(partial ? "Scout" : `@Scout (${key})`);
+      const input = page.getByTestId("message-input");
+      await input.focus();
+      await input.evaluate((element, flavors) => {
+        const clipboardData = new DataTransfer();
+        clipboardData.setData("text/plain", flavors.text);
+        clipboardData.setData("text/html", flavors.html);
+        element.dispatchEvent(
+          new ClipboardEvent("paste", {
+            bubbles: true,
+            cancelable: true,
+            clipboardData,
+          }),
+        );
+      }, flavors);
+      const marker = ` copied-${keys.indexOf(key)}`;
+      await page.keyboard.type(marker);
+      const content = `${flavors.text}${marker}`;
+      await expect(input).toHaveText(content);
+      await page.getByTestId("send-message").click();
+      if (!partial) {
+        await page
+          .getByRole("alertdialog")
+          .getByRole("button", { name: "Invite", exact: true })
+          .click();
+      }
+      // Chromium can preserve the typed separator as NBSP after a rich paste.
+      // Assert the full literal body and exact tags, tolerating only that space.
+      await expect
+        .poll(() =>
+          page.evaluate(
+            (marker) =>
+              (window.__BUZZ_E2E_SIGNED_EVENTS__ ?? [])
+                .filter(
+                  (event) =>
+                    event.kind === 9 && event.content.endsWith(marker.trim()),
+                )
+                .map((event) => ({
+                  content: event.content.replace(/\u00a0/g, " ").trim(),
+                  keys: event.tags
+                    .filter((tag) => tag[0] === "p")
+                    .map((tag) => tag[1]),
+                })),
+            marker,
+          ),
+        )
+        .toEqual([{ content: content.trim(), keys: partial ? [] : [key] }]);
+    }
   });
 }

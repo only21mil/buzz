@@ -822,3 +822,39 @@ test("delayed browser thread lookup cannot sign after an author/community change
   assert.equal(signs, 0);
   assert.equal(sends, 0);
 });
+
+test("browser channel publication retains validated thread provenance", async () => {
+  let published;
+  registerRelayQueryCommands(identity, {
+    async publishEvent(event) {
+      published = event;
+      return event;
+    },
+  });
+  const input = {
+    channelId: "12345678-1234-1234-1234-123456789abc",
+    content: "forwarded",
+    sentFromThreadTag: [
+      "buzz:sent-from-thread",
+      "a".repeat(64),
+      "Root excerpt",
+    ],
+  };
+  await dispatch("send_channel_message", input);
+  assert.ok(
+    published.tags.some(
+      (tag) => JSON.stringify(tag) === JSON.stringify(input.sentFromThreadTag),
+    ),
+  );
+  await assert.rejects(
+    dispatch("send_channel_message", { ...input, kind: 45001 }),
+    /top-level stream/,
+  );
+  await assert.rejects(
+    dispatch("send_channel_message", {
+      ...input,
+      sentFromThreadTag: ["bad", "a".repeat(64)],
+    }),
+    /invalid sent-from-thread/,
+  );
+});

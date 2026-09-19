@@ -137,13 +137,13 @@ assert_provenance_refused 'Victor Vogel' '263261067+only21mil@users.noreply.gith
 scripts/prepare-desktop-release.sh 0.1.0 publish
 grep -Fq 'pr create --repo only21mil/buzz' "$CALL_LOG"
 [[ -z "$(git status --porcelain)" ]]
-# The same generator still emits and validates the upstream release identity.
+# Upstream now accepts the caller's identity; it still requires a matching signoff.
 RELEASE_REPOSITORY=block/buzz scripts/prepare-desktop-release.sh 0.1.0 validate-only
-[[ "$(git show -s --format='%an <%ae>')" == "$wes" ]]
-git show -s --format='%(trailers:only,unfold)' | grep -Fxq "Signed-off-by: $wes"
-git commit -q --amend --no-edit --author="$victor"
+[[ "$(git show -s --format='%an <%ae>')" == "$victor" ]]
+git show -s --format='%(trailers:only,unfold)' | grep -Fxq "Signed-off-by: $victor"
+git commit -q --amend --no-edit --author="$wes"
 if scripts/desktop_release.py validate --version 0.1.0 --repo block/buzz >"$tmp/upstream-author.log" 2>&1; then
-  echo 'upstream validator accepted fork author' >&2; exit 1
+  echo 'upstream validator accepted a signoff that differs from its author' >&2; exit 1
 fi
-grep -Fq 'unexpected candidate author' "$tmp/upstream-author.log"
+grep -Fq 'Signed-off-by trailer matching its author' "$tmp/upstream-author.log"
 echo 'desktop fork release policy and repository routing passed'

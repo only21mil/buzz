@@ -11,7 +11,6 @@ import {
   type ChannelSection,
 } from "@/features/sidebar/lib/useChannelSections";
 import { useActiveWorkingChannelsById } from "@/features/sidebar/lib/useActiveWorkingChannelsById";
-import { useUnreadDmPreviews } from "@/features/sidebar/lib/useUnreadDmPreviews";
 import { useDmSidebarMetadata } from "@/features/sidebar/useDmSidebarMetadata";
 import { sortDmChannelsForSidebar } from "@/features/sidebar/lib/dmSidebarSort";
 import {
@@ -37,7 +36,11 @@ import {
   AppSidebarPinnedHeader,
   AppSidebarPrimaryMenu,
 } from "@/features/sidebar/ui/AppSidebarPinnedHeader";
-import { MoreUnreadButton } from "@/features/sidebar/ui/MoreUnreadButton";
+import {
+  canPreviewUnreadDm,
+  MoreUnreadButton,
+  preferredUnreadTarget,
+} from "@/features/sidebar/ui/MoreUnreadButton";
 import { SidebarSection } from "@/features/sidebar/ui/SidebarSection";
 import {
   ChannelGroupSection,
@@ -72,6 +75,7 @@ import {
   SidebarRail,
   useSidebar,
 } from "@/shared/ui/sidebar";
+import { useProtectedVisibleDirectMessages } from "@protected-feature-components";
 
 export function AppSidebar({
   addCommunityPrefill,
@@ -86,6 +90,7 @@ export function AppSidebar({
   isCreatingChannel,
   isCreatingForum,
   profile,
+  projectsOverviewActive,
   relayConnectionCard,
   selfPresenceStatus,
   errorMessage,
@@ -149,9 +154,13 @@ export function AppSidebar({
   const showSidebarUpdateCard =
     canShowSidebarUpdateCard && !isSidebarUpdateCardDismissed;
   const [dmActionsMenuOpen, setDmActionsMenuOpen] = React.useState(false);
-  const directMessages = React.useMemo(
+  const allDirectMessages = React.useMemo(
     () => channels.filter((channel) => channel.channelType === "dm"),
     [channels],
+  );
+  const directMessages = useProtectedVisibleDirectMessages(
+    allDirectMessages,
+    currentPubkey,
   );
   const dmChannelIds = React.useMemo(
     () => new Set(directMessages.map(({ id }) => id)),
@@ -398,12 +407,49 @@ export function AppSidebar({
       ),
     [directMessages, dmChannelLabels, sortModeFor],
   );
-  const { unreadDmPreviewsBelow, nextUnreadDmBelowId } = useUnreadDmPreviews({
-    directMessages,
-    dmChannelLabels,
-    dmParticipantsByChannelId,
+  const unreadDmPreviewsBelow = React.useMemo(
+    () =>
+      unreadMessageBelowChannelIds.flatMap((channelId) => {
+        const channel = directMessages.find(
+          (candidate) => candidate.id === channelId,
+        );
+        const participants = dmParticipantsByChannelId[channelId];
+        const participant = participants?.[0];
+        if (
+          !channel ||
+          !participant ||
+          !canPreviewUnreadDm(
+            channel.participantPubkeys.length,
+            participants?.length ?? 0,
+          )
+        ) {
+          return [];
+        }
+        return [
+          {
+            accessibleLabel: participant.label,
+            avatarUrl: participant.avatarUrl,
+            channelId,
+            isAgent: participant.isAgent,
+            label: dmChannelLabels[channelId] ?? participant.label,
+          },
+        ];
+      }),
+    [
+      directMessages,
+      dmChannelLabels,
+      dmParticipantsByChannelId,
+      unreadMessageBelowChannelIds,
+    ],
+  );
+  const unreadDmChannelIds = React.useMemo(
+    () => new Set(directMessages.map(({ id }) => id)),
+    [directMessages],
+  );
+  const nextUnreadDmBelowId = preferredUnreadTarget(
     unreadMessageBelowChannelIds,
-  });
+    unreadDmChannelIds,
+  );
   const sidebarLoadingShape = useSidebarLoadingShape({
     activeCommunityId: activeCommunity?.id,
     currentPubkey,
@@ -510,7 +556,7 @@ export function AppSidebar({
           ) : null}
 
           <SidebarContent
-            className="buzz-sidebar-scrollbar overscroll-none"
+            className="buzz-sidebar-scrollbar overscroll-none [overflow-anchor:none]"
             data-sidebar-background
             ref={scrollRef}
           >
@@ -526,6 +572,7 @@ export function AppSidebar({
                 onSelectProjects={onSelectProjects}
                 onSelectPulse={onSelectPulse}
                 onSelectWorkflows={onSelectWorkflows}
+                projectsOverviewActive={projectsOverviewActive}
                 selectedView={selectedView}
               />
 
@@ -783,12 +830,12 @@ export function AppSidebar({
               testId="sidebar-more-unread-below"
             />
           ) : null}
+
           <SidebarFooter>
             {relayConnectionCard.showSidebarRelayConnectionCard &&
             (isMobile ? openMobile : sidebarOpen) ? (
               <SidebarRelayConnectionCard
                 className="mb-2"
-                errorMessage={relayConnectionCard.relayErrorMessage}
                 isConnected={relayConnectionCard.isRelayConnectionSuccess}
                 isReconnectPending={relayConnectionCard.isRelayReconnectPending}
                 isWaitingOnReconnectHook={

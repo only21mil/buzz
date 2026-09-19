@@ -1,11 +1,13 @@
 import { useIdentityQuery } from "@/shared/api/hooks";
-import { getCachedRelayOrigin } from "@/shared/lib/mediaUrl";
+import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
 
-/** The relay and signer shared by collection reads and mutation callbacks. */
-export function useProjectCollectionScope() {
+import type { ProjectCollectionScope } from "./projectCollectionScope";
+
+/** Waits for both parts of the active project collection identity. */
+export function useProjectCollectionScope(): ProjectCollectionScope | null {
   const identity = useIdentityQuery();
-  const relayOrigin = getCachedRelayOrigin();
-  return relayOrigin && identity.data?.pubkey
-    ? { relayOrigin, pubkey: identity.data.pubkey }
+  const relayOrigin = useRelayOrigin();
+  return identity.data?.pubkey && relayOrigin
+    ? { pubkey: identity.data.pubkey, relayOrigin }
     : null;
 }

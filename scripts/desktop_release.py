@@ -180,6 +180,7 @@ def previous_release(
 
 def bullet(commit: dict[str, str], repo: str) -> str:
     sha, subject = commit["sha"], commit["subject"]
+    short = sha[:12]
     pr_match = re.search(r" \(#([0-9]+)\)$", subject)
     if pr_match:
         pr = pr_match.group(1)
@@ -288,17 +289,23 @@ def validate(args: argparse.Namespace) -> None:
     bad = [str(path.relative_to(ROOT)) for path, value in manifests.items() if value != version]
     if bad:
         raise SystemExit(f"version mismatch in: {', '.join(bad)}")
-    author = git("show", "-s", "--format=%an <%ae>", candidate)
+    name = git("show", "-s", "--format=%an", candidate)
+    email = git("show", "-s", "--format=%ae", candidate)
+    if not name or not email:
+        raise SystemExit("candidate has no author identity")
+    author = f"{name} <{email}>"
     body = git("show", "-s", "--format=%B", candidate)
-    expected_author = (
-        "Victor Vogel <263261067+only21mil@users.noreply.github.com>"
-        if repo == "only21mil/buzz" else "Wes <wesbillman@users.noreply.github.com>"
-    )
-    if author != expected_author:
-        raise SystemExit(f"unexpected candidate author: {author}")
-    trailers = git("show", "-s", "--format=%(trailers:only,unfold)", candidate).splitlines()
-    if f"Signed-off-by: {expected_author}" not in trailers:
-        raise SystemExit(f"candidate is missing Signed-off-by trailer for {expected_author}")
+    if repo == "only21mil/buzz":
+        expected_author = "Victor Vogel <263261067+only21mil@users.noreply.github.com>"
+        if author != expected_author:
+            raise SystemExit(f"unexpected candidate author: {author}")
+        trailers = git("show", "-s", "--format=%(trailers:only,unfold)", candidate).splitlines()
+        if f"Signed-off-by: {expected_author}" not in trailers:
+            raise SystemExit(f"candidate is missing Signed-off-by trailer for {expected_author}")
+    else:
+        signoffs = re.findall(rf"(?m)^Signed-off-by: {re.escape(author)}$", body)
+        if len(signoffs) != 1:
+            raise SystemExit(f"candidate must carry exactly one Signed-off-by trailer matching its author {author}")
     if not re.search(r"(?m)^Co-authored-by: .+ <.+>$", body):
         raise SystemExit("candidate is missing automation Co-authored-by trailer")
     print(f"validated immutable desktop candidate {candidate} for desktop-v{version}")

@@ -1,3 +1,4 @@
+import { truncateNpub } from "@/shared/lib/pubkey.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -62,7 +63,7 @@ test("known DM peer kind-0 name replaces a raw npub channel name", () => {
 test("missing DM peer profile uses the bounded canonical identifier", () => {
   assert.equal(
     resolveChannelDisplayLabel(makeDm("DM"), SELF, undefined),
-    "bbbbbbbb…bbbb",
+    truncateNpub(PEER),
   );
 });
 

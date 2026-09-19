@@ -11,7 +11,7 @@ import { DEFAULT_FORM_STATE, formStateToYaml } from "./workflowFormTypes";
  * and editable. These fields therefore come from the YAML document itself
  * rather than from {@link yamlToFormState}.
  */
-type WorkflowDocumentFields = {
+export type WorkflowDocumentFields = {
   /** Whether top-level keys can be written back into the document. */
   editable: boolean;
   /** The explicit `enabled` value, or `null` when the key is absent. */
@@ -56,7 +56,7 @@ export function readWorkflowDocumentFields(
 }
 
 /** What the dialog header renders for a definition, in a single parse. */
-type WorkflowHeaderState = {
+export type WorkflowHeaderState = {
   /** Whether the name can be edited and the enabled toggle can be written. */
   canEdit: boolean;
   enabled: boolean;

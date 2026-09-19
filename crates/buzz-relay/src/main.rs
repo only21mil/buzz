@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tracing::{error, info, warn};
@@ -17,7 +16,9 @@ use buzz_db::{Db, DbConfig};
 use buzz_pubsub::PubSubManager;
 use buzz_search::SearchService;
 
+use buzz_relay::audit_pool::connect_audit_pool;
 use buzz_relay::config::{Config, MAX_DRAIN_JITTER_MS};
+use buzz_relay::lifecycle::{BootTracker, LifecycleReason, StartupPhase};
 use buzz_relay::metrics as relay_metrics;
 use buzz_relay::router::{build_health_router, build_router};
 use buzz_relay::state::AppState;
@@ -93,15 +94,36 @@ impl EmissionScope {
 
 const USAGE_METRICS_LOCK_KEY: i64 = 0x4255_5A5A_4D45_5452;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let (runtime, boot) = BootTracker::start_before_runtime(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+    })
+    .map_err(|error| anyhow::anyhow!("failed to build Tokio runtime: {error}"))?;
+    runtime.block_on(run_relay_main(boot))
+}
+
+async fn run_relay_main(boot: BootTracker) -> anyhow::Result<()> {
     // Install the ring CryptoProvider for rustls. Required before any rustls
     // TLS connection (rediss:// to ElastiCache, wss://, S3 over TLS): both
     // aws-lc-rs and ring are compiled in transitively, so rustls can't
     // auto-select a provider and would panic at first use without this.
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("failed to install rustls crypto provider");
+    let (mut boot, ()) = boot
+        .run_required(
+            StartupPhase::CryptoInit,
+            || {
+                rustls::crypto::ring::default_provider()
+                    .install_default()
+                    .map_err(|_provider| ())
+            },
+            |_error| LifecycleReason::ProviderConflict,
+        )
+        .map_err(|()| {
+            anyhow::anyhow!(
+                "failed to install rustls crypto provider: another provider is already installed"
+            )
+        })?;
 
     // JSON-only structured logs — simple, machine-parseable, CAKE-compatible.
     // If OTEL_EXPORTER_OTLP_ENDPOINT is set, also attach an OpenTelemetry tracing
@@ -110,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
     // Build a single shared Resource (service.name=buzz-relay by default, overridable
     // via OTEL_SERVICE_NAME) for the trace provider so that Datadog can identify
     // spans under the correct service identity.
+    let tracing_init = boot.start(StartupPhase::TracingInit);
     let resource = telemetry::service_resource();
     let tracer_init = telemetry::try_init_tracer(resource.clone());
     let otel_enabled = matches!(&tracer_init, telemetry::TracerInit::Enabled(_));
@@ -143,17 +166,43 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // Log any exporter-build failure now that the subscriber is installed.
-    if let telemetry::TracerInit::ExporterBuildFailed(ref e) = tracer_init {
-        warn!(error = %e, "Failed to build OTLP trace exporter; distributed tracing disabled");
+    match &tracer_init {
+        telemetry::TracerInit::Enabled(_) => tracing_init.succeed(),
+        // Structured logging is installed regardless of whether optional OTLP
+        // export is configured, so the phase itself completed successfully.
+        telemetry::TracerInit::Disabled => tracing_init.succeed(),
+        telemetry::TracerInit::ExporterBuildFailed(_) => {
+            tracing_init.degrade(LifecycleReason::ExporterBuild);
+            boot.mark_degraded(LifecycleReason::ExporterBuild);
+            // Do not log the raw exporter error: OTLP endpoint URLs can carry
+            // credentials. The bounded lifecycle reason is sufficient here.
+            warn!("Failed to build OTLP trace exporter; distributed tracing disabled");
+        }
     }
 
     info!("Starting buzz-relay");
 
-    let config = Config::from_env().map_err(|e| {
-        error!("Invalid configuration: {e}");
-        anyhow::anyhow!("Configuration error: {e}")
-    })?;
-    let relay_keypair = relay_keypair_from_config(config.relay_private_key.as_deref())?;
+    let (next_boot, config) = boot
+        .run_required(StartupPhase::ConfigLoad, Config::from_env, |_error| {
+            LifecycleReason::ConfigInvalid
+        })
+        .map_err(|error| {
+            error!("Invalid configuration: {error}");
+            anyhow::anyhow!("Configuration error: {error}")
+        })?;
+    boot = next_boot;
+
+    let key_failure = if config.relay_private_key.is_some() {
+        LifecycleReason::RequiredInvalid
+    } else {
+        LifecycleReason::Missing
+    };
+    let (next_boot, relay_keypair) = boot.run_required(
+        StartupPhase::KeyLoad,
+        || relay_keypair_from_config(config.relay_private_key.as_deref()),
+        |_error| key_failure,
+    )?;
+    boot = next_boot;
     info!(
         bind_addr = %config.bind_addr,
         relay_url = %config.relay_url,
@@ -167,7 +216,18 @@ async fn main() -> anyhow::Result<()> {
 
     let usage_interval_secs = usage_metrics_interval_secs();
     let usage_idle_timeout_secs = usage_metrics_idle_timeout_secs(usage_interval_secs);
-    relay_metrics::install(config.metrics_port, usage_idle_timeout_secs);
+    let (boot, ()) = boot.run_required(
+        StartupPhase::MetricsBind,
+        || relay_metrics::try_install(config.metrics_port, usage_idle_timeout_secs),
+        |error| match error.failure() {
+            relay_metrics::MetricsInstallFailure::Bind => LifecycleReason::Bind,
+            relay_metrics::MetricsInstallFailure::RecorderConflict => {
+                LifecycleReason::RecorderConflict
+            }
+            relay_metrics::MetricsInstallFailure::ExporterBuild => LifecycleReason::ExporterBuild,
+        },
+    )?;
+    boot.finish();
     metrics::gauge!("buzz_audit_enabled").set(if config.audit_enabled { 1.0 } else { 0.0 });
     metrics::gauge!("buzz_push_enabled").set(if config.push_enabled { 1.0 } else { 0.0 });
     info!(
@@ -214,6 +274,12 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) = db.ensure_future_partitions(3).await {
         error!("Failed to ensure partitions: {e}");
     }
+
+    db.validate_deletion_serving_catalog().await.map_err(|e| {
+        error!("Community deletion serving-fence validation failed: {e}");
+        anyhow::anyhow!("Community deletion serving fence is unsafe: {e}")
+    })?;
+    info!("Community deletion serving fences verified");
 
     // Freshness fence probe: cursor pages route to the replica only for
     // history the probe has verified as fully replayed. Deliberately AFTER
@@ -275,7 +341,7 @@ async fn main() -> anyhow::Result<()> {
             );
             None
         } else {
-            match db.ensure_configured_community(&host).await {
+            match db.ensure_configured_community_for_bootstrap(&host).await {
                 Ok(record) => {
                     info!(host = %record.host, community = %record.id, "Deployment community ensured");
                     Some(record.id)
@@ -350,19 +416,16 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => error!("Failed to backfill d_tags: {e}"),
     }
 
-    let audit = if config.audit_enabled {
-        let audit_pool = Db::connect_writer_pool(&DbConfig {
-            max_connections: 5,
-            min_connections: 1,
-            ..db_config.clone()
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("Audit DB connection failed: {e}"))?;
+    let (audit, audit_metrics_pool) = if config.audit_enabled {
+        let audit_pool = connect_audit_pool(&db_config)
+            .await
+            .map_err(|e| anyhow::anyhow!("Audit DB connection failed: {e}"))?;
         info!("Audit service ready");
-        Some(AuditService::new(audit_pool))
+        let metrics_pool = audit_pool.clone();
+        (Some(AuditService::new(audit_pool)), Some(metrics_pool))
     } else {
         info!("Audit logging disabled by BUZZ_AUDIT_ENABLED");
-        None
+        (None, None)
     };
 
     let redis_pool = {
@@ -412,6 +475,7 @@ async fn main() -> anyhow::Result<()> {
         .connect(search_db_url)
         .await
         .map_err(|e| anyhow::anyhow!("Search DB connection failed: {e}"))?;
+    let search_metrics_pool = search_pool.clone();
     let search = SearchService::new(search_pool);
     info!(
         replica = config.read_database_url.is_some(),
@@ -451,6 +515,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(handle) = buzz_relay::mesh_boot::boot_mesh(
         &state.config,
         state.redis_pool.clone(),
+        state.db.clone(),
         &state.relay_keypair,
         Arc::clone(&state.shutting_down),
     )
@@ -534,12 +599,41 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    match state.db.verify_channel_roster_fence().await {
+        Ok(()) => {
+            info!("Channel roster fence verified");
+        }
+        Err(error) => {
+            error!(%error, "Channel roster fence validation failed");
+            return Err(anyhow::anyhow!(
+                "Channel roster fence is unsafe; apply or repair migration 0032 before starting this relay: {error}"
+            ));
+        }
+    }
+
+    // Repair legacy NIP-29 channel rosters that were persisted while the
+    // canonical member query still truncated at 1,000 rows. Validation above
+    // makes migration 0032 a code/schema compatibility gate before the new
+    // replacement protocol or listener can serve traffic.
+    match buzz_relay::handlers::side_effects::reconcile_large_channel_member_snapshots(&state).await
+    {
+        Ok(count) if count > 0 => info!(count, "large channel member snapshots repaired"),
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(%error, "large channel member snapshot startup reconciliation failed")
+        }
+    }
+
     // NIP-43: reconcile the event-backed roster for every provisioned
     // community before opening the listener. `relay_members` is canonical;
     // this repairs pre-snapshot communities and any publication that failed
     // after a membership transaction committed.
     if config.require_relay_membership {
-        match buzz_relay::handlers::side_effects::reconcile_nip43_membership_snapshots(&state).await
+        match buzz_relay::handlers::side_effects::reconcile_nip43_membership_snapshots_with_purpose(
+            &state,
+            buzz_relay::handlers::side_effects::Nip43ReconciliationPurpose::Bootstrap,
+        )
+        .await
         {
             Ok(count) => info!(count, "NIP-43 membership snapshots reconciled on startup"),
             Err(error) => {
@@ -558,8 +652,9 @@ async fn main() -> anyhow::Result<()> {
             interval.tick().await;
             loop {
                 interval.tick().await;
-                match buzz_relay::handlers::side_effects::reconcile_nip43_membership_snapshots(
+                match buzz_relay::handlers::side_effects::reconcile_nip43_membership_snapshots_with_purpose(
                     &reconcile_state,
+                    buzz_relay::handlers::side_effects::Nip43ReconciliationPurpose::Maintenance,
                 )
                 .await
                 {
@@ -699,6 +794,7 @@ async fn main() -> anyhow::Result<()> {
                         &reaper_state,
                         channel_id,
                         serde_json::json!({ "type": "channel_auto_archived" }),
+                        chrono::Utc::now(),
                     )
                     .await
                     {
@@ -741,6 +837,30 @@ async fn main() -> anyhow::Result<()> {
         info!("NIP-PL push matcher and delivery worker started");
     } else {
         info!("NIP-PL push disabled by BUZZ_PUSH_ENABLED");
+    }
+
+    // Admin outbox delivery worker — drives `relay_admin_outbox` rows.
+    // Uses DB-level leases (held_by / lease_expires_at) so multiple pods can
+    // run the worker concurrently without double-delivery.
+    {
+        let outbox_state = Arc::clone(&state);
+        tokio::spawn(
+            async move { buzz_relay::handlers::admin_outbox_worker::run(outbox_state).await },
+        );
+        info!("Admin outbox delivery worker started");
+    }
+
+    // Action recovery worker: re-drives stranded relay_admin_actions rows whose
+    // action lease expired before the enforcement state machine completed.
+    // Crash safety: a process that died between claim and finalization leaves
+    // an action in pending/enforcing; this worker resumes from the persisted
+    // step_marker state without re-running the mutation.
+    {
+        let action_state = Arc::clone(&state);
+        tokio::spawn(
+            async move { buzz_relay::handlers::admin_action_worker::run(action_state).await },
+        );
+        info!("Admin action recovery worker started");
     }
 
     // NIP-ER reminder scheduler — polls for due reminders and publishes them
@@ -1004,19 +1124,18 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 interval.tick().await;
                 let db_stats = pool_state.db.pool_stats();
-                let active = db_stats.size.saturating_sub(db_stats.idle);
-                metrics::gauge!("buzz_db_pool_size").set(db_stats.size as f64);
-                metrics::gauge!("buzz_db_pool_idle").set(db_stats.idle as f64);
-                metrics::gauge!("buzz_db_pool_active").set(active as f64);
-                metrics::gauge!("buzz_db_pool_max").set(db_stats.max as f64);
+                let read_stats = pool_state.db.read_pool_stats();
+                relay_metrics::record_db_pool_metrics(relay_metrics::DbPoolMetricsInput {
+                    writer: db_stats,
+                    reader: read_stats,
+                    audit: audit_metrics_pool
+                        .as_ref()
+                        .map(buzz_db::DbPoolStats::from_pool),
+                    search: buzz_db::DbPoolStats::from_pool(&search_metrics_pool),
+                });
+                pool_state.db.refresh_pool_waiter_metrics();
 
-                if let Some(read_stats) = pool_state.db.read_pool_stats() {
-                    let read_active = read_stats.size.saturating_sub(read_stats.idle);
-                    metrics::gauge!("buzz_db_read_pool_size").set(read_stats.size as f64);
-                    metrics::gauge!("buzz_db_read_pool_idle").set(read_stats.idle as f64);
-                    metrics::gauge!("buzz_db_read_pool_active").set(read_active as f64);
-                    metrics::gauge!("buzz_db_read_pool_max").set(read_stats.max as f64);
-
+                if read_stats.is_some() {
                     // Fence observability: 1 when replica routing is
                     // eligible, and the verified-freshness lag in seconds.
                     // Closed/stale fence reports open=0 with lag untouched.
@@ -1043,6 +1162,24 @@ async fn main() -> anyhow::Result<()> {
                 metrics::gauge!("buzz_redis_pool_size").set(rs.size as f64);
                 metrics::gauge!("buzz_redis_pool_max").set(rs.max_size as f64);
                 metrics::gauge!("buzz_redis_pool_waiting").set(rs.waiting as f64);
+
+                let deletion_store = pool_state.db.deletion_store();
+                match deletion_store.reap_expired_serving_write_leases(1000).await {
+                    Ok(reaped) => metrics::counter!("buzz_deletion_serving_leases_reaped_total")
+                        .increment(reaped),
+                    Err(error) => tracing::warn!(%error, "serving-lease reaper failed"),
+                }
+                match deletion_store.serving_lease_stats().await {
+                    Ok(stats) => {
+                        metrics::gauge!("buzz_deletion_serving_leases_active")
+                            .set(stats.active as f64);
+                        metrics::gauge!("buzz_deletion_serving_leases_expired")
+                            .set(stats.expired as f64);
+                        metrics::gauge!("buzz_deletion_serving_leases_dead_tuples")
+                            .set(stats.dead_tuples as f64);
+                    }
+                    Err(error) => tracing::warn!(%error, "serving-lease metrics failed"),
+                }
             }
         });
     }
@@ -1261,7 +1398,7 @@ async fn serve(
     });
 
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
-    let shutdown_flag = Arc::clone(&state.shutting_down);
+    let shutdown_state = Arc::clone(&state);
     let drain_conn_manager = Arc::clone(&state.conn_manager);
     let drain_jitter_ms = state.config.drain_jitter_ms;
     let tx = shutdown_tx.clone();
@@ -1294,7 +1431,7 @@ async fn serve(
     // sleeps. Not implemented here. This comment records the plan only.
     let shutdown_handle = tokio::spawn(async move {
         shutdown_signal().await;
-        shutdown_flag.store(true, Ordering::Relaxed);
+        shutdown_state.begin_shutdown();
         info!("Shutdown signal received — readiness now returns 503");
         // 5s grace: let K8s stop routing new traffic before we close listeners.
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -1493,6 +1630,7 @@ impl InMemoryMetricKey {
 /// racing the lifecycle-relative increments and decrements.
 fn refresh_legacy_active_gauge_recency() {
     metrics::gauge!("buzz_ws_connections_active").increment(0.0);
+    metrics::gauge!("buzz_ws_authenticated_connections_active").increment(0.0);
     metrics::gauge!("buzz_subscriptions_active").increment(0.0);
 }
 
@@ -1647,27 +1785,62 @@ async fn run_storage_sweep_tick(
     // leader tick, and stable for the process lifetime (env is immutable).
     // Keeping it here avoids widening Config/AppState for a single consumer.
     let config = *SWEEP_CONFIG.get_or_init(storage_sweep::StorageSweepConfig::from_env);
-    if !config.enabled {
-        return;
+    match config.mode {
+        storage_sweep::StorageMetricsMode::Disabled => return,
+        storage_sweep::StorageMetricsMode::Inline => {
+            let media_storage = Arc::clone(&state.media_storage);
+            let max_objects = config.max_objects;
+            storage_sweep::maybe_spawn_sweep(
+                &state.storage_sweep,
+                config.interval,
+                config.timeout,
+                async move {
+                    buzz_media::fold_bucket_listing(max_objects, move |token| {
+                        let media_storage = Arc::clone(&media_storage);
+                        async move { media_storage.list_page(token, 1000).await }
+                    })
+                    .await
+                },
+            )
+            .await;
+        }
+        storage_sweep::StorageMetricsMode::Snapshot => {
+            match state.db.load_storage_accounting_snapshot().await {
+                Ok(Some(stored)) => match serde_json::from_value(stored.snapshot) {
+                    Ok(snapshot) => {
+                        let duration = std::time::Duration::from_millis(
+                            u64::try_from(stored.duration_ms).unwrap_or_default(),
+                        );
+                        let max_objects = u64::try_from(stored.max_objects).unwrap_or_default();
+                        storage_sweep::cache_persisted_snapshot(
+                            &state.storage_sweep,
+                            snapshot,
+                            stored.completed_at,
+                            duration,
+                            max_objects,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "stored storage snapshot is invalid");
+                        storage_sweep::record_persisted_snapshot_load_failure(&state.storage_sweep)
+                            .await;
+                    }
+                },
+                Ok(None) => {
+                    storage_sweep::record_persisted_snapshot_load_failure(&state.storage_sweep)
+                        .await;
+                }
+                Err(error) => {
+                    warn!(error = %error, "failed to load stored storage snapshot");
+                    storage_sweep::record_persisted_snapshot_load_failure(&state.storage_sweep)
+                        .await;
+                }
+            }
+        }
     }
 
-    let media_storage = Arc::clone(&state.media_storage);
-    let max_objects = config.max_objects;
-    storage_sweep::maybe_spawn_sweep(
-        &state.storage_sweep,
-        config.interval,
-        config.timeout,
-        async move {
-            buzz_media::fold_bucket_listing(max_objects, move |token| {
-                let media_storage = Arc::clone(&media_storage);
-                async move { media_storage.list_page(token, 1000).await }
-            })
-            .await
-        },
-    )
-    .await;
-
-    storage_sweep::emit_storage_metrics(&state.storage_sweep, host_map, |id| {
+    storage_sweep::emit_storage_metrics(&state.storage_sweep, config.mode, host_map, |id| {
         emission_scope.allows(id)
     })
     .await;
@@ -2117,13 +2290,16 @@ mod tests {
 
         metrics::with_local_recorder(&recorder, || {
             let connections = metrics::gauge!("buzz_ws_connections_active");
+            let authenticated = metrics::gauge!("buzz_ws_authenticated_connections_active");
             let subscriptions = metrics::gauge!("buzz_subscriptions_active");
             connections.increment(1.0);
+            authenticated.increment(1.0);
             subscriptions.increment(1.0);
 
             refresh_legacy_active_gauge_recency();
 
             connections.decrement(1.0);
+            authenticated.decrement(1.0);
             subscriptions.increment(1.0);
         });
 
@@ -2140,6 +2316,10 @@ mod tests {
             .collect::<std::collections::HashMap<_, _>>();
 
         assert_eq!(values.get("buzz_ws_connections_active"), Some(&0.0));
+        assert_eq!(
+            values.get("buzz_ws_authenticated_connections_active"),
+            Some(&0.0)
+        );
         assert_eq!(values.get("buzz_subscriptions_active"), Some(&2.0));
     }
 

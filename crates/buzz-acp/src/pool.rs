@@ -47,6 +47,9 @@ use crate::scope::SessionScope;
 /// the turn as "recently active" (eligible for requeue instead of dead-letter).
 const RECENT_ACTIVITY_WINDOW: Duration = Duration::from_secs(60);
 
+/// Maximum thread roots remembered per session; eviction only repeats context.
+const MAX_HYDRATED_THREAD_ROOTS_PER_SCOPE: usize = 1024;
+
 // FlushBatch and BatchEvent derive Clone (added in queue.rs) so we can store
 // a recoverable copy in TaskMeta for panic recovery in Queue mode.
 
@@ -155,6 +158,10 @@ pub struct ChannelDeliveryState {
     /// Buzz event IDs already delivered to this ACP session, either as trigger
     /// events or conversation context.
     pub delivered_event_ids: HashSet<String>,
+    /// Canonical thread roots that have completed a successful context fetch in
+    /// this ACP session. Hydrated threads use bounded overfetch so exact event-ID
+    /// deduplication does not unnecessarily shrink the new-context window.
+    pub hydrated_thread_roots: VecDeque<String>,
 }
 
 /// Per-channel session IDs, turn counters, and delivery state.
@@ -405,15 +412,35 @@ impl SessionState {
         });
     }
 
+    /// Record a delivery that did not fetch thread history, such as native steer.
     pub(crate) fn mark_scope_delivery_success(
         &mut self,
         scope: SessionScope,
         standing_context_sent: bool,
         event_ids: impl IntoIterator<Item = String>,
     ) {
+        self.mark_scope_delivery_with_hydration(scope, standing_context_sent, event_ids, []);
+    }
+
+    pub(crate) fn mark_scope_delivery_with_hydration(
+        &mut self,
+        scope: SessionScope,
+        standing_context_sent: bool,
+        event_ids: impl IntoIterator<Item = String>,
+        hydrated_thread_roots: impl IntoIterator<Item = String>,
+    ) {
         let delivery = self.deliveries.entry(scope).or_default();
         delivery.standing_context_sent |= standing_context_sent;
         delivery.delivered_event_ids.extend(event_ids);
+        for root in hydrated_thread_roots {
+            if delivery.hydrated_thread_roots.contains(&root) {
+                continue;
+            }
+            if delivery.hydrated_thread_roots.len() >= MAX_HYDRATED_THREAD_ROOTS_PER_SCOPE {
+                delivery.hydrated_thread_roots.pop_front();
+            }
+            delivery.hydrated_thread_roots.push_back(root);
+        }
     }
 
     #[cfg(test)]
@@ -443,6 +470,8 @@ pub struct OwnedAgent {
     /// desktop reader to distinguish a genuine runtime override from a stale
     /// session whose persona model was edited. Reset on spawn/restart.
     pub model_overridden: bool,
+    /// Unsettled live model pick, retained until the adapter applies or rejects it.
+    pub pending_model_ack: Option<(Option<String>, Uuid)>,
     /// Normalized agent name from initialize (`agentInfo.name`/`serverInfo.name`).
     pub agent_name: String,
     /// Whether Goose accepted its custom system-prompt method. `None` probes on
@@ -458,6 +487,8 @@ pub struct OwnedAgent {
 /// on `session/new` — the feature landed in v0.6.0 (Oct 2025), before the
 /// `@zed-industries/claude-code-acp` → `@agentclientprotocol/claude-agent-acp`
 /// rename, so the new name is a reliable capability gate.
+const BUZZ_PI_ACP_NAME: &str = "buzz-pi-acp";
+
 const CLAUDE_AGENT_ACP_NAME: &str = "@agentclientprotocol/claude-agent-acp";
 
 fn has_system_prompt_support(
@@ -467,7 +498,7 @@ fn has_system_prompt_support(
 ) -> bool {
     if agent_name == "goose" {
         goose_system_prompt_supported == Some(true)
-    } else if agent_name == CLAUDE_AGENT_ACP_NAME {
+    } else if agent_name == CLAUDE_AGENT_ACP_NAME || agent_name == BUZZ_PI_ACP_NAME {
         true
     } else {
         protocol_version >= 2
@@ -480,8 +511,14 @@ fn session_new_system_prompt<'a>(
     agent_name: &str,
     prompt: Option<&'a str>,
 ) -> Option<SystemPromptTransport<'a>> {
-    if is_goose || (protocol_version < 2 && agent_name != CLAUDE_AGENT_ACP_NAME) {
+    if is_goose
+        || (protocol_version < 2
+            && agent_name != CLAUDE_AGENT_ACP_NAME
+            && agent_name != BUZZ_PI_ACP_NAME)
+    {
         None
+    } else if agent_name == BUZZ_PI_ACP_NAME {
+        prompt.map(SystemPromptTransport::PiMeta)
     } else if agent_name == CLAUDE_AGENT_ACP_NAME {
         prompt.map(SystemPromptTransport::ClaudeMeta)
     } else {
@@ -800,7 +837,7 @@ fn apply_completed_before_control_signal(
     // the fresh session applies the new model on its next creation.
     if matches!(
         control_signal,
-        ControlSignal::Rotate | ControlSignal::SwitchModel(_)
+        ControlSignal::Rotate | ControlSignal::SwitchModel { .. }
     ) {
         state.take_source_session(source)
     } else {
@@ -890,7 +927,12 @@ pub enum ControlSignal {
     /// setting `OwnedAgent::desired_model` before invalidation; the requeued
     /// turn re-creates the session and re-applies `desired_model`. Runtime-only
     /// — never persisted, gone on restart/respawn.
-    SwitchModel(String),
+    SwitchModel {
+        /// Requested adapter model identifier.
+        model_id: String,
+        /// Opaque desktop pick identifier, echoed in acknowledgements.
+        request_id: Option<String>,
+    },
 }
 
 /// Goose-native non-cancelling steer request, sent from the main loop to an
@@ -1079,6 +1121,7 @@ impl ChannelInfoResolver {
                 (info.channel_type != "unknown").then_some((
                     id,
                     PromptChannelInfo {
+                        description: info.description,
                         project: None,
                         name: info.name,
                         channel_type: info.channel_type,
@@ -1341,6 +1384,7 @@ impl AgentPool {
                 "pending ACP session close exhausted on return; restarting adapter"
             );
             agent.state.invalidate_all();
+            emit_pending_model_ack(&mut agent, "failure");
             agent.acp.shutdown().await;
             self.session_owners.retain(|_, owner| *owner != idx);
             self.pending_scope_invalidations.remove(&idx);
@@ -1371,6 +1415,37 @@ impl AgentPool {
             .iter()
             .flatten()
             .any(|agent| self.can_reuse_scope(agent, scope))
+    }
+
+    /// Remove derived hold stamps for scopes that no longer have pending work.
+    pub(crate) fn retain_held_scopes(
+        &mut self,
+        mut has_pending_work: impl FnMut(&SessionScope) -> bool,
+    ) {
+        self.held_since.retain(|scope, _| has_pending_work(scope));
+    }
+
+    /// Earliest scheduled wake for a currently held scope that can claim a
+    /// worker. A worker return wakes the main loop independently, so arming an
+    /// already-expired timer while every slot is checked out would only spin.
+    pub(crate) fn next_hold_deadline(&self, timeout: Duration) -> Option<tokio::time::Instant> {
+        if !self.any_idle() {
+            return None;
+        }
+        self.held_since
+            .values()
+            .map(|held_since| tokio::time::Instant::from_std(*held_since + timeout))
+            .min()
+    }
+
+    /// Sleep until a held scope's scheduled wake, or remain pending when no
+    /// scope is held. This is the future polled directly by the main
+    /// `select!`, kept here so paused-time tests exercise the production seam.
+    pub(crate) async fn wait_for_hold_deadline(deadline: Option<tokio::time::Instant>) {
+        match deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => std::future::pending().await,
+        }
     }
 
     /// Count of agents that are alive: idle OR checked out (have a task_map entry).
@@ -1613,6 +1688,7 @@ impl AgentPool {
                         return 0;
                     };
                     agent.state.invalidate_all();
+                    emit_pending_model_ack(&mut agent, "failure");
                     agent.acp.shutdown().await;
                     self.session_owners.retain(|_, owner| *owner != index);
                     self.pending_scope_invalidations.remove(&index);
@@ -1672,6 +1748,7 @@ impl AgentPool {
         &mut self,
         channel_id: Uuid,
         model_id: &str,
+        request_id: Option<String>,
     ) -> IdleSwitchResult {
         if self.channel_control_is_ambiguous(channel_id) {
             return IdleSwitchResult::AmbiguousTarget;
@@ -1704,6 +1781,8 @@ impl AgentPool {
             }
         }
 
+        emit_pending_model_ack(agent, "failure");
+        agent.pending_model_ack = Some((request_id, channel_id));
         agent.desired_model = Some(model_id.to_string());
         agent.model_overridden = true;
         agent.invalidate_scope(&scope, "idle_model_switch").await;
@@ -1835,6 +1914,31 @@ async fn create_session_and_apply_model(
     session_scope: Option<&SessionScope>,
     channel_type: Option<&str>,
 ) -> Result<String, AcpError> {
+    let result = create_session_and_apply_model_inner(
+        agent,
+        ctx,
+        agent_core,
+        agent_canvas,
+        channel_name,
+        session_scope,
+        channel_type,
+    )
+    .await;
+    if result.is_err() {
+        emit_pending_model_ack(agent, "failure");
+    }
+    result
+}
+
+async fn create_session_and_apply_model_inner(
+    agent: &mut OwnedAgent,
+    ctx: &PromptContext,
+    agent_core: Option<&str>,
+    agent_canvas: Option<&str>,
+    channel_name: Option<&str>,
+    session_scope: Option<&SessionScope>,
+    channel_type: Option<&str>,
+) -> Result<String, AcpError> {
     if session_scope.is_some() {
         agent
             .make_room_for_channel_session(ctx.max_live_sessions)
@@ -1928,14 +2032,46 @@ async fn create_session_and_apply_model(
         match resolve_model_switch_method(&resp.raw, desired) {
             Some(method) => {
                 let switched =
-                    apply_model_switch(&mut agent.acp, &resp.session_id, desired, &method).await?;
+                    match apply_model_switch(&mut agent.acp, &resp.session_id, desired, &method)
+                        .await
+                    {
+                        Ok(switched) => switched,
+                        Err(error) => {
+                            emit_pending_model_ack(agent, "failure");
+                            return Err(error);
+                        }
+                    };
                 if let Some(ref updated) = switched {
-                    // A model can change effort support. Never trust pre-switch options.
-                    session_config["configOptions"] = updated
+                    // Capabilities and captured identity must describe the same
+                    // post-switch model. An omitted snapshot is unknown, not
+                    // evidence that the old model's catalog still applies.
+                    agent.model_capabilities = updated
                         .get("configOptions")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null);
+                        .filter(|options| !options.is_null())
+                        .map(|_| AgentModelCapabilities {
+                            config_options_raw: extract_model_config_options(updated),
+                            available_models_raw: extract_model_state(updated),
+                            captured_at: Instant::now(),
+                        });
+                    session_config = updated.clone();
+                } else {
+                    agent.acp.observe(
+                        "control_result",
+                        serde_json::json!({
+                            "type": "switch_model",
+                            "status": "failure",
+                            "modelId": desired,
+                        }),
+                    );
                 }
+                emit_pending_model_ack(
+                    agent,
+                    if switched.is_some() {
+                        "switched"
+                    } else {
+                        "failure"
+                    },
+                );
                 switched.is_some()
             }
             None => {
@@ -1955,6 +2091,7 @@ async fn create_session_and_apply_model(
                         "modelId": desired,
                     }),
                 );
+                emit_pending_model_ack(agent, "unsupported_model");
                 false
             }
         }
@@ -1962,28 +2099,16 @@ async fn create_session_and_apply_model(
         false
     };
 
-    if let Some(effort) = ctx.startup_effort.as_deref() {
-        let updated = match agent
-            .acp
-            .session_set_startup_effort(&resp.session_id, &session_config, effort)
-            .await
-        {
-            Ok(updated) => updated,
-            Err(error @ AcpError::AgentError { .. }) => {
-                // This new session has not entered pool state; reject without leaking it.
-                agent
-                    .release_invalidated_session(
-                        resp.session_id.clone(),
-                        "startup_effort_rejected",
-                        true,
-                    )
-                    .await;
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        };
-        if let Some(options) = updated.get("configOptions") {
-            session_config["configOptions"] = options.clone();
+    if let Some(StartupEffortOutcome::Applied { config_id, value }) = apply_startup_effort(
+        agent,
+        &session_config,
+        &resp.session_id,
+        ctx.startup_effort.as_deref(),
+    )
+    .await?
+    {
+        if let Some(options) = session_config.get_mut("configOptions") {
+            patch_config_option_current_value(options, &config_id, &value);
         }
     }
 
@@ -1997,7 +2122,7 @@ async fn create_session_and_apply_model(
         serde_json::json!({
             "configOptions": session_config.get("configOptions").cloned().unwrap_or(serde_json::Value::Null),
             "modes": resp.raw.get("modes").cloned().unwrap_or(serde_json::Value::Null),
-            "models": resp.raw.get("models").cloned().unwrap_or(serde_json::Value::Null),
+            "models": session_config.get("models").cloned().unwrap_or(serde_json::Value::Null),
             "modelOverridden": agent.model_overridden && switch_succeeded,
             // Pair identity for the desktop session-config cache, which is
             // keyed by (agent, relay) like the lifecycle frames.
@@ -2023,6 +2148,156 @@ async fn create_session_and_apply_model(
     }
 
     Ok(resp.session_id)
+}
+
+/// Settle one live pick using its original channel, even if another scope runs next.
+fn emit_pending_model_ack(agent: &mut OwnedAgent, status: &str) {
+    let Some((request_id, channel_id)) = agent.pending_model_ack.take() else {
+        return;
+    };
+    if let Some(observer) = agent.acp.observer_handle() {
+        observer.emit(
+            "control_result",
+            agent.acp.observer_agent_index(),
+            &observer::ObserverContext {
+                channel_id: Some(channel_id.to_string()),
+                ..Default::default()
+            },
+            serde_json::json!({
+                "type": "switch_model", "status": status,
+                "modelId": agent.desired_model, "requestId": request_id,
+            }),
+        );
+    }
+}
+
+/// Outcome of applying a worker's spawn-scoped startup effort at session creation.
+///
+/// Drives truthful capture: only `Applied` patches the cached `currentValue`.
+/// `Rejected` (adapter refused) and the `None` return (model advertises no
+/// `thought_level` option, or no effort was configured) leave the session/new
+/// snapshot untouched so the panel reflects the session's real state.
+enum StartupEffortOutcome {
+    Applied { config_id: String, value: String },
+    Rejected,
+}
+
+/// Apply the worker's held `startup_effort` via `session/set_config_option`, if
+/// set and the current model advertises a `thought_level` option.
+///
+/// Returns `Ok(None)` when there is nothing to apply (no configured effort, or
+/// the model has no `thought_level` option) or `Ok(Some(_))` describing whether
+/// the adapter accepted the value. Transport-class errors propagate as `Err` so
+/// the caller respawns the worker rather than reuse a poisoned stream — mirroring
+/// [`apply_model_switch`]'s classification. Application-level rejection is
+/// non-fatal: the session proceeds on the model's default effort.
+async fn apply_startup_effort(
+    agent: &mut OwnedAgent,
+    session_new_result: &serde_json::Value,
+    session_id: &str,
+    startup_effort: Option<&str>,
+) -> Result<Option<StartupEffortOutcome>, AcpError> {
+    let Some(value) = startup_effort.map(str::to_owned) else {
+        return Ok(None);
+    };
+    let Some(config_id) = extract_thought_level_config_id(session_new_result) else {
+        tracing::info!(
+            target: "pool::effort",
+            "startup effort {value} configured but model advertises no thought_level option — leaving agent default"
+        );
+        return Ok(None);
+    };
+
+    let result = tokio::time::timeout(MODEL_SWITCH_TIMEOUT, async {
+        agent
+            .acp
+            .session_set_config_option(session_id, &config_id, &value)
+            .await
+    })
+    .await;
+
+    match result {
+        Ok(Ok(_)) => {
+            tracing::info!(
+                target: "pool::effort",
+                "applied startup effort {value} via configId={config_id} on session {session_id}"
+            );
+            Ok(Some(StartupEffortOutcome::Applied { config_id, value }))
+        }
+        // Transport-class errors may have corrupted the stdio stream — propagate
+        // so the caller can respawn the agent instead of reusing a poisoned one.
+        Ok(Err(e @ AcpError::Io(_)))
+        | Ok(Err(e @ AcpError::WriteTimeout(_)))
+        | Ok(Err(e @ AcpError::Timeout(_)))
+        | Ok(Err(e @ AcpError::Protocol(_)))
+        | Ok(Err(e @ AcpError::AgentExited)) => {
+            tracing::error!(
+                target: "pool::effort",
+                "fatal error applying startup effort {value} via configId={config_id}: {e}"
+            );
+            Err(e)
+        }
+        // Application-level rejection (e.g. Json) — agent is fine, uses default effort.
+        Ok(Err(e)) => {
+            tracing::warn!(
+                target: "pool::effort",
+                "adapter rejected startup effort {value} via configId={config_id}: {e} — proceeding with agent default"
+            );
+            Ok(Some(StartupEffortOutcome::Rejected))
+        }
+        Err(_) => {
+            // Outer timeout fired — the inner send_request may have left the
+            // stream in an unknown state. Treat as transport error.
+            tracing::error!(
+                target: "pool::effort",
+                "startup effort {value} via configId={config_id} timed out ({MODEL_SWITCH_TIMEOUT:?}) — treating as fatal"
+            );
+            Err(AcpError::Timeout(MODEL_SWITCH_TIMEOUT))
+        }
+    }
+}
+
+/// Patch the `currentValue` of the configOption whose `configId`/`id` matches
+/// `config_id` in a session/new `configOptions` array, in place.
+///
+/// Used by truthful capture: a successful `session/set_config_option` is not
+/// reflected in the original session/new snapshot, so the accepted value is
+/// written back before the snapshot is cached. A no-op when `options` is not an
+/// array or no entry matches (the id came from the same array, so a match is
+/// expected in practice).
+fn patch_config_option_current_value(
+    options: &mut serde_json::Value,
+    config_id: &str,
+    value: &str,
+) {
+    let Some(arr) = options.as_array_mut() else {
+        return;
+    };
+    for opt in arr {
+        let matches = opt
+            .get("configId")
+            .or_else(|| opt.get("id"))
+            .and_then(|v| v.as_str())
+            == Some(config_id);
+        if matches {
+            opt["currentValue"] = serde_json::Value::String(value.to_string());
+            return;
+        }
+    }
+}
+
+fn extract_thought_level_config_id(result: &serde_json::Value) -> Option<String> {
+    result
+        .get("configOptions")?
+        .as_array()?
+        .iter()
+        .find(|option| {
+            option.get("category").and_then(serde_json::Value::as_str) == Some("thought_level")
+        })
+        .and_then(|option| option.get("configId").or_else(|| option.get("id")))
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
 }
 
 fn mcp_servers_with_git_origin(
@@ -2453,6 +2728,15 @@ fn send_prompt_result(
     outcome: PromptOutcome,
     batch: Option<FlushBatch>,
 ) {
+    if matches!(
+        outcome,
+        PromptOutcome::Error(_)
+            | PromptOutcome::AgentExited
+            | PromptOutcome::Timeout(_)
+            | PromptOutcome::CancelDrainTimeout(_)
+    ) {
+        emit_pending_model_ack(&mut agent, "failure");
+    }
     agent.acp.clear_steer_rx();
     let _ = result_tx.send(PromptResult {
         agent,
@@ -3026,6 +3310,16 @@ pub async fn run_prompt_task(
                             .state
                             .mark_scope_delivery_success(scope.clone(), true, []);
                     }
+                    let usage = agent.acp.take_turn_usage();
+                    publish_agent_turn_metric(
+                        &ctx,
+                        usage,
+                        Some(*cid),
+                        &session_id,
+                        &format!("{turn_id}:initial"),
+                        Some(acp_stop_to_core(&stop_reason)),
+                    )
+                    .await;
                 }
                 Err(AcpError::AgentExited) => {
                     agent.state.invalidate_all();
@@ -3050,7 +3344,18 @@ pub async fn run_prompt_task(
                         .cancel_with_cleanup(&session_id, ctx.idle_timeout)
                         .await
                     {
-                        Ok(_) => {
+                        Ok(stop_reason) => {
+                            let usage = agent.acp.take_turn_usage();
+                            publish_agent_turn_metric(
+                                &ctx,
+                                usage,
+                                Some(*cid),
+                                &session_id,
+                                &format!("{turn_id}:initial"),
+                                Some(acp_stop_to_core(&stop_reason)),
+                            )
+                            .await;
+
                             agent
                                 .invalidate_source(&source, "initial_message_idle_timeout")
                                 .await;
@@ -3142,6 +3447,8 @@ pub async fn run_prompt_task(
     // Event IDs represented by this prompt. Commit only after ACP reports a
     // successful turn; failed/cancelled prompts must be retryable without loss.
     let mut pending_delivered_event_ids = HashSet::new();
+    // Commit hydration only after a successful turn, just like event delivery.
+    let mut pending_hydrated_thread_roots = HashSet::new();
     let prompt_sections: Vec<String> = if let Some(text) = prompt_text {
         // Heartbeats create their session before this point, so a Goose method-not-found
         // probe has already selected the correct framing for this process.
@@ -3166,15 +3473,26 @@ pub async fn run_prompt_task(
         };
         vec![text]
     } else if let Some(ref b) = batch {
-        // Build prompt from batch with context enrichment.
-        // Try startup cache first; lazy-fetch via REST for dynamic channels.
+        // Project authority was resolved before any ACP session boundary above;
+        // reuse that exact typed result for prompt formatting.
         let channel_info = resolved_channel_info.clone();
 
-        let conversation_context = if ctx.context_message_limit > 0 {
-            fetch_conversation_context(b, &channel_info, &ctx).await
-        } else {
-            None
+        let is_dm = channel_info
+            .as_ref()
+            .map(|info| info.channel_type == "dm")
+            .unwrap_or(false);
+        let context_target = resolve_context_target(b, is_dm);
+        let hydrated_thread_root = match &context_target {
+            ContextTarget::Thread(root) => Some(root),
+            ContextTarget::Dm | ContextTarget::None => None,
         };
+        let thread_context_is_hydrated = hydrated_thread_root.is_some_and(|root| {
+            agent
+                .state
+                .deliveries
+                .get(&b.scope)
+                .is_some_and(|delivery| delivery.hydrated_thread_roots.contains(root))
+        });
         let rendered_batch_ids: HashSet<String> = b
             .events
             .iter()
@@ -3188,6 +3506,23 @@ pub async fn run_prompt_task(
             .map(|delivery| &delivery.delivered_event_ids)
             .cloned()
             .unwrap_or_default();
+        let conversation_context = if ctx.context_message_limit > 0 {
+            fetch_conversation_context_for_target(
+                b.channel_id,
+                &context_target,
+                &ctx,
+                thread_context_is_hydrated,
+                &delivered_ids,
+            )
+            .await
+        } else {
+            None
+        };
+        if let Some(root) =
+            fetched_thread_root_to_hydrate(&context_target, conversation_context.as_ref(), is_dm)
+        {
+            pending_hydrated_thread_roots.insert(root);
+        }
         let conversation_context_had_delivered_events =
             conversation_context.as_ref().is_some_and(|context| {
                 conversation_context_event_ids(Some(context))
@@ -3484,7 +3819,11 @@ pub async fn run_prompt_task(
                     // `desired_model` here means the fresh session created by the
                     // requeued turn (busy) or the next turn (already-completed)
                     // applies the new model. Runtime-only — never persisted.
-                    if let ControlSignal::SwitchModel(ref model_id) = control_signal {
+                    if let ControlSignal::SwitchModel { model_id, request_id } = &control_signal {
+                        emit_pending_model_ack(&mut agent, "failure");
+                        if let Some(channel_id) = observer_channel_id {
+                            agent.pending_model_ack = Some((request_id.clone(), channel_id));
+                        }
                         agent.desired_model = Some(model_id.clone());
                         agent.model_overridden = true;
                     }
@@ -3581,7 +3920,7 @@ pub async fn run_prompt_task(
                         // MUST send a PromptResult or the main loop deadlocks.
                         if matches!(
                             control_signal,
-                            ControlSignal::Rotate | ControlSignal::SwitchModel(_)
+                            ControlSignal::Rotate | ControlSignal::SwitchModel { .. }
                         ) {
                             tracing::debug!(
                                 target: "pool::prompt",
@@ -3595,11 +3934,13 @@ pub async fn run_prompt_task(
                         }
                         if let PromptSource::Channel(scope) = &source {
                             let standing_sent = !agent.has_system_prompt_support();
-                            agent.state.mark_scope_delivery_success(
+                            record_scope_delivery_success(
+                                &mut agent,
                                 scope.clone(),
                                 standing_sent,
-                                pending_delivered_event_ids.iter().cloned(),
-                            );
+                                &pending_delivered_event_ids,
+                                &pending_hydrated_thread_roots,
+                                );
                         }
                         if let Some(session_id) = apply_completed_before_control_signal(
                             &mut agent.state,
@@ -3669,10 +4010,12 @@ pub async fn run_prompt_task(
 
             if let PromptSource::Channel(scope) = &source {
                 let standing_sent = !agent.has_system_prompt_support();
-                agent.state.mark_scope_delivery_success(
+                record_scope_delivery_success(
+                    &mut agent,
                     scope.clone(),
                     standing_sent,
-                    pending_delivered_event_ids.iter().cloned(),
+                    &pending_delivered_event_ids,
+                    &pending_hydrated_thread_roots,
                 );
             } else if !agent.has_system_prompt_support() {
                 agent.state.heartbeat_standing_context_sent = true;
@@ -3963,6 +4306,18 @@ pub(crate) async fn fetch_channel_info(
                     project: None,
                     name: name.unwrap_or(UNKNOWN_CHANNEL_NAME).to_string(),
                     channel_type,
+                    description: tags.iter().find_map(|tag| {
+                        let tag = tag.as_array()?;
+                        (tag.first()?.as_str()? == "about")
+                            .then(|| {
+                                tag.get(1)?
+                                    .as_str()
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_owned)
+                            })
+                            .flatten()
+                    }),
                 })
             }
             Ok(Err(e)) => {
@@ -4203,14 +4558,18 @@ fn conversation_context_delta(
     triggering: &HashSet<String>,
 ) -> Option<ConversationContext> {
     let filter = |messages: Vec<ContextMessage>| {
-        messages
+        let omitted_from_prior_session = messages
+            .iter()
+            .any(|message| !message.event_id.is_empty() && delivered.contains(&message.event_id));
+        let messages = messages
             .into_iter()
             .filter(|message| {
                 message.event_id.is_empty()
                     || (!delivered.contains(&message.event_id)
                         && !triggering.contains(&message.event_id))
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (messages, omitted_from_prior_session)
     };
 
     match context? {
@@ -4220,12 +4579,12 @@ fn conversation_context_delta(
             root_present,
             truncated,
         } => {
-            let messages = filter(messages);
+            let (messages, omitted_from_prior_session) = filter(messages);
             (!messages.is_empty()).then_some(ConversationContext::Thread {
                 messages,
                 total,
                 root_present,
-                truncated,
+                truncated: truncated || omitted_from_prior_session,
             })
         }
         ConversationContext::Dm {
@@ -4233,11 +4592,11 @@ fn conversation_context_delta(
             total,
             truncated,
         } => {
-            let messages = filter(messages);
+            let (messages, omitted_from_prior_session) = filter(messages);
             (!messages.is_empty()).then_some(ConversationContext::Dm {
                 messages,
                 total,
-                truncated,
+                truncated: truncated || omitted_from_prior_session,
             })
         }
     }
@@ -4265,29 +4624,28 @@ fn conversation_context_delta(
 /// The delivery-delta filter (`conversation_context_delta`) then removes any
 /// events this scope's live session already received, so subsequent turns
 /// deliver only intervening same-thread messages plus the trigger.
-async fn fetch_conversation_context(
-    batch: &FlushBatch,
-    channel_info: &Option<PromptChannelInfo>,
+async fn fetch_conversation_context_for_target(
+    channel_id: Uuid,
+    target: &ContextTarget,
     ctx: &PromptContext,
+    overfetch_session_delta: bool,
+    delivered_ids: &HashSet<String>,
 ) -> Option<ConversationContext> {
     let limit = ctx.context_message_limit;
-    let is_dm = channel_info
-        .as_ref()
-        .map(|ci| ci.channel_type == "dm")
-        .unwrap_or(false);
-
-    match resolve_context_target(batch, is_dm) {
+    match target {
         ContextTarget::Thread(root_id) => {
             fetch_thread_context(
-                batch.channel_id,
-                &root_id,
+                channel_id,
+                root_id,
                 limit,
                 ctx.agent_keys.public_key(),
                 &ctx.rest_client,
+                overfetch_session_delta,
+                delivered_ids,
             )
             .await
         }
-        ContextTarget::Dm => fetch_dm_context(batch.channel_id, limit, &ctx.rest_client).await,
+        ContextTarget::Dm => fetch_dm_context(channel_id, limit, &ctx.rest_client).await,
         ContextTarget::None => None,
     }
 }
@@ -4312,18 +4670,36 @@ enum ContextTarget {
 ///   conversation history; a plain top-level channel message has none.
 fn resolve_context_target(batch: &FlushBatch, is_dm: bool) -> ContextTarget {
     if let Some(root_id) = batch.scope.root_event_id() {
-        return ContextTarget::Thread(root_id.to_string());
+        return ContextTarget::Thread(root_id.to_ascii_lowercase());
     }
     let Some(last_event) = batch.events.last() else {
         return ContextTarget::None;
     };
     if let Some(root_id) = crate::queue::parse_thread_tags(&last_event.event).root_event_id {
-        return ContextTarget::Thread(root_id);
+        return ContextTarget::Thread(root_id.to_ascii_lowercase());
     }
     if is_dm {
         return ContextTarget::Dm;
     }
     ContextTarget::None
+}
+
+/// Return the one canonical thread whose history this prompt successfully
+/// fetched. This is deliberately narrower than the set of events rendered in
+/// a merged channel-policy batch: only fetched context proves that a provider
+/// session can use bounded overfetch for exact event-ID delta filtering later.
+fn fetched_thread_root_to_hydrate(
+    target: &ContextTarget,
+    context: Option<&ConversationContext>,
+    is_dm: bool,
+) -> Option<String> {
+    if is_dm || !matches!(context, Some(ConversationContext::Thread { .. })) {
+        return None;
+    }
+    match target {
+        ContextTarget::Thread(root) => Some(root.clone()),
+        ContextTarget::Dm | ContextTarget::None => None,
+    }
 }
 
 /// Normalize AND validate a pubkey for the batch profile API request.
@@ -4483,16 +4859,20 @@ async fn fetch_prompt_profile_lookup(
 /// when the relay has more thread history, instead of reporting the capped page
 /// as the total. When the window is full, a best-effort `/count` attempts to
 /// improve that lower-bound total; because it is a separate racy request, the
-/// result is clamped to the sentinel-proven minimum. The query also asks for the
-/// agent's newest reply separately so the next prompt can include the agent's
-/// own prior turn even in busy threads where the recent-message window would
-/// otherwise push it out.
+/// result is clamped to the sentinel-proven minimum. The query also asks for
+/// the agent's newest reply separately so it survives a busy recent-message
+/// window. A hydrated session overfetches a bounded 2x window so removing exact
+/// event IDs already delivered to that session does not unnecessarily displace
+/// new context. Author identity alone is never delivery evidence because
+/// independent provider sessions can share one signing key.
 async fn fetch_thread_context(
     channel_id: Uuid,
     root_event_id: &str,
     limit: u32,
     agent_pubkey: nostr::PublicKey,
     rest: &RestClient,
+    overfetch_session_delta: bool,
+    delivered_ids: &HashSet<String>,
 ) -> Option<ConversationContext> {
     fetch_thread_context_with(
         channel_id,
@@ -4501,8 +4881,18 @@ async fn fetch_thread_context(
         agent_pubkey,
         |filters| async move { rest.query(&filters).await },
         |filters| async move { rest.count(&filters).await },
+        ThreadContextSessionDelta {
+            overfetch: overfetch_session_delta,
+            delivered_ids,
+        },
     )
     .await
+}
+
+#[derive(Clone, Copy)]
+struct ThreadContextSessionDelta<'a> {
+    overfetch: bool,
+    delivered_ids: &'a HashSet<String>,
 }
 
 async fn fetch_thread_context_with<Query, QueryFut, Count, CountFut>(
@@ -4512,6 +4902,7 @@ async fn fetch_thread_context_with<Query, QueryFut, Count, CountFut>(
     agent_pubkey: nostr::PublicKey,
     query: Query,
     count: Count,
+    session_delta: ThreadContextSessionDelta<'_>,
 ) -> Option<ConversationContext>
 where
     Query: Fn(Vec<nostr::Filter>) -> QueryFut,
@@ -4540,6 +4931,7 @@ where
     // Three filters: (1) root event by ID, (2) recent replies with #e=root +
     // #h=channel plus a sentinel, and (3) the agent's newest reply for pinning.
     let root_filter = nostr::Filter::new().id(nostr::EventId::from_hex(root_event_id).ok()?);
+    let reply_fetch_limit = thread_reply_fetch_limit(limit, session_delta.overfetch);
     let replies_filter = nostr::Filter::new()
         .kinds([
             nostr::Kind::Custom(buzz_core::kind::KIND_STREAM_MESSAGE as u16),
@@ -4547,23 +4939,22 @@ where
         ])
         .custom_tags(e_tag, [root_event_id])
         .custom_tags(h_tag, [ch_str.as_str()])
-        .limit(limit.saturating_add(1) as usize);
+        .limit(reply_fetch_limit.saturating_add(1) as usize);
     let agent_reply_filter = replies_filter.clone().author(agent_pubkey).limit(1);
 
     let context = fetch_with_retry(|| async {
-        match timeout(
-            CONTEXT_FETCH_TIMEOUT,
-            query(vec![
-                root_filter.clone(),
-                replies_filter.clone(),
-                agent_reply_filter.clone(),
-            ]),
-        )
-        .await
-        {
-            Ok(Ok(json)) => {
-                parse_nostr_thread_response_with_meta(json, root_event_id, limit, &agent_pubkey)
-            }
+        let mut filters = vec![root_filter.clone(), replies_filter.clone()];
+        filters.push(agent_reply_filter.clone());
+        match timeout(CONTEXT_FETCH_TIMEOUT, query(filters)).await {
+            Ok(Ok(json)) => parse_nostr_thread_response_with_meta(
+                json,
+                root_event_id,
+                limit,
+                &agent_pubkey,
+                session_delta.overfetch,
+                reply_fetch_limit,
+                session_delta.delivered_ids,
+            ),
             Ok(Err(e)) => {
                 tracing::warn!(
                     channel_id = %channel_id,
@@ -4586,13 +4977,7 @@ where
 
     let mut parsed = context?;
 
-    if matches!(
-        parsed.context,
-        ConversationContext::Thread {
-            truncated: true,
-            ..
-        }
-    ) {
+    if parsed.needs_exact_count {
         let replies_count_filter = replies_filter.clone().limit(0);
         if let Some(total) = fetch_thread_total(
             channel_id,
@@ -4659,6 +5044,21 @@ async fn fetch_dm_context(
     limit: u32,
     rest: &RestClient,
 ) -> Option<ConversationContext> {
+    fetch_dm_context_with(channel_id, limit, |filters| async move {
+        rest.query(&filters).await
+    })
+    .await
+}
+
+async fn fetch_dm_context_with<Query, QueryFut>(
+    channel_id: Uuid,
+    limit: u32,
+    query: Query,
+) -> Option<ConversationContext>
+where
+    Query: Fn(Vec<nostr::Filter>) -> QueryFut,
+    QueryFut: std::future::Future<Output = Result<serde_json::Value, crate::relay::RelayError>>,
+{
     use nostr::{Alphabet, SingleLetterTag};
 
     let h_tag = SingleLetterTag::lowercase(Alphabet::H);
@@ -4672,12 +5072,7 @@ async fn fetch_dm_context(
         .limit(limit as usize);
 
     fetch_with_retry(|| async {
-        match timeout(
-            CONTEXT_FETCH_TIMEOUT,
-            rest.query(std::slice::from_ref(&filter)),
-        )
-        .await
-        {
+        match timeout(CONTEXT_FETCH_TIMEOUT, query(vec![filter.clone()])).await {
             Ok(Ok(json)) => parse_nostr_dm_response(json, limit),
             Ok(Err(e)) => {
                 tracing::warn!(
@@ -4811,11 +5206,11 @@ fn json_to_context_message(obj: &serde_json::Value) -> Option<ContextMessage> {
 
 /// Parse a Nostr query response (array of events) into thread context.
 ///
-/// Separates the root event (matching `root_event_id`) from replies, keeps the
-/// newest `limit` replies returned by the sentinel query, then sorts the
-/// displayed window chronologically for the prompt. If the agent's newest reply
-/// is outside that window, keep it instead of the oldest displayed reply so the
-/// next prompt always includes the agent's most recent prior turn.
+/// Separates the root event (matching `root_event_id`) from replies, then sorts
+/// the selected window chronologically for the prompt. Fresh sessions pin the
+/// agent's newest reply inside the `limit`; hydrated sessions reserve the full
+/// limit for events not yet delivered to this provider session and retain
+/// already-delivered events only until the session delta accounts for them.
 #[cfg(test)]
 fn parse_nostr_thread_response(
     json: serde_json::Value,
@@ -4823,13 +5218,30 @@ fn parse_nostr_thread_response(
     limit: u32,
     agent_pubkey: &nostr::PublicKey,
 ) -> Option<ConversationContext> {
-    parse_nostr_thread_response_with_meta(json, root_event_id, limit, agent_pubkey)
-        .map(|parsed| parsed.context)
+    parse_nostr_thread_response_with_meta(
+        json,
+        root_event_id,
+        limit,
+        agent_pubkey,
+        false,
+        thread_reply_fetch_limit(limit, false),
+        &HashSet::new(),
+    )
+    .map(|parsed| parsed.context)
 }
 
 struct ParsedThreadContext {
     context: ConversationContext,
     root_present: bool,
+    needs_exact_count: bool,
+}
+
+fn thread_reply_fetch_limit(limit: u32, overfetch_session_delta: bool) -> u32 {
+    if overfetch_session_delta {
+        limit.saturating_mul(2)
+    } else {
+        limit
+    }
 }
 
 fn parse_nostr_thread_response_with_meta(
@@ -4837,6 +5249,9 @@ fn parse_nostr_thread_response_with_meta(
     root_event_id: &str,
     limit: u32,
     agent_pubkey: &nostr::PublicKey,
+    overfetch_session_delta: bool,
+    reply_fetch_limit: u32,
+    delivered_ids: &HashSet<String>,
 ) -> Option<ParsedThreadContext> {
     let events = json.as_array()?;
     let agent_pubkey_hex = agent_pubkey.to_hex();
@@ -4851,10 +5266,12 @@ fn parse_nostr_thread_response_with_meta(
                 root_msg = Some(msg);
             } else if seen_reply_ids.insert(ev_id.to_string()) {
                 let is_agent = msg.pubkey.eq_ignore_ascii_case(&agent_pubkey_hex);
+                let was_delivered = delivered_ids.contains(ev_id);
                 reply_msgs.push((
                     ev_id.to_string(),
                     ev.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
                     is_agent,
+                    was_delivered,
                     msg,
                 ));
             }
@@ -4862,51 +5279,77 @@ fn parse_nostr_thread_response_with_meta(
     }
 
     let root_present = root_msg.is_some();
-    let fetched_total = reply_msgs.len() + usize::from(root_present);
+    let fetched_reply_count = reply_msgs.len();
+    let fetched_total = fetched_reply_count + usize::from(root_present);
     let newest_agent_reply = reply_msgs
         .iter()
-        .filter(|(_, _, is_agent, _)| *is_agent)
-        .max_by_key(|(_, ts, _, _)| *ts)
+        .filter(|(_, _, is_agent, _, _)| *is_agent)
+        .max_by_key(|(_, ts, _, _, _)| *ts)
         .cloned();
 
-    let truncated = reply_msgs.len() > limit as usize;
-    if truncated {
+    let relay_window_truncated = fetched_reply_count > reply_fetch_limit as usize;
+    let new_reply_count = reply_msgs
+        .iter()
+        .filter(|(_, _, _, was_delivered, _)| !was_delivered)
+        .count();
+    let truncated = relay_window_truncated || new_reply_count > limit as usize;
+
+    if !overfetch_session_delta && truncated {
         // The relay returns limited REQ results newest-first. Sort explicitly so
         // the sentinel we drop is the oldest reply in the fetched window, not an
         // arbitrary last element if the HTTP bridge ever changes iteration order.
-        reply_msgs.sort_by_key(|(_, ts, _, _)| Reverse(*ts));
+        reply_msgs.sort_by_key(|(_, ts, _, _, _)| Reverse(*ts));
         reply_msgs.truncate(limit as usize);
+    } else if overfetch_session_delta {
+        // Keep delivered replies until `conversation_context_delta` records
+        // that context was omitted, but count only new replies against the
+        // display budget. An unseen reply signed by this same agent remains new:
+        // it may have come from an independent heartbeat/provider session.
+        reply_msgs.sort_by_key(|(_, ts, _, _, _)| Reverse(*ts));
+        let mut retained_new = 0usize;
+        reply_msgs.retain(|(_, _, _, was_delivered, _)| {
+            if *was_delivered {
+                true
+            } else if retained_new < limit as usize {
+                retained_new += 1;
+                true
+            } else {
+                false
+            }
+        });
     }
 
-    if let Some(agent_reply) = newest_agent_reply {
-        let agent_reply_already_displayed =
-            reply_msgs.iter().any(|(id, _, _, _)| *id == agent_reply.0);
+    if let Some(agent_reply) = newest_agent_reply.filter(|reply| !reply.3) {
+        let agent_reply_already_displayed = reply_msgs
+            .iter()
+            .any(|(id, _, _, _, _)| *id == agent_reply.0);
         if !agent_reply_already_displayed {
-            reply_msgs.sort_by_key(|(_, ts, _, _)| *ts);
-            if let Some(oldest) = reply_msgs.first_mut() {
+            reply_msgs.sort_by_key(|(_, ts, _, _, _)| *ts);
+            if let Some(oldest) = reply_msgs
+                .iter_mut()
+                .find(|(_, _, _, was_delivered, _)| !was_delivered)
+            {
                 *oldest = agent_reply;
             }
         }
     }
 
     // Sort displayed replies chronologically.
-    reply_msgs.sort_by_key(|(_, ts, _, _)| *ts);
+    reply_msgs.sort_by_key(|(_, ts, _, _, _)| *ts);
 
     let mut messages = Vec::new();
     if let Some(root) = root_msg {
         messages.push(root);
     }
-    messages.extend(reply_msgs.into_iter().map(|(_, _, _, msg)| msg));
+    messages.extend(reply_msgs.into_iter().map(|(_, _, _, _, msg)| msg));
 
     if messages.is_empty() {
         return None;
     }
 
-    let total = if truncated {
-        fetched_total // all distinct fetched replies plus the root are proven visible history
-    } else {
-        messages.len()
-    };
+    // Preserve the canonical fetched count even when session-delta filtering
+    // intentionally omits exact replies already delivered to this session.
+    let total = fetched_total;
 
     Some(ParsedThreadContext {
         context: ConversationContext::Thread {
@@ -4916,6 +5359,7 @@ fn parse_nostr_thread_response_with_meta(
             truncated,
         },
         root_present,
+        needs_exact_count: relay_window_truncated,
     })
 }
 
@@ -4977,7 +5421,7 @@ fn requeue_cancelled_batch(
 ) -> Option<FlushBatch> {
     let reason = match signal {
         ControlSignal::Steer => CancelReason::Steer,
-        ControlSignal::Interrupt | ControlSignal::SwitchModel(_) => CancelReason::Interrupt,
+        ControlSignal::Interrupt | ControlSignal::SwitchModel { .. } => CancelReason::Interrupt,
         // Cancel/Rotate discard the batch — no merged re-prompt.
         ControlSignal::Cancel | ControlSignal::Rotate => return None,
     };
@@ -5075,6 +5519,35 @@ fn log_stop_reason(source: &PromptSource, stop_reason: &StopReason) {
             tracing::warn!(target: "pool::prompt", "turn refused for {label}");
         }
     }
+}
+
+fn delivery_receipt_line(channel_id: Uuid, event_ids: &HashSet<String>) -> String {
+    let mut event_ids: Vec<&str> = event_ids.iter().map(String::as_str).collect();
+    event_ids.sort_unstable();
+    format!(
+        "turn delivered Buzz events for channel {channel_id}: {}",
+        event_ids.join(",")
+    )
+}
+
+fn record_scope_delivery_success(
+    agent: &mut OwnedAgent,
+    scope: SessionScope,
+    standing_context_sent: bool,
+    event_ids: &HashSet<String>,
+    hydrated_thread_roots: &HashSet<String>,
+) {
+    tracing::info!(
+        target: "pool::prompt",
+        "{}",
+        delivery_receipt_line(scope.channel_id(), event_ids)
+    );
+    agent.state.mark_scope_delivery_with_hydration(
+        scope,
+        standing_context_sent,
+        event_ids.iter().cloned(),
+        hydrated_thread_roots.iter().cloned(),
+    );
 }
 
 //
@@ -5344,9 +5817,8 @@ pub(crate) fn build_turn_metric_counts(
             // Field-local: present when the cumulative counter was monotonic
             // across this turn. Zero means no cache hits this turn (not absent).
             cache_read_tokens: usage.turn_cache_read_tokens,
-            // buzz-agent does not emit a cache-write count on the wire today;
-            // leave None rather than deriving it from other fields.
-            cache_write_tokens: None,
+            // Field-local: same contract as cache_read_tokens.
+            cache_write_tokens: usage.turn_cache_write_tokens,
         })
     } else {
         // Defense-in-depth: UsageTracker already sets all turn_* fields to None
@@ -5356,8 +5828,8 @@ pub(crate) fn build_turn_metric_counts(
         None
     };
     let cumulative_counts = Some(TokenCounts {
-        input_tokens: Some(usage.cumulative_input_tokens),
-        output_tokens: Some(usage.cumulative_output_tokens),
+        input_tokens: usage.cumulative_input_tokens,
+        output_tokens: usage.cumulative_output_tokens,
         // Present when every turn in the session reported a genuine provider
         // total. None when the session has never emitted one or any turn lacked
         // one. Never derived from input+output (NIP-AM MUST NOT).
@@ -5368,11 +5840,37 @@ pub(crate) fn build_turn_metric_counts(
         // Passes through directly — do not wrap in Some() as the field already
         // carries provenance (None vs Some(0) are distinct meanings).
         cache_read_tokens: usage.cumulative_cache_read_tokens,
-        // buzz-agent does not emit a cache-write count on the wire today;
-        // leave None rather than deriving it from other fields.
-        cache_write_tokens: None,
+        // Session-cumulative cache-write tokens; same provenance contract as
+        // cache_read_tokens.
+        cache_write_tokens: usage.cumulative_cache_write_tokens,
     });
     (turn_counts, cumulative_counts)
+}
+
+fn build_turn_metric_payload(
+    ctx: &PromptContext,
+    usage: &crate::usage::TurnUsage,
+    channel_id: Option<uuid::Uuid>,
+    turn_id: &str,
+    stop_reason: Option<buzz_core::agent_turn_metric::StopReason>,
+) -> buzz_core::agent_turn_metric::AgentTurnMetricPayload {
+    use buzz_core::agent_turn_metric::AgentTurnMetricPayload;
+    let (turn_counts, cumulative_counts) = build_turn_metric_counts(usage);
+    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    AgentTurnMetricPayload {
+        harness: ctx.harness_name.clone(),
+        model: usage.model.clone(),
+        pricing_identity: usage.pricing_identity.clone(),
+        channel_id: channel_id.map(|id| id.to_string()),
+        session_id: Some(usage.session_id.clone()),
+        turn_id: Some(turn_id.to_string()),
+        turn_seq: Some(usage.turn_seq),
+        timestamp,
+        turn: turn_counts,
+        cumulative: cumulative_counts,
+        delta_reliable: usage.delta_reliable,
+        stop_reason,
+    }
 }
 
 /// Best-effort: build and publish a `kind:44200` NIP-AM agent turn metric event.
@@ -5389,7 +5887,6 @@ async fn publish_agent_turn_metric(
     turn_id: &str,
     stop_reason: Option<buzz_core::agent_turn_metric::StopReason>,
 ) {
-    use buzz_core::agent_turn_metric::AgentTurnMetricPayload;
     use nostr::{EventBuilder, Kind, Tag};
 
     let (usage, owner_pk) = match (usage, ctx.agent_owner_pubkey.as_ref()) {
@@ -5397,21 +5894,7 @@ async fn publish_agent_turn_metric(
         _ => return,
     };
 
-    let (turn_counts, cumulative_counts) = build_turn_metric_counts(&usage);
-    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let payload = AgentTurnMetricPayload {
-        harness: ctx.harness_name.clone(),
-        model: usage.model.clone(),
-        channel_id: channel_id.map(|id| id.to_string()),
-        session_id: Some(usage.session_id.clone()),
-        turn_id: Some(turn_id.to_string()),
-        turn_seq: Some(usage.turn_seq),
-        timestamp,
-        turn: turn_counts,
-        cumulative: cumulative_counts,
-        delta_reliable: usage.delta_reliable,
-        stop_reason,
-    };
+    let payload = build_turn_metric_payload(ctx, &usage, channel_id, turn_id, stop_reason);
     let ciphertext = match buzz_core::agent_turn_metric::encrypt_agent_turn_metric(
         &ctx.agent_keys,
         owner_pk,
@@ -5576,7 +6059,7 @@ pub(crate) async fn post_harness_notice(
     extra_tags: &[Vec<String>],
 ) -> Option<String> {
     let mut builder =
-        match buzz_sdk::build_message(channel_id, content, thread_ref, mentions, false, &[]) {
+        match buzz_sdk::build_message(channel_id, content, thread_ref, mentions, false, &[], &[]) {
             Ok(b) => b,
             Err(e) => {
                 tracing::warn!(channel = %channel_id, "harness notice: build failed: {e}");
@@ -6534,6 +7017,10 @@ mod tests {
                 assert_thread_count_filter(&filters, channel_id, root_id);
                 std::future::ready(Ok(json!({ "count": 6 })))
             },
+            ThreadContextSessionDelta {
+                overfetch: false,
+                delivered_ids: &HashSet::new(),
+            },
         )
         .await
         .expect("thread context");
@@ -6586,6 +7073,10 @@ mod tests {
             agent.public_key(),
             move |_filters| std::future::ready(Ok(json.clone())),
             |_filters| std::future::ready(Ok(json!({ "count": 6 }))),
+            ThreadContextSessionDelta {
+                overfetch: false,
+                delivered_ids: &HashSet::new(),
+            },
         )
         .await
         .expect("thread context");
@@ -6640,6 +7131,10 @@ mod tests {
             agent.public_key(),
             move |_filters| std::future::ready(Ok(json.clone())),
             |_filters| std::future::ready(Ok(json!({ "count": 1 }))),
+            ThreadContextSessionDelta {
+                overfetch: false,
+                delivered_ids: &HashSet::new(),
+            },
         )
         .await
         .expect("thread context");
@@ -6693,6 +7188,10 @@ mod tests {
             agent.public_key(),
             move |_filters| std::future::ready(Ok(json.clone())),
             |_filters| std::future::ready(Err(crate::relay::RelayError::Http("boom".into()))),
+            ThreadContextSessionDelta {
+                overfetch: false,
+                delivered_ids: &HashSet::new(),
+            },
         )
         .await
         .expect("thread context");
@@ -6755,6 +7254,10 @@ mod tests {
             agent.public_key(),
             move |_filters| std::future::ready(Ok(json.clone())),
             |_filters| std::future::ready(Ok(json!({ "count": 3 }))),
+            ThreadContextSessionDelta {
+                overfetch: false,
+                delivered_ids: &HashSet::new(),
+            },
         )
         .await
         .expect("thread context");
@@ -6829,6 +7332,10 @@ mod tests {
             agent.public_key(),
             move |_filters| std::future::ready(Ok(json.clone())),
             |_filters| std::future::ready(Err(crate::relay::RelayError::Http("boom".into()))),
+            ThreadContextSessionDelta {
+                overfetch: false,
+                delivered_ids: &HashSet::new(),
+            },
         )
         .await
         .expect("thread context");
@@ -7110,6 +7617,7 @@ mod tests {
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name,
             goose_system_prompt_supported: None,
@@ -7139,6 +7647,7 @@ mod tests {
                 crate::relay::ChannelInfo {
                     name: "test-dm".into(),
                     channel_type: "dm".into(),
+                    description: None,
                 },
             )]),
             ctx.rest_client.clone(),
@@ -7239,6 +7748,7 @@ mod tests {
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name,
             goose_system_prompt_supported: None,
@@ -7314,6 +7824,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
@@ -7467,6 +7978,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
@@ -7490,6 +8002,7 @@ done"#
                 crate::relay::ChannelInfo {
                     name: "test-dm".into(),
                     channel_type: "dm".into(),
+                    description: None,
                 },
             )]),
             RestClient {
@@ -7628,6 +8141,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
@@ -7650,6 +8164,7 @@ done"#
                 crate::relay::ChannelInfo {
                     name: "test-dm".into(),
                     channel_type: "dm".into(),
+                    description: None,
                 },
             )]),
             RestClient {
@@ -7862,6 +8377,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
@@ -7889,6 +8405,7 @@ done"#
                 crate::relay::ChannelInfo {
                     name: "test-dm".into(),
                     channel_type: "dm".into(),
+                    description: None,
                 },
             )]),
             RestClient {
@@ -8054,6 +8571,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
@@ -8082,6 +8600,7 @@ done"#
                 crate::relay::ChannelInfo {
                     name: "test-dm".into(),
                     channel_type: "dm".into(),
+                    description: None,
                 },
             )]),
             ctx.rest_client.clone(),
@@ -8134,6 +8653,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
@@ -8181,6 +8701,7 @@ done"#
                 crate::relay::ChannelInfo {
                     name: "test-dm".into(),
                     channel_type: "dm".into(),
+                    description: None,
                 },
             )]),
             ctx.rest_client.clone(),
@@ -8440,6 +8961,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
@@ -8476,6 +8998,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 crate::relay::ChannelInfo {
                     name: "test-dm".into(),
                     channel_type: "dm".into(),
+                    description: None,
                 },
             )]),
             RestClient {
@@ -8651,7 +9174,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 assert_eq!(messages.len(), 1);
                 assert_eq!(messages[0].event_id, "new");
                 assert_eq!(total, 3);
-                assert!(!truncated);
+                assert!(truncated);
                 assert!(root_present);
             }
             _ => panic!("expected thread context"),
@@ -8738,6 +9261,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         s.deliveries.insert(
             conv(ch_a),
             ChannelDeliveryState {
+                hydrated_thread_roots: VecDeque::new(),
                 standing_context_sent: true,
                 delivered_event_ids: HashSet::from(["event-a".into()]),
             },
@@ -8745,6 +9269,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         s.deliveries.insert(
             conv(ch_b),
             ChannelDeliveryState {
+                hydrated_thread_roots: VecDeque::new(),
                 standing_context_sent: true,
                 delivered_event_ids: HashSet::from(["event-b".into()]),
             },
@@ -8786,6 +9311,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "test".into(),
             goose_system_prompt_supported: None,
@@ -8861,6 +9387,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "test".into(),
             goose_system_prompt_supported: None,
@@ -9136,6 +9663,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "test".into(),
             goose_system_prompt_supported: None,
@@ -9273,6 +9801,47 @@ done"#
     /// Insert a `task_map` entry so `agent_index` reads as checked-out (busy)
     /// for the busy-owner predicate, mirroring an in-flight prompt task without
     /// spawning a real one. `busy_scope` is the turn the worker is running.
+    #[tokio::test(start_paused = true)]
+    async fn held_scope_deadline_wakes_a_quiet_dispatch_loop() {
+        let channel_id = Uuid::new_v4();
+        let scope = thread_scope(channel_id, &"a".repeat(64));
+        let idle_scope = thread_scope(channel_id, &"c".repeat(64));
+        let idle_agent = idle_agent_with_session(idle_scope).await;
+        let mut pool = AgentPool::from_slots(vec![Some(idle_agent)]);
+        pool.record_scope_owner(scope.clone(), 1);
+        mark_agent_busy(&mut pool, 1, thread_scope(channel_id, &"b".repeat(64)));
+
+        let started = tokio::time::Instant::now();
+        assert!(matches!(
+            pool.hold_decision(&scope, started.into_std(), HOLD_BUSY_OWNER_TIMEOUT),
+            HoldDecision::Hold { .. }
+        ));
+        let deadline = pool
+            .next_hold_deadline(HOLD_BUSY_OWNER_TIMEOUT)
+            .expect("held scope schedules an independent wake");
+        let wake = AgentPool::wait_for_hold_deadline(Some(deadline));
+        tokio::pin!(wake);
+
+        tokio::time::advance(HOLD_BUSY_OWNER_TIMEOUT - Duration::from_millis(1)).await;
+        assert!(
+            tokio::time::timeout(Duration::ZERO, &mut wake)
+                .await
+                .is_err(),
+            "quiet loop stays asleep before deadline"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        wake.await;
+
+        assert!(matches!(
+            pool.hold_decision(
+                &scope,
+                tokio::time::Instant::now().into_std(),
+                HOLD_BUSY_OWNER_TIMEOUT
+            ),
+            HoldDecision::ForkAfterHold { .. }
+        ));
+    }
+
     fn mark_agent_busy(pool: &mut AgentPool, agent_index: usize, busy_scope: SessionScope) {
         let abort = pool.join_set.spawn(async {});
         pool.task_map_mut().insert(
@@ -9303,6 +9872,7 @@ done"#
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "test".into(),
             goose_system_prompt_supported: None,
@@ -9352,6 +9922,7 @@ for line in sys.stdin:
                 state: SessionState::default(),
                 model_capabilities: None,
                 desired_model: None,
+                pending_model_ack: None,
                 model_overridden: false,
                 agent_name: "test".into(),
                 goose_system_prompt_supported: None,
@@ -9374,6 +9945,7 @@ for line in sys.stdin:
                 crate::relay::ChannelInfo {
                     name: "affinity-test".into(),
                     channel_type: "channel".into(),
+                    description: None,
                 },
             )]),
             ctx.rest_client.clone(),
@@ -10061,7 +10633,10 @@ for line in sys.stdin:
         let _ = apply_completed_before_control_signal(
             &mut s,
             &PromptSource::Channel(SessionScope::Conversation { channel_id: ch_a }),
-            &ControlSignal::SwitchModel("gpt-5".into()),
+            &ControlSignal::SwitchModel {
+                model_id: "gpt-5".into(),
+                request_id: None,
+            },
         );
 
         assert!(!s.has_channel_state(&ch_a));
@@ -10102,7 +10677,10 @@ for line in sys.stdin:
             (ControlSignal::Steer, Some(CancelReason::Steer)),
             (ControlSignal::Interrupt, Some(CancelReason::Interrupt)),
             (
-                ControlSignal::SwitchModel("gpt-5".into()),
+                ControlSignal::SwitchModel {
+                    model_id: "gpt-5".into(),
+                    request_id: None,
+                },
                 Some(CancelReason::Interrupt),
             ),
             (ControlSignal::Cancel, None),
@@ -10219,7 +10797,10 @@ for line in sys.stdin:
             Case {
                 name: "CancelDrainTimeout + SwitchModel preserves batch with Interrupt reason",
                 error: || AcpError::CancelDrainTimeout(CONTROL_CANCEL_GRACE),
-                signal: ControlSignal::SwitchModel("gpt-5".to_string()),
+                signal: ControlSignal::SwitchModel {
+                    model_id: "gpt-5".to_string(),
+                    request_id: None,
+                },
                 expected_outcome: "CancelDrainTimeout",
                 batch_preserved: true,
                 expected_reason: Some(CancelReason::Interrupt),
@@ -10636,6 +11217,7 @@ for line in sys.stdin:
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -10694,6 +11276,7 @@ for line in sys.stdin:
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -10765,6 +11348,7 @@ for line in sys.stdin:
             state,
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -10827,6 +11411,7 @@ for line in sys.stdin:
                 captured_at: Instant::now(),
             }),
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -10835,7 +11420,7 @@ for line in sys.stdin:
         let mut pool = AgentPool::from_slots(vec![Some(agent)]);
 
         let result = pool
-            .switch_idle_agent_model(channel_id, "recovered-model")
+            .switch_idle_agent_model(channel_id, "recovered-model", None)
             .await;
 
         assert_eq!(result, IdleSwitchResult::Switched);
@@ -10904,6 +11489,7 @@ for line in sys.stdin:
             state,
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -10958,6 +11544,7 @@ for line in sys.stdin:
             state,
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -11015,6 +11602,7 @@ for line in sys.stdin:
             state,
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -11060,6 +11648,7 @@ for line in sys.stdin:
             state,
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -11101,6 +11690,7 @@ for line in sys.stdin:
             state: SessionState::default(),
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -11167,6 +11757,7 @@ for line in sys.stdin:
             state,
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -11208,6 +11799,7 @@ for line in sys.stdin:
             state,
             model_capabilities: None,
             desired_model: None,
+            pending_model_ack: None,
             model_overridden: false,
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
@@ -11243,6 +11835,32 @@ for line in sys.stdin:
         assert_eq!(acp_stop_to_core(&StopReason::Refusal), CoreStop::Unknown);
     }
 
+    #[test]
+    fn metric_payload_preserves_pricing_identity_cache_writes_and_absence() {
+        let mut tracker = crate::usage::UsageTracker::default();
+        tracker.seed_zero_baseline("priced");
+        tracker.begin_turn("priced");
+        let raw = serde_json::json!({
+            "accumulatedInputTokens": 100, "accumulatedOutputTokens": 20,
+            "accumulatedCacheWriteTokens": 35,
+            "pricingIdentity": {"authority": "api.anthropic.com", "model": "claude-opus-4-5"}
+        });
+        let payload = serde_json::from_value(raw).unwrap();
+        tracker.record("priced", &payload);
+        let usage = tracker.take().unwrap();
+        let metric =
+            build_turn_metric_payload(&make_prompt_context_no_owner(), &usage, None, "turn", None);
+        assert_eq!(metric.pricing_identity, usage.pricing_identity);
+        assert!(metric.pricing_identity.is_some());
+        assert_eq!(metric.turn.unwrap().cache_write_tokens, Some(35));
+        assert_eq!(metric.cumulative.unwrap().cache_write_tokens, Some(35));
+        let mut absent = usage;
+        absent.cumulative_input_tokens = None;
+        let metric =
+            build_turn_metric_payload(&make_prompt_context_no_owner(), &absent, None, "turn", None);
+        assert!(metric.cumulative.unwrap().input_tokens.is_none());
+    }
+
     /// `publish_agent_turn_metric` is a no-op when `usage` is `None`.
     #[tokio::test]
     async fn test_publish_agent_turn_metric_noop_on_no_usage() {
@@ -11271,11 +11889,14 @@ for line in sys.stdin:
             turn_output_tokens: Some(50),
             turn_total_tokens: None,
             turn_cost_usd: None,
+            turn_cache_write_tokens: None,
             turn_cache_read_tokens: None,
-            cumulative_input_tokens: 100,
-            cumulative_output_tokens: 50,
+            cumulative_input_tokens: Some(100),
+            cumulative_output_tokens: Some(50),
             cumulative_total_tokens: None,
             cumulative_cost_usd: None,
+            pricing_identity: None,
+            cumulative_cache_write_tokens: None,
             cumulative_cache_read_tokens: None,
             model: None,
         };
@@ -11307,11 +11928,14 @@ for line in sys.stdin:
             turn_output_tokens: Some(80),
             turn_total_tokens: None,
             turn_cost_usd: Some(0.001),
+            turn_cache_write_tokens: None,
             turn_cache_read_tokens: None,
-            cumulative_input_tokens: 200,
-            cumulative_output_tokens: 80,
+            cumulative_input_tokens: Some(200),
+            cumulative_output_tokens: Some(80),
             cumulative_total_tokens: None,
             cumulative_cost_usd: Some(0.001),
+            pricing_identity: None,
+            cumulative_cache_write_tokens: None,
             cumulative_cache_read_tokens: None,
             model: None,
         };
@@ -11344,11 +11968,14 @@ for line in sys.stdin:
             turn_output_tokens: Some(20),
             turn_total_tokens: None,
             turn_cost_usd: None,
+            turn_cache_write_tokens: None,
             turn_cache_read_tokens: None,
-            cumulative_input_tokens: 150,
-            cumulative_output_tokens: 70,
+            cumulative_input_tokens: Some(150),
+            cumulative_output_tokens: Some(70),
             cumulative_total_tokens: None,
             cumulative_cost_usd: None,
+            pricing_identity: None,
+            cumulative_cache_write_tokens: None,
             cumulative_cache_read_tokens: None,
             model: None,
         };
@@ -11381,11 +12008,14 @@ for line in sys.stdin:
             turn_output_tokens: None,
             turn_total_tokens: None,
             turn_cost_usd: None,
+            turn_cache_write_tokens: None,
             turn_cache_read_tokens: None,
-            cumulative_input_tokens: 400,
-            cumulative_output_tokens: 100,
+            cumulative_input_tokens: Some(400),
+            cumulative_output_tokens: Some(100),
             cumulative_total_tokens: None,
             cumulative_cost_usd: None,
+            pricing_identity: None,
+            cumulative_cache_write_tokens: None,
             cumulative_cache_read_tokens: None,
             model: None,
         };
@@ -11415,11 +12045,14 @@ for line in sys.stdin:
             turn_output_tokens: Some(30),
             turn_total_tokens: Some(130), // genuine per-turn total
             turn_cost_usd: None,
+            turn_cache_write_tokens: None,
             turn_cache_read_tokens: None,
-            cumulative_input_tokens: 500,
-            cumulative_output_tokens: 120,
+            cumulative_input_tokens: Some(500),
+            cumulative_output_tokens: Some(120),
             cumulative_total_tokens: Some(620), // genuine cumulative total
             cumulative_cost_usd: None,
+            pricing_identity: None,
+            cumulative_cache_write_tokens: None,
             cumulative_cache_read_tokens: None,
             model: None,
         };
@@ -11464,11 +12097,14 @@ for line in sys.stdin:
             turn_output_tokens: Some(60),
             turn_total_tokens: None, // provider did not supply a total
             turn_cost_usd: None,
+            turn_cache_write_tokens: None,
             turn_cache_read_tokens: None,
-            cumulative_input_tokens: 200,
-            cumulative_output_tokens: 60,
+            cumulative_input_tokens: Some(200),
+            cumulative_output_tokens: Some(60),
             cumulative_total_tokens: None, // session has no total
             cumulative_cost_usd: None,
+            pricing_identity: None,
+            cumulative_cache_write_tokens: None,
             cumulative_cache_read_tokens: None,
             model: None,
         };
@@ -11599,7 +12235,7 @@ for line in sys.stdin:
         );
     }
 
-    fn make_prompt_context_no_owner() -> PromptContext {
+    pub(super) fn make_prompt_context_no_owner() -> PromptContext {
         let agent_keys = nostr::Keys::generate();
         make_prompt_context_impl(&agent_keys, None)
     }
@@ -12117,4 +12753,821 @@ for line in sys.stdin:
         );
         server.abort();
     }
+    #[tokio::test]
+    async fn hydrated_thread_retains_same_key_reply_from_another_session() {
+        let agent = Keys::generate();
+        let agent_hex = agent.public_key().to_hex();
+        let root_id = "1111111111111111111111111111111111111111111111111111111111111111";
+        let channel_id = Uuid::new_v4();
+        let json = json!([
+            thread_event(root_id, "rootpub", "root", 1000),
+            thread_event(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "humanpub",
+                "newer human reply",
+                5000
+            ),
+            thread_event(
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "humanpub",
+                "middle human reply",
+                4000
+            ),
+            thread_event(
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                &agent_hex,
+                "recent agent reply already in provider history",
+                6000
+            ),
+            thread_event(
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                &agent_hex,
+                "same-key reply from another provider session",
+                5500
+            )
+        ]);
+        let delivered = HashSet::from([
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string(),
+        ]);
+
+        let ctx = fetch_thread_context_with(
+            channel_id,
+            root_id,
+            3,
+            agent.public_key(),
+            move |filters| {
+                assert_eq!(
+                    filters.len(),
+                    3,
+                    "same-key replies still require the agent pin query"
+                );
+                let replies = serde_json::to_value(&filters[1]).expect("serialize replies filter");
+                assert!(replies.get("authors").is_none());
+                assert_eq!(replies.get("limit"), Some(&json!(7)));
+                std::future::ready(Ok(json.clone()))
+            },
+            |_filters| -> std::future::Ready<Result<serde_json::Value, crate::relay::RelayError>> {
+                panic!("session-delta omission alone must not issue /count")
+            },
+            ThreadContextSessionDelta {
+                overfetch: true,
+                delivered_ids: &delivered,
+            },
+        )
+        .await
+        .expect("thread context");
+
+        let ctx = conversation_context_delta(Some(ctx), &delivered, &HashSet::new())
+            .expect("human context remains after hydrated-session filtering");
+
+        let ConversationContext::Thread {
+            messages,
+            total,
+            truncated,
+            ..
+        } = ctx
+        else {
+            panic!("expected thread context");
+        };
+        assert_eq!(total, 5);
+        assert!(
+            truncated,
+            "omitted session history must be represented as a truncated context window"
+        );
+        assert!(messages
+            .iter()
+            .any(|message| message.content == "newer human reply"));
+        assert!(messages
+            .iter()
+            .any(|message| message.content == "middle human reply"));
+        assert!(messages
+            .iter()
+            .all(|message| message.content != "recent agent reply already in provider history"));
+        assert!(messages
+            .iter()
+            .any(|message| message.content == "same-key reply from another provider session"));
+    }
+
+    #[test]
+    fn delivery_state_bounds_hydrated_thread_roots() {
+        let channel = Uuid::new_v4();
+        let mut state = SessionState::default();
+        let roots = (0..=MAX_HYDRATED_THREAD_ROOTS_PER_SCOPE)
+            .map(|index| format!("root-{index}"))
+            .collect::<Vec<_>>();
+
+        state.mark_scope_delivery_with_hydration(conv(channel), false, [], roots);
+
+        let hydrated = &state.deliveries[&conv(channel)].hydrated_thread_roots;
+        assert_eq!(hydrated.len(), MAX_HYDRATED_THREAD_ROOTS_PER_SCOPE);
+        assert!(!hydrated.contains(&"root-0".to_string()));
+        assert!(hydrated.contains(&format!("root-{MAX_HYDRATED_THREAD_ROOTS_PER_SCOPE}")));
+    }
+
+    #[test]
+    fn merged_batch_hydrates_only_successfully_fetched_non_dm_target() {
+        let channel = Uuid::new_v4();
+        let cancelled_root = "a".repeat(64);
+        let fetched_root = "b".repeat(64);
+        let cancelled = signed_event_with_tags(vec![
+            vec!["e".into(), cancelled_root, String::new(), "root".into()],
+            vec!["e".into(), "c".repeat(64), String::new(), "reply".into()],
+        ]);
+        let current = signed_event_with_tags(vec![
+            vec![
+                "e".into(),
+                fetched_root.clone(),
+                String::new(),
+                "root".into(),
+            ],
+            vec!["e".into(), "d".repeat(64), String::new(), "reply".into()],
+        ]);
+        let mut batch = batch_with_scope(conv(channel), current);
+        batch.cancelled_events.push(crate::queue::BatchEvent {
+            event: cancelled,
+            prompt_tag: "cancelled".into(),
+            received_at: std::time::Instant::now(),
+        });
+        let target = resolve_context_target(&batch, false);
+        let context = ConversationContext::Thread {
+            messages: vec![context_message(&fetched_root, "thread root")],
+            total: 1,
+            root_present: true,
+            truncated: false,
+        };
+
+        assert_eq!(
+            fetched_thread_root_to_hydrate(&target, Some(&context), false),
+            Some(fetched_root)
+        );
+        assert_eq!(fetched_thread_root_to_hydrate(&target, None, false), None);
+        assert_eq!(
+            fetched_thread_root_to_hydrate(&target, Some(&context), true),
+            None,
+            "DM conversations do not use per-thread hydration"
+        );
+        assert_eq!(
+            fetched_thread_root_to_hydrate(&ContextTarget::None, Some(&context), false),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn hydrated_thread_prompt_omits_agent_reply_but_keeps_new_human_context() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let channel_id = Uuid::new_v4();
+        let agent_keys = Keys::generate();
+        let human_keys = Keys::generate();
+        let h_tag = Tag::parse(["h", channel_id.to_string().as_str()]).unwrap();
+        let root = EventBuilder::new(Kind::Custom(9), "original question")
+            .tags([h_tag.clone()])
+            .sign_with_keys(&human_keys)
+            .unwrap();
+        let root_id = root.id.to_hex();
+        let reply_tag = Tag::parse(["e", root_id.as_str(), "", "reply"]).unwrap();
+        let agent_reply = EventBuilder::new(
+            Kind::Custom(9),
+            "agent reply already retained in the provider session",
+        )
+        .tags([h_tag.clone(), reply_tag.clone()])
+        .sign_with_keys(&agent_keys)
+        .unwrap();
+        let intervening_human = EventBuilder::new(Kind::Custom(9), "new human context")
+            .tags([h_tag.clone(), reply_tag.clone()])
+            .sign_with_keys(&human_keys)
+            .unwrap();
+        let trigger = EventBuilder::new(Kind::Custom(9), "follow-up mention")
+            .tags([h_tag, reply_tag])
+            .sign_with_keys(&human_keys)
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind context server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let first_response_body = serde_json::to_string(&vec![root.clone(), agent_reply.clone()])
+            .expect("serialize first context response");
+        let response_body = serde_json::to_string(&vec![
+            root.clone(),
+            agent_reply,
+            intervening_human,
+            trigger.clone(),
+        ])
+        .unwrap();
+        let server_root_id = root_id.clone();
+        let server = tokio::spawn(async move {
+            let mut served_first_context = false;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = vec![0; 16 * 1024];
+                let read = socket.read(&mut request).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..read]);
+                let body = if request.contains(&server_root_id) && !served_first_context {
+                    served_first_context = true;
+                    &first_response_body
+                } else {
+                    &response_body
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        let capture = std::env::temp_dir().join(format!(
+            "buzz-acp-hydrated-thread-wire-{}.ndjson",
+            Uuid::new_v4()
+        ));
+        let quoted_capture = capture.to_string_lossy().replace('\'', "'\\''");
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{quoted_capture}'
+  printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$count,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
+  count=$((count + 1))
+done"#
+        );
+        let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+            .await
+            .expect("spawn wire-capture ACP");
+        let scope = SessionScope::Thread {
+            channel_id,
+            root_event_id: root_id.clone(),
+        };
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            pending_model_ack: None,
+            model_overridden: false,
+            agent_name: "legacy-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+        };
+        agent
+            .state
+            .sessions
+            .insert(scope.clone(), "live-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(scope.clone(), ChannelDeliveryState::default());
+
+        let make_context = |context_message_limit| {
+            let mut ctx = make_prompt_context_impl(&agent_keys, None);
+            ctx.context_message_limit = context_message_limit;
+            ctx.rest_client.base_url = base_url.clone();
+            ctx.channel_info = ChannelInfoResolver::new(
+                HashMap::from([(
+                    channel_id,
+                    crate::relay::ChannelInfo {
+                        name: "test-thread".into(),
+                        channel_type: "stream".into(),
+                        description: None,
+                    },
+                )]),
+                RestClient {
+                    http: reqwest::Client::new(),
+                    base_url: base_url.clone(),
+                    keys: agent_keys.clone(),
+                    auth_tag_json: None,
+                },
+            );
+            ctx
+        };
+        let first_batch = FlushBatch {
+            channel_id,
+            scope: scope.clone(),
+            events: vec![crate::queue::BatchEvent {
+                event: root,
+                prompt_tag: "@mention".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let follow_up_batch = FlushBatch {
+            channel_id,
+            scope: scope.clone(),
+            events: vec![crate::queue::BatchEvent {
+                event: trigger,
+                prompt_tag: "@mention".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        run_prompt_task(
+            agent,
+            Some(first_batch),
+            None,
+            Arc::new(make_context(10)),
+            result_tx.clone(),
+            None,
+            "first-turn".into(),
+        )
+        .await;
+        let first_result = result_rx.recv().await.expect("first prompt result");
+        assert!(matches!(
+            first_result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        assert!(first_result.agent.state.deliveries[&scope]
+            .hydrated_thread_roots
+            .contains(&root_id));
+
+        run_prompt_task(
+            first_result.agent,
+            Some(follow_up_batch),
+            None,
+            Arc::new(make_context(10)),
+            result_tx,
+            None,
+            "follow-up-turn".into(),
+        )
+        .await;
+        let mut result = result_rx.recv().await.expect("prompt result");
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        assert!(result.agent.state.deliveries[&scope]
+            .hydrated_thread_roots
+            .contains(&root_id));
+        result.agent.acp.shutdown().await;
+        server.abort();
+
+        let requests: Vec<serde_json::Value> = std::fs::read_to_string(&capture)
+            .expect("read prompt capture")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("captured prompt JSON"))
+            .collect();
+        std::fs::remove_file(&capture).expect("remove prompt capture");
+        assert_eq!(requests.len(), 2);
+        let wire = requests[1]["params"]["prompt"]
+            .as_array()
+            .expect("prompt blocks")
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(wire.contains("new human context"));
+        assert!(!wire.contains("agent reply already retained in the provider session"));
+        assert!(wire.contains("follow-up mention"));
+        assert!(wire.contains("truncated=\"true\""));
+        assert!(wire.contains("buzz messages thread"));
+    }
 }
+
+#[cfg(test)]
+mod startup_effort_tests {
+    use super::*;
+    use crate::acp::AcpClient;
+    use tests::make_prompt_context_no_owner;
+
+    /// Build a protocol-v2, non-goose agent whose only ACP requests will be
+    /// `session/new` (id 0) then the startup-effort `session/set_config_option`
+    /// (id 1). `startup_effort` is the held spawn-scoped value under test.
+    fn effort_agent(acp: AcpClient) -> OwnedAgent {
+        OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            pending_model_ack: None,
+            model_overridden: false,
+            agent_name: "effort-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        }
+    }
+
+    /// Spawn a scripted ACP that answers `session/new` (request #1) with the
+    /// given configOptions, then replies to the effort `set_config_option`
+    /// (request #2) with `effort_reply` (a JSON-RPC `result`/`error` body, minus
+    /// the id which is filled in). Any later request gets `{"ok":true}`.
+    async fn spawn_effort_acp(session_new_config_options: &str, effort_reply: &str) -> AcpClient {
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  id=$((count - 1))
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"sessionId":"sess-1","configOptions":{session_new_config_options}}}}}'
+  elif [ "$count" -eq 2 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',{effort_reply}}}'
+  else
+    printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"ok":true}}}}'
+  fi
+done"#
+        );
+        AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn effort ACP script")
+    }
+
+    fn captured_config_options(obs: &observer::ObserverHandle) -> serde_json::Value {
+        obs.snapshot()
+            .into_iter()
+            .find(|e| e.kind == "session_config_captured")
+            .expect("session_config_captured emitted")
+            .payload["configOptions"]
+            .clone()
+    }
+
+    fn effort_current_value(options: &serde_json::Value) -> Option<String> {
+        options
+            .as_array()?
+            .iter()
+            .find(|o| o["category"] == "thought_level")
+            .and_then(|o| o["currentValue"].as_str())
+            .map(str::to_string)
+    }
+
+    const OPTS_WITH_EFFORT_DEFAULT_LOW: &str = r#"[{"configId":"effort","category":"thought_level","currentValue":"low","options":[{"value":"low"},{"value":"high"}]}]"#;
+
+    #[tokio::test]
+    async fn test_applied_effort_patches_captured_current_value_to_high() {
+        let acp = spawn_effort_acp(OPTS_WITH_EFFORT_DEFAULT_LOW, r#""result":{"ok":true}"#).await;
+        let mut agent = effort_agent(acp);
+        let obs = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(obs.clone()), 0);
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.startup_effort = Some("high".into());
+        create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None)
+            .await
+            .expect("session creation must succeed");
+
+        let opts = captured_config_options(&obs);
+        assert_eq!(
+            effort_current_value(&opts).as_deref(),
+            Some("high"),
+            "applied effort must overwrite the pre-set currentValue in the capture"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rejected_effort_retains_captured_current_value() {
+        // Adapter answers the effort set with a JSON-RPC error → AgentError →
+        // application-level rejection: non-fatal, capture keeps the default.
+        let acp = spawn_effort_acp(
+            OPTS_WITH_EFFORT_DEFAULT_LOW,
+            r#""error":{"code":-32602,"message":"unsupported effort value"}"#,
+        )
+        .await;
+        let mut agent = effort_agent(acp);
+        let obs = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(obs.clone()), 0);
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.startup_effort = Some("high".into());
+        create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None)
+            .await
+            .expect("rejection is non-fatal; session creation still succeeds");
+
+        let opts = captured_config_options(&obs);
+        assert_eq!(
+            effort_current_value(&opts).as_deref(),
+            Some("low"),
+            "a rejected effort must not falsify the capture — keep the running value"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_thought_level_model_leaves_capture_unpatched() {
+        // Model advertises only a `model` option — no thought_level. The held
+        // effort is silently ignored and no set_config_option is sent.
+        let opts_no_effort = r#"[{"configId":"model","category":"model","currentValue":"m-a","options":[{"value":"m-a"}]}]"#;
+        let acp = spawn_effort_acp(opts_no_effort, r#""result":{"ok":true}"#).await;
+        let mut agent = effort_agent(acp);
+        let obs = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(obs.clone()), 0);
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.startup_effort = Some("high".into());
+        create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None)
+            .await
+            .expect("session creation must succeed");
+
+        let opts = captured_config_options(&obs);
+        assert_eq!(
+            opts,
+            serde_json::from_str::<serde_json::Value>(opts_no_effort).unwrap(),
+            "no thought_level option → capture is the untouched session/new snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_startup_effort_leaves_capture_unpatched() {
+        // No held effort at all: the set_config_option is never sent and the
+        // default currentValue survives into the capture.
+        let acp = spawn_effort_acp(OPTS_WITH_EFFORT_DEFAULT_LOW, r#""result":{"ok":true}"#).await;
+        let mut agent = effort_agent(acp);
+        let obs = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(obs.clone()), 0);
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.startup_effort = None;
+        create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None)
+            .await
+            .expect("session creation must succeed");
+
+        let opts = captured_config_options(&obs);
+        assert_eq!(
+            effort_current_value(&opts).as_deref(),
+            Some("low"),
+            "with no configured effort the capture reflects the model default"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_transport_error_on_effort_propagates_for_respawn() {
+        // Adapter exits after answering session/new but before the effort set →
+        // AgentExited (transport class) → Err so the caller respawns the worker
+        // instead of reusing a possibly-poisoned stream.
+        let script = format!(
+            r#"IFS= read -r _new
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"sessionId":"sess-1","configOptions":{OPTS_WITH_EFFORT_DEFAULT_LOW}}}}}'
+IFS= read -r _effort
+exit 0"#
+        );
+        let acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn transport-exit ACP script");
+        let mut agent = effort_agent(acp);
+
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.startup_effort = Some("high".into());
+        let err = create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None)
+            .await
+            .expect_err("transport-class effort failure must propagate as Err");
+        assert!(
+            matches!(err, AcpError::AgentExited | AcpError::Io(_)),
+            "process exit mid-effort is a transport error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_patch_config_option_current_value_matches_by_id_key() {
+        // The `id` key (claude-agent-acp) must also match, not just `configId`.
+        let mut opts = serde_json::json!([
+            { "id": "effort", "category": "thought_level", "currentValue": "low" }
+        ]);
+        patch_config_option_current_value(&mut opts, "effort", "high");
+        assert_eq!(opts[0]["currentValue"], "high");
+    }
+
+    #[test]
+    fn test_patch_config_option_current_value_noop_on_non_array() {
+        let mut opts = serde_json::Value::Null;
+        patch_config_option_current_value(&mut opts, "effort", "high");
+        assert!(opts.is_null(), "a null snapshot must stay null");
+    }
+}
+
+#[cfg(test)]
+mod model_switch_tests {
+    use super::*;
+    use crate::acp::AcpClient;
+    use tests::make_prompt_context_no_owner;
+
+    /// A protocol-v2 agent with a live `desired_model` override and no startup
+    /// effort. `model_overridden` is set so the capture's `modelOverridden`
+    /// reflects only whether the switch actually landed.
+    fn switching_agent(acp: AcpClient, desired_model: &str) -> OwnedAgent {
+        OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: Some(desired_model.to_string()),
+            pending_model_ack: None,
+            model_overridden: true,
+            agent_name: "switch-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        }
+    }
+
+    /// Scripted ACP: `session/new` (request #1) returns `session_new_options`,
+    /// then the model-switch `set_config_option` (request #2) replies with
+    /// `switch_reply` (a JSON-RPC `result`/`error` body minus the id). Any later
+    /// request gets `{"ok":true}`.
+    async fn spawn_switch_acp(session_new_options: &str, switch_reply: &str) -> AcpClient {
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  id=$((count - 1))
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"sessionId":"sess-1","configOptions":{session_new_options}}}}}'
+  elif [ "$count" -eq 2 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',{switch_reply}}}'
+  else
+    printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"ok":true}}}}'
+  fi
+done"#
+        );
+        AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn switch ACP script")
+    }
+
+    fn capture(obs: &observer::ObserverHandle) -> serde_json::Value {
+        obs.snapshot()
+            .into_iter()
+            .find(|e| e.kind == "session_config_captured")
+            .expect("session_config_captured emitted")
+            .payload
+    }
+
+    fn control_results(obs: &observer::ObserverHandle) -> Vec<serde_json::Value> {
+        obs.snapshot()
+            .into_iter()
+            .filter(|e| e.kind == "control_result")
+            .map(|e| e.payload)
+            .collect()
+    }
+
+    // A `model`-category option offering the default model plus the target the
+    // agent wants to switch to.
+    const OPTS_MODEL_A_AND_B: &str = r#"[{"configId":"model","category":"model","currentValue":"model-a","options":[{"value":"model-a"},{"value":"model-b"}]}]"#;
+
+    async fn spawn_switch_acp_full(session_new_result: &str, switch_reply: &str) -> AcpClient {
+        let script = format!(
+            r#"count=0
+while IFS= read -r line; do
+  count=$((count + 1))
+  id=$((count - 1))
+  if [ "$count" -eq 1 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{session_new_result}}}'
+  elif [ "$count" -eq 2 ]; then
+    printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',{switch_reply}}}'
+  else
+    printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"',"result":{{"ok":true}}}}'
+  fi
+done"#
+        );
+        AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn switch ACP script")
+    }
+    #[tokio::test]
+    async fn test_rejected_switch_preserves_capabilities_and_emits_failure() {
+        // The adapter refuses the switch with a JSON-RPC error. The session is
+        // still on its default model: pre-switch capabilities survive, the
+        // capture reports modelOverridden false, and a terminal `failure`
+        // control_result tells Desktop the pick did not land.
+        let acp = spawn_switch_acp(
+            OPTS_MODEL_A_AND_B,
+            r#""error":{"code":-32602,"message":"model not accepted"}"#,
+        )
+        .await;
+        let mut agent = switching_agent(acp, "model-b");
+        let obs = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(obs.clone()), 0);
+
+        let ctx = make_prompt_context_no_owner();
+        create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None)
+            .await
+            .expect("an application-level rejection is non-fatal");
+
+        let caps = agent
+            .model_capabilities
+            .as_ref()
+            .expect("pre-switch capabilities must be preserved on rejection");
+        assert!(
+            caps.config_options_raw
+                .iter()
+                .any(|o| o["currentValue"] == "model-a"),
+            "capabilities must still describe the default model the session runs"
+        );
+        let cap = capture(&obs);
+        assert_eq!(
+            cap["modelOverridden"], false,
+            "a rejected switch must not claim an override"
+        );
+        let results = control_results(&obs);
+        assert_eq!(results.len(), 1, "exactly one control_result on rejection");
+        assert_eq!(results[0]["status"], "failure");
+        assert_eq!(results[0]["modelId"], "model-b");
+    }
+    #[tokio::test]
+    async fn test_applied_switch_caches_target_model_not_pre_switch() {
+        // session/new: model-a is current. switch reply: model-b is current,
+        // and it echoes rebuilt configOptions so capabilities refresh cleanly.
+        let session_new = r#"{"sessionId":"sess-1","configOptions":[{"configId":"model","category":"model","currentValue":"model-a","options":[{"value":"model-a"},{"value":"model-b"}]}],"models":{"currentModelId":"model-a","availableModels":[{"modelId":"model-a"},{"modelId":"model-b"}]}}"#;
+        let switch_reply = r#""result":{"configOptions":[{"configId":"model","category":"model","currentValue":"model-b","options":[{"value":"model-a"},{"value":"model-b"}]}],"models":{"currentModelId":"model-b","availableModels":[{"modelId":"model-a"},{"modelId":"model-b"}]}}"#;
+        let acp = spawn_switch_acp_full(session_new, switch_reply).await;
+        let mut agent = switching_agent(acp, "model-b");
+        let obs = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(obs.clone()), 0);
+
+        let ctx = make_prompt_context_no_owner();
+        create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None)
+            .await
+            .expect("session creation must succeed");
+
+        let cap = capture(&obs);
+        assert_eq!(
+            cap["models"]["currentModelId"], "model-b",
+            "an applied switch must cache the target model, not the pre-switch model-a"
+        );
+    }
+    #[tokio::test]
+    async fn poisoned_switch_settles_before_agent_is_returned_for_respawn() {
+        let acp = spawn_switch_acp(OPTS_MODEL_A_AND_B, r#""result":{}"#).await;
+        let mut agent = switching_agent(acp, "model-b");
+        let channel = Uuid::new_v4();
+        agent.pending_model_ack = Some((Some("poisoned-pick".into()), channel));
+        let obs = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(obs.clone()), 0);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        send_prompt_result(
+            &tx,
+            "turn",
+            agent,
+            PromptSource::Heartbeat,
+            PromptOutcome::CancelDrainTimeout(Duration::from_secs(5)),
+            None,
+        );
+        assert!(rx.recv().await.unwrap().agent.pending_model_ack.is_none());
+        let frames = control_results(&obs);
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0]["requestId"], "poisoned-pick");
+        assert_eq!(frames[0]["status"], "failure");
+    }
+
+    #[tokio::test]
+    async fn correlated_switch_terminal_is_consumed_once_on_success_and_failure() {
+        for (reply, status) in [
+            (r#""result":{"configOptions":[]}"#, "switched"),
+            (r#""error":{"code":-32602,"message":"rejected"}"#, "failure"),
+        ] {
+            let acp = spawn_switch_acp(OPTS_MODEL_A_AND_B, reply).await;
+            let mut agent = switching_agent(acp, "model-b");
+            let channel = Uuid::new_v4();
+            agent.pending_model_ack = Some((Some("pick-1".into()), channel));
+            let obs = observer::ObserverHandle::in_process();
+            agent.acp.set_observer(Some(obs.clone()), 0);
+            create_session_and_apply_model(
+                &mut agent,
+                &make_prompt_context_no_owner(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(agent.pending_model_ack.is_none());
+            emit_pending_model_ack(&mut agent, "failure");
+            let frames: Vec<_> = obs
+                .snapshot()
+                .into_iter()
+                .filter(|e| e.kind == "control_result" && e.payload["requestId"] == "pick-1")
+                .collect();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(frames[0].payload["status"], status);
+            assert_eq!(
+                frames[0].channel_id.as_deref(),
+                Some(channel.to_string().as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_applied_switch_without_models_does_not_leak_pre_switch_model() {
+        // session/new advertises model-a as current; the successful switch reply
+        // echoes configOptions (so the switch is Applied) but NO models block.
+        let session_new = r#"{"sessionId":"sess-1","configOptions":[{"configId":"model","category":"model","currentValue":"model-a","options":[{"value":"model-a"},{"value":"model-b"}]}],"models":{"currentModelId":"model-a","availableModels":[{"modelId":"model-a"},{"modelId":"model-b"}]}}"#;
+        let switch_reply = r#""result":{"configOptions":[{"configId":"model","category":"model","currentValue":"model-b","options":[{"value":"model-a"},{"value":"model-b"}]}]}"#;
+        let acp = spawn_switch_acp_full(session_new, switch_reply).await;
+        let mut agent = switching_agent(acp, "model-b");
+        let obs = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(obs.clone()), 0);
+
+        let ctx = make_prompt_context_no_owner();
+        create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None)
+            .await
+            .expect("session creation must succeed");
+
+        let cap = capture(&obs);
+        assert!(
+            cap["models"].is_null(),
+            "an optionless-models successful switch must emit Null, not the pre-switch models"
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "pool/pi_transport_tests.rs"]
+mod pi_transport_tests;

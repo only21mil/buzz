@@ -125,42 +125,26 @@ test("tag helpers drop malformed value-less tags", () => {
 
   const issue = eventToProjectIssue(event);
   assert.deepEqual(issue.labels, ["bug"]);
+  assert.equal(issue.category, "issue");
   assert.equal(issue.status, PROJECT_ISSUE_STATUS.BACKLOG);
   assert.equal(issue.title, "Something is broken");
 });
 
-test("preserves advisory issue origin tags with stable valid selection", () => {
-  const issue = eventToProjectIssue(
+test("derives task categories from labels while defaulting legacy tasks to issue", () => {
+  const changeRequest = eventToProjectIssue(
     issueEvent({
       tags: [
         ["a", REPO_ADDRESS],
-        ["h"],
-        ["h", "  source-channel-id  "],
-        ["h", "later-channel-id"],
-        ["i", "bad\nexternal-id"],
-        ["i", "  github:issue:block/buzz#123  "],
-        ["i", "github:issue:block/buzz#456"],
+        ["subject", "Update the release workflow"],
+        ["t", "change-request"],
+        ["t", "release"],
       ],
     }),
   );
 
-  assert.equal(issue.channelId, "source-channel-id");
-  assert.equal(issue.externalId, "github:issue:block/buzz#123");
-});
-
-test("drops malformed issue origin tags", () => {
-  const issue = eventToProjectIssue(
-    issueEvent({
-      tags: [
-        ["a", REPO_ADDRESS],
-        ["h", "\u0000channel"],
-        ["i", "x".repeat(257)],
-      ],
-    }),
-  );
-
-  assert.equal(issue.channelId, null);
-  assert.equal(issue.externalId, null);
+  assert.equal(changeRequest.category, "change-request");
+  assert.deepEqual(changeRequest.labels, ["change-request", "release"]);
+  assert.equal(eventToProjectIssue(issueEvent()).category, "issue");
 });
 
 test("preserves root and comment tags for rich content rendering", () => {

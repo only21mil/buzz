@@ -157,6 +157,10 @@ jobs:
           # Push by digest, not by tag — the merge job assembles the tags
           # into one multi-arch manifest. This is what makes the native-arm
           # matrix possible.
+          build-args: |
+            BUZZ_SOURCE_SHA=${{ github.sha }}
+            BUZZ_BUILD_ID=github-actions:${{ github.run_id }}:${{ github.run_attempt }}
+            BUZZ_BUILD_URL=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           cache-from: |
             type=registry,ref=${{ env.IMAGE_NAME }}-buildcache:${{ matrix.arch }}
@@ -172,6 +176,10 @@ jobs:
           target: runtime-debug
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            BUZZ_SOURCE_SHA=${{ github.sha }}
+            BUZZ_BUILD_ID=github-actions:${{ github.run_id }}:${{ github.run_attempt }}
+            BUZZ_BUILD_URL=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}
           outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
           cache-from: |
             type=registry,ref=${{ env.IMAGE_NAME }}-buildcache:${{ matrix.arch }}

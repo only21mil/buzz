@@ -65,17 +65,14 @@ test("deleteProject lets the relay authorize an agent owner and tombstones only 
     "#d": ["platform"],
     limit: 1,
   });
-  assert.deepEqual(calls[1][1].tags, [
-    ["e", "1".repeat(64)],
-    ["k", "30621"],
-  ]);
+  assert.deepEqual(calls[1][1].tags, [["a", PROJECT_ADDRESS]]);
   assert.equal(calls[1][1].createdAt, 76);
   assert.equal(calls[2][1].pubkey, VIEWER);
   assert.deepEqual(calls[3][1], calls[0][1]);
   assert.equal(calls[1][1].content, "Delete project Platform");
 });
 
-test("deleteProject builds a exact-event tombstone", async () => {
+test("deleteProject builds a one-coordinate tombstone", async () => {
   const calls = [];
   await deleteProject(project, {
     fetchEvents: async () => (calls.length === 0 ? [event()] : []),
@@ -92,10 +89,7 @@ test("deleteProject builds a exact-event tombstone", async () => {
   });
 
   assert.equal(calls[0].kind, 5);
-  assert.deepEqual(calls[0].tags, [
-    ["e", "1".repeat(64)],
-    ["k", "30621"],
-  ]);
+  assert.deepEqual(calls[0].tags, [["a", PROJECT_ADDRESS]]);
 });
 
 test("deleteProject fails closed when the live project head is missing", async () => {
@@ -143,34 +137,4 @@ test("deleteProject reports uncertain outcome when publish acknowledgement is lo
     }),
     /Could not confirm whether the project was deleted\. Projects were refreshed\./,
   );
-});
-
-test("exact-event deletion spares a concurrent head even inside the tombstone timestamp", async () => {
-  const original = event();
-  const replacement = event({ id: "2".repeat(64), created_at: 76 });
-  let head = original;
-  await assert.rejects(
-    deleteProject(project, {
-      nowSeconds: () => 100,
-      fetchEvents: async () => (head ? [head] : []),
-      signEvent: async (template) => {
-        head = replacement;
-        return event({
-          kind: template.kind,
-          created_at: template.createdAt,
-          tags: template.tags,
-        });
-      },
-      publishEvent: async (tombstone) => {
-        assert.equal(
-          tombstone.tags.some((tag) => tag[0] === "a"),
-          false,
-        );
-        const target = tombstone.tags.find((tag) => tag[0] === "e")?.[1];
-        if (head?.id === target) head = null;
-      },
-    }),
-    /updated while it was being deleted/,
-  );
-  assert.equal(head, replacement);
 });

@@ -1,4 +1,3 @@
-import { hasAuthoritativeHomeBinding } from "./projectHomeChannel.ts";
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -85,8 +84,7 @@ test("absorbStandaloneProjectRepositories folds an authorized home-channel repo 
   assert.equal(folded[0].legacy, false);
   assert.equal(folded[0].repositories.length, 1);
   assert.equal(folded[0].repositories[0].repoAddress, repoCard.projectAddress);
-  assert.deepEqual(folded[0].repositoryAddresses, []);
-  assert.equal(hasAuthoritativeHomeBinding(folded[0]), false);
+  assert.equal(folded[0].repositoryAddresses[0], repoCard.projectAddress);
 });
 
 test("absorbStandaloneProjectRepositories rejects a hostile home-channel claim", () => {

@@ -1,12 +1,27 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { QueryClient, QueryObserver } from "@tanstack/react-query";
-import {
-  projectCollectionQueryKey,
-  projectCollectionQueryOptions,
-} from "./projectCollectionQuery.ts";
+import { projectCollectionQueryOptions } from "./projectCollectionQuery.ts";
 import { isRelayDependentQuery } from "@/shared/api/relayQueryInvalidation.ts";
+import { buildProjectsFromFetcher } from "./projectEnumeration.ts";
+import { markProjectDataAuthoritative } from "./projectSnapshot.ts";
 const scope = { relayOrigin: "https://relay.example", pubkey: "a".repeat(64) };
+function optionsFor(client, fetcher) {
+  return projectCollectionQueryOptions(client, async (_, signal) => {
+    const projects = await buildProjectsFromFetcher(
+      async (...args) => {
+        signal.throwIfAborted();
+        const rows = await fetcher(...args);
+        signal.throwIfAborted();
+        return rows;
+      },
+      { relayOrigin: scope.relayOrigin, viewerPubkey: scope.pubkey },
+    );
+    return projects.map((project) =>
+      markProjectDataAuthoritative(project, "relay"),
+    );
+  });
+}
 const repo = {
   id: "1".repeat(64),
   pubkey: scope.pubkey,
@@ -27,12 +42,10 @@ test("warm reentry reuses rows; failed refresh retains them and reconnect invali
   const queryClient = client();
   let calls = 0;
   let fail = false;
-  const options = projectCollectionQueryOptions(scope, {
-    fetchExhaustively: async (kinds) => {
-      calls++;
-      if (fail) throw Error("relay unavailable");
-      return kinds.includes(30617) ? [repo] : [];
-    },
+  const options = optionsFor(queryClient, async (kinds) => {
+    calls++;
+    if (fail) throw Error("relay unavailable");
+    return kinds.includes(30617) ? [repo] : [];
   });
   const rows = await queryClient.fetchQuery(options);
   assert.equal(rows.length, 1);
@@ -47,21 +60,8 @@ test("warm reentry reuses rows; failed refresh retains them and reconnect invali
   fail = true;
   await assert.rejects(queryClient.fetchQuery(options), /relay unavailable/);
   assert.equal(queryClient.getQueryData(options.queryKey), rows);
-  assert.equal(
-    queryClient.getQueryData(
-      projectCollectionQueryKey({ ...scope, pubkey: "b".repeat(64) }),
-    ),
-    undefined,
-  );
-  assert.equal(
-    queryClient.getQueryData(
-      projectCollectionQueryKey({
-        ...scope,
-        relayOrigin: "https://other.example",
-      }),
-    ),
-    undefined,
-  );
+  // Community and identity switches own a fresh QueryClient upstream.
+  assert.equal(client().getQueryData(options.queryKey), undefined);
   queryClient.clear();
 });
 
@@ -69,11 +69,9 @@ test("last observer departure cancels unused enumeration before followup queries
   const queryClient = client();
   const releases = [];
   let calls = 0;
-  const options = projectCollectionQueryOptions(scope, {
-    fetchExhaustively: () => {
-      calls++;
-      return new Promise((resolve) => releases.push(resolve));
-    },
+  const options = optionsFor(queryClient, () => {
+    calls++;
+    return new Promise((resolve) => releases.push(resolve));
   });
   const observer = new QueryObserver(queryClient, options);
   const unsubscribe = observer.subscribe(() => {});
@@ -90,9 +88,10 @@ test("last observer departure cancels unused enumeration before followup queries
 test("a persistent consumer keeps an enumeration alive after one observer leaves", async () => {
   const queryClient = client();
   const releases = [];
-  const options = projectCollectionQueryOptions(scope, {
-    fetchExhaustively: () => new Promise((resolve) => releases.push(resolve)),
-  });
+  const options = optionsFor(
+    queryClient,
+    () => new Promise((resolve) => releases.push(resolve)),
+  );
   const first = new QueryObserver(queryClient, options);
   const second = new QueryObserver(queryClient, options);
   const unsub1 = first.subscribe(() => {});
