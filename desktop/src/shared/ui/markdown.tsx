@@ -1,3 +1,10 @@
+import { parseChannelLink } from "@/features/messages/lib/channelLink";
+import {
+  AuthoredDeepLinkAnchor,
+  ChannelDeepLinkAnchor,
+  MarkdownChannelDeepLink,
+  MarkdownChannelReference,
+} from "./markdown/ChannelDeepLink";
 import { isAudioAttachment } from "@/features/messages/lib/audioAttachment";
 import { renderAudioMessageAttachment } from "@/features/messages/ui/AudioMessageAttachment";
 import { isRelayDownloadable } from "./markdown/mediaEntry";
@@ -39,8 +46,6 @@ import {
 } from "@/shared/lib/computeConfigNudge";
 import {
   INLINE_CODE_CHIP_CLASS,
-  MENTION_CHIP_BASE_CLASSES,
-  MENTION_CHIP_HOVER_CLASSES,
   MESSAGE_MARKDOWN_CLASS,
 } from "@/shared/ui/mentionChip";
 
@@ -1289,6 +1294,7 @@ export function createMarkdownComponents(
       channels,
       imetaByUrl,
       onOpenEntityLink,
+      resolveChannelReferences,
       onOpenMessageLink,
       onOpenChannel,
       onImportSnapshotFromUrl,
@@ -1307,6 +1313,13 @@ export function createMarkdownComponents(
     }
 
     const label = getReactNodeText(children);
+    if (href && parseChannelLink(href).ok) {
+      return (
+        <ChannelDeepLinkAnchor href={href} interactive={interactive}>
+          {children}
+        </ChannelDeepLinkAnchor>
+      );
+    }
 
     const audioAttachment = renderAudioMessageAttachment(
       href ? imetaByUrl?.get(href) : undefined,
@@ -1374,6 +1387,7 @@ export function createMarkdownComponents(
           return (
             <MessageLinkPill
               channels={channels}
+              resolveChannelReference={resolveChannelReferences}
               href={href}
               interactive={interactive}
               link={messageLinkTarget.link}
@@ -1384,17 +1398,14 @@ export function createMarkdownComponents(
         }
 
         return (
-          <a
-            {...props}
-            className="font-medium text-primary underline underline-offset-4 transition-colors hover:text-primary/80 cursor-pointer"
+          <AuthoredDeepLinkAnchor
+            channelId={messageLinkTarget.link.channelId}
             href={href}
-            onClick={(event) => {
-              event.preventDefault();
-              onOpenMessageLink(messageLinkTarget.link);
-            }}
+            interactive={interactive}
+            messageLink={messageLinkTarget.link}
           >
             {children}
-          </a>
+          </AuthoredDeepLinkAnchor>
         );
       }
       // Malformed message deep link — fall through to the default
@@ -1404,6 +1415,7 @@ export function createMarkdownComponents(
     // `buzz://pr|issue|repo?…` entity links navigate in-app; malformed ones
     // fall through to the default anchor.
     const entityAnchor = renderEntityLinkAnchor({
+      asChip: label === href,
       children,
       href,
       onOpenEntityLink,
@@ -1630,44 +1642,31 @@ export function createMarkdownComponents(
       }
       return <InlineEmojiPopover alt={alt} resolvedSrc={resolvedSrc} />;
     },
-    "channel-link": function MarkdownChannelLink({
+    "channel-link": function ChannelReference(props: {
+      children?: React.ReactNode;
+    }) {
+      return <MarkdownChannelReference {...props} interactive={interactive} />;
+    },
+    "channel-deep-link": function ChannelDeepLink(props: {
+      children?: React.ReactNode;
+    }) {
+      return <MarkdownChannelDeepLink {...props} interactive={interactive} />;
+    },
+    "entity-link": function MarkdownEntityLink({
       children,
     }: {
       children?: React.ReactNode;
     }) {
-      const { channels, onOpenChannel } = useMarkdownRuntime();
-      const text = String(children ?? "");
-      const channelName = text.startsWith("#") ? text.slice(1) : text;
-      const channel = channels.find(
-        (c) =>
-          c.channelType !== "dm" &&
-          c.name.toLowerCase() === channelName.toLowerCase(),
-      );
-
-      if (channel && interactive) {
-        return (
-          <button
-            type="button"
-            data-channel-link=""
-            aria-label={`Open channel ${channelName}`}
-            className={cn(
-              "cursor-pointer",
-              MENTION_CHIP_BASE_CLASSES,
-              MENTION_CHIP_HOVER_CLASSES,
-            )}
-            onClick={() => {
-              onOpenChannel(channel.id);
-            }}
-          >
-            {children}
-          </button>
-        );
-      }
-
+      const { onOpenEntityLink, relayOrigin } = useMarkdownRuntime();
+      const href = String(children ?? "");
       return (
-        <span data-channel-link="" className={MENTION_CHIP_BASE_CLASSES}>
-          {children}
-        </span>
+        renderEntityLinkAnchor({
+          children,
+          href,
+          onOpenEntityLink,
+          relayOrigin,
+          interactive,
+        }) ?? <span>{children}</span>
       );
     },
     "message-link": function MarkdownMessageLink({
@@ -1675,8 +1674,12 @@ export function createMarkdownComponents(
     }: {
       children?: React.ReactNode;
     }) {
-      const { channels, onOpenMessageLink, onOpenChannel } =
-        useMarkdownRuntime();
+      const {
+        channels,
+        onOpenMessageLink,
+        onOpenChannel,
+        resolveChannelReferences,
+      } = useMarkdownRuntime();
       const href = String(children ?? "");
       const parsed = parseMessageLink(href);
       if (!parsed.ok) {
@@ -1688,6 +1691,7 @@ export function createMarkdownComponents(
       return (
         <MessageLinkPill
           channels={channels}
+          resolveChannelReference={resolveChannelReferences}
           href={href}
           interactive={interactive}
           link={parsed.value}
@@ -1704,7 +1708,7 @@ export function createMarkdownComponents(
  * four instances ever exist. Module-stable maps mean cached markdown element
  * trees (see ./markdown/nodeCache.ts) never embed per-mount closures.
  */
-const MARKDOWN_COMPONENT_SCHEMA_VERSION = "5";
+const MARKDOWN_COMPONENT_SCHEMA_VERSION = "6";
 const markdownComponentsByVariant = new Map<string, MarkdownComponentSet>();
 
 type MarkdownComponentSet = { components: Components; variant: string };
@@ -1800,6 +1804,7 @@ function MarkdownInner({
   const runtime = React.useMemo<MarkdownRuntime>(
     () => ({
       agentMentionPubkeysByName,
+      resolveChannelReferences: true,
       channels,
       imetaByUrl,
       mentionPubkeysByName,
