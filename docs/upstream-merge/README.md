@@ -35,7 +35,7 @@ The rules apply only to conflicted paths; clean merges remain Git's automatic re
 
 ## Phase 2 ledger
 
-[handmerge.tsv](handmerge.tsv) contains exactly the 138 fork-held files, with original status, hunk count, and area. Each row holds the fork's version pending a port of upstream's changes. For a path in that ledger, inspect the patch with:
+[handmerge.tsv](handmerge.tsv) contains exactly the 138 fork-held files, with original status, hunk count, and area. The disposition column records the final area decision. `ported` means a combined implementation, not adoption of every upstream hunk; `accepted-fork` keeps the fork design with the omissions below; `accepted-upstream` takes upstream behavior; `retired` removes an obsolete path. For a path in that ledger, inspect the patch with:
 
 ```bash
 git diff 5bf78671f45178f8de02ba18d3d321cbbf19cd1f 5511b56fc -- <path>
@@ -381,3 +381,43 @@ requires the approved ledger readback, a fresh backup, the reviewed forward
 ledger rewrite, deployment through the migration count gate, and verification
 of 59 successful migrations ending at 1044 plus healthy relay probes. Neither
 the SQL cutover nor deployment was run by this lane.
+
+## Final dispositions
+
+The handmerge ledger covers all 138 original fork-held paths. Dispositions use
+`rust_relay.md`, `rust_acp_workflow.md`, `desktop_agents.md`,
+`desktop_messages.md`, `desktop_other.md`, `desktop_shared.md`, `root_ci.md`,
+`migrations.md`, `rust_crates.md`, and `polish.md` in the lane reports directory.
+Later reports supersede earlier incomplete checks. Exact parent-file matches
+identify whole-side acceptances; mixed implementations are marked `ported`
+unless the following explicit fork-design acceptance governs the path.
+
+- `ci.yml` retains the fork job layout. Upstream's reusable-workflow refactor
+  is not adopted. The six uncalled `_ci-*.yml` workflow-call files are retired.
+- `docker.yml` retains the fork pipeline. The upstream same-SHA image
+  qualification gate is not adopted by this merge.
+- Projects UI retains the integrated project implementation. The review's
+  unused upstream-import observation belongs to the desktop worker; it is
+  recorded here without claiming those imports implement an upstream feature.
+- `markdown.tsx` keeps the fork renderer; upstream lightbox/ImageMosaic is
+  not ported. The size worker's extraction preserves that decision.
+- Native `commands/workflows.rs` keeps the fork workflow API. Upstream run-cursor
+  pagination is not ported.
+- Workflow `executor.rs` and relay `workflow_sink.rs` keep the fork authority
+  design, including `trigger_injected_rendered_mention_gets_no_authority`.
+  Upstream rendering cannot grant authority to injected mentions.
+- Desktop E2E `mentions.spec.ts` and `agents.spec.ts` keep the fork scenarios;
+  the omitted upstream test lines are accepted omissions, not passing coverage.
+- Relay admin `auth.rs` and `mod.rs` accept upstream roster authority in place
+  of the fork database roster, with the owner fallback kept. The restored
+  NIP-11 advertisement test covers configured, loopback and absent surfaces.
+- ACP pool/queue/lib keep the hybrid decision above. Local archive keeps the
+  fork feature despite upstream deletion. Migration guards moved into the
+  active runtime module; the obsolete root module is retired.
+
+### Accepted upstream code
+
+The `unsafe` blocks in desktop native managed-agent discovery are unchanged
+upstream code accepted with that implementation. This merge does not introduce
+new unsafe operations in the final-fixes lane. Desktop extraction is owned by
+the size worker.
