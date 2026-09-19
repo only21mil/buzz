@@ -625,7 +625,17 @@ export function useChannelSubscription(channel: Channel | null) {
             queryClient,
             channelId,
             () => generationToken.guard.current,
-          );
+          ).catch((error) => {
+            // A history outage must not retire an established live stream.
+            // The failed query remains retryable, including on reconnect.
+            if (!isDisposed && generationToken.guard.current) {
+              console.error(
+                "Failed to refresh subscribed channel",
+                channelId,
+                error,
+              );
+            }
+          });
           if (isDisposed || !generationToken.guard.current) return;
           isReady = true;
           setReadySubscription(generationToken);
