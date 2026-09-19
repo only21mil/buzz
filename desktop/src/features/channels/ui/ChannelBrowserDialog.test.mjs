@@ -31,7 +31,7 @@ const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   url: "http://localhost/",
   pretendToBeVisual: true,
 });
-before(() => {
+before(async () => {
   for (const name of [
     "window",
     "document",
@@ -57,12 +57,28 @@ before(() => {
   };
   document.fonts = { ready: Promise.resolve() };
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;
+  const { mockIPC } = await import("@tauri-apps/api/mocks");
+  mockIPC((command) => {
+    if (command === "get_relay_http_url") return "http://localhost";
+    if (command === "get_media_proxy_port") return 12345;
+    if (command === "get_channel_templates") return [];
+    throw new Error(`Unexpected IPC: ${command}`);
+  });
 });
+const queryClients = [];
 afterEach(async () => {
   (await import("@testing-library/react")).cleanup();
+  for (const client of queryClients.splice(0)) {
+    await client.cancelQueries();
+    client.clear();
+  }
   delete globalThis.__channelBrowserHeldQuery;
 });
-after(() => dom.window.close());
+after(async () => {
+  (await import("@/shared/lib/mediaUrl.ts")).resetMediaCaches();
+  (await import("@tauri-apps/api/mocks")).clearMocks();
+  dom.window.close();
+});
 
 function channel(id, overrides = {}) {
   return {
@@ -89,6 +105,7 @@ async function setup({ heldQuery = "", channels, ...props } = {}) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { enabled: false, gcTime: Infinity } },
   });
+  queryClients.push(queryClient);
   queryClient.setQueryData(["channel-templates"], []);
   const selected = [];
   const openChanges = [];
