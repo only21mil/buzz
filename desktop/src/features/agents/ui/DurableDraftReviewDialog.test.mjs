@@ -4,6 +4,7 @@ import { JSDOM } from "jsdom";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   url: "https://desktop.example",
+  pretendToBeVisual: true,
 });
 Object.assign(globalThis, {
   window: dom.window,
