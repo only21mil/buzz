@@ -6,6 +6,10 @@ import 'package:nostr/nostr.dart' as nostr;
 /// never looks like a real identity.
 const unavailableKeyLabel = 'Unavailable';
 
+// Public identity display only; bound entries across long-lived sessions.
+const _compactNpubCacheSize = 256;
+final _compactNpubCache = <String, String>{};
+
 final _hex64 = RegExp(r'^[0-9a-f]{64}$');
 
 /// Canonical full npub for an identity key.
@@ -46,10 +50,20 @@ String? canonicalNpub(String input) {
 /// Identity surfaces render this form so a displayed prefix always reads as
 /// npub-shaped. Invalid keys render [unavailableKeyLabel], never raw hex.
 String truncateNpub(String input) {
-  final npub = canonicalNpub(input);
+  final key = input.trim();
+  final cached = _compactNpubCache.remove(key);
+  if (cached != null) {
+    _compactNpubCache[key] = cached;
+    return cached;
+  }
+  final npub = canonicalNpub(key);
   if (npub == null) return unavailableKeyLabel;
-  if (npub.length <= 12) return npub;
-  return '${npub.substring(0, 8)}…${npub.substring(npub.length - 4)}';
+  final compact = '${npub.substring(0, 8)}…${npub.substring(npub.length - 4)}';
+  if (_compactNpubCache.length == _compactNpubCacheSize) {
+    _compactNpubCache.remove(_compactNpubCache.keys.first);
+  }
+  _compactNpubCache[key] = compact;
+  return compact;
 }
 
 /// True when [input] is a 64-character hex pubkey (any case).
