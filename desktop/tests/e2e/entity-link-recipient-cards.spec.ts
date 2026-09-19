@@ -245,7 +245,9 @@ test("agent-style Buzz links stay chip-only with metadata tooltips", async ({
     cloneTooltip.locator('[data-buzz-tooltip-metadata-content=""]'),
   ).toContainText("Operator tooling and admin CLI for relay deployments.");
   await labeledClone.click();
-  await expect(page.locator("[data-project-detail-screen]")).toBeVisible();
+  await expect(
+    page.getByRole("navigation", { name: "Project breadcrumb" }),
+  ).toBeVisible();
   await page.getByTestId("channel-general").click();
 
   const missingRepoChip = row.getByRole("button", {
@@ -374,6 +376,13 @@ test("entity tooltip uses project context while relay metadata is delayed", asyn
 }) => {
   await installMockBridge(page);
   await page.goto("/", { waitUntil: "domcontentloaded" });
+  // Prime the authoritative project collection before delaying entity metadata.
+  await page.getByTestId("open-projects-view").click();
+  await expect(
+    page
+      .getByText("The complete Buzz community platform.", { exact: true })
+      .first(),
+  ).toBeVisible();
   await page.getByTestId("channel-general").click();
   await page.evaluate(() =>
     window.__BUZZ_E2E_ACTIVATE_RELAY_RATE_LIMIT__?.(300),
@@ -502,7 +511,9 @@ test("composer classifies a same-relay clone URL as a repository chip, not a car
   // The chip navigates in-app, proving the clone URL resolved onto the
   // canonical buzz://repo target rather than being handed to the OS.
   await repoChip.click();
-  await expect(page.locator("[data-project-detail-screen]")).toBeVisible();
+  await expect(
+    page.getByRole("navigation", { name: "Project breadcrumb" }),
+  ).toBeVisible();
 });
 
 test("reopening the same entity link reapplies its workspace state", async ({
@@ -579,8 +590,18 @@ test("reopening the same entity link reapplies its workspace state", async ({
     name: "Project breadcrumb",
   });
   await breadcrumb.getByRole("button").nth(1).click();
-  await expect(page.getByTestId("project-channel-home")).toBeVisible();
+  await expect(
+    page.getByRole("tab", { name: "Overview", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
 
+  await emitEntityLink(repoLink);
+  await expect(pullRequestsTab).toHaveAttribute("aria-selected", "true");
+
+  // A fresh link without a tab must also clear a previous explicit tab.
+  await emitEntityLink(`buzz://repo?owner=${DEFAULT_MOCK_PUBKEY}&d=buzz`);
+  await expect(
+    page.getByRole("tab", { name: "Overview", exact: true }),
+  ).toHaveAttribute("aria-selected", "true");
   await emitEntityLink(repoLink);
   await expect(pullRequestsTab).toHaveAttribute("aria-selected", "true");
 
@@ -603,7 +624,7 @@ test("reopening the same entity link reapplies its workspace state", async ({
 
   await emitEntityLink(issueLink);
   const issueHeading = page
-    .getByTestId("project-issue-detail")
+    .locator("[data-project-detail-screen]")
     .getByRole("heading", { name: ISSUE_SUBJECT });
   await expect(issueHeading).toBeVisible();
   await breadcrumb.getByRole("button", { name: "Tasks", exact: true }).click();

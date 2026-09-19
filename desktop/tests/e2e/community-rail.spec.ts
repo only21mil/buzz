@@ -1508,8 +1508,19 @@ test.describe("community rail", () => {
         }),
       );
     }, `community-rail-button-${COMMUNITY_B.id}`);
-    // ArrowUp moves the active item one slot up.
+    // Wait for the sensor's active state before moving. Its key listener is
+    // installed after activation, so an immediate ArrowUp can be lost in CI.
+    await expect(buttonB).toHaveAttribute("aria-pressed", "true");
     await page.keyboard.press("ArrowUp");
+    await expect
+      .poll(async () => {
+        const [a, b] = await Promise.all([
+          buttonA.boundingBox(),
+          buttonB.boundingBox(),
+        ]);
+        return a !== null && b !== null && b.y < a.y;
+      })
+      .toBe(true);
     // Space drops the item — same synthetic dispatch for consistency.
     await page.evaluate((testId) => {
       const el = document.querySelector(`[data-testid="${testId}"]`);
