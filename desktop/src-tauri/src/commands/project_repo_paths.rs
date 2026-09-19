@@ -45,6 +45,30 @@ fn normalized_clone_url(value: &str) -> &str {
     value.trim().trim_end_matches('/').trim_end_matches(".git")
 }
 
+// Git escapes backslashes in local Windows origins and quotes values containing
+// comment delimiters. Compare the decoded value, not its config-file spelling.
+fn decode_git_config_value(value: &str) -> Option<String> {
+    let mut decoded = String::new();
+    let mut quoted = false;
+    let mut chars = value.trim().chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => quoted = !quoted,
+            '#' | ';' if !quoted => break,
+            '\\' => decoded.push(match chars.next()? {
+                '\\' => '\\',
+                '"' => '"',
+                'n' => '\n',
+                't' => '\t',
+                'b' => '\u{0008}',
+                _ => return None,
+            }),
+            _ => decoded.push(ch),
+        }
+    }
+    (!quoted).then_some(decoded)
+}
+
 fn checkout_git_dir(
     repo_dir: &std::path::Path,
     repos_root: &std::path::Path,
@@ -92,7 +116,9 @@ fn checkout_origin_matches(
         if in_origin {
             if let Some((key, value)) = line.split_once('=') {
                 if key.trim() == "url" {
-                    return normalized_clone_url(value) == normalized_clone_url(clone_url);
+                    return decode_git_config_value(value).is_some_and(|value| {
+                        normalized_clone_url(&value) == normalized_clone_url(clone_url)
+                    });
                 }
             }
         }
