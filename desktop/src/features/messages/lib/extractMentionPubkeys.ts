@@ -116,6 +116,7 @@ export function mentionMatchCandidates({
 
 /** Extract recipients from the same exact occurrences used by draft routing. */
 export function extractMentionPubkeys(options: {
+  onResolvedDisplayName?: (displayName: string) => void;
   text: string;
   selectedMentions: ReadonlyMap<string, string>;
   selectedDisplayNames?: Iterable<string>;
@@ -137,7 +138,10 @@ export function extractMentionPubkeys(options: {
       );
     }
     for (const match of winners) {
-      if (match.pubkey) winningPubkeys.add(match.pubkey);
+      if (match.pubkey) {
+        winningPubkeys.add(match.pubkey);
+        options.onResolvedDisplayName?.(match.displayName);
+      }
     }
   }
 

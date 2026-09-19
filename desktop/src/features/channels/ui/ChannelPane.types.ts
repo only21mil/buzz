@@ -1,3 +1,4 @@
+import type { PublicationScope } from "@/shared/api/publicationScope";
 import type * as React from "react";
 import type { BotActivityAgent } from "@/features/channels/ui/BotActivityBar";
 import type { ChannelAgentSessionAgent } from "@/features/channels/ui/useChannelAgentSessions";
@@ -107,6 +108,8 @@ export type ChannelPaneProps = {
     content: string,
     mediaTags?: string[][],
     mentionPubkeys?: string[],
+    eventId?: string,
+    publicationScope?: PublicationScope,
   ) => Promise<void>;
   onMarkUnread?: (message: TimelineMessage) => void;
   onMarkRead?: (message: TimelineMessage) => void;
@@ -132,6 +135,7 @@ export type ChannelPaneProps = {
       threadHeadId: string | null;
     } | null,
     forceRest?: boolean,
+    publicationScope?: PublicationScope,
   ) => Promise<void>;
   onSendToChannel: (
     message: TimelineMessage,

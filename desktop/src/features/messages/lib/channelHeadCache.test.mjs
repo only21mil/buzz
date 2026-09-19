@@ -40,6 +40,12 @@ let channelWindowCalls = 0;
 let channelWindowEvents = [];
 
 before(() => {
+  mock.method(relayClient, "fetchAuxEventsByReference", async () => []);
+  mock.method(
+    relayClient,
+    "fetchAuxDeletionEventsForAuxEvents",
+    async () => [],
+  );
   Object.assign(globalThis, {
     document: dom.window.document,
     HTMLElement: dom.window.HTMLElement,
