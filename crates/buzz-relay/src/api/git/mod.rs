@@ -33,6 +33,7 @@ pub mod manifest_event;
 pub mod merge_gate;
 pub mod pack_cache;
 pub mod policy;
+mod settings;
 pub mod snapshot;
 pub mod store;
 pub mod transport;
