@@ -60,3 +60,7 @@ test("community teardown calls resetPendingSnapshotImport", () => {
     /resetPendingSnapshotImport\(\);/,
   );
 });
+
+test("community teardown releases reminder watermark fallbacks", () => {
+  assert.match(functionBody("resetCommunityState"), /resetReminderWatermarks\(\);/);
+});

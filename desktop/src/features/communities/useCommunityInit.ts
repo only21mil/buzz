@@ -1,3 +1,4 @@
+import { resetReminderWatermarks } from "@/features/reminders/lib/reminderWatermarks";
 import { resetPendingSnapshotImport } from "@/features/agents/openSnapshotImportFromUrlEvent";
 import { resetPendingOpenEditAgent } from "@/features/agents/openEditAgentEvent";
 import { resetPendingOpenCreateAgent } from "@/features/agents/openCreateAgentEvent";
@@ -73,6 +74,7 @@ function resetCommunityState({
   resetActiveAgentTurnsStore();
   resetAgentWorkingSignal();
   resetCardMintStore();
+  resetReminderWatermarks();
   resetPendingSnapshotImport();
   resetPendingOpenEditAgent();
   resetPendingOpenCreateAgent();
