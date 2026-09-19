@@ -25,9 +25,12 @@ assert_contains() {
 }
 
 assert_not_contains() {
-  local file=$1 pattern=$2
-  if grep -Eq "${pattern}" "${file}"; then
+  local file=$1 pattern=$2 status
+  if grep -E "${pattern}" "${file}" >/dev/null; then
     fail "${file} unexpectedly contains /${pattern}/"
+  else
+    status=$?
+    [[ ${status} -eq 1 ]] || fail "grep failed for ${file} with status ${status}"
   fi
 }
 
@@ -1288,8 +1291,7 @@ assert_contains "${scratch}/prior_child_inspectable/commands.log" \
   'rm -v buzz-rollback-verify-.*-1'
 assert_not_contains "${scratch}/prior_child_inspectable/commands.log" \
   'create --pull=never .* --platform '
-inspectable_source=$(rg --files "${scratch}/prior_child_inspectable/logs" | \
-  grep '/rollback-source[.]txt$')
+inspectable_source=$(find "${scratch}/prior_child_inspectable/logs" -type f -name 'rollback-source.txt')
 assert_contains "${inspectable_source}" \
   '^sha256:1111111111111111111111111111111111111111111111111111111111111111$'
 assert_contains "${scratch}/prior_child_inspectable/output" 'DEPLOY SUCCEEDED'
@@ -1301,10 +1303,8 @@ assert_not_contains "${scratch}/prior_child_uninspectable_valid_ref/commands.log
   'image inspect localhost/buzz-relay:old'
 assert_contains "${scratch}/prior_child_uninspectable_valid_ref/commands.log" \
   'image tag sha256:1111111111111111111111111111111111111111111111111111111111111111 localhost/buzz-relay:rollback-'
-fallback_source=$(rg --files "${scratch}/prior_child_uninspectable_valid_ref/logs" | \
-  grep '/rollback-source[.]txt$')
-fallback_source_id=$(rg --files "${scratch}/prior_child_uninspectable_valid_ref/logs" | \
-  grep '/rollback-source-image-id[.]txt$')
+fallback_source=$(find "${scratch}/prior_child_uninspectable_valid_ref/logs" -type f -name 'rollback-source.txt')
+fallback_source_id=$(find "${scratch}/prior_child_uninspectable_valid_ref/logs" -type f -name 'rollback-source-image-id.txt')
 assert_contains "${fallback_source}" \
   '^sha256:1111111111111111111111111111111111111111111111111111111111111111$'
 assert_contains "${fallback_source_id}" \
@@ -1322,16 +1322,13 @@ assert_contains "${scratch}/prior_index_platform_survives/commands.log" \
   'image tag sha256:5555555555555555555555555555555555555555555555555555555555555555 localhost/buzz-relay:rollback-'
 assert_not_contains "${scratch}/prior_index_platform_survives/commands.log" \
   'image inspect sha256:4444444444444444444444444444444444444444444444444444444444444444'
-index_evidence=$(rg --files "${scratch}/prior_index_platform_survives/logs" | \
-  grep '/prior-image-id[.]txt$')
-platform_evidence=$(rg --files "${scratch}/prior_index_platform_survives/logs" | \
-  grep '/prior-platform-image-id[.]txt$')
+index_evidence=$(find "${scratch}/prior_index_platform_survives/logs" -type f -name 'prior-image-id.txt')
+platform_evidence=$(find "${scratch}/prior_index_platform_survives/logs" -type f -name 'prior-platform-image-id.txt')
 assert_contains "${index_evidence}" \
   '^sha256:4444444444444444444444444444444444444444444444444444444444444444$'
 assert_contains "${platform_evidence}" \
   '^sha256:5555555555555555555555555555555555555555555555555555555555555555$'
-index_resolution=$(rg --files "${scratch}/prior_index_platform_survives/logs" | \
-  grep '/rollback-source-resolution[.]txt$')
+index_resolution=$(find "${scratch}/prior_index_platform_survives/logs" -type f -name 'rollback-source-resolution.txt')
 assert_contains "${index_resolution}" '^platform-image-id$'
 assert_contains "${scratch}/prior_index_platform_survives/output" 'DEPLOY SUCCEEDED'
 
@@ -1342,10 +1339,8 @@ assert_contains "${scratch}/platform_digest_untaggable/commands.log" \
   'image tag localhost/buzz-relay:old localhost/buzz-relay:rollback-'
 assert_contains "${scratch}/platform_digest_untaggable/output" \
   'not taggable in the image store; falling back to prior image reference localhost/buzz-relay:old'
-untaggable_source=$(rg --files "${scratch}/platform_digest_untaggable/logs" | \
-  grep '/rollback-source[.]txt$')
-untaggable_resolution=$(rg --files "${scratch}/platform_digest_untaggable/logs" | \
-  grep '/rollback-source-resolution[.]txt$')
+untaggable_source=$(find "${scratch}/platform_digest_untaggable/logs" -type f -name 'rollback-source.txt')
+untaggable_resolution=$(find "${scratch}/platform_digest_untaggable/logs" -type f -name 'rollback-source-resolution.txt')
 assert_contains "${untaggable_source}" '^localhost/buzz-relay:old$'
 assert_contains "${untaggable_resolution}" '^prior-image-ref$'
 assert_contains "${scratch}/platform_digest_untaggable/output" \
@@ -1357,8 +1352,7 @@ assert_contains "${scratch}/prior_ref_index_digest_mismatch/commands.log" \
   'image tag localhost/buzz-relay:old localhost/buzz-relay:rollback-'
 assert_contains "${scratch}/prior_ref_index_digest_mismatch/output" \
   'resolves to platform image sha256:999999.*expected prior platform image sha256:555555'
-index_mismatch_resolution=$(rg --files "${scratch}/prior_ref_index_digest_mismatch/logs" | \
-  grep '/rollback-source-resolution[.]txt$')
+index_mismatch_resolution=$(find "${scratch}/prior_ref_index_digest_mismatch/logs" -type f -name 'rollback-source-resolution.txt')
 assert_contains "${index_mismatch_resolution}" '^prior-image-ref$'
 assert_not_contains "${scratch}/prior_ref_index_digest_mismatch/commands.log" \
   'exec -T postgres sh -euc.*pg_dump'
@@ -1544,8 +1538,11 @@ fi
 
 for secret_value in test-relay-key test-hook-secret test-postgres-password \
   test-redis-password test-s3-access test-s3-secret test-owner-pubkey test-github-token; do
-  if rg -F "${secret_value}" "${scratch}" --glob output --glob commands.log >/dev/null; then
+  if grep -rF --include=output --include=commands.log -- "${secret_value}" "${scratch}" >/dev/null; then
     fail "secret value appeared in output or command logs: ${secret_value}"
+  else
+    status=$?
+    [[ ${status} -eq 1 ]] || fail "secret scan failed with status ${status}"
   fi
 done
 
