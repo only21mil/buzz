@@ -703,7 +703,7 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 46);
+        assert_eq!(migrations.len(), 59);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -911,8 +911,9 @@ mod postgres_tests {
         assert!(migrations[32].sql.as_str().contains("kind = 30179"));
         assert!(migrations[32].sql.as_str().contains("search_tsv"));
         assert!(!migrations[0].sql.as_str().contains("30179"));
-        assert!(include_str!("../../../../schema/schema.sql")
-            .contains("kind IN (1059, 30179, 30300, 30350, 30622, 44100, 44101, 44200)"));
+        assert!(include_str!("../../../../schema/schema.sql").contains(
+            "kind IN (1059, 14201, 14202, 30179, 30300, 30350, 30622, 44100, 44101, 44200)"
+        ));
 
         // Public push-gateway authority is intentionally deployment-global and
         // durable: immediate revocation and hostile-relay admission cannot be
@@ -1564,7 +1565,10 @@ mod postgres_tests {
         // never holds relay tenant tables, so it is exempt from the relay
         // schema/destruction lock. The community_id check below keeps that
         // exemption honest.
-        let push_gateway_exception = crates_dir.join("buzz-push-gateway/src/postgres.rs");
+        let push_gateway_exceptions = [
+            crates_dir.join("buzz-push-gateway/src/postgres.rs"),
+            crates_dir.join("buzz-push-gateway/src/migration_tests.rs"),
+        ];
         let push_gateway_migrations = crates_dir.join("buzz-push-gateway/migrations");
         for entry in
             std::fs::read_dir(&push_gateway_migrations).expect("read push gateway migrations")
@@ -1594,7 +1598,11 @@ mod postgres_tests {
                     "migration.rs must embed the migrator once, run it once in production, \
                      and expose exactly one test-only bounded run"
                 );
-            } else if *path == push_gateway_exception {
+            } else if push_gateway_exceptions.contains(path) {
+                assert!(
+                    source.contains(&["sqlx", "::migrate!(\"./migrations\")"].concat()),
+                    "gateway exception must embed only its dedicated migrations"
+                );
                 continue;
             } else {
                 assert_eq!(
@@ -1767,7 +1775,19 @@ mod postgres_tests {
         let schema_sql = std::fs::read_to_string(workspace_root.join("schema/schema.sql"))
             .expect("read schema/schema.sql");
 
-        let migration = surface(migration_0029);
+        let mut migration = surface(migration_0029);
+        let fork_fences = surface(
+            MIGRATOR
+                .iter()
+                .find(|migration| migration.version == 1043)
+                .expect("embedded migration 1043")
+                .sql
+                .as_ref(),
+        );
+        assert_eq!(fork_fences.fence_attachments.len(), 11);
+        migration
+            .fence_attachments
+            .extend(fork_fences.fence_attachments);
         let schema = surface(&schema_sql);
 
         assert_eq!(
@@ -2764,4 +2784,1055 @@ mod postgres_tests {
             .await
             .expect("deletion catalog validates after migration 0044");
     }
+    /// Fork identities approved after the contiguous upstream block.
+    const APPROVED_EXTRA_TAIL: &[(i64, &str)] = &[
+        (1029, "workflow run snapshots"),
+        (1030, "workflow state"),
+        (1031, "workflow approval foundations"),
+        (1032, "ci event storage"),
+        (1033, "workflow resume recovery"),
+        (1034, "workflow effect claims"),
+        (1035, "ci grants"),
+        (1039, "channel admin audit actions"),
+        (1040, "agent drafts"),
+        (1041, "ci check storage"),
+        (1042, "ci merge gate"),
+        (1043, "attach community write fences"),
+        (1044, "agent drafts soft delete"),
+    ];
+
+    #[test]
+    fn embedded_migrator_retains_fork_workflow_and_ci_contracts() {
+        let migrations: Vec<_> = MIGRATOR.iter().collect();
+        let desired_schema = include_str!("../../../../schema/schema.sql");
+        // Workflow runs retain the exact definition they started with. The
+        // additive migration backfills existing rows through the tenant-scoped
+        // workflow foreign key before making both snapshot columns required.
+        assert_eq!(
+            migrations
+                .iter()
+                .find(|m| m.version == 1029)
+                .expect("fork migration present")
+                .version,
+            1029
+        );
+        let workflow_run_snapshots = migrations
+            .iter()
+            .find(|m| m.version == 1029)
+            .expect("fork migration present")
+            .sql
+            .as_str();
+        assert!(workflow_run_snapshots.contains("ADD COLUMN definition_snapshot JSONB"));
+        assert!(workflow_run_snapshots.contains("ADD COLUMN definition_hash BYTEA"));
+        assert!(workflow_run_snapshots.contains("ADD COLUMN generation BIGINT NOT NULL DEFAULT 1"));
+        assert!(workflow_run_snapshots.contains("workflow.community_id = run.community_id"));
+        assert!(workflow_run_snapshots.contains("workflow.id = run.workflow_id"));
+        assert!(workflow_run_snapshots.contains("ALTER COLUMN definition_snapshot SET NOT NULL"));
+        assert!(workflow_run_snapshots.contains("ALTER COLUMN definition_hash SET NOT NULL"));
+        assert!(workflow_run_snapshots.contains("octet_length(definition_hash) = 32"));
+        assert!(workflow_run_snapshots.contains("UNIQUE (community_id, id, workflow_id)"));
+        assert!(desired_schema.contains("definition_snapshot JSONB NOT NULL"));
+        assert!(desired_schema.contains("generation          BIGINT NOT NULL DEFAULT 1"));
+        assert!(desired_schema.contains("UNIQUE (community_id, id, workflow_id)"));
+
+        // Durable workflow state is tenant/workflow scoped. Receipt identities
+        // bind the run to the same workflow so one run cannot write state for
+        // another definition.
+        assert_eq!(
+            migrations
+                .iter()
+                .find(|m| m.version == 1030)
+                .expect("fork migration present")
+                .version,
+            1030
+        );
+        let workflow_state = migrations
+            .iter()
+            .find(|m| m.version == 1030)
+            .expect("fork migration present")
+            .sql
+            .as_str();
+        assert!(workflow_state.contains("CREATE TABLE workflow_state"));
+        assert!(workflow_state.contains("PRIMARY KEY (community_id, workflow_id, state_key)"));
+        assert!(workflow_state.contains("octet_length(state_key) BETWEEN 1 AND 512"));
+        assert!(workflow_state.contains("octet_length(value) <= 65536"));
+        assert!(workflow_state.contains("CREATE TABLE workflow_state_receipts"));
+        assert!(workflow_state.contains("octet_length(request_hash) = 32"));
+        assert!(workflow_state.contains("FOREIGN KEY (community_id, run_id, workflow_id)"));
+        assert!(desired_schema.contains("CREATE TABLE workflow_state"));
+        assert!(desired_schema.contains("CREATE TABLE workflow_state_receipts"));
+
+        // Approval gates use the run snapshot/generation from 0029, store the
+        // exact resume point and prior outputs, and enqueue semantic lifecycle
+        // records without replacing the still-live legacy token approval table.
+        assert_eq!(
+            migrations
+                .iter()
+                .find(|m| m.version == 1031)
+                .expect("fork migration present")
+                .version,
+            1031
+        );
+        let approval_foundations = migrations
+            .iter()
+            .find(|m| m.version == 1031)
+            .expect("fork migration present")
+            .sql
+            .as_str();
+        assert!(approval_foundations.contains("ADD VALUE 'resume_pending'"));
+        assert!(approval_foundations.contains("ALTER TABLE workflows"));
+        assert!(approval_foundations.contains("ADD COLUMN deleted_at TIMESTAMPTZ"));
+        assert!(approval_foundations.contains("ADD COLUMN next_step INTEGER NOT NULL"));
+        assert!(approval_foundations.contains("ADD COLUMN step_outputs JSONB NOT NULL"));
+        assert!(approval_foundations.contains("MAX(step_index) + 1 AS next_step"));
+        assert!(approval_foundations.contains("FROM workflow_approvals"));
+        assert!(approval_foundations.contains("CREATE TABLE workflow_approval_gates"));
+        assert!(approval_foundations.contains("policy_snapshot JSONB NOT NULL"));
+        assert!(approval_foundations.contains("resolved_approver_set JSONB NOT NULL"));
+        assert!(approval_foundations.contains("UNIQUE (community_id, run_id, step_index)"));
+        assert!(approval_foundations.contains("workflow_approval_gates_workflow_fkey"));
+        assert!(approval_foundations.contains("workflow_approval_gates_run_binding_fkey"));
+        assert!(approval_foundations
+            .contains("REFERENCES workflows (community_id, id) ON DELETE NO ACTION"));
+        assert!(approval_foundations.contains(
+            "REFERENCES workflow_runs (community_id, id, workflow_id) ON DELETE NO ACTION"
+        ));
+        assert!(!approval_foundations.contains("ALTER TABLE workflow_approvals"));
+        assert!(!approval_foundations.contains("DROP TABLE workflow_approvals"));
+        assert!(approval_foundations.contains("CREATE TABLE workflow_approval_outbox"));
+        assert!(approval_foundations.contains("id BIGINT GENERATED ALWAYS AS IDENTITY"));
+
+        // Approval continuations carry a renewable generation-bound lease so
+        // relay startup and periodic recovery can reclaim crashed executors.
+        assert_eq!(
+            migrations
+                .iter()
+                .find(|m| m.version == 1033)
+                .expect("fork migration present")
+                .version,
+            1033
+        );
+        let workflow_resume_recovery = migrations
+            .iter()
+            .find(|m| m.version == 1033)
+            .expect("fork migration present")
+            .sql
+            .as_str();
+        assert!(workflow_resume_recovery.contains("ADD COLUMN resume_lease_expires_at"));
+        assert!(workflow_resume_recovery.contains("SET resume_lease_expires_at = '-infinity'"));
+        assert!(workflow_resume_recovery.contains("workflow_runs_resume_lease_running"));
+        assert!(workflow_resume_recovery.contains("idx_workflow_runs_resume_lease_recovery"));
+        assert!(workflow_resume_recovery.contains("idx_workflow_approval_gates_resume_recovery"));
+        assert!(desired_schema.contains("resume_lease_expires_at TIMESTAMPTZ"));
+        assert!(desired_schema.contains("idx_workflow_runs_resume_lease_recovery"));
+
+        // Effect claims bind one resolved action to a run/step identity across
+        // executor generations and retain the delivery marker after recovery.
+        assert_eq!(
+            migrations
+                .iter()
+                .find(|m| m.version == 1034)
+                .expect("fork migration present")
+                .version,
+            1034
+        );
+        let workflow_effect_claims = migrations
+            .iter()
+            .find(|m| m.version == 1034)
+            .expect("fork migration present")
+            .sql
+            .as_str();
+        assert!(workflow_effect_claims.contains("CREATE TABLE workflow_effect_claims"));
+        assert!(workflow_effect_claims
+            .contains("PRIMARY KEY (community_id, run_id, step_id, effect_index)"));
+        assert!(workflow_effect_claims.contains("UNIQUE (community_id, idempotency_key)"));
+        assert!(workflow_effect_claims.contains("effect_payload JSONB NOT NULL"));
+        assert!(workflow_effect_claims.contains("workflow_effect_claim_identity_immutable"));
+        assert!(desired_schema.contains("CREATE TABLE workflow_effect_claims"));
+        assert!(desired_schema.contains("workflow_effect_claim_identity_immutable"));
+        assert!(approval_foundations.contains("payload_version SMALLINT NOT NULL DEFAULT 1"));
+        assert!(approval_foundations.contains("UNIQUE (community_id, dedupe_key)"));
+        assert!(approval_foundations.contains("published_event_id BYTEA"));
+        assert!(!approval_foundations.contains("nostr_kind"));
+        assert!(!approval_foundations.contains("state_version"));
+
+        assert!(desired_schema.contains("'waiting_approval', 'resume_pending'"));
+        assert!(desired_schema.contains("deleted_at      TIMESTAMPTZ"));
+        assert!(desired_schema.contains("next_step           INTEGER NOT NULL DEFAULT 0"));
+        assert!(desired_schema.contains("step_outputs        JSONB NOT NULL DEFAULT '{}'::jsonb"));
+        assert!(desired_schema.contains("CREATE TABLE workflow_approval_gates"));
+        assert!(desired_schema.contains("workflow_approval_gates_workflow_fkey"));
+        assert!(desired_schema.contains("workflow_approval_gates_run_binding_fkey"));
+        assert!(desired_schema.contains("CREATE INDEX idx_workflow_approval_gates_status"));
+        assert!(desired_schema.contains("CREATE FUNCTION enforce_workflow_approval_history()"));
+        assert!(desired_schema.contains("CREATE TRIGGER workflow_approval_history_update"));
+        assert!(desired_schema.contains("CREATE TRIGGER workflow_approval_history_delete"));
+        assert!(desired_schema.contains("CREATE TABLE workflow_approval_outbox"));
+        assert!(desired_schema.contains("CREATE INDEX idx_workflow_approval_outbox_due"));
+        assert!(desired_schema.contains("CREATE INDEX idx_workflow_approval_outbox_recovery"));
+        assert!(
+            desired_schema.contains("CREATE FUNCTION enforce_workflow_approval_outbox_identity()")
+        );
+        assert!(
+            desired_schema.contains("CREATE TRIGGER workflow_approval_outbox_identity_immutable")
+        );
+
+        // CI signed events remain canonical in `events`; the additive index
+        // pins one immutable run identity and serializes per-run watch cursors.
+        assert_eq!(
+            migrations
+                .iter()
+                .find(|m| m.version == 1032)
+                .expect("fork migration present")
+                .version,
+            1032
+        );
+        let ci_storage = migrations
+            .iter()
+            .find(|m| m.version == 1032)
+            .expect("fork migration present")
+            .sql
+            .as_str();
+        assert!(ci_storage.contains("CREATE TABLE ci_runs"));
+        assert!(ci_storage.contains("CREATE TABLE ci_run_events"));
+        assert!(ci_storage.contains("PRIMARY KEY (community_id, run_id, watch_cursor)"));
+        assert!(ci_storage.contains("UNIQUE (community_id, event_id)"));
+        assert!(ci_storage.contains("idx_ci_run_events_run_sequence"));
+        assert!(ci_storage.contains("idx_ci_run_events_job_sequence"));
+        assert!(!ci_storage.contains("lease_generation"));
+        assert!(desired_schema.contains("CREATE TABLE ci_runs"));
+        assert!(desired_schema.contains("CREATE TABLE ci_run_events"));
+        assert!(desired_schema.contains("CREATE TRIGGER ci_run_identity_immutable"));
+
+        // CI grants (0035, index 34) carry per-repository CI endorsement
+        // approval for a run's signed events.
+        let ci_grants = migrations
+            .iter()
+            .find(|m| m.version == 1035)
+            .expect("fork migration present")
+            .sql
+            .as_str();
+        assert_eq!(
+            migrations
+                .iter()
+                .find(|m| m.version == 1035)
+                .expect("fork migration present")
+                .version,
+            1035
+        );
+        assert_eq!(
+            &*migrations
+                .iter()
+                .find(|m| m.version == 1035)
+                .expect("fork migration present")
+                .description,
+            "ci grants"
+        );
+        assert!(
+            ci_grants.contains("CREATE TABLE ci_grants"),
+            "0035 must create the ci_grants table"
+        );
+        assert!(
+            ci_grants.contains("signer_pubkey"),
+            "0035 ci_grants must carry the signer_pubkey authorization column"
+        );
+        assert!(
+            ci_grants.contains("target_repo"),
+            "0035 ci_grants must carry the target_repo grant target"
+        );
+        assert!(
+            desired_schema.contains("CREATE TABLE ci_grants"),
+            "desired-state schema must mirror the additive ci_grants table"
+        );
+        assert!(
+            desired_schema.contains("signer_pubkey"),
+            "desired-state schema must carry ci_grants.signer_pubkey"
+        );
+        assert!(
+            desired_schema.contains("target_repo"),
+            "desired-state schema must carry ci_grants.target_repo"
+        );
+    }
+
+    #[test]
+    fn migration_versions_are_contiguous_unique_and_tail_approved() {
+        let migrations: Vec<_> = MIGRATOR.iter().collect();
+        let versions: Vec<_> = migrations.iter().map(|m| m.version).collect();
+        let unique: BTreeSet<_> = versions.iter().copied().collect();
+        assert_eq!(versions, unique.into_iter().collect::<Vec<_>>());
+        let upstream: Vec<_> = versions.iter().copied().filter(|v| *v < 1000).collect();
+        assert_eq!(upstream, (1..=46).collect::<Vec<_>>());
+        for (version, description) in [
+            (31, "workflow run error codes"),
+            (40, "push message kinds"),
+            (43, "push gateway dogfood profile"),
+        ] {
+            assert_eq!(
+                migrations
+                    .iter()
+                    .find(|m| m.version == version)
+                    .map(|m| m.description.as_ref()),
+                Some(description)
+            );
+        }
+        let extra: Vec<_> = migrations
+            .iter()
+            .filter(|m| m.version >= 1000)
+            .map(|m| (m.version, m.description.as_ref()))
+            .collect();
+        assert_eq!(
+            extra, APPROVED_EXTRA_TAIL,
+            "extend APPROVED_EXTRA_TAIL deliberately for new fork migrations"
+        );
+    }
+
+    #[test]
+    fn migration_checksums_match_file_bytes_and_are_unique() {
+        use sha2::Digest;
+
+        let migrations: Vec<_> = MIGRATOR.iter().collect();
+        let mut seen = std::collections::HashSet::new();
+        for migration in &migrations {
+            assert!(
+                seen.insert(migration.checksum.as_ref().to_vec()),
+                "duplicate sqlx checksum on migration {}",
+                migration.version
+            );
+        }
+
+        // SQLx 0.9 records SHA-384 over the raw file bytes. Recompute a
+        // spread of pinned files so a silent byte edit fails here too.
+        for (version, sql) in [
+            (
+                1,
+                include_str!("../../../../migrations/0001_initial_schema.sql"),
+            ),
+            (
+                6,
+                include_str!("../../../../migrations/0006_moderation.sql"),
+            ),
+            (
+                1029,
+                include_str!("../../../../migrations/1029_workflow_run_snapshots.sql"),
+            ),
+            (
+                1035,
+                include_str!("../../../../migrations/1035_ci_grants.sql"),
+            ),
+            (
+                31,
+                include_str!("../../../../migrations/0031_workflow_run_error_codes.sql"),
+            ),
+            (
+                1040,
+                include_str!("../../../../migrations/1040_agent_drafts.sql"),
+            ),
+            (
+                1042,
+                include_str!("../../../../migrations/1042_ci_merge_gate.sql"),
+            ),
+        ] {
+            let migration = migrations
+                .iter()
+                .find(|m| m.version == version)
+                .expect("pinned migration present");
+            let expected = sha2::Sha384::digest(sql.as_bytes()).to_vec();
+            assert_eq!(
+                migration.checksum.as_ref(),
+                expected.as_slice(),
+                "sqlx checksum mismatch on migration {version:04}"
+            );
+        }
+    }
+
+    fn added_columns(statement: &str) -> Vec<String> {
+        let normalized = normalize_sql(statement);
+        let mut columns = Vec::new();
+        let mut rest = normalized.as_str();
+        while let Some(pos) = rest.find("add column") {
+            rest = rest[pos + "add column".len()..].trim_start();
+            if let Some(name) = rest
+                .split(|ch: char| ch.is_whitespace() || ch == '(' || ch == ';' || ch == ',')
+                .next()
+                .map(|s| s.trim_matches('"').to_owned())
+                .filter(|s| !s.is_empty())
+            {
+                columns.push(name);
+            }
+        }
+        columns
+    }
+
+    #[test]
+    fn no_table_is_created_twice_across_migrations() {
+        let mut migrations: Vec<_> = MIGRATOR.iter().collect();
+        migrations.sort_by_key(|migration| migration.version);
+        let mut created: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut duplicates = Vec::new();
+        for migration in migrations {
+            for statement in split_sql_statements(migration.sql.as_ref()) {
+                let normalized = normalize_sql(&statement);
+                if !normalized.starts_with("create table") || normalized.contains(" partition of ")
+                {
+                    continue;
+                }
+                if let Some(table) = identifier_after_keyword(&statement, "create table") {
+                    if let Some(first) = created.insert(table.clone(), migration.version) {
+                        duplicates.push(format!(
+                            "{table} created by {:04} and {:04}",
+                            first, migration.version
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            duplicates.is_empty(),
+            "each table must be created exactly once:\n{}",
+            duplicates.join("\n")
+        );
+    }
+
+    #[test]
+    fn no_column_is_added_twice_except_pinned_search_tsv_evolution() {
+        // events.search_tsv is intentionally dropped and re-added as the FTS
+        // policy evolves (negative skip-set, fresh-install allowlist, lease
+        // exclusion, agent-draft exclusion). Every other ADD COLUMN must be
+        // unique per table.
+        let pinned_search_tsv_chain = [5, 8, 14, 33, 1040];
+        let mut migrations: Vec<_> = MIGRATOR.iter().collect();
+        migrations.sort_by_key(|migration| migration.version);
+        let mut added: std::collections::HashMap<(String, String), i64> =
+            std::collections::HashMap::new();
+        let mut duplicates = Vec::new();
+        let mut search_tsv_versions = Vec::new();
+        for migration in migrations {
+            for statement in split_sql_statements(migration.sql.as_ref()) {
+                if !normalize_sql(&statement).contains("alter table") {
+                    continue;
+                }
+                let Some(table) = identifier_after_keyword(&statement, "alter table") else {
+                    continue;
+                };
+                for column in added_columns(&statement) {
+                    if table == "events" && column == "search_tsv" {
+                        search_tsv_versions.push(migration.version);
+                        continue;
+                    }
+                    if let Some(first) =
+                        added.insert((table.clone(), column.clone()), migration.version)
+                    {
+                        duplicates.push(format!(
+                            "{table}.{column} added by {first:04} and {:04}",
+                            migration.version
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            duplicates.is_empty(),
+            "each column must be added exactly once:\n{}",
+            duplicates.join("\n")
+        );
+        assert_eq!(
+            search_tsv_versions, pinned_search_tsv_chain,
+            "search_tsv evolution chain changed: update the pin deliberately"
+        );
+    }
+
+    #[test]
+    fn agent_drafts_stale_dependency_comment_is_preserved_and_corrected_beside_sql() {
+        // The 0040 file header claims a 0039 dependency that does not exist.
+        // The applied bytes stay frozen; the correction lives in the
+        // operation map, and this test locks both sides together.
+        let sql = include_str!("../../../../migrations/1040_agent_drafts.sql");
+        let first_line = sql.lines().next().unwrap_or("");
+        assert_eq!(
+            first_line, "-- Depends on reserved 0039 relay authorization migration; source only.",
+            "applied 0040 bytes must stay frozen, stale comment included"
+        );
+
+        let map: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../migrations/operation-map.json"))
+                .expect("operation map parses");
+        let entry = map
+            .get("fork")
+            .and_then(|fork| fork.as_array())
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|e| e.get("version") == Some(&1040.into()))
+            })
+            .expect("operation map covers 0040");
+        assert_eq!(
+            entry.get("prerequisites"),
+            Some(&serde_json::json!([1])),
+            "0040 depends only on the 0001 base, not on 0039"
+        );
+        assert!(
+            entry
+                .get("notes")
+                .and_then(|n| n.as_str())
+                .is_some_and(|n| n.contains("CORRECTED DEPENDENCY")),
+            "0040 correction must be recorded beside the SQL"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn agent_draft_rows_soft_delete_but_never_rewrite_or_hard_delete() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        run_migrations(&pool).await.expect("apply migrations");
+
+        let community_id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(community_id)
+            .bind(format!("drafts-0050-{}.example", community_id.simple()))
+            .execute(&pool)
+            .await
+            .expect("insert community");
+        // Two draft rows (request, decision) and one ordinary message.
+        for (marker, kind) in [(1_u8, 14_201_i32), (2, 14_202), (3, 1)] {
+            sqlx::query(
+                "INSERT INTO events \
+                 (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at) \
+                 VALUES ($1, $2, $3, NOW(), $4, '[]'::jsonb, 'draft body', $5, NOW())",
+            )
+            .bind(community_id)
+            .bind(vec![marker; 32])
+            .bind(vec![marker + 10; 32])
+            .bind(kind)
+            .bind(vec![marker + 20; 64])
+            .execute(&pool)
+            .await
+            .expect("insert event");
+        }
+        let draft = vec![1_u8; 32];
+
+        // A soft delete is the relay's ordinary delete statement; it passes.
+        let soft = sqlx::query(
+            "UPDATE events SET deleted_at = NOW() \
+             WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL",
+        )
+        .bind(community_id)
+        .bind(&draft)
+        .execute(&pool)
+        .await
+        .expect("soft delete a draft row");
+        assert_eq!(soft.rows_affected(), 1);
+
+        // A bulk sweep whose range holds draft rows no longer aborts.
+        let sweep = sqlx::query(
+            "UPDATE events SET deleted_at = NOW() \
+             WHERE community_id = $1 AND deleted_at IS NULL",
+        )
+        .bind(community_id)
+        .execute(&pool)
+        .await
+        .expect("bulk soft delete across draft and ordinary rows");
+        assert_eq!(sweep.rows_affected(), 2);
+
+        // Bookkeeping columns stay writable.
+        sqlx::query("UPDATE events SET delivered_at = 1 WHERE community_id = $1 AND id = $2")
+            .bind(community_id)
+            .bind(&draft)
+            .execute(&pool)
+            .await
+            .expect("bookkeeping update on a draft row");
+
+        // Signed columns stay immutable.
+        for statement in [
+            "UPDATE events SET content = 'rewritten' WHERE community_id = $1 AND id = $2",
+            "UPDATE events SET tags = '[[\"x\"]]'::jsonb WHERE community_id = $1 AND id = $2",
+            "UPDATE events SET kind = 1 WHERE community_id = $1 AND id = $2",
+            "UPDATE events SET pubkey = $2 WHERE community_id = $1 AND id = $2",
+        ] {
+            let error = sqlx::query(statement)
+                .bind(community_id)
+                .bind(&draft)
+                .execute(&pool)
+                .await
+                .expect_err("draft rewrite must raise");
+            assert!(
+                error.to_string().contains("cannot be rewritten"),
+                "{statement}: {error}"
+            );
+        }
+
+        // A hard delete of a draft row still raises; an ordinary row deletes.
+        let error = sqlx::query("DELETE FROM events WHERE community_id = $1 AND id = $2")
+            .bind(community_id)
+            .bind(&draft)
+            .execute(&pool)
+            .await
+            .expect_err("draft hard delete must raise");
+        assert!(error.to_string().contains("cannot be deleted"), "{error}");
+        let ordinary = sqlx::query("DELETE FROM events WHERE community_id = $1 AND id = $2")
+            .bind(community_id)
+            .bind(vec![3_u8; 32])
+            .execute(&pool)
+            .await
+            .expect("ordinary row hard delete");
+        assert_eq!(ordinary.rows_affected(), 1);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn populated_workflow_approval_upgrade_sets_resume_defaults_and_retains_history() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        run_migrations_through(&pool, 1030)
+            .await
+            .expect("apply migrations 1-30");
+
+        let community_id = uuid::Uuid::new_v4();
+        let workflow_id = uuid::Uuid::new_v4();
+        let run_id = uuid::Uuid::new_v4();
+        let channel_id = uuid::Uuid::new_v4();
+        let owner_pubkey = vec![0x42_u8; 32];
+        let definition_hash = vec![0x31_u8; 32];
+        let token_hash = vec![0x99_u8; 32];
+
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(community_id)
+            .bind(format!("approval-{}.example", community_id.simple()))
+            .execute(&pool)
+            .await
+            .expect("insert community");
+        sqlx::query("INSERT INTO users (community_id, pubkey) VALUES ($1, $2)")
+            .bind(community_id)
+            .bind(&owner_pubkey)
+            .execute(&pool)
+            .await
+            .expect("insert workflow owner");
+        sqlx::query(
+            "INSERT INTO channels (community_id, id, name, created_by) \
+             VALUES ($1, $2, 'approvals', $3)",
+        )
+        .bind(community_id)
+        .bind(channel_id)
+        .bind(&owner_pubkey)
+        .execute(&pool)
+        .await
+        .expect("insert channel");
+        sqlx::query(
+            "INSERT INTO channel_members (community_id, channel_id, pubkey, role) \
+             VALUES ($1, $2, $3, 'owner')",
+        )
+        .bind(community_id)
+        .bind(channel_id)
+        .bind(&owner_pubkey)
+        .execute(&pool)
+        .await
+        .expect("insert channel owner");
+        sqlx::query(
+            "INSERT INTO workflows \
+             (community_id, id, name, owner_pubkey, channel_id, definition, definition_hash) \
+             VALUES ($1, $2, 'approval migration', $3, $4, $5, $6)",
+        )
+        .bind(community_id)
+        .bind(workflow_id)
+        .bind(&owner_pubkey)
+        .bind(channel_id)
+        .bind(serde_json::json!({"steps": []}))
+        .bind(&definition_hash)
+        .execute(&pool)
+        .await
+        .expect("insert workflow");
+        sqlx::query(
+            "INSERT INTO workflow_runs \
+             (community_id, id, workflow_id, definition_snapshot, definition_hash, generation, \
+              status, current_step, execution_trace) \
+             VALUES ($1, $2, $3, $4, $5, 7, 'waiting_approval', 1, $6)",
+        )
+        .bind(community_id)
+        .bind(run_id)
+        .bind(workflow_id)
+        .bind(serde_json::json!({"steps": []}))
+        .bind(&definition_hash)
+        .bind(serde_json::json!([
+            {"step_id": "prepare", "status": "completed", "output": {"value": 21}}
+        ]))
+        .execute(&pool)
+        .await
+        .expect("insert waiting run");
+        sqlx::query(
+            "INSERT INTO workflow_approvals \
+             (community_id, token, workflow_id, run_id, step_id, step_index, \
+              approver_spec, status, expires_at) \
+             VALUES ($1, $2, $3, $4, 'approve', 1, $5, 'pending', now() + interval '1 day')",
+        )
+        .bind(community_id)
+        .bind(&token_hash)
+        .bind(workflow_id)
+        .bind(run_id)
+        .bind(hex::encode(&owner_pubkey))
+        .execute(&pool)
+        .await
+        .expect("insert legacy approval");
+
+        run_migrations_through(&pool, 1031)
+            .await
+            .expect("upgrade populated approval tables");
+
+        let (next_step, step_outputs, generation): (i32, serde_json::Value, i64) = sqlx::query_as(
+            "SELECT next_step, step_outputs, generation \
+                 FROM workflow_runs WHERE community_id = $1 AND id = $2",
+        )
+        .bind(community_id)
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read migrated run state");
+        assert_eq!(next_step, 2, "approval step i=1 must resume at i+1");
+        assert_eq!(step_outputs, serde_json::json!({"prepare": {"value": 21}}));
+        assert_eq!(generation, 7, "0031 must reuse the run generation");
+
+        let retained_legacy: (Vec<u8>, String, String) = sqlx::query_as(
+            "SELECT token, approver_spec, status::text FROM workflow_approvals \
+             WHERE community_id = $1 AND run_id = $2",
+        )
+        .bind(community_id)
+        .bind(run_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read retained legacy approval");
+        assert_eq!(
+            retained_legacy,
+            (token_hash, hex::encode(&owner_pubkey), "pending".into())
+        );
+
+        let legacy_token_column_exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = 'public' \
+                   AND table_name = 'workflow_approvals' \
+                   AND column_name = 'token' \
+             )",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("inspect approval columns");
+        assert!(
+            legacy_token_column_exists,
+            "0031 must retain token-hash authority"
+        );
+
+        let raw_token = "legacy-api-still-live-after-0031";
+        crate::workflow::create_approval(
+            &pool,
+            crate::workflow::CreateApprovalParams {
+                community_id: buzz_core::CommunityId::from_uuid(community_id),
+                token: raw_token,
+                workflow_id,
+                run_id,
+                step_id: "legacy-create-get",
+                step_index: 2,
+                approver_spec: "owner",
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            },
+        )
+        .await
+        .expect("legacy create approval after 0031");
+        let created = crate::workflow::get_approval(
+            &pool,
+            buzz_core::CommunityId::from_uuid(community_id),
+            raw_token,
+        )
+        .await
+        .expect("legacy get approval after 0031");
+        assert_eq!(created.workflow_id, workflow_id);
+        assert_eq!(created.run_id, run_id);
+        assert_eq!(created.step_id, "legacy-create-get");
+        assert_eq!(created.status, crate::workflow::ApprovalStatus::Pending);
+
+        let new_gate_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM workflow_approval_gates WHERE community_id = $1",
+        )
+        .bind(community_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count immutable approval gates");
+        assert_eq!(
+            new_gate_count, 0,
+            "legacy rows must not be rewritten as new gates"
+        );
+    }
+
+    async fn assert_push_message_kinds(pool: &PgPool, community: uuid::Uuid) {
+        for kind in [7, 9, 1059, 40002, 40007, 45001, 45003, 46010] {
+            sqlx::query(
+                "INSERT INTO events (community_id,id,pubkey,created_at,kind,tags,content,sig) \
+                 VALUES ($1,$2,$3,now(),$4,'[]','push migration',$5)",
+            )
+            .bind(community)
+            .bind(vec![(kind % 251) as u8; 32])
+            .bind(vec![21_u8; 32])
+            .bind(kind)
+            .bind(vec![22_u8; 64])
+            .execute(pool)
+            .await
+            .expect("insert eligible and excluded events");
+        }
+        let kinds: Vec<i32> = sqlx::query_scalar(
+            "SELECT e.kind FROM push_match_queue q JOIN events e \
+             ON e.community_id=q.community_id AND e.id=q.event_id \
+             WHERE q.community_id=$1 ORDER BY e.kind",
+        )
+        .bind(community)
+        .fetch_all(pool)
+        .await
+        .expect("read matched kinds");
+        assert_eq!(kinds, [9, 40002, 45001, 45003]);
+    }
+
+    async fn seed_push_migration_lease(pool: &PgPool) -> uuid::Uuid {
+        let community = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO communities(id,host) VALUES($1,$2)")
+            .bind(community)
+            .bind(format!("push-migration-{community}.example"))
+            .execute(pool)
+            .await
+            .expect("seed community");
+        sqlx::query(
+            "INSERT INTO push_leases(community_id,author,installation_id,source_event_id,\
+             source_created_at,generation,active,app_profile,endpoint_hash,endpoint_grant,\
+             max_class,subscriptions,expires_at) \
+             VALUES($1,$2,'legacy',$3,1,1,true,'buzz-ios-production',$4,'retained-grant',\
+             'time_sensitive','[]',9223372036854775806)",
+        )
+        .bind(community)
+        .bind(vec![11_u8; 32])
+        .bind(vec![12_u8; 32])
+        .bind(vec![13_u8; 32])
+        .execute(pool)
+        .await
+        .expect("seed legacy lease");
+        community
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres initialized with desired schema"]
+    async fn desired_schema_push_message_kinds() {
+        assert_eq!(
+            std::env::var("BUZZ_TEST_SCHEMA_MODE").as_deref(),
+            Ok("desired")
+        );
+        let pool = connect_test_pool().await;
+        let community = seed_push_migration_lease(&pool).await;
+        assert_push_message_kinds(&pool, community).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn push_message_kinds_fresh_install() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        run_migrations(&pool).await.expect("fresh migrations");
+        let community = seed_push_migration_lease(&pool).await;
+        assert_push_message_kinds(&pool, community).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn push_message_kinds_populated_upgrade_preserves_authority() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        run_migrations_through(&pool, 39)
+            .await
+            .expect("frozen fork prefix");
+        let community = seed_push_migration_lease(&pool).await;
+        let installation = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO push_gateway_installations(id,app_attest_key_id,app_attest_public_key,\
+             assertion_counter,app_profile,token_ciphertext,token_fingerprint,endpoint_epoch,expires_at) \
+             VALUES($1,$2,$3,0,'buzz-ios-sandbox',$4,$5,1,now()+interval '1 day')",
+        )
+        .bind(installation).bind(vec![1_u8; 32]).bind(vec![2_u8; 33])
+        .bind(vec![3_u8; 32]).bind(vec![4_u8; 32])
+        .execute(&pool).await.expect("seed gateway installation");
+        sqlx::query(
+            "INSERT INTO push_gateway_delegations(id,installation_id,relay_pubkey,endpoint_epoch,\
+             generation,not_before,expires_at) VALUES($1,$2,$3,1,1,now(),now()+interval '1 hour')",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(installation)
+        .bind(vec![5_u8; 32])
+        .execute(&pool)
+        .await
+        .expect("seed gateway delegation");
+        let snapshot_sql = "SELECT jsonb_build_array(\
+            (SELECT jsonb_agg(to_jsonb(l)) FROM push_leases l),\
+            (SELECT jsonb_agg(to_jsonb(i)) FROM push_gateway_installations i),\
+            (SELECT jsonb_agg(to_jsonb(d)) FROM push_gateway_delegations d))";
+        let before: serde_json::Value = sqlx::query_scalar(snapshot_sql)
+            .fetch_one(&pool)
+            .await
+            .expect("snapshot existing authority");
+        run_migrations_through(&pool, 40)
+            .await
+            .expect("admit only migration 0037");
+        let after: serde_json::Value = sqlx::query_scalar(snapshot_sql)
+            .fetch_one(&pool)
+            .await
+            .expect("read preserved authority");
+        assert_eq!(
+            before, after,
+            "profile authority and leases must remain byte-equivalent"
+        );
+        let checksum: Vec<u8> = sqlx::query_scalar(
+            "SELECT checksum FROM _sqlx_migrations WHERE version=40 AND success",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("successful adopted migration ledger");
+        assert_eq!(
+            checksum,
+            MIGRATOR
+                .iter()
+                .find(|m| m.version == 40)
+                .unwrap()
+                .checksum
+                .as_ref()
+        );
+        assert_push_message_kinds(&pool, community).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires private PostgreSQL migration fixture"]
+    async fn dogfood_profile_upgrade_retires_authority_preserves_lease_and_event_data() {
+        // The existing 0037 test proves preservation through that admission.
+        // This fixture explicitly proves the later, separately approved cutover.
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        run_migrations_through(&pool, 40).await.unwrap();
+        let community = seed_push_migration_lease(&pool).await;
+        assert_push_message_kinds(&pool, community).await;
+        sqlx::query("INSERT INTO push_gateway_installations(id,app_attest_key_id,app_attest_public_key,assertion_counter,app_profile,token_ciphertext,token_fingerprint,endpoint_epoch,expires_at) VALUES($1,$2,$3,0,'buzz-ios-sandbox',$4,$5,1,now()+interval '1 day')")
+            .bind(uuid::Uuid::new_v4()).bind(vec![1_u8;32]).bind(vec![2_u8;33]).bind(vec![3_u8;32]).bind(vec![4_u8;32]).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO push_gateway_delegations(id,installation_id,relay_pubkey,endpoint_epoch,generation,not_before,expires_at) SELECT $1,id,$2,1,1,now(),now()+interval '1 hour' FROM push_gateway_installations")
+            .bind(uuid::Uuid::new_v4()).bind(vec![5_u8;32]).execute(&pool).await.unwrap();
+        let snapshot = "SELECT jsonb_build_array((SELECT jsonb_agg(to_jsonb(l) ORDER BY l.installation_id) FROM push_leases l),(SELECT jsonb_agg(to_jsonb(e) ORDER BY e.id) FROM events e),(SELECT jsonb_agg(to_jsonb(q) ORDER BY q.event_id) FROM push_match_queue q))";
+        let before: serde_json::Value =
+            sqlx::query_scalar(snapshot).fetch_one(&pool).await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let after: serde_json::Value = sqlx::query_scalar(snapshot).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            before, after,
+            "cutover must retain relay leases, events and queue rows"
+        );
+        let counts: (i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM push_gateway_installations),(SELECT count(*) FROM push_gateway_delegations)").fetch_one(&pool).await.unwrap();
+        assert_eq!(counts, (0, 0));
+        let checksum: Vec<u8> = sqlx::query_scalar(
+            "SELECT checksum FROM _sqlx_migrations WHERE version=43 AND success",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            checksum,
+            MIGRATOR
+                .iter()
+                .find(|m| m.version == 43)
+                .unwrap()
+                .checksum
+                .as_ref()
+        );
+        let constraint: String = sqlx::query_scalar("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid='push_gateway_installations'::regclass AND conname='push_gateway_installations_app_profile_check'").fetch_one(&pool).await.unwrap();
+        assert!(constraint.contains("buzz-ios-dogfood"));
+        assert!(!constraint.contains("buzz-ios-sandbox"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn populated_upgrade_preserves_search_policy_except_for_push_leases() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        run_migrations_through(&pool, 7)
+            .await
+            .expect("apply migrations 1-7");
+
+        let community_id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(community_id)
+            .bind(format!("pre-0008-{}.example", community_id.simple()))
+            .execute(&pool)
+            .await
+            .expect("insert community");
+
+        for (marker, kind) in [(1_u8, 1_i32), (2_u8, 30_350_i32)] {
+            sqlx::query(
+                "INSERT INTO events \
+                 (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at) \
+                 VALUES ($1, $2, $3, NOW(), $4, '[]'::jsonb, 'brownfield needle', $5, NOW())",
+            )
+            .bind(community_id)
+            .bind(vec![marker; 32])
+            .bind(vec![marker + 10; 32])
+            .bind(kind)
+            .bind(vec![marker + 20; 64])
+            .execute(&pool)
+            .await
+            .expect("insert brownfield event");
+        }
+
+        run_migrations_through(&pool, 11)
+            .await
+            .expect("apply main migrations through 11");
+        let before: Vec<(i32, bool)> = sqlx::query_as(
+            "SELECT kind, search_tsv @@ plainto_tsquery('simple', 'needle') \
+             FROM events ORDER BY kind",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read pre-push search behavior");
+        assert_eq!(before, vec![(1, true), (30_350, true)]);
+
+        run_migrations(&pool)
+            .await
+            .expect("apply push migrations to populated database");
+        let after: Vec<(i32, Option<bool>)> = sqlx::query_as(
+            "SELECT kind, search_tsv @@ plainto_tsquery('simple', 'needle') \
+             FROM events ORDER BY kind",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read post-push search behavior");
+        assert_eq!(after, vec![(1, Some(true)), (30_350, None)]);
+    }
+
+    #[test]
+    fn ci_grants_lands_only_after_workflow_and_ci_storage_base() {
+        let migrations: Vec<_> = MIGRATOR.iter().collect();
+        let ci_grants = migrations
+            .iter()
+            .position(|m| m.version == 1035)
+            .expect("1035_ci_grants must be present");
+        for version in 1029..=1034 {
+            let dependency = migrations
+                .iter()
+                .position(|m| m.version == version)
+                .expect("fork prerequisite must be present");
+            assert!(dependency < ci_grants);
+        }
+        let sql = migrations[ci_grants].sql.as_str();
+        assert!(
+            sql.contains("CREATE TABLE ci_grants"),
+            "0035_ci_grants must create the ci_grants table"
+        );
+        assert!(
+            sql.contains("PRIMARY KEY (community_id, channel_id, target_repo_a, signer_pubkey)"),
+            "0035_ci_grants must key on the full (community, channel, repo, signer) tuple"
+        );
+        assert!(
+            sql.contains("valid_from") && sql.contains("valid_until"),
+            "0035_ci_grants must carry the validity window columns"
+        );
+    }
 }
+
+#[cfg(test)]
+#[path = "migration/workflow_approval_contract.rs"]
+mod workflow_approval_contract;
