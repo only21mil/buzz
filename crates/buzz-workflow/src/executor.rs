@@ -2428,7 +2428,7 @@ async fn execute_steps(
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_postgres_tests {
     use super::*;
     use crate::action_sink::{ActionSink, ActionSinkError};
     use serde_json::json;

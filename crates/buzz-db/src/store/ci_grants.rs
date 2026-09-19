@@ -90,7 +90,7 @@ pub async fn get_active_ci_signers(
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_postgres_tests {
     use super::*;
     use uuid::Uuid;
 

@@ -3835,4 +3835,4 @@ mod postgres_tests {
 
 #[cfg(test)]
 #[path = "migration/workflow_approval_contract.rs"]
-mod workflow_approval_contract;
+mod workflow_approval_contract_postgres_tests;

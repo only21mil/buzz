@@ -1613,7 +1613,7 @@ fn bound_request_payload(
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_postgres_tests {
     use super::*;
     use crate::user::ensure_user;
 

@@ -1030,7 +1030,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod integration_tests {
+mod integration_tests_postgres_tests {
     //! Regression test for `e3661764` / `7899c1a8`: a workflow `send_message`
     //! that mentions a channel member by name (`@Name`) must emit a `p` tag for
     //! that member so ACP agent wake (`event_mentions_agent`, p-tag gated) fires.

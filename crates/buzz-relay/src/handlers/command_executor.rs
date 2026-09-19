@@ -1484,7 +1484,7 @@ async fn resume_workflow_from_persisted_cursor(
 }
 
 #[cfg(test)]
-mod approval_decision_tests {
+mod approval_decision_tests_postgres_tests {
     use super::*;
     use buzz_core::channel::{ChannelType, ChannelVisibility};
     use buzz_db::CreateCommunityWithOwnerResult;
@@ -1777,7 +1777,7 @@ steps:
 }
 
 #[cfg(test)]
-mod tests {
+mod tests_postgres_tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
 
