@@ -324,12 +324,11 @@ pool lifecycle has no idle re-sleep consumer, so accepting the flag would advert
 an inert feature. Existing replay-floor and startup-effort implementations remain.
 
 For a future full port, exact comparisons against pinned upstream `5511b56fc`
-are saved outside the repository under
-`/home/victor/work/buzz_upstream/reports/rust_acp_workflow-hunks/`:
+live outside the repository in the lane's reports directory:
 `um9e-pool-remaining.patch`, `um9e-lib-remaining.patch`, and
 `um9e-queue-remaining.patch`. These `*remaining.patch` files include intentional
 fork differences, not just missing features. The decision and check receipt is
-`/home/victor/work/buzz_upstream/reports/rust_acp_workflow.md`.
+`rust_acp_workflow.md` in that directory.
 
 ## Status at polish
 
@@ -363,7 +362,7 @@ The run used `CARGO_BUILD_JOBS=4`, `NEXTEST_TEST_THREADS=4`, and
 The previous four CLI failures and executable-start failure passed their six
 focused rechecks and the full CLI suite. They were resource-exhaustion failures.
 Formatting also passes. Per-crate results and logs are recorded in
-`/home/victor/work/buzz_upstream/reports/polish.md`.
+`polish.md` in the lane's reports directory.
 
 The earlier polish call passed mobile analysis, 2,416 Flutter tests with four
 skipped, the separate unconfigured-push test, web typecheck/lint and 24 tests,
