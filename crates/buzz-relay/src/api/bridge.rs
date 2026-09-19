@@ -524,11 +524,9 @@ fn build_aux_query(
     query
 }
 
-/// Where an aux hop reads from: the window path pins the request's proved
-/// read session; the thread path takes the routed display-read fast path.
+/// Where a window aux hop reads from, pinned to the request's proved read session.
 enum AuxReader<'a> {
     Session(&'a mut buzz_db::ReadSession),
-    Routed(&'a buzz_db::Db, &'static str),
     #[cfg(test)]
     Fake(&'a mut (dyn FnMut(&buzz_db::EventQuery) -> Vec<buzz_core::StoredEvent> + Send)),
 }
@@ -540,7 +538,6 @@ impl AuxReader<'_> {
     ) -> buzz_db::Result<Vec<buzz_core::StoredEvent>> {
         match self {
             AuxReader::Session(session) => session.query_events(query).await,
-            AuxReader::Routed(db, path) => db.query_events_routed(path, query).await,
             #[cfg(test)]
             AuxReader::Fake(fetch) => Ok(fetch(query)),
         }
