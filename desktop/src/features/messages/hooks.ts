@@ -371,6 +371,7 @@ export function useChannelMessagesQuery(
       channel !== null &&
       channel.channelType !== "forum",
     queryKey,
+    meta: { subscriptionGated: subscriptionGeneration !== true },
     queryFn: async ({ signal }) => {
       if (!channel) throw new Error("No channel selected.");
       const generationToken =
@@ -616,6 +617,20 @@ export function useChannelSubscription(channel: Channel | null) {
 
         cleanup = dispose;
         const historyQueryKey = channelMessagesKey(channelId);
+        const query = queryClient
+          .getQueryCache()
+          .find({ queryKey: historyQueryKey, exact: true });
+        if (query?.meta?.subscriptionGated !== true) {
+          await refreshChannelWindowMessages(
+            queryClient,
+            channelId,
+            () => generationToken.guard.current,
+          );
+          if (isDisposed || !generationToken.guard.current) return;
+          isReady = true;
+          setReadySubscription(generationToken);
+          return;
+        }
         await queryClient.cancelQueries({
           queryKey: historyQueryKey,
           exact: true,
@@ -640,6 +655,22 @@ export function useChannelSubscription(channel: Channel | null) {
         disposeSubscription();
         if (!isDisposed && generationToken.guard.current) {
           console.error("Failed to subscribe to channel", channelId, error);
+          const query = queryClient
+            .getQueryCache()
+            .find({ queryKey: channelMessagesKey(channelId), exact: true });
+          if (query?.meta?.subscriptionGated !== true) {
+            void refreshChannelWindowMessages(
+              queryClient,
+              channelId,
+              () => generationToken.guard.current,
+            ).catch((refreshError) => {
+              console.error(
+                "Failed to refresh channel after subscription failure",
+                channelId,
+                refreshError,
+              );
+            });
+          }
         }
       });
 
@@ -767,6 +798,8 @@ export function useSendMessageMutation(
           )
         : undefined;
 
+      // Captured sends use the native epoch fence until the shared WebSocket
+      // publisher accepts publicationScope again.
       // Messages carrying media OR custom-emoji tags MUST go through REST so
       // the relay's tag validation runs. The WebSocket path emits no extra
       // tags, so emoji-only messages would otherwise lose their emoji tag.
