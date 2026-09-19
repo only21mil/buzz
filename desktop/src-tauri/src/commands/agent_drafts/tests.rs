@@ -58,6 +58,44 @@ fn fixture() -> (tempfile::TempDir, RetentionScope, Event, DraftOperation) {
     (dir, scope, request, op)
 }
 #[test]
+fn queue_reads_all_operations_from_the_supplied_connection_in_id_order() {
+    let (_dir, s, request, mut op) = fixture();
+    // There is no on-disk database. A per-row connection would fail to find
+    // these operations, so this also guards against reopening the database.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE draft_events(id TEXT PRIMARY KEY,event TEXT NOT NULL); CREATE TABLE draft_operations(id TEXT PRIMARY KEY,ciphertext TEXT NOT NULL);").unwrap();
+    conn.execute(
+        "INSERT INTO draft_events VALUES (?1,?2)",
+        params![request.id.to_hex(), request.as_json()],
+    )
+    .unwrap();
+    for id in ["second", "first"] {
+        op.request_event_id = id.into();
+        conn.execute(
+            "INSERT INTO draft_operations VALUES (?1,?2)",
+            params![id, encrypt(&s, &op).unwrap()],
+        )
+        .unwrap();
+    }
+    let queue = read_queue(&s, &conn).unwrap();
+    assert_eq!(queue.events, vec![request]);
+    assert_eq!(queue.operations.len(), 2);
+    assert_eq!(queue.operations[0].request_event_id, "first");
+    assert_eq!(queue.operations[1].request_event_id, "second");
+    assert_eq!(queue.operations[0].target_id, op.target_id);
+
+    let other = RetentionScope {
+        db_path: s.db_path.clone(),
+        relay_url: s.relay_url.clone(),
+        owner_keys: nostr::Keys::generate(),
+    };
+    assert!(read_queue(&other, &conn).is_err());
+    conn.execute("UPDATE draft_operations SET ciphertext='corrupt'", [])
+        .unwrap();
+    assert!(read_queue(&s, &conn).is_err());
+}
+
+#[test]
 fn queue_and_operation_restart_keep_ciphertext_and_scoped_keys() {
     let (_dir, s, request, op) = fixture();
     store_event(&s, &request).unwrap();

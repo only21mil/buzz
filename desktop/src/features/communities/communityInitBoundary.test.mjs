@@ -23,3 +23,8 @@ test("community initialization serializes the full backend apply", () => {
   assert.match(source, /communityApplyQueue\.run\(async \(\) => \{/);
   assert.match(source, /if \(cancelled\) return;\s+await applyCommunity\(/);
 });
+
+test("community teardown clears card mint state and pending completions", () => {
+  assert.match(source, /import \{ resetCardMintStore \} from/);
+  assert.match(functionBody("resetCommunityState"), /resetCardMintStore\(\);/);
+});

@@ -88,17 +88,16 @@ fn read_operation(scope: &RetentionScope, id: &str) -> Result<Option<DraftOperat
         )
         .optional()
         .map_err(|e| e.to_string())?;
-    ciphertext
-        .map(|c| {
-            let text = nostr::nips::nip44::decrypt(
-                scope.owner_keys.secret_key(),
-                &scope.owner_keys.public_key(),
-                c,
-            )
-            .map_err(|e| e.to_string())?;
-            serde_json::from_str(&text).map_err(|e| e.to_string())
-        })
-        .transpose()
+    ciphertext.map(|c| decrypt_operation(scope, c)).transpose()
+}
+fn decrypt_operation(scope: &RetentionScope, ciphertext: String) -> Result<DraftOperation, String> {
+    let text = nostr::nips::nip44::decrypt(
+        scope.owner_keys.secret_key(),
+        &scope.owner_keys.public_key(),
+        ciphertext,
+    )
+    .map_err(|e| e.to_string())?;
+    serde_json::from_str(&text).map_err(|e| e.to_string())
 }
 fn stored_request(scope: &RetentionScope, id: &str) -> Result<Event, String> {
     let text: String = db(scope)?
@@ -189,6 +188,12 @@ pub fn agent_draft_queue(
 ) -> Result<DraftQueue, String> {
     let s = scope(&app, &owner, &relay_url)?;
     let conn = db(&s)?;
+    let queue = read_queue(&s, &conn)?;
+    // Reject results if the active identity or community changed during the read.
+    scope(&app, &owner, &relay_url)?;
+    Ok(queue)
+}
+fn read_queue(scope: &RetentionScope, conn: &Connection) -> Result<DraftQueue, String> {
     let mut stmt = conn
         .prepare("SELECT event FROM draft_events ORDER BY id")
         .map_err(|e| e.to_string())?;
@@ -198,18 +203,13 @@ pub fn agent_draft_queue(
         .map(|r| Event::from_json(r.map_err(|e| e.to_string())?).map_err(|e| e.to_string()))
         .collect::<Result<Vec<_>, String>>()?;
     let mut stmt = conn
-        .prepare("SELECT id FROM draft_operations ORDER BY id")
+        .prepare("SELECT ciphertext FROM draft_operations ORDER BY id")
         .map_err(|e| e.to_string())?;
-    let mut operations = Vec::new();
-    for id in stmt
+    let operations = stmt
         .query_map([], |r| r.get::<_, String>(0))
         .map_err(|e| e.to_string())?
-    {
-        if let Some(op) = read_operation(&s, &id.map_err(|e| e.to_string())?)? {
-            operations.push(op);
-        }
-    }
-    scope(&app, &owner, &relay_url)?;
+        .map(|r| decrypt_operation(scope, r.map_err(|e| e.to_string())?))
+        .collect::<Result<Vec<_>, String>>()?;
     Ok(DraftQueue { events, operations })
 }
 #[tauri::command]
