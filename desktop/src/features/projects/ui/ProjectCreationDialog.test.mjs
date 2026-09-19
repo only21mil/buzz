@@ -370,10 +370,9 @@ test("empty Projects uses the shared creation flow and preserves desktop capabil
     );
     assert.equal(view.queryByText("No projects yet"), null);
     assert.equal(client.getQueryData(collectionKey).length, 1);
-    // The populated menu opens the same form after first-run creation.
-    fireEvent.click(view.getByRole("button", { name: "Create", exact: true }));
+    // Upstream replaces the generic Create menu with category actions.
     fireEvent.click(
-      view.getByRole("menuitem", { name: "Project", exact: true }),
+      view.getByRole("button", { name: "Create project", exact: true }),
     );
     await waitFor(() => assert.ok(view.getByTestId("create-project-dialog")));
     assert.equal(view.getByTestId("create-project-name").value, "");

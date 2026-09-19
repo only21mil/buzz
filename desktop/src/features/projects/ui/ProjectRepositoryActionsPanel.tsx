@@ -66,8 +66,8 @@ type ProjectRepositoryActionsPanelProps = {
   onChatWithAgent: (items: ProjectSelectionItem[]) => void;
   onCreateTask: () => void;
   onCreatePullRequest?: () => void;
-  onOpenLocalRepository: () => void;
-  onOpenTerminal: () => void;
+  onOpenLocalRepository?: () => void;
+  onOpenTerminal?: () => void;
   onRepositoryChange: (repositoryId: string) => void;
   onResetWidth: () => void;
   onResizeStart: (event: React.PointerEvent<HTMLButtonElement>) => void;
@@ -382,7 +382,8 @@ export function ProjectRepositoryActionsPanel({
                         </RepositoryActionButton>
                       ) : null}
                       <RepositoryActionButton
-                        onClick={onOpenTerminal}
+                        disabled={!onOpenTerminal}
+                        onClick={() => onOpenTerminal?.()}
                         title={terminalTitle ?? "Open terminal"}
                       >
                         <SquareTerminal className="h-3.5 w-3.5" />
@@ -390,7 +391,8 @@ export function ProjectRepositoryActionsPanel({
                       </RepositoryActionButton>
                       {sourceControls.source === "local" ? (
                         <RepositoryActionButton
-                          onClick={onOpenLocalRepository}
+                          disabled={!onOpenLocalRepository}
+                          onClick={() => onOpenLocalRepository?.()}
                           title="Open local repository folder"
                         >
                           <FolderOpen className="h-3.5 w-3.5" />

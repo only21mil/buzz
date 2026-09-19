@@ -1,3 +1,4 @@
+import { isTauri } from "@tauri-apps/api/core";
 import * as React from "react";
 
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
@@ -228,11 +229,10 @@ export function ProjectsOverviewProjectItems({
                       key={project.id}
                     >
                       <ProjectGridCard
-                        canDelete={canDeleteProject(
-                          project,
-                          currentPubkey,
-                          profiles,
-                        )}
+                        canDelete={
+                          isTauri() &&
+                          canDeleteProject(project, currentPubkey, profiles)
+                        }
                         deleteDisabled={deleteDisabled}
                         hasLocal={hasLocalCheckout(project, localRepoNames)}
                         onDelete={onDelete}
@@ -273,11 +273,10 @@ export function ProjectsOverviewProjectItems({
                   key={project.id}
                 >
                   <ProjectListRow
-                    canDelete={canDeleteProject(
-                      project,
-                      currentPubkey,
-                      profiles,
-                    )}
+                    canDelete={
+                      isTauri() &&
+                      canDeleteProject(project, currentPubkey, profiles)
+                    }
                     deleteDisabled={deleteDisabled}
                     hasLocal={hasLocalCheckout(project, localRepoNames)}
                     onDelete={onDelete}
