@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+mod closed_response;
+
 pub mod activation;
 #[cfg(target_os = "linux")]
 pub mod activation_coordinator;
@@ -60,7 +62,7 @@ pub mod qualification_host;
 #[cfg(unix)]
 pub mod runtime;
 
-use buzz_ci_broker_protocol::{BrokerState, Conclusion, ResponseCode};
+use buzz_ci_broker_protocol::ResponseCode;
 
 pub mod seccomp;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -89,12 +91,10 @@ pub fn forbidden_environment_key<'a>(keys: impl IntoIterator<Item = &'a str>) ->
         .find(|key| FORBIDDEN_ENVIRONMENT_KEYS.contains(key))
 }
 
-/// Exercise the v2 fixed-frame codec with a capacity-zero response without touching
+/// Exercise the real capacity-zero response encoder through the v2 codec without touching
 /// sockets, accounts, files, processes, or network state.
 pub fn self_check() -> Result<(), &'static str> {
-    use buzz_ci_broker_protocol::v2::{
-        decode_request, decode_response, encode_request, encode_response, BrokerResponse, Request,
-    };
+    use buzz_ci_broker_protocol::v2::{decode_request, decode_response, encode_request, Request};
     use buzz_ci_broker_protocol::HelloRequest;
 
     let request = Request::Hello(HelloRequest {
@@ -106,30 +106,10 @@ pub fn self_check() -> Result<(), &'static str> {
     if decoded != request {
         return Err("request round-trip mismatch");
     }
-    let response = BrokerResponse {
-        code: ResponseCode::NotProvisioned,
-        retry_after_millis: 0,
-        attempt_id: [0; 16],
-        run_id: [0; 16],
-        accepted_request_digest: [0; 32],
-        job_intent_digest: [0; 32],
-        execution_binding_digest: [0; 32],
-        tip_oid: None,
-        broker_state: BrokerState::Reconciling,
-        conclusion: Conclusion::None,
-        terminal_reason: 0,
-        generation: 1,
-        accepted_at: 0,
-        updated_at: 1,
-        lease_generation: 0,
-        evidence_set_digest: [0; 32],
-        teardown_digest: [0; 32],
-        attempt: 0,
-    };
-    let encoded_response = encode_response(header, response);
+    let encoded_response = closed_response::encode_not_provisioned_v2(header, decoded, 1);
     let decoded_response =
         decode_response(header, encoded_response.as_bytes()).map_err(|_| "response decode")?;
-    if decoded_response != response {
+    if decoded_response != closed_response::empty_response(ResponseCode::NotProvisioned, 1) {
         return Err("response round-trip mismatch");
     }
     Ok(())

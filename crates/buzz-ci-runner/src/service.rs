@@ -172,8 +172,7 @@ pub fn serve_runner_connection(
 
 /// Authenticate controld, parse one frame, and invoke an injected production handler.
 ///
-/// The default binary deliberately does not call this path until its verifier,
-/// receipt journal, broker transport, and unprivileged executor are configured.
+/// The caller supplies the handler after composing its verifier and broker transport.
 #[cfg(target_os = "linux")]
 pub fn serve_runner_connection_with_handler(
     mut stream: UnixStream,
