@@ -107,7 +107,10 @@ case "${args}" in
   *" merge-base --is-ancestor "*) exit 0 ;;
   *" check-ref-format "*) exit 0 ;;
   *" diff --quiet "*) exit 0 ;;
-  *" ls-tree -r --name-only "*) printf 'migrations/0031_workflow_approval_foundations.sql\n' ;;
+  # The merged lineage has 59 files, with gaps and a maximum version of 1044.
+  *" ls-tree -r --name-only "*)
+    printf 'migrations/%s_fixture.sql\n' {0001..0046} {1029..1035} {1039..1044}
+    ;;
   *" status --porcelain "*)
     [[ ${TEST_DIRTY_CHECKOUT} == 1 ]] && printf ' M deploy/compose/deploy-local.sh\n'
     [[ ${TEST_DIRTY_CHECKOUT} == 2 ]] && printf '?? pre-freeze-receipt.json\n'
@@ -118,7 +121,9 @@ case "${args}" in
     for arg in "$@"; do
       if [[ ${previous} == --detach ]]; then
         mkdir -p "${arg}/migrations"
-        : >"${arg}/migrations/0031_workflow_approval_foundations.sql"
+        for version in {0001..0046} {1029..1035} {1039..1044}; do
+          : >"${arg}/migrations/${version}_fixture.sql"
+        done
         : >"${arg}/Dockerfile"
         exit 0
       fi
@@ -225,11 +230,14 @@ if [[ " $* " == *"to_regclass"* ]]; then
     check_db_read_failure:*) exit 25 ;;
     *) printf 't\n' ;;
   esac
-elif [[ " $* " == *"SELECT count"* ]]; then
+elif [[ " $* " == *"SELECT count(*) FROM _sqlx_migrations WHERE NOT success"* ]]; then
   [[ ${TEST_SCENARIO} == check_db_failed_rows ]] && printf '1\n' || printf '0\n'
-else
-  [[ ${TEST_SCENARIO} == check_db_malformed ]] && printf '31|t|extra\n' || \
+elif [[ " $* " == *"SELECT count(*) FILTER (WHERE success) || '|' || COALESCE(bool_and(success), true) FROM _sqlx_migrations"* ]]; then
+  [[ ${TEST_SCENARIO} == check_db_malformed ]] && printf '59|t|extra\n' || \
     printf '%s|t\n' "$(cat "${TEST_DB_STATE}")"
+else
+  printf 'unexpected psql query: %s\n' "$*" >&2
+  exit 96
 fi
 STUB
 
@@ -444,29 +452,32 @@ case "${args}" in
         boolean_true:*) printf '  true  \n' ;;
         *) printf 't\n' ;;
       esac
-    elif [[ ${args} == *"SELECT count"* ]]; then
+    elif [[ ${args} == *"SELECT count(*) FROM _sqlx_migrations WHERE NOT success"* ]]; then
       if [[ ${TEST_SCENARIO} == check_db_failed_rows ]]; then
         printf '1\n'
       else
         printf '0\n'
       fi
-    else
+    elif [[ ${args} == *"SELECT count(*) FILTER (WHERE success) || '|' || COALESCE(bool_and(success), true) FROM _sqlx_migrations"* ]]; then
       case "${TEST_SCENARIO}" in
-        check_db_malformed) printf '31|t|extra\n' ;;
+        check_db_malformed) printf '59|t|extra\n' ;;
         db_row_empty) ;;
-        db_row_malformed) printf '31|t|extra\n' ;;
-        rollback_refusal) printf '32|t\n' ;;
+        db_row_malformed) printf '59|t|extra\n' ;;
+        rollback_refusal) printf '60|t\n' ;;
         boolean_false) printf '%s|false\n' "$(cat "${TEST_DB_STATE}")" ;;
         boolean_true) printf '%s|true\n' "$(cat "${TEST_DB_STATE}")" ;;
         *) printf '%s|t\n' "$(cat "${TEST_DB_STATE}")" ;;
       esac
+    else
+      printf 'unexpected database query: %s\n' "$*" >&2
+      exit 96
     fi
     ;;
   *" compose "*" run --rm --no-deps "*)
     if [[ ${TEST_SCENARIO} == migration_fail ]]; then
       exit 17
     fi
-    printf '31\n' >"${TEST_DB_STATE}"
+    printf '59\n' >"${TEST_DB_STATE}"
     exit 0
     ;;
   *" compose "*" up -d --no-deps --force-recreate relay "*)
@@ -491,7 +502,7 @@ run_case() {
   local scenario=$1 expected=$2
   local invocation_mode=${3:-deploy}
   local case_dir=${scratch}/${scenario}
-  local initial_db=28 prior_required_migration=28
+  local initial_db=42 prior_required_migration=42
   local checkout_head=${test_commit} source_head=${test_commit} dirty_checkout=0
   local pre_freeze_head=${test_commit} protected_ci_head=${test_commit}
   local pre_freeze_receipt_path=${case_dir}/pre-freeze-receipt.json
@@ -512,13 +523,13 @@ run_case() {
     ${scenario} == post_swap_failure_idxplat || \
     ${scenario} == rollback_revalidation_mismatch || ${scenario} == rollback_db_read_* || \
     ${scenario} == rollback_verification_remove_failure ]]; then
-    initial_db=31
-    prior_required_migration=31
+    initial_db=59
+    prior_required_migration=59
   fi
   if [[ ${scenario} == manifest_list || ${scenario} == prior_override_required || \
     ${scenario} == prior_override_success || ${scenario} == prior_override_mismatch ]]; then
-    initial_db=31
-    prior_required_migration=31
+    initial_db=59
+    prior_required_migration=59
   fi
   case "${scenario}" in
     stale_checkout|check_stale_checkout) checkout_head=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb ;;
@@ -547,20 +558,20 @@ run_case() {
     prior_override_required) prior_required_migration=invalid ;;
     prior_override_success)
       prior_required_migration=invalid
-      prior_migration_override=sha256:1111111111111111111111111111111111111111111111111111111111111111@31
+      prior_migration_override=sha256:1111111111111111111111111111111111111111111111111111111111111111@59
       ;;
     prior_override_mismatch)
       prior_required_migration=invalid
-      prior_migration_override=sha256:1111111111111111111111111111111111111111111111111111111111111111@30
+      prior_migration_override=sha256:1111111111111111111111111111111111111111111111111111111111111111@58
       ;;
     prior_override_with_valid_label)
-      initial_db=31
-      prior_required_migration=28
-      prior_migration_override=sha256:1111111111111111111111111111111111111111111111111111111111111111@31
+      initial_db=59
+      prior_required_migration=42
+      prior_migration_override=sha256:1111111111111111111111111111111111111111111111111111111111111111@59
       ;;
     prior_label_inspect_failure_override)
-      initial_db=31
-      prior_migration_override=sha256:1111111111111111111111111111111111111111111111111111111111111111@31
+      initial_db=59
+      prior_migration_override=sha256:1111111111111111111111111111111111111111111111111111111111111111@59
       ;;
     docker_default_platform) docker_default_platform=linux/amd64 ;;
   esac
@@ -852,7 +863,7 @@ prepare_run_local_case() {
   chmod 700 "${case_dir}"
   make_stubs "${case_dir}/bin"
   printf 'old\n' >"${case_dir}/container-state"
-  printf '31\n' >"${case_dir}/db-state"
+  printf '59\n' >"${case_dir}/db-state"
   printf '0\n' >"${case_dir}/verify-create-count"
   printf '0\n' >"${case_dir}/verify-remove-count"
   printf '0\n' >"${case_dir}/db-read-count"
@@ -886,7 +897,7 @@ run_local_image_case() {
       TEST_DB_READ_COUNT="${case_dir}/db-read-count" \
       TEST_VERIFY_CREATE_COUNT="${case_dir}/verify-create-count" \
       TEST_VERIFY_REMOVE_COUNT="${case_dir}/verify-remove-count" \
-      TEST_PRIOR_REQUIRED_MIGRATION=31 \
+      TEST_PRIOR_REQUIRED_MIGRATION=59 \
       BUZZ_SECRET_ENV_FILE="${case_dir}/secrets.env" \
       BUZZ_COMPOSE_ENV_FILE="${case_dir}/compose.env" \
       BUZZ_EXPECTED_IMAGE="${expected_image}" \
@@ -900,7 +911,7 @@ run_local_image_case() {
       TEST_DB_READ_COUNT="${case_dir}/db-read-count" \
       TEST_VERIFY_CREATE_COUNT="${case_dir}/verify-create-count" \
       TEST_VERIFY_REMOVE_COUNT="${case_dir}/verify-remove-count" \
-      TEST_PRIOR_REQUIRED_MIGRATION=31 \
+      TEST_PRIOR_REQUIRED_MIGRATION=59 \
       BUZZ_SECRET_ENV_FILE="${case_dir}/secrets.env" \
       BUZZ_COMPOSE_ENV_FILE="${case_dir}/compose.env" \
       BUZZ_IMAGE="${image}" \
@@ -936,7 +947,7 @@ run_local_unpinned_case() {
     TEST_DB_READ_COUNT="${case_dir}/db-read-count" \
     TEST_VERIFY_CREATE_COUNT="${case_dir}/verify-create-count" \
     TEST_VERIFY_REMOVE_COUNT="${case_dir}/verify-remove-count" \
-    TEST_PRIOR_REQUIRED_MIGRATION=31 \
+    TEST_PRIOR_REQUIRED_MIGRATION=59 \
     BUZZ_SECRET_ENV_FILE="${case_dir}/secrets.env" \
     BUZZ_COMPOSE_ENV_FILE="${case_dir}/compose.env" \
     "${compose_dir}/run-local.sh" "$@" >"${case_dir}/output" 2>&1
@@ -1174,7 +1185,7 @@ assert_contains "${scratch}/check_service_unhealthy/output" 'Compose service rel
 assert_contains "${scratch}/check_binary_archive_invalid/output" 'relay binary archive stream is invalid'
 assert_contains "${scratch}/check_db_read_failure/output" 'database migration table-marker query failed'
 assert_contains "${scratch}/check_db_unreachable/output" 'database migration table-marker query failed'
-assert_contains "${scratch}/check_db_malformed/output" 'database latest-migration row is empty or malformed'
+assert_contains "${scratch}/check_db_malformed/output" 'database migration-count row is empty or malformed'
 assert_contains "${scratch}/check_db_failed_rows/output" 'database contains 1 failed migration rows'
 
 run_local_image_case missing __unset__ localhost/buzz-relay:${test_commit} failure
@@ -1215,7 +1226,7 @@ assert_contains "${scratch}/migration_fail/output" 'migration command failed'
 assert_not_contains "${scratch}/migration_fail/commands.log" ' up -d --no-deps --force-recreate relay'
 
 run_case rollback_refusal failure
-assert_contains "${scratch}/rollback_refusal/output" 'database migration 32 is newer than image requirement 31'
+assert_contains "${scratch}/rollback_refusal/output" 'database migration 60 is newer than image requirement 59'
 assert_not_contains "${scratch}/rollback_refusal/commands.log" ' run --rm --no-deps '
 assert_not_contains "${scratch}/rollback_refusal/commands.log" ' up -d --no-deps --force-recreate relay'
 
@@ -1237,19 +1248,20 @@ assert_contains "${scratch}/db_marker_empty/output" \
 assert_contains "${scratch}/db_marker_malformed/output" \
   'database migration table marker is empty or malformed: unknown'
 assert_contains "${scratch}/db_row_empty/output" \
-  'database latest-migration row is empty or malformed: <empty>'
+  'database migration-count row is empty or malformed: <empty>'
 assert_contains "${scratch}/db_row_malformed/output" \
-  'database latest-migration row is empty or malformed: 31\|t\|extra'
+  'database migration-count row is empty or malformed: 59\|t\|extra'
 
 run_case manifest_list success
 assert_contains "${scratch}/manifest_list/output" 'DEPLOY SUCCEEDED'
+assert_not_contains "${scratch}/manifest_list/commands.log" ' run --rm --no-deps '
 
 run_case prior_override_success success
 assert_contains "${scratch}/prior_override_success/output" 'migration override accepted'
 
 run_case prior_override_required failure
 assert_contains "${scratch}/prior_override_required/output" \
-  'BUZZ_PRIOR_MIGRATION_OVERRIDE=sha256:1111111111111111111111111111111111111111111111111111111111111111@31'
+  'BUZZ_PRIOR_MIGRATION_OVERRIDE=sha256:1111111111111111111111111111111111111111111111111111111111111111@59'
 assert_not_contains "${scratch}/prior_override_required/commands.log" \
   ' up -d --no-deps --force-recreate relay'
 
@@ -1261,7 +1273,7 @@ assert_not_contains "${scratch}/prior_override_mismatch/commands.log" \
 
 run_case prior_override_with_valid_label failure
 assert_contains "${scratch}/prior_override_with_valid_label/output" \
-  'BUZZ_PRIOR_MIGRATION_OVERRIDE is not permitted because the prior image has valid required-migration label 28'
+  'BUZZ_PRIOR_MIGRATION_OVERRIDE is not permitted because the prior image has valid required-migration label 42'
 assert_not_contains "${scratch}/prior_override_with_valid_label/output" \
   'migration override accepted'
 assert_not_contains "${scratch}/prior_override_with_valid_label/commands.log" \
@@ -1437,9 +1449,12 @@ swap_line=$(grep -n '^docker .*up -d --no-deps --force-recreate relay' "${health
 [[ -n ${dump_line} && -n ${migrate_line} && -n ${swap_line} ]] || fail 'healthy path did not run dump, migrate, and swap'
 ((dump_line < migrate_line && migrate_line < swap_line)) || fail 'healthy ordering is not dump before migrate before swap'
 assert_contains "${scratch}/healthy/output" 'DEPLOY SUCCEEDED'
+assert_contains "${scratch}/healthy/output" 'Migration gate: image requires 59, database is at 42 success=t'
+assert_contains "${scratch}/healthy/output" 'Migration recheck passed at 59 success=t'
+[[ $(cat "${scratch}/healthy/db-state") == 59 ]] || fail 'healthy path did not apply all 59 migrations'
 
 run_case post_swap_failure failure
-assert_contains "${scratch}/post_swap_failure/output" 'AUTOMATIC ROLLBACK REFUSED: database migration 31 exceeds prior image requirement 28'
+assert_contains "${scratch}/post_swap_failure/output" 'AUTOMATIC ROLLBACK REFUSED: database migration 59 exceeds prior image requirement 42'
 assert_contains "${scratch}/post_swap_failure/output" 'Database dump: .*/buzz-prod-before-.*[.]dump'
 assert_contains "${scratch}/post_swap_failure/output" 'LOUD STOP: do not restore the prior image'
 swap_count=$(grep -c '^docker .*up -d --no-deps --force-recreate relay' "${scratch}/post_swap_failure/commands.log")
