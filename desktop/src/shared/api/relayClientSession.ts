@@ -1,3 +1,4 @@
+import { RelayLiveEvents } from "./relayLiveEvents";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import {
   createAuthEvent,
@@ -31,7 +32,6 @@ import {
 import {
   clearClosedRetry,
   flushEvents,
-  handleRelayClosed,
   handleSubscriptionEose,
   prepareSubscriptionEvent,
 } from "@/shared/api/relayClosedRecovery";
@@ -97,6 +97,7 @@ export class RelayClient {
   private visibleChannelId: string | null = null;
   private authOkTracker = new AuthOkTracker();
   private terminal = false;
+  readonly liveEvents = new RelayLiveEvents();
 
   private connectionStateEmitter = new RelayConnectionStateEmitter("idle");
   private stallWatchdog = new RelayStallWatchdog({
@@ -609,7 +610,7 @@ export class RelayClient {
     this.subscriptions.set(subId, {
       mode: "live",
       filter,
-      onEvent,
+      onEvent: this.liveEvents.forward(onEvent),
       resolveReady,
     });
 
@@ -789,7 +790,7 @@ export class RelayClient {
       return;
     }
     if (type === "CLOSED" && typeof rest[0] === "string") {
-      handleRelayClosed({
+      this.liveEvents.handleClosed({
         subscriptions: this.subscriptions,
         subId: rest[0],
         message: typeof rest[1] === "string" ? rest[1] : "",

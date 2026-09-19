@@ -46,7 +46,7 @@ export async function requestHistoryGated(
 
     subscriptions.set(subId, {
       mode: "history",
-      filter,
+      filter: requestFilters[0],
       events: [],
       resolve,
       reject,
