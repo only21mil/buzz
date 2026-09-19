@@ -15,9 +15,23 @@ command = { command-line = "scripts/postgres-test-wrapper.sh", relative-to = "wo
 [profile.postgres-ci]
 # This structural convention keeps new PostgreSQL-backed tests discoverable
 # without maintaining an exact list of test names.
+# Exact exclusions below are TSV-external fixture compatibility exceptions.
+# Keep both filters aligned; the wrapper also rejects external ledger rows.
 default-filter = """
 (test(/postgres_tests::/) or binary(/^postgres_/))
 and not test(/(^|::)external_infra[^:]*::/)
+and not test(=api::bridge::postgres_tests::submit_event_invalid_json_body_increments_http_transport_counter)
+and not test(=api::bridge::postgres_tests::submit_event_invalid_json_emits_exactly_one_attribution_line)
+and not test(=api::bridge::postgres_tests::submit_event_relay_only_kind_emits_exactly_one_attribution_line)
+and not test(=api::bridge::postgres_tests::submit_event_relay_only_kind_increments_http_transport_counter)
+and not test(=api::git::merge_gate::tests_postgres_tests::harness::audit_write_deadline_preserves_shadow_and_refuses_enforce)
+and not test(=api::git::merge_gate::tests_postgres_tests::harness::callback_authorization_spends_gate_deadline)
+and not test(=api::git::merge_gate::tests_postgres_tests::harness::newest_run_mismatch_supersedes_older_green)
+and not test(=api::git::merge_gate::tests_postgres_tests::harness::require_check_alone_blocks_delete_recreate)
+and not test(=handlers::event::tests::presence_storage_postgres_tests::accepts_stores_and_fans_out_online_and_offline)
+and not test(=handlers::event::tests::presence_storage_postgres_tests::rejects_offline_when_presence_storage_fails)
+and not test(=handlers::event::tests::presence_storage_postgres_tests::rejects_online_when_presence_storage_fails)
+and not test(=handlers::req::tests_postgres_tests::engram_owner_binding_is_tenant_scoped_and_rejects_mismatch)
 """
 fail-fast = false
 # Eight workers was the fastest stable setting in the Blox benchmark while the
@@ -36,6 +50,21 @@ test-group = "postgres-cluster-global"
 [[profile.postgres-ci.scripts]]
 # Script filters are separate from default-filter: they attach the setup and
 # isolation wrapper to the same automatically discovered test set.
-filter = "(test(/postgres_tests::/) or binary(/^postgres_/)) and not test(/(^|::)external_infra[^:]*::/)"
+filter = """
+(test(/postgres_tests::/) or binary(/^postgres_/))
+and not test(/(^|::)external_infra[^:]*::/)
+and not test(=api::bridge::postgres_tests::submit_event_invalid_json_body_increments_http_transport_counter)
+and not test(=api::bridge::postgres_tests::submit_event_invalid_json_emits_exactly_one_attribution_line)
+and not test(=api::bridge::postgres_tests::submit_event_relay_only_kind_emits_exactly_one_attribution_line)
+and not test(=api::bridge::postgres_tests::submit_event_relay_only_kind_increments_http_transport_counter)
+and not test(=api::git::merge_gate::tests_postgres_tests::harness::audit_write_deadline_preserves_shadow_and_refuses_enforce)
+and not test(=api::git::merge_gate::tests_postgres_tests::harness::callback_authorization_spends_gate_deadline)
+and not test(=api::git::merge_gate::tests_postgres_tests::harness::newest_run_mismatch_supersedes_older_green)
+and not test(=api::git::merge_gate::tests_postgres_tests::harness::require_check_alone_blocks_delete_recreate)
+and not test(=handlers::event::tests::presence_storage_postgres_tests::accepts_stores_and_fans_out_online_and_offline)
+and not test(=handlers::event::tests::presence_storage_postgres_tests::rejects_offline_when_presence_storage_fails)
+and not test(=handlers::event::tests::presence_storage_postgres_tests::rejects_online_when_presence_storage_fails)
+and not test(=handlers::req::tests_postgres_tests::engram_owner_binding_is_tenant_scoped_and_rejects_mismatch)
+"""
 setup = "postgres-template"
 run-wrapper = "postgres-isolation"

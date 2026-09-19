@@ -81,6 +81,59 @@ fn decision(
         stamp,
     )
 }
+// Preserve the namespace runner's private socket route and admit the nextest
+// wrapper's localhost clone only when its authority matches the explicit admin.
+fn admitted_fixture_url(value: &str, admin: Option<&str>) -> bool {
+    let Ok(parsed) = url::Url::parse(value) else {
+        return false;
+    };
+    if parsed.host_str() == Some("buzz-test.invalid") {
+        return parsed.path().starts_with("/buzz_nt_")
+            && parsed
+                .query_pairs()
+                .any(|(k, v)| k == "host" && v.starts_with("/work/"));
+    }
+    let Some(name) = parsed.path().strip_prefix("/buzz_nt_") else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "postgres" | "postgresql")
+        || !matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || name.len() != 24
+        || !name.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    admin.is_some_and(|admin| {
+        admin
+            .rsplit_once('/')
+            .is_some_and(|(authority, _)| value == format!("{authority}{}", parsed.path()))
+    })
+}
+
+#[test]
+fn fixture_url_admission_preserves_private_socket_and_fences_localhost() {
+    let local = "postgres://buzz@localhost/buzz_nt_0123456789abcdef01234567";
+    let admin = Some("postgres://buzz@localhost/postgres");
+    assert!(admitted_fixture_url(local, admin));
+    assert!(admitted_fixture_url(
+        "postgres://buzz@buzz-test.invalid/buzz_nt_fixture?host=/work/socket",
+        None
+    ));
+    for value in [
+        "postgres://buzz@remote/buzz_nt_0123456789abcdef01234567",
+        "postgres://buzz@localhost/production",
+        "postgres://buzz@localhost/buzz_nt_fixture",
+        "postgres://other@localhost/buzz_nt_0123456789abcdef01234567",
+        "postgres://buzz@localhost/buzz_nt_0123456789abcdef01234567?host=remote",
+        "postgres://buzz@buzz-test.invalid/buzz_nt_fixture?host=/tmp/socket",
+    ] {
+        assert!(!admitted_fixture_url(value, admin), "{value}");
+    }
+    assert!(!admitted_fixture_url(local, None));
+}
+
 struct Fixture {
     db: Db,
     pool: PgPool,
@@ -94,21 +147,10 @@ impl Fixture {
     async fn new() -> Self {
         let url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .expect("explicit disposable fixture URL required");
-        let parsed = url::Url::parse(&url).unwrap();
-        assert_eq!(
-            parsed.host_str(),
-            Some("buzz-test.invalid"),
-            "refusing non-fixture database host"
-        );
+        let admin = std::env::var("BUZZ_POSTGRES_ADMIN_URL").ok();
         assert!(
-            parsed.path().starts_with("/buzz_nt_"),
-            "refusing non-fixture database name"
-        );
-        assert!(
-            parsed
-                .query_pairs()
-                .any(|(k, v)| k == "host" && v.starts_with("/work/")),
-            "fixture must use private namespace socket"
+            admitted_fixture_url(&url, admin.as_deref()),
+            "refusing non-fixture database URL"
         );
         let pool = PgPoolOptions::new()
             .max_connections(6)
@@ -482,99 +524,105 @@ async fn event_write_failure_rolls_back_request_identity_and_decision_head() {
     assert!(f.store(&reject).await);
 }
 
-#[tokio::test]
-#[ignore = "requires disposable PostgreSQL fixture with server restart checkpoint"]
-async fn postgres_process_restart_retains_signed_pending_and_rejected_history() {
-    let checkpoint = std::env::var("BUZZ_DRAFT_CHECKPOINT").expect("owned fixture checkpoint path");
-    assert!(checkpoint.starts_with("/work/"));
-    if std::env::var("BUZZ_DRAFT_RESTART_PHASE").as_deref() == Ok("read") {
-        let (community, events): (Uuid, Vec<Event>) =
-            serde_json::from_slice(&std::fs::read(checkpoint).unwrap()).unwrap();
-        let url = std::env::var("BUZZ_TEST_DATABASE_URL").unwrap();
-        let pool = PgPoolOptions::new().connect(&url).await.unwrap();
-        let db = Db::from_pool(pool.clone());
-        let community = CommunityId::from_uuid(community);
-        // Inspect durable state before any replay can recreate a missing sidecar.
-        for (request, head, generation, state) in [
-            (&events[0], &events[0], 0_i64, "pending"),
-            (&events[1], &events[2], 1_i64, "rejected"),
-        ] {
-            let actual: (Vec<u8>, i64, String) = sqlx::query_as(
+mod external_infra_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires disposable PostgreSQL server restart and private checkpoint storage"]
+    async fn postgres_process_restart_retains_signed_pending_and_rejected_history() {
+        let checkpoint =
+            std::env::var("BUZZ_DRAFT_CHECKPOINT").expect("owned fixture checkpoint path");
+        assert!(checkpoint.starts_with("/work/"));
+        if std::env::var("BUZZ_DRAFT_RESTART_PHASE").as_deref() == Ok("read") {
+            let (community, events): (Uuid, Vec<Event>) =
+                serde_json::from_slice(&std::fs::read(checkpoint).unwrap()).unwrap();
+            let url = std::env::var("BUZZ_TEST_DATABASE_URL").unwrap();
+            let pool = PgPoolOptions::new().connect(&url).await.unwrap();
+            let db = Db::from_pool(pool.clone());
+            let community = CommunityId::from_uuid(community);
+            // Inspect durable state before any replay can recreate a missing sidecar.
+            for (request, head, generation, state) in [
+                (&events[0], &events[0], 0_i64, "pending"),
+                (&events[1], &events[2], 1_i64, "rejected"),
+            ] {
+                let actual: (Vec<u8>, i64, String) = sqlx::query_as(
                 "SELECT head_event_id,generation,state FROM agent_drafts WHERE community_id=$1 AND request_event_id=$2",
             ).bind(community.as_uuid()).bind(request.id.as_bytes().as_slice())
                 .fetch_one(&pool).await.unwrap();
+                assert_eq!(
+                    actual,
+                    (head.id.as_bytes().to_vec(), generation, state.into())
+                );
+            }
+            let searchable: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM events WHERE community_id=$1 AND search_tsv IS NOT NULL",
+            )
+            .bind(community.as_uuid())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
             assert_eq!(
-                actual,
-                (head.id.as_bytes().to_vec(), generation, state.into())
+                searchable, 0,
+                "requests and terminal outcomes remain unsearchable after restart"
             );
-        }
-        let searchable: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM events WHERE community_id=$1 AND search_tsv IS NOT NULL",
-        )
-        .bind(community.as_uuid())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            searchable, 0,
-            "requests and terminal outcomes remain unsearchable after restart"
-        );
-        for expected in &events {
-            let restored = db
-                .get_event_by_id(community, expected.id.as_bytes())
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(restored.event, *expected);
-            restored.event.verify().unwrap();
-            assert!(reader_authorized_for_event(
-                &restored.event,
-                &keys(1).public_key().to_hex()
+            for expected in &events {
+                let restored = db
+                    .get_event_by_id(community, expected.id.as_bytes())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(restored.event, *expected);
+                restored.event.verify().unwrap();
+                assert!(reader_authorized_for_event(
+                    &restored.event,
+                    &keys(1).public_key().to_hex()
+                ));
+                assert!(!reader_authorized_for_event(
+                    &restored.event,
+                    &keys(2).public_key().to_hex()
+                ));
+                assert!(!db.store_agent_draft(community, expected).await.unwrap().1);
+            }
+            let state: String = sqlx::query_scalar(
+                "SELECT state FROM agent_drafts WHERE community_id=$1 AND request_event_id=$2",
+            )
+            .bind(community.as_uuid())
+            .bind(events[1].id.as_bytes().as_slice())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(state, "rejected");
+            let replay = decision(
+                &keys(1),
+                &events[1],
+                &events[1],
+                1,
+                "applying",
+                "restart-replay",
+                STAMP + 86400,
+            );
+            assert!(matches!(
+                db.store_agent_draft(community, &replay).await,
+                Err(DbError::Conflict(_))
             ));
-            assert!(!reader_authorized_for_event(
-                &restored.event,
-                &keys(2).public_key().to_hex()
-            ));
-            assert!(!db.store_agent_draft(community, expected).await.unwrap().1);
+            println!("verified actual PostgreSQL restart: pending request and rejected history retain exact signatures and owner-only result gates");
+        } else {
+            let f = Fixture::new().await;
+            let pending = f.request(10, "pending across restart");
+            let rejected = f.request(11, "rejected across restart");
+            f.store(&pending).await;
+            f.store(&rejected).await;
+            let outcome = decision(
+                &f.owner, &rejected, &rejected, 1, "rejected", "owner", STAMP,
+            );
+            f.store(&outcome).await;
+            std::fs::write(
+                checkpoint,
+                serde_json::to_vec(&(f.community.as_uuid(), vec![pending, rejected, outcome]))
+                    .unwrap(),
+            )
+            .unwrap();
+            f.pool.close().await;
         }
-        let state: String = sqlx::query_scalar(
-            "SELECT state FROM agent_drafts WHERE community_id=$1 AND request_event_id=$2",
-        )
-        .bind(community.as_uuid())
-        .bind(events[1].id.as_bytes().as_slice())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(state, "rejected");
-        let replay = decision(
-            &keys(1),
-            &events[1],
-            &events[1],
-            1,
-            "applying",
-            "restart-replay",
-            STAMP + 86400,
-        );
-        assert!(matches!(
-            db.store_agent_draft(community, &replay).await,
-            Err(DbError::Conflict(_))
-        ));
-        println!("verified actual PostgreSQL restart: pending request and rejected history retain exact signatures and owner-only result gates");
-    } else {
-        let f = Fixture::new().await;
-        let pending = f.request(10, "pending across restart");
-        let rejected = f.request(11, "rejected across restart");
-        f.store(&pending).await;
-        f.store(&rejected).await;
-        let outcome = decision(
-            &f.owner, &rejected, &rejected, 1, "rejected", "owner", STAMP,
-        );
-        f.store(&outcome).await;
-        std::fs::write(
-            checkpoint,
-            serde_json::to_vec(&(f.community.as_uuid(), vec![pending, rejected, outcome])).unwrap(),
-        )
-        .unwrap();
-        f.pool.close().await;
     }
 }
