@@ -150,32 +150,27 @@ test("native settings show capability notices before their hooks or controls mou
   assert.deepEqual(nativeCalls, []);
 });
 
-test("persona controls disable native Start while keeping definition Edit available", async () => {
+test("persona controls disable native Start until managed agents are available", async () => {
   initializeBrowserCapabilities();
   const { ProfilePersonaPrimaryActions } = await import(
     "../../features/profile/ui/UserProfilePrimaryActions.tsx"
   );
   const { TooltipProvider } = await import("./tooltip.tsx");
   let starts = 0;
-  let edits = 0;
   const view = render(
     React.createElement(
       TooltipProvider,
       null,
       React.createElement(ProfilePersonaPrimaryActions, {
-        canEditAgent: true,
         disabled: false,
         onStartAgent: () => starts++,
-        onEditAgent: () => edits++,
       }),
     ),
   );
-  const start = view.getByRole("button", { name: "Start Agent" });
+  const start = view.getByRole("button", { name: "Start agent" });
   assert.equal(start.disabled, true);
   fireEvent.click(start);
-  fireEvent.click(view.getByRole("button", { name: "Edit" }));
   assert.equal(starts, 0);
-  assert.equal(edits, 1);
   await act(() => setCapabilityAvailable(Capability.ManagedAgents, true));
   fireEvent.click(start);
   assert.equal(starts, 1);
