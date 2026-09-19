@@ -1,3 +1,10 @@
+import { sendScopedRelayMessage } from "./relayPublication";
+import { capturePublicationScope } from "./publicationScope";
+import {
+  assertPublicationRelay,
+  assertPublicationSigner,
+  type PublicationScope,
+} from "./publicationScope";
 import { RelayLiveEvents } from "./relayLiveEvents";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import {
@@ -7,7 +14,6 @@ import {
 } from "@/shared/api/tauri";
 import type { PresenceStatus, RelayEvent } from "@/shared/api/types";
 import {
-  KIND_STREAM_MESSAGE,
   KIND_TYPING_INDICATOR,
   KIND_USER_STATUS,
   CHANNEL_EVENT_KINDS,
@@ -254,27 +260,15 @@ export class RelayClient {
     content: string,
     mentionPubkeys: string[] = [],
     extraTags: string[][] = [],
+    expectedScope: PublicationScope = capturePublicationScope(),
   ) {
-    await this.ensureConnected();
-
-    const tags: string[][] = [["h", channelId]];
-    for (const pubkey of mentionPubkeys) {
-      tags.push(["p", pubkey]);
-    }
-    for (const tag of extraTags) {
-      tags.push(tag);
-    }
-
-    const event = await signRelayEvent({
-      kind: KIND_STREAM_MESSAGE,
-      content: content.trim(),
-      tags,
-    });
-
-    return this.publishEvent(
-      event,
-      "Timed out while sending the message.",
-      "Failed to send the message.",
+    return sendScopedRelayMessage(
+      async () => {
+        await this.ensureConnected();
+      },
+      (event, timeout, error, scope) =>
+        this.publishEvent(event, timeout, error, scope),
+      { channelId, content, mentionPubkeys, extraTags, expectedScope },
     );
   }
 
@@ -711,9 +705,17 @@ export class RelayClient {
     event: RelayEvent,
     timeoutMessage: string,
     sendErrorMessage: string,
+    expectedScope?: PublicationScope,
   ) {
+    const validateScope = () => {
+      if (!expectedScope) return;
+      assertPublicationSigner(expectedScope, event.pubkey);
+      assertPublicationRelay(expectedScope, this.relayUrl);
+    };
+    validateScope();
     return publishSessionEvent(
       {
+        validateScope,
         generation: () => this.connectionGeneration,
         ownership: () => this.sessionEpoch,
         pendingEvents: this.pendingEvents,

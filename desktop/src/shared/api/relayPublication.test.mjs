@@ -47,7 +47,12 @@ function harness({
 } = {}) {
   scopes.setPublicationScope(PUBKEY, RELAY, true);
   const scope = scopes.capturePublicationScope();
+  const publisher = load("./relayEventPublisher.ts", {
+    "@/shared/api/relayRateLimitGate": { waitForRateLimit: () => admission },
+    "@/shared/api/relayClientTimings": { PUBLISH_TIMEOUT_MS: 1000 },
+  });
   const { RelayClient } = load("./relayClientSession.ts", {
+    "@/shared/api/relayEventPublisher": publisher,
     "./publicationScope": scopes,
     "./preparePublicationScope": {
       preparePublicationScope: async (scope) => scope,

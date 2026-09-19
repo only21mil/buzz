@@ -869,6 +869,30 @@ async function sendChannelMessage(
   }
   const parentEventId = optionalString(input, "parentEventId") ?? null;
   const requestedKind = optionalNumber(input, "kind") ?? 9;
+  const sentFromThreadTag = optionalStrings(input, "sentFromThreadTag");
+  if (sentFromThreadTag.length) {
+    if (requestedKind !== 9 || parentEventId)
+      throw new Error(
+        "sent-from-thread provenance requires a top-level stream message",
+      );
+    if (
+      (sentFromThreadTag.length !== 2 && sentFromThreadTag.length !== 3) ||
+      sentFromThreadTag[0] !== "buzz:sent-from-thread" ||
+      !/^[0-9a-f]{64}$/i.test(sentFromThreadTag[1].trim())
+    )
+      throw new Error("invalid sent-from-thread tag");
+    const excerpt = sentFromThreadTag[2];
+    if (
+      excerpt !== undefined &&
+      (!excerpt.trim() ||
+        Array.from(excerpt).length > 64 ||
+        Array.from(excerpt).some((character) => {
+          const point = character.codePointAt(0) ?? 0;
+          return point < 32 || (point >= 127 && point <= 159);
+        }))
+    )
+      throw new Error("invalid sent-from-thread excerpt");
+  }
   const mentions = validatePubkeys(optionalStrings(input, "mentionPubkeys"));
   const mediaTags = optionalStringArrays(input, "mediaTags");
   const emojiTags = optionalStringArrays(input, "emojiTags");
@@ -906,6 +930,7 @@ async function sendChannelMessage(
   tags.push(...mentions.map((pubkey) => ["p", pubkey]));
   tags.push(...mediaTags, ...mentionTags);
   if (kind === 9) tags.push(...emojiTags, ...linkPreviewTags);
+  if (sentFromThreadTag.length) tags.push(sentFromThreadTag);
 
   const published = await publishSignedEvent(
     identity,

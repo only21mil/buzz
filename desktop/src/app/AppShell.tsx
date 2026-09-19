@@ -1,4 +1,5 @@
 import * as React from "react";
+import { useDetachedToastScope } from "@/features/messages/ui/useDetachedToastScope";
 import { ProtectedGlobalOverlay } from "@protected-feature-components";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useLocation } from "@tanstack/react-router";
@@ -162,11 +163,17 @@ export function AppShell() {
     () => deriveShellRoute(location.pathname),
     [location.pathname],
   );
+  const identityQuery = useIdentityQuery();
+  useDetachedToastScope(
+    communitiesHook.activeCommunity?.relayUrl,
+    identityQuery.data?.pubkey,
+  );
   const {
     removeCommunity: handleRemoveCommunity,
     switchCommunity: handleSwitchCommunity,
   } = useCommunityNavigationTransitions({
     communities: communitiesHook,
+    currentSignerPubkey: identityQuery.data?.pubkey,
     goHome,
     selectedChannelId,
     selectedView,
@@ -181,7 +188,6 @@ export function AppShell() {
     ? locationSearchSection
     : DEFAULT_SETTINGS_SECTION;
   const startupReady = useDeferredStartup();
-  const identityQuery = useIdentityQuery();
   const { mutedChannelIds, muteChannel, unmuteChannel } = useChannelMutes(
     identityQuery.data?.pubkey,
     communitiesHook.activeCommunity?.relayUrl,

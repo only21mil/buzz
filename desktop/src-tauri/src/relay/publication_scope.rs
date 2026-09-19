@@ -111,7 +111,7 @@ impl MessagePublication {
         }
         Ok(Self {
             keys,
-            api_base_url: super::relay_http_base_url(&relay_url),
+            api_base_url: super::relay_api_base_url_with_override(state),
             relay_url,
             epoch: *epoch,
             owner: state.publication_epoch.clone(),
