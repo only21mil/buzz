@@ -1792,51 +1792,15 @@ mod tests {
     const ORDINARY: VerifiedSigner = VerifiedSigner([3; 32]);
 
     fn host() -> HostActivationCoordinates {
-        HostActivationCoordinates {
-            integrated_candidate_sha: GitOid::Sha256([4; 32]),
-            broker_build_identity: [5; 32],
-            host_profile_digest: [6; 32],
-            suite_identity: [7; 32],
-        }
+        crate::test_support::host(4)
     }
 
     fn permit(expires_at: u64) -> QualificationPermit {
-        QualificationPermit {
-            authorized_by: ROOT,
-            host: host(),
-            fixture_job: FixtureJobCoordinates {
-                request_digest: [8; 32],
-                manifest_digest: [9; 32],
-                isolation_profile_digest: [10; 32],
-                source_oid: GitOid::Sha256([11; 32]),
-                base_oid: GitOid::Sha256([12; 32]),
-                test_identity: [13; 32],
-            },
-            fixture_identity: [14; 32],
-            fixture_signer: FIXTURE,
-            nonce: [15; 32],
-            not_before: 10,
-            expires_at,
-            directive: None,
-        }
+        crate::test_support::permit(host(), crate::test_support::fixture_job(8), 10, expires_at)
     }
 
     fn grant(expires_at: u64) -> ActivationGrant {
-        ActivationGrant {
-            authorized_by: ROOT,
-            host: host(),
-            security_records_passed: 17,
-            security_records_total: 17,
-            probes_passed: 12,
-            probes_total: 12,
-            evidence_set_digest: [16; 32],
-            blocker_closure_digest: [17; 32],
-            all_blockers_closed: true,
-            ordinary_signer: ORDINARY,
-            max_capacity: 1,
-            minimum_admission_interval_seconds: 5,
-            expires_at,
-        }
+        crate::test_support::grant(host(), 5, expires_at)
     }
 
     fn admit() -> AdmitAttemptRequest {

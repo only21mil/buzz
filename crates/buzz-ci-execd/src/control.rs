@@ -15,8 +15,8 @@ use std::{
 
 use buzz_ci_broker_protocol::v2;
 use buzz_ci_broker_protocol::{
-    decode_request, decode_request_header, encode_response, BrokerResponse, BrokerState,
-    Conclusion, FrameHeader, Operation, Request, ResponseCode, HEADER_SIZE, PROTOCOL_VERSION,
+    BrokerResponse, BrokerState, Conclusion, FrameHeader, Operation, Request, ResponseCode,
+    HEADER_SIZE, PROTOCOL_VERSION,
 };
 use nix::{
     fcntl::{fcntl, FcntlArg, FdFlag},
@@ -277,81 +277,7 @@ impl<T: ControlDispatch + ?Sized> ControlDispatch for Box<T> {
     }
 }
 
-/// Encode the operation-specific capacity-zero response without constructing a
-/// legacy dispatcher.
-pub fn encode_not_provisioned_v2(
-    header: v2::FrameHeader,
-    request: v2::Request,
-    now: u64,
-) -> v2::EncodedFrame {
-    match request {
-        v2::Request::DescribeAttemptEvidence(value) => v2::encode_evidence_description_response(
-            header,
-            v2::EvidenceDescriptionResponse {
-                code: ResponseCode::NotProvisioned,
-                execution_binding_digest: value.coordinates.execution_binding_digest,
-                generation: value.coordinates.expected_generation,
-                request_frame_digest: value.request_frame_digest,
-                descriptor_set_digest: [0; 32],
-                item_count: 0,
-                items: [None; v2::MAX_EVIDENCE_ITEMS],
-                request_event_id: value.coordinates.request_event_id,
-                run_id: value.coordinates.run_id,
-                workflow_id: value.coordinates.workflow_id,
-                workflow_digest: value.coordinates.workflow_digest,
-                job_id: value.coordinates.job_id,
-                attempt: value.coordinates.attempt,
-            },
-        ),
-        v2::Request::ReadAttemptEvidence(value) => v2::encode_evidence_chunk_response(
-            header,
-            &v2::EvidenceChunkResponse {
-                code: ResponseCode::NotProvisioned,
-                execution_binding_digest: value.coordinates.execution_binding_digest,
-                generation: value.coordinates.expected_generation,
-                request_frame_digest: value.request_frame_digest,
-                kind: value.kind,
-                item_index: value.item_index,
-                descriptor_digest: value.descriptor_digest,
-                offset: value.offset,
-                total_length: 0,
-                bytes: Vec::new(),
-                request_event_id: value.coordinates.request_event_id,
-                run_id: value.coordinates.run_id,
-                workflow_id: value.coordinates.workflow_id,
-                workflow_digest: value.coordinates.workflow_digest,
-                job_id: value.coordinates.job_id,
-                attempt: value.coordinates.attempt,
-            },
-        ),
-        v2::Request::RegisterJobIntent(value) => {
-            let admission = value.admission;
-            v2::encode_intent_registration_response(
-                header,
-                v2::IntentRegistrationResponse {
-                    code: ResponseCode::NotProvisioned,
-                    retry_after_millis: 0,
-                    signed_request_digest: admission.signed_request_digest,
-                    job_intent_digest: admission.job_intent_digest,
-                    request_frame_digest: value.request_frame_digest,
-                    admission_message_digest: sha256_v2_admission(admission),
-                    registration_key_digest: v2::intent_registration_key_digest(&value),
-                    lane_manifest_digest: admission.lane_manifest_digest,
-                    run_id: admission.run_id,
-                    lane_epoch: admission.lane_epoch,
-                    admission_key_generation: admission.admission_key_generation,
-                    issued_at: admission.issued_at,
-                    expires_at: admission.expires_at,
-                    attempt: admission.attempt,
-                },
-            )
-        }
-        _ => v2::encode_response(
-            header,
-            crate::production_binding::empty_response(ResponseCode::NotProvisioned, now),
-        ),
-    }
-}
+pub use crate::closed_response::encode_not_provisioned_v2;
 
 /// Runtime dispatcher used until the durable activation adapter is installed.
 pub struct ClosedDispatch;
@@ -388,7 +314,6 @@ pub struct ControlServer<D> {
     peer_policy: PeerUidPolicy,
     dispatch: D,
     io_timeout: Duration,
-    allow_v1: bool,
 }
 
 impl<D: ControlDispatch> ControlServer<D> {
@@ -399,7 +324,6 @@ impl<D: ControlDispatch> ControlServer<D> {
             peer_policy,
             dispatch,
             io_timeout: IO_TIMEOUT,
-            allow_v1: true,
         }
     }
 
@@ -410,20 +334,17 @@ impl<D: ControlDispatch> ControlServer<D> {
         dispatch: D,
     ) -> Result<Self, ControlError> {
         listener.set_nonblocking(true).map_err(ControlError::Io)?;
-        let mut server = Self::new(listener, peer_policy, dispatch);
-        server.allow_v1 = false;
-        Ok(server)
+        Ok(Self::new(listener, peer_policy, dispatch))
     }
 
     /// Accept and process one connection. The caller owns loop policy.
     pub fn serve_once(&mut self) -> Result<(), ControlError> {
         let (stream, _) = self.listener.accept().map_err(ControlError::Accept)?;
-        serve_stream_mode(
+        serve_stream(
             stream,
             self.peer_policy,
             self.io_timeout,
             &mut self.dispatch,
-            self.allow_v1,
         )
     }
 
@@ -439,12 +360,11 @@ impl<D: ControlDispatch> ControlServer<D> {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
             Err(error) => return Err(ControlError::Accept(error)),
         };
-        serve_stream_mode(
+        serve_stream(
             stream,
             self.peer_policy,
             self.io_timeout,
             &mut self.dispatch,
-            self.allow_v1,
         )
         .map(|()| true)
     }
@@ -508,28 +428,17 @@ fn validate_listener_path(
     Ok(listener)
 }
 
-#[cfg(test)]
 fn serve_stream<D: ControlDispatch>(
     stream: UnixStream,
     peer_policy: PeerUidPolicy,
     timeout: Duration,
     dispatch: &mut D,
 ) -> Result<(), ControlError> {
-    serve_stream_mode(stream, peer_policy, timeout, dispatch, true)
-}
-
-fn serve_stream_mode<D: ControlDispatch>(
-    stream: UnixStream,
-    peer_policy: PeerUidPolicy,
-    timeout: Duration,
-    dispatch: &mut D,
-    allow_v1: bool,
-) -> Result<(), ControlError> {
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     let credentials = getsockopt(&stream, PeerCredentials).map_err(nix_io)?;
     let role = peer_policy.role_for_credentials(credentials.uid(), credentials.gid())?;
-    serve_verified_stream_protocol_mode(stream, role, dispatch, allow_v1)
+    serve_verified_stream(stream, role, dispatch)
 }
 
 fn serve_verified_stream<D: ControlDispatch>(
@@ -540,57 +449,16 @@ fn serve_verified_stream<D: ControlDispatch>(
     serve_verified_stream_mode(stream, role, dispatch, true)
 }
 
-fn serve_verified_stream_protocol_mode<D: ControlDispatch>(
-    stream: UnixStream,
-    role: PeerRole,
-    dispatch: &mut D,
-    allow_v1: bool,
-) -> Result<(), ControlError> {
-    if allow_v1 {
-        serve_verified_stream(stream, role, dispatch)
-    } else {
-        serve_verified_stream_mode_with_protocol(stream, role, dispatch, true, false)
-    }
-}
-
 fn serve_verified_stream_mode<D: ControlDispatch>(
-    stream: UnixStream,
-    role: PeerRole,
-    dispatch: &mut D,
-    require_write_shutdown: bool,
-) -> Result<(), ControlError> {
-    serve_verified_stream_mode_with_protocol(stream, role, dispatch, require_write_shutdown, true)
-}
-
-fn serve_verified_stream_mode_with_protocol<D: ControlDispatch>(
     mut stream: UnixStream,
     role: PeerRole,
     dispatch: &mut D,
     require_write_shutdown: bool,
-    allow_v1: bool,
 ) -> Result<(), ControlError> {
     let mut frame = [0_u8; HEADER_SIZE + v2::MAX_BODY_SIZE];
     read_exact_frame_part(&mut stream, &mut frame[..HEADER_SIZE], "short header")?;
     let version = u16::from_be_bytes([frame[4], frame[5]]);
     match version {
-        PROTOCOL_VERSION if allow_v1 => {
-            let (header, body_size) = decode_request_header(&frame[..HEADER_SIZE])
-                .map_err(|_| ControlError::Frame("malformed header"))?;
-            authorize_and_read_body(
-                &mut stream,
-                role,
-                header.operation,
-                &mut frame,
-                body_size,
-                require_write_shutdown,
-            )?;
-            let frame_size = HEADER_SIZE + body_size;
-            let (decoded_header, request) = decode_request(&frame[..frame_size])
-                .map_err(|_| ControlError::Frame("malformed body"))?;
-            debug_assert_eq!(decoded_header, header);
-            let response = dispatch.dispatch(header, request, unix_now()?);
-            write_all_fd(&stream, encode_response(header, response).as_bytes())
-        }
         v2::PROTOCOL_VERSION => {
             let (header, body_size) = v2::decode_request_header(&frame[..HEADER_SIZE])
                 .map_err(|_| ControlError::Frame("malformed header"))?;
@@ -731,10 +599,11 @@ mod tests {
     use std::{cell::Cell, io::Read, rc::Rc};
 
     use super::*;
-    use buzz_ci_broker_protocol::{
-        decode_response, encode_request, AdmitAttemptRequest, GitOid, HelloRequest, Request,
-        ResponseCode, TrustClass, MAX_FRAME_SIZE,
+    use buzz_ci_broker_protocol::v2::{
+        decode_request, decode_response, encode_request, AdmissionSignatureAlgorithm,
+        AdmitAttemptRequest, Request, MAX_FRAME_SIZE,
     };
+    use buzz_ci_broker_protocol::{GitOid, HelloRequest, ResponseCode, TrustClass};
 
     struct MaintenanceCounter(Rc<Cell<u64>>);
 
@@ -742,7 +611,7 @@ mod tests {
         fn dispatch(
             &mut self,
             _header: FrameHeader,
-            _request: Request,
+            _request: buzz_ci_broker_protocol::Request,
             _now: u64,
         ) -> BrokerResponse {
             unreachable!("maintenance test has no control traffic")
@@ -774,7 +643,7 @@ mod tests {
         serve_verified_stream(server, PeerRole::Runner, &mut ClosedDispatch::new()).unwrap_err()
     }
 
-    fn hello() -> buzz_ci_broker_protocol::EncodedFrame {
+    fn hello() -> v2::EncodedFrame {
         encode_request(
             [3; 16],
             Request::Hello(HelloRequest {
@@ -784,7 +653,7 @@ mod tests {
         )
     }
 
-    fn admit() -> buzz_ci_broker_protocol::EncodedFrame {
+    fn admit() -> v2::EncodedFrame {
         encode_request(
             [4; 16],
             Request::AdmitAttempt(AdmitAttemptRequest {
@@ -794,7 +663,12 @@ mod tests {
                 idempotency_digest: [4; 32],
                 source_pin_event_id: [5; 32],
                 workflow_digest: [6; 32],
-                job_manifest_digest: [7; 32],
+                job_intent_digest: [7; 32],
+                lane_manifest_digest: [12; 32],
+                admission_signature: [13; 64],
+                lane_epoch: 1,
+                admission_key_generation: 1,
+                admission_signature_algorithm: AdmissionSignatureAlgorithm::Bip340Secp256k1Sha256,
                 isolation_profile_digest: [8; 32],
                 run_id: [9; 16],
                 tip_oid: GitOid::Sha256([10; 32]),
@@ -1023,17 +897,13 @@ mod tests {
 
     #[test]
     fn production_protocol_mode_rejects_every_v1_frame() {
-        let encoded = hello();
+        let mut encoded = hello().as_bytes().to_vec();
+        encoded[4..6].copy_from_slice(&1_u16.to_be_bytes());
         let (client, server) = UnixStream::pair().expect("socketpair");
-        write_all_fd(&client, &encoded.as_bytes()[..HEADER_SIZE]).expect("write header");
-        let error = serve_verified_stream_mode_with_protocol(
-            server,
-            PeerRole::Runner,
-            &mut ClosedDispatch::new(),
-            false,
-            false,
-        )
-        .unwrap_err();
+        write_all_fd(&client, &encoded[..HEADER_SIZE]).expect("write header");
+        let error =
+            serve_verified_stream_mode(server, PeerRole::Runner, &mut ClosedDispatch::new(), false)
+                .unwrap_err();
         assert!(matches!(
             error,
             ControlError::Frame("version 1 is disabled")
@@ -1087,18 +957,12 @@ mod tests {
         assert_eq!(client_frame[4..6], v2::PROTOCOL_VERSION.to_be_bytes());
         assert_ne!(client_frame[4..6], PROTOCOL_VERSION.to_be_bytes());
 
-        // Production mode (`allow_v1 == false`) reads the client's exact bytes
+        // The server reads the client's exact bytes
         // past the version check and answers on the same connection.
         let (mut client, server) = UnixStream::pair().expect("socketpair");
         write_all_fd(&client, &client_frame).expect("write client frame");
-        serve_verified_stream_mode_with_protocol(
-            server,
-            PeerRole::Control,
-            &mut ClosedDispatch::new(),
-            false,
-            false,
-        )
-        .expect("version 2 qualification frame is served");
+        serve_verified_stream_mode(server, PeerRole::Control, &mut ClosedDispatch::new(), false)
+            .expect("version 2 qualification frame is served");
         let mut response = Vec::new();
         client.read_to_end(&mut response).expect("read response");
         assert_eq!(response[..4], *b"BZCI");
@@ -1109,11 +973,10 @@ mod tests {
         downgraded[4..6].copy_from_slice(&PROTOCOL_VERSION.to_be_bytes());
         let (client, server) = UnixStream::pair().expect("socketpair");
         write_all_fd(&client, &downgraded[..HEADER_SIZE]).expect("write downgraded header");
-        let error = serve_verified_stream_mode_with_protocol(
+        let error = serve_verified_stream_mode(
             server,
             PeerRole::Control,
             &mut ClosedDispatch::new(),
-            false,
             false,
         )
         .unwrap_err();

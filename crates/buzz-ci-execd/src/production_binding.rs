@@ -1828,29 +1828,7 @@ fn record_response(
     }
 }
 
-/// Construct the v2 zero-capacity response used by control transport fallback.
-pub fn empty_response(code: ResponseCode, now: u64) -> BrokerResponse {
-    BrokerResponse {
-        code,
-        retry_after_millis: 0,
-        attempt_id: [0; 16],
-        run_id: [0; 16],
-        accepted_request_digest: [0; 32],
-        job_intent_digest: [0; 32],
-        execution_binding_digest: [0; 32],
-        tip_oid: None,
-        broker_state: BrokerState::Reconciling,
-        conclusion: Conclusion::None,
-        terminal_reason: 0,
-        generation: 0,
-        accepted_at: 0,
-        updated_at: now,
-        lease_generation: 0,
-        evidence_set_digest: [0; 32],
-        teardown_digest: [0; 32],
-        attempt: 0,
-    }
-}
+pub use crate::closed_response::empty_response;
 
 fn error_response(error: BindingError, now: u64) -> BrokerResponse {
     empty_response(error_code(error), now)

@@ -64,26 +64,6 @@ pub enum RunnerMode {
     },
 }
 
-/// Test-only shape retained for the closed legacy host unit tests. Production
-/// configuration cannot deserialize this shape and the binary cannot compose it.
-#[cfg(test)]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RunnerHostConfig {
-    pub owner_pubkey: String,
-    pub manifest_verification_key: String,
-    pub relay_signer: String,
-    pub broker_socket: PathBuf,
-    pub broker_uid: u32,
-    pub executor_program: PathBuf,
-    pub evidence_directory: PathBuf,
-    pub journal_directory: PathBuf,
-    pub max_argv_items: usize,
-    pub max_argv_bytes: usize,
-    pub max_environment_items: usize,
-    pub max_environment_bytes: usize,
-    pub max_output_bytes: usize,
-}
-
 /// Fail-closed configuration loading failures.
 #[derive(Debug, Error)]
 pub enum ConfigError {

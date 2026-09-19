@@ -1263,23 +1263,11 @@ mod tests {
     const ORDINARY_SIGNER: VerifiedSigner = VerifiedSigner([3; 32]);
 
     fn host_coordinates() -> HostActivationCoordinates {
-        HostActivationCoordinates {
-            integrated_candidate_sha: GitOid::Sha256([10; 32]),
-            broker_build_identity: [11; 32],
-            host_profile_digest: [12; 32],
-            suite_identity: [13; 32],
-        }
+        crate::test_support::host(10)
     }
 
     fn fixture_job() -> FixtureJobCoordinates {
-        FixtureJobCoordinates {
-            request_digest: [4; 32],
-            manifest_digest: [5; 32],
-            isolation_profile_digest: [6; 32],
-            source_oid: GitOid::Sha256([7; 32]),
-            base_oid: GitOid::Sha256([8; 32]),
-            test_identity: [9; 32],
-        }
+        crate::test_support::fixture_job(4)
     }
 
     fn ordinary_job() -> OrdinaryJobCoordinates {
@@ -1350,17 +1338,7 @@ mod tests {
     }
 
     fn permit() -> QualificationPermit {
-        QualificationPermit {
-            authorized_by: ROOT,
-            host: host_coordinates(),
-            fixture_job: fixture_job(),
-            fixture_identity: [14; 32],
-            fixture_signer: FIXTURE_SIGNER,
-            nonce: [15; 32],
-            not_before: 10,
-            expires_at: 30,
-            directive: None,
-        }
+        crate::test_support::permit(host_coordinates(), fixture_job(), 10, 30)
     }
 
     fn qualification_admission() -> QualificationAdmission {
@@ -1400,21 +1378,7 @@ mod tests {
     }
 
     fn grant() -> ActivationGrant {
-        ActivationGrant {
-            authorized_by: ROOT,
-            host: host_coordinates(),
-            security_records_passed: 17,
-            security_records_total: 17,
-            probes_passed: 12,
-            probes_total: 12,
-            evidence_set_digest: [16; 32],
-            blocker_closure_digest: [17; 32],
-            all_blockers_closed: true,
-            ordinary_signer: ORDINARY_SIGNER,
-            max_capacity: 1,
-            minimum_admission_interval_seconds: 5,
-            expires_at: 100,
-        }
+        crate::test_support::grant(host_coordinates(), 5, 100)
     }
 
     fn seccomp_readback(path: &str, digest: &str) -> SeccompFileReadback {

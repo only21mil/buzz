@@ -14,8 +14,10 @@ The former `/usr/libexec/buzz-ci-acceptance-ctl` launcher spoke broker
 protocol version 1, which production execd refuses, and its `qualification_v1`
 fixture lane has no server in the production composition. The unused
 in-memory v1 activation dispatcher and runner client have also been removed.
-The execd self-check exercises the v2 codec. The manifest no
-longer installs it, and no sudoers rule is shipped. The only qualification
+All execd control servers now reject v1 before reading the body; no transport
+compatibility switch remains. The execd self-check exercises the runtime
+capacity-zero response encoder through the v2 codec. The manifest no longer
+installs the old launcher, and no sudoers rule is shipped. The only qualification
 client that production execd serves is `buzz-ci-production-qualification`
 (protocol version 2, `AdmitQualification`), which is built and invoked by the
 activation package rather than by this substrate.
