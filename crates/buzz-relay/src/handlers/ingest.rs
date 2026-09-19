@@ -1205,26 +1205,6 @@ impl ReplyAncestry {
     pub fn parent_hex(&self) -> String {
         hex::encode(&self.parent_event_id)
     }
-
-    /// Build the DB thread-metadata params for the signed reply event.
-    pub fn into_thread_meta(
-        self,
-        reply_event_id: Vec<u8>,
-        reply_created_at: chrono::DateTime<Utc>,
-        channel_id: Uuid,
-    ) -> ThreadMetadataOwned {
-        ThreadMetadataOwned {
-            event_id: reply_event_id,
-            event_created_at: reply_created_at,
-            channel_id,
-            parent_event_id: self.parent_event_id,
-            parent_event_created_at: self.parent_event_created_at,
-            root_event_id: self.root_event_id,
-            root_event_created_at: self.root_event_created_at,
-            depth: self.depth,
-            broadcast: false,
-        }
-    }
 }
 
 /// Resolve thread ancestry for a reply built by the relay (workflow path).
