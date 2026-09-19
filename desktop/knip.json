@@ -1,0 +1,26 @@
+{
+  "entry": [
+    "src/main.tsx",
+    "src/app/routes.ts",
+    "src/app/routes/**/*.{ts,tsx}",
+    "src/**/*.test.mjs",
+    "src/**/*.typecheck.ts",
+    "src/platform/web/shims/*.ts",
+    "src/testing/e2eBridge*.ts",
+    "scripts/**/*.mjs",
+    "tests/**/*.{ts,mjs}",
+    "test-loader*.mjs",
+    "*.config.{ts,js}"
+  ],
+  "project": [
+    "src/**/*.{ts,tsx,mjs}",
+    "scripts/**/*.mjs",
+    "tests/**/*.{ts,mjs}",
+    "*.{ts,js,mjs}"
+  ],
+  "paths": {
+    "@/*": ["./src/*"],
+    "@features-manifest": ["../preview-features.json"]
+  },
+  "ignoreDependencies": ["tw-animate-css"]
+}
