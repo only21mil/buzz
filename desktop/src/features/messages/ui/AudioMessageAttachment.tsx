@@ -1,4 +1,5 @@
 import * as React from "react";
+import { isTauri } from "@tauri-apps/api/core";
 import { AlertCircle, Download, Loader2, X } from "lucide-react";
 import { motion, useReducedMotion } from "motion/react";
 import { toast } from "sonner";
@@ -50,6 +51,7 @@ export function renderAudioMessageAttachment(
   label: string,
   downloadUrl?: string,
 ) {
+  if (!isTauri()) return null;
   const attachment = resolveAudioAttachment(entry, href, label);
   return attachment ? (
     <AudioMessageAttachment
