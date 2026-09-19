@@ -6,8 +6,6 @@ on: # zizmor: ignore[dangerous-triggers] untrusted PR code is inspected only in 
     types: [opened, reopened, ready_for_review, synchronize]
   issue_comment:
     types: [created]
-  push:
-    branches: [main]
   repository_dispatch:
     types: [codex-security-review-reconcile]
 
