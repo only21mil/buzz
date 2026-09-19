@@ -63,10 +63,6 @@ use builderlab::*;
 pub use commands::print_agent_access_owner_only_probe_if_requested;
 use commands::*;
 use deep_link::*;
-use huddle::audio_output::{
-    get_audio_output_device, list_audio_output_devices, set_audio_output_device,
-};
-use huddle::reconnect::reconnect_huddle_audio;
 use huddle::{
     add_agent_to_huddle,
     audio_output::{get_audio_output_device, list_audio_output_devices, set_audio_output_device},
@@ -569,8 +565,6 @@ pub fn run() {
             sign_project_issue_assignment,
             sign_project_issue_unassignment,
             sign_project_pull_request_review_request,
-            sign_project_issue_assignment,
-            sign_project_issue_unassignment,
             publish_project_pull_request_merged_status,
             merge_project_pull_request,
             open_project_terminal,
