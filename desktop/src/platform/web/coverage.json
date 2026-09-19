@@ -284,7 +284,6 @@
     "set_persona_shared",
     "set_pocket_voice",
     "set_team_shared",
-    "set_thread_scoped_acp_sessions",
     "set_tts_enabled",
     "set_voice_input_mode",
     "sign_project_issue_assignment",
@@ -319,5 +318,34 @@
     "upload_media",
     "validate_repos_dir"
   ],
-  "pending": {}
+  "pending": {
+    "acknowledge_pending_navigation_deep_link": "desktop_shared: browser command implementation pending after upstream merge",
+    "announce_archive_sync_epoch": "desktop_shared: browser command implementation pending after upstream merge",
+    "assign_bestie": "desktop_shared: browser command implementation pending after upstream merge",
+    "cancel_link_preview_metadata": "desktop_shared: browser command implementation pending after upstream merge",
+    "channel_head_cache_clear": "desktop_shared: browser command implementation pending after upstream merge",
+    "channel_head_cache_load": "desktop_shared: browser command implementation pending after upstream merge",
+    "channel_head_cache_store": "desktop_shared: browser command implementation pending after upstream merge",
+    "clear_bestie_assignment": "desktop_shared: browser command implementation pending after upstream merge",
+    "clear_pending_navigation_deep_links": "desktop_shared: browser command implementation pending after upstream merge",
+    "fetch_persona_catalog": "desktop_shared: browser command implementation pending after upstream merge",
+    "get_agent_usage_series": "desktop_shared: browser command implementation pending after upstream merge",
+    "get_bestie_assignment": "desktop_shared: browser command implementation pending after upstream merge",
+    "get_channel_reconnect_repair": "desktop_shared: browser command implementation pending after upstream merge",
+    "get_open_channel_directory": "desktop_shared: browser command implementation pending after upstream merge",
+    "get_project_local_repo_file_content": "desktop_shared: browser command implementation pending after upstream merge",
+    "get_project_repo_file_content": "desktop_shared: browser command implementation pending after upstream merge",
+    "observed_unread_ingest": "desktop_shared: browser command implementation pending after upstream merge",
+    "observed_unread_open_scope": "desktop_shared: browser command implementation pending after upstream merge",
+    "open_project_repository_folder": "desktop_shared: browser command implementation pending after upstream merge",
+    "publish_project_owner_announcement": "desktop_shared: browser command implementation pending after upstream merge",
+    "release_link_preview_metadata": "desktop_shared: browser command implementation pending after upstream merge",
+    "release_media_upload": "desktop_shared: browser command implementation pending after upstream merge",
+    "resolve_bestie_conversation": "desktop_shared: browser command implementation pending after upstream merge",
+    "set_agent_avatar_communities": "desktop_shared: browser command implementation pending after upstream merge",
+    "start_archive_sync": "desktop_shared: browser command implementation pending after upstream merge",
+    "stop_archive_sync": "desktop_shared: browser command implementation pending after upstream merge",
+    "take_pending_navigation_deep_link": "desktop_shared: browser command implementation pending after upstream merge",
+    "unread_catch_up": "desktop_shared: browser command implementation pending after upstream merge"
+  }
 }

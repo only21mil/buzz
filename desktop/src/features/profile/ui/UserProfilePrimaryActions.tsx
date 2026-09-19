@@ -1,3 +1,4 @@
+import { Capability, useCapability } from "@/platform/web/capabilities";
 import type { LucideIcon } from "lucide-react";
 import type { ReactNode, Ref } from "react";
 import {
@@ -63,6 +64,7 @@ export function ProfilePrimaryActions({
   unfollowMutation: ReturnType<typeof useUnfollowMutation>;
   wavePending?: boolean;
 }) {
+  const managedAgentsAvailable = useCapability(Capability.ManagedAgents);
   const showFollowAction = useFeatureEnabled("pulse");
   const followToggleMutation = isFollowing ? unfollowMutation : followMutation;
 
@@ -96,7 +98,11 @@ export function ProfilePrimaryActions({
       {onAgentPrimaryAction && agentActionLabel ? (
         <ProfileActionTile
           active
-          disabled={agentActionDisabled || Boolean(agentStartBlockReason)}
+          disabled={
+            !managedAgentsAvailable ||
+            agentActionDisabled ||
+            Boolean(agentStartBlockReason)
+          }
           title={agentStartBlockReason}
           icon={agentActionLive ? Square : Play}
           label={agentActionLabel}
@@ -106,7 +112,7 @@ export function ProfilePrimaryActions({
       ) : null}
       {onAgentRestart ? (
         <ProfileActionTile
-          disabled={agentActionDisabled}
+          disabled={!managedAgentsAvailable || agentActionDisabled}
           icon={RefreshCw}
           label="Restart agent"
           onClick={onAgentRestart}
@@ -169,6 +175,7 @@ export function ProfilePersonaPrimaryActions({
   disabled: boolean;
   onStartAgent: () => void;
 }) {
+  const managedAgentsAvailable = useCapability(Capability.ManagedAgents);
   return (
     <ProfileActionGroup
       className={className}
@@ -177,7 +184,7 @@ export function ProfilePersonaPrimaryActions({
     >
       <ProfileActionTile
         active
-        disabled={disabled}
+        disabled={disabled || !managedAgentsAvailable}
         icon={Play}
         label="Start agent"
         onClick={onStartAgent}

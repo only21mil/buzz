@@ -1,3 +1,8 @@
+import {
+  getStorageItem,
+  setStorageItem,
+  removeStorageItem,
+} from "@/shared/lib/safeStorage";
 import * as React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
@@ -59,9 +64,7 @@ function readStoredPresencePreference(pubkey: string): PresencePreference {
     return null;
   }
 
-  const value = window.localStorage.getItem(
-    presencePreferenceStorageKey(pubkey),
-  );
+  const value = getStorageItem(presencePreferenceStorageKey(pubkey));
   return value === "auto" || value === "away" || value === "offline"
     ? value
     : null;
@@ -76,11 +79,11 @@ function writeStoredPresencePreference(
   }
 
   if (preference === null) {
-    window.localStorage.removeItem(presencePreferenceStorageKey(pubkey));
+    removeStorageItem(presencePreferenceStorageKey(pubkey));
     return;
   }
 
-  window.localStorage.setItem(presencePreferenceStorageKey(pubkey), preference);
+  setStorageItem(presencePreferenceStorageKey(pubkey), preference);
 }
 
 function resolveAutomaticPresenceStatusSync(

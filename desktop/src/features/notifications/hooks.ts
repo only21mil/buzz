@@ -1,3 +1,4 @@
+import { getStorageItem, setStorageItem } from "@/shared/lib/safeStorage";
 import * as React from "react";
 
 import { useHomeFeedQuery } from "@/features/home/hooks";
@@ -128,9 +129,7 @@ function readStoredNotificationSettings(pubkey: string): NotificationSettings {
     return DEFAULT_NOTIFICATION_SETTINGS;
   }
 
-  const rawValue = window.localStorage.getItem(
-    notificationSettingsStorageKey(pubkey),
-  );
+  const rawValue = getStorageItem(notificationSettingsStorageKey(pubkey));
   if (!rawValue) {
     return DEFAULT_NOTIFICATION_SETTINGS;
   }
@@ -150,7 +149,7 @@ function writeStoredNotificationSettings(
     return;
   }
 
-  window.localStorage.setItem(
+  setStorageItem(
     notificationSettingsStorageKey(pubkey),
     JSON.stringify(settings),
   );
