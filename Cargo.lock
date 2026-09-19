@@ -804,7 +804,6 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "buzz-core",
- "buzz-persona",
  "buzz-sdk",
  "chrono",
  "clap",
@@ -835,24 +834,17 @@ name = "buzz-admin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "buzz-audit",
- "buzz-auth",
  "buzz-core",
  "buzz-db",
- "buzz-media",
  "buzz-pubsub",
- "buzz-search",
- "buzz-workflow",
  "clap",
  "deadpool-redis",
  "hex",
  "nostr",
  "rustls",
  "serde_json",
- "sqlx",
  "tokio",
  "tracing",
- "url",
  "uuid",
 ]
 
@@ -906,7 +898,6 @@ dependencies = [
  "buzz-core",
  "chrono",
  "futures-util",
- "hex",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -930,7 +921,6 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror 2.0.18",
  "tokio",
- "tracing",
  "url",
  "uuid",
 ]
@@ -1299,7 +1289,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.29.0",
- "url",
  "zeroize",
 ]
 
@@ -1320,7 +1309,6 @@ version = "0.1.0"
 dependencies = [
  "buzz-auth",
  "buzz-core",
- "chrono",
  "deadpool-redis",
  "futures-util",
  "nostr",
@@ -1351,7 +1339,6 @@ dependencies = [
  "minicbor",
  "nostr",
  "proptest",
- "rand 0.10.1",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
@@ -1442,9 +1429,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "deadpool-redis",
- "futures-util",
  "hex",
- "hmac 0.13.0",
  "iroh",
  "nostr",
  "postcard",
@@ -1465,7 +1450,6 @@ version = "0.1.0"
 dependencies = [
  "buzz-core",
  "nostr",
- "serde",
  "serde_json",
  "thiserror 2.0.18",
  "uuid",
@@ -1507,7 +1491,6 @@ dependencies = [
  "reqwest 0.13.4",
  "rust-s3",
  "rustls",
- "serde",
  "serde_json",
  "sha2 0.11.0",
  "sqlx",
