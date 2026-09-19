@@ -277,3 +277,44 @@ The following upstream-whole files have matching fork tests:
 - `mobile/lib/shared/widgets/avatar_image.dart`
 - `mobile/lib/shared/widgets/frosted_app_bar.dart`
 - `mobile/lib/shared/widgets/ios_glass_navigation_button.dart`
+
+## buzz-acp accepted hybrid
+
+The integration accepts the fork's `pool.rs`, `queue.rs`, and `lib.rs` design
+with selected upstream behavior. A full rewrite onto upstream's layout is not
+part of this merge. This preserves tested session ownership and cancellation
+behavior while incorporating the following upstream features:
+
+- Hydrated thread context, model capability refresh and post-switch identity,
+  per-session startup effort, and shared project-home prompt guidance.
+- Nonblocking reap of completed respawn tasks and `PromptChannelInfo::default`.
+- Provenance-aware pricing identity, cache-read/write accounting, missing and
+  overflowed counter handling, and standard Claude/Codex usage parsing.
+- Correlated model-control acknowledgements. Both idle and busy picks return
+  provisional `sent`; only adapter application emits terminal `switched`.
+  Rejection or setup failure emits a correlated failure. A pending pick keeps
+  its original channel and is consumed once.
+
+We deliberately retain the fork's async close/delete/resume lifecycle, exact
+session-scope routing, bounded hold queues, inbox admission, stop/self-wake
+handling, slash commands, and shared repository-backed project authority.
+Tests naming these contracts include
+`close_session_preserves_final_pending_metric_then_forgets_baseline`,
+`test_shutdown_closes_every_live_session_but_keeps_cold_history`,
+`affinity_expired_dispatch_survives_exhaustion_and_preserves_inbox`,
+`test_discovery_without_metadata_stays_fail_closed_at_author_gate`,
+`stop_after_a_steer_took_control_discards_the_returning_batch`, and
+`self_wake_keeps_policy_rules_dedup_and_normal_queue_scheduling`.
+Upstream's wholesale pool/queue/lib admission and dispatch layout, its
+channel-description/huddle prompt additions, and its `NewSessionChannelContext`
+caller reshaping are not adopted here. Replacing the fork paths would require
+re-proving those contracts; the accepted merge does not claim those differences
+are resolved.
+
+For a future full port, exact comparisons against pinned upstream `5511b56fc`
+are saved outside the repository under
+`/home/victor/work/buzz_upstream/reports/rust_acp_workflow-hunks/`:
+`um9e-pool-remaining.patch`, `um9e-lib-remaining.patch`, and
+`um9e-queue-remaining.patch`. These `*remaining.patch` files include intentional
+fork differences, not just missing features. The decision and check receipt is
+`/home/victor/work/buzz_upstream/reports/rust_acp_workflow.md`.
