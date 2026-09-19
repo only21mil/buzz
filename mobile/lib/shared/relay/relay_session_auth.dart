@@ -3,7 +3,7 @@ part of 'relay_session.dart';
 String buildNip98AuthHeader({
   required String method,
   required String url,
-  required List<int> bodyBytes,
+  List<int>? bodyBytes,
   required String? nsec,
 }) {
   if (nsec == null || nsec.isEmpty) {
@@ -13,17 +13,19 @@ String buildNip98AuthHeader({
   if (privkeyHex.isEmpty) {
     throw Exception('Invalid nsec');
   }
-  final payloadHash = SHA256Digest()
-      .process(Uint8List.fromList(bodyBytes))
-      .map((byte) => byte.toRadixString(16).padLeft(2, '0'))
-      .join();
+  final payloadHash = bodyBytes == null
+      ? null
+      : SHA256Digest()
+            .process(Uint8List.fromList(bodyBytes))
+            .map((byte) => byte.toRadixString(16).padLeft(2, '0'))
+            .join();
   final event = nostr.Event.from(
     kind: 27235,
     content: '',
     tags: [
       ['u', url],
       ['method', method.toUpperCase()],
-      ['payload', payloadHash],
+      if (payloadHash != null) ['payload', payloadHash],
       ['nonce', const Uuid().v4()],
     ],
     secretKey: privkeyHex,

@@ -12,6 +12,8 @@ import '../../shared/push/push_presentation_export_recovery.dart';
 import '../../shared/relay/relay.dart';
 import '../../shared/theme/theme_provider.dart';
 import '../../shared/utils/string_utils.dart';
+import '../notifications/live_notification_dispatcher.dart';
+import '../../shared/profile/user_cache_provider.dart';
 import 'channel.dart';
 import 'channel_management_provider.dart'
     show ChannelMember, channelDetailsProvider;
@@ -649,6 +651,7 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
     final myPk = ref.read(myPubkeyProvider);
     final mutedChannelIds = _mutedChannelIds();
 
+    Channel? notificationChannel;
     state = state.whenData((channels) {
       final idx = channels.indexWhere((c) => c.id == channelId);
       if (idx == -1) {
@@ -657,6 +660,7 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
       }
       final updated = List<Channel>.of(channels);
       final channel = updated[idx];
+      notificationChannel = channel;
 
       if (myPk != null && event.pubkey.toLowerCase() == myPk.toLowerCase()) {
         _recordSelfThreadInterest(event, myPk);
@@ -685,6 +689,44 @@ class ChannelsNotifier extends AsyncNotifier<List<Channel>> {
 
       return updated;
     });
+    final channel = notificationChannel;
+    if (channel != null && myPk != null) {
+      unawaited(
+        ref
+            .read(liveNotificationDispatcherProvider)
+            .dispatch(
+              event: event,
+              channel: channel,
+              myPubkey: myPk,
+              senderName: _notificationSenderName(channel, event.pubkey),
+              participatedRootIds: _participatedRootIds,
+              followedRootIds: _followedRootIds(),
+              authoredRootIds: _authoredRootIds,
+              mutedChannelIds: mutedChannelIds,
+            ),
+      );
+    }
+  }
+
+  String? _notificationSenderName(Channel channel, String pubkey) {
+    final normalizedPubkey = pubkey.toLowerCase();
+    final cachedName = ref
+        .read(userCacheProvider)[normalizedPubkey]
+        ?.displayName
+        ?.trim();
+    if (cachedName?.isNotEmpty == true) return cachedName;
+
+    if (!channel.isDm) return null;
+    final participantIndex = channel.participantPubkeys.indexWhere(
+      (participantPubkey) =>
+          participantPubkey.toLowerCase() == normalizedPubkey,
+    );
+    if (participantIndex < 0 ||
+        participantIndex >= channel.participants.length) {
+      return null;
+    }
+    final participantName = channel.participants[participantIndex].trim();
+    return participantName.isEmpty ? null : participantName;
   }
 
   Set<String> _mutedChannelIds() => {

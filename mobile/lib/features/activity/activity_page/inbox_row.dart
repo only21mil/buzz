@@ -82,7 +82,7 @@ class _InboxRow extends HookConsumerWidget {
     final profile = profiles[senderPubkey];
     // The shared label contract: blank cached names (empty or whitespace-only
     // are relay-valid) fall back to the compact npub, never a blank sender.
-    final senderLabel = profile?.label ?? shortPubkey(item.item.pubkey);
+    final senderLabel = profile?.label ?? truncateNpub(item.item.pubkey);
     final profileMentionNames = {
       for (final pubkey in mentionPubkeys)
         if (profiles[pubkey]?.displayName?.trim().isNotEmpty == true)

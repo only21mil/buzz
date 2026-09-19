@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:app_badge_plus/app_badge_plus.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 
 import 'package:hooks_riverpod/hooks_riverpod.dart';
@@ -35,6 +36,7 @@ import 'shared/deeplink/pending_deep_link_provider.dart';
 import 'shared/emoji/emoji_burst.dart';
 import 'shared/push/push_subscription_provider.dart';
 import 'shared/push/push_relay_capability_provider.dart';
+import 'shared/notifications/notifications.dart';
 import 'shared/relay/relay.dart';
 import 'shared/read_state/read_state_provider.dart';
 import 'shared/theme/theme.dart';
@@ -49,30 +51,6 @@ const _starterChannels = [
     description: 'Say hi, ask a question, or share what brought you here.',
   ),
 ];
-
-final _inviteRelayConnectedProvider = FutureProvider.family<void, String>((
-  ref,
-  expectedRelayUrl,
-) async {
-  final currentConfig = ref.read(relayConfigProvider);
-  if (currentConfig.baseUrl != expectedRelayUrl) {
-    throw StateError('Active community changed before invite recovery');
-  }
-  if (ref.read(relaySessionProvider).status == SessionStatus.connected) return;
-
-  final connected = Completer<void>();
-  ref.listen(relaySessionProvider, (_, next) {
-    if (connected.isCompleted) return;
-    if (ref.read(relayConfigProvider).baseUrl != expectedRelayUrl) {
-      connected.completeError(
-        StateError('Active community changed during invite recovery'),
-      );
-    } else if (next.status == SessionStatus.connected) {
-      connected.complete();
-    }
-  });
-  await connected.future;
-});
 
 /// App-level bridge from invite joining to the channels feature.
 class MobileInviteJoinRecovery implements InviteJoinRecovery {
@@ -145,11 +123,7 @@ class MobileInviteJoinRecovery implements InviteJoinRecovery {
           _ensureScopeCurrent();
           channels = await _loadChannels();
           _ensureScopeCurrent();
-          channel =
-              _findStarterChannel(channels, starter.slug) ??
-              channels
-                  .where((candidate) => candidate.id == channelId)
-                  .firstOrNull;
+          channel = _findStarterChannel(channels, starter.slug);
           if (channel == null) rethrow;
         }
       }
@@ -229,14 +203,49 @@ InviteJoinRecovery buildMobileInviteJoinRecovery(
     }
   }
 
+  Future<void> waitForConnection() async {
+    ensureScopeCurrent();
+    if (ref.read(relaySessionProvider).status == SessionStatus.connected) {
+      return;
+    }
+
+    // Each attempt owns its wait. A timeout or scope change must not leave a
+    // cached failure (or a cached connection) for the next Retry setup.
+    final connected = Completer<void>();
+    void checkConnection() {
+      if (connected.isCompleted) return;
+      if (!isScopeCurrent()) {
+        connected.completeError(
+          StateError('Active community changed during invite recovery'),
+        );
+      } else if (ref.read(relaySessionProvider).status ==
+          SessionStatus.connected) {
+        connected.complete();
+      }
+    }
+
+    final configSubscription = ref.listen(
+      relayConfigProvider,
+      (_, _) => checkConnection(),
+    );
+    final sessionSubscription = ref.listen(
+      relaySessionProvider,
+      (_, _) => checkConnection(),
+    );
+    try {
+      await connected.future.timeout(const Duration(seconds: 15));
+    } finally {
+      configSubscription.close();
+      sessionSubscription.close();
+    }
+  }
+
   return MobileInviteJoinRecovery(
     loadChannels: () async {
       ensureScopeCurrent();
       await ref.read(activeCommunityProvider.future);
       ensureScopeCurrent();
-      await ref
-          .read(_inviteRelayConnectedProvider(scope.relayHttpOrigin).future)
-          .timeout(const Duration(seconds: 15));
+      await waitForConnection();
       ensureScopeCurrent();
       await ref.read(channelsProvider.notifier).refresh(fetchDirectory: true);
       ensureScopeCurrent();
@@ -358,6 +367,35 @@ class App extends HookConsumerWidget {
     // Start listening for buzz:// links immediately (even pre-auth) so a
     // cold-start link survives until the authenticated UI can dispatch it.
     ref.watch(pendingDeepLinkProvider);
+
+    final notificationBridge =
+        !kIsWeb && defaultTargetPlatform == TargetPlatform.android
+        ? ref.watch(androidNotificationBridgeProvider)
+        : null;
+    useEffect(() {
+      final bridge = notificationBridge;
+      if (bridge == null) return null;
+
+      void dispatchRoute(String route) {
+        final uri = Uri.tryParse(route);
+        if (uri == null) {
+          debugPrint('notification: ignoring invalid route: $route');
+          return;
+        }
+        ref.read(pendingDeepLinkProvider.notifier).open(uri);
+      }
+
+      final subscription = bridge.notificationTaps.listen(dispatchRoute);
+      unawaited(() async {
+        try {
+          final route = await bridge.getInitialRoute();
+          if (route != null) dispatchRoute(route);
+        } catch (error) {
+          debugPrint('notification: initial route unavailable: $error');
+        }
+      }());
+      return subscription.cancel;
+    }, [notificationBridge]);
 
     void applyBadge(UnreadBadgeState state) {
       if (state.highPriorityCount > 0) {
