@@ -96,8 +96,11 @@ class ChannelSortManager {
   }
 
   Future<void> _syncWithRelay() async {
+    if (_disposed) return;
     final firstFetch = await _fetchAndApply();
+    if (_disposed) return;
     final subscribed = _unsubscribe != null || await _startLiveSubscription();
+    if (_disposed) return;
     // Fetch again after the subscription is ready. This closes the event gap
     // between history and live setup (and catches anything published while a
     // rate-limited subscription was retrying).
@@ -187,9 +190,9 @@ class ChannelSortManager {
   }
 
   Future<bool> _startLiveSubscription() async {
-    if (_relaySession == null) return false;
+    if (_disposed || _relaySession == null) return false;
     try {
-      _unsubscribe = await _relaySession.subscribe(
+      final unsubscribe = await _relaySession.subscribe(
         _filter(),
         _handleIncomingEvent,
         onClosed: (_) {
@@ -199,6 +202,11 @@ class ChannelSortManager {
           _scheduleStartupRetry();
         },
       );
+      if (_disposed) {
+        unsubscribe();
+        return false;
+      }
+      _unsubscribe = unsubscribe;
       return true;
     } catch (error) {
       debugPrint('[ChannelSortManager] subscribe failed: $error');
