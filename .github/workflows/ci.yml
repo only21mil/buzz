@@ -659,7 +659,7 @@ jobs:
           wait_healthy() {
             local service="$1"
             local container="$2"
-            for attempt in $(seq 1 60); do
+            for _attempt in $(seq 1 60); do
               status=$(docker inspect --format='{{.State.Health.Status}}' "${container}" 2>/dev/null || echo "not_found")
               if [ "${status}" = "healthy" ]; then
                 echo "${service} is healthy"
@@ -716,7 +716,8 @@ jobs:
         run: |
           chmod +x ./target/ci/buzz-relay
           # Ephemeral identity belongs only to this isolated test process tree.
-          export BUZZ_RELAY_PRIVATE_KEY="$(openssl rand -hex 32)"
+          BUZZ_RELAY_PRIVATE_KEY="$(openssl rand -hex 32)"
+          export BUZZ_RELAY_PRIVATE_KEY
           nohup env \
             DATABASE_URL="postgres://buzz:${BUZZ_TEST_POSTGRES_PASSWORD}@localhost:5432/buzz" \
             REDIS_URL=redis://localhost:6379 \
@@ -731,7 +732,7 @@ jobs:
             SPROUT_REMINDER_SCHEDULER_INTERVAL_SECS=1 \
             ./target/ci/buzz-relay > /tmp/buzz-relay.log 2>&1 &
           echo $! > /tmp/buzz-relay.pid
-          for attempt in $(seq 1 60); do
+          for _attempt in $(seq 1 60); do
             if ! kill -0 "$(cat /tmp/buzz-relay.pid)" 2>/dev/null; then
               cat /tmp/buzz-relay.log
               exit 1
@@ -842,7 +843,7 @@ jobs:
           wait_healthy() {
             local service="$1"
             local container="$2"
-            for attempt in $(seq 1 60); do
+            for _attempt in $(seq 1 60); do
               status=$(docker inspect --format='{{.State.Health.Status}}' "${container}" 2>/dev/null || echo "not_found")
               if [ "${status}" = "healthy" ]; then
                 echo "${service} is healthy"
@@ -899,7 +900,8 @@ jobs:
         run: |
           chmod +x ./target/ci/buzz-relay
           # Ephemeral identity belongs only to this isolated test process tree.
-          export BUZZ_RELAY_PRIVATE_KEY="$(openssl rand -hex 32)"
+          BUZZ_RELAY_PRIVATE_KEY="$(openssl rand -hex 32)"
+          export BUZZ_RELAY_PRIVATE_KEY
           nohup env \
             DATABASE_URL="postgres://buzz:${BUZZ_TEST_POSTGRES_PASSWORD}@localhost:5432/buzz" \
             REDIS_URL=redis://localhost:6379 \
@@ -911,7 +913,7 @@ jobs:
             SPROUT_REMINDER_SCHEDULER_INTERVAL_SECS=1 \
             ./target/ci/buzz-relay > /tmp/buzz-relay.log 2>&1 &
           echo $! > /tmp/buzz-relay.pid
-          for attempt in $(seq 1 60); do
+          for _attempt in $(seq 1 60); do
             if ! kill -0 "$(cat /tmp/buzz-relay.pid)" 2>/dev/null; then
               cat /tmp/buzz-relay.log
               exit 1
@@ -980,7 +982,8 @@ jobs:
       - name: Start relay
         run: |
           chmod +x ./target/ci/buzz-relay ./target/ci/git-credential-nostr
-          export BUZZ_RELAY_PRIVATE_KEY="$(openssl rand -hex 32)"
+          BUZZ_RELAY_PRIVATE_KEY="$(openssl rand -hex 32)"
+          export BUZZ_RELAY_PRIVATE_KEY
           ./scripts/start-relay-for-tests.sh --no-build
       - name: Install isolated invite fixture tools
         run: scripts/ci-apt-retry.sh sudo apt-get install -y --no-install-recommends postgresql postgresql-contrib redis-server bubblewrap iproute2 util-linux apparmor
@@ -1253,9 +1256,9 @@ jobs:
           # Fail if dead API token patterns reappear in desktop, mobile, docs, or config.
           # Relay crates are excluded — they still use token auth internally.
           PATTERNS='TokenScope|MintTokenResponse|hasApiToken|spr_tok_'
-          PATHS='desktop/src/ desktop/tests/ mobile/test/ mobile/lib/ .env.example'
-          EXCLUDES='--exclude-dir=node_modules --exclude-dir=.dart_tool'
-          if grep -rn $EXCLUDES -E "$PATTERNS" $PATHS 2>/dev/null; then
+          PATHS=(desktop/src/ desktop/tests/ mobile/test/ mobile/lib/ .env.example)
+          EXCLUDES=(--exclude-dir=node_modules --exclude-dir=.dart_tool)
+          if grep -rn "${EXCLUDES[@]}" -E "$PATTERNS" "${PATHS[@]}" 2>/dev/null; then
             echo "::error::Dead API token references found in client code. See above."
             exit 1
           fi
