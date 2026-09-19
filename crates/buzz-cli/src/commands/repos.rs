@@ -634,6 +634,14 @@ pub async fn cmd_create_repo(
         }
     };
     crate::client::print_create_response(&output, "link", &link);
+    {
+        // Best-effort: a repo announced into a project home channel should
+        // join that project instead of rendering as a second project card.
+        let _ = crate::commands::projects::try_add_own_repo_to_channel_project(
+            client, channel, repo_id,
+        )
+        .await;
+    }
     Ok(())
 }
 
@@ -963,6 +971,9 @@ pub async fn dispatch(cmd: crate::ReposCmd, client: &BuzzClient) -> Result<(), C
             .await
         }
         ReposCmd::Bind { id, channel } => cmd_bind_repo(client, &id, &channel).await,
+        ReposCmd::DefaultBranch(command) => {
+            super::repo_default_branch::dispatch(command, client).await
+        }
         ReposCmd::Protect(command) => match command {
             ReposProtectCmd::List { id } => cmd_protect_list(client, &id).await,
             ReposProtectCmd::Set {
