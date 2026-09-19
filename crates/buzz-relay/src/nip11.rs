@@ -700,4 +700,38 @@ mod tests {
         let advertised = admin_api_advertisement(Some(&admin_config("admin.example.com")));
         assert_eq!(advertised.as_deref(), Some("https://admin.example.com"));
     }
+    #[test]
+    fn admin_api_advertisement_follows_admin_surface_config() {
+        let with_admin = admin_api_advertisement(Some(&crate::config::AdminConfig {
+            host: "admin.example.com".to_string(),
+            auth: crate::config::AdminAuth::Nip98,
+            web_dir: None,
+        }));
+        assert_eq!(with_admin.as_deref(), Some("https://admin.example.com"));
+        let loopback = admin_api_advertisement(Some(&crate::config::AdminConfig {
+            host: "admin.localhost:3000".to_string(),
+            auth: crate::config::AdminAuth::Disabled,
+            web_dir: None,
+        }));
+        assert_eq!(loopback.as_deref(), Some("http://admin.localhost:3000"));
+        assert_eq!(admin_api_advertisement(None), None);
+
+        let info = RelayInfo::build(None, None, false, DEFAULT_MAX_FRAME_BYTES, None, None, None);
+        let json = serde_json::to_value(&info).expect("serialize");
+        assert!(json.get("admin_api").is_none());
+        let info = RelayInfo::build(
+            None,
+            None,
+            false,
+            DEFAULT_MAX_FRAME_BYTES,
+            None,
+            Some("https://admin.example.com"),
+            None,
+        );
+        let json = serde_json::to_value(&info).expect("serialize");
+        assert_eq!(
+            json.get("admin_api").and_then(|value| value.as_str()),
+            Some("https://admin.example.com")
+        );
+    }
 }
