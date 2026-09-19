@@ -19,7 +19,8 @@ use crate::{
     nostr_convert,
     relay::{
         assert_expected_relay_scope, assert_expected_signer, query_relay, submit_event,
-        submit_event_at_created_at, submit_event_with_keys_created_at,
+        submit_event_with_keys_created_at, submit_retained_event_in_scope,
+        ExpectedPublicationScope, MessagePublication,
     },
 };
 
@@ -423,6 +424,7 @@ pub async fn send_channel_message(
     sent_from_thread_tag: Option<Vec<String>>,
     mention_pubkeys: Option<Vec<String>>,
     kind: Option<u32>,
+    expected_scope: Option<ExpectedPublicationScope>,
     expected_relay_url: Option<String>,
     expected_signer_pubkey: Option<String>,
     state: State<'_, AppState>,
@@ -445,9 +447,10 @@ pub async fn send_channel_message(
     // catch the latter: relay and keys mutate under separate locks during a
     // workspace switch, so the keys are snapshotted here, asserted, and that
     // exact snapshot signs the event and its NIP-98 auth below.
-    let relay_base = crate::relay::relay_api_base_url_with_override(&state);
+    let publication = MessagePublication::capture(&state, expected_scope.as_ref())?;
+    let relay_base = publication.api_base_url.clone();
     assert_expected_relay_scope(expected_relay_url.as_deref(), &relay_base)?;
-    let signing_keys = state.signing_keys()?;
+    let signing_keys = publication.keys.clone();
     assert_expected_signer(
         expected_signer_pubkey.as_deref(),
         &signing_keys.public_key().to_hex(),
@@ -528,8 +531,12 @@ pub async fn send_channel_message(
     // Submit through the base resolved (and scope-checked) above and the
     // identity snapshotted (and signer-checked) above — a re-resolve or key
     // re-read here would reopen the mid-command switch window.
-    let (result, created_at) =
-        submit_event_at_created_at(builder, &state, &relay_base, &signing_keys).await?;
+    publication.validate()?;
+    let event = builder
+        .sign_with_keys(&publication.keys)
+        .map_err(|e| format!("failed to sign event: {e}"))?;
+    let created_at = event.created_at.as_secs() as i64;
+    let result = submit_retained_event_in_scope(&event, &state, publication).await?;
 
     let depth = match (&parent_event_id, &resolved_root) {
         (None, _) => 0,
@@ -874,6 +881,7 @@ pub async fn remove_reaction(
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EditMessageInput {
+    expected_scope: Option<ExpectedPublicationScope>,
     channel_id: String,
     event_id: String,
     content: String,
@@ -898,6 +906,7 @@ pub async fn edit_message(
     input: EditMessageInput,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    let publication = MessagePublication::capture(&state, input.expected_scope.as_ref())?;
     let channel_uuid = uuid::Uuid::parse_str(&input.channel_id)
         .map_err(|_| format!("invalid channel UUID: {}", input.channel_id))?;
     let target_eid =
@@ -921,7 +930,11 @@ pub async fn edit_message(
         },
         input.suppress_link_previews,
     )?;
-    submit_event(builder, &state).await?;
+    publication.validate()?;
+    let event = builder
+        .sign_with_keys(&publication.keys)
+        .map_err(|e| format!("failed to sign event: {e}"))?;
+    submit_retained_event_in_scope(&event, &state, publication).await?;
     Ok(())
 }
 

@@ -4,6 +4,7 @@ import { waitForRateLimit } from "@/shared/api/relayRateLimitGate";
 import { PUBLISH_TIMEOUT_MS } from "@/shared/api/relayClientTimings";
 
 type PublishSession = {
+  validateScope?: () => void;
   generation: () => number;
   ownership: () => number;
   pendingEvents: Map<string, PendingEvent>;
@@ -20,8 +21,10 @@ export async function publishSessionEvent(
   timeoutMessage: string,
   sendErrorMessage: string,
 ): Promise<RelayEvent> {
+  session.validateScope?.();
   const publishOwnership = session.ownership();
   await waitForRateLimit();
+  session.validateScope?.();
   if (publishOwnership !== session.ownership()) {
     throw new Error("Relay disconnected for community switch.");
   }
@@ -56,6 +59,7 @@ export async function publishSessionEvent(
 
         try {
           retryGeneration = await session.reconnect();
+          session.validateScope?.();
           if (
             publishOwnership !== session.ownership() ||
             session.generation() !== retryGeneration ||

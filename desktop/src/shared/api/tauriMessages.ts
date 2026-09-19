@@ -1,3 +1,9 @@
+import { preparePublicationScope } from "./preparePublicationScope";
+import {
+  assertPublicationScope,
+  capturePublicationScope,
+  type PublicationScope,
+} from "./publicationScope";
 import { invokeTauri } from "@/shared/api/tauri";
 import type { RawSendChannelMessageResult } from "@/shared/api/tauriMessageTypes";
 import type { SendChannelMessageResult } from "@/shared/api/types";
@@ -13,13 +19,20 @@ export async function sendChannelMessage(
   mentionTags?: string[][],
   linkPreviewTags?: string[][],
   sentFromThreadTag?: string[],
-  expectedRelayUrl?: string,
+  expectedRelayUrl?: string | PublicationScope,
   expectedSignerPubkey?: string,
   rootEventId?: string | null,
 ): Promise<SendChannelMessageResult> {
+  const expectedScope = await preparePublicationScope(
+    typeof expectedRelayUrl === "object"
+      ? expectedRelayUrl
+      : capturePublicationScope(),
+  );
+  assertPublicationScope(expectedScope);
   const response = await invokeTauri<RawSendChannelMessageResult>(
     "send_channel_message",
     {
+      expectedScope,
       channelId,
       content,
       parentEventId,
@@ -33,7 +46,8 @@ export async function sendChannelMessage(
       kind: kind ?? null,
       // Tenant scope captured by the caller before its first await; the
       // backend fails closed when the active community no longer matches.
-      expectedRelayUrl: expectedRelayUrl ?? null,
+      expectedRelayUrl:
+        typeof expectedRelayUrl === "string" ? expectedRelayUrl : null,
       // Signer identity captured with the relay scope; the backend fails
       // closed when the active identity no longer matches, so a community
       // switch cannot re-sign the captured tenant's content as the new one.
