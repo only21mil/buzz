@@ -93,7 +93,6 @@ pub struct TaskMeta {
 /// Agent-level model capabilities. Refreshed on every session creation because
 /// upstream model availability can change while the adapter process stays alive.
 /// Fields are read by the desktop's `get_agent_models` Tauri command (Phase 3).
-#[allow(dead_code)] // Scaffolding for desktop integration — fields read via serde.
 pub struct AgentModelCapabilities {
     /// Stable: configOptions with category "model" from session/new.
     pub config_options_raw: Vec<serde_json::Value>,

@@ -661,7 +661,7 @@ mod tests {
     use std::sync::Mutex;
 
     use buzz_relay_mesh::endpoint::MeshEndpoint;
-    use buzz_relay_mesh::{InboundHandler, MeshDatagram, PeerInfo};
+    use buzz_relay_mesh::{InboundHandler, MeshDatagram};
 
     use super::*;
 
@@ -944,7 +944,4 @@ mod tests {
         assert_eq!(chunks, 50);
         assert!(MAX_RELIABLE_PAYLOAD_BYTES < buzz_relay_mesh::wire::MAX_STREAM_FRAME as usize);
     }
-
-    #[allow(dead_code)]
-    fn _peer_info_is_not_an_owner_signal(_peer: PeerInfo) {}
 }
