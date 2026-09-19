@@ -104,15 +104,21 @@ const scenarios = [
       "mobile/lib/features/age_gate/age_signal_provider.dart",
       "mobile/test/features/age_gate/age_signal_provider_test.dart",
     ],
-    ["mobile"],
+    ["mobile", "rust"],
   ],
-  ["mobile lockfile", ["mobile/pubspec.lock"], ["mobile"]],
-  ["mobile release script", ["scripts/mobile-release.sh"], ["mobile"]],
+  ["mobile lockfile", ["mobile/pubspec.lock"], ["mobile", "rust"]],
+  ["mobile release script", ["scripts/mobile-release.sh"], ["mobile", "rust"]],
   ["desktop", ["desktop/src/main.tsx"], ["desktop"]],
   ["Tauri", ["desktop/src-tauri/src/main.rs"], ["desktop", "desktop-rust"]],
   ["relay", ["crates/buzz-relay/src/main.rs"], ["rust"]],
   ["migration", ["migrations/123.sql"], ["rust"]],
-  ["shared workflow", [".github/workflows/ci.yml"], ["rust", "mobile"]],
+  // The fork also routes shared CI changes to its web job.
+  ["shared workflow", [".github/workflows/ci.yml"], ["rust", "mobile", "web"]],
+  [
+    "reusable workflow",
+    [".github/workflows/_ci-rust.yml"],
+    ["rust", "mobile", "web"],
+  ],
   [
     "mixed mobile and relay",
     ["mobile/lib/main.dart", "crates/buzz-core/src/lib.rs"],
@@ -121,9 +127,14 @@ const scenarios = [
   [
     "mixed mobile and desktop",
     ["mobile/lib/main.dart", "desktop/src/main.tsx"],
-    ["desktop", "mobile"],
+    ["desktop", "mobile", "rust"],
   ],
   ["web", ["web/src/main.tsx"], ["web"]],
+  ["admin web", ["admin-web/src/main.tsx"], ["web"]],
+  ["shared package manifest", ["package.json"], ["desktop", "web"]],
+  ["native CI", ["deploy/native-ci/runner.toml"], ["rust"]],
+  ["CI documentation", ["docs/ci/README.md"], ["rust"]],
+  ["shared task recipes", ["Justfile"], ["rust", "web"]],
   ["documentation", ["README.md"], []],
 ];
 for (const [name, paths, expected] of scenarios) {
