@@ -35,7 +35,7 @@ The rules apply only to conflicted paths; clean merges remain Git's automatic re
 
 ## Phase 2 ledger
 
-[handmerge.tsv](handmerge.tsv) contains exactly the 138 fork-held files, with original status, hunk count, and area. Each row holds the fork's version pending a port of upstream's changes. For a path in that ledger, inspect the patch with:
+[handmerge.tsv](handmerge.tsv) contains exactly the 138 fork-held files, with original status, hunk count, and area. The disposition column records the final area decision. `ported` means a combined implementation, not adoption of every upstream hunk; `accepted-fork` keeps the fork design with the omissions below; `accepted-upstream` takes upstream behavior; `retired` removes an obsolete path. For a path in that ledger, inspect the patch with:
 
 ```bash
 git diff 5bf78671f45178f8de02ba18d3d321cbbf19cd1f 5511b56fc -- <path>
@@ -306,18 +306,29 @@ Tests naming these contracts include
 `stop_after_a_steer_took_control_discards_the_returning_batch`, and
 `self_wake_keeps_policy_rules_dedup_and_normal_queue_scheduling`.
 Upstream's wholesale pool/queue/lib admission and dispatch layout, its
-channel-description/huddle prompt additions, and its `NewSessionChannelContext`
+huddle prompt additions, and its `NewSessionChannelContext`
 caller reshaping are not adopted here. Replacing the fork paths would require
 re-proving those contracts; the accepted merge does not claim those differences
 are resolved.
 
+The final fixes port activates `relay/recovery.rs` and both recovery test files,
+including targeted replay scheduling, capacity wakes and per-subscription retry
+fairness. Rate-limited EVENT acknowledgements requeue only the refused observer
+frame. Channel discovery now retains the `about` description. Channel descriptions also flow through the fork channel resolver into prompt
+context. Huddle context still belongs to the unadopted pool layout.
+`PermissionMode::Auto`, the 1500-second idle timeout, missing-binary setup nudges,
+and the incoming-turn prompt contract are ported. The existing fork setup listener
+keeps its tested workflow-effective-author gate and DM fail-closed behavior.
+`--idle-pool-sleep` and its config fields are explicitly not adopted: the fork
+pool lifecycle has no idle re-sleep consumer, so accepting the flag would advertise
+an inert feature. Existing replay-floor and startup-effort implementations remain.
+
 For a future full port, exact comparisons against pinned upstream `5511b56fc`
-are saved outside the repository under
-`/home/victor/work/buzz_upstream/reports/rust_acp_workflow-hunks/`:
+live outside the repository in the lane's reports directory:
 `um9e-pool-remaining.patch`, `um9e-lib-remaining.patch`, and
 `um9e-queue-remaining.patch`. These `*remaining.patch` files include intentional
 fork differences, not just missing features. The decision and check receipt is
-`/home/victor/work/buzz_upstream/reports/rust_acp_workflow.md`.
+`rust_acp_workflow.md` in that directory.
 
 ## Status at polish
 
@@ -351,7 +362,7 @@ The run used `CARGO_BUILD_JOBS=4`, `NEXTEST_TEST_THREADS=4`, and
 The previous four CLI failures and executable-start failure passed their six
 focused rechecks and the full CLI suite. They were resource-exhaustion failures.
 Formatting also passes. Per-crate results and logs are recorded in
-`/home/victor/work/buzz_upstream/reports/polish.md`.
+`polish.md` in the lane's reports directory.
 
 The earlier polish call passed mobile analysis, 2,416 Flutter tests with four
 skipped, the separate unconfigured-push test, web typecheck/lint and 24 tests,
@@ -369,3 +380,43 @@ requires the approved ledger readback, a fresh backup, the reviewed forward
 ledger rewrite, deployment through the migration count gate, and verification
 of 59 successful migrations ending at 1044 plus healthy relay probes. Neither
 the SQL cutover nor deployment was run by this lane.
+
+## Final dispositions
+
+The handmerge ledger covers all 138 original fork-held paths. Dispositions use
+`rust_relay.md`, `rust_acp_workflow.md`, `desktop_agents.md`,
+`desktop_messages.md`, `desktop_other.md`, `desktop_shared.md`, `root_ci.md`,
+`migrations.md`, `rust_crates.md`, and `polish.md` in the lane reports directory.
+Later reports supersede earlier incomplete checks. Exact parent-file matches
+identify whole-side acceptances; mixed implementations are marked `ported`
+unless the following explicit fork-design acceptance governs the path.
+
+- `ci.yml` retains the fork job layout. Upstream's reusable-workflow refactor
+  is not adopted. The six uncalled `_ci-*.yml` workflow-call files are retired.
+- `docker.yml` retains the fork pipeline. The upstream same-SHA image
+  qualification gate is not adopted by this merge.
+- Projects UI retains the integrated project implementation. The review's
+  unused upstream-import observation belongs to the desktop worker; it is
+  recorded here without claiming those imports implement an upstream feature.
+- `markdown.tsx` keeps the fork renderer; upstream lightbox/ImageMosaic is
+  not ported. The size worker's extraction preserves that decision.
+- Native `commands/workflows.rs` keeps the fork workflow API. Upstream run-cursor
+  pagination is not ported.
+- Workflow `executor.rs` and relay `workflow_sink.rs` keep the fork authority
+  design, including `trigger_injected_rendered_mention_gets_no_authority`.
+  Upstream rendering cannot grant authority to injected mentions.
+- Desktop E2E `mentions.spec.ts` and `agents.spec.ts` keep the fork scenarios;
+  the omitted upstream test lines are accepted omissions, not passing coverage.
+- Relay admin `auth.rs` and `mod.rs` accept upstream roster authority in place
+  of the fork database roster, with the owner fallback kept. The restored
+  NIP-11 advertisement test covers configured, loopback and absent surfaces.
+- ACP pool/queue/lib keep the hybrid decision above. Local archive keeps the
+  fork feature despite upstream deletion. Migration guards moved into the
+  active runtime module; the obsolete root module is retired.
+
+### Accepted upstream code
+
+The `unsafe` blocks in desktop native managed-agent discovery are unchanged
+upstream code accepted with that implementation. This merge does not introduce
+new unsafe operations in the final-fixes lane. Desktop extraction is owned by
+the size worker.

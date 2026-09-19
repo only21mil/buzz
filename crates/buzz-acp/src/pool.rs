@@ -1121,6 +1121,7 @@ impl ChannelInfoResolver {
                 (info.channel_type != "unknown").then_some((
                     id,
                     PromptChannelInfo {
+                        description: info.description,
                         project: None,
                         name: info.name,
                         channel_type: info.channel_type,
@@ -4305,6 +4306,18 @@ pub(crate) async fn fetch_channel_info(
                     project: None,
                     name: name.unwrap_or(UNKNOWN_CHANNEL_NAME).to_string(),
                     channel_type,
+                    description: tags.iter().find_map(|tag| {
+                        let tag = tag.as_array()?;
+                        (tag.first()?.as_str()? == "about")
+                            .then(|| {
+                                tag.get(1)?
+                                    .as_str()
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_owned)
+                            })
+                            .flatten()
+                    }),
                 })
             }
             Ok(Err(e)) => {
@@ -7634,6 +7647,7 @@ mod tests {
                 crate::relay::ChannelInfo {
                     name: "test-dm".into(),
                     channel_type: "dm".into(),
+                    description: None,
                 },
             )]),
             ctx.rest_client.clone(),
@@ -7988,6 +8002,7 @@ done"#
                 crate::relay::ChannelInfo {
                     name: "test-dm".into(),
                     channel_type: "dm".into(),
+                    description: None,
                 },
             )]),
             RestClient {
@@ -8149,6 +8164,7 @@ done"#
                 crate::relay::ChannelInfo {
                     name: "test-dm".into(),
                     channel_type: "dm".into(),
+                    description: None,
                 },
             )]),
             RestClient {
@@ -8389,6 +8405,7 @@ done"#
                 crate::relay::ChannelInfo {
                     name: "test-dm".into(),
                     channel_type: "dm".into(),
+                    description: None,
                 },
             )]),
             RestClient {
@@ -8583,6 +8600,7 @@ done"#
                 crate::relay::ChannelInfo {
                     name: "test-dm".into(),
                     channel_type: "dm".into(),
+                    description: None,
                 },
             )]),
             ctx.rest_client.clone(),
@@ -8683,6 +8701,7 @@ done"#
                 crate::relay::ChannelInfo {
                     name: "test-dm".into(),
                     channel_type: "dm".into(),
+                    description: None,
                 },
             )]),
             ctx.rest_client.clone(),
@@ -8979,6 +8998,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 crate::relay::ChannelInfo {
                     name: "test-dm".into(),
                     channel_type: "dm".into(),
+                    description: None,
                 },
             )]),
             RestClient {
@@ -9925,6 +9945,7 @@ for line in sys.stdin:
                 crate::relay::ChannelInfo {
                     name: "affinity-test".into(),
                     channel_type: "channel".into(),
+                    description: None,
                 },
             )]),
             ctx.rest_client.clone(),
@@ -13006,6 +13027,7 @@ done"#
                     crate::relay::ChannelInfo {
                         name: "test-thread".into(),
                         channel_type: "stream".into(),
+                        description: None,
                     },
                 )]),
                 RestClient {

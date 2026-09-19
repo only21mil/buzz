@@ -572,6 +572,40 @@ impl Drop for TransactionTimer {
     }
 }
 
+/// Records the terminal readiness query outcome, including dropped futures.
+pub(super) struct ReadinessQueryObservation {
+    outcome: &'static str,
+}
+impl ReadinessQueryObservation {
+    pub(super) fn new() -> Self {
+        Self {
+            outcome: "cancelled",
+        }
+    }
+    pub(super) fn finish_timeout(&mut self) {
+        self.outcome = "timeout";
+    }
+    pub(super) fn finish<T>(&mut self, result: &sqlx::Result<T>) -> bool {
+        self.outcome = match result {
+            Ok(_) => "success",
+            Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("57014") => {
+                if error.message().contains("statement timeout") {
+                    "timeout"
+                } else {
+                    "cancelled"
+                }
+            }
+            Err(_) => "error",
+        };
+        self.outcome == "timeout"
+    }
+}
+impl Drop for ReadinessQueryObservation {
+    fn drop(&mut self) {
+        metrics::counter!("buzz_db_readiness_queries_total", "pool_role" => "writer", "operation" => "readiness", "phase" => "query", "outcome" => self.outcome).increment(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1861,39 +1895,5 @@ mod tests {
         async fn advisory_lock_records_success_contention_timeout_and_error() {
             super::advisory_lock_records_success_contention_timeout_and_error().await;
         }
-    }
-}
-
-/// Records the terminal readiness query outcome, including dropped futures.
-pub(super) struct ReadinessQueryObservation {
-    outcome: &'static str,
-}
-impl ReadinessQueryObservation {
-    pub(super) fn new() -> Self {
-        Self {
-            outcome: "cancelled",
-        }
-    }
-    pub(super) fn finish_timeout(&mut self) {
-        self.outcome = "timeout";
-    }
-    pub(super) fn finish<T>(&mut self, result: &sqlx::Result<T>) -> bool {
-        self.outcome = match result {
-            Ok(_) => "success",
-            Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("57014") => {
-                if error.message().contains("statement timeout") {
-                    "timeout"
-                } else {
-                    "cancelled"
-                }
-            }
-            Err(_) => "error",
-        };
-        self.outcome == "timeout"
-    }
-}
-impl Drop for ReadinessQueryObservation {
-    fn drop(&mut self) {
-        metrics::counter!("buzz_db_readiness_queries_total", "pool_role" => "writer", "operation" => "readiness", "phase" => "query", "outcome" => self.outcome).increment(1);
     }
 }

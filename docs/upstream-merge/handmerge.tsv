@@ -1,139 +1,139 @@
-path	status code	hunks	area
-.env.example	UU	2	root-and-ci
-.github/workflows/benchmark-harbor.yml	UU	1	root-and-ci
-.github/workflows/ci.yml	UU	8	root-and-ci
-.github/workflows/docker.yml	UU	2	root-and-ci
-.release/desktop-candidate.json	UU	1	root-and-ci
-AGENTS.md	UU	2	root-and-ci
-CHANGELOG.md	UU	2	root-and-ci
-Justfile	UU	5	root-and-ci
-crates/buzz-acp/README.md	UU	1	buzz-acp
-crates/buzz-acp/src/acp.rs	UU	3	buzz-acp
-crates/buzz-acp/src/base_prompt.md	UU	2	buzz-acp
-crates/buzz-acp/src/config.rs	UU	5	buzz-acp
-crates/buzz-acp/src/lib.rs	UU	61	buzz-acp
-crates/buzz-acp/src/pool.rs	UU	126	buzz-acp
-crates/buzz-acp/src/queue.rs	UU	51	buzz-acp
-crates/buzz-acp/src/relay.rs	UU	15	buzz-acp
-crates/buzz-acp/src/setup_mode.rs	UU	8	buzz-acp
-crates/buzz-acp/src/usage.rs	UU	3	buzz-acp
-crates/buzz-admin/Cargo.toml	UU	1	root-and-ci
-crates/buzz-admin/src/main.rs	UU	2	root-and-ci
-crates/buzz-agent/src/auth.rs	UU	3	root-and-ci
-crates/buzz-agent/tests/fake_llm.rs	UU	8	root-and-ci
-crates/buzz-audit/src/service.rs	UU	1	root-and-ci
-crates/buzz-auth/src/nip98.rs	UU	1	root-and-ci
-crates/buzz-cli/Cargo.toml	UU	1	root-and-ci
-crates/buzz-cli/README.md	UU	1	root-and-ci
-crates/buzz-cli/src/agent_management.rs	UU	1	root-and-ci
-crates/buzz-cli/src/client.rs	UU	5	root-and-ci
-crates/buzz-cli/src/commands/channels.rs	UU	3	root-and-ci
-crates/buzz-cli/src/commands/issues.rs	UU	4	root-and-ci
-crates/buzz-cli/src/commands/messages.rs	UU	3	root-and-ci
-crates/buzz-cli/src/commands/mod.rs	UU	2	root-and-ci
-crates/buzz-cli/src/commands/projects.rs	UU	5	root-and-ci
-crates/buzz-cli/src/commands/repos.rs	UU	2	root-and-ci
-crates/buzz-cli/src/lib.rs	UU	9	root-and-ci
-crates/buzz-cli/src/links.rs	UU	6	root-and-ci
-crates/buzz-db/src/migration.rs	UD	0	migrations
-crates/buzz-media/src/storage.rs	UU	2	root-and-ci
-crates/buzz-media/src/validation.rs	UU	2	root-and-ci
-crates/buzz-push-gateway/Cargo.toml	UU	1	root-and-ci
-crates/buzz-push-gateway/src/authority.rs	UU	13	root-and-ci
-crates/buzz-push-gateway/src/config.rs	UU	5	root-and-ci
-crates/buzz-push-gateway/src/http.rs	UU	7	root-and-ci
-crates/buzz-push-gateway/src/main.rs	UU	1	root-and-ci
-crates/buzz-push-gateway/src/postgres.rs	UU	8	root-and-ci
-crates/buzz-relay/src/api/bridge.rs	UU	11	buzz-relay
-crates/buzz-relay/src/api/git/mod.rs	UU	1	buzz-relay
-crates/buzz-relay/src/api/git/policy.rs	UU	1	buzz-relay
-crates/buzz-relay/src/api/git/transport.rs	UU	8	buzz-relay
-crates/buzz-relay/src/api/media.rs	UU	2	buzz-relay
-crates/buzz-relay/src/api/mod.rs	UU	1	buzz-relay
-crates/buzz-relay/src/api/operator.rs	UU	3	buzz-relay
-crates/buzz-relay/src/audio/handler.rs	UU	9	buzz-relay
-crates/buzz-relay/src/audio/join.rs	UU	2	buzz-relay
-crates/buzz-relay/src/config.rs	UU	17	buzz-relay
-crates/buzz-relay/src/connection.rs	UU	2	buzz-relay
-crates/buzz-relay/src/handlers/auth.rs	UU	1	buzz-relay
-crates/buzz-relay/src/handlers/command_executor.rs	UU	8	buzz-relay
-crates/buzz-relay/src/handlers/event.rs	UU	2	buzz-relay
-crates/buzz-relay/src/handlers/identity_archive.rs	UU	1	buzz-relay
-crates/buzz-relay/src/handlers/ingest.rs	UU	8	buzz-relay
-crates/buzz-relay/src/handlers/push_lease.rs	UU	1	buzz-relay
-crates/buzz-relay/src/handlers/req.rs	UU	4	buzz-relay
-crates/buzz-relay/src/handlers/side_effects.rs	UU	10	buzz-relay
-crates/buzz-relay/src/main.rs	UU	6	buzz-relay
-crates/buzz-relay/src/nip11.rs	UU	19	buzz-relay
-crates/buzz-relay/src/push_runtime.rs	UU	2	buzz-relay
-crates/buzz-relay/src/router.rs	UU	2	buzz-relay
-crates/buzz-relay/src/subscription.rs	UU	2	buzz-relay
-crates/buzz-relay/src/workflow_sink.rs	UU	10	buzz-relay
-crates/buzz-sdk/src/nip_oa.rs	UU	1	root-and-ci
-crates/buzz-test-client/tests/e2e_relay.rs	UU	1	root-and-ci
-crates/buzz-workflow/src/action_sink.rs	UU	1	buzz-workflow
-crates/buzz-workflow/src/executor.rs	UU	4	buzz-workflow
-crates/buzz-workflow/src/lib.rs	UU	2	buzz-workflow
-crates/buzz-workflow/src/schema.rs	UU	1	buzz-workflow
-deploy/charts/buzz-push-gateway/Chart.yaml	UU	1	root-and-ci
-deploy/charts/buzz-push-gateway/tests/render.sh	UU	7	root-and-ci
-deploy/charts/buzz-push-gateway/values-production.yaml	UU	2	root-and-ci
-deploy/charts/buzz-push-gateway/values.yaml	UU	1	root-and-ci
-desktop/src-tauri/src/commands/agents.rs	UU	13	desktop-other
-desktop/src-tauri/src/commands/messages.rs	UU	9	desktop-other
-desktop/src-tauri/src/commands/personas/inbound.rs	UU	12	desktop-other
-desktop/src-tauri/src/commands/workflows.rs	UU	9	desktop-other
-desktop/src-tauri/src/deep_link.rs	UU	8	desktop-other
-desktop/src-tauri/src/huddle/mod.rs	UU	7	desktop-other
-desktop/src-tauri/src/lib.rs	UU	6	desktop-other
-desktop/src-tauri/src/managed_agents/discovery/presets.rs	UU	6	desktop-other
-desktop/src-tauri/src/managed_agents/runtime.rs	UU	6	desktop-other
-desktop/src-tauri/src/managed_agents/spawn_snapshot.rs	UU	6	desktop-other
-desktop/src/features/agents/activeAgentTurnsStore.test.mjs	UU	3	desktop-agents
-desktop/src/features/agents/activeAgentTurnsStore.ts	UU	2	desktop-agents
-desktop/src/features/agents/channelAgents.ts	UU	3	desktop-agents
-desktop/src/features/agents/hooks.ts	UU	6	desktop-agents
-desktop/src/features/agents/lib/agentAutocompleteEligibility.test.mjs	UU	2	desktop-agents
-desktop/src/features/agents/lib/agentAutocompleteEligibility.ts	UU	2	desktop-agents
-desktop/src/features/agents/lib/managedAgentControlActions.ts	UU	1	desktop-agents
-desktop/src/features/agents/lib/usePersonaCatalogRelay.ts	UU	2	desktop-agents
-desktop/src/features/agents/lib/usePersonaSync.test.mjs	UU	1	desktop-agents
-desktop/src/features/agents/lib/usePersonaSync.ts	UU	9	desktop-agents
-desktop/src/features/agents/observerRelayStore.ts	UU	10	desktop-agents
-desktop/src/features/agents/ui/AgentDefinitionDialog.tsx	UU	1	desktop-agents
-desktop/src/features/agents/ui/AgentDefinitionDialogFooter.tsx	UU	2	desktop-agents
-desktop/src/features/agents/ui/AgentsView.tsx	UU	1	desktop-agents
-desktop/src/features/agents/ui/agentSessionTranscript.ts	UU	1	desktop-agents
-desktop/src/features/agents/ui/agentSessionTranscriptHelpers.test.mjs	UU	1	desktop-agents
-desktop/src/features/agents/ui/catalogOwnerLabel.test.mjs	UU	2	desktop-agents
-desktop/src/features/agents/ui/useManagedAgentActions.ts	UU	1	desktop-agents
-desktop/src/features/agents/useAgentManagement.ts	UU	1	desktop-agents
-desktop/src/features/channels/readState/readStateManager.ts	UU	7	desktop-other
-desktop/src/features/channels/ui/ChannelManagementSheet.tsx	UU	9	desktop-other
-desktop/src/features/channels/ui/ChannelPane.tsx	UU	6	desktop-other
-desktop/src/features/channels/ui/ChannelScreen.tsx	UU	7	desktop-other
-desktop/src/features/local-archive/archiveSyncManager.test.mjs	UD	0	desktop-other
-desktop/src/features/local-archive/archiveSyncManager.ts	UD	0	desktop-other
-desktop/src/features/messages/hooks.ts	UU	8	desktop-other
-desktop/src/features/messages/lib/useMentions.ts	UU	10	desktop-other
-desktop/src/features/messages/ui/MessageComposer.tsx	UU	9	desktop-other
-desktop/src/features/messages/ui/submitMessageEdit.ts	UU	9	desktop-other
-desktop/src/features/messages/ui/useMentionSendFlow.ts	UU	10	desktop-other
-desktop/src/features/projects/hooks.ts	UU	7	desktop-other
-desktop/src/features/projects/ui/ProjectDetailScreen.tsx	UU	10	desktop-other
-desktop/src/features/projects/ui/ProjectIssuesPanel.tsx	UU	9	desktop-other
-desktop/src/features/projects/ui/ProjectsView.tsx	UU	6	desktop-other
-desktop/src/features/pulse/hooks.ts	UU	11	desktop-other
-desktop/src/features/sidebar/ui/AppSidebar.types.ts	UU	6	desktop-other
-desktop/src/features/workflows/ui/WorkflowDialog.tsx	UU	6	desktop-other
-desktop/src/shared/api/relayReconnectReplay.test.mjs	UU	19	desktop-other
-desktop/src/shared/api/relayReconnectReplay.ts	UU	8	desktop-other
-desktop/src/shared/ui/markdown.tsx	UU	6	desktop-other
-desktop/src/testing/e2eBridge.ts	UU	12	desktop-other
-desktop/tests/e2e/agents.spec.ts	UU	9	desktop-other
-desktop/tests/e2e/mentions.spec.ts	UU	13	desktop-other
-desktop/tests/e2e/persistent-agent-audience.spec.ts	UU	7	desktop-other
-desktop/tests/e2e/workflows.spec.ts	UU	9	desktop-other
-docs/push-gateway-deployment.md	UU	7	root-and-ci
-schema/schema.sql	UU	13	migrations
-scripts/reconcile-schema-after-pgschema.sql	UU	8	root-and-ci
+path	status code	hunks	area	disposition
+.env.example	UU	2	root-and-ci	ported
+.github/workflows/benchmark-harbor.yml	UU	1	root-and-ci	ported
+.github/workflows/ci.yml	UU	8	root-and-ci	accepted-fork
+.github/workflows/docker.yml	UU	2	root-and-ci	accepted-fork
+.release/desktop-candidate.json	UU	1	root-and-ci	accepted-fork
+AGENTS.md	UU	2	root-and-ci	ported
+CHANGELOG.md	UU	2	root-and-ci	ported
+Justfile	UU	5	root-and-ci	ported
+crates/buzz-acp/README.md	UU	1	buzz-acp	accepted-fork
+crates/buzz-acp/src/acp.rs	UU	3	buzz-acp	ported
+crates/buzz-acp/src/base_prompt.md	UU	2	buzz-acp	ported
+crates/buzz-acp/src/config.rs	UU	5	buzz-acp	ported
+crates/buzz-acp/src/lib.rs	UU	61	buzz-acp	accepted-fork
+crates/buzz-acp/src/pool.rs	UU	126	buzz-acp	accepted-fork
+crates/buzz-acp/src/queue.rs	UU	51	buzz-acp	accepted-fork
+crates/buzz-acp/src/relay.rs	UU	15	buzz-acp	ported
+crates/buzz-acp/src/setup_mode.rs	UU	8	buzz-acp	ported
+crates/buzz-acp/src/usage.rs	UU	3	buzz-acp	ported
+crates/buzz-admin/Cargo.toml	UU	1	root-and-ci	ported
+crates/buzz-admin/src/main.rs	UU	2	root-and-ci	accepted-upstream
+crates/buzz-agent/src/auth.rs	UU	3	root-and-ci	ported
+crates/buzz-agent/tests/fake_llm.rs	UU	8	root-and-ci	accepted-upstream
+crates/buzz-audit/src/service.rs	UU	1	root-and-ci	ported
+crates/buzz-auth/src/nip98.rs	UU	1	root-and-ci	ported
+crates/buzz-cli/Cargo.toml	UU	1	root-and-ci	ported
+crates/buzz-cli/README.md	UU	1	root-and-ci	ported
+crates/buzz-cli/src/agent_management.rs	UU	1	root-and-ci	accepted-fork
+crates/buzz-cli/src/client.rs	UU	5	root-and-ci	ported
+crates/buzz-cli/src/commands/channels.rs	UU	3	root-and-ci	ported
+crates/buzz-cli/src/commands/issues.rs	UU	4	root-and-ci	accepted-fork
+crates/buzz-cli/src/commands/messages.rs	UU	3	root-and-ci	ported
+crates/buzz-cli/src/commands/mod.rs	UU	2	root-and-ci	ported
+crates/buzz-cli/src/commands/projects.rs	UU	5	root-and-ci	ported
+crates/buzz-cli/src/commands/repos.rs	UU	2	root-and-ci	ported
+crates/buzz-cli/src/lib.rs	UU	9	root-and-ci	ported
+crates/buzz-cli/src/links.rs	UU	6	root-and-ci	ported
+crates/buzz-db/src/migration.rs	UD	0	migrations	retired
+crates/buzz-media/src/storage.rs	UU	2	root-and-ci	ported
+crates/buzz-media/src/validation.rs	UU	2	root-and-ci	ported
+crates/buzz-push-gateway/Cargo.toml	UU	1	root-and-ci	accepted-upstream
+crates/buzz-push-gateway/src/authority.rs	UU	13	root-and-ci	ported
+crates/buzz-push-gateway/src/config.rs	UU	5	root-and-ci	ported
+crates/buzz-push-gateway/src/http.rs	UU	7	root-and-ci	accepted-upstream
+crates/buzz-push-gateway/src/main.rs	UU	1	root-and-ci	accepted-upstream
+crates/buzz-push-gateway/src/postgres.rs	UU	8	root-and-ci	ported
+crates/buzz-relay/src/api/bridge.rs	UU	11	buzz-relay	ported
+crates/buzz-relay/src/api/git/mod.rs	UU	1	buzz-relay	ported
+crates/buzz-relay/src/api/git/policy.rs	UU	1	buzz-relay	accepted-fork
+crates/buzz-relay/src/api/git/transport.rs	UU	8	buzz-relay	ported
+crates/buzz-relay/src/api/media.rs	UU	2	buzz-relay	ported
+crates/buzz-relay/src/api/mod.rs	UU	1	buzz-relay	ported
+crates/buzz-relay/src/api/operator.rs	UU	3	buzz-relay	ported
+crates/buzz-relay/src/audio/handler.rs	UU	9	buzz-relay	accepted-upstream
+crates/buzz-relay/src/audio/join.rs	UU	2	buzz-relay	accepted-upstream
+crates/buzz-relay/src/config.rs	UU	17	buzz-relay	ported
+crates/buzz-relay/src/connection.rs	UU	2	buzz-relay	ported
+crates/buzz-relay/src/handlers/auth.rs	UU	1	buzz-relay	ported
+crates/buzz-relay/src/handlers/command_executor.rs	UU	8	buzz-relay	ported
+crates/buzz-relay/src/handlers/event.rs	UU	2	buzz-relay	ported
+crates/buzz-relay/src/handlers/identity_archive.rs	UU	1	buzz-relay	ported
+crates/buzz-relay/src/handlers/ingest.rs	UU	8	buzz-relay	ported
+crates/buzz-relay/src/handlers/push_lease.rs	UU	1	buzz-relay	accepted-upstream
+crates/buzz-relay/src/handlers/req.rs	UU	4	buzz-relay	ported
+crates/buzz-relay/src/handlers/side_effects.rs	UU	10	buzz-relay	ported
+crates/buzz-relay/src/main.rs	UU	6	buzz-relay	ported
+crates/buzz-relay/src/nip11.rs	UU	19	buzz-relay	ported
+crates/buzz-relay/src/push_runtime.rs	UU	2	buzz-relay	accepted-upstream
+crates/buzz-relay/src/router.rs	UU	2	buzz-relay	ported
+crates/buzz-relay/src/subscription.rs	UU	2	buzz-relay	ported
+crates/buzz-relay/src/workflow_sink.rs	UU	10	buzz-relay	accepted-fork
+crates/buzz-sdk/src/nip_oa.rs	UU	1	root-and-ci	accepted-fork
+crates/buzz-test-client/tests/e2e_relay.rs	UU	1	root-and-ci	ported
+crates/buzz-workflow/src/action_sink.rs	UU	1	buzz-workflow	accepted-fork
+crates/buzz-workflow/src/executor.rs	UU	4	buzz-workflow	accepted-fork
+crates/buzz-workflow/src/lib.rs	UU	2	buzz-workflow	accepted-fork
+crates/buzz-workflow/src/schema.rs	UU	1	buzz-workflow	accepted-fork
+deploy/charts/buzz-push-gateway/Chart.yaml	UU	1	root-and-ci	accepted-upstream
+deploy/charts/buzz-push-gateway/tests/render.sh	UU	7	root-and-ci	ported
+deploy/charts/buzz-push-gateway/values-production.yaml	UU	2	root-and-ci	accepted-upstream
+deploy/charts/buzz-push-gateway/values.yaml	UU	1	root-and-ci	ported
+desktop/src-tauri/src/commands/agents.rs	UU	13	desktop-other	ported
+desktop/src-tauri/src/commands/messages.rs	UU	9	desktop-other	ported
+desktop/src-tauri/src/commands/personas/inbound.rs	UU	12	desktop-other	ported
+desktop/src-tauri/src/commands/workflows.rs	UU	9	desktop-other	accepted-fork
+desktop/src-tauri/src/deep_link.rs	UU	8	desktop-other	ported
+desktop/src-tauri/src/huddle/mod.rs	UU	7	desktop-other	ported
+desktop/src-tauri/src/lib.rs	UU	6	desktop-other	ported
+desktop/src-tauri/src/managed_agents/discovery/presets.rs	UU	6	desktop-other	accepted-upstream
+desktop/src-tauri/src/managed_agents/runtime.rs	UU	6	desktop-other	ported
+desktop/src-tauri/src/managed_agents/spawn_snapshot.rs	UU	6	desktop-other	accepted-upstream
+desktop/src/features/agents/activeAgentTurnsStore.test.mjs	UU	3	desktop-agents	ported
+desktop/src/features/agents/activeAgentTurnsStore.ts	UU	2	desktop-agents	ported
+desktop/src/features/agents/channelAgents.ts	UU	3	desktop-agents	ported
+desktop/src/features/agents/hooks.ts	UU	6	desktop-agents	accepted-upstream
+desktop/src/features/agents/lib/agentAutocompleteEligibility.test.mjs	UU	2	desktop-agents	ported
+desktop/src/features/agents/lib/agentAutocompleteEligibility.ts	UU	2	desktop-agents	ported
+desktop/src/features/agents/lib/managedAgentControlActions.ts	UU	1	desktop-agents	ported
+desktop/src/features/agents/lib/usePersonaCatalogRelay.ts	UU	2	desktop-agents	accepted-upstream
+desktop/src/features/agents/lib/usePersonaSync.test.mjs	UU	1	desktop-agents	accepted-fork
+desktop/src/features/agents/lib/usePersonaSync.ts	UU	9	desktop-agents	accepted-fork
+desktop/src/features/agents/observerRelayStore.ts	UU	10	desktop-agents	ported
+desktop/src/features/agents/ui/AgentDefinitionDialog.tsx	UU	1	desktop-agents	ported
+desktop/src/features/agents/ui/AgentDefinitionDialogFooter.tsx	UU	2	desktop-agents	ported
+desktop/src/features/agents/ui/AgentsView.tsx	UU	1	desktop-agents	ported
+desktop/src/features/agents/ui/agentSessionTranscript.ts	UU	1	desktop-agents	accepted-upstream
+desktop/src/features/agents/ui/agentSessionTranscriptHelpers.test.mjs	UU	1	desktop-agents	accepted-upstream
+desktop/src/features/agents/ui/catalogOwnerLabel.test.mjs	UU	2	desktop-agents	accepted-fork
+desktop/src/features/agents/ui/useManagedAgentActions.ts	UU	1	desktop-agents	accepted-upstream
+desktop/src/features/agents/useAgentManagement.ts	UU	1	desktop-agents	ported
+desktop/src/features/channels/readState/readStateManager.ts	UU	7	desktop-other	ported
+desktop/src/features/channels/ui/ChannelManagementSheet.tsx	UU	9	desktop-other	accepted-upstream
+desktop/src/features/channels/ui/ChannelPane.tsx	UU	6	desktop-other	ported
+desktop/src/features/channels/ui/ChannelScreen.tsx	UU	7	desktop-other	ported
+desktop/src/features/local-archive/archiveSyncManager.test.mjs	UD	0	desktop-other	accepted-fork
+desktop/src/features/local-archive/archiveSyncManager.ts	UD	0	desktop-other	accepted-fork
+desktop/src/features/messages/hooks.ts	UU	8	desktop-other	ported
+desktop/src/features/messages/lib/useMentions.ts	UU	10	desktop-other	ported
+desktop/src/features/messages/ui/MessageComposer.tsx	UU	9	desktop-other	ported
+desktop/src/features/messages/ui/submitMessageEdit.ts	UU	9	desktop-other	accepted-fork
+desktop/src/features/messages/ui/useMentionSendFlow.ts	UU	10	desktop-other	ported
+desktop/src/features/projects/hooks.ts	UU	7	desktop-other	ported
+desktop/src/features/projects/ui/ProjectDetailScreen.tsx	UU	10	desktop-other	ported
+desktop/src/features/projects/ui/ProjectIssuesPanel.tsx	UU	9	desktop-other	accepted-fork
+desktop/src/features/projects/ui/ProjectsView.tsx	UU	6	desktop-other	ported
+desktop/src/features/pulse/hooks.ts	UU	11	desktop-other	accepted-upstream
+desktop/src/features/sidebar/ui/AppSidebar.types.ts	UU	6	desktop-other	accepted-upstream
+desktop/src/features/workflows/ui/WorkflowDialog.tsx	UU	6	desktop-other	accepted-fork
+desktop/src/shared/api/relayReconnectReplay.test.mjs	UU	19	desktop-other	accepted-upstream
+desktop/src/shared/api/relayReconnectReplay.ts	UU	8	desktop-other	accepted-upstream
+desktop/src/shared/ui/markdown.tsx	UU	6	desktop-other	accepted-fork
+desktop/src/testing/e2eBridge.ts	UU	12	desktop-other	ported
+desktop/tests/e2e/agents.spec.ts	UU	9	desktop-other	accepted-fork
+desktop/tests/e2e/mentions.spec.ts	UU	13	desktop-other	accepted-fork
+desktop/tests/e2e/persistent-agent-audience.spec.ts	UU	7	desktop-other	accepted-fork
+desktop/tests/e2e/workflows.spec.ts	UU	9	desktop-other	accepted-fork
+docs/push-gateway-deployment.md	UU	7	root-and-ci	ported
+schema/schema.sql	UU	13	migrations	ported
+scripts/reconcile-schema-after-pgschema.sql	UU	8	root-and-ci	ported
