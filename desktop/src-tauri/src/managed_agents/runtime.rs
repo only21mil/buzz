@@ -176,7 +176,10 @@ pub fn build_managed_agent_summary(
         };
         (status, None, String::new())
     } else {
-        let persisted_pid = record.runtime_pid.filter(|pid| process_is_running(*pid));
+        let persisted_pid = record
+            .runtime_pid
+            .filter(|_| tracked_runtime_pids(runtimes, &record.pubkey).is_empty())
+            .filter(|pid| process_is_running(*pid));
         if let Some(runtime) = pair_runtime {
             (
                 "running".to_string(),
@@ -941,3 +944,6 @@ mod test_fixtures;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod runtime_pid_tests;

@@ -27,7 +27,7 @@ fn live_pair_runtime() -> crate::managed_agents::ManagedAgentPairRuntime {
             &[],
             "wss://relay.example",
             &Default::default(),
-            crate::managed_agents::AcpSessionPolicy::Channel,
+            crate::managed_agents::owner_only_access_build(),
         ),
         setup_mode: false,
         adapter_availability: None,
