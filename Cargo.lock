@@ -881,7 +881,6 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "buzz-core",
- "buzz-persona",
  "buzz-sdk",
  "chrono",
  "clap",
@@ -912,25 +911,17 @@ name = "buzz-admin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "buzz-audit",
- "buzz-auth",
  "buzz-core",
  "buzz-db",
- "buzz-deletion",
- "buzz-media",
  "buzz-pubsub",
- "buzz-search",
- "buzz-workflow",
  "clap",
  "deadpool-redis",
  "hex",
  "nostr 0.44.7",
  "rustls",
  "serde_json",
- "sqlx",
  "tokio",
  "tracing",
- "url",
  "uuid",
 ]
 
@@ -946,6 +937,7 @@ dependencies = [
  "fs2",
  "getrandom 0.4.3",
  "hex",
+ "image",
  "nix 0.31.3",
  "rcgen",
  "reqwest 0.13.4",
@@ -965,6 +957,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-agent-key-handoff"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "keyring",
+ "nostr 0.44.7",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "zeroize",
+]
+
+[[package]]
 name = "buzz-audit"
 version = "0.1.0"
 dependencies = [
@@ -972,7 +980,6 @@ dependencies = [
  "buzz-datastore-tracing",
  "chrono",
  "futures-util",
- "hex",
  "metrics",
  "serde",
  "serde_json",
@@ -1002,7 +1009,6 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror 2.0.18",
  "tokio",
- "tracing",
  "url",
  "uuid",
 ]
@@ -1028,6 +1034,173 @@ dependencies = [
 ]
 
 [[package]]
+name = "buzz-ci-acceptance-ctl"
+version = "0.1.0"
+dependencies = [
+ "buzz-ci-broker-protocol",
+ "buzz-core",
+ "hex",
+ "nix 0.31.3",
+ "nostr 0.44.7",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "buzz-ci-admission-verifier"
+version = "0.1.0"
+dependencies = [
+ "buzz-ci-broker-protocol",
+ "hex",
+ "nostr 0.44.7",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "buzz-ci-broker-protocol"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "buzz-ci-controld"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "buzz-ci-acceptance-ctl",
+ "buzz-ci-broker-protocol",
+ "buzz-ci-execd",
+ "buzz-ci-keyholder",
+ "buzz-core",
+ "hex",
+ "nix 0.31.3",
+ "nostr 0.44.7",
+ "reqwest 0.13.4",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "buzz-ci-execd"
+version = "0.1.0"
+dependencies = [
+ "buzz-ci-acceptance-ctl",
+ "buzz-ci-broker-protocol",
+ "buzz-ci-isolation-contract",
+ "buzz-ci-materializer",
+ "buzz-ci-policy-proxy",
+ "hex",
+ "nix 0.31.3",
+ "nostr 0.44.7",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "buzz-ci-isolation-contract"
+version = "0.1.0"
+dependencies = [
+ "buzz-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "buzz-ci-keyholder"
+version = "0.1.0"
+dependencies = [
+ "buzz-ci-acceptance-ctl",
+ "buzz-ci-broker-protocol",
+ "buzz-core",
+ "hex",
+ "nix 0.31.3",
+ "nostr 0.44.7",
+ "proptest",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "url",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "buzz-ci-materializer"
+version = "0.1.0"
+dependencies = [
+ "buzz-ci-isolation-contract",
+ "hex",
+ "nix 0.31.3",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "buzz-ci-policy-proxy"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "buzz-ci-isolation-contract",
+ "flate2",
+ "hex",
+ "nix 0.31.3",
+ "proptest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tar",
+ "thiserror 2.0.18",
+ "url",
+]
+
+[[package]]
+name = "buzz-ci-runner"
+version = "0.1.0"
+dependencies = [
+ "buzz-ci-broker-protocol",
+ "buzz-ci-controld",
+ "buzz-core",
+ "ed25519-dalek",
+ "hex",
+ "nix 0.31.3",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "buzz-cli"
 version = "0.1.0"
 dependencies = [
@@ -1036,6 +1209,8 @@ dependencies = [
  "buzz-core",
  "buzz-persona",
  "buzz-sdk",
+ "buzz-test-client",
+ "buzz-workflow",
  "buzz-ws-client",
  "bytes",
  "chrono",
@@ -1044,6 +1219,7 @@ dependencies = [
  "dirs",
  "hex",
  "infer",
+ "nix 0.31.3",
  "nostr 0.44.7",
  "rand 0.10.1",
  "reqwest 0.13.4",
@@ -1126,6 +1302,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -1241,7 +1418,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite 0.29.0",
- "url",
  "zeroize",
 ]
 
@@ -1262,7 +1438,6 @@ version = "0.1.0"
 dependencies = [
  "buzz-auth",
  "buzz-core",
- "chrono",
  "deadpool-redis",
  "futures-util",
  "nostr 0.44.7",
@@ -1293,7 +1468,6 @@ dependencies = [
  "minicbor",
  "nostr 0.44.7",
  "proptest",
- "rand 0.10.1",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
@@ -1386,9 +1560,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "deadpool-redis",
- "futures-util",
  "hex",
- "hmac 0.13.0",
  "iroh",
  "nostr 0.44.7",
  "postcard",
@@ -1435,11 +1607,18 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "buzz-auth",
  "buzz-core",
+ "buzz-db",
  "buzz-media",
+ "buzz-pubsub",
+ "buzz-relay",
  "buzz-sdk",
+ "buzz-search",
+ "buzz-workflow",
  "buzz-ws-client",
  "chrono",
+ "deadpool-redis",
  "futures-util",
  "hex",
  "nostr 0.44.7",
@@ -1447,7 +1626,6 @@ dependencies = [
  "reqwest 0.13.4",
  "rust-s3",
  "rustls",
- "serde",
  "serde_json",
  "sha2 0.11.0",
  "sqlx",
@@ -5910,6 +6088,7 @@ dependencies = [
  "cfg-if 1.0.4",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -5988,8 +6167,7 @@ dependencies = [
 [[package]]
 name = "nostr"
 version = "0.44.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7d3d987ea7078dc36947cde532637c472a229426702e4331dd7667325378bd9"
+source = "git+https://github.com/nostrdevkit/nostr?rev=94dac28e9a718d853170308aeb551b1ebf89a0d0#94dac28e9a718d853170308aeb551b1ebf89a0d0"
 dependencies = [
  "base64 0.22.1",
  "bech32 0.11.1",
@@ -12000,3 +12178,13 @@ dependencies = [
  "quote",
  "syn 2.0.117",
 ]
+
+[[patch.unused]]
+name = "nostr-database"
+version = "0.44.0"
+source = "git+https://github.com/nostrdevkit/nostr?rev=94dac28e9a718d853170308aeb551b1ebf89a0d0#94dac28e9a718d853170308aeb551b1ebf89a0d0"
+
+[[patch.unused]]
+name = "nostr-relay-pool"
+version = "0.44.3"
+source = "git+https://github.com/nostrdevkit/nostr?rev=94dac28e9a718d853170308aeb551b1ebf89a0d0#94dac28e9a718d853170308aeb551b1ebf89a0d0"
