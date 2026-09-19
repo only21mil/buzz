@@ -162,6 +162,16 @@ class IsolationTests(unittest.TestCase):
             shutil.copy(frozen.ROOT / 'scripts/migrations-0036-0042.sha256', root / 'scripts')
             shutil.copy(frozen.ROOT / 'scripts/migrations-0043-0049.sha256', root / 'scripts')
             (root / 'migrations/0050_new.sql').write_text('-- new migration\n')
+            sql = (root / 'migrations/0050_new.sql').read_bytes()
+            operation_path = root / frozen.OPERATION_MAP
+            operations = json.loads(operation_path.read_text())
+            operations['fork'].append({
+                'version': 50, 'file': 'migrations/0050_new.sql', 'description': 'new',
+                'sha256': hashlib.sha256(sql).hexdigest(),
+                'sqlx_sha384': hashlib.sha384(sql).hexdigest(),
+                'prerequisites': [], 'operations': ['create-table:brand_new_table'],
+            })
+            operation_path.write_text(json.dumps(operations))
             ledger = root / 'map.json'
             tail_entries = json.loads(
                 (frozen.ROOT / 'migrations/admission-map.json').read_text()
@@ -220,6 +230,7 @@ class IsolationTests(unittest.TestCase):
             (root / 'scripts').mkdir()
             shutil.copy(frozen.ROOT / 'scripts/migrations-0001-0035.sha256', root / 'scripts')
             shutil.copy(frozen.ROOT / 'scripts/migrations-0036-0042.sha256', root / 'scripts')
+            shutil.copy(frozen.ROOT / 'scripts/migrations-0043-0049.sha256', root / 'scripts')
             frozen.check(root)
             original = next((root / 'migrations').glob('0001_*.sql'))
             data = original.read_bytes()
