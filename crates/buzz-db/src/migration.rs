@@ -365,6 +365,14 @@ mod tests {
             "push_gateway_delivery_request_replays",
             "product_feedback",
             "replica_heartbeat",
+            "community_deletion_requests",
+            "community_deletion_approvals",
+            "community_deletion_checkpoints",
+            "community_deletion_manifest_keys",
+            "storage_taxonomy_sweeps",
+            "community_serving_write_leases",
+            "community_deletion_executor_heartbeats",
+            "storage_accounting_snapshots",
         ] {
             if normalized[insert_pos..].contains(&format!("'{value}'")) {
                 globals.insert(value.to_owned());
@@ -580,42 +588,54 @@ mod tests {
 
         assert_eq!(
             migrations.len(),
-            49,
+            59,
             "embedded migration matrix must contain the frozen prefix plus admitted tail"
         );
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
-        assert!(migrations[0]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE communities"));
+        assert!(
+            migrations[0]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE communities")
+        );
         assert!(migrations[0].sql.as_str().contains("CREATE TABLE channels"));
-        assert!(migrations[0]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE scheduled_workflow_fires"));
-        assert!(migrations[0]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE audit_log"));
-        assert!(migrations[0]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE _operator_global_tables"));
-        assert!(migrations[0]
-            .sql
-            .as_str()
-            .contains("search_tsv  TSVECTOR GENERATED ALWAYS"));
+        assert!(
+            migrations[0]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE scheduled_workflow_fires")
+        );
+        assert!(
+            migrations[0]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE audit_log")
+        );
+        assert!(
+            migrations[0]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE _operator_global_tables")
+        );
+        assert!(
+            migrations[0]
+                .sql
+                .as_str()
+                .contains("search_tsv  TSVECTOR GENERATED ALWAYS")
+        );
 
         // The git repo-name registry is an additive migration, never folded into
         // 0001 — folding it would change 0001's checksum and break brownfield
         // startup (sqlx VersionMismatch). It must live in its own version, and
         // 0001 must not carry it.
         assert_eq!(migrations[1].version, 2);
-        assert!(migrations[1]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE git_repo_names"));
+        assert!(
+            migrations[1]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE git_repo_names")
+        );
         assert!(!migrations[0].sql.as_str().contains("git_repo_names"));
         let desired_schema = include_str!("../../../schema/schema.sql");
         assert!(
@@ -632,18 +652,22 @@ mod tests {
         // Same additive-migration rule for the per-community workspace icon
         // (NIP-11 `icon`): its own version, never folded into 0001.
         assert_eq!(migrations[2].version, 3);
-        assert!(migrations[2]
-            .sql
-            .as_str()
-            .contains("ALTER TABLE communities ADD COLUMN icon"));
+        assert!(
+            migrations[2]
+                .sql
+                .as_str()
+                .contains("ALTER TABLE communities ADD COLUMN icon")
+        );
         assert!(!migrations[0].sql.as_str().contains("icon"));
         // Same additive-migration rule for the e-tag containment GIN index
         // (channel-window aux closure): its own version, never folded into 0001.
         assert_eq!(migrations[3].version, 4);
-        assert!(migrations[3]
-            .sql
-            .as_str()
-            .contains("CREATE INDEX idx_events_tags_gin"));
+        assert!(
+            migrations[3]
+                .sql
+                .as_str()
+                .contains("CREATE INDEX idx_events_tags_gin")
+        );
         assert!(!migrations[0].sql.as_str().contains("idx_events_tags_gin"));
 
         // NIP-AM (kind 44200) FTS exclusion: additive migration, never folded
@@ -658,25 +682,45 @@ mod tests {
         // Community moderation (reports/bans/audit): additive migration, never
         // folded into 0001 — same brownfield checksum rule as above.
         assert_eq!(migrations[5].version, 6);
-        assert!(migrations[5]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE moderation_reports"));
-        assert!(migrations[5]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE community_bans"));
-        assert!(migrations[5]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE moderation_actions"));
+        assert!(
+            migrations[5]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE moderation_reports")
+        );
+        assert!(
+            migrations[5]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE community_bans")
+        );
+        assert!(
+            migrations[5]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE moderation_actions")
+        );
         // 0006 is checksum-frozen. The admitted tail replaces its action CHECK;
         // fresh desired-schema installs must enforce the same effective vocabulary.
-        assert_eq!(migrations[38].version, 39);
-        let audit_extension = migrations[38].sql.as_str();
+        assert_eq!(
+            migrations
+                .iter()
+                .find(|m| m.version == 1039)
+                .expect("fork migration present")
+                .version,
+            1039
+        );
+        let audit_extension = migrations
+            .iter()
+            .find(|m| m.version == 1039)
+            .expect("fork migration present")
+            .sql
+            .as_str();
         assert!(audit_extension.contains("DROP CONSTRAINT moderation_actions_action_check"));
-        assert!(audit_extension
-            .contains("ADD CONSTRAINT moderation_actions_action_check CHECK (action IN ("));
+        assert!(
+            audit_extension
+                .contains("ADD CONSTRAINT moderation_actions_action_check CHECK (action IN (")
+        );
         let desired_audit = desired_schema
             .split_once("CREATE TABLE moderation_actions (")
             .unwrap()
@@ -710,109 +754,149 @@ mod tests {
         // NIP-RS retention is additive and boot-safe: seed replay watermarks
         // before deleting payload history, without rewriting search storage.
         assert_eq!(migrations[6].version, 7);
-        assert!(migrations[6]
-            .sql
-            .as_str()
-            .contains("LOCK TABLE events IN SHARE ROW EXCLUSIVE MODE"));
-        assert!(migrations[6]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE parameterized_event_watermarks"));
-        assert!(migrations[6]
-            .sql
-            .as_str()
-            .contains("INSERT INTO parameterized_event_watermarks"));
-        assert!(migrations[6]
-            .sql
-            .as_str()
-            .contains("CREATE INDEX idx_event_mentions_community_event"));
-        assert!(migrations[6]
-            .sql
-            .as_str()
-            .contains("NIP-RS retention blocked: deleted event outranks live head"));
-        assert!(migrations[6]
-            .sql
-            .as_str()
-            .contains("DELETE FROM events old"));
-        assert!(!migrations[6]
-            .sql
-            .as_str()
-            .contains("ALTER TABLE events DROP COLUMN search_tsv"));
+        assert!(
+            migrations[6]
+                .sql
+                .as_str()
+                .contains("LOCK TABLE events IN SHARE ROW EXCLUSIVE MODE")
+        );
+        assert!(
+            migrations[6]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE parameterized_event_watermarks")
+        );
+        assert!(
+            migrations[6]
+                .sql
+                .as_str()
+                .contains("INSERT INTO parameterized_event_watermarks")
+        );
+        assert!(
+            migrations[6]
+                .sql
+                .as_str()
+                .contains("CREATE INDEX idx_event_mentions_community_event")
+        );
+        assert!(
+            migrations[6]
+                .sql
+                .as_str()
+                .contains("NIP-RS retention blocked: deleted event outranks live head")
+        );
+        assert!(
+            migrations[6]
+                .sql
+                .as_str()
+                .contains("DELETE FROM events old")
+        );
+        assert!(
+            !migrations[6]
+                .sql
+                .as_str()
+                .contains("ALTER TABLE events DROP COLUMN search_tsv")
+        );
 
         // Fresh installs opt into the positive search allowlist without making
         // populated databases rewrite their events heap during relay startup.
         assert_eq!(migrations[7].version, 8);
-        assert!(migrations[7]
-            .sql
-            .as_str()
-            .contains("IF NOT EXISTS (SELECT 1 FROM events LIMIT 1)"));
-        assert!(migrations[7]
-            .sql
-            .as_str()
-            .contains("CASE WHEN kind IN (0, 9, 40002, 45001, 45003)"));
+        assert!(
+            migrations[7]
+                .sql
+                .as_str()
+                .contains("IF NOT EXISTS (SELECT 1 FROM events LIMIT 1)")
+        );
+        assert!(
+            migrations[7]
+                .sql
+                .as_str()
+                .contains("CASE WHEN kind IN (0, 9, 40002, 45001, 45003)")
+        );
         assert!(migrations[7].sql.as_str().contains("ELSE NULL::tsvector"));
 
         // Mixed-version guards are additive because 0007/0008 may already be
         // recorded by a running relay and their sqlx checksums are immutable.
         assert_eq!(migrations[8].version, 9);
-        assert!(migrations[8]
-            .sql
-            .as_str()
-            .contains("CREATE TRIGGER trg_events_nip_rs_watermark"));
-        assert!(migrations[8]
-            .sql
-            .as_str()
-            .contains("stale NIP-RS event rejected by durable watermark"));
-        assert!(migrations[8]
-            .sql
-            .as_str()
-            .contains("CREATE TRIGGER trg_events_purge_soft_deleted_nip_rs"));
-        assert!(migrations[8]
-            .sql
-            .as_str()
-            .contains("CREATE TRIGGER trg_event_mentions_require_live_event"));
+        assert!(
+            migrations[8]
+                .sql
+                .as_str()
+                .contains("CREATE TRIGGER trg_events_nip_rs_watermark")
+        );
+        assert!(
+            migrations[8]
+                .sql
+                .as_str()
+                .contains("stale NIP-RS event rejected by durable watermark")
+        );
+        assert!(
+            migrations[8]
+                .sql
+                .as_str()
+                .contains("CREATE TRIGGER trg_events_purge_soft_deleted_nip_rs")
+        );
+        assert!(
+            migrations[8]
+                .sql
+                .as_str()
+                .contains("CREATE TRIGGER trg_event_mentions_require_live_event")
+        );
 
         assert_eq!(migrations[9].version, 10);
-        assert!(migrations[9]
-            .sql
-            .as_str()
-            .contains("CREATE OR REPLACE FUNCTION guard_nip_rs_watermark"));
+        assert!(
+            migrations[9]
+                .sql
+                .as_str()
+                .contains("CREATE OR REPLACE FUNCTION guard_nip_rs_watermark")
+        );
         assert!(migrations[9].sql.as_str().contains("RETURN NULL"));
 
         assert_eq!(migrations[10].version, 11);
-        assert!(migrations[10]
-            .sql
-            .as_str()
-            .contains("CREATE OR REPLACE FUNCTION guard_nip_rs_watermark"));
-        assert!(migrations[10]
-            .sql
-            .as_str()
-            .contains("CREATE OR REPLACE FUNCTION purge_soft_deleted_nip_rs"));
+        assert!(
+            migrations[10]
+                .sql
+                .as_str()
+                .contains("CREATE OR REPLACE FUNCTION guard_nip_rs_watermark")
+        );
+        assert!(
+            migrations[10]
+                .sql
+                .as_str()
+                .contains("CREATE OR REPLACE FUNCTION purge_soft_deleted_nip_rs")
+        );
         assert!(migrations[10].sql.as_str().contains("tag->>0 = 'd'"));
         assert!(migrations[10].sql.as_str().contains(") = 1"));
 
         // Push leases and their durable outbox are relay-owned and structurally
         // community-scoped; the public gateway remains stateless.
         assert_eq!(migrations[11].version, 12);
-        assert!(migrations[11]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE push_leases"));
-        assert!(migrations[11]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE push_wake_outbox"));
-        assert!(migrations[11]
-            .sql
-            .as_str()
-            .contains("PRIMARY KEY (community_id, author, installation_id)"));
+        assert!(
+            migrations[11]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE push_leases")
+        );
+        assert!(
+            migrations[11]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE push_wake_outbox")
+        );
+        assert!(
+            migrations[11]
+                .sql
+                .as_str()
+                .contains("PRIMARY KEY (community_id, author, installation_id)")
+        );
         assert!(!migrations[0].sql.as_str().contains("push_leases"));
 
         assert_eq!(migrations[12].version, 13);
-        assert!(migrations[12]
-            .sql
-            .as_str()
-            .contains("ADD COLUMN endpoint_enabled"));
+        assert!(
+            migrations[12]
+                .sql
+                .as_str()
+                .contains("ADD COLUMN endpoint_enabled")
+        );
 
         // Kind 30350 is author-only encrypted data, so its ciphertext is never
         // indexed for NIP-50 search. Preserve the 0001 checksum and extend the
@@ -826,42 +910,56 @@ mod tests {
         // durable: immediate revocation and hostile-relay admission cannot be
         // honestly provided by a stateless gateway.
         assert_eq!(migrations[14].version, 15);
-        assert!(migrations[14]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE push_gateway_installations"));
-        assert!(migrations[14]
-            .sql
-            .as_str()
-            .contains("push_gateway_delegations"));
-        assert!(migrations[14]
-            .sql
-            .as_str()
-            .contains("_operator_global_tables"));
+        assert!(
+            migrations[14]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE push_gateway_installations")
+        );
+        assert!(
+            migrations[14]
+                .sql
+                .as_str()
+                .contains("push_gateway_delegations")
+        );
+        assert!(
+            migrations[14]
+                .sql
+                .as_str()
+                .contains("_operator_global_tables")
+        );
 
         // Community archival and product feedback landed concurrently. Keep
         // both additive migrations in a single, unambiguous sequence.
         assert_eq!(migrations[15].version, 16);
-        assert!(migrations[15]
-            .sql
-            .as_str()
-            .contains("ADD COLUMN archived_at"));
+        assert!(
+            migrations[15]
+                .sql
+                .as_str()
+                .contains("ADD COLUMN archived_at")
+        );
 
         // Product feedback is a deployment-private sidecar; community_id is
         // provenance, not an operator-review authorization boundary.
         assert_eq!(migrations[16].version, 17);
-        assert!(migrations[16]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE product_feedback"));
-        assert!(migrations[16]
-            .sql
-            .as_str()
-            .contains("community_id UUID NOT NULL"));
-        assert!(migrations[16]
-            .sql
-            .as_str()
-            .contains("('product_feedback', 'deployment product inbox"));
+        assert!(
+            migrations[16]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE product_feedback")
+        );
+        assert!(
+            migrations[16]
+                .sql
+                .as_str()
+                .contains("community_id UUID NOT NULL")
+        );
+        assert!(
+            migrations[16]
+                .sql
+                .as_str()
+                .contains("('product_feedback', 'deployment product inbox")
+        );
         assert!(!migrations[0].sql.as_str().contains("product_feedback"));
 
         // Matching is driven from a parent-table trigger so all partition and
@@ -880,31 +978,41 @@ mod tests {
         let mesh_retention = migrations[18].sql.as_str();
         assert!(mesh_retention.contains("buzz-mesh-member-status:%"));
         assert!(mesh_retention.contains("buzz-mesh-status"));
-        assert!(mesh_retention
-            .contains("CREATE TRIGGER trg_events_purge_soft_deleted_buzz_mesh_status"));
-        assert!(!migrations[0]
-            .sql
-            .as_str()
-            .contains("purge_soft_deleted_buzz_mesh_status"));
+        assert!(
+            mesh_retention
+                .contains("CREATE TRIGGER trg_events_purge_soft_deleted_buzz_mesh_status")
+        );
+        assert!(
+            !migrations[0]
+                .sql
+                .as_str()
+                .contains("purge_soft_deleted_buzz_mesh_status")
+        );
 
         // Join policy acceptances landed concurrently with mesh status retention;
         // keep both additive migrations in a single, unambiguous sequence.
         assert_eq!(migrations[19].version, 20);
-        assert!(migrations[19]
-            .sql
-            .as_str()
-            .contains("CREATE TABLE join_policy_acceptances"));
+        assert!(
+            migrations[19]
+                .sql
+                .as_str()
+                .contains("CREATE TABLE join_policy_acceptances")
+        );
 
         // Replica-fence commit-time floor guard on channel-bearing events.
         assert_eq!(migrations[20].version, 21);
-        assert!(migrations[20]
-            .sql
-            .as_str()
-            .contains("events_created_at_floor_guard"));
-        assert!(!migrations[0]
-            .sql
-            .as_str()
-            .contains("join_policy_acceptances"));
+        assert!(
+            migrations[20]
+                .sql
+                .as_str()
+                .contains("events_created_at_floor_guard")
+        );
+        assert!(
+            !migrations[0]
+                .sql
+                .as_str()
+                .contains("join_policy_acceptances")
+        );
 
         // Channel TTL refresh belongs to the event insertion transaction so a
         // concurrent permanent -> ephemeral transition cannot be missed.
@@ -931,16 +1039,20 @@ mod tests {
         // so permanent-channel commits no longer serialize.
         assert_eq!(migrations[23].version, 24);
         let ttl_shared = migrations[23].sql.as_str();
-        assert!(ttl_shared
-            .contains("CREATE OR REPLACE FUNCTION refresh_channel_ttl_after_event_insert"));
+        assert!(
+            ttl_shared
+                .contains("CREATE OR REPLACE FUNCTION refresh_channel_ttl_after_event_insert")
+        );
         assert!(ttl_shared.contains("pg_advisory_xact_lock_shared"));
         assert!(ttl_shared.contains("'buzz_channel_ttl:' || NEW.community_id::text"));
         // The row read must be a bare SELECT (comments describe the removed
         // FOR UPDATE; the executable body must not reintroduce it).
         assert!(ttl_shared.contains("SELECT ttl_seconds INTO channel_ttl"));
-        assert!(!strip_sql_comments(ttl_shared)
-            .to_lowercase()
-            .contains("for update"));
+        assert!(
+            !strip_sql_comments(ttl_shared)
+                .to_lowercase()
+                .contains("for update")
+        );
         assert!(ttl_shared.contains("NEW.kind <> 9007"));
 
         // Use-limited invite links: durable relay_invites table stores only
@@ -949,8 +1061,10 @@ mod tests {
         assert_eq!(migrations[24].version, 25);
         let relay_invites = migrations[24].sql.as_str();
         assert!(relay_invites.contains("CREATE TABLE relay_invites"));
-        assert!(relay_invites
-            .contains("token_hash   BYTEA       NOT NULL CHECK (length(token_hash) = 32)"));
+        assert!(
+            relay_invites
+                .contains("token_hash   BYTEA       NOT NULL CHECK (length(token_hash) = 32)")
+        );
         assert!(relay_invites.contains("PRIMARY KEY (community_id, id)"));
         assert!(relay_invites.contains("UNIQUE (community_id, token_hash)"));
         assert!(
@@ -958,8 +1072,11 @@ mod tests {
         );
         assert!(relay_invites.contains("CHECK (max_uses IS NULL OR use_count <= max_uses)"));
         assert!(relay_invites.contains("role = 'member'"));
-        assert!(relay_invites
-            .contains("CREATE INDEX relay_invites_expires_at_idx ON relay_invites (expires_at)"));
+        assert!(
+            relay_invites.contains(
+                "CREATE INDEX relay_invites_expires_at_idx ON relay_invites (expires_at)"
+            )
+        );
         assert!(!relay_invites.contains("_operator_global_tables"));
 
         let desired_schema = include_str!("../../../schema/schema.sql");
@@ -1012,8 +1129,20 @@ mod tests {
         // Workflow runs retain the exact definition they started with. The
         // additive migration backfills existing rows through the tenant-scoped
         // workflow foreign key before making both snapshot columns required.
-        assert_eq!(migrations[28].version, 29);
-        let workflow_run_snapshots = migrations[28].sql.as_str();
+        assert_eq!(
+            migrations
+                .iter()
+                .find(|m| m.version == 1029)
+                .expect("fork migration present")
+                .version,
+            1029
+        );
+        let workflow_run_snapshots = migrations
+            .iter()
+            .find(|m| m.version == 1029)
+            .expect("fork migration present")
+            .sql
+            .as_str();
         assert!(workflow_run_snapshots.contains("ADD COLUMN definition_snapshot JSONB"));
         assert!(workflow_run_snapshots.contains("ADD COLUMN definition_hash BYTEA"));
         assert!(workflow_run_snapshots.contains("ADD COLUMN generation BIGINT NOT NULL DEFAULT 1"));
@@ -1030,8 +1159,20 @@ mod tests {
         // Durable workflow state is tenant/workflow scoped. Receipt identities
         // bind the run to the same workflow so one run cannot write state for
         // another definition.
-        assert_eq!(migrations[29].version, 30);
-        let workflow_state = migrations[29].sql.as_str();
+        assert_eq!(
+            migrations
+                .iter()
+                .find(|m| m.version == 1030)
+                .expect("fork migration present")
+                .version,
+            1030
+        );
+        let workflow_state = migrations
+            .iter()
+            .find(|m| m.version == 1030)
+            .expect("fork migration present")
+            .sql
+            .as_str();
         assert!(workflow_state.contains("CREATE TABLE workflow_state"));
         assert!(workflow_state.contains("PRIMARY KEY (community_id, workflow_id, state_key)"));
         assert!(workflow_state.contains("octet_length(state_key) BETWEEN 1 AND 512"));
@@ -1045,8 +1186,20 @@ mod tests {
         // Approval gates use the run snapshot/generation from 0029, store the
         // exact resume point and prior outputs, and enqueue semantic lifecycle
         // records without replacing the still-live legacy token approval table.
-        assert_eq!(migrations[30].version, 31);
-        let approval_foundations = migrations[30].sql.as_str();
+        assert_eq!(
+            migrations
+                .iter()
+                .find(|m| m.version == 1031)
+                .expect("fork migration present")
+                .version,
+            1031
+        );
+        let approval_foundations = migrations
+            .iter()
+            .find(|m| m.version == 1031)
+            .expect("fork migration present")
+            .sql
+            .as_str();
         assert!(approval_foundations.contains("ADD VALUE 'resume_pending'"));
         assert!(approval_foundations.contains("ALTER TABLE workflows"));
         assert!(approval_foundations.contains("ADD COLUMN deleted_at TIMESTAMPTZ"));
@@ -1060,8 +1213,10 @@ mod tests {
         assert!(approval_foundations.contains("UNIQUE (community_id, run_id, step_index)"));
         assert!(approval_foundations.contains("workflow_approval_gates_workflow_fkey"));
         assert!(approval_foundations.contains("workflow_approval_gates_run_binding_fkey"));
-        assert!(approval_foundations
-            .contains("REFERENCES workflows (community_id, id) ON DELETE NO ACTION"));
+        assert!(
+            approval_foundations
+                .contains("REFERENCES workflows (community_id, id) ON DELETE NO ACTION")
+        );
         assert!(approval_foundations.contains(
             "REFERENCES workflow_runs (community_id, id, workflow_id) ON DELETE NO ACTION"
         ));
@@ -1072,8 +1227,20 @@ mod tests {
 
         // Approval continuations carry a renewable generation-bound lease so
         // relay startup and periodic recovery can reclaim crashed executors.
-        assert_eq!(migrations[32].version, 33);
-        let workflow_resume_recovery = migrations[32].sql.as_str();
+        assert_eq!(
+            migrations
+                .iter()
+                .find(|m| m.version == 1033)
+                .expect("fork migration present")
+                .version,
+            1033
+        );
+        let workflow_resume_recovery = migrations
+            .iter()
+            .find(|m| m.version == 1033)
+            .expect("fork migration present")
+            .sql
+            .as_str();
         assert!(workflow_resume_recovery.contains("ADD COLUMN resume_lease_expires_at"));
         assert!(workflow_resume_recovery.contains("SET resume_lease_expires_at = '-infinity'"));
         assert!(workflow_resume_recovery.contains("workflow_runs_resume_lease_running"));
@@ -1084,11 +1251,25 @@ mod tests {
 
         // Effect claims bind one resolved action to a run/step identity across
         // executor generations and retain the delivery marker after recovery.
-        assert_eq!(migrations[33].version, 34);
-        let workflow_effect_claims = migrations[33].sql.as_str();
+        assert_eq!(
+            migrations
+                .iter()
+                .find(|m| m.version == 1034)
+                .expect("fork migration present")
+                .version,
+            1034
+        );
+        let workflow_effect_claims = migrations
+            .iter()
+            .find(|m| m.version == 1034)
+            .expect("fork migration present")
+            .sql
+            .as_str();
         assert!(workflow_effect_claims.contains("CREATE TABLE workflow_effect_claims"));
-        assert!(workflow_effect_claims
-            .contains("PRIMARY KEY (community_id, run_id, step_id, effect_index)"));
+        assert!(
+            workflow_effect_claims
+                .contains("PRIMARY KEY (community_id, run_id, step_id, effect_index)")
+        );
         assert!(workflow_effect_claims.contains("UNIQUE (community_id, idempotency_key)"));
         assert!(workflow_effect_claims.contains("effect_payload JSONB NOT NULL"));
         assert!(workflow_effect_claims.contains("workflow_effect_claim_identity_immutable"));
@@ -1123,8 +1304,20 @@ mod tests {
 
         // CI signed events remain canonical in `events`; the additive index
         // pins one immutable run identity and serializes per-run watch cursors.
-        assert_eq!(migrations[31].version, 32);
-        let ci_storage = migrations[31].sql.as_str();
+        assert_eq!(
+            migrations
+                .iter()
+                .find(|m| m.version == 1032)
+                .expect("fork migration present")
+                .version,
+            1032
+        );
+        let ci_storage = migrations
+            .iter()
+            .find(|m| m.version == 1032)
+            .expect("fork migration present")
+            .sql
+            .as_str();
         assert!(ci_storage.contains("CREATE TABLE ci_runs"));
         assert!(ci_storage.contains("CREATE TABLE ci_run_events"));
         assert!(ci_storage.contains("PRIMARY KEY (community_id, run_id, watch_cursor)"));
@@ -1138,9 +1331,28 @@ mod tests {
 
         // CI grants (0035, index 34) carry per-repository CI endorsement
         // approval for a run's signed events.
-        let ci_grants = migrations[34].sql.as_str();
-        assert_eq!(migrations[34].version, 35);
-        assert_eq!(&*migrations[34].description, "ci grants");
+        let ci_grants = migrations
+            .iter()
+            .find(|m| m.version == 1035)
+            .expect("fork migration present")
+            .sql
+            .as_str();
+        assert_eq!(
+            migrations
+                .iter()
+                .find(|m| m.version == 1035)
+                .expect("fork migration present")
+                .version,
+            1035
+        );
+        assert_eq!(
+            &*migrations
+                .iter()
+                .find(|m| m.version == 1035)
+                .expect("fork migration present")
+                .description,
+            "ci grants"
+        );
         assert!(
             ci_grants.contains("CREATE TABLE ci_grants"),
             "0035 must create the ci_grants table"
@@ -1167,73 +1379,52 @@ mod tests {
         );
     }
 
-    /// Versions beyond the frozen 0042 prefix approved for the tail. Empty:
-    /// appending a migration must extend this list deliberately, or the
-    /// contiguity test below fails closed on the unseen tail.
+    /// Fork identities approved after the contiguous upstream block.
     const APPROVED_EXTRA_TAIL: &[(i64, &str)] = &[
-        (43, "channel roster snapshot fence"),
-        (44, "replica heartbeat vacuum truncate"),
-        (45, "relay operators"),
-        (46, "relay admin actions"),
-        (47, "relay admin action lease"),
-        (48, "relay admin outbox claim token"),
-        (49, "relay operator audit"),
+        (1029, "workflow run snapshots"),
+        (1030, "workflow state"),
+        (1031, "workflow approval foundations"),
+        (1032, "ci event storage"),
+        (1033, "workflow resume recovery"),
+        (1034, "workflow effect claims"),
+        (1035, "ci grants"),
+        (1039, "channel admin audit actions"),
+        (1040, "agent drafts"),
+        (1041, "ci check storage"),
+        (1042, "ci merge gate"),
+        (1043, "attach community write fences"),
+        (1044, "agent drafts soft delete"),
     ];
 
     #[test]
     fn migration_versions_are_contiguous_unique_and_tail_approved() {
-        let mut migrations: Vec<_> = MIGRATOR.iter().collect();
-        migrations.sort_by_key(|migration| migration.version);
-        let versions: Vec<i64> = migrations.iter().map(|m| m.version).collect();
-
-        let mut unique = versions.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(
-            versions, unique,
-            "embedded migration versions must be unique"
-        );
-        assert!(
-            versions.starts_with(&[1]),
-            "migration numbering must start at 1"
-        );
-        for pair in versions.windows(2) {
-            assert_eq!(
-                pair[1],
-                pair[0] + 1,
-                "migration versions must be contiguous with no gaps"
-            );
-        }
-
-        // The frozen prefix is pinned by description, not just count, and any
-        // tail past 0042 must be approved entry by entry.
-        let mut by_version: std::collections::HashMap<i64, &str> = migrations
-            .iter()
-            .map(|m| (m.version, m.description.as_ref()))
-            .collect();
+        let migrations: Vec<_> = MIGRATOR.iter().collect();
+        let versions: Vec<_> = migrations.iter().map(|m| m.version).collect();
+        let unique: BTreeSet<_> = versions.iter().copied().collect();
+        assert_eq!(versions, unique.into_iter().collect::<Vec<_>>());
+        let upstream: Vec<_> = versions.iter().copied().filter(|v| *v < 1000).collect();
+        assert_eq!(upstream, (1..=46).collect::<Vec<_>>());
         for (version, description) in [
-            (36, "workflow run error codes"),
-            (37, "push message kinds"),
-            (38, "push gateway dogfood profile"),
-            (39, "channel admin audit actions"),
-            (40, "agent drafts"),
-            (41, "ci check storage"),
-            (42, "ci merge gate"),
+            (31, "workflow run error codes"),
+            (40, "push message kinds"),
+            (43, "push gateway dogfood profile"),
         ] {
             assert_eq!(
-                by_version.remove(&version),
-                Some(description),
-                "frozen tail migration {version:04} must keep its pinned identity"
+                migrations
+                    .iter()
+                    .find(|m| m.version == version)
+                    .map(|m| m.description.as_ref()),
+                Some(description)
             );
         }
-        let extra: Vec<(i64, &str)> = versions
+        let extra: Vec<_> = migrations
             .iter()
-            .filter(|v| **v > 42)
-            .map(|v| (*v, by_version[v]))
+            .filter(|m| m.version >= 1000)
+            .map(|m| (m.version, m.description.as_ref()))
             .collect();
         assert_eq!(
             extra, APPROVED_EXTRA_TAIL,
-            "unapproved migration tail: extend APPROVED_EXTRA_TAIL deliberately"
+            "extend APPROVED_EXTRA_TAIL deliberately for new fork migrations"
         );
     }
 
@@ -1260,21 +1451,21 @@ mod tests {
             ),
             (6, include_str!("../../../migrations/0006_moderation.sql")),
             (
-                29,
-                include_str!("../../../migrations/0029_workflow_run_snapshots.sql"),
+                1029,
+                include_str!("../../../migrations/1029_workflow_run_snapshots.sql"),
             ),
-            (35, include_str!("../../../migrations/0035_ci_grants.sql")),
+            (1035, include_str!("../../../migrations/1035_ci_grants.sql")),
             (
-                36,
-                include_str!("../../../migrations/0036_workflow_run_error_codes.sql"),
-            ),
-            (
-                40,
-                include_str!("../../../migrations/0040_agent_drafts.sql"),
+                31,
+                include_str!("../../../migrations/0031_workflow_run_error_codes.sql"),
             ),
             (
-                42,
-                include_str!("../../../migrations/0042_ci_merge_gate.sql"),
+                1040,
+                include_str!("../../../migrations/1040_agent_drafts.sql"),
+            ),
+            (
+                1042,
+                include_str!("../../../migrations/1042_ci_merge_gate.sql"),
             ),
         ] {
             let migration = migrations
@@ -1344,7 +1535,7 @@ mod tests {
         // policy evolves (negative skip-set, fresh-install allowlist, lease
         // exclusion, agent-draft exclusion). Every other ADD COLUMN must be
         // unique per table.
-        let pinned_search_tsv_chain = [5, 8, 14, 40];
+        let pinned_search_tsv_chain = [5, 8, 14, 33, 1040];
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
         let mut added: std::collections::HashMap<(String, String), i64> =
@@ -1391,7 +1582,7 @@ mod tests {
         // The 0040 file header claims a 0039 dependency that does not exist.
         // The applied bytes stay frozen; the correction lives in the
         // operation map, and this test locks both sides together.
-        let sql = include_str!("../../../migrations/0040_agent_drafts.sql");
+        let sql = include_str!("../../../migrations/1040_agent_drafts.sql");
         let first_line = sql.lines().next().unwrap_or("");
         assert_eq!(
             first_line, "-- Depends on reserved 0039 relay authorization migration; source only.",
@@ -1407,7 +1598,7 @@ mod tests {
             .and_then(|entries| {
                 entries
                     .iter()
-                    .find(|e| e.get("version") == Some(&40.into()))
+                    .find(|e| e.get("version") == Some(&1040.into()))
             })
             .expect("operation map covers 0040");
         assert_eq!(
@@ -1468,9 +1659,11 @@ mod tests {
 
         let violations = scoped_constraint_violations(sql);
 
-        assert!(violations
-            .iter()
-            .any(|violation| violation.kind == ConstraintKind::PrimaryKey));
+        assert!(
+            violations
+                .iter()
+                .any(|violation| violation.kind == ConstraintKind::PrimaryKey)
+        );
         assert_eq!(
             violations
                 .iter()
@@ -1599,11 +1792,109 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn agent_draft_rows_soft_delete_but_never_rewrite_or_hard_delete() {
+        let pool = connect_test_pool().await;
+        reset_public_schema(&pool).await;
+        run_migrations(&pool).await.expect("apply migrations");
+
+        let community_id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(community_id)
+            .bind(format!("drafts-0050-{}.example", community_id.simple()))
+            .execute(&pool)
+            .await
+            .expect("insert community");
+        // Two draft rows (request, decision) and one ordinary message.
+        for (marker, kind) in [(1_u8, 14_201_i32), (2, 14_202), (3, 1)] {
+            sqlx::query(
+                "INSERT INTO events \
+                 (community_id, id, pubkey, created_at, kind, tags, content, sig, received_at) \
+                 VALUES ($1, $2, $3, NOW(), $4, '[]'::jsonb, 'draft body', $5, NOW())",
+            )
+            .bind(community_id)
+            .bind(vec![marker; 32])
+            .bind(vec![marker + 10; 32])
+            .bind(kind)
+            .bind(vec![marker + 20; 64])
+            .execute(&pool)
+            .await
+            .expect("insert event");
+        }
+        let draft = vec![1_u8; 32];
+
+        // A soft delete is the relay's ordinary delete statement; it passes.
+        let soft = sqlx::query(
+            "UPDATE events SET deleted_at = NOW() \
+             WHERE community_id = $1 AND id = $2 AND deleted_at IS NULL",
+        )
+        .bind(community_id)
+        .bind(&draft)
+        .execute(&pool)
+        .await
+        .expect("soft delete a draft row");
+        assert_eq!(soft.rows_affected(), 1);
+
+        // A bulk sweep whose range holds draft rows no longer aborts.
+        let sweep = sqlx::query(
+            "UPDATE events SET deleted_at = NOW() \
+             WHERE community_id = $1 AND deleted_at IS NULL",
+        )
+        .bind(community_id)
+        .execute(&pool)
+        .await
+        .expect("bulk soft delete across draft and ordinary rows");
+        assert_eq!(sweep.rows_affected(), 2);
+
+        // Bookkeeping columns stay writable.
+        sqlx::query("UPDATE events SET delivered_at = 1 WHERE community_id = $1 AND id = $2")
+            .bind(community_id)
+            .bind(&draft)
+            .execute(&pool)
+            .await
+            .expect("bookkeeping update on a draft row");
+
+        // Signed columns stay immutable.
+        for statement in [
+            "UPDATE events SET content = 'rewritten' WHERE community_id = $1 AND id = $2",
+            "UPDATE events SET tags = '[[\"x\"]]'::jsonb WHERE community_id = $1 AND id = $2",
+            "UPDATE events SET kind = 1 WHERE community_id = $1 AND id = $2",
+            "UPDATE events SET pubkey = $2 WHERE community_id = $1 AND id = $2",
+        ] {
+            let error = sqlx::query(statement)
+                .bind(community_id)
+                .bind(&draft)
+                .execute(&pool)
+                .await
+                .expect_err("draft rewrite must raise");
+            assert!(
+                error.to_string().contains("cannot be rewritten"),
+                "{statement}: {error}"
+            );
+        }
+
+        // A hard delete of a draft row still raises; an ordinary row deletes.
+        let error = sqlx::query("DELETE FROM events WHERE community_id = $1 AND id = $2")
+            .bind(community_id)
+            .bind(&draft)
+            .execute(&pool)
+            .await
+            .expect_err("draft hard delete must raise");
+        assert!(error.to_string().contains("cannot be deleted"), "{error}");
+        let ordinary = sqlx::query("DELETE FROM events WHERE community_id = $1 AND id = $2")
+            .bind(community_id)
+            .bind(vec![3_u8; 32])
+            .execute(&pool)
+            .await
+            .expect("ordinary row hard delete");
+        assert_eq!(ordinary.rows_affected(), 1);
+    }
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn populated_workflow_approval_upgrade_sets_resume_defaults_and_retains_history() {
         let pool = connect_test_pool().await;
         reset_public_schema(&pool).await;
         MIGRATOR
-            .run_to(30, &pool)
+            .run_to(1030, &pool)
             .await
             .expect("apply migrations 1-30");
 
@@ -1694,7 +1985,7 @@ mod tests {
         .expect("insert legacy approval");
 
         MIGRATOR
-            .run_to(31, &pool)
+            .run_to(1031, &pool)
             .await
             .expect("upgrade populated approval tables");
 
@@ -1937,7 +2228,7 @@ mod tests {
         let pool = connect_test_pool().await;
         reset_public_schema(&pool).await;
         MIGRATOR
-            .run_to(36, &pool)
+            .run_to(39, &pool)
             .await
             .expect("frozen fork prefix");
         let community = seed_push_migration_lease(&pool).await;
@@ -1969,7 +2260,7 @@ mod tests {
             .await
             .expect("snapshot existing authority");
         MIGRATOR
-            .run_to(37, &pool)
+            .run_to(40, &pool)
             .await
             .expect("admit only migration 0037");
         let after: serde_json::Value = sqlx::query_scalar(snapshot_sql)
@@ -1981,7 +2272,7 @@ mod tests {
             "profile authority and leases must remain byte-equivalent"
         );
         let checksum: Vec<u8> = sqlx::query_scalar(
-            "SELECT checksum FROM _sqlx_migrations WHERE version=37 AND success",
+            "SELECT checksum FROM _sqlx_migrations WHERE version=40 AND success",
         )
         .fetch_one(&pool)
         .await
@@ -1990,7 +2281,7 @@ mod tests {
             checksum,
             MIGRATOR
                 .iter()
-                .find(|m| m.version == 37)
+                .find(|m| m.version == 40)
                 .unwrap()
                 .checksum
                 .as_ref()
@@ -2005,7 +2296,7 @@ mod tests {
         // This fixture explicitly proves the later, separately approved cutover.
         let pool = connect_test_pool().await;
         reset_public_schema(&pool).await;
-        MIGRATOR.run_to(37, &pool).await.unwrap();
+        MIGRATOR.run_to(40, &pool).await.unwrap();
         let community = seed_push_migration_lease(&pool).await;
         assert_push_message_kinds(&pool, community).await;
         sqlx::query("INSERT INTO push_gateway_installations(id,app_attest_key_id,app_attest_public_key,assertion_counter,app_profile,token_ciphertext,token_fingerprint,endpoint_epoch,expires_at) VALUES($1,$2,$3,0,'buzz-ios-sandbox',$4,$5,1,now()+interval '1 day')")
@@ -2024,7 +2315,7 @@ mod tests {
         let counts: (i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM push_gateway_installations),(SELECT count(*) FROM push_gateway_delegations)").fetch_one(&pool).await.unwrap();
         assert_eq!(counts, (0, 0));
         let checksum: Vec<u8> = sqlx::query_scalar(
-            "SELECT checksum FROM _sqlx_migrations WHERE version=38 AND success",
+            "SELECT checksum FROM _sqlx_migrations WHERE version=43 AND success",
         )
         .fetch_one(&pool)
         .await
@@ -2033,7 +2324,7 @@ mod tests {
             checksum,
             MIGRATOR
                 .iter()
-                .find(|m| m.version == 38)
+                .find(|m| m.version == 43)
                 .unwrap()
                 .checksum
                 .as_ref()
@@ -2167,95 +2458,23 @@ mod tests {
 
 #[cfg(test)]
 mod b1_ci_grants_ordering {
-    //! A4 test-only hook for B1 lane objective 4: `0035_ci_grants` must run
-    //! only after 0029..0034.
-    //!
-    //! This module is additive-only (never edits or re-binds migration
-    //! indexes inside the main test module). It asserts the *semantic*
-    //! ordering: the workflow snapshot/state/approval/CI-event storage base
-    //! (0029-0034) must still occupy versions 29-34, and the CI-signer-grant
-    //! migration must remain version 35 in the frozen prefix and must not have
-    //! displaced any of 0029-0034.
-    //!
-    //! The embedded migrator must retain its frozen 35-migration prefix, with 0035
-    //! immediately after 0034.
-
+    //! The fork CI grant migration follows its workflow and CI storage dependencies.
     use super::MIGRATOR;
 
     #[test]
     fn ci_grants_lands_only_after_workflow_and_ci_storage_base() {
-        let mut migrations: Vec<_> = MIGRATOR.iter().collect();
-        migrations.sort_by_key(|migration| migration.version);
-
-        assert_eq!(
-            migrations
-                .iter()
-                .take(35)
-                .map(|m| m.version)
-                .collect::<Vec<_>>(),
-            (1..=35).collect::<Vec<_>>()
-        );
-        assert_eq!(
-            migrations
-                .iter()
-                .skip(35)
-                .map(|m| (m.version, m.description.as_ref()))
-                .collect::<Vec<_>>(),
-            vec![
-                (36, "workflow run error codes"),
-                (37, "push message kinds"),
-                (38, "push gateway dogfood profile"),
-                (39, "channel admin audit actions"),
-                (40, "agent drafts"),
-                (41, "ci check storage"),
-                (42, "ci merge gate"),
-                (43, "channel roster snapshot fence"),
-                (44, "replica heartbeat vacuum truncate"),
-                (45, "relay operators"),
-                (46, "relay admin actions"),
-                (47, "relay admin action lease"),
-                (48, "relay admin outbox claim token"),
-                (49, "relay operator audit"),
-            ]
-        );
+        let migrations: Vec<_> = MIGRATOR.iter().collect();
         let ci_grants = migrations
             .iter()
-            .position(|migration| migration.description == "ci grants")
-            .expect("0035_ci_grants must be present");
-
-        // 0035_ci_grants.sql must have sqlx version 35.
-        assert_eq!(
-            migrations[ci_grants].version, 35,
-            "0035_ci_grants must be migration version 35"
-        );
-
-        // The base the workflow/CI ingestion depends on must remain in place
-        // (semantic index): index 28 is 0029_workflow_run_snapshots and the
-        // sequence 29-34 (vector indexes 28..=33) is unchanged. This is the
-        // "index 34 semantic vs index 28 workflow snapshots" binding: the tail
-        // migration is exactly one past 0034's vector slot, and 0029 has not
-        // been replaced or displaced.
-        let snapshot = &migrations[28];
-        assert_eq!(snapshot.version, 29, "index 28 must be 0029");
-        assert_eq!(
-            &*snapshot.description, "workflow run snapshots",
-            "index 28 must still be 0029_workflow_run_snapshots"
-        );
-
-        let tail_versions: Vec<i64> = migrations.iter().map(|m| m.version).collect();
-        let tail = &tail_versions[29..35];
-        assert_eq!(
-            tail,
-            &[30, 31, 32, 33, 34, 35],
-            "migration 0035 must land immediately after 0034 with no renumbering of 0030-0034"
-        );
-
-        // And `ci_grants` must stay at its original vector index (35 in 1-based
-        // terms, i.e. vector index 34 because 0001 occupies index 0).
-        assert_eq!(ci_grants, 34, "0035_ci_grants must retain vector index 34");
-
-        // Fact-bound: the migration itself must create the grants table with
-        // the B1 authorizer's PK and window columns.
+            .position(|m| m.version == 1035)
+            .expect("1035_ci_grants must be present");
+        for version in 1029..=1034 {
+            let dependency = migrations
+                .iter()
+                .position(|m| m.version == version)
+                .expect("fork prerequisite must be present");
+            assert!(dependency < ci_grants);
+        }
         let sql = migrations[ci_grants].sql.as_str();
         assert!(
             sql.contains("CREATE TABLE ci_grants"),

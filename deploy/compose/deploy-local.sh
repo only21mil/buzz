@@ -493,12 +493,12 @@ PY
 candidate_required_migration() {
   local required_raw
   required_raw=$(git -C "${repo_root}" ls-tree -r --name-only "${commit}" -- migrations \
-    | sed -n 's#^migrations/\([0-9][0-9]*\)_.*[.]sql$#\1#p' | sort -n | tail -1)
-  [[ -n ${required_raw} ]] || {
+    | sed -n 's#^migrations/\([0-9][0-9]*\)_.*[.]sql$#\1#p' | wc -l)
+  ((required_raw > 0)) || {
     printf 'REFUSED: no numbered SQL migrations found at %s\n' "${commit}" >&2
     return 1
   }
-  printf '%d\n' "$((10#${required_raw}))"
+  printf '%d\n' "${required_raw}"
 }
 
 container_network_ip() {
@@ -684,12 +684,12 @@ read_db_migration() {
     return 0
   fi
   if ! row=$(db_query \
-    "SELECT version || '|' || success FROM _sqlx_migrations ORDER BY version DESC LIMIT 1"); then
-    printf 'REFUSED: database latest-migration query failed\n' >&2
+    "SELECT count(*) FILTER (WHERE success) || '|' || COALESCE(bool_and(success), true) FROM _sqlx_migrations"); then
+    printf 'REFUSED: database migration-count query failed\n' >&2
     return 1
   fi
   if [[ ! ${row} =~ ^([0-9]+)\|(t|true|f|false)$ ]]; then
-    printf 'REFUSED: database latest-migration row is empty or malformed: %s\n' \
+    printf 'REFUSED: database migration-count row is empty or malformed: %s\n' \
       "${row:-<empty>}" >&2
     return 1
   fi
@@ -1629,7 +1629,7 @@ print(image)
   preflight_active=0
   IFS='|' read -r db_migration db_success <<<"${db_state}"
   [[ ${db_migration} =~ ^[0-9]+$ ]] || {
-    printf 'REFUSED: invalid migration version returned by database: %s\n' "${db_state}" >&2
+    printf 'REFUSED: invalid migration count returned by database: %s\n' "${db_state}" >&2
     return 1
   }
   pg_boolean_true "${db_success}" || {
@@ -1764,7 +1764,7 @@ compose exec -T postgres sh -euc \
 db_state=$(read_db_migration)
 IFS='|' read -r db_migration db_success <<<"${db_state}"
 [[ ${db_migration} =~ ^[0-9]+$ ]] || {
-  printf 'REFUSED: invalid migration version returned by database: %s\n' "${db_state}" >&2
+  printf 'REFUSED: invalid migration count returned by database: %s\n' "${db_state}" >&2
   exit 1
 }
 if ! pg_boolean_true "${db_success}"; then
