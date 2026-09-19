@@ -819,8 +819,8 @@ mod postgres_tests {
             .await
             .expect("create scratch db");
         let base = crate::test_support::database_url();
-        let idx = base.rfind('/').expect("db url has a path segment");
-        let pool = PgPool::connect(&format!("{}/{}", &base[..idx], name))
+
+        let pool = PgPool::connect(&crate::test_connection::database_url(&base, &name))
             .await
             .expect("connect scratch db");
         crate::migration::run_migrations(&pool)
@@ -1061,12 +1061,8 @@ mod postgres_tests {
         .expect("create unprivileged role");
 
         let base = crate::test_support::database_url();
-        let unpriv_url = {
-            let rest = base.strip_prefix("postgres://").expect("pg url");
-            let at = rest.rfind('@').expect("credentials in url");
-            format!("postgres://{role}:fence_probe_test@{}", &rest[at + 1..])
-        };
-        let unpriv = PgPool::connect(&unpriv_url).await.expect("connect unpriv");
+        let options = crate::test_connection::role_options(&base, &role, "fence_probe_test");
+        let unpriv = PgPool::connect_with(options).await.expect("connect unpriv");
 
         let err = sample_writer(&unpriv)
             .await

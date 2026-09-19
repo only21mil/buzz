@@ -663,10 +663,7 @@ async fn create_scratch_db_through(
         .expect("create scratch db");
     let base = admin_url().await;
     // Swap the database path segment of the admin URL for the scratch name.
-    let scratch_url = {
-        let idx = base.rfind('/').expect("db url has a path segment");
-        format!("{}/{}", &base[..idx], name)
-    };
+    let scratch_url = crate::test_connection::database_url(&base, &name);
     let pool = PgPool::connect(&scratch_url)
         .await
         .expect("connect scratch db");
@@ -1836,10 +1833,7 @@ async fn routed_fallback_spends_one_acquire_budget_when_aurora_cache_is_cold() {
     let (seed, wname) = create_scratch_db(&admin, "one_budget").await;
     seed.close().await;
     let base = admin_url().await;
-    let scratch_url = {
-        let idx = base.rfind('/').expect("db url has a path segment");
-        format!("{}/{}", &base[..idx], wname)
-    };
+    let scratch_url = crate::test_connection::database_url(&base, &wname);
 
     // `Db::new` so the writer arms the floor guard and the reader is the
     // real lazy `connect_read_pool` pool (min_connections=0, 150ms
@@ -2163,8 +2157,8 @@ async fn lazy_reader_pool_still_spawns_fence_probe() {
 
     let writer_url = {
         let base = admin_url().await;
-        let idx = base.rfind('/').expect("db url has a path segment");
-        format!("{}/{}", &base[..idx], wname)
+
+        crate::test_connection::database_url(&base, &wname)
     };
     // `Db::new` (not `from_pools`) so the WRITER pool arms the
     // `buzz.created_at_floor` GUC — `spawn_fence_probe` verifies the
@@ -2760,8 +2754,8 @@ async fn writer_pool_rejects_non_read_committed_database_default() {
     seed_pool.close().await;
 
     let base = admin_url().await;
-    let idx = base.rfind('/').expect("db url has a path segment");
-    let scratch_url = format!("{}/{}", &base[..idx], name);
+
+    let scratch_url = crate::test_connection::database_url(&base, &name);
     let error = Db::new(&DbConfig {
         database_url: scratch_url,
         max_connections: 1,
@@ -2924,8 +2918,8 @@ async fn session_timeouts_install_through_db_new_and_bound_lock_waits() {
     seed_pool.close().await;
 
     let base = admin_url().await;
-    let idx = base.rfind('/').expect("db url has a path segment");
-    let scratch_url = format!("{}/{}", &base[..idx], name);
+
+    let scratch_url = crate::test_connection::database_url(&base, &name);
     let db = Db::new(&DbConfig {
         database_url: scratch_url.clone(),
         max_connections: 2,
@@ -3016,8 +3010,8 @@ async fn armed_pool_rejects_old_channel_inserts_through_public_api() {
 
     // Connect a Db the production way: after_connect arms the guard.
     let base = admin_url().await;
-    let idx = base.rfind('/').expect("db url has a path segment");
-    let scratch_url = format!("{}/{}", &base[..idx], name);
+
+    let scratch_url = crate::test_connection::database_url(&base, &name);
     let db = Db::new(&DbConfig {
         database_url: scratch_url,
         max_connections: 2,
@@ -3115,9 +3109,9 @@ async fn fence_probe_refuses_to_start_without_verified_floor_guard() {
     replica_pool.close().await;
 
     let base = admin_url().await;
-    let idx = base.rfind('/').expect("db url has a path segment");
-    let writer_url = format!("{}/{}", &base[..idx], wname);
-    let replica_url = format!("{}/{}", &base[..idx], rname);
+
+    let writer_url = crate::test_connection::database_url(&base, &wname);
+    let replica_url = crate::test_connection::database_url(&base, &rname);
 
     // Healthy schema: verification passes, probe starts. A SEPARATE Db
     // instance, because its background probe legitimately opens its own

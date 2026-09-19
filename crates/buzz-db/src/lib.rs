@@ -28,6 +28,8 @@ mod store;
 pub mod error;
 
 #[cfg(test)]
+mod test_connection;
+#[cfg(test)]
 mod test_support;
 
 pub use runtime::{

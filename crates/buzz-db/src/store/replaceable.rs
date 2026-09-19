@@ -638,10 +638,7 @@ mod postgres_tests {
             .expect("create scratch db");
         let base = admin_url().await;
         // Swap the database path segment of the admin URL for the scratch name.
-        let scratch_url = {
-            let idx = base.rfind('/').expect("db url has a path segment");
-            format!("{}/{}", &base[..idx], name)
-        };
+        let scratch_url = crate::test_connection::database_url(&base, &name);
         let pool = PgPool::connect(&scratch_url)
             .await
             .expect("connect scratch db");
@@ -792,8 +789,8 @@ mod postgres_tests {
             .expect("connect admin");
         let (setup_pool, scratch_name) = create_scratch_db(&admin, "mixed_roster_writer").await;
         let base_url = admin_url().await;
-        let slash = base_url.rfind('/').expect("database URL has path segment");
-        let scratch_url = format!("{}/{}", &base_url[..slash], scratch_name);
+
+        let scratch_url = crate::test_connection::database_url(&base_url, &scratch_name);
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(1))
