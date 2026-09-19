@@ -33,6 +33,10 @@ fn agent_secret_store() -> Option<&'static SecretStore> {
 }
 
 pub fn managed_agents_base_dir<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
+    #[cfg(test)]
+    if let Some(probe) = app.try_state::<crate::managed_agents::poll_read_probe::PollReadProbe>() {
+        return Ok(probe.directory.path().to_path_buf());
+    }
     let dir = app
         .path()
         .app_data_dir()

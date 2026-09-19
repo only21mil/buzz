@@ -672,9 +672,8 @@ pub use get::get_relay_json;
 
 mod submit;
 pub use submit::{
-    submit_event, submit_event_at_created_at, submit_event_at_with_keys,
-    submit_event_with_keys_created_at, submit_retained_event_in_scope,
-    submit_signed_event_at_with_keys, SubmitEventResponse,
+    submit_event, submit_event_at_with_keys, submit_event_with_keys_created_at,
+    submit_retained_event_in_scope, submit_signed_event_at_with_keys, SubmitEventResponse,
 };
 
 /// Sign an event with explicit keys and POST it to `/events` with NIP-98 auth.

@@ -30,6 +30,8 @@ pub struct ProjectRepoContributorInfo {
 
 #[derive(Serialize)]
 pub struct ProjectRepoSnapshotInfo {
+    /// Total commits in the activity range, independent of the preview limit.
+    pub commit_count: Option<usize>,
     pub latest_commit: Option<ProjectRepoCommitInfo>,
     pub commits: Vec<ProjectRepoCommitInfo>,
     pub files: Vec<ProjectRepoFileInfo>,
@@ -44,6 +46,8 @@ pub struct ProjectLocalRepoSnapshotInfo {
 
 #[derive(Serialize)]
 pub struct ProjectLocalRepoInfo {
+    /// Branch checked out in this repository or linked worktree.
+    pub branch: Option<String>,
     pub name: String,
     pub path: String,
 }
