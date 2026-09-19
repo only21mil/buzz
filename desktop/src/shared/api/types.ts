@@ -1,3 +1,5 @@
+export type { PersonaReviewContent } from "./personaReviewContent";
+
 export type ChannelType = "stream" | "forum" | "dm";
 export type ChannelVisibility = "open" | "private";
 export type ChannelRole = "owner" | "admin" | "member" | "guest" | "bot";
@@ -309,6 +311,7 @@ export type AcpSessionPolicy = "channel" | "thread";
 import type { RestartDiffEntry } from "./restartDiff";
 export type { JsonValue, RestartChange, RestartDiffEntry } from "./restartDiff";
 export type ManagedAgent = {
+  effortLevel?: string | null;
   pubkey: string;
   name: string;
   personaId: string | null;
