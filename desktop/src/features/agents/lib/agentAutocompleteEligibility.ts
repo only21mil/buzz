@@ -184,9 +184,10 @@ export function shouldHideAgentFromMentions({
   managedAgentPubkeys,
   mentionableAgentPubkeys,
   directoryAgentPubkeys,
+  directoryReady = true,
 }: {
   isAgent: boolean;
-  isMember: boolean;
+  isMember?: boolean;
   pubkey: string;
   ownerPubkey?: string | null;
   currentPubkey?: string | null;
@@ -194,15 +195,15 @@ export function shouldHideAgentFromMentions({
   relayAgents?: readonly Pick<RelayAgent, "pubkey" | "respondTo">[];
   managedAgentPubkeys?: ReadonlySet<string>;
   mentionableAgentPubkeys: ReadonlySet<string>;
-  directoryAgentPubkeys: ReadonlySet<string>;
+  directoryAgentPubkeys?: ReadonlySet<string>;
+  directoryReady?: boolean;
 }) {
   if (!isAgent) return false;
   const normalized = normalizePubkey(pubkey);
   // Local custody keeps explicit references available even for stopped agents.
   // Relay-only identity still follows relay policy below.
   if (managedAgentPubkeys?.has(normalized)) return false;
-  // Invocable => always show.
-  if (mentionableAgentPubkeys.has(normalized)) return false;
+  if (directoryReady && mentionableAgentPubkeys.has(normalized)) return false;
   const isOwnedByCurrentUser = Boolean(
     isMember &&
       ownerPubkey &&
@@ -214,24 +215,21 @@ export function shouldHideAgentFromMentions({
     relayAgents?.find((agent) => normalizePubkey(agent.pubkey) === normalized)
       ?.respondTo;
   // For current-owned members, an explicit policy wins over directory
-  // absence. An unknown policy still follows the Option B fallback below.
+  // absence. Unknown policy retains the fork's owner/member visibility.
   if (isOwnedByCurrentUser && effectiveRespondTo != null) {
     return effectiveRespondTo !== "owner-only";
   }
-  // Non-member, non-invocable => hide (preserves prior behavior).
-  if (!isMember) return true;
-  // Member (Option B): hide only when we have an explicit not-invocable
-  // signal — a relay directory (kind:10100) entry that excludes us.
-  // Unknown invocability (not in directory) => show.
-  //
-  // NOTE: this assumes `directoryAgentPubkeys` and `mentionableAgentPubkeys`
-  // share the same source query (`relayAgentsQuery.data`), so directory
-  // presence without membership in `mentionableAgentPubkeys` is a real
-  // explicit-exclusion signal. If a future change sources the directory set
-  // from a different query, an agent that's directory-present but whose
-  // mentionability is still loading could be hidden prematurely — keep the
-  // two sets derived from the same query.
-  return directoryAgentPubkeys.has(normalized);
+  if (isOwnedByCurrentUser && !directoryAgentPubkeys?.has(normalized)) {
+    return false;
+  }
+  return (
+    getAgentMentionAdmission({
+      isAgent,
+      pubkey,
+      mentionableAgentPubkeys,
+      directoryReady,
+    }) !== "allow"
+  );
 }
 
 export function getAgentIdentityPubkeys({
