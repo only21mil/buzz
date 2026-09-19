@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use buzz_core::kind::*;
 use buzz_core::tenant::{CommunityId, TenantContext};
+use buzz_datastore_tracing::datastore_span;
 use buzz_db::workflow::{ApprovalStatus, RunStatus};
 use buzz_db::{
     ApprovalDecisionPayload, DbError, DecideWorkflowApprovalGateParams, WorkflowApprovalDecision,
@@ -481,6 +482,7 @@ async fn handle_dm_open(
                 "actor": self_hex,
                 "participants": participant_hexes,
             }),
+            Utc::now(),
         )
         .await
         {

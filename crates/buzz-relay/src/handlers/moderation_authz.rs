@@ -418,6 +418,7 @@ pub(crate) async fn audit_channel_admin_event(
             tenant.community(),
             buzz_db::moderation::NewAction {
                 actor_pubkey: event.pubkey.as_bytes(),
+                actor_authority: None, // channel/community authority
                 action,
                 target_pubkey: target.as_deref(),
                 target_event_id: target_event.as_deref(),
