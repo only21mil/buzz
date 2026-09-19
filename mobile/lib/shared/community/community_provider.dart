@@ -191,10 +191,10 @@ class _CommunitySnapshotSync {
     return result;
   }
 
-  Future<void> write(List<Community> communities) =>
-      _serializeMutation(() => _write(communities));
+  Future<void> write(List<Community> communities, {bool force = false}) =>
+      _serializeMutation(() => _write(communities, force: force));
 
-  Future<void> _write(List<Community> communities) async {
+  Future<void> _write(List<Community> communities, {bool force = false}) async {
     final effectiveCommunities = communities;
     final contentFingerprint = effectiveCommunities
         .map(
@@ -211,15 +211,21 @@ class _CommunitySnapshotSync {
           ].join('\u0000'),
         )
         .join('\u0001');
-    if (contentFingerprint == _lastSuccessfulSnapshot) return;
+    if (!force && contentFingerprint == _lastSuccessfulSnapshot) return;
     await _writer(effectiveCommunities);
     _lastSuccessfulSnapshot = contentFingerprint;
   }
 }
 
-Future<void> syncCommunitySnapshot(Ref ref, List<Community> communities) async {
+Future<void> syncCommunitySnapshot(
+  Ref ref,
+  List<Community> communities, {
+  bool force = false,
+}) async {
   try {
-    await ref.read(_communitySnapshotSyncProvider).write(communities);
+    await ref
+        .read(_communitySnapshotSyncProvider)
+        .write(communities, force: force);
     pushCommunitySnapshotError.value = null;
   } catch (error, stackTrace) {
     reportPushCommunitySnapshotError(error, stackTrace);
@@ -234,6 +240,27 @@ Future<void> syncStoredCommunitySnapshot(Ref ref) async {
 class CommunityListNotifier extends AsyncNotifier<List<Community>> {
   Future<void> _pushMutationTail = Future.value();
   final Map<String, Future<void>> _tombstoneAttempts = {};
+
+  final Map<String, Object> _pushLifecycles = {};
+
+  /// Captures consent, identity, and policy before asynchronous enrollment starts.
+  Object capturePushLifecycle(String id) =>
+      _pushLifecycles.putIfAbsent(id, Object.new);
+
+  /// Rejects completions after consent, identity, policy, or disposal changes.
+  bool isPushLifecycleCurrent(String id, Object lifecycle) =>
+      ref.mounted &&
+      identical(_pushLifecycles[id], lifecycle) &&
+      (state.value ?? const <Community>[]).any(
+        (community) => community.id == id && community.pushNotificationsEnabled,
+      );
+
+  /// Refreshes metadata from current authority in the same queue as removal.
+  /// Force bypasses content deduplication because native relay metadata changed.
+  Future<void> refreshPushSnapshot() => _serializePushMutation(() async {
+    if (!ref.mounted) return;
+    await syncCommunitySnapshot(ref, state.value ?? const [], force: true);
+  });
 
   Future<T> _serializePushMutation<T>(Future<T> Function() operation) {
     final result = _pushMutationTail.then((_) => operation());
@@ -265,6 +292,7 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
     );
     if (existingIndex >= 0) {
       final existing = current[existingIndex];
+      _pushLifecycles[existing.id] = Object();
       final updated = existing.copyWith(
         pubkey: community.pubkey,
         nsec: community.nsec,
@@ -302,26 +330,29 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
       final activeId = await storage.loadActiveId();
       final id = requestedId ?? activeId;
       if (id == null) return;
+      _pushLifecycles[id] = Object();
       if (activeId == id) {
         await ref.read(communityTransitionProvider).run();
       }
-      final current = state.value ?? await storage.loadAll();
-      final removedIndex = current.indexWhere(
-        (community) => community.id == id,
-      );
-      if (removedIndex >= 0) {
-        // Persist every remote-cleanup dependency before erasing credentials.
-        // This local transaction is the only removal prerequisite. Relay I/O
-        // starts after the community and NSE snapshot have been removed.
-        revocationJournaled = await ref.read(
-          communityPushLeaseRevocationEnqueuerProvider,
-        )(current[removedIndex]);
-      }
-      await storage.remove(id);
+      await _serializePushMutation(() async {
+        final current = state.value ?? await storage.loadAll();
+        final removedIndex = current.indexWhere(
+          (community) => community.id == id,
+        );
+        if (removedIndex >= 0) {
+          // Persist every remote-cleanup dependency before erasing credentials.
+          // This local transaction is the only removal prerequisite. Relay I/O
+          // starts after the community and NSE snapshot have been removed.
+          revocationJournaled = await ref.read(
+            communityPushLeaseRevocationEnqueuerProvider,
+          )(current[removedIndex]);
+        }
+        await storage.remove(id);
 
-      final updatedList = current.where((w) => w.id != id).toList();
-      state = AsyncData(updatedList);
-      await syncCommunitySnapshot(ref, updatedList);
+        final updatedList = current.where((w) => w.id != id).toList();
+        state = AsyncData(updatedList);
+        await syncCommunitySnapshot(ref, updatedList);
+      });
 
       // If we removed the active community, switch to another or sign out.
       if (activeId == id) {
@@ -391,12 +422,16 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
     );
     await storage.save(updated);
     final updatedList = [...current]..[index] = updated;
+    _pushLifecycles[id] = Object();
     state = AsyncData(updatedList);
     await syncCommunitySnapshot(ref, updatedList);
   });
 
-  Future<int> reservePushLeaseGeneration(String id) {
+  Future<int> reservePushLeaseGeneration(String id, {Object? lifecycle}) {
     return _serializePushMutation(() async {
+      if (lifecycle != null && !isPushLifecycleCurrent(id, lifecycle)) {
+        throw StateError('Push enrollment is obsolete.');
+      }
       final storage = ref.read(communityStorageProvider);
       final current = state.value ?? await storage.loadAll();
       final index = current.indexWhere((community) => community.id == id);
@@ -427,7 +462,11 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
     String id, {
     required List<BuzzPushSubscription> subscriptions,
     required int generation,
+    Object? lifecycle,
   }) => _serializePushMutation(() async {
+    if (lifecycle != null && !isPushLifecycleCurrent(id, lifecycle)) {
+      return false;
+    }
     final storage = ref.read(communityStorageProvider);
     final current = state.value ?? await storage.loadAll();
     final index = current.indexWhere((community) => community.id == id);
@@ -459,6 +498,7 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
   });
 
   Future<void> setPushNotificationsEnabled(String id, bool enabled) async {
+    _pushLifecycles[id] = Object();
     var shouldDeactivate = false;
     await _serializePushMutation(() async {
       final storage = ref.read(communityStorageProvider);

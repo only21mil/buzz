@@ -1,3 +1,4 @@
+import '../../shared/identity/npub.dart';
 import 'dart:async';
 import 'dart:math' show cos, max, min, pi;
 import 'dart:ui' show ImageFilter, lerpDouble;

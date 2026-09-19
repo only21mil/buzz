@@ -1,6 +1,7 @@
 package xyz.block.buzz.mobile
 
 
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -129,6 +130,7 @@ class MainActivity : FlutterFragmentActivity() {
     private var mediaUploadChannel: MethodChannel? = null
     private var ageSignalChannel: MethodChannel? = null
     private val ageSignalRequest = AgeSignalRequest()
+    private var notificationBridge: AndroidNotificationBridge? = null
     private var huddleMediaPlugin: HuddleMediaPlugin? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -137,6 +139,12 @@ class MainActivity : FlutterFragmentActivity() {
         huddleMediaPlugin = HuddleMediaPlugin(
             this,
             flutterEngine.dartExecutor.binaryMessenger,
+        )
+
+        notificationBridge?.dispose()
+        notificationBridge = AndroidNotificationBridge(
+            activity = this,
+            binaryMessenger = flutterEngine.dartExecutor.binaryMessenger,
         )
 
         mediaUploadChannel = MethodChannel(
@@ -192,16 +200,29 @@ class MainActivity : FlutterFragmentActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        notificationBridge?.handleIntent(intent) ?: setIntent(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        notificationBridge?.handleResume()
+    }
+
     override fun onRequestPermissionsResult(
         requestCode: Int,
         permissions: Array<out String>,
         grantResults: IntArray,
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        notificationBridge?.handlePermissionResult(requestCode, permissions, grantResults)
         huddleMediaPlugin?.onRequestPermissionsResult(requestCode, permissions, grantResults)
     }
 
     override fun onDestroy() {
+        notificationBridge?.dispose()
+        notificationBridge = null
         ageSignalRequest.retire()
         huddleMediaPlugin?.dispose()
         huddleMediaPlugin = null
