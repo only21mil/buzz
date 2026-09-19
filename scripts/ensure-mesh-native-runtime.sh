@@ -13,7 +13,7 @@ fi
 CACHE_DIR="${MESH_LLM_NATIVE_RUNTIME_CACHE_DIR:-$ROOT/.cache/mesh-llm-native-runtime}"
 OUT_DIR="${MESH_LLM_NATIVE_RUNTIME_OUT_DIR:-$ROOT/.cache/mesh-llm-native-runtime-artifacts}"
 
-metadata="$($ROOT/bin/cargo metadata --manifest-path "$ROOT/desktop/src-tauri/Cargo.toml" --features mesh-llm --format-version 1)"
+metadata="$("$ROOT/bin/cargo" metadata --manifest-path "$ROOT/desktop/src-tauri/Cargo.toml" --features mesh-llm --format-version 1)"
 SDK_MANIFEST="$(python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["manifest_path"] for p in data["packages"] if p["name"]=="mesh-llm-sdk"))' <<<"$metadata")"
 MESH_ROOT="$(cd "$(dirname "$SDK_MANIFEST")/../.." && pwd)"
 MESH_VERSION="$(python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"]=="mesh-llm-sdk"))' <<<"$metadata")"
@@ -40,9 +40,16 @@ fi
 
 echo "Preparing MeshLLM native runtime ($BACKEND) for MeshLLM $MESH_VERSION..." >&2
 runtime_dir="$(cd "$MESH_ROOT" && scripts/ci-prepare-native-runtime.sh "$OUT_DIR" "$BACKEND")"
-version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"].get("mesh_version") or "unknown")' "$runtime_dir/manifest.json")"
+version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"].get("mesh_version", "unknown"))' "$runtime_dir/manifest.json")"
 id="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"]["id"])' "$runtime_dir/manifest.json")"
+# Manifest values become directory names below, never relative paths.
+for component in "$version" "$id"; do
+  if [[ ! "$component" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+    printf 'Invalid native runtime path component: %q\n' "$component" >&2
+    exit 1
+  fi
+done
 mkdir -p "$CACHE_DIR/$version"
-rm -rf "$CACHE_DIR/$version/$id"
+rm -rf "${CACHE_DIR:?}/${version:?}/${id:?}"
 cp -a "$runtime_dir" "$CACHE_DIR/$version/$id"
 printf '%s\n' "$CACHE_DIR"

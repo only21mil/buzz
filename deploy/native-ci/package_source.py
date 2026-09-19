@@ -14,6 +14,7 @@ import subprocess
 GIT_OID = re.compile(r"^[0-9a-f]{40}$")
 GIT_REGULAR_MODES = {0o100644: {0o600, 0o644}, 0o100755: {0o700, 0o755}}
 SHARED_HELPER = Path("deploy/native-ci/package_source.py")
+INSTALLER_HELPER = Path("deploy/native-ci/_common.py")
 
 
 def git_output(root: Path, *arguments: str) -> str:
@@ -127,7 +128,13 @@ def verify_checkout(source_root: Path, source_commit: str, package_relative: Pat
         tracked_payload(source_root, relative)
     if package_relative != SHARED_HELPER:
         tracked_payload(source_root, SHARED_HELPER, 0o100644, 1024 * 1024)
-    bound_paths = sorted({str(package_relative), str(SHARED_HELPER)})
+    bound_paths = {str(package_relative), str(SHARED_HELPER)}
+    if package_relative in {
+        Path("deploy/native-ci/controld"), Path("deploy/native-ci/runner"),
+    }:
+        tracked_payload(source_root, INSTALLER_HELPER, 0o100644, 1024 * 1024)
+        bound_paths.add(str(INSTALLER_HELPER))
+    bound_paths = sorted(bound_paths)
     if git_output(source_root, "status", "--porcelain", "--untracked-files=all", "--", *bound_paths):
         raise ValueError("package source path is not clean")
     subprocess.run(

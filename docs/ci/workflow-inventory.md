@@ -93,7 +93,7 @@ Triggers: pull_request, push[branches=release], workflow_dispatch. Concurrency: 
 
 | Job | Names | Runners | Gate | Needs | Timeout | Permissions | Secrets | Effects | Cost | Required | Disposition | Native job | Owner | Exit condition |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| `changes` | Detect Changed Paths | ubuntu-latest | - | - | 2 | read-only | - | none | S/2 | Detect Changed Paths | retained-github | - | #184 native CI program | native runs every required ci.yml job for main PRs without path filtering; the ruleset drops this context in the reviewed reversible cutover step |
+| `changes` | Detect Changed Paths | ubuntu-latest | - | - | 8 | read-only | - | none | S/8 | Detect Changed Paths | retained-github | - | #184 native CI program | native runs every required ci.yml job for main PRs without path filtering; the ruleset drops this context in the reviewed reversible cutover step |
 | `rust-lint` | Rust Lint | ubuntu-latest | main-pr, path-filtered | changes | 30 | read-only | - | none | M/30 | Rust Lint | native | rust-lint | - | - |
 | `unit-tests` | Unit Tests | ubuntu-latest | main-pr, path-filtered | changes | 30 | read-only | - | none | M/30 | Unit Tests | native | unit-tests | - | - |
 | `desktop-core` | Desktop Core | ubuntu-latest | main-pr, path-filtered | changes | 45 | read-only | - | none | M/45 | - | native | desktop-core | - | - |
