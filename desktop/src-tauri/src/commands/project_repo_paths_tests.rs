@@ -338,3 +338,17 @@ fn suggested_command_preserves_local_branch_without_fetching_unavailable_origin(
         "feature/local"
     );
 }
+
+#[test]
+fn worktree_command_paths_drop_windows_verbatim_prefixes() {
+    use std::path::Path;
+    assert_eq!(
+        shell_path(Path::new(r"\\?\C:\Users\a b\repo")),
+        r"C:\Users\a b\repo"
+    );
+    assert_eq!(
+        shell_path(Path::new(r"\\?\UNC\server\share\repo")),
+        r"\\server\share\repo"
+    );
+    assert_eq!(shell_path(Path::new("/tmp/repo")), "/tmp/repo");
+}

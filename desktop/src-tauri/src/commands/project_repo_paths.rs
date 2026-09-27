@@ -281,6 +281,17 @@ pub(crate) fn find_local_repo_dir(
     )
 }
 
+/// Windows `canonicalize` yields verbatim `\\?\` paths, which Git for Windows
+/// rejects as a `-C` directory; render the equivalent ordinary path instead.
+fn shell_path(path: &std::path::Path) -> String {
+    let path = path.to_string_lossy();
+    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(&path).to_string()
+    }
+}
+
 /// A command for a new worktree; producing it never fetches or switches the existing checkout.
 pub(crate) fn worktree_add_command(checkout: &LocalProjectCheckout, branch: &str) -> String {
     fn quote(value: &str) -> String {
@@ -295,8 +306,8 @@ pub(crate) fn worktree_add_command(checkout: &LocalProjectCheckout, branch: &str
             .to_string_lossy(),
         branch.replace('/', "-")
     ));
-    let repo = quote(&checkout.path.to_string_lossy());
-    let destination = quote(&destination.to_string_lossy());
+    let repo = quote(&shell_path(&checkout.path));
+    let destination = quote(&shell_path(&destination));
     let local_ref = quote(&format!("refs/heads/{branch}"));
     let remote_ref = quote(&format!("refs/remotes/origin/{branch}"));
     let refspec = quote(&format!(
